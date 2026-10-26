@@ -21,6 +21,10 @@ use super::{
 use crate::status_item::SystemStateLine;
 use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
 
+#[cfg(target_os = "macos")]
+#[path = "system_state_access/not_now_retry_tests.rs"]
+mod not_now_retry_tests;
+
 /// How the last record filed under `key` ended, if it ended.
 fn ended_as(app: &App, key: &str) -> Option<aterm_messages::Retired> {
     app.messages
@@ -2017,7 +2021,7 @@ fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
         )],
     ));
     assert!(pending(&app), "no reading of the Secrets row yet");
-    let code = "Approve on an admin Mac: ABCD-EFGH";
+    let code = "On an admin Mac: aterm secrets approve ABCD-EFGH";
     let mut earlier = status(
         Selection::all(),
         vec![observed(
@@ -2143,7 +2147,7 @@ fn an_entry_the_parent_raised_before_commit_ends_like_one_adopted_at_launch() {
         vec![observed(
             Subject::Setting(Setting::Secrets),
             Standing::NeedsYou,
-            Some("Approve on an admin Mac: ABCD-EFGH"),
+            Some("On an admin Mac: aterm secrets approve ABCD-EFGH"),
         )],
     ));
     let mut parent = App::headless_for_test();

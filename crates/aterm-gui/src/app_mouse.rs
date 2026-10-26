@@ -6323,6 +6323,9 @@ mod tests {
             !app.commit_glassless_native_frame(wid),
             "the window has glass"
         );
+        // The chrome fonts the first present would install after it, so the page it
+        // presents is not redrawn for them.
+        app.sync_chrome_fonts();
         app.redraw_window(wid);
         let first_key = format!("settings/nav{}", SettingsRoute::WindowTabs.path());
         let second_key = format!("settings/nav{}", SettingsRoute::KeyboardInput.path());

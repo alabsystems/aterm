@@ -1,13 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conformance and reference-counting tests for [`Com`] and DXGI declarations.
+//! Conformance and reference-counting tests for [`Com`] and the DXGI, Direct3D 11 and DirectComposition declarations.
 
 #![allow(non_snake_case)]
 
 use aterm_win32::Win32::Foundation::E_POINTER;
 use aterm_win32::com::{Com, IUnknown_Vtbl, check};
 use aterm_win32::core::{GUID, HRESULT};
+use aterm_win32::d3d11 as X;
+use aterm_win32::dcomp as XD;
 use aterm_win32::dxgi as D;
 use core::cell::Cell;
 use core::ffi::c_void;
@@ -28,14 +30,122 @@ const _: () = {
     assert!(size_of::<IUnknown_Vtbl>() == slot(3));
     assert!(offset_of!(D::IDXGIFactory1_Vtbl, EnumAdapters1) == slot(12));
     assert!(size_of::<D::IDXGIFactory1_Vtbl>() == slot(13));
+    assert!(offset_of!(D::IDXGIAdapter1_Vtbl, GetParent) == slot(6));
     assert!(offset_of!(D::IDXGIAdapter1_Vtbl, EnumOutputs) == slot(7));
-    assert!(size_of::<D::IDXGIAdapter1_Vtbl>() == slot(8));
+    assert!(offset_of!(D::IDXGIAdapter1_Vtbl, GetDesc1) == slot(10));
+    assert!(size_of::<D::IDXGIAdapter1_Vtbl>() == slot(11));
     assert!(offset_of!(D::IDXGIOutput6_Vtbl, GetDesc1) == slot(27));
     assert!(size_of::<D::IDXGIOutput6_Vtbl>() == slot(28));
+    assert!(offset_of!(D::IDXGISwapChain3_Vtbl, Present) == slot(8));
+    assert!(offset_of!(D::IDXGISwapChain3_Vtbl, GetBuffer) == slot(9));
+    assert!(offset_of!(D::IDXGISwapChain3_Vtbl, ResizeBuffers) == slot(13));
     assert!(offset_of!(D::IDXGISwapChain3_Vtbl, GetContainingOutput) == slot(15));
+    assert!(offset_of!(D::IDXGISwapChain3_Vtbl, SetMaximumFrameLatency) == slot(31));
+    assert!(offset_of!(D::IDXGISwapChain3_Vtbl, GetFrameLatencyWaitableObject) == slot(33));
     assert!(offset_of!(D::IDXGISwapChain3_Vtbl, CheckColorSpaceSupport) == slot(37));
     assert!(offset_of!(D::IDXGISwapChain3_Vtbl, SetColorSpace1) == slot(38));
     assert!(size_of::<D::IDXGISwapChain3_Vtbl>() == slot(39));
+    assert!(offset_of!(D::IDXGIDevice_Vtbl, GetAdapter) == slot(7));
+    assert!(size_of::<D::IDXGIDevice_Vtbl>() == slot(8));
+    assert!(offset_of!(D::IDXGIFactory2_Vtbl, MakeWindowAssociation) == slot(8));
+    assert!(offset_of!(D::IDXGIFactory2_Vtbl, EnumAdapters1) == slot(12));
+    assert!(offset_of!(D::IDXGIFactory2_Vtbl, CreateSwapChainForHwnd) == slot(15));
+    assert!(offset_of!(D::IDXGIFactory2_Vtbl, CreateSwapChainForComposition) == slot(24));
+    assert!(size_of::<D::IDXGIFactory2_Vtbl>() == slot(25));
+    assert!(offset_of!(D::IDXGIFactory6_Vtbl, EnumWarpAdapter) == slot(27));
+    assert!(offset_of!(D::IDXGIFactory6_Vtbl, EnumAdapterByGpuPreference) == slot(29));
+    assert!(size_of::<D::IDXGIFactory6_Vtbl>() == slot(30));
+    assert!(offset_of!(X::ID3DBlob_Vtbl, GetBufferPointer) == slot(3));
+    assert!(offset_of!(X::ID3DBlob_Vtbl, GetBufferSize) == slot(4));
+    assert!(size_of::<X::ID3DBlob_Vtbl>() == slot(5));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateBuffer) == slot(3));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateTexture2D) == slot(5));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateShaderResourceView) == slot(7));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateRenderTargetView) == slot(9));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateInputLayout) == slot(11));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateVertexShader) == slot(12));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreatePixelShader) == slot(15));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateBlendState) == slot(20));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateRasterizerState) == slot(22));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateSamplerState) == slot(23));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CreateQuery) == slot(24));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, CheckFormatSupport) == slot(29));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, GetFeatureLevel) == slot(37));
+    assert!(offset_of!(X::ID3D11Device_Vtbl, GetDeviceRemovedReason) == slot(39));
+    assert!(size_of::<X::ID3D11Device_Vtbl>() == slot(40));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, VSSetConstantBuffers) == slot(7));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, PSSetShaderResources) == slot(8));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, PSSetShader) == slot(9));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, PSSetSamplers) == slot(10));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, VSSetShader) == slot(11));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, Draw) == slot(13));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, Map) == slot(14));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, Unmap) == slot(15));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, PSSetConstantBuffers) == slot(16));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, IASetInputLayout) == slot(17));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, IASetVertexBuffers) == slot(18));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, DrawInstanced) == slot(21));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, IASetPrimitiveTopology) == slot(24));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, VSSetShaderResources) == slot(25));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, Begin) == slot(27));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, End) == slot(28));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, GetData) == slot(29));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, OMSetRenderTargets) == slot(33));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, OMSetBlendState) == slot(35));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, RSSetState) == slot(43));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, RSSetViewports) == slot(44));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, RSSetScissorRects) == slot(45));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, CopySubresourceRegion) == slot(46));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, CopyResource) == slot(47));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, UpdateSubresource) == slot(48));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, ClearRenderTargetView) == slot(50));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, ClearState) == slot(110));
+    assert!(offset_of!(X::ID3D11DeviceContext_Vtbl, Flush) == slot(111));
+    assert!(size_of::<X::ID3D11DeviceContext_Vtbl>() == slot(112));
+    assert!(offset_of!(XD::IDCompositionDevice_Vtbl, Commit) == slot(3));
+    assert!(offset_of!(XD::IDCompositionDevice_Vtbl, CreateTargetForHwnd) == slot(6));
+    assert!(offset_of!(XD::IDCompositionDevice_Vtbl, CreateVisual) == slot(7));
+    assert!(size_of::<XD::IDCompositionDevice_Vtbl>() == slot(8));
+    assert!(offset_of!(XD::IDCompositionTarget_Vtbl, SetRoot) == slot(3));
+    assert!(size_of::<XD::IDCompositionTarget_Vtbl>() == slot(4));
+    assert!(offset_of!(XD::IDCompositionVisual_Vtbl, SetContent) == slot(15));
+    assert!(size_of::<XD::IDCompositionVisual_Vtbl>() == slot(16));
+
+    // GW.5's structs, on 64-bit hosts.
+    assert!(
+        size_of::<D::DXGI_SWAP_CHAIN_DESC1>() == 48 && align_of::<D::DXGI_SWAP_CHAIN_DESC1>() == 4
+    );
+    assert!(offset_of!(D::DXGI_SWAP_CHAIN_DESC1, SampleDesc) == 16);
+    assert!(offset_of!(D::DXGI_SWAP_CHAIN_DESC1, Flags) == 44);
+    assert!(size_of::<D::DXGI_SWAP_CHAIN_FULLSCREEN_DESC>() == 20);
+    assert!(size_of::<D::DXGI_ADAPTER_DESC1>() == 312 && align_of::<D::DXGI_ADAPTER_DESC1>() == 8);
+    assert!(offset_of!(D::DXGI_ADAPTER_DESC1, DedicatedVideoMemory) == 272);
+    assert!(offset_of!(D::DXGI_ADAPTER_DESC1, AdapterLuid) == 296);
+    assert!(offset_of!(D::DXGI_ADAPTER_DESC1, Flags) == 304);
+    assert!(size_of::<X::D3D_SHADER_MACRO>() == 16);
+    assert!(size_of::<X::D3D11_BUFFER_DESC>() == 24);
+    assert!(size_of::<X::D3D11_TEXTURE2D_DESC>() == 44);
+    assert!(offset_of!(X::D3D11_TEXTURE2D_DESC, SampleDesc) == 20);
+    assert!(size_of::<X::D3D11_SUBRESOURCE_DATA>() == 16);
+    assert!(size_of::<X::D3D11_SHADER_RESOURCE_VIEW_DESC_0>() == 16);
+    assert!(size_of::<X::D3D11_SHADER_RESOURCE_VIEW_DESC>() == 24);
+    assert!(size_of::<X::D3D11_RENDER_TARGET_VIEW_DESC_0>() == 12);
+    assert!(size_of::<X::D3D11_RENDER_TARGET_VIEW_DESC>() == 20);
+    assert!(
+        size_of::<X::D3D11_INPUT_ELEMENT_DESC>() == 32
+            && align_of::<X::D3D11_INPUT_ELEMENT_DESC>() == 8
+    );
+    assert!(offset_of!(X::D3D11_INPUT_ELEMENT_DESC, InstanceDataStepRate) == 28);
+    assert!(size_of::<X::D3D11_RENDER_TARGET_BLEND_DESC>() == 32);
+    assert!(offset_of!(X::D3D11_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) == 28);
+    assert!(size_of::<X::D3D11_BLEND_DESC>() == 264);
+    assert!(size_of::<X::D3D11_RASTERIZER_DESC>() == 40);
+    assert!(size_of::<X::D3D11_SAMPLER_DESC>() == 52);
+    assert!(offset_of!(X::D3D11_SAMPLER_DESC, BorderColor) == 28);
+    assert!(size_of::<X::D3D11_MAPPED_SUBRESOURCE>() == 16);
+    assert!(size_of::<X::D3D11_BOX>() == 24);
+    assert!(size_of::<X::D3D11_VIEWPORT>() == 24);
+    assert!(size_of::<X::D3D11_QUERY_DESC>() == 8);
 
     assert!(size_of::<D::DXGI_OUTPUT_DESC1>() == 152 && align_of::<D::DXGI_OUTPUT_DESC1>() == 8);
     assert!(offset_of!(D::DXGI_OUTPUT_DESC1, DeviceName) == 0);

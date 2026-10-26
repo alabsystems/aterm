@@ -130,13 +130,15 @@ pub(crate) const MARKER_ROOM: f64 = 8.0;
 /// The time scale's ticks after the middle of the span, how long ago each is, most wanted
 /// first: the last minute, two minutes, half a minute, five minutes ([`tick_ages`]).
 const TICK_AGES: [u32; 4] = [60, 120, 30, 300];
-/// A Folded strip's column, seconds: the ring's own bucket, so the glide is as fast as the
-/// data allows (`docs/DESIGN-stats-deck-live-2026-10-24.md` §11).
-pub(crate) const FOLD_PERIOD_S: u32 = 10;
-/// A Folded strip's pitch, pt: one 10 s column every 10 pt, so its strips glide 1 pt a second
-/// (2 device px at 2x), fast enough to be seen moving at a glance; the span is then the
-/// strip's width in seconds (a minute in the default window).
-pub(crate) const FOLD_PITCH: f64 = 10.0;
+/// A strip under a minute's ticks after the middle of its span: twenty seconds, then ten.
+const TICK_AGES_SHORT: [u32; 2] = [20, 10];
+/// A Folded strip's column, seconds: one reading's second, at the focused window's cadence of a
+/// reading a second, so each reading slides the strip one whole cell left, a step a person sees
+/// at a glance (`docs/DESIGN-stats-deck-live-2026-10-24.md` §12). The cells are v2's own (20 on
+/// 3 or 4 pt, 30 on 5 pt), so a Folded strip spans 20 or 30 seconds.
+pub(crate) const FOLD_SLOT_S: u32 = 1;
+/// The most slots a Folded strip draws (fwide's 30), and the one its slide brings in.
+pub(crate) const FOLD_SLOTS_MAX: usize = 30;
 /// The least room between a tick's words and the words beside them, pt.
 const TICK_GAP: f64 = 6.0;
 /// How far a tick's words may stand off centre over it, as a share of their width: the tick
@@ -213,11 +215,10 @@ impl Strip {
         Self::of(x, cols, Self::FULL_SPAN_S / cols, pitch)
     }
 
-    /// A Folded strip `w` pt wide: [`FOLD_PERIOD_S`] columns on [`FOLD_PITCH`], so it spans
-    /// `w` seconds and glides 1 pt a second.
-    fn folded(x: f64, w: f64) -> Self {
-        let cols = (w / FOLD_PITCH).round().max(1.0) as u32;
-        Self::of(x, cols, FOLD_PERIOD_S, FOLD_PITCH)
+    /// A Folded strip: `cols` slots of [`FOLD_SLOT_S`] on `pitch`, a reading's second each, so it
+    /// spans `cols` seconds and each reading slides it one pitch left.
+    const fn folded(x: f64, cols: u32, pitch: f64) -> Self {
+        Self::of(x, cols, FOLD_SLOT_S, pitch)
     }
 
     const fn of(x: f64, cols: u32, period_s: u32, pitch: f64) -> Self {
@@ -723,9 +724,9 @@ fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bo
     };
     let name = Col::new(x, name_width(name_base, rows.name_pt, m));
     let well = Col::new(name.end(), well_w);
-    // The block's strip keeps its place (`cols` on `pitch`, 60 to 150 pt) and draws it in
-    // 10 s columns on a 10 pt pitch (§11 of the live edge's design).
-    let strip = Strip::folded(well.end() + strip_gap, f64::from(cols) * pitch);
+    // The block's strip keeps v2's cells (`cols` on `pitch`, 60 to 150 pt), each a reading's
+    // second (§12 of the live edge's design).
+    let strip = Strip::folded(well.end() + strip_gap, cols, pitch);
     let e = strip.after();
     let end = x + b;
     let cores_x = if kind == BlockKind::Slim {
@@ -1163,25 +1164,27 @@ fn age_words(age_s: u32) -> String {
 }
 
 /// The time label over (or beside) `strip`, long then short: how far back its left end is,
-/// `10 min ago` and `–10 min` on a Full strip, `1 min ago` and `–1 min` on the default
-/// window's Folded one.
+/// `10 min ago` and `–10 min` on a Full strip, `20 s ago` and `–20 s` on the default window's
+/// Folded one.
 pub(crate) fn time_words(strip: Strip) -> [String; 2] {
     let span = age_words(strip.span_s());
     [format!("{span} ago"), format!("\u{2013}{span}")]
 }
 
 /// The ages `strip`'s scale may mark, most wanted first: the middle of its span where that is
-/// a round age (a whole minute, or a multiple of 10 s under one), then [`TICK_AGES`]; only ages
-/// inside the span, since its left end is the label's.
+/// a round age (a whole minute, or a multiple of 10 s under one), then [`TICK_AGES`], and on a
+/// strip under a minute [`TICK_AGES_SHORT`]; only ages inside the span, since its left end is the
+/// label's.
 pub(crate) fn tick_ages(strip: Strip) -> Vec<u32> {
     let span = strip.span_s();
     let mid = span / 2;
     let round =
         span.is_multiple_of(2) && (mid.is_multiple_of(60) || (mid < 60 && mid.is_multiple_of(10)));
+    let short = TICK_AGES_SHORT.into_iter().filter(|_| span < 60);
     round
         .then_some(mid)
         .into_iter()
-        .chain(TICK_AGES.into_iter().filter(|&age| age != mid))
+        .chain(TICK_AGES.into_iter().chain(short).filter(|&age| age != mid))
         .filter(|&age| age > 0 && age < span)
         .collect()
 }
@@ -1873,13 +1876,13 @@ mod tests {
         assert_eq!(p.divider, 595.0);
         assert_eq!(details(&p), [None, None]);
         let a = p.blocks[0];
-        // Its strip keeps 150 pt and draws 10 s columns on a 10 pt pitch: two and a half
-        // minutes, gliding 1 pt a second (§11 of the live edge's design).
+        // Its strip keeps v2's 30 cells on 5 pt, each a reading's second: half a minute, sliding
+        // a cell left at each reading (§12 of the live edge's design).
         assert_eq!(
             (a.strip.x, a.strip.cols, a.strip.period_s, a.strip.pitch),
-            (150.0, 15, 10, 10.0)
+            (150.0, 30, 1, 5.0)
         );
-        assert_eq!((a.strip.end(), a.strip.span_s()), (299.0, 150));
+        assert_eq!((a.strip.end(), a.strip.span_s()), (299.0, 30));
         assert_eq!(a.pct, Some(Col::new(306.0, 30.0)));
         // The glance's columns, as Full wide's (§3.2).
         assert_eq!(a.amount, Some(Col::new(344.0, 96.0)));
@@ -2097,19 +2100,23 @@ mod tests {
                 }
                 assert_eq!(folded.gauge.is_some(), w >= slim_beside, "Folded W {w}");
                 for block in &folded.blocks {
-                    // 10 s columns on a 10 pt pitch over the strip's 60, 80 or 150 pt: it
-                    // spans its width in seconds and glides 1 pt a second.
-                    let width = match block.kind {
-                        BlockKind::Wide => 150,
-                        BlockKind::Mid => 80,
-                        BlockKind::Narrow | BlockKind::Slim => 60,
+                    // v2's cells over the strip's 60, 80 or 150 pt, each a reading's second: it
+                    // spans 20 or 30 s and slides 3 to 5 pt at each reading.
+                    let (width, span, pitch) = match block.kind {
+                        BlockKind::Wide => (150, 30, 5.0),
+                        BlockKind::Mid => (80, 20, 4.0),
+                        BlockKind::Narrow | BlockKind::Slim => (60, 20, 3.0),
                     };
                     assert_eq!(
-                        (block.strip.period_s, block.strip.span_s()),
-                        (FOLD_PERIOD_S, width),
+                        (
+                            block.strip.period_s,
+                            block.strip.span_s(),
+                            block.strip.pitch
+                        ),
+                        (FOLD_SLOT_S, span, pitch),
                         "Folded W {w}"
                     );
-                    assert!((block.strip.pt_per_s() - 1.0).abs() < 1e-12, "Folded W {w}");
+                    assert!(block.strip.pt_per_s() >= 3.0, "Folded W {w}");
                     assert!(
                         (block.strip.end() + 1.0 - block.strip.x - f64::from(width)).abs() < 1e-9,
                         "Folded W {w}: the strip keeps its place"
@@ -2424,16 +2431,19 @@ mod tests {
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
         assert_eq!(label_x(&head, Label::Time), Some(a.strip.x));
-        // Its 150 pt strip spans two and a half minutes (§11 of the live edge's design):
-        // "2.5 min ago" over its left end, and the last minute marked.
+        // Its 150 pt strip spans half a minute, a reading's second a cell (§12 of the live
+        // edge's design): "30 s ago" over its left end, and twenty and ten seconds marked.
         assert_eq!(
             head.labels
                 .iter()
                 .find(|l| l.label == Label::Time)
                 .map(|l| l.text.as_str()),
-            Some("2.5 min ago")
+            Some("30 s ago")
         );
-        assert_eq!(head.ruler.iter().map(|t| t.age_s).collect::<Vec<_>>(), [60]);
+        assert_eq!(
+            head.ruler.iter().map(|t| t.age_s).collect::<Vec<_>>(),
+            [20, 10]
+        );
         assert_eq!(placed(&head, KeyItem::Over), Some(b.strip.x));
         assert_eq!(
             (

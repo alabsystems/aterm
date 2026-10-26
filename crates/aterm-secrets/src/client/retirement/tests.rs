@@ -10,18 +10,30 @@ struct Lab {
     source: PathBuf,
 }
 
+/// How a lab's vault holds its admin custody.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Custody {
+    /// Created with a Commons root (the default since Commons custody).
+    Founded,
+    /// Created without one, its Commons key never bound.
+    Unbound,
+    /// Last written by an admin before Commons custody: a version-1 locker, read as bound,
+    /// with no Commons control.
+    V1,
+}
+
 impl Lab {
-    fn new(enrolled: bool, legacy: bool) -> Self {
+    fn new(enrolled: bool, custody: Custody) -> Self {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = [
             Paths::for_home(&root.path().join("m1")),
             Paths::for_home(&root.path().join("m2")),
         ];
         let source = root.path().join("vault");
-        let created = if legacy {
-            test_create_unbound(&paths[0], source.to_str().unwrap(), None, Some("m1"))
-        } else {
+        let created = if custody == Custody::Founded {
             create(&paths[0], source.to_str().unwrap(), None, Some("m1"))
+        } else {
+            test_create_unbound(&paths[0], source.to_str().unwrap(), None, Some("m1"))
         }
         .unwrap();
         let recipient = machine_identity(&paths[1]).unwrap().recipient().to_bech32();
@@ -37,12 +49,18 @@ impl Lab {
                 interactive: false,
                 wait: Duration::ZERO,
                 confirm: &|_| false,
-                password: &|| None,
+                password: crate::client::JoinPassword::Given(None),
+                fetched: None,
                 requested: &|| {},
                 say: &|_| {},
             },
         )
         .unwrap();
+        if custody == Custody::V1 {
+            admin_keys::legacy::publish_legacy(&paths[0], &admin_cached(&paths[0]).unwrap());
+            let admin = admin_cached(&paths[0]).unwrap();
+            assert!(admin.commons_bound && admin.custody != admin_keys::MAGIC);
+        }
         let lab = Self {
             root,
             paths,
@@ -91,7 +109,8 @@ impl Lab {
                 interactive: false,
                 wait: Duration::ZERO,
                 confirm: &|_| false,
-                password: &|| None,
+                password: crate::client::JoinPassword::Given(None),
+                fetched: None,
                 requested: &|| {},
                 say: &|_| {},
             },
@@ -163,27 +182,20 @@ pub(crate) fn retirement_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    let bound = action != "Legacy";
+    let custody = match action {
+        "Legacy" => Custody::Unbound,
+        "Unfounded" | "RetainedRoot" | "UnfoundedEdit" => Custody::V1,
+        _ => Custody::Founded,
+    };
     let lab = Lab::new(
-        !matches!(action, "NoBinding" | "Legacy"),
-        action == "Legacy",
+        custody == Custody::Founded && action != "NoBinding",
+        custody,
     );
-    if action == "Legacy" {
-        let admin = admin_cached(&lab.paths[0]).unwrap();
-        let result = admin_revoke(&lab.paths[0], &admin, "m2", false).unwrap();
-        assert!(result.retirement.is_none());
-        let mut next = state.clone();
-        for (name, value) in [
-            ("scenario", 5),
-            ("bound", 0),
-            ("retired", 0),
-            ("published", 1),
-            ("same", 1),
-        ] {
-            next.insert(name, value);
-        }
-        return next;
+    if custody != Custody::Founded {
+        return without_control(state, &lab, action);
     }
+    // What the setup made: every founded vault names its control entry.
+    let controlled = admin_keys::has_control(&admin_cached(&lab.paths[0]).unwrap().published_doc);
     let owner = lab.bootstrap(0);
     let peer = lab.bootstrap(1);
     let actor = peer.request().unwrap().binding().actor();
@@ -324,7 +336,7 @@ pub(crate) fn retirement_transition(
     let mut next = state.clone();
     for (name, value) in [
         ("scenario", scenario),
-        ("bound", i64::from(bound)),
+        ("controlled", i64::from(controlled)),
         ("retired", i64::from(retired)),
         ("published", i64::from(published)),
         ("same", i64::from(before == after)),
@@ -332,6 +344,82 @@ pub(crate) fn retirement_transition(
         next.insert(name, value);
     }
     next
+}
+
+/// [`retirement_transition`] on a vault with no control journal: an unbound one (`Legacy`) or a
+/// version-1 one, which removes vault-only unless this Mac keeps Commons control state
+/// (`RetainedRoot`, a control directory planted beside the vault's files).
+fn without_control(
+    state: &aterm_spec::interp::State,
+    lab: &Lab,
+    action: &str,
+) -> aterm_spec::interp::State {
+    if action == "RetainedRoot" {
+        std::fs::create_dir_all(lab.paths[0].dir.join("commons/control")).unwrap();
+    }
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    // What the setup made: only `RetainedRoot` leaves Commons state on the admin's Mac.
+    let controlled = action == "RetainedRoot";
+    let authority = admin.commons_authority().unwrap();
+    let result = if action == "UnfoundedEdit" {
+        let mut doc = admin.doc.clone();
+        doc.remove_machine("m2", false).unwrap();
+        admin_publish(&lab.paths[0], &admin, &doc).map(|_| None)
+    } else {
+        admin_revoke(&lab.paths[0], &admin, "m2", false).map(|done| done.retirement)
+    };
+    let reopened = admin_cached(&lab.paths[0]).unwrap();
+    let scenario = match action {
+        "Legacy" => 5,
+        "Unfounded" => 14,
+        "RetainedRoot" => 15,
+        "UnfoundedEdit" => 16,
+        _ => panic!("unknown retirement action"),
+    };
+    match result {
+        Err(refused) => {
+            assert_eq!(scenario, 15, "{action}: {refused}");
+            assert!(
+                refused.to_string().contains("missing its descriptor"),
+                "{refused}"
+            );
+            assert_eq!(reopened.seq, admin.seq, "nothing was published");
+        }
+        Ok(retirement) => {
+            assert_ne!(scenario, 15, "retained control refuses");
+            assert_eq!(retirement, None, "{action}: nothing to retire");
+            assert_eq!(reopened.custody, admin_keys::MAGIC);
+            assert_eq!(reopened.commons_bound, custody_bound(action));
+            if action != "Legacy" {
+                assert_eq!(
+                    reopened.commons_authority().unwrap(),
+                    authority,
+                    "the root key stays"
+                );
+            }
+        }
+    }
+    let published = !reopened
+        .doc
+        .machines()
+        .iter()
+        .any(|machine| machine.name == "m2");
+    let mut next = state.clone();
+    for (name, value) in [
+        ("scenario", scenario),
+        ("controlled", i64::from(controlled)),
+        ("retired", 0),
+        ("published", i64::from(published)),
+        ("same", 1),
+    ] {
+        next.insert(name, value);
+    }
+    next
+}
+
+/// Whether `action`'s lab is bound once it published: every version-1 vault is.
+fn custody_bound(action: &str) -> bool {
+    action != "Legacy"
 }
 
 #[test]
@@ -358,7 +446,7 @@ fn retirement_publication_matches_real_failures_retries_and_preflight_refusals()
 
 #[test]
 fn retirement_preserves_other_roles_and_reapproval_cannot_resurrect_the_recipient() {
-    let lab = Lab::new(true, false);
+    let lab = Lab::new(true, Custody::Founded);
     let owner = lab.bootstrap(0);
     let peer = lab.bootstrap(1);
     let admin = admin_cached(&lab.paths[0]).unwrap();
@@ -410,7 +498,7 @@ pub(crate) fn recipient_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    let lab = Lab::new(false, false);
+    let lab = Lab::new(false, Custody::Founded);
     let owner = lab.bootstrap(0);
     let peer = lab.bootstrap(1);
     let request = peer.request().unwrap();
@@ -561,4 +649,152 @@ fn recipient_retirement_survives_delayed_binding_and_concurrent_recovery() {
     let mut mutant = recipient_transition(&initial, "ConcurrentRecovery");
     mutant.insert("old_ready", 1);
     assert!(!model.check_invariant("OldKeyWithheld", &mutant));
+}
+
+/// A vault with no Commons control (version-1 custody, as an admin before Commons custody
+/// wrote it) revokes vault-only and keeps its root key. Each control after the first changes
+/// one input: Commons state on the admin's Mac, or a control entry the vault or the edit
+/// names, refuses with nothing published; a device key alone does not.
+#[test]
+fn a_vault_without_commons_control_revokes_vault_only_and_keeps_its_root() {
+    let revoke = |lab: &Lab| {
+        let admin = admin_cached(&lab.paths[0]).unwrap();
+        let result = admin_revoke(&lab.paths[0], &admin, "m2", false).map(|done| done.retirement);
+        (admin.seq, result)
+    };
+    let refused = |lab: &Lab, case: &str| {
+        let (seq, result) = revoke(lab);
+        let Err(refused) = result else {
+            panic!("{case}: revoked");
+        };
+        let after = admin_cached(&lab.paths[0]).unwrap();
+        assert_eq!(after.seq, seq, "{case}: nothing was published");
+        assert!(
+            after
+                .doc
+                .machines()
+                .iter()
+                .any(|machine| machine.name == "m2"),
+            "{case}"
+        );
+        refused.to_string()
+    };
+    let gone = |lab: &Lab| {
+        !admin_cached(&lab.paths[0])
+            .unwrap()
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.name == "m2")
+    };
+
+    // Revokes vault-only, and the marker stays: an admin added later cannot be demoted.
+    let lab = Lab::new(false, Custody::V1);
+    let authority = admin_cached(&lab.paths[0])
+        .unwrap()
+        .commons_authority()
+        .unwrap();
+    assert_eq!(revoke(&lab).1.unwrap(), None);
+    assert!(gone(&lab));
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    assert!(admin.commons_bound);
+    assert_eq!(admin.custody, admin_keys::MAGIC);
+    assert_eq!(admin.commons_authority().unwrap(), authority);
+    let third = Identity::from_secret_bytes([41; 32])
+        .recipient()
+        .to_bech32();
+    let mut doc = admin.doc.clone();
+    doc.add_machine("m3", &third).unwrap();
+    doc.add_admin("m3").unwrap();
+    admin_publish_approved(&lab.paths[0], &admin, &doc, &[third]).unwrap();
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.remove_admin("m3").unwrap();
+    let demoted = admin_publish(&lab.paths[0], &admin, &doc).err().unwrap();
+    assert!(demoted.to_string().contains("cannot demote"), "{demoted}");
+    // There is no Commons membership to retire.
+    let error = admin_retire(&lab.paths[0], &admin, &["m3".into()])
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("no Commons control"), "{error}");
+
+    // A version-1 vault a later build already rewrote (bound, no entry) revokes too.
+    let lab = Lab::new(false, Custody::V1);
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&crate::text::Audience::Everyone, "note", b"kept")
+        .unwrap();
+    admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    assert!(admin.commons_bound && admin.custody == admin_keys::MAGIC);
+    assert_eq!(revoke(&lab).1.unwrap(), None);
+    assert!(gone(&lab));
+
+    // A device key alone is no control state.
+    let lab = Lab::new(false, Custody::V1);
+    std::fs::create_dir_all(lab.paths[0].dir.join("commons")).unwrap();
+    std::fs::write(lab.paths[0].dir.join("commons/device.age"), b"").unwrap();
+    std::fs::write(lab.paths[0].dir.join("commons/device.claim"), b"").unwrap();
+    assert_eq!(revoke(&lab).1.unwrap(), None);
+    assert!(gone(&lab));
+
+    // A Commons claim on the admin's Mac refuses, the revoke and a generic removal alike.
+    let lab = Lab::new(false, Custody::V1);
+    std::fs::write(lab.paths[0].dir.join("commons.claim"), b"").unwrap();
+    let why = refused(&lab, "a retained claim");
+    assert!(why.contains("missing its descriptor"), "{why}");
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.remove_machine("m2", false).unwrap();
+    let why = admin_publish(&lab.paths[0], &admin, &doc).err().unwrap();
+    assert!(why.to_string().contains("custody is unavailable"), "{why}");
+
+    // A control entry the vault names, with no descriptor yet, refuses.
+    let lab = Lab::new(false, Custody::V1);
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &crate::text::Audience::Hosts(vec!["m1".into()]),
+        crate::commons::ENTRY,
+        b"pending",
+    )
+    .unwrap();
+    admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    let why = refused(&lab, "a published control entry");
+    assert!(why.contains("missing its descriptor"), "{why}");
+    // Nor does an edit that drops that entry and the member together.
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.unset_entry(
+        &crate::text::Audience::Hosts(vec!["m1".into()]),
+        crate::commons::ENTRY,
+    )
+    .unwrap();
+    doc.remove_machine("m2", false).unwrap();
+    let why = admin_publish(&lab.paths[0], &admin, &doc).err().unwrap();
+    assert!(why.to_string().contains("custody is unavailable"), "{why}");
+    assert_eq!(admin_cached(&lab.paths[0]).unwrap().seq, admin.seq);
+    assert!(!gone(&lab));
+
+    // An edit that removes a member and adds a control entry in one publish refuses.
+    let lab = Lab::new(false, Custody::V1);
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.remove_machine("m2", false).unwrap();
+    doc.set_entry(
+        &crate::text::Audience::Hosts(vec!["m1".into()]),
+        crate::commons::ENTRY,
+        b"pending",
+    )
+    .unwrap();
+    let why = admin_publish(&lab.paths[0], &admin, &doc).err().unwrap();
+    assert!(why.to_string().contains("custody is unavailable"), "{why}");
+    assert_eq!(admin_cached(&lab.paths[0]).unwrap().seq, admin.seq);
+    assert!(!gone(&lab));
+
+    // An unbound vault removes vault-only whatever this Mac keeps.
+    let lab = Lab::new(false, Custody::Unbound);
+    std::fs::write(lab.paths[0].dir.join("commons.claim"), b"").unwrap();
+    assert_eq!(revoke(&lab).1.unwrap(), None);
+    assert!(gone(&lab));
 }

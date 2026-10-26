@@ -171,9 +171,9 @@ fn sf_mono_italic_draws_the_weight_of_its_upright() {
 }
 
 /// The font list offers a variable styled face by the instance it draws in that role:
-/// SF Mono's italic file is "SF Mono Italic", not the "SF Mono Light Italic" its name
-/// table gives its default, and that name finds the file. A static styled face keeps
-/// its own full name.
+/// SF Mono's italic file is "SF Mono Italic" (its Light Italic default is offered by
+/// that instance's own name, `named_instance_tests`), and that name finds the file. A
+/// static styled face keeps its own full name.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_variable_italic_is_offered_and_found_by_the_name_it_draws() {
@@ -182,13 +182,16 @@ fn a_variable_italic_is_offered_and_found_by_the_name_it_draws() {
         std::path::PathBuf::from("/System/Library/Fonts/SFNSMonoItalic.ttf"),
     ];
     let families = font_catalog::monospace_families_in(&files, &[]);
-    assert_eq!(families.italic, vec!["SF Mono Italic".to_string()]);
+    assert_eq!(
+        families.italic.first().map(String::as_str),
+        Some("SF Mono Italic")
+    );
 
     let italic = std::fs::read(&files[1]).unwrap();
     let face = aterm_font::Face::parse(&italic, 0).unwrap();
     assert_eq!(
         face_name_match(&face, &normalize_family("SF Mono Italic")),
-        Some(NameMatch::Face)
+        Some(NameMatch::Role { bold: false })
     );
     let upright = std::fs::read(&files[0]).unwrap();
     let upright = aterm_font::Face::parse(&upright, 0).unwrap();
@@ -199,5 +202,5 @@ fn a_variable_italic_is_offered_and_found_by_the_name_it_draws() {
 
     let static_italic = include_bytes!("../assets/bundled/JetBrainsMono-Italic.ttf");
     let face = aterm_font::Face::parse(static_italic, 0).unwrap();
-    assert_eq!(font_catalog::variable_role_words(&face), None);
+    assert!(font_catalog::variable_roles(&face).is_empty());
 }

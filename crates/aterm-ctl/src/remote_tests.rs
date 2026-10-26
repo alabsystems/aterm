@@ -600,7 +600,7 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
         drive("lab-mini", DRIVE_WITHIN).expect("a link"),
         "spawn agent=claude len=2",
         b"go",
-        Within::Timeout(Duration::from_secs(5)),
+        Within::Timeout(Duration::from_secs(5), DRIVE_WITHIN),
     )
     .expect_err("unanswered")
     .to_string();
@@ -653,9 +653,25 @@ fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
             "{total:?}: {refused}"
         );
     }
-    let awaited = await_task::run_driven(&words("await task @s-a1"), None, "lab-mini", frozen)
+    for (total, most) in [
+        (Some(Some(five)), five),
+        (None, Duration::from_secs(8)),
+        (Some(Some(Duration::from_secs(60))), Duration::from_secs(8)),
+    ] {
+        let awaited = run(
+            "lab-mini",
+            &words("await task @s-a1 timeout=2000"),
+            total,
+            &local,
+        )
         .expect_err("never served");
-    assert_eq!(crate::exit_for(&awaited), ExitCode::from(2), "{awaited}");
+        assert_eq!(crate::exit_for(&awaited), ExitCode::from(2), "{awaited}");
+        let asked = ASKED.lock().unwrap().pop().expect("a dial");
+        assert!(asked <= most, "{total:?}: {asked:?}");
+        if total == Some(Some(five)) {
+            assert!(asked < Duration::from_secs(8), "{asked:?}");
+        }
+    }
     fn cut(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
         Err(DriveRefused::once(
             "127.0.0.1:7100: no connection within 5.0s".to_owned(),
@@ -667,4 +683,44 @@ fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
     };
     let refused = run("lab-mini", &words("@s-a1 status"), None, &local).expect_err("refused");
     assert_eq!(crate::exit_for(&refused), ExitCode::FAILURE, "{refused}");
+}
+
+#[test]
+fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
+    static ASKED: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn baseline(_: &str) -> String {
+        "OK 1 status=timeout\n@s-a1 rev=3 state=working agent=busy attention=- result_bytes=0\n"
+            .to_owned()
+    }
+    fn drive(_: &str, within: Duration) -> Result<DriveLink, DriveRefused> {
+        let mut asked = ASKED.lock().unwrap_or_else(|p| p.into_inner());
+        asked.push(within);
+        Ok(if asked.len() == 1 {
+            link(baseline, &SEEN)
+        } else {
+            DriveLink {
+                stream: Box::new(Frozen),
+                label: "lab-mini".to_owned(),
+            }
+        })
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(drive),
+        ..LocalVerbs::NONE
+    };
+    let five = Duration::from_secs(5);
+    let code = run(
+        "lab-mini",
+        &words("await task @s-a1 timeout=600000"),
+        Some(Some(five)),
+        &local,
+    )
+    .expect("the rows read");
+    assert_eq!(code, ExitCode::from(EXIT_TIMEOUT));
+    let asked = ASKED.lock().unwrap();
+    assert_eq!(asked.len(), 2, "a baseline and one leg: {asked:?}");
+    assert!(asked.iter().all(|within| *within <= five), "{asked:?}");
+    let seen = SEEN.lock().unwrap();
+    assert_eq!(*seen, ["await task @s-a1 any timeout=0"]);
 }

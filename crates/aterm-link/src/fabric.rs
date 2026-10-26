@@ -2172,7 +2172,9 @@ impl NodeRow {
     }
 }
 
-/// The distinct subjects one producer (one node) may ever hold.
+/// The distinct subjects one producer (one node) may hold at once. A departed session's
+/// presence row and the lanes its node wrote to it go back (the bridge's reclaim, astream's
+/// conditional retire); each topic face a session broadcast on (`say`) stays spent for good.
 pub const SUBJECT_BUDGET: usize = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER;
 
 /// How much of [`SUBJECT_BUDGET`] spent is a warning: three quarters, while about a thousand
@@ -2958,9 +2960,13 @@ fn warnings(
         if *used >= SUBJECT_BUDGET_WARN {
             w.push(format!(
                 "node {} holds {used} of the {SUBJECT_BUDGET} distinct subjects one node may \
-                 ever mint, and none but a closed session's own `ev` face (while the session-log \
-                 mirror runs) is ever given back: past the bound a new session gets no presence \
-                 row and its posts are refused; the remedy is a new node id",
+                 hold at once: a departed session's presence row and the lanes this node wrote \
+                 to it go back five minutes after it leaves (its `ev` face once the session-log \
+                 mirror landed its tail), but each topic a session broadcast on keeps one \
+                 subject for good, so what stays is held by live sessions, every topic face a \
+                 session of this node ever broadcast on, mail still owed and the node's own \
+                 faces; past the bound a new session gets no presence row and its posts are \
+                 refused",
                 safe(node, 64)
             ));
         }
@@ -3586,8 +3592,9 @@ pub fn render_text(r: &Report) -> String {
             match subjects {
                 Ok(n) => format!(
                     "{n} of {SUBJECT_BUDGET} spent by this node — one per presence, `ev` and \
-                     `say` face and lane it ever wrote; only a closed session's `ev` face is ever \
-                     given back, while the session-log mirror runs"
+                     `say` face and lane it holds; a departed session's presence row and the \
+                     lanes this node wrote to it go back five minutes after it leaves, its `ev` \
+                     face once the session-log mirror landed its tail, and its `say` faces never"
                 ),
                 Err(e) => format!("- (could not be counted: {})", safe(e, 256)),
             },

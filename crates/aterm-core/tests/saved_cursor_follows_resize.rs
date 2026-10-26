@@ -345,3 +345,99 @@ fn a_move_that_follows_the_content_in_the_offload_window_keeps_the_owed_rows() {
         );
     }
 }
+
+fn wrapped(term: &Terminal, row: u16) -> bool {
+    term.grid().row_is_wrapped(row).expect("visible row")
+}
+
+/// A pager quits after a maximize: the wrap the 80 x's left pending when `?1049h` saved the
+/// cursor sits mid-row at 120 columns, so the prompt follows the x's on their row, and back at
+/// 80 columns it continues their line on the next row, at the cell after the last x.
+#[test]
+fn a_prompt_after_a_pager_quit_on_a_wider_window_follows_the_output() {
+    for (tiered, path) in [
+        (false, Path::Sync),
+        (true, Path::Sync),
+        (true, Path::Offloaded),
+    ] {
+        let at = format!("tiered={tiered} {path:?}");
+        let mut term = terminal(tiered, 6, 80);
+        let xs = "x".repeat(80);
+        term.process(b"$ cmd\r\n");
+        term.process(xs.as_bytes());
+        term.process(b"\x1b[?1049h");
+        path.resize(&mut term, 6, 120);
+        term.process(b"\x1b[?1049l$ ");
+        assert_eq!(screen(&term)[1].trim_end(), format!("{xs}$"), "{at}");
+        assert!(!wrapped(&term, 2), "{at}: nothing joined below");
+        path.resize(&mut term, 6, 80);
+        assert_eq!(screen(&term)[..3], ["$ cmd", xs.as_str(), "$ "], "{at}");
+        assert!(wrapped(&term, 2), "{at}: the prompt continues the line");
+        assert_eq!((term.cursor().row, term.cursor().col), (2, 2), "{at}");
+    }
+}
+
+/// The reflow moves a saved wrap off the line end it was armed at: the next glyph lands in the
+/// cell after the saved one on the same row (Ghostty `Screen.resize`). It neither overwrites
+/// the saved glyph nor goes to the next row, where it would land on the next line's first cell
+/// and join the two lines, or leave a row of blanks inside the line.
+#[test]
+fn a_saved_wrap_the_reflow_moved_mid_line_takes_the_next_column() {
+    for (tiered, path) in [
+        (false, Path::Sync),
+        (true, Path::Sync),
+        (true, Path::Offloaded),
+    ] {
+        let at = format!("tiered={tiered} {path:?}");
+
+        let mut term = terminal(tiered, 6, 5);
+        term.process(b"abcde\x1b[?1049h");
+        path.resize(&mut term, 6, 10);
+        term.process(b"\x1b[?1049l$ ");
+        path.resize(&mut term, 6, 5);
+        assert_eq!(
+            screen(&term)[..3],
+            ["abcde", "$ ", ""],
+            "{at}: widen, 1049l, narrow"
+        );
+        assert!(wrapped(&term, 1), "{at}");
+
+        let mut term = terminal(tiered, 6, 10);
+        term.process(b"abcdefghij\x1b7");
+        path.resize(&mut term, 6, 6);
+        term.process(b"\x1b8X");
+        assert_eq!(
+            screen(&term)[..3],
+            ["abcdef", "ghijX", ""],
+            "{at}: narrow, DECRC"
+        );
+        path.resize(&mut term, 6, 10);
+        assert_eq!(screen(&term)[..2], ["abcdefghij", "X"], "{at}: and back");
+        assert!(wrapped(&term, 1), "{at}");
+
+        let mut term = terminal(tiered, 4, 10);
+        term.process(b"abcdefghij\x1b7\r\n$ p");
+        path.resize(&mut term, 4, 6);
+        term.process(b"\x1b8X");
+        assert_eq!(
+            screen(&term)[..3],
+            ["abcdef", "ghijX", "$ p"],
+            "{at}: narrow over a next line"
+        );
+        assert!(!wrapped(&term, 2), "{at}: the prompt line stays its own");
+        path.resize(&mut term, 4, 10);
+        assert_eq!(screen(&term)[..3], ["abcdefghij", "X", "$ p"], "{at}");
+        assert!(!wrapped(&term, 2), "{at}");
+
+        let mut term = terminal(tiered, 4, 10);
+        term.process(b"abcdefghij\x1b7KL\r\n$ prompt");
+        path.resize(&mut term, 4, 20);
+        term.process(b"\x1b8X");
+        assert_eq!(
+            screen(&term)[..2],
+            ["abcdefghijXL", "$ prompt"],
+            "{at}: widen over text the wrap carried"
+        );
+        assert!(!wrapped(&term, 1), "{at}");
+    }
+}

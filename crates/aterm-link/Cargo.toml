@@ -52,11 +52,15 @@ astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # boot (`durability::this_boot`): the boot the broker opens its log in and judges
 # a legacy relaxed mark by (`durability.rs`, "One boot, one reading"), and whether
 # the page cache holding the incarnation lease's unflushed write has run
-# throughout (`state.rs`, "The incarnation lease"). Zero dependencies; its one
-# cordoned unsafe module is four Apple FFI calls (astream claim `os.cordon`):
-# `fcntl(F_BARRIERFSYNC)`, `sysctlbyname`, a zero-wait `poll` (which this crate
-# reaches through astream-broker's client, only after a read or a write timeout
-# was refused `EINVAL`: `transport::connect` sets both on every dial) and
+# throughout (`state.rs`, "The incarnation lease"); and the one classification of a
+# directory flush's error (`dir_flush_unavailable`), by which a tolerated state-dir
+# flush goes on as the broker's own does. Zero dependencies; its two cordoned
+# unsafe modules (astream claim `os.cordon`) are the owner-only file rule's
+# (`geteuid`, and on Apple the ACL reads) and five Apple FFI calls:
+# `fcntl(F_BARRIERFSYNC)`, `fsync` (a test's plain flush, compiled only with debug
+# assertions), `sysctlbyname`, a zero-wait `poll` (which this crate reaches
+# through astream-broker's client, only after a read or a write timeout was
+# refused `EINVAL`: `transport::connect` sets both on every dial) and
 # `signal(SIGHUP)`, whose handler only astream's revocation file installs and
 # aterm never does. So aterm-link stays `forbid(unsafe_code)`.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }

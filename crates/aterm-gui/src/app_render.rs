@@ -12371,12 +12371,7 @@ impl App {
                 .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
                 .unwrap_or_default();
             self.refill_strip_metadata(id, &mut metadata);
-            let active = self
-                .windows
-                .get(&id)
-                .and_then(|ws| ws.tab_set.active_index())
-                .unwrap_or(0);
-            let fp = self.tab_strip_fingerprint_from_parts(id, &titles, &metadata, active);
+            let fp = self.tab_strip_fingerprint_from_parts(id, &titles, &metadata);
             if let Some(ws) = self.windows.get_mut(&id) {
                 ws.strip_titles_scratch = titles;
                 ws.strip_metadata_scratch = metadata;
@@ -15908,12 +15903,7 @@ impl App {
             .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
             .unwrap_or_default();
         self.refill_strip_metadata(wid, &mut metadata);
-        let active = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.tab_set.active_index())
-            .unwrap_or(0);
-        let tab_strip = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
+        let tab_strip = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_titles_scratch = titles;
             ws.strip_metadata_scratch = metadata;

@@ -279,7 +279,11 @@ impl CursorBeamRod {
         ];
         let (y0_i, h_i) = (y0 as i32, h as i32);
         let (cell_y, ch_i) = (oy as i32 + (cr as i32) * ch as i32, ch as i32);
-        for (i, &(hw, cmul, target, mix)) in layers.iter().enumerate() {
+        let mut i = 0;
+        while i < layers.len() {
+            let (hw, cmul, target, mix) = layers[i];
+            let is_core = i < 2;
+            i += 1;
             let cov = (cov_axis * cmul).min(COV_CAP) as u8;
             if cov == 0 {
                 continue;
@@ -288,7 +292,7 @@ impl CursorBeamRod {
             let x = (ax - cw * hw) as i32;
             let color = lerp_rgb(cfg.color, target, mix);
             let premul = premul_rgb(color, cov);
-            if i < 2 {
+            if is_core {
                 // Full rod including the overshoot caps.
                 push_rect(out, geom, x, y0_i, w, h_i, premul);
             } else {
@@ -341,7 +345,11 @@ impl CursorBeamRod {
             }
         };
         let ch_i = geom.ch as i32;
-        for (hw, share) in [(0.30, 0.45), (0.11, 1.0)] {
+        const BANDS: [(f32, f32); 2] = [(0.30, 0.45), (0.11, 1.0)];
+        let mut bi = 0;
+        while bi < BANDS.len() {
+            let (hw, share) = BANDS[bi];
+            bi += 1;
             let a = (LIGHT_BODY_ALPHA_CAP * share * strength) as u8;
             if a == 0 {
                 continue;
@@ -430,8 +438,10 @@ impl CursorBeamRod {
                         (rx_i, lx_i, cov, premul_rgb(color, cov))
                     };
                     let mut prev = knot(0);
-                    for k in 1..=AURA_SEGMENTS {
+                    let mut k = 1;
+                    while k <= AURA_SEGMENTS {
                         let next = knot(k);
+                        k += 1;
                         let ((r_in, l_in, c_in, inner), (r_out, l_out, c_out, outer)) =
                             (prev, next);
                         prev = next;

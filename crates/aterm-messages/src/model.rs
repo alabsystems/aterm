@@ -392,8 +392,15 @@ pub enum Intent {
     },
     /// Close every tab whose shell the PTY keeper held through the last run's crash.
     EndRecovered,
-    /// Open System State with its review set for the vault sync.
+    /// Open System State: a vault line's remedy (its Secrets row), and the navigation of the
+    /// note that setup waits for its review.
     ReviewVaultSync,
+    /// Let exactly the machine with this key, which asks to join this admin Mac's secrets vault,
+    /// in. Pressed only by name: never a row's primary ([`Intent::never_default`]).
+    ApproveJoin {
+        /// The asking machine's key (`age1…`).
+        recipient: String,
+    },
 }
 
 const SHOW_TAB: [&str; 10] = [
@@ -457,6 +464,7 @@ impl Intent {
             Self::AgentUpgrade { word, .. } => word.label(),
             Self::EndRecovered => "End sessions",
             Self::ReviewVaultSync => "System State",
+            Self::ApproveJoin { .. } => "Approve",
         }
     }
 
@@ -492,7 +500,16 @@ impl Intent {
             },
             Self::EndRecovered => "End",
             Self::ReviewVaultSync => "System",
+            Self::ApproveJoin { .. } => "Approve",
         }
+    }
+
+    /// An intent pressed only by name, never a row's primary or default button: letting a
+    /// machine into the vault is a person's reading of its code, not a reflex.
+    #[inline]
+    #[must_use]
+    pub const fn never_default(&self) -> bool {
+        matches!(self, Self::ApproveJoin { .. })
     }
 
     /// Only `NotNow` closes its row.
@@ -597,6 +614,9 @@ impl Intent {
             ),
             Self::EndRecovered => "end-recovered".to_string(),
             Self::ReviewVaultSync => "review-vault-sync".to_string(),
+            Self::ApproveJoin { recipient } => {
+                format!("approve-join:{}", escape_payload(recipient))
+            }
         }
     }
 
@@ -663,6 +683,12 @@ impl Intent {
                 }),
                 _ => None,
             },
+            "approve-join" => {
+                let recipient = unescape_payload(payload);
+                (recipient.starts_with("age1")
+                    && recipient.bytes().all(|b| b.is_ascii_alphanumeric()))
+                .then_some(Self::ApproveJoin { recipient })
+            }
             "agent-upgrade" => {
                 let (word, rest) = payload.split_once(':')?;
                 let (to, tab) = rest.split_once(':')?;
@@ -752,6 +778,9 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         Intent::NewWindow,
         Intent::EndRecovered,
         Intent::ReviewVaultSync,
+        Intent::ApproveJoin {
+            recipient: "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq".into(),
+        },
         Intent::StopPaste { session: 3 },
         Intent::ShowTab { tab: 2, window: 7 },
         Intent::ShowSession {

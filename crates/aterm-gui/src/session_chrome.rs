@@ -180,6 +180,13 @@ pub(crate) struct TimelineNote {
     pub at_ms: u64,
 }
 
+/// The terminal leaf whose recording a timeline row describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RewindMenuOrigin {
+    pub view: crate::tab_model::ViewId,
+    pub session: u64,
+}
+
 /// One entry of the composed context menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabMenuEntry {
@@ -188,7 +195,12 @@ pub(crate) enum TabMenuEntry {
     /// A disabled timeline row: its event in a person's words and when it happened ([`crate::turn_ledger::now_ms`]'s clock).
     Event { words: String, at_ms: u64 },
     /// A timeline row of a session that keeps screen history: a click opens Rewind at `at_ms`.
-    RewindTo { words: String, at_ms: u64 },
+    RewindTo {
+        words: String,
+        at_ms: u64,
+        /// Bound on a per-tab clone; the session's cached template has no view owner.
+        origin: Option<RewindMenuOrigin>,
+    },
     /// A native separator.
     Separator,
     /// A command row: the `NSMenuItem` carries `action`'s tag, so the click dispatches through the menu bar's tag→[`MenuAction`] decode.
@@ -229,6 +241,17 @@ pub(crate) struct TabChromeExt {
     pub tooltip: Option<String>,
     /// Context-menu model (`empty` = no context menu pops).
     pub menu: Vec<TabMenuEntry>,
+}
+
+impl TabChromeExt {
+    /// Bind this tab's cloned timeline rows without changing the shared session cache.
+    pub(crate) fn bind_rewind_origin(&mut self, origin: RewindMenuOrigin) {
+        for entry in &mut self.menu {
+            if let TabMenuEntry::RewindTo { origin: owner, .. } = entry {
+                *owner = Some(origin);
+            }
+        }
+    }
 }
 
 /// One session's cached chrome and the input epochs it was composed from (the `App::session_chrome` map's value).
@@ -463,6 +486,7 @@ fn timeline_rows(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
                 TabMenuEntry::RewindTo {
                     words,
                     at_ms: n.at_ms,
+                    origin: None,
                 }
             } else {
                 TabMenuEntry::Event {
@@ -483,12 +507,17 @@ impl TabMenuEntry {
                 "{words} \u{b7} {}",
                 relative_age(now_ms.saturating_sub(*at_ms))
             )),
-            Self::RewindTo { words, at_ms } => Self::RewindTo {
+            Self::RewindTo {
+                words,
+                at_ms,
+                origin,
+            } => Self::RewindTo {
                 words: format!(
                     "{words} \u{b7} {}",
                     relative_age(now_ms.saturating_sub(*at_ms))
                 ),
                 at_ms: *at_ms,
+                origin: *origin,
             },
             other => other.clone(),
         }
@@ -1178,7 +1207,7 @@ mod tests {
         let rewind: Vec<_> = rows
             .iter()
             .filter_map(|e| match e {
-                TabMenuEntry::RewindTo { words, at_ms } => Some((words.as_str(), *at_ms)),
+                TabMenuEntry::RewindTo { words, at_ms, .. } => Some((words.as_str(), *at_ms)),
                 _ => None,
             })
             .collect();
@@ -1192,9 +1221,27 @@ mod tests {
         );
         assert!(
             rows.iter()
+                .filter(|e| matches!(e, TabMenuEntry::RewindTo { .. }))
+                .all(|e| !crate::tab_menu::is_selectable(e)),
+            "unbound templates cannot dispatch"
+        );
+        let mut bound = TabChromeExt {
+            menu: rows.clone(),
+            ..TabChromeExt::default()
+        };
+        bound.bind_rewind_origin(RewindMenuOrigin {
+            view: crate::tab_model::ViewId::from_stored(1),
+            session: 2,
+        });
+        assert_eq!(
+            bound
+                .menu
+                .iter()
+                .filter(|e| matches!(e, TabMenuEntry::RewindTo { .. }))
                 .filter(|e| crate::tab_menu::is_selectable(e))
-                .count()
-                >= 3
+                .count(),
+            3,
+            "each bound recording row can dispatch"
         );
         assert!(
             tab_menu_chrome_line(0, &compose_tab_menu(&input), NOW)

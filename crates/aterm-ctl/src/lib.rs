@@ -75,7 +75,11 @@ OPTIONS:
                   --host it bounds each drive connection, handshake and reply,
                   whose own deadline is 28 s; a shorter one is taken, and cuts
                   a `turn` whose own wait (timeout=, 20 s unless named) runs
-                  past it. A fleet survey (`survey --fleet`, `--host`) takes
+                  past it. An `await task` takes it as one deadline over all
+                  its legs (each leg's own is its wait and 8 s), so it ends
+                  by it whatever its timeout=, with the rows its last leg
+                  read, whose wait ends up to a second before it (exit 124).
+                  A fleet survey (`survey --fleet`, `--host`) takes
                   it the same way: each peer's read (3 s, or survey's own
                   --timeout) is cut to a shorter one. On `subscribe`, an
                   explicit --timeout instead caps the whole watch (frames so
@@ -101,15 +105,17 @@ EXIT CODES:
          serve it within 10 s (or a shorter --timeout; --timeout 0 waits
          without bound), so the request was not sent. With --host, an aterm
          took the connection and sent no fleet handshake in time: a drive's
-         peer within 28 s (or a shorter --timeout); this machine's issuer,
-         read for which Mac a word no book here holds names (a refusal that
-         says `try again once it answers`); or the peer a `survey --host`
-         read, within its deadline. That aterm is stopped, frozen or
-         overloaded, and the request was not sent; any other refusal, a
-         connection refused or hung up included, exits 1. For `ls`/
-         `instances`/`windows`: no socket found answered, or the directory
-         is missing, unreadable or unresolvable (every variable it is read
-         from unset); stderr names each socket's cause and a hint.
+         peer within 28 s (each `await task` leg's: its wait and 8 s) or a
+         shorter --timeout; this machine's issuer, read for which Mac a word
+         no book here holds names; or the peer a `survey --host` read,
+         within its deadline. That aterm is stopped, frozen or overloaded,
+         and the request was not sent. Any other cause exits 1, even where
+         its refusal also says to try again: nothing listening there or no
+         route, a connection refused or hung up, another fleet's secret,
+         a denial. For `ls`/`instances`/`windows`: no socket found
+         answered, or the directory is missing, unreadable or unresolvable
+         (every variable it is read from unset); stderr names each socket's
+         cause and a hint.
     124  timeout: the client's deadline fired, or the server reported one (a
          `turn` with status=timeout, or `OK timeout` from await/ready/wait);
          for `ls`/`instances`/`windows`, every socket found timed out.

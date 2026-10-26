@@ -1,0 +1,20 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, no `apiKeyHelper` and no OAuth token but a scratch `.credentials.json` and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Esc out of the /login picker typed at the `⏺ Login expired · Please run /login` error row (no method picked): `⎿  Login interrupted` under `❯ /login`, the composer back, 2.1.310
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+
+⏺ Login expired · Please run /login
+
+✻ Churned for 0s · done 12:56 PM
+
+❯ /login
+  ⎿  Login interrupted
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                              Not logged in · Run /login
+                                                                                                                            ◐ medium · /effort

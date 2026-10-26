@@ -1084,6 +1084,7 @@ impl App {
         (news > self.turn_end_seen.get(&session).copied().unwrap_or(0)).then_some(news)
     }
 
+    /// THE LOOK (§14.11 of `docs/DESIGN-harness-autopilot-2026-10-15.md`): window `wid` is the frontmost window, the OS made it its key window (aterm is the active app and this its key window: `WindowState::os_key`, which a controller's `focus in|out` never writes), and it is on screen — or, in a development build, the `person look` stand-in looks at it in place of a headless window. A window left frontmost while he works in another app looks at nothing: what lands in its front tab then stands until he comes back to it.
     fn window_looked_at(&self, wid: WindowId) -> bool {
         #[cfg(any(test, debug_assertions))]
         let stood_in = self.person_look == Some(wid)
@@ -1093,7 +1094,10 @@ impl App {
                 .is_some_and(|ws| ws.os_window.is_none());
         #[cfg(not(any(test, debug_assertions)))]
         let stood_in = false;
-        self.frontmost_window == Some(wid) && (stood_in || Desk::pill_visible(self, wid))
+        self.frontmost_window == Some(wid)
+            && (stood_in
+                || (self.windows.get(&wid).is_some_and(|ws| ws.os_key)
+                    && Desk::pill_visible(self, wid)))
     }
 
     /// `aterm ctl person …` on the main thread.
@@ -1217,8 +1221,7 @@ impl App {
     pub(crate) fn restamp_for_hover(&mut self, session: u64) {
         for wid in self.windows_with_focused_session(session) {
             let (titles, metadata) = self.refresh_window_tabs(wid);
-            let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
+            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
             let Some(ws) = self.windows.get(&wid) else {
                 continue;
             };
@@ -3733,3 +3736,7 @@ mod tests {
 #[cfg(test)]
 #[path = "person_stand_in_tests.rs"]
 mod person_stand_in_tests;
+
+#[cfg(test)]
+#[path = "look_needs_focus_tests.rs"]
+mod look_needs_focus_tests;

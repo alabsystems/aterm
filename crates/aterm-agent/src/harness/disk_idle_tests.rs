@@ -107,6 +107,9 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
     let (repo, target) = checkout(&tmp);
     std::fs::create_dir_all(tmp.path().join("bin")).expect("bin");
     std::os::unix::fs::symlink("/usr/bin/true", tmp.path().join("bin/elsewhere")).expect("link");
+    // A link left by a tool whose checkout is gone names nothing in this one.
+    std::os::unix::fs::symlink("../gone/target/release/tool", tmp.path().join("bin/stale"))
+        .expect("dangling link");
     let rep = survey(&tmp, &repo, &target, now, |_| {}, &nobody);
     let rows = whole(&rep);
     assert_eq!(rows.len(), 1, "{:#?}", rep.notes);
@@ -164,14 +167,14 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
             }),
         ),
         (
-            "could not be resolved",
+            "installed link",
             Box::new(|tmp, _, _| {
                 std::fs::create_dir_all(tmp.path().join("bin")).expect("bin");
                 std::os::unix::fs::symlink(
                     "../repo/target/debug/missing",
                     tmp.path().join("bin/tool"),
                 )
-                .expect("unresolved relative installed link");
+                .expect("dangling relative installed link");
             }),
         ),
     ];
@@ -860,15 +863,28 @@ fn links_are_resolved_only_on_local_mounts() {
     let link = unknown.join("tool");
     std::os::unix::fs::symlink("../real/bin/missing", &link).expect("dangling local link");
     let missing = inbound_links(std::slice::from_ref(&unknown), Some(&table));
+    assert!(
+        missing
+            .as_ref()
+            .is_ok_and(|to| to.contains(&base.join("real/bin/missing"))),
+        "a dangling local link names the place it points at: {missing:?}"
+    );
+    std::fs::remove_file(&link).expect("retire owned fixture link");
+    std::os::unix::fs::symlink("../via/gone/../bin/tool-2", &link).expect("link past a gap");
+    let gap = inbound_links(std::slice::from_ref(&unknown), Some(&table));
+    assert!(
+        gap.as_ref()
+            .is_ok_and(|to| to.contains(&base.join("real/bin/tool-2"))),
+        "the links before the missing folder are followed, the rest read as written: {gap:?}"
+    );
     std::fs::remove_file(&link).expect("retire owned fixture link");
     std::os::unix::fs::symlink("tool", &link).expect("cyclic local link");
     let cycle = inbound_links(std::slice::from_ref(&unknown), Some(&table));
     assert!(
-        missing.is_err()
-            && cycle.is_err()
+        cycle.is_err()
             && unresolved_remote.iter().all(|refused| *refused)
             && unresolved_enumeration.iter().all(|refused| *refused),
-        "UNKNOWN_INBOUND_LINK_MUST_KEEP_CANDIDATES: missing={missing:?}, cycle={cycle:?}, remote={unresolved_remote:?}, directories={unresolved_enumeration:?}"
+        "UNKNOWN_INBOUND_LINK_MUST_KEEP_CANDIDATES: cycle={cycle:?}, remote={unresolved_remote:?}, directories={unresolved_enumeration:?}"
     );
 }
 

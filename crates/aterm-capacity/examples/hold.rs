@@ -6,8 +6,12 @@
 //!
 //! ```text
 //! targo --unverified run -p aterm-capacity --example hold -- \
-//!     --what "demo" [--mem-gib N] [--cores N] [--disk-gib N] [--quiet LOAD] [--admit now] [--for S]
+//!     --what "demo" [--mem-gib N] [--cores N] [--disk-gib N] [--quiet LOAD]
+//!     [--patience RESERVE,START,HOLD] [--admit now] [--for S]
 //! ```
+//!
+//! `--patience` takes seconds (`120,600,900` is timed work's, `aterm_capacity::QUIET_PATIENCE`);
+//! without it a `--quiet` claim waits until the load falls, as before QUIET-BOUND.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -43,6 +47,21 @@ fn main() -> ExitCode {
                 .ok()
                 .map(|q| need.quiet = Some(q))
                 .is_some(),
+            "--patience" => {
+                let secs: Vec<Option<u64>> =
+                    value.split(',').map(|v| v.trim().parse().ok()).collect();
+                match secs[..] {
+                    [Some(reserve), Some(start), Some(hold)] => {
+                        need.patience = Some(aterm_capacity::Patience {
+                            reserve: Duration::from_secs(reserve),
+                            start: Duration::from_secs(start),
+                            hold: Duration::from_secs(hold),
+                        });
+                        true
+                    }
+                    _ => false,
+                }
+            }
             "--admit" => aterm_capacity::Admit::parse(value)
                 .map(|m| mode = m)
                 .is_some(),
@@ -57,11 +76,12 @@ fn main() -> ExitCode {
     match aterm_capacity::admit(need, mode) {
         Ok(claim) => {
             println!(
-                "hold: admitted pid {} cores {} after {} ({})",
+                "hold: admitted pid {} cores {} after {} ({}){}",
                 std::process::id(),
                 claim.cores(),
                 aterm_capacity::span(claim.waited()),
-                claim.path().display()
+                claim.path().display(),
+                claim.quiet().map_or_else(String::new, |q| format!(": {q}"))
             );
             std::thread::sleep(hold);
             ExitCode::SUCCESS

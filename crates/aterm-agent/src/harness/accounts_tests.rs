@@ -6110,26 +6110,6 @@ fn a_session_that_ended_is_forgotten_and_a_canarys_end_wakes_the_others() {
 }
 
 #[test]
-fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
-    let dir = tmp("several");
-    let path = dir.path().join(ACCOUNTS_FILE);
-    assert!(!several_listed(None));
-    assert!(!several_listed(Some(&path)), "no file");
-    let one = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n";
-    std::fs::write(&path, one).unwrap();
-    assert!(!several_listed(Some(&path)), "one account is one login");
-    let two = format!(
-        "{one}\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-        abs("/logins/work-2")
-    );
-    std::fs::write(&path, &two).unwrap();
-    assert!(several_listed(Some(&path)));
-    std::fs::write(&path, format!("rotate = true\n{two}")).unwrap();
-    assert!(Roster::load(&path).is_err(), "control: it does not admit");
-    assert!(!several_listed(Some(&path)), "a refused roster lists none");
-}
-
-#[test]
 fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
     let r = three();
     let written = NOW - 10;

@@ -2565,6 +2565,7 @@ mod tests {
             capacity: Some(capacity),
             ring: Arc::from(Vec::new()),
             binds,
+            ..Series::default()
         }
     }
 

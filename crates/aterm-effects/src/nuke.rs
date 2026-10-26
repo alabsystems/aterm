@@ -143,21 +143,20 @@ pub fn paint_nuke(tile: &mut Tile, part: NukePart) {
             );
             tile.disc(0.40 * wf, 0.12 * hf, (0.11 * hf).max(1.0), white, 1.0);
             tile.disc(0.62 * wf, 0.14 * hf, (0.09 * hf).max(1.0), white, 1.0);
-            for &(sx, sy, sr, sa) in &[
-                (0.035f32, 0.44f32, 0.045f32, 0.38f32),
+            const PUFFS: [(f32, f32, f32, f32); 6] = [
+                (0.035, 0.44, 0.045, 0.38),
                 (0.075, 0.28, 0.035, 0.30),
                 (0.955, 0.42, 0.045, 0.38),
                 (0.925, 0.26, 0.035, 0.30),
                 (0.30, 0.02, 0.030, 0.34),
                 (0.72, 0.03, 0.030, 0.34),
-            ] {
-                tile.disc(
-                    sx * wf,
-                    sy * hf,
-                    (sr * hf.max(wf * 0.4)).max(1.0),
-                    white,
-                    NUKE_A * sa,
-                );
+            ];
+            let r_base = hf.max(wf * 0.4);
+            let mut i = 0;
+            while i < PUFFS.len() {
+                let (sx, sy, sr, sa) = PUFFS[i];
+                tile.disc(sx * wf, sy * hf, (sr * r_base).max(1.0), white, NUKE_A * sa);
+                i += 1;
             }
         }
         NukePart::Stem => {
@@ -174,14 +173,20 @@ pub fn paint_nuke(tile: &mut Tile, part: NukePart) {
             let inv_span = 1.0 / (h.saturating_sub(ramp_top)).max(1) as f32;
             let row_bytes = w as usize * 4;
             let px = tile.pixels_mut();
-            for y in ramp_top..h {
+            let mut y = ramp_top;
+            while y < h {
                 let scale = 1.0 - 0.58 * ((y - ramp_top) as f32 * inv_span);
                 let row_start = y as usize * row_bytes;
-                for p in px[row_start..row_start + row_bytes].as_chunks_mut::<4>().0 {
-                    if p[3] != 0 {
-                        p[3] = (f32::from(p[3]) * scale) as u8;
+                let row_px = px[row_start..row_start + row_bytes].as_chunks_mut::<4>().0;
+                let mut x = 0;
+                while x < row_px.len() {
+                    let a = row_px[x][3];
+                    if a != 0 {
+                        row_px[x][3] = (f32::from(a) * scale) as u8;
                     }
+                    x += 1;
                 }
+                y += 1;
             }
         }
         NukePart::Skirt => {
@@ -230,6 +235,20 @@ const fn fade_after_skirt(t_ms: u64) -> f32 {
     }
 }
 
+#[inline]
+const fn cap_geom(t_ms: u64) -> (f32, f32, f32, f32) {
+    let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
+    let omq = 1.0 - q;
+    let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
+    let bloom = (1.0 - omq * omq * omq) + 0.06 * sin_q;
+    let tail = (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS).clamp(0.0, 1.0);
+    let spread = 1.0 + 0.55 * tail;
+    let sx = (0.45 + 0.75 * bloom) * spread;
+    let sy = (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0));
+    let dy_cells = -(0.90 + 0.60 * q) - 0.70 * tail;
+    (q, sx, sy, dy_cells)
+}
+
 /// Resolve `part`'s draw state at `t_ms`, or `None` outside its active window.
 #[inline]
 #[must_use]
@@ -256,17 +275,11 @@ pub const fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
                 return None;
             }
             let c = cool(t_ms);
-            let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
-            let omq = 1.0 - q;
-            let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
-            let bloom = (1.0 - omq * omq * omq) + 0.06 * sin_q;
-            let tail =
-                (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS).clamp(0.0, 1.0);
-            let spread = 1.0 + 0.55 * tail;
+            let (q, sx, sy, dy_cells) = cap_geom(t_ms);
             Some(NukeDraw {
-                sx: (0.45 + 0.75 * bloom) * spread,
-                sy: (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0)),
-                dy_cells: -(0.90 + 0.60 * q) - 0.70 * tail,
+                sx,
+                sy,
+                dy_cells,
                 alpha: (q * 4.0).min(1.0) * fade_after_skirt(t_ms),
                 tint: crate::effect_util::lerp_rgb(CAP_HOT, CAP_DUST, c),
             })
@@ -297,16 +310,13 @@ pub const fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
     if t_ms < CAP_BLOOM_START_MS || t_ms >= CORE_END_MS {
         return None;
     }
-    let Some(cap) = nuke_draw(t_ms, NukePart::Cap) else {
-        return None;
-    };
-    let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
+    let (q, cap_sx, cap_sy, dy_cells) = cap_geom(t_ms);
     let die = 1.0
         - ((t_ms.saturating_sub(CAP_BLOOM_END_MS)) as f32 * INV_CORE_DIE_SPAN_MS).clamp(0.0, 1.0);
     Some(NukeDraw {
-        sx: cap.sx * 0.58,
-        sy: cap.sy * 0.52,
-        dy_cells: cap.dy_cells,
+        sx: cap_sx * 0.58,
+        sy: cap_sy * 0.52,
+        dy_cells,
         alpha: (q * 4.0).min(1.0) * die * 0.92,
         tint: crate::effect_util::lerp_rgb(CORE_HOT, CAP_HOT, 0.35 + 0.45 * q),
     })

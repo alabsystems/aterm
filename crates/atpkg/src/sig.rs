@@ -535,7 +535,7 @@ impl Floor {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
-        crate::store::sync_dir(parent);
+        let _flushed_or_unavailable = aterm_durable::Flush::Durable.dir_best_effort(parent)?;
         Ok(())
     }
 

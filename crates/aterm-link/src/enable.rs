@@ -3765,20 +3765,23 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             .to_string()
     } else if s("fleet halt standing") || s("stands on this node with no row on the bus") {
         FLEET_HALT_LIFT.to_string()
-    } else if s("distinct subjects one node may ever mint") {
+    } else if s("distinct subjects one node may hold at once") {
         format!(
-            "move <root>/link-state/node aside and run {again}: it provisions a new node id, \
-             re-mints the cap for it and writes the new [fabric] command; then quit and reopen \
-             each aterm instance (`on` names every one still armed with the old command), whose \
-             bridge starts on the new id with a fresh budget (a killed bridge would come back on \
-             the command its aterm armed at launch); mail still queued for the old id is \
-             abandoned with it"
+            "close the sessions you do not need: five minutes after one leaves, its bridge gives \
+             its presence row and the lanes it was mailed on back. If what stays holds the \
+             budget (live sessions, and a subject for each topic a session ever broadcast on), \
+             move <root>/link-state/node aside and run {again}: it provisions a new \
+             node id, re-mints the cap for it and writes the new [fabric] command; then quit \
+             and reopen each aterm instance (`on` names every one still armed with the old \
+             command), whose bridge starts on the new id with a fresh budget (a killed bridge \
+             would come back on the command its aterm armed at launch); mail still queued for \
+             the old id is abandoned with it"
         )
     } else if s("presence roster has more than") && s("truncated") {
         "nothing on the bus is wrong: one roster read takes at most that many rows and every \
-         session ever hosted keeps one; a session past the cut is still listed by `aterm ctl \
-         ls`"
-        .to_string()
+         session keeps one until five minutes after it leaves; a session past the cut is still \
+         listed by `aterm ctl ls`"
+            .to_string()
     } else if s("no rendezvous file") {
         format!("{again} writes it")
     } else if s("is another build than the instance") || s("could not parse") {
@@ -5498,10 +5501,13 @@ mod tests {
             "no rendezvous file at /x",
             "instance 1's bridge is another build than the instance: bridge a, instance b",
             "instance 1 could not parse 3 of its bridge's lines (lane_faults=3)",
-            "node n-a holds 3072 of the 4096 distinct subjects one node may ever mint, and none but \
-             a closed session's own `ev` face (while the session-log mirror runs) is ever given \
-             back: past the bound a new session gets no presence row and its posts are refused; \
-             the remedy is a new node id",
+            "node n-a holds 3072 of the 4096 distinct subjects one node may hold at once: a \
+             departed session's presence row and the lanes this node wrote to it go back five \
+             minutes after it leaves (its `ev` face once the session-log mirror landed its tail), \
+             but each topic a session broadcast on keeps one subject for good, so what stays is \
+             held by live sessions, every topic face a session of this node ever broadcast on, \
+             mail still owed and the node's own faces; past the bound a new session gets no \
+             presence row and its posts are refused",
             "the presence roster has more than 4096 rows and the read stopped there (rows=4096+ \
              truncated): NODES, SESSIONS and every warning drawn from them leave out what lies \
              past it",

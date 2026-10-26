@@ -689,6 +689,62 @@ fn the_line_goes_once_then_free_space_rising_settles_the_episode_and_rising_past
     );
 }
 
+/// The ask's whole success: the asked session's cleanup alone lifts the volume past its floor and
+/// the margin. The look that reads it so settles the episode in the session's name, and the next
+/// look ends it; a look while another instance's pass runs waits for that pass's record first.
+/// Before this, that look ended the episode at once: no `freed` row, no owner's line saying the
+/// session freed space, only `ended`, as if the volume had cleared by itself (`lab disk-ask`
+/// found it with a real Claude Code that removed a 7 GiB build). A volume aterm's own pass
+/// clears ends as before.
+#[test]
+fn a_session_whose_cleanup_clears_the_volume_past_its_margin_is_credited_before_the_episode_ends() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let t = T0 + NOMINATE_MS + 10_000;
+    assert!(matches!(
+        at_break(&mut lease, KEY, &h1, "s-a", t, false),
+        Break::Yours
+    ));
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    let clear = FLOOR + END_MARGIN + 7 * GIB;
+    one.reads(clear);
+    one.passing = true;
+    assert!(
+        matches!(one.step(&mut lease, t + 30_000), Said::Asked { .. }),
+        "another instance's pass may have freed it: judged once that pass is recorded"
+    );
+    one.passing = false;
+    assert_eq!(
+        one.step(&mut lease, t + 60_000),
+        Said::Freed {
+            sid: "s-a".to_owned(),
+            freed: clear - 20 * GIB
+        },
+        "the asked session freed the volume clear: it is credited"
+    );
+    assert!(matches!(phase(&lease), Phase::Settled { sid, .. } if sid == "s-a"));
+    assert_eq!(one.step(&mut lease, t + 120_000), Said::Ended { asks: 1 });
+
+    // aterm's own pass clears it after the next episode's line: that ends it, credited to nobody.
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    elected(&mut lease, &one, &two);
+    assert!(matches!(
+        at_break(&mut lease, KEY, &h1, "s-a", t, false),
+        Break::Yours
+    ));
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    one.reads(clear);
+    one.reclaimed = vec![Reclaimed {
+        ended_ms: t + 20_000,
+        bytes: clear - 20 * GIB,
+    }];
+    assert_eq!(one.step(&mut lease, t + 30_000), Said::Ended { asks: 1 });
+}
+
 /// aterm's own cleanup keeps running every few minutes while the volume is short, and reclaims
 /// caches that went idle since its last pass. What it frees after an asked session's line is not
 /// the session's: each host's look records its own passes in the lease, and the rise the session
@@ -2872,6 +2928,7 @@ fn the_line_names_the_volume_the_holders_and_the_rule_within_its_cap() {
         done: Done::Spent,
         holders: &holders,
         checkout: Some(Path::new("/Users//u/aterm")),
+        shared: false,
         home: Some(Path::new("/Users//u")),
     });
     assert!(text.starts_with("[aterm harness] aterm: "), "{text}");
@@ -2901,6 +2958,7 @@ fn a_line_owed_while_the_episode_is_held_past_its_floor_says_how_near_it_is() {
         done: Done::Spent,
         holders: &[],
         checkout: None,
+        shared: false,
         home: None,
     });
     assert!(
@@ -2927,6 +2985,7 @@ fn a_holder_path_with_any_character_beyond_the_plain_ones_is_not_said() {
         done: Done::CleanupOff,
         holders: &holders,
         checkout: None,
+        shared: false,
         home: Some(Path::new("/Users//u")),
     });
     assert!(!text.contains("rm -rf"), "{text}");
@@ -2947,6 +3006,7 @@ fn a_long_holder_path_is_clipped_and_holders_drop_before_the_line_passes_its_cap
         done: Done::Inodes,
         holders: &holders,
         checkout: None,
+        shared: false,
         home: Some(Path::new("/Users//u")),
     });
     assert!(text.contains('…'), "{text}");
@@ -2972,6 +3032,7 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
             done: Done::Spent,
             holders: &holders,
             checkout: Some(Path::new(own)),
+            shared: false,
             home: Some(Path::new(home)),
         })
     };
@@ -2988,9 +3049,11 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
         "{text}"
     );
     assert!(text.ends_with("(rule disk-free@v1)"), "{text}");
-    // A volume whose name leaves the holder's path exactly `room` characters, measured off the
-    // line itself, so the path as usually said (whole, or clipped to `HOLDER_PATH_CAP`) overflows
-    // the cap by far whatever the line's other words come to.
+    // A volume whose name, said whole, leaves the holder's path only `room` characters, measured
+    // off the line itself: the volume's name gives way first, clipped in its middle, and the
+    // holder keeps the path it is usually said by and its mark. Before this the holder's path
+    // was clipped to those few characters while the volume's name, which the agent does not act
+    // on, stayed whole.
     let room = 30;
     let short = at("/Volumes/v", "/Users//u/w");
     assert!(short.contains(" Largest left: ~/w's builds"), "{short}");
@@ -2999,6 +3062,55 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
         .checked_sub(room + bare)
         .expect("the line leaves a holder's path more than `room` characters");
     let mount = format!("/Volumes/v{}", "v".repeat(pad));
+    for own in ["/Users//u/aterm/.claude/worktrees/disk-free-round7-own", own] {
+        let usual = shown_path(Path::new(own), Some(Path::new(home)));
+        assert!(usual.chars().count() > room + 10, "{usual}");
+        let text = at(&mount, own);
+        assert!(
+            text.chars().count() <= LINE_CAP,
+            "{}: {text}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains(&format!(
+                " Largest left: {usual}'s builds 61.0 GiB (this tab's). Free what"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("the volume this tab works on (/…/vvv") && text.contains("vvv) is"),
+            "{text}"
+        );
+        assert!(!text.contains(&mount), "{text}");
+    }
+    // A line too long for the holder as usually said even with the volume said as "its volume"
+    // (a cap measured off the line, as no real line comes to that) names it with its path
+    // clipped to the room left, never says it has none, and keeps its mark.
+    let lab = |own: &str, cap: usize| {
+        let holders = [hog(
+            "/Users//u/Library/Caches/aterm/cargo-build.noindex/w/.cargo-build",
+            61,
+            Some(own),
+        )];
+        line_within(
+            &Line {
+                mount: Path::new(&mount),
+                total: 1000 * GIB,
+                free: 18 * GIB,
+                floor: 25 * GIB,
+                emergency: false,
+                done: Done::Spent,
+                holders: &holders,
+                checkout: Some(Path::new(own)),
+                shared: false,
+                home: Some(Path::new(home)),
+            },
+            cap,
+        )
+    };
+    let unsaid = lab("/Users//u/w", LINE_CAP);
+    let unsaid = unsaid.replace(&mount, UNSAID_VOLUME);
+    let bare = unsaid.chars().count() - "~/w".len();
     for (own, shown) in [
         // Whole components of its lead that fit, and its last one.
         (
@@ -3008,10 +3120,12 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
         // A last component too long for the room is clipped in its own middle.
         (own, "~/…/disk-free-rou…-a-long-name"),
     ] {
-        let usual = shown_path(Path::new(own), Some(Path::new(home)));
-        assert!(usual.chars().count() > room + 10, "{usual}");
-        let text = at(&mount, own);
-        assert_eq!(text.chars().count(), LINE_CAP, "{text}");
+        let text = lab(own, bare + room);
+        assert_eq!(text.chars().count(), bare + room, "{text}");
+        assert!(
+            text.contains("the volume this tab works on (its volume) is"),
+            "{text}"
+        );
         assert!(
             text.contains(&format!(
                 " Largest left: {shown}'s builds 61.0 GiB (this tab's). Free what"
@@ -3020,14 +3134,205 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
         );
         assert!(!text.contains("names no holder"), "{text}");
     }
-    // A volume whose name leaves no room for any path is still not said to have no holder.
+    // A volume whose name leaves no room for any path still names the holder, with its mark, and
+    // the line keeps to its cap: the name is clipped to the room left, its last component in its
+    // own middle.
     let crowded = format!("/Volumes/{}", "x".repeat(LINE_CAP));
     let text = at(&crowded, own);
     assert!(!text.contains("names no holder"), "{text}");
+    assert!(!text.contains("lists the largest holders left"), "{text}");
     assert!(
-        text.contains("`aterm harness disk` lists the largest holders left."),
+        text.contains("'s builds 61.0 GiB (this tab's). Free what"),
         "{text}"
     );
+    assert!(
+        text.chars().count() <= LINE_CAP,
+        "{}: {text}",
+        text.chars().count()
+    );
+    assert!(
+        text.contains("the volume this tab works on (/…/xxx"),
+        "{text}"
+    );
+    assert!(text.contains("xxx…xxx"), "{text}");
+}
+
+/// A home on a volume of its own mounted at a long path (`lab disk-ask`'s image, 80 characters):
+/// the name whole would pass the cap with the asked tab's own build named, and with none. Before
+/// this the line came to 628 characters, and then, the name clipped, it still dropped the asked
+/// tab's build for the pointer to `aterm harness disk`, so the agent was never told which build
+/// was its own (`lab disk-ask` found both). Now the name is clipped in its middle, its lead and
+/// last component kept, and the line names the tab's build with its mark.
+#[test]
+fn a_volume_mounted_at_a_long_path_gives_way_to_the_asked_tabs_own_build() {
+    let mount = "/private/tmp/at.lab-501/lab-disk-free-7fa3ae6b/runs/disk-ask-26058/scratch/home";
+    let alpha = format!("{mount}/work/alpha");
+    let line_of = |holders: &[Hog]| {
+        line(&Line {
+            mount: Path::new(mount),
+            total: 16 * GIB,
+            free: 4 * GIB + 6 * GIB / 10,
+            floor: 5 * GIB,
+            emergency: false,
+            done: Done::Spent,
+            holders,
+            checkout: Some(Path::new(&alpha)),
+            shared: false,
+            home: Some(Path::new(mount)),
+        })
+    };
+    let holders = [
+        hog(&format!("{alpha}/target"), 7, Some(&alpha)),
+        hog(
+            &format!("{mount}/work/beta/target"),
+            2,
+            Some(&format!("{mount}/work/beta")),
+        ),
+    ];
+    let named = line_of(&holders);
+    assert!(
+        named.contains(" Largest left: ~/work/alpha's builds 7.0 GiB (this tab's). Free what"),
+        "{named}"
+    );
+    assert!(!named.contains("lists the largest holders left"), "{named}");
+    for text in [named, line_of(&[])] {
+        assert!(
+            text.chars().count() <= LINE_CAP,
+            "{}: {text}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains("the volume this tab works on (/private/tmp/")
+                && text.contains("…/home) is"),
+            "{text}"
+        );
+        assert!(text.ends_with("(rule disk-free@v1)"), "{text}");
+    }
+}
+
+/// A holder that builds for the asked tab's checkout is marked its own only while no other
+/// session works in that checkout. Several tabs in one checkout (`~/aterm`, ordinary on a machine
+/// that runs many agents) build in the same cache, so the line says it is this tab's checkout's,
+/// shared: marked `(this tab's)`, it told the agent a cache other sessions build in was its own
+/// to clean. The mark stays within the line's cap, also where the holder's path is clipped to fit.
+#[test]
+fn a_holder_of_a_checkout_another_session_works_in_is_marked_shared_within_the_cap() {
+    let home = Path::new("/Users//u");
+    let holders = [
+        hog(
+            "/Users//u/Library/Caches/aterm/cargo-build.noindex/x/.cargo-build",
+            212,
+            Some("/Users//u/aterm"),
+        ),
+        hog("/Users//u/trust/build", 94, Some("/Users//u/trust")),
+    ];
+    let at = |mount: &str, holders: &[Hog], own: &str, shared: bool| {
+        line(&Line {
+            mount: Path::new(mount),
+            total: 1000 * GIB,
+            free: 18 * GIB,
+            floor: 25 * GIB,
+            emergency: false,
+            done: Done::Spent,
+            holders,
+            checkout: Some(Path::new(own)),
+            shared,
+            home: Some(home),
+        })
+    };
+    let alone = at("/System/Volumes/Data", &holders, "/Users//u/aterm", false);
+    assert!(
+        alone.contains(" Largest left: ~/aterm's builds 212.0 GiB (this tab's); $HOME/trust's"),
+        "CONTROL: the only session in its checkout: {alone}"
+    );
+    assert!(!alone.contains("shared"), "{alone}");
+    let shared = at("/System/Volumes/Data", &holders, "/Users//u/aterm", true);
+    assert!(
+        shared.contains(
+            " Largest left: ~/aterm's builds 212.0 GiB (this tab's checkout, shared); \
+             $HOME/trust's builds 94.0 GiB. Free what"
+        ),
+        "{shared}"
+    );
+    assert!(!shared.contains("(this tab's)"), "{shared}");
+    assert!(shared.contains("a build directory another session is using"));
+    assert!(
+        shared.chars().count() <= LINE_CAP,
+        "{}",
+        shared.chars().count()
+    );
+    // A checkout nobody's holder serves marks nothing, shared or not.
+    let elsewhere = at("/System/Volumes/Data", &holders, "/Users//u/other", true);
+    assert!(!elsewhere.contains("this tab's"), "{elsewhere}");
+    // A volume whose name, said whole, leaves the asked tab's own holder a path of only `room`
+    // characters, measured off the line itself, gives way first: the holder keeps its path and
+    // the mark within the cap, as it keeps `(this tab's)`.
+    let builds = |own: &str| {
+        [hog(
+            "/Users//u/Library/Caches/aterm/cargo-build.noindex/w/.cargo-build",
+            61,
+            Some(own),
+        )]
+    };
+    let short = at("/Volumes/v", &builds("/Users//u/w"), "/Users//u/w", true);
+    assert!(short.contains(" Largest left: ~/w's builds"), "{short}");
+    let bare = short.chars().count() - "~/w".len();
+    let room = 30;
+    let pad = LINE_CAP
+        .checked_sub(room + bare)
+        .expect("the line leaves a holder's path more than `room` characters");
+    let mount = format!("/Volumes/v{}", "v".repeat(pad));
+    let own = "/Users//u/aterm/.claude/worktrees/disk-free-round8-own";
+    let text = at(&mount, &builds(own), own, true);
+    assert!(
+        text.chars().count() <= LINE_CAP,
+        "{}: {text}",
+        text.chars().count()
+    );
+    assert!(
+        text.contains(
+            " Largest left: ~/aterm/.claude/worktrees/disk-free-round8-own's builds 61.0 GiB \
+             (this tab's checkout, shared). Free what"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains(&mount), "{text}");
+    assert!(text.ends_with("(rule disk-free@v1)"), "{text}");
+    // Too long for the holder's path even with the volume said as "its volume" (a cap measured
+    // off the line): the path is clipped to the room left, and the mark kept.
+    let within = |own: &str, cap: usize| {
+        let holders = builds(own);
+        line_within(
+            &Line {
+                mount: Path::new(&mount),
+                total: 1000 * GIB,
+                free: 18 * GIB,
+                floor: 25 * GIB,
+                emergency: false,
+                done: Done::Spent,
+                holders: &holders,
+                checkout: Some(Path::new(own)),
+                shared: true,
+                home: Some(home),
+            },
+            cap,
+        )
+    };
+    let bare = within("/Users//u/w", LINE_CAP)
+        .replace(&mount, UNSAID_VOLUME)
+        .chars()
+        .count()
+        - "~/w".len();
+    let text = within(own, bare + room);
+    assert_eq!(text.chars().count(), bare + room, "{text}");
+    assert!(
+        text.contains(
+            " Largest left: ~/aterm/…/disk-free-round8-own's builds 61.0 GiB (this tab's \
+             checkout, shared). Free what"
+        ),
+        "{text}"
+    );
+    assert!(text.ends_with("(rule disk-free@v1)"), "{text}");
 }
 
 #[test]

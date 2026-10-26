@@ -35,6 +35,23 @@ fn retired_token_flags_are_unknown_arguments() {
     assert_eq!(tree(&home.home), Vec::<String>::new());
 }
 
+/// `--no-open` is an argument the gate takes (it leaves the installed app closed), not an
+/// unknown one.
+#[test]
+fn no_open_is_an_argument() {
+    let scratch = Scratch::new();
+    let home = scratch.home("no-open");
+    let control = gate(&home, &[]);
+    let run = gate(&home, &["--no-open"]);
+    assert_eq!(
+        (run.code(), run.stderr.as_str()),
+        (control.code(), control.stderr.as_str()),
+        "{}",
+        run.all()
+    );
+    assert_eq!(tree(&home.home), Vec::<String>::new());
+}
+
 /// `sh install.sh` on macOS runs it in bash 3.2's POSIX mode, which takes
 /// no process substitution: there the script parses and answers as bash
 /// does.

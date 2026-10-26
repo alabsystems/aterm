@@ -711,6 +711,7 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
             inset: None,
             bar_room_given: false,
             preview_listed: false,
+            toolbar_listed: false,
         }
     );
     assert_eq!((need, room), (212.0, 214.0));
@@ -725,6 +726,7 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
             inset: None,
             bar_room_given: false,
             preview_listed: false,
+            toolbar_listed: false,
         }
     );
     // Its card keeps its words beside its buttons where the list holds them together.
@@ -2352,4 +2354,247 @@ fn the_wheel_leaves_no_note_alone_and_no_screen_draws_a_caption_twice() {
         passed_over > 0,
         "some page holds a note the wheel passes over"
     );
+}
+
+/// A NARROW SHORT WINDOW GIVES ITS LIST THE ROOM ITS CHROME CAN SHED, AND NO MORE THAN ITS PAGE: in
+/// a 178x152 window (the window's least is 164x98) at 1× and 2× text, on every page and screen,
+/// no list runs past the window's bottom edge, an icon toolbar is as tall at 2× as at 1×, every
+/// stop the list's room can hold is whole on some screen, by the wheel and by Page Down, and every
+/// caption by the wheel; a stop taller than the room (a control whose words take more lines than
+/// the room holds) is all a screen can show of it. Negative control: Manual, Wallpaper, Tab Color, Tab Control, Harness, AI
+/// CLIs, Packages and About drew a 128pt list in 72pt at 2×, a control's height over a room the
+/// status bar's keep had taken, so the chrome ladder never gave the list that room; and a wrapped
+/// Auto/Light/Dark never showed Dark.
+#[test]
+fn a_narrow_short_window_gives_its_list_the_room_and_no_more() {
+    at_each_text_scale(&[1.0, 2.0], "narrow short windows", |scale| {
+        let mut faults = Vec::new();
+        for (width, height) in [(178.0_f32, 152.0_f32), (164.0, 98.0)] {
+            let cx = view_cx_at(width, height);
+            for route in SettingsRoute::ALL {
+                let context = format!("{route:?} {width}x{height} {scale}x");
+                let (mut runtime, instance, view) = if route == SettingsRoute::Messages {
+                    super::setup_with_messages()
+                } else {
+                    paging_view("", route)
+                };
+                let mut before = None;
+                for _ in 0..400 {
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    for node in &compiled.paint {
+                        let list = matches!(
+                            &node.content,
+                            UiContent::Group(spec) if spec.role == SemanticRole::List
+                        );
+                        if list && node.rect.bottom() > height + 0.5 {
+                            faults.push(format!(
+                                "{context}: {} {:?} runs past the window",
+                                node.key.as_str(),
+                                node.rect
+                            ));
+                        }
+                    }
+                    let toolbar = compiled
+                        .semantic(&UiKey::new("settings/compact-toolbar"))
+                        .map(|node| node.rect);
+                    let icons = compiled
+                        .semantic(&UiKey::new("settings/compact-navigation"))
+                        .is_some_and(|node| node.rect.width < 96.0)
+                        && compiled
+                            .semantic(&UiKey::new("settings/search-open"))
+                            .is_some();
+                    if let Some(toolbar) = toolbar.filter(|toolbar| icons && toolbar.height > 52.5)
+                    {
+                        faults.push(format!("{context}: an icon toolbar {toolbar:?} grew"));
+                    }
+                    let state = messages_view_state(&runtime, view);
+                    let place = (state.page_scroll, state.messages_drawn.get());
+                    if before == Some(place) {
+                        break;
+                    }
+                    before = Some(place);
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollLines(1))
+                        .unwrap();
+                }
+                if route == SettingsRoute::Messages || height < 150.0 {
+                    continue;
+                }
+                let (mut runtime, instance, view) = paging_view("", route);
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                    continue;
+                };
+                let held: Vec<usize> = (0..plan.len())
+                    .filter(|&stop| {
+                        plan.paints(stop) && plan.span(stop..stop + 1) <= plan.room() + 0.5
+                    })
+                    .collect();
+                for event in [AppEvent::ScrollLines(1), AppEvent::ScrollPage(1)] {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.scroll_page_to(0);
+                    state.page_reveal = None;
+                    let walk = walk_screens(&mut runtime, instance, view, &cx, &event);
+                    let never: Vec<String> = held
+                        .iter()
+                        .filter(|stop| !walk.whole.contains(stop))
+                        .map(|&stop| {
+                            plan.identities(stop)
+                                .next()
+                                .map_or_else(|| format!("#{stop}"), |key| key.as_str().to_string())
+                        })
+                        .collect();
+                    if !never.is_empty() {
+                        faults.push(format!("{context} {event:?}: never whole {never:?}"));
+                    }
+                    // By the wheel every caption is whole on some screen; Page Down starts a
+                    // screen bare where its stop fits only without its caption ([`starts_bare`]).
+                    let unread: Vec<&String> = walk
+                        .captions
+                        .iter()
+                        .filter(|(_, whole)| !**whole)
+                        .map(|(caption, _)| caption)
+                        .collect();
+                    if matches!(event, AppEvent::ScrollLines(_)) && !unread.is_empty() {
+                        faults.push(format!("{context}: captions never whole {unread:?}"));
+                    }
+                }
+            }
+        }
+        faults.sort();
+        faults.dedup();
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// THE TOOLBAR SCROLLS AWAY WITH THE PAGE WHERE ITS ROW CUTS A CONTROL: in a 178x152 window at 1×,
+/// 1.5× and 2× text and in the window's least (164x98), on every page but Messages (whose entry
+/// over its day is taller than such a window at 2×) and the Themes chooser's rows (on its grid, a
+/// two-line name or Community 84pt over an 82pt list at 1.5× in 164x98, a three-line name 168pt at
+/// 2× in 178x152), every control no taller than the window is whole on some screen by the wheel;
+/// in the 178x152 window none is taller than the window and no stop is cut; the list's top draws
+/// the toolbar once, leading the page's list where it does not stand over the page, and over a
+/// taller window's page (178x348 at 2×) where the toolbar's row cuts nothing. Negative controls:
+/// with the toolbar kept over every page, Coding Agent Harness (130pt) under the 52pt toolbar of a
+/// 178x152 window at 2× was never whole, its screen drawing nothing; Packages' Check & Update Now
+/// and Install ALab Tools Now stood on four lines (163pt) beside 22pt card sides; and an empty
+/// Fleet document field set "ai-fleet.toml beside aterm.toml" on five lines (196pt).
+#[test]
+fn a_short_windows_toolbar_scrolls_away_where_its_row_cuts_a_control() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "listed toolbar", |scale| {
+        let mut faults = Vec::new();
+        for (width, height) in [(178.0_f32, 152.0_f32), (164.0, 98.0)] {
+            let cx = view_cx_at(width, height);
+            for route in SettingsRoute::ALL {
+                if route == SettingsRoute::Messages {
+                    continue;
+                }
+                let context = format!("{route:?} {width}x{height} {scale}x");
+                let (mut runtime, instance, view) = paging_view("", route);
+                // From the list's top, where a page that lands on a row of its own has one.
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+                    .unwrap();
+                // Each control by its key: whether a screen drew it whole, and its height.
+                let mut controls = std::collections::BTreeMap::<String, (bool, f32)>::new();
+                let mut before = None;
+                for screen in 0..400 {
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    let toolbars: Vec<LogicalRect> = compiled
+                        .semantics
+                        .iter()
+                        .filter(|node| node.key.as_str() == "settings/compact-toolbar")
+                        .map(|node| node.rect)
+                        .collect();
+                    if screen == 0 && toolbars.len() != 1 {
+                        faults.push(format!("{context}: the list's top draws {toolbars:?}"));
+                    }
+                    // A control no screen draws (a list draws none it would cut): no stop of the
+                    // 178x152 window's lists is cut.
+                    if screen == 0
+                        && height > 150.0
+                        && route != SettingsRoute::Themes
+                        && let Some(plan) = messages_view_state(&runtime, view).scroll_plan()
+                        && plan.cut_stops() > 0
+                    {
+                        faults.push(format!("{context}: {} stops are cut", plan.cut_stops()));
+                    }
+                    for node in &compiled.paint {
+                        let key = node.key.as_str();
+                        if !matches!(
+                            node.content,
+                            UiContent::Button(_)
+                                | UiContent::Switch(_)
+                                | UiContent::Slider(_)
+                                | UiContent::TextField(_)
+                        ) || key.starts_with("settings/compact-")
+                            || key.starts_with("settings/search")
+                        {
+                            continue;
+                        }
+                        let whole = (node.clip.y - node.rect.y).abs() < 0.5
+                            && (node.clip.height - node.rect.height).abs() < 0.5;
+                        let seen = controls.entry(key.to_string()).or_default();
+                        seen.0 |= whole;
+                        seen.1 = seen.1.max(node.rect.height);
+                    }
+                    let state = messages_view_state(&runtime, view);
+                    let place = (state.page_scroll, compiled.paint.len());
+                    if before == Some(place) {
+                        break;
+                    }
+                    before = Some(place);
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollLines(1))
+                        .unwrap();
+                }
+                for (key, (whole, tall)) in controls {
+                    // The chooser's grid rows, a row's height to a line ([`showcase_page`]).
+                    if route == SettingsRoute::Themes
+                        && (key.starts_with("settings/showcase/card/")
+                            || key == "settings/showcase/pack")
+                    {
+                        continue;
+                    }
+                    if tall > height + 0.5 {
+                        if height > 150.0 {
+                            faults.push(format!("{context}: {key} is {tall}pt"));
+                        }
+                    } else if !whole {
+                        faults.push(format!("{context}: {key} ({tall}pt) is never whole"));
+                    }
+                }
+            }
+        }
+        // Where the toolbar's row cuts nothing, the toolbar stays over the page, the window wide.
+        if scale > 1.5 {
+            let cx = view_cx_at(178.0, 348.0);
+            let (runtime, instance, view) = paging_view("", SettingsRoute::Tabs);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let toolbar = compiled
+                .semantic(&UiKey::new("settings/compact-toolbar"))
+                .map(|node| node.rect);
+            if toolbar.is_none_or(|rect| rect.x > 0.5 || rect.width < 177.5) {
+                faults.push(format!(
+                    "Tabs 178x348 2x: the toolbar {toolbar:?} is listed"
+                ));
+            }
+        }
+        faults.sort();
+        faults.dedup();
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
 }

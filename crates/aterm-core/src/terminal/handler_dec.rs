@@ -805,6 +805,7 @@ impl TerminalHandler<'_> {
             charset: *self.charset,
             pending_wrap: self.grid.pending_wrap(),
             underline_color: self.transient.current_underline_color,
+            resized: false,
         }
     }
 
@@ -845,11 +846,7 @@ impl TerminalHandler<'_> {
             } else {
                 (state.cursor.row, state.cursor.col)
             };
-            self.grid.set_cursor_following_content(row, col);
-            if state.pending_wrap {
-                self.grid
-                    .set_pending_wrap(super::handler_state::at_a_line_end(self.grid, row, col));
-            }
+            super::handler_state::place_restored_cursor(self.grid, &state, row, col);
             self.style.update_cached_colors();
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),

@@ -882,7 +882,7 @@ mod tests {
         assert_eq!(
             (jobs, granted),
             (6, Some(6)),
-            "14 idle cores less lima's 8 just granted leave Windows its 6"
+            "the 14 cores less lima's 8 leave Windows its 6"
         );
         let said: Vec<String> = heard.try_iter().collect();
         assert!(
@@ -1016,14 +1016,15 @@ mod tests {
     }
 
     /// The guest's jobs are the cores the claim was granted: on 14 cores at a 5-minute load of
-    /// 11, lima's boot is granted 3 and its guest builds with `CARGO_BUILD_JOBS=3`; a run on the
-    /// VM already up claims cores alone and is never short of memory.
+    /// 60, lima's boot is granted its share, 3, and its guest builds with `CARGO_BUILD_JOBS=3`
+    /// (CAP-1's first rule granted 1); a run on the VM already up claims cores alone and is
+    /// never short of memory.
     #[test]
     fn the_guests_jobs_are_the_cores_admitted() {
         let dir = aterm_tempfile::tempdir().expect("a scratch ledger");
         let ledger = Ledger::at(dir.path().join("capacity"));
         let mut loaded = Reading::of_gib(48, 48, 14);
-        loaded.load5 = Some(11.0);
+        loaded.load5 = Some(60.0);
         let admitted = admit_in(
             &ledger,
             &Fixed::new(loaded),

@@ -100,6 +100,10 @@ fn another_pass_runs(home: &Path) -> bool {
 struct Seated {
     seat: ask::Seat,
     checkout: Option<PathBuf>,
+    /// Another of this process's live sessions, supervised or not, works in that same checkout
+    /// ([`rule`]): its builds are not this tab's alone, and its line says so
+    /// ([`ask::Line::shared`]).
+    shared: bool,
 }
 
 /// The last word each volume's step said here, so a standing state is journalled once.
@@ -150,7 +154,7 @@ pub(super) fn before_pass(sids: &[String], store: &Store) {
     }
     let Rule {
         barred, live, held, ..
-    } = rule(store, sids, &key, &Left::NONE, false);
+    } = rule(store, sids, &key, &Left::NONE, &DRAFTS, false);
     let alive = |h: &ask::HostId| h.alive();
     let roster = ask::Roster {
         host: &host,
@@ -267,6 +271,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             root: &checkout_root,
             there: &dir_there,
         },
+        &DRAFTS,
         true,
     );
     let seats: Vec<ask::Seat> = seated.iter().map(|s| s.seat.clone()).collect();
@@ -350,6 +355,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
                 .unwrap_or(ask::Done::Spent),
             holders: &holders,
             checkout: s.checkout.as_deref(),
+            shared: s.shared,
             home: Some(&home),
         });
         Some((sid, text))
@@ -473,7 +479,8 @@ struct Facts {
     unfit: Option<&'static str>,
     /// What holds it where it cannot take a line now and passes ([`held_of`]): `limited`, an
     /// unspent usage-limit wall; `box`, a box its loop escalated to its owner; `hold`, the owner's
-    /// hold or a person's take-over; `draft`, a draft standing in its composer at a rest.
+    /// hold or a person's take-over; `draft`, a draft standing in its composer at a turn break (a
+    /// rest, or a break of the agent's own background work), or unchanged since one.
     held: Option<ask::HeldBy>,
     /// Whether the board places its directory on the volume asked about; `None`: its directory,
     /// or the volume it is on, was not read.
@@ -549,8 +556,13 @@ fn judge(f: &Facts) -> Judged {
 ///   loop's grace, when the loop rests there and its line could go);
 /// - `box` while its agent reads a box (`prompt`, `question`) its loop escalated to its owner
 ///   (`escalated`: the supervisor's own attention stands on it, not a limit's);
-/// - `draft` while its agent reads `idle` with a draft standing in its composer (`drafted`: the
-///   same typed text this process's last look read there, [`Draft::stands`]).
+/// - `draft` while a draft stands in its composer at a turn break (`drafted`, [`Drafted`]): its
+///   agent reads `idle`, or its screen is at a break of the agent's own background work, where
+///   it reads `busy` but its loop offers a line as at an idle point and refuses it for the draft
+///   (`background fact held: draft`); and on through a turn the agent opens itself while the
+///   draft that stood at its last break stands unchanged ([`Drafted::SinceBreak`]), as it meets
+///   that turn's break too. A draft typed while the agent works mid-turn, never yet left over a
+///   turn break, goes with its turn, and holds nothing.
 ///
 /// A box no rule answers waits on a person, a sign-in on a person too, and a wall on its reset:
 /// none of those turns ends, and the credits hold types nothing at the turns that do, so a line
@@ -564,7 +576,7 @@ fn held_of(
     wall: Option<&crate::disk_board::Wall>,
     withhold: Option<&crate::disk_board::Withhold>,
     halted: bool,
-    drafted: bool,
+    drafted: Drafted,
     now_s: i64,
 ) -> Option<ask::HeldBy> {
     use crate::disk_board::Withhold;
@@ -582,7 +594,10 @@ fn held_of(
         w if w == sign_in => Some(ask::HeldBy::SignIn),
         w if limit_word(w) && wall.is_some_and(|w| w.holds(now_s)) => Some(ask::HeldBy::Limit),
         "prompt" | "question" if escalated => Some(ask::HeldBy::Box),
-        "idle" if drafted => Some(ask::HeldBy::Draft),
+        "idle" if drafted != Drafted::No => Some(ask::HeldBy::Draft),
+        _ if matches!(drafted, Drafted::AtBackgroundBreak | Drafted::SinceBreak) => {
+            Some(ask::HeldBy::Draft)
+        }
         _ => None,
     }
 }
@@ -630,6 +645,51 @@ impl Draft {
     }
 }
 
+/// Whether a draft stands in a session's composer as a look reads it, and whether its screen is
+/// then at a break of the agent's own background work, or the draft stood at a turn break before
+/// ([`held_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drafted {
+    /// None stands: its composer is clear or was not read, or its text is new since this
+    /// process's last look ([`Draft::stands`]).
+    No,
+    /// One stands, its screen at no break of the agent's own background work, and no look read
+    /// it at a turn break: at a rest (its agent reads `idle`, which is one), or mid-turn, where it
+    /// goes with the turn.
+    Stands,
+    /// One stands, and its screen is at a break of the agent's own background work: its turn is
+    /// over, and only a shell or a monitor it left runs on
+    /// ([`aterm_phase::turn_over_background`], the reader its loop offers a line there by). Its
+    /// agent reads `busy` there, and its loop refuses that line for the draft.
+    AtBackgroundBreak,
+    /// One stands that a look read at a turn break, and every look since read unchanged
+    /// ([`Kept::at_break`]), its screen now at no break of the agent's own background work: the
+    /// agent works on in a turn it opened itself (a worker's report ending its background await, a
+    /// monitor's event), as a person's message takes the composer's text with it. The draft meets
+    /// that turn's break as it met the last, where its loop refuses the line for it again. Read
+    /// as a draft typed mid-turn, the session was seated and elected again through such a turn,
+    /// and held again at its break it was released ([`ask::Miss::Released`]): an
+    /// episode whose only seat it was ran out and parked for its cooldown.
+    SinceBreak,
+}
+
+impl Drafted {
+    /// `draft` as it stands since `last`, what this process's last look kept of the composer
+    /// ([`Draft::stands`], [`Kept`]), read on a screen at a break of the agent's own background
+    /// work or not (`background`).
+    fn of_reading(draft: &Draft, last: Option<&Kept>, background: bool) -> Self {
+        if !draft.stands(last.map(|k| k.text.as_str())) {
+            Drafted::No
+        } else if background {
+            Drafted::AtBackgroundBreak
+        } else if last.is_some_and(|k| k.at_break) {
+            Drafted::SinceBreak
+        } else {
+            Drafted::Stands
+        }
+    }
+}
+
 /// What the composer drawn in `rows` holds, the caret at `cursor` and `dim` saying whether a
 /// row's first composer glyph is dim (Claude Code's placeholder, [`glyph_dim`]): read as the
 /// fenced write reads it ([`aterm_agent::harness::upgrade::composer_is_empty`]), so a draft the
@@ -645,17 +705,20 @@ fn draft_in(rows: &[String], cursor: (usize, usize), dim: impl Fn(usize) -> bool
     }
 }
 
-/// What `t`'s live screen shows in its composer ([`draft_in`]); [`Draft::Unread`] while it is
-/// scrolled back or mid-frame.
-fn draft_on(t: &aterm_core::terminal::Terminal) -> Draft {
+/// What `t`'s live screen shows in its composer ([`draft_in`]), and whether it is at a break of
+/// the agent's own background work, read off the same rows ([`aterm_phase::turn_over_background`]:
+/// its turn is over, and only a shell or a monitor it left runs on, where its loop offers a line
+/// as at an idle point); [`Draft::Unread`], and no such break, while it is scrolled back or
+/// mid-frame.
+fn draft_on(t: &aterm_core::terminal::Terminal) -> (Draft, bool) {
     if t.grid().display_offset() > 0 || crate::frame_unfinished_now(t) {
-        return Draft::Unread;
+        return (Draft::Unread, false);
     }
     let rows: Vec<String> = (0..usize::from(t.rows()))
         .map(|r| crate::claude_lights::row_text(t, r))
         .collect();
     let cursor = t.cursor();
-    draft_in(
+    let draft = draft_in(
         &rows,
         (usize::from(cursor.row), usize::from(cursor.col)),
         |row| {
@@ -667,7 +730,8 @@ fn draft_on(t: &aterm_core::terminal::Terminal) -> Draft {
                 cells.and_then(|cells| cells.get(col)).map(|c| c.flags())
             })
         },
-    )
+    );
+    (draft, aterm_phase::turn_over_background(&rows))
 }
 
 /// Whether the composer's first glyph is dim, `flags(col)` the composer row's cell flags at
@@ -693,9 +757,39 @@ fn glyph_dim(flags: impl Fn(usize) -> Option<aterm_core::grid::CellFlags>) -> bo
     glyph.is_some_and(|f| f.contains(CellFlags::DIM))
 }
 
-/// The typed text each session's composer held at this process's last look ([`after_look`]), so
-/// the next look knows a draft that stands ([`Draft::stands`]).
-static DRAFTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+/// What each session's composer held at a look, by sid, so the next look knows a draft that
+/// stands ([`Draft::stands`]) and one that stood at a turn break ([`Drafted::SinceBreak`]): this
+/// process's is [`DRAFTS`], and a test keeps its own, as a look's own rule keeps only its store's
+/// live sessions in it ([`rule`]).
+type Drafts = Mutex<BTreeMap<String, Kept>>;
+
+/// What a look kept of a session's composer ([`Drafts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kept {
+    /// The typed text it held.
+    text: String,
+    /// A look read this same text at a turn break (its agent at a rest, `idle`, or its screen at a
+    /// break of the agent's own background work), and every look since that read the composer
+    /// read it unchanged: a turn opened since took nothing from the composer, so it was not a
+    /// person's message but the agent's own wake ([`Drafted::SinceBreak`]).
+    at_break: bool,
+}
+
+impl Kept {
+    /// What a look keeps of `text`, read in a composer after `last`, at a turn break or not
+    /// (`at_break`: its agent at a rest, or its screen at a break of the agent's own background
+    /// work), as [`Kept::at_break`] says.
+    fn after(last: Option<&Kept>, text: &str, at_break: bool) -> Self {
+        let at_break = at_break || last.is_some_and(|k| k.at_break && k.text == text);
+        Self {
+            text: text.to_owned(),
+            at_break,
+        }
+    }
+}
+
+/// What each of this process's sessions' composers held at its last look ([`after_look`]).
+static DRAFTS: Drafts = Mutex::new(BTreeMap::new());
 
 /// Why the seat rule bars a session by its task record: its task is done (it landed) or
 /// exited, or it goes on, so the session is a manager's worker (`managed`, as its loop's guard
@@ -718,7 +812,9 @@ struct Read {
     supervised: bool,
     program: Option<Program>,
     task: Option<TaskState>,
-    /// Its directory, read only for a supervised session.
+    /// Its directory, off its terminal (while that is busy, as the look's start read it): a
+    /// seat's checkout is read off it, and every other session's says whether it works in that
+    /// checkout too ([`Seated::shared`]).
     cwd: Option<PathBuf>,
     /// It rests at a turn break.
     at_break: bool,
@@ -733,6 +829,10 @@ struct Read {
     halted: bool,
     /// What its composer holds, read only for a supervised session ([`Draft`]).
     draft: Draft,
+    /// Its screen, read with [`Self::draft`], is at a break of the agent's own background work
+    /// ([`draft_on`]): its agent reads `busy`, but its loop offers a line there as at an idle
+    /// point ([`Drafted::AtBackgroundBreak`]).
+    background: bool,
 }
 
 /// This process's live sessions (`only`: that one alone), each as [`Read`] says; `sids` are the
@@ -773,24 +873,24 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
             let halted = h.ctx.fabric.hold().is_some();
             let sid = h.sid.as_str().to_owned();
             let supervised = sids.contains(&sid);
-            let (cwd, draft) = if supervised {
-                match h.term.try_lock() {
-                    Ok(t) => (
-                        t.native_working_directory()
-                            .filter(|c| !c.is_empty())
-                            .map(|c| PathBuf::from(c.into_owned())),
-                        draft_on(&t),
-                    ),
-                    Err(_) => (
-                        known
-                            .iter()
-                            .find(|(id, _)| *id == h.local_id)
-                            .map(|(_, cwd)| cwd.clone()),
-                        Draft::Unread,
-                    ),
-                }
-            } else {
-                (None, Draft::Unread)
+            let (cwd, (draft, background)) = match h.term.try_lock() {
+                Ok(t) => (
+                    t.native_working_directory()
+                        .filter(|c| !c.is_empty())
+                        .map(|c| PathBuf::from(c.into_owned())),
+                    if supervised {
+                        draft_on(&t)
+                    } else {
+                        (Draft::Unread, false)
+                    },
+                ),
+                Err(_) => (
+                    known
+                        .iter()
+                        .find(|(id, _)| *id == h.local_id)
+                        .map(|(_, cwd)| cwd.clone()),
+                    (Draft::Unread, false),
+                ),
             };
             let cwd = cwd.filter(|cwd| cwd.is_absolute());
             Read {
@@ -806,6 +906,7 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
                 escalated,
                 halted,
                 draft,
+                background,
             }
         })
         .collect()
@@ -815,19 +916,20 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
 /// each session and says what its worker found at its last turn break, as that holds now: all of
 /// it until the session works again, and only whose it is (the person's own exchange, a manager's
 /// wait) while its agent reads busy ([`crate::disk_board::Unfit::bars`]), so a session given
-/// something to do since is seated again.
-fn judged(read: Vec<Read>, key: &str) -> Vec<(Read, Judged)> {
+/// something to do since is seated again. A draft stands when `drafts` holds the same text from
+/// the last look.
+fn judged(read: Vec<Read>, key: &str, drafts: &Drafts) -> Vec<(Read, Judged)> {
     let now_s = aterm_time::unix_secs()
         .and_then(|s| i64::try_from(s).ok())
         .unwrap_or(0);
-    let drafts = DRAFTS
+    let drafts = drafts
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let b = crate::disk_board::SHELF.board_lock();
     read.into_iter()
         .map(|r| {
-            let drafted = r.draft.stands(drafts.get(&r.sid).map(String::as_str));
+            let drafted = Drafted::of_reading(&r.draft, drafts.get(&r.sid), r.background);
             let facts = Facts {
                 supervised: r.supervised,
                 program: r.program,
@@ -895,23 +997,32 @@ const fn unread(_: &Path) -> bool {
 
 /// The seat rule over this process's live sessions on volume `key` (its spelling), `sids` the
 /// supervised ones and `left` what the pass left, each seat holding what its own checkout's
-/// builds hold ([`checkout_of`], [`held_in`]). A look's own rule (`remember`, after its pass)
-/// keeps what each composer held for the next look ([`DRAFTS`]); the take-over before the pass
-/// reads it alone.
-fn rule(store: &Store, sids: &[String], key: &str, left: &Left<'_>, remember: bool) -> Rule {
+/// builds hold ([`checkout_of`], [`held_in`]), and knowing whether another live session works in
+/// that checkout too ([`shared_with`]). A look's own rule (`remember`, after its pass) keeps
+/// what each composer held in `drafts` for the next look, and only its store's live sessions'
+/// ([`DRAFTS`]); the take-over before the pass reads it alone.
+fn rule(
+    store: &Store,
+    sids: &[String],
+    key: &str,
+    left: &Left<'_>,
+    drafts: &Drafts,
+    remember: bool,
+) -> Rule {
     let mut out = Rule {
         seated: Vec::new(),
         barred: Vec::new(),
         live: Vec::new(),
         held: Vec::new(),
     };
-    let judged = judged(read_sessions(store, sids, None), key);
+    let judged = judged(read_sessions(store, sids, None), key, drafts);
     if remember {
-        let mut drafts = DRAFTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut drafts = drafts.lock().unwrap_or_else(PoisonError::into_inner);
         for (r, _) in &judged {
             match &r.draft {
                 Draft::Text(t) => {
-                    drafts.insert(r.sid.clone(), t.clone());
+                    let kept = Kept::after(drafts.get(&r.sid), t, r.at_break || r.background);
+                    drafts.insert(r.sid.clone(), kept);
                 }
                 Draft::Clear => {
                     drafts.remove(&r.sid);
@@ -921,6 +1032,10 @@ fn rule(store: &Store, sids: &[String], key: &str, left: &Left<'_>, remember: bo
         }
         drafts.retain(|sid, _| judged.iter().any(|(r, _)| r.sid == *sid));
     }
+    let dirs: Vec<(String, PathBuf)> = judged
+        .iter()
+        .filter_map(|(r, _)| Some((r.sid.clone(), r.cwd.clone()?)))
+        .collect();
     for (r, judged) in judged {
         out.live.push(r.sid.clone());
         match (judged, r.cwd) {
@@ -928,6 +1043,9 @@ fn rule(store: &Store, sids: &[String], key: &str, left: &Left<'_>, remember: bo
             (Judged::Held(why), _) => out.held.push((r.sid, why)),
             (Judged::Seat, Some(cwd)) => {
                 let checkout = checkout_of(left.holders, &cwd, left.home, left.root, left.there);
+                let shared = checkout
+                    .as_deref()
+                    .is_some_and(|c| shared_with(c, &r.sid, &dirs, left));
                 out.seated.push(Seated {
                     seat: ask::Seat {
                         held: held_in(left.holders, checkout.as_deref()),
@@ -935,6 +1053,7 @@ fn rule(store: &Store, sids: &[String], key: &str, left: &Left<'_>, remember: bo
                         at_break: r.at_break,
                     },
                     checkout,
+                    shared,
                 });
             }
             (Judged::Seat | Judged::Unseated, _) => {}
@@ -943,16 +1062,34 @@ fn rule(store: &Store, sids: &[String], key: &str, left: &Left<'_>, remember: bo
     out
 }
 
+/// Whether a session other than `sid`, of those in `dirs` (each live session's sid and
+/// directory), works in `checkout` itself ([`checkout_of`] over `left`): several tabs in one
+/// checkout build in its one cache, which is then not `sid`'s alone ([`Seated::shared`]). Only a
+/// directory under `checkout` is read for its own checkout, so a session elsewhere costs no walk.
+fn shared_with(checkout: &Path, sid: &str, dirs: &[(String, PathBuf)], left: &Left<'_>) -> bool {
+    dirs.iter().any(|(other, cwd)| {
+        other != sid
+            && cwd.starts_with(checkout)
+            && checkout_of(left.holders, cwd, left.home, left.root, left.there).as_deref()
+                == Some(checkout)
+    })
+}
+
 /// What the seat rule says of this process's session `sid` on volume `key` (its spelling) now,
 /// read as the look reads it ([`judge`]), so a session the look would not seat by a lasting fact
 /// is never typed its line, and one it holds is neither claimed nor typed it.
+/// A draft stands when `drafts` holds the same text from the last look ([`DRAFTS`]).
 /// [`Judged::Unseated`]: it is not this process's.
-fn judge_at(store: &Store, sid: &str, key: &str) -> Judged {
-    judged(read_sessions(store, &[sid.to_owned()], Some(sid)), key)
-        .into_iter()
-        .map(|(_, judged)| judged)
-        .next()
-        .unwrap_or(Judged::Unseated)
+fn judge_at(store: &Store, sid: &str, key: &str, drafts: &Drafts) -> Judged {
+    judged(
+        read_sessions(store, &[sid.to_owned()], Some(sid)),
+        key,
+        drafts,
+    )
+    .into_iter()
+    .map(|(_, judged)| judged)
+    .next()
+    .unwrap_or(Judged::Unseated)
 }
 
 /// The most directories [`checkout_of`] looks into for a session's own checkout.
@@ -1089,7 +1226,7 @@ pub(super) fn act(
     let host = ask::HostId::this();
     let now = now_ms();
     let (free, level) = volume_on(&owed.key);
-    let (unfit, held) = guards(judge_at(store, sid, &owed.key), unfit, held);
+    let (unfit, held) = guards(judge_at(store, sid, &owed.key, &DRAFTS), unfit, held);
     let token = super::harness_drive_token();
     let at = AtBreak {
         state: &state,
@@ -1242,7 +1379,7 @@ mod tests {
     /// Why the seat rule bars this process's session `sid` on volume `key` now ([`judge_at`]).
     /// `None`: it may be asked, or it is not this process's.
     fn bar_at(store: &Store, sid: &str, key: &str) -> Option<&'static str> {
-        match judge_at(store, sid, key) {
+        match judge_at(store, sid, key, &Drafts::default()) {
             Judged::Barred(why) => Some(why),
             Judged::Seat | Judged::Unseated | Judged::Held(_) => None,
         }
@@ -1434,7 +1571,7 @@ mod tests {
         let wall = |until_s| Wall { until_s };
         let now = 1_000_000;
         let held = |word, escalated, wall: Option<&Wall>| {
-            held_of(word, escalated, wall, None, false, false, now)
+            held_of(word, escalated, wall, None, false, Drafted::No, now)
         };
         for word in [
             "wall:usage-session",
@@ -1545,7 +1682,7 @@ mod tests {
         use crate::disk_board::Withhold;
         let now = 1_000_000;
         let held = |word, withhold: Option<&Withhold>| {
-            held_of(word, false, None, withhold, false, false, now)
+            held_of(word, false, None, withhold, false, Drafted::No, now)
         };
         let credits = |until_s| Withhold::Credits { until_s };
         assert_eq!(
@@ -1589,31 +1726,115 @@ mod tests {
     }
 
     /// A session the owner holds (or a person took over: `status hold=1`), or whose composer
-    /// holds a draft that stands at a rest, keeps to a turn break, and the fenced write refuses
-    /// every try there (`wait:held`, `wait:draft`): the look holds it, as a wall or a box. Read as
-    /// fit, it was nominated before a working session in the same GiB (it rests at a turn break),
-    /// elected, refused at every step of the wait for the delivery window and a grace, and handed
-    /// on as undelivered, spending an election with no line typed.
+    /// holds a draft that stands at a turn break (a rest, or a break of the agent's own background
+    /// work, where its agent reads busy), keeps to that turn break, and the loop refuses every
+    /// try there (`wait:held`, `wait:draft`, `background fact held: draft`): the look holds it,
+    /// as a wall or a box. Read as fit, it was nominated before a working session in the same GiB
+    /// (it rests at a turn break), elected, refused at every step of the wait for the delivery
+    /// window and a grace, and handed on as undelivered, spending an election with no line typed.
     #[test]
-    fn a_held_session_or_one_whose_draft_stands_at_a_rest_is_held() {
+    fn a_held_session_or_one_whose_draft_stands_at_a_turn_break_is_held() {
         let now = 1_000_000;
         for word in ["idle", "busy", "prompt", "wall:usage-session"] {
             assert_eq!(
-                held_of(word, false, None, None, true, false, now),
+                held_of(word, false, None, None, true, Drafted::No, now),
                 Some(ask::HeldBy::Hold),
                 "{word}: the hold refuses any typed line"
             );
         }
+        for drafted in [
+            Drafted::Stands,
+            Drafted::AtBackgroundBreak,
+            Drafted::SinceBreak,
+        ] {
+            assert_eq!(
+                held_of("idle", false, None, None, false, drafted, now),
+                Some(ask::HeldBy::Draft),
+                "{drafted:?}: at rest"
+            );
+        }
         assert_eq!(
-            held_of("idle", false, None, None, false, true, now),
-            Some(ask::HeldBy::Draft)
+            held_of(
+                "busy",
+                false,
+                None,
+                None,
+                false,
+                Drafted::AtBackgroundBreak,
+                now
+            ),
+            Some(ask::HeldBy::Draft),
+            "its turn over, only its own shell or monitor running: the loop's break refuses it"
         );
         assert_eq!(
-            held_of("busy", false, None, None, false, true, now),
+            held_of("busy", false, None, None, false, Drafted::SinceBreak, now),
+            Some(ask::HeldBy::Draft),
+            "the draft that stood at its last break, through a turn the agent opened itself"
+        );
+        assert_eq!(
+            held_of("busy", false, None, None, false, Drafted::Stands, now),
             None,
-            "a draft queued while it works goes with its turn"
+            "a draft typed while it works mid-turn goes with its turn"
         );
-        assert_eq!(held_of("idle", false, None, None, false, false, now), None);
+        for word in ["idle", "busy"] {
+            assert_eq!(
+                held_of(word, false, None, None, false, Drafted::No, now),
+                None,
+                "{word}"
+            );
+        }
+        // What the look reads: the draft standing since its last look, and where.
+        let typed = Draft::Text("land it".to_owned());
+        let kept = |text: &str, at_break| Kept {
+            text: text.to_owned(),
+            at_break,
+        };
+        assert_eq!(
+            Drafted::of_reading(&typed, Some(&kept("land it", false)), false),
+            Drafted::Stands
+        );
+        assert_eq!(
+            Drafted::of_reading(&typed, Some(&kept("land it", false)), true),
+            Drafted::AtBackgroundBreak
+        );
+        assert_eq!(
+            Drafted::of_reading(&typed, Some(&kept("land it", true)), true),
+            Drafted::AtBackgroundBreak
+        );
+        assert_eq!(
+            Drafted::of_reading(&typed, Some(&kept("land it", true)), false),
+            Drafted::SinceBreak,
+            "read at a break before, and the turn since took nothing from the composer"
+        );
+        assert_eq!(
+            Drafted::of_reading(&typed, None, true),
+            Drafted::No,
+            "first read: it may be a person typing"
+        );
+        assert_eq!(
+            Drafted::of_reading(&typed, Some(&kept("land", true)), false),
+            Drafted::No,
+            "still being typed"
+        );
+        assert_eq!(Drafted::of_reading(&Draft::Clear, None, true), Drafted::No);
+        // What a look keeps: a text read at a turn break, and kept so while it stands unchanged.
+        assert_eq!(Kept::after(None, "land it", true), kept("land it", true));
+        assert_eq!(Kept::after(None, "land it", false), kept("land it", false));
+        assert_eq!(
+            Kept::after(Some(&kept("land it", true)), "land it", false),
+            kept("land it", true),
+            "unchanged since the break"
+        );
+        assert_eq!(
+            Kept::after(Some(&kept("land it", true)), "land it now", false),
+            kept("land it now", false),
+            "typed into since, mid-turn: a new draft"
+        );
+        assert_eq!(
+            Kept::after(Some(&kept("land it", false)), "land it", false),
+            kept("land it", false),
+            "typed mid-turn, never at a break"
+        );
         let seat = Facts {
             supervised: true,
             program: Some(Program::Claude),
@@ -1670,11 +1891,12 @@ mod tests {
     }
 
     /// Through the look: the owner's hold reads on the session at once, and its composer off its
-    /// own screen, a look's own rule keeping what it held for the next look ([`DRAFTS`]), so the
+    /// own screen, a look's own rule keeping what it held for the next look (its [`Drafts`]), so the
     /// second look to read the same typed text reads it standing; the take-over's rule before the
     /// pass keeps nothing, and a cleared composer is forgotten.
     #[test]
     fn a_look_reads_the_owners_hold_and_a_draft_that_stands_since_its_last_look() {
+        let drafts = Drafts::default();
         let mut sessions = crate::session_store::SessionStore::default();
         let h = crate::session_store::test_handle(9_300);
         sessions.register(h.clone());
@@ -1697,11 +1919,11 @@ mod tests {
             let r = read_sessions(&store, &sids, Some(&sid))
                 .pop()
                 .expect("the session");
-            let last = DRAFTS
+            let last = drafts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(&sid)
-                .cloned();
+                .map(|k| k.text.clone());
             let stands = r.draft.stands(last.as_deref());
             (r.halted, r.draft, stands)
         };
@@ -1718,13 +1940,13 @@ mod tests {
         assert!(crate::fabric::apply_hold_for_test(&*h.ctx, None));
         draw("fix the flaky test");
         let first = read();
-        let _ = rule(&store, &sids, key, &Left::NONE, false);
+        let _ = rule(&store, &sids, key, &Left::NONE, &drafts, false);
         let before_pass = read();
-        let _ = rule(&store, &sids, key, &Left::NONE, true);
+        let _ = rule(&store, &sids, key, &Left::NONE, &drafts, true);
         let second = read();
         draw("");
-        let _ = rule(&store, &sids, key, &Left::NONE, true);
-        let forgotten = DRAFTS
+        let _ = rule(&store, &sids, key, &Left::NONE, &drafts, true);
+        let forgotten = drafts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&sid)
@@ -1762,27 +1984,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_seat_rule_holds_a_tab_on_hold_or_with_a_standing_draft_and_its_line_waits_unclaimed() {
-        use aterm_sysprobe::volumes::{Reading, VolumeKey};
+        use aterm_sysprobe::volumes::VolumeKey;
+        let drafts = Drafts::default();
         let mut sessions = crate::session_store::SessionStore::default();
         let h = crate::session_store::test_handle(9_400);
         sessions.register(h.clone());
         let sid = h.sid.as_str().to_owned();
         let sids = [sid.clone()];
         let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
-        h.ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .publish_agent(
-                "idle",
-                None,
-                None,
-                Some(Program::Claude),
-                crate::session_timeline::AgentStamp {
-                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                    fp: 1,
-                },
-            );
+        publishes(&h, "idle", Program::Claude);
         let draw = |line: &str| {
             let rule = "\u{2500}".repeat(60);
             let col = line.chars().count() + 3;
@@ -1800,30 +2010,9 @@ mod tests {
         // The board places the tab on the volume asked about, as a pass does.
         let volume = VolumeKey::Fsid(9_400);
         let key = volume.spelled();
-        {
-            let mut b = crate::disk_board::SHELF.board_lock();
-            b.volumes.push(crate::disk_board::VolumeRow {
-                reading: Reading {
-                    mount: PathBuf::from("/u"),
-                    key: volume.clone(),
-                    total: 2000 * GIB,
-                    free: 10 * GIB,
-                    files_free: Some(1 << 30),
-                    dev: 9_400,
-                    read_only: false,
-                },
-                thresholds: disk::Config::default().thresholds(Some(2000 * GIB)),
-                level: Level::Short,
-                room: None,
-                as_of: std::time::Instant::now(),
-                as_of_unix: 0,
-                reclaimed_here: true,
-            });
-            let at = b.volumes.len() - 1;
-            b.sessions.insert(h.local_id, at);
-        }
+        placed(&volume, Some(&[h.local_id]));
         let read = || {
-            let r = rule(&store, &sids, &key, &Left::NONE, true);
+            let r = rule(&store, &sids, &key, &Left::NONE, &drafts, true);
             (
                 r.seated
                     .iter()
@@ -1845,24 +2034,16 @@ mod tests {
         let clear = read();
         hold(true);
         let on_hold = read();
-        let judged_hold = judge_at(&store, &sid, &key);
+        let judged_hold = judge_at(&store, &sid, &key, &drafts);
         hold(false);
         let lifted = read();
         draw("refactor the parser");
         let first = read();
         let second = read();
-        let judged_draft = judge_at(&store, &sid, &key);
+        let judged_draft = judge_at(&store, &sid, &key, &drafts);
         draw("");
         let cleared = read();
-        {
-            let mut b = crate::disk_board::SHELF.board_lock();
-            b.sessions.remove(&h.local_id);
-            b.volumes.retain(|r| r.reading.key != volume);
-        }
-        DRAFTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&sid);
+        placed(&volume, None);
         let seated = (vec![sid.clone()], Vec::new());
         let held = |why| (Vec::new(), vec![(sid.clone(), why)]);
         assert_eq!(clear, seated, "CONTROL: a fit tab at rest is seated");
@@ -1917,6 +2098,579 @@ mod tests {
             (None, None),
             "CONTROL: a seat is typed"
         );
+    }
+
+    /// The board places sessions `locals` on volume `volume`, as a pass does; `None` takes them,
+    /// and the volume, off it again. Its callers read unix paths off a terminal (`OSC 7`).
+    #[cfg(unix)]
+    fn placed(volume: &aterm_sysprobe::volumes::VolumeKey, locals: Option<&[u64]>) {
+        use aterm_sysprobe::volumes::Reading;
+        let mut b = crate::disk_board::SHELF.board_lock();
+        let Some(locals) = locals else {
+            if let Some(at) = b.volumes.iter().position(|r| r.reading.key == *volume) {
+                b.sessions.retain(|_, row| *row != at);
+                b.volumes.remove(at);
+                for row in b.sessions.values_mut() {
+                    if *row > at {
+                        *row -= 1;
+                    }
+                }
+            }
+            return;
+        };
+        b.volumes.push(crate::disk_board::VolumeRow {
+            reading: Reading {
+                mount: PathBuf::from("/u"),
+                key: volume.clone(),
+                total: 2000 * GIB,
+                free: 10 * GIB,
+                files_free: Some(1 << 30),
+                dev: 0,
+                read_only: false,
+            },
+            thresholds: disk::Config::default().thresholds(Some(2000 * GIB)),
+            level: Level::Short,
+            room: None,
+            as_of: std::time::Instant::now(),
+            as_of_unix: 0,
+            reclaimed_here: true,
+        });
+        let at = b.volumes.len() - 1;
+        for local in locals {
+            b.sessions.insert(*local, at);
+        }
+    }
+
+    /// Claude Code publishes `word` for session `h`.
+    #[cfg(unix)]
+    fn publishes(h: &crate::session_store::SessionHandle, word: &'static str, program: Program) {
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publish_agent(
+                word,
+                None,
+                None,
+                Some(program),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+    }
+
+    /// A tab whose turn is over with only its own background shell still running (a manager in
+    /// `aterm ctl await task` on its workers) reads busy, yet its loop offers its line at that
+    /// break as at an idle point, and refuses it there for a draft standing in its composer
+    /// (`background fact held: draft`). The look reads the same: from the second look that reads
+    /// the same text it holds the tab (`draft`), so a line owed it goes back to the episode at its
+    /// host's next look, at no election's cost. The look held a draft only at `idle`, so such a
+    /// pick stood owed through every refused break and was handed on as undelivered at its
+    /// deadline: one of the episode's elections spent, the tab never asked again that episode
+    /// once its draft was sent, and with no other seat the episode ran out and parked for its
+    /// cooldown. A draft queued while the agent works mid-turn goes with its turn: it holds
+    /// nothing, and a line owed it stays owed.
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_standing_at_a_break_of_the_agents_own_background_work_gives_its_pick_back() {
+        use aterm_sysprobe::volumes::VolumeKey;
+        let drafts = Drafts::default();
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_500);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let sids = [sid.clone()];
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        publishes(&h, "busy", Program::Claude);
+        let draw = |status: &str, line: &str| {
+            let rule = "\u{2500}".repeat(60);
+            let col = line.chars().count() + 3;
+            h.term
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .process(
+                    format!(
+                        "\x1b]7;file://localhost/u/manager\x07\x1b[2J\x1b[H\u{23fa} The workers \
+                         run on; I land each as it reports.\r\n{status}\r\n{rule}\r\n\u{276f} \
+                         {line}\r\n{rule}\x1b[4;{col}H"
+                    )
+                    .as_bytes(),
+                );
+        };
+        let rows = || {
+            let t = h.term.lock().unwrap_or_else(PoisonError::into_inner);
+            (0..usize::from(t.rows()))
+                .map(|r| crate::claude_lights::row_text(&t, r))
+                .collect::<Vec<_>>()
+        };
+        let background =
+            "\u{273b} Crunched for 9m 27s \u{b7} done 11:07 AM \u{b7} 1 shell still running";
+        let working = "\u{273b} Crunching\u{2026} (3s \u{b7} esc to interrupt)";
+        let volume = VolumeKey::Fsid(9_500);
+        let key = volume.spelled();
+        placed(&volume, Some(&[h.local_id]));
+        // Each screen read by two looks a minute apart, the same draft typed in its prompt.
+        let read = |status: &str| {
+            draw(status, "");
+            let _ = rule(&store, &sids, &key, &Left::NONE, &drafts, true);
+            draw(status, "and then land the merge");
+            let screen = rows();
+            let first = rule(&store, &sids, &key, &Left::NONE, &drafts, true);
+            let second = rule(&store, &sids, &key, &Left::NONE, &drafts, true);
+            (screen, first, second)
+        };
+        let (bg_rows, bg_first, bg) = read(background);
+        let (mid_rows, _, mid) = read(working);
+        placed(&volume, None);
+        assert!(
+            aterm_phase::turn_over_background(&bg_rows),
+            "CONTROL: the loop's own reader takes this screen as a break of its background work: \
+             {bg_rows:#?}"
+        );
+        assert!(
+            !aterm_phase::turn_over_background(&mid_rows),
+            "CONTROL: mid-turn: {mid_rows:#?}"
+        );
+        let seated = |r: &Rule| {
+            r.seated
+                .iter()
+                .map(|s| s.seat.sid.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (seated(&bg_first), bg_first.held.clone()),
+            (vec![sid.clone()], Vec::new()),
+            "a draft read once: a person may be typing"
+        );
+        assert_eq!(
+            (seated(&bg), bg.held.clone()),
+            (Vec::new(), vec![(sid.clone(), ask::HeldBy::Draft)]),
+            "the same draft a look on, at a break its loop would offer the line at"
+        );
+        assert_eq!(
+            (seated(&mid), mid.held.clone()),
+            (vec![sid.clone()], Vec::new()),
+            "a draft queued mid-turn goes with its turn"
+        );
+        // A line owed it, at its host's next look, as each reading leaves the lease.
+        let state = aterm_tempfile::TempDir::new().expect("owned lease dir");
+        let host = ask::HostId {
+            pid: 10,
+            start: "start-10".to_owned(),
+        };
+        let now = now_ms();
+        let alive = |_: &ask::HostId| true;
+        let next_look = |r: &Rule| {
+            owed_at(state.path(), &key, &host, &sid, now);
+            let seats: Vec<ask::Seat> = r.seated.iter().map(|s| s.seat.clone()).collect();
+            let look = ask::Look {
+                now_ms: now + 60_000,
+                host: &host,
+                key: &key,
+                level: Level::Short,
+                free: 10 * GIB,
+                floor: 25 * GIB,
+                files_free: None,
+                files_floor: 0,
+                done: Some(ask::Done::Spent),
+                seats: &seats,
+                supervised: &sids,
+                barred: &r.barred,
+                live: &r.live,
+                held: &r.held,
+                reclaimed: &[],
+                passing: false,
+                alive: &alive,
+            };
+            let said = ask::transact(state.path(), &ask::LOCK_LADDER, |l| ask::step(l, &look))
+                .expect("the lease is stepped")
+                .expect("nobody holds its lock");
+            (
+                said,
+                ask::read(state.path()).entry(&key).cloned().expect("entry"),
+            )
+        };
+        let pick = ask::Pick {
+            host: host.clone(),
+            sid: sid.clone(),
+        };
+        let (said, entry) = next_look(&bg);
+        assert_eq!(
+            said,
+            ask::Said::Returned {
+                from: pick.clone(),
+                why: ask::HeldBy::Draft
+            },
+            "{entry:?}"
+        );
+        assert!(entry.picks.is_empty(), "no election spent: {entry:?}");
+        assert_eq!(
+            entry.returned,
+            std::slice::from_ref(&sid),
+            "back in the episode"
+        );
+        assert_eq!(entry.released, 0, "{entry:?}");
+        let (said, entry) = next_look(&mid);
+        assert!(
+            matches!(&said, ask::Said::Owed { pick: p, .. } if *p == pick),
+            "CONTROL: mid-turn, owed until its turn break: {said:?} {entry:?}"
+        );
+    }
+
+    /// A manager in `aterm ctl await task` on its workers, with text left in its prompt, wakes
+    /// whenever a worker reports: its background command ends, Claude Code opens a turn of the
+    /// agent's own (`Background command "…" completed`), and that turn works for minutes before
+    /// it goes back to its await. The text stays in the prompt throughout. The look holds the tab
+    /// at the first break (`draft`), and its owed pick goes back to the episode; it holds it on
+    /// through the turn the agent's own wake opened, as the text that stood at the break stands
+    /// unchanged (that turn took nothing from the composer), whether or not the turn's first row
+    /// is still on screen; and at the next break. So the round, with nobody else to elect, waits
+    /// naming the draft, and never runs out; once the text is sent, the tab is seated and elected
+    /// again. The look read a draft that stood at a break as one typed mid-turn once the agent
+    /// woke: it seated the tab, the round elected it again, the next break held it, and a
+    /// session goes back to the episode only once, so it was released, and with no other seat
+    /// the episode ran out and parked for its cooldown, the text still in the prompt. A draft
+    /// typed while the agent works mid-turn, never yet left over a break, still holds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_that_stood_at_a_break_holds_its_tab_through_the_agents_own_wake_and_its_round_waits()
+    {
+        use aterm_sysprobe::volumes::VolumeKey;
+        let drafts = Drafts::default();
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_700);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let sids = [sid.clone()];
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        publishes(&h, "busy", Program::Claude);
+        // Its screen: the transcript rows `above` its status row, then its composer holding `line`.
+        let draw = |above: &[&str], status: &str, line: &str| {
+            let rule = "\u{2500}".repeat(60);
+            let col = line.chars().count() + 3;
+            let row = above.len() + 3;
+            let above: String = above.iter().map(|r| format!("{r}\r\n")).collect();
+            h.term
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .process(
+                    format!(
+                        "\x1b]7;file://localhost/u/manager\x07\x1b[2J\x1b[H{above}{status}\r\n\
+                         {rule}\r\n\u{276f} {line}\r\n{rule}\x1b[{row};{col}H"
+                    )
+                    .as_bytes(),
+                );
+        };
+        let rows = || {
+            let t = h.term.lock().unwrap_or_else(PoisonError::into_inner);
+            (0..usize::from(t.rows()))
+                .map(|r| crate::claude_lights::row_text(&t, r))
+                .collect::<Vec<_>>()
+        };
+        let waits = "\u{23fa} The workers run on; I land each as it reports.";
+        let woke = "\u{23fa} Background command \"aterm ctl await task @w1,@w2 since=0\" completed \
+                    (exit code 0)";
+        let merging = "\u{23fa} w1 landed its work; merging it and running the checks.";
+        let verifying = "\u{23fa} Bash(targo --unverified verify -p aterm-gui)";
+        let merged = "\u{23fa} Merged w1. Waiting on w2.";
+        let background =
+            "\u{273b} Crunched for 9m 27s \u{b7} done 11:07 AM \u{b7} 1 shell still running";
+        let working = "\u{273b} Crunching\u{2026} (2m 3s \u{b7} esc to interrupt)";
+        let draft = "and then land the merge";
+        let volume = VolumeKey::Fsid(9_700);
+        let key = volume.spelled();
+        placed(&volume, Some(&[h.local_id]));
+        // One look a minute, each reading the screen drawn before it.
+        let look = |above: &[&str], status: &str, line: &str| {
+            draw(above, status, line);
+            let screen = rows();
+            (
+                screen,
+                rule(&store, &sids, &key, &Left::NONE, &drafts, true),
+            )
+        };
+        let (_, typed) = look(&[waits], background, draft);
+        let (break_rows, at_break) = look(&[waits], background, draft);
+        let (wake_rows, woken) = look(&[waits, woke, merging], working, draft);
+        let (later_rows, later) = look(&[verifying], working, draft);
+        let (_, back) = look(&[merging, merged], background, draft);
+        let sent_with = format!("\u{276f} {draft}");
+        let (_, sent) = look(&[merged, &sent_with], working, "");
+        let fresh = "also bump the version";
+        let (_, fresh_first) = look(&[merged, &sent_with], working, fresh);
+        let (_, fresh_stands) = look(&[merged, &sent_with], working, fresh);
+        placed(&volume, None);
+        assert!(
+            aterm_phase::turn_over_background(&break_rows),
+            "CONTROL: a break of its background work: {break_rows:#?}"
+        );
+        assert!(
+            !aterm_phase::turn_over_background(&wake_rows)
+                && !aterm_phase::turn_over_background(&later_rows),
+            "CONTROL: its own wake's turn is no break: {wake_rows:#?} {later_rows:#?}"
+        );
+        assert_eq!(
+            (
+                aterm_phase::opened_by_own_wake(&wake_rows),
+                aterm_phase::opened_by_own_wake(&later_rows)
+            ),
+            (Some(true), None),
+            "CONTROL: its own wake opened the turn, and the screen stops saying so"
+        );
+        let seated = |r: &Rule| {
+            r.seated
+                .iter()
+                .map(|s| s.seat.sid.clone())
+                .collect::<Vec<_>>()
+        };
+        let draft_held = (Vec::new(), vec![(sid.clone(), ask::HeldBy::Draft)]);
+        let read = |r: &Rule| (seated(r), r.held.clone());
+        assert_eq!(
+            read(&typed),
+            (vec![sid.clone()], Vec::new()),
+            "read once: a person may be typing"
+        );
+        assert_eq!(read(&at_break), draft_held, "at its background break");
+        assert_eq!(
+            read(&woken),
+            draft_held,
+            "its own wake: the draft stood at the break and the turn took nothing from it"
+        );
+        assert_eq!(
+            read(&later),
+            draft_held,
+            "the turn's first row scrolled off: the same text still stands"
+        );
+        assert_eq!(read(&back), draft_held, "back at its break");
+        assert_eq!(
+            read(&sent),
+            (vec![sid.clone()], Vec::new()),
+            "the text sent: seated"
+        );
+        assert_eq!(
+            (read(&fresh_first), read(&fresh_stands)),
+            (
+                (vec![sid.clone()], Vec::new()),
+                (vec![sid.clone()], Vec::new())
+            ),
+            "CONTROL: a draft typed mid-turn, never left over a break, goes with its turn"
+        );
+        // The lease, owed to it since the look that read the draft once seated it, stepped by
+        // its host at each look after.
+        let state = aterm_tempfile::TempDir::new().expect("owned lease dir");
+        let host = ask::HostId {
+            pid: 11,
+            start: "start-11".to_owned(),
+        };
+        let t0 = now_ms();
+        owed_at(state.path(), &key, &host, &sid, t0);
+        let alive = |_: &ask::HostId| true;
+        let step_at = |r: &Rule, at: i64| {
+            let seats: Vec<ask::Seat> = r.seated.iter().map(|s| s.seat.clone()).collect();
+            let look = ask::Look {
+                now_ms: at,
+                host: &host,
+                key: &key,
+                level: Level::Short,
+                free: 10 * GIB,
+                floor: 25 * GIB,
+                files_free: None,
+                files_floor: 0,
+                done: Some(ask::Done::Spent),
+                seats: &seats,
+                supervised: &sids,
+                barred: &r.barred,
+                live: &r.live,
+                held: &r.held,
+                reclaimed: &[],
+                passing: false,
+                alive: &alive,
+            };
+            let said = ask::transact(state.path(), &ask::LOCK_LADDER, |l| ask::step(l, &look))
+                .expect("the lease is stepped")
+                .expect("nobody holds its lock");
+            (
+                said,
+                ask::read(state.path()).entry(&key).cloned().expect("entry"),
+            )
+        };
+        let minute = 60_000;
+        let pick = ask::Pick {
+            host: host.clone(),
+            sid: sid.clone(),
+        };
+        let (said, _) = step_at(&at_break, t0 + minute);
+        assert_eq!(
+            said,
+            ask::Said::Returned {
+                from: pick.clone(),
+                why: ask::HeldBy::Draft
+            }
+        );
+        let waiting = ask::Said::Waiting {
+            held: vec![sid.clone()],
+            why: vec![ask::HeldBy::Draft],
+        };
+        let round_past = t0 + minute + ask::NOMINATE_MS;
+        let (said, _) = step_at(&woken, t0 + 2 * minute);
+        assert!(
+            matches!(said, ask::Said::Nominating { seat: None, .. }),
+            "its round gathers, the tab held: {said:?}"
+        );
+        for (r, at, what) in [
+            (&later, round_past, "through its own wake's turn"),
+            (&back, round_past + minute, "back at its break"),
+        ] {
+            let (said, entry) = step_at(r, at);
+            assert_eq!(said, waiting, "{what}: {entry:?}");
+            assert!(
+                entry.picks.is_empty() && entry.released == 0,
+                "{what}: no election spent, none released: {entry:?}"
+            );
+        }
+        let (said, entry) = step_at(&sent, round_past + 2 * minute);
+        assert_eq!(
+            said,
+            ask::Said::Elected {
+                pick: pick.clone(),
+                held: 0
+            },
+            "the text sent: elected again, {entry:?}"
+        );
+    }
+
+    /// The asked tab's line marks its own checkout's builds `(this tab's)` only while no other
+    /// session of this process works in that checkout, supervised or not: several Claude Code
+    /// tabs in `~/aterm` is ordinary, and they build in one cache, so the line says `(this tab's
+    /// checkout, shared)`, and never tells the agent a cache other sessions build in is its own.
+    /// A tab in a worktree nested in the checkout works in its own checkout, and shares nothing
+    /// of it. The seat's rank is unchanged: it holds what its checkout's builds hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_whose_checkout_another_session_works_in_is_told_its_builds_are_shared() {
+        use aterm_sysprobe::volumes::VolumeKey;
+        let asked = crate::session_store::test_handle(9_600);
+        let shell = crate::session_store::test_handle(9_601);
+        let nested = crate::session_store::test_handle(9_602);
+        let peer = crate::session_store::test_handle(9_603);
+        let cd = |h: &crate::session_store::SessionHandle, dir: &str| {
+            h.term
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .process(format!("\x1b]7;file://localhost{dir}\x07").as_bytes());
+        };
+        cd(&asked, "/u/aterm/crates/x");
+        cd(&shell, "/u/aterm");
+        cd(&nested, "/u/aterm/.claude/worktrees/w/crates");
+        cd(&peer, "/u/aterm/crates/y");
+        publishes(&asked, "idle", Program::Claude);
+        publishes(&nested, "busy", Program::Claude);
+        publishes(&peer, "busy", Program::Claude);
+        let sid = asked.sid.as_str().to_owned();
+        let peer_sid = peer.sid.as_str().to_owned();
+        let volume = VolumeKey::Fsid(9_600);
+        let key = volume.spelled();
+        placed(
+            &volume,
+            Some(&[
+                asked.local_id,
+                shell.local_id,
+                nested.local_id,
+                peer.local_id,
+            ]),
+        );
+        let holders = [
+            Hog {
+                path: PathBuf::from("/u/Library/Caches/aterm/cargo-build.noindex/a"),
+                bytes: 61 * GIB,
+                bytes_partial: false,
+                why: String::new(),
+                serves: Some(PathBuf::from("/u/aterm")),
+            },
+            Hog {
+                path: PathBuf::from("/u/trust/build"),
+                bytes: 30 * GIB,
+                bytes_partial: false,
+                why: String::new(),
+                serves: Some(PathBuf::from("/u/trust")),
+            },
+        ];
+        let roots = ["/u/aterm", "/u/aterm/.claude/worktrees/w", "/u/trust"];
+        let root = |dir: &Path| roots.iter().any(|r| dir == Path::new(r));
+        let there = |_: &Path| true;
+        let left = Left {
+            holders: &holders,
+            home: Some(Path::new("/u")),
+            root: &root,
+            there: &there,
+        };
+        // The asked tab's seat and its line, with `with` the other live sessions and `supervised`
+        // those the harness supervises.
+        let seat = |with: &[&crate::session_store::SessionHandle], supervised: &[String]| {
+            let mut sessions = crate::session_store::SessionStore::default();
+            sessions.register(asked.clone());
+            for h in with {
+                sessions.register((*h).clone());
+            }
+            let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+            let r = rule(&store, supervised, &key, &left, &Drafts::default(), false);
+            let s = r
+                .seated
+                .into_iter()
+                .find(|s| s.seat.sid == sid)
+                .expect("the asked tab is seated");
+            let text = ask::line(&ask::Line {
+                mount: Path::new("/System/Volumes/Data"),
+                total: 1000 * GIB,
+                free: 18 * GIB,
+                floor: 25 * GIB,
+                emergency: false,
+                done: ask::Done::Spent,
+                holders: &holders,
+                checkout: s.checkout.as_deref(),
+                shared: s.shared,
+                home: Some(Path::new("/u")),
+            });
+            (s.seat.held, s.shared, text)
+        };
+        let one = std::slice::from_ref(&sid);
+        let alone = seat(&[], one);
+        let beside_nested = seat(&[&nested], &[sid.clone(), nested.sid.as_str().to_owned()]);
+        let beside_shell = seat(&[&shell, &nested], one);
+        let beside_peer = seat(&[&peer], &[sid.clone(), peer_sid.clone()]);
+        placed(&volume, None);
+        let own = "~/aterm's builds 61.0 GiB (this tab's); $HOME/trust's builds 30.0 GiB.";
+        let shared =
+            "~/aterm's builds 61.0 GiB (this tab's checkout, shared); $HOME/trust's builds 30.0 GiB.";
+        assert_eq!((alone.0, alone.1), (61 * GIB, false), "CONTROL: alone");
+        assert!(alone.2.contains(own), "{}", alone.2);
+        assert_eq!(
+            (beside_nested.0, beside_nested.1),
+            (61 * GIB, false),
+            "a worktree nested in the checkout is its own checkout"
+        );
+        assert!(beside_nested.2.contains(own), "{}", beside_nested.2);
+        assert_eq!(
+            (beside_shell.0, beside_shell.1),
+            (61 * GIB, true),
+            "a shell in the same checkout, unsupervised: shared, and the seat ranks as before"
+        );
+        assert!(beside_shell.2.contains(shared), "{}", beside_shell.2);
+        assert!(
+            !beside_shell.2.contains("(this tab's)"),
+            "{}",
+            beside_shell.2
+        );
+        assert_eq!(
+            (beside_peer.0, beside_peer.1),
+            (61 * GIB, true),
+            "another Claude Code tab working in the same checkout"
+        );
+        assert!(beside_peer.2.contains(shared), "{}", beside_peer.2);
+        for text in [&alone.2, &beside_shell.2, &beside_peer.2] {
+            assert!(text.chars().count() <= ask::LINE_CAP, "{text}");
+        }
     }
 
     /// The composer's first glyph is read past a caret the program draws over it, as the fenced
@@ -2068,7 +2822,7 @@ mod tests {
             },
         );
         let key = "fsid:9000";
-        let found = rule(&store, &sids, key, &Left::NONE, false);
+        let found = rule(&store, &sids, key, &Left::NONE, &Drafts::default(), false);
         let bars: Vec<Option<&'static str>> =
             (0..5).map(|i| bar_at(&store, &sid(i), key)).collect();
         crate::disk_board::SHELF.board_lock().unfit.remove(&sid(2));
@@ -2199,6 +2953,7 @@ mod tests {
                 done: ask::Done::Spent,
                 holders: &holders,
                 checkout,
+                shared: false,
                 home: Some(home),
             })
         };
@@ -2316,6 +3071,7 @@ mod tests {
                 done: ask::Done::Spent,
                 holders: &holders,
                 checkout: checkout.as_deref(),
+                shared: false,
                 home: Some(home),
             });
             assert!(text.contains("~/aterm's builds 61.0 GiB"), "{text}");

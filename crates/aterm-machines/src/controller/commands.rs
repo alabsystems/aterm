@@ -1147,7 +1147,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
         );
     }
 
-    let own_facts = crate::facts::gather(env.sys);
+    let own_facts = crate::facts::gather_without_keyboards(env.sys);
     let self_in_hosts = !own_facts.uuid.is_empty()
         && hosts
             .iter()
@@ -2253,6 +2253,7 @@ fn pending_upgrade_row(hello: &Hello, own: &OwnAgent) -> ItemReport {
         explain: None,
         stood_aside: None,
         essential: false,
+        elapsed_ms: None,
     }
 }
 
@@ -3801,7 +3802,7 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
             return ExitCode::FAILURE;
         }
     };
-    let facts = crate::facts::gather(sys);
+    let mut facts = crate::facts::gather_without_keyboards(sys);
     let name = facts.local_host_name.clone();
     let text = match crate::baseline::fill(
         &text,
@@ -3825,6 +3826,13 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
             return ExitCode::FAILURE;
         }
     };
+    if baseline
+        .keyboard
+        .as_ref()
+        .is_some_and(|table| table.caps_lock.is_some())
+    {
+        facts.keyboards = crate::facts::inventory_keyboards(sys);
+    }
     let mut users = Vec::new();
     let wanted: Vec<String> = if baseline.users.is_empty() {
         facts.console_user.iter().cloned().collect()
@@ -4115,6 +4123,7 @@ mod tests {
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         }
     }
 
@@ -6400,6 +6409,11 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
             journaled(&sys),
             Vec::<aterm_json::Value>::new(),
             "a line for a run that changed nothing"
+        );
+        assert!(
+            !sys.calls().iter().any(|call| call.contains("hidutil")),
+            "a baseline with no keyboard table must not search live devices: {:?}",
+            sys.calls()
         );
         let sys = mac();
         sys.on(

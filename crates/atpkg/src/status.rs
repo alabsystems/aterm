@@ -410,7 +410,7 @@ fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    crate::store::sync_dir(&layout.prefix);
+    let _flushed_or_unavailable = aterm_durable::Flush::Durable.dir_best_effort(&layout.prefix)?;
     #[cfg(test)]
     counted::note(layout);
     Ok(())

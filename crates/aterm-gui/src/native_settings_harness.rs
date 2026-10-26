@@ -355,8 +355,7 @@ pub(super) fn harness_page(
         harness_page_title(page_width),
         harness_page_subtitle(width),
     );
-    let room = (settings_list_body_height(state, width, viewport) - heading_height)
-        .max(scaled_control_height());
+    let room = page_list_room(state, width, viewport, heading_height);
     let cards = harness_cards(state, harness, update, width, page_width, (room, gap));
     let mut out = heading;
     out.push(scroll::list_page_peeking(
@@ -444,26 +443,27 @@ fn harness_cards(
         crate::harness_screen::HarnessFocus::Session(id) => Some(id),
         _ => None,
     };
+    let (sessions, resting) = session_rows(
+        harness,
+        rows_width,
+        inner,
+        (state.harness_timer_open, state.harness_every_timer_open),
+        selected,
+    );
     cards.extend(row_cards_inset(
         "harness/sessions",
         ("Sessions", ("SESSIONS", "SESSIONS")),
-        session_rows(
-            harness,
-            rows_width,
-            inner,
-            (state.harness_timer_open, state.harness_every_timer_open),
-            selected,
-        ),
+        (sessions, resting),
         (room, card_width),
         true,
     ));
     if !harness.decided.is_empty() {
-        cards.extend(row_cards(
+        cards.extend(row_cards_inset(
             "harness/decided",
             ("Decided for you", ("DECIDED FOR YOU", "DECIDED")),
             decided_rows(harness, inner, state.harness_decided_open),
-            room,
-            card_width,
+            (room, card_width),
+            false,
         ));
     }
     cards.push(harness_actions(harness, card_width));
@@ -969,17 +969,25 @@ pub(super) fn row_cards(
     room: f32,
     card_width: f32,
 ) -> Vec<(UiNode, f32)> {
-    row_cards_inset(key, names, rows, (room, card_width), false)
+    let tallest = rows
+        .iter()
+        .map(|(_, height)| *height)
+        .fold(0.0_f32, f32::max);
+    row_cards_inset(key, names, (rows, tallest), (room, card_width), false)
 }
 
 /// How far a SESSIONS row's words stand inside the block its landing draws the accent card on.
 pub(super) const ROW_INSET: f32 = 8.0;
 
 /// [`row_cards`]; with `blocks`, each row's block keeps [`ROW_INSET`] beside its words.
+/// `resting` is the tallest row's height with nothing in the card opened (a SESSIONS row's
+/// Timer closed, DECIDED FOR YOU showing its newest): the card's padding is chosen by it, so
+/// opening a row in place, or the rest of the card, never re-pads the card and moves every row
+/// in it, the one pressed with them.
 fn row_cards_inset(
     key: &str,
     names: (&str, (&str, &str)),
-    rows: Vec<(UiNode, f32)>,
+    (rows, resting): (Vec<(UiNode, f32)>, f32),
     (room, card_width): (f32, f32),
     blocks: bool,
 ) -> Vec<(UiNode, f32)> {
@@ -991,11 +999,7 @@ fn row_cards_inset(
         &card_heading(heading.0, heading.1, inner),
         inner,
     );
-    let tallest = rows
-        .iter()
-        .map(|(_, height)| *height)
-        .fold(0.0_f32, f32::max);
-    let pad = if 2.0 * CARD_PAD + heading_height + tallest + CARD_GAP <= room {
+    let pad = if 2.0 * CARD_PAD + heading_height + resting + CARD_GAP <= room {
         CARD_PAD
     } else {
         TIGHT_CARD_PAD
@@ -1237,51 +1241,68 @@ fn no_session_open() -> String {
     format!("No {named} session is open")
 }
 
-/// The SESSIONS card's rows ([`every_row`]).
+/// The SESSIONS card's rows ([`every_row`]), and the tallest of them with every Timer closed
+/// ([`row_cards_inset`]'s `resting`).
 fn session_rows(
     harness: &HarnessProjection,
     width: SettingsWidth,
     inner: f32,
     (timer_open, every_open): (Option<u64>, bool),
     selected: Option<u64>,
-) -> Vec<(UiNode, f32)> {
+) -> (Vec<(UiNode, f32)>, f32) {
+    let tallest = |rows: &[(UiNode, f32)]| {
+        rows.iter()
+            .map(|(_, height)| *height)
+            .fold(0.0_f32, f32::max)
+    };
     if harness.sessions.is_empty() {
         let text = if harness.observed {
             no_session_open()
         } else {
             "Reading the sessions\u{2026}".to_string()
         };
-        return vec![wrapped_words_node(
+        let rows = vec![wrapped_words_node(
             "harness/sessions/empty",
             &text,
             (SemanticRole::Text, StyleRef::Quiet),
             inner,
             22.0_f32.max(18.0 * settings_text_scale()),
         )];
+        let resting = tallest(&rows);
+        return (rows, resting);
     }
     let offer = harness.land_at_offer;
     let measure = RowMeasure::of(&harness.sessions, width, inner);
-    let mut rows: Vec<(UiNode, f32)> = harness
-        .sessions
-        .iter()
-        .map(|row| {
-            let open = timer_open == Some(row.local_id);
-            let landed = selected == Some(row.local_id);
-            let (node, height) = session_row(row, open, landed, measure, inner);
-            session_timer(
-                row,
-                (node, height),
-                row.default.is_some(),
-                offer,
-                (open, landed),
-                inner,
-            )
-        })
-        .collect();
-    if let Some(every) = &harness.every {
-        rows.push(every_row(every, measure, offer, every_open, inner));
-    }
-    rows
+    let laid = |timer_open: Option<u64>, every_open: bool| {
+        let mut rows: Vec<(UiNode, f32)> = harness
+            .sessions
+            .iter()
+            .map(|row| {
+                let open = timer_open == Some(row.local_id);
+                let landed = selected == Some(row.local_id);
+                let (node, height) = session_row(row, open, landed, measure, inner);
+                session_timer(
+                    row,
+                    (node, height),
+                    row.default.is_some(),
+                    offer,
+                    (open, landed),
+                    inner,
+                )
+            })
+            .collect();
+        if let Some(every) = &harness.every {
+            rows.push(every_row(every, measure, offer, every_open, inner));
+        }
+        rows
+    };
+    let rows = laid(timer_open, every_open);
+    let resting = if timer_open.is_none() && !every_open {
+        tallest(&rows)
+    } else {
+        tallest(&laid(None, false))
+    };
+    (rows, resting)
 }
 
 /// AN OPEN TIMER'S CHOICES, ONE PIECE OF ITS ROW ([`scroll::row_parts`]).
@@ -1885,23 +1906,25 @@ fn session_timer(
     )
 }
 
-/// DECIDED FOR YOU'S ROWS ([`DECIDED_LINES`]).
-fn decided_rows(harness: &HarnessProjection, inner: f32, open: bool) -> Vec<(UiNode, f32)> {
-    let shown = if open {
-        harness.decided.len()
-    } else {
-        harness.decided.len().min(DECIDED_SHOWN)
-    };
+/// DECIDED FOR YOU'S ROWS ([`DECIDED_LINES`]), and the tallest of the rows it shows closed
+/// ([`row_cards_inset`]'s `resting`). Its columns are measured from every choice it holds, shown
+/// or not, so showing the rest adds rows under the newest without re-laying them: measured from
+/// the rows shown, an older choice with a live tab or a wider clock narrowed the sentence column
+/// the moment it opened, and the newest rows wrapped again under the pointer.
+fn decided_rows(harness: &HarnessProjection, inner: f32, open: bool) -> (Vec<(UiNode, f32)>, f32) {
+    let closed = harness.decided.len().min(DECIDED_SHOWN);
+    let shown = if open { harness.decided.len() } else { closed };
     let rows = &harness.decided[..shown];
     let (clock_px, clock_face) =
         crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
-    let clock_width = rows
+    let clock_width = harness
+        .decided
         .iter()
         .map(|row| crate::tray_raster::ui_text_width_for(clock_face, &row.clock, clock_px))
         .fold(0.0_f32, f32::max)
         + ABOUT_METADATA_TEXT_SAFETY;
     let button_width = (crate::native_ui::native_button_label_width("Show tab") + 40.0).min(inner);
-    let any_show = rows.iter().any(|row| row.show.is_some());
+    let any_show = harness.decided.iter().any(|row| row.show.is_some());
     let words = inner - clock_width - MODE_GAP;
     let beside = words
         - if any_show {
@@ -1917,14 +1940,18 @@ fn decided_rows(harness: &HarnessProjection, inner: f32, open: bool) -> Vec<(UiN
         stacked,
     };
     let mut out: Vec<(UiNode, f32)> = rows.iter().map(|row| decided_row(row, measure)).collect();
+    // The newest rows are laid alike open or closed, so the closed card's are a prefix of these.
+    let mut resting = out[..closed]
+        .iter()
+        .map(|(_, height)| *height)
+        .fold(0.0_f32, f32::max);
     if harness.decided.len() > DECIDED_SHOWN {
-        out.push(decided_disclosure(
-            open,
-            (harness.decided.len(), harness.decided_total),
-            inner,
-        ));
+        let disclosure =
+            decided_disclosure(open, (harness.decided.len(), harness.decided_total), inner);
+        resting = resting.max(disclosure.1);
+        out.push(disclosure);
     }
-    out
+    (out, resting)
 }
 
 /// How DECIDED FOR YOU's rows are laid out at the page's measure ([`decided_rows`]).

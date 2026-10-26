@@ -590,3 +590,188 @@ pub fn explain_honesty_model() -> Model {
         }
     }
 }
+
+/// THE REAP CREDIT (`docs/DESIGN-system-awareness-2026-10-16.md` §7.5): a tab's cumulative CPU,
+/// live and reaped, across one member parent `p`, alive throughout, and one member child `m` at
+/// a time (`aterm_vitals::explain::reap`). Its `Tick` reads every process at one instant, so the
+/// sweep's order (a zombie read after its parent) is outside it, as are members gone together
+/// and a parent that dies or waits as a zombie (what it leaves is uncertain): the walk is already
+/// 63,082 states of the interpreter's 100,000, so the ledger's and the sweep's own tests hold
+/// those.
+///
+/// `pc` and `pk` are `p`'s own CPU and its reaped children's (the kernel adds a child's own and
+/// reaped time at its reap); `mc` and `mk` are `m`'s; `ms` is `m` running (1), a zombie (2) or
+/// gone (0); `mo` is `m` under `p` (0) or under launchd (1), where a wrapper between them that
+/// died leaves it; `gen` is `m`'s generation (a new process, its pid perhaps reused); `w` is the
+/// tab's true work. `Tick` is the ledger's step on one whole sweep: `p`'s row (`rpc`, `rpk`, and
+/// `pend`, the work counted that its reaped time has yet to show), `m`'s (`row`, `rgen`, `rmc`,
+/// `rmk`, `rpar` its parent as last read, `zread` whether that reading was of a zombie, `gone`
+/// whether it was reaped since), the counter `c` (`cp` before the step), the live-only figure
+/// `live` (`livep` before: the own CPU of the members read at both readings), `pendp` (`pend`
+/// before) and `fr` (the step found a member gone that its last reading put under launchd);
+/// `lpc`, `lmc`, `lgen`, `lpres` and `lmo` are what the last reading read. Laws `TabCounterMonotone` and `RateNeverBelowLive` (Buggy 1:
+/// the naive Δ(live + reaped), the counter its members' `cpu + child` now, which dips when
+/// launchd reaps a member), `ZombieReadOnce` (Buggy 2, SA's `ForgetZombieRead`: a zombie keeps
+/// its last live reading), `PendingDropsOnForeignReap` (Buggy 3: a member keeps the parent it
+/// was first read under), `CountedOnce` (Buggy 4: nothing is absorbed, so a member its parent
+/// reaped counts twice).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn reap_credit_model() -> Model {
+    aterm_spec::ty_model! {
+        ReapCredit {
+            const Buggy = 0;
+            const Work = 3;
+            var n = 0;
+            var w = 0;
+            var pc = 0;
+            var pk = 0;
+            var mc = 0;
+            var mk = 0;
+            var ms = 1;
+            var mo = 0;
+            var gen = 0;
+            var lpc = 0;
+            var lmc = 0;
+            var lgen = 0;
+            var lpres = 1;
+            var lmo = 0;
+            var rpc = 0;
+            var rpk = 0;
+            var pend = 0;
+            var row = 1;
+            var rgen = 0;
+            var rmc = 0;
+            var rmk = 0;
+            var rpar = 0;
+            var zread = 0;
+            var gone = 0;
+            var c = 0;
+            var cp = 0;
+            var live = 0;
+            var livep = 0;
+            var pendp = 0;
+            var fr = 0;
+
+            action PWork when (n <= Work - 1) {
+                n = n + 1;
+                w = w + 1;
+                pc = pc + 1;
+            }
+            action PChildWork when (n <= Work - 1) {
+                n = n + 1;
+                w = w + 1;
+                pk = pk + 1;
+            }
+            action MWork when (n <= Work - 1 && ms == 1) {
+                n = n + 1;
+                w = w + 1;
+                mc = mc + 1;
+            }
+            action MChildWork when (n <= Work - 1 && ms == 1) {
+                n = n + 1;
+                w = w + 1;
+                mk = mk + 1;
+            }
+            action Reparent when (ms > 0 && mo == 0) {
+                mo = 1;
+            }
+            action Exit when (ms == 1) {
+                ms = 2;
+            }
+            action PReap when (ms == 2 && mo == 0) {
+                ms = 0;
+                pk = pk + mc + mk;
+                gone = if (row == 1 && rgen == gen) { 1 } else { gone };
+            }
+            action ForeignReap when (ms == 2 && mo == 1) {
+                ms = 0;
+                gone = if (row == 1 && rgen == gen) { 1 } else { gone };
+            }
+            action Respawn when (ms == 0 && gen == 0) {
+                gen = 1;
+                ms = 1;
+                mo = 0;
+                mc = 0;
+                mk = 0;
+            }
+            action Tick {
+                c = if (Buggy == 1) {
+                    pc + pk + (if (ms > 0) { mc + mk } else { 0 })
+                } else {
+                    c + pc - rpc + pk - rpk
+                        - (if (Buggy == 4) {
+                            0
+                        } else {
+                            if (pend + (if (gone == 1 && rpar == 0) { rmc + rmk } else { 0 })
+                                <= pk - rpk)
+                            {
+                                pend + (if (gone == 1 && rpar == 0) { rmc + rmk } else { 0 })
+                            } else {
+                                pk - rpk
+                            }
+                        })
+                        + (if (ms > 0) {
+                            if (row == 1 && rgen == gen) {
+                                if (Buggy == 2 && ms == 2) { 0 } else { mc + mk - rmc - rmk }
+                            } else {
+                                mc + mk
+                            }
+                        } else {
+                            0
+                        })
+                };
+                cp = c;
+                live = live
+                    + (pc - lpc)
+                    + (if (lpres == 1 && lgen == gen && ms > 0) { mc - lmc } else { 0 });
+                livep = live;
+                pend = if (Buggy == 4) {
+                    pend + (if (gone == 1 && rpar == 0) { rmc + rmk } else { 0 })
+                } else {
+                    if (pend + (if (gone == 1 && rpar == 0) { rmc + rmk } else { 0 }) <= pk - rpk) {
+                        0
+                    } else {
+                        pend + (if (gone == 1 && rpar == 0) { rmc + rmk } else { 0 }) - (pk - rpk)
+                    }
+                };
+                pendp = pend;
+                fr = if (gone == 1 && lmo == 1) { 1 } else { 0 };
+                gone = 0;
+                rpc = pc;
+                rpk = pk;
+                row = if (ms > 0) { 1 } else { 0 };
+                rgen = gen;
+                rmc = if (ms > 0) {
+                    if (Buggy == 2 && row == 1 && rgen == gen && ms == 2) { rmc } else { mc }
+                } else {
+                    0
+                };
+                rmk = if (ms > 0) {
+                    if (Buggy == 2 && row == 1 && rgen == gen && ms == 2) { rmk } else { mk }
+                } else {
+                    0
+                };
+                rpar = if (ms > 0) {
+                    if (Buggy == 3 && row == 1 && rgen == gen) { rpar } else { mo }
+                } else {
+                    0
+                };
+                zread = if (ms == 2) { 1 } else { 0 };
+                lpc = pc;
+                lmc = mc;
+                lgen = gen;
+                lpres = if (ms > 0) { 1 } else { 0 };
+                lmo = mo;
+            }
+
+            invariant TabCounterMonotone: cp <= c;
+            invariant RateNeverBelowLive: live - livep <= c - cp;
+            invariant PendingDropsOnForeignReap: fr == 0 || pend <= pendp;
+            invariant ZombieReadOnce:
+                zread == 0 || rgen > gen || gen > rgen || rmc + rmk == mc + mk;
+            invariant CountedOnce: c <= w;
+            bound Box: n <= Work;
+        }
+    }
+}

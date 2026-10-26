@@ -326,8 +326,10 @@ impl Listener {
             version: "0.95.0".to_owned(),
         });
         // A fixed-key listener represents the key at construction, even when its
-        // worker starts after the caller rotates the key. Later rounds may reread it.
-        let mut first_secret = Some(read_key_file(state).expect("init wrote the key"));
+        // worker starts after the caller rotates the key. Later rounds may reread it, and keep
+        // the one they serve while none is on disk.
+        let mut secret = read_key_file(state).expect("init wrote the key");
+        let mut first = true;
         let state = state.to_path_buf();
         let serving = std::thread::spawn({
             let (running, round) = (Arc::clone(&running), Arc::clone(&round));
@@ -336,10 +338,13 @@ impl Listener {
                 if !running.load(Ordering::Acquire) {
                     break listener;
                 }
+                if !std::mem::take(&mut first)
+                    && let Ok(read) = read_key_file(&state)
+                {
+                    secret = read;
+                }
                 let listening = Listening {
-                    secret: first_secret
-                        .take()
-                        .unwrap_or_else(|| read_key_file(&state).expect("init wrote the key")),
+                    secret: secret.clone(),
                     scope: FleetScope::Facts,
                     node: node.clone(),
                     serves,
@@ -1479,6 +1484,120 @@ fn a_rotate_returns_once_this_machines_listener_serves_the_new_key() {
              key was written"
         )),
         "{again}"
+    );
+    drop(stuck);
+}
+
+#[test]
+fn a_new_fleets_init_returns_once_this_machines_listener_serves_its_key() {
+    let (issuer, _, old) = issuing("init-serves");
+    let port = fleet_table(&issuer.config())
+        .unwrap()
+        .listen_port()
+        .unwrap();
+    let serving = Listener::rereading(old.take(), &issuer.places.state);
+    ok(leave(&issuer.places, &[]));
+    let fresh = ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+    ));
+    assert!(!fresh.contains("  listener "), "{fresh}");
+    let code = std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap();
+    let member = World::new("init-serves-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    drop(serving);
+}
+
+fn with_aterm_here<R>(hook: impl FnMut() -> bool + 'static, act: impl FnOnce() -> R) -> R {
+    ATERM_HERE.with(|here| *here.borrow_mut() = Some(Box::new(hook)));
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
+    ATERM_HERE.with(|here| *here.borrow_mut() = None);
+    done.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+#[test]
+fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
+    let issuer = World::new("init-binds");
+    let port = closed_port();
+    let state = issuer.places.state.clone();
+    let bound: Rc<RefCell<Option<Listener>>> = Rc::default();
+    let fresh = with_aterm_here(
+        {
+            let bound = Rc::clone(&bound);
+            // The aterm here reads [fleet] and binds its listener while the init waits.
+            move || {
+                if bound.borrow().is_none() {
+                    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+                    *bound.borrow_mut() = Some(Listener::serve(listener, &state));
+                }
+                true
+            }
+        },
+        || {
+            ok(init(
+                &issuer.places,
+                &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+            ))
+        },
+    );
+    assert!(bound.borrow().is_some(), "the init asked for an aterm here");
+    assert!(!fresh.contains("  listener "), "{fresh}");
+    let code = std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap();
+    let member = World::new("init-binds-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+
+    let unbound = World::new("init-unbound");
+    let port = closed_port();
+    let waited = with_aterm_here(
+        || true,
+        || {
+            ok(init(
+                &unbound.places,
+                &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+            ))
+        },
+    );
+    assert!(
+        waited.contains(&format!(
+            "  listener   nothing listens on 127.0.0.1:{port} 3 s after the new key was written, \
+             though an aterm runs here"
+        )),
+        "{waited}"
+    );
+}
+
+#[test]
+fn a_join_after_a_leave_waits_for_this_machines_listener_to_serve_the_new_key() {
+    let (_one, first, _first) = issuing("join-serves-first");
+    let (_two, second, _second) = issuing("join-serves-second");
+    let member = World::new("join-serves-member");
+    let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    let opts = Opts {
+        port: Some(port),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first));
+    let stuck = Listener::serve(held, &member.places.state);
+    ok(leave(&member.places, &[]));
+    let joined = ok(join(&member.places, &opts, &second));
+    assert!(
+        joined.contains(&format!(
+            "  listener   127.0.0.1:{port} still answers under another secret 3 s after the new \
+             key was written"
+        )),
+        "{joined}"
     );
     drop(stuck);
 }
@@ -2897,7 +3016,7 @@ fn a_join_at_another_machines_address_is_told_its_host_not_its_port() {
                 place: place.to_owned(),
                 node: holder.clone(),
             },
-            false,
+            (Path::new("/state"), false),
         )
     };
     let elsewhere = refused("192.0.2.1:7100");
@@ -3789,6 +3908,8 @@ fn a_drive_that_meets_a_listener_between_generations_is_asked_again() {
         Unreached::Handshake(at, FleetError::Io(io::ErrorKind::UnexpectedEof.into())),
         Unreached::Handshake(at, FleetError::AddressBusy),
         Unreached::Connect(at, io::ErrorKind::ConnectionRefused.into()),
+        Unreached::Connect(at, io::Error::from_raw_os_error(libc::ECONNRESET)),
+        Unreached::Connect(at, io::ErrorKind::ConnectionAborted.into()),
     ] {
         assert!(drive_again(&again), "{again:?}");
     }
@@ -3858,6 +3979,17 @@ fn a_failed_join_is_advised_by_its_kind() {
             Advice::Answered,
         ),
         (
+            JoinFailed::Registration(format!(
+                "{}, and the issuer does not join itself",
+                member::OWN_NODE
+            )),
+            Advice::IssuersNode,
+        ),
+        (
+            JoinFailed::Registration(member::MOVED_ON.to_owned()),
+            Advice::MovedOn,
+        ),
+        (
             JoinFailed::Dial(Unreached::Handshake(at, FleetError::AddressBusy)),
             Advice::Busy,
         ),
@@ -3877,7 +4009,11 @@ fn a_failed_join_is_advised_by_its_kind() {
         JoinFailed::Unanswered("the issuer did not answer within 2.9s".to_owned()),
         JoinFailed::Dial(Unreached::Handshake(at, FleetError::AddressBusy)),
     ] {
-        let said = not_recorded("192.168.1.23:7100", &unanswered, false);
+        let said = not_recorded(
+            "192.168.1.23:7100",
+            &unanswered,
+            (Path::new("/state"), false),
+        );
         assert!(!said.contains("The issuer answered"), "{said}");
     }
     let older = "this machine is no fleet's issuer: it holds no join code, so it records no \
@@ -3886,7 +4022,7 @@ fn a_failed_join_is_advised_by_its_kind() {
         let said = not_recorded(
             "127.0.0.1:49201",
             &JoinFailed::Registration(words.to_owned()),
-            false,
+            (Path::new("/state"), false),
         );
         assert_eq!(
             said,
@@ -3898,10 +4034,40 @@ fn a_failed_join_is_advised_by_its_kind() {
             "{words}"
         );
     }
+    let cloned = not_recorded(
+        "127.0.0.1:49201",
+        &JoinFailed::Registration(format!(
+            "{}, and the issuer does not join itself (a Mac cloned or restored from the issuer \
+             carries its node)",
+            member::OWN_NODE
+        )),
+        (Path::new("/state"), false),
+    );
+    assert!(
+        cloned.contains(
+            "This machine carries the issuer's node (/state/fleet-node, /state/fleet-node-key)"
+        ) && cloned.contains("Remove those two files here, and a join mints this machine a node")
+            && !cloned.contains("on the issuer (`aterm fleet peers`"),
+        "{cloned}"
+    );
+    let moved = not_recorded(
+        "127.0.0.1:49201",
+        &JoinFailed::Registration(member::MOVED_ON.to_owned()),
+        (Path::new("/state"), false),
+    );
+    assert!(
+        moved.contains("copy the code it issues now")
+            && moved.contains(
+                "if it left (`aterm fleet leave`), it issues none until `aterm fleet init` runs \
+                 there again: copy the code that writes"
+            )
+            && !moved.contains("put right on the issuer"),
+        "{moved}"
+    );
     let rotated = not_recorded(
         "192.168.1.23:7100",
         &JoinFailed::Dial(Unreached::Handshake(at, FleetError::ListenerWrongSecret)),
-        false,
+        (Path::new("/state"), false),
     );
     assert!(
         rotated.contains("rotated") && !rotated.contains("start aterm on the issuer"),
@@ -3915,7 +4081,7 @@ fn a_failed_join_is_advised_by_its_kind() {
                 to,
                 io::Error::from_raw_os_error(libc::ECONNREFUSED),
             )),
-            false,
+            (Path::new("/state"), false),
         )
     };
     assert!(refused("192.168.1.23:7100").contains("local network"));

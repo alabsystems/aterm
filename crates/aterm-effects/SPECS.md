@@ -3,6 +3,12 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-25: `glow-landing-ring-raster` (§1) now says a veiled style lands a round rim about the
+> caret (r17 CA4: on dark the bound veil alone lifted the ground some 70 levels over about 150 px, so
+> "Ring on jumps" read as broken for Lumen, Comet, Sparkle, Phaser and Laser), and the classic wake's
+> light ring lays its square in the accent's ink; `the_dark_landing_ring_is_a_soft_bloom_in_its_row`
+> is now `the_dark_landing_ring_is_a_round_rim_over_a_soft_bloom_in_its_row` (§2).
+
 > 2026-10-25: `host-line-head-law` (§1) now says how the stand on top of the host's line is taken
 > while the person types: as a perch, its soles clear of the line by the clearance a hold asks of a
 > body (with the soles on the line the stand passed and the hold did not, and a cat watching a
@@ -302,7 +308,7 @@ glow-style-switch-crossfade	invariant	CursorGlow::{tick,tick_fades}; fields fadi
 glow-bolt-jag-deterministic	equivalence	CursorGlow::{spawn_bolt,emit_bolts}	For every seed and geometry the strike polyline is the same whatever strikes used the pooled jag buffers before.	0,1,2,3,4,5,7	1
 glow-crown-radial	contract	CursorGlow::tick (crown channel); CursorGlow::halos	For every non-fire built-in style the crown is RainHalos only, radius >= 1, at least one centred on the head cell.	0,1,2,3,4,5,7	1
 classic-ring-grade	contract	classic_ring_radius_factor; classic_ring_life	classic_ring_radius_factor(s) = 1 for non-finite s, else 1 + 0.4*(clamp(s,1,IMPACT_MAX)-1); classic_ring_life(b,s) = b for non-finite s, else b*(1 + 0.267*(clamp(s,1,IMPACT_MAX)-1)). Both are monotone in s with floors and caps (2.0, b*1.6675).	0,3,5	1
-glow-landing-ring-raster	contract	CursorGlow::{spawn_landing_ring,emit_ring}; classic_ring_radius_factor	On dark themes the ring is additive quads whose four bars are pixel-disjoint and union the closed square outline (clamped to the box); on light themes a source-over veil (cap 1..=120) with no additive quads; a capped-impact ring reaches further than impact 1 at equal age; a halo centre past the box stays true and a negative centre culls.	0,1,2,3,4,5,7	4
+glow-landing-ring-raster	contract	CursorGlow::{spawn_landing_ring,emit_ring,emit_ring_rim}; classic_ring_radius_factor	A style whose landing light is a veil (every style that reads the Ring knob but Water, and Fire on dark) lands a round rim about the caret's cell, 0.7 to 1.7 rows across its life, faded at the effects box: on dark additive quads in the veil's hue over a soft halo veil bound to the caret's row; on light source-over over-text ink under LIGHT_INK_ALPHA_CAP over a source-over veil (cap 1..=120); a style that reads no Ring knob lands no rim; a capped-impact ring reaches further than impact 1 at equal age; a halo centre past the box stays true and a negative centre culls.	0,1,2,3,4,5,7	4
 rainbow-sweep-and-bands	table-property	rainbow_sweep_at; rainbow_band_at; RAINBOW_BANDS; spectrum::spectrum_stop	RAINBOW_BANDS[i] == spectrum_stop(i), RAINBOW_BANDS[0] == 0xFF0000, entries distinct. rainbow_sweep_at(col,phase) is in [0,1], a reflected (non-wrapping) sweep with bounded per-step change attaining both ends; rainbow_band_at returns one of the seven anchors as a function of (col, phase) only.	0,3,5,6	2
 glyph-tint-palette	contract	fresh_ink_glyph_palette; fresh_ink_glyph_ink; CursorGlow.glyph_palette memo	fresh_ink_glyph_palette(fg,bg) is None if either is unset, fg == bg, or contrast is below the usable floor; otherwise every band and weight keeps the box-corner colour's luminance on the usable side of the cap (1e-6). The bisection predicate is monotone and its answer satisfies it. The engine memoizes per (fg,bg) and re-derives exactly when they change.	0,1,3,5,6,7	4
 light-ink-laws	contract	light_ink; light_ink_bold; LIGHT_INK_ALPHA_CAP	light_ink(rgb) has luma <= LIGHT_INK_MAX_LUMA and max channel <= LIGHT_INK_MAX_CHANNEL, keeps channel order, and is the identity under both bars; light_ink_bold lands chromatic input on the luma bar preserving hue, maps achromatic non-black to 0x787878 and 0 to 0; every band at LIGHT_INK_ALPHA_CAP stays dark over near-black ink and visibly darkens white.	0,3,5,6	3
@@ -1310,7 +1316,7 @@ src/cursor_glow/tests/review.rs	the_coalesced_fold_on_the_alt_screen_is_admitted
 src/cursor_glow/tests/rings.rs	classic_landing_ring_expands_wider_with_the_jump	glow-landing-ring-raster	
 src/cursor_glow/tests/rings.rs	cold_navigation_timestamp_scatters_nothing	glow-no-licence-no-light	
 src/cursor_glow/tests/rings.rs	halo_centres_past_the_box_stay_true_and_negative_centres_cull	glow-landing-ring-raster	
-src/cursor_glow/tests/rings.rs	the_dark_landing_ring_is_a_soft_bloom_in_its_row	glow-landing-ring-raster	
+src/cursor_glow/tests/rings.rs	the_dark_landing_ring_is_a_round_rim_over_a_soft_bloom_in_its_row	glow-landing-ring-raster	
 src/cursor_glow/tests/rings.rs	rainbow_landing_ring_light_theme_forks_to_source_over	glow-landing-ring-raster	
 src/cursor_glow/tests/seam_laws.rs	a_classic_erase_key_leaves_no_standing_wake	glow-idle-to-zero	
 src/cursor_glow/tests/seam_laws.rs	a_composer_newline_starts_the_walk_again_however_soon_the_next_glyph_follows	glow-typed-cell-lit	

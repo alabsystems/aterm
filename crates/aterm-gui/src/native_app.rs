@@ -4279,12 +4279,19 @@ impl MarkdownApp {
         );
     }
 
+    /// Where a page from `view` in `geometry` lands: most of a viewport back or on. Once the
+    /// view shows the document's end ([`Self::shown_through`], what reads 100%) there is no
+    /// next page, so Next is off where the status says the document is read, and a
+    /// document that fits on one page is not paged onto a page of its last row alone.
     fn page_target(
         &self,
         view: &MarkdownViewState,
         geometry: &MarkdownReaderGeometry,
         direction: i32,
     ) -> crate::native_markdown::MarkdownLocation {
+        if direction > 0 && self.shown_through(view, geometry) >= self.parsed.source_len {
+            return Self::location(view);
+        }
         let ty = crate::native_ui::reader_type();
         let page = geometry.preview_viewport_height * 0.82;
         if view.mode == MarkdownViewMode::Source {
@@ -4315,11 +4322,48 @@ impl MarkdownApp {
         }
     }
 
+    /// How far `view` in `geometry` has shown the document, as a source offset
+    /// ([`crate::native_markdown::source_shown_through`]): what the reader's progress counts.
+    fn shown_through(&self, view: &MarkdownViewState, geometry: &MarkdownReaderGeometry) -> usize {
+        let ty = crate::native_ui::reader_type();
+        if view.mode == MarkdownViewMode::Source {
+            let row_h = crate::native_markdown::block_frame(
+                crate::native_markdown::BlockShape::Code {
+                    labelled: true,
+                    dense: false,
+                },
+                ty,
+            )
+            .map_or(22.0, |frame| frame.line_h);
+            crate::native_markdown::source_lines_shown_through(
+                &self.parsed,
+                view.source_anchor,
+                (geometry.preview_viewport_height / row_h).floor() as usize,
+            )
+        } else {
+            crate::native_markdown::source_shown_through(
+                &self.parsed,
+                view.source_anchor,
+                view.visual_row,
+                geometry.preview_content_width,
+                geometry.preview_viewport_height,
+                ty,
+            )
+        }
+    }
+
     /// The reader's status line: a notice while one stands, else the reading position. The
     /// `compact` form leaves the section's name out. `widest` gives the position's numbers at
     /// their widest (the last section or block, 100% read), so a layout measured with it
-    /// does not change as the reader moves.
-    fn reader_status(&self, view: &MarkdownViewState, compact: bool, widest: bool) -> String {
+    /// does not change as the reader moves; otherwise the share read is the share shown
+    /// through `shown` ([`Self::shown_through`]), 100% at the end of the document.
+    fn reader_status(
+        &self,
+        view: &MarkdownViewState,
+        compact: bool,
+        widest: bool,
+        shown: usize,
+    ) -> String {
         if let Some(notice) = view.notice.as_deref().or(self.recovery_status.as_deref()) {
             return bounded_markdown_text(notice, 180);
         }
@@ -4337,11 +4381,11 @@ impl MarkdownApp {
         let percent = if widest {
             100
         } else {
-            view.source_anchor
+            shown
                 .min(self.parsed.source_len)
                 .saturating_mul(100)
                 .checked_div(self.parsed.source_len)
-                .unwrap_or(0)
+                .unwrap_or(100)
         };
         let section_count = self.parsed.outline.len();
         if section_count == 0 {
@@ -4408,9 +4452,24 @@ impl MarkdownApp {
             crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Primary);
         let width = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
         let fits = |text: &str, room: f32| width(text) <= room + crate::native_ui::TEXT_FIT_SLACK;
-        let short = compact || !fits(&self.reader_status(view, false, true), beside);
-        let shown = self.reader_status(view, short, false);
-        let measured = self.reader_status(view, short, true);
+        let short = compact || !fits(&self.reader_status(view, false, true, 0), beside);
+        let measured = self.reader_status(view, short, true, 0);
+        let wrap = |text: &str| crate::native_settings::wrap_to_box(text, room, &width);
+        // The share read is counted under the header the widest status measures, the
+        // header the reader keeps as it moves.
+        let measured_rows = if fits(&measured, beside) {
+            MarkdownReaderHeader::rows_height(compact, 1, false)
+        } else {
+            MarkdownReaderHeader::rows_height(
+                compact,
+                wrap(&measured)
+                    .len()
+                    .clamp(1, MarkdownReaderHeader::MAX_STATUS_LINES),
+                true,
+            )
+        };
+        let through = self.shown_through(view, &geometry.with_header_height(measured_rows));
+        let shown = self.reader_status(view, short, false, through);
         let controls_h = MarkdownReaderHeader::controls_height(compact);
         let status_line_h = MarkdownReaderHeader::status_line_height();
         if fits(&measured, beside) && fits(&shown, beside) {
@@ -4422,7 +4481,6 @@ impl MarkdownApp {
                 height: MarkdownReaderHeader::rows_height(compact, 1, false),
             };
         }
-        let wrap = |text: &str| crate::native_settings::wrap_to_box(text, room, &width);
         let rows = wrap(&measured)
             .len()
             .max(wrap(&shown).len())
@@ -6432,22 +6490,26 @@ impl NativeAppModel for EditorApp {
             (context, assist, waiting, listed)
         })
         .filter(|(_, assist, _, _)| assist.help.is_some() || !assist.completions.is_empty());
-        let completion_count = command_completion.as_ref().map_or_else(
-            || {
-                config_assist.as_ref().map_or(
-                    crate::native_ui::EditorPalette::None,
-                    |(_, assist, _, listed)| {
-                        if *listed {
-                            crate::native_ui::EditorPalette::Rows(assist.completions.len().max(1))
-                        } else {
-                            crate::native_ui::EditorPalette::Help
-                        }
-                    },
-                )
-            },
-            |(_, candidates, _)| crate::native_ui::EditorPalette::Rows(candidates.len().max(1)),
-        );
         let toolbar = self.toolbar_in(view);
+        // The config help line on the rows its text wraps to, in the panel's width.
+        let config_help = config_assist
+            .as_ref()
+            .filter(|_| command_completion.is_none())
+            .map(|(_, assist, _, listed)| {
+                crate::native_ui::editor_help_palette(
+                    cx.viewport,
+                    toolbar,
+                    listed.then(|| assist.completions.len().max(1)),
+                    config_assist_help(assist),
+                )
+            });
+        let completion_count = match (&command_completion, &config_help) {
+            (Some((_, candidates, _)), _) => {
+                crate::native_ui::EditorPalette::from(candidates.len().max(1))
+            }
+            (None, Some((palette, _))) => *palette,
+            (None, None) => crate::native_ui::EditorPalette::None,
+        };
         let shell = crate::native_ui::editor_shell_metrics(cx.viewport, completion_count, toolbar);
         let outer_padding = shell.outer_padding;
         let command_gap = shell.command_gap;
@@ -6544,29 +6606,38 @@ impl NativeAppModel for EditorApp {
         } else {
             view.preedit.clone()
         };
-        // The title fitted to the room the header's measured plan leaves it, the unsaved
-        // mark included ([`crate::native_ui::editor_header_layout`]).
+        // The whole title where the header holds it, the caret's place giving way first;
+        // shortened in the middle only where it does not fit alone, the unsaved mark
+        // included ([`crate::native_ui::editor_header_layout`]).
+        let title_px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get();
+        let mark = if self.dirty {
+            crate::native_ui::EDITOR_DIRTY_MARK
+        } else {
+            ""
+        };
+        let whole =
+            bounded_middle_label_from_graphemes(&self.title.graphemes().collect::<Vec<_>>(), 96);
         let header = crate::native_ui::editor_header_layout(
             editor_rect,
+            &format!("{whole}{mark}"),
             cursor_label.as_deref(),
             self.checkpoint_pending,
         );
-        let title_px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get();
-        let mark = if self.dirty {
-            crate::tray_raster::ui_text_width_for(
-                crate::widget::TextFace::UiBold,
-                crate::native_ui::EDITOR_DIRTY_MARK,
-                title_px,
-            )
-        } else {
-            0.0
+        let title_width = |title: &str| {
+            crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, title, title_px)
         };
-        let title = bounded_middle_label_to_width_for_face(
-            &bounded_middle_label_from_graphemes(&self.title.graphemes().collect::<Vec<_>>(), 96),
-            header.title_right - header.title_x - mark,
-            title_px,
-            crate::widget::TextFace::UiBold,
-        );
+        let room = header.title_right - header.title_x;
+        let title =
+            if title_width(&format!("{whole}{mark}")) <= room + crate::native_ui::TEXT_FIT_SLACK {
+                whole
+            } else {
+                bounded_middle_label_to_width_for_face(
+                    &whole,
+                    room - title_width(mark),
+                    title_px,
+                    crate::widget::TextFace::UiBold,
+                )
+            };
         let focused = view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
         let buffer_ready = view.buffer.is_some();
         let can_navigate_config_diagnostics = self.can_navigate_config_diagnostics(view);
@@ -6903,16 +6974,8 @@ impl NativeAppModel for EditorApp {
             if shell.palette_height <= 0.0 {
                 return None;
             }
-            let text_scale = crate::native_appearance::text_scale();
-            let available_width = (cx.viewport.width
-                - shell.outer_padding * 2.0
-                - shell.palette_padding * 2.0
-                - 72.0)
-                .max(0.0);
-            let help = assist
-                .help
-                .as_deref()
-                .unwrap_or("Type a setting name for metadata-derived completions");
+            let available_width = crate::native_ui::editor_help_width(cx.viewport);
+            let help = config_assist_help(assist);
             let capacity = shell
                 .palette_visible_rows
                 .min(assist.completions.len().max(1));
@@ -6951,29 +7014,49 @@ impl NativeAppModel for EditorApp {
             } else {
                 None
             };
-            let help_px = 13.0 * text_scale;
+            let (help_px, help_face) = crate::native_ui::editor_help_type();
             let fits = |text: &str| {
-                crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, text, help_px)
-                    <= available_width
+                crate::tray_raster::ui_text_width_for(help_face, text, help_px)
+                    <= available_width + crate::native_ui::TEXT_FIT_SLACK
             };
             let ladder = [
                 [Some(concise_help.as_str()), range.as_deref(), hints],
                 [Some(concise_help.as_str()), range.as_deref(), None],
-                [Some(concise_help.as_str()), None, None],
             ]
             .map(|parts| parts.into_iter().flatten().collect::<Vec<_>>().join(" · "));
-            let visual_help = ladder
-                .iter()
-                .find(|candidate| fits(candidate))
-                .cloned()
-                .unwrap_or_else(|| {
-                    crate::native_ui::elide_text_label(
-                        &concise_help,
-                        available_width,
-                        help_px,
-                        crate::widget::TextFace::Ui,
+            // The help whole: on one row with its range and key hints where they fit beside
+            // it, else on the rows it wraps to ([`crate::native_ui::editor_help_lines`]).
+            let visual_help = match config_help.as_ref().map(|(_, lines)| lines.as_slice()) {
+                Some(lines) if !fits(&concise_help) => lines.to_vec(),
+                _ => vec![
+                    ladder
+                        .iter()
+                        .find(|candidate| fits(candidate))
+                        .cloned()
+                        .unwrap_or(concise_help),
+                ],
+            };
+            let row_h = shell.palette_header_height / visual_help.len().max(1) as f32;
+            let help_rows = visual_help
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    UiNode::new(
+                        if index == 0 {
+                            "editor/config-help/visual".to_string()
+                        } else {
+                            format!("editor/config-help/visual/{index}")
+                        },
+                        UiContent::Text(crate::native_ui::TextSpec {
+                            text,
+                            role: SemanticRole::Text,
+                            style: StyleRef::Quiet,
+                        }),
                     )
-                });
+                    .layout(Layout::default().width(Length::Fill).height(Length::Fixed(row_h)))
+                    .paint_only()
+                })
+                .collect();
             let mut children = vec![
                 UiNode::new(
                     "editor/config-help",
@@ -6984,22 +7067,11 @@ impl NativeAppModel for EditorApp {
                     }),
                 )
                 .layout(
-                    Layout::default()
+                    Layout::column()
                         .width(Length::Fill)
                         .height(Length::Fixed(shell.palette_header_height)),
                 )
-                .children(vec![
-                    UiNode::new(
-                        "editor/config-help/visual",
-                        UiContent::Text(crate::native_ui::TextSpec {
-                            text: visual_help,
-                            role: SemanticRole::Text,
-                            style: StyleRef::Quiet,
-                        }),
-                    )
-                    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-                    .paint_only(),
-                ]),
+                .children(help_rows),
             ];
             if !*listed {
             } else if assist.completions.is_empty() {
@@ -7032,24 +7104,28 @@ impl NativeAppModel for EditorApp {
                 {
                     let index = start + visible_index;
                     let is_selected = index == selected;
-                    let visual = bounded_middle_label_to_width(
+                    let spec = ButtonSpec::new(format!(
+                        "Insert {}, result {} of {}{}. {}",
+                        completion.display,
+                        index + 1,
+                        total,
+                        if is_selected { ", selected" } else { "" },
+                        completion.help
+                    ));
+                    // Shortened to the room the painter gives the button's label, in the
+                    // face and size it paints it ([`crate::native_ui::native_button_label_width`]).
+                    let visual = bounded_middle_label_to_width_for_face(
                         &completion.display,
-                        completion_width,
-                        13.0 * text_scale,
+                        crate::native_ui::text_button_label_room(&spec, completion_width),
+                        crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary)
+                            .get(),
+                        crate::widget::TextFace::Ui,
                     );
                     let completion_node = UiNode::new(
                         format!("editor/config-completion/{index}"),
                         UiContent::Button(
                             Control::new(
-                                ButtonSpec::new(format!(
-                                    "Insert {}, result {} of {}{}. {}",
-                                    completion.display,
-                                    index + 1,
-                                    total,
-                                    if is_selected { ", selected" } else { "" },
-                                    completion.help
-                                ))
-                                .visual_label(visual),
+                                spec.visual_label(visual),
                                 ActionId::new(
                                     crate::native_config_language::config_completion_action(
                                         *context, index, completion,
@@ -7490,6 +7566,14 @@ impl EditorApp {
     }
 }
 
+/// What the config editor's help line says for `assist`.
+pub(crate) fn config_assist_help(assist: &crate::native_config_language::ConfigAssist) -> &str {
+    assist
+        .help
+        .as_deref()
+        .unwrap_or("Type a setting name for metadata-derived completions")
+}
+
 /// The editor's whole status sentence ([`editor_status_forms`]).
 #[cfg(test)]
 fn editor_status_message(
@@ -7902,6 +7986,75 @@ mod markdown_reader_tests {
             )
             .unwrap();
         (runtime, instance, view)
+    }
+
+    /// The reader's progress counts what it has shown: paging from the top of a
+    /// document to its end the share read never falls, and Next is disabled exactly
+    /// where it reads 100% (the end shown), in the preview and in the source pane, at 1x
+    /// and 2x, narrow and wide. Before, the share counted from the start of the top
+    /// block's source line, so the Japanese document a review paged through read "78%
+    /// read" at its last row; and Next stayed on at "100% read" until the last row was
+    /// at the top, paging a document that fits one page onto a page of "did." alone.
+    #[test]
+    fn the_reader_reads_100_percent_at_the_end_of_a_document() {
+        let _scale = RestoreAppearance::at(1.0);
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let source = "# 設定ファイルの読み込み\n\n\
+            設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\
+            コーヒーブレイク中にアップデートをダウンロードしています、ちょっと待ってください。\n\n\
+            ```\n設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\n```\n\n\
+            The quick brown fox jumps over the lazy dog, and aarch64-apple-darwin wraps \
+            at its spaces as it always did.\n";
+        let mut documents = crate::test_document_store();
+        let document = documents.open("file:///ja.md".to_string(), source.to_string());
+        let app = MarkdownApp::new(document, "ja.md".to_string(), source);
+        let percent = |status: &str| -> usize {
+            let end = status.find("% read").expect("the share read");
+            let digits = status[..end]
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap();
+            digits.parse().unwrap()
+        };
+        let mut ended_below_100_before = false;
+        for scale in [1.0_f32, 2.0] {
+            let _scale = RestoreAppearance::at(scale);
+            for mode in [MarkdownViewMode::Preview, MarkdownViewMode::Source] {
+                for (width, height) in [(444.0_f32, 574.0_f32), (934.0, 574.0)] {
+                    let context = format!("{mode:?} {width}x{height} at {scale}x");
+                    let mut view = MarkdownViewState {
+                        mode,
+                        ..MarkdownViewState::default()
+                    };
+                    let mut last = 0;
+                    for step in 0.. {
+                        assert!(step < 500, "{context}: the pages end");
+                        let (geometry, header) = app.reader_layout(&view, width, height);
+                        let read = percent(&header.status_lines.join(" "));
+                        assert!(read >= last, "{context}: {read}% after {last}%");
+                        last = read;
+                        let next = app.page_target(&view, &geometry, 1);
+                        let at_end = next == MarkdownApp::location(&view);
+                        assert_eq!(
+                            at_end,
+                            read == 100,
+                            "{context}: Next is off exactly where {read}% is read"
+                        );
+                        if at_end {
+                            ended_below_100_before |= view
+                                .source_anchor
+                                .saturating_mul(100)
+                                .checked_div(app.parsed.source_len)
+                                .is_some_and(|old| old < 100);
+                            break;
+                        }
+                        view.source_anchor = next.source_anchor;
+                        view.visual_row = next.visual_row;
+                    }
+                }
+            }
+        }
+        assert!(ended_below_100_before, "the negative control");
     }
 
     /// THE READER PAINTS EVERY ROW OF EVERY BLOCK, AND ITS HEADER WHOLE, AT
@@ -8950,6 +9103,27 @@ mod markdown_reader_tests {
         );
     }
 
+    /// The assist panel `compiled` shows when nothing is listed: none, or the help line
+    /// on the rows it painted.
+    fn shown_help_palette(
+        compiled: &crate::native_ui::CompiledUi,
+    ) -> crate::native_ui::EditorPalette {
+        if compiled
+            .semantic(&UiKey::new("editor/config-assist"))
+            .is_none()
+        {
+            return crate::native_ui::EditorPalette::None;
+        }
+        crate::native_ui::EditorPalette::Help {
+            help_rows: compiled
+                .paint
+                .iter()
+                .filter(|node| node.key.as_str().starts_with("editor/config-help/visual"))
+                .count()
+                .max(1),
+        }
+    }
+
     fn editor_spec(compiled: &crate::native_ui::CompiledUi) -> &TextViewportSpec {
         compiled
             .paint
@@ -9096,6 +9270,56 @@ mod markdown_reader_tests {
         }
     }
 
+    /// Every listed config completion's label fits the room its button paints it in, at
+    /// every width and text size: shortened in the middle to that room, in the face and
+    /// size the button paints. Before, the labels were measured against the help line's
+    /// width with the button's own insets left out, so at 50 columns at 2x the painter cut
+    /// "gpu — G…nder…" a second time past its end. The negative control: some label is
+    /// shortened, so the room is what decides.
+    #[test]
+    fn listed_config_completions_fit_their_buttons() {
+        let source = "";
+        let (mut app, mut view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = 1;
+        view.config_completion_interaction =
+            Some(crate::native_config_language::ConfigCompletionContext::new(
+                snapshot.id.get(),
+                snapshot.seq.0,
+                0,
+            ));
+        let mut shortened = false;
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _scale = RestoreAppearance::at(scale);
+            for width in [1_074.0_f32, 738.0, 514.0, 374.0, 350.0, 286.5] {
+                let context = format!("{width} at {scale}x");
+                let viewport = LogicalRect::new(0.0, 0.0, width, 558.0);
+                let compiled = app
+                    .view(&view, &cx(viewport, Some(&snapshot)))
+                    .compile(viewport)
+                    .unwrap();
+                let labels: Vec<String> = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with("editor/config-completion/"))
+                    .filter_map(|node| match &node.content {
+                        UiContent::Button(control) => control.spec.visual_label.clone(),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!labels.is_empty(), "{context}: the list shows");
+                shortened |= labels.iter().any(|label| label.contains('\u{2026}'));
+                assert!(
+                    compiled.fit_failures().is_empty(),
+                    "{context}: {:?}",
+                    compiled.fit_failures()
+                );
+            }
+        }
+        assert!(shortened, "the negative control");
+    }
+
     #[test]
     fn manual_config_completions_page_every_candidate_and_keep_full_live_help() {
         let source = "";
@@ -9214,6 +9438,210 @@ mod markdown_reader_tests {
         }
     }
 
+    /// The text scale for one test, put back when the test ends.
+    struct RestoreAppearance(crate::native_appearance::AppearancePreferences);
+
+    impl RestoreAppearance {
+        fn at(scale: f32) -> Self {
+            let held = Self(crate::native_appearance::current_preferences());
+            crate::native_appearance::install_preferences(
+                crate::native_appearance::AppearancePreferences {
+                    text_scale: scale,
+                    ..crate::native_appearance::AppearancePreferences::default()
+                },
+            );
+            held
+        }
+    }
+
+    impl Drop for RestoreAppearance {
+        fn drop(&mut self) {
+            crate::native_appearance::install_preferences(self.0);
+        }
+    }
+
+    /// The config editor's help line takes the rows its text needs, as the footer
+    /// does: at 50 columns (350 points) the help for `agents_auto_prime` is painted
+    /// whole on the rows it wraps to, never "Prime coding agents automatically ·
+    /// agents_a…" on one; where the rows the document can spare cannot hold it whole,
+    /// the longest form that fits them whole (its last facts left out), and what the
+    /// setting does (its first fact) always whole, at 2x too, never "Prime coding
+    /// agents…"; each row inside the panel, the panel exactly as tall as its rows, and
+    /// the input side's palette (the rows it counts for the document) the view's. The
+    /// negative control: at 50 columns the help is wider than one row, so a one-row help
+    /// line (the cut this replaces) could not have painted it.
+    #[test]
+    fn the_config_help_line_wraps_whole_onto_its_own_rows() {
+        let source = "agents_auto_prime = false\n";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = snapshot.seq.0;
+        let help = app
+            .config_assist(&snapshot, 0)
+            .and_then(|(_, assist)| assist.resting_help)
+            .expect("the key under the caret has help");
+        let mut wrapped = false;
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _scale = RestoreAppearance::at(scale);
+            for width in [1_074.0_f32, 738.0, 514.0, 374.0, 350.0, 286.5] {
+                let context = format!("{width} at {scale}x");
+                let viewport = LogicalRect::new(0.0, 0.0, width, 558.0);
+                let compiled = app
+                    .view(&view, &cx(viewport, Some(&snapshot)))
+                    .compile(viewport)
+                    .unwrap();
+                let painted: Vec<String> = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with("editor/config-help/visual"))
+                    .map(|node| match &node.content {
+                        UiContent::Text(spec) => spec.text.clone(),
+                        other => panic!("{context}: the help is text: {other:?}"),
+                    })
+                    .collect();
+                let room = crate::native_ui::editor_help_width(viewport);
+                let (px, face) = crate::native_ui::editor_help_type();
+                let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+                let one_row = measure(&help) <= room;
+                wrapped |= !one_row;
+                let palette = shown_help_palette(&compiled);
+                let shell =
+                    crate::native_ui::editor_shell_metrics(viewport, palette, app.toolbar());
+                let needs = |form: &str| {
+                    if measure(form) <= room {
+                        1
+                    } else {
+                        crate::native_settings::wrap_to_box(form, room, &measure).len()
+                    }
+                };
+                if one_row {
+                    assert_eq!(painted.len(), 1, "{context}: {painted:?}");
+                    assert!(painted[0].starts_with(&help), "{context}: {painted:?}");
+                } else {
+                    let forms = crate::native_ui::editor_help_forms(&help);
+                    let shown = forms.iter().position(|form| {
+                        crate::native_ui::footer_shows_whole(form, &painted.join("\n"))
+                    });
+                    // Every form holds the first fact whole, the shortest it alone.
+                    if needs(&forms[forms.len() - 1]) <= crate::native_ui::EDITOR_HELP_MAX_ROWS {
+                        assert!(
+                            shown.is_some(),
+                            "{context}: what the setting does is whole: {painted:?}"
+                        );
+                    }
+                    match shown {
+                        Some(shown) => assert!(
+                            forms[..shown]
+                                .iter()
+                                .all(|longer| needs(longer) > shell.help_rows),
+                            "{context}: a longer form fits the {} rows: {painted:?}",
+                            shell.help_rows
+                        ),
+                        // Cut only where not even the first fact fits every row the
+                        // document can spare the panel.
+                        None => assert!(
+                            needs(&forms[forms.len() - 1]) > shell.help_rows
+                                && painted.last().is_some_and(|line| line.ends_with('…')),
+                            "{context}: cut only past the panel's rows: {painted:?}"
+                        ),
+                    }
+                    if needs(&help) <= crate::native_ui::EDITOR_HELP_MAX_ROWS && width <= 374.0 {
+                        assert!(shell.help_rows > 1, "{context}: the help takes rows");
+                    }
+                    for line in &painted {
+                        assert!(
+                            measure(line) <= room + crate::native_ui::TEXT_FIT_SLACK,
+                            "{context}: {line:?} fits the panel's {room}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    palette,
+                    crate::native_ui::editor_help_palette(viewport, app.toolbar(), None, &help).0,
+                    "{context}: the rows the input side counts are the rows painted"
+                );
+                assert_eq!(painted.len(), shell.help_rows, "{context}");
+                let assist = compiled
+                    .semantic(&UiKey::new("editor/config-assist"))
+                    .expect("the help panel");
+                assert!(
+                    (assist.rect.height
+                        - (shell.palette_padding * 2.0 + shell.palette_header_height))
+                        .abs()
+                        < 0.01,
+                    "{context}: the panel is its rows' height"
+                );
+                assert!(
+                    compiled.fit_failures().is_empty(),
+                    "{context}: {:?}",
+                    compiled.fit_failures()
+                );
+                if width == 350.0 {
+                    assert!(!one_row, "{context}: the negative control");
+                }
+            }
+        }
+        assert!(wrapped);
+    }
+
+    /// The editor's header keeps the file's name whole: where the name and the
+    /// caret's place do not both fit, the place gives way (`aterm.toml` alone, never
+    /// `ate…oml`); a wide editor shows both. The negative control: at 50 columns
+    /// (350 points) at 2x the whole name does not fit beside the place, so keeping
+    /// the place (the rule this replaces) cut the name.
+    #[test]
+    fn the_editor_header_keeps_the_file_name_whole_before_the_caret_place() {
+        let (app, view, snapshot) = editor_fixture("agents_auto_prime = false\n", "aterm.toml");
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _scale = RestoreAppearance::at(scale);
+            for width in [1_074.0_f32, 738.0, 514.0, 374.0, 350.0, 286.5, 248.0] {
+                let context = format!("{width} at {scale}x");
+                let viewport = LogicalRect::new(0.0, 0.0, width, 558.0);
+                let compiled = app
+                    .view(&view, &cx(viewport, Some(&snapshot)))
+                    .compile(viewport)
+                    .unwrap();
+                let spec = editor_spec(&compiled);
+                let rect = compiled
+                    .semantic(&UiKey::new("editor/buffer"))
+                    .expect("the buffer")
+                    .rect;
+                let cursor = spec.cursor_label.as_deref().expect("the caret's place");
+                let alone = crate::native_ui::editor_header_layout(rect, "", None, false);
+                let header =
+                    crate::native_ui::editor_header_layout(rect, &spec.label, Some(cursor), false);
+                let room_beside =
+                    crate::native_ui::editor_header_layout(rect, "", Some(cursor), false);
+                let name_w = crate::tray_raster::ui_text_width_for(
+                    crate::widget::TextFace::UiBold,
+                    "aterm.toml",
+                    crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get(),
+                );
+                let fits_beside = name_w
+                    <= room_beside.title_right - room_beside.title_x
+                        + crate::native_ui::TEXT_FIT_SLACK;
+                let fits_alone =
+                    name_w <= alone.title_right - alone.title_x + crate::native_ui::TEXT_FIT_SLACK;
+                if fits_alone {
+                    assert_eq!(spec.label, "aterm.toml", "{context}: the name whole");
+                } else {
+                    assert!(spec.label.contains('…'), "{context}: {:?}", spec.label);
+                }
+                assert_eq!(header.cursor_x.is_some(), fits_beside, "{context}");
+                if width >= 738.0 {
+                    assert!(header.cursor_x.is_some(), "{context}: room for both");
+                }
+                if width == 350.0 && scale == 2.0 {
+                    assert!(
+                        fits_alone && !fits_beside,
+                        "{context}: the negative control"
+                    );
+                }
+            }
+        }
+    }
+
     /// A resting caret's help line is a panel of its own height with no row
     /// under it (no "Nothing to suggest here"), so the file keeps that room;
     /// how to open the list is said on the help line itself.
@@ -9234,7 +9662,7 @@ mod markdown_reader_tests {
             .expect("the help line for the key under the caret");
         let shell = crate::native_ui::editor_shell_metrics(
             viewport,
-            crate::native_ui::EditorPalette::Help,
+            shown_help_palette(&compiled),
             app.toolbar(),
         );
         assert_eq!(
@@ -9251,7 +9679,7 @@ mod markdown_reader_tests {
         assert_eq!(
             crate::native_ui::editor_text_viewport_rect_with_palette(
                 viewport,
-                crate::native_ui::EditorPalette::Help,
+                shown_help_palette(&compiled),
                 app.toolbar(),
             )
             .height,
@@ -9561,14 +9989,7 @@ mod markdown_reader_tests {
                             < 0.01,
                         "{context}"
                     );
-                    let palette = if compiled
-                        .semantic(&UiKey::new("editor/config-assist"))
-                        .is_some()
-                    {
-                        crate::native_ui::EditorPalette::Help
-                    } else {
-                        crate::native_ui::EditorPalette::None
-                    };
+                    let palette = shown_help_palette(&compiled);
                     let painted_rows = spec.projection.as_ref().expect("projection").lines.len();
                     assert!(
                         painted_rows
@@ -9678,7 +10099,7 @@ mod markdown_reader_tests {
                     .count();
                 let shell = crate::native_ui::editor_shell_metrics(
                     viewport,
-                    crate::native_ui::EditorPalette::Help,
+                    shown_help_palette(&compiled),
                     app.toolbar(),
                 );
                 assert_eq!(rows, shell.command_rows, "{context}");
@@ -9717,14 +10138,7 @@ mod markdown_reader_tests {
                         "{context}"
                     );
                 }
-                let palette = if compiled
-                    .semantic(&UiKey::new("editor/config-assist"))
-                    .is_some()
-                {
-                    crate::native_ui::EditorPalette::Help
-                } else {
-                    crate::native_ui::EditorPalette::None
-                };
+                let palette = shown_help_palette(&compiled);
                 assert_eq!(
                     crate::native_ui::editor_text_viewport_rect_with_palette(
                         viewport,

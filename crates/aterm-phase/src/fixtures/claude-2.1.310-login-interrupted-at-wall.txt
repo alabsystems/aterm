@@ -1,0 +1,18 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Esc out of the /login picker typed at the `Not logged in` wall (its focus moved by one Up, no method picked): `⎿  Login interrupted` under `❯ /login`, the wall above, the composer back, 2.1.310
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Churned for 1s · done 12:43 PM
+
+❯ /login
+  ⎿  Login interrupted
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                                      ◐ medium · /effort

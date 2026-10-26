@@ -55,6 +55,10 @@ pub const fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bo
 }
 
 /// Returns the incoming-row strip `(dst_y, rows)` for band `[y0, y1)` shifted up by `frac_px`.
+///
+/// Its subtractions are `wrapping_sub` behind the guards that make them exact: Trust refuses an
+/// inlined body with an overflow assert after a branch, and aterm-gpu's `apron_strip_plan` lost a
+/// proof to that (`docs/measured/trust-prover-2026-10-21.md`).
 #[must_use]
 #[inline]
 pub const fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize, usize)> {
@@ -65,10 +69,11 @@ pub const fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize
         return None;
     }
     let n = frac_px as usize;
-    if n >= y1 - y0 {
+    // `y0 < y1`, so the band height is exact; `n < y1 - y0 <= y1`, so is the strip's top.
+    if n >= y1.wrapping_sub(y0) {
         return None;
     }
-    Some((y1 - n, n))
+    Some((y1.wrapping_sub(n), n))
 }
 
 /// Copies the incoming-row raster `apron` into the bottom strip of `[y0, y1)` exposed by `frac_px`, returning rows painted.

@@ -330,7 +330,7 @@ fn tab_label_rungs_fall_back_in_order_and_move_the_strip_fingerprint() {
     let fingerprint = |app: &mut App| {
         let titles = app.tab_titles(wid);
         let metadata = app.tab_strip_metadata(wid);
-        app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, 0)
+        app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata)
     };
     assert_eq!(app.tab_titles(wid)[0], "aterm");
     app.windows
@@ -684,13 +684,14 @@ fn failed_native_restore_staging_republishes_the_surviving_terminal() {
     assert_eq!(app.focused_session_id(wid), Some(0));
     assert!(app.active_handle.lock().unwrap().is_some());
 
+    let mark = app.restore_staging_mark(wid);
     app.stage_settings_restore_view(wid, crate::native_settings::SettingsRoute::About)
         .expect("native restore staging view");
     assert_eq!(app.focused_session_id(wid), None);
     assert!(app.active_handle.lock().unwrap().is_none());
 
     let (staged_view, _, _) = app
-        .detach_restore_staging_tab(wid)
+        .detach_restore_staging_tab(wid, &mark)
         .expect("detach staged leaf");
     assert_eq!(
         app.windows[&wid].tab_set.active().unwrap().focus,
@@ -1165,6 +1166,104 @@ fn manual_editor_identity_survives_capture_restore_and_blocks_malformed_save() {
         .find(|command| command.id.as_str() == "editor/save")
         .unwrap();
     assert!(!save.enabled, "malformed restored Manual cannot Save");
+}
+
+#[test]
+fn reopening_a_closed_aterm_toml_tab_beside_an_open_one_lifts_no_tab_of_the_persons() {
+    const ROOT: &str = "ATERM_CONFIG_REOPEN_BESIDE_ROOT";
+    if !crate::test_alone::in_child() {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        crate::test_alone::run_alone_with(&[
+            (ROOT, root.path().as_os_str()),
+            ("XDG_CONFIG_HOME", root.path().as_os_str()),
+        ]);
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+    let wid = WindowId(0);
+    for (as_config, on_open_tab) in [(true, false), (true, true), (false, false), (false, true)] {
+        let at = format!(
+            "aterm.toml open {}, reopened from {}",
+            if as_config {
+                "in the config editor"
+            } else {
+                "as a plain file"
+            },
+            if on_open_tab {
+                "its tab"
+            } else {
+                "a terminal tab"
+            },
+        );
+        let mut app = App::headless_for_test();
+        app.open_config_editor_in_front().expect("Open aterm.toml");
+        app.close_active_tab();
+        assert_eq!(app.closed_recovery.tabs.len(), 1, "{at}: the close is kept");
+        if as_config {
+            app.open_config_editor_in_front()
+                .expect("Open aterm.toml again");
+        } else {
+            let uri = crate::native_document_host::path_to_file_uri(&root.join("aterm/aterm.toml"))
+                .unwrap();
+            app.open_document_tab_in_window(wid, crate::native_app::AppKind::Editor, &uri)
+                .expect("open aterm.toml as a file");
+        }
+        let open_tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let (open_instance, open_view) = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            app.native_runtime.config_editor_enabled(open_instance),
+            as_config,
+            "PRECONDITION {at}"
+        );
+        if !on_open_tab {
+            app.switch_tab_in(wid, 0);
+        }
+
+        app.reopen_last_closed_tab()
+            .expect("the closed tab reopens");
+        let ws = &app.windows[&wid];
+        let reopened = ws.tab_set.active().unwrap();
+        assert_ne!(
+            reopened.id, open_tab,
+            "{at}: the reopened tab is one of its own"
+        );
+        assert!(
+            !reopened.root.contains(open_view),
+            "{at}: with a view of its own"
+        );
+        let kept = ws
+            .tab_set
+            .get(open_tab)
+            .unwrap_or_else(|| panic!("{at}: the open aterm.toml tab stays"));
+        assert_eq!(kept.root.leaves(), vec![open_view], "{at}");
+        assert_eq!(ws.tab_set.len(), 3, "{at}");
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            instance, open_instance,
+            "{at}: of the one aterm.toml document"
+        );
+        assert!(app.native_runtime.config_editor_enabled(instance), "{at}");
+        assert_eq!(app.structural_invariant_violation(), None, "{at}");
+    }
+}
+
+#[test]
+fn a_restore_that_fronts_an_open_tab_lifts_none_and_gives_the_front_back() {
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+    let settings_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    app.switch_tab_in(wid, 0);
+    let mark = app.restore_staging_mark(wid);
+    // A staging step that fronts the window's own tab instead of building one.
+    app.switch_tab_in(wid, 1);
+
+    assert!(app.detach_restore_staging_tab(wid, &mark).is_err());
+    assert!(app.windows[&wid].tab_set.get(settings_tab).is_some());
+    assert_eq!(app.windows[&wid].tab_set.active_index(), Some(0));
+    assert_eq!(app.focused_session_id(wid), Some(0));
+    assert_eq!(app.structural_invariant_violation(), None);
 }
 
 #[test]

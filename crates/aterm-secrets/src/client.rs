@@ -9,7 +9,7 @@ use crate::materialize::{self, Manifest, Report};
 use crate::text::{self, Audience, Document, Entry};
 use crate::transport::{self, Fetched, Source};
 use crate::{Error, SecretBytes, fsx, join};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ mod admission;
 mod creation;
 mod enrollment;
 mod inspection;
+mod locker_skew;
 mod retirement;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
@@ -27,6 +28,8 @@ pub use inspection::CommonsControlInspection;
 pub use retirement::{Retirement, Revocation, admin_retire, admin_revoke};
 #[cfg(test)]
 mod birth_tests;
+#[cfg(test)]
+mod join_tests;
 
 /// Where a machine keeps its vault state, under one home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +74,14 @@ impl Paths {
 
     fn lock_file(&self) -> PathBuf {
         self.dir.join(".lock")
+    }
+
+    fn asking_file(&self) -> PathBuf {
+        self.dir.join("asking")
+    }
+
+    fn stuck_file(&self, pid: u32) -> PathBuf {
+        self.dir.join(format!("{STUCK_PREFIX}{pid}"))
     }
 
     /// Where `aterm secrets serve` keeps its store by default.
@@ -165,12 +176,117 @@ pub struct JoinOptions<'a> {
     pub wait: Duration,
     /// Shown a fingerprint, answers whether to trust it (interactive only).
     pub confirm: &'a dyn Fn(&str) -> bool,
-    /// Returns the vault's join password when joining a URL source, or `None` for manual approval.
-    pub password: &'a dyn Fn() -> Option<SecretBytes>,
+    /// The vault's join password, for when this machine is not in yet and the source is a URL
+    /// (an admin Mac then approves within seconds); none waits for an admin to approve the
+    /// code.
+    pub password: JoinPassword<'a>,
+    /// What the caller already fetched from the source (a [`Probed::envelope`]): the join
+    /// verifies and applies it in place of a fetch of its own, unless this machine holds a
+    /// newer version of that vault.
+    pub fetched: Option<&'a [u8]>,
     /// Called once the request is queued and before any wait.
     pub requested: &'a dyn Fn(),
-    /// Progress lines for a person (never a value).
-    pub say: &'a dyn Fn(&str),
+    /// Each step, as it happens (never a value): its `Display` is the line a person reads.
+    pub say: &'a dyn Fn(&JoinEvent<'_>),
+}
+
+/// Where a join's password comes from ([`JoinOptions::password`]).
+#[derive(Clone)]
+pub enum JoinPassword<'a> {
+    /// What the caller holds already (`None`: an approval by code). The join stretches it on
+    /// a thread while its fetch is out.
+    Given(Option<SecretBytes>),
+    /// Asked once, when this machine is not in yet and the source is a URL (a terminal's
+    /// prompt): `None` waits for an admin to approve the code.
+    Ask(&'a dyn Fn() -> Option<SecretBytes>),
+}
+
+/// A step of a join ([`JoinOptions::say`]): names, codes and keys only, never a value. Its
+/// `Display` is the line a person reads, so a caller prints each one, or renders one line of
+/// its own from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinEvent<'a> {
+    /// The vault verified, and this machine holds its key: the name it asks for, its join code
+    /// (what an admin compares) and its `age1…` key.
+    Machine {
+        /// The machine name.
+        host: &'a str,
+        /// Its join code.
+        code: &'a str,
+        /// Its `age1…` key.
+        recipient: &'a str,
+    },
+    /// A request to join `vault` is queued at its URL: with a proof of the join password,
+    /// which an admin Mac's subscriber approves, or for an approval by `code`.
+    Asked {
+        /// The vault's name.
+        vault: &'a str,
+        /// This machine's join code.
+        code: &'a str,
+        /// Whether the request proves the join password.
+        by_password: bool,
+    },
+    /// How a mistyped join password is fixed, said as the request with it is queued.
+    Retype(&'a str),
+    /// Not in the vault at a path yet: an admin approves this key under this name.
+    NotInPath {
+        /// The vault's name.
+        vault: &'a str,
+        /// This machine's `age1…` key.
+        recipient: &'a str,
+        /// The machine name.
+        host: &'a str,
+    },
+    /// The join waits for the approval ([`JoinOptions::wait`]).
+    Waiting,
+    /// A pass of that wait failed; the wait goes on.
+    StillWaiting(&'a Error),
+    /// An admin Mac refused the request: its join password is not the vault's.
+    Refused {
+        /// The vault's name.
+        vault: &'a str,
+    },
+}
+
+impl std::fmt::Display for JoinEvent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinEvent::Machine {
+                host,
+                code,
+                recipient,
+            } => write!(f, "this machine: {host}, code {code}, key {recipient}"),
+            JoinEvent::Asked {
+                vault,
+                by_password: true,
+                ..
+            } => write!(
+                f,
+                "asked to join {vault} with the join password; an admin Mac's subscriber approves it"
+            ),
+            JoinEvent::Asked { vault, code, .. } => write!(
+                f,
+                "asked to join {vault}. On an admin Mac run: aterm secrets approve {code}"
+            ),
+            JoinEvent::Retype(hint) => f.write_str(hint),
+            JoinEvent::NotInPath {
+                vault,
+                recipient,
+                host,
+            } => write!(
+                f,
+                "not in {vault} yet. On an admin Mac run: aterm secrets approve {recipient} --name {host}"
+            ),
+            JoinEvent::Waiting => f.write_str(
+                "waiting for the approval (Ctrl-C stops waiting; this Mac joins by itself once approved)",
+            ),
+            JoinEvent::StillWaiting(error) => write!(f, "still waiting ({error})"),
+            JoinEvent::Refused { vault } => write!(
+                f,
+                "an admin Mac refused the join password: it is not {vault}'s"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -622,6 +738,9 @@ struct State {
     membership: Stored,
     /// The join request's proof of the password, re-sent with each hourly request.
     proof: Option<String>,
+    /// The tag ([`join::proof_tag`]) of a proof an admin Mac's verdict refused
+    /// ([`read_verdict`]).
+    refused: Option<String>,
     /// The last apply left a file unwritten: the next fetch of the same version applies again.
     failed: bool,
     manifest: Manifest,
@@ -679,6 +798,10 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
             .get("proof")
             .and_then(aterm_toml::Value::as_str)
             .map(str::to_string),
+        refused: table
+            .get("refused")
+            .and_then(aterm_toml::Value::as_str)
+            .map(str::to_string),
         failed: table
             .get("failed")
             .and_then(aterm_toml::Value::as_bool)
@@ -717,6 +840,9 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
     ));
     if let Some(proof) = &state.proof {
         text.push_str(&format!("proof = {}\n", toml_str(proof)));
+    }
+    if let Some(refused) = &state.refused {
+        text.push_str(&format!("refused = {}\n", toml_str(refused)));
     }
     if state.failed {
         text.push_str("failed = true\n");
@@ -806,6 +932,64 @@ pub fn asked_with_password(paths: &Paths) -> bool {
     load_state(paths).is_ok_and(|state| state.proof.is_some())
 }
 
+/// Whether an admin Mac's verdict, as last read ([`read_verdict`]), refused the proof this
+/// waiting machine's join request carries now: its join password is not the vault's. From the
+/// local records alone; a request with a new proof is not refused until a verdict on it is read.
+pub fn password_refused(paths: &Paths) -> bool {
+    load_state(paths).is_ok_and(|state| refused_now(&state))
+}
+
+fn refused_now(state: &State) -> bool {
+    matches!(state.membership, Stored::Pending | Stored::None)
+        && state
+            .proof
+            .as_deref()
+            .zip(state.refused.as_deref())
+            .is_some_and(|(proof, refused)| join::proof_tag(proof) == refused)
+}
+
+/// Ask the source whether an admin Mac refused this waiting machine's join request because its
+/// proof of the join password did not match (`GET <url>/join/verdict`), and keep a refusal for
+/// [`password_refused`]. Only a machine waiting with a proof at a URL asks; a server that keeps
+/// no verdicts answers none. A verdict is unauthenticated, so a forged one only asks the person
+/// for the password again.
+/// # Errors
+/// The local records cannot be read or written, or the server could not be asked.
+pub fn read_verdict(paths: &Paths) -> crate::Result<bool> {
+    let Some(config) = config(paths)? else {
+        return Ok(false);
+    };
+    let Source::Url(url) = &config.source else {
+        return Ok(false);
+    };
+    let state = load_state(paths)?;
+    let Some(proof) = state
+        .proof
+        .clone()
+        .filter(|_| matches!(state.membership, Stored::Pending | Stored::None))
+    else {
+        return Ok(false);
+    };
+    let Some(identity) = read_identity(paths)? else {
+        return Ok(false);
+    };
+    let recipient = identity.recipient().to_bech32();
+    let tag = join::proof_tag(&proof);
+    let refused = transport::list_verdicts(url)?
+        .iter()
+        .any(|(key, refused)| *key == recipient && *refused == tag);
+    if refused && state.refused.as_deref() != Some(tag.as_str()) {
+        change_request(paths, &config, |state| {
+            if state.proof.as_deref() != Some(proof.as_str()) {
+                return false;
+            }
+            state.refused = Some(tag);
+            true
+        })?;
+    }
+    Ok(refused)
+}
+
 /// Whether an admitted vault's last sync finished and its tracked files still match.
 pub fn materialization_ready(paths: &Paths) -> crate::Result<bool> {
     materialization_ready_with(paths, None, files_intact)
@@ -891,15 +1075,51 @@ pub struct Materialized<T> {
     pub snapshot: MaterializationSnapshot,
 }
 
+/// How long [`MaterializationSnapshot::is_current`] waits for a writer holding the state lock.
+const CURRENT_WAIT: Duration = Duration::from_secs(30);
+
+/// How often [`MaterializationSnapshot::is_current`] looks again while a writer holds the lock.
+const CURRENT_LOOK: Duration = Duration::from_millis(100);
+
 impl MaterializationSnapshot {
-    /// Whether the same complete version is still configured and intact.
+    /// Whether the same vault is still configured, ready and intact, holding the files this
+    /// snapshot read: a later version that writes none of them (a machine let in, which on an
+    /// open vault every join publishes) leaves it current, and one that changes, adds or
+    /// removes a file does not. A writer holding the state lock (an apply now) is waited for,
+    /// up to [`CURRENT_WAIT`], since a busy lock says nothing either way.
     /// This is a point-in-time check, not a lease over later effects.
     /// # Errors
     /// The local configuration or state cannot be safely read.
     pub fn is_current(&self, paths: &Paths) -> crate::Result<bool> {
-        Ok(with_materialization_ready(paths, &self.config, || Ok(()))?
-            .is_some_and(|current| current.snapshot == *self))
+        let until = Instant::now() + CURRENT_WAIT;
+        let mut looked_again = false;
+        loop {
+            match with_materialization_ready(paths, &self.config, || Ok(()))? {
+                Some(current) => return Ok(current.snapshot.holds_the_files_of(self)),
+                // A writer may have let go between the read and this look: one more read
+                // settles it, and a busy lock is waited for.
+                None if (!looked_again || state_lock_busy(paths)?) && Instant::now() < until => {
+                    looked_again = true;
+                    std::thread::sleep(CURRENT_LOOK);
+                }
+                None => return Ok(false),
+            }
+        }
     }
+
+    /// The same vault, with the same files at the same digests ([`Self::is_current`]).
+    fn holds_the_files_of(&self, then: &Self) -> bool {
+        self.config == then.config && self.manifest == then.manifest
+    }
+}
+
+/// Whether a writer holds the state lock now: the lock file is there and a shared take of it
+/// would wait.
+fn state_lock_busy(paths: &Paths) -> crate::Result<bool> {
+    Ok(
+        StateLock::observe(paths)?.is_none()
+            && fsx::kind(&paths.lock_file())? != fsx::Kind::Missing,
+    )
 }
 
 /// Read local inputs under the ready vault's shared state lock, releasing it on return.
@@ -1352,13 +1572,25 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
         && cache_intact(paths, state)
-        && state.manifest.files.iter().all(|(name, digest)| {
-            materialize::behind_a_link(&paths.home, name)
-                || materialize::target_path(&paths.home, name)
+        && changed_files(paths, state).is_empty()
+}
+
+/// The files `state`'s manifest names that are not as the vault wrote them (changed, missing or
+/// unreadable); one behind a link is left out, as the vault never writes through one.
+fn changed_files(paths: &Paths, state: &State) -> BTreeSet<String> {
+    state
+        .manifest
+        .files
+        .iter()
+        .filter(|(name, digest)| {
+            !materialize::behind_a_link(&paths.home, name)
+                && materialize::target_path(&paths.home, name)
                     .ok()
                     .and_then(|path| fsx::read_private(&path, text::MAX_VALUE).ok().flatten())
-                    .is_some_and(|bytes| materialize::digest_hex(bytes.as_slice()) == *digest)
+                    .is_none_or(|bytes| materialize::digest_hex(bytes.as_slice()) != **digest)
         })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 fn cache_intact(paths: &Paths, state: &State) -> bool {
@@ -1412,11 +1644,16 @@ const fn quiet(report: &Report) -> bool {
         && report.failed.is_empty()
 }
 
+/// The configured source, or why there is none to sync.
+fn configured(paths: &Paths) -> crate::Result<Config> {
+    config(paths)?.ok_or_else(|| {
+        Error::new("no vault configured: run aterm secrets join <url> (or aterm init)")
+    })
+}
+
 /// Fetch, verify, decrypt, and materialize once, optionally long-polling for `wait`.
 pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome> {
-    let config = config(paths)?.ok_or_else(|| {
-        Error::new("no vault configured: run aterm secrets join <url> (or aterm init)")
-    })?;
+    let config = configured(paths)?;
     let before = load_state(paths)?;
     let fetched = match (&config.source, wait) {
         (Source::Url(_), Some(wait)) => {
@@ -1431,6 +1668,14 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         _ => transport::fetch(&config.source, None, Duration::from_secs(30))?,
     };
     apply_fetched(paths, config, before, fetched)
+}
+
+/// [`sync`] of the envelope a join fetched and verified from the configured source already, in
+/// place of a fetch of its own.
+fn sync_with(paths: &Paths, bytes: Vec<u8>) -> crate::Result<SyncOutcome> {
+    let config = configured(paths)?;
+    let before = load_state(paths)?;
+    apply_fetched(paths, config, before, Fetched::Body(bytes))
 }
 
 fn apply_fetched(
@@ -1697,26 +1942,50 @@ fn pass_line(
     line.filter(|line| *line != last)
 }
 
-fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
+/// The last repair a subscriber made: of which version (source and seq), and the files that
+/// were not as written then.
+type Repaired = Option<(([u8; 32], u64), BTreeSet<String>)>;
+
+/// Whether this pass repairs the files a version wrote, rather than long-polling: when they are
+/// not as written, once per version and set of such files. Another file changed since (or one
+/// put back that changed again with another) is repaired again; the same set is not, so a file
+/// a program on this Mac keeps rewriting is put back once, not every pass.
+fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
     let Ok(state) = load_state(paths) else {
         return false;
     };
     let Some(source) = state.source_identity else {
         return false;
     };
+    if state.membership != Stored::In || state.failed || !state.pending.is_empty() {
+        return false;
+    }
     let version = (source, state.seq);
-    let due = state.membership == Stored::In
-        && !state.failed
-        && state.pending.is_empty()
-        && (!cache_intact(paths, &state)
-            || (*repaired != Some(version) && !files_intact(paths, &state)));
+    if !cache_intact(paths, &state) {
+        *repaired = Some((version, BTreeSet::new()));
+        return true;
+    }
+    let changed = changed_files(paths, &state);
+    let due = !changed.is_empty()
+        && repaired
+            .as_ref()
+            .is_none_or(|(last, files)| *last != version || *files != changed);
     if due {
-        *repaired = Some(version);
+        *repaired = Some((version, changed));
     }
     due
 }
 
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
+    subscriber_loop_until(paths, log, &|| false)
+}
+
+/// [`subscriber_loop`], ending at the top of a round once `stop` says so (a test's end).
+fn subscriber_loop_until(
+    paths: &Paths,
+    log: &(dyn Fn(&str) + Sync),
+    stop: &dyn Fn() -> bool,
+) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
     let mut failing = FIRST_RETRY;
     let mut repaired = None;
@@ -1724,10 +1993,16 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     let mut repeated = String::new();
     let program = program_stamp();
     loop {
+        if stop() {
+            return Ok(());
+        }
         if program.is_some() && program_stamp() != program {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
         }
+        // A verdict kept before this round's long-poll begins does not end it (only a new one
+        // does), so it is read first: one that came while this subscriber started, or paused.
+        heed_verdict(paths, log);
         let started = Instant::now();
         match subscriber_pass(paths, &mut repaired) {
             Ok((config, outcome)) => {
@@ -1737,6 +2012,8 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
                     log(&line);
                 }
                 ask_again_if_due(paths, &config, log);
+                // A verdict that ended the long-poll.
+                heed_verdict(paths, log);
                 let pause = pause_after(&config.source, &outcome, &mut failing);
                 std::thread::sleep(pause.saturating_sub(started.elapsed()));
             }
@@ -1754,20 +2031,40 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
                     &mut || crate::server::route_sources() != routes,
                     &mut std::thread::sleep,
                 );
-                backoff = retry_after(backoff, moved);
+                // Until macOS lets aterm onto the LAN, asking again soon is what joins.
+                backoff = if error.kind() == crate::ErrorKind::LocalNetworkPending {
+                    FIRST_RETRY
+                } else {
+                    retry_after(backoff, moved)
+                };
             }
         }
     }
 }
 
-fn subscriber_pass(
-    paths: &Paths,
-    repaired: &mut Option<([u8; 32], u64)>,
-) -> crate::Result<(Config, SyncOutcome)> {
+/// Read an admin Mac's verdict on this waiting machine's join password when one is due
+/// ([`verdict_due`]), and say a refusal once.
+fn heed_verdict(paths: &Paths, log: &dyn Fn(&str)) {
+    if verdict_due(paths) && read_verdict(paths).unwrap_or(false) {
+        log(
+            "an admin Mac refused this Mac's join password: retype it (System State's Secrets row, or aterm secrets join)",
+        );
+    }
+}
+
+/// Whether this machine waits with a proof of the join password that no verdict refused yet
+/// ([`read_verdict`]).
+fn verdict_due(paths: &Paths) -> bool {
+    load_state(paths).is_ok_and(|state| {
+        state.membership == Stored::Pending && state.proof.is_some() && !refused_now(&state)
+    })
+}
+
+fn subscriber_pass(paths: &Paths, repaired: &mut Repaired) -> crate::Result<(Config, SyncOutcome)> {
     creation::resume(paths)?;
     let config = config(paths)?
         .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
-    let before = *repaired;
+    let before = repaired.clone();
     let wait = match config.source {
         Source::Url(_) if !repair_due(paths, repaired) => Some(Duration::from_secs(55)),
         Source::Url(_) | Source::Path(_) => None,
@@ -1851,11 +2148,22 @@ impl Approval {
     }
 }
 
-fn admin_here_approving(
+/// Whether this machine is an admin of the recorded vault (`Some`), and the automatic approval
+/// its `[join]` line sets there, if any.
+fn admin_here(
     paths: &Paths,
     config: &Config,
     state: &State,
-) -> crate::Result<Option<Approval>> {
+) -> crate::Result<Option<Option<Approval>>> {
+    Ok(admin_text_here(paths, config, state)?.map(|opened| Approval::of(&opened.doc)))
+}
+
+/// The admin text of the recorded vault from the local cache, when this machine is its admin.
+fn admin_text_here(
+    paths: &Paths,
+    config: &Config,
+    state: &State,
+) -> crate::Result<Option<admin_keys::AdminText>> {
     let Some(pin) = config.signer else {
         return Ok(None);
     };
@@ -1884,20 +2192,41 @@ fn admin_here_approving(
     };
     let opened = parse_admin(&plain)?;
     opened.admissions.validate(&opened.doc, envelope.seq)?;
-    Ok(Approval::of(&opened.doc))
+    Ok(Some(opened))
+}
+
+/// Why the approver in process `pid` cannot read this Mac's recorded admin locker: its program
+/// is a release older than the first that reads the locker's format. An approver from before
+/// [`approver_stuck`]'s record existed says nothing of itself; `None` where it reads the locker,
+/// this Mac is no admin, or nothing can be told.
+pub fn approver_cannot_read(paths: &Paths, pid: u32) -> Option<String> {
+    let _lock = StateLock::observe(paths).ok()??;
+    let config = config(paths).ok()??;
+    let state = load_state(paths).ok()?;
+    let custody = admin_text_here(paths, &config, &state).ok()??.custody;
+    locker_skew::unreadable_by(pid, custody)
 }
 
 struct ApprovalCheck {
     version: ([u8; 32], u64),
     digest: Option<[u8; 32]>,
     at: Instant,
-    approval: Option<Approval>,
+    admin: Option<Option<Approval>>,
 }
 
 fn approval_here(
     paths: &Paths,
     checked: &mut Option<ApprovalCheck>,
 ) -> crate::Result<Option<(Config, u64, Approval)>> {
+    Ok(admin_check(paths, checked)?
+        .and_then(|(config, seq, approval)| approval.map(|approval| (config, seq, approval))))
+}
+
+/// The recorded vault, its version and its automatic approval, when this machine is its admin.
+fn admin_check(
+    paths: &Paths,
+    checked: &mut Option<ApprovalCheck>,
+) -> crate::Result<Option<(Config, u64, Option<Approval>)>> {
     let Some(_lock) = StateLock::observe(paths)? else {
         if config(paths)?.is_none() {
             return Ok(None);
@@ -1925,17 +2254,17 @@ fn approval_here(
             || held.at.elapsed() >= Duration::from_secs(300)
     }) {
         *checked = None;
-        let approval = admin_here_approving(paths, &config, &state)?;
+        let admin = admin_here(paths, &config, &state)?;
         *checked = Some(ApprovalCheck {
             version,
             digest: state.digest,
             at: Instant::now(),
-            approval,
+            admin,
         });
     }
     Ok(checked
         .as_ref()
-        .and_then(|held| held.approval)
+        .and_then(|held| held.admin)
         .map(|approval| (config, seq, approval)))
 }
 
@@ -1948,6 +2277,9 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
 
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
     let mut approver = Approver::default();
+    if let Err(error) = clear_dead_stuck(paths) {
+        log(&format!("could not clear old approver records: {error}"));
+    }
     while !stop.load(Ordering::Relaxed) {
         let pause = approver_pass(paths, log, &mut approver);
         nap(stop, pause);
@@ -1959,42 +2291,244 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
 struct Approver {
     settled: Settled,
     checked: Option<ApprovalCheck>,
+    /// The vault version and the requests the last judged pass read.
+    listed: Option<(u64, std::collections::BTreeSet<Judged>)>,
+    /// What [`write_asking`] last wrote.
+    told: Option<Vec<Asking>>,
+    /// Whether the last pass met a failure, other than a failure to read on a Mac last read as a
+    /// member, which leaves it as it was.
+    failing: bool,
+    /// The failure this approver last reported, in its log and in [`approver_stuck`]'s record.
+    reported: Option<String>,
+    /// Whether this approver's record outlived a removal that failed, and waits for another.
+    uncleared: bool,
+    /// Whether the record of the failure reported last failed to be written, and waits for
+    /// another try.
+    unrecorded: bool,
+    /// Whether the last pass that read this Mac's role found it no admin.
+    member: bool,
+}
+
+impl Approver {
+    /// Keep `asking` in the record an admin Mac's aterm reads ([`asking`]) when it changed.
+    fn tell(&mut self, paths: &Paths, log: &dyn Fn(&str), asking: Vec<Asking>) {
+        if self.told.as_ref() == Some(&asking) {
+            return;
+        }
+        match write_asking(paths, &asking) {
+            Ok(()) => self.told = Some(asking),
+            Err(error) => log(&format!(
+                "could not record the Macs asking to join: {error}"
+            )),
+        }
+    }
+
+    /// Note `text`, a failure this pass met. It is reported, in the log and in the record
+    /// `status` reads ([`approver_stuck`]), when the pass before failed too (or the caller set
+    /// `failing` first, for a failure that must not wait), and then once until a failure that
+    /// differs in more than its numbers comes: a pass that meets a sync mid-write goes
+    /// unreported, and an approver that stays stuck says why.
+    fn trouble(&mut self, paths: &Paths, log: &dyn Fn(&str), text: String) {
+        let shape =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_ascii_digit()).collect() };
+        let fresh = self.failing && self.reported.as_deref().map(shape) != Some(shape(&text));
+        if fresh {
+            log(&format!("not approving: {text}"));
+        }
+        if fresh || self.unrecorded {
+            match write_stuck(paths, Some(&text)) {
+                Ok(()) => self.unrecorded = false,
+                Err(error) => {
+                    if fresh || !self.unrecorded {
+                        log(&format!(
+                            "could not record why the approver is stuck: {error}"
+                        ));
+                    }
+                    self.unrecorded = true;
+                }
+            }
+        }
+        if fresh {
+            self.reported = Some(text);
+        }
+        self.failing = true;
+    }
+
+    /// Note a pass that met no failure, withdrawing a reported one with the line `said`.
+    fn untroubled(&mut self, paths: &Paths, log: &dyn Fn(&str), said: &str) {
+        self.failing = false;
+        self.unrecorded = false;
+        let withdrawn = self.reported.take().is_some();
+        if withdrawn {
+            log(said);
+        }
+        if withdrawn || self.uncleared {
+            match write_stuck(paths, None) {
+                Ok(()) => self.uncleared = false,
+                Err(error) => {
+                    if !self.uncleared {
+                        log(&format!("could not clear the approver's record: {error}"));
+                    }
+                    self.uncleared = true;
+                }
+            }
+        }
+    }
+}
+
+/// The approver records' names: `approver-stuck.<pid>`, one per process, so an approver writes
+/// only its own and removes no live approver's (its own, and at its start those of processes
+/// that are gone, [`clear_dead_stuck`]), and `status` reads the one of the subscriber it names.
+const STUCK_PREFIX: &str = "approver-stuck.";
+
+/// The longest failure text the approver's record keeps.
+const STUCK_MOST: usize = 512;
+
+/// Record `stuck`, why this process's approver stopped approving, where `status` reads it
+/// ([`approver_stuck`]); the record gone when `stuck` is `None`.
+fn write_stuck(paths: &Paths, stuck: Option<&str>) -> crate::Result<()> {
+    let path = paths.stuck_file(std::process::id());
+    let Some(text) = stuck else {
+        return remove_stuck(&path);
+    };
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(STUCK_MOST)
+        .collect();
+    fsx::ensure_private_dir(&paths.dir)?;
+    fsx::write_atomic(&path, format!("{text}\n").as_bytes(), 0o600)
+}
+
+fn remove_stuck(path: &Path) -> crate::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+    }
+}
+
+/// Remove the records of approvers that are gone, and one an earlier process with this pid left.
+fn clear_dead_stuck(paths: &Paths) -> crate::Result<()> {
+    let entries = match std::fs::read_dir(&paths.dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::new(format!("{}: {error}", paths.dir.display()))),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(STUCK_PREFIX))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || !aterm_uds::process::pid_alive(pid) {
+            remove_stuck(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Why the approver in process `pid` last said it stopped approving: from the local record
+/// alone, `None` where it reported nothing or approves again.
+pub fn approver_stuck(paths: &Paths, pid: u32) -> Option<String> {
+    let bytes = fsx::read_private(&paths.stuck_file(pid), 4 << 10).ok()??;
+    let text = String::from_utf8_lossy(bytes.as_slice());
+    let why = text.lines().next()?;
+    (!why.is_empty()).then(|| why.to_owned())
 }
 
 fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> Duration {
-    let (config, seq, approval) = match approval_here(paths, &mut approver.checked) {
-        Ok(Some(held)) => held,
-        Ok(None) => return Duration::from_secs(30),
-        Err(_) => return Duration::from_secs(2),
+    let (config, seq, approval) = match admin_check(paths, &mut approver.checked) {
+        Ok(Some(held)) => {
+            approver.member = false;
+            held
+        }
+        Ok(None) => {
+            approver.member = true;
+            approver.listed = None;
+            approver.tell(paths, log, Vec::new());
+            approver.untroubled(
+                paths,
+                log,
+                "not approving: this Mac is no admin of a vault now",
+            );
+            return Duration::from_secs(30);
+        }
+        // A Mac last read as a member is no approver: its failures to read are not reported.
+        Err(_) if approver.member => return Duration::from_secs(2),
+        Err(error) => {
+            approver.trouble(paths, log, error.to_string());
+            return Duration::from_secs(2);
+        }
     };
-    let Ok(pending) = requests_for(&config, None) else {
-        return Duration::from_secs(10);
+    let pending = match requests_for(&config, None) {
+        Ok(pending) => pending,
+        Err(error) => {
+            approver.trouble(
+                paths,
+                log,
+                format!("could not read the machines asking to join: {error}"),
+            );
+            return Duration::from_secs(10);
+        }
     };
     let by = match approval {
-        Approval::Password => "by the join password",
-        Approval::Open => "as the vault is open",
+        Some(Approval::Password) => "by the join password",
+        Some(Approval::Open) => "as the vault is open",
+        None => "by code",
     };
-    if approver.settled.due(&config, seq, &pending, approval) {
+    let listed = (seq, pending.iter().map(Judged::of).collect());
+    let due =
+        approval.is_some_and(|approval| approver.settled.due(&config, seq, &pending, approval));
+    // A request that came or went, or a version that let a Mac in, is read again too, so the
+    // record of the Macs an admin approves by hand follows the queue and the vault.
+    if due || approver.listed.as_ref() != Some(&listed) {
+        let mut publishing = false;
         let done = admin_open(paths).and_then(|admin| {
             if admin.config != config || admin.seq != seq {
                 return Err(Error::new("the vault changed while checking approval"));
             }
-            auto_approve_opened(paths, &admin)
+            auto_approve_opened(paths, &admin, &mut publishing)
         });
         match done {
-            Ok(done) => {
+            Ok(mut done) => {
+                approver.listed = Some(listed);
+                approver.tell(paths, log, std::mem::take(&mut done.asking));
                 if !done.approved.is_empty() {
                     log(&format!("approved {} {by}", done.approved.join(", ")));
+                }
+                let refused: Vec<&str> = done
+                    .judged
+                    .iter()
+                    .filter(|judged| {
+                        judged.proof.is_some() && done.refused.contains(&judged.recipient)
+                    })
+                    .map(|judged| judged.host.as_str())
+                    .collect();
+                if !refused.is_empty() {
+                    log(&format!("refused {} {by}", refused.join(", ")));
                 }
                 approver.settled.settle(done.judged);
             }
             Err(error) => {
-                log(&format!("approving {by} failed: {error}"));
+                // A failed publish may still have landed (a reply lost after the server took
+                // it): say so from the first pass, unlike a failure to read.
+                approver.failing |= publishing;
+                approver.trouble(paths, log, format!("approving {by} failed: {error}"));
                 return Duration::from_secs(30);
             }
         }
     }
-    Duration::from_secs(2)
+    approver.untroubled(paths, log, "approving again");
+    // A vault an admin approves only by code is read every 10 s, as often as its notices need.
+    if approval.is_some() {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
+    }
 }
 
 /// Join request key tuple evaluated by [`auto_approve`].
@@ -2064,6 +2598,9 @@ pub struct AutoApproved {
     pub code_only: Vec<String>,
     /// Every request read and judged in this pass.
     pub judged: Vec<Judged>,
+    /// The requests from machines not in the vault that this pass left for an admin to approve
+    /// by hand: no proof of the join password, one that did not match it, or a `code-only` key.
+    pub asking: Vec<Asking>,
     /// The version published, when any machine was added.
     pub seq: Option<u64>,
 }
@@ -2071,19 +2608,23 @@ pub struct AutoApproved {
 /// Approve and publish all queued requests eligible under the vault's `[join]` policy.
 pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     let admin = admin_open(paths)?;
-    auto_approve_opened(paths, &admin)
+    auto_approve_opened(paths, &admin, &mut false)
 }
 
-fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApproved> {
+/// [`auto_approve`] with `admin` opened; `publishing` is set once a publish is attempted, since a
+/// failed one may still have landed.
+fn auto_approve_opened(
+    paths: &Paths,
+    admin: &Admin,
+    publishing: &mut bool,
+) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
-    let Some(approval) = Approval::of(&admin.published_doc) else {
-        return Ok(done);
-    };
+    let policy = Approval::of(&admin.published_doc);
     let name = &admin.config.name;
     let key = admin
         .published_doc
         .join_password()
-        .filter(|_| approval == Approval::Password)
+        .filter(|_| policy == Some(Approval::Password))
         .map(|password| join::Key::derive(name, password.as_slice()));
     let mut members: Vec<String> = admin
         .published_doc
@@ -2094,10 +2635,14 @@ fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApprov
     let code_only = admin.published_doc.code_only();
     let mut doc = admin.published_doc.clone();
     let mut admissions = Vec::new();
+    let mut refusals = Vec::new();
     for request in requests_for(&admin.config, None)? {
-        if !approval.reads(&request) {
+        let Some(approval) = policy.filter(|approval| approval.reads(&request)) else {
+            if !members.contains(&request.recipient) {
+                done.asking.push(Asking::of(&request));
+            }
             continue;
-        }
+        };
         let judged = Judged::of(&request);
         if !members.contains(&request.recipient) {
             let admitted = match approval {
@@ -2125,17 +2670,126 @@ fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApprov
                 members.push(request.recipient.clone());
             } else if approval == Approval::Password {
                 done.refused.push(request.recipient.clone());
+                if let Some(proof) = &request.proof {
+                    refusals.push((request.recipient.clone(), join::proof_tag(proof)));
+                }
+                done.asking.push(Asking::of(&request));
             } else {
                 done.code_only.push(request.recipient.clone());
+                done.asking.push(Asking::of(&request));
             }
         }
         done.judged.push(judged);
     }
     if !done.approved.is_empty() {
-        done.seq = Some(publish_as(paths, admin, &doc, false, &admissions)?.seq);
+        *publishing = true;
+        done.seq = Some(publish_as(paths, admin, &doc, false, &admissions, false)?.seq);
+    }
+    // The joining Mac reads the verdict and asks its person again at once; one that is not
+    // told still waits as before, so a verdict that does not arrive changes nothing.
+    if let Source::Url(url) = &admin.config.source {
+        for (recipient, tag) in &refusals {
+            let _ = transport::post_verdict(url, recipient, tag);
+        }
     }
     Ok(done)
 }
+
+/// A machine asking to join that an admin approves by hand: what its notice names, and what
+/// its Approve approves ([`approve_request`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Asking {
+    /// Its approval code, which its own screen shows.
+    pub code: String,
+    /// Its key: the one machine an Approve lets in.
+    pub recipient: String,
+    /// The name it asked for.
+    pub host: String,
+}
+
+impl Asking {
+    fn of(request: &Request) -> Asking {
+        Asking {
+            code: request.code.clone(),
+            recipient: request.recipient.clone(),
+            host: request.host.clone(),
+        }
+    }
+}
+
+/// The most machines the record of those asking to join holds.
+const ASKING_MOST: usize = 64;
+
+/// Write `asking`, the machines an admin Mac's approver left for a person to approve, where this
+/// Mac's aterm reads them ([`asking`]): one `code<TAB>key<TAB>name` line each, the record gone
+/// when none ask.
+fn write_asking(paths: &Paths, asking: &[Asking]) -> crate::Result<()> {
+    let path = paths.asking_file();
+    if asking.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+        };
+    }
+    let text: String = asking
+        .iter()
+        .take(ASKING_MOST)
+        .map(|asking| {
+            let host: String = asking.host.chars().filter(|c| !c.is_control()).collect();
+            format!("{}\t{}\t{host}\n", asking.code, asking.recipient)
+        })
+        .collect();
+    fsx::ensure_private_dir(&paths.dir)?;
+    fsx::write_atomic(&path, text.as_bytes(), 0o600)
+}
+
+/// The machines asking to join that this admin Mac's approver left for a person to approve, as
+/// it last recorded them: from the local record alone, empty where none ask or no approver runs.
+pub fn asking(paths: &Paths) -> Vec<Asking> {
+    let Ok(Some(bytes)) = fsx::read_private(&paths.asking_file(), 64 << 10) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(bytes.as_slice())
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.splitn(3, '\t');
+            let (code, recipient, host) = (words.next()?, words.next()?, words.next()?);
+            (!code.is_empty() && recipient.starts_with("age1") && !host.is_empty()).then(|| {
+                Asking {
+                    code: code.to_owned(),
+                    recipient: recipient.to_owned(),
+                    host: host.to_owned(),
+                }
+            })
+        })
+        .take(ASKING_MOST)
+        .collect()
+}
+
+/// Approve exactly the machine with key `recipient` that asks to join now, under the name it
+/// asked for (or the next free one), and publish: what an admin Mac's notice Approve does. The
+/// name the vault gave it.
+/// # Errors
+/// This Mac is no admin, no request from that key is waiting, or the publish failed.
+pub fn approve_request(paths: &Paths, recipient: &str) -> crate::Result<String> {
+    let admin = admin_open(paths)?;
+    let mut doc = admin.doc.clone();
+    let pending = requests(paths, Some(&doc))?;
+    let request = pending
+        .iter()
+        .find(|request| request.recipient == recipient)
+        .ok_or_else(|| Error::new("that Mac no longer asks to join"))?;
+    let host = free_name(&doc, &request.host);
+    doc.add_machine(&host, recipient)
+        .map_err(|e| Error::new(e.to_string()))?;
+    admin_publish_approved(paths, &admin, &doc, &[recipient.to_owned()])?;
+    Ok(host)
+}
+
+/// How long a look for a vault ([`probe_within`]) takes at most, all of it: a vault on this
+/// LAN answers within milliseconds, and a Mac elsewhere is not kept waiting.
+pub const PROBE_DEADLINE: Duration = Duration::from_millis(1500);
 
 /// A vault that answered a [`probe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2144,6 +2798,9 @@ pub struct Probed {
     pub seq: u64,
     /// Its signer's fingerprint.
     pub fingerprint: String,
+    /// The envelope it served, verified: what a join that follows may take in place of its
+    /// own fetch ([`JoinOptions::fetched`]).
+    pub envelope: Vec<u8>,
 }
 
 /// What a [`probe`] heard back from a server that answered.
@@ -2155,12 +2812,19 @@ pub enum ProbeOutcome {
     Absent,
     /// The endpoint answered with something other than the requested vault.
     NotThisVault(String),
+    /// Another vault of the requested name answered, its signature good under a signer the pin
+    /// does not reach: a vault someone else keeps at that address. Unlike
+    /// [`ProbeOutcome::NotThisVault`] (an error page, a redirect, a server mid-restart), it says
+    /// what the network holds.
+    AnotherVault(String),
 }
 
-/// Check whether `url` serves a vault verified under `pin` within `wait`.
-pub fn probe(url: &str, pin: &[u8; 32], wait: Duration) -> crate::Result<ProbeOutcome> {
+/// Check whether `url` serves a vault verified under `pin`: one GET, all of it within `total`
+/// ([`transport::get_within`]); no route to a LAN address is
+/// [`crate::ErrorKind::LocalNetworkPending`].
+pub fn probe(url: &str, pin: &[u8; 32], total: Duration) -> crate::Result<ProbeOutcome> {
     let name = transport::vault_name(&Source::Url(url.to_string()))?;
-    let body = match transport::get(url, None, wait)? {
+    let body = match transport::get_within(url, total)? {
         transport::Answer::Fetched(Fetched::Body(body)) => body,
         transport::Answer::Fetched(Fetched::Missing | Fetched::NoNewer(_)) => {
             return Ok(ProbeOutcome::Absent);
@@ -2172,8 +2836,14 @@ pub fn probe(url: &str, pin: &[u8; 32], wait: Duration) -> crate::Result<ProbeOu
         Ok((envelope, _, _)) => ProbeOutcome::Found(Probed {
             seq: envelope.seq,
             fingerprint: envelope::fingerprint(&envelope.signer),
+            envelope: body,
         }),
-        Err(error) => ProbeOutcome::NotThisVault(error.to_string()),
+        Err(error) => match envelope::parse(&body) {
+            Ok(other) if other.name == name && other.verify_signature().is_ok() => {
+                ProbeOutcome::AnotherVault(error.to_string())
+            }
+            _ => ProbeOutcome::NotThisVault(error.to_string()),
+        },
     })
 }
 
@@ -2185,12 +2855,30 @@ pub fn refused_by_local_network(error: &crate::Error) -> bool {
     error.0.contains(aterm_http::LOCAL_NETWORK_REFUSED)
 }
 
-/// Probe the default ALab vault URL under the compiled-in signer.
-pub fn probe_default(wait: Duration) -> crate::Result<ProbeOutcome> {
-    match decode_key32(crate::ALAB_SIGNER) {
-        Some(pin) => probe(crate::ALAB_DEFAULT_URL, &pin, wait),
-        None => Ok(ProbeOutcome::Absent),
+/// [`probe`] of the vault at `url` (a `#<signer>` pin allowed) under its pin: the URL's own,
+/// else the key built in for the ALab vault's URL. A URL with neither is refused, since only a
+/// pin tells the vault apart from anything else that answers there.
+pub fn probe_within(url: &str, total: Duration) -> crate::Result<ProbeOutcome> {
+    let (source, fragment) = transport::parse_source(url, Path::new("/"))?;
+    let Source::Url(base) = &source else {
+        return Err(Error::new("a probe looks for a vault at an http(s):// URL"));
+    };
+    let pin = fragment.or_else(|| default_pin(&source)).ok_or_else(|| {
+        Error::new(format!(
+            "{}: nothing pins this vault's signing key; add #<signer> to the URL",
+            transport::describe(base)
+        ))
+    })?;
+    probe(base, &pin, total)
+}
+
+/// [`probe_within`] of the ALab vault under the compiled-in signer ([`ProbeOutcome::Absent`]
+/// when none is compiled in).
+pub fn probe_default(total: Duration) -> crate::Result<ProbeOutcome> {
+    if decode_key32(crate::ALAB_SIGNER).is_none() {
+        return Ok(ProbeOutcome::Absent);
     }
+    probe_within(crate::ALAB_DEFAULT_URL, total)
 }
 
 /// Who asks to join, which says what [`request_join`] records.
@@ -2212,6 +2900,20 @@ fn request_join(
     let identity = machine_identity(paths)?;
     let recipient = identity.recipient();
     let code = join_code(&recipient);
+    // A join keeps its new proof before it asks: a request cut short (no answer, an interrupt,
+    // the change gap's pause) leaves the proof the next ask sends, never the one before it.
+    if asker == Asker::Join {
+        change_request(paths, config, |state| {
+            if state.proof != proof {
+                state.refused = None;
+            }
+            state.proof.clone_from(&proof);
+            if matches!(state.membership, Stored::None | Stored::Revoked) {
+                state.membership = Stored::Pending;
+            }
+            true
+        })?;
+    }
     let posted = match &config.source {
         Source::Url(url) => {
             let mut line = format!("{} {} {code}", recipient.to_bech32(), config.host);
@@ -2223,17 +2925,12 @@ fn request_join(
         Source::Path(_) => Ok(()),
     };
     let queued = posted.is_ok();
+    // Only while the proof sent is still this machine's (a later join may have changed it).
     let recorded = change_request(paths, config, |state| {
-        if asker == Asker::Again && state.proof != proof {
+        if state.proof != proof {
             return false;
         }
         state.requested = if queued { now() } else { 0 };
-        if asker == Asker::Join {
-            state.proof = proof;
-            if matches!(state.membership, Stored::None | Stored::Revoked) {
-                state.membership = Stored::Pending;
-            }
-        }
         true
     });
     posted.and(recorded).map(|()| code)
@@ -2309,27 +3006,38 @@ fn join_with(
         Some(host) => return Err(Error::new(format!("{host:?} is not a valid machine name"))),
         None => default_host_name(),
     };
-    let announce = |identity: &Identity| {
-        (options.say)(&format!(
-            "this machine: {host}, code {}, key {}",
-            join_code(&identity.recipient()),
-            identity.recipient().to_bech32()
-        ));
-    };
-    let identity = match expected {
-        ExpectedConfig::Any => {
-            let identity = machine_identity(paths)?;
-            announce(&identity);
-            Some(identity)
+    // A password the caller holds stretches while the fetch is out.
+    let stretching = match &options.password {
+        JoinPassword::Given(Some(password)) if matches!(source, Source::Url(_)) => {
+            let (vault, password) = (name.clone(), password.clone());
+            Some(std::thread::spawn(move || {
+                join::Key::derive(&vault, password.as_slice())
+            }))
         }
-        ExpectedConfig::Read(_) => None,
+        _ => None,
     };
-    let bytes = match fetch(&source)? {
+    let fetched = match options.fetched {
+        Some(bytes) if fetched_serves(paths, &source, &name, bytes)? => {
+            Fetched::Body(bytes.to_vec())
+        }
+        _ => fetch(&source)?,
+    };
+    let bytes = match fetched {
         Fetched::Body(bytes) => bytes,
         Fetched::Missing => return Err(Error::new(format!("{source_display}: no vault there"))),
         Fetched::NoNewer(_) => return Err(Error::new("the source answered with no vault")),
     };
     let previous = self::config(paths)?;
+    // The machine key is made only once the source holds a vault this join takes, so a join
+    // that fails before leaves none.
+    let announce = |identity: &Identity| {
+        let recipient = identity.recipient();
+        (options.say)(&JoinEvent::Machine {
+            host: &host,
+            code: &join_code(&recipient),
+            recipient: &recipient.to_bech32(),
+        });
+    };
     if !is_envelope(&bytes) {
         let Source::Path(path) = &source else {
             return Err(Error::new(format!(
@@ -2348,10 +3056,7 @@ fn join_with(
             let _lock = StateLock::take(paths)?;
             creation::permit_join(paths)?;
             expected.check(paths)?;
-            let identity = match identity {
-                Some(identity) => identity,
-                None => machine_identity(paths)?,
-            };
+            let identity = machine_identity(paths)?;
             let mut state = load_state(paths)?;
             state.seq = 0;
             state.digest = None;
@@ -2360,9 +3065,7 @@ fn join_with(
             save_config(paths, &config)?;
             identity
         };
-        if matches!(expected, ExpectedConfig::Read(_)) {
-            announce(&identity);
-        }
+        announce(&identity);
         sync(paths, None)?;
         return Ok(JoinOutcome::Plain {
             names: load_state(paths)?.manifest.files.keys().cloned().collect(),
@@ -2415,10 +3118,7 @@ fn join_with(
         let _lock = StateLock::take(paths)?;
         creation::permit_join(paths)?;
         expected.check(paths)?;
-        let identity = match identity {
-            Some(identity) => identity,
-            None => machine_identity(paths)?,
-        };
+        let identity = machine_identity(paths)?;
         let replaced = matches!(checked, Pin::Replaced(_));
         let mut state = load_state(paths)?;
         if !same_place || stored != Some(pin) || replaced {
@@ -2441,12 +3141,11 @@ fn join_with(
         save_config(paths, &config)?;
         identity
     };
-    if matches!(expected, ExpectedConfig::Read(_)) {
-        announce(&identity);
-    }
+    announce(&identity);
     let recipient_text = identity.recipient().to_bech32();
     let code = join_code(&identity.recipient());
-    let synced = sync(paths, None).inspect_err(|_| {
+    // The envelope just verified is the version this join applies: no second fetch.
+    let synced = sync_with(paths, bytes).inspect_err(|_| {
         let _ = change_request(paths, &config, |state| {
             state.requested = 0;
             true
@@ -2461,22 +3160,30 @@ fn join_with(
     if let Some(JoinOutcome::Joined { seq, names }) = already_in(paths)? {
         return Ok(JoinOutcome::Joined { seq, names });
     }
+    let prove = |key: join::Key| key.prove(&name, &recipient_text, &host);
+    let mut by_password = false;
     match &source {
         Source::Url(_) => {
-            let proof = (options.password)().map(|password| {
-                join::Key::derive(&name, password.as_slice()).prove(&name, &recipient_text, &host)
-            });
-            let by_password = proof.is_some();
-            request_join(paths, &config, proof, Asker::Join)?;
-            (options.say)(&if by_password {
-                format!(
-                    "asked to join {name} with the join password; an admin Mac's subscriber approves it"
-                )
-            } else {
-                format!("asked to join {name}. On an admin Mac run: aterm secrets approve {code}")
+            let key = match (stretching, &options.password) {
+                (Some(stretching), _) => Some(
+                    stretching
+                        .join()
+                        .map_err(|_| Error::new("stretching the join password failed"))?,
+                ),
+                (None, JoinPassword::Ask(ask)) => {
+                    ask().map(|password| join::Key::derive(&name, password.as_slice()))
+                }
+                (None, JoinPassword::Given(_)) => None,
+            };
+            by_password = key.is_some();
+            request_join(paths, &config, key.map(prove), Asker::Join)?;
+            (options.say)(&JoinEvent::Asked {
+                vault: &name,
+                code: &code,
+                by_password,
             });
             if by_password {
-                (options.say)(&mistyped_hint(options, &source, &host));
+                (options.say)(&JoinEvent::Retype(&mistyped_hint(options, &source, &host)));
             }
         }
         Source::Path(_) => {
@@ -2484,18 +3191,42 @@ fn join_with(
             let mut state = load_state(paths)?;
             state.membership = Stored::Pending;
             save_state(paths, &state)?;
-            (options.say)(&format!(
-                "not in {name} yet. On an admin Mac run: aterm secrets approve {recipient_text} --name {host}"
-            ));
+            (options.say)(&JoinEvent::NotInPath {
+                vault: &name,
+                recipient: &recipient_text,
+                host: &host,
+            });
         }
     }
     (options.requested)();
     if !options.wait.is_zero() {
-        (options.say)(
-            "waiting for the approval (Ctrl-C stops waiting; this Mac joins by itself once approved)",
-        );
+        (options.say)(&JoinEvent::Waiting);
         let deadline = Instant::now() + options.wait;
+        let mut pause = Duration::ZERO;
         while Instant::now() < deadline {
+            // An admin Mac's verdict (which also ends the server's long-poll): a refused
+            // password is asked again at once, or ends a wait that cannot ask. Without one, a
+            // look that came back within 5 s waits out the rest of them before the next.
+            if by_password && read_verdict(paths).unwrap_or(false) {
+                (options.say)(&JoinEvent::Refused { vault: &name });
+                let JoinPassword::Ask(ask) = &options.password else {
+                    break;
+                };
+                match ask() {
+                    Some(password) => {
+                        let key = join::Key::derive(&name, password.as_slice());
+                        request_join(paths, &config, Some(prove(key)), Asker::Join)?;
+                        (options.say)(&JoinEvent::Asked {
+                            vault: &name,
+                            code: &code,
+                            by_password,
+                        });
+                    }
+                    None => by_password = false,
+                }
+            } else {
+                std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+            }
             let started = Instant::now();
             let left = deadline
                 .saturating_duration_since(started)
@@ -2516,13 +3247,25 @@ fn join_with(
                         return Ok(joined);
                     }
                 }
-                Err(error) => (options.say)(&format!("still waiting ({error})")),
+                Err(error) => (options.say)(&JoinEvent::StillWaiting(&error)),
             }
-            let pause = Duration::from_secs(5).saturating_sub(started.elapsed());
-            std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+            pause = Duration::from_secs(5).saturating_sub(started.elapsed());
         }
     }
     Ok(JoinOutcome::Pending { code, host })
+}
+
+/// Whether `bytes`, what the caller fetched from `source` earlier, still serve a join there:
+/// not when this machine holds a newer version of that vault, which a fetch now serves.
+fn fetched_serves(paths: &Paths, source: &Source, name: &str, bytes: &[u8]) -> crate::Result<bool> {
+    if !matches!(source, Source::Url(_)) {
+        return Ok(false);
+    }
+    let held = match self::config(paths)? {
+        Some(config) if config.source == *source && config.name == name => load_state(paths)?.seq,
+        _ => 0,
+    };
+    Ok(envelope::parse(bytes).is_ok_and(|parsed| parsed.seq >= held))
 }
 
 fn mistyped_hint(options: &JoinOptions<'_>, source: &Source, host: &str) -> String {
@@ -2574,6 +3317,8 @@ pub struct Admin {
     seed: [u8; 32],
     commons_seed: [u8; 32],
     commons_bound: bool,
+    /// The admin locker's format as opened: a publish writes [`admin_keys::MAGIC`].
+    custody: &'static str,
     seq: u64,
     /// The handoff chain from the vault's first key to the current one, carried whole on
     /// every version, so a machine pinned to any earlier key (asleep across rotations, or a
@@ -3007,6 +3752,7 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
         seed: opened.seed,
         commons_seed: opened.commons_seed,
         commons_bound: opened.commons_bound,
+        custody: opened.custody,
         seq: envelope.seq,
         handoff,
         opened_pairs: envelope.handoff.len(),
@@ -3203,7 +3949,13 @@ fn alab_release(
 
 /// Publish `doc` as the next version, rotating keys or join credentials when members leave.
 pub fn admin_publish(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
-    publish_as(paths, admin, doc, false, &[])
+    publish_as(paths, admin, doc, false, &[], false)
+}
+
+/// [`admin_publish`] for a revoke that ran [`custody_readable`] before its permanent Commons
+/// retirement: no later read of this Mac's subscriber may refuse the publish that completes it.
+fn admin_publish_checked(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
+    publish_as(paths, admin, doc, false, &[], true)
 }
 
 /// Publish explicit manual recipient approvals with their machine-list changes.
@@ -3220,12 +3972,21 @@ pub fn admin_publish_approved(
         .iter()
         .map(|r| (r.clone(), AdmissionMethod::Manual))
         .collect::<Vec<_>>();
-    publish_as(paths, admin, doc, false, &admissions)
+    publish_as(paths, admin, doc, false, &admissions, false)
 }
 
 /// Publish `doc` signed by a newly rotated vault key endorsed by the current key.
 pub fn admin_rotate(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
-    publish_as(paths, admin, doc, true, &[])
+    publish_as(paths, admin, doc, true, &[], false)
+}
+
+/// Refuse rewriting `admin`'s locker into this build's format while this Mac's approver may not
+/// read it ([`locker_skew`]): before a publish, and before anything a publish completes.
+fn custody_readable(paths: &Paths, admin: &Admin) -> crate::Result<()> {
+    if admin.custody == admin_keys::MAGIC {
+        return Ok(());
+    }
+    locker_skew::check(paths, admin.custody, admin_keys::MAGIC)
 }
 
 #[cfg_attr(
@@ -3282,8 +4043,12 @@ fn publish_as(
     doc: &Document,
     rotate: bool,
     approved: &[(String, AdmissionMethod)],
+    custody_checked: bool,
 ) -> crate::Result<Published> {
     admin_keys::validate_commons_transition(&admin.published_doc, doc)?;
+    if !custody_checked {
+        custody_readable(paths, admin)?;
+    }
     let seq = envelope::next_seq(admin.seq)?;
     let identity = machine_identity(paths)?;
     let (bound, demoted) = publication_rights(admin, doc, &identity)?;
@@ -4373,7 +5138,8 @@ mod tests {
                     interactive: false,
                     wait: Duration::ZERO,
                     confirm: &|_| false,
-                    password: &|| None,
+                    password: JoinPassword::Given(None),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 };
@@ -4563,7 +5329,8 @@ mod tests {
                 interactive: false,
                 wait: Duration::ZERO,
                 confirm: &|_| false,
-                password: &|| None,
+                password: JoinPassword::Given(None),
+                fetched: None,
                 requested: &|| {},
                 say: &|_| {},
             },
@@ -4976,6 +5743,14 @@ mod tests {
         );
         sync(&admin, None).unwrap();
         assert!(materialization_ready(&admin).unwrap());
+        assert!(!repair_due(&admin, &mut repaired), "all as written");
+        // Within the same version, a file that changes after the repair is put back again,
+        // once: the same set changing again is not repaired every pass.
+        std::fs::remove_file(&token).unwrap();
+        assert!(repair_due(&admin, &mut repaired), "another set of files");
+        assert!(!repair_due(&admin, &mut repaired), "the same set once");
+        sync(&admin, None).unwrap();
+        assert!(materialization_ready(&admin).unwrap());
         assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
         assert_eq!(
             std::fs::read(&config).unwrap(),
@@ -5091,6 +5866,12 @@ mod tests {
             "not a new version"
         );
 
+        {
+            let _writer = StateLock::take(&paths).unwrap();
+            assert!(state_lock_busy(&paths).unwrap());
+        }
+        assert!(!state_lock_busy(&paths).unwrap());
+
         fsx::write_atomic(&source, b"token=inert-next-token\n", 0o600).unwrap();
         sync(&paths, None).unwrap();
         assert!(materialization_ready(&paths).unwrap());
@@ -5124,6 +5905,45 @@ mod tests {
             StateLock::observe(&paths).unwrap().is_some(),
             "failure releases the lease"
         );
+    }
+
+    #[test]
+    fn a_version_that_writes_no_file_leaves_a_snapshot_current() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let publish = |change: &dyn Fn(&mut Document)| {
+            let opened = admin_open(&admin).unwrap();
+            let mut doc = opened.doc.clone();
+            change(&mut doc);
+            admin_publish(&admin, &opened, &doc).unwrap();
+            sync(&admin, None).unwrap();
+        };
+        publish(&|doc| {
+            doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+                .unwrap();
+        });
+        let configured = config(&admin).unwrap().unwrap();
+        let captured = with_materialization_ready(&admin, &configured, || Ok(()))
+            .unwrap()
+            .unwrap();
+        // A machine let in (what every open-vault join publishes): a new version, no file.
+        publish(&|doc| {
+            doc.add_machine("m2", &transport::test_recipient(2))
+                .unwrap();
+        });
+        assert!(load_state(&admin).unwrap().seq > captured.snapshot.seq);
+        assert!(
+            captured.snapshot.is_current(&admin).unwrap(),
+            "no file it read changed"
+        );
+        // CONTROL: a version that changes a file it wrote is not current.
+        publish(&|doc| {
+            doc.set_entry(&Audience::Everyone, "token", b"inert-next")
+                .unwrap();
+        });
+        assert!(!captured.snapshot.is_current(&admin).unwrap());
     }
 
     #[test]
@@ -6029,7 +6849,7 @@ mod tests {
         let before_a = body(&opened.config.source);
         let before_b = body(&current.source);
         let state = std::fs::read(admin.state_file()).expect("current state");
-        assert!(auto_approve_opened(&admin, &opened).is_err());
+        assert!(auto_approve_opened(&admin, &opened, &mut false).is_err());
         assert_eq!(body(&opened.config.source), before_a);
         assert_eq!(body(&current.source), before_b);
         assert_eq!(std::fs::read(admin.state_file()).unwrap(), state);
@@ -6068,7 +6888,8 @@ mod tests {
 
         let fresh = admin_open(&admin).expect("capture admitted first vault");
         join_pinned(&admin, &sources[1], "admin");
-        let rested = auto_approve_opened(&admin, &fresh).expect("no publication needed");
+        let rested =
+            auto_approve_opened(&admin, &fresh, &mut false).expect("no publication needed");
         assert!(rested.approved.is_empty());
         assert_eq!(rested.seq, None);
         assert_eq!(
@@ -6109,7 +6930,8 @@ mod tests {
                     interactive: false,
                     wait: Duration::ZERO,
                     confirm: &|_| false,
-                    password,
+                    password: JoinPassword::Ask(password),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 },
@@ -6156,9 +6978,13 @@ mod tests {
         let admin = Paths::for_home(&root.path().join("ma"));
         let created = create(&admin, &url, None, Some("ma")).expect("create");
         let gone = std::cell::RefCell::new(None);
+        // The join applies the version it verified without a second fetch, so a server stopped
+        // at the confirm stays stopped through the password prompt, up to the request.
         let stop = || {
-            server.borrow_mut().take().expect("running").stop();
-            *gone.borrow_mut() = Some(Unserved::at(&socket));
+            if let Some(running) = server.borrow_mut().take() {
+                running.stop();
+                *gone.borrow_mut() = Some(Unserved::at(&socket));
+            }
         };
         let cut_off = |host: &str, source: String, interactive: bool| {
             let paths = Paths::for_home(&root.path().join(host));
@@ -6173,10 +6999,11 @@ mod tests {
                         stop();
                         true
                     },
-                    password: &|| {
+                    password: JoinPassword::Ask(&|| {
                         stop();
                         None
-                    },
+                    }),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 },
@@ -6186,9 +7013,9 @@ mod tests {
             *server.borrow_mut() = Some(serve(&store, &socket));
             paths
         };
-        let at_sync = cut_off("mb", url.clone(), true);
+        let at_confirm = cut_off("mb", url.clone(), true);
         let at_request = cut_off("mc", format!("{url}#{}", created.signer), false);
-        for (paths, host) in [(&at_sync, "mb"), (&at_request, "mc")] {
+        for (paths, host) in [(&at_confirm, "mb"), (&at_request, "mc")] {
             assert_eq!(
                 status(paths).expect("status").membership,
                 Membership::Pending
@@ -6236,11 +7063,12 @@ mod tests {
                 interactive: false,
                 wait: Duration::ZERO,
                 confirm: &|_| false,
-                password: &|| {
+                password: JoinPassword::Ask(&|| {
                     other_server.borrow_mut().take().expect("running").stop();
                     *gone.borrow_mut() = Some(Unserved::at(&other_socket));
                     Some(password.clone())
-                },
+                }),
+                fetched: None,
                 requested: &|| {},
                 say: &|_| {},
             },
@@ -6278,11 +7106,12 @@ mod tests {
                     interactive: false,
                     wait: Duration::ZERO,
                     confirm: &|_| false,
-                    password: &|| {
+                    password: JoinPassword::Ask(&|| {
                         server.borrow_mut().take().expect("running").stop();
                         *gone.borrow_mut() = Some(Unserved::at(&socket));
                         None
-                    },
+                    }),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 },
@@ -6323,7 +7152,10 @@ mod tests {
                     interactive: false,
                     wait: Duration::ZERO,
                     confirm: &|_| false,
-                    password: &|| panic!("the process ends at the password prompt"),
+                    password: JoinPassword::Ask(&|| {
+                        panic!("the process ends at the password prompt")
+                    }),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 },
@@ -6381,7 +7213,8 @@ mod tests {
                     interactive: false,
                     wait: Duration::ZERO,
                     confirm: &|_| false,
-                    password,
+                    password: JoinPassword::Ask(password),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 },
@@ -6502,7 +7335,8 @@ mod tests {
                 interactive: false,
                 wait: Duration::ZERO,
                 confirm: &|_| false,
-                password: &|| None,
+                password: JoinPassword::Given(None),
+                fetched: None,
                 requested: &|| {},
                 say: &|_| {},
             },
@@ -7779,7 +8613,8 @@ mod commons_tests {
                 interactive: false,
                 wait: Duration::ZERO,
                 confirm: &|_| false,
-                password: &|| None,
+                password: JoinPassword::Given(None),
+                fetched: None,
                 requested: &|| {},
                 say: &|_| {},
             },

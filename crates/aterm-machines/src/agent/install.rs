@@ -555,7 +555,7 @@ pub fn uninstall(
     out: &mut dyn Write,
 ) -> ExitCode {
     let started = sys.now();
-    let facts = crate::facts::gather(sys);
+    let facts = crate::facts::gather_without_keyboards(sys);
     let mut rows: Vec<ItemReport> = Vec::new();
     let mut push = |id: &str, title: &str, outcome: Outcome, why: Option<String>| {
         let row = ItemReport {
@@ -574,6 +574,7 @@ pub fn uninstall(
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         };
         let _ = aterm_json::to_string(&Line::Item(Box::new(row.clone())))
             .map(|l| writeln!(out, "{l}").and_then(|()| out.flush()));

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Revoke through durable Commons retirement before publishing vault removal.
-//! A failed publication cannot restore an already retired device's membership.
+//! Revoke through durable Commons retirement before publishing vault removal, wherever
+//! Commons control exists ([`holds_control`]); a vault without it removes a member from the
+//! vault alone. A failed publication cannot restore an already retired device's membership.
 
 use super::*;
 use crate::commons::{bootstrap::Bootstrap, constraints::Fact, journal::Journal, roster::Grant};
@@ -261,6 +262,22 @@ impl Admin {
         project = "aterm_secrets::client::retirement::tests::retirement_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbRetirementPublication",
+        action = "Unfounded",
+        project = "aterm_secrets::client::retirement::tests::retirement_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbRetirementPublication",
+        action = "RetainedRoot",
+        project = "aterm_secrets::client::retirement::tests::retirement_transition"
+    )
+)]
 pub fn admin_revoke(
     paths: &Paths,
     admin: &Admin,
@@ -285,9 +302,11 @@ pub fn admin_revoke(
     publication_rights(admin, &doc, &identity)?;
     admin_keys::validate_commons(&doc, &admin.commons_seed)?;
     admin.admissions.retained(&doc)?.validate(&doc, sequence)?;
+    // A refused locker rewrite comes before the permanent retirement, not after it.
+    custody_readable(paths, admin)?;
 
-    let retirement = retire_cached(paths, admin, &[recipient])?;
-    let published = admin_publish(paths, admin, &doc).map_err(|error| {
+    let retirement = retire_cached(paths, admin, &doc, &[recipient])?;
+    let published = admin_publish_checked(paths, admin, &doc).map_err(|error| {
         if retirement.is_some() {
             Error::new(format!("Commons membership is permanently retired; vault removal was not confirmed: {error}. Retry the same revoke command"))
         } else { error }
@@ -347,14 +366,36 @@ pub fn admin_retire(
     }).collect::<crate::Result<Vec<_>>>()?;
     let identity = read_identity(paths)?.ok_or_else(|| Error::new("admin identity is missing"))?;
     publication_rights(admin, &admin.published_doc, &identity)?;
-    retire_cached(paths, admin, &recipients)?.ok_or_else(|| {
+    if admin_keys::control_descriptor(&admin.published_doc)?.is_none()
+        && !(admin.commons_bound && holds_control(paths, admin, &admin.published_doc)?)
+    {
+        return Err(Error::new(
+            "this vault has no Commons control, so it has no Commons membership to retire; aterm secrets revoke removes a machine",
+        ));
+    }
+    retire_cached(paths, admin, &admin.published_doc, &recipients)?.ok_or_else(|| {
         Error::new("a requested recipient has no authenticated vault or Commons identity")
     })
+}
+
+/// Whether a member removal of a bound vault must retire through Commons: the published
+/// document or the edit `doc` names a control entry, or this Mac keeps Commons control state
+/// ([`crate::commons::bootstrap::retains_control`]). A roster can name a machine only there:
+/// without a published entry nothing observes, serves or extends a control journal, and a
+/// grant needs the host in the published entry's audience. Every caller asks it only of a
+/// bound vault (`commons_bound`): an unbound one cannot carry a control entry and removes
+/// vault-only. The marker governs the root key's lifetime (rotation keeps it, demotion
+/// refuses, a descriptor must carry it); alone it does not refuse a removal.
+fn holds_control(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<bool> {
+    Ok(admin_keys::has_control(&admin.published_doc)
+        || admin_keys::has_control(doc)
+        || crate::commons::bootstrap::retains_control(paths)?)
 }
 
 fn retire_cached(
     paths: &Paths,
     admin: &Admin,
+    doc: &Document,
     recipients: &[Recipient],
 ) -> crate::Result<Option<Retirement>> {
     if let Some(descriptor) = admin_keys::control_descriptor(&admin.published_doc)? {
@@ -379,12 +420,11 @@ fn retire_cached(
         }
         let mut journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())?;
         admin.retire_commons_members(&bootstrap, &mut journal, recipients)
+    } else if admin.commons_bound && holds_control(paths, admin, doc)? {
+        Err(Error::new(
+            "bound Commons custody is missing its descriptor; refusing partial revocation (the vault names a Commons control entry, or this Mac keeps Commons control state)",
+        ))
     } else {
-        if admin.commons_bound {
-            return Err(Error::new(
-                "bound Commons custody is missing its descriptor; refusing partial revocation",
-            ));
-        }
         Ok(None)
     }
 }
@@ -399,13 +439,21 @@ fn retire_cached(
         project = "aterm_secrets::client::retirement::tests::retirement_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbRetirementPublication",
+        action = "UnfoundedEdit",
+        project = "aterm_secrets::client::retirement::tests::retirement_transition"
+    )
+)]
 pub(super) fn validate_removals(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<()> {
     let removed = let_go(&admin.published_doc, doc);
     if removed.is_empty() {
         return Ok(());
     }
     let Some(descriptor) = admin_keys::control_descriptor(&admin.published_doc)? else {
-        return if admin.commons_bound {
+        return if admin.commons_bound && holds_control(paths, admin, doc)? {
             Err(Error::new(
                 "cannot remove members while bound Commons custody is unavailable",
             ))

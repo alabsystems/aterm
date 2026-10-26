@@ -342,7 +342,8 @@ fn classic_light_is_reported_and_paced() {
     assert_eq!(glow.live_sparks(), 0);
 }
 
-/// On a light theme, Classic emits under-ink quads and source-over halo veils with a non-zero fingerprint.
+/// On a light theme, Classic emits under-ink quads, its landing ring's square as source-over ink and
+/// source-over halo veils, with a non-zero fingerprint, and no additive quad.
 #[test]
 fn classic_on_a_light_ground_reaches_the_host_as_ink_and_veils() {
     let g = geom();
@@ -363,7 +364,10 @@ fn classic_on_a_light_ground_reaches_the_host_as_ink_and_veils() {
         g,
         &mut out,
     );
-    assert!(out.is_empty(), "no additive quad on a light ground");
+    assert!(
+        !out.is_empty() && out.iter().all(|q| q.alpha > 0),
+        "no additive quad on a light ground: the landing ring is source-over ink"
+    );
     assert!(
         !glow.under_quads().is_empty() && glow.under_quads().iter().all(|q| q.alpha > 0),
         "the jump is visible as source-over ink under the letters"

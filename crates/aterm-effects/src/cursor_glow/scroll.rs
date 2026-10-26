@@ -218,15 +218,21 @@ impl CursorGlow {
             });
             self.bolts.retain_mut(|bolt| {
                 let mut any_above = false;
-                for (_, y) in &mut bolt.pts {
+                let pts = bolt.pts.as_mut_slice();
+                let mut pi = 0;
+                while pi < pts.len() {
+                    let y = &mut pts[pi].1;
                     *y -= dy;
                     any_above |= *y > top;
+                    pi += 1;
                 }
                 any_above
             });
         }
 
-        for fade in &mut self.fading {
+        let mut fi = 0;
+        while fi < self.fading.len() {
+            let fade = &mut self.fading[fi];
             fade.engine.translate_scroll_state(rows, cell_h);
             if let Some((row, _)) = &mut fade.anchor {
                 match row.checked_sub(rows) {
@@ -236,6 +242,7 @@ impl CursorGlow {
             }
             fade.engine.last = fade.anchor;
             fade.engine.last_ch = cell_h;
+            fi += 1;
         }
         if self.v2.engaged() {
             self.v2.translate_scroll(rows, cell_h);
@@ -346,12 +353,14 @@ impl CursorGlow {
             *r = to;
         }
         self.insert.translate_rows(|r| Some(map(r)));
-        for slot in &mut self.anchor_rows {
-            match slot {
-                Some(m) if m.row == to => *slot = None,
+        let mut ai = 0;
+        while ai < self.anchor_rows.len() {
+            match &mut self.anchor_rows[ai] {
+                Some(m) if m.row == to => self.anchor_rows[ai] = None,
                 Some(m) if m.row == from => m.row = to,
                 _ => {}
             }
+            ai += 1;
         }
     }
 
@@ -383,28 +392,36 @@ impl CursorGlow {
             self.fire_meteors
                 .retain_mut(|meteor| px.span(&mut meteor.y0, &mut meteor.y1));
             self.bolts.retain_mut(|bolt| {
-                let Some(&(_, y0)) = bolt.pts.first() else {
+                let pts = bolt.pts.as_mut_slice();
+                if pts.is_empty() {
                     return true;
-                };
-                let first_in = px.inside(y0);
-                for &(_, y) in &bolt.pts[1..] {
-                    if px.inside(y) != first_in {
+                }
+                let first_in = px.inside(pts[0].1);
+                let mut pi = 1;
+                while pi < pts.len() {
+                    if px.inside(pts[pi].1) != first_in {
                         return false;
                     }
+                    pi += 1;
                 }
                 if !first_in {
                     return true;
                 }
                 let mut keep = true;
-                for (_, y) in &mut bolt.pts {
+                let mut pi = 0;
+                while pi < pts.len() {
+                    let y = &mut pts[pi].1;
                     *y += px.dy;
                     keep &= px.inside(*y);
+                    pi += 1;
                 }
                 keep
             });
         }
 
-        for fade in &mut self.fading {
+        let mut fi = 0;
+        while fi < self.fading.len() {
+            let fade = &mut self.fading[fi];
             fade.engine
                 .translate_band_state(top, bottom, delta, cell_h, origin_y);
             if let Some((row, _)) = &mut fade.anchor {
@@ -416,6 +433,7 @@ impl CursorGlow {
             fade.engine.last = fade.anchor;
             fade.engine.last_ch = cell_h;
             fade.engine.last_origin_y = origin_y;
+            fi += 1;
         }
         if self.v2.engaged() {
             self.v2.translate_band(top, bottom, delta, cell_h, origin_y);

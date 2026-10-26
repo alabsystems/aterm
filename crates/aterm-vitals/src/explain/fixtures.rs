@@ -100,6 +100,10 @@ pub struct Proc {
     pub mc: u64,
     /// Its CPU over the last sweep's window, millicores (its figure, unless a build is starting).
     pub fast_mc: u64,
+    /// Its reaped children's CPU over the window, millicores: children no sweep saw (a build's
+    /// compilers), whose time the kernel adds to its reaped-children time at each reap. A child
+    /// the scene lists that is gone by a reading adds its final CPU there too.
+    pub child_mc: u64,
     /// Its footprint, bytes (16 MiB unless set).
     pub footprint: u64,
     /// When it is swept.
@@ -132,10 +136,17 @@ impl Proc {
             name: name.to_owned(),
             mc,
             fast_mc: mc,
+            child_mc: 0,
             footprint: 16 << 20,
             span: Span::Whole,
             ahead_ns: (0, 0),
         }
+    }
+
+    /// The same, reaping children no sweep saw at `child_mc` millicores.
+    #[must_use]
+    pub fn reaping(self, child_mc: u64) -> Self {
+        Self { child_mc, ..self }
     }
 
     /// The same, its coalition's counter `first_ns` ahead of its own time
@@ -228,6 +239,12 @@ const TICKS0: u64 = 1_000_000;
 /// A counter's value at the first tick, ns.
 const CPU0_NS: u64 = 1_000_000_000_000;
 
+/// Process `p`'s CPU at the first tick, ns (its reaped children's is half): one born inside the
+/// window starts from nothing.
+fn cpu0(p: &Proc) -> u64 {
+    if p.span == Span::Born { 0 } else { CPU0_NS }
+}
+
 impl Scene {
     /// The scene's three readings.
     #[must_use]
@@ -238,6 +255,23 @@ impl Scene {
             self.reading(w - self.sweep_ms, false),
             self.reading(w, true),
         ]
+    }
+
+    /// What gone process `c` leaves its reaper at the window's end, ns: its own CPU and its
+    /// reaped children's, its gone children's among them (`depth` guards a cycle).
+    fn final_ns(&self, c: &Proc, depth: usize) -> u64 {
+        let w = self.window_ms;
+        let gone: u64 = if depth < 64 {
+            self.procs
+                .iter()
+                .filter(|g| g.ppid == c.pid && g.pid != c.pid && g.span == Span::Gone)
+                .map(|g| self.final_ns(g, depth + 1))
+                .sum()
+        } else {
+            0
+        };
+        let cpu0 = cpu0(c);
+        cpu0 + c.mc * w * 1000 + cpu0 / 2 + c.child_mc * w * 1000 + gone
     }
 
     /// The same work held over `windows` windows.
@@ -277,6 +311,15 @@ impl Scene {
                 mc * (at_ms + self.sweep_ms) * 1000 - fast * self.sweep_ms * 1000
             }
         };
+        // One gone by this reading was reaped by its parent, whose reaped-children time holds
+        // its final CPU and its own reaped children's.
+        let reaped = |parent: &Proc| -> u64 {
+            self.procs
+                .iter()
+                .filter(|c| c.ppid == parent.pid && c.span == Span::Gone && !there(c.span))
+                .map(|c| self.final_ns(c, 0))
+                .sum()
+        };
         let busy = self.busy_mc * w / 1000;
         let cores = (0..self.cores)
             .map(|i| {
@@ -297,7 +340,8 @@ impl Scene {
                 pid: p.pid,
                 start: Some(u64::try_from(p.birth_ms).unwrap_or(0)),
                 ppid: p.ppid,
-                cpu_ns: Some(CPU0_NS + grown(p.mc, p.fast_mc)),
+                cpu_ns: Some(cpu0(p) + grown(p.mc, p.fast_mc)),
+                child_cpu_ns: Some(cpu0(p) / 2 + grown(p.child_mc, p.child_mc) + reaped(p)),
                 footprint: Some(p.footprint),
                 name: p.name.clone(),
                 uid: Some(p.uid),
@@ -444,12 +488,14 @@ fn identities_1032() -> Vec<LeadIdentity> {
     ]
 }
 
-/// A tab of one pane with key `key`, labelled `Tab <key>`, whose shell is `shell_pid`.
+/// A tab of one pane with key `key` and host id `key`, labelled `Tab <key>`, whose shell is
+/// `shell_pid`.
 #[must_use]
 pub fn tab(key: u64, shell_pid: u32) -> TabRoot {
     TabRoot {
         key,
         tab: key,
+        tab_id: Some(key),
         shell_pid,
         label: format!("Tab {key}"),
         program: String::new(),
@@ -751,7 +797,9 @@ pub fn lane_off_1032() -> Scene {
     }
 }
 
-/// The 10:32 moment with a build in tab 1 whose compilers exited between sweeps.
+/// The 10:32 moment with a build in tab 1 whose compilers exited between sweeps, reaped by no
+/// member: a build server that left for launchd before any sweep read it ran them, so aterm's
+/// coalition holds their 3 cores and no process the tab's ledger holds shows them.
 #[must_use]
 pub fn finished_1032() -> Scene {
     let mut scene = spotlight_1032();
@@ -761,6 +809,17 @@ pub fn finished_1032() -> Scene {
             c.mc += 3000;
             c.reaped = 40;
         }
+    }
+    scene
+}
+
+/// [`finished_1032`] with claude (pid 1210) the compilers' reaper: its reaped-children time holds
+/// their 3 cores, so the reap credit puts them in tab 1.
+#[must_use]
+pub fn claude_reaped_1032() -> Scene {
+    let mut scene = finished_1032();
+    for p in scene.procs.iter_mut().filter(|p| p.pid == 1210) {
+        p.child_mc = 3000;
     }
     scene
 }
@@ -883,6 +942,21 @@ pub fn exited_skewed_1510() -> Scene {
     scene
         .procs
         .push(Proc::new(1220, 1200, 501, 1342, USERSPACE_MS + 300_000, "git", 3).gone());
+    scene
+}
+
+/// [`idle_skewed_1510`] with a task of aterm's coalition that ran 3 mc and
+/// exited inside the window under no member (its parent had left for launchd
+/// before any sweep read it): its coalition's task counters show it and no
+/// member's reaped time does, so the work no member holds may be the tab's.
+#[must_use]
+pub fn exited_unseen_1510() -> Scene {
+    let mut scene = idle_skewed_1510();
+    scene.busy_mc += 3;
+    for c in scene.coalitions.iter_mut().filter(|c| c.id == 1342) {
+        c.mc += 3;
+        c.reaped = 1;
+    }
     scene
 }
 

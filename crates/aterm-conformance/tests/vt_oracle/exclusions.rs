@@ -118,38 +118,6 @@ pub const EXCLUSIONS: &[Exclusion] = &[
               no DECSTBM has come since (generator.rs `OriginSlot`).",
     },
     Exclusion {
-        case: "decrc_of_a_wrap_after_the_margins_moved",
-        triage: Triage::ByDesign {
-            diverges: |c| c.lr_margins,
-        },
-        want: text(&["abcX"], (0, 4)),
-        why: "a DECRC of a wrap DECSC saved on a right margin that has moved \
-              since: xterm's CursorRestore puts the wrap flag back wherever the \
-              column lands (cursor.c `screen->do_wrap = sc->wrap_flag`, after \
-              the CursorSet), so the next glyph wraps from mid-line, where the \
-              fold puts it (row 1). aterm puts a saved wrap back only at a line \
-              end, the row's last column or the right margin (aterm-core \
-              handler_state.rs `at_a_line_end`), as after a resize moved the \
-              edge, so a DECRC never leaves a wrap pending mid-line. The \
-              generator restores no slot the margins moved past (generator.rs \
-              `OriginSlot::margins_moved`).",
-    },
-    Exclusion {
-        case: "decrc_of_a_wrap_a_declrmm_reset_left_mid_line",
-        triage: Triage::ByDesign {
-            diverges: |c| c.lr_margins,
-        },
-        want: text(&["abcX"], (0, 4)),
-        why: "a DECSC of a wrap left pending mid-line, on a right margin a \
-              DECLRMM reset moved aside, then a DECRC: xterm and the fold put \
-              the wrap back with the column (cursor.c `screen->do_wrap = \
-              sc->wrap_flag`), so the next glyph wraps to row 1. aterm restores \
-              a saved wrap only at a line end (aterm-core handler_state.rs \
-              `at_a_line_end`), so X overwrites the d. The generator restores \
-              no slot saved once a DECLRMM reset may have left such a wrap \
-              (generator.rs `Track::wrap_off_a_line_end`).",
-    },
-    Exclusion {
         case: "stray_1049l_with_a_saved_slot",
         triage: Triage::ByDesign { diverges: |_| true },
         want: text(&["", "", "", "        X"], (3, 9)),

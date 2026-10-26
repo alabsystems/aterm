@@ -11,7 +11,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 const LEGACY_MAGIC: &str = "alab-vault-admin/1";
 const V2_MAGIC: &str = "alab-vault-admin/2";
-const MAGIC: &str = "alab-vault-admin/3";
+/// The admin locker format this build writes.
+pub(super) const MAGIC: &str = "alab-vault-admin/3";
 
 pub(super) fn admin_plaintext_with_admissions(
     seed: &[u8; 32],
@@ -46,6 +47,8 @@ pub(super) fn admin_plaintext_with_admissions(
 }
 
 pub(super) struct AdminText {
+    /// The format the locker was read in: [`MAGIC`] or an older one a publish rewrites.
+    pub(super) custody: &'static str,
     pub(super) seed: [u8; 32],
     pub(super) commons_seed: [u8; 32],
     pub(super) commons_bound: bool,
@@ -102,10 +105,12 @@ pub(super) fn parse_admin(plain: &SecretBytes) -> crate::Result<AdminText> {
         .split_once("\n\n")
         .ok_or_else(|| Error::new("admin locker: malformed"))?;
     let mut lines = header.lines();
-    let magic = lines.next().unwrap_or_default();
-    if !matches!(magic, LEGACY_MAGIC | V2_MAGIC | MAGIC) {
-        return Err(Error::new("admin locker: unsupported custody version"));
-    }
+    let magic = match lines.next().unwrap_or_default() {
+        LEGACY_MAGIC => LEGACY_MAGIC,
+        V2_MAGIC => V2_MAGIC,
+        MAGIC => MAGIC,
+        other => return Err(unsupported(other)),
+    };
     let signer = lines
         .next()
         .and_then(|line| line.strip_prefix("signer-seed: "))
@@ -122,6 +127,9 @@ pub(super) fn parse_admin(plain: &SecretBytes) -> crate::Result<AdminText> {
     };
     // A legacy locker cannot attest that no replica has ever pinned its key.
     // Missing historical evidence is not permission to rotate a Commons root.
+    // The marker governs the root key's lifetime (rotation keeps it, demotion
+    // refuses, a descriptor must carry it); it is not evidence that Commons
+    // control exists, and member removal follows retirement::holds_control.
     let commons_bound = if magic == LEGACY_MAGIC {
         true
     } else {
@@ -163,12 +171,29 @@ pub(super) fn parse_admin(plain: &SecretBytes) -> crate::Result<AdminText> {
     }
     admissions.validate(&doc, u64::MAX)?;
     Ok(AdminText {
+        custody: magic,
         seed: *seed,
         commons_seed: *commons_seed,
         commons_bound,
         doc,
         admissions,
     })
+}
+
+/// The refusal of a locker whose first line is `magic`: a later format names itself, so an
+/// approver an older build runs says what to update.
+fn unsupported(magic: &str) -> Error {
+    let number = |text: &str| {
+        text.strip_prefix("alab-vault-admin/")
+            .filter(|number| (1..=6).contains(&number.len()))
+            .and_then(|number| number.parse::<u32>().ok())
+    };
+    match (number(magic), number(MAGIC)) {
+        (Some(found), Some(written)) if found > written => Error::new(format!(
+            "admin locker: {magic} is newer than this aterm reads ({MAGIC} at most); run a newer aterm"
+        )),
+        _ => Error::new("admin locker: unsupported custody version"),
+    }
 }
 
 pub(super) fn has_control(doc: &Document) -> bool {
@@ -233,6 +258,58 @@ pub(super) fn validate_commons_transition(
         }
     }
     Ok(())
+}
+
+/// Test-only stand-ins for a vault an admin before Commons custody (version-1 lockers) wrote.
+#[cfg(test)]
+pub(super) mod legacy {
+    use super::{LEGACY_MAGIC, SecretBytes, Zeroizing, envelope};
+    use crate::{
+        age,
+        client::{self, Admin, Paths},
+        envelope::Unsigned,
+        transport,
+    };
+
+    fn legacy_plaintext(admin: &Admin) -> SecretBytes {
+        let seed = Zeroizing::new(crate::b64::encode_padded(&admin.seed));
+        let mut bytes = format!("{LEGACY_MAGIC}\nsigner-seed: {}\n\n", seed.as_str()).into_bytes();
+        bytes.extend_from_slice(admin.doc.render().as_slice());
+        SecretBytes::new(bytes)
+    }
+
+    /// Emulate an old admin's complete signed publication, including loss of the
+    /// independent Commons field. This is deliberately unavailable in production.
+    pub(in crate::client) fn publish_legacy(paths: &Paths, admin: &Admin) {
+        let bytes = client::seal(
+            &admin.config.name,
+            admin.seq() + 1,
+            &admin.seed,
+            &admin.commons_seed,
+            admin.commons_bound,
+            &admin.doc,
+            &admin.handoff,
+        )
+        .unwrap();
+        let parsed = envelope::parse(&bytes).unwrap();
+        let mut lockers = parsed.lockers.clone();
+        let recipients = client::recipients_of(&admin.doc.admins(), &admin.doc).unwrap();
+        lockers[0].armored =
+            age::armor(&age::encrypt(&recipients, legacy_plaintext(admin).as_slice()).unwrap());
+        let bytes = envelope::sign(
+            &Unsigned {
+                name: parsed.name.clone(),
+                seq: parsed.seq,
+                time: parsed.time,
+                handoff: parsed.handoff.clone(),
+                lockers,
+            },
+            &admin.seed,
+        )
+        .unwrap();
+        transport::publish(&admin.config.source, &bytes).unwrap();
+        client::sync(paths, None).unwrap();
+    }
 }
 
 #[cfg(test)]

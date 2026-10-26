@@ -12903,27 +12903,30 @@ fn a_row_named_under_its_own_handoff_backs_out_of_it() {
 /// THE PICKER OF THE `/login` ATERM TYPED, LEFT TO A PERSON (no method read), THE ROSTER NAMING
 /// THE LOGIN'S ROW ONLY AFTER: the accounts' news decides the picker again, as the box of a
 /// roster row's login, and it gets one fenced Esc, no method; the host is told the row's login
-/// ended once it is gone. CONTROL: with no row named, no key at all.
+/// ended once it is gone. Alike in both renderers' frames: the inline dialog under its `─` rule
+/// and the fullscreen renderer's bottom panel under its `▔` rule (measured on 2.1.310, which
+/// echoes no `❯ /login` above it), as it first opens with Claude Code's `/effort` hint in that
+/// rule and once the hint is gone. CONTROL: with no row named, no key at all.
 #[test]
 fn a_row_named_under_its_own_picker_backs_out_of_it() {
+    use aterm_phase::prompt::fixtures as f;
     let mut login = rows(&[
         "⏺ Carrying on.",
         "  ⎿  Not logged in · Please run /login",
         "",
     ]);
     login.extend(composer("  ? for shortcuts"));
-    let picker = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER);
-    let left =
-        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED);
-    let run = |tag: &str, label: Option<&str>| {
+    let run = |tag: &str, frame: (&str, &str), label: Option<&str>| {
+        let picker = f::screen(frame.0);
+        let left = f::screen(frame.1);
         let (dir, path) = journal_file(tag);
         let mut m = fenced(vec![
             busy_screen(),
             login.clone(),
             login.clone(),
             login.clone(),
-            picker.clone(),
-            left.clone(),
+            picker,
+            left,
         ]);
         m.vanish_after = Some(3);
         m.cursor_on_caret = true;
@@ -12953,21 +12956,43 @@ fn a_row_named_under_its_own_picker_backs_out_of_it() {
             .collect();
         (keys, host, log)
     };
-    let (keys, host, log) = run("te-picker-named-late", Some("m7-a"));
-    assert_eq!(keys.len(), 1, "one key: {log}");
-    assert!(
-        keys[0].starts_with("key if-human=7 ") && keys[0].ends_with(" esc"),
-        "the picker's own Esc, fenced on the person: {log}"
-    );
-    assert!(
-        !host.said("account:login-ended").is_empty(),
-        "the host is told the row's login ended: {log}"
-    );
-    let (keys, _, log) = run("te-picker-unnamed-late", None);
-    assert!(
-        keys.is_empty(),
-        "no key at a picker left to a person: {log}"
-    );
+    for (frame, screens) in [
+        ("inline", (f::LOGIN_PICKER, f::LOGIN_INTERRUPTED)),
+        (
+            "fullscreen-first-open",
+            (
+                f::LOGIN_PICKER_FULLSCREEN_HINT_AT_EXPIRED_2_1_310,
+                f::LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310,
+            ),
+        ),
+        (
+            "fullscreen",
+            (
+                f::LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310,
+                f::LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310,
+            ),
+        ),
+    ] {
+        let (keys, host, log) = run(
+            &format!("te-picker-named-late-{frame}"),
+            screens,
+            Some("m7-a"),
+        );
+        assert_eq!(keys.len(), 1, "{frame}: one key: {log}");
+        assert!(
+            keys[0].starts_with("key if-human=7 ") && keys[0].ends_with(" esc"),
+            "{frame}: the picker's own Esc, fenced on the person: {log}"
+        );
+        assert!(
+            !host.said("account:login-ended").is_empty(),
+            "{frame}: the host is told the row's login ended: {log}"
+        );
+        let (keys, _, log) = run(&format!("te-picker-unnamed-late-{frame}"), screens, None);
+        assert!(
+            keys.is_empty(),
+            "{frame}: no key at a picker left to a person: {log}"
+        );
+    }
 }
 
 /// A LOST LOGIN NO ROSTER ROW NAMES YET, BEFORE ANY `/login`: the host's discovery is asked once

@@ -7,12 +7,15 @@
 //! tells (`rules::wake_opens`, which `OpenWake` drives in its own evidence window), the wake's
 //! episode told per episode (`FactsState`) and the hold a pending wake declares; in its hold-rule
 //! runs, `age` and `esc` to the K clock (`DueClock`), whose `sample` its `Sample` and `SampleLast`
-//! drive in their own evidence windows.
+//! drive in their own evidence windows; and at each break, the host's own step (`UpgradeTypes`,
+//! the upgrade's notice) to `door::host_step_may_go` of the decider's due line, which
+//! `UpgradeTypes` drives in its own evidence window.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use aterm_agent::harness::disk::Level;
 use aterm_agent::supervise::facts::{EpisodeKey, FactKind, FactsReading, FactsState, SeedOutcome};
+use aterm_agent::supervise::occupancy::door::host_step_may_go;
 use aterm_agent::supervise::occupancy::due::DueClock;
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_agent::supervise::occupancy::reading::LOOK_EVERY_MS;
@@ -570,6 +573,12 @@ fn mirror(
         "Point" => r.pointed = false,
         "UpgradeDue" => r.upgrade_due = true,
         "UpgradeTypes" => {
+            // The loop asks of the decider's due line whether the host's step may go before it
+            // (read before the window, which enters `host_step_may_go` alone).
+            let due = (!run.stuck && decided(m, st, r, run) == Said::Due).then_some(rule);
+            if !ev.step(action, || host_step_may_go(due)) {
+                return false;
+            }
             r.upgrade_due = false;
             r.host_line = true;
             r.clock.step(HoldEvent::HarnessLine);
@@ -742,6 +751,16 @@ impl Walked {
         if let Some(said) = &said {
             ok &= agrees(m, st, said, run);
             self.said.insert(format!("{said:?}"));
+            // §2.1's ranks 2 and 3: the host's own step waits for a wake's line the decider says
+            // due (the model's `UpgradeTypes` waits for `due = 2`), and goes before any other
+            // line. A wake the decider holds lets it go, a step the model's `due = 2` does not
+            // take: the loop orders a due line alone, so that state is not judged here.
+            let real_due = (!run.stuck && *said == Said::Due).then_some(run.rule);
+            let wake_open = st["due"] == 2
+                || (run.rule == RuleId::Wake && !run.stuck && m.action_enabled("OpenWake", st));
+            if real_due == Some(RuleId::Wake) || !wake_open {
+                ok &= host_step_may_go(real_due) == !wake_open;
+            }
         }
         if !ok {
             assert!(
@@ -969,7 +988,7 @@ type Shows = fn(&State) -> bool;
 
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 13] = [
+    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 14] = [
         (
             Fault::DedupeByRule,
             Some(RuleId::WaitNudge),
@@ -1042,6 +1061,14 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             Some(RuleId::Wake),
             |st| st["told"] == 0 && st["due"] > 0,
             Some(|st| st["intent"] == 0),
+        ),
+        // The host's step before a due wake's line (§2.1's ranks 2 and 3 turned): the break the
+        // decider says the wake due at, its episode open or opening there.
+        (
+            Fault::HostBeforeWake,
+            Some(RuleId::Wake),
+            |st| st["door"] == 1 && st["cond"] == 1 && (st["due"] == 2 || st["due"] == 0),
+            Some(|st| st["due"] == 2),
         ),
     ];
     let mut runs = Vec::new();
@@ -1133,7 +1160,8 @@ fn tier1_the_anchors_name_what_the_code_implements() {
             "Sample",
             "SampleLast",
             "Skip",
-            "Type"
+            "Type",
+            "UpgradeTypes"
         ]),
         "{anchored:?}"
     );
@@ -1191,6 +1219,34 @@ fn tier1_open_wake_enters_the_books_head_in_its_own_window() {
     );
     assert!(!audit.unwitnessed.contains(&"OpenWake"), "{audit:?}");
     assert!(!audit.blind_steps.contains(&"OpenWake"), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
+    assert!(audit.witnessed_steps > 0, "{audit:?}");
+}
+
+/// `UpgradeTypes` ENTERS `host_step_may_go` IN ITS OWN WINDOW: each step the host's own line takes
+/// in the hold rules' runs asks the predicate of the break's due line (the decider's, read before
+/// the window), and no other anchored function is entered there.
+#[test]
+fn tier1_upgrade_types_asks_the_host_steps_rank_in_its_own_window() {
+    let mut ev = Ev(Some(StepEvidence::new("OccupancyDoor")));
+    for rule in RuleId::ALL.into_iter().filter(|r| *r != RuleId::Wake) {
+        let run = Run {
+            rule,
+            variant: 0,
+            fault: None,
+            key: 0,
+            stuck: false,
+        };
+        walk(&under(1, 0), true, run, &mut ev);
+    }
+    let audit = ev.0.expect("the audited walk's evidence").audit();
+    assert!(
+        audit.actions.contains("UpgradeTypes") && !audit.undriven.contains(&"UpgradeTypes"),
+        "{audit:?}"
+    );
+    assert!(!audit.unwitnessed.contains(&"UpgradeTypes"), "{audit:?}");
+    assert!(!audit.blind_steps.contains(&"UpgradeTypes"), "{audit:?}");
     assert!(audit.stray.is_empty(), "{audit:?}");
     assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
     assert!(audit.witnessed_steps > 0, "{audit:?}");

@@ -1022,9 +1022,11 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail, json: bool) -> bool {
 }
 
 /// The doctor's rows over the real environment (home, PATH, the clock, the `[packages]` config).
+/// The Developer Tools read runs on its own thread beside the others, so its `log show` adds
+/// nothing past the slowest of them.
 #[must_use]
 pub fn rows(layout: &Layout) -> Vec<ItemReport> {
-    rows_reading(layout, crate::devtools::facts())
+    std::thread::scope(|scope| rows_reading(layout, Some(scope.spawn(crate::devtools::facts))))
 }
 
 /// [`rows`] without the Developer Tools read ([`crate::devtools::facts`]: a TCC.db read and a `log show`, which can take seconds).
@@ -1033,12 +1035,16 @@ pub fn packages_rows(layout: &Layout) -> Vec<ItemReport> {
     rows_reading(layout, None)
 }
 
-fn rows_reading(layout: &Layout, devtools: Option<crate::devtools::Facts>) -> Vec<ItemReport> {
+/// The rows, the `devtools` read joined last, once every other probe has read.
+fn rows_reading(
+    layout: &Layout,
+    devtools: Option<std::thread::ScopedJoinHandle<'_, Option<crate::devtools::Facts>>>,
+) -> Vec<ItemReport> {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
     let cfg = crate::config::cached();
-    let probes = Probes {
+    let mut probes = Probes {
         workspace: std::env::current_dir()
             .ok()
             .and_then(|cwd| probe_workspace_policy(layout, &cwd)),
@@ -1053,7 +1059,6 @@ fn rows_reading(layout: &Layout, devtools: Option<crate::devtools::Facts>) -> Ve
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
-        devtools,
         rosetta: crate::machine::ROSETTA_APPLIES.then(|| {
             (
                 crate::machine::rosetta_posture(&crate::machine::SystemRosetta),
@@ -1062,7 +1067,12 @@ fn rows_reading(layout: &Layout, devtools: Option<crate::devtools::Facts>) -> Ve
         }),
         trust_chain: probe_trust_chain(layout),
         login_rc: home.as_deref().and_then(crate::hooks::account_login_rc),
+        devtools: None,
     };
+    probes.devtools = devtools.and_then(|read| {
+        read.join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    });
     report_with(
         layout,
         home.as_deref(),

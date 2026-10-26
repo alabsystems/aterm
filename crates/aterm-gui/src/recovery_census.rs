@@ -174,9 +174,6 @@ fn record_into(
                 return;
             };
             let mut row = census_row(&dir, &Me::current(), launch, now_secs(), &System);
-            if let Some(node) = node {
-                node.note_prev_end(row.prev.class);
-            }
             row.keeper = Some(keeper);
             row.restores = restores;
             let path = ledger_path(&dir);
@@ -192,6 +189,11 @@ fn record_into(
                     "recovery census: could not append to {}: {e}",
                     path.display()
                 ),
+            }
+            // After the row: the next launch judges this one from the row, so a node log that
+            // says the run before ended a given way means the ledger already holds this run.
+            if let Some(node) = node {
+                node.note_prev_end(row.prev.class);
             }
         },
     );
@@ -689,11 +691,8 @@ mod tests {
             amended.starts_with("2 amend n start prev_end=none by=aterm src=aterm conf=exact "),
             "{amended}"
         );
-        let rows = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the census's row",
-            || Some(read_rows(&ledger_path(s.0.path()))).filter(|rows| rows.len() == 1),
-        );
+        let rows = read_rows(&ledger_path(s.0.path()));
+        assert_eq!(rows.len(), 1, "the row lands before the amend that says it");
         assert_eq!(rows[0].keeper, Some(KeeperAtLaunch::On));
     }
 

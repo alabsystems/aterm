@@ -1,0 +1,1325 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The D3D11 arm's renderer side (Windows, docs/AUDIT-third-party-2026-10-15.md
+//! GW.5), the twin of `gl_arm.rs`: the arm's resident state ([`D3dArmLive`]:
+//! device, pipelines by table row, the uniform block, instance streams, glyph
+//! and decoration atlases) and the encode tail [`encode_tail`] that
+//! `encode_frame` forks into once the shared instance building is done.
+//!
+//! Staged: an armed renderer (`GpuRenderer::arm_d3d11`, only a test arms one
+//! until the Windows flip) draws every frame here: its readbacks, effect
+//! layers and the tray card included, and its headless presents with their
+//! taps (`d3d11_present.rs`). A window still attaches on wgpu-dx12, the
+//! oracle every armed frame is diffed against, and disarms the renderer. A
+//! frame that fails on D3D11 falls through to the wgpu tail by name.
+//!
+//! The immediate context orders a buffer or texture write after every draw
+//! already issued that reads the object (a `WRITE_DISCARD` map renames the
+//! buffer; `UpdateSubresource` copies or waits), so the arm needs none of the
+//! Metal arm's frame-slot rings for correctness. The fx palette keeps a ring
+//! of three textures all the same: a rewrite of a texture a draw in flight
+//! samples makes the driver copy or wait.
+
+use super::*;
+use crate::d3d11::device::D3dDevice;
+use crate::d3d11::pipelines::D3dPipeline;
+use crate::d3d11::resources::{D3dBuffer, D3dSampler, D3dTexture};
+use crate::device_layer::{
+    DeviceHandle, FrameCopyTexture, FrameEncoder, SamplerKind, SubmittedFrame, TexUsage,
+    TexelFormat,
+};
+
+/// A named D3D11-arm degrade note, printed once per message per process.
+pub(crate) fn d3d11_arm_note(what: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    if seen
+        .lock()
+        .expect("the note set is never poisoned (no panics under the lock)")
+        .insert(what.to_owned())
+    {
+        crate::stderr_line!("aterm-gpu (d3d11 arm): {what}");
+    }
+}
+
+/// The armed frame's offscreen on the D3D11 arm.
+#[derive(Debug)]
+pub(crate) struct D3dOffscreen {
+    pub(crate) tex: D3dTexture,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+}
+
+/// One instance stream: a buffer grown geometrically, rewritten from 0.
+struct D3dStream {
+    buf: D3dBuffer,
+    cap: usize,
+}
+
+/// One resident atlas texture with the structural key and shelf write state
+/// it was uploaded under (the Metal arm's `ArmAtlas` law: re-mint on a new
+/// key, upload only the appended row band on an advanced `write_gen`).
+pub(crate) struct D3dArmAtlas {
+    tex: D3dTexture,
+    key: (u32, u32, u64),
+    write_gen: u64,
+    uploaded_py: u32,
+}
+
+/// The D3D11 arm's resident state, minted lazily at the first armed frame (or at
+/// a window's attach, on the window system's display).
+pub(crate) struct D3dArmLive {
+    pub(crate) dev: D3dDevice,
+    /// Pipelines by table row, built on first use.
+    pipelines: [Option<D3dPipeline>; pipeline_table::PIPELINE_COUNT],
+    /// The NEAREST clamp sampler every frame atlas binds with.
+    nearest: D3dSampler,
+    /// The LINEAR clamp sampler the post passes (bloom, shimmer, card) bind.
+    linear: D3dSampler,
+    /// The cell `Uniforms` block and the `(w, h, text_blend)` it holds.
+    uniform: D3dBuffer,
+    uniform_key: Option<(u32, u32, u32)>,
+    streams: [Option<D3dStream>; STREAM_COUNT],
+    /// Glyph (mono, colour) and decoration coverage. Sprite textures live with
+    /// their source (`SpriteTex::d3d11_atlas`).
+    atlases: [Option<D3dArmAtlas>; DRAW_ATLAS_COUNT],
+    /// The fx atlases (`fx_gpu::FxAtlasKind` order), synced from the
+    /// renderer's append-only `FxAtlas`.
+    fx_tex: [Option<fx_gpu::FxArmTex>; 2],
+    /// The fx palette ring: one RGBA8 texture (1024 entries a row) per slot,
+    /// written in turn. The driver orders a write after the draws that read
+    /// the old texels, but a write into a texture an in-flight draw samples
+    /// makes it copy or wait; a ring of three never writes the texture the
+    /// last two frames bound.
+    fx_palettes: [Option<D3dTexture>; fx_gpu::FX_PALETTE_RING],
+    fx_palette_next: usize,
+    /// The bloom's item list (`aterm_render::bloom::BloomItems`) as the
+    /// vertex stage reads it: an RGBA8 texture 1024 words a row, the GL
+    /// arm's `glow_items`.
+    pub(crate) glow_items: Option<D3dTexture>,
+    /// The present's resident uniforms and glow streams (`d3d11_present.rs`),
+    /// minted at the first present.
+    pub(crate) present: Option<d3d11_present::D3dPresentBufs>,
+    /// The present's tray scrim fill, minted at the first scrim.
+    pub(crate) scrim: Option<d3d11_present::D3dScrimFill>,
+    /// The negative control's seam: flip one byte of the next frame's first
+    /// staged stream.
+    #[cfg(test)]
+    pub(crate) corrupt_next: bool,
+}
+
+impl D3dArmLive {
+    /// The frame's fixed resources on `dev`.
+    pub(crate) fn on(dev: D3dDevice) -> Result<Self, String> {
+        // Minted through the device layer, as the Metal arm mints.
+        let nearest = DeviceHandle::D3d11(&dev)
+            .try_create_sampler("aterm-gpu d3d11 nearest", SamplerKind::NearestClamp)?
+            .into_d3d11();
+        let linear = dev.sampler(SamplerKind::LinearClamp)?;
+        let uniform = dev.buffer(
+            crate::d3d11::resources::D3dBufferRole::Uniform,
+            std::mem::size_of::<Uniforms>(),
+        )?;
+        Ok(Self {
+            dev,
+            pipelines: std::array::from_fn(|_| None),
+            nearest,
+            linear,
+            uniform,
+            uniform_key: None,
+            streams: std::array::from_fn(|_| None),
+            atlases: std::array::from_fn(|_| None),
+            fx_tex: std::array::from_fn(|_| None),
+            fx_palettes: std::array::from_fn(|_| None),
+            fx_palette_next: 0,
+            glow_items: None,
+            present: None,
+            scrim: None,
+            #[cfg(test)]
+            corrupt_next: false,
+        })
+    }
+
+    /// Bring both fx atlases up to date with `atlas` (re-minted on a new
+    /// generation or another device, else the log's tail appended in place)
+    /// when the frame draws fx or prefetches. The texel bytes uploaded.
+    fn sync_fx(&mut self, atlas: &fx_gpu::FxAtlas, drawing: bool) -> Result<u64, String> {
+        let mut bytes = 0;
+        for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
+            let side = atlas.side(kind);
+            let slot = &mut self.fx_tex[kind as usize];
+            if !fx_gpu::fx_tex_due(slot, side, drawing) {
+                continue;
+            }
+            let dev = &self.dev;
+            bytes += fx_gpu::sync_fx_tex(
+                DeviceHandle::D3d11(dev),
+                slot,
+                side,
+                |t| t.tex.d3d11().on(dev),
+                || {},
+            )?
+            .bytes;
+        }
+        Ok(bytes)
+    }
+
+    /// Drop the fx textures (the renderer's residency test seam).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn drop_fx_residency(&mut self) {
+        self.fx_tex = [None, None];
+        self.fx_palettes = std::array::from_fn(|_| None);
+    }
+
+    /// Write the frame's palette into the ring's next texture. The slot
+    /// written.
+    fn upload_fx_palette(&mut self, words: &[u32]) -> Result<usize, String> {
+        let slot = self.fx_palette_next;
+        self.fx_palette_next = (slot + 1) % fx_gpu::FX_PALETTE_RING;
+        write_fx_palette(&self.dev, &mut self.fx_palettes[slot], words)?;
+        Ok(slot)
+    }
+
+    /// The pipeline for `row`, built on first use.
+    pub(crate) fn ensure_pipeline(&mut self, row: Pipeline) -> Result<(), String> {
+        if self.pipelines[row as usize].is_none() {
+            self.pipelines[row as usize] = Some(self.dev.pipeline(row.spec())?);
+        }
+        Ok(())
+    }
+
+    /// The pipeline for `row`, when built.
+    #[inline]
+    pub(crate) fn pipeline(&self, row: Pipeline) -> Option<&D3dPipeline> {
+        self.pipelines[row as usize].as_ref()
+    }
+
+    /// The NEAREST clamp sampler.
+    #[inline]
+    pub(crate) const fn nearest(&self) -> &D3dSampler {
+        &self.nearest
+    }
+
+    /// The LINEAR clamp sampler.
+    #[inline]
+    pub(crate) const fn linear(&self) -> &D3dSampler {
+        &self.linear
+    }
+
+    /// Rewrite the uniform block when `(w, h, text_blend)` moved.
+    fn ensure_uniform(&mut self, w: u32, h: u32, text_blend: u32) -> Result<(), String> {
+        if self.uniform_key == Some((w, h, text_blend)) {
+            return Ok(());
+        }
+        self.dev.write_buffer(
+            &self.uniform,
+            aterm_bits::bytes_of(&Uniforms {
+                screen: [w as f32, h as f32],
+                text_blend: text_blend as f32,
+                _pad: 0.0,
+            }),
+        )?;
+        self.uniform_key = Some((w, h, text_blend));
+        Ok(())
+    }
+
+    /// Stage one stream's bytes; `Ok(false)` for an empty stream (no draw).
+    fn upload_stream(&mut self, id: StreamId, bytes: &[u8]) -> Result<bool, String> {
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        let slot = &mut self.streams[id as usize];
+        if slot.as_ref().is_none_or(|s| s.cap < bytes.len()) {
+            let cap = bytes.len().next_power_of_two().max(256);
+            *slot = Some(D3dStream {
+                buf: self
+                    .dev
+                    .buffer(crate::d3d11::resources::D3dBufferRole::Instance, cap)?,
+                cap,
+            });
+        }
+        let stream = slot.as_ref().expect("sized above");
+        self.dev.write_buffer(&stream.buf, bytes)?;
+        Ok(true)
+    }
+
+    /// Ensure the resident texture for `atlas` holds `bytes` (`occupied rows
+    /// x row_bytes`, tightly packed) under `key = (width, tex_h, salt)` and
+    /// shelf write state `(write_gen, cur_py)`.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_atlas(
+        dev: &D3dDevice,
+        slot: &mut Option<D3dArmAtlas>,
+        atlas: DrawAtlas,
+        key: (u32, u32, u64),
+        write_gen: u64,
+        cur_py: u32,
+        format: TexelFormat,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let (tw, th, _) = key;
+        let bpp: u32 = match format {
+            TexelFormat::R8Unorm => 1,
+            _ => 4,
+        };
+        // In usize: a 16384-square RGBA atlas (D3D11's ceiling) is 1 GiB.
+        let row_bytes = tw as usize * bpp as usize;
+        let full = row_bytes.saturating_mul(th as usize);
+        if bytes.len() > full || (row_bytes > 0 && !bytes.len().is_multiple_of(row_bytes)) {
+            return Err(format!(
+                "d3d11 arm: {atlas:?} atlas bytes ({}) invalid for {tw}x{th}x{bpp}",
+                bytes.len()
+            ));
+        }
+        let occupied = bytes.len().checked_div(row_bytes).unwrap_or(0) as u32;
+        if let Some(a) = slot.as_mut()
+            && a.key == key
+            && a.tex.on(dev)
+        {
+            if a.write_gen == write_gen {
+                return Ok(());
+            }
+            let y0 = a.uploaded_py.min(occupied);
+            let rows = occupied.saturating_sub(y0);
+            if rows > 0 {
+                let start = y0 as usize * row_bytes;
+                dev.upload_rows(&a.tex, y0, rows, &bytes[start..], row_bytes as u32, tw)?;
+            }
+            a.write_gen = write_gen;
+            a.uploaded_py = cur_py;
+            return Ok(());
+        }
+        let tex = dev.texture_2d(format, tw, th.max(1), None)?;
+        dev.upload_rows(&tex, 0, occupied, bytes, row_bytes as u32, tw)?;
+        *slot = Some(D3dArmAtlas {
+            tex,
+            key,
+            write_gen,
+            uploaded_py: cur_py,
+        });
+        Ok(())
+    }
+}
+
+/// The offscreen storage: wgpu-dx12's native plan, `Rgba8Unorm` with its sRGB
+/// alias (one `R8G8B8A8_TYPELESS` texture with both view pairs). Every
+/// feature-level 11_0 device has it, so there is no downlevel plan.
+#[inline]
+pub(crate) const fn offscreen_format() -> (TexelFormat, Option<TexelFormat>) {
+    (TexelFormat::Rgba8Unorm, Some(TexelFormat::Rgba8UnormSrgb))
+}
+
+/// Write `words` into `tex` (`FX_PALETTE_ROW` entries a row, entry `j` at
+/// `(j % row, j / row)`), re-minted at a power-of-two row count when it is
+/// absent, too short or on another device.
+pub(crate) fn write_fx_palette(
+    dev: &D3dDevice,
+    tex: &mut Option<D3dTexture>,
+    words: &[u32],
+) -> Result<(), String> {
+    let row = fx_gpu::FX_PALETTE_ROW;
+    let rows = u32::try_from(words.len().div_ceil(row as usize).max(1))
+        .map_err(|_| "d3d11 arm: the fx palette outgrows a texture".to_owned())?;
+    if tex.as_ref().is_none_or(|t| t.height < rows || !t.on(dev)) {
+        *tex =
+            Some(dev.texture_2d(TexelFormat::Rgba8Unorm, row, rows.next_power_of_two(), None)?);
+    }
+    let tex = tex.as_ref().expect("minted above");
+    let bytes: &[u8] = aterm_bits::cast_slice(words);
+    let full = (words.len() / row as usize) as u32;
+    dev.upload_rows(tex, 0, full, bytes, row * 4, row)?;
+    let rem = (words.len() % row as usize) as u32;
+    let tail = &bytes[(full * row * 4) as usize..];
+    dev.upload_region(tex, 0, full, rem, 1, tail, rem * 4)
+}
+
+/// What the shared part of `encode_frame` hands the D3D11 tail.
+pub(crate) struct D3dTailIn<'a> {
+    pub(crate) inst: &'a Instances,
+    pub(crate) mono: &'a ResidentAtlas,
+    pub(crate) color: &'a ResidentAtlas,
+    pub(crate) atlas_epoch: u64,
+    pub(crate) deco: Option<&'a DecoAtlas>,
+    pub(crate) scope: &'a RepaintScope<'a>,
+    pub(crate) dirty_band: Option<(usize, usize)>,
+    pub(crate) grid_top: usize,
+    pub(crate) ch: usize,
+    pub(crate) rows: usize,
+    pub(crate) dims: (u32, u32),
+    pub(crate) clear: crate::device_layer::ClearColor4,
+    pub(crate) text_blend: u32,
+    pub(crate) cursor_opaque: bool,
+    /// The pass-economy ablation (`FramePlanCtx::ablation`).
+    pub(crate) ablation: crate::renderer::UnormAblation,
+    /// Whether the Under fx layers draw opaque (`FramePlanCtx::under_opaque`).
+    pub(crate) under_opaque: bool,
+    /// The fx engine: its atlas and this frame's palette.
+    pub(crate) fx: &'a fx_gpu::FxGpu,
+}
+
+/// What the tail drew: the pass count, pass 0's load, the scissor and the
+/// CPU time staging the instance streams.
+pub(crate) struct D3dTailOut {
+    pub(crate) passes: usize,
+    pub(crate) stage_ns: u64,
+    /// What the plan held on the Unorm view, under the ablation it took.
+    pub(crate) unorm: crate::renderer::PlanUnorm,
+    pub(crate) load0: crate::device_layer::FrameLoad,
+    pub(crate) scissor: Option<(u32, u32, u32, u32)>,
+    /// The fx atlas texel bytes uploaded this frame.
+    pub(crate) fx_atlas_bytes: u64,
+    /// Whether the fx streams were staged (the residency and the palette
+    /// went up; otherwise the frame's fx failed closed).
+    pub(crate) fx_staged: bool,
+}
+
+/// The D3D11 encode tail: stage the instance streams, build the plan, resolve
+/// it through a [`D3dFrameRig`] over the arm's residency and run the shared
+/// `run_frame_plan` on the D3D11 encoder. `plan` is the renderer's plan
+/// buffer, rebuilt here. `Err` names why the frame could not draw on D3D11;
+/// the caller falls through to the wgpu tail.
+pub(crate) fn encode_tail(
+    live: &mut D3dArmLive,
+    win: &mut WindowGpu,
+    plan: &mut Vec<DrawItem>,
+    t: D3dTailIn<'_>,
+) -> Result<D3dTailOut, String> {
+    let (w, h) = t.dims;
+    // 1. Stage the streams: `Some` count iff the stream uploaded. The fx
+    //    residency first: without both atlases and the palette no fx stream
+    //    is staged (fail closed, by name).
+    let stage_started = aterm_time::Instant::now();
+    let drawing = t.inst.fx_instances() > 0;
+    let (fx_atlas_bytes, fx_palette) = match live.sync_fx(&t.fx.atlas, drawing).and_then(|b| {
+        Ok((
+            b,
+            if drawing {
+                Some(live.upload_fx_palette(&t.fx.palette)?)
+            } else {
+                None
+            },
+        ))
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            d3d11_arm_note(&format!("fx residency: {e}; fx draws nothing"));
+            (0, None)
+        }
+    };
+    let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
+    for id in StreamId::ALL {
+        if id.is_fx() && fx_palette.is_none() {
+            continue;
+        }
+        let (bytes, count) = t.inst.stream_bytes(id);
+        // The negative control: byte 8 of the first staged stream (a colour
+        // or geometry byte of its first instance in every layout) flipped.
+        #[cfg(test)]
+        let flipped;
+        #[cfg(test)]
+        let bytes = if live.corrupt_next && bytes.len() > 8 {
+            live.corrupt_next = false;
+            flipped = {
+                let mut v = bytes.to_vec();
+                v[8] ^= 0x5a;
+                v
+            };
+            &flipped[..]
+        } else {
+            bytes
+        };
+        if live.upload_stream(id, bytes)? {
+            counts[id as usize] = Some(count);
+        }
+    }
+    let stage_ns = u64::try_from(stage_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // 2. The plan. The image plane's CPU-side texels are retained at build
+    //    time while armed (`ImagePlane::d3d11_texels`); a plane built before
+    //    arming withholds its draws by name rather than draw stale texels.
+    let image_plane = win
+        .image_plane
+        .as_ref()
+        .is_some_and(|p| p.d3d11_texels.is_some());
+    if win.image_plane.is_some() && !image_plane {
+        d3d11_arm_note(
+            "armed frame: an image plane without resident texels; image draws withheld \
+             (built before arming?)",
+        );
+    }
+    let unorm = build_frame_plan(
+        plan,
+        &counts,
+        FramePlanCtx {
+            has_image_plane: image_plane,
+            has_deco: t.deco.is_some(),
+            has_wallpaper: win.wallpaper_tex.is_some(),
+            cursor_opaque: t.cursor_opaque,
+            ablation: t.ablation,
+            under_opaque: t.under_opaque,
+        },
+    );
+    // 3. The offscreen, reused at the same dims.
+    let recreate = win
+        .d3d11_offscreen
+        .as_ref()
+        .is_none_or(|o| o.w != w || o.h != h || !o.tex.on(&live.dev));
+    if recreate {
+        let (format, alias) = offscreen_format();
+        let tex = live.dev.texture_2d(format, w, h, alias)?;
+        win.d3d11_offscreen = Some(D3dOffscreen { tex, w, h });
+    }
+    // 4. Load and scissor, shared with the other arms.
+    let (load0, scissor) = frame_load_and_scissor(
+        t.scope,
+        recreate,
+        t.dirty_band,
+        t.grid_top,
+        t.ch,
+        t.rows,
+        (w, h),
+        t.clear,
+    );
+    note_offscreen_written(
+        win,
+        scissor.map(|(sx, sy, sw, sh)| [sx, sy, sx + sw, sy + sh]),
+        (w, h),
+    );
+    // 5. Residency: the uniform block, a program per drawn row, the atlases.
+    live.ensure_uniform(w, h, t.text_blend)?;
+    let mut uniform_binding: Option<u32> = None;
+    for item in plan.iter() {
+        let row = item.pipe.row();
+        let vu = row
+            .spec()
+            .binds
+            .vertex_uniform
+            .unwrap_or_else(|| panic!("frame row {row:?} declares no vertex uniform"));
+        match uniform_binding {
+            None => uniform_binding = Some(vu),
+            Some(prev) => assert_eq!(prev, vu, "one uniform binding per frame; {row:?}"),
+        }
+        live.ensure_pipeline(row)?;
+    }
+    // The sprites' textures on this device, held for the frame (a sprite's
+    // upload is per device; see `SpriteTex::d3d11_atlas`).
+    let mut sprites: [Option<Arc<D3dTexture>>; DRAW_ATLAS_COUNT] = std::array::from_fn(|_| None);
+    for item in plan.iter() {
+        let Some(a) = item.atlas else { continue };
+        let (format, key, write_gen, cur_py, bytes) = match a {
+            DrawAtlas::Mono => (
+                TexelFormat::R8Unorm,
+                (t.mono.atlas.width, t.mono.tex_h, t.atlas_epoch),
+                t.mono.atlas.write_gen,
+                t.mono.atlas.py,
+                &t.mono.atlas.data[..(t.mono.atlas.width * t.mono.atlas.height) as usize],
+            ),
+            DrawAtlas::Color => (
+                TexelFormat::Rgba8Unorm,
+                (t.color.atlas.width, t.color.tex_h, t.atlas_epoch),
+                t.color.atlas.write_gen,
+                t.color.atlas.py,
+                &t.color.atlas.data[..(t.color.atlas.width * t.color.atlas.height * 4) as usize],
+            ),
+            DrawAtlas::Deco => {
+                let d = t.deco.expect("has_deco gated this item");
+                (
+                    TexelFormat::R8Unorm,
+                    (
+                        d.atlas_w as u32,
+                        d.ch as u32,
+                        ((d.curl_band.0 as u64) << 32) | (d.curl_band.1 as u64 & 0xffff_ffff),
+                    ),
+                    0,
+                    0,
+                    &d.data[..],
+                )
+            }
+            DrawAtlas::Wallpaper => {
+                let sprite = win
+                    .wallpaper_tex
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("plan samples {a:?} but its SpriteTex is absent"));
+                sprites[a as usize] = Some(sprite.d3d11_atlas(&live.dev)?);
+                continue;
+            }
+            // Synced with the palette in step 1.
+            DrawAtlas::Fx => continue,
+            DrawAtlas::Image => {
+                let p = win
+                    .image_plane
+                    .as_mut()
+                    .expect("has_image_plane gated this item");
+                D3dArmLive::ensure_atlas(
+                    &live.dev,
+                    &mut p.d3d11_atlas,
+                    a,
+                    (p.w, p.h, p.d3d11_epoch),
+                    0,
+                    0,
+                    TexelFormat::Rgba8Unorm,
+                    p.d3d11_texels
+                        .as_deref()
+                        .expect("has_image_plane requires resident texels"),
+                )?;
+                continue;
+            }
+        };
+        D3dArmLive::ensure_atlas(
+            &live.dev,
+            &mut live.atlases[a as usize],
+            a,
+            key,
+            write_gen,
+            cur_py,
+            format,
+            bytes,
+        )?;
+    }
+    // 6. The rig, borrowed from the residency, and the shared walk.
+    let live = &*live;
+    let off = &win.d3d11_offscreen.as_ref().expect("ensured above").tex;
+    let rig = D3dFrameRig {
+        offscreen: off,
+        pipelines: std::array::from_fn(|i| live.pipelines[i].as_ref()),
+        uniform: &live.uniform,
+        uniform_binding: uniform_binding.unwrap_or(0),
+        streams: std::array::from_fn(|i| {
+            counts[i].and_then(|_| live.streams[i].as_ref().map(|s| &s.buf))
+        }),
+        atlases: std::array::from_fn(|i| {
+            let tex = match sprites[i].as_deref() {
+                Some(sprite) => Some(sprite),
+                None if i == DrawAtlas::Image as usize => win
+                    .image_plane
+                    .as_ref()
+                    .and_then(|p| p.d3d11_atlas.as_ref())
+                    .map(|a| &a.tex),
+                None => live.atlases[i].as_ref().map(|a| &a.tex),
+            };
+            tex.map(|tex| (tex, &live.nearest))
+        }),
+        fx: fx_palette.map(|slot| D3dFxBind {
+            r8: live.fx_tex[0]
+                .as_ref()
+                .expect("synced in step 1")
+                .tex
+                .d3d11(),
+            rgba: live.fx_tex[1]
+                .as_ref()
+                .expect("synced in step 1")
+                .tex
+                .d3d11(),
+            palette: live.fx_palettes[slot].as_ref().expect("written in step 1"),
+            sampler: &live.nearest,
+        }),
+    };
+    let mut enc = FrameEncoder::d3d11(&live.dev)?;
+    let passes = run_frame_plan(&mut enc, &FrameRes::D3d11(&rig), plan, load0, scissor)?;
+    match enc.submit() {
+        SubmittedFrame::D3d11(outcome) => outcome?,
+        #[allow(unreachable_patterns, reason = "the other arms of a multi-arm build")]
+        _ => unreachable!("a D3D11 encoder commits a D3D11 frame"),
+    }
+    Ok(D3dTailOut {
+        passes,
+        stage_ns,
+        unorm,
+        load0,
+        scissor,
+        fx_atlas_bytes,
+        fx_staged: fx_palette.is_some(),
+    })
+}
+
+impl SpriteTex {
+    /// This sprite's texture on `dev`, uploaded on first use and again when
+    /// the renderer's device changed (a texture belongs to the device that
+    /// made it; a device-loss recovery mints a new one).
+    fn d3d11_atlas(&self, dev: &D3dDevice) -> Result<Arc<D3dTexture>, String> {
+        let mut slot = self
+            .d3d11_atlas
+            .lock()
+            .map_err(|_| "d3d11 arm: a sprite's texture lock is poisoned".to_owned())?;
+        if let Some(t) = slot.as_ref().filter(|t| t.on(dev)) {
+            return Ok(Arc::clone(t));
+        }
+        let tex = dev.texture_2d(TexelFormat::Rgba8Unorm, self.w, self.h, None)?;
+        dev.upload_rows(
+            &tex,
+            0,
+            self.h,
+            &self.src.rgba[..(self.w as usize * self.h as usize * 4)],
+            self.w * 4,
+            self.w,
+        )?;
+        let tex = Arc::new(tex);
+        *slot = Some(Arc::clone(&tex));
+        Ok(tex)
+    }
+}
+
+impl GpuRenderer {
+    /// Arm the D3D11 arm: every frame, present and readback draws on it. A
+    /// renderer is armed at construction (GW.5's flip); a suite that disarmed
+    /// it for the oracle arms it again.
+    #[doc(hidden)]
+    #[inline]
+    pub const fn arm_d3d11(&mut self) {
+        self.d3d11_armed = true;
+    }
+
+    /// Disarm the D3D11 arm, for a suite that reads the wgpu offscreen or drives
+    /// wgpu-typed seams (the Windows twin of `disarm_metal_for_oracle`). Only a
+    /// build carrying the oracle arm has it.
+    #[doc(hidden)]
+    #[cfg(wgpu_arm)]
+    #[inline]
+    pub const fn disarm_d3d11_for_oracle(&mut self) {
+        self.d3d11_armed = false;
+    }
+
+    /// Whether the last encoded frame drew on the D3D11 arm.
+    #[doc(hidden)]
+    #[inline]
+    pub const fn last_frame_on_d3d11(&self) -> bool {
+        self.last_frame_arm_d3d11
+    }
+
+    /// Mint the D3D11 arm on first use; `false` (with the cause kept) disarms.
+    /// The arm's device is its own (`D3dDevice::headless`); in the oracle
+    /// build it sits beside the wgpu context's.
+    pub(crate) fn d3d11_arm_ready(&mut self) -> bool {
+        if !self.d3d11_armed {
+            return false;
+        }
+        if self.d3d11_arm.is_some() {
+            return true;
+        }
+        match D3dDevice::headless().and_then(D3dArmLive::on) {
+            Ok(live) => {
+                // The context's name came from a probe's device; the device
+                // that renders answers it from its mint on. The oracle
+                // build's facts are wgpu's.
+                #[cfg(not(wgpu_arm))]
+                self.ctx.adapter_name.clone_from(&live.dev.caps().adapter);
+                self.d3d11_arm = Some(live);
+                true
+            }
+            Err(e) => {
+                d3d11_arm_note(&format!("the D3D11 renderer could not start: {e}"));
+                self.d3d11_mint_error = Some(e);
+                self.d3d11_armed = false;
+                false
+            }
+        }
+    }
+
+    /// The error a caller returns when the arm cannot start: the mint
+    /// failure's cause when there was one.
+    #[cfg_attr(
+        wgpu_arm,
+        expect(dead_code, reason = "a build carrying wgpu falls back to it, by name")
+    )]
+    pub(crate) fn d3d11_start_error(&self) -> String {
+        match &self.d3d11_mint_error {
+            Some(e) => format!("the D3D11 renderer could not start: {e}"),
+            None => "the D3D11 renderer could not start".to_owned(),
+        }
+    }
+
+    /// Read the armed frame back from `win.d3d11_offscreen`.
+    pub(crate) fn d3d11_read_back_offscreen(
+        &self,
+        win: &WindowGpu,
+        width: u32,
+        height: u32,
+    ) -> Result<Frame, String> {
+        let off = win
+            .d3d11_offscreen
+            .as_ref()
+            .ok_or("armed frame lacks its D3D11 offscreen")?;
+        let live = self
+            .d3d11_arm
+            .as_ref()
+            .ok_or("the D3D11 arm is not minted")?;
+        crate::device_layer::d3d11_try_read_back(&live.dev, &off.tex, width, height)
+    }
+
+    /// The sub-row glide on the D3D11 offscreen (the readback path): the band
+    /// shift, then the incoming-row apron over the exposed strip.
+    pub(crate) fn d3d11_shift_offscreen_band(&mut self, win: &mut WindowGpu, input: &RenderInput) {
+        let Some(h) = win.d3d11_offscreen.as_ref().map(|o| o.h) else {
+            return;
+        };
+        let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            self.cell_size().1,
+            input.grid_top_row,
+            input.grid_bot_row,
+            h as usize,
+        );
+        let apron = self.apron_strip_plan(win, input, h as usize);
+        self.d3d11_shift_offscreen_band_px(win, y0, y1, i64::from(input.scroll_frac_px), apron);
+    }
+
+    /// Shift `[y0, y1)` of the D3D11 offscreen by the signed `delta` device pixels
+    /// (positive = up): the shared `BandShift` plan as two staged copies through
+    /// the resident scratch, then `apron`'s rows over the exposed strip. Shared
+    /// by the sub-row glide and the whole-row scroll rescue
+    /// (`shift_offscreen_rows`), as `shift_offscreen_band_px` is on the wgpu
+    /// arm. A failure leaves the band unshifted with one named note.
+    pub(crate) fn d3d11_shift_offscreen_band_px(
+        &mut self,
+        win: &mut WindowGpu,
+        y0: usize,
+        y1: usize,
+        delta: i64,
+        apron: Option<ApronStrip>,
+    ) {
+        let Some((w, h)) = win.d3d11_offscreen.as_ref().map(|o| (o.w, o.h)) else {
+            return;
+        };
+        let Some(shift) = band_shift_ops(y0, y1, delta) else {
+            return;
+        };
+        let Some(live) = self.d3d11_arm.as_ref() else {
+            return;
+        };
+        let shifted = (|| -> Result<(), String> {
+            let handle = DeviceHandle::D3d11(&live.dev);
+            let (format, alias) = offscreen_format();
+            if win
+                .d3d11_shift_scratch
+                .as_ref()
+                .is_none_or(|t| (t.width, t.height) != (w, h) || !t.on(&live.dev))
+            {
+                win.d3d11_shift_scratch = None;
+                win.d3d11_shift_scratch = Some(
+                    handle
+                        .try_create_texture_2d(
+                            "aterm-gpu d3d11 scroll shift scratch",
+                            format,
+                            w,
+                            h,
+                            TexUsage::COPY_STAGING,
+                            alias,
+                        )?
+                        .into_d3d11(),
+                );
+            }
+            let off = &win.d3d11_offscreen.as_ref().expect("checked above").tex;
+            let scratch = win.d3d11_shift_scratch.as_ref().expect("ensured above");
+            let mut enc = FrameEncoder::d3d11(&live.dev)?;
+            enc.copy_texture_rect(
+                FrameCopyTexture::D3d11(off),
+                (0, shift.src_y),
+                FrameCopyTexture::D3d11(scratch),
+                (0, 0),
+                w,
+                shift.moved,
+            )?;
+            enc.copy_texture_rect(
+                FrameCopyTexture::D3d11(scratch),
+                (0, 0),
+                FrameCopyTexture::D3d11(off),
+                (0, shift.dst_y),
+                w,
+                shift.moved,
+            )?;
+            if let Some(strip) = apron {
+                let tex = handle.try_create_texture_2d(
+                    "aterm-gpu d3d11 apron row",
+                    format,
+                    strip.w,
+                    strip.cell_h,
+                    TexUsage::COPY_STAGING,
+                    alias,
+                )?;
+                // A removed device refuses the write, and the shift fails
+                // with the device's error, as its other steps do.
+                handle.try_upload_texture_region(
+                    &tex,
+                    0,
+                    0,
+                    strip.w,
+                    strip.cell_h,
+                    &win.apron_rgba,
+                    strip.w * 4,
+                )?;
+                enc.copy_texture_rect(
+                    FrameCopyTexture::D3d11(tex.d3d11()),
+                    (0, 0),
+                    FrameCopyTexture::D3d11(off),
+                    (0, strip.dst_y),
+                    strip.w.min(w),
+                    strip.rows,
+                )?;
+            }
+            match enc.submit() {
+                SubmittedFrame::D3d11(outcome) => outcome,
+                #[allow(unreachable_patterns, reason = "the other arms of a multi-arm build")]
+                _ => unreachable!("a D3D11 encoder commits a D3D11 frame"),
+            }
+        })();
+        if let Err(e) = shifted {
+            d3d11_arm_note(&format!(
+                "armed scroll shift failed ({e}); band left unshifted"
+            ));
+        }
+        // The shift moves the offscreen outside any scissor.
+        note_offscreen_written(win, None, (w, h));
+    }
+}
+
+/// The armed window's resident settings card on the D3D11 arm, the twin of
+/// `MetalTrayCard`: re-uploaded only when the card's bytes change.
+pub(crate) struct D3dTrayCard {
+    pub(crate) tex: D3dTexture,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) pixels: Vec<u8>,
+}
+
+impl GpuRenderer {
+    /// The offscreen's storage and view rule, for a post pass: `(format, alias,
+    /// raw)`, where `raw` is the Unorm view's read and write (the native plan,
+    /// the only one this arm has).
+    #[inline]
+    const fn d3d11_post_plan() -> (TexelFormat, Option<TexelFormat>, bool) {
+        let (format, alias) = offscreen_format();
+        (format, alias, true)
+    }
+
+    /// A post pass's uniform, minted for the call (the readback is the cold
+    /// path).
+    fn d3d11_post_uniform(live: &D3dArmLive, bytes: &[u8]) -> Result<D3dBuffer, String> {
+        let buf = live
+            .dev
+            .buffer(crate::d3d11::resources::D3dBufferRole::Uniform, bytes.len())?;
+        live.dev.write_buffer(&buf, bytes)?;
+        Ok(buf)
+    }
+
+    /// Armed arm of `composite_bloom_in_place`: the glow extract into a
+    /// half-resolution target, then the screen composite back onto the
+    /// offscreen's Unorm view under the same scissor, fx clip and written-rect
+    /// footprint as the wgpu and Metal arms.
+    pub(crate) fn d3d11_composite_bloom_in_place(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+    ) -> Result<(), String> {
+        let (glow_count, bbox, extract_first) = self.build_bloom_glow(input, true);
+        if glow_count == 0 {
+            return Ok(());
+        }
+        let (fw, fh) = win
+            .d3d11_offscreen
+            .as_ref()
+            .map(|o| (o.w, o.h))
+            .ok_or("armed frame lacks its D3D11 offscreen")?;
+        let text_blend =
+            u32::from(self.cpu.text_blending() == aterm_render::TextBlending::LinearCorrected);
+        let live = self
+            .d3d11_arm
+            .as_mut()
+            .ok_or("the D3D11 arm is not minted")?;
+        let extract_row = if self.bloom_items_live {
+            Pipeline::GlowItems
+        } else {
+            Pipeline::GlowAdd
+        };
+        live.ensure_pipeline(extract_row)?;
+        live.ensure_pipeline(Pipeline::Bloom)?;
+        let (format, alias, raw) = Self::d3d11_post_plan();
+        let (bw, bh) = ((fw / BLOOM_DOWNSCALE).max(1), (fh / BLOOM_DOWNSCALE).max(1));
+        let half = live.dev.texture_2d(format, bw, bh, alias)?;
+        let stream = if self.bloom_items_live {
+            write_fx_palette(&live.dev, &mut live.glow_items, self.bloom_items.words())?;
+            None
+        } else {
+            let insts = &self.bloom_glow_scratch[extract_first as usize..];
+            let stream = live.dev.buffer(
+                crate::d3d11::resources::D3dBufferRole::Instance,
+                std::mem::size_of_val(insts),
+            )?;
+            live.dev
+                .write_buffer(&stream, aterm_bits::cast_slice(insts))?;
+            Some(stream)
+        };
+        let cell_u = Self::d3d11_post_uniform(
+            live,
+            aterm_bits::bytes_of(&Uniforms {
+                screen: [fw as f32, fh as f32],
+                text_blend: text_blend as f32,
+                _pad: 0.0,
+            }),
+        )?;
+        let bu = Self::d3d11_post_uniform(
+            live,
+            aterm_bits::bytes_of(&BloomUniform {
+                texel: [1.0 / bw as f32, 1.0 / bh as f32],
+                strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
+                radius: self.bloom_radius,
+                chroma_radius: bloom_chroma_radius(self.bloom_radius),
+                extent: [1.0; 2],
+                _pad: 0.0,
+            }),
+        )?;
+        // The composite scissor: `encode_bloom_halo`'s spelling, clip and
+        // collapse arms included (the Metal arm's twin).
+        let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
+            [
+                u32::from(cx0),
+                u32::from(cy0),
+                u32::from(cx1),
+                u32::from(cy1),
+            ]
+        });
+        let scissor = if let Some([x0, y0, x1, y1]) = bbox {
+            let d = ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+            Some([
+                x0.saturating_sub(d),
+                y0.saturating_sub(d),
+                (x1 + d).min(fw),
+                (y1 + d).min(fh),
+            ])
+        } else {
+            clip.map(|_| [0, 0, fw, fh])
+        };
+        let scissor = match (scissor, clip) {
+            (Some([sx0, sy0, sx1, sy1]), Some([cx0, cy0, cx1, cy1])) => Some([
+                sx0.max(cx0),
+                sy0.max(cy0),
+                sx1.min(cx1).min(fw),
+                sy1.min(cy1).min(fh),
+            ]),
+            (s, None) => s,
+            (None, Some(_)) => unreachable!("clip-only case handled above"),
+        };
+        let live = &*live;
+        let extract = live.pipelines[extract_row as usize]
+            .as_ref()
+            .expect("ensured above");
+        let bloom = live.pipelines[Pipeline::Bloom as usize]
+            .as_ref()
+            .expect("ensured above");
+        let off = &win.d3d11_offscreen.as_ref().expect("checked above").tex;
+        let cell_binding = extract_row
+            .spec()
+            .binds
+            .vertex_uniform
+            .expect("the extract rows have a vertex uniform");
+        let binds = Pipeline::Bloom.spec().binds;
+        let linear = &live.linear;
+        let mut frame = crate::d3d11::encoder::D3dFrame::begin(&live.dev)?;
+        {
+            let mut pass = frame.begin_pass(
+                &half,
+                false,
+                crate::device_layer::FrameLoad::Clear(crate::device_layer::ClearColor4 {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }),
+                None,
+                (&cell_u, cell_binding),
+            )?;
+            pass.set_pipeline(extract);
+            match stream.as_ref() {
+                Some(stream) => pass.set_stream(stream),
+                None => {
+                    let items = live.glow_items.as_ref().expect("written above");
+                    let unit = extract_row.spec().binds.vertex_items;
+                    pass.bind_vertex_texture(items, unit.expect("GLOW_ITEMS"));
+                }
+            }
+            pass.draw(6, glow_count)?;
+        }
+        let composite = |frame: &mut crate::d3d11::encoder::D3dFrame<'_>,
+                         sc: Option<(u32, u32, u32, u32)>|
+         -> Result<(), String> {
+            let mut pass = frame.begin_pass(
+                off,
+                false,
+                crate::device_layer::FrameLoad::Load,
+                sc,
+                (&bu, binds.fragment_buffers[0]),
+            )?;
+            pass.set_pipeline(bloom);
+            pass.bind_texture(&half, linear, binds.fragment_textures[0], raw);
+            pass.draw(3, 1)
+        };
+        let halo = match (scissor, clip) {
+            (Some([sx0, sy0, sx1, sy1]), _) if sx1 > sx0 && sy1 > sy0 => {
+                composite(&mut frame, Some((sx0, sy0, sx1 - sx0, sy1 - sy0)))?;
+                Some([sx0, sy0, sx1, sy1])
+            }
+            // An empty pane intersection paints nothing: the empty footprint.
+            (Some(_), Some(_)) => Some([0, 0, 0, 0]),
+            // Collapse fallback: the unscissored draw covers the whole target.
+            (Some(_), None) | (None, _) => {
+                composite(&mut frame, None)?;
+                None
+            }
+        };
+        frame.submit()?;
+        note_offscreen_written(win, halo, (fw, fh));
+        Ok(())
+    }
+
+    /// Armed arm of `shimmer_offscreen_in_place`: stage-copy the sample rect,
+    /// then the scissored refract in place on the D3D11 offscreen.
+    pub(crate) fn d3d11_shimmer_in_place(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+    ) -> Result<(), String> {
+        let (fw, fh) = win
+            .d3d11_offscreen
+            .as_ref()
+            .map(|o| (o.w, o.h))
+            .ok_or("armed frame lacks its D3D11 offscreen")?;
+        let Some(region) = self.shimmer_region(input, fw, fh) else {
+            return Ok(());
+        };
+        let phase = self.shimmer_phase();
+        let (cell_w, cell_h) = self.cpu.cell_size();
+        let live = self
+            .d3d11_arm
+            .as_mut()
+            .ok_or("the D3D11 arm is not minted")?;
+        live.ensure_pipeline(Pipeline::Shimmer)?;
+        let (format, alias, raw) = Self::d3d11_post_plan();
+        let scratch = live.dev.texture_2d(format, fw, fh, alias)?;
+        let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
+        for (i, v) in region.heat.iter().enumerate() {
+            heat[i / 4][i % 4] = *v;
+        }
+        let su = ShimmerUniform {
+            frame: [fw as f32, fh as f32],
+            region_min: [region.x0 as f32, region.y0 as f32],
+            region_max: [region.x1 as f32, region.y1 as f32],
+            hot_top: region.hot_top,
+            rise: region.rise,
+            amp: (cell_h as f32 / 18.0).clamp(0.75, SHIMMER_AMP_PX),
+            period: (cell_h as f32).max(4.0),
+            phase,
+            band_x0: region.band_x0,
+            band_w: region.band_w,
+            rolloff: (cell_w as f32).max(1.0),
+            _pad: [0.0; 2],
+            heat,
+        };
+        let ub = Self::d3d11_post_uniform(live, aterm_bits::bytes_of(&su))?;
+        let m = SHIMMER_COPY_MARGIN;
+        let [sx0, sy0, sx1, sy1] = [
+            region.x0.saturating_sub(m),
+            region.y0.saturating_sub(m),
+            region.x1.saturating_add(m).min(fw),
+            region.y1.saturating_add(m).min(fh),
+        ];
+        let live = &*live;
+        let pipe = live.pipelines[Pipeline::Shimmer as usize]
+            .as_ref()
+            .expect("ensured above");
+        let binds = Pipeline::Shimmer.spec().binds;
+        let linear = &live.linear;
+        let off = &win.d3d11_offscreen.as_ref().expect("checked above").tex;
+        let mut frame = crate::d3d11::encoder::D3dFrame::begin(&live.dev)?;
+        frame.copy_rect(off, (sx0, sy0), &scratch, (sx0, sy0), sx1 - sx0, sy1 - sy0)?;
+        {
+            let mut pass = frame.begin_pass(
+                off,
+                false,
+                crate::device_layer::FrameLoad::Load,
+                Some((
+                    region.x0,
+                    region.y0,
+                    region.x1 - region.x0,
+                    region.y1 - region.y0,
+                )),
+                (&ub, binds.fragment_buffers[0]),
+            )?;
+            pass.set_pipeline(pipe);
+            pass.bind_texture(&scratch, linear, binds.fragment_textures[0], raw);
+            pass.draw(3, 1)?;
+        }
+        frame.submit()?;
+        note_offscreen_written(
+            win,
+            Some([region.x0, region.y0, region.x1, region.y1]),
+            (fw, fh),
+        );
+        Ok(())
+    }
+
+    /// Armed arm of `draw_tray_into_offscreen`: the scrim (`TrayQuad::scrim`,
+    /// a 1×1 texture of its colour over every pixel from its top row down),
+    /// then the resident card, each composited straight-alpha source-over onto
+    /// the D3D11 offscreen's Unorm view with the tray pipeline, as the wgpu arm
+    /// draws them.
+    pub(crate) fn d3d11_tray_into_offscreen(
+        &mut self,
+        win: &mut WindowGpu,
+        t: TrayQuad<'_>,
+    ) -> Result<(), String> {
+        let (fw, fh) = win
+            .d3d11_offscreen
+            .as_ref()
+            .map(|o| (o.w, o.h))
+            .ok_or("armed frame lacks its D3D11 offscreen")?;
+        // The card composites outside any encode scissor.
+        note_offscreen_written(win, None, (fw, fh));
+        let live = self
+            .d3d11_arm
+            .as_mut()
+            .ok_or("the D3D11 arm is not minted")?;
+        live.ensure_pipeline(Pipeline::Tray)?;
+        let unchanged = win
+            .d3d11_tray_card
+            .as_ref()
+            .is_some_and(|c| c.w == t.pw && c.h == t.ph && c.pixels.as_slice() == t.rgba);
+        if !unchanged {
+            let tex = live
+                .dev
+                .texture_2d(TexelFormat::Rgba8Unorm, t.pw, t.ph, None)?;
+            live.dev
+                .upload_rows(&tex, 0, t.ph, t.rgba, t.pw * 4, t.pw)?;
+            self.tray_uploads += 1;
+            let mut pixels = win
+                .d3d11_tray_card
+                .take()
+                .map_or_else(Vec::new, |c| c.pixels);
+            pixels.clear();
+            pixels.extend_from_slice(t.rgba);
+            win.d3d11_tray_card = Some(D3dTrayCard {
+                tex,
+                w: t.pw,
+                h: t.ph,
+                pixels,
+            });
+        }
+        let tray_uniform = |rect: [f32; 4]| TrayUniform {
+            rect,
+            fb: [fw as f32, fh as f32],
+            _pad: [0.0, 0.0],
+        };
+        // The scrim's fill and placement, minted for the call (the readback is
+        // the cold path); `None` when it covers nothing.
+        let scrim = match t.scrim {
+            Some(scrim) if scrim.top.min(fh) < fh && fw > 0 => {
+                let top = scrim.top.min(fh);
+                let tex = live.dev.texture_2d(TexelFormat::Rgba8Unorm, 1, 1, None)?;
+                live.dev.upload_rows(&tex, 0, 1, &scrim.rgba, 4, 1)?;
+                let u = Self::d3d11_post_uniform(
+                    live,
+                    aterm_bits::bytes_of(&tray_uniform([
+                        0.0,
+                        top as f32,
+                        fw as f32,
+                        (fh - top) as f32,
+                    ])),
+                )?;
+                Some((tex, u))
+            }
+            _ => None,
+        };
+        let tu = Self::d3d11_post_uniform(
+            live,
+            aterm_bits::bytes_of(&tray_uniform([
+                t.dx as f32,
+                t.dy as f32,
+                t.pw as f32,
+                t.ph as f32,
+            ])),
+        )?;
+        let live = &*live;
+        let pipe = live.pipelines[Pipeline::Tray as usize]
+            .as_ref()
+            .expect("ensured above");
+        let binds = Pipeline::Tray.spec().binds;
+        let binding = binds.vertex_uniform.expect("row 17 binds at 2");
+        let linear = &live.linear;
+        let card = win.d3d11_tray_card.as_ref().expect("set above");
+        let off = &win.d3d11_offscreen.as_ref().expect("checked above").tex;
+        let mut frame = crate::d3d11::encoder::D3dFrame::begin(&live.dev)?;
+        {
+            let first = scrim.as_ref().map_or(&tu, |(_, u)| u);
+            let mut pass = frame.begin_pass(
+                off,
+                false,
+                crate::device_layer::FrameLoad::Load,
+                None,
+                (first, binding),
+            )?;
+            pass.set_pipeline(pipe);
+            // The scrim first, so the card composites over it.
+            if let Some((tex, _)) = scrim.as_ref() {
+                pass.bind_texture(tex, linear, binds.fragment_textures[0], false);
+                pass.draw(4, 1)?;
+                pass.bind_uniform(&tu, binding);
+            }
+            pass.bind_texture(&card.tex, linear, binds.fragment_textures[0], false);
+            pass.draw(4, 1)?;
+        }
+        frame.submit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frame palette's texture is the layout `cell.hlsl`'s `fx_ink` reads:
+    /// entry `j` at `(j % FX_PALETTE_ROW, j / FX_PALETTE_ROW)`, holding the
+    /// word's little-endian bytes, over whole rows and a partial last row. A
+    /// palette that fits reuses the texture; a longer one re-mints it at a
+    /// power-of-two row count.
+    #[test]
+    fn the_fx_palette_texture_holds_entry_j_at_its_texel() {
+        let dev = crate::d3d11::test_device();
+        let row = fx_gpu::FX_PALETTE_ROW;
+        let mut tex = None;
+        let mut heights = Vec::new();
+        for n in [3usize, 1024, 2500, 7] {
+            let words: Vec<u32> = (0..n as u32)
+                .map(|j| j.wrapping_mul(0x9e37_79b9) ^ (j << 7))
+                .collect();
+            write_fx_palette(&dev, &mut tex, &words).expect("written");
+            let t = tex.as_ref().expect("minted");
+            heights.push(t.height);
+            let rows = n.div_ceil(row as usize) as u32;
+            let bytes = dev
+                .read_rgba8(t, row, rows, row as usize * 4)
+                .expect("read back");
+            for (j, w) in words.iter().enumerate() {
+                assert_eq!(bytes[4 * j..4 * j + 4], w.to_le_bytes(), "entry {j} of {n}");
+            }
+        }
+        assert_eq!(heights, [1, 1, 4, 4], "reused while it fits");
+    }
+
+    /// The palette ring writes three distinct textures in turn, so no frame
+    /// rewrites a texture either of the two frames before it bound.
+    #[test]
+    fn the_fx_palette_ring_never_rewrites_the_last_two_frames_texture() {
+        let mut live = D3dArmLive::on(crate::d3d11::test_device()).expect("the arm's resources");
+        let names: Vec<usize> = (0..7u32)
+            .map(|f| {
+                let slot = live.upload_fx_palette(&[f]).expect("written");
+                live.fx_palettes[slot].as_ref().expect("written").tex.raw() as usize
+            })
+            .collect();
+        for w in names.windows(3) {
+            assert!(
+                w[0] != w[1] && w[1] != w[2] && w[0] != w[2],
+                "three frames in a row wrote {w:?} ({names:?})"
+            );
+        }
+        assert_eq!(names[..4], [names[0], names[1], names[2], names[0]]);
+    }
+}

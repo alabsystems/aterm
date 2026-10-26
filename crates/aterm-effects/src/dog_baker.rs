@@ -95,7 +95,11 @@ fn paint_breed_onto(tile: &mut Tile, breed: DogGlyphId, fills: &ResolvedFills, w
         return;
     }
     let xform = PathTransform::fit(w, h);
-    for layer in DOG_GLYPHS[breed as usize].layers {
+    let layers = DOG_GLYPHS[breed as usize].layers;
+    let mut i = 0;
+    while i < layers.len() {
+        let layer = &layers[i];
+        i += 1;
         let (col, alpha) = if layer.role == GlyphRole::Eye {
             (fills.eye_ink, 1.0)
         } else {

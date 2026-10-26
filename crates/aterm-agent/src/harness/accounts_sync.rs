@@ -2195,7 +2195,6 @@ pub fn normalize_google_sheet_url(url: &str) -> String {
 
 struct SyncedAccounts {
     fleet_path: PathBuf,
-    state: accounts::State,
     note: Option<String>,
     /// Whether the sync changed anything: a file whose bytes differ from what it held (each is
     /// written only then), account state or logins, or a ledger row.
@@ -2534,18 +2533,8 @@ fn persist_accounts_sync(
             )
         })?;
     }
-    let (state, read) = store.load(now).map_err(|why| {
-        format!(
-            "sync files were published but their state could not be read: {why}; \
-             the published files are kept"
-        )
-    })?;
-    if note.is_none() {
-        note = read;
-    }
     Ok(SyncedAccounts {
         fleet_path,
-        state,
         note,
         changed,
     })
@@ -2580,37 +2569,78 @@ fn run_accounts_sync_with(
     (out, err): (&mut dyn Write, &mut dyn Write),
     how: &SyncHow<'_>,
 ) -> ExitCode {
-    let Some(roster_path) = env.accounts_roster() else {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts sync: no config directory is known (set HOME or XDG_CONFIG_HOME)"
-        );
-        return ExitCode::FAILURE;
+    let report = match sync_accounts_with(env, source, machine_override, how) {
+        Ok(report) => report,
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts sync: {why}");
+            return ExitCode::FAILURE;
+        }
     };
+    write_sync_report(&report, env.now, json, out, err)
+}
+
+/// The source this sync admitted and whether its publication or recovery wrote data.
+struct SyncPublication {
+    machine: String,
+    roster_path: PathBuf,
+    fleet_path: PathBuf,
+    fleet_accounts: usize,
+    changed: bool,
+}
+
+/// One observation after sync and sign-in recovery. The source metadata describes
+/// this sync; the account records describe one completed local publication. Login
+/// file presence is observed once afterward, outside the local commit protocol.
+struct SyncReport {
+    publication: SyncPublication,
+    records: accounts::AccountRecords,
+    enrolled: BTreeSet<String>,
+    needs_renew: Vec<String>,
+}
+
+impl SyncReport {
+    fn into_init(self, recovered: bool) -> InitSynced {
+        let enrolled = self
+            .records
+            .roster
+            .rows
+            .iter()
+            .filter(|row| {
+                (row.dir.is_none() || self.enrolled.contains(&row.label))
+                    && self
+                        .records
+                        .state
+                        .accounts
+                        .get(&row.label)
+                        .is_none_or(|account| account.auth != accounts::Auth::SignedOut)
+            })
+            .count();
+        InitSynced {
+            machine: self.publication.machine,
+            rows: self.records.roster.rows.len(),
+            enrolled,
+            fleet: self.publication.fleet_accounts,
+            changed: self.publication.changed || recovered,
+            to_sign_in: self.needs_renew,
+        }
+    }
+}
+
+fn sync_accounts_with(
+    env: &Env,
+    source: Option<&str>,
+    machine_override: Option<&str>,
+    how: &SyncHow<'_>,
+) -> Result<SyncReport, String> {
+    let roster_path = env
+        .accounts_roster()
+        .ok_or("no config directory is known (set HOME or XDG_CONFIG_HOME)")?;
     let store = env.accounts_store();
-    let recovered_commit = match store.recover_sync_within(how.ladder, &roster_path) {
-        Ok(recovered) => recovered,
-        Err(why) => {
-            let _ = writeln!(err, "aterm harness accounts sync: {why}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let (fleet, opt_in) = match load_fleet_source_with(env, source, how.fetch) {
-        Ok(f) => f,
-        Err(why) => {
-            let _ = writeln!(err, "aterm harness accounts sync: {why}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let recovered_commit = store.recover_sync_within(how.ladder, &roster_path)?;
+    let (fleet, opt_in) = load_fleet_source_with(env, source, how.fetch)?;
     let default_email = read_default_profile_email(env);
-    let Some(machine) = sync_machine(env, &fleet, default_email.as_deref(), machine_override)
-    else {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts sync: could not determine machine id (`m<N>`); pass `--machine m8`"
-        );
-        return ExitCode::FAILURE;
-    };
+    let machine = sync_machine(env, &fleet, default_email.as_deref(), machine_override)
+        .ok_or("could not determine machine id (`m<N>`); pass `--machine m8`")?;
 
     let prelim_roster =
         build_machine_roster(&fleet, &machine, &store, None, default_email.as_deref());
@@ -2620,10 +2650,9 @@ fn run_accounts_sync_with(
         .unwrap_or_default();
     let SyncedAccounts {
         fleet_path,
-        state,
         note,
         changed,
-    } = match persist_accounts_sync(
+    } = persist_accounts_sync(
         &store,
         &roster_path,
         (&fleet, opt_in),
@@ -2631,17 +2660,7 @@ fn run_accounts_sync_with(
         &standing_walls,
         env.now,
         (how.ladder, how.fleet_snapshots),
-    ) {
-        Ok(saved) => saved,
-        Err(why) => {
-            let _ = writeln!(err, "aterm harness accounts sync: {why}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let changed = changed || recovered_commit;
-    if let Some(note) = note {
-        let _ = writeln!(err, "aterm harness accounts: {note}");
-    }
+    )?;
     let recovered = recover_interrupted_staging_renewals_for(
         Cli::Claude,
         &store,
@@ -2649,22 +2668,59 @@ fn run_accounts_sync_with(
         &AUTO_RENEW_GUARD,
         env.now,
     );
-    let roster = match Roster::load(&roster_path) {
-        Ok(roster) => roster,
-        Err(why) => {
-            let _ = writeln!(err, "aterm harness accounts sync: {why}");
-            return ExitCode::FAILURE;
-        }
+    read_sync_report(
+        &store,
+        env.now,
+        SyncPublication {
+            machine,
+            roster_path,
+            fleet_path,
+            fleet_accounts: fleet.accounts.len(),
+            changed: changed || recovered_commit || recovered,
+        },
+        note,
+    )
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSyncReport",
+        action = "Read",
+        project = "aterm_agent::harness::accounts_sync::sync_report_tests::report_transition"
+    )
+)]
+fn read_sync_report(
+    store: &accounts::Store,
+    now: i64,
+    mut publication: SyncPublication,
+    note: Option<String>,
+) -> Result<SyncReport, String> {
+    let failure = |why| {
+        format!(
+            "sync ran but its report could not be read: {why}; \
+             any published files are kept"
+        )
     };
-    let state = if recovered {
-        store.load(env.now).map(|(s, _)| s).unwrap_or(state)
-    } else {
-        state
-    };
-    let bound = store
-        .bound(&roster, env.now)
-        .unwrap_or_else(|_| roster.clone());
-    let enrolled = accounts::enrolled(&bound);
+    // A staging transaction can leave an admitted journal even when it could not
+    // finish. Count the recovery performed by the same read that captures its image.
+    let (recovered, mut records) = store
+        .recover_account_records(Some(&publication.roster_path), now)
+        .map_err(|why| {
+            failure(match why {
+                accounts::RosterReadError::Roster(why)
+                | accounts::RosterReadError::Records(why) => why,
+            })
+        })?;
+    publication.changed |= recovered;
+    if let Some(note) = note
+        && !records.notes.contains(&note)
+    {
+        records.notes.insert(0, note);
+    }
+    let roster = &records.roster;
+    let state = &records.state;
+    let enrolled = accounts::enrolled(roster);
     let needs_renew: Vec<String> = roster
         .rows
         .iter()
@@ -2674,16 +2730,48 @@ fn run_accounts_sync_with(
                 && !state
                     .accounts
                     .get(&r.label)
-                    .is_some_and(|a| a.limited_until(env.now).is_some())
+                    .is_some_and(|a| a.limited_until(now).is_some())
         })
         .map(|r| r.label.clone())
         .collect();
+    Ok(SyncReport {
+        publication,
+        records,
+        enrolled,
+        needs_renew,
+    })
+}
 
+fn write_sync_report(
+    report: &SyncReport,
+    now: i64,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let SyncReport {
+        publication:
+            SyncPublication {
+                machine,
+                roster_path,
+                fleet_path,
+                fleet_accounts,
+                changed,
+            },
+        records,
+        enrolled,
+        needs_renew,
+    } = report;
+    let roster = &records.roster;
+    let state = &records.state;
+    for note in &records.notes {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
     if json {
         let mut o = Map::new();
         o.insert("schema".to_owned(), Value::from(1u64));
         o.insert("kind".to_owned(), Value::from("accounts-sync".to_owned()));
-        o.insert("machine".to_owned(), Value::from(machine));
+        o.insert("machine".to_owned(), Value::from(machine.clone()));
         o.insert(
             "roster".to_owned(),
             Value::from(roster_path.display().to_string()),
@@ -2694,9 +2782,9 @@ fn run_accounts_sync_with(
         );
         o.insert(
             "fleet_accounts".to_owned(),
-            Value::from(u64::try_from(fleet.accounts.len()).unwrap_or(0)),
+            Value::from(u64::try_from(*fleet_accounts).unwrap_or(0)),
         );
-        o.insert("changed".to_owned(), Value::from(changed));
+        o.insert("changed".to_owned(), Value::from(*changed));
         o.insert(
             "machine_accounts".to_owned(),
             Value::Array(
@@ -2705,7 +2793,7 @@ fn run_accounts_sync_with(
                     .iter()
                     .map(|r| {
                         let here = r.dir.is_none() || enrolled.contains(&r.label);
-                        let cond = accounts::condition(r, &state, here, env.now);
+                        let cond = accounts::condition(r, state, here, now);
                         let mut m = Map::new();
                         m.insert("label".to_owned(), Value::from(r.label.clone()));
                         m.insert("class".to_owned(), Value::from(r.class.as_str().to_owned()));
@@ -2722,7 +2810,7 @@ fn run_accounts_sync_with(
         );
         o.insert(
             "needs_renew".to_owned(),
-            Value::Array(needs_renew.into_iter().map(Value::from).collect()),
+            Value::Array(needs_renew.iter().cloned().map(Value::from).collect()),
         );
         let _ = writeln!(
             out,
@@ -2734,25 +2822,21 @@ fn run_accounts_sync_with(
             out,
             "synced machine `{machine}` ({} accounts on this machine, {} across fleet){}",
             roster.rows.len(),
-            fleet.accounts.len(),
-            if changed {
-                ""
-            } else {
-                "; nothing changed, so no file was written"
-            }
+            fleet_accounts,
+            if *changed { "" } else { "; no account changes" }
         );
         let _ = writeln!(out, "roster: {}", roster_path.display());
         let _ = writeln!(out, "fleet:  {}", fleet_path.display());
         for row in &roster.rows {
             let here = row.dir.is_none() || enrolled.contains(&row.label);
-            let cond = match accounts::condition(row, &state, here, env.now) {
+            let cond = match accounts::condition(row, state, here, now) {
                 accounts::Condition::Limited { until } => {
                     format!("limited until {}", super::usage::rfc3339_utc(until))
                 }
                 accounts::Condition::NotEnrolled => match state
                     .accounts
                     .get(&row.label)
-                    .and_then(|a| a.limited_until(env.now))
+                    .and_then(|a| a.limited_until(now))
                 {
                     Some(until) => format!(
                         "not-enrolled (limited until {})",
@@ -3863,94 +3947,21 @@ fn sync_accounts_for_init_with(
             fetch_uncaptured(env, source)
         }
     };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    if run_accounts_sync_with(
+    let report = sync_accounts_with(
         &env,
-        (init_source.as_deref(), None, true),
-        (&mut out, &mut err),
+        init_source.as_deref(),
+        None,
         &SyncHow {
             fetch: &fetch,
             ladder: &sync_lock_ladder(),
             fleet_snapshots: &fleet_snapshots,
         },
-    ) != ExitCode::SUCCESS
-    {
-        let msg = String::from_utf8_lossy(&err).trim().to_owned();
-        return Err(if msg.is_empty() {
-            "could not sync accounts.toml".to_owned()
-        } else {
-            msg
-        });
+    )?;
+    let synced = report.into_init(recovered_commit);
+    if synced.changed {
+        let _ = accounts::Store::at(state_dir).touch_wake();
     }
-    // The sync's own word of what it changed and which rows are still to sign in.
-    let said = aterm_json::from_str::<Value>(String::from_utf8_lossy(&out).trim()).ok();
-    let changed = said
-        .as_ref()
-        .and_then(|said| said.get("changed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-        || recovered_commit;
-    let to_sign_in: Vec<String> = said
-        .as_ref()
-        .and_then(|said| said.get("needs_renew"))
-        .and_then(Value::as_array)
-        .map(|labels| {
-            labels
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let store = accounts::Store::at(state_dir);
-    let raw = Roster::load(roster_path)?;
-    let bound = store.bound(&raw, now)?;
-    let enrolled = accounts::enrolled(&bound);
-    let state = store.load(now)?.0;
-    let enrolled_count = bound
-        .rows
-        .iter()
-        .filter(|r| {
-            (r.dir.is_none() || enrolled.contains(&r.label))
-                && state
-                    .accounts
-                    .get(&r.label)
-                    .is_none_or(|a| a.auth != accounts::Auth::SignedOut)
-        })
-        .count();
-    let fleet_count = fs::read_to_string(&fleet_path)
-        .ok()
-        .and_then(|t| FleetRoster::from_toml(&t, "fleet-accounts.toml").ok())
-        .map_or(bound.rows.len(), |f| f.accounts.len());
-    let machine = config_machine_id(env.config.as_deref())
-        .or_else(|| {
-            detect_machine_id(None, None).filter(|m| {
-                bound
-                    .rows
-                    .iter()
-                    .any(|r| r.label == *m || r.label.starts_with(&format!("{m}-")))
-            })
-        })
-        .or_else(|| {
-            bound
-                .rows
-                .first()
-                .map(|r| r.label.split('-').next().unwrap_or(&r.label).to_owned())
-        })
-        .or_else(|| detect_machine_id(None, None))
-        .unwrap_or_else(|| "local".to_owned());
-    if changed {
-        let _ = store.touch_wake();
-    }
-    Ok(InitSynced {
-        machine,
-        rows: bound.rows.len(),
-        enrolled: enrolled_count,
-        fleet: fleet_count,
-        changed,
-        to_sign_in,
-    })
+    Ok(synced)
 }
 
 /// What one periodic resync of this machine's accounts did ([`resync_for_setup`]).
@@ -4572,24 +4583,30 @@ pub struct CliPool {
     pub state: accounts::State,
 }
 
-/// The pools of [`OTHER_CLIS`] whose roster stands beside `config` (none where none does): what
-/// the doctor's `base.ai.accounts` row and the dashboard show beside Claude Code's.
+/// The pools of [`OTHER_CLIS`] whose roster stands beside `config`, plus refused
+/// stores whose records cannot establish absence. Clean absent pools stay absent.
+/// The doctor and dashboard use one recovered snapshot for each pool.
 #[must_use]
 pub fn cli_pools(config: &Path, state_dir: &Path, home: &Path, now: i64) -> Vec<CliPool> {
     OTHER_CLIS
         .into_iter()
         .filter_map(|cli| {
             let roster = accounts::roster_beside_for(config, cli)?;
-            if !roster.is_file() {
+            let store = accounts::Store::at_for(state_dir, cli, home);
+            let records = store.read_account_records(Some(&roster), now);
+            if records
+                .as_ref()
+                .is_ok_and(|records| !records.roster_present)
+            {
                 return None;
             }
-            let store = accounts::Store::at_for(state_dir, cli, home);
-            let mut state = accounts::State::default();
-            let rows = Roster::load_for(cli, &roster).and_then(|raw| {
-                let bound = store.bound(&raw, now)?;
-                state = store.load(now)?.0;
-                Ok(bound)
-            });
+            let (rows, state) = match records {
+                Ok(records) => (Ok(records.roster), records.state),
+                Err(
+                    accounts::RosterReadError::Roster(why)
+                    | accounts::RosterReadError::Records(why),
+                ) => (Err(why), accounts::State::default()),
+            };
             let enrolled = rows
                 .as_ref()
                 .map(|bound| accounts::enrolled_for(cli, bound))
@@ -4683,20 +4700,21 @@ fn renew_pool_due(
     let store = accounts::Store::at_for(state_dir, cli, home);
     let recovered =
         recover_interrupted_staging_renewals_for(cli, &store, roster_path, fx.renew_guard, now);
-    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
+    let Ok(candidates) = read_renewal_candidates(cli, &store, roster_path, now) else {
         return recovered;
     };
-    let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
-        return recovered;
-    };
-    for row in needed_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now) {
+    for (_, row) in candidates
+        .tiered
+        .into_iter()
+        .filter(|(tier, _)| *tier < UNNEEDED_TIER)
+    {
         if spawn_row_renewal(
             cli,
             home,
             state_dir,
             roster_path,
-            file_roster.clone(),
-            &logins,
+            candidates.records.raw_roster.clone(),
+            &candidates.records.logins,
             row,
             (None, false),
             now,
@@ -5122,6 +5140,42 @@ pub(super) fn auto_renew_candidates(
 /// rows Claude Code's upkeep signs in by itself, and a person's `accounts renew --due`, the
 /// fact menu's rotation or a pooled CLI's upkeep never does ([`needed_renew_candidates_for`]).
 const UNNEEDED_TIER: u8 = 2;
+
+/// A scheduling observation, not permission to authenticate. Workers still admit
+/// its raw policy and login generation again before starting an attempt.
+struct RenewalCandidates {
+    records: accounts::AccountRecords,
+    tiered: Vec<(u8, accounts::Row)>,
+}
+
+/// Keep candidate ranking and the worker's captured policy in the same completed
+/// account publication. Credential presence and sign-in task history remain
+/// independent observations, as in the existing ranking policy.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountRenewalRead",
+        action = "Read",
+        project = "aterm_agent::harness::accounts_sync::renewal_read_tests::renewal_read_transition"
+    )
+)]
+fn read_renewal_candidates(
+    cli: Cli,
+    store: &accounts::Store,
+    roster_path: &Path,
+    now: i64,
+) -> Result<RenewalCandidates, accounts::RosterReadError> {
+    let records = store.read_account_records(Some(roster_path), now)?;
+    let tiered = auto_renew_candidates_tiered(
+        cli,
+        Some(store),
+        &records.raw_roster,
+        &records.state,
+        &records.logins,
+        now,
+    );
+    Ok(RenewalCandidates { records, tiered })
+}
 
 /// Claude Code's [`needed_renew_candidates_for`], ordered without a store.
 pub(super) fn needed_renew_candidates(
@@ -5815,33 +5869,23 @@ fn auto_renew_next_account(
         fx.renew_guard,
         now,
     );
-    let Ok(file_roster) = Roster::load(roster_path) else {
-        return recovered;
-    };
-    let Ok((state, _)) = store.load(now) else {
-        return recovered;
-    };
-    let Ok((logins, _)) = store.load_logins(now) else {
+    let Ok(candidates) = read_renewal_candidates(Cli::Claude, &store, roster_path, now) else {
         return recovered;
     };
     let ladder = LadderCtx::of(fx, roster_path);
-    let tiered = auto_renew_candidates_tiered(
-        Cli::Claude,
-        Some(&store),
-        &file_roster,
-        &state,
-        &logins,
-        now,
-    );
     // A row no session needs yet is signed in only where it is a Claude Code account by some
     // word: a source's or a person's row, or one Claude Code's own files show, never an address
     // discovery listed only because a credential names it.
-    let unclaimed = if tiered.iter().any(|(tier, _)| *tier >= UNNEEDED_TIER) {
+    let unclaimed = if candidates
+        .tiered
+        .iter()
+        .any(|(tier, _)| *tier >= UNNEEDED_TIER)
+    {
         unclaimed_emails(home, state_dir, roster_path, now, fx.rediscovery)
     } else {
         BTreeSet::new()
     };
-    for (tier, next_row) in tiered {
+    for (tier, next_row) in candidates.tiered {
         if tier >= UNNEEDED_TIER
             && next_row
                 .email
@@ -5855,8 +5899,8 @@ fn auto_renew_next_account(
             home,
             state_dir,
             roster_path,
-            file_roster.clone(),
-            &logins,
+            candidates.records.raw_roster.clone(),
+            &candidates.records.logins,
             next_row,
             (None, false),
             now,
@@ -5949,27 +5993,23 @@ pub fn auto_renew_next_account_interactive_for(
     let store = accounts::Store::at_for(state_dir, cli, home);
     let recovered =
         recover_interrupted_staging_renewals_for(cli, &store, roster_path, &AUTO_RENEW_GUARD, now);
-    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
-        return recovered;
-    };
-    let Ok((state, _)) = store.load(now) else {
-        return recovered;
-    };
-    let Ok((logins, _)) = store.load_logins(now) else {
+    let Ok(candidates) = read_renewal_candidates(cli, &store, roster_path, now) else {
         return recovered;
     };
     // A person's click starts only what a session needs now: a row no session needs is the
     // upkeep's to sign in, headless, never in a browser opened for a click.
-    for next_row in
-        needed_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now)
+    for (_, next_row) in candidates
+        .tiered
+        .into_iter()
+        .filter(|(tier, _)| *tier < UNNEEDED_TIER)
     {
         if spawn_row_renewal(
             cli,
             home,
             state_dir,
             roster_path,
-            file_roster.clone(),
-            &logins,
+            candidates.records.raw_roster.clone(),
+            &candidates.records.logins,
             next_row,
             (None, true),
             now,
@@ -7484,14 +7524,48 @@ fn render_dashboard_html(
     machine_override: Option<&str>,
     local_addr: &str,
 ) -> String {
+    render_dashboard_html_with(env, source, machine_override, local_addr, || {})
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountDashboard",
+        action = "Draw",
+        project = "aterm_agent::harness::accounts_sync::dashboard_tests::dashboard_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountDashboard",
+        action = "AnotherFault",
+        reason = "Fixture selection supplies a clean, interrupted or refused record read."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountDashboard",
+        action = "LaterChange",
+        reason = "Fixture selection changes records after the report has been captured."
+    )
+)]
+fn render_dashboard_html_with(
+    env: &Env,
+    source: Option<&str>,
+    machine_override: Option<&str>,
+    local_addr: &str,
+    after_report: impl FnOnce(),
+) -> String {
     let machine = detect_machine_id(machine_override, env.config.as_deref())
         .unwrap_or_else(|| "unknown".to_owned());
     let mut report_out = Vec::new();
     let mut report_err = Vec::new();
-    let _ = super::cli::run_accounts(
-        &super::cli::AccountsCmd::Report { json: false },
+    let report = super::cli::write_accounts_report(
+        Cli::Claude,
         env,
-        &super::cli::LiveAccounts,
+        false,
         &mut report_out,
         &mut report_err,
     );
@@ -7500,56 +7574,8 @@ fn render_dashboard_html(
         String::from_utf8_lossy(&report_out),
         String::from_utf8_lossy(&report_err)
     );
-    let store = env.accounts_store();
-    let pool = (|| {
-        let path = env.accounts_roster().ok_or("no account roster path")?;
-        let raw = Roster::load(&path)?;
-        let roster = store.bound(&raw, env.now)?;
-        let (state, _) = store.load(env.now)?;
-        Ok::<_, String>((roster, state))
-    })();
-    let (roster, state, mut rows_html) = match pool {
-        Ok((roster, state)) => (roster, state, String::new()),
-        Err(why) => (
-            Roster::default(),
-            accounts::State::default(),
-            format!(
-                "<tr><td colspan=\"6\">Pool state is unknown: {}</td></tr>",
-                html_escape(&why)
-            ),
-        ),
-    };
-    let enrolled = accounts::enrolled(&roster);
-
-    for row in &roster.rows {
-        let here = row.dir.is_none() || enrolled.contains(&row.label);
-        let cond = match accounts::condition(row, &state, here, env.now) {
-            accounts::Condition::Limited { until } => {
-                format!("limited until {}", super::usage::rfc3339_utc(until))
-            }
-            other => other.as_str().to_owned(),
-        };
-        let active_badge = if state.active.as_deref() == Some(row.label.as_str()) {
-            if state.pinned { "pinned" } else { "active" }
-        } else if state.active.is_none() && row.dir.is_none() {
-            "default (in use)"
-        } else {
-            "-"
-        };
-        let login_cmd = format!("aterm harness accounts renew {}", row.label);
-        rows_html.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td>\
-             <td><code>{}</code></td>\
-             <td><form method=\"POST\" action=\"/use?label={}\" style=\"display:inline\">\
-             <button type=\"submit\">Use</button></form></td></tr>\n",
-            html_escape(&row.label),
-            html_escape(row.class.as_str()),
-            html_escape(&cond),
-            html_escape(active_badge),
-            html_escape(&login_cmd),
-            html_escape(&row.label),
-        ));
-    }
+    after_report();
+    let rows_html = dashboard_rows_html(report.as_ref(), env.now);
 
     let fleet_summary = match load_fleet_source(env, source) {
         Ok(fleet) => format!(
@@ -7600,6 +7626,50 @@ fn render_dashboard_html(
             ))
             .unwrap_or_default(),
     )
+}
+
+fn dashboard_rows_html(report: Option<&super::cli::ReportedAccounts>, now: i64) -> String {
+    let Some(super::cli::ReportedAccounts {
+        roster,
+        state,
+        enrolled,
+    }) = report
+    else {
+        return "<tr><td colspan=\"6\">Pool state is unknown; see the report below.</td></tr>"
+            .into();
+    };
+    let mut rows_html = String::new();
+    for row in &roster.rows {
+        let here = row.dir.is_none() || enrolled.contains(&row.label);
+        let cond = match accounts::condition(row, state, here, now) {
+            accounts::Condition::Limited { until } => {
+                format!("limited until {}", super::usage::rfc3339_utc(until))
+            }
+            other => other.as_str().to_owned(),
+        };
+        let active_badge = if state.active.as_deref() == Some(row.label.as_str()) {
+            if state.pinned { "pinned" } else { "active" }
+        } else if state.active.is_none() && row.dir.is_none() {
+            "default (in use)"
+        } else {
+            "-"
+        };
+        let login_cmd = format!("aterm harness accounts renew {}", row.label);
+        rows_html.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td>\
+             <td><code>{}</code></td>\
+             <td><form method=\"POST\" action=\"/use?label={}\" style=\"display:inline\">\
+             <button type=\"submit\">Use</button></form></td></tr>\n",
+            html_escape(&row.label),
+            html_escape(row.class.as_str()),
+            html_escape(&cond),
+            html_escape(active_badge),
+            html_escape(&login_cmd),
+            html_escape(&row.label),
+        ));
+    }
+
+    rows_html
 }
 
 /// The dashboard's card for each other CLI's pool this machine keeps ([`cli_pools`]): its rows,
@@ -7726,6 +7796,72 @@ mod rename_tests;
 #[cfg(test)]
 #[path = "accounts_alias_relabel_tests.rs"]
 mod alias_relabel_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_report_tests.rs"]
+mod sync_report_tests;
+
+#[cfg(test)]
+#[path = "accounts_dashboard_tests.rs"]
+mod dashboard_tests;
+
+#[cfg(test)]
+#[path = "accounts_renewal_read_tests.rs"]
+mod renewal_read_tests;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalRead",
+        action = "AnotherProvider",
+        reason = "Native fixture selection for the four pooled providers."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalRead",
+        action = "AnotherFault",
+        reason = "Native fixture selection for recovered, damaged and held records."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalRead",
+        action = "LaterChange",
+        reason = "Native fixture selection for publication after candidate capture."
+    )
+)]
+#[doc(hidden)]
+pub fn account_renewal_read_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSyncReport",
+        action = "AnotherFault",
+        reason = "Fixture selection for journal, roster and record failures before the bound read."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSyncReport",
+        action = "Published",
+        reason = "Fixture selection for a sync which already changed its admitted source."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSyncReport",
+        action = "LaterEdit",
+        reason = "Fixture selection for a later publication after the report was captured."
+    )
+)]
+#[doc(hidden)]
+pub fn account_sync_report_environment() {}
 
 #[cfg_attr(
     any(test, debug_assertions),

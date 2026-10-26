@@ -74,6 +74,10 @@ pub struct Run {
     pub window: String,
     /// `1` when `up` laid the jail's reroute prefix (`LAB_REROUTE=1`) and the instance reroutes.
     pub reroute: String,
+    /// The sparse APFS image `up` attached as the scratch's `home/` (`LAB_HOME_IMAGE`), which the
+    /// `down` that removes the scratch detaches, once no hold keeps a copy on it; empty when the
+    /// home is a plain folder.
+    pub home_image: String,
 }
 
 impl Run {
@@ -130,6 +134,7 @@ impl Run {
             ("CLOCK", self.clock.clone()),
             ("WINDOW", self.window.clone()),
             ("REROUTE", self.reroute.clone()),
+            ("HOME_IMAGE", self.home_image.clone()),
         ]
     }
 
@@ -184,6 +189,7 @@ impl Run {
                 "CLOCK" => r.clock = v,
                 "WINDOW" => r.window = v,
                 "REROUTE" => r.reroute = v,
+                "HOME_IMAGE" => r.home_image = v,
                 _ => {}
             }
         }
@@ -390,6 +396,7 @@ mod tests {
             clock: "1".into(),
             window: "1".into(),
             reroute: "1".into(),
+            home_image: "/s/runs/t1/home.sparseimage".into(),
         };
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");

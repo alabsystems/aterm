@@ -2,12 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! What the last look for the ALab vault heard on this network, kept so the next look on it
-//! is skipped (`~/.config/aterm/secrets/probe`): one line, `<unix seconds> <found|absent>
-//! <network>`.
+//! is skipped (`~/.config/aterm/secrets/probe`): one line, `<unix seconds> <found|elsewhere>
+//! <network>`. The word `absent` is what builds that also kept a look that heard no definitive
+//! answer wrote; such a record is not read.
 //!
-//! A look that heard the vault stands for [`FOUND_FOR`], one that heard none for
-//! [`ABSENT_FOR`], each only on the network it was made on ([`network`]). A join, a sync and a
-//! configured Mac never read it: it only spares an unconfigured Mac the look.
+//! A look that heard the vault stands for [`FOUND_FOR`], one that heard another vault's signed
+//! envelope at its address for [`ABSENT_FOR`], each only on the network it was made on
+//! ([`network`]). A look that heard nothing definitive (a timeout, a refused connect, a server
+//! holding no vault yet, an answer that is no vault) is not kept. A join, a sync and a configured Mac never read it: it only spares an
+//! unconfigured Mac the look.
 
 use crate::client::Paths;
 use std::net::IpAddr;
@@ -18,7 +21,8 @@ pub const FILE: &str = "probe";
 /// How long a look that heard the vault stands.
 pub const FOUND_FOR: u64 = 10 * 60;
 
-/// How long a look that heard no vault stands on its network.
+/// How long a look that heard another vault answer at the ALab vault's address stands on its
+/// network.
 pub const ABSENT_FOR: u64 = 24 * 60 * 60;
 
 /// What a look heard.
@@ -26,7 +30,7 @@ pub const ABSENT_FOR: u64 = 24 * 60 * 60;
 pub enum Heard {
     /// The ALab vault answered under the key built into aterm.
     Found,
-    /// No ALab vault answered.
+    /// Another vault answered at the ALab vault's address, under a key aterm does not pin.
     Absent,
 }
 
@@ -56,7 +60,7 @@ impl Verdict {
     fn line(&self) -> String {
         let heard = match self.heard {
             Heard::Found => "found",
-            Heard::Absent => "absent",
+            Heard::Absent => "elsewhere",
         };
         format!("{} {heard} {}\n", self.at, self.network)
     }
@@ -66,7 +70,8 @@ impl Verdict {
         let at = words.next()?.parse().ok()?;
         let heard = match words.next()? {
             "found" => Heard::Found,
-            "absent" => Heard::Absent,
+            "elsewhere" => Heard::Absent,
+            // `absent` (an older build's) may be a timeout kept as no vault: not read.
             _ => return None,
         };
         let network = words.next()?.to_owned();
@@ -185,5 +190,11 @@ mod tests {
         assert_eq!(found.standing(here, 1_000 + FOUND_FOR), None);
         std::fs::write(paths.dir.join(FILE), b"1000 maybe 192.168.4.0/24\n").unwrap();
         assert_eq!(read(&paths), None, "an unknown word keeps nothing");
+        std::fs::write(paths.dir.join(FILE), b"1000 absent 192.168.4.0/24\n").unwrap();
+        assert_eq!(
+            read(&paths),
+            None,
+            "an older build's failed look is not read"
+        );
     }
 }

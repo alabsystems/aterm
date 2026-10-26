@@ -194,9 +194,10 @@ const GPU_BACKEND_LABEL: &str = "gpu (metal)";
 /// Linux: the first-party GLES renderer over EGL.
 #[cfg(target_os = "linux")]
 const GPU_BACKEND_LABEL: &str = "gpu (gl)";
-/// Windows restricts wgpu to DX12, the only backend wired for the HDR/scRGB present.
+/// Windows: the first-party Direct3D 11 renderer, flip-model swap chains with the scRGB
+/// present (docs/AUDIT-third-party-2026-10-15.md GW.5).
 #[cfg(windows)]
-const GPU_BACKEND_LABEL: &str = "gpu (dx12)";
+const GPU_BACKEND_LABEL: &str = "gpu (d3d11)";
 /// Everything else: wgpu's Vulkan backend.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 const GPU_BACKEND_LABEL: &str = "gpu (vulkan)";

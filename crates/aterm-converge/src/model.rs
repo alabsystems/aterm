@@ -4,7 +4,9 @@
 //! Shared convergence vocabulary: host reads, probe verdicts, outcomes, layers, and report rows.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// What one read of the host learned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +299,14 @@ pub struct ItemReport {
     /// Whether leaving this row wrong fails a surface under [`ItemReport::fails_surface`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub essential: bool,
+    /// The wall time the engine spent on this row, in milliseconds: its item's probe, plan,
+    /// apply and read-back, or the decision that left it unprobed; 0 on a row a surface
+    /// reports with no item behind it (a refusal, missing evidence). What a surface reads
+    /// before the engine runs (the doctor's facts, the packages' read) is in its report's
+    /// [`Report::phases`]. `None` on a report written before rows were timed and on a row
+    /// no run made (a machines agent's job rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 impl ItemReport {
@@ -394,6 +404,10 @@ pub struct Report {
     /// Optional stricter readiness assessment used by `aterm doctor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<Readiness>,
+    /// Each phase of the run and its wall time in milliseconds ([`Laps`]), by name.
+    /// Empty, and not written, on a report written before surfaces timed their phases.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phases: Phases,
 }
 
 impl Report {
@@ -406,7 +420,69 @@ impl Report {
             complete,
             items,
             readiness: None,
+            phases: BTreeMap::new(),
         }
+    }
+}
+
+/// A report's [`Report::phases`]: each phase's name and its wall time in milliseconds.
+pub type Phases = BTreeMap<String, u64>;
+
+/// `elapsed` in whole milliseconds; a span past `u64::MAX` of them reads as that.
+#[must_use]
+pub fn millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A run's phase clock. Each [`Laps::lap`] charges the time since the one before (or since
+/// [`Laps::start`]) to a phase, adding to what that phase already holds, so a surface that
+/// laps after every phase accounts for each moment of its run once. Displayed in run
+/// order with the total, for the run's one log line.
+#[derive(Debug)]
+pub struct Laps {
+    since: Instant,
+    laps: Vec<(&'static str, Duration)>,
+}
+
+impl Laps {
+    /// The clock of a run starting now.
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            since: Instant::now(),
+            laps: Vec::new(),
+        }
+    }
+
+    /// Charge the time since the last lap to `phase`.
+    pub fn lap(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        let took = now.saturating_duration_since(self.since);
+        self.since = now;
+        match self.laps.iter_mut().find(|(name, _)| *name == phase) {
+            Some((_, total)) => *total = total.saturating_add(took),
+            None => self.laps.push((phase, took)),
+        }
+    }
+
+    /// Each phase's total, for [`Report::phases`].
+    #[must_use]
+    pub fn phases(&self) -> Phases {
+        self.laps
+            .iter()
+            .map(|&(name, took)| (name.to_owned(), millis(took)))
+            .collect()
+    }
+}
+
+impl fmt::Display for Laps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut total = Duration::ZERO;
+        for &(name, took) in &self.laps {
+            write!(f, "{name} {} ms, ", millis(took))?;
+            total = total.saturating_add(took);
+        }
+        write!(f, "total {} ms", millis(total))
     }
 }
 
@@ -509,7 +585,45 @@ mod tests {
             }),
             stood_aside: Some(StoodAside::Offline("no network".into())),
             essential: true,
+            elapsed_ms: Some(12),
         }
+    }
+
+    /// A report written before rows and phases were timed still reads, as untimed (the
+    /// negative control: an old machines agent's or doctor's report), and a timed one
+    /// round-trips with every row's time and each phase.
+    #[test]
+    fn a_report_written_before_timing_reads_as_untimed_and_a_timed_one_round_trips() {
+        let old = r#"{"schema":1,"mode":"check","complete":true,"items":[{"id":"power.sleep","family":"power","title":"sleep","outcome":"ok","effect":"now"}]}"#;
+        let report: Report = aterm_json::from_str(old).unwrap();
+        assert_eq!(report.items[0].elapsed_ms, None);
+        assert!(report.phases.is_empty());
+        let text = aterm_json::to_string(&report).unwrap();
+        assert!(
+            !text.contains("elapsed_ms") && !text.contains("phases"),
+            "{text}"
+        );
+
+        let mut laps = Laps::start();
+        laps.lap("gather");
+        laps.lap("packages");
+        laps.lap("gather");
+        let mut timed = Report::new(ReportMode::Check, false, vec![row()]);
+        timed.phases = laps.phases();
+        assert_eq!(
+            timed.phases.keys().collect::<Vec<_>>(),
+            ["gather", "packages"]
+        );
+        let text = aterm_json::to_string(&timed).unwrap();
+        assert!(text.contains(r#""elapsed_ms":12"#), "{text}");
+        assert_eq!(aterm_json::from_str::<Report>(&text).unwrap(), timed);
+        let line = laps.to_string();
+        assert!(
+            line.starts_with("gather ")
+                && line.contains(", packages ")
+                && line.contains(", total "),
+            "run order, each phase once, then the total: {line}"
+        );
     }
 
     #[test]

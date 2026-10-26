@@ -17,6 +17,14 @@ pub const DEFAULT_TARGET_STALE_DAYS: i64 = 1;
 /// `disk.apply` (design §5.5): the owner's verb removes nothing until this is on.
 pub const DEFAULT_APPLY: bool = false;
 
+/// THE DISK WATCH'S DEVELOPMENT SEAM. A window that runs under a private state root
+/// (`ATERM_STATE_HOME`) measures and removes nothing, and takes no part in the ask
+/// (`disk-free@v1`). With this seam set, admitted only there and only over a scratch home, the
+/// window drops that one reason, and the others still stand: it is the owner's watch only where
+/// its home lies on a volume of its own, never on the account home's, as the sparse image of
+/// `lab disk-ask` is. Only a development build reads it.
+pub const WATCH_SEAM: &str = "ATERM_DEBUG_DISK_WATCH";
+
 /// The volume's lines (the warning, the floor, the emergency) are one definition, which the tools that admit a disk need read too (`aterm_capacity::floor`, `docs/DESIGN-adaptive-build-2026-10-24.md` CAP-1); [`Config`] carries the owner's knobs into it.
 pub use aterm_capacity::floor::{
     AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB, DEFAULT_AUTO_FREE_GIB, DEFAULT_WARN_FREE_GIB,

@@ -42,17 +42,24 @@ impl World {
     /// A session whose log holds its open (`ms` 1, the model's first
     /// `Append`), mirrored one slot a batch.
     fn new() -> World {
-        World::with_broker(false)
+        World::with_broker(None)
     }
 
     /// [`World::new`] over a broker that retains its log by aterm's default
     /// rules, its `Hello` read and judged.
     fn retaining() -> World {
-        World::with_broker(true)
+        World::with_broker(Some(crate::broker_rules::default_rules()))
     }
 
-    fn with_broker(retained: bool) -> World {
-        let (lane, mut bridge, server, broker) = rig_with_kept_broker(&[], retained);
+    /// [`World::retaining`] by aterm's rules scaled to `ev`, `mail` and `default`
+    /// bytes ([`crate::broker_rules::rules_scaled`]), so a test's records take a
+    /// class past its bytes and the writer asks the broker's own tick for the cut.
+    fn retaining_scaled(ev: u64, mail: u64, default: u64) -> World {
+        World::with_broker(Some(crate::broker_rules::rules_scaled(ev, mail, default)))
+    }
+
+    fn with_broker(rules: Option<astream_broker::Retention>) -> World {
+        let (lane, mut bridge, server, broker) = rig_retained_by(&[], rules);
         bridge.mirror = Some(MirrorRun::acked_for_tests(&bridge.state, 1));
         let mut log = Log::with_limits(1, limits());
         log.open_session(
@@ -1332,7 +1339,9 @@ fn a_retaining_brokers_window_lets_a_total_past_the_cap_mirror_on() {
         m.set_total_for_tests(crate::mirror::TOTAL_MAX_BYTES + 1);
         m.note_window_for_tests(old[0], crate::mirror::NODE_WINDOW_BYTES);
     }
-    w.broker.retain_before(old[1]).expect("the broker's cut");
+    w.broker
+        .retain_before_carrying_state(old[1])
+        .expect("the broker's cut");
     w.take();
     w.publish();
     w.settle();
@@ -1388,7 +1397,7 @@ fn a_node_at_its_window_budget_waits_and_goes_on_when_the_broker_gives_its_oldes
     assert_eq!(budget(&w), 1, "said once");
 
     w.broker
-        .retain_before(old[1] + 1)
+        .retain_before_carrying_state(old[1] + 1)
         .expect("the broker's cut");
     w.take();
     assert!(!w.bridge.mirror.as_deref().unwrap().waiting(), "room again");
@@ -1422,7 +1431,7 @@ fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
         "at the budget"
     );
     w.broker
-        .retain_before(old[N / 2])
+        .retain_before_carrying_state(old[N / 2])
         .expect("the broker's cut");
     w.take();
     let m = w.bridge.mirror.as_deref().unwrap();
@@ -1437,6 +1446,77 @@ fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
         Some("link mirror on"),
         "{links:?}"
     );
+}
+
+/// THE TICK'S OWN CUT LEAVES A CLOSED SESSION'S FACE RETIRABLE: on a broker retained by
+/// aterm's rules scaled to a few records, the session's open goes on the bus, then enough
+/// of another face's `ev` records that the writer asks the broker's retention tick, which
+/// cuts past the session's record by itself (the base moves past it, under the one-minute
+/// hang detector). The endpoint then answers the session `done`, and the mirror retires its
+/// `ev` face: the retire is not refused, the face leaves the bridge's index and the node's
+/// subject budget falls by one. LIVE CONTROL: on an unretained broker cut by a plain
+/// `retain_before`, the cut astream carries no state for, the same retire is refused and the
+/// face stays indexed, charged.
+#[test]
+fn a_closed_sessions_face_is_retired_after_the_brokers_own_cut() {
+    const BODY: usize = 256;
+    for retained in [true, false] {
+        let mut w = if retained {
+            World::retaining_scaled(8 * BODY as u64, 64 * 1024, 64 * 1024)
+        } else {
+            World::new()
+        };
+        w.take();
+        w.publish();
+        w.settle();
+        let face = subject::session_face("f", &w.bridge.node, SID, "ev");
+        assert!(
+            w.bridge.indexed_subjects.contains(&face),
+            "PRECONDITION ({retained}): the session's face is on the bus"
+        );
+        let past = w.broker.head();
+        let (mut god, _) = w.bridge.connect().expect("a connection of the test's own");
+        let filler = "/f/f/pub/n-fill/s-fill/ev";
+        for seq in 1..=64 {
+            god.publish(93, seq, filler, &[b'e'; BODY])
+                .expect("a filler record");
+        }
+        if retained {
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the broker's own tick to cut past the session's face",
+                || (w.broker.stats().log.base.0 >= past).then_some(()),
+            );
+        } else {
+            assert!(w.broker.retain_before(past).unwrap() > 0, "the plain cut");
+        }
+        let producer = w.bridge.producer_id;
+        let spent = |god: &mut crate::transport::Conn| {
+            god.subject_budget(producer)
+                .expect("the budget")
+                .expect("a broker that says it")
+                .subjects
+        };
+        let before = spent(&mut god);
+        w.lane.mirror.lock().unwrap().done.insert(SID.to_string());
+        w.append();
+        w.take();
+        w.publish();
+        w.settle();
+        if retained {
+            assert!(
+                !w.bridge.indexed_subjects.contains(&face),
+                "the retire landed: the face left the index"
+            );
+            assert_eq!(spent(&mut god), before - 1, "and its subject went back");
+        } else {
+            assert!(
+                w.bridge.indexed_subjects.contains(&face),
+                "CONTROL: the retire is refused on the uncarried cut"
+            );
+            assert_eq!(spent(&mut god), before, "CONTROL: nothing went back");
+        }
+    }
 }
 
 /// An `auto` mirror runs only over a broker that retains it.
@@ -2534,7 +2614,7 @@ fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
         "PRECONDITION: the republish is deduped at its record"
     );
     assert!(
-        broker.retain_before(off + 1).unwrap() > 0,
+        broker.retain_before_carrying_state(off + 1).unwrap() > 0,
         "PRECONDITION: retention took it"
     );
     next.mirror_settle();

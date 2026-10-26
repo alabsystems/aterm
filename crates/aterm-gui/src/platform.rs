@@ -990,6 +990,135 @@ pub(crate) const fn no_recent_user_input_event(_within: std::time::Duration) -> 
     false
 }
 
+/// Whether this login's screen is out of a person's reach: locked
+/// (`CGSessionCopyCurrentDictionary`'s `CGSSessionScreenIsLocked`, which the session carries
+/// only while it is), or switched away for another login at this Mac (its
+/// `kCGSessionOnConsoleKey` false: fast user switching, whose keyboard and mouse the HID idle
+/// reading counts as input too). `false` when the session cannot be read.
+#[cfg(target_os = "macos")]
+fn screen_is_away() -> bool {
+    screen_lock::away()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screen_is_away() -> bool {
+    false
+}
+
+/// The screen-away source an `App` holds: a headless instance never reaches the window server.
+pub(crate) fn screen_away_source(headless: bool) -> fn() -> bool {
+    if headless {
+        screen_never_away
+    } else {
+        screen_is_away
+    }
+}
+
+/// The screen-away source for headless instances and unit tests: never away.
+#[must_use]
+pub(crate) const fn screen_never_away() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+mod screen_lock {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    type CfTypeRef = *const c_void;
+    type CfTypeId = usize;
+
+    const SCREEN_IS_LOCKED_KEY: &[u8] = b"CGSSessionScreenIsLocked\0";
+    /// `CGSession.h`'s `kCGSessionOnConsoleKey`.
+    const ON_CONSOLE_KEY: &[u8] = b"kCGSSessionOnConsoleKey\0";
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CfTypeRef;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: CfTypeRef,
+            c_str: *const c_char,
+            encoding: u32,
+        ) -> CfTypeRef;
+        fn CFDictionaryGetValue(dict: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
+        fn CFGetTypeID(cf: CfTypeRef) -> CfTypeId;
+        fn CFBooleanGetTypeID() -> CfTypeId;
+        fn CFBooleanGetValue(boolean: CfTypeRef) -> u8;
+        fn CFRelease(cf: CfTypeRef);
+    }
+
+    /// The two session keys, made once for the process.
+    struct Keys {
+        locked: CfTypeRef,
+        on_console: CfTypeRef,
+    }
+    // SAFETY: immutable CFStrings kept for the process, which CF documents as usable from any thread; nothing here is dereferenced by Rust.
+    unsafe impl Send for Keys {}
+    // SAFETY: as for `Send`: the strings are immutable and never released.
+    unsafe impl Sync for Keys {}
+
+    fn cf_string(text: &'static [u8]) -> CfTypeRef {
+        // SAFETY: `text` is a NUL-terminated UTF-8 literal; the Create rule's +1 goes to the caller.
+        unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                text.as_ptr().cast::<c_char>(),
+                CF_STRING_ENCODING_UTF8,
+            )
+        }
+    }
+
+    fn keys() -> Option<&'static Keys> {
+        static KEYS: OnceLock<Option<Keys>> = OnceLock::new();
+        KEYS.get_or_init(|| {
+            let locked = cf_string(SCREEN_IS_LOCKED_KEY);
+            let on_console = cf_string(ON_CONSOLE_KEY);
+            if locked.is_null() || on_console.is_null() {
+                for key in [locked, on_console] {
+                    if !key.is_null() {
+                        // SAFETY: a +1 string made just above that nothing else holds.
+                        unsafe { CFRelease(key) };
+                    }
+                }
+                return None;
+            }
+            // The Create rule's +1 on each is the process-wide cache, never released.
+            Some(Keys { locked, on_console })
+        })
+        .as_ref()
+    }
+
+    /// Whether the session dictionary names its screen locked or its session off the console;
+    /// `false` when there is none.
+    #[must_use]
+    pub(super) fn away() -> bool {
+        let Some(keys) = keys() else {
+            return false;
+        };
+        // SAFETY: the Copy rule gives +1 on the session dictionary, released on every path after use; `CFDictionaryGetValue` borrows (Get rule) values that live as long as the dictionary, and each one's type is checked before `CFBooleanGetValue` reads it.
+        unsafe {
+            let session = CGSessionCopyCurrentDictionary();
+            if session.is_null() {
+                return false;
+            }
+            let boolean = CFBooleanGetTypeID();
+            let locked = CFDictionaryGetValue(session, keys.locked);
+            let locked = !locked.is_null()
+                && (CFGetTypeID(locked) != boolean || CFBooleanGetValue(locked) != 0);
+            let on_console = CFDictionaryGetValue(session, keys.on_console);
+            let switched_away = !on_console.is_null()
+                && CFGetTypeID(on_console) == boolean
+                && CFBooleanGetValue(on_console) == 0;
+            CFRelease(session);
+            locked || switched_away
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod hid_idle {
     use std::ffi::{c_char, c_void};

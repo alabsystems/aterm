@@ -48,6 +48,10 @@ struct Startup {
     offered: Vec<Plan>,
     /// A real local read failure that starts after the startup captured readable state.
     after_bind: Option<AfterBind>,
+    /// An update successor's startup, which may show no review.
+    successor: bool,
+    /// The reviews it withheld.
+    withheld: usize,
 }
 
 impl Startup {
@@ -139,11 +143,17 @@ impl SetupStartup for Startup {
         }))
     }
 
+    fn may_offer(&mut self) -> bool {
+        self.withheld += usize::from(self.successor);
+        !self.successor
+    }
+
     fn initial(&mut self) -> Result<Plan, String> {
         assert!(
             self.fresh,
             "an admitted pending run resumes without another offer"
         );
+        assert!(!self.successor, "a withheld review reads no plan");
         Ok(self.snapshot()?.plan)
     }
 
@@ -224,6 +234,52 @@ fn startup(home: &Path) -> Startup {
         fresh: false,
         offered: Vec::new(),
         after_bind: None,
+        successor: false,
+        withheld: 0,
+    }
+}
+
+/// An update successor never shows a review: on records nobody admitted a run of, it reads no
+/// plan, offers nothing and leaves setup as it was, where a launch the person started offers the
+/// plan. A run already admitted resumes in the successor as in any launch.
+#[test]
+fn an_update_successor_resumes_an_admitted_run_and_never_offers_a_review() {
+    for successor in [true, false] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        let (_, before) = pending(&home);
+        let mut host = startup(&home);
+        host.fresh = true;
+        host.successor = successor;
+        let prepared = prepare_setup(&mut host).unwrap();
+        if successor {
+            assert!(matches!(prepared, PreparedSetup::Unavailable));
+            assert!(host.offered.is_empty(), "{:?}", host.offered);
+            assert_eq!(host.withheld, 1);
+            assert_eq!(host.snapshot().unwrap().observation, before);
+        } else {
+            assert!(matches!(
+                prepared,
+                PreparedSetup::Authorized { revision: 1, .. }
+            ));
+            assert_eq!(host.offered.len(), 1, "a cold launch offers its plan");
+            assert_eq!(host.withheld, 0);
+        }
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        let (revision, _) = pending(&home);
+        let mut host = startup(&home);
+        host.successor = successor;
+        assert!(matches!(
+            prepare_setup(&mut host).unwrap(),
+            PreparedSetup::Authorized { revision: resumed, .. } if resumed == revision
+        ));
+        assert!(host.offered.is_empty());
+        assert_eq!(
+            host.withheld, 0,
+            "an admitted run asks nothing of the review"
+        );
     }
 }
 
@@ -238,8 +294,9 @@ fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
     std::fs::create_dir(&account).unwrap();
     std::fs::create_dir(&other).unwrap();
     let window = [OsString::from("--window")];
-    let at =
-        |home: &Path| doctor_startup_env_from(|_| None, lasting_scope_refusal_at(home, &account));
+    let at = |home: &Path| {
+        doctor_startup_env_from(|_| None, lasting_scope_refusal_at(home, &account), || false)
+    };
 
     let own = at(&account);
     assert!(!own.outside_person_scope);
@@ -252,9 +309,19 @@ fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
         let env = doctor_startup_env_from(
             |key| (key == marker).then(|| OsString::from("1")),
             lasting_scope_refusal_at(&account, &account),
+            || false,
         );
         assert!(!first_run_window_eligible(&window, env), "{marker}");
     }
+    // Outside the console owner's graphic session (no window server, another login at the
+    // screen), with no marker set, the window leaves setup to one started at this Mac.
+    let away = doctor_startup_env_from(
+        |_| None,
+        lasting_scope_refusal_at(&account, &account),
+        || true,
+    );
+    assert!(away.remote);
+    assert!(!first_run_window_eligible(&window, away));
 
     // The launch's own reader: a test binary runs under its private state root, a lasting
     // refusal, so this process is never the person's.

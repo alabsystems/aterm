@@ -10,16 +10,17 @@ repository.workspace = true
 authors.workspace = true
 description = "How aterm finishes a write: durable (on stable media at return, F_FULLFSYNC on Apple) or ordered (ahead of every later write on the device, F_BARRIERFSYNC on Apple), with a counting seam that tells a test which one each operation took."
 
-# Std-only apart from the barrier itself, so a dependency-free crate (aterm-primer)
-# can finish its writes here and still pull no third-party code: astream-sys has no
-# dependencies, and its one cordoned module of five FFI calls (`fcntl`, `fsync`,
-# `sysctlbyname`, `poll`, `signal`; astream claim `os.cordon`) is the only `unsafe`
-# the barrier needs. This crate calls `barrier_sync` (`fcntl(F_BARRIERFSYNC)`) and
-# `barrier_refused`, on files and on directories (`ordered_dir`), and reads and sets
-# the test mark (`test_plain_fsync`, `TEST_PLAIN_FSYNC_ENV`); it never installs the
-# `SIGHUP` handler. Only Apple targets have an ordering-only flush, so only they
-# compile it.
-[target.'cfg(target_vendor = "apple")'.dependencies]
+# Std-only apart from astream-sys, so a dependency-free crate (aterm-primer) can
+# finish its writes here and still pull no third-party code: astream-sys has no
+# dependencies, and its cordoned modules of FFI calls (astream claim `os.cordon`) hold
+# the only `unsafe` the barrier needs. On every target this crate classifies a directory
+# flush's error by astream's one rule (`dir_flush_unavailable`, for
+# `Flush::dir_best_effort` and `DirFlushed::classify`), a plain judgement of the error
+# that crosses into no kernel. On Apple targets, the only ones with an ordering-only
+# flush, it also calls `barrier_sync` (`fcntl(F_BARRIERFSYNC)`) and `barrier_refused`,
+# on files and on directories (`ordered_dir`), and reads and sets the test mark
+# (`test_plain_fsync`, `TEST_PLAIN_FSYNC_ENV`); it never installs the `SIGHUP` handler.
+[dependencies]
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
 [dev-dependencies]

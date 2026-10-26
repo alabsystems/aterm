@@ -11,13 +11,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use aterm_agent::supervise::facts::SeedOutcome;
+use aterm_agent::supervise::occupancy::WakeDoor;
 use aterm_agent::supervise::occupancy::declarer::{AgentId, ProcLink, prove};
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_agent::supervise::occupancy::wakes::{
     DeclaredWake, Levels, ParkBook, ParkRefusal, SourceAtom, SysWait, UNHEARD_MS, WakeBook, WakeReq,
 };
 use aterm_agent::supervise::occupancy::wakes_seen::{Declarer, WakeState};
-use aterm_agent::supervise::occupancy::{WakeClaim, WakeDoor};
 use aterm_models_harness::wake_book_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
@@ -284,7 +284,8 @@ fn agrees(st: &State, r: &Real) -> bool {
     let (s, parked) = (st["st"], st["parked"]);
     let granted = r.book.get(1).map(DeclaredWake::episode).is_some_and(|ep| {
         let mut book = r.book.clone();
-        book.claim(1, ep, WakeDoor::Break, r.now + UNHEARD_MS) == WakeClaim::Granted
+        book.claim(1, ep, WakeDoor::Break, r.now + UNHEARD_MS)
+            .lets()
     });
     let answers = r.book.for_await().contains(&1);
     let parks = r.parks.clone().park(r.conns + 1, &r.book, r.now).is_ok();
@@ -431,7 +432,7 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut Ev)
             let (ep, now, door) = (r.episode(), r.now, run.door());
             let claim = ev.step(action, || r.book.claim(1, ep, door, now));
             r.rows.push((ep, SeedOutcome::Intent));
-            claim == WakeClaim::Granted
+            claim.lets()
         }
         "Write" => {
             let ep = r.episode();
@@ -441,7 +442,7 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut Ev)
         "Release" => {
             let ep = r.episode();
             r.rows.push((ep, SeedOutcome::Skipped));
-            ev.step(action, || r.book.release(1, ep))
+            ev.step(action, || r.book.release(1, ep, run.door()))
         }
         // The loop typed and booked its line, and ended before it told the book: a successor
         // reconciles.

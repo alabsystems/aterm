@@ -54,7 +54,10 @@ pub use events::{
     classify, event_advance_offset_monotone, event_carry_within_bound, quiesced_at,
     EventClassifier, Profile, SessionEvent,
 };
-pub use ops::{op_clamp_scroll_top, op_scroll_region_nonempty, ScreenOp};
+pub use ops::{
+    decode_ops, encode_ops, op_clamp_scroll_top, op_scroll_region_nonempty, OpsWireError, ScreenOp,
+    MAX_MODE_PARAMS, MAX_OPS_PER_BATCH, OPS_WIRE_MAGIC, OPS_WIRE_VERSION,
+};
 pub use perceive::{
     blocks, frame, perceive_clamp_take_count, perceive_row_in_bounds, search, text, Block, Hit,
 };
@@ -68,6 +71,6 @@ pub use render::{
     Image,
 };
 pub use screen::{
-    apply_ops, dec_special_graphic, emit_ops, fold, screen_clamp_dim, screen_coord_in_bounds, Cell,
-    Charset, Color, Folder, Screen,
+    apply_ops, apply_ops_to, dec_special_graphic, emit_ops, fold, screen_clamp_dim,
+    screen_coord_in_bounds, Cell, Charset, Color, Folder, Screen,
 };

@@ -2082,9 +2082,7 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             "vim",
         ),
         (r"& C:\tools\my` app.exe --token SECRET".into(), "my"),
-        ("claude` /secret/tok --resume x".into(), "claude"),
         ("claude `echo /secret/tok`".into(), "claude"),
-        ("`which less` README.md".into(), "which"),
         (
             r"& 'C:\Program Files\Git\usr\bin\less.exe' C:\Windows\win.ini".into(),
             "less",
@@ -2166,6 +2164,280 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             );
         }
     }
+}
+
+/// Every word holding `QZP6` is an argument or a flag's value, never the program a wrapper runs.
+#[test]
+fn a_wrapper_flag_value_is_never_kept_as_the_program() {
+    let cases: &[(&str, &str)] = &[
+        ("sudo -n ./deploy.sh --token QZP6a", "deploy.sh"),
+        ("sudo -D /tmp/QZP6b make", "make"),
+        ("sudo -p QZP6c ls", "ls"),
+        ("env -C /tmp/QZP6d make", "make"),
+        ("time -o QZP6e make", "make"),
+        ("sudo -n cp QZP6f.key /etc/", "cp"),
+        ("sudo -h QZP6g ls", "ls"),
+        ("sudo -hQZP6g ls", "ls"),
+        ("sudo -C 3 ls", "ls"),
+        ("sudo --prompt QZP6h ls", "ls"),
+        ("sudo --prompt=QZP6h ls", "ls"),
+        ("sudo -nu QZP6i make", "make"),
+        ("sudo -uQZP6i make", "make"),
+        (
+            "sudo -g QZP6j -r QZP6k -t QZP6l -T 5 -R /QZP6m -U QZP6n ls",
+            "ls",
+        ),
+        (
+            "sudo --user QZP6i --chdir=/QZP6o --close-from 4 --preserve-env=QZP6p make",
+            "make",
+        ),
+        ("sudo -AbBEHkNPSs -i make QZP6q", "make"),
+        ("sudo --preserve-env make QZP6q", "make"),
+        ("sudo FOO=QZP6q make", "make"),
+        ("sudo -- FOO=QZP6q make QZP6q", "make"),
+        ("sudo -e /etc/QZP6r.conf", "sudo"),
+        ("sudo -l QZP6s", "sudo"),
+        ("sudo -v QZP6s", "sudo"),
+        ("sudo -V QZP6s", "sudo"),
+        ("sudo -K QZP6s", "sudo"),
+        ("sudo -ne QZP6s", "sudo"),
+        ("sudo --edit QZP6s", "sudo"),
+        ("sudo --help QZP6s", "sudo"),
+        ("sudo -h", "sudo"),
+        ("sudo -h -n QZP6s ls", "sudo"),
+        ("sudo -nZ QZP6s ls", "sudo"),
+        ("sudo -nuroot make QZP6s", "make"),
+        ("sudo --us QZP6s ls", "sudo"),
+        ("sudo --non-interactive=QZP6s ls", "sudo"),
+        ("sudo FOO=1 -n QZP6s", "sudo"),
+        ("sudo -- -n QZP6s", "sudo"),
+        ("sudo -u", "sudo"),
+        ("sudo", "sudo"),
+        ("env --chdir QZP6t make", "make"),
+        ("env --chdir=/QZP6t make", "make"),
+        ("env -P /QZP6u make", "make"),
+        ("env -u QZP6v --unset QZP6v --unset=QZP6v make", "make"),
+        (
+            "env -i0v - --ignore-environment --null FOO=QZP6w make",
+            "make",
+        ),
+        ("env -iC/QZP6t make", "make"),
+        ("env -S '-C /tmp/QZP6x make --token QZP6x'", "make"),
+        ("env -S 'sudo -n ./deploy.sh --token QZP6x'", "deploy.sh"),
+        ("env -S '-i' -S 'make QZP6x'", "make"),
+        ("env -S '-C /QZP6x n\u{7f}ode QZP6x'", "node"),
+        ("e\u{7f}nv -C /QZP6x make", "make"),
+        ("env -S '-S QZP6x make'", "env"),
+        ("env -X QZP6s make", "env"),
+        ("env FOO=1 -i QZP6s", "env"),
+        ("env -S", "env"),
+        ("time -f QZP6y make", "make"),
+        (
+            "time --output=QZP6y --format QZP6y -pavq --append --portability --verbose --quiet make",
+            "make",
+        ),
+        ("time -l make QZP6y", "make"),
+        ("time -h QZP6s make", "time"),
+        ("time -o", "time"),
+        ("time -o QZP6y for i in 1 2; do sleep 1; done", "for"),
+        ("nice -n 5 ./run.sh --key QZP6z", "run.sh"),
+        ("nice -n -10 make QZP6z", "make"),
+        ("nice -n5 make", "make"),
+        ("nice --adjustment=5 make", "make"),
+        ("nice --adjustment 5 make", "make"),
+        ("nice -5 make QZP6z", "make"),
+        ("nice --5 make QZP6z", "make"),
+        ("nice -+5 make QZP6z", "make"),
+        ("nice -5x QZP6s make", "nice"),
+        ("nice -u QZP6s make", "nice"),
+        ("nice FOO=QZP6s make", "nice"),
+        ("command -p make QZP6z", "make"),
+        ("command -v QZP6s", "command"),
+        ("command -V QZP6s", "command"),
+        ("nohup -n QZP6s make", "nohup"),
+        ("nohup -- make QZP6z", "make"),
+        ("exec -a QZP6z make", "make"),
+        ("exec -cl -a QZP6z make", "make"),
+        ("exec -laQZP6z make", "make"),
+        ("exec -x QZP6s make", "exec"),
+        ("sudo nice -n 5 ./run.sh --token QZP6z", "run.sh"),
+        ("time sudo -u root nice -n -5 env -C /QZP6z make", "make"),
+        ("nohup sudo -Z QZP6s make", "sudo"),
+        ("/usr/bin/sudo -Z QZP6s make", "sudo"),
+    ];
+    for (cmd, want) in cases {
+        let got = command_detail(cmd);
+        assert_eq!(got.as_deref(), Some(*want), "{cmd:?}");
+        assert!(
+            !got.unwrap_or_default().contains("QZP6"),
+            "{cmd:?} keeps an argument"
+        );
+    }
+}
+
+/// The shell takes a redirection and its target out of the words before any program reads them,
+/// a here-document's lines are its text, and a substitution's output is not on the line: none of
+/// them is ever kept as the program, through a wrapper or without one.
+#[test]
+fn a_redirection_or_substitution_is_never_kept_as_the_program() {
+    let cases: &[(&str, Option<&str>)] = &[
+        ("sudo >/tmp/QZP6a.txt make", Some("make")),
+        ("sudo -u root 2>/tmp/QZP6b.err make", Some("make")),
+        ("nohup >/tmp/QZP6c.out make", Some("make")),
+        ("exec >/tmp/QZP6d.log", Some("exec")),
+        ("exec 3>/tmp/QZP6e", Some("exec")),
+        ("exec 3> /tmp/QZP6e", Some("exec")),
+        ("sudo -n <<<QZP6f cat", Some("cat")),
+        ("sudo -u root <<< QZP6g cat", Some("cat")),
+        ("sudo -S <<<QZP6h apt update", Some("apt")),
+        ("sudo -u >/tmp/QZP6i root make", Some("make")),
+        ("sudo 2> /tmp/QZP6j -n make", Some("make")),
+        ("env -C /tmp/QZP6k >/tmp/QZP6k make", Some("make")),
+        ("sudo >! /tmp/QZP6l make", Some("sudo")),
+        ("sudo >!/tmp/QZP6l make", Some("make")),
+        ("sudo &>/tmp/QZP6m make", Some("make")),
+        ("sudo >>/tmp/QZP6n make", Some("make")),
+        ("sudo {fd}>/tmp/QZP6o make", Some("make")),
+        ("sudo >&2 make", Some("make")),
+        ("2>/dev/QZP6q make", Some("make")),
+        ("> /tmp/QZP6r make", Some("make")),
+        ("make>/tmp/QZP6s", Some("make")),
+        ("make&>/tmp/QZP6s", Some("make")),
+        ("make 2>&1 >/tmp/QZP6t", Some("make")),
+        ("cat<<<QZP6u", Some("cat")),
+        ("<<<QZP6v cat", Some("cat")),
+        ("<QZP6w sort", Some("sort")),
+        ("git >/tmp/QZP6x status", Some("git status")),
+        ("FOO=1 >/tmp/QZP6z make", Some("make")),
+        (">/tmp/QZP6y", None),
+        ("2>", None),
+        ("cat <<QZP6END\nQZP6 body\nQZP6END", Some("cat")),
+        (
+            "cd /tmp/x && cat <<- 'QZP6END' >/tmp/QZP6out\n\tfor x in QZP6; do QZP6; done\nQZP6END",
+            Some("cat"),
+        ),
+        ("sort <<EOF | uniq\nQZP6a\nQZP6b; QZP6c\nEOF", Some("sort")),
+        ("cat <<<QZP6 && make", Some("make")),
+        ("sudo \"$(cat /tmp/QZP6a)\"", Some("sudo")),
+        ("\"$(cat /tmp/QZP6b)\" x", None),
+        ("$(cat /tmp/QZP6c) x", None),
+        ("`cat /tmp/QZP6d` x", None),
+        ("\"`cat /tmp/QZP6e`\" x", None),
+        ("FOO=$(cat /tmp/QZP6f) make", None),
+        ("sudo -u $(echo root QZP6g) make", Some("sudo")),
+        ("<(cat /tmp/QZP6h) x", None),
+        ("sudo >$(mktemp QZP6i) make", Some("sudo")),
+        ("sudo > \"$(mktemp QZP6i)\" make", Some("sudo")),
+        ("$((1 + 2)) QZP6m", None),
+        ("`which less` README.md", None),
+        ("claude` /secret/tok --resume x", None),
+        ("claude $(cat /tmp/QZP6j)", Some("claude")),
+        ("git $(cat /tmp/QZP6k) status", Some("git")),
+        ("env -S \"$(cat /tmp/QZP6l)\" make", Some("env")),
+        ("env -S \"-C '/tmp/QZP6 dir' make\"", Some("env")),
+        ("env -S '-P \"/QZP6a b\" make'", Some("env")),
+        ("env -S \"FOO='QZP6c d' make\"", Some("env")),
+        ("env -S 'make\\_QZP6b'", Some("env")),
+        ("env -S '#QZP6 make'", Some("env")),
+        ("env -S 'make ${QZP6}'", Some("env")),
+        ("env -S \"$QZP6 make\"", Some("env")),
+        ("env -S'make QZP6'", Some("make")),
+        ("env --split-string='-C /QZP6 make'", Some("make")),
+        ("env -S make\\ QZP6", Some("make")),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(cmd, want)| {
+            let got = command_detail(cmd);
+            (got.as_deref() != want || got.as_deref().is_some_and(|d| d.contains("QZP6")))
+                .then(|| format!("{cmd:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Each wrapper's grammar, read from its own tables: a flag it knows keeps the program after its
+/// value, and a flag it does not know keeps only the wrapper's name.
+#[test]
+fn each_wrapper_reads_its_own_flags_and_closes_on_any_other() {
+    let mut wrong = Vec::new();
+    for wrapper in &WRAPPERS {
+        let name = wrapper.name;
+        let mut closes = vec![
+            name.to_owned(),
+            format!("{name} -- -x QZP6x"),
+            format!("{name} '' QZP6x"),
+        ];
+        for flag in ["-Z", "--zz", "-Zq"] {
+            closes.push(format!("{name} {flag} QZP6x prog"));
+        }
+        let mut reads = vec![
+            format!("{name} prog QZP6x"),
+            format!("{name} -- prog QZP6x"),
+        ];
+        let (numeric, lone_dash) = (
+            format!("{name} -5 QZP6x prog"),
+            format!("{name} - QZP6x prog"),
+        );
+        if wrapper.numeric {
+            reads.push(format!("{name} -5 prog QZP6x"));
+        } else {
+            closes.push(numeric);
+        }
+        if wrapper.lone_dash {
+            reads.push(format!("{name} - prog QZP6x"));
+        } else {
+            closes.push(lone_dash);
+        }
+        for &(flag, takes) in wrapper.short {
+            let flag = format!("-{flag}");
+            reads.extend(match takes {
+                Takes::Nothing => vec![format!("{name} {flag} prog QZP6x")],
+                Takes::Attached => vec![format!("{name} {flag}QZP6x prog")],
+                Takes::Value | Takes::HostOrHelp => vec![
+                    format!("{name} {flag} QZP6x prog QZP6y"),
+                    format!("{name} {flag}QZP6x prog QZP6y"),
+                ],
+                Takes::Split => vec![
+                    format!("{name} {flag} 'prog QZP6x' QZP6y"),
+                    format!("{name} {flag}'prog QZP6x'"),
+                ],
+            });
+            if takes != Takes::Nothing && takes != Takes::Attached {
+                closes.push(format!("{name} {flag}"));
+            }
+        }
+        for &(flag, takes) in wrapper.long {
+            let flag = format!("--{flag}");
+            reads.extend(match takes {
+                Takes::Nothing => vec![format!("{name} {flag} prog QZP6x")],
+                Takes::Attached => vec![
+                    format!("{name} {flag} prog QZP6x"),
+                    format!("{name} {flag}=QZP6x prog"),
+                ],
+                Takes::Value | Takes::HostOrHelp => vec![
+                    format!("{name} {flag} QZP6x prog QZP6y"),
+                    format!("{name} {flag}=QZP6x prog QZP6y"),
+                ],
+                Takes::Split => vec![
+                    format!("{name} {flag} 'prog QZP6x' QZP6y"),
+                    format!("{name} {flag}='prog QZP6x'"),
+                ],
+            });
+            if takes == Takes::Nothing {
+                closes.push(format!("{name} {flag}=QZP6x prog"));
+            }
+        }
+        for (cmds, want) in [(closes, name), (reads, "prog")] {
+            for cmd in cmds {
+                let got = command_detail(&cmd);
+                if got.as_deref() != Some(want) {
+                    wrong.push(format!("{cmd:?}: {got:?}, want {want:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

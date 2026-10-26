@@ -1677,11 +1677,13 @@ pub(crate) struct EditorHeaderLayout {
     pub(crate) saving_x: Option<f32>,
 }
 
-/// The room the title keeps before the caret's place gives way to it.
-const EDITOR_TITLE_LEAST: f32 = 96.0;
-
+/// The header's marks for `title` (as painted, its unsaved mark included). The title comes
+/// first: the caret's place shows only while the whole title fits beside it, so a narrow
+/// editor drops the place rather than cut the file's name (`aterm.toml`, not `ate…oml`).
+/// The caret's line stays marked in the gutter.
 pub(crate) fn editor_header_layout(
     rect: LogicalRect,
+    title: &str,
     cursor_label: Option<&str>,
     saving: bool,
 ) -> EditorHeaderLayout {
@@ -1691,6 +1693,11 @@ pub(crate) fn editor_header_layout(
     let badge_x = rect.x + 14.0;
     let badge_w = crate::tray_raster::ui_text_width_for(TextFace::UiBold, "EDIT", caption);
     let title_x = (badge_x + badge_w + 12.0).max(rect.x + 58.0);
+    let title_w = crate::tray_raster::ui_text_width_for(
+        TextFace::UiBold,
+        title,
+        native_type_px(TypeStep::Body).get(),
+    );
     let mut right = rect.right() - 12.0;
     let saving_x = saving.then(|| {
         let x = (right - crate::tray_raster::ui_text_width_for(TextFace::Ui, "Saving…", caption))
@@ -1700,7 +1707,7 @@ pub(crate) fn editor_header_layout(
     });
     let cursor_x = cursor_label.and_then(|cursor| {
         let x = right - crate::tray_raster::measure_text(cursor, caption, TextWeight::Regular);
-        (x - 8.0 - title_x >= EDITOR_TITLE_LEAST).then(|| {
+        (title_w <= x - 8.0 - title_x + TEXT_FIT_SLACK).then(|| {
             right = x - 8.0;
             x
         })
@@ -1779,7 +1786,15 @@ pub(crate) struct EditorShellMetrics {
     pub(crate) command_bar_height: f32,
     pub(crate) content_gap: f32,
     pub(crate) palette_padding: f32,
+    /// The help line's height: its first row's, and a [`editor_help_line_h`] for each
+    /// further row it takes ([`Self::help_rows`]).
     pub(crate) palette_header_height: f32,
+    /// The rows the help line takes, as its panel asks ([`editor_help_palette`]), at most
+    /// [`EDITOR_HELP_MAX_ROWS`].
+    pub(crate) help_rows: usize,
+    /// The rows past its first the help line may take and leave the document its minimum
+    /// rows (a candidate row needs room first).
+    pub(crate) spare_help_rows: usize,
     pub(crate) palette_row_height: f32,
     pub(crate) palette_row_gap: f32,
     pub(crate) palette_visible_rows: usize,
@@ -1790,8 +1805,15 @@ pub(crate) struct EditorShellMetrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditorPalette {
     None,
-    Help,
-    Rows(usize),
+    /// The help line alone, which wraps to `help_rows` rows ([`editor_help_lines`]).
+    Help {
+        help_rows: usize,
+    },
+    /// The help line (`help_rows` rows) over `candidates` rows.
+    Rows {
+        candidates: usize,
+        help_rows: usize,
+    },
 }
 
 impl From<usize> for EditorPalette {
@@ -1799,9 +1821,143 @@ impl From<usize> for EditorPalette {
         if candidates == 0 {
             Self::None
         } else {
-            Self::Rows(candidates)
+            Self::Rows {
+                candidates,
+                help_rows: 1,
+            }
         }
     }
+}
+
+/// The most rows the editor's assist-panel help line takes; past them its last row is cut.
+pub(crate) const EDITOR_HELP_MAX_ROWS: usize = 3;
+
+/// The size and face the help line is painted at: a quiet text line's
+/// ([`text_paint_metrics`]).
+pub(crate) fn editor_help_type() -> (f32, crate::widget::TextFace) {
+    text_paint_metrics(SemanticRole::Text, StyleRef::Quiet)
+}
+
+/// The height of each help-line row after the first at `text_scale`.
+pub(crate) fn editor_help_line_h(text_scale: f32) -> f32 {
+    (13.0 * text_scale * 1.4).ceil()
+}
+
+/// The paddings `(outer, palette)` an editor in `viewport` keeps at `text_scale`
+/// ([`editor_shell_metrics_at_scale`]).
+fn editor_shell_paddings(viewport: LogicalRect, text_scale: f32) -> (f32, f32) {
+    let chrome_scale = text_scale.min(1.35);
+    let short = viewport.height < 440.0 * text_scale.min(1.2);
+    let outer_padding = if short {
+        6.0 * chrome_scale
+    } else if viewport.width < 560.0 * text_scale.min(1.4) {
+        8.0 * chrome_scale
+    } else {
+        16.0 * chrome_scale
+    };
+    (outer_padding, 6.0 * chrome_scale)
+}
+
+/// The text scale the editor's shell is measured at.
+fn editor_text_scale(text_scale: f32) -> f32 {
+    if text_scale.is_finite() && text_scale > 0.0 {
+        text_scale.clamp(0.85, 2.0)
+    } else {
+        1.0
+    }
+}
+
+/// The width the assist panel's help line is painted in, in an editor in `viewport`: the
+/// panel's, inside its padding.
+pub(crate) fn editor_help_width(viewport: LogicalRect) -> f32 {
+    let text_scale = editor_text_scale(crate::native_appearance::text_scale());
+    let (outer, palette) = editor_shell_paddings(viewport, text_scale);
+    (viewport.width - outer * 2.0 - palette * 2.0).max(0.0)
+}
+
+/// THE ASSIST PANEL'S HELP LINE AS ROWS in an editor in `viewport`, as the footer paints
+/// its status: `help` whole on one row where it fits, else wrapped at whole words onto
+/// the rows it needs, at most `max_rows`. Where those rows cannot hold it, the longest
+/// shorter form that fits whole, the facts after its first left out from the last
+/// ([`editor_help_forms`]); only a first fact too long for them is cut. The panel takes
+/// as many rows ([`EditorPalette`]).
+pub(crate) fn editor_help_lines(viewport: LogicalRect, help: &str, max_rows: usize) -> Vec<String> {
+    let (px, face) = editor_help_type();
+    let width = editor_help_width(viewport);
+    let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+    let max_rows = max_rows.max(1);
+    let wrap = |text: &str| {
+        if measure(text) <= width + TEXT_FIT_SLACK {
+            vec![text.to_string()]
+        } else {
+            crate::native_settings::wrap_to_box(text, width, &measure)
+        }
+    };
+    let forms = editor_help_forms(help);
+    if let Some(lines) = forms
+        .iter()
+        .map(|form| wrap(form))
+        .find(|lines| lines.len() <= max_rows)
+    {
+        return lines;
+    }
+    let mut lines = wrap(forms.last().map_or(help, String::as_str));
+    if lines.len() > max_rows {
+        let rest = lines.split_off(max_rows - 1).join(" ");
+        lines.push(whole_word_cut(
+            &rest,
+            elide_text_label(&rest, width, px, face),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// The assist panel an editor in `viewport` with `toolbar` shows for `help`, over
+/// `candidates` rows where it lists any, and the help line's rows: the form
+/// [`editor_help_lines`] paints in the rows the document can spare it
+/// ([`EditorShellMetrics::spare_help_rows`]), and always in the rows its first fact (what
+/// the setting does) takes whole, as the footer always has its reserved rows
+/// ([`EDITOR_FOOTER_RESERVED_ROWS`]): a narrow editor at a large text size gives the
+/// file a row rather than cut "Prime coding agents automatically" to "Prime coding
+/// agents…". The view paints these rows and the input side counts the document's rows
+/// under this panel, so both measure the one panel.
+pub(crate) fn editor_help_palette(
+    viewport: LogicalRect,
+    toolbar: EditorToolbar,
+    candidates: Option<usize>,
+    help: &str,
+) -> (EditorPalette, Vec<String>) {
+    let palette = |help_rows: usize| match candidates {
+        Some(candidates) => EditorPalette::Rows {
+            candidates,
+            help_rows,
+        },
+        None => EditorPalette::Help { help_rows },
+    };
+    let spare = editor_shell_metrics(viewport, palette(1), toolbar).spare_help_rows;
+    let first_fact = editor_help_forms(help).last().map_or(1, |first| {
+        editor_help_lines(viewport, first, EDITOR_HELP_MAX_ROWS).len()
+    });
+    let rows = spare
+        .saturating_add(1)
+        .max(first_fact)
+        .min(EDITOR_HELP_MAX_ROWS);
+    let lines = editor_help_lines(viewport, help, rows);
+    (palette(lines.len()), lines)
+}
+
+/// The help line's forms, longest first: the whole help, then without its last fact
+/// (`Prime coding agents automatically · agents_auto_prime · true / false` without `·
+/// default true`), down to its first fact alone.
+pub(crate) fn editor_help_forms(help: &str) -> Vec<String> {
+    let facts: Vec<&str> = help.split(FACT_SEPARATOR).collect();
+    (1..=facts.len())
+        .rev()
+        .map(|count| facts[..count].join(FACT_SEPARATOR))
+        .collect()
 }
 
 /// What the editor's toolbar holds beyond its fixed commands.
@@ -1968,25 +2124,18 @@ pub(crate) fn editor_shell_metrics_at_scale(
     text_scale: f32,
 ) -> EditorShellMetrics {
     let palette = palette.into();
-    let palette_candidates = match palette {
-        EditorPalette::Rows(candidates) => candidates,
-        EditorPalette::None | EditorPalette::Help => 0,
+    let (palette_candidates, wanted_help_rows) = match palette {
+        EditorPalette::Rows {
+            candidates,
+            help_rows,
+        } => (candidates, help_rows),
+        EditorPalette::Help { help_rows } => (0, help_rows),
+        EditorPalette::None => (0, 1),
     };
-    let text_scale = if text_scale.is_finite() && text_scale > 0.0 {
-        text_scale.clamp(0.85, 2.0)
-    } else {
-        1.0
-    };
+    let text_scale = editor_text_scale(text_scale);
     let chrome_scale = text_scale.min(1.35);
     let dense_commands = viewport.width < 390.0 * text_scale.min(1.4);
-    let short = viewport.height < 440.0 * text_scale.min(1.2);
-    let outer_padding = if short {
-        6.0 * chrome_scale
-    } else if viewport.width < 560.0 * text_scale.min(1.4) {
-        8.0 * chrome_scale
-    } else {
-        16.0 * chrome_scale
-    };
+    let (outer_padding, palette_padding) = editor_shell_paddings(viewport, text_scale);
     let command_gap = if dense_commands {
         4.0 * chrome_scale
     } else {
@@ -2010,8 +2159,7 @@ pub(crate) fn editor_shell_metrics_at_scale(
     let command_bar_height =
         command_button_height * command_rows as f32 + command_gap * (command_rows - 1) as f32;
     let content_gap = 8.0 * chrome_scale;
-    let palette_padding = 6.0 * chrome_scale;
-    let palette_header_height = (28.0 * text_scale).clamp(28.0, 40.0);
+    let help_row_height = (28.0 * text_scale).clamp(28.0, 40.0);
     let palette_row_height = (34.0 * text_scale).clamp(34.0, 48.0);
     let palette_row_gap = 3.0 * chrome_scale;
     // The footer with the rows it always has room for ([`EDITOR_FOOTER_RESERVED_ROWS`]): a
@@ -2027,6 +2175,23 @@ pub(crate) fn editor_shell_metrics_at_scale(
         - content_gap * 2.0
         - minimum_editor_height)
         .max(0.0);
+    // The rows past its first the help line can take where the document keeps its minimum
+    // rows under them (a candidate row needs room first); its panel decides how many it
+    // takes ([`editor_help_palette`]).
+    let spare_help_rows = ((available_palette_height
+        - palette_padding * 2.0
+        - help_row_height
+        - if palette_candidates == 0 {
+            0.0
+        } else {
+            palette_row_height + palette_row_gap
+        })
+    .max(0.0)
+        / editor_help_line_h(text_scale))
+    .floor() as usize;
+    let help_rows = wanted_help_rows.clamp(1, EDITOR_HELP_MAX_ROWS);
+    let palette_header_height =
+        help_row_height + (help_rows - 1) as f32 * editor_help_line_h(text_scale);
     let palette_chrome = palette_padding * 2.0 + palette_header_height;
     let palette_visible_rows = if palette_candidates == 0 {
         0
@@ -2038,8 +2203,8 @@ pub(crate) fn editor_shell_metrics_at_scale(
     };
     let palette_height = match palette {
         EditorPalette::None => 0.0,
-        EditorPalette::Help => palette_chrome,
-        EditorPalette::Rows(_) => {
+        EditorPalette::Help { .. } => palette_chrome,
+        EditorPalette::Rows { .. } => {
             palette_chrome
                 + palette_visible_rows as f32 * palette_row_height
                 + palette_visible_rows as f32 * palette_row_gap
@@ -2056,6 +2221,8 @@ pub(crate) fn editor_shell_metrics_at_scale(
         content_gap,
         palette_padding,
         palette_header_height,
+        help_rows,
+        spare_help_rows,
         palette_row_height,
         palette_row_gap,
         palette_visible_rows,
@@ -2502,6 +2669,16 @@ impl UiNode {
     /// Compute the scrollable list room below a sticky caption of `height`.
     pub(crate) fn under_caption(self, height: f32) -> Self {
         self.room(height, false)
+    }
+
+    /// Mark this scrolling list ([`Self::room`]) as giving the tree every row, on its screen or
+    /// off it ([`ListRoom::lists_all`]): a row its edge cuts to a sliver, which it paints only
+    /// as a picture, stays in the semantic tree and in Tab's walk, off its screen.
+    pub(crate) const fn lists_every_row(mut self) -> Self {
+        if let Some(room) = self.room.as_mut() {
+            room.lists_all = true;
+        }
+        self
     }
 
     /// Mark this subtree a scrolling list's row off its screen.
@@ -4231,10 +4408,35 @@ const fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
         && control.spec.visual_label.is_some()
 }
 
-/// The width a centred label line may take in a text button `width` wide: the
-/// painter's end reserve kept clear on both sides.
+/// The least a centred label keeps clear of each end of its button where its widest word needs
+/// the rest ([`centred_label_end`]).
+pub(crate) const CENTRED_LABEL_LEAST_END: f32 = 6.0;
+
+/// What a centred label keeps clear of each end of a text button `width` wide: the painter's end
+/// reserve, giving way to the label's widest word down to [`CENTRED_LABEL_LEAST_END`], since a
+/// centred line lines up with nothing but its button. A chip as wide as its row holds "Problems"
+/// whole at 2× text where its 10pt ends broke it "Prob-" / "lems". The word is measured in the
+/// widest face a label is set in, so its room never moves with the button's state.
+pub(crate) fn centred_label_end(spec: &ButtonSpec, width: f32) -> f32 {
+    let reserve = text_button_trailing_reserve(spec) + button_end_reserve(spec);
+    let label = spec.visual_label.as_deref().unwrap_or(&spec.label);
+    let size = native_type_px(TypeStep::Secondary).get();
+    let widest = aterm_grapheme::pieces(label, aterm_grapheme::BreakKind::is_word_boundary)
+        .into_iter()
+        .map(|piece| {
+            visual_text_width(piece.text, size, crate::widget::TextFace::UiBold).max(
+                visual_text_width(piece.text, size, crate::widget::TextFace::Ui),
+            )
+        })
+        .fold(0.0_f32, f32::max);
+    let least = CENTRED_LABEL_LEAST_END + button_end_reserve(spec);
+    reserve.min(((width - widest) / 2.0).max(least))
+}
+
+/// The width a centred label line may take in a text button `width` wide: what
+/// [`centred_label_end`] keeps clear on both sides.
 pub(crate) fn centred_label_room(spec: &ButtonSpec, width: f32) -> f32 {
-    (width - 2.0 * (text_button_trailing_reserve(spec) + button_end_reserve(spec))).max(0.0)
+    (width - 2.0 * centred_label_end(spec, width)).max(0.0)
 }
 
 fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
@@ -4468,6 +4670,8 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     && control.style == StyleRef::Plain
                 {
                     DISCLOSURE_LABEL_END
+                } else if centres_its_label(control) {
+                    centred_label_end(&control.spec, node.rect.width)
                 } else {
                     text_button_trailing_reserve(&control.spec) + button_end_reserve(&control.spec)
                 };
@@ -4982,7 +5186,7 @@ fn text_viewport_paint_audit(node: &PaintNode, spec: &TextViewportSpec) -> Strin
     } else {
         spec.label.clone()
     };
-    let header = editor_header_layout(node.rect, spec.cursor_label.as_deref(), spec.saving);
+    let header = editor_header_layout(node.rect, &title, spec.cursor_label.as_deref(), spec.saving);
     let (title_x, title_right) = (header.title_x, header.title_right);
     let title_required = visual_text_width(
         &title,
@@ -5354,20 +5558,19 @@ fn paint_compiled_node(
                     (roles.danger, 220)
                 } else if control.state.focus_visible {
                     (roles.accent, 255)
-                } else if chip_selected {
+                } else if idle && (chip_selected || primary || nav_selected) {
+                    // An idle choice's mark is the tertiary text, under 3:1 on a card.
+                    resting_rim(&roles)
+                } else if chip_selected || primary || nav_selected {
+                    // Opaque: a rim thinned by alpha falls under 3:1 (a Primary's
+                    // accent at 176 read 2.3:1 on light cards).
                     (mark, 255)
-                } else if chip {
-                    (roles.control_edge, 255)
-                } else if primary {
-                    (mark, 176)
                 } else if danger {
-                    (roles.danger, 200)
-                } else if nav_selected {
-                    (mark, 150)
+                    (roles.danger, 255)
                 } else if inert {
                     (roles.separator, 96)
                 } else {
-                    (roles.separator, 176)
+                    resting_rim(&roles)
                 };
                 prims.push(DrawPrim::Stroke {
                     x: rect.x + 0.5,
@@ -5498,6 +5701,11 @@ fn paint_compiled_node(
                     .as_ref()
                     .unwrap_or(&control.spec.label);
                 let trailing_reserve = text_button_trailing_reserve(&control.spec);
+                let label_end = if centres_its_label(control) {
+                    centred_label_end(&control.spec, rect.width)
+                } else {
+                    trailing_reserve + button_end_reserve(&control.spec)
+                };
                 let painted_lines = button_label_lines(label)
                     .map(|line| {
                         let text_x = if centres_its_label(control) {
@@ -5509,11 +5717,7 @@ fn paint_compiled_node(
                         };
                         let painted = elide_text_label(
                             line,
-                            (rect.right()
-                                - trailing_reserve
-                                - button_end_reserve(&control.spec)
-                                - text_x)
-                                .max(0.0),
+                            (rect.right() - label_end - text_x).max(0.0),
                             size.get(),
                             nav_face,
                         );
@@ -7120,7 +7324,12 @@ fn paint_text_viewport(
     let body = native_type_px(TypeStep::Body);
     let secondary = native_type_px(TypeStep::Secondary);
     let header_baseline = row_baseline(rect.y, header_h, body.get());
-    let header = editor_header_layout(rect, spec.cursor_label.as_deref(), spec.saving);
+    let title = if spec.dirty {
+        format!("{}{EDITOR_DIRTY_MARK}", spec.label)
+    } else {
+        spec.label.clone()
+    };
+    let header = editor_header_layout(rect, &title, spec.cursor_label.as_deref(), spec.saving);
     prims.push(text_prim(
         header.badge_x,
         header_baseline,
@@ -7130,11 +7339,6 @@ fn paint_text_viewport(
         TextFace::UiBold,
         rgba(roles.accent, 255),
     ));
-    let title = if spec.dirty {
-        format!("{}{EDITOR_DIRTY_MARK}", spec.label)
-    } else {
-        spec.label.clone()
-    };
     prims.push(text_prim(
         header.title_x,
         header_baseline,
@@ -7996,17 +8200,27 @@ fn paint_control_surface(
         h: (rect.height - 1.0).max(0.0),
         radius: 8.0,
         width: if state.focus_visible { 2.0 } else { 1.0 },
-        color: rgba(
-            if state.invalid {
-                roles.danger
-            } else if state.focus_visible {
-                roles.accent
-            } else {
-                roles.separator
-            },
-            220,
-        ),
+        color: if state.invalid {
+            rgba(roles.danger, 220)
+        } else if state.focus_visible {
+            rgba(roles.accent, 220)
+        } else if !state.enabled {
+            rgba(roles.separator, 220)
+        } else {
+            let (rim, alpha) = resting_rim(&roles);
+            rgba(rim, alpha)
+        },
     });
+}
+
+/// The rim of a resting control (a chip, a Secondary or Setting button, a field, a slider, a
+/// boxed switch): its fill stands only a few percent off the ground it sits on, so the rim is
+/// the control's only boundary and holds the non-text floor, 3:1
+/// ([`crate::native_appearance::NativeRoles::control_edge`]), on the card and on the page. The
+/// separator is a 1.5:1 hairline for dividing, never a control's edge. A disabled control's rim
+/// stays soft, as WCAG exempts it.
+const fn resting_rim(roles: &crate::settings::Roles) -> ([u8; 3], u8) {
+    (roles.control_edge, 255)
 }
 
 fn control_text_color(state: ControlState, roles: &crate::settings::Roles) -> [u8; 3] {
@@ -12912,5 +13126,178 @@ pub(crate) mod tests {
         assert_eq!(hard.list_picture_at(24.0, 12.0), Some(&top));
         let fading = list(true);
         assert!(words_painted(&fading), "the strip fades the line out");
+    }
+
+    /// A RESTING CONTROL'S RIM, WHERE IT IS THE CONTROL'S ONLY BOUNDARY, HOLDS 3:1 (WCAG
+    /// 1.4.11's non-text floor) AGAINST THE GROUND IT STANDS ON, IN THE RASTERIZED PIXELS: every
+    /// built-in theme, on a card and on the page, every button style and every boxed control (a
+    /// field, a slider, a switch). A rest fill a few percent off the ground draws no boundary, so
+    /// the rim is all a person sees of the control's extent. A disabled control is exempt, as
+    /// WCAG exempts it, and stays soft.
+    #[test]
+    fn a_resting_controls_rim_holds_3_to_1_against_its_ground() {
+        use crate::native_appearance::contrast_ratio;
+        use crate::widget::DrawPrim;
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let rect = LogicalRect::new(12.0, 10.0, 160.0, 36.0);
+        let styles = [
+            StyleRef::Plain,
+            StyleRef::Hero,
+            StyleRef::Primary,
+            StyleRef::Secondary,
+            StyleRef::Quiet,
+            StyleRef::Accent,
+            StyleRef::Success,
+            StyleRef::Danger,
+            StyleRef::DangerCompact,
+            StyleRef::Navigation,
+            StyleRef::Setting,
+            StyleRef::Code,
+            StyleRef::Chip,
+        ];
+        let action = || ActionId::new("test/control");
+        let mut controls: Vec<(String, UiContent)> = Vec::new();
+        for style in styles {
+            for (selected, muted) in [(false, false), (true, false), (false, true), (true, true)] {
+                controls.push((
+                    format!(
+                        "{style:?} button{}{}",
+                        if selected { " (selected)" } else { "" },
+                        if muted { " (idle)" } else { "" }
+                    ),
+                    UiContent::Button(
+                        Control::new(
+                            ButtonSpec::new("Copy All").visual_label("Copy All"),
+                            action(),
+                        )
+                        .state(ControlState {
+                            selected,
+                            muted,
+                            ..ControlState::default()
+                        })
+                        .style(style),
+                    ),
+                ));
+            }
+        }
+        controls.push((
+            "text field".to_string(),
+            UiContent::TextField(Control::new(
+                TextFieldSpec {
+                    label: "Query".to_string(),
+                    placeholder: Some("Search".to_string()),
+                    secret: false,
+                    visual_value: None,
+                    input: None,
+                    swatch: None,
+                    swatch_line: false,
+                    trailing_hint: None,
+                    description: None,
+                    end_button: false,
+                },
+                action(),
+            )),
+        ));
+        controls.push((
+            "slider".to_string(),
+            UiContent::Slider(
+                Control::new(
+                    SliderSpec {
+                        description: None,
+                        track: None,
+                        label: "Font size".to_string(),
+                        step: 1.0,
+                        display_value: "14".to_string(),
+                    },
+                    action(),
+                )
+                .value(SemanticValue::Number {
+                    value: 14.0,
+                    minimum: 6.0,
+                    maximum: 32.0,
+                }),
+            ),
+        ));
+        controls.push((
+            "switch".to_string(),
+            UiContent::Switch(
+                Control::new(
+                    SwitchSpec {
+                        label: "Automatic updates".to_string(),
+                        description: None,
+                    },
+                    action(),
+                )
+                .value(SemanticValue::Bool(false)),
+            ),
+        ));
+        let mut rims = 0;
+        let mut short = Vec::new();
+        for name in aterm_types::scheme::builtin_names() {
+            let scheme = aterm_types::scheme::builtin(name).expect("a built-in scheme");
+            let theme = aterm_render::Theme::from(&scheme);
+            let roles = crate::settings::Roles::from_theme(theme);
+            for (what, content) in &controls {
+                let node = PaintNode {
+                    cut_edges: CutEdges::NONE,
+                    key: UiKey::new("test/control"),
+                    rect,
+                    clip: rect,
+                    content: content.clone(),
+                    peek: false,
+                    fade: None,
+                    joins: Joins::default(),
+                };
+                let mut prims = Vec::new();
+                paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+                let rimmed = prims.iter().any(|prim| {
+                    matches!(prim, DrawPrim::Stroke { x, y, .. }
+                        if (*x - rect.x - 0.5).abs() < 0.01 && (*y - rect.y - 0.5).abs() < 0.01)
+                });
+                if !rimmed {
+                    continue;
+                }
+                for (on, ground) in [("card", roles.elevated), ("page", roles.surface)] {
+                    let mut drawn = vec![DrawPrim::Panel {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 200.0,
+                        h: 60.0,
+                        radius: 0.0,
+                        fill: [ground[0], ground[1], ground[2], 255],
+                    }];
+                    drawn.extend(prims.iter().cloned());
+                    let (pixels, width, _) =
+                        crate::tray_raster::rasterize_tray(&drawn, 200, 60, 1.0, [0, 0, 0, 255]);
+                    let at = |x: f32, y: f32| -> [u8; 3] {
+                        let index = ((y as u32 * width + x as u32) * 4) as usize;
+                        [pixels[index], pixels[index + 1], pixels[index + 2]]
+                    };
+                    let mid = rect.y + rect.height / 2.0;
+                    let beside = at(rect.x - 2.0, mid);
+                    assert_eq!(beside, ground, "{name} {what} on the {on}: the ground");
+                    let edge = [
+                        at(rect.x, mid),
+                        at(rect.right() - 1.0, mid),
+                        at(rect.x + rect.width / 2.0, rect.y),
+                        at(rect.x + rect.width / 2.0, rect.bottom() - 1.0),
+                    ]
+                    .into_iter()
+                    .map(|rim| contrast_ratio(rim, ground))
+                    .fold(f32::INFINITY, f32::min);
+                    rims += 1;
+                    if edge < 3.0 {
+                        short.push(format!("{name} {what} on the {on}: {edge:.2}:1"));
+                    }
+                }
+            }
+        }
+        assert!(rims > 100, "rims measured: {rims}");
+        assert!(
+            short.is_empty(),
+            "{} rims under 3:1:\n{}",
+            short.len(),
+            short.join("\n")
+        );
     }
 }

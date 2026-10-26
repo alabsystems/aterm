@@ -26,6 +26,7 @@ fn failed(root: &Path, revision: u64, pace: &Pace) {
         name: "Secrets vault".into(),
         status: "error".into(),
         detail: "the subscriber could not start".into(),
+        elapsed_ms: None,
     }];
     record(root, revision, pace, false, &mut rows).unwrap();
 }

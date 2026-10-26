@@ -63,7 +63,7 @@ pub const SYSTEMCTL_PATHS: [&str; 3] = [
 const CHILD_HANG: Duration = Duration::from_secs(30);
 
 /// Timeout waiting for launchd to forget a booted-out job ([`install`]).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const BOOTOUT_SETTLE: Duration = Duration::from_secs(30);
 
 /// The job's launchd property list: `~/Library/LaunchAgents/<label>.plist`.
@@ -332,6 +332,73 @@ pub fn systemd_unit(description: &str, program: &Path, args: &[String]) -> Strin
     )
 }
 
+/// The program `unit`, a job's plist on macOS or its systemd unit elsewhere, starts: the first
+/// `ProgramArguments` string or `ExecStart` word, as [`plist_text`] and [`systemd_unit`] write
+/// them. `None` for a file it cannot read or a form they never write.
+pub fn unit_program(unit: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(unit).ok()?;
+    if cfg!(target_os = "macos") {
+        plist_program(&text)
+    } else {
+        exec_program(&text)
+    }
+}
+
+/// [`unit_program`] of a plist's text.
+pub fn plist_program(text: &str) -> Option<PathBuf> {
+    let (_, after) = text.split_once("<key>ProgramArguments</key>")?;
+    let after = after.trim_start().strip_prefix("<array>")?;
+    let (escaped, _) = after
+        .trim_start()
+        .strip_prefix("<string>")?
+        .split_once("</string>")?;
+    let mut out = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let (entity, c) = [
+            ("&amp;", '&'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+        ]
+        .into_iter()
+        .find(|(entity, _)| rest.starts_with(entity))?;
+        out.push(c);
+        rest = &rest[entity.len()..];
+    }
+    out.push_str(rest);
+    Some(PathBuf::from(out))
+}
+
+/// [`unit_program`] of a systemd unit's text: its `ExecStart`'s first word, which
+/// [`systemd_word`] quoted (a program holds no control character, [`check_argv`]).
+pub fn exec_program(text: &str) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let mut chars = line.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(PathBuf::from(out)),
+            '\\' => match chars.next()? {
+                c @ ('\\' | '"') => out.push(c),
+                _ => return None,
+            },
+            c @ ('%' | '$') => {
+                if chars.next()? != c {
+                    return None;
+                }
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
 /// What a `launchctl` call does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launchctl<'a> {
@@ -341,8 +408,10 @@ pub enum Launchctl<'a> {
     Bootout(&'a str),
     /// `bootstrap gui/<uid> <plist>`: load (and with `RunAtLoad`, start) the job a plist defines.
     Bootstrap(&'a Path),
-    /// `kickstart -k gui/<uid>/<label>`: start the job, killing a running instance first.
+    /// `kickstart gui/<uid>/<label>`: start the job unless it runs.
     Kickstart(&'a str),
+    /// `kickstart -k gui/<uid>/<label>`: start the job, killing a running instance first.
+    Restart(&'a str),
 }
 
 /// The argv (after `/bin/launchctl`) of one call in this user's GUI domain, `gui/<uid>`.
@@ -356,7 +425,8 @@ pub fn launchctl_argv(uid: u32, call: Launchctl<'_>) -> Vec<String> {
             domain,
             plist.to_string_lossy().into_owned(),
         ],
-        Launchctl::Kickstart(label) => {
+        Launchctl::Kickstart(label) => vec!["kickstart".into(), format!("{domain}/{label}")],
+        Launchctl::Restart(label) => {
             vec!["kickstart".into(), "-k".into(), format!("{domain}/{label}")]
         }
     }
@@ -530,6 +600,44 @@ pub fn program_for_service() -> crate::Result<PathBuf> {
     service_program(&exe, &|path| std::fs::symlink_metadata(path).is_ok())
 }
 
+/// The file that defines `job` under `home`: its launchd plist on macOS ([`plist_path`]), its
+/// systemd user unit elsewhere ([`unit_path`]).
+pub fn unit_file(home: &Path, job: Job) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        plist_path(home, job)
+    } else {
+        unit_path(home, job)
+    }
+}
+
+/// The program `job`'s unit file starts, when that is an executable file in a lasting place
+/// (one [`service_program`] names as itself): what a repair keeps ([`repair_subscriber`]), so a
+/// repair never moves a job a person pointed at another aterm (`agent on --program`, a held
+/// snapshot) onto the aterm that repairs it; only an explicit [`install`] does. `None` where
+/// the unit names no such program (none, one gone, a build, a copy that goes away).
+pub fn kept_program(home: &Path, job: Job) -> Option<PathBuf> {
+    kept(
+        unit_program(&unit_file(home, job)),
+        &|path| std::fs::symlink_metadata(path).is_ok(),
+        &|path| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        },
+    )
+}
+
+/// [`kept_program`] of the program a unit file names, `held`.
+fn kept(
+    held: Option<PathBuf>,
+    exists: &dyn Fn(&Path) -> bool,
+    runnable: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    held.filter(|held| {
+        runnable(held) && service_program(held, exists).is_ok_and(|named| named == *held)
+    })
+}
+
 /// Refuse what a unit file cannot name faithfully.
 fn check_argv(program: &Path, args: &[String]) -> crate::Result<()> {
     let Some(text) = program.to_str() else {
@@ -566,7 +674,7 @@ fn write_unit_file(path: &Path, text: &str) -> crate::Result<()> {
     crate::fsx::write_atomic(path, text.as_bytes(), 0o644)
 }
 
-/// Write the job's launchd plist: what [`install`] does on macOS before any `launchctl` call.
+/// Write the job's launchd plist: what [`install`] writes on macOS before it loads the job.
 pub fn write_plist(
     home: &Path,
     job: Job,
@@ -604,7 +712,11 @@ fn run(program: &Path, argv: &[String]) -> crate::Result<std::process::Output> {
 
 /// One child run that must succeed: a refusal is an error carrying what it said.
 fn run_ok(program: &Path, argv: &[String]) -> crate::Result<()> {
-    let out = run(program, argv)?;
+    succeeded(program, argv, &run(program, argv)?)
+}
+
+/// `out`, what `program argv` answered, as [`run_ok`] judges it.
+fn succeeded(program: &Path, argv: &[String], out: &std::process::Output) -> crate::Result<()> {
     if out.status.success() {
         return Ok(());
     }
@@ -639,14 +751,38 @@ fn launchctl_ok(call: Launchctl<'_>) -> crate::Result<()> {
     )
 }
 
+/// What one `launchctl` call answers, run or (in a test) made up.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+type LaunchctlRun<'a> = dyn FnMut(Launchctl<'_>) -> crate::Result<std::process::Output> + 'a;
+
 /// launchd's view of `label`: `None` when it knows no such job, else its pid if running.
 #[cfg(target_os = "macos")]
 fn launchd_job(label: &str) -> crate::Result<Option<Option<u32>>> {
+    launchd_job_with(label, &mut launchctl)
+}
+
+/// [`launchd_job`] through `launchctl`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn launchd_job_with(
+    label: &str,
+    launchctl: &mut LaunchctlRun<'_>,
+) -> crate::Result<Option<Option<u32>>> {
     let out = launchctl(Launchctl::Print(label))?;
     Ok(out
         .status
         .success()
         .then(|| print_pid(&String::from_utf8_lossy(&out.stdout))))
+}
+
+/// `launchctl`'s refusal of `call` as an error carrying what it said.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn launchctl_checked(call: Launchctl<'_>, launchctl: &mut LaunchctlRun<'_>) -> crate::Result<()> {
+    let out = launchctl(call)?;
+    succeeded(
+        Path::new(LAUNCHCTL),
+        &launchctl_argv(aterm_uds::peer::our_uid(), call),
+        &out,
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -700,12 +836,31 @@ fn check_own_home(home: &Path) -> crate::Result<()> {
 ///
 /// The subscriber installed is on again: the person's record that it was turned off
 /// ([`subscriber_off_path`]) goes.
+///
+/// A launchd job that runs as this would set it up is left running; a systemd unit is
+/// restarted.
 pub fn install(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
+    install_restarting(home, job, program, args, false)
+}
+
+/// [`install`], restarting the job even when it runs as this would set it up
+/// (`aterm secrets agent on --force`).
+pub fn reinstall(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
+    install_restarting(home, job, program, args, true)
+}
+
+fn install_restarting(
+    home: &Path,
+    job: Job,
+    program: &Path,
+    args: &[String],
+    restart: bool,
+) -> crate::Result<String> {
     check_own_home(home)?;
     if job != Job::Subscriber {
-        return install_job(home, job, program, args);
+        return install_job(home, job, program, args, restart);
     }
-    install_subscriber_with(home, || install_job(home, job, program, args))
+    install_subscriber_with(home, || install_job(home, job, program, args, restart))
 }
 
 fn install_subscriber_with(
@@ -724,13 +879,20 @@ fn install_subscriber_with(
 /// Repair a subscriber setup already found missing, preserving a person's Sync
 /// off recorded since that probe. `None` means it was left off, not installed.
 /// The check and install are ordered with [`turn_off`] and explicit [`install`].
+///
+/// The job keeps the program its unit file names when that one lasts ([`kept_program`]);
+/// `program` runs only where it does not, so a caller asks [`kept_program`] first and names its
+/// own program only on `None`.
 pub fn repair_subscriber(
     home: &Path,
     program: &Path,
     args: &[String],
 ) -> crate::Result<Option<String>> {
     check_own_home(home)?;
-    repair_subscriber_with(home, || install_job(home, Job::Subscriber, program, args))
+    repair_subscriber_with(home, || {
+        let program = kept_program(home, Job::Subscriber).unwrap_or_else(|| program.to_path_buf());
+        install_job(home, Job::Subscriber, &program, args, false)
+    })
 }
 
 fn repair_subscriber_with(
@@ -747,33 +909,21 @@ fn repair_subscriber_with(
 }
 
 /// [`install`]'s job, without the person's record.
-fn install_job(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
+fn install_job(
+    home: &Path,
+    job: Job,
+    program: &Path,
+    args: &[String],
+    restart: bool,
+) -> crate::Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let plist = write_plist(home, job, program, args)?;
-        let label = job.label();
-        let _ = launchctl(Launchctl::Bootout(label));
-        let settle = Instant::now() + BOOTOUT_SETTLE;
-        while launchd_job(label)?.is_some() && Instant::now() < settle {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        launchctl_ok(Launchctl::Bootstrap(&plist)).map_err(|e| {
-            Error::new(format!(
-                "{e} (gui/{} exists only while this user is logged in at the Mac's screen)",
-                aterm_uds::peer::our_uid()
-            ))
-        })?;
-        launchctl_ok(Launchctl::Kickstart(label))?;
-        Ok(format!(
-            "{label}: launchd user agent {} runs {} {} (log {})",
-            plist.display(),
-            program.display(),
-            args.join(" "),
-            log_path(home, job).display()
-        ))
+        install_launchd(home, job, (program, args), restart, &mut launchctl)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // systemd restarts the unit on every install, a changed one or not.
+        let _ = restart;
         let systemctl = systemctl()?;
         let unit = write_unit(home, job, program, args)?;
         let name = unit_name(job);
@@ -787,6 +937,60 @@ fn install_job(home: &Path, job: Job, program: &Path, args: &[String]) -> crate:
             args.join(" ")
         ))
     }
+}
+
+/// [`install_job`] on macOS, each `launchctl` call through `launchctl`. A job launchd runs from
+/// the plist this would write is left as it is (one `print`) unless `restart`; any other is
+/// booted out if loaded, bootstrapped (`RunAtLoad` starts it) and kickstarted, killing a
+/// running instance only when `restart`, so a reinstall never cuts a long-poll twice.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn install_launchd(
+    home: &Path,
+    job: Job,
+    (program, args): (&Path, &[String]),
+    restart: bool,
+    launchctl: &mut LaunchctlRun<'_>,
+) -> crate::Result<String> {
+    check_argv(program, args)?;
+    let label = job.label();
+    let plist = plist_path(home, job);
+    let log = log_path(home, job);
+    let text = plist_text(label, program, args, &log);
+    let line = format!(
+        "{label}: launchd user agent {} runs {} {} (log {})",
+        plist.display(),
+        program.display(),
+        args.join(" "),
+        log.display()
+    );
+    let loaded = launchd_job_with(label, launchctl)?;
+    if !restart
+        && matches!(loaded, Some(Some(_)))
+        && std::fs::read(&plist).is_ok_and(|held| held == text.as_bytes())
+    {
+        return Ok(format!("{line}; already running"));
+    }
+    write_plist(home, job, program, args)?;
+    if loaded.is_some() {
+        let _ = launchctl(Launchctl::Bootout(label));
+        let settle = Instant::now() + BOOTOUT_SETTLE;
+        while launchd_job_with(label, launchctl)?.is_some() && Instant::now() < settle {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    launchctl_checked(Launchctl::Bootstrap(&plist), launchctl).map_err(|e| {
+        Error::new(format!(
+            "{e} (gui/{} exists only while this user is logged in at the Mac's screen)",
+            aterm_uds::peer::our_uid()
+        ))
+    })?;
+    let start = if restart {
+        Launchctl::Restart(label)
+    } else {
+        Launchctl::Kickstart(label)
+    };
+    launchctl_checked(start, launchctl)?;
+    Ok(line)
 }
 
 /// Stop and remove `job`, for this login's own `home` ([`own_home`]).
@@ -921,6 +1125,63 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repair_keeps_the_lasting_program_its_job_names() {
+        let held = Path::new("/Users//o/.local/share/aterm-secrets/aterm");
+        let nothing = |_: &Path| false;
+        let all = |_: &Path| true;
+        // A held snapshot the job runs stays, whatever aterm repairs it.
+        assert_eq!(
+            kept(Some(held.into()), &nothing, &all).as_deref(),
+            Some(held)
+        );
+        // CONTROL: gone or not executable, or no unit naming one, nothing is kept.
+        assert_eq!(kept(Some(held.into()), &nothing, &nothing), None);
+        assert_eq!(kept(None, &nothing, &all), None);
+        // A build, or a copy that goes away, is no program to keep.
+        for fleeting in [
+            "/Users//o/aterm/target/release/aterm",
+            "/Volumes/aterm/aterm.app/Contents/MacOS/aterm",
+            "/tmp/aterm",
+        ] {
+            assert_eq!(
+                kept(Some(fleeting.into()), &nothing, &all),
+                None,
+                "{fleeting}"
+            );
+        }
+        // A file in a bundle that is not its executable names another program.
+        let inner = Path::new("/Applications/b.app/Contents/Resources/aterm");
+        let bundled = |path: &Path| path == Path::new("/Applications/b.app/Contents/MacOS/aterm");
+        assert_eq!(kept(Some(inner.into()), &bundled, &all), None);
+    }
+
+    #[test]
+    fn a_unit_names_back_the_program_it_starts() {
+        let program = Path::new("/Applications/A&B <\"q'>.app/Contents/MacOS/aterm");
+        let args = ["secrets".to_string(), "watch".to_string()];
+        let plist = plist_text("l", program, &args, Path::new("/var/log/x.log"));
+        assert_eq!(plist_program(&plist).as_deref(), Some(program));
+        let odd = Path::new("/home/o neil/50%$x\"q\\/aterm");
+        let unit = systemd_unit("d", odd, &args);
+        assert_eq!(exec_program(&unit).as_deref(), Some(odd));
+        // A form neither writer makes names nothing.
+        for unit in [
+            "ExecStart=/bin/aterm watch",
+            "ExecStart=\"/a\\x41\"",
+            "ExecStart=\"/a%b\"",
+            "",
+        ] {
+            assert_eq!(exec_program(unit), None, "{unit}");
+        }
+        for plist in [
+            "<key>ProgramArguments</key><array><string>/a&nbsp;</string>",
+            "<string>/a</string>",
+        ] {
+            assert_eq!(plist_program(plist), None, "{plist}");
+        }
+    }
 
     fn assert_subscriber_decision_held(home: &Path) {
         let independent = std::fs::OpenOptions::new()
@@ -1289,6 +1550,10 @@ mod tests {
         );
         assert_eq!(
             launchctl_argv(502, Launchctl::Kickstart("l.x")),
+            ["kickstart", "gui/502/l.x"]
+        );
+        assert_eq!(
+            launchctl_argv(502, Launchctl::Restart("l.x")),
             ["kickstart", "-k", "gui/502/l.x"]
         );
         assert_eq!(
@@ -1303,6 +1568,157 @@ mod tests {
             systemctl_argv(&["show", "-p", "MainPID", "--value", "l.service"]),
             ["--user", "show", "-p", "MainPID", "--value", "l.service"]
         );
+    }
+
+    /// launchd as `install_launchd` sees it: one job, loaded or not, and every call it got.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FakeLaunchd {
+        loaded: bool,
+        calls: Vec<Vec<String>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeLaunchd {
+        fn answer(&mut self, call: Launchctl<'_>) -> crate::Result<std::process::Output> {
+            use std::os::unix::process::ExitStatusExt as _;
+            self.calls.push(launchctl_argv(0, call));
+            let (ok, stdout) = match call {
+                Launchctl::Print(_) if self.loaded => (true, "\tpid = 42\n"),
+                Launchctl::Print(_) => (false, ""),
+                Launchctl::Bootout(_) => (std::mem::take(&mut self.loaded), ""),
+                Launchctl::Bootstrap(_) => (!std::mem::replace(&mut self.loaded, true), ""),
+                Launchctl::Kickstart(_) | Launchctl::Restart(_) => (self.loaded, ""),
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+
+        /// Install `args` (restarting when `restart`): its line, and the calls it made.
+        fn install(
+            &mut self,
+            home: &Path,
+            program: &Path,
+            args: &[&str],
+            restart: bool,
+        ) -> (String, Vec<String>) {
+            self.calls.clear();
+            let line = install_launchd(
+                home,
+                Job::Subscriber,
+                (program, &words(args)),
+                restart,
+                &mut |call| self.answer(call),
+            )
+            .expect("installs");
+            let calls = self.calls.iter().map(|argv| argv.join(" ")).collect();
+            (line, calls)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_launchd_runs_as_installed_is_left_running_and_no_install_kills_one() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let program = root.path().join("aterm");
+        std::fs::write(&program, b"").expect("program");
+        let label = Job::Subscriber.label();
+        let plist = plist_path(&home, Job::Subscriber).display().to_string();
+        let print = format!("print gui/0/{label}");
+        let bootout = format!("bootout gui/0/{label}");
+        let bootstrap = format!("bootstrap gui/0 {plist}");
+        let kickstart = format!("kickstart gui/0/{label}");
+        let mut launchd = FakeLaunchd::default();
+
+        // Fresh: bootstrapped, then started without killing anything.
+        let (_, calls) = launchd.install(&home, &program, &["secrets", "watch"], false);
+        assert_eq!(
+            calls,
+            [print.as_str(), bootstrap.as_str(), kickstart.as_str()]
+        );
+
+        // `agent on` again, the job running from the same plist: one print, nothing else.
+        let (line, calls) = launchd.install(&home, &program, &["secrets", "watch"], false);
+        assert_eq!(calls, [print.as_str()]);
+        assert!(line.ends_with("; already running"), "{line}");
+
+        // CONTROL: a changed plist reloads the job, still never `kickstart -k`.
+        let (line, calls) = launchd.install(&home, &program, &["secrets", "watch", "-v"], false);
+        assert_eq!(
+            calls,
+            [
+                print.as_str(),
+                bootout.as_str(),
+                print.as_str(),
+                bootstrap.as_str(),
+                kickstart.as_str()
+            ]
+        );
+        assert!(!line.ends_with("; already running"), "{line}");
+        let written = std::fs::read_to_string(&plist).expect("plist");
+        assert!(written.contains("<string>-v</string>"), "{written}");
+
+        // `agent on --force` restarts the job it would otherwise leave running.
+        let (_, calls) = launchd.install(&home, &program, &["secrets", "watch", "-v"], true);
+        let restart = format!("kickstart -k gui/0/{label}");
+        assert_eq!(
+            calls,
+            [
+                print.as_str(),
+                bootout.as_str(),
+                print.as_str(),
+                bootstrap.as_str(),
+                restart.as_str()
+            ]
+        );
+
+        // A job launchd holds but does not run is started again.
+        let (_, calls) = {
+            let mut stopped = |call: Launchctl<'_>| match call {
+                Launchctl::Print(_) if launchd.loaded => {
+                    let mut out = launchd.answer(call)?;
+                    out.stdout = b"\tstate = not running\n".to_vec();
+                    Ok(out)
+                }
+                _ => launchd.answer(call),
+            };
+            launchd_calls(&home, &program, &mut stopped)
+        };
+        assert_eq!(
+            calls,
+            [
+                print.as_str(),
+                bootout.as_str(),
+                print.as_str(),
+                bootstrap.as_str(),
+                kickstart.as_str()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    fn launchd_calls(
+        home: &Path,
+        program: &Path,
+        launchctl: &mut LaunchctlRun<'_>,
+    ) -> (String, Vec<String>) {
+        let mut calls = Vec::new();
+        let line = install_launchd(
+            home,
+            Job::Subscriber,
+            (program, &words(&["secrets", "watch", "-v"])),
+            false,
+            &mut |call| {
+                calls.push(launchctl_argv(0, call).join(" "));
+                launchctl(call)
+            },
+        )
+        .expect("installs");
+        (line, calls)
     }
 
     #[test]

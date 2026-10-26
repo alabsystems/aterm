@@ -6962,7 +6962,7 @@ impl App {
                 mods,
                 &self.keybindings,
                 &self.key_sequences,
-                |dir| self.focus_pane_would_move(dir),
+                |dir| self.focus_pane_would_move(wid, dir),
             ) {
                 keybinding::ChordResolution::Action(action) => {
                     if action == keybinding::Action::Copy {
@@ -6986,7 +6986,7 @@ impl App {
         if HARDCODED_SUPER_CHORDS
             && (self.on_key_super_shift_chord(wid, mods, ev)
                 || self.on_key_super_chord(wid, mods, ev)
-                || self.on_key_pane_focus(mods, ev))
+                || self.on_key_pane_focus(wid, mods, ev))
         {
             self.note_consumed_press(wid, ev);
             return true;
@@ -7310,7 +7310,7 @@ impl App {
                 mods,
                 &self.keybindings,
                 &self.key_sequences,
-                |dir| self.focus_pane_would_move(dir),
+                |dir| self.focus_pane_would_move(wid, dir),
             ) {
                 keybinding::ChordResolution::Action(action)
                     if find_suspends_action(action)
@@ -7406,7 +7406,7 @@ impl App {
             self.note_consumed_press(wid, &ev);
             return;
         }
-        if HARDCODED_SUPER_CHORDS && self.on_key_pane_focus(mods, &ev) {
+        if HARDCODED_SUPER_CHORDS && self.on_key_pane_focus(wid, mods, &ev) {
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -7620,31 +7620,29 @@ impl App {
                     let _ = self.reopen_last_closed_tab();
                     return true;
                 }
-                "n" | "N" => {
-                    if let Some(proxy) = self.proxy.as_ref() {
-                        let _ = proxy.send_event(Wake::DetachActiveTab);
+                "n" | "N" | "o" | "O" => {
+                    if let Some(command) = self.tab_window_shortcut(wid, s.as_str())
+                        && let Some(proxy) = self.proxy.as_ref()
+                    {
+                        let _ = proxy.send_event(Wake::TabWindowCommand(command));
                     }
                     return true;
                 }
                 "d" | "D" => {
-                    self.split_focused_pane(pane::SplitDir::Horizontal);
-                    return true;
-                }
-                "o" | "O" => {
-                    if let Some(proxy) = self.proxy.as_ref() {
-                        let _ = proxy.send_event(Wake::ViewActiveSessionInNewWindow);
-                    }
+                    let _ = self.split_focused_pane_in_window(
+                        wid,
+                        pane::SplitDir::Horizontal,
+                        crate::tab_spawn::SpawnAsk::default(),
+                        crate::tab_spawn::TabSpawnThen::Nothing,
+                    );
                     return true;
                 }
                 "m" | "M" => {
-                    let _ = self.migrate_active_tab_to_next_window();
+                    let _ = self.migrate_active_tab_from_window(wid);
                     return true;
                 }
                 "l" | "L" => {
-                    // Ledger follows the front window.
-                    if let Some(wid) = self.frontmost_window {
-                        self.open_session_ledger(wid);
-                    }
+                    self.open_session_ledger(wid);
                     return true;
                 }
                 _ => {}
@@ -7670,7 +7668,12 @@ impl App {
                     return true;
                 }
                 "d" => {
-                    self.split_focused_pane(pane::SplitDir::Vertical);
+                    let _ = self.split_focused_pane_in_window(
+                        wid,
+                        pane::SplitDir::Vertical,
+                        crate::tab_spawn::SpawnAsk::default(),
+                        crate::tab_spawn::TabSpawnThen::Nothing,
+                    );
                     return true;
                 }
                 "q" => {
@@ -7700,14 +7703,14 @@ impl App {
     }
 
     /// Pane chords (iTerm2 parity).
-    fn on_key_pane_focus(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
+    fn on_key_pane_focus(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         // Cmd-Shift-Enter (no Alt): toggle pane zoom.
         if mods.super_key()
             && mods.shift_key()
             && !mods.alt_key()
             && matches!(&ev.logical_key, Key::Named(NamedKey::Enter))
         {
-            self.toggle_pane_zoom();
+            self.toggle_pane_zoom_in(wid);
             return true;
         }
         if !(mods.super_key() && mods.alt_key()) {
@@ -7720,7 +7723,7 @@ impl App {
             Key::Named(NamedKey::ArrowDown) => pane::FocusDir::Down,
             _ => return false,
         };
-        self.focus_pane(dir);
+        self.focus_pane_in(wid, dir);
         true
     }
 
@@ -7759,7 +7762,12 @@ impl App {
     }
 
     /// Keep resolved selection commands in the rename field, which has no selection model.
-    fn rename_claims_selection_chord(&self, mods: ModifiersState, ev: &KeyEvent) -> bool {
+    fn rename_claims_selection_chord(
+        &self,
+        wid: WindowId,
+        mods: ModifiersState,
+        ev: &KeyEvent,
+    ) -> bool {
         matches!(
             keybinding::resolve_chord(
                 &base_logical_key(ev),
@@ -7767,7 +7775,7 @@ impl App {
                 mods,
                 &self.keybindings,
                 &self.key_sequences,
-                |dir| self.focus_pane_would_move(dir),
+                |dir| self.focus_pane_would_move(wid, dir),
             ),
             keybinding::ChordResolution::Action(
                 keybinding::Action::Copy | keybinding::Action::SelectAll
@@ -7783,7 +7791,7 @@ impl App {
         ev: &KeyEvent,
     ) -> Option<(u64, crate::app_search::SearchEdit)> {
         let session = self.inline_rename_edit(wid)?.session;
-        if self.rename_claims_selection_chord(mods, ev) {
+        if self.rename_claims_selection_chord(wid, mods, ev) {
             return None;
         }
         Some((session, field_edit_action(mods, ev)?))
@@ -7846,7 +7854,7 @@ impl App {
         if is_bare_modifier_key(&ev.logical_key) {
             return true;
         }
-        if self.rename_claims_selection_chord(mods, ev) {
+        if self.rename_claims_selection_chord(wid, mods, ev) {
             return true;
         }
         if let Some((_, edit)) = self.rename_repeat_action(wid, mods, ev) {
@@ -8286,13 +8294,32 @@ impl App {
             Action::NextTab => self.cycle_tab_in(wid, true),
             Action::PrevTab => self.cycle_tab_in(wid, false),
             Action::SwitchTab(n) => self.switch_tab_in(wid, usize::from(n).saturating_sub(1)),
-            Action::SplitVertical => self.split_focused_pane(pane::SplitDir::Vertical),
-            Action::SplitHorizontal => self.split_focused_pane(pane::SplitDir::Horizontal),
-            Action::FocusPaneLeft => self.focus_pane(pane::FocusDir::Left),
-            Action::FocusPaneRight => self.focus_pane(pane::FocusDir::Right),
-            Action::FocusPaneUp => self.focus_pane(pane::FocusDir::Up),
-            Action::FocusPaneDown => self.focus_pane(pane::FocusDir::Down),
-            Action::TogglePaneZoom => self.toggle_pane_zoom(),
+            Action::SplitVertical | Action::SplitHorizontal => {
+                let dir = if action == Action::SplitVertical {
+                    pane::SplitDir::Vertical
+                } else {
+                    pane::SplitDir::Horizontal
+                };
+                let _ = self.split_focused_pane_in_window(
+                    wid,
+                    dir,
+                    crate::tab_spawn::SpawnAsk::default(),
+                    crate::tab_spawn::TabSpawnThen::Nothing,
+                );
+            }
+            Action::FocusPaneLeft => {
+                self.focus_pane_in(wid, pane::FocusDir::Left);
+            }
+            Action::FocusPaneRight => {
+                self.focus_pane_in(wid, pane::FocusDir::Right);
+            }
+            Action::FocusPaneUp => {
+                self.focus_pane_in(wid, pane::FocusDir::Up);
+            }
+            Action::FocusPaneDown => {
+                self.focus_pane_in(wid, pane::FocusDir::Down);
+            }
+            Action::TogglePaneZoom => self.toggle_pane_zoom_in(wid),
             Action::Copy => {
                 self.copy_selection_in(wid);
             }
@@ -8364,21 +8391,19 @@ impl App {
                 );
             }
             Action::ToggleSettings => {
-                if self.headless {
-                    let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
-                } else {
-                    self.post_menu_action(crate::menu::MenuAction::ToggleSettings);
-                }
+                let _ = self
+                    .open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Home);
             }
             Action::ToggleAbout => {
-                let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::About);
+                let _ = self
+                    .open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::About);
             }
             Action::ToggleMatrixRain => self.toggle_matrix_rain(wid),
             Action::ToggleSeriousMode => {
                 self.user_toggle_serious_mode();
             }
-            Action::OpenPalette => self.toggle_palette(),
-            Action::ChooseTheme => self.open_theme_palette(),
+            Action::OpenPalette => self.toggle_palette_in(wid),
+            Action::ChooseTheme => self.open_theme_palette_in(wid),
             Action::RenameSession => {
                 self.begin_active_session_rename(wid);
             }
@@ -8393,7 +8418,7 @@ impl App {
                 self.select_all_in(wid);
             }
             Action::ToggleFullscreen => {
-                let _ = self.toggle_fullscreen();
+                let _ = self.toggle_fullscreen_in(wid);
             }
         }
     }
@@ -9401,6 +9426,26 @@ impl App {
         }
     }
 
+    /// Validate the captured tab before fencing movement or settling its window's rename.
+    pub(crate) fn prepare_tab_menu_action(
+        &mut self,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+        action: menu::MenuAction,
+    ) -> Option<usize> {
+        let Some(index) = self.tab_index_for_id(window, tab) else {
+            aterm_log::info!(
+                "tab context-menu {action:?} dropped: tab {tab} no longer exists in its window"
+            );
+            return None;
+        };
+        self.clear_tab_surface_move_license(Some(window));
+        if action != menu::MenuAction::RenameSession {
+            self.settle_rename_edit(window);
+        }
+        Some(index)
+    }
+
     /// Dispatch one tab context-menu action against the exact tab it was popped on.
     pub(crate) fn dispatch_tab_menu_action(
         &mut self,
@@ -9410,10 +9455,7 @@ impl App {
         action: menu::MenuAction,
     ) {
         use menu::MenuAction;
-        let Some(index) = self.tab_index_for_id(window, tab) else {
-            aterm_log::info!(
-                "tab context-menu {action:?} dropped: tab {tab} no longer exists in its window"
-            );
+        let Some(index) = self.prepare_tab_menu_action(window, tab, action) else {
             return;
         };
         match action {

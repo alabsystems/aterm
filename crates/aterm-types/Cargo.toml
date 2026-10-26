@@ -25,7 +25,8 @@ dev-seams = []
 [dependencies]
 # Exclusive owned staging for the shared atomic theme writer.
 aterm-tempfile = { workspace = true }
-# The theme writer's full flush (aterm-durable: std plus astream-sys, no other code).
+# The theme writer's full flush and its folder's best-effort one (aterm-durable: std plus
+# astream-sys, no other code).
 aterm-durable = { workspace = true }
 aterm-alloc = { workspace = true }
 # FNV-1a/64 for `RowsFence::hash_rows`: server and clients must compute one hash.

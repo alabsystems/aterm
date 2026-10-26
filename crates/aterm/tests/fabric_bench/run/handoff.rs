@@ -23,12 +23,13 @@ use crate::stats;
 /// so each holder in turn hands off.
 const QUIT_BYE: (&str, &str) = ("ATERM_DEBUG_QUIT_BYE", "handoff");
 
-/// How often a standing-by bridge tries the held lock: `aterm-link`'s
-/// `STANDBY_POLL` (`bridge.rs`, private there), spelled here for
-/// [`phase_of`] alone.
+/// How often a standing-by bridge tried the held lock until H1 (`aterm-link`
+/// 8410b07cee) woke it on the holder's release instead: the rounds still
+/// spread their quits over that second ([`phase_of`]), so a build that polls
+/// and one that does not run the same rounds.
 const STANDBY_POLL: Duration = Duration::from_secs(1);
 
-/// WHERE IN THE SUCCESSOR'S POLL round `n` of `rounds` (1-based) quits: the
+/// WHERE IN A POLLING SUCCESSOR'S POLL round `n` of `rounds` (1-based) quits: the
 /// holder waits `(n - 1) / rounds` of [`STANDBY_POLL`] after the standby was
 /// seen and the round set up.
 fn phase_of(n: usize, rounds: usize) -> Duration {
@@ -50,8 +51,13 @@ struct Timed {
     /// Whether the state dir's pid file still named the old bridge (or none)
     /// right after that `OK`: the post was queued in the gap.
     in_gap: bool,
-    /// The successor's pid file seen.
+    /// The successor's pid file seen: read from the quit on, beside the
+    /// old bridge's liveness, so a take before the old bridge was gone is
+    /// timed where it came.
     t_pid: u64,
+    /// Whether the pid file named the successor before the old bridge was
+    /// seen gone.
+    took_first: bool,
     /// The gap's post visible in its recipient's inbox.
     t_seen: u64,
 }
@@ -99,17 +105,28 @@ fn hand_off(
     std::thread::sleep(phase);
     let t_quit = clock.us();
     let _ = w.ctl().request("invoke Quit");
+    let mut took = None;
     aterm_spec::wait::within(DEADLINE, PID_POLL, || {
+        if took.is_none() {
+            took = read_pid(w)
+                .filter(|p| *p != old_pid)
+                .map(|p| (p, clock.us()));
+        }
         (!harness::alive(old_pid)).then_some(())
     })
     .unwrap_or_else(|| panic!("the old bridge (pid {old_pid}) did not exit within {DEADLINE:?}"));
     let t_gone = clock.us();
+    let took_first = took.is_some();
     let (_, t_post) = post(&mut ctl, clock, from, to, gap);
     let in_gap = read_pid(w).is_none_or(|p| p == old_pid);
-    let pid =
-        aterm_spec::wait::within(DEADLINE, PID_POLL, || read_pid(w).filter(|p| *p != old_pid))
-            .unwrap_or_else(|| panic!("the successor's bridge took no dir within {DEADLINE:?}"));
-    let t_pid = clock.us();
+    let (pid, t_pid) = took.unwrap_or_else(|| {
+        let pid =
+            aterm_spec::wait::within(DEADLINE, PID_POLL, || read_pid(w).filter(|p| *p != old_pid))
+                .unwrap_or_else(|| {
+                    panic!("the successor's bridge took no dir within {DEADLINE:?}")
+                });
+        (pid, clock.us())
+    });
     let (woke_at, t_seen) =
         await_note(&mut ctl, clock, to, since).unwrap_or_else(|e| panic!("`{gap}`: {e}"));
     let listed = list_since(&mut ctl, to, since);
@@ -125,6 +142,7 @@ fn hand_off(
         t_post,
         in_gap,
         t_pid,
+        took_first,
         t_seen,
     }
 }
@@ -192,14 +210,15 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let names = [
         "quit -> the old bridge gone",
         "**the old bridge gone -> the successor's every row acked (the outage)**",
-        "the old bridge gone -> the successor's pid (it took the dir)",
+        "the old bridge gone -> the successor's pid (it took the dir; below 0 before the old bridge was gone)",
         "the successor's pid -> its every row acked (its attach)",
         "the old bridge gone -> its will acked",
         "**the gap's post -> visible**",
         "the gap's post -> acked",
         "the gap's post acked -> visible",
+        "**quit -> the successor's every row acked (end to end)**",
     ];
-    let mut series: [Vec<f64>; 8] = Default::default();
+    let mut series: [Vec<f64>; 9] = Default::default();
     let mut detail = Vec::with_capacity(rounds.len());
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut totals = Vec::with_capacity(rounds.len());
@@ -253,6 +272,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         series[5].push(ms(t.t_post, t.t_seen));
         series[6].extend(ms_opt(Some(t.t_post), t_gap_acked));
         series[7].extend(ms_opt(t_gap_acked, Some(t.t_seen)));
+        series[8].extend(ms_opt(Some(t.t_quit), t_all));
         let window = || census::window(&recs, r.mark, last).filter(|rec| rec.seq != gap_seq);
         let c = census::census(window().filter(|rec| !fired.contains(&rec.seq)));
         for (class, n) in &c.by_class {
@@ -269,17 +289,20 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "gap_post_offset": gap_seq,
             "will_offset": will,
             "gap_post_queued_in_gap": t.in_gap,
+            "took_before_gone": t.took_first,
             "records": c.total,
             "fired_wills": fired_here,
             "phase_ms": phase_of(i + 1, n_rounds).as_millis(),
             "quit_to_gone_ms": stats::round3(ms(t.t_quit, t.t_gone)),
             "outage_ms": ms_opt(Some(t.t_gone), t_all).map(stats::round3),
             "gone_to_pid_ms": stats::round3(ms(t.t_gone, t.t_pid)),
+            "quit_to_all_ms": ms_opt(Some(t.t_quit), t_all).map(stats::round3),
             "gap_post_to_visible_ms": stats::round3(ms(t.t_post, t.t_seen)),
         }));
     }
     let n = rounds.len();
     let in_gap = rounds.iter().filter(|r| r.timed.in_gap).count();
+    let took_first = rounds.iter().filter(|r| r.timed.took_first).count();
     let by_kind: Vec<String> = kinds
         .iter()
         .map(|(class, k)| format!("`{class}` {:.1}", *k as f64 / n.max(1) as f64))
@@ -294,17 +317,27 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "A seamless update's bridge handoff, its bridges' half (a headless instance cannot \
              update): a successor instance armed with the same fabric command comes up on the \
              same `--state`, its bridge STANDING BY on the held dir (`link down \
-             reason=state-locked`, the lock tried once a second); the holder quits saying `bye \
+             reason=state-locked`, its take of the lock waiting in the kernel's queue, which \
+             hands it the lock the moment the holder lets go); the holder quits saying `bye \
              handoff`; the moment its bridge is gone (`kill(pid, 0)` refused, read every \
-             millisecond) one successor session posts a note to the other, queued while no \
-             bridge carries the node; the successor's bridge takes the dir, attaches (its node \
-             and both sessions' presence rows, under its own pid and incarnation) and drains the \
-             post. Then the successor holds the node and the next round hands it on. Round k of \
-             n quits (k - 1)/n of the 1 s poll later than the first, counted from the standby \
-             seen and the round set up, so the rounds sample where in the poll the exit lands \
-             rather than one point of it. Times are \
-             read off the log afterwards, as the attach phase's are. {n} handoff(s); the gap's \
-             post was queued before the successor took the dir in {in_gap} of them.\n"
+             millisecond) one successor session posts a note to the other, queued if no bridge \
+             carries the node yet; the successor's bridge takes the dir, attaches (its node and \
+             both sessions' presence rows, under its own pid and incarnation) and drains the \
+             post. Then the successor holds the node and the next round hands it on. The bench \
+             reads the state dir's pid file from the quit on, beside its `kill(pid, 0)` poll, \
+             so a successor woken by the release, which takes the dir before the old bridge is \
+             reaped, is timed where its pid file appeared: the old bridge gone -> its pid then \
+             reads below zero, and its attach row starts at its take. The outage, the time no \
+             bridge carries the node, begins after the quit and no later than the old bridge's \
+             exit, so the row from the old bridge gone bounds it from below and quit -> every \
+             row acked (end to end) from above. Round k of \
+             n quits (k - 1)/n of a second later than the first, counted from the standby seen \
+             and the round set up: on builds before H1, whose standby tried the lock once a \
+             second, that sampled where in the poll the exit landed; here it changes nothing \
+             but the moment of the quit. Times are read off the log afterwards, as the attach \
+             phase's are. {n} handoff(s); the successor took the dir before the old bridge was \
+             seen gone in {took_first} of them, and the gap's post was queued before it took \
+             the dir in {in_gap}.\n"
         ),
         "| measure (ms) | n | mean | p50 | p95 | p99 |".to_string(),
         "|---|---:|---:|---:|---:|---:|".to_string(),
@@ -330,6 +363,8 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "served": served.trim_end(),
         "handoffs": n,
         "gap_posts_queued_in_gap": in_gap,
+        "took_before_gone": took_first,
+        "quit_to_all_ms": stats::to_json(&series[8]),
         "quit_to_gone_ms": stats::to_json(&series[0]),
         "outage_ms": stats::to_json(&series[1]),
         "gone_to_pid_ms": stats::to_json(&series[2]),

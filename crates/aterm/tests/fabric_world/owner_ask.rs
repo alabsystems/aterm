@@ -1260,6 +1260,12 @@ fn the_journal_across_a_quit_and_a_kill() {
         "the command's first word is kept"
     );
     let old = cursor(&a, &shell);
+    // The relaunch judges this run by its ledger row, which its census lands before the amend.
+    until("the first launch's start amended prev_end=none", || {
+        a.text("log n")
+            .contains(" amend n start prev_end=none ")
+            .then_some(())
+    });
 
     // A quit, then a relaunch on the same roots.
     quit(&mut a);
@@ -1978,6 +1984,16 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     until_on(&a, &x, DEADLINE, "the title", || {
         a.text(&format!("@{x} log tier=content"))
             .contains("QZP6SECRET2")
+            .then_some(())
+    });
+    // An address naming B routes only while B advertises Y live.
+    let y_row = format!("/f/{FLEET}/pub/{NODE_B}/{y}/presence");
+    let mut root = owner.root_client();
+    until("B to advertise its session live", || {
+        let page = root.last(&y_row, "", 8).ok()?;
+        page.0
+            .iter()
+            .any(|(_, s, b)| *s == y_row && String::from_utf8_lossy(b).contains("state=live"))
             .then_some(())
     });
     for line in [

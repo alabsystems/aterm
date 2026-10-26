@@ -1086,33 +1086,42 @@ fn is_enrolled(row: &Row, enrolled: &BTreeSet<String>) -> bool {
     row.dir.is_none() || enrolled.contains(&row.label)
 }
 
-/// Returns whether the roster at `path` admits and lists at least two accounts.
+/// Recovers and reads the bound [`Roster`] used to attribute usage-tap readings at `now`.
+/// Unavailable account publication never falls back to the default login. With no configured
+/// path, only local record publication can recover; a pending roster-bound or damaged receipt
+/// refuses that fallback.
 #[must_use]
-pub fn several_listed(path: Option<&Path>) -> bool {
-    path.and_then(|path| Roster::load(path).ok())
-        .is_some_and(|roster| roster.several())
-}
-
-/// Loads the bound [`Roster`] used to attribute usage-tap readings at `now`.
-#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountTapRead",
+        action = "Read",
+        project = "aterm_agent::harness::accounts::tap_recovery_tests::tap_transition"
+    )
+)]
 pub fn tap_roster(path: Option<&Path>, store: &Store, now: i64) -> Option<Roster> {
-    let roster = match path.map(Roster::load) {
-        None => return Some(Roster::own()),
-        Some(read) => read.ok()?,
-    };
+    let roster = store.read_roster(path, now).ok()?;
     if roster.rows.is_empty() {
         return Some(Roster::own());
     }
-    store.bound(&roster, now).ok()
+    Some(roster)
 }
 
 /// Returns [`Roster::lone_login`] for the bound roster at `path`.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountTapRead",
+        action = "Read",
+        project = "aterm_agent::harness::accounts::tap_recovery_tests::tap_transition"
+    )
+)]
 pub fn lone_login_at(path: Option<&Path>, store: &Store, now: i64) -> Option<String> {
-    let roster = Roster::load(path?).ok().filter(|r| r.rows.len() == 1)?;
     store
-        .bound(&roster, now)
-        .ok()?
+        .read_bound_roster(path?, now)
+        .ok()
+        .filter(|roster| roster.rows.len() == 1)?
         .lone_login()
         .map(str::to_owned)
 }
@@ -1123,14 +1132,19 @@ pub fn lone_login_at(path: Option<&Path>, store: &Store, now: i64) -> Option<Str
 /// rows (one row follows only its current login) or the store's logins cannot be read, since
 /// [`tap_roster`] and the footer's account gate refuse that roster too.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountTapRead",
+        action = "Read",
+        project = "aterm_agent::harness::accounts::tap_recovery_tests::tap_transition"
+    )
+)]
 pub fn listed_logins_at(path: Option<&Path>, store: &Store, now: i64) -> Vec<String> {
     let Some(roster) = path
-        .and_then(|path| Roster::load(path).ok())
+        .and_then(|path| store.read_bound_roster(path, now).ok())
         .filter(Roster::several)
     else {
-        return Vec::new();
-    };
-    let Ok(roster) = store.bound(&roster, now) else {
         return Vec::new();
     };
     roster
@@ -6555,6 +6569,32 @@ pub struct LoginObservation<'a> {
     pub who: &'a ProcessLogin,
 }
 
+/// Why a bounded read of the current roster and its local bindings could not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterReadError {
+    /// The roster path or its contents could not be read as a roster.
+    Roster(String),
+    /// The writer, receipt, state or bindings were unavailable, or publication spanned the read.
+    Records(String),
+}
+
+/// An account observation's roster, bindings and state read within one completed publication.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountRecords {
+    /// The configured roster before local bindings, retained for later policy admission.
+    pub raw_roster: Roster,
+    /// The effective roster after applying local login bindings.
+    pub roster: Roster,
+    /// Whether the supplied roster path held a file, including an empty roster.
+    pub roster_present: bool,
+    /// The account state from the same publication, with [`Store::load`]'s local machine identity.
+    pub state: State,
+    /// The login bindings used to form the effective roster.
+    pub logins: Logins,
+    /// Nonfatal state and binding diagnostics, in report order.
+    pub notes: Vec<String>,
+}
+
 impl LoginObservation<'_> {
     /// Whether this observation still describes the current row in an effective roster.
     pub(super) fn matches_current(&self, current: &Roster) -> bool {
@@ -6777,9 +6817,8 @@ impl Store {
         Ok(None)
     }
 
-    /// Overrides the ladder of this store's bounded lock takes.
-    #[cfg(any(test, debug_assertions))]
-    #[doc(hidden)]
+    /// Overrides the ladder of this store's bounded lock takes: a seat's own ladder, as the
+    /// window's roster read passes it in every build, and a test's shorter one.
     #[must_use]
     pub fn bounded_by(self, ladder: &'static [std::time::Duration]) -> Store {
         Store { ladder, ..self }
@@ -7023,6 +7062,175 @@ impl Store {
         self.load_logins(now)
             .map_err(|why| format!("{why} ({})", self.logins_file().display()))?;
         Ok(())
+    }
+
+    /// Completes an interrupted, admitted account-record publication at `roster_path`.
+    /// Uses this store's bounded lock wait and replays exact saved images without running
+    /// the original edit or contacting a provider. With no pending publication, it reads
+    /// the receipt without taking the writer lock and returns `false`.
+    /// # Errors
+    /// An unreadable or damaged receipt, a lost receipt with retained evidence, unavailable
+    /// writer, different recovery target, conflicting image, or failed durable publication.
+    pub fn recover_records(&self, roster_path: &Path) -> Result<bool, String> {
+        self.recover_sync_within(self.ladder, roster_path)
+    }
+
+    /// Completes an admitted state or local-login publication at fixed paths in this store.
+    /// Ordinary reads create no storage and take no lock. A pending roster-bound write
+    /// refuses because it needs a caller-supplied roster path.
+    /// # Errors
+    /// As [`Self::recover_records`], or a pending publication requires a roster path.
+    pub fn recover_state_records(&self) -> Result<bool, String> {
+        self.recover_state_within(self.ladder)
+    }
+
+    /// Recovers account publication before interpreting an optional roster path.
+    /// With no path, only fixed-path records can recover; a validated receipt then
+    /// permits an empty roster. This neither discovers an external path from the
+    /// journal nor reads bindings that no roster row uses.
+    /// # Errors
+    /// As [`Self::read_bound_roster`], including a pending roster-bound publication
+    /// when the caller supplies no path.
+    pub fn read_roster(
+        &self,
+        roster_path: Option<&Path>,
+        now: i64,
+    ) -> Result<Roster, RosterReadError> {
+        match roster_path {
+            Some(path) => self.read_bound_roster(path, now),
+            None => {
+                self.recover_state_records()
+                    .map_err(RosterReadError::Records)?;
+                self.sync_read_receipt().map_err(RosterReadError::Records)?;
+                Ok(Roster::default())
+            }
+        }
+    }
+
+    /// Recovers admitted publication and reads a report's entire account snapshot.
+    /// Unlike [`Self::read_roster`], this validates state and bindings even for an
+    /// empty or absent roster. A receipt check covers the roster's presence as well
+    /// as all three records. External file editors are not serialized by this read.
+    /// # Errors
+    /// As [`Self::read_bound_roster`], plus unreadable account state. No partial
+    /// snapshot is returned, including when a publication overlaps a failed read.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountReportRead",
+            action = "Read",
+            project = "aterm_agent::harness::accounts::report_read_tests::report_transition"
+        )
+    )]
+    pub fn read_account_records(
+        &self,
+        roster_path: Option<&Path>,
+        now: i64,
+    ) -> Result<AccountRecords, RosterReadError> {
+        self.read_account_records_with(roster_path, now, || {})
+    }
+
+    fn read_account_records_with(
+        &self,
+        roster_path: Option<&Path>,
+        now: i64,
+        after_raw: impl FnOnce(),
+    ) -> Result<AccountRecords, RosterReadError> {
+        self.recover_account_records_with(roster_path, now, after_raw)
+            .map(|(_, records)| records)
+    }
+
+    /// Captures the same image as [`Self::read_account_records`] and reports whether
+    /// this read completed an interrupted publication. A sync uses that fact in its
+    /// change report, including a journal admitted just before the read begins.
+    /// # Errors
+    /// As [`Self::read_account_records`].
+    pub(super) fn recover_account_records(
+        &self,
+        roster_path: Option<&Path>,
+        now: i64,
+    ) -> Result<(bool, AccountRecords), RosterReadError> {
+        self.recover_account_records_with(roster_path, now, || {})
+    }
+
+    fn recover_account_records_with(
+        &self,
+        roster_path: Option<&Path>,
+        now: i64,
+        after_raw: impl FnOnce(),
+    ) -> Result<(bool, AccountRecords), RosterReadError> {
+        let recovered = match roster_path {
+            Some(path) => self.recover_records(path),
+            None => self.recover_state_records(),
+        }
+        .map_err(RosterReadError::Records)?;
+        let receipt = self.sync_read_receipt().map_err(RosterReadError::Records)?;
+        let raw = roster_path.map_or(Ok(None), roster_text).and_then(|text| {
+            let present = text.is_some();
+            let roster = text.map_or(Ok(Roster::default()), |text| {
+                Roster::parse_for(self.cli, &text)
+            })?;
+            Ok((roster, present))
+        });
+        after_raw();
+        let result = (|| {
+            let (raw, roster_present) = raw.map_err(RosterReadError::Roster)?;
+            let (logins, login_note) = self.load_logins(now).map_err(RosterReadError::Records)?;
+            let (state, state_note) = self.load(now).map_err(RosterReadError::Records)?;
+            Ok(AccountRecords {
+                roster: bound(&raw, &logins),
+                raw_roster: raw,
+                roster_present,
+                state,
+                logins,
+                notes: state_note.into_iter().chain(login_note).collect(),
+            })
+        })();
+        self.check_sync_read_receipt(&receipt)
+            .map_err(RosterReadError::Records)?;
+        result.map(|records| (recovered, records))
+    }
+
+    /// Recovers admitted publication and reads the raw roster with its local bindings.
+    /// A receipt check across both reads refuses a cooperating publication that overlaps
+    /// the snapshot. Ordinary reads create no storage and need no writer lock. An external
+    /// editor can still change a file after its read; observations must recheck their
+    /// captured row when they publish.
+    /// # Errors
+    /// [`RosterReadError::Roster`] for an unreadable roster or target path, or
+    /// [`RosterReadError::Records`] for recovery or binding failures, or a publication
+    /// overlapping the read.
+    pub fn read_bound_roster(
+        &self,
+        roster_path: &Path,
+        now: i64,
+    ) -> Result<Roster, RosterReadError> {
+        self.read_bound_roster_with(roster_path, now, || {})
+    }
+
+    // The hook lets native tests publish precisely between the raw and binding reads.
+    fn read_bound_roster_with(
+        &self,
+        roster_path: &Path,
+        now: i64,
+        after_raw: impl FnOnce(),
+    ) -> Result<Roster, RosterReadError> {
+        self.recover_records(roster_path)
+            .map_err(RosterReadError::Records)?;
+        let receipt = self.sync_read_receipt().map_err(RosterReadError::Records)?;
+        let result = (|| {
+            let raw = Roster::load_for(self.cli, roster_path).map_err(RosterReadError::Roster)?;
+            after_raw();
+            if raw.rows.is_empty() {
+                return Ok(raw);
+            }
+            self.load_logins(now)
+                .map(|(logins, _)| bound(&raw, &logins))
+                .map_err(RosterReadError::Records)
+        })();
+        self.check_sync_read_receipt(&receipt)
+            .map_err(RosterReadError::Records)?;
+        result
     }
 
     /// Refuses new roster labels that would inherit retained login or account state.
@@ -7364,20 +7572,31 @@ impl Store {
 
     /// Reads the newest `max` events from `ledger.jsonl` in chronological order.
     /// # Errors
-    /// The ledger exists and cannot be read.
+    /// The ledger exists and cannot be read, or a pending, damaged or overlapping
+    /// publication refuses the read.
     pub fn tail(&self, max: usize) -> io::Result<Vec<Event>> {
-        Ok(super::cli::tail_lines(&self.ledger_path(), max)?
+        self.tail_with(max, || {})
+    }
+
+    fn tail_with(&self, max: usize, after_read: impl FnOnce()) -> io::Result<Vec<Event>> {
+        let receipt = self.sync_read_receipt().map_err(io::Error::other)?;
+        let events = super::cli::tail_lines(&self.ledger_path(), max)?
             .iter()
             .filter_map(|line| Event::of_json_line(line))
-            .collect())
+            .collect();
+        after_read();
+        self.check_sync_read_receipt(&receipt)
+            .map_err(io::Error::other)?;
+        Ok(events)
     }
 
     /// Serializes a read-modify-write transaction on `state.json` and `ledger.jsonl` under
     /// `accounts.lock`.
     /// # Errors
     /// [`Store::load`]'s refusal, naming the file; `edit`'s own, with nothing written; or
-    /// the file that could not be locked or written, by path. A later write failure can leave
-    /// an earlier file published; this legacy API has no multi-file recovery receipt.
+    /// the file that could not be locked or written, by path. State, history and notification
+    /// publish through a durable receipt. An interrupted state-only write recovers before
+    /// the edit runs; a pending roster-bound write needs its caller-supplied recovery path.
     pub fn transact(
         &self,
         now: i64,
@@ -7387,7 +7606,7 @@ impl Store {
         let held = self
             .acquire()
             .map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        self.transact_held(&held, now, note, edit)
+        self.transact_state_held(&held, now, note, edit)
     }
 
     /// Runs [`Store::transact`] with a bounded lock wait over `ladder` ([`LOCK_HELD`]).
@@ -7405,7 +7624,7 @@ impl Store {
             .acquire_within(ladder)
             .map_err(|e| format!("{}: {e}", self.dir.display()))?
             .ok_or_else(|| LOCK_HELD.to_string())?;
-        self.transact_held(&held, now, note, edit)
+        self.transact_state_held(&held, now, note, edit)
     }
 
     /// Saves an explicit selection before its login worker starts.
@@ -7600,15 +7819,15 @@ impl Store {
         Ok(())
     }
 
-    /// Serializes edits to `state.json` and `logins.json` under `accounts.lock`
-    /// ([`Store::transact`]).
+    /// Publishes edits to `state.json`, `logins.json` and history through a durable receipt
+    /// under `accounts.lock` ([`Store::transact`]).
     /// A renewal or change to a binding's location, proved identity or existence consumes
     /// a generation. Multiple changes to one label consume it once per transaction.
     /// # Errors
     /// As [`Store::transact`], for either file, or a renewed binding is missing or its
-    /// generation is exhausted. A later write failure can leave earlier files published;
-    /// this legacy transaction has no multi-file crash receipt. The edit's own external
-    /// effects are not rolled back.
+    /// generation is exhausted. Interrupted local publication recovers before the edit;
+    /// a pending roster-bound publication needs its caller-supplied path. The edit's own
+    /// external effects are not rolled back.
     pub fn transact_logins(
         &self,
         now: i64,
@@ -7644,19 +7863,27 @@ impl Store {
     /// the binding/state transaction, then compares the complete effective row.
     ///
     /// This validates local routing evidence, not the provider's identity or a process's
-    /// in-memory token. Roster writers do not share this lock, so the check describes the
-    /// roster read here rather than guaranteeing it cannot change after the read.
+    /// in-memory token. The roster image checked here is also the publication's admitted
+    /// image. A conflicting external roster edit refuses publication or recovery.
     /// # Errors
-    /// As [`Self::transact_logins_within`], an unreadable roster, or a changed row, historical
-    /// login or credential override. A failed observation check runs no edit and publishes
-    /// no account records; subsequent edit or write failures have the transaction's usual
-    /// guarantees.
+    /// An unavailable writer, unreadable roster or records, changed row, historical login,
+    /// credential override, `edit`'s refusal or failed durable publication. A failed check runs
+    /// no edit. An admitted partial publication fences readers until its exact state,
+    /// bindings, history and event-dependent notification recover together.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "AccountLoginObservation",
             action = "Record",
             project = "aterm_agent::harness::accounts::observation_tests::observation_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountLifecycleCommit",
+            action = "Record",
+            project = "aterm_agent::harness::accounts::lifecycle_commit_tests::lifecycle_transition"
         )
     )]
     pub fn observe_login_within(
@@ -7666,17 +7893,22 @@ impl Store {
         observation: LoginObservation<'_>,
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
-        self.transact_logins_within(ladder, now, &mut None, |state, logins| {
-            let raw = Roster::load_for(self.cli, observation.roster_path)?;
-            let current = bound(&raw, logins);
-            if !observation.matches_current(&current) {
-                return Err(format!(
-                    "account `{}` login changed since observation; nothing recorded",
-                    observation.row.label
-                ));
-            }
-            edit(state, logins)
-        })
+        self.transact_pool_logins_within(
+            ladder,
+            observation.roster_path,
+            now,
+            &mut None,
+            |raw, state, logins| {
+                let current = bound(raw, logins);
+                if !observation.matches_current(&current) {
+                    return Err(format!(
+                        "account `{}` login changed since observation; nothing recorded",
+                        observation.row.label
+                    ));
+                }
+                edit(state, logins)
+            },
+        )
     }
 
     /// Publishes a renewal only while its captured roster and effective target row still
@@ -7720,7 +7952,7 @@ impl Store {
         })
     }
 
-    /// The logins' transaction itself ([`Store::transact_held`]).
+    /// The local logins' transaction while the caller retains the account writer lock.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -7744,92 +7976,7 @@ impl Store {
         note: &mut Option<String>,
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
-        let (mut logins, read) = self.load_logins(now).map_err(|why| {
-            format!(
-                "{why}: {} is left as it is and nothing was written",
-                self.logins_file().display()
-            )
-        })?;
-        let before = logins.clone();
-        let mut saved = Ok(());
-        let events = self.transact_held(held, now, note, |state| {
-            let events = edit(state, &mut logins)?;
-            advance_renewal_generations(&before, &mut logins, &events)?;
-            if logins != before {
-                saved = self.save_logins(&logins);
-            }
-            saved
-                .as_ref()
-                .map_err(|e| format!("{}: {e}", self.logins_file().display()))?;
-            Ok(events)
-        })?;
-        if note.is_none() {
-            *note = read;
-        }
-        Ok(events)
-    }
-
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountStateRead",
-            action = "Torn",
-            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountStateRetention",
-            action = "Edit",
-            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountStateRetention",
-            action = "EventOnly",
-            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
-        )
-    )]
-    fn transact_held(
-        &self,
-        held: &Lock,
-        now: i64,
-        note: &mut Option<String>,
-        edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
-    ) -> Result<Vec<Event>, String> {
-        let (mut state, read) = self.load(now).map_err(|why| {
-            format!(
-                "{why}: {} is left as it is and no account state was written; restore a \
-                 known-good state before changing accounts",
-                self.state_file().display()
-            )
-        })?;
-        *note = read;
-        if let Ok(id) = self.machine_id(&state.machine) {
-            state.machine = id;
-        }
-        let before = state.clone();
-        let events = edit(&mut state)?;
-        let first_event = !events.is_empty()
-            && !self
-                .state_file()
-                .try_exists()
-                .map_err(|e| format!("{}: {e}", self.state_file().display()))?;
-        if state != before || first_event {
-            drop_stale_sessions(&mut state, now);
-            self.save(&state)
-                .map_err(|e| format!("{}: {e}", self.state_file().display()))?;
-        }
-        self.append_held(held, &events)
-            .map_err(|e| format!("{}: {e}", self.ledger_path().display()))?;
-        if events.iter().any(Event::wakes) {
-            self.touch_wake()
-                .map_err(|e| format!("{}: {e}", self.wake_path().display()))?;
-        }
-        Ok(events)
+        self.transact_local_logins_held(held, now, note, edit)
     }
 }
 
@@ -8341,6 +8488,33 @@ pub fn account_login_observation_environment() {}
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLifecycleCommit",
+        action = "AnotherProvider",
+        reason = "Select a native provider fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLifecycleCommit",
+        action = "AnotherOperation",
+        reason = "Select a process lifecycle observation fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLifecycleCommit",
+        action = "AnotherFault",
+        reason = "Select a publication obstruction fixture."
+    )
+)]
+#[doc(hidden)]
+pub fn account_lifecycle_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "AccountRenewalPolicy",
         action = "AnotherCase",
         reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for the bound Publish"
@@ -8469,6 +8643,80 @@ mod binding_tests;
 #[cfg(test)]
 #[path = "accounts_observation_tests.rs"]
 mod observation_tests;
+
+#[cfg(test)]
+#[path = "accounts_lifecycle_commit_tests.rs"]
+mod lifecycle_commit_tests;
+
+#[cfg(test)]
+#[path = "accounts_report_read_tests.rs"]
+mod report_read_tests;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReportRead",
+        action = "AnotherProvider",
+        reason = "Fixture selection chooses one of the four provider stores"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReportRead",
+        action = "AnotherShape",
+        reason = "Fixture selection chooses an absent, empty, or populated roster"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReportRead",
+        action = "AnotherFault",
+        reason = "Fixture selection installs a publication, read failure, or overlapping transaction"
+    )
+)]
+#[doc(hidden)]
+pub fn account_report_environment() {}
+
+#[cfg(test)]
+#[path = "accounts_tap_recovery_tests.rs"]
+mod tap_recovery_tests;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountTapRead",
+        action = "AnotherProvider",
+        reason = "Fixture selection chooses the provider whose local account store is read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountTapRead",
+        action = "AnotherReader",
+        reason = "Fixture selection chooses the tap roster, lone login, or listed login projection"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountTapRead",
+        action = "AnotherFault",
+        reason = "Fixture selection installs a healthy, pending, locked, conflicting, or damaged publication"
+    )
+)]
+#[doc(hidden)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountTapRead",
+        action = "AnotherShape",
+        reason = "Fixture selection chooses the empty, single-row, or multi-row pre-image"
+    )
+)]
+pub fn account_tap_environment() {}
 
 #[cfg(test)]
 #[path = "accounts_renewal_policy_tests.rs"]

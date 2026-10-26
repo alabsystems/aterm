@@ -473,18 +473,22 @@ pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
     let inks = b.icon.on(dark_ground(ground));
     let mut floored = [0u32; MAX_ICON_INKS];
-    for (slot, &ink) in floored[..inks.len()].iter_mut().zip(inks) {
-        *slot = floor_contrast_keeping_hue(ink, ground, ICON_CONTRAST);
+    let mut k = 0;
+    while k < inks.len() {
+        floored[k] = floor_contrast_keeping_hue(inks[k], ground, ICON_CONTRAST);
+        k += 1;
     }
     let mut out = Vec::with_capacity(b.texels.len());
-    for &t in b.texels {
-        out.push(match t {
+    let mut j = 0;
+    while j < b.texels.len() {
+        out.push(match b.texels[j] {
             Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
             Texel::Half(i) => {
                 FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA)
             }
             Texel::Hole(rgb) => FxInk::over(rgb, 255),
         });
+        j += 1;
     }
     out
 }

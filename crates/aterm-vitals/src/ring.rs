@@ -102,27 +102,59 @@ impl Cell {
     }
 }
 
-/// The last minute of readings with their wall-clock times, for a trailing mean ([`Recent::mean`]).
+/// One reading as it was taken: when, its value, and whether it was over the resource's maximum.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Reading {
+    /// When it was taken, unix ms.
+    pub at_ms: i64,
+    /// Its value, raw.
+    pub v: f64,
+    /// Whether it was over the resource's maximum.
+    pub over: bool,
+}
+
+impl Reading {
+    /// The reading as a strip cell of its own.
+    #[inline]
+    #[must_use]
+    pub const fn cell(self) -> Cell {
+        Cell {
+            mean: Some(self.v),
+            max: Some(self.v),
+            over: self.over,
+        }
+    }
+}
+
+/// The last minute of readings with their wall-clock times, for a trailing mean ([`Recent::mean`])
+/// and a strip drawn reading by reading ([`slots_of`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Recent {
-    v: VecDeque<(i64, f64)>,
+    v: VecDeque<Reading>,
 }
 
 impl Recent {
     /// Record reading `v` taken at `at_ms` (unix ms).
     pub fn push(&mut self, at_ms: i64, v: f64) {
-        if !v.is_finite() {
+        self.push_reading(Reading {
+            at_ms,
+            v,
+            over: false,
+        });
+    }
+
+    /// Record reading `r`; a reading not after the newest kept replaces the readings since it.
+    pub fn push_reading(&mut self, r: Reading) {
+        if !r.v.is_finite() {
             return;
         }
-        while self.v.back().is_some_and(|&(t, _)| t > at_ms) {
+        while self.v.back().is_some_and(|b| b.at_ms > r.at_ms) {
             self.v.pop_back();
         }
-        self.v.push_back((at_ms, v));
-        while self
-            .v
-            .front()
-            .is_some_and(|&(t, _)| i128::from(t) <= i128::from(at_ms) - i128::from(RECENT_KEEP_MS))
-            || self.v.len() > RECENT_CAP
+        self.v.push_back(r);
+        while self.v.front().is_some_and(|f| {
+            i128::from(f.at_ms) <= i128::from(r.at_ms) - i128::from(RECENT_KEEP_MS)
+        }) || self.v.len() > RECENT_CAP
         {
             self.v.pop_front();
         }
@@ -135,9 +167,15 @@ impl Recent {
         let (sum, n) = self
             .v
             .iter()
-            .filter(|&&(t, _)| i128::from(t) > cutoff && t <= now_ms)
-            .fold((0.0, 0u32), |(s, n), &(_, v)| (s + v, n + 1));
+            .filter(|r| i128::from(r.at_ms) > cutoff && r.at_ms <= now_ms)
+            .fold((0.0, 0u32), |(s, n), r| (s + r.v, n + 1));
         (n > 0).then(|| sum / f64::from(n))
+    }
+
+    /// Every reading kept, oldest first.
+    #[must_use]
+    pub fn readings(&self) -> Vec<Reading> {
+        self.v.iter().copied().collect()
     }
 
     /// Forget every reading.
@@ -146,14 +184,146 @@ impl Recent {
     }
 
     fn shift(&mut self, by_ms: i128) {
-        self.v.retain_mut(|(t, _)| {
-            let Ok(shifted) = i64::try_from(i128::from(*t) + by_ms) else {
+        self.v.retain_mut(|r| {
+            let Ok(shifted) = i64::try_from(i128::from(r.at_ms) + by_ms) else {
                 return false;
             };
-            *t = shifted;
+            r.at_ms = shifted;
             true
         });
     }
+}
+
+/// How long a reading slot is, ms: a second, the focused window's cadence.
+pub const SLOT_MS: i64 = 1000;
+
+/// How close to a slot's edge a reading may land before [`SlotGrid::clear_of`] moves the edges,
+/// ms: a tenth of a second, under a quarter of the lens's half-second cadence, so its two readings
+/// a second both stand clear.
+pub const SLOT_GUARD_MS: i64 = 100;
+
+/// Where reading slots stand on the wall clock: `slot_ms` long, each starting `origin_ms` past a
+/// multiple of `slot_ms`. A strip of slots draws a reading a slot, so its edges must stand
+/// between the readings, never on them: readings paced from the moment each was asked drift
+/// through the second, and a reading on a slot's edge would land in the slot before or after by
+/// a millisecond, leaving one slot empty and the next holding two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotGrid {
+    /// A slot's length, ms.
+    pub slot_ms: i64,
+    /// Where in each `slot_ms` a slot starts, ms (`0..slot_ms`).
+    pub origin_ms: i64,
+}
+
+impl Default for SlotGrid {
+    fn default() -> Self {
+        Self::SECONDS
+    }
+}
+
+impl SlotGrid {
+    /// The wall clock's own seconds.
+    pub const SECONDS: Self = Self {
+        slot_ms: SLOT_MS,
+        origin_ms: 0,
+    };
+
+    const fn len(self) -> i64 {
+        if self.slot_ms > 0 { self.slot_ms } else { 1 }
+    }
+
+    /// The index of the slot holding `at_ms`.
+    #[must_use]
+    pub const fn slot(self, at_ms: i64) -> i64 {
+        at_ms.saturating_sub(self.origin_ms).div_euclid(self.len())
+    }
+
+    /// How many slots a reading at `at_ms` opened past one at `prev_ms` (0 for one in the same
+    /// slot, negative for one before it).
+    #[must_use]
+    pub const fn opened(self, prev_ms: i64, at_ms: i64) -> i64 {
+        self.slot(at_ms).saturating_sub(self.slot(prev_ms))
+    }
+
+    /// Whether `at_ms` stands at least `guard_ms` inside its slot, clear of both edges.
+    #[must_use]
+    pub const fn clear(self, at_ms: i64, guard_ms: i64) -> bool {
+        let into = at_ms.saturating_sub(self.origin_ms).rem_euclid(self.len());
+        into >= guard_ms && self.len() - into >= guard_ms
+    }
+
+    /// The grid of `slot_ms` whose edges stand furthest from every one of `times` (unix ms):
+    /// each edge in the middle of the widest gap between the times' places in a slot. Readings
+    /// a second apart then stand in the middles of their slots, and the lens's two a second a
+    /// quarter of a slot inside each edge. With no times, the wall clock's own seconds.
+    #[must_use]
+    pub fn clear_of(times: &[i64], slot_ms: i64) -> Self {
+        let len = slot_ms.max(1);
+        let mut phases: Vec<i64> = times.iter().map(|t| t.rem_euclid(len)).collect();
+        phases.sort_unstable();
+        phases.dedup();
+        let (Some(&first), Some(&last)) = (phases.first(), phases.last()) else {
+            return Self {
+                slot_ms: len,
+                origin_ms: 0,
+            };
+        };
+        let mut widest = (first + len - last, last);
+        for pair in phases.windows(2) {
+            let gap = pair[1] - pair[0];
+            if gap > widest.0 {
+                widest = (gap, pair[0]);
+            }
+        }
+        Self {
+            slot_ms: len,
+            origin_ms: (widest.1 + widest.0 / 2).rem_euclid(len),
+        }
+    }
+}
+
+/// `n` slots of `grid`, oldest first, the last the one holding `at_ms` (the snapshot's reading):
+/// each the merge of the `readings` taken in it ([`Cell::merge`]). A slot no reading fell in
+/// takes the first reading after it, which speaks for the time back to the reading before (a
+/// rate read at `t` is the mean since that reading), when that span is at most `cover_ms`; else
+/// it is unread, as is the last slot of a series not read at `at_ms`. `readings` are oldest
+/// first, as [`Recent::readings`] keeps them.
+#[must_use]
+pub fn slots_of(
+    readings: &[Reading],
+    at_ms: i64,
+    grid: SlotGrid,
+    n: usize,
+    cover_ms: i64,
+) -> Vec<Cell> {
+    let slot_ms = grid.len();
+    let readings = &readings[..readings.partition_point(|r| r.at_ms <= at_ms)];
+    let last = grid.slot(at_ms);
+    (0..n)
+        .map(|j| {
+            let k = i128::from(last) - (n - 1 - j) as i128;
+            let lo = k * i128::from(slot_ms) + i128::from(grid.origin_ms);
+            let hi = lo + i128::from(slot_ms);
+            let from = readings.partition_point(|r| i128::from(r.at_ms) < lo);
+            let to = readings.partition_point(|r| i128::from(r.at_ms) < hi);
+            let inside = readings.get(from..to).unwrap_or_default();
+            if !inside.is_empty() {
+                return Cell::merge(inside.iter().map(|r| r.cell()));
+            }
+            match (
+                to.checked_sub(1).and_then(|i| readings.get(i)),
+                readings.get(to),
+            ) {
+                (Some(before), Some(after))
+                    if i128::from(after.at_ms) - i128::from(before.at_ms)
+                        <= i128::from(cover_ms) =>
+                {
+                    after.cell()
+                }
+                _ => Cell::default(),
+            }
+        })
+        .collect()
 }
 
 /// An hour of 10 s buckets, keyed by the wall clock.
@@ -224,7 +394,11 @@ impl BucketRing {
             if let Some(b) = self.b.back_mut() {
                 b.add(v, over);
             }
-            self.recent.push(at_unix_ms, v);
+            self.recent.push_reading(Reading {
+                at_ms: at_unix_ms,
+                v,
+                over,
+            });
         }
         closed
     }
@@ -301,6 +475,12 @@ impl BucketRing {
             ncols,
             now_unix_ms,
         )
+    }
+
+    /// The last minute of readings, oldest first ([`slots_of`]).
+    #[must_use]
+    pub fn readings(&self) -> Vec<Reading> {
+        self.recent.readings()
     }
 
     /// Mean of readings in the `window_ms` preceding `now_unix_ms` ([`NOW_WINDOW_MS`]).
@@ -542,5 +722,163 @@ mod tests {
         assert_eq!(r.sustained(k0 + 2), Some(5.0));
         assert_eq!(r.sustained(k0 + 3), Some(6.0), "the spike is not sustained");
         assert_eq!(r.sustained(k0 + 4), Some(6.0));
+    }
+
+    fn reading(at_ms: i64, v: f64) -> Reading {
+        Reading {
+            at_ms,
+            v,
+            over: false,
+        }
+    }
+
+    fn means(cells: &[Cell]) -> Vec<Option<f64>> {
+        cells.iter().map(|c| c.mean).collect()
+    }
+
+    #[test]
+    fn slots_hold_each_reading_in_its_second_and_end_at_the_newest() {
+        // A reading a second, 300 ms into each: five 1 s slots end with the one holding the
+        // newest, each the reading taken in it.
+        let rs: Vec<Reading> = (0..8)
+            .map(|i| reading(T0 + 300 + i * 1000, i as f64))
+            .collect();
+        let at = T0 + 7_300;
+        assert_eq!(
+            means(&slots_of(&rs, at, SlotGrid::SECONDS, 5, 15_000)),
+            [3.0, 4.0, 5.0, 6.0, 7.0].map(Some)
+        );
+        // Over rides with its reading.
+        let mut hot = rs.clone();
+        hot[6].over = true;
+        let cells = slots_of(&hot, at, SlotGrid::SECONDS, 5, 15_000);
+        assert_eq!(
+            cells.iter().map(|c| c.over).collect::<Vec<_>>(),
+            [false, false, false, true, false]
+        );
+        // Two readings in one second merge (the lens's half-second cadence).
+        let twice = [reading(T0 + 100, 2.0), reading(T0 + 600, 4.0)];
+        let one = slots_of(&twice, T0 + 600, SlotGrid::SECONDS, 1, 15_000);
+        assert_eq!((one[0].mean, one[0].max), (Some(3.0), Some(4.0)));
+        // A reading later than the snapshot is not drawn; the snapshot's slot then holds the
+        // reading of its own second only.
+        assert_eq!(
+            means(&slots_of(&rs, T0 + 5_300, SlotGrid::SECONDS, 2, 15_000)),
+            [Some(4.0), Some(5.0)]
+        );
+    }
+
+    #[test]
+    fn a_grid_stands_its_edges_between_the_readings() {
+        let clearance = |grid: SlotGrid, t: i64| {
+            let into = (t - grid.origin_ms).rem_euclid(grid.slot_ms);
+            into.min(grid.slot_ms - into)
+        };
+        // A reading a second, drifting 3 ms later each, 990 ms into the second: the wall clock's
+        // own seconds put every edge on a reading; the grid clear of them puts each reading in
+        // the middle of its slot.
+        let drift: Vec<i64> = (0..8).map(|i| T0 + 990 + i * 1_003).collect();
+        assert!(
+            drift
+                .iter()
+                .any(|&t| !SlotGrid::SECONDS.clear(t, SLOT_GUARD_MS)),
+            "CONTROL: the wall clock's seconds have an edge on a reading"
+        );
+        let grid = SlotGrid::clear_of(&drift, SLOT_MS);
+        assert_eq!(grid.slot_ms, SLOT_MS);
+        for &t in &drift {
+            assert!(clearance(grid, t) >= 480, "{grid:?} {t}");
+        }
+        for pair in drift.windows(2) {
+            assert_eq!(grid.opened(pair[0], pair[1]), 1, "{grid:?} {pair:?}");
+        }
+        // The lens's two readings a second: each a quarter of a slot inside an edge, so a slot
+        // holds one of each and opens once a second.
+        let lens: Vec<i64> = (0..8).map(|i| T0 + 40 + i * 500).collect();
+        let grid = SlotGrid::clear_of(&lens, SLOT_MS);
+        for &t in &lens {
+            assert!(clearance(grid, t) >= 240, "{grid:?} {t}");
+        }
+        let opened: Vec<i64> = lens.windows(2).map(|p| grid.opened(p[0], p[1])).collect();
+        assert_eq!(opened.iter().sum::<i64>(), 3, "{opened:?}");
+        assert!(opened.iter().all(|&o| o == 0 || o == 1), "{opened:?}");
+        // One reading: the edge half a slot from it; none: the wall clock's seconds.
+        let one = SlotGrid::clear_of(&[T0 + 200], SLOT_MS);
+        assert_eq!(one.origin_ms, 700);
+        assert_eq!(SlotGrid::clear_of(&[], SLOT_MS), SlotGrid::SECONDS);
+        // Slots start at the origin: with edges 700 ms into each second, a reading at 650 and
+        // one at 750 stand in neighbouring slots.
+        assert_eq!(one.opened(T0 + 650, T0 + 750), 1);
+        assert_eq!(one.opened(T0 + 750, T0 + 1_650), 0);
+        assert!(one.clear(T0 + 200, SLOT_GUARD_MS) && !one.clear(T0 + 690, SLOT_GUARD_MS));
+        let rs = [reading(T0 + 650, 1.0), reading(T0 + 750, 2.0)];
+        assert_eq!(
+            means(&slots_of(&rs, T0 + 750, one, 2, 15_000)),
+            [Some(1.0), Some(2.0)]
+        );
+        assert_eq!(
+            means(&slots_of(&rs, T0 + 750, SlotGrid::SECONDS, 2, 15_000)),
+            [None, Some(1.5)],
+            "CONTROL: on the wall clock's seconds the two merge"
+        );
+    }
+
+    #[test]
+    fn an_empty_slot_takes_the_reading_that_speaks_for_it_or_stays_unread() {
+        // Readings 5 s apart (aterm in the background): each speaks for the four seconds before
+        // it that hold no reading of their own.
+        let rs = [
+            reading(T0, 1.0),
+            reading(T0 + 5_000, 2.0),
+            reading(T0 + 10_000, 3.0),
+        ];
+        assert_eq!(
+            means(&slots_of(&rs, T0 + 10_000, SlotGrid::SECONDS, 11, 15_000)),
+            [1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 3.0].map(Some)
+        );
+        // A gap over the cover is unread, never filled.
+        let gap = [reading(T0, 1.0), reading(T0 + 20_000, 2.0)];
+        let cells = slots_of(&gap, T0 + 20_000, SlotGrid::SECONDS, 3, 15_000);
+        assert_eq!(means(&cells), [None, None, Some(2.0)]);
+        // Before the first reading nothing speaks; a series not read at the snapshot's moment
+        // leaves its last slot unread.
+        assert_eq!(
+            means(&slots_of(&rs, T0 + 12_000, SlotGrid::SECONDS, 4, 15_000)),
+            [Some(3.0), Some(3.0), None, None],
+            "nothing after the last reading speaks for the slots after it"
+        );
+        assert_eq!(
+            means(&slots_of(&[], T0, SlotGrid::SECONDS, 2, 15_000)),
+            [None, None]
+        );
+        let early = slots_of(&rs, T0 + 10_000, SlotGrid::SECONDS, 13, 15_000);
+        assert_eq!(&means(&early)[..2], [None, None], "{early:?}");
+    }
+
+    #[test]
+    fn a_ring_keeps_its_readings_with_their_over_marks() {
+        let mut r = BucketRing::default();
+        let _ = r.push(T0, Some(1.0), false);
+        let _ = r.push(T0 + 1_000, None, false);
+        let _ = r.push(T0 + 2_000, Some(3.0), true);
+        assert_eq!(
+            r.readings(),
+            [
+                Reading {
+                    at_ms: T0,
+                    v: 1.0,
+                    over: false
+                },
+                Reading {
+                    at_ms: T0 + 2_000,
+                    v: 3.0,
+                    over: true
+                },
+            ],
+            "an unread reading is no reading"
+        );
+        // The minute it keeps, and no more.
+        let _ = r.push(T0 + 2_000 + RECENT_KEEP_MS, Some(4.0), false);
+        assert_eq!(r.readings().len(), 1);
     }
 }

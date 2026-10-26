@@ -2912,6 +2912,125 @@ fn decided_for_you_lists_its_keys_after_sessions() {
     );
 }
 
+/// SHOWING ALL OF DECIDED FOR YOU ADDS ROWS UNDER THE ONES SHOWN AND RE-LAYS NONE OF THEM: the
+/// card's columns (the clock's width, room for `Show tab`) and its padding are measured from every
+/// choice it holds, so the newest three keep their width, their lines and their place when the
+/// older ones open under them. Before, the columns were measured from the rows shown: older
+/// choices with a live tab (or a wider clock) narrowed the sentence column the moment they
+/// opened, so the newest rows wrapped again and grew (one line to two at 584pt, two to three at
+/// 2x) under the pointer, and the disclosure pressed moved with them.
+#[test]
+fn showing_all_decided_choices_re_lays_none_of_the_ones_shown() {
+    use aterm_agent::harness::stats::{Decision, DecisionKind};
+    let mut state = fixture();
+    let report = state.stats.report.take().expect("a reading");
+    let mut report = (*report).clone();
+    let mut today = HarnessStats::per_session(0);
+    today.declined = 5;
+    let decided = today.decided.as_mut().expect("per session");
+    decided.total = 5;
+    // The two oldest choices were made at 9 in a session whose tab is still open; the newest
+    // three at 18 in one that closed.
+    decided.rows = (0..5_i64)
+        .map(|k| Decision {
+            t_ms: (if k < 2 { 9 } else { 18 } * 3_600 + k * 60) * 1_000,
+            sid: if k < 2 { "s-7" } else { "s-gone" }.to_string(),
+            kind: DecisionKind::Declined,
+            asked: Box::from(format!("rm -rf build-{k}")),
+            said: false,
+            did: Box::from(""),
+            why: Some(Box::from("Nothing outside the worktree is removed.")),
+            times: 1,
+        })
+        .collect();
+    report.today = today;
+    report = HarnessStatsReport::new(
+        report.today,
+        report.week,
+        report.collected_unix_ms,
+        report.offset_s,
+        &|_| Some(0),
+    );
+    state.stats.report = Some(std::sync::Arc::new(report));
+    let k = decided_keys(&state);
+    let relaid = std::sync::Mutex::new(Vec::<String>::new());
+    at_each_text_scale(&[1.0, 2.0], "showing all decided choices", |scale| {
+        for width in [320.0_f32, 504.0, 584.0, 849.0, 1_200.0] {
+            let context = format!("{scale}\u{d7} {width}");
+            let cx = view_cx_at(width, 2_400.0);
+            let (mut runtime, instance, view) = harness_route(state.clone());
+            // Each shown row's parts as laid inside their card: where they stand and how large.
+            let shape = |ui: &crate::native_ui::CompiledUi| {
+                let card = ui
+                    .paint
+                    .iter()
+                    .find(|n| n.key.as_str() == "harness/decided")
+                    .map(|n| n.rect)
+                    .unwrap_or_else(|| panic!("{context}: DECIDED FOR YOU is drawn"));
+                ui.paint
+                    .iter()
+                    .filter(|n| {
+                        k[2..]
+                            .iter()
+                            .any(|key| n.key.as_str().starts_with(key.as_str()))
+                    })
+                    .map(|n| {
+                        (
+                            n.key.as_str().to_string(),
+                            (
+                                n.rect.x - card.x,
+                                n.rect.y - card.y,
+                                n.rect.width,
+                                n.rect.height,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let closed = compile_settings_view(&runtime, instance, view, &cx);
+            let before = shape(&closed);
+            assert!(
+                k[..2]
+                    .iter()
+                    .all(|key| closed.semantic(&UiKey::new(key.as_str())).is_none())
+                    && before.len() >= 3,
+                "{context}: PRECONDITION: the newest three are shown, the older two are not"
+            );
+            press_for_requests(
+                &mut runtime,
+                instance,
+                view,
+                crate::native_settings::harness_page::HARNESS_DECIDED_ALL,
+                None,
+            );
+            let open = compile_settings_view(&runtime, instance, view, &cx);
+            assert!(
+                k[..2]
+                    .iter()
+                    .all(|key| open.semantic(&UiKey::new(key.as_str())).is_some()),
+                "{context}: PRECONDITION: Show all opens the older two"
+            );
+            let after = shape(&open);
+            if after != before {
+                relaid.lock().unwrap().push(format!(
+                    "{context}: {:?}",
+                    before
+                        .iter()
+                        .zip(&after)
+                        .filter(|(b, a)| b != a)
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+    });
+    let relaid = relaid.into_inner().unwrap();
+    assert!(
+        relaid.is_empty(),
+        "the rows shown were re-laid when the rest opened under them:\n{}",
+        relaid.join("\n")
+    );
+}
+
 #[test]
 fn decided_for_you_says_the_newest_of_how_many() {
     let (mut runtime, instance, view) = harness_route(fixture_deciding(64, 80));

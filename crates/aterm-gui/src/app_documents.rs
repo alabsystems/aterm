@@ -974,10 +974,38 @@ impl App {
         path: &std::path::Path,
         target: Option<&crate::native_app::ConfigEditorTarget>,
     ) -> Result<String, String> {
+        self.open_config_editor_placed(wid, path, target, Placement::FocusOrNewTab)
+    }
+
+    /// A restore's config-editor leaf: a fresh view of aterm.toml in a staging tab of its
+    /// own, never the window's open aterm.toml tab, which Open aterm.toml would front.
+    pub(crate) fn stage_config_editor_restore_view(
+        &mut self,
+        wid: WindowId,
+    ) -> Result<String, String> {
+        let path = crate::app_config::config_path().ok_or_else(|| {
+            "could not resolve the config path (HOME/XDG_CONFIG_HOME unset)".to_string()
+        })?;
+        self.open_config_editor_placed(wid, &path, None, Placement::NewTab)
+    }
+
+    fn open_config_editor_placed(
+        &mut self,
+        wid: WindowId,
+        path: &std::path::Path,
+        target: Option<&crate::native_app::ConfigEditorTarget>,
+        placement: Placement,
+    ) -> Result<String, String> {
         let logical_path = ensure_config_file(path)?;
         let uri = crate::native_document_host::path_to_file_uri(&logical_path)
             .map_err(|error| format!("could not address aterm.toml: {error}"))?;
-        self.open_document_tab_in_window_with_config_symlinks(wid, AppKind::Editor, &uri, true)?;
+        self.open_document_tab_in_window_with_config_symlinks(
+            wid,
+            AppKind::Editor,
+            &uri,
+            true,
+            placement,
+        )?;
         let document = self
             .active_native_view(wid)
             .and_then(|(instance, _)| self.native_runtime.document_id(instance))
@@ -2558,27 +2586,7 @@ impl App {
                     .map(|tab| (*wid, tab.id))
             })
             .ok_or_else(|| "Editor window is no longer available".to_string())?;
-        let focused = self.windows.get_mut(&wid).is_some_and(|ws| {
-            ws.tab_set.switch_to(tab)
-                && ws
-                    .tab_set
-                    .active_mut()
-                    .is_some_and(|active| active.set_focus(view))
-        });
-        if !focused {
-            return Err("Editor view could not take focus to close".to_string());
-        }
-        self.resync_active_or_window(wid);
-        let split = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.tab_set.active())
-            .is_some_and(|active| active.root.len() > 1);
-        let closed = if split {
-            self.close_focused_mixed_leaf(wid)
-        } else {
-            self.close_active_native_tab(wid)
-        };
+        let closed = self.close_view_keeping_front(wid, tab, view);
         self.request_native_redraw(wid);
         closed
     }
@@ -4370,7 +4378,13 @@ impl App {
         kind: AppKind,
         uri: &str,
     ) -> Result<String, String> {
-        self.open_document_tab_in_window_with_config_symlinks(wid, kind, uri, false)
+        self.open_document_tab_in_window_with_config_symlinks(
+            wid,
+            kind,
+            uri,
+            false,
+            Placement::FocusOrNewTab,
+        )
     }
 
     fn open_document_tab_in_window_with_config_symlinks(
@@ -4379,13 +4393,14 @@ impl App {
         kind: AppKind,
         uri: &str,
         allow_config_symlinks: bool,
+        placement: Placement,
     ) -> Result<String, String> {
         Self::validate_document_request(kind, allow_config_symlinks)?;
         if !self.windows.contains_key(&wid) {
             return Err("requesting window disappeared".to_string());
         }
         let admitted = Self::admit_document_now(uri, allow_config_symlinks)?;
-        self.install_admitted_document(wid, kind, uri, admitted, Placement::FocusOrNewTab)
+        self.install_admitted_document(wid, kind, uri, admitted, placement)
             .map(|installed| installed.line())
     }
 
@@ -10789,6 +10804,131 @@ mod tests {
             beside,
             "the take-back lands after the quiet"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_document_leaf_whose_save_lands_behind_a_later_tab_leaves_that_tab_in_front() {
+        for settings_in_front in [false, true] {
+            let at = if settings_in_front { "parked" } else { "front" };
+            let dir = fresh_dir(&format!("aterm-doc-close-behind-{at}"));
+            let path = dir.join("behind.md");
+            fs::write(&path, "before\n").unwrap();
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.open_document_tab(AppKind::Editor, &file_uri(&path))
+                .unwrap();
+            let (instance, editor_view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            let mixed = app.windows[&wid].tab_set.active_id().unwrap();
+            let (left_behind, _) =
+                app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .active_mut()
+                .unwrap()
+                .set_focus(editor_view);
+            app.sync_active_session();
+            commit(&mut app, wid, "held ");
+            let held = app.hold_document_save_for_test(document);
+            app.close_active_tab();
+            assert!(app.document_close_pending_for_test(document), "{at}");
+
+            // A terminal tab after the mixed one takes the front while the save is in
+            // flight, or holds the parked slot behind a Settings tab that took it.
+            let front = app.next_session_id;
+            app.push_stub_tab(wid, crate::stub_session(front));
+            assert_eq!(app.focused_session_id(wid), Some(front), "{at}");
+            if settings_in_front {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+            }
+            app.land_held_document_save_for_test(document, editor_view, held)
+                .unwrap();
+
+            assert!(!app.document_close_pending_for_test(document), "{at}");
+            assert!(
+                !app.windows[&wid]
+                    .tab_set
+                    .get(mixed)
+                    .unwrap()
+                    .root
+                    .contains(editor_view),
+                "{at}: the saved document leaf left its tab"
+            );
+            assert_eq!(
+                app.structural_invariant_violation(),
+                None,
+                "{at}: the promoted tab's projection slot lands before the front tab's"
+            );
+            let ws = &app.windows[&wid];
+            assert_eq!(
+                ws.layouts
+                    .get(ws.tabs.active)
+                    .map(crate::pane::PaneTree::sessions),
+                Some(vec![front]),
+                "{at}: the active or parked slot still names the later tab"
+            );
+            if settings_in_front {
+                app.close_active_tab();
+            }
+            assert_eq!(app.focused_session_id(wid), Some(front), "{at}");
+            assert_eq!(
+                app.active_tree(wid).map(crate::pane::PaneTree::sessions),
+                Some(vec![front]),
+                "{at}"
+            );
+            app.close_active_tab();
+            assert!(
+                app.pool.get(front).is_none(),
+                "{at}: Cmd-W closes the tab in front"
+            );
+            assert!(
+                app.windows[&wid].tab_set.get(mixed).is_some()
+                    && app.pool.get(left_behind).is_some(),
+                "{at}: and not the tab whose save landed behind it"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_dirty_document_tab_closed_from_behind_leaves_the_front_while_it_saves() {
+        let dir = fresh_dir("aterm-doc-close-from-behind");
+        let path = dir.join("behind.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "held ");
+        let held = app.hold_document_save_for_test(document);
+        app.switch_tab_in(wid, 0);
+
+        assert!(!app.close_tab_at(wid, 1), "the close waits for the save");
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            2,
+            "the document stays open"
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.active_index(),
+            Some(0),
+            "the refused close leaves the person's front tab in front"
+        );
+        assert_eq!(app.focused_session_id(wid), Some(0));
+        assert_eq!(app.structural_invariant_violation(), None);
+
+        app.land_held_document_save_for_test(document, view, held)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "held before\n");
+        assert!(!app.close_tab_at(wid, 1));
+        assert_eq!(app.windows[&wid].tab_set.len(), 1, "the saved tab closes");
+        assert_eq!(app.focused_session_id(wid), Some(0));
+        assert_eq!(app.structural_invariant_violation(), None);
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -98,6 +98,22 @@ fn an_explicit_node_address_never_writes_the_pin_table() {
             b"v=1 t=1 state=live inc=1",
         )
         .expect("show n-attacker to the fleet");
+    let shown = w.verb(&format!(
+        "@{a} post to=@s-victim@n-attacker kind=note --wait=60000 r1unadvertised"
+    ));
+    assert!(
+        shown.header().starts_with("ERR unroutable"),
+        "a sid the named node does not advertise is no route: {}",
+        shown.header()
+    );
+    w.god()
+        .publish(
+            9_400,
+            2,
+            &format!("/f/{FLEET}/pub/n-attacker/s-victim/presence"),
+            b"v=1 t=1 state=live inc=1",
+        )
+        .expect("n-attacker advertises s-victim");
 
     let posted = w.verb(&format!(
         "@{a} post to=@s-victim@n-attacker kind=note r1poison"

@@ -2079,21 +2079,37 @@ fn two_grok_auth_walls_give_one_need() {
         assert_eq!(wait.word, WaitWord::Login);
         assert_eq!(wait_words(&wait, true), GROK_SIGNIN_WAIT);
     }
-    // ... while the leader's own session carries the one need, the code first.
-    let leader = NeedFacts {
-        attention: vec![entry(
-            aterm_agent::harness::grok_signin::NEED_OWNER,
-            &aterm_agent::harness::grok_signin::need_text(
-                "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
-                Some("WMRT-8KQZ"),
-            ),
-            Some(AttentionKind::Ask),
-        )],
-        ..facts()
-    };
-    let need = of(&leader).need.expect("the leader's need");
-    assert_eq!(need.word, NeedWord::Ask);
-    assert!(need.what.contains("WMRT-8KQZ"), "{}", need.what);
+    // ... while the leader's own session carries the one need: the once-ever setup first, and
+    // still the code within the row, for every setup of the label `adopt-default` gives.
+    {
+        use aterm_agent::harness::grok_signin::{ADOPT_LABEL, Setup, need_words};
+        for setup in [
+            Setup::Window(ADOPT_LABEL.to_owned()),
+            Setup::Mailbox(ADOPT_LABEL.to_owned()),
+            Setup::Email(ADOPT_LABEL.to_owned()),
+            Setup::Adopt(ADOPT_LABEL.to_owned()),
+        ] {
+            let leader = NeedFacts {
+                attention: vec![entry(
+                    aterm_agent::harness::grok_signin::NEED_OWNER,
+                    &need_words(
+                        &setup,
+                        "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
+                        Some("WMRT-8KQZ"),
+                    ),
+                    Some(AttentionKind::Ask),
+                )],
+                ..facts()
+            };
+            let need = of(&leader).need.expect("the leader's need");
+            assert_eq!(need.word, NeedWord::Ask);
+            assert!(
+                need.what.starts_with("once: ") && need.what.contains("code WMRT-8KQZ"),
+                "{setup:?}: {}",
+                need.what
+            );
+        }
+    }
     // Signed in: a per-session restart, never the machine need.
     let signed = of(&walled(7, Some(GrokSignin::SignedIn)))
         .need

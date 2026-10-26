@@ -30,6 +30,10 @@ use timing::{JUMP_MIN_CELLS, SPRING_SNAP_RESPONSE_S, half_life};
 use witness::{RowSample, Witness};
 
 const RELIGHT_LIFE_S: f32 = SPRING_SNAP_RESPONSE_S + 8.0 * SPRING_SNAP_RESPONSE_S;
+const SPRING_SNAP_RESPONSE_DUR: Duration =
+    Duration::from_micros(((SPRING_SNAP_RESPONSE_S as f64) * 1_000_000.0 + 0.5) as u64);
+const RELIGHT_LIFE_DUR: Duration =
+    Duration::from_micros(((RELIGHT_LIFE_S as f64) * 1_000_000.0 + 0.5) as u64);
 
 /// Travel direction, resolved to the dominant axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -569,16 +573,18 @@ impl EchoLedger {
     #[inline]
     fn expire(&mut self, now: Instant) {
         let mut any = false;
-        for slot in &mut self.slots {
-            let Some((at, _c)) = *slot else { break };
+        let mut i = 0;
+        while i < ECHO_LEDGER_DEPTH {
+            let Some((at, _c)) = self.slots[i] else { break };
             if now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR {
                 #[cfg(test)]
                 {
                     self.tally.expired += u32::from(_c);
                 }
-                *slot = None;
+                self.slots[i] = None;
                 any = true;
             }
+            i += 1;
         }
         if any {
             self.repack();
@@ -623,15 +629,17 @@ impl EchoLedger {
     #[inline]
     fn older_and_total(&self, key: Instant) -> (usize, usize) {
         let (mut older, mut total) = (0, 0);
-        for slot in &self.slots {
-            let Some((at, cells)) = *slot else {
+        let mut i = 0;
+        while i < ECHO_LEDGER_DEPTH {
+            let Some((at, cells)) = self.slots[i] else {
                 break;
             };
-            let c = usize::from(cells);
+            let c = cells as usize;
             if at < key {
                 older += c;
             }
             total += c;
+            i += 1;
         }
         (older, total)
     }
@@ -1129,7 +1137,10 @@ impl Engine {
         }
         let mut held_cells: u16 = 0;
         let mut soft_held: u16 = 0;
-        for (index, &(ev, at)) in self.events.iter().enumerate() {
+        let events = self.events.as_slice();
+        let mut index = 0;
+        while index < events.len() {
+            let (ev, at) = events[index];
             let Event::Typed { cells, .. } = ev else {
                 match (soft, lift, reflow, revive) {
                     (Some((sw, at_move, _)), _, _, _) if at_move == index => {
@@ -1145,10 +1156,11 @@ impl Engine {
                     _ => self.ribbon.on_event(&ev, at, ctx),
                 }
                 if matches!(ev, Event::Sweep { .. })
-                    && let Some((row, col)) = swept_space_cell(&self.events, index)
+                    && let Some((row, col)) = swept_space_cell(events, index)
                 {
                     self.ribbon.observe_space_cell(row, col);
                 }
+                index += 1;
                 continue;
             };
             if index >= tail_start {
@@ -1188,6 +1200,7 @@ impl Engine {
             } else {
                 self.ribbon.on_event(&ev, at, ctx);
             }
+            index += 1;
         }
     }
 
@@ -1378,7 +1391,10 @@ impl Engine {
         cols: &[char],
         now: Instant,
     ) -> bool {
-        for cell in self.ribbon.cells() {
+        let cells = self.ribbon.cells();
+        let mut i = 0;
+        while i < cells.len() {
+            let cell = &cells[i];
             if cell.row == row
                 && cell.col == col
                 && cell.typing
@@ -1387,6 +1403,7 @@ impl Engine {
             {
                 return true;
             }
+            i += 1;
         }
         false
     }
@@ -1404,6 +1421,43 @@ impl Engine {
         self.ribbon_rows_at_caret(arming, None, out)
     }
 
+    #[inline]
+    const fn push_unique_row(out: &mut [u16], n: &mut usize, grid_rows: u16, row: u16) {
+        if (grid_rows == 0 || row < grid_rows) && *n < out.len() {
+            let mut i = 0;
+            while i < *n {
+                if out[i] == row {
+                    return;
+                }
+                i += 1;
+            }
+            out[*n] = row;
+            *n += 1;
+        }
+    }
+
+    #[inline]
+    const fn carry_back_row(row: u16, carry: u16) -> Option<u16> {
+        if carry > 0 {
+            row.checked_add(carry)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    const fn lead_ahead_row(row: u16, lead: Option<i32>) -> Option<u16> {
+        let Some(d) = lead else {
+            return None;
+        };
+        let r = row as i32 + d;
+        if r >= 0 && r <= u16::MAX as i32 {
+            Some(r as u16)
+        } else {
+            None
+        }
+    }
+
     /// [`Engine::ribbon_rows_for`] with this frame's caret move `(from, to)`.
     pub fn ribbon_rows_at_caret(
         &self,
@@ -1414,42 +1468,36 @@ impl Engine {
         if !self.engaged {
             return 0;
         }
-        let add = |out: &mut [u16], n: &mut usize, row: u16| {
-            if (self.grid_rows == 0 || row < self.grid_rows)
-                && *n < out.len()
-                && !out[..*n].contains(&row)
-            {
-                out[*n] = row;
-                *n += 1;
-            }
+        let grid_rows = self.grid_rows;
+        let budget = if out.len() < witness::WITNESS_ROWS {
+            out.len()
+        } else {
+            witness::WITNESS_ROWS
         };
-        let budget = out.len().min(witness::WITNESS_ROWS);
-        let mut n = self.band_rows(&mut out[..budget], caret_move, add);
+        let mut n = self.band_rows(&mut out[..budget], caret_move);
         if let Some(row) = arming {
-            add(out, &mut n, row);
+            Self::push_unique_row(out, &mut n, grid_rows, row);
             if let Some(r) = row.checked_sub(1) {
-                add(out, &mut n, r);
+                Self::push_unique_row(out, &mut n, grid_rows, r);
             }
             if let Some(r) = row.checked_add(1) {
-                add(out, &mut n, r);
+                Self::push_unique_row(out, &mut n, grid_rows, r);
             }
         }
         n
     }
 
-    fn band_rows(
-        &self,
-        out: &mut [u16],
-        caret_move: Option<(u16, u16)>,
-        add: impl Fn(&mut [u16], &mut usize, u16),
-    ) -> usize {
+    fn band_rows(&self, out: &mut [u16], caret_move: Option<(u16, u16)>) -> usize {
         let cohorts = self.ribbon.cohorts();
         if cohorts.is_empty() || out.is_empty() {
             return 0;
         }
+        let grid_rows = self.grid_rows;
         let mut n = 0usize;
         let mut focus: Option<&ribbon::Cohort> = None;
-        for coh in cohorts {
+        let mut ci = 0;
+        while ci < cohorts.len() {
+            let coh = &cohorts[ci];
             let key = (self.caret_known && coh.row == self.caret.0, coh.alive_at);
             if !matches!(
                 focus,
@@ -1457,15 +1505,9 @@ impl Engine {
             ) {
                 focus = Some(coh);
             }
+            ci += 1;
         }
         let carry = self.witness.scroll_carry();
-        let back = |row: u16| {
-            if carry > 0 {
-                row.checked_add(carry)
-            } else {
-                None
-            }
-        };
         let lead = match caret_move {
             Some((from, to)) => {
                 let d = i32::from(to) - i32::from(from);
@@ -1477,67 +1519,74 @@ impl Engine {
             }
             None => None,
         };
-        let ahead = |row: u16| match lead {
-            Some(d) => u16::try_from(i32::from(row) + d).ok(),
-            None => None,
-        };
         if let Some(focus) = focus {
             let focus = focus.row;
-            add(out, &mut n, focus);
+            Self::push_unique_row(out, &mut n, grid_rows, focus);
             if let Some(row) = focus.checked_sub(1) {
-                add(out, &mut n, row);
+                Self::push_unique_row(out, &mut n, grid_rows, row);
             }
             if let Some(row) = focus.checked_add(1) {
-                add(out, &mut n, row);
+                Self::push_unique_row(out, &mut n, grid_rows, row);
             }
-            if let Some(row) = back(focus) {
-                add(out, &mut n, row);
+            if let Some(row) = Self::carry_back_row(focus, carry) {
+                Self::push_unique_row(out, &mut n, grid_rows, row);
             }
-            if let Some(row) = ahead(focus) {
-                add(out, &mut n, row);
+            if let Some(row) = Self::lead_ahead_row(focus, lead) {
+                Self::push_unique_row(out, &mut n, grid_rows, row);
             }
             if n == out.len() {
                 return n;
             }
         }
-        for coh in cohorts {
-            add(out, &mut n, coh.row);
+        let mut i = 0;
+        while i < cohorts.len() {
+            Self::push_unique_row(out, &mut n, grid_rows, cohorts[i].row);
             if n == out.len() {
                 return n;
             }
+            i += 1;
         }
         if carry > 0 {
-            for coh in cohorts {
-                let Some(row) = back(coh.row) else {
+            let mut i = 0;
+            while i < cohorts.len() {
+                let Some(row) = Self::carry_back_row(cohorts[i].row, carry) else {
                     break;
                 };
-                add(out, &mut n, row);
+                Self::push_unique_row(out, &mut n, grid_rows, row);
                 if n == out.len() {
                     return n;
                 }
+                i += 1;
             }
         }
         if lead.is_some() {
-            for coh in cohorts {
-                let Some(row) = ahead(coh.row) else {
-                    continue;
-                };
-                add(out, &mut n, row);
-                if n == out.len() {
-                    return n;
+            let mut i = 0;
+            while i < cohorts.len() {
+                if let Some(row) = Self::lead_ahead_row(cohorts[i].row, lead) {
+                    Self::push_unique_row(out, &mut n, grid_rows, row);
+                    if n == out.len() {
+                        return n;
+                    }
                 }
+                i += 1;
             }
         }
-        for coh in cohorts {
-            for nb in [coh.row.checked_sub(1), coh.row.checked_add(1)] {
+        let mut i = 0;
+        while i < cohorts.len() {
+            let r = cohorts[i].row;
+            if let Some(nb) = r.checked_sub(1) {
+                Self::push_unique_row(out, &mut n, grid_rows, nb);
                 if n == out.len() {
                     return n;
                 }
-                let Some(nb) = nb else {
-                    continue;
-                };
-                add(out, &mut n, nb);
             }
+            if let Some(nb) = r.checked_add(1) {
+                Self::push_unique_row(out, &mut n, grid_rows, nb);
+                if n == out.len() {
+                    return n;
+                }
+            }
+            i += 1;
         }
         n
     }
@@ -1565,25 +1614,38 @@ impl Engine {
         if !self.engaged || rows.is_empty() {
             return (0, false);
         }
-        for &r in asked {
+        let mut ai = 0;
+        while ai < asked.len() {
+            let r = asked[ai];
             let readable = r < self.grid_rows
                 && !matches!(self.pane_rows, Some((first, n)) if r < first || r - first >= n);
-            if readable
-                && !self.withheld[..self.withheld_n].contains(&r)
-                && self.withheld_n < self.withheld.len()
-            {
-                let mut present = false;
-                for s in rows {
-                    if s.row == r {
-                        present = true;
+            if readable && self.withheld_n < self.withheld.len() {
+                let mut dup = false;
+                let mut wi = 0;
+                while wi < self.withheld_n {
+                    if self.withheld[wi] == r {
+                        dup = true;
                         break;
                     }
+                    wi += 1;
                 }
-                if !present {
-                    self.withheld[self.withheld_n] = r;
-                    self.withheld_n += 1;
+                if !dup {
+                    let mut present = false;
+                    let mut si = 0;
+                    while si < rows.len() {
+                        if rows[si].row == r {
+                            present = true;
+                            break;
+                        }
+                        si += 1;
+                    }
+                    if !present {
+                        self.withheld[self.withheld_n] = r;
+                        self.withheld_n += 1;
+                    }
                 }
             }
+            ai += 1;
         }
         self.note_rewrap_starts(rows, park);
         let caret = if self.caret_known {
@@ -1609,15 +1671,16 @@ impl Engine {
         }
         let mut n = 0u32;
         let mut park_proved = false;
-        for k in 0..self.shift_scratch.len() {
+        let mut k = 0;
+        while k < self.shift_scratch.len() {
             let run = self.shift_scratch[k];
             self.moved_scratch.clear();
             let moved = self.ribbon.shift_run(run, &mut self.moved_scratch);
-            if moved == 0 {
-                continue;
+            if moved > 0 {
+                self.witness.shift_cells(&mut self.moved_scratch, run.dc);
+                n = n.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
             }
-            self.witness.shift_cells(&mut self.moved_scratch, run.dc);
-            n = n.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
+            k += 1;
         }
         let score = self.witness.follow_runs_with_short_park(
             self.ribbon.cells(),
@@ -1636,11 +1699,14 @@ impl Engine {
         self.witness.end_scroll_carry();
         if let Some(h) = hand {
             let mut has_hand = false;
-            for r in &self.follow_scratch {
+            let mut fi = 0;
+            while fi < self.follow_scratch.len() {
+                let r = &self.follow_scratch[fi];
                 if r.row == h.row && r.cohort == h.cohort && r.dr == h.dr {
                     has_hand = true;
                     break;
                 }
+                fi += 1;
             }
             if !has_hand {
                 self.follow_scratch
@@ -1661,11 +1727,15 @@ impl Engine {
             && let Some(last_col) = from.1.checked_sub(1)
         {
             let mut owner = None;
-            for cell in self.ribbon.cells() {
+            let cells = self.ribbon.cells();
+            let mut ci = 0;
+            while ci < cells.len() {
+                let cell = &cells[ci];
                 if !cell.leaving() && cell.row == from.0 && cell.col == last_col {
                     owner = Some((from.0, cell.cohort));
                     break;
                 }
+                ci += 1;
             }
             owner
         } else {
@@ -1675,8 +1745,10 @@ impl Engine {
             Some(h) => h.row,
             None => self.caret.0,
         };
-        for k in 0..self.follow_scratch.len() {
+        let mut k = 0;
+        while k < self.follow_scratch.len() {
             let run = self.follow_scratch[k];
+            k += 1;
             let Some(target) = run.row.checked_add_signed(run.dr) else {
                 continue;
             };
@@ -1723,13 +1795,16 @@ impl Engine {
         let Some(run) = self.hand_line_follow(rows, None) else {
             let row = self.caret.0;
             let mut waits = None;
-            for dr in [-2i16, -1, 1, 2] {
-                if let Some(to) = row.checked_add_signed(dr)
+            const DRS: [i16; 4] = [-2, -1, 1, 2];
+            let mut di = 0;
+            while di < DRS.len() {
+                if let Some(to) = row.checked_add_signed(DRS[di])
                     && let Some(found) = self.hand_line_follow(rows, Some(to))
                 {
                     waits = Some((found.row, found.cohort));
                     break;
                 }
+                di += 1;
             }
             self.witness.await_caret(waits);
             return None;
@@ -1745,7 +1820,9 @@ impl Engine {
             return None;
         }
         let mut found = None;
-        for &r in &self.follow_scratch {
+        let mut fi = 0;
+        while fi < self.follow_scratch.len() {
+            let r = self.follow_scratch[fi];
             if r.row == self.caret.0
                 && (r.dr.unsigned_abs() > 2
                     || matches!(
@@ -1756,6 +1833,7 @@ impl Engine {
                 found = Some(r);
                 break;
             }
+            fi += 1;
         }
         let run = match found {
             Some(run) => run,
@@ -1815,29 +1893,62 @@ impl Engine {
         self.lift_hand_anchors(row, to);
     }
 
+    #[inline]
+    const fn map_hand_row(r: u16, row: u16, to: u16) -> u16 {
+        if r == row { to } else { r }
+    }
+
     fn lift_hand_anchors(&mut self, row: u16, to: u16) {
-        let map = |r: u16| if r == row { to } else { r };
         if self.caret_known {
-            self.caret.0 = map(self.caret.0);
+            self.caret.0 = Self::map_hand_row(self.caret.0, row, to);
         }
         if let Some((r, _)) = &mut self.caret_seen {
-            *r = map(*r);
+            *r = Self::map_hand_row(*r, row, to);
         }
-        self.erased.0 = map(self.erased.0);
-        for (cell, _) in &mut self.earned {
-            cell.0 = map(cell.0);
+        self.erased.0 = Self::map_hand_row(self.erased.0, row, to);
+        let earned = self.earned.as_mut_slice();
+        let mut i = 0;
+        while i < earned.len() {
+            earned[i].0.0 = Self::map_hand_row(earned[i].0.0, row, to);
+            i += 1;
         }
         self.ribbon.lift_hand(row, to);
-        self.translate_events(|r| Some(map(r)), map);
-        self.translate_pre_move(|r| Some(map(r)));
+        let events = self.events.as_mut_slice();
+        let mut ei = 0;
+        while ei < events.len() {
+            match &mut events[ei].0 {
+                Event::Sweep { row: r, .. } | Event::Rewrite { row: r, .. } => {
+                    *r = Self::map_hand_row(*r, row, to);
+                }
+                Event::Move { from, to: t, .. } => {
+                    from.0 = Self::map_hand_row(from.0, row, to);
+                    t.0 = Self::map_hand_row(t.0, row, to);
+                }
+                _ => {}
+            }
+            ei += 1;
+        }
+        if let Some((lift, _)) = &mut self.lift {
+            lift.origin.0 = Self::map_hand_row(lift.origin.0, row, to);
+            lift.landing.0 = Self::map_hand_row(lift.landing.0, row, to);
+            lift.dst.0 = Self::map_hand_row(lift.dst.0, row, to);
+        }
+        if let Some(rv) = &mut self.revive {
+            rv.row = Self::map_hand_row(rv.row, row, to);
+        }
+        if let Some((_, caret)) = &mut self.pre_move
+            && let Some((r, _)) = caret
+        {
+            *r = Self::map_hand_row(*r, row, to);
+        }
         if let Some((sw, _)) = &mut self.soft_wrap {
-            sw.origin.0 = map(sw.origin.0);
-            sw.landing.0 = map(sw.landing.0);
+            sw.origin.0 = Self::map_hand_row(sw.origin.0, row, to);
+            sw.landing.0 = Self::map_hand_row(sw.landing.0, row, to);
         }
         if let Some((sw, reflow_to)) = &mut self.reflow {
-            sw.origin.0 = map(sw.origin.0);
-            sw.landing.0 = map(sw.landing.0);
-            reflow_to.0 = map(reflow_to.0);
+            sw.origin.0 = Self::map_hand_row(sw.origin.0, row, to);
+            sw.landing.0 = Self::map_hand_row(sw.landing.0, row, to);
+            reflow_to.0 = Self::map_hand_row(reflow_to.0, row, to);
         }
     }
 
@@ -1910,24 +2021,29 @@ impl Engine {
             return;
         };
         let mut sample = None;
-        for r in rows {
-            if r.row == to.0 {
-                sample = Some(r);
+        let mut ri = 0;
+        while ri < rows.len() {
+            if rows[ri].row == to.0 {
+                sample = Some(&rows[ri]);
                 break;
             }
+            ri += 1;
         }
         let Some(sample) = sample else {
             return;
         };
-        for c in to.1..from.1 {
+        let mut c = to.1;
+        while c < from.1 {
             if matches!(
                 sample.cols.get(usize::from(c)),
                 Some(&ch) if ch != ' ' && ch != '\0'
             ) {
                 return;
             }
+            c += 1;
         }
-        for c in pane_col0..to.1 {
+        let mut c = pane_col0;
+        while c < to.1 {
             if matches!(
                 sample.cols.get(usize::from(c)),
                 Some(&ch) if ch != ' ' && ch != '\0'
@@ -1935,6 +2051,7 @@ impl Engine {
                 self.ribbon.note_rewrap_start(from, to, c, None, None);
                 break;
             }
+            c += 1;
         }
     }
 
@@ -1954,8 +2071,11 @@ impl Engine {
         }
         let impulse = CompanionImpulse::Delight;
         self.offer(impulse);
-        for _ in 0..companion::heroes_earned(impulse) {
+        let n = companion::heroes_earned(impulse);
+        let mut i = 0;
+        while i < n {
             self.earned.push(((row, col), now));
+            i += 1;
         }
     }
 
@@ -2043,12 +2163,12 @@ impl Engine {
         self.spine.update(now);
         self.stardust.budget.refill(now);
         if let Some(t) = self.caret_seam.flare_at
-            && now.saturating_duration_since(t).as_secs_f32() >= SPRING_SNAP_RESPONSE_S
+            && now.saturating_duration_since(t) >= SPRING_SNAP_RESPONSE_DUR
         {
             self.caret_seam.flare_at = None;
         }
         if let Some(t) = self.paint_at
-            && now.saturating_duration_since(t).as_secs_f32() >= RELIGHT_LIFE_S
+            && now.saturating_duration_since(t) >= RELIGHT_LIFE_DUR
         {
             self.paint_at = None;
         }
@@ -2059,23 +2179,28 @@ impl Engine {
         self.grid_rows = u16::try_from(geom.rows).unwrap_or(u16::MAX);
         let mut keys = 0usize;
         let mut saw_erase = false;
-        for (ev, _) in &self.events {
-            match ev {
+        let mut ei = 0;
+        while ei < self.events.len() {
+            match self.events[ei].0 {
                 Event::Erase => saw_erase = true,
                 Event::Typed { .. } => keys += 1,
                 _ => {}
             }
+            ei += 1;
         }
         if saw_erase {
             self.erased = self.caret;
         }
-        let mend = self.mend.take().map(|m| Mend {
-            at: m.at,
-            disp: m.disp,
-            row: self.erased.0,
-            col: self.erased.1,
-            deletes: m.count,
-        });
+        let mend = match self.mend.take() {
+            Some(m) => Some(Mend {
+                at: m.at,
+                disp: m.disp,
+                row: self.erased.0,
+                col: self.erased.1,
+                deletes: m.count,
+            }),
+            None => None,
+        };
         let price = self.spine.birth_disp();
         self.spine
             .note_keys(now, u32::try_from(keys).unwrap_or(u32::MAX), price);
@@ -2104,8 +2229,10 @@ impl Engine {
         self.meteor.set_hand_floor(self.ribbon.hand_floor_cell());
 
         if !self.events.is_empty() {
-            for i in 0..self.events.len() {
+            let mut i = 0;
+            while i < self.events.len() {
                 let (ev, at) = self.events[i];
+                i += 1;
                 let Event::Move {
                     from,
                     to,
@@ -2134,14 +2261,20 @@ impl Engine {
                 }
             }
 
-            for &(ev, at) in &self.events {
+            let mut si = 0;
+            while si < self.events.len() {
+                let (ev, at) = self.events[si];
                 self.stardust.on_event(&ev, at, &ctx, &self.ribbon);
+                si += 1;
             }
             self.events.clear();
         }
         if !self.earned.is_empty() {
-            for &(cell, at) in &self.earned {
+            let mut hi = 0;
+            while hi < self.earned.len() {
+                let (cell, at) = self.earned[hi];
                 self.stardust.earn_hero(at, cell, &ctx, &self.ribbon);
+                hi += 1;
             }
             self.earned.clear();
         }
@@ -2384,11 +2517,15 @@ impl Engine {
     pub fn caret_paint(&self, now: Instant) -> f32 {
         let relight = match self.paint_at {
             Some(at) => {
-                let age = now.saturating_duration_since(at).as_secs_f32();
-                if age >= RELIGHT_LIFE_S {
+                let elapsed = now.saturating_duration_since(at);
+                if elapsed >= RELIGHT_LIFE_DUR {
                     0.0
                 } else {
-                    half_life(age, SPRING_SNAP_RESPONSE_S, SPRING_SNAP_RESPONSE_S)
+                    half_life(
+                        elapsed.as_secs_f32(),
+                        SPRING_SNAP_RESPONSE_S,
+                        SPRING_SNAP_RESPONSE_S,
+                    )
                 }
             }
             None => 0.0,
@@ -2693,6 +2830,7 @@ impl Engine {
         self.translate_pre_move(|r| r.checked_sub(rows));
     }
 
+    #[inline]
     fn translate_events(&mut self, mark: impl Fn(u16) -> Option<u16>, pos: impl Fn(u16) -> u16) {
         self.events.retain_mut(|(ev, _)| match ev {
             Event::Sweep { row, .. } | Event::Rewrite { row, .. } => match mark(*row) {

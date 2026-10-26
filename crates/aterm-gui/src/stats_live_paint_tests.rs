@@ -7,7 +7,8 @@
 
 use super::paint_tests::{AT, Scene, scene, scene_input};
 use super::*;
-use crate::stats_live::{BEAT_REACH, DOT_R, DOT_RISE, LINE_DX};
+use crate::stats_live::{BEAT_REACH, DOT_R, DOT_RISE, LINE_DX, glide_step};
+use aterm_vitals::SlotGrid;
 
 /// 10:42:10: a 10 s column opens (the scene's reading, 10:42:17, moved back to it).
 const OPEN: i64 = AT - 7_000;
@@ -256,6 +257,7 @@ fn the_strips_glide_left_by_the_part_of_the_period_run() {
     for s in [1.0, 2.0] {
         let glide = |ms: i64| DeckLive {
             glide_ms: Some(ms),
+            slide: None,
             beat: None,
             fresh: true,
         };
@@ -321,6 +323,67 @@ fn the_strips_glide_left_by_the_part_of_the_period_run() {
     }
 }
 
+/// Every live frame draws every cell on a whole device pixel (review of 2026-10-25): a Full
+/// strip's glide when the reading landed between two of the glide's steps (the clock behind it
+/// counts as the reading's moment) and at any instant after, and a Folded strip's slide at every
+/// phase its frames draw. Unrounded, those shifts fall between pixels (the control), and the cell
+/// edges blur.
+#[test]
+fn every_live_frame_draws_its_cells_on_whole_pixels() {
+    use crate::stats_live::open_frac;
+    let mut fractional = 0;
+    let at = OPEN + 3_457;
+    let mut snap = scene(Scene::Calm);
+    snap.at_unix_ms = at;
+    for w in [1424.0, 1119.0, 800.0, 550.0] {
+        let d = strips(DeckForm::Full, w)[0];
+        for s in [1.0, 2.0] {
+            let pitch = px(d.strip.pitch, s);
+            for glide_ms in [OPEN + 3_000, at, OPEN + 4_321, OPEN + 7_777, OPEN + 12_345] {
+                let live = DeckLive {
+                    glide_ms: Some(glide_ms),
+                    slide: None,
+                    beat: None,
+                    fresh: true,
+                };
+                let prims = paint(&snap, DeckForm::Full, w, s, live);
+                let xs = row_cells(&prims, &d, s);
+                assert!(!xs.is_empty(), "CONTROL Full {w} pt {s}x");
+                assert!(
+                    xs.iter().all(|x| x.fract() == 0.0),
+                    "Full {w} pt {s}x at {glide_ms}: {xs:?}"
+                );
+                let f = open_frac(at, glide_ms, d.strip.period_s);
+                fractional += usize::from(((1.0 - f) as f32 * pitch).fract() != 0.0);
+            }
+        }
+    }
+    for w in [600.0, 800.0, 1119.0] {
+        let d = strips(DeckForm::Folded, w)[0];
+        for s in [1.0, 2.0] {
+            let pitch = px(d.strip.pitch, s);
+            for slide in [0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75] {
+                let live = DeckLive {
+                    slide: Some(slide),
+                    ..DeckLive::STILL
+                };
+                let prims = paint(&snap, DeckForm::Folded, w, s, live);
+                let xs = row_cells(&prims, &d, s);
+                assert!(!xs.is_empty(), "CONTROL Folded {w} pt {s}x");
+                assert!(
+                    xs.iter().all(|x| x.fract() == 0.0),
+                    "Folded {w} pt {s}x at {slide}: {xs:?}"
+                );
+                fractional += usize::from(((1.0 - slide) * pitch).fract() != 0.0);
+            }
+        }
+    }
+    assert!(
+        fractional >= 10,
+        "CONTROL: unrounded, {fractional} of these frames fall between pixels"
+    );
+}
+
 /// The shift, `-max..=max` device px, that best lines `b`'s pixel row `y` up with `a`'s over
 /// `x0..x1` (`b[x]` against `a[x + shift]`, so a positive shift is content gone left), and the
 /// mean channel difference left there and with no shift at all.
@@ -360,17 +423,43 @@ fn best_shift(
     (best, cost(best), cost(0))
 }
 
+/// `snap` with its CPU row's readings replaced: one a second for the minute before `at` (its
+/// snapshot's moment), each `heat(t)` of capacity, `t` its second.
+fn with_cpu_readings(mut snap: Snapshot, at: i64, heat: impl Fn(i64) -> f64) -> Snapshot {
+    let view = &mut snap.resources[Resource::Cpu.index()];
+    let cap = view.capacity.expect("the scene's CPU capacity");
+    view.recent = (0..60_i64)
+        .rev()
+        .map(|back| {
+            let t = at - back * 1000;
+            aterm_vitals::Reading {
+                at_ms: t,
+                v: heat(t.div_euclid(1000)) * cap,
+                over: false,
+            }
+        })
+        .collect();
+    snap.at_unix_ms = at;
+    snap
+}
+
+/// A CPU second's heat that never repeats within a strip: 0.05 to 0.95 by a step of 0.3 a
+/// second over 0.9, so every heat step shows and no shift under 30 s lines it up again.
+fn varied(t: i64) -> f64 {
+    0.05 + ((t * 7).rem_euclid(31) as f64 / 31.0) * 0.9
+}
+
 /// The owner's ask, "I want to see a shifting to the left animation" (2026-10-24), where he
-/// looks: the default window, Folded at about 600 pt and focused. Its strips glide at least a
-/// device pixel a second (one 10 s column on a 10 pt pitch: 1 px a second at 1x, 2 at 2x), as
-/// every Folded width's do, each move a whole pixel; and on the raster two seconds of glide
-/// carry the strip's pixels that far left, measured as two screenshots are: by the shift that
-/// best lines the later frame's strip up with the earlier's. The label over it still names
-/// what the strip spans (`the_time_scale_marks_how_far_back_at_every_width`).
+/// looks: the default window, Folded at about 600 pt and focused. Each cell is a reading's
+/// second, so each reading slides the strip one pitch left (3 pt: 3 device px at 1x, 6 at 2x), as
+/// every Folded width's do (3 to 5 pt), in whole-pixel moves under half a pitch, over the beat's
+/// frames; and on the raster two readings carry the strip's pixels two pitches left, measured as
+/// two screenshots are: by the shift that best lines the later frame's strip up with the
+/// earlier's. The label over it still names what the strip spans
+/// (`the_time_scale_marks_how_far_back_at_every_width`).
 #[test]
-fn the_default_window_is_seen_gliding_left() {
-    use crate::stats_live::glide_step;
-    use std::time::Duration;
+fn the_default_window_is_seen_sliding_left() {
+    use crate::stats_live::{slide_frames, slide_phase};
     let m = deck_metrics();
     for w in (300..=2560).map(f64::from) {
         let p = plan::plan_folded(w, &m);
@@ -378,14 +467,13 @@ fn the_default_window_is_seen_gliding_left() {
             continue;
         }
         for b in p.blocks {
-            for s in [1.0, 2.0] {
-                assert!(
-                    b.strip.pt_per_s() * s >= 1.0,
-                    "Folded {w} pt {s}x glides {} px a second: {:?}",
-                    b.strip.pt_per_s() * s,
-                    b.strip
-                );
-            }
+            assert_eq!(b.strip.period_s, plan::FOLD_SLOT_S, "Folded {w} pt");
+            assert!(
+                b.strip.pitch >= 3.0 && b.strip.pt_per_s() >= 3.0,
+                "Folded {w} pt slides {} pt a reading: {:?}",
+                b.strip.pitch,
+                b.strip
+            );
         }
     }
     // NEGATIVE CONTROL: a Full strip keeps its ten minutes, and at 1x glides under a pixel a
@@ -394,61 +482,83 @@ fn the_default_window_is_seen_gliding_left() {
     assert_eq!(full.span_s(), 600);
     assert!(full.pt_per_s() < 1.0, "{full:?}");
 
-    let mut snap = scene(Scene::Calm);
-    snap.at_unix_ms = OPEN;
     let (form, w) = (DeckForm::Folded, 600.0);
     let d = strips(form, w)[0];
     assert_eq!(
-        (d.strip.period_s, d.strip.span_s()),
-        (10, 60),
-        "the default window's strip spans a minute of 10 s columns"
+        (d.strip.period_s, d.strip.span_s(), d.strip.pitch),
+        (1, 20, 3.0),
+        "the default window's strip spans 20 s, a reading's second on each 3 pt cell"
     );
-    let glide = |ms: i64| DeckLive {
-        glide_ms: Some(ms),
-        beat: None,
-        fresh: true,
+    let at0 = OPEN + 300;
+    let snap_at = |at: i64| with_cpu_readings(scene(Scene::Calm), at, varied);
+    let slid = |phase: Option<f32>| DeckLive {
+        slide: phase,
+        ..DeckLive::STILL
     };
     for s in [1.0, 2.0] {
         let g = geom_at(w, s, form);
-        let (_, _, out) = deck_paint_live(&g, &scene_input(&snap, form));
-        let step = glide_step(out.glide_px_per_s);
-        assert!(
-            (out.glide_px_per_s - d.strip.pt_per_s() * s).abs() < 1e-9,
-            "{s}x: {out:?}"
+        let pitch = px(d.strip.pitch, s);
+        let (_, _, out) = deck_paint_live(&g, &scene_input(&snap_at(at0), form));
+        assert_eq!(
+            (out.slide_pitch_px, out.glide_px_per_s),
+            (f64::from(pitch), 0.0),
+            "{s}x: a Folded card slides and never glides: {out:?}"
         );
-        assert!(
-            (out.glide_px_per_s * step.as_secs_f64() - 1.0).abs() < 1e-9
-                && step <= Duration::from_secs(1),
-            "{s}x: each move a whole pixel, at least one a second ({step:?})"
-        );
-        let want = 2.0 * d.strip.pt_per_s() * s;
-        let (t1, t2) = (OPEN + 2_000, OPEN + 4_000);
-        // The prims: every cell of the first row, the newest included, `want` px left.
-        let cells = |ms| row_cells(&paint(&snap, form, w, s, glide(ms)), &d, s);
-        let (before, after) = (cells(t1), cells(t2));
-        assert_eq!(before.len(), after.len(), "{s}x");
-        assert!(
-            before.len() > d.strip.cols as usize,
-            "CONTROL {s}x: {before:?}"
-        );
-        for (a, b) in before.iter().zip(&after) {
+        // The prims through one reading's slide: the first row's cells stand a shift right of
+        // their slots, which runs from a whole pitch (the reading before's strip, read in the new
+        // one's slots) down to none, each frame a whole pixel or more and under half a pitch.
+        let frames = slide_frames(out.slide_pitch_px);
+        assert!(frames >= 3, "{s}x: {frames} frames");
+        let x0 = px(d.strip.x, s);
+        let shift_of = |cells: &[f32]| -> f32 {
+            let shifts: Vec<f32> = cells.iter().map(|x| (x - x0).rem_euclid(pitch)).collect();
             assert!(
-                (a - b - want as f32).abs() < 1e-3,
-                "{s}x: a cell at {a} stands at {b} two seconds on, not {want} px left"
+                shifts.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+                "{s}x: the cells moved as one: {cells:?}"
+            );
+            shifts.first().copied().unwrap_or_default()
+        };
+        let next = snap_at(at0 + 1_000);
+        let mut shifts = vec![pitch];
+        for k in 0..frames {
+            let cells = row_cells(
+                &paint(&next, form, w, s, slid(slide_phase(k, frames))),
+                &d,
+                s,
+            );
+            assert!(cells.len() >= d.strip.cols as usize, "{s}x: {cells:?}");
+            shifts.push(shift_of(&cells));
+        }
+        assert_eq!(shifts.last(), Some(&0.0), "{s}x: it comes in: {shifts:?}");
+        for m in shifts.windows(2).map(|w| w[0] - w[1]) {
+            assert!(
+                m >= 1.0 && m < pitch / 2.0 && m.fract() == 0.0,
+                "{s}x: a frame moved {m} px: {shifts:?}"
             );
         }
-        // The raster, read as two screenshots are.
-        let raster = |ms| {
-            let mut input = scene_input(&snap, form);
-            input.live = glide(ms);
+        assert_eq!(
+            row_cells(&paint(&next, form, w, s, slid(None)), &d, s),
+            row_cells(&paint(&snap_at(at0), form, w, s, slid(None)), &d, s),
+            "{s}x: come in, a reading's strip stands in the slots the last one's did"
+        );
+        // The raster, read as two screenshots are: two readings on, the strip's pixels stand
+        // two pitches left.
+        let raster = |snap: &Snapshot| {
+            let mut input = scene_input(snap, form);
+            input.live = DeckLive::STILL;
             let (prims, _) = deck_paint(&g, &input);
             crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0; 4]).0
         };
-        let (a, b) = (raster(t1), raster(t2));
+        let (a, b) = (raster(&snap_at(at0)), raster(&snap_at(at0 + 2_000)));
         let y = (px(d.top, s) + px(d.cell, s) / 2.0) as u32;
         let span = (px(d.strip.x, s) as u32, px(d.strip.end(), s) as u32);
-        let (shift, left, unmoved) = best_shift(&a, &b, g.w as u32, y, span, 8);
-        assert_eq!(f64::from(shift), want, "{s}x: the strip moved {shift} px");
+        let max = (3.0 * pitch) as i32;
+        let (shift, left, unmoved) = best_shift(&a, &b, g.w as u32, y, span, max);
+        assert_eq!(
+            shift as f32,
+            2.0 * pitch,
+            "{s}x: two readings moved the strip {shift} px"
+        );
         assert!(left < 1.0, "{s}x: {left} left after lining up");
         assert!(
             unmoved > 10.0,
@@ -457,33 +567,18 @@ fn the_default_window_is_seen_gliding_left() {
     }
 }
 
-/// A Folded strip draws the newest of its row's 10 s columns, never the oldest: with the CPU
-/// hot for its last 70 seconds and cold for the nine minutes before, every CPU cell of the
-/// default window's minute is hot, and with the hour the other way round every one is cold.
+/// A Folded strip draws each second's reading, the newest at its right end: with the CPU hot for
+/// its last 8 seconds and cold for the minute before, the default window's 20 cells are 12 cold
+/// then 8 hot, and the other way round 12 hot then 8 cold.
 #[test]
-fn a_folded_strip_draws_the_newest_ten_second_columns() {
+fn a_folded_strip_draws_each_seconds_reading() {
     let (form, w) = (DeckForm::Folded, 600.0);
     let d = strips(form, w)[0];
-    let cpu = Resource::Cpu.index();
-    let painted = |hot_last: bool, s: f64| -> Vec<[u8; 4]> {
-        let mut snap = scene(Scene::Calm);
-        let view = &mut snap.resources[cpu];
-        let cap = view.capacity.expect("the scene's CPU capacity");
-        let ring: Vec<aterm_vitals::Cell> = (0..61)
-            .map(|i| {
-                let hot = (i >= 54) == hot_last;
-                let v = Some(if hot { cap } else { 0.0 });
-                aterm_vitals::Cell {
-                    mean: v,
-                    max: v,
-                    over: false,
-                }
-            })
-            .collect();
-        view.ring = ring.into();
-        let prims = paint(&snap, form, w, s, DeckLive::STILL);
+    let at = OPEN + 300;
+    let cells_of = |snap: &Snapshot, s: f64| -> Vec<[u8; 4]> {
+        let prims = paint(snap, form, w, s, DeckLive::STILL);
         let xs = row_cells(&prims, &d, s);
-        prims
+        let mut cells: Vec<(f32, [u8; 4])> = prims
             .iter()
             .filter_map(|p| match *p {
                 DrawPrim::Panel {
@@ -492,11 +587,20 @@ fn a_folded_strip_draws_the_newest_ten_second_columns() {
                     && (w - px(d.strip.cell, s)).abs() < 0.01
                     && (y + h - (px(d.top, s) + px(d.cell, s))).abs() < 0.01 =>
                 {
-                    Some(fill)
+                    Some((x, fill))
                 }
                 _ => None,
             })
-            .collect()
+            .collect();
+        cells.sort_by(|a, b| a.0.total_cmp(&b.0));
+        cells.into_iter().map(|(_, fill)| fill).collect()
+    };
+    let painted = |hot_last: bool, s: f64| -> Vec<[u8; 4]> {
+        let last8 = at.div_euclid(1000) - 8;
+        let snap = with_cpu_readings(scene(Scene::Calm), at, |t| {
+            if (t > last8) == hot_last { 1.0 } else { 0.0 }
+        });
+        cells_of(&snap, s)
     };
     let inks = super::tests::dark_inks();
     let (hot, cold) = (
@@ -507,10 +611,49 @@ fn a_folded_strip_draws_the_newest_ten_second_columns() {
     for s in [1.0, 2.0] {
         let newest = painted(true, s);
         assert_eq!(newest.len(), d.strip.cols as usize, "{s}x: {newest:?}");
-        assert!(newest.iter().all(|&f| f == hot), "{s}x: {newest:?}");
+        assert!(newest[..12].iter().all(|&f| f == cold), "{s}x: {newest:?}");
+        assert!(newest[12..].iter().all(|&f| f == hot), "{s}x: {newest:?}");
         let oldest = painted(false, s);
         assert_eq!(oldest.len(), d.strip.cols as usize, "{s}x");
-        assert!(oldest.iter().all(|&f| f == cold), "{s}x: {oldest:?}");
+        assert!(oldest[..12].iter().all(|&f| f == hot), "{s}x: {oldest:?}");
+        assert!(oldest[12..].iter().all(|&f| f == cold), "{s}x: {oldest:?}");
+    }
+    // Readings a second apart that straddle the wall clock's second by 30 ms either way, hot
+    // and cold in turn: on the snapshot's grid (its edges half a second in, where the model puts
+    // them for such readings) each stands in its own slot and the strip alternates as they do;
+    // on the wall clock's own seconds two share a slot and the next is spoken for by a third.
+    let straddling = |grid: SlotGrid| {
+        let mut snap = scene(Scene::Calm);
+        let view = &mut snap.resources[Resource::Cpu.index()];
+        let cap = view.capacity.expect("the scene's CPU capacity");
+        view.recent = (0..60_i64)
+            .map(|k| aterm_vitals::Reading {
+                at_ms: OPEN - 59_000 + k * 1000 + if k % 2 == 0 { -30 } else { 30 },
+                v: if k % 2 == 0 { cap } else { 0.0 },
+                over: false,
+            })
+            .collect();
+        snap.at_unix_ms = OPEN + 30;
+        snap.slot_grid = grid;
+        snap
+    };
+    let grid = SlotGrid {
+        origin_ms: 500,
+        ..SlotGrid::SECONDS
+    };
+    for s in [1.0, 2.0] {
+        let cells = cells_of(&straddling(grid), s);
+        assert_eq!(cells.len(), d.strip.cols as usize, "{s}x: {cells:?}");
+        assert_eq!(cells.last(), Some(&cold), "{s}x: the newest reading's");
+        assert!(
+            cells.windows(2).all(|p| p[0] != p[1]) && cells.iter().all(|c| [hot, cold].contains(c)),
+            "{s}x: a reading a cell: {cells:?}"
+        );
+        let seconds = cells_of(&straddling(SlotGrid::SECONDS), s);
+        assert!(
+            !seconds.windows(2).all(|p| p[0] != p[1]),
+            "CONTROL {s}x: on the wall clock's seconds the readings pair up: {seconds:?}"
+        );
     }
 }
 
@@ -566,6 +709,7 @@ fn a_stalled_deck_greys_its_marker_and_beats_nothing() {
 
     let beat = |phase| DeckLive {
         glide_ms: None,
+        slide: None,
         beat: Some(phase),
         fresh: true,
     };
@@ -787,7 +931,7 @@ fn the_default_window_carries_a_time_scale() {
 /// slowest widths too; past the open column's end the glide holds and asks none.
 #[test]
 fn every_glide_frame_moves_the_cards_pixels() {
-    use crate::stats_live::{LiveFacts, glide_step, open_start_ms};
+    use crate::stats_live::{Flow, LiveFacts, glide_step, open_start_ms, slide_frames};
     use std::time::{Duration, Instant};
     let t0 = Instant::now();
     let ms0 = OPEN + 1_234;
@@ -808,9 +952,15 @@ fn every_glide_frame_moves_the_cards_pixels() {
         };
         let first = snap_at(ms0);
         let (_, _, out) = deck_paint_live(&g, &scene_input(&first, form));
+        let folded = form == DeckForm::Folded;
         assert!(
-            out.glide_px_per_s > 0.0 && out.glide_period_s > 0,
-            "CONTROL: the card glides and its strips share one period (else nothing holds): {out:?}"
+            if folded {
+                out.slide_pitch_px >= 3.0 && out.glide_px_per_s == 0.0
+            } else {
+                out.glide_px_per_s > 0.0 && out.glide_period_s > 0
+            },
+            "CONTROL: a Folded card slides, a Full one glides and its strips share one period \
+             (else nothing holds): {out:?}"
         );
         let raster = |snap: &Snapshot, live: DeckLive| {
             let mut input = scene_input(snap, form);
@@ -823,13 +973,23 @@ fn every_glide_frame_moves_the_cards_pixels() {
             let landed = t0 + Duration::from_secs(u64::from(r));
             let at_ms = wall(landed);
             let snap = snap_at(at_ms);
+            // A reading a second, each opening its own second of a Folded strip.
+            let flow = if folded {
+                Flow::Slide {
+                    frames: slide_frames(out.slide_pitch_px),
+                }
+            } else {
+                Flow::Glide {
+                    step: glide_step(out.glide_px_per_s),
+                    end_ms: Some(open_start_ms(at_ms, period) + i64::from(period) * 1000),
+                }
+            };
             let facts = LiveFacts {
                 landed: Some(landed),
                 stale_after: Duration::from_secs(3),
                 motion: true,
                 beat: false,
-                step: glide_step(out.glide_px_per_s),
-                glide_end_ms: Some(open_start_ms(at_ms, period) + i64::from(period) * 1000),
+                flow,
             };
             let mut now = landed;
             let mut was = raster(&snap, facts.live(now, wall(now)));
@@ -862,29 +1022,44 @@ fn a_live_frame_patches_only_what_moved_to_the_whole_rasters_bytes() {
     let still = DeckLive::STILL;
     let gliding = |ms| DeckLive {
         glide_ms: Some(ms),
+        slide: None,
         beat: Some(0.0),
         fresh: true,
     };
+    let sliding = |slide| DeckLive {
+        slide,
+        beat: Some(0.0),
+        ..DeckLive::STILL
+    };
+    // Full's 5 pt pitch over 10 s glides half a pixel a second at 1x: its glide steps every 2 s
+    // ([`glide_step`]), a whole pixel each.
     let cases = [
         (
             DeckForm::Full,
             1424.0,
             1.0,
             gliding(OPEN + 2_000),
-            gliding(OPEN + 2_250),
+            gliding(OPEN + 2_000 + glide_step(0.5).as_millis() as i64),
         ),
         (DeckForm::Full, 1119.0, 2.0, still, DeckLive::STALE),
         (
             DeckForm::Folded,
             1119.0,
             1.0,
-            gliding(OPEN + 2_000),
+            sliding(Some(0.5)),
             DeckLive {
                 beat: Some(0.5),
-                ..gliding(OPEN + 2_000)
+                ..sliding(Some(0.5))
             },
         ),
-        (DeckForm::Folded, 1119.0, 1.0, gliding(OPEN + 2_000), still),
+        (DeckForm::Folded, 1119.0, 1.0, sliding(Some(0.25)), still),
+        (
+            DeckForm::Folded,
+            600.0,
+            2.0,
+            sliding(Some(0.25)),
+            sliding(Some(0.5)),
+        ),
     ];
     for (form, w, s, was, now) in cases {
         let at = format!("{form:?} {w} pt {s}x, {was:?} to {now:?}");
@@ -917,7 +1092,7 @@ fn a_live_frame_patches_only_what_moved_to_the_whole_rasters_bytes() {
         );
         assert!(card.rgba == want, "{at}: the patch is not the whole raster");
         // A beat or a grey moves only the marker's narrow rects.
-        if was.glide_ms == now.glide_ms {
+        if was.glide_ms == now.glide_ms && was.slide == now.slide {
             let moved: f32 = out
                 .rects
                 .iter()
@@ -943,6 +1118,7 @@ fn a_beat_patch_blends_only_the_glyphs_over_its_rects() {
     snap.at_unix_ms = OPEN;
     let was = DeckLive {
         glide_ms: Some(OPEN + 2_000),
+        slide: None,
         beat: Some(0.0),
         fresh: true,
     };
@@ -1044,6 +1220,7 @@ fn a_live_frame_keeps_the_prim_budget() {
     let snap = scene(Scene::Costly);
     let live = DeckLive {
         glide_ms: Some(snap.at_unix_ms + 1),
+        slide: Some(0.5),
         beat: Some(0.0),
         fresh: true,
     };
@@ -1058,8 +1235,8 @@ fn a_live_frame_keeps_the_prim_budget() {
     }
 }
 
-/// The live edge's frames for a person to read: still, gliding half a period, beating, and
-/// stalled, in both forms and grounds, at 2× and 1×.
+/// The live edge's frames for a person to read: still, gliding half a period (a Folded strip
+/// halfway through its slide), beating, and stalled, in both forms and grounds, at 2× and 1×.
 #[test]
 #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_live_gallery() {
@@ -1077,6 +1254,7 @@ fn deck_live_gallery() {
             "glide_half",
             DeckLive {
                 glide_ms: Some(OPEN + 5_000),
+                slide: Some(0.5),
                 beat: None,
                 fresh: true,
             },
@@ -1085,6 +1263,7 @@ fn deck_live_gallery() {
             "beat",
             DeckLive {
                 glide_ms: Some(OPEN + 1_000),
+                slide: Some(0.25),
                 beat: crate::stats_live::beat_phase(0),
                 fresh: true,
             },

@@ -668,6 +668,7 @@ pub const MAX_NOTES: usize = 16;
 
 /// Note sprite lifetime in seconds.
 pub const NOTE_LIFE: f32 = 1.6;
+const NOTE_LIFE_DUR: Duration = Duration::from_millis(1_600);
 
 const NOTE_RISE_CELLS: f32 = 1.4;
 
@@ -761,7 +762,7 @@ impl MusicNotes {
             let mut i = 0;
             while i < MAX_NOTES {
                 if let Some(n) = self.ring[i]
-                    && now.saturating_duration_since(n.born).as_secs_f32() >= NOTE_LIFE
+                    && now.saturating_duration_since(n.born) >= NOTE_LIFE_DUR
                 {
                     self.ring[i] = None;
                     self.live -= 1;

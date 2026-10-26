@@ -863,13 +863,99 @@ pub struct Armed {
     pub listed: Vec<String>,
 }
 
+/// Model evidence and tap identities derived from one recovered account roster.
+/// An unavailable roster or clock excludes account file evidence and all taps.
+/// This is a read snapshot, not a lease on later changes to the account pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPolicy {
+    /// Exclude model and billing file evidence, also when the pool is unknown.
+    pub several_logins: bool,
+    /// The tap and account directories admitted by that same roster.
+    pub usage_tap: Option<Armed>,
+}
+
+impl LaunchPolicy {
+    /// Recover and read the account roster once for this launch decision. Failed
+    /// recovery or binding reads are restrictive even when the tap is switched off.
+    #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountLaunchRead",
+            action = "Read",
+            project = "aterm_agent::harness::cli::tests::upgrade_policy::launch_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLaunchRead",
+            action = "AnotherShape",
+            reason = "Fixture selection chooses the committed roster size"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLaunchRead",
+            action = "AnotherFault",
+            reason = "Fixture selection supplies a publication or read failure"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLaunchRead",
+            action = "EnableTap",
+            reason = "Fixture input sets the existing usage tap switch"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLaunchRead",
+            action = "HaveExecutable",
+            reason = "Fixture input supplies an executable without discovering a live installation"
+        )
+    )]
+    pub fn read(
+        on: bool,
+        exe: impl FnOnce() -> Option<PathBuf>,
+        path: Option<&Path>,
+        store: &accounts::Store,
+        now: Option<i64>,
+    ) -> Self {
+        let roster = now.and_then(|now| store.read_roster(path, now).ok());
+        Self {
+            several_logins: roster.as_ref().is_none_or(accounts::Roster::several),
+            usage_tap: roster.as_ref().and_then(|roster| {
+                on.then(exe).flatten().map(|exe| Armed {
+                    exe,
+                    lone_login: roster.lone_login().map(str::to_owned),
+                    listed: if roster.several() {
+                        roster
+                            .rows
+                            .iter()
+                            .flat_map(|row| row.dir.iter().chain(row.was.iter().flatten()))
+                            .filter(|dir| !dir.is_empty())
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                })
+            }),
+        }
+    }
+}
+
 impl Armed {
     /// THE TAP ARMED for the relaunch lines one pass types, the one block every pass that
     /// relaunches shares (the window's background lane, `aterm harness upgrade`): when `on`,
     /// for the aterm `exe` names ([`stable_exe`]), with the lone login of the roster at
-    /// `roster` as `store` binds it at `now` ([`accounts::lone_login_at`]), else, on a roster
-    /// of two or more rows, every login it names ([`accounts::listed_logins_at`]); neither
-    /// where `now` was not read or the store's logins cannot be.
+    /// `roster` as `store` binds it at `now`, else, on a roster of two or more rows,
+    /// every current and previous login it names. No tap is armed where the clock,
+    /// account publication or required bindings cannot be read ([`LaunchPolicy::read`]).
     #[must_use]
     pub fn arm(
         on: bool,
@@ -878,18 +964,11 @@ impl Armed {
         store: &accounts::Store,
         now: Option<i64>,
     ) -> Option<Self> {
-        on.then(exe).flatten().map(|exe| {
-            let lone_login = now.and_then(|now| accounts::lone_login_at(roster, store, now));
-            let listed = match (now, &lone_login) {
-                (Some(now), None) => accounts::listed_logins_at(roster, store, now),
-                _ => Vec::new(),
-            };
-            Self {
-                exe,
-                lone_login,
-                listed,
-            }
-        })
+        if !on {
+            return None;
+        }
+        let exe = exe()?;
+        LaunchPolicy::read(true, || Some(exe), roster, store, now).usage_tap
     }
 
     /// THE LOGIN [`gate`] JUDGES A LINE ON `login` BY ([`GateFacts::lone_login`]): the

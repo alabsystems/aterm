@@ -1630,11 +1630,11 @@ struct Shared {
     /// THE BATCH LOCK: held by the writer thread for a batch's whole life — staging, the
     /// write and flush it runs with the LOG lock released, the promotion — and taken by
     /// nothing else but retention, before the log lock (lock order: batch → log). So a
-    /// `retain_before` that arrives while a batch is being written waits for that batch
-    /// to commit or roll back, exactly as it waited on the log lock when the writer held
-    /// that across the fsync, instead of meeting the batch staged and being refused
-    /// ("a batch is being written"). No reader ever takes it, so it costs a reader
-    /// nothing; the writer takes it uncontended once per batch.
+    /// `retain_before`, a tick or a `set_retention` that arrives while a batch is being
+    /// written waits for that batch to commit or roll back, exactly as it waited on the log
+    /// lock when the writer held that across the fsync, instead of meeting the batch staged
+    /// and being refused ("a batch is being written"). No reader ever takes it, so it costs
+    /// a reader nothing; the writer takes it uncontended once per batch.
     batch: Mutex<()>,
     /// [`BrokerStats::retention_waits`].
     retention_waits: AtomicU64,
@@ -2701,13 +2701,13 @@ pub struct BrokerStats {
     /// writer publishes the head under — so a batch whose head is published after a
     /// read of N here finds those N tails waiting.
     pub parked_tails: usize,
-    /// Retention calls (`Broker::retain_before` and
-    /// `Broker::retain_before_carrying_state`, the `retention` feature's) that found the
-    /// writer's batch lock (`Shared::batch`) taken and waited for it, at the compaction's
-    /// begin or at its finish — counted once per call, not once per wait. The writer
-    /// writes and flushes a batch with the log lock released, so retention, which
-    /// rewrites the file, waits on that lock instead — for the batch the writer is in to
-    /// commit or roll back. Two retention calls made at once queue on a lock of their own
+    /// Retention calls (`Broker::retain_before`, `Broker::retain_before_carrying_state`,
+    /// `Broker::set_retention` and a retention tick, the `retention` feature's) that found
+    /// the writer's batch lock (`Shared::batch`) taken and waited for it, at the
+    /// compaction's begin or at its finish, or before the rules are written — counted once
+    /// per call, not once per wait. The writer writes and flushes a batch with the log lock
+    /// released, so retention, which rewrites the file, waits on that lock instead — for
+    /// the batch the writer is in to commit or roll back. Two retention calls made at once queue on a lock of their own
     /// (`Shared::compaction`), which this does not count, so what it counts is retention
     /// that waited for a batch.
     pub retention_waits: u64,
@@ -3221,13 +3221,19 @@ impl Broker {
     ///
     /// Refused on a simulated log (no held store), and on a poisoned one. Waits for a
     /// compaction under way, a tick's or a retention call's, to finish first: the rules
-    /// change between compactions, never inside one.
+    /// change between compactions, never inside one. Waits, too, for a batch the writer
+    /// is in the middle of, its write and flush included
+    /// ([`BrokerStats::retention_waits`]), as a compaction's begin does: the held store's
+    /// rules frame is written between batches, never beside one. So the rules may be set
+    /// the moment a broker opens — while the writer still commits the wills the open
+    /// fired, as `asb serve --retain-file` sets them — with no flush first.
     #[cfg(feature = "retention")]
     pub fn set_retention(&self, rules: crate::Retention) -> io::Result<()> {
         {
-            // Lock order: compaction → log. A job begun under the old rules appends its
-            // held frames where the store ended at its begin; the rules frame set here
-            // goes after them, and its cut is the base the new rules hold from.
+            // Lock order: compaction → batch → log, a compaction's own. A job begun under
+            // the old rules appends its held frames where the store ended at its begin;
+            // the rules frame set here goes after them, and its cut is the base the new
+            // rules hold from.
             let _one = match self.shared.compaction.try_lock() {
                 Ok(held) => held,
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -3237,6 +3243,24 @@ impl Broker {
                         .compaction
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+            };
+            // The writer's batch lock, taken as a compaction's begin takes it: a batch in
+            // its write window is waited out (the log, met there, refuses every mutation:
+            // "a batch is being written outside the log lock"). A poisoned try-lock
+            // already owns its guard; panic with it rather than lock again.
+            let mut waited = false;
+            let _batch = match self.shared.batch.try_lock() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    record_retention_wait(&self.shared, &mut waited);
+                    self.shared
+                        .batch
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("retention: the writer panicked inside a batch ({poisoned})")
                 }
             };
             let mut log = self
@@ -10296,24 +10320,106 @@ mod tests {
         assert!(died.is_err(), "the stand-in writer did not panic");
         assert!(b.shared.batch.is_poisoned(), "the batch lock is poisoned");
 
-        for carrying_state in [false, true] {
+        for call in [
+            "retain_before",
+            "retain_before_carrying_state",
+            "set_retention",
+        ] {
             let b2 = Arc::clone(&b);
             let failed = within_a_minute("retention after the writer panicked", move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if carrying_state {
-                        b2.retain_before_carrying_state(0)
-                    } else {
-                        b2.retain_before(0)
-                    }
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match call {
+                    "retain_before" => b2.retain_before(0).map(drop),
+                    "retain_before_carrying_state" => b2.retain_before_carrying_state(0).map(drop),
+                    _ => b2.set_retention(
+                        crate::Retention::new(
+                            vec![crate::Rule::prefix("/t/>").unwrap()],
+                            crate::Rule::default_keeping_all(),
+                        )
+                        .unwrap(),
+                    ),
                 }))
                 .is_err()
             });
-            assert!(
-                failed,
-                "retention (carrying state: {carrying_state}) returned past a dead writer"
-            );
+            assert!(failed, "{call} returned past a dead writer");
         }
         assert_eq!(b.stats().retention_waits, 0, "nothing waited");
+    }
+
+    /// THE RULES ARE SET PAST THE WILLS AN OPEN FIRES. A broker's open fires every will
+    /// its log still holds (`fire_will`, queued to the writer, answered by nobody), and
+    /// whoever opened it sets its rules at once — `asb serve --retain-file`, aterm's open
+    /// — with no flush between. Here a will is registered, the writer is parked in the
+    /// write window of the next batch, and the will is fired exactly as the open fires it,
+    /// into that batch. `set_retention` from another thread waits for the batch (counted,
+    /// `retention_waits` 0 → 1) instead of answering inside it; resumed, the will's record
+    /// commits and the rules are set. NEGATIVE CONTROL (planted, scratch-reverted):
+    /// `set_retention` without the batch lock is refused "a batch is being written outside
+    /// the log lock", and the `Ok` below fails.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn the_rules_are_set_past_the_wills_an_open_fires() {
+        let root = crate::test_scratch::Scratch::new("rules-past-wills");
+        let b = Arc::new(Broker::open(root.path().join("log")).unwrap());
+        let will = WillRecord {
+            producer_id: 9,
+            producer_seq: crate::will_seq(1).unwrap(),
+            subject: "/f/F/pub/n1/presence".to_string(),
+            body: b"v=1 state=gone".to_vec(),
+        };
+        let shared = Arc::clone(&b.shared);
+        let registered = within_a_minute("the will's registration", move || {
+            submit_blocking(
+                &shared,
+                WriteKind::WillRegister {
+                    conn_id: None,
+                    will,
+                },
+            )
+        });
+        assert!(registered.is_ok(), "{registered:?}");
+        let pending = b.shared.log.lock().unwrap().pending_wills();
+        assert_eq!(pending.len(), 1, "the will the next open would fire");
+        let head = b.head();
+
+        let pause = b.pause_next_write();
+        for will in pending {
+            fire_will(&b.shared, will);
+        }
+        let pause = within_a_minute("the writer to reach the will's write", move || {
+            assert!(pause.wait(), "the writer stopped before the paused write");
+            pause
+        });
+        let b2 = Arc::clone(&b);
+        let setting = thread::spawn(move || {
+            b2.set_retention(
+                crate::Retention::new(
+                    vec![crate::Rule::prefix("/f/*/pub/*/*/ev").unwrap()],
+                    crate::Rule::default_keeping_all(),
+                )
+                .unwrap(),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !setting.is_finished() && b.stats().retention_waits == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "set_retention neither waited nor answered"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            !setting.is_finished(),
+            "set_retention answered inside the will's write window: {:?}",
+            setting.join()
+        );
+        pause.resume();
+        let set = within_a_minute("set_retention after the will's batch", move || {
+            setting.join().unwrap()
+        });
+        assert!(set.is_ok(), "{set:?}");
+        assert_eq!(b.stats().retention_waits, 1);
+        assert_eq!(b.head(), head + 1, "the will fired");
+        assert!(b.retention().is_some(), "the rules are set");
     }
 
     /// OFF THE ACK PATH (6E-1a): a broker's compaction copies the kept suffix with no

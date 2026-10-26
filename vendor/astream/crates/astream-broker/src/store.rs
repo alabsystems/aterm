@@ -1870,6 +1870,17 @@ pub enum Durability {
     /// `BrokerLog::open_encrypted_repair` with its key. A log no sealing build has
     /// opened yet is judged by the rules that predate the floor, which refuse a torn
     /// batch whose bytes the open cannot tell from damage.
+    ///
+    /// One residual, on every tier: the promise rests on the directory entry that names
+    /// the log, and each sidecar created or renamed beside it, being flushed too
+    /// (`sync_parent_dir`). Where a directory's entries cannot be flushed here
+    /// (`astream_sys::dir_flush_unavailable`: a volume that refuses to flush a directory
+    /// handle, or a write-only log directory this process cannot open), the open and
+    /// the sidecar writes go on without that flush, and nothing records that they did.
+    /// Off Unix no directory is flushed at all. The records are on stable media, but a
+    /// power loss there can take an entry made since the directory was last flushed with
+    /// them: a log created there, or a sidecar replaced. On Unix astream-engine's segment
+    /// log makes the other choice and refuses the open.
     #[default]
     Strict,
     /// `ack` ⟹ the batch is ORDERED on the device (Apple: `F_BARRIERFSYNC`): every write
@@ -2727,37 +2738,30 @@ fn replica_marker_path(path: &Path) -> std::path::PathBuf {
 /// that names it.
 #[cfg(unix)]
 pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    sync_parent_dir_by(path, |dir| astream_sys::full_sync(&File::open(dir)?))
+}
+
+/// [`sync_parent_dir`] with the directory's open and full flush (`flush`) handed in, so a
+/// test can make them fail; what that outcome means here is decided below either way.
+#[cfg(unix)]
+fn sync_parent_dir_by(path: &Path, flush: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let res = match File::open(parent) {
-        Ok(d) => astream_sys::full_sync(&d),
-        Err(e) => Err(e),
-    };
-    match res {
+    match flush(parent) {
         Ok(()) => {
             #[cfg(all(test, feature = "retention"))]
             crate::power_loss::dir_synced(path);
             Ok(())
         }
         // The directory entry simply cannot be fsync'd here, through no fault of the
-        // log: a filesystem that refuses to fsync a directory handle (Unsupported /
-        // InvalidInput), or a directory this process may write but not OPEN — a
-        // write-only 0300 log directory, where opening the log itself is allowed.
-        // The file's own bytes are still fsync'd; there is nothing more we can do
-        // about the entry, and FAILING here would refuse a log that opens fine.
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::Unsupported
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::NotFound
-            ) =>
-        {
-            Ok(())
-        }
+        // log (`astream_sys::dir_flush_unavailable`: a filesystem that refuses to flush
+        // a directory handle, or a write-only 0300 log directory, where opening the log
+        // itself is allowed). FAILING here would refuse a log that opens fine, so the
+        // open goes on without the entry's flush; the power-loss model is told nothing,
+        // since nothing was flushed.
+        Err(e) if astream_sys::dir_flush_unavailable(&e) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -8693,6 +8697,45 @@ mod tests {
                 log.publish(1, 1, "/a/s/x".into(), b"a".to_vec()).unwrap(),
                 (Offset(0), false)
             );
+        }
+    }
+
+    /// The directory flush goes on exactly where `astream_sys::dir_flush_unavailable` says
+    /// the entry cannot be flushed: the volume's `ENOTSUP` (Darwin's 45, which std leaves
+    /// uncategorized, so a list of kinds alone refused the log there; Linux's 95) is
+    /// tolerated, and `EIO` is returned with its errno. Either way the flush is asked of
+    /// the directory that names the path, `.` for a bare name.
+    #[test]
+    #[cfg(unix)]
+    fn the_directory_flush_tolerates_enotsup_and_returns_eio() {
+        let enotsup = if cfg!(target_vendor = "apple") {
+            45
+        } else {
+            95
+        };
+        for (path, dir) in [
+            (Path::new("/logs/x.log"), Path::new("/logs")),
+            (Path::new("x.log"), Path::new(".")),
+        ] {
+            for (errno, tolerated) in [(enotsup, true), (5, false)] {
+                let mut asked = None;
+                let flushed = sync_parent_dir_by(path, |d| {
+                    asked = Some(d.to_path_buf());
+                    Err(io::Error::from_raw_os_error(errno))
+                });
+                assert_eq!(
+                    flushed.map_err(|e| e.raw_os_error()),
+                    if tolerated { Ok(()) } else { Err(Some(errno)) },
+                    "{} errno {errno}",
+                    path.display()
+                );
+                assert_eq!(
+                    asked.as_deref(),
+                    Some(dir),
+                    "{} errno {errno}",
+                    path.display()
+                );
+            }
         }
     }
 

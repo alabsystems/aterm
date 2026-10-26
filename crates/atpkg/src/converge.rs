@@ -7,118 +7,130 @@ use aterm_converge::{Class, Explain, Item, ItemReport, Layer, Mode, Outcome, Pro
 
 pub mod repair;
 
-/// Which atpkg is speaking.
-pub const ATPKG: &str = "base.pkg.atpkg";
-/// The aterm app's own update posture.
-pub const APP: &str = "base.pkg.aterm-app";
-/// The index source.
-pub const INDEX_SOURCE: &str = "base.pkg.index-source";
-/// The trust root compiled in.
-pub const TRUST_ROOT: &str = "base.pkg.trust-root";
-/// The `[packages]` table's own spelling.
-pub const CONFIG: &str = "base.pkg.config";
-/// A retired opt-out still exported, `@<variable>`.
-pub const RETIRED_ENV: &str = "base.pkg.env";
-/// The prefix.
-pub const PREFIX: &str = "base.pkg.prefix";
-/// The managed `bin/` on PATH.
-pub const PATH: &str = "base.pkg.path";
-/// The reroute stubs, abrew's `brew` included, `@<name>`.
-pub const STUBS: &str = "base.pkg.stubs";
-/// The reroute directory's place on PATH.
-pub const REROUTE: &str = "base.pkg.reroute";
-/// A bin/ shim, `@<name>`.
-pub const SHIMS: &str = "base.pkg.shims";
-/// The exposed names an active build was refused a shim.
-pub const REFUSED: &str = "base.pkg.refused";
-/// A shim an older atpkg laid under a name no shim may carry now, `@<name>`.
-pub const REFUSED_SHIM: &str = "base.pkg.refused.shim";
-/// The active builds' store trees.
-pub const STORE: &str = "base.pkg.store";
-/// A solver the trust bundle pins privately, `@<program>`.
-pub const SOLVER: &str = "base.pkg.solver";
-/// The trust bundle's compiler as tippy needs it.
-pub const TRUST_COMPILER: &str = "base.pkg.trust.compiler";
-/// A stock name in the rustup view, `@<seam>.<name>`.
-pub const RUSTUP_VIEW: &str = "base.pkg.rustup.view";
-/// A directory on the trust build's chain `targo trust` refuses, `@<dir>`.
-pub const TRUST_CHAIN: &str = "base.pkg.trust.chain";
-/// The trust build's exec root.
-pub const EXEC_ROOTS: &str = "base.pkg.exec-roots";
-/// An exec root no build needs, `@<path>`.
-pub const EXEC_ROOT_STRAY: &str = "base.pkg.exec-roots.stray";
-/// The workspace's `[trust]` policy against the installed targo.
-pub const WORKSPACE: &str = "base.pkg.workspace";
-/// A local toolchain behind rustup's `trust` channel.
-pub const RUSTUP_LOCAL: &str = "base.pkg.rustup.local";
-/// The held toolchain update.
-pub const HELD_UPDATE: &str = "base.pkg.held-update";
-/// The build leases.
-pub const LEASES: &str = "base.pkg.leases";
-/// The live builds.
-pub const LIVE: &str = "base.pkg.live";
-/// The shell.d hooks.
-pub const HOOKS: &str = "base.shell.hooks";
-/// A POSIX `.sh` in shell.d, which breaks fish, `@<file>`.
-pub const FISH_SAFE: &str = "base.shell.fish-safe";
-/// The rc files' wiring.
-pub const RC: &str = "base.shell.rc";
-/// A copied command at a command path, `@<path>`.
-pub const COPIED_COMMANDS: &str = "base.shell.copied-commands";
-/// A login-sourced directory others can write, `@<dir>`.
-pub const PRIVATE: &str = "base.shell.private";
-/// Disk headroom.
-pub const DISK: &str = "base.pkg.disk";
-/// The Developer Tools list.
-pub const DEVTOOLS: &str = "base.privacy.devtools";
-/// Universal Control.
-pub const UNIVERSAL_CONTROL: &str = "base.machine.universal-control";
-/// Rosetta 2, on Apple silicon.
-pub const ROSETTA: &str = "base.machine.rosetta";
-/// The last completed update pass.
-pub const INDEX_AGE: &str = "base.pkg.index-age";
-/// Whether the signed index has been reached lately.
-pub const INDEX_REACHED: &str = "base.pkg.index-reached";
-/// Whether publishing looks frozen upstream.
-pub const INDEX_FROZEN: &str = "base.pkg.index-frozen";
-/// The accepted index build and roster generation.
-pub const INDEX_FLOOR: &str = "base.pkg.index-floor";
-/// The roster generation, when the floor row does not name it.
-pub const ROSTER_FLOOR: &str = "base.pkg.roster-floor";
-/// Whether the accepted index is the newest.
-pub const INDEX_HEAD: &str = "base.pkg.index-head";
-/// Who watches the vendor heads.
-pub const VENDOR_WATCH: &str = "base.pkg.vendor-watch";
-/// rustup.
-pub const RUSTUP: &str = "base.pkg.rustup";
-/// rustup's `trust` entry against the managed seam.
-pub const RUSTUP_SEAM: &str = "base.pkg.rustup.seam";
-/// A stale `trust` link the machine replaced.
-pub const RUSTUP_REPLACED: &str = "base.pkg.rustup.replaced";
-/// A record row that cannot be a program, `@<key>`.
-pub const RECORD_STRAY: &str = "base.pkg.record.stray";
-/// A member satisfied by the system, `@<program>`.
-pub const SYSTEM: &str = "base.pkg.system";
-/// A member held on its current build, `@<program>`.
-pub const HELD: &str = "base.pkg.held";
-/// A managed member and what PATH runs for it, `@<program>`.
-pub const SHADOW: &str = "base.pkg.shadow";
-/// A managed member's shim environment, `@<program>`.
-pub const SHIM_ENV: &str = "base.pkg.shim-env";
-/// Claude Code's defaults.
-pub const CLAUDE_DEFAULTS: &str = "base.agents.claude-defaults";
-/// A dev link.
-pub const DEV_LINK: &str = "base.pkg.dev-link";
-/// The toolset against the signed index.
-pub const TOOLSET: &str = "base.pkg.toolset";
-/// The toolset on a platform no build is published for.
-pub const TOOLSET_PLATFORM: &str = "base.pkg.toolset.platform";
-/// A recorded problem the toolset row lists, `@<program>`.
-pub const TOOLSET_MEMBER: &str = "base.pkg.toolset.member";
-/// A member removed on purpose, `@<program>`.
-pub const REMOVED: &str = "base.pkg.removed";
-/// The C toolchain.
-pub const CLT: &str = "base.clt";
+/// Each check id `aterm pkg doctor` reports, as a constant, and every one of them in [`IDS`],
+/// so a word is checked against them without reading the machine ([`names`]).
+macro_rules! ids {
+    ($($(#[$doc:meta])* $name:ident = $id:literal;)*) => {
+        $($(#[$doc])* pub const $name: &str = $id;)*
+        /// Every check id above, in order.
+        pub const IDS: &[&str] = &[$($name),*];
+    };
+}
+
+ids! {
+    /// Which atpkg is speaking.
+    ATPKG = "base.pkg.atpkg";
+    /// The aterm app's own update posture.
+    APP = "base.pkg.aterm-app";
+    /// The index source.
+    INDEX_SOURCE = "base.pkg.index-source";
+    /// The trust root compiled in.
+    TRUST_ROOT = "base.pkg.trust-root";
+    /// The `[packages]` table's own spelling.
+    CONFIG = "base.pkg.config";
+    /// A retired opt-out still exported, `@<variable>`.
+    RETIRED_ENV = "base.pkg.env";
+    /// The prefix.
+    PREFIX = "base.pkg.prefix";
+    /// The managed `bin/` on PATH.
+    PATH = "base.pkg.path";
+    /// The reroute stubs, abrew's `brew` included, `@<name>`.
+    STUBS = "base.pkg.stubs";
+    /// The reroute directory's place on PATH.
+    REROUTE = "base.pkg.reroute";
+    /// A bin/ shim, `@<name>`.
+    SHIMS = "base.pkg.shims";
+    /// The exposed names an active build was refused a shim.
+    REFUSED = "base.pkg.refused";
+    /// A shim an older atpkg laid under a name no shim may carry now, `@<name>`.
+    REFUSED_SHIM = "base.pkg.refused.shim";
+    /// The active builds' store trees.
+    STORE = "base.pkg.store";
+    /// A solver the trust bundle pins privately, `@<program>`.
+    SOLVER = "base.pkg.solver";
+    /// The trust bundle's compiler as tippy needs it.
+    TRUST_COMPILER = "base.pkg.trust.compiler";
+    /// A stock name in the rustup view, `@<seam>.<name>`.
+    RUSTUP_VIEW = "base.pkg.rustup.view";
+    /// A directory on the trust build's chain `targo trust` refuses, `@<dir>`.
+    TRUST_CHAIN = "base.pkg.trust.chain";
+    /// The trust build's exec root.
+    EXEC_ROOTS = "base.pkg.exec-roots";
+    /// An exec root no build needs, `@<path>`.
+    EXEC_ROOT_STRAY = "base.pkg.exec-roots.stray";
+    /// The workspace's `[trust]` policy against the installed targo.
+    WORKSPACE = "base.pkg.workspace";
+    /// A local toolchain behind rustup's `trust` channel.
+    RUSTUP_LOCAL = "base.pkg.rustup.local";
+    /// The held toolchain update.
+    HELD_UPDATE = "base.pkg.held-update";
+    /// The build leases.
+    LEASES = "base.pkg.leases";
+    /// The live builds.
+    LIVE = "base.pkg.live";
+    /// The shell.d hooks.
+    HOOKS = "base.shell.hooks";
+    /// A POSIX `.sh` in shell.d, which breaks fish, `@<file>`.
+    FISH_SAFE = "base.shell.fish-safe";
+    /// The rc files' wiring.
+    RC = "base.shell.rc";
+    /// A copied command at a command path, `@<path>`.
+    COPIED_COMMANDS = "base.shell.copied-commands";
+    /// A login-sourced directory others can write, `@<dir>`.
+    PRIVATE = "base.shell.private";
+    /// Disk headroom.
+    DISK = "base.pkg.disk";
+    /// The Developer Tools list.
+    DEVTOOLS = "base.privacy.devtools";
+    /// Universal Control.
+    UNIVERSAL_CONTROL = "base.machine.universal-control";
+    /// Rosetta 2, on Apple silicon.
+    ROSETTA = "base.machine.rosetta";
+    /// The last completed update pass.
+    INDEX_AGE = "base.pkg.index-age";
+    /// Whether the signed index has been reached lately.
+    INDEX_REACHED = "base.pkg.index-reached";
+    /// Whether publishing looks frozen upstream.
+    INDEX_FROZEN = "base.pkg.index-frozen";
+    /// The accepted index build and roster generation.
+    INDEX_FLOOR = "base.pkg.index-floor";
+    /// The roster generation, when the floor row does not name it.
+    ROSTER_FLOOR = "base.pkg.roster-floor";
+    /// Whether the accepted index is the newest.
+    INDEX_HEAD = "base.pkg.index-head";
+    /// Who watches the vendor heads.
+    VENDOR_WATCH = "base.pkg.vendor-watch";
+    /// rustup.
+    RUSTUP = "base.pkg.rustup";
+    /// rustup's `trust` entry against the managed seam.
+    RUSTUP_SEAM = "base.pkg.rustup.seam";
+    /// A stale `trust` link the machine replaced.
+    RUSTUP_REPLACED = "base.pkg.rustup.replaced";
+    /// A record row that cannot be a program, `@<key>`.
+    RECORD_STRAY = "base.pkg.record.stray";
+    /// A member satisfied by the system, `@<program>`.
+    SYSTEM = "base.pkg.system";
+    /// A member held on its current build, `@<program>`.
+    HELD = "base.pkg.held";
+    /// A managed member and what PATH runs for it, `@<program>`.
+    SHADOW = "base.pkg.shadow";
+    /// A managed member's shim environment, `@<program>`.
+    SHIM_ENV = "base.pkg.shim-env";
+    /// Claude Code's defaults.
+    CLAUDE_DEFAULTS = "base.agents.claude-defaults";
+    /// A dev link.
+    DEV_LINK = "base.pkg.dev-link";
+    /// The toolset against the signed index.
+    TOOLSET = "base.pkg.toolset";
+    /// The toolset on a platform no build is published for.
+    TOOLSET_PLATFORM = "base.pkg.toolset.platform";
+    /// A recorded problem the toolset row lists, `@<program>`.
+    TOOLSET_MEMBER = "base.pkg.toolset.member";
+    /// A member removed on purpose, `@<program>`.
+    REMOVED = "base.pkg.removed";
+    /// The C toolchain.
+    CLT = "base.clt";
+}
 
 /// The `detail` of a row whose warn says a managed tool cannot run.
 pub const CANNOT_RUN: &str = "cannot-run";
@@ -129,6 +141,17 @@ pub const UNPROVEN: &str = "unproven";
 #[must_use]
 pub fn of(id: &str, subject: impl std::fmt::Display) -> String {
     format!("{id}@{subject}")
+}
+
+/// Whether the `--only` word `token` can name one of `aterm pkg doctor`'s rows: one of
+/// [`IDS`] or a subject of one (`base.pkg.stubs@cargo`), their family or the base layer.
+/// Read from the table alone, so a word is judged without reading the machine.
+#[must_use]
+pub fn names(token: &str) -> bool {
+    let item = token.split_once('@').map_or(token, |(item, _)| item);
+    IDS.iter().any(|id| {
+        *id == item || aterm_converge::selects(token, id, family_of(id), Some(Layer::Base))
+    })
 }
 
 /// Whether `row_id` is the item `id` or one of its subjects (`id@…`).
@@ -440,6 +463,7 @@ pub fn report(findings: Vec<Finding>) -> Vec<ItemReport> {
             }),
             stood_aside: None,
             essential: true,
+            elapsed_ms: Some(0),
         }],
     }
 }

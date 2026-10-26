@@ -16,7 +16,10 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Replace `path` with `bytes`.
 /// # Errors
-/// The temp could not be created, written, flushed or renamed; the temp is removed.
+/// The temp could not be created, written, flushed or renamed; the temp is removed. Or the
+/// directory's flush after the rename failed other than as unavailable
+/// ([`aterm_durable::Flush::dir_best_effort`]): `path` holds `bytes`, but its entry may not
+/// survive a power loss.
 pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = temp_path(path, TEMP_SEQ.fetch_add(1, Ordering::Relaxed))?;
     replace_via(&tmp, path, bytes)
@@ -34,7 +37,8 @@ pub(crate) fn write_ordered(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    crate::store::sync_dir_ordered(path.parent().unwrap_or_else(|| Path::new(".")));
+    let _flushed_or_unavailable =
+        aterm_durable::Flush::Ordered.dir_best_effort(parent_dir(path))?;
     Ok(())
 }
 
@@ -47,8 +51,17 @@ fn replace_via(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(tmp);
         return Err(error);
     }
-    crate::store::sync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+    let _flushed_or_unavailable =
+        aterm_durable::Flush::Durable.dir_best_effort(parent_dir(path))?;
     Ok(())
+}
+
+/// The directory that names `path`: its parent, or `.` for a bare name.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
 }
 
 /// How many times [`again_while_refused`] tries an operation again.
@@ -200,14 +213,17 @@ mod tests {
         let dest = d.join("x.toml");
         let recording = Recording::start();
         write_durable(&dest, b"a = 1\n").unwrap();
-        assert_eq!(recording.take(), [Flush::Durable]);
-        write_ordered(&dest, b"a = 2\n").unwrap();
-        let ordered: &[Flush] = if cfg!(windows) {
-            &[Flush::Ordered]
+        // The directory's flush is recorded everywhere (on Windows `Flush::dir` only notes
+        // it). The temp's durable flush is recorded on Windows (`durable_data`) and not on
+        // Unix, where it is atpkg's own `fsync`.
+        let durable: &[Flush] = if cfg!(windows) {
+            &[Flush::Durable, Flush::Durable]
         } else {
-            &[Flush::Ordered, Flush::Ordered]
+            &[Flush::Durable]
         };
-        assert_eq!(recording.take(), ordered);
+        assert_eq!(recording.take(), durable);
+        write_ordered(&dest, b"a = 2\n").unwrap();
+        assert_eq!(recording.take(), [Flush::Ordered, Flush::Ordered]);
         assert_eq!(std::fs::read(&dest).unwrap(), b"a = 2\n");
     }
 

@@ -3,7 +3,9 @@
 
 //! Busy CPU split over one matched window, by coalition.
 
-use super::{CoalRow, CoalSample, CoalSplit, CoalUsage, IdMap, Named, Part, Via};
+use super::{
+    CoalRow, CoalSample, CoalSplit, CoalUsage, IdMap, Named, Part, ReapLedger, ReapTotals, Via,
+};
 use crate::model::{Membership, ProcSample, Sample, Split, TabRoot, TabView};
 
 /// The longest window a split reads, ns.
@@ -30,6 +32,8 @@ pub struct CoalBase {
     pub truncated: bool,
     /// Whether the list stopped short.
     pub list_truncated: bool,
+    /// The reap credit's counters at this reading, where its ledger read the sweep.
+    pub reap: Option<ReapTotals>,
 }
 
 impl CoalBase {
@@ -51,6 +55,7 @@ impl CoalBase {
                 .collect(),
             truncated: read.truncated || s.procs_truncated,
             list_truncated: read.truncated,
+            reap: None,
         })
     }
 
@@ -86,6 +91,10 @@ pub struct SplitIn<'a> {
     pub live: &'a IdMap<u64, u32>,
     /// Coalitions the kernel listed.
     pub listed: u32,
+    /// The reap credit's ledger, as it read this tick's sweep: where it read the window's both
+    /// ends ([`CoalBase::reap`]), each tab's figure and aterm's own are its counters' growth over
+    /// the window, live and reaped; else the live figures alone.
+    pub reap: Option<&'a ReapLedger>,
 }
 
 /// The split of `i`'s window, by coalition.
@@ -102,12 +111,38 @@ pub fn split(i: &SplitIn) -> CoalSplit {
 
     let mut tabs = vec![0u64; i.tabs.len()];
     let mut own_ns = 0u64;
-    // Whether every member of aterm's coalitions swept now is in a live
-    // figure ([`CoalSplit::skew_mc`]).
+    let mut short_tabs = Vec::new();
+    // The reap credit, where its ledger read both ends: it counts every
+    // member but a delegated job's, whose live work the loop below reads.
+    let reap = match (i.reap, &i.base.reap, &i.now.reap) {
+        (Some(ledger), Some(base), Some(now)) => Some((ledger, base, now)),
+        _ => None,
+    };
+    if let Some((_, base, now)) = reap {
+        let mut in_tabs = 0u64;
+        for (k, (t, sum)) in i.tabs.iter().zip(tabs.iter_mut()).enumerate() {
+            // A split tab's panes share its key: its counter once, on its first.
+            if i.tabs[..k].iter().all(|o| o.tab != t.tab) {
+                let (ns, missed) = now.since(base, t.tab);
+                *sum = ns;
+                in_tabs = in_tabs.saturating_add(ns);
+                if missed {
+                    short_tabs.push(t.tab);
+                }
+            }
+        }
+        own_ns = now.all.saturating_sub(base.all).saturating_sub(in_tabs);
+    }
+    // Whether every member of aterm's coalitions swept now is in a figure
+    // that read it at both ends of the window ([`CoalSplit::skew_mc`]).
     let mut all_live = true;
     let mut moved: IdMap<u64, u64> = IdMap::default();
     for ((p, m), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
         let ours = p.coalition.is_some_and(|c| part_of(c) == Part::Aterm);
+        if let Some((ledger, base, _)) = reap.filter(|_| !*delegated) {
+            all_live &= !ours || ledger.counted(p.pid, p.start, base.step);
+            continue;
+        }
         let (Some(ns), Some(&(start, before))) = (p.cpu_ns, i.base.procs.get(&p.pid)) else {
             all_live &= !ours;
             continue;
@@ -116,6 +151,11 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             all_live &= !ours;
             continue;
         }
+        // A member a job took over since the window began: from where the ledger's counter
+        // left it, which took its work until then.
+        let before = reap
+            .and_then(|(ledger, _, _)| ledger.credited(p.pid, p.start))
+            .map_or(before, |c| c.max(before));
         let work = ns.saturating_sub(before);
         match m.tab.and_then(|t| tabs.get_mut(t)) {
             Some(tab) => add(tab, work),
@@ -208,10 +248,10 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     let past_ns = aterm_ns
         .saturating_add(delegated_ns)
         .saturating_sub(live_ns);
-    // With no member made or reaped and every member swept and in a live
-    // figure, aterm's counters held only live figures' work: what they ran
-    // past the live figures is the counters' skew against their members'
-    // times, never finished work (RD §3.5).
+    // With no member made or reaped and every member swept and in a figure
+    // that read it at both ends, aterm's counters held only the figures'
+    // work: what they ran past the figures is the counters' skew against
+    // their members' times, never finished work (RD §3.5).
     let (unattributed_ns, skew_ns) = if kept_members && all_live {
         (0, past_ns)
     } else {
@@ -248,6 +288,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         own_mc: mc(own_ns),
         unattributed_mc,
         skew_mc: mc(skew_ns),
+        short_tabs,
         rows,
     }
 }
@@ -345,6 +386,7 @@ impl CoalSplit {
             own_mc,
             unattributed_mc: (aterm_mc - own_mc - in_tabs).max(0),
             skew_mc: 0,
+            short_tabs: Vec::new(),
             rows: Vec::new(),
         }
     }

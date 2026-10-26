@@ -779,7 +779,7 @@ fn gradient_glow_under_is_byte_exact_cpu_vs_gpu() {
 /// [`gradient_glow_under_is_byte_exact_cpu_vs_gpu`] through the wgpu oracle arm
 /// on macOS and Linux, so the WGSL `fs_glow` (the live shader on Windows and
 /// wasm) runs here too.
-#[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+#[cfg(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm))]
 #[test]
 fn gradient_glow_under_is_byte_exact_cpu_vs_wgpu_oracle() {
     gradient_glow_under_parity(true, &ByteExact::default());
@@ -788,11 +788,11 @@ fn gradient_glow_under_is_byte_exact_cpu_vs_wgpu_oracle() {
 fn gradient_glow_under_parity(oracle: bool, exact: &ByteExact) {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
-    #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm))]
     if oracle {
         crate::common::disarm_for_oracle(&mut gpu);
     }
-    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm)))]
     let _ = oracle;
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (12usize, 40usize);

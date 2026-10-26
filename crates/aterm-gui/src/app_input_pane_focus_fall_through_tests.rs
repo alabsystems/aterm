@@ -425,3 +425,298 @@ fn a_ctrl_letter_pane_focus_binding_never_hands_its_byte_to_the_shell() {
         "its release is swallowed with it"
     );
 }
+
+#[test]
+fn pane_focus_uses_the_event_windows_neighbors_and_press_owner() {
+    let mut failures = Vec::new();
+    for (split, left_edge, zoomed, front_split) in [
+        (true, false, false, false),
+        (false, false, false, true),
+        (true, false, false, true),
+        (true, true, false, true),
+        (true, false, true, true),
+    ] {
+        for literal in [false, true] {
+            let (mut app, source) = app_with_alt_arrow_pane_focus();
+            if split {
+                app.split_active_stub_tab(source);
+            }
+            if left_edge {
+                assert!(app.focus_pane_in(source, crate::pane::FocusDir::Left));
+            }
+            if zoomed {
+                app.toggle_pane_zoom();
+            }
+            if literal {
+                app.key_sequences = crate::keybinding::KeySequences::from_config(Some(
+                    &[("alt+left".to_string(), "literal-left".to_string())]
+                        .into_iter()
+                        .collect(),
+                ));
+            }
+            let before_source = focus(&app, source);
+            let next = app.next_session_id;
+            let front = app.insert_logical_window(crate::stub_session(next), 24, 80);
+            if front_split {
+                app.split_active_stub_tab(front);
+            }
+            let before_front = app.windows[&front].tab_set.active().unwrap().clone();
+            assert_eq!(app.frontmost_window, Some(front));
+            let moves = split && !left_edge && !zoomed;
+            let context = format!(
+                "split={split} edge={left_edge} zoom={zoomed} front_split={front_split} literal={literal}"
+            );
+
+            press(&mut app, source, LEFT);
+            if focus(&app, source) != if moves { 0 } else { before_source } {
+                failures.push(format!("{context}: focus did not follow the event window"));
+            }
+            let expected_owner = match owner(&app, LEFT) {
+                Some(PhysicalPressOwner::Consumed { window }) => moves && window == source,
+                Some(PhysicalPressOwner::Literal {
+                    window,
+                    session,
+                    event: crate::input::InputEvent::KeySequence(bytes),
+                    ..
+                }) => {
+                    !moves
+                        && literal
+                        && window == source
+                        && session == before_source
+                        && bytes.as_slice() == b"literal-left"
+                }
+                Some(PhysicalPressOwner::Forwarded {
+                    window, session, ..
+                }) => {
+                    !moves
+                        && !literal
+                        && window == source
+                        && session == before_source
+                        && forwarded(&app, LEFT) == (before_source, LEFT.alt_bytes.to_vec())
+                }
+                _ => false,
+            };
+            if !expected_owner {
+                failures.push(format!(
+                    "{context}: wrong press owner: {:?}",
+                    owner(&app, LEFT)
+                ));
+            }
+            if app.windows[&front].tab_set.active() != Some(&before_front) {
+                failures.push(format!("{context}: the unrelated front pane changed"));
+            }
+            let source_after_press = app.windows[&source].tab_set.active().unwrap().clone();
+            let front_after_press = app.windows[&front].tab_set.active().unwrap().clone();
+            app.on_key(front, event(LEFT, ElementState::Pressed, true));
+            assert_eq!(
+                app.windows[&source].tab_set.active(),
+                Some(&source_after_press)
+            );
+            assert_eq!(
+                app.windows[&front].tab_set.active(),
+                Some(&front_after_press)
+            );
+            if expected_owner && !moves {
+                let trace = take_physical_release_trace();
+                assert!(
+                    match trace {
+                        Some(PhysicalReleaseTrace::Literal {
+                            press_window,
+                            session,
+                            repeated: true,
+                            ..
+                        }) => literal && press_window == source && session == before_source,
+                        Some(PhysicalReleaseTrace::Forwarded {
+                            press_window,
+                            session,
+                            event_type: KeyEventType::Repeat,
+                            ..
+                        }) => !literal && press_window == source && session == before_source,
+                        _ => false,
+                    },
+                    "{context}: repeats retain their actual press-time route"
+                );
+            }
+            release(&mut app, front, LEFT);
+            assert!(
+                owner(&app, LEFT).is_none(),
+                "{context}: release ends the hold"
+            );
+            assert!(!consumed(&app, source, LEFT));
+            assert_eq!(app.frontmost_window, Some(front));
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn configured_and_hardcoded_focus_keep_native_event_window_ownership() {
+    let mut failures = Vec::new();
+    for native in [false, true] {
+        for hardcoded in [false, true] {
+            if hardcoded && !super::HARDCODED_SUPER_CHORDS {
+                continue;
+            }
+            let (mut app, source) = app_with_alt_arrow_pane_focus();
+            let left = if native {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                let (instance, left) = app.active_native_view(source).unwrap();
+                app.split_active_with_native(
+                    source,
+                    crate::tab_model::SplitAxis::Horizontal,
+                    instance,
+                    crate::native_app::AppViewState::Settings(Box::new(
+                        crate::native_settings::SettingsViewState::new(&app.config),
+                    )),
+                )
+                .unwrap();
+                left
+            } else {
+                let left = app.windows[&source].tab_set.active().unwrap().focus;
+                app.split_active_stub_tab(source);
+                left
+            };
+            let source_before = app.windows[&source].tab_set.active().unwrap().clone();
+            let next = app.next_session_id;
+            let front = app.insert_logical_window(crate::stub_session(next), 24, 80);
+            app.split_active_stub_tab(front);
+            let front_before = app.windows[&front].tab_set.active().unwrap().clone();
+            app.windows.get_mut(&source).unwrap().mods = if hardcoded {
+                ModifiersState::SUPER | ModifiersState::ALT
+            } else {
+                ModifiersState::ALT
+            };
+            press(&mut app, source, LEFT);
+            let after = app.windows[&source].tab_set.active().unwrap();
+            if after.focus != left {
+                failures.push(format!(
+                    "native={native} hardcoded={hardcoded}: source pane did not take focus"
+                ));
+            }
+            assert_eq!(after.id, source_before.id);
+            assert_eq!(after.root, source_before.root);
+            if app.windows[&front].tab_set.active() != Some(&front_before) {
+                failures.push(format!(
+                    "native={native} hardcoded={hardcoded}: front window changed"
+                ));
+            }
+            assert!(
+                matches!(owner(&app, LEFT), Some(PhysicalPressOwner::Consumed { window }) if window == source)
+            );
+            let after = app.windows[&source].tab_set.active().unwrap().clone();
+            let front_after = app.windows[&front].tab_set.active().unwrap().clone();
+            app.on_key(front, event(LEFT, ElementState::Pressed, true));
+            assert_eq!(app.windows[&source].tab_set.active(), Some(&after));
+            assert_eq!(app.windows[&front].tab_set.active(), Some(&front_after));
+            release(&mut app, front, LEFT);
+            assert!(
+                matches!(take_physical_release_trace(), Some(PhysicalReleaseTrace::Consumed { press_window, arrival_window }) if press_window == source && arrival_window == front)
+            );
+            assert!(owner(&app, LEFT).is_none());
+            assert_eq!(app.frontmost_window, Some(front));
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn configured_and_hardcoded_zoom_keep_the_event_window() {
+    let mut failures = Vec::new();
+    for (split, native) in [(false, false), (true, false), (true, true)] {
+        for hardcoded in [false, true] {
+            if hardcoded && !super::HARDCODED_SUPER_CHORDS {
+                continue;
+            }
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            if native {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                let (instance, _) = app.active_native_view(source).unwrap();
+                app.split_active_with_native(
+                    source,
+                    crate::tab_model::SplitAxis::Horizontal,
+                    instance,
+                    crate::native_app::AppViewState::Settings(Box::new(
+                        crate::native_settings::SettingsViewState::new(&app.config),
+                    )),
+                )
+                .unwrap();
+            } else if split {
+                app.split_active_stub_tab(source);
+            }
+            let source_before = app.windows[&source].tab_set.active().unwrap().clone();
+            let next = app.next_session_id;
+            let front = app.insert_logical_window(crate::stub_session(next), 24, 80);
+            app.split_active_stub_tab(front);
+            let front_before = app.windows[&front].tab_set.active().unwrap().clone();
+            let (mods, code, logical) = if hardcoded {
+                (
+                    ModifiersState::SUPER | ModifiersState::SHIFT,
+                    KeyCode::Enter,
+                    Key::Named(NamedKey::Enter),
+                )
+            } else {
+                app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+                    &[("ctrl+shift+z".to_string(), "toggle_pane_zoom".to_string())]
+                        .into_iter()
+                        .collect(),
+                ));
+                (
+                    ModifiersState::CONTROL | ModifiersState::SHIFT,
+                    KeyCode::KeyZ,
+                    Key::Character("z".into()),
+                )
+            };
+            app.windows.get_mut(&source).unwrap().mods = mods;
+            let zoom_key = |state, repeat| {
+                KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    logical.clone(),
+                    None,
+                    KeyLocation::Standard,
+                    state,
+                    repeat,
+                )
+            };
+            app.on_key(source, zoom_key(ElementState::Pressed, false));
+            let after = app.windows[&source].tab_set.active().unwrap();
+            if after.zoomed != split {
+                failures.push(format!(
+                    "split={split} native={native} hardcoded={hardcoded}: zoom missed source"
+                ));
+            }
+            assert_eq!(after.id, source_before.id);
+            assert_eq!(after.root, source_before.root);
+            assert_eq!(after.focus, source_before.focus);
+            if !native && app.active_tree(source).unwrap().is_zoomed() != split {
+                failures.push(format!(
+                    "split={split} hardcoded={hardcoded}: terminal projection zoom mismatch"
+                ));
+            }
+            if app.windows[&front].tab_set.active() != Some(&front_before) {
+                failures.push(format!("split={split} native={native} hardcoded={hardcoded}: unrelated front zoom changed"));
+            }
+            assert!(
+                matches!(app.physical_press_owners.get(&PhysicalKey::Code(code)), Some(PhysicalPressOwner::Consumed { window }) if *window == source)
+            );
+            let source_after = app.windows[&source].tab_set.active().unwrap().clone();
+            let front_after = app.windows[&front].tab_set.active().unwrap().clone();
+            app.on_key(front, zoom_key(ElementState::Pressed, true));
+            assert_eq!(app.windows[&source].tab_set.active(), Some(&source_after));
+            assert_eq!(app.windows[&front].tab_set.active(), Some(&front_after));
+            app.on_key(front, zoom_key(ElementState::Released, false));
+            assert!(
+                matches!(take_physical_release_trace(), Some(PhysicalReleaseTrace::Consumed { press_window, arrival_window }) if press_window == source && arrival_window == front)
+            );
+            assert!(
+                !app.physical_press_owners
+                    .contains_key(&PhysicalKey::Code(code))
+            );
+            assert_eq!(app.frontmost_window, Some(front));
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

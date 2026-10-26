@@ -111,7 +111,12 @@ pub const fn dark_nudge_permitted(adv_nudged_px: f32, adv_default_px: f32) -> bo
 /// Parse face `index` of `bytes` for its variation facts.
 #[must_use]
 pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
-    let face = aterm_font::Face::parse(bytes, index).ok()?;
+    probe_face(&aterm_font::Face::parse(bytes, index).ok()?)
+}
+
+/// [`probe`] on a parsed face.
+#[must_use]
+pub fn probe_face(face: &aterm_font::Face<'_>) -> Option<VfProbe> {
     let axes: Vec<VfAxis> = face
         .variation_axes()
         .into_iter()
@@ -125,7 +130,7 @@ pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
     if axes.is_empty() {
         return None;
     }
-    let regular_coords = regular_instance_coords(&face, axes.len());
+    let regular_coords = regular_instance_coords(face, axes.len());
     Some(VfProbe {
         axes,
         regular_coords,
@@ -161,44 +166,87 @@ fn instance_coords_named(
     axis_count: usize,
     wanted: impl Fn(&str) -> bool,
 ) -> Option<Vec<f32>> {
-    let data = face
-        .raw_face()
-        .table(aterm_font::Tag::from_bytes(b"fvar"))?;
+    instance_records(face)
+        .into_iter()
+        .filter(|record| record.coords.len() == axis_count)
+        .find(|record| name_is(face, record.subfamily_name_id, &wanted))
+        .map(|record| record.design_coords())
+}
+
+/// One named instance of a variable face, as its `fvar` record gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceRecord {
+    /// The `name` id of its subfamily name (`Light Italic`).
+    pub subfamily_name_id: u16,
+    /// The `name` id of its PostScript name, where the record carries one.
+    pub postscript_name_id: Option<u16>,
+    /// Its design-space coords as the record stores them (16.16 fixed), one per axis
+    /// in `fvar` order.
+    pub coords: Vec<i32>,
+}
+
+impl InstanceRecord {
+    /// [`Self::coords`] as design-space values.
+    #[must_use]
+    pub fn design_coords(&self) -> Vec<f32> {
+        self.coords
+            .iter()
+            .map(|&raw| raw as f32 / 65536.0)
+            .collect()
+    }
+}
+
+/// Every named instance of `face` from its raw `fvar` table (bounds-checked; empty for
+/// a static face or a table this reader does not know).
+#[must_use]
+pub fn instance_records(face: &aterm_font::Face<'_>) -> Vec<InstanceRecord> {
+    let Some(data) = face.raw_face().table(aterm_font::Tag::from_bytes(b"fvar")) else {
+        return Vec::new();
+    };
     let u16_at = |off: usize| -> Option<u16> {
         Some(u16::from_be_bytes([*data.get(off)?, *data.get(off + 1)?]))
     };
-    if u16_at(0)? != 1 {
-        return None;
-    }
-    let axes_off = usize::from(u16_at(4)?);
-    let n_axes = usize::from(u16_at(8)?);
-    let axis_size = usize::from(u16_at(10)?);
-    let n_inst = usize::from(u16_at(12)?);
-    let inst_size = usize::from(u16_at(14)?);
-    if n_axes != axis_count || inst_size < 4 + 4 * n_axes {
-        return None;
-    }
-    let inst_base = axes_off.checked_add(n_axes.checked_mul(axis_size)?)?;
-    for i in 0..n_inst {
-        let rec = inst_base.checked_add(i.checked_mul(inst_size)?)?;
-        let name_id = u16_at(rec)?;
-        if !name_is(face, name_id, &wanted) {
-            continue;
+    let i32_at = |off: usize| -> Option<i32> {
+        Some(i32::from_be_bytes([
+            *data.get(off)?,
+            *data.get(off + 1)?,
+            *data.get(off + 2)?,
+            *data.get(off + 3)?,
+        ]))
+    };
+    let records = || -> Option<Vec<InstanceRecord>> {
+        if u16_at(0)? != 1 {
+            return None;
         }
-        let mut coords = Vec::with_capacity(n_axes);
-        for a in 0..n_axes {
-            let off = rec + 4 + 4 * a;
-            let raw = i32::from_be_bytes([
-                *data.get(off)?,
-                *data.get(off + 1)?,
-                *data.get(off + 2)?,
-                *data.get(off + 3)?,
-            ]);
-            coords.push(raw as f32 / 65536.0);
+        let axes_off = usize::from(u16_at(4)?);
+        let n_axes = usize::from(u16_at(8)?);
+        let axis_size = usize::from(u16_at(10)?);
+        let n_inst = usize::from(u16_at(12)?);
+        let inst_size = usize::from(u16_at(14)?);
+        let coords_end = 4 + 4 * n_axes;
+        if inst_size < coords_end {
+            return None;
         }
-        return Some(coords);
-    }
-    None
+        let inst_base = axes_off.checked_add(n_axes.checked_mul(axis_size)?)?;
+        let mut out = Vec::with_capacity(n_inst);
+        for i in 0..n_inst {
+            let rec = inst_base.checked_add(i.checked_mul(inst_size)?)?;
+            let coords = (0..n_axes)
+                .map(|a| i32_at(rec + 4 + 4 * a))
+                .collect::<Option<Vec<i32>>>()?;
+            let postscript_name_id = (inst_size >= coords_end + 2)
+                .then(|| u16_at(rec + coords_end))
+                .flatten()
+                .filter(|&id| id != 0xFFFF);
+            out.push(InstanceRecord {
+                subfamily_name_id: u16_at(rec)?,
+                postscript_name_id,
+                coords,
+            });
+        }
+        Some(out)
+    };
+    records().unwrap_or_default()
 }
 
 /// Whether `name` record `name_id` decodes to a name `wanted` accepts

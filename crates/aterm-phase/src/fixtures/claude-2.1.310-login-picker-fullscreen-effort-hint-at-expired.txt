@@ -1,0 +1,51 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, the harness tape's own `text --json` read (seq 554, 0.8 s after aterm's harness typed /login; `aterm drive tape cat --text`) of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path on its default route (no `CLAUDE_CONFIG_DIR`, no `ANTHROPIC_BASE_URL` and no proxy: the lab's scratch HOME, `CLAUDE_SECURESTORAGE_CONFIG_DIR` a scratch login dir whose `.credentials.json` is a dead stored login, no `apiKeyHelper` and no OAuth token, every connection but loopback denied by the lab's jail, crates/aterm-lab), which drew its fullscreen renderer of its own accord (no `CLAUDE_CODE_NO_FLICKER`) · the /login method picker on the fullscreen renderer as it first opens, typed by aterm's harness (auth-login@v1) at the `⏺ Login expired · Please run /login` error row, the focus where it opens (no method picked): Claude Code's right-aligned `◐ medium · /effort` hint drawn into the panel's `▔` rule, 2.1.310
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.kKi5/proj
+
+
+❯ Write one sentence about harbours, then stop.
+
+⏺ Login expired · Please run /login
+
+✻ Cooked for 0s · done 2:07 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Login
+
+   Claude Code can be used with your Claude subscription or billed based on API usage through your Console account.
+
+   Select login method:
+
+   ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise
+     2. Anthropic Console account · API usage billing
+     3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex AI
+
+   Esc to cancel

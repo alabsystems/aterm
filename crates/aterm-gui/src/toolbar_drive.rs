@@ -39,9 +39,10 @@ mod macos {
     use aterm_window::window::{Window, WindowId as WinitWindowId};
 
     use super::{FINDING, HUNG, NOT_RUN, PASS};
-    use crate::session_chrome::{TabChromeExt, TabMenuEntry};
+    use crate::app_tabs::NativeTabCommand;
+    use crate::session_chrome::{RewindMenuOrigin, TabChromeExt, TabMenuEntry};
     use crate::tab_bar::TabStripMetadata;
-    use crate::tab_model::{TabConnRole, TabIconKind, TabId};
+    use crate::tab_model::{TabConnRole, TabIconKind, TabId, ViewId};
     use crate::{Wake, WindowId, toolbar};
 
     type PopUpContextMenu = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id);
@@ -50,6 +51,11 @@ mod macos {
         aterm_objc::swizzle::SwizzleSite::new();
     static MENUS_SWALLOWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static LAST_MENU_ITEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    std::thread_local! {
+        static LAST_POPPED_MENU: std::cell::RefCell<Option<aterm_objc::Obj>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
 
     unsafe extern "C-unwind" fn swallow_pop_up(
         _cls: Id,
@@ -66,6 +72,9 @@ mod macos {
             usize::try_from(unsafe { s_isize(menu, sel!(numberOfItems)) }).unwrap_or(0)
         };
         LAST_MENU_ITEMS.store(items, Relaxed);
+        // SAFETY: AppKit passed this live +0 menu on the main thread. Keep a +1
+        // beyond the swallowed tracking call so its real row can be the sender.
+        LAST_POPPED_MENU.with(|slot| *slot.borrow_mut() = unsafe { aterm_objc::Obj::retain(menu) });
         MENUS_SWALLOWED.fetch_add(1, Relaxed);
     }
 
@@ -409,16 +418,35 @@ mod macos {
     struct Driver {
         window: Option<Window>,
         wakes: Vec<String>,
+        native_wakes: Vec<(WindowId, NativeTabCommand)>,
+        rewind_wakes: Vec<(WindowId, TabId, RewindMenuOrigin, u64)>,
         blocked: Option<String>,
+    }
+
+    impl Driver {
+        fn clear_wakes(&mut self) {
+            self.wakes.clear();
+            self.native_wakes.clear();
+            self.rewind_wakes.clear();
+        }
     }
 
     fn show_wake(w: &Wake) -> Option<String> {
         Some(match w {
-            Wake::SelectTab { index, .. } => format!("SelectTab({index})"),
-            Wake::CloseTab { index, .. } => format!("CloseTab({index})"),
+            Wake::NativeTabCommand { window, command } => {
+                format!("NativeTabCommand({window:?},{command:?})")
+            }
             Wake::TabCmd { action, .. } => format!("TabCmd({action:?})"),
             Wake::TabContextMenuOpening { .. } => "TabContextMenuOpening".to_owned(),
             Wake::TabMenuAction { action, .. } => format!("TabMenuAction({action:?})"),
+            Wake::TabMenuRewind {
+                window,
+                tab,
+                origin,
+                at_ms,
+            } => {
+                format!("TabMenuRewind({window:?},{tab:?},{origin:?},{at_ms})")
+            }
             Wake::MenuAction { action, .. } => format!("MenuAction({action:?})"),
             Wake::BeginSessionRename { tab, .. } => format!("BeginSessionRename({tab})"),
             Wake::CommitSessionRename { session, text, .. } => {
@@ -455,6 +483,18 @@ mod macos {
         ) {
         }
         fn user_event(&mut self, _el: &ActiveEventLoop, w: Wake) {
+            if let Wake::NativeTabCommand { window, command } = &w {
+                self.native_wakes.push((*window, *command));
+            }
+            if let Wake::TabMenuRewind {
+                window,
+                tab,
+                origin,
+                at_ms,
+            } = &w
+            {
+                self.rewind_wakes.push((*window, *tab, *origin, *at_ms));
+            }
             if let Some(s) = show_wake(&w) {
                 self.wakes.push(s);
             }
@@ -831,6 +871,8 @@ mod macos {
         let mut d = Driver {
             window: None,
             wakes: Vec::new(),
+            native_wakes: Vec::new(),
+            rewind_wakes: Vec::new(),
             blocked: None,
         };
         let start = Instant::now();
@@ -847,7 +889,8 @@ mod macos {
             );
             return NOT_RUN;
         };
-        let Some(handle) = toolbar::install_window_toolbar(win, &proxy, WindowId(1)) else {
+        let strip_window = WindowId(42);
+        let Some(handle) = toolbar::install_window_toolbar(win, &proxy, strip_window) else {
             crate::logging::stderr_line!(
                 "objc-toolbar-drive: NOT RUN — install_window_toolbar returned None"
             );
@@ -978,7 +1021,7 @@ mod macos {
         take_focus(&mut d, &mut el);
         pump(&mut d, &mut el, 250);
         for (i, c) in cs.iter().enumerate() {
-            d.wakes.clear();
+            d.clear_wakes();
             let before = focused();
             // SAFETY: `c` and `strip` are live views, `ns_window` is live; the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
@@ -1001,67 +1044,165 @@ mod macos {
             pump(&mut d, &mut el, 120);
             cx.check_focused(
                 before && focused(),
-                d.wakes.iter().any(|w| w == &format!("SelectTab({i})")),
-                format!("chip{i} click posted SelectTab({i}); saw {:?}", d.wakes),
+                d.native_wakes == [(strip_window, NativeTabCommand::Select(m3.ids[i]))],
+                format!(
+                    "chip{i} click selected {:?} in {strip_window:?}; saw {:?}",
+                    m3.ids[i], d.native_wakes
+                ),
             );
         }
 
-        println!("\n-- stage 4: drag chip0 across chip2 (down, 6 drags, up)");
-        d.wakes.clear();
-        let before = focused();
-        // SAFETY: live views and NSWindow, as stage 3.
-        unsafe {
-            let b0 = s_rect(cs[0], sel!(bounds));
-            let p0 = s_point_point_id(
-                cs[0],
-                sel!(convertPoint:toView:),
-                CGPoint {
-                    x: b0.size.width * 0.5,
-                    y: b0.size.height * 0.5,
-                },
-                Id::NIL,
+        println!("\n-- stage 3b: VoiceOver press and close callbacks keep the tab's identity");
+        for (i, c) in cs.iter().enumerate() {
+            d.clear_wakes();
+            // SAFETY: each live ATermTabView implements these exact callbacks;
+            // the driver observes their queued effects without closing the views.
+            let pressed = unsafe {
+                let pressed = s_bool(*c, sel!(accessibilityPerformPress));
+                s_v_id(*c, sel!(closeTab:), Id::NIL);
+                pressed
+            };
+            pump(&mut d, &mut el, 120);
+            cx.check(
+                pressed
+                    && d.native_wakes
+                        == [
+                            (strip_window, NativeTabCommand::Select(m3.ids[i])),
+                            (strip_window, NativeTabCommand::Close(m3.ids[i])),
+                        ],
+                format!(
+                    "chip{i} AX press and close name {:?} in {strip_window:?}; saw {:?}",
+                    m3.ids[i], d.native_wakes
+                ),
             );
-            let b2 = s_rect(cs[2], sel!(bounds));
-            let p2 = s_point_point_id(
-                cs[2],
-                sel!(convertPoint:toView:),
-                CGPoint {
-                    x: b2.size.width * 0.6,
-                    y: b2.size.height * 0.5,
-                },
-                Id::NIL,
-            );
-            s_v_id(
-                ns_window,
-                sel!(sendEvent:),
-                mouse_event(LEFT_DOWN, p0, 0, win_no, 1),
-            );
-            for k in 1..=6 {
-                let t = f64::from(k) / 6.0;
-                let p = CGPoint {
-                    x: p0.x + (p2.x - p0.x) * t,
-                    y: p0.y,
-                };
+        }
+        let mut protected = model(3);
+        protected.metadata[1].closable = false;
+        apply(&handle, &protected);
+        d.clear_wakes();
+        // SAFETY: the strip is live; acquire its current receivers after update.
+        let protected_chips = unsafe { chips(strip) };
+        cx.check(
+            protected_chips.len() == 3,
+            format!(
+                "the non-closable model still has three chips (got {})",
+                protected_chips.len()
+            ),
+        );
+        if protected_chips.len() != 3 {
+            return FINDING;
+        }
+        // SAFETY: the current chip implements the void(id, SEL, id) callback.
+        unsafe { s_v_id(protected_chips[1], sel!(closeTab:), Id::NIL) };
+        pump(&mut d, &mut el, 120);
+        cx.check(
+            d.native_wakes.is_empty(),
+            format!(
+                "a non-closable chip posts no native tab command; saw {:?}",
+                d.native_wakes
+            ),
+        );
+        apply(&handle, &m3);
+        // SAFETY: the strip is live; subsequent gestures use its current receivers.
+        let cs = unsafe { chips(strip) };
+        cx.check(
+            cs.len() == 3,
+            format!("the restored model has three chips (got {})", cs.len()),
+        );
+        if cs.len() != 3 {
+            return FINDING;
+        }
+
+        println!("\n-- stage 4: drag chip0 across chip2, including a row rebind after press");
+        let mut rebound = model(3);
+        for (i, id) in rebound.ids.iter_mut().enumerate() {
+            *id = TabId::from_stored(i as u64 + 101);
+        }
+        for (rebind_after_press, ids) in [(true, &m3.ids), (false, &rebound.ids)] {
+            d.clear_wakes();
+            let before = focused();
+            // SAFETY: live views and NSWindow, as stage 3. The same-geometry
+            // model update below is checked to retain these exact receivers.
+            unsafe {
+                let b0 = s_rect(cs[0], sel!(bounds));
+                let p0 = s_point_point_id(
+                    cs[0],
+                    sel!(convertPoint:toView:),
+                    CGPoint {
+                        x: b0.size.width * 0.5,
+                        y: b0.size.height * 0.5,
+                    },
+                    Id::NIL,
+                );
+                let b2 = s_rect(cs[2], sel!(bounds));
+                let p2 = s_point_point_id(
+                    cs[2],
+                    sel!(convertPoint:toView:),
+                    CGPoint {
+                        x: b2.size.width * 0.6,
+                        y: b2.size.height * 0.5,
+                    },
+                    Id::NIL,
+                );
                 s_v_id(
                     ns_window,
                     sel!(sendEvent:),
-                    mouse_event(LEFT_DRAG, p, 0, win_no, 0),
+                    mouse_event(LEFT_DOWN, p0, 0, win_no, 1),
+                );
+                if rebind_after_press {
+                    apply(&handle, &rebound);
+                    let retained = chips(strip) == cs;
+                    cx.check(
+                        retained,
+                        "same-geometry ID rebinding retained all three pressed chip receivers"
+                            .to_owned(),
+                    );
+                    if !retained {
+                        return FINDING;
+                    }
+                }
+                for k in 1..=6 {
+                    let t = f64::from(k) / 6.0;
+                    let p = CGPoint {
+                        x: p0.x + (p2.x - p0.x) * t,
+                        y: p0.y,
+                    };
+                    s_v_id(
+                        ns_window,
+                        sel!(sendEvent:),
+                        mouse_event(LEFT_DRAG, p, 0, win_no, 0),
+                    );
+                }
+                s_v_id(
+                    ns_window,
+                    sel!(sendEvent:),
+                    mouse_event(LEFT_UP, p2, 0, win_no, 1),
                 );
             }
-            s_v_id(
-                ns_window,
-                sel!(sendEvent:),
-                mouse_event(LEFT_UP, p2, 0, win_no, 1),
+            pump(&mut d, &mut el, 200);
+            cx.check_focused(
+                before && focused(),
+                d.native_wakes == [
+                    (strip_window, NativeTabCommand::Select(ids[0])),
+                    (strip_window, NativeTabCommand::Move {
+                        tab: ids[0], neighbor: ids[1], forward: true,
+                    }),
+                ],
+                format!("drag rebind_after_press={rebind_after_press} keeps the pressed adjacent pair {:?} in {strip_window:?}; saw {:?}", &ids[..2], d.native_wakes),
             );
         }
-        pump(&mut d, &mut el, 200);
-        cx.check_focused(
-            before && focused(),
-            d.wakes.iter().any(|w| w.starts_with("TabCmd(Move")),
-            format!("the drag posted a reorder; saw {:?}", d.wakes),
-        );
+        apply(&handle, &m3);
 
         println!("\n-- stage 5: the context menu, two ways in");
+        // SAFETY: the strip is live; read back current receivers after restoring IDs.
+        let cs = unsafe { chips(strip) };
+        cx.check(
+            cs.len() == 3,
+            format!("the drag control leaves three chips (got {})", cs.len()),
+        );
+        if cs.len() != 3 {
+            return FINDING;
+        }
         // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it answers its metaclass.
         let meta = unsafe { aterm_objc::class_of(class(c"NSMenu").as_id()) };
         // SAFETY: the stub has exactly the row's prototype and cannot unwind; NSMenu's metaclass is live and the selector is interned.
@@ -1097,7 +1238,7 @@ mod macos {
         take_focus(&mut d, &mut el);
         pump(&mut d, &mut el, 250);
         for (i, c) in cs.iter().enumerate() {
-            d.wakes.clear();
+            d.clear_wakes();
             let before = focused();
             // SAFETY: `c` is a live view, `app` is the live NSApp, and the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
@@ -1121,10 +1262,10 @@ mod macos {
             pump(&mut d, &mut el, 120);
             cx.check_focused(
                 before && focused(),
-                d.wakes.iter().any(|w| w == &format!("SelectTab({i})")),
+                d.native_wakes == [(strip_window, NativeTabCommand::Select(m3.ids[i]))],
                 format!(
-                    "chip{i} NSApp click posted SelectTab({i}); saw {:?}",
-                    d.wakes
+                    "chip{i} NSApp click selected {:?} in {strip_window:?}; saw {:?}",
+                    m3.ids[i], d.native_wakes
                 ),
             );
         }
@@ -1152,7 +1293,7 @@ mod macos {
                     s_bool(ns_window, sel!(isMainWindow))
                 );
 
-                d.wakes.clear();
+                d.clear_wakes();
                 let before = focused();
                 s_v_id(
                     app,
@@ -1165,7 +1306,8 @@ mod macos {
                     mouse_event(LEFT_UP, wp, 0, win_no, 1),
                 );
                 pump(&mut d, &mut el, 200);
-                let control_arrived = d.wakes.iter().any(|w| w == "SelectTab(1)");
+                let control_arrived =
+                    d.native_wakes == [(strip_window, NativeTabCommand::Select(m3.ids[1]))];
                 println!("  --  [NSApp sendEvent:] plain left -> {:?}", d.wakes);
                 cx.check_focused(
                     before && focused(),
@@ -1173,7 +1315,7 @@ mod macos {
                     "the CONTROL arrived: NSApp routes a plain left click".to_owned(),
                 );
 
-                d.wakes.clear();
+                d.clear_wakes();
                 let before = pops();
                 s_v_id(app, sel!(sendEvent:), ctrl_ev);
                 s_v_id(
@@ -1188,7 +1330,7 @@ mod macos {
                     pops() - before
                 );
 
-                d.wakes.clear();
+                d.clear_wakes();
                 let before = pops();
                 s_v_id(app, sel!(sendEvent:), right_ev);
                 s_v_id(
@@ -1219,7 +1361,7 @@ mod macos {
                     ),
                     ("chip mouseDown: ctrl", cs[1], sel!(mouseDown:), ctrl_ev),
                 ] {
-                    d.wakes.clear();
+                    d.clear_wakes();
                     let before = pops();
                     s_v_id(recv, s, ev);
                     pump(&mut d, &mut el, 300);
@@ -1270,7 +1412,7 @@ mod macos {
                         ("label rightMouseDown:", sel!(rightMouseDown:), right_ev),
                         ("label mouseDown: ctrl", sel!(mouseDown:), ctrl_ev),
                     ] {
-                        d.wakes.clear();
+                        d.clear_wakes();
                         s_v_id(lab, s, ev);
                         pump(&mut d, &mut el, 300);
                         println!("  --  [{label_txt}] -> {:?}", d.wakes);
@@ -1285,6 +1427,146 @@ mod macos {
             }
         } else {
             println!("  --  stage 5's menu entries NOT driven: the pop site is still AppKit's");
+        }
+
+        if pop_site_replaced {
+            println!("\n-- stage 5b: Rewind callbacks retain their popped row's owner");
+            let original = RewindMenuOrigin {
+                view: ViewId::from_stored(701),
+                session: 71,
+            };
+            let rebound = RewindMenuOrigin {
+                view: ViewId::from_stored(902),
+                session: 92,
+            };
+            let original_time = 1_700_000_000_123;
+            let rebound_time = 1_700_000_000_987;
+            let rebound_tab = TabId::from_stored(102);
+            let mut sender = None;
+            let mut previous_receivers = Vec::new();
+            for (label, tab, origin, at_ms, pop) in [
+                (
+                    "original pop",
+                    m3.ids[1],
+                    Some(original),
+                    original_time,
+                    true,
+                ),
+                (
+                    "rebound without pop",
+                    rebound_tab,
+                    Some(rebound),
+                    rebound_time,
+                    false,
+                ),
+                ("fresh pop", rebound_tab, Some(rebound), rebound_time, true),
+                ("unbound pop", rebound_tab, None, rebound_time + 1, true),
+            ] {
+                let mut fixture = model(3);
+                fixture.ids[1] = tab;
+                fixture.ext[1].menu = vec![
+                    TabMenuEntry::Header("recorded timeline".to_owned()),
+                    TabMenuEntry::RewindTo {
+                        words: label.to_owned(),
+                        at_ms,
+                        origin,
+                    },
+                ];
+                apply(&handle, &fixture);
+                // SAFETY: the strip is live; reacquire receivers after each model update.
+                let receivers = unsafe { chips(strip) };
+                cx.check(
+                    receivers.len() == 3,
+                    format!("{label}: three chip receivers remain"),
+                );
+                if receivers.len() != 3 {
+                    break;
+                }
+                if !pop {
+                    let reused = receivers == previous_receivers;
+                    cx.check(
+                        reused,
+                        "Rewind row rebinding retains the same chip receivers".to_owned(),
+                    );
+                    if !reused {
+                        continue;
+                    }
+                }
+                if pop {
+                    let before = pops();
+                    d.clear_wakes();
+                    // SAFETY: this is the live chip and its window's +0 NSEvent. The
+                    // installed pop stub prevents a modal tracking loop.
+                    unsafe {
+                        let bounds = s_rect(receivers[1], sel!(bounds));
+                        let point = s_point_point_id(
+                            receivers[1],
+                            sel!(convertPoint:toView:),
+                            CGPoint {
+                                x: bounds.size.width * 0.35,
+                                y: bounds.size.height * 0.5,
+                            },
+                            Id::NIL,
+                        );
+                        s_v_id(
+                            receivers[1],
+                            sel!(rightMouseDown:),
+                            mouse_event(RIGHT_DOWN, point, 0, win_no, 1),
+                        );
+                    }
+                    pump(&mut d, &mut el, 120);
+                    let popped = pops() > before
+                        && d.wakes.iter().any(|wake| wake == "TabContextMenuOpening");
+                    cx.check(
+                        popped,
+                        format!("{label}: the actual chip built and popped its Rewind menu"),
+                    );
+                    sender = if popped {
+                        LAST_POPPED_MENU.with(|slot| {
+                            let menu = slot.borrow();
+                            let menu = menu.as_ref()?;
+                            // SAFETY: the retained real menu has a header then its Rewind
+                            // row; itemAtIndex: takes NSInteger and returns a +0 item.
+                            unsafe {
+                                if s_isize(menu.id(), sel!(numberOfItems)) <= 1 {
+                                    return None;
+                                }
+                                let item_at: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id =
+                                    checked_msg();
+                                aterm_objc::Obj::retain(item_at(menu.id(), sel!(itemAtIndex:), 1))
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                }
+                previous_receivers = receivers.clone();
+                let Some(item) = sender.as_ref() else {
+                    cx.check(
+                        false,
+                        format!("{label}: the popped Rewind item is retained"),
+                    );
+                    continue;
+                };
+                d.clear_wakes();
+                // SAFETY: the receiver is the same live chip and the sender is the
+                // retained real NSMenuItem from its pop, including the disabled control.
+                unsafe {
+                    s_v_id(receivers[1], sel!(tabMenuRewind:), item.id());
+                }
+                pump(&mut d, &mut el, 120);
+                let expected = if !pop {
+                    vec![(strip_window, m3.ids[1], original, original_time)]
+                } else {
+                    origin
+                        .map(|owner| (strip_window, tab, owner, at_ms))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                };
+                cx.check(d.rewind_wakes == expected, format!("{label}: Rewind callback keeps window/tab/view/session/time; expected {expected:?}, saw {:?}", d.rewind_wakes));
+            }
+            apply(&handle, &m3);
+            LAST_POPPED_MENU.with(|slot| *slot.borrow_mut() = None);
         }
 
         println!("\n-- stage 6: a real resize, then the strip's own re-layout");
@@ -1408,7 +1690,7 @@ mod macos {
             "can_present_tab_rename".to_owned(),
         );
         let mut rename_target_cls = ClassPtr::NULL;
-        d.wakes.clear();
+        d.clear_wakes();
         cx.check(
             toolbar::begin_tab_rename(&handle, m3.ids[1], 77, "vim", "name"),
             "begin_tab_rename".to_owned(),
@@ -1476,7 +1758,7 @@ mod macos {
             toolbar::rename_editor_edit(&handle, crate::platform::RenameEditorEdit::SelectAll),
             "rename_editor_edit(SelectAll) found a field editor".to_owned(),
         );
-        d.wakes.clear();
+        d.clear_wakes();
         // SAFETY: live NSApp, +0 autoreleased events.
         unsafe {
             s_v_id(
@@ -1501,13 +1783,13 @@ mod macos {
         );
         toolbar::end_tab_rename(&handle);
         pump(&mut d, &mut el, 150);
-        d.wakes.clear();
+        d.clear_wakes();
         cx.check(
             toolbar::begin_tab_rename(&handle, m3.ids[1], 77, "vim", "name"),
             "begin_tab_rename again, for the commit branch".to_owned(),
         );
         pump(&mut d, &mut el, 200);
-        d.wakes.clear();
+        d.clear_wakes();
         // SAFETY: live NSApp, +0 autoreleased events.
         unsafe {
             s_v_id(
@@ -1766,7 +2048,7 @@ mod macos {
                 )
             };
             row("plus pressed", &mut d, &mut el, &mut matrix);
-            d.wakes.clear();
+            d.clear_wakes();
             // SAFETY: as above.
             unsafe { s_v_id(p, sel!(mouseUp:), mouse_event(LEFT_UP, wp, 0, win_no, 1)) };
             pump(&mut d, &mut el, 150);

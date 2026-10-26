@@ -489,12 +489,22 @@ impl Instance {
         let sock = self.sock.to_string_lossy();
         let mut argv = vec!["ctl", "--sock", &sock, "--timeout", "90"];
         argv.extend_from_slice(args);
-        let out = aterm_uds::spawnfd::command(&self.client)
-            .env_clear()
+        self.cli(None, &argv)
+    }
+
+    /// Runs `aterm <args>` (the instance's client) in the world's environment, in `cwd` when
+    /// given: a read view of its home such as `harness disk`.
+    #[must_use]
+    pub fn cli(&self, cwd: Option<&Path>, argv: &[&str]) -> Reply {
+        let mut cmd = aterm_uds::spawnfd::command(&self.client);
+        cmd.env_clear()
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .args(&argv)
-            .stdin(Stdio::null())
-            .output();
+            .args(argv)
+            .stdin(Stdio::null());
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let out = cmd.output();
         match out {
             Ok(o) => Reply {
                 code: o.status.code().unwrap_or(-1),

@@ -197,6 +197,9 @@ fn native_present_is_unchanged_by_the_footer_menu_and_link_steps() {
         ChromeStep::LinkTarget,
     ];
     let mut app = shaped(Shape::Native);
+    // The chrome fonts the first present would install after it, so the page it presents
+    // is not redrawn for them in the next.
+    app.sync_chrome_fonts();
     let masked = {
         let _mask = trace::mask(&STEPS);
         present(&mut app)

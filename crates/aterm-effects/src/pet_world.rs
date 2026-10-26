@@ -805,13 +805,13 @@ impl PetWorld {
             let mut row_strokes = 0usize;
             let mut spans = [(0, 0); MAX_REGIONS];
             let mut n_spans = 0;
-            if !exclusions.is_empty() {
-                for rect in exclusions {
-                    if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
-                        spans[n_spans] = span;
-                        n_spans += 1;
-                    }
+            let mut ei = 0;
+            while ei < exclusions.len() {
+                if let Some(span) = exclusion_span(exclusions[ei], local_r, pane.cols) {
+                    spans[n_spans] = span;
+                    n_spans += 1;
                 }
+                ei += 1;
             }
             let spans = &spans[..n_spans];
             if n_spans > 0 {
@@ -819,24 +819,24 @@ impl PetWorld {
             }
             let mut overlay_spans = [(0, 0); MAX_REGIONS];
             let mut n_overlay = 0;
-            if !overlays.is_empty() {
-                for rect in overlays {
-                    if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
-                        overlay_spans[n_overlay] = span;
-                        n_overlay += 1;
-                    }
+            let mut oi = 0;
+            while oi < overlays.len() {
+                if let Some(span) = exclusion_span(overlays[oi], local_r, pane.cols) {
+                    overlay_spans[n_overlay] = span;
+                    n_overlay += 1;
                 }
+                oi += 1;
             }
             let overlay_spans = &overlay_spans[..n_overlay];
             let mut typed_spans = [(0, 0); MAX_REGIONS];
             let mut n_typed = 0;
-            if !reserved_ink.is_empty() {
-                for rect in reserved_ink {
-                    if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
-                        typed_spans[n_typed] = span;
-                        n_typed += 1;
-                    }
+            let mut ti = 0;
+            while ti < reserved_ink.len() {
+                if let Some(span) = exclusion_span(reserved_ink[ti], local_r, pane.cols) {
+                    typed_spans[n_typed] = span;
+                    n_typed += 1;
                 }
+                ti += 1;
             }
             let typed_spans = &typed_spans[..n_typed];
             let mut scan = RowScan::new(input, frame_r);
@@ -1034,8 +1034,10 @@ impl PetWorld {
         if !s.alt_screen {
             let top = facts.stamp.top_absolute_row;
             let end = top.saturating_add(pane.rows as u64);
-            for (slot, block) in self.anchors.iter_mut().zip(facts.blocks.iter()) {
-                let Some(block) = block else {
+            let mut ai = 0;
+            while ai < MAX_WORLD_ANCHORS {
+                let Some(block) = &facts.blocks[ai] else {
+                    ai += 1;
                     continue;
                 };
                 let start = (match block.output_row {
@@ -1045,11 +1047,14 @@ impl PetWorld {
                 .max(top);
                 let last = block.end_row.min(end).saturating_sub(1);
                 if start > last {
+                    ai += 1;
                     continue;
                 }
                 let mut absolute_row = start;
                 let mut col = 0.0;
-                'rows: for r in (0..rows).rev() {
+                let mut r = rows;
+                'rows: while r > 0 {
+                    r -= 1;
                     let abs = top.saturating_add((self.coverage.row + r) as u64);
                     if abs < start || abs > last {
                         continue;
@@ -1069,7 +1074,7 @@ impl PetWorld {
                         }
                     }
                 }
-                *slot = Some(PetAnchor {
+                self.anchors[ai] = Some(PetAnchor {
                     surface: s,
                     block_id: block.id,
                     absolute_row,
@@ -1078,6 +1083,7 @@ impl PetWorld {
                     state: block.state,
                     exit_code: block.exit_code,
                 });
+                ai += 1;
             }
         }
         true
@@ -2660,16 +2666,27 @@ impl<'a, T> SparseRow<'a, T> {
 
     /// The value at `col`.
     #[inline]
-    fn get(&mut self, col: usize) -> Option<&'a T> {
+    const fn get(&mut self, col: usize) -> Option<&'a T> {
         let items = self.items;
         if items.is_empty() {
             return None;
         }
         if !self.ordered {
-            let Ok(i) = items.binary_search_by_key(&col, |(c, _)| *c) else {
-                return None;
+            let mut size = items.len();
+            let mut base = 0;
+            while size > 1 {
+                let half = size / 2;
+                let mid = base + half;
+                if items[mid].0 <= col {
+                    base = mid;
+                }
+                size -= half;
+            }
+            return if items[base].0 == col {
+                Some(&items[base].1)
+            } else {
+                None
             };
-            return Some(&items[i].1);
         }
         while self.cursor < items.len() && items[self.cursor].0 < col {
             self.cursor += 1;
@@ -2828,15 +2845,19 @@ impl<'a> RowScan<'a> {
     }
 
     #[inline]
-    fn cluster(&mut self, col: usize) -> Option<&'a str> {
-        let s = self.clusters.get(col)?;
-        Some(s.as_ref())
+    const fn cluster(&mut self, col: usize) -> Option<&'a str> {
+        let Some(s) = self.clusters.get(col) else {
+            return None;
+        };
+        Some(&**s)
     }
 
     #[inline]
-    fn combining(&mut self, col: usize) -> Option<&'a [char]> {
-        let s = self.combining.get(col)?;
-        Some(s.as_ref())
+    const fn combining(&mut self, col: usize) -> Option<&'a [char]> {
+        let Some(s) = self.combining.get(col) else {
+            return None;
+        };
+        Some(&**s)
     }
 
     #[inline]
@@ -2980,12 +3001,15 @@ fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
         )
     } else {
         let limit = input.selections.len().min(MAX_REGIONS);
-        for s in &input.selections[..limit] {
+        let mut i = 0;
+        while i < limit {
+            let s = &input.selections[i];
             if !s.inactive
                 && let Some(pos) = project_selection_target(&s.selection, 0, s.clip, max_col, pane)
             {
                 return Some(pos);
             }
+            i += 1;
         }
         None
     }

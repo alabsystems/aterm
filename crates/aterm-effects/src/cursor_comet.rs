@@ -319,7 +319,9 @@ impl CursorComet {
         let dimmed = lerp_rgb(cfg.color, 0x0000_0000, 0.50);
         let whitened = lerp_rgb(cfg.color, ICE_WHITE, 0.55);
         let mut discs = [(0.0f32, 0.0f32, 0.0f32, 0u32); 4];
-        for (slot, &(rx, cov_x, t0, dt)) in discs.iter_mut().zip(&COMA_DISCS) {
+        let mut di = 0;
+        while di < 4 {
+            let (rx, cov_x, t0, dt) = COMA_DISCS[di];
             let ramp = ice_ramp_with(cfg.color, dimmed, whitened, t0 + dt * e);
             let color = if rx >= 1.0 {
                 lerp_rgb(cfg.accent, ramp, 0.45)
@@ -327,7 +329,8 @@ impl CursorComet {
                 ramp
             };
             let r = radius * rx;
-            *slot = (r, r * r, (cov_core * cov_x).min(COV_CAP), color);
+            discs[di] = (r, r * r, (cov_core * cov_x).min(COV_CAP), color);
+            di += 1;
         }
         let slab = ((ch * 0.125) as i32).max(2);
         let wob_freq = 0.55 / ch.max(1.0) * 10.0;
@@ -336,7 +339,10 @@ impl CursorComet {
             |ym: f32| 1.0 + 0.05 * crate::supernova::sin_cos_f32(ym * wob_freq + wob_phase).0;
 
         let (cxi, cyi) = (cx as i32, cy as i32);
-        for &(r, r2, cov, color) in &discs {
+        let mut di = 0;
+        while di < discs.len() {
+            let (r, r2, cov, color) = discs[di];
+            di += 1;
             let cov = cov as u8;
             if r < 1.0 || cov == 0 {
                 continue;
@@ -368,24 +374,24 @@ impl CursorComet {
         if outer >= 1.0 {
             let mut ring_premul = [0u32; 4];
             let (mut sum, mut acc) = (0.0f32, [0.0f32; 3]);
-            for i in 0..discs.len() {
+            let mut i = 0;
+            while i < discs.len() {
                 let (_, _, cov, color) = discs[i];
                 sum += cov;
                 acc[0] += ((color >> 16) & 0xff) as f32 * cov;
                 acc[1] += ((color >> 8) & 0xff) as f32 * cov;
                 acc[2] += (color & 0xff) as f32 * cov;
-                if sum <= 0.0 {
-                    continue;
+                if sum > 0.0 {
+                    let cov = (sum * COMA_OUTSIDE_SCALE) as u8;
+                    if cov != 0 {
+                        let inv_sum = 1.0 / sum;
+                        let r_avg = ((acc[0] * inv_sum).round() as u32).min(255);
+                        let g_avg = ((acc[1] * inv_sum).round() as u32).min(255);
+                        let b_avg = ((acc[2] * inv_sum).round() as u32).min(255);
+                        ring_premul[i] = premul_rgb((r_avg << 16) | (g_avg << 8) | b_avg, cov);
+                    }
                 }
-                let cov = (sum * COMA_OUTSIDE_SCALE) as u8;
-                if cov == 0 {
-                    continue;
-                }
-                let inv_sum = 1.0 / sum;
-                let r_avg = ((acc[0] * inv_sum).round() as u32).min(255);
-                let g_avg = ((acc[1] * inv_sum).round() as u32).min(255);
-                let b_avg = ((acc[2] * inv_sum).round() as u32).min(255);
-                ring_premul[i] = premul_rgb((r_avg << 16) | (g_avg << 8) | b_avg, cov);
+                i += 1;
             }
             let top = (cy - outer).floor() as i32;
             let bot = (cy + outer).ceil() as i32;
@@ -495,40 +501,49 @@ fn ring_row(
     }
     let cx_round = cx.round() as i32;
     let mut x_edges = [(cx_round, cx_round); 4];
-    for i in 0..4 {
+    let mut i = 0;
+    while i < 4 {
         let w = hw[i];
         if w != 0.0 {
             x_edges[i] = ((cx - w).round() as i32, (cx + w).round() as i32);
         }
+        i += 1;
     }
-    for i in 0..discs.len() {
+    let mut i = 0;
+    while i < discs.len() {
         let premul = ring_premul[i];
-        if hw[i] < 1.0 || premul == 0 {
-            continue;
-        }
-        let (xo0, xo1) = x_edges[i];
-        let (xi0, xi1) = if i + 1 < 4 {
-            x_edges[i + 1]
-        } else {
-            (cx_round, cx_round)
-        };
-        let spans: [(i32, i32); 2] = if xi1 > xi0 {
-            [(xo0, xi0), (xi1, xo1)]
-        } else {
-            [(xo0, xo1), (0, 0)]
-        };
-        for (a, b) in spans {
-            let pieces: [(i32, i32); 2] = if in_band {
-                [(a, b.min(cell_x0)), (a.max(cell_x1), b)]
+        if hw[i] >= 1.0 && premul != 0 {
+            let (xo0, xo1) = x_edges[i];
+            let (xi0, xi1) = if i + 1 < 4 {
+                x_edges[i + 1]
             } else {
-                [(a, b), (0, 0)]
+                (cx_round, cx_round)
             };
-            for (x0, x1) in pieces {
-                if x1 > x0 {
-                    push_rect(out, geom, x0, y, x1 - x0, h, premul);
+            let spans: [(i32, i32); 2] = if xi1 > xi0 {
+                [(xo0, xi0), (xi1, xo1)]
+            } else {
+                [(xo0, xo1), (0, 0)]
+            };
+            let mut si = 0;
+            while si < 2 {
+                let (a, b) = spans[si];
+                si += 1;
+                let pieces: [(i32, i32); 2] = if in_band {
+                    [(a, b.min(cell_x0)), (a.max(cell_x1), b)]
+                } else {
+                    [(a, b), (0, 0)]
+                };
+                let mut pi = 0;
+                while pi < 2 {
+                    let (x0, x1) = pieces[pi];
+                    pi += 1;
+                    if x1 > x0 {
+                        push_rect(out, geom, x0, y, x1 - x0, h, premul);
+                    }
                 }
             }
         }
+        i += 1;
     }
 }
 

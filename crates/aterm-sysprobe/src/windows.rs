@@ -504,6 +504,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     ))
                     .unwrap_or(0),
                     cpu_ns: Some(cpu_100ns.saturating_mul(100)),
+                    child_cpu_ns: None,
                     footprint: Some(field(
                         rec,
                         offset_of!(ProcessInformation64, private_page_count),
@@ -515,6 +516,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     uid: None,
                     state: RunState::Unknown,
                     session_leader: None,
+                    sid: 0,
                     has_tty: None,
                     exec: None,
                     runnable_ns: None,
@@ -523,6 +525,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     coalition: None,
                     version: None,
                     birth_ms: start.and_then(crate::procs::birth_of_filetime),
+                    reaps_unwaited: None,
                 },
                 i64_at(rec, offset_of!(ProcessInformation64, create_time)).unwrap_or(0),
             ));

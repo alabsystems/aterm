@@ -1346,8 +1346,8 @@ struct DevtoolsFacts {
     did: Option<String>,
 }
 
-#[cfg(test)]
 impl DevtoolsFacts {
+    /// No list read: no row.
     const fn absent() -> Self {
         Self {
             facts: None,
@@ -1386,32 +1386,116 @@ fn unix_shell(
     (program.to_string_lossy().into_owned(), label)
 }
 
-fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
-    let program_check = program_check_fact();
+/// What [`doctor_facts_rows`] reads, one port per probe: [`FactReads::LIVE`] reads this
+/// machine, and a test counts the reads a narrowed run makes and makes none for real.
+struct FactReads<'a> {
+    /// One look at the program check's pool ([`program_check_fact`]).
+    program_check: &'a (dyn Fn() -> Option<aterm_uds::program_check::Look> + Sync),
+    /// The `devtools:` row's facts, and the hand-over due after the report ([`devtools_facts`]),
+    /// given `fix` and whether the program check is full.
+    devtools: &'a (dyn Fn(bool, bool) -> (DevtoolsFacts, Option<atpkg::devtools::Facts>) + Sync),
+    /// [`spotlight::facts`].
+    spotlight: &'a (dyn Fn() -> Option<Result<spotlight::Spotlit, String>> + Sync),
+    /// [`privacy_facts`].
+    privacy: &'a (dyn Fn() -> PrivacyFacts + Sync),
+    /// [`debugger_facts`].
+    debugger: &'a (dyn Fn() -> DebuggerFacts + Sync),
+    /// [`instances_fact`].
+    instances: &'a (dyn Fn() -> Result<aterm_ctl::census::Census, String> + Sync),
+    /// [`fabric_fact`], given why every program's command line goes unread.
+    fabric: &'a (dyn Fn(Option<&str>) -> FabricFact + Sync),
+}
+
+/// The fabric's row as [`fabric_fact`] reads it: its mark, its fact, and whether it went
+/// unmeasured.
+type FabricFact = Option<(Mark, String, bool)>;
+
+impl FactReads<'static> {
+    const LIVE: Self = Self {
+        program_check: &program_check_fact,
+        devtools: &devtools_facts,
+        spotlight: &spotlight::facts,
+        privacy: &privacy_facts,
+        debugger: &debugger_facts,
+        instances: &instances_fact,
+        fabric: &fabric_fact,
+    };
+}
+
+/// `aterm doctor`'s own rows that `reads` names (the shell's always), each probe on a thread
+/// of its own, and the Developer Tools facts when the hand-over is due after the report
+/// ([`devtools_hand_over_due`]). Nothing here waits on a person or opens a pane.
+fn doctor_facts_rows(
+    fix: bool,
+    reads: &dyn Fn(&str) -> bool,
+) -> (Vec<DoctorRow>, Option<atpkg::devtools::Facts>) {
+    facts_rows_over(fix, reads, &FactReads::LIVE)
+}
+
+/// [`doctor_facts_rows`] over `ports`.
+fn facts_rows_over(
+    fix: bool,
+    reads: &dyn Fn(&str) -> bool,
+    ports: &FactReads<'_>,
+) -> (Vec<DoctorRow>, Option<atpkg::devtools::Facts>) {
+    let program_check = ["syspolicyd:", "devtools:", "instances:", "fabric:"]
+        .into_iter()
+        .any(reads)
+        .then(ports.program_check)
+        .flatten();
     let withheld = args_read_withheld(program_check.as_ref());
     let withheld = withheld.as_deref();
-    std::thread::scope(|scope| {
+    fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+        handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+    fn unread<T>() -> Result<T, String> {
+        Err("not read".to_owned())
+    }
+    let (mut rows, hand_over) = std::thread::scope(|scope| {
         let check_full = withheld.is_some();
-        let devtools = scope.spawn(move || devtools_facts(fix, check_full));
-        let spotlight = scope.spawn(spotlight::facts);
-        let privacy = privacy_facts();
-        let debugger = debugger_facts();
-        let instances = match withheld {
-            Some(why) => Err(why.to_owned()),
-            None => aterm_ctl::census::window_census(FRONT_DOOR),
+        let devtools =
+            reads("devtools:").then(|| scope.spawn(move || (ports.devtools)(fix, check_full)));
+        let spotlight = reads("spotlight:").then(|| scope.spawn(ports.spotlight));
+        let privacy = reads("privacy:").then(|| scope.spawn(ports.privacy));
+        let debugger = reads("debugger:").then(|| scope.spawn(ports.debugger));
+        let instances = reads("instances:").then(|| {
+            scope.spawn(move || match withheld {
+                Some(why) => Err(why.to_owned()),
+                None => (ports.instances)(),
+            })
+        });
+        let fabric = reads("fabric:").then(|| scope.spawn(move || (ports.fabric)(withheld)));
+        let recovery = if reads("recovery:") {
+            recovery_facts()
+        } else {
+            unread()
         };
-        let recovery = recovery_facts();
-        let exceptions = exceptions_facts();
-        let mut machine = machine_facts(withheld);
-        let devtools = devtools
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        machine.spotlight = spotlight
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        machine.program_check = program_check;
+        let exceptions = if reads("exceptions:") {
+            exceptions_facts()
+        } else {
+            unread()
+        };
+        let machine = MachineFacts {
+            console_host: reads("conpty:").then(console_host_fact).flatten(),
+            fabric: fabric.and_then(join),
+            spotlight: spotlight.and_then(join),
+            program_check,
+            ..MachineFacts::absent()
+        };
+        let privacy = privacy.map_or_else(
+            || PrivacyFacts::not_measured(ProbeLabel::UnsupportedPlatform),
+            join,
+        );
+        let debugger = debugger.map_or_else(
+            || DebuggerFacts::not_measured(DebuggerProbeLabel::UnsupportedPlatform),
+            join,
+        );
+        let instances = instances.map_or_else(unread, join);
+        let (devtools, hand_over) = devtools.map_or_else(|| (DevtoolsFacts::absent(), None), join);
         #[cfg(not(windows))]
-        {
+        let rows = {
             let (shell, origin) = unix_shell(aterm_pty::select_shell_with_origin(None));
             doctor_rows(
                 &shell,
@@ -1425,9 +1509,9 @@ fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
                 &exceptions,
                 &machine,
             )
-        }
+        };
         #[cfg(windows)]
-        {
+        let rows = {
             let window_shell = driver::WindowShell::resolve();
             doctor_rows(
                 &window_shell.program,
@@ -1441,15 +1525,18 @@ fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
                 &exceptions,
                 &machine,
             )
-        }
-    })
+        };
+        (rows, hand_over)
+    });
+    rows.retain(|row| reads(row.label));
+    (rows, hand_over)
 }
 
 /// `aterm-cli`'s half of `aterm doctor`, without the packages' items: gathered, then
 /// applied with `fix` (the stale copies to the Trash) or planned without it.
 #[cfg(all(test, any(windows, target_os = "macos")))]
 fn doctor_report(fix: bool) -> (String, i32) {
-    let gathered = doctor::gather(fix);
+    let gathered = doctor::gather(fix, &[]);
     let items = gathered.items();
     let mode = if fix {
         aterm_converge::Mode::Apply
@@ -1494,12 +1581,9 @@ impl MachineFacts {
     }
 }
 
-fn machine_facts(withheld: Option<&str>) -> MachineFacts {
-    MachineFacts {
-        console_host: console_host_fact(),
-        fabric: fabric_fact(withheld),
-        ..MachineFacts::absent()
-    }
+/// The window census ([`aterm_ctl::census::window_census`]) through the front door.
+fn instances_fact() -> Result<aterm_ctl::census::Census, String> {
+    aterm_ctl::census::window_census(FRONT_DOOR)
 }
 
 fn program_check_fact() -> Option<aterm_uds::program_check::Look> {
@@ -1625,110 +1709,161 @@ fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     }
 }
 
-/// The `devtools:` row's facts ([`devtools_read_and_hand_over`]): the list and tccd's answers,
-/// and the wait beside them ([`wait_beside`]), which reads thread lists and start records only
+/// The `devtools:` row's facts: the list and tccd's answers ([`atpkg::devtools::facts`]), the
+/// wait beside them, which reads thread lists and start records only
 /// ([`aterm_uds::process::held_programs`]), never a process's arguments, so it reads while the
-/// check's pool is full too.
-fn devtools_facts(fix: bool, check_full: bool) -> DevtoolsFacts {
-    let (facts, did) = devtools_read_and_hand_over(fix, check_full);
-    DevtoolsFacts { facts, did }
-}
-
-/// The wait the `devtools:` row counts beside `facts` (the list as this run's hand-over left it):
-/// `held()`, this user's programs macOS's program check holds now, or none when the hand-over
-/// switched aterm on (`before` not granted, `facts` granted). Every program held then started
-/// before the grant, which may still wait for them (leftover §5.1), so they say nothing of
-/// whether it took.
-fn wait_beside(
-    before: aterm_containment::DevToolGrant,
-    facts: &atpkg::devtools::Facts,
-    held: impl FnOnce() -> Option<aterm_uds::process::HeldNow>,
-) -> Option<aterm_uds::process::HeldNow> {
-    use aterm_containment::DevToolGrant;
-    let switched_on = before == DevToolGrant::NotGranted && facts.grant() == DevToolGrant::Granted;
-    if switched_on { None } else { held() }
-}
-
-fn devtools_read_and_hand_over(
-    fix: bool,
-    check_full: bool,
-) -> (Option<atpkg::devtools::Facts>, Option<String>) {
-    use atpkg::devtools as dt;
+/// check's pool is full too, and the row's word on a hand-over this run cannot make. The facts
+/// come back a second time when the hand-over is due after the report
+/// ([`devtools_hand_over_due`]); nothing is asked, opened or waited for here.
+fn devtools_facts(fix: bool, check_full: bool) -> (DevtoolsFacts, Option<atpkg::devtools::Facts>) {
     use std::io::IsTerminal as _;
-    let Some(facts) = dt::facts() else {
-        return (None, None);
+    let Some(mut facts) = atpkg::devtools::facts() else {
+        return (DevtoolsFacts::absent(), None);
     };
-    let over_ssh =
-        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    facts.program_check = aterm_uds::process::held_programs();
     let person = std::io::stdout().is_terminal();
-    let subject = facts.subject.clone().unwrap_or_default();
-    let version = aterm_types::version::app_version();
-    let reach = DevtoolsReach {
-        ask_window: &ask_window_for_devtools,
-        list_terminal: &dt::list_terminal,
-        open_pane: &dt::open_pane,
-        opened_within: &dt::opened_within,
-        note_opened: &|| dt::note_opened(version),
-        declined_at: &|| dt::declined_until().map(|declined| declined.at),
-        await_on: &|| {
-            let list = dt::await_switch(&subject, std::time::Duration::from_secs(120), |id| {
-                aterm_containment::probe_devtool_list(aterm_containment::ProbeGate::on(), id)
-            });
-            list.listing == aterm_containment::DevToolListing::On
+    let (did, due) = devtools_hand_over_due(fix, &facts, check_full, person, console_absence);
+    let hand_over = due.then(|| facts.clone());
+    (
+        DevtoolsFacts {
+            facts: Some(facts),
+            did,
         },
-        refresh_verdict: &dt::refresh_verdict,
-        local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
-        say: &|words| eprintln!("{words}"),
-    };
-    let before = facts.grant();
-    let (mut facts, did) =
-        devtools_hand_over_when(fix, facts, over_ssh, check_full, person, &reach, dt::facts);
-    facts.program_check = wait_beside(before, &facts, aterm_uds::process::held_programs);
-    (Some(facts), did)
+        hand_over,
+    )
 }
 
-fn devtools_hand_over_when(
+/// Whether `aterm doctor`'s Developer Tools hand-over follows its report, and the row's word
+/// when it cannot be made. Due only with `fix` (never `--read-only` or `--json`), aterm not
+/// granted, a person at this Mac's console (`away` reads why not: [`console_absence`]) and
+/// stdout a terminal (`person`). Where nobody is at the console (an SSH session, a coding
+/// agent, no terminal to ask at), or macOS's program check is at its thread limit, the row
+/// says why; a stdout that is no terminal (a pipe, a file) is nobody to bring to a pane, so
+/// nothing is opened or queued for it. `away` is read only once a hand-over could be due.
+fn devtools_hand_over_due(
     fix: bool,
-    facts: atpkg::devtools::Facts,
-    over_ssh: bool,
+    facts: &atpkg::devtools::Facts,
     check_full: bool,
     person: bool,
-    reach: &DevtoolsReach<'_>,
-    reread: impl FnOnce() -> Option<atpkg::devtools::Facts>,
-) -> (atpkg::devtools::Facts, Option<String>) {
+    away: impl FnOnce() -> Option<&'static str>,
+) -> (Option<String>, bool) {
     if !fix || facts.grant() != aterm_containment::DevToolGrant::NotGranted {
-        return (facts, None);
+        return (None, false);
     }
-    if over_ssh {
+    if let Some(why) = away() {
         return (
-            facts,
-            Some(
-                "did nothing: this shell is over ssh, so no pane can open on the Mac's screen"
-                    .to_string(),
-            ),
+            Some(format!(
+                "did nothing: no pane opens without a person at this Mac's console ({why})"
+            )),
+            false,
         );
     }
     if check_full {
         return (
-            facts,
             Some(
                 "did nothing: macOS's program check is at its thread limit (`syspolicyd:`); \
                  held there, the switch cannot change until the Mac restarts, so run doctor \
                  again once it has room"
                     .to_string(),
             ),
+            false,
         );
     }
-    let (did, opened) = devtools_hand_over(&facts, person, reach);
-    let facts = if opened {
-        reread().unwrap_or(facts)
-    } else {
-        facts
-    };
-    (facts, Some(did))
+    (None, person)
 }
 
-/// What the running aterm window answered `devtools hand-over`, as `aterm
+/// Why nobody at this process may be brought to the Developer Tools page: SAFE-1's one
+/// person-at-console reading ([`aterm_machines::console::here`]: an SSH session, a coding
+/// agent's tab, no terminal to ask at, another login, or none), `None` for a person at the
+/// Mac's console.
+#[cfg(target_os = "macos")]
+fn console_absence() -> Option<&'static str> {
+    aterm_machines::console::here().why()
+}
+
+/// No Mac's console to bring anyone to: the Developer Tools list is macOS's.
+#[cfg(not(target_os = "macos"))]
+const fn console_absence() -> Option<&'static str> {
+    Some("this is not a Mac")
+}
+
+/// `aterm doctor`'s Developer Tools hand-over, after its report ([`doctor::answer`]), over
+/// the live reach: the window, System Settings, the markers, a wait for the switch that Enter
+/// ends ([`enter_pressed`]), and stderr for its lines.
+fn devtools_hand_over_live(facts: &atpkg::devtools::Facts) {
+    use atpkg::devtools as dt;
+    let subject = facts.subject.clone().unwrap_or_default();
+    let version = aterm_types::version::app_version();
+    let reach = DevtoolsReach {
+        ask_window: &ask_window_for_devtools,
+        list_terminal: &dt::list_terminal,
+        open_pane: &dt::open_pane,
+        note_opened: &|| dt::note_opened(version),
+        declined_at: &|| dt::declined_until().map(|declined| declined.at),
+        await_on: &|| {
+            let entered = enter_pressed();
+            let list = dt::await_switch(
+                &subject,
+                DEVTOOLS_WAIT,
+                |id| aterm_containment::probe_devtool_list(aterm_containment::ProbeGate::on(), id),
+                || entered.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            list.listing == aterm_containment::DevToolListing::On
+        },
+        refresh_verdict: &dt::refresh_verdict,
+        local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
+        say: &|words| eprintln!("{words}"),
+    };
+    devtools_hand_over_after(facts, &reach);
+}
+
+/// The hand-over over `reach` ([`devtools_hand_over`]), then the one line that says what it
+/// did: the report is already out, so nothing it did is a row.
+fn devtools_hand_over_after(facts: &atpkg::devtools::Facts, reach: &DevtoolsReach<'_>) {
+    let (did, _) = devtools_hand_over(facts, reach);
+    (reach.say)(&format!("aterm doctor: {did}"));
+}
+
+/// Set once Enter is pressed at this terminal: a line read on stdin, read only while stdin is
+/// a terminal this process's group holds in the foreground, so a closed or redirected stdin
+/// never ends the wait and a background job (`aterm doctor &`) is never stopped by `SIGTTIN`.
+/// It ends doctor's wait for the switch early; the reading thread is left to the process's
+/// end.
+fn enter_pressed() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use std::io::IsTerminal as _;
+    let pressed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if std::io::stdin().is_terminal() && stdin_in_foreground() {
+        let seen = std::sync::Arc::clone(&pressed);
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            if std::io::stdin()
+                .read_line(&mut line)
+                .is_ok_and(|read| read > 0)
+            {
+                seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+    pressed
+}
+
+/// Whether this process's group is the foreground group of the terminal on stdin; a read
+/// from it by a background group stops the whole process (`SIGTTIN`).
+#[cfg(unix)]
+fn stdin_in_foreground() -> bool {
+    // SAFETY: tcgetpgrp takes a descriptor by value and returns -1 when it is no terminal
+    // (which never equals a group id); getpgrp takes no arguments and cannot fail. Neither
+    // reads or writes memory of this process.
+    unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp() }
+}
+
+/// Windows stops no console reader for being in the background.
+#[cfg(not(unix))]
+const fn stdin_in_foreground() -> bool {
+    true
+}
+
+/// What the running aterm window answered `devtools hand-over now`, as `aterm
 /// doctor` acts on it ([`ask_window_for_devtools`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WindowAnswer {
@@ -1736,23 +1871,21 @@ enum WindowAnswer {
     /// connect phase failed, or refused it: `ERR auth`, `ERR control server
     /// busy`).
     Unreachable,
-    /// The request reached the window and no reply came (the words say how): the
-    /// window may still act, so doctor opens nothing.
+    /// The request reached the window and no reply came (the words say how): no
+    /// panel can be counted on, so doctor opens the page itself.
     Unanswered(String),
     /// The window's reply line (`OK …` / `ERR …`).
     Reply(String),
 }
 
-fn ask_window_for_devtools(now: bool) -> WindowAnswer {
+fn ask_window_for_devtools() -> WindowAnswer {
     let Some(sock) = aterm_ctl::front_door_instance() else {
         return WindowAnswer::Unreachable;
     };
-    let request = if now {
-        "devtools hand-over now\n"
-    } else {
-        "devtools hand-over\n"
-    };
-    window_answer(aterm_ctl::front_door_send(&sock, request))
+    window_answer(aterm_ctl::front_door_send(
+        &sock,
+        "devtools hand-over now\n",
+    ))
 }
 
 fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
@@ -1767,23 +1900,21 @@ fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
 }
 
 struct DevtoolsReach<'a> {
-    /// Ask the running aterm window ([`ask_window_for_devtools`]); the argument
-    /// is `now` (a person at this terminal).
-    ask_window: &'a dyn Fn(bool) -> WindowAnswer,
+    /// Ask the running aterm window ([`ask_window_for_devtools`]), for a person at
+    /// this terminal (`now`).
+    ask_window: &'a dyn Fn() -> WindowAnswer,
     /// [`atpkg::devtools::list_terminal`].
     list_terminal: &'a dyn Fn() -> Result<(), String>,
     /// [`atpkg::devtools::open_pane`]: `/usr/bin/open`, the path measured to work
     /// from a foreground command line.
     open_pane: &'a dyn Fn() -> Result<(), String>,
-    /// [`atpkg::devtools::opened_within`]: seconds since aterm last opened the
-    /// pane, when under the window.
-    opened_within: &'a dyn Fn(u64) -> Option<u64>,
     /// [`atpkg::devtools::note_opened`] for this version.
     note_opened: &'a dyn Fn(),
     /// When the owner said Not now to the panel (unix seconds), while it holds
     /// ([`atpkg::devtools::declined_until`]).
     declined_at: &'a dyn Fn() -> Option<u64>,
-    /// Wait up to two minutes for aterm's switch: `true` once it reads on.
+    /// Wait up to [`DEVTOOLS_WAIT`] for aterm's switch, or until Enter: `true` once it
+    /// reads on.
     await_on: &'a dyn Fn() -> bool,
     /// [`atpkg::devtools::refresh_verdict`]: make macOS ask about aterm again once the
     /// switch read on (the running aterm, checked before, keeps that verdict until a
@@ -1791,36 +1922,34 @@ struct DevtoolsReach<'a> {
     refresh_verdict: &'a dyn Fn() -> Result<(), String>,
     /// A unix time as the calendar day it fell on here ([`local_day_words`]).
     local_day: &'a dyn Fn(u64) -> String,
-    /// Where the banner and the wait line go (stderr: the report itself goes to
-    /// stdout only at the end).
+    /// Where the banner, the wait line and the did-line go: stderr, after the report
+    /// on stdout.
     say: &'a dyn Fn(&str),
 }
 
-const DEVTOOLS_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for aterm's switch to read on \
-                                  in Developer Tools (ctrl-c stops doctor)\u{2026}";
+/// How long doctor waits for the switch after its report, when no window's panel
+/// watches it.
+const DEVTOOLS_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-fn devtools_hand_over(
-    facts: &atpkg::devtools::Facts,
-    person: bool,
-    reach: &DevtoolsReach<'_>,
-) -> (String, bool) {
+/// The line printed while doctor waits for the switch, after its report: ctrl-c ends
+/// doctor (it installs no handler), which leaves the report as printed.
+const DEVTOOLS_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for aterm's switch to read on \
+                                  in Developer Tools (Enter or ctrl-c ends the wait; the report \
+                                  above stands)\u{2026}";
+
+/// Coordinate the Developer Tools hand-over with any running aterm window, for a person at
+/// this terminal, after the report.
+///
+/// Asks the running window first (`now`), so its helper panel appears beside System Settings
+/// and confirms the switch; doctor then opens the page and says one line, with no wait. Where
+/// no panel is up (no window, no answer, an older window, or a window whose last reading
+/// disagrees with doctor's) doctor opens the page with the whole banner and waits for the
+/// switch itself. Returns `(did, opened)`.
+fn devtools_hand_over(facts: &atpkg::devtools::Facts, reach: &DevtoolsReach<'_>) -> (String, bool) {
     use atpkg::devtools as dt;
-    let reply = match (reach.ask_window)(person) {
-        WindowAnswer::Unreachable => {
-            return devtools_open_here(facts, person, reach, true, !person);
-        }
-        WindowAnswer::Unanswered(_) if person => {
-            return devtools_open_here(facts, person, reach, true, false);
-        }
-        WindowAnswer::Unanswered(why) => {
-            return (
-                format!(
-                    "did nothing: asked the aterm window for the page and it did not answer \
-                     ({why}); it may still bring the page up at a quiet moment, so doctor \
-                     opened nothing"
-                ),
-                false,
-            );
+    let reply = match (reach.ask_window)() {
+        WindowAnswer::Unreachable | WindowAnswer::Unanswered(_) => {
+            return devtools_open_here(facts, reach, true);
         }
         WindowAnswer::Reply(reply) => reply,
     };
@@ -1829,46 +1958,24 @@ fn devtools_hand_over(
         dt::STATUS_PAGE
     );
     let did = match reply.as_str() {
-        "OK shown" => return devtools_open_here(facts, person, reach, false, false),
-        "OK unshown" => return devtools_open_here(facts, person, reach, true, false),
-        "OK granted" | "OK unknown" if person => {
-            return devtools_open_here(facts, person, reach, true, false);
+        "OK shown" => return devtools_open_here(facts, reach, false),
+        // No panel could be shown, or the window's last reading disagrees with doctor's a
+        // moment ago (not granted): the window's verdict is older.
+        "OK unshown" | "OK granted" | "OK unknown" => {
+            return devtools_open_here(facts, reach, true);
         }
         _ if reply.starts_with("ERR unknown verb") => {
-            return devtools_open_here(facts, person, reach, true, !person);
+            return devtools_open_here(facts, reach, true);
         }
-        "OK queued" => format!(
-            "asked the aterm window to show the owner the page at a quiet moment (status: {})",
-            dt::STATUS_PAGE
-        ),
-        "OK recent" if person => format!(
+        "OK recent" => format!(
             "did nothing: within the last minute aterm opened the page, or the aterm window \
              answered a request for it, or aterm's Full Disk Access page is waiting or open and \
              goes first; {no_window_press}"
         ),
-        "OK recent" => match (reach.opened_within)(dt::REOPEN_AFTER_S) {
-            Some(ago) => format!(
-                "did nothing: aterm opened the pane {}",
-                opened_ago_words(ago)
-            ),
-            None => format!(
-                "did nothing: the aterm window says aterm opened the page within the last {} \
-                 minutes",
-                dt::REOPEN_AFTER_S / 60
-            ),
-        },
         "OK declined" => format!(
             "did nothing: you said Not now{}; {no_window_press}",
             (reach.declined_at)()
                 .map_or_else(String::new, |at| format!(" on {}", (reach.local_day)(at)))
-        ),
-        "OK granted" => format!(
-            "did nothing: the aterm window's last reading has aterm on the list and switched \
-             on; {no_window_press}"
-        ),
-        "OK unknown" => format!(
-            "did nothing: the aterm window could not tell from its last reading whether aterm \
-             is on the list, so it leaves the list alone; {no_window_press}"
         ),
         "OK listed" => format!(
             "did nothing: the aterm window reads aterm's row on while macOS still checks its \
@@ -1887,34 +1994,16 @@ fn devtools_hand_over(
     (did, false)
 }
 
+/// Open the Developer Tools pane from `doctor`, after its report. `full` (no panel beside
+/// it): the whole banner first, then, on a list read whole, a wait for the switch that Enter
+/// ends. Otherwise the window's panel is up and confirms the switch, so doctor says one line
+/// and waits for nothing.
 fn devtools_open_here(
     facts: &atpkg::devtools::Facts,
-    person: bool,
     reach: &DevtoolsReach<'_>,
     full: bool,
-    rate_limited: bool,
 ) -> (String, bool) {
     use atpkg::devtools as dt;
-    if rate_limited && let Some(at) = (reach.declined_at)() {
-        return (
-            format!(
-                "did nothing: you said Not now on {}; {} \u{25b8} Open Developer Tools\u{2026} \
-                 opens the page",
-                (reach.local_day)(at),
-                dt::STATUS_PAGE
-            ),
-            false,
-        );
-    }
-    if rate_limited && let Some(ago) = (reach.opened_within)(dt::REOPEN_AFTER_S) {
-        return (
-            format!(
-                "did nothing: aterm opened the pane {}",
-                opened_ago_words(ago)
-            ),
-            false,
-        );
-    }
     let listed = std::cell::Cell::new(false);
     let list_terminal = || {
         let outcome = (reach.list_terminal)();
@@ -1922,8 +2011,8 @@ fn devtools_open_here(
         outcome
     };
     let open_pane = || {
-        if person {
-            (reach.say)(&devtools_banner(facts, full, listed.get()));
+        if full {
+            (reach.say)(&devtools_banner(facts, listed.get()));
         }
         (reach.open_pane)()
     };
@@ -1934,12 +2023,15 @@ fn devtools_open_here(
             open_pane: &open_pane,
         },
     );
-    let mut did = dt::handled_words(&handled);
-    if !matches!(handled, dt::Handled::Opened { .. }) {
-        return (did, false);
-    }
+    let dt::Handled::Opened { step, .. } = &handled else {
+        return (dt::handled_words(&handled), false);
+    };
     (reach.note_opened)();
-    if person && facts.list.label == aterm_containment::DevToolListLabel::Read {
+    if !full {
+        return (devtools_panel_line(*step, listed.get()), true);
+    }
+    let mut did = dt::handled_words(&handled);
+    if facts.list.label == aterm_containment::DevToolListLabel::Read {
         (reach.say)(DEVTOOLS_WAIT_LINE);
         let switched = (reach.await_on)();
         if switched && let Err(why) = (reach.refresh_verdict)() {
@@ -1950,7 +2042,7 @@ fn devtools_open_here(
         did.push_str(if switched {
             "; you switched it on"
         } else {
-            "; not switched on within 2 min"
+            "; not switched on while doctor waited"
         });
     }
     (did, true)
@@ -1969,28 +2061,33 @@ fn local_day_words(at: u64, offset_s: Option<i64>) -> String {
     day
 }
 
-fn opened_ago_words(ago: u64) -> String {
-    if ago < 60 {
-        "under a minute ago".to_string()
+/// The one line `aterm doctor` says once it opened the page beside the window's panel, which
+/// watches the switch and has macOS ask about aterm again: the step, the + route beside a
+/// drag, and, when this run's `spctl` added Terminal, whose row that is.
+fn devtools_panel_line(step: atpkg::devtools::Step, listed_terminal: bool) -> String {
+    use atpkg::devtools as dt;
+    let route = if step == dt::Step::Add {
+        format!(" ({})", dt::PLUS_ROUTE)
     } else {
-        format!("{} min ago", ago / 60)
+        String::new()
+    };
+    let mut line = format!(
+        "System Settings is open at Developer Tools: {}{route}. The aterm window confirms \
+         when it is on.",
+        step.action()
+    );
+    if listed_terminal {
+        line.push(' ');
+        line.push_str(dt::only_aterm(true));
     }
+    line
 }
 
-fn devtools_banner(facts: &atpkg::devtools::Facts, full: bool, listed_terminal: bool) -> String {
+/// The banner `doctor` prints on stderr when it opens System Settings with no window's
+/// panel beside it.
+fn devtools_banner(facts: &atpkg::devtools::Facts, listed_terminal: bool) -> String {
     use atpkg::devtools as dt;
     let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
-    let status = format!("  {}", dt::STATUS_LINK);
-    if !full {
-        let mut short = format!(
-            "aterm doctor: {}: aterm's panel beside System Settings shows how.",
-            dt::HELPER_TITLE
-        );
-        if listed_terminal {
-            short.push_str(&format!("\n  {}", dt::only_aterm(true)));
-        }
-        return format!("{short}\n{status}");
-    }
     let how = dt::Step::of(&facts.list).how();
     [
         format!("aterm doctor: {}", dt::HELPER_TITLE),
@@ -1998,7 +2095,7 @@ fn devtools_banner(facts: &atpkg::devtools::Facts, full: bool, listed_terminal: 
         format!("  {how}"),
         format!("  {}", dt::only_aterm(listed_terminal)),
         format!("  {}", dt::trade(skips)),
-        status,
+        format!("  {}", dt::STATUS_LINK),
     ]
     .join("\n")
 }
@@ -3094,7 +3191,7 @@ mod tests {
         session_limits, session_path_env, show_face_report, version_text,
     };
     #[cfg(unix)]
-    use super::{args_read_withheld, fabric_mark, machine_facts, unix_shell};
+    use super::{args_read_withheld, fabric_fact, fabric_mark, unix_shell};
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
@@ -5106,11 +5203,11 @@ mod tests {
         }
     }
 
-    /// `machine_facts` populates `fabric` on Unix and never produces `Mark::Fail`.
+    /// `fabric_fact` reads the fabric row on Unix and never produces `Mark::Fail`.
     #[cfg(unix)]
     #[test]
     fn the_doctors_machine_facts_read_the_fabric_row() {
-        let (mark, fact, _) = machine_facts(None).fabric.expect("a fabric row on Unix");
+        let (mark, fact, _) = fabric_fact(None).expect("a fabric row on Unix");
         assert!(!mark.is_fail(), "{fact}");
         assert!(!fact.trim().is_empty());
     }
@@ -5158,55 +5255,10 @@ mod tests {
     #[test]
     fn doctor_reads_the_live_wait_beside_the_list() {
         let facts = super::devtools_facts(false, false)
+            .0
             .facts
             .expect("macOS has a Developer Tools list");
         assert!(facts.program_check.is_some(), "{facts:?}");
-    }
-
-    /// A grant this run made is not judged by programs held before it (leftover §5.1): when the
-    /// hand-over switched aterm on, the `devtools:` row counts no wait and stays ok; any other run
-    /// counts what it reads.
-    #[test]
-    fn the_devtools_row_reads_no_wait_against_a_grant_this_run_made() {
-        use aterm_containment::{DevToolGrant, DevToolListing};
-        use aterm_uds::process::HeldNow;
-        let two = HeldNow {
-            count: 2,
-            oldest_ms: 30_000,
-        };
-        let on = devtools_facts_with(read_list(DevToolListing::On, 2));
-        let off = devtools_facts_with(read_list(DevToolListing::Off, 2));
-        assert_eq!(on.grant(), DevToolGrant::Granted);
-        assert_eq!(off.grant(), DevToolGrant::NotGranted);
-        let beside = |before, facts: &atpkg::devtools::Facts| {
-            super::wait_beside(before, facts, || Some(two))
-        };
-        assert_eq!(
-            beside(DevToolGrant::NotGranted, &on),
-            None,
-            "switched on by this run"
-        );
-        let row = atpkg::devtools::row(&atpkg::devtools::Facts {
-            program_check: beside(DevToolGrant::NotGranted, &on),
-            ..on.clone()
-        })
-        .expect("a row");
-        assert_eq!(row.level, atpkg::doctor::Level::Ok, "{}", row.text);
-        assert_eq!(
-            beside(DevToolGrant::Granted, &on),
-            Some(two),
-            "granted before"
-        );
-        assert_eq!(
-            beside(DevToolGrant::NotGranted, &off),
-            Some(two),
-            "still off"
-        );
-        assert_eq!(
-            beside(DevToolGrant::Unknown, &on),
-            Some(two),
-            "no hand-over ran"
-        );
     }
 
     #[test]
@@ -5257,10 +5309,13 @@ mod tests {
                 &machine,
             )
         };
-        let did = atpkg::devtools::handled_words(&atpkg::devtools::Handled::Opened {
-            listed_terminal: None,
-            step: atpkg::devtools::Step::SwitchOn,
-        });
+        // The one hand-over word a row carries (nobody at the console, where no pane may
+        // open), so this pins where it lands, not its spelling.
+        let off = devtools(DevToolListing::Off, None).facts.unwrap();
+        let (did, due) =
+            super::devtools_hand_over_due(true, &off, false, true, || Some("a remote shell"));
+        assert!(!due, "away from the console nothing is handed over");
+        let did = did.expect("the row says why");
         let did = did.as_str();
         let (r, code) = report(&devtools(DevToolListing::Off, Some(did)));
         assert_eq!(code, 0, "a warning never fails: {r}");
@@ -5277,12 +5332,15 @@ mod tests {
         assert!(!r.contains("devtools:"), "{r}");
     }
 
+    /// A scripted [`super::DevtoolsReach`]: the window answers `answer`, a decline on record
+    /// dates `declined_at`, `before_wait` runs as the wait starts, and every act is logged in
+    /// order instead of done (nothing is asked, run, opened, written, waited for or printed).
     struct Scripted {
         answer: super::WindowAnswer,
-        opened_ago: Option<u64>,
         declined_at: Option<u64>,
         /// The wait sees the switch go on.
         switched: bool,
+        before_wait: Box<dyn Fn()>,
         log: std::cell::RefCell<Vec<String>>,
     }
 
@@ -5290,24 +5348,24 @@ mod tests {
         fn new(answer: super::WindowAnswer) -> Self {
             Self {
                 answer,
-                opened_ago: None,
                 declined_at: None,
                 switched: true,
+                before_wait: Box::new(|| {}),
                 log: std::cell::RefCell::new(Vec::new()),
             }
         }
 
-        fn run(&self, facts: &atpkg::devtools::Facts, person: bool) -> (String, bool, Vec<String>) {
-            let ((did, opened), log) =
-                self.with(|reach| super::devtools_hand_over(facts, person, reach));
+        /// The hand-over for `facts`: `(did, opened, log)`.
+        fn run(&self, facts: &atpkg::devtools::Facts) -> (String, bool, Vec<String>) {
+            let ((did, opened), log) = self.with(|reach| super::devtools_hand_over(facts, reach));
             (did, opened, log)
         }
 
         fn with<R>(&self, act: impl FnOnce(&super::DevtoolsReach<'_>) -> R) -> (R, Vec<String>) {
             let note = |entry: String| self.log.borrow_mut().push(entry);
             let reach = super::DevtoolsReach {
-                ask_window: &|now| {
-                    note(format!("ask now={now}"));
+                ask_window: &|| {
+                    note("ask".to_string());
                     self.answer.clone()
                 },
                 list_terminal: &|| {
@@ -5318,10 +5376,10 @@ mod tests {
                     note("open".to_string());
                     Ok(())
                 },
-                opened_within: &|window| self.opened_ago.filter(|ago| *ago < window),
                 note_opened: &|| note("marker".to_string()),
                 declined_at: &|| self.declined_at,
                 await_on: &|| {
+                    (self.before_wait)();
                     note("wait".to_string());
                     self.switched
                 },
@@ -5337,80 +5395,171 @@ mod tests {
         }
     }
 
+    /// THE HAND-OVER IS DUE ONLY FOR A PERSON AT THE MAC'S CONSOLE, READING STDOUT (S5,
+    /// SAFE-1): a gather with `fix` leaves it due when aterm is not granted, the console's
+    /// presence reads a person, and stdout is a terminal. `--read-only` and `--json` (no
+    /// `fix`), a granted list (neither reads the presence), and a stdout that is no terminal
+    /// (a pipe, a file) leave nothing due and say nothing. Away from the console (an SSH
+    /// session, a coding agent's tab with a terminal of its own, no terminal to ask at), or
+    /// with the program check at its thread limit, nothing is due and the row says why.
+    /// NEGATIVE CONTROL: a hand-over judged by stdout and SSH alone is due for an agent's tab.
     #[test]
-    fn the_doctors_devtools_hand_over_keeps_the_ten_minute_throttle() {
-        use super::WindowAnswer;
+    fn the_hand_over_is_due_only_for_a_person_at_the_macs_own_terminal() {
         use aterm_containment::DevToolListing;
         let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
-        let mut recent = Scripted::new(WindowAnswer::Unreachable);
-        recent.opened_ago = Some(120);
-        let ((facts, did), log) = recent.with(|reach| {
-            super::devtools_hand_over_when(true, absent.clone(), false, false, false, reach, || {
-                panic!("nothing opened, so nothing is read again")
-            })
-        });
+        let granted = devtools_facts_with(read_list(DevToolListing::On, 2));
+        assert_eq!(granted.grant(), aterm_containment::DevToolGrant::Granted);
+        let here = || None;
         assert_eq!(
-            did.as_deref(),
-            Some("did nothing: aterm opened the pane 2 min ago")
+            super::devtools_hand_over_due(true, &absent, false, true, here),
+            (None, true)
         );
-        assert_eq!(log, ["ask now=false"], "the pane is not opened");
-        let (report, code) = super::doctor_checks_with_origin(
-            "/bin/sh",
-            ShellCheck::Runs,
-            None,
-            &unmeasured(),
-            &no_debugger(),
-            &DevtoolsFacts {
-                facts: Some(facts),
-                did,
-            },
-            &no_census(),
-            &no_recovery(),
-            &no_exceptions(),
-            &MachineFacts::absent(),
+        assert_eq!(
+            super::devtools_hand_over_due(true, &absent, false, false, here),
+            (None, false),
+            "a stdout that is no terminal"
         );
-        assert_eq!(code, 0);
-        assert!(
-            report.contains("did nothing: aterm opened the pane 2 min ago"),
-            "{report}"
-        );
-
-        let mut stale = Scripted::new(WindowAnswer::Unreachable);
-        stale.opened_ago = Some(atpkg::devtools::REOPEN_AFTER_S + 1);
-        let (_, log) = stale.with(|reach| {
-            super::devtools_hand_over_when(true, absent.clone(), false, false, false, reach, || {
-                None
-            })
-        });
-        assert!(log.iter().any(|entry| entry == "open"), "{log:?}");
-
-        for (fix, over_ssh, check_full) in [
-            (false, false, false),
-            (true, true, false),
-            (true, false, true),
-        ] {
-            let ((_, did), log) = Scripted::new(WindowAnswer::Unreachable).with(|reach| {
-                super::devtools_hand_over_when(
-                    fix,
-                    absent.clone(),
-                    over_ssh,
-                    check_full,
-                    false,
-                    reach,
-                    || None,
-                )
-            });
-            assert!(
-                log.is_empty(),
-                "fix={fix} ssh={over_ssh} full={check_full}: {log:?}"
-            );
+        for (fix, facts) in [(false, &absent), (true, &granted)] {
             assert_eq!(
-                did.as_deref()
-                    .is_some_and(|d| d.contains("program check is at its thread limit")),
-                check_full,
-                "{did:?}"
+                super::devtools_hand_over_due(fix, facts, false, true, || unreachable!(
+                    "no hand-over could be due, so nobody's presence is read"
+                )),
+                (None, false),
+                "fix={fix} grant={:?}",
+                facts.grant()
             );
         }
+        for (away, check_full, words) in [
+            (
+                Some("a coding agent started this"),
+                false,
+                "a coding agent started this",
+            ),
+            (
+                Some("this is a remote shell"),
+                false,
+                "this is a remote shell",
+            ),
+            (None, true, "program check is at its thread limit"),
+        ] {
+            let (did, due) =
+                super::devtools_hand_over_due(true, &absent, check_full, true, || away);
+            assert!(!due, "{words}");
+            assert!(did.is_some_and(|did| did.contains(words)), "{words}");
+        }
+    }
+
+    /// Counting stand-ins for every probe [`super::facts_rows_over`] makes, each meeting the
+    /// others at `met` (a barrier of every threaded probe, or none), and the reads made.
+    struct CountedReads {
+        met: Option<std::sync::Barrier>,
+        reads: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl CountedReads {
+        fn new(met: Option<std::sync::Barrier>) -> Self {
+            Self {
+                met,
+                reads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn read(&self, what: &'static str) {
+            self.reads.lock().unwrap().push(what);
+            if let Some(met) = &self.met {
+                met.wait();
+            }
+        }
+
+        /// The rows `reads` names, over these stand-ins, and the probes they read (sorted).
+        fn rows(&self, reads: &dyn Fn(&str) -> bool) -> (Vec<&'static str>, Vec<&'static str>) {
+            let ports = super::FactReads {
+                program_check: &|| None,
+                devtools: &|_, _| {
+                    self.read("devtools");
+                    (DevtoolsFacts::absent(), None)
+                },
+                spotlight: &|| {
+                    self.read("spotlight");
+                    None
+                },
+                privacy: &|| {
+                    self.read("privacy");
+                    unmeasured()
+                },
+                debugger: &|| {
+                    self.read("debugger");
+                    no_debugger()
+                },
+                instances: &|| {
+                    self.read("instances");
+                    no_census()
+                },
+                fabric: &|_| {
+                    self.read("fabric");
+                    None
+                },
+            };
+            let (rows, _) = super::facts_rows_over(false, reads, &ports);
+            let mut read = self.reads.lock().unwrap().clone();
+            read.sort_unstable();
+            (rows.iter().map(|row| row.label).collect(), read)
+        }
+    }
+
+    /// `--ONLY NARROWS WHAT DOCTOR'S OWN ROWS READ`: the help's "shell usability alone" check
+    /// reads only the shell (no Developer Tools `log show`, no Spotlight `mdfind`, no
+    /// codesign); a word naming one row reads that row's probe alone. NEGATIVE CONTROL: with
+    /// no words every probe reads once.
+    #[test]
+    fn doctors_own_rows_read_only_what_the_words_name() {
+        let shell_only = CountedReads::new(None);
+        let (rows, read) = shell_only
+            .rows(&|label| super::doctor::reads(&["base.shell.starts".to_owned()], label));
+        assert_eq!(rows, ["shell:"]);
+        assert_eq!(read, Vec::<&str>::new(), "the shell alone is read");
+
+        let spotlight = CountedReads::new(None);
+        let (rows, read) = spotlight
+            .rows(&|label| super::doctor::reads(&["base.machine.spotlight".to_owned()], label));
+        assert_eq!(rows, ["shell:"], "a Spotlight that read nothing has no row");
+        assert_eq!(read, ["spotlight"]);
+
+        let every = CountedReads::new(None);
+        let (rows, read) = every.rows(&|label| super::doctor::reads(&[], label));
+        assert_eq!(
+            read,
+            [
+                "debugger",
+                "devtools",
+                "fabric",
+                "instances",
+                "privacy",
+                "spotlight"
+            ],
+            "each probe once"
+        );
+        assert!(
+            rows.contains(&"instances:") && rows.contains(&"exceptions:"),
+            "{rows:?}"
+        );
+    }
+
+    /// DOCTOR'S OWN PROBES READ AT ONCE, NOT ONE AFTER ANOTHER: each threaded probe waits on
+    /// one barrier of them all, which only a gather that starts every probe before it joins
+    /// any passes. The one-minute wait is the hang detector a serial gather trips (its first
+    /// probe's wait never returns).
+    #[test]
+    fn doctors_own_probes_read_at_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let all = CountedReads::new(Some(std::sync::Barrier::new(6)));
+            let _ = tx.send(all.rows(&|label| super::doctor::reads(&[], label)).1);
+        });
+        let read = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the probes never met: one waited for another to finish");
+        assert_eq!(read.len(), 6, "{read:?}");
     }
 
     fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
@@ -5436,6 +5585,87 @@ mod tests {
         }
     }
 
+    /// THE REPORT IS OUT, ON STDOUT, BEFORE THE HAND-OVER WAITS (S5): `aterm doctor` prints
+    /// its whole report before it hands anything over, so a wait for the switch holds no row
+    /// back and ctrl-c during it leaves the report printed. A NOT READY report (exit 1) goes
+    /// to stdout like a green one, and stderr carries only the hand-over's lines; a refusal
+    /// goes to stderr. The scripted wait panics unless the report is already out. NEGATIVE
+    /// CONTROL: the order the gather had (the hand-over first, the report after) trips it.
+    #[test]
+    fn the_report_is_out_on_stdout_before_the_hand_over_waits() {
+        use super::WindowAnswer;
+        use aterm_containment::DevToolListing;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let report = "shell:      ok    /bin/sh (executable)\n\
+                      readiness: NOT READY \u{2014} 1 satisfied, 0 not applicable, 0 pending \
+                      activation, 1 unresolved\n";
+        let waits_after = |out: &Rc<RefCell<String>>| {
+            let mut script = Scripted::new(WindowAnswer::Unreachable);
+            let out = Rc::clone(out);
+            script.before_wait = Box::new(move || {
+                assert!(
+                    out.borrow().contains("readiness: NOT READY"),
+                    "the hand-over waited before the report was out"
+                );
+            });
+            script
+        };
+
+        let stdout = Rc::new(RefCell::new(String::new()));
+        let stderr = RefCell::new(String::new());
+        let script = waits_after(&stdout);
+        let waited = std::cell::Cell::new(false);
+        let hand_over = |facts: &atpkg::devtools::Facts| {
+            let ((), log) = script.with(|reach| super::devtools_hand_over_after(facts, reach));
+            waited.set(log.iter().any(|entry| entry == "wait"));
+            for line in log.iter().filter_map(|entry| entry.strip_prefix("say ")) {
+                stderr.borrow_mut().push_str(&format!("{line}\n"));
+            }
+        };
+        let ends = super::doctor::Ends {
+            stdout: &|text| {
+                stdout.borrow_mut().push_str(text);
+                Ok(())
+            },
+            stderr: &|text| stderr.borrow_mut().push_str(text),
+            hand_over: &hand_over,
+        };
+        let status = super::doctor::answer_over(report, 1, true, Some(&absent), &ends);
+        assert_eq!(status, 1, "the report's own code");
+        assert!(waited.get(), "no window: doctor waits for the switch");
+        assert_eq!(*stdout.borrow(), report, "the whole report, on stdout");
+        let said = stderr.take();
+        assert!(!said.contains("readiness:"), "{said}");
+        assert!(said.contains(super::DEVTOOLS_WAIT_LINE), "{said}");
+        assert!(said.ends_with("; you switched it on\n"), "{said}");
+
+        // A refusal is stderr's, and nothing is handed over without a hand-over due.
+        stdout.borrow_mut().clear();
+        let refusal = "aterm doctor: --only typo: no item, family or layer has that name\n";
+        assert_eq!(
+            super::doctor::answer_over(refusal, 2, false, None, &ends),
+            2
+        );
+        assert_eq!(
+            (stdout.borrow().as_str(), stderr.take()),
+            ("", refusal.to_owned())
+        );
+
+        // NEGATIVE CONTROL: the hand-over before the report trips the scripted wait.
+        let early = Rc::new(RefCell::new(String::new()));
+        let first = waits_after(&early);
+        let tripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first.with(|reach| super::devtools_hand_over_after(&absent, reach));
+        }));
+        assert!(tripped.is_err(), "the check must trip on the old order");
+    }
+
+    /// `devtools_hand_over` asks the running window first (`now`) and opens System Settings
+    /// itself: with one line and no wait beside the window's panel, which confirms the switch;
+    /// with the whole banner and a wait where no panel is up. Every other answer is the
+    /// window's decision, and nothing opens.
     #[test]
     fn doctor_asks_the_window_first_and_opens_only_where_the_window_leaves_it() {
         use super::{DEVTOOLS_WAIT_LINE, WindowAnswer};
@@ -5455,7 +5685,8 @@ mod tests {
             step: dt::Step::Add,
         });
 
-        let (did, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&absent, true);
+        // No window: the whole banner, then the page, the marker and the wait.
+        let (did, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&absent);
         assert!(opened);
         assert_eq!(did, format!("{opened_words}; you switched it on"));
         let banner = said(&log);
@@ -5475,7 +5706,7 @@ mod tests {
                 .position(|entry| entry.starts_with(what))
                 .unwrap_or_else(|| panic!("{what} in {log:?}"))
         };
-        assert_eq!(log[0], "ask now=true", "a person here asks with `now`");
+        assert_eq!(log[0], "ask", "the window is asked first");
         assert!(
             at("say aterm doctor: Add") < at("open"),
             "the banner first: {log:?}"
@@ -5488,133 +5719,55 @@ mod tests {
             at("wait") < at("refresh"),
             "the switch read on: macOS is asked about aterm again: {log:?}"
         );
+        // NEGATIVE CONTROL: a wait that never sees the switch (Enter, or the two minutes)
+        // asks macOS nothing, and the did-line says so.
         let mut unswitched = Scripted::new(WindowAnswer::Unreachable);
         unswitched.switched = false;
-        let (did, _, log) = unswitched.run(&absent, true);
+        let (did, _, log) = unswitched.run(&absent);
         assert!(log.contains(&"wait".to_string()), "{log:?}");
         assert!(!log.contains(&"refresh".to_string()), "{did}: {log:?}");
-
-        let mut shown = Scripted::new(reply("OK shown"));
-        shown.opened_ago = Some(5);
-        let (did, opened, log) = shown.run(&absent, true);
-        assert!(opened, "{did}");
-        let banner = said(&log);
         assert!(
-            banner.contains("aterm's panel beside System Settings"),
-            "{banner}"
-        );
-        assert!(
-            !banner.contains(dt::HELPER_HOW),
-            "the panel says how: {banner}"
-        );
-        assert!(log.contains(&"open".to_string()), "{log:?}");
-
-        for answer in ["OK unshown", "ERR unknown verb (try: help)"] {
-            let (_, opened, log) = Scripted::new(reply(answer)).run(&absent, true);
-            assert!(opened, "{answer}");
-            assert!(said(&log).contains(dt::HELPER_HOW), "{answer}: {log:?}");
-        }
-
-        let (did, opened, log) = Scripted::new(reply("OK queued")).run(&absent, false);
-        assert!(!opened);
-        assert_eq!(log, ["ask now=false"]);
-        assert!(did.contains("at a quiet moment"), "{did}");
-
-        let mut looped = Scripted::new(WindowAnswer::Unreachable);
-        looped.opened_ago = Some(120);
-        let (did, opened, log) = looped.run(&absent, false);
-        assert_eq!(
-            (did.as_str(), opened),
-            ("did nothing: aterm opened the pane 2 min ago", false)
-        );
-        assert_eq!(log, ["ask now=false"]);
-        for answer in [
-            WindowAnswer::Unreachable,
-            reply("ERR unknown verb (try: help)"),
-        ] {
-            let mut declined_here = Scripted::new(answer.clone());
-            declined_here.declined_at = Some(1_790_812_800);
-            let (did, opened, log) = declined_here.run(&absent, false);
-            assert_eq!(
-                (did.as_str(), opened),
-                (
-                    "did nothing: you said Not now on 2026-10-01; aterm Settings \u{25b8} \
-                     Security \u{25b8} Open Developer Tools\u{2026} opens the page",
-                    false
-                ),
-                "{answer:?}"
-            );
-            assert_eq!(log, ["ask now=false"], "{answer:?}");
-            let mut person_here = Scripted::new(answer);
-            person_here.declined_at = Some(1_790_812_800);
-            let (did, opened, _) = person_here.run(&absent, true);
-            assert!(opened, "a person asked: {did}");
-        }
-        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&absent, false);
-        assert!(opened);
-        assert!(said(&log).is_empty(), "nobody to read a banner: {log:?}");
-        assert!(
-            !log.contains(&"wait".to_string()) && !log.contains(&"refresh".to_string()),
-            "nobody to wait for: {log:?}"
-        );
-
-        let silent = || {
-            Scripted::new(WindowAnswer::Unanswered(
-                "did not answer within 10s".to_string(),
-            ))
-        };
-        let (did, opened, log) = silent().run(&absent, true);
-        assert!(opened, "{did}");
-        assert!(said(&log).contains(dt::HELPER_HOW), "{log:?}");
-        let (did, opened, log) = silent().run(&absent, false);
-        assert!(
-            !opened && did.contains("may still bring the page up"),
+            did.ends_with("; not switched on while doctor waited"),
             "{did}"
         );
-        assert_eq!(log, ["ask now=false"]);
 
-        for (person, opened_ago, words) in [
-            (
-                true,
-                Some(30),
-                "within the last minute aterm opened the page, or the aterm window",
-            ),
-            (
-                true,
-                None,
-                "within the last minute aterm opened the page, or the aterm window",
-            ),
-            (
-                false,
-                Some(120),
-                "did nothing: aterm opened the pane 2 min ago",
-            ),
-            (
-                false,
-                None,
-                "the aterm window says aterm opened the page within the last 10",
-            ),
+        // The window's panel is up and confirms the switch: doctor opens the page and says
+        // one line, the step with its + route and the panel, and waits for nothing.
+        let (did, opened, log) = Scripted::new(reply("OK shown")).run(&absent);
+        assert!(opened, "{did}");
+        assert_eq!(log, ["ask", "open", "marker"], "no banner and no wait");
+        for words in [
+            "System Settings is open at Developer Tools",
+            dt::HELPER_STEP,
+            dt::PLUS_ROUTE,
+            "The aterm window confirms",
         ] {
-            let mut recent = Scripted::new(reply("OK recent"));
-            recent.opened_ago = opened_ago;
-            let (did, opened, log) = recent.run(&absent, person);
-            assert!(!opened && did.contains(words), "{words:?} in {did}");
-            assert_eq!(log.len(), 1, "asked, nothing else: {log:?}");
+            assert!(did.contains(words), "{words:?} in {did}");
         }
+        assert!(!did.contains('\n'), "one line: {did}");
 
-        for answer in ["OK granted", "OK unknown"] {
-            let (did, opened, log) = Scripted::new(reply(answer)).run(&absent, true);
-            assert!(opened, "{answer}: {did}");
-            assert!(said(&log).contains(dt::HELPER_HOW), "{answer}: {log:?}");
-            let (did, opened, log) = Scripted::new(reply(answer)).run(&absent, false);
-            assert!(
-                !opened && did.starts_with("did nothing: "),
-                "{answer}: {did}"
-            );
-            assert!(did.contains("last reading"), "{answer}: {did}");
-            assert_eq!(log, ["ask now=false"], "{answer}");
+        // No panel is up: none could be shown, the window is older than the verb, the request
+        // went out and no reply came, or the window's last reading disagrees with doctor's a
+        // moment ago. The whole banner, the page and the wait.
+        for answer in [
+            reply("OK unshown"),
+            reply("ERR unknown verb (try: help)"),
+            reply("OK granted"),
+            reply("OK unknown"),
+            WindowAnswer::Unanswered("did not answer within 10s".to_string()),
+        ] {
+            let (did, opened, log) = Scripted::new(answer.clone()).run(&absent);
+            assert!(opened, "{answer:?}: {did}");
+            assert!(said(&log).contains(dt::HELPER_HOW), "{answer:?}: {log:?}");
+            assert!(log.contains(&"wait".to_string()), "{answer:?}: {log:?}");
         }
+        // A decline on record does not hold back a person who asked here.
+        let mut declined_here = Scripted::new(WindowAnswer::Unreachable);
+        declined_here.declined_at = Some(1_790_812_800);
+        let (did, opened, _) = declined_here.run(&absent);
+        assert!(opened, "a person asked: {did}");
 
+        // Everything else is the window's decision: nothing opens here.
         let mut declined = Scripted::new(reply("OK declined"));
         declined.declined_at = Some(1_790_812_800);
         for (script, words) in [
@@ -5622,6 +5775,10 @@ mod tests {
                 declined,
                 "did nothing: you said Not now on 2026-10-01; aterm Settings \u{25b8} Security \
                  \u{25b8} Open Developer Tools\u{2026} opens the page",
+            ),
+            (
+                Scripted::new(reply("OK recent")),
+                "within the last minute aterm opened the page, or the aterm window",
             ),
             (Scripted::new(reply("OK unstable")), "ad hoc or dev build"),
             (Scripted::new(reply("OK listed")), "nothing to add"),
@@ -5634,11 +5791,11 @@ mod tests {
                 "stalled",
             ),
         ] {
-            let (did, opened, log) = script.run(&absent, true);
+            let (did, opened, log) = script.run(&absent);
             assert!(!opened, "{did}");
             assert!(did.starts_with("did nothing: "), "{did}");
             assert!(did.contains(words), "{words:?} in {did}");
-            assert_eq!(log, ["ask now=true"], "{did}");
+            assert_eq!(log, ["ask"], "{did}");
         }
     }
 
@@ -5702,9 +5859,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let shown = || Scripted::new(WindowAnswer::Reply("OK shown".to_string()));
 
         let empty = devtools_facts_with(read_list(DevToolListing::Absent, 0));
-        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&empty, true);
+        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&empty);
         assert!(opened);
         let spctl = log.iter().position(|e| e == "spctl").expect("spctl ran");
         let banner = log
@@ -5713,21 +5871,24 @@ mod tests {
             .expect("the banner");
         assert!(spctl < banner, "{log:?}");
         assert!(said(&log).contains(dt::only_aterm(true)), "{log:?}");
-        let (_, opened, log) =
-            Scripted::new(WindowAnswer::Reply("OK shown".to_string())).run(&empty, true);
-        assert!(opened);
-        assert!(said(&log).contains(dt::only_aterm(true)), "{log:?}");
+        // Beside the window's panel the one line says it. NEGATIVE CONTROL: with no `spctl`,
+        // the line speaks of no Terminal.
+        let (did, opened, log) = shown().run(&empty);
+        assert!(opened && log.contains(&"spctl".to_string()), "{log:?}");
+        assert!(did.contains(dt::only_aterm(true)), "{did}");
         let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
-        let (_, _, log) =
-            Scripted::new(WindowAnswer::Reply("OK shown".to_string())).run(&absent, true);
-        assert!(!said(&log).contains("Terminal"), "{log:?}");
+        let (did, _, _) = shown().run(&absent);
+        assert!(!did.contains("Terminal"), "{did}");
 
         let off = devtools_facts_with(read_list(DevToolListing::Off, 2));
-        let (_, _, log) = Scripted::new(WindowAnswer::Unreachable).run(&off, true);
+        let (_, _, log) = Scripted::new(WindowAnswer::Unreachable).run(&off);
         let banner = said(&log);
         assert!(banner.contains(dt::HELPER_SWITCH_ON), "{banner}");
         assert!(!banner.contains("Drag"), "aterm is listed: {banner}");
         assert!(!log.contains(&"spctl".to_string()), "{log:?}");
+        let (did, _, _) = shown().run(&off);
+        assert!(did.contains(dt::STEP_SWITCH_ON), "{did}");
+        assert!(!did.contains("Drag"), "aterm is listed: {did}");
 
         let mut unread =
             devtools_facts_with(DevToolList::refused(DevToolListLabel::NoFullDiskAccess));
@@ -5739,7 +5900,7 @@ mod tests {
             answered_at_ms: Some(1),
         };
         assert_eq!(unread.grant(), aterm_containment::DevToolGrant::NotGranted);
-        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&unread, true);
+        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&unread);
         assert!(opened);
         assert!(said(&log).contains(dt::HELPER_HOW), "{log:?}");
         assert!(

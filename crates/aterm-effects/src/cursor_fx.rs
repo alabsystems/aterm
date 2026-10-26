@@ -983,10 +983,13 @@ impl CursorFx {
         first_seq: u64,
         count: u8,
     ) {
-        for i in 0..u64::from(count) {
+        let n = u64::from(count);
+        let mut i = 0;
+        while i < n {
             let m = current.band(first_seq + i);
             self.glow.note_band_move(m.top, m.bottom, m.delta);
             self.trail.note_band_move(m.top, m.bottom, m.delta);
+            i += 1;
         }
         self.glow.drop_row_probe();
     }

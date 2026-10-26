@@ -3421,21 +3421,23 @@ fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Ho
             let (host, sid) = (&remote.host, ctx.self_id().as_str());
             let short = remote.node.get(..8).unwrap_or(&remote.node);
             let lifts = format!(
-                "that node's own `hold {sid} off`, or the person here (Take Over, or `aterm fleet \
-                 peers rm {short}` once that Mac left the fleet), lifts it"
+                "`aterm ctl --host <this session's Mac> hold {sid} off` run on {host}, or the \
+                 person at this session's Mac (Take Over, or `aterm fleet peers rm {short}` there \
+                 once that node left the fleet), lifts it"
             );
             match found {
                 Some(Holder::Drives) => format!(
-                    " (held by {host} over the fleet, which still drives this Mac: {lifts})"
+                    " (held by {host} over the fleet, which still drives this session's Mac: \
+                     {lifts})"
                 ),
                 Some(Holder::Again(why)) => format!(
-                    " (held by {host} over the fleet, which may still drive this Mac: its place \
-                     did not prove it just now ({why}), and its drives are its own dials of this \
-                     Mac; {lifts})"
+                    " (held by {host} over the fleet, which may still drive this session's Mac: \
+                     its place did not prove it just now ({why}), and its drives are its own dials \
+                     of that Mac; {lifts})"
                 ),
                 Some(Holder::Gone(_)) | None => format!(
                     " (held by {host} over the fleet: {lifts}; so does `aterm ctl hold {sid} off` \
-                     on this session's Mac once that node may drive it no more)"
+                     on this session's Mac once node {short} may drive it no more)"
                 ),
             }
         }
@@ -3546,6 +3548,16 @@ const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fl
 /// The usage a drive connection gets: it holds as its own node and names no `origin=`.
 const HOLD_REMOTE_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] (a drive connection \
                                  holds as its own node, so it takes no origin=)\n";
+
+/// The usage `hold` answers `issuer` with.
+#[must_use]
+pub fn hold_usage(issuer: HoldIssuer) -> &'static str {
+    if issuer == HoldIssuer::Remote {
+        HOLD_REMOTE_USAGE
+    } else {
+        HOLD_USAGE
+    }
+}
 
 /// The answer to a `hold` that names the person's slot from the wire (`origin=person`).
 pub const HOLD_PERSON_USAGE: &str = "ERR usage: origin=person is the window's own hold \
@@ -3963,11 +3975,7 @@ pub fn cmd_hold_within_waking(
     wake: &dyn Fn(&SessionId),
 ) -> String {
     let store = &store.as_store();
-    let usage = if issuer == HoldIssuer::Remote {
-        HOLD_REMOTE_USAGE
-    } else {
-        HOLD_USAGE
-    };
+    let usage = hold_usage(issuer);
     let mut toks = rest.split_whitespace();
     let (Some(sid), Some(state)) = (toks.next(), toks.next()) else {
         return usage.to_string();

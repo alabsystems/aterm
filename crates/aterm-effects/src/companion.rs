@@ -1206,7 +1206,10 @@ impl CompanionOwner {
             glass: t.glass,
         };
         let offered = std::mem::take(&mut self.resight_offered);
-        for slot in &mut self.own_glass {
+        let mut si = 0;
+        while si < self.own_glass.len() {
+            let slot = &mut self.own_glass[si];
+            si += 1;
             let Some(own) = slot.as_mut() else {
                 continue;
             };
@@ -1229,11 +1232,13 @@ impl CompanionOwner {
                 // The same glass, a new surface on it.
             } else if offered && drawn.glass.origin != frame_px.glass.origin {
                 let mut free = None;
-                for (i, slot) in self.own_glass.iter().enumerate() {
-                    if slot.is_none() {
+                let mut i = 0;
+                while i < self.own_glass.len() {
+                    if self.own_glass[i].is_none() {
                         free = Some(i);
                         break;
                     }
+                    i += 1;
                 }
                 if let Some(free) = free {
                     self.glass_key = self.glass_key.wrapping_add(1).max(1);
@@ -1277,28 +1282,34 @@ impl CompanionOwner {
         self.last_alpha = if on_glass { pet_frame.alpha } else { 0 };
         self.drawn_frame = if on_glass { Some(frame_px) } else { None };
         self.last_visible = t.visible;
-        for slot in &mut self.own_glass {
-            if let Some(own) = *slot
+        let mut si = 0;
+        while si < self.own_glass.len() {
+            if let Some(own) = self.own_glass[si]
                 && !self.pet.has_ghost_on_glass(own.key)
             {
-                *slot = None;
+                self.own_glass[si] = None;
             }
+            si += 1;
         }
         let mut glass = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
-        for (dst, dep) in glass.iter_mut().zip(&pet_frame.departures) {
-            if let Some(d) = dep
+        let mut di = 0;
+        while di < crate::kitty_pet::PET_DEPARTURES_MAX {
+            if let Some(d) = &pet_frame.departures[di]
                 && d.own_glass
             {
                 let key = d.glass;
-                for slot in &self.own_glass {
-                    if let Some(own) = slot
+                let mut si = 0;
+                while si < self.own_glass.len() {
+                    if let Some(own) = &self.own_glass[si]
                         && own.key == key
                     {
-                        *dst = Some(own.frame.glass);
+                        glass[di] = Some(own.frame.glass);
                         break;
                     }
+                    si += 1;
                 }
             }
+            di += 1;
         }
         let companion = cursor_companion_on_glass(duty, t.painted_caret, None, body_px);
         CompanionFrame {
@@ -1422,18 +1433,20 @@ impl CompanionOwner {
                 Some(window) => window,
                 None => free,
             };
-            for (slot, glass) in t.glass.iter().enumerate() {
-                let Some(glass) = glass else {
-                    continue;
-                };
-                let own = EffectGeom {
-                    cols: glass.cols,
-                    rows: glass.rows,
-                    ..geom
-                };
-                if let Some(ghost_fp) = decos.pet_own_glass(frame, own, glass.origin, slot, out) {
-                    fp ^= ghost_fp.rotate_left(37);
+            let mut slot = 0;
+            while slot < t.glass.len() {
+                if let Some(glass) = &t.glass[slot] {
+                    let own = EffectGeom {
+                        cols: glass.cols,
+                        rows: glass.rows,
+                        ..geom
+                    };
+                    if let Some(ghost_fp) = decos.pet_own_glass(frame, own, glass.origin, slot, out)
+                    {
+                        fp ^= ghost_fp.rotate_left(37);
+                    }
                 }
+                slot += 1;
             }
         }
         (fp, outcome)

@@ -27,9 +27,9 @@ pub(super) const NO_VAULT: &str = "No vault on this network";
 /// vault being down look the same from here.
 pub(super) const NOT_REACHED: &str = "The ALab vault did not answer on this network";
 
-/// How long one probe of the ALab vault waits: it answers within a few seconds
-/// on its own LAN, and a Mac elsewhere must not hold its first launch longer.
-const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long one probe of the ALab vault takes at most, all of it: it answers within
+/// milliseconds on its own LAN, and a Mac elsewhere must not hold its first launch longer.
+const PROBE_WAIT: std::time::Duration = aterm_secrets::client::PROBE_DEADLINE;
 
 /// What the last probe of the ALab vault in this process heard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +108,7 @@ pub(super) fn probe_lan() -> VaultHere {
             VaultHere::Found
         }
         // Something on this LAN answered at the vault's `.local` address.
-        Ok(ProbeOutcome::NotThisVault(_)) => {
+        Ok(ProbeOutcome::NotThisVault(_) | ProbeOutcome::AnotherVault(_)) => {
             access::lan_answered(LanAnswer::Reached);
             VaultHere::Absent
         }

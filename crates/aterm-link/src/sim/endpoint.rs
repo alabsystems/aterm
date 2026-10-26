@@ -236,6 +236,18 @@ impl Endpoint {
         Some(sid)
     }
 
+    /// A session that left comes back under `local`, rows, posts and receipts as it left
+    /// them, as an update's handoff or the keeper's recovery serves it again.
+    pub(crate) fn revive(&self, sid: &str, local: u64) -> bool {
+        let mut s = lock(&self.state);
+        let Some(at) = s.gone.iter().rposition(|x| x.sid == sid) else {
+            return false;
+        };
+        let session = s.gone.remove(at);
+        s.sessions.insert(local, session);
+        true
+    }
+
     /// aterm loses power: every session goes.
     pub(crate) fn power_cut(&self) {
         let mut s = lock(&self.state);

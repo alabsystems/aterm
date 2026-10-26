@@ -63,7 +63,7 @@ pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
     match v.parse::<usize>() {
         Ok(n) if n <= TASK_MAX => Ok(n),
         _ if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Err(too_large(v, agent)),
-        _ => Err(crate::control::control_media::SPAWN_USAGE.to_string()),
+        _ => Err(crate::control::control_media::spawn_usage()),
     }
 }
 

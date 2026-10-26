@@ -1284,9 +1284,29 @@ pub(crate) fn only_sid(replies: &[HostReply], sid: &str) -> Vec<HostReply> {
         .collect()
 }
 
-/// Error message when `--sid` does not match any returned session.
+/// Error message when `--sid` does not match any returned session: led by why each reply that
+/// did not come failed, as its row says, where none came.
 pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> String {
     let sid = shown(sid, 32);
+    let unread: Vec<String> = replies
+        .iter()
+        .filter_map(|reply| {
+            let why = reply.answer.as_ref().err()?;
+            Some(format!(
+                "{}{UNANSWERED_JOIN}{}",
+                fit_place(&reply.label, 60),
+                shown(why, 200)
+            ))
+        })
+        .collect();
+    if !unread.is_empty() && replies.iter().all(|reply| reply.answer.is_err()) {
+        return format!("ERR {}, so no session @{sid} was read", unread.join("; "));
+    }
+    let unread = if unread.is_empty() {
+        String::new()
+    } else {
+        format!("{}, so @{sid} was not read there; ", unread.join("; "))
+    };
     let capped: Vec<String> = replies
         .iter()
         .filter_map(|reply| {
@@ -1296,15 +1316,15 @@ pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> St
         .collect();
     if capped.is_empty() && !fleet {
         format!(
-            "ERR no such session @{sid} on any local instance that answered (a fleet peer's: \
-             --fleet --sid <s>, or --host <h> --sid <s>)"
+            "ERR {unread}no such session @{sid} on any local instance that answered (a fleet \
+             peer's: --fleet --sid <s>, or --host <h> --sid <s>)"
         )
     } else if capped.is_empty() {
-        format!("ERR no such session @{sid} on any instance that answered")
+        format!("ERR {unread}no such session @{sid} on any instance that answered")
     } else {
         format!(
-            "ERR no session @{sid} in the rows that came: it may be among those a reply cap \
-             left out ({})",
+            "ERR {unread}no session @{sid} in the rows that came: it may be among those a reply \
+             cap left out ({})",
             capped.join(", ")
         )
     }

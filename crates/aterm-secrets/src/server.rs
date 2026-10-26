@@ -132,12 +132,13 @@ pub fn serve(options: Options) -> crate::Result<()> {
         note(&line);
     }
     let children = Children::default();
-    if options.keep_awake {
-        children.keep_awake();
-    }
-    if let Some(name) = &options.advertise {
-        children.advertise(name, running.addr.port());
-    }
+    children.tend(
+        options.keep_awake,
+        options
+            .advertise
+            .as_ref()
+            .map(|name| (name.clone(), running.addr.port())),
+    );
     let result = supervise(running, PROGRAM_EVERY, &program_stamp, &signalled);
     drop(children);
     result
@@ -223,9 +224,16 @@ impl Running {
         }
     }
 
+    /// How many long-polls it holds now.
     #[cfg(test)]
-    fn waiting(&self) -> usize {
+    pub(crate) fn waiting(&self) -> usize {
         self.shared.waiting.load(Ordering::SeqCst)
+    }
+
+    /// How many GETs of a vault's envelope it has answered.
+    #[cfg(test)]
+    pub(crate) fn envelope_gets(&self) -> usize {
+        self.shared.envelope_gets.load(Ordering::SeqCst)
     }
 }
 
@@ -352,6 +360,8 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         waiting: AtomicUsize::new(0),
         #[cfg(test)]
         served: AtomicUsize::new(0),
+        #[cfg(test)]
+        envelope_gets: AtomicUsize::new(0),
     });
     let (refusals, refused) = sync_channel::<TcpStream>(REFUSALS_QUEUED);
     std::thread::Builder::new()
@@ -400,6 +410,9 @@ struct Held {
 struct Slot {
     held: Held,
     wake: Arc<Condvar>,
+    /// Verdicts kept on this vault's join requests since the start: each one ends the
+    /// long-polls held then, so a refused Mac waiting on one reads it at once.
+    verdicts: u64,
 }
 
 /// A queued join request and the address it came from (`None`: no `peer` line in the store).
@@ -413,6 +426,9 @@ struct Queued {
     changed: u64,
     /// When the log last noted it (unix secs; 0: not since the server started).
     noted: u64,
+    /// The tag of its proof an admin Mac's verdict refused (`POST …/join/verdict`), kept in
+    /// memory only.
+    refused: Option<String>,
 }
 
 #[derive(Default)]
@@ -442,6 +458,9 @@ struct Shared {
     /// Connections admitted since the start.
     #[cfg(test)]
     served: AtomicUsize,
+    /// GETs of a vault's envelope (`/v1/<name>`, long-polls among them) since the start.
+    #[cfg(test)]
+    envelope_gets: AtomicUsize,
 }
 
 impl Shared {
@@ -478,9 +497,10 @@ fn now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// A line for the server's log (stderr).
+/// A line for the server's log (stderr). A log that cannot take it (a full disk) loses the line,
+/// not the server: `eprintln!` panics when the write fails.
 fn note(line: &str) {
-    eprintln!("aterm secrets serve: {line}");
+    crate::log_line(&format!("aterm secrets serve: {line}"));
 }
 
 /// What [`serve`] logs at start when its store holds no vault yet ([`refuse_unheld`]).
@@ -531,6 +551,7 @@ fn load(store: &Path, now: u64) -> crate::Result<State> {
                         Slot {
                             held,
                             wake: Arc::new(Condvar::new()),
+                            verdicts: 0,
                         },
                     );
                 }
@@ -629,6 +650,7 @@ fn parse_stored(text: &str) -> Vec<Queued> {
                 asked: asked.unwrap_or(0),
                 changed: 0,
                 noted: 0,
+                refused: None,
             });
         }
     }
@@ -827,6 +849,8 @@ struct Reply {
     body: Body,
     etag: Option<u64>,
     allow: Option<&'static str>,
+    /// `Retry-After`, in seconds: when a refused request may be sent again and be taken.
+    retry_after: Option<u64>,
 }
 
 enum Body {
@@ -844,6 +868,7 @@ impl Reply {
             body: Body::Text(text),
             etag: None,
             allow: None,
+            retry_after: None,
         }
     }
 
@@ -853,6 +878,7 @@ impl Reply {
             body: Body::Empty,
             etag: None,
             allow: None,
+            retry_after: None,
         }
     }
 }
@@ -905,6 +931,9 @@ fn write_reply(
     }
     if let Some(allow) = reply.allow {
         head.push_str(&format!("Allow: {allow}\r\n"));
+    }
+    if let Some(secs) = reply.retry_after {
+        head.push_str(&format!("Retry-After: {secs}\r\n"));
     }
     if reply.status != 204 {
         head.push_str("Content-Type: text/plain; charset=utf-8\r\n");
@@ -1166,24 +1195,20 @@ fn token_char(b: u8) -> bool {
 enum Route<'a> {
     Vault(&'a str),
     Join(&'a str),
+    Verdict(&'a str),
 }
 
-/// `/v1/<name>` or `/v1/<name>/join`, with `<name>` a vault name.
+/// `/v1/<name>`, `/v1/<name>/join` or `/v1/<name>/join/verdict`, with `<name>` a vault name.
 fn route(path: &str) -> Option<Route<'_>> {
     let rest = path.strip_prefix("/v1/")?;
-    let (name, join) = match rest.split_once('/') {
-        None => (rest, false),
-        Some((name, "join")) => (name, true),
+    let route = match rest.split_once('/') {
+        None => Route::Vault(rest),
+        Some((name, "join")) => Route::Join(name),
+        Some((name, "join/verdict")) => Route::Verdict(name),
         Some(_) => return None,
     };
-    if !envelope::valid_name(name) {
-        return None;
-    }
-    Some(if join {
-        Route::Join(name)
-    } else {
-        Route::Vault(name)
-    })
+    let (Route::Vault(name) | Route::Join(name) | Route::Verdict(name)) = route;
+    envelope::valid_name(name).then_some(route)
 }
 
 fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Request) -> Reply {
@@ -1191,17 +1216,17 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
     let Some(route) = route(&path) else {
         return Reply::text(
             404,
-            "no such path: the vault paths are /v1/<name> and /v1/<name>/join",
+            "no such path: the vault paths are /v1/<name>, /v1/<name>/join and /v1/<name>/join/verdict",
         );
     };
     let method = request.method.as_str();
     if !matches!(
         (&route, method),
-        (Route::Vault(_), "GET" | "PUT") | (Route::Join(_), "GET" | "POST")
+        (Route::Vault(_), "GET" | "PUT") | (Route::Join(_) | Route::Verdict(_), "GET" | "POST")
     ) {
         let allow = match route {
             Route::Vault(_) => "GET, PUT",
-            Route::Join(_) => "GET, POST",
+            Route::Join(_) | Route::Verdict(_) => "GET, POST",
         };
         let mut reply = Reply::text(405, format!("{method} is not answered here; use {allow}"));
         reply.allow = Some(allow);
@@ -1215,7 +1240,11 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
         return Reply::text(400, "this path takes no query");
     }
     match (route, method) {
-        (Route::Vault(name), "GET") => get_vault(shared, stream, name, request.query.as_deref()),
+        (Route::Vault(name), "GET") => {
+            #[cfg(test)]
+            shared.envelope_gets.fetch_add(1, Ordering::SeqCst);
+            get_vault(shared, stream, name, request.query.as_deref())
+        }
         (Route::Vault(name), _) => {
             let length = match body_length(&request, MAX_ENVELOPE) {
                 Ok(length) => length,
@@ -1241,6 +1270,13 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
             .and_then(|length| read_body(stream, request, length, &shared.tuning))
         {
             Ok(body) => post_join(shared, name, &body, peer),
+            Err(reply) => reply,
+        },
+        (Route::Verdict(name), "GET") => list_verdicts(shared, name),
+        (Route::Verdict(name), _) => match body_length(&request, MAX_JOIN_BODY)
+            .and_then(|length| read_body(stream, request, length, &shared.tuning))
+        {
+            Ok(body) => post_verdict(shared, name, &body),
             Err(reply) => reply,
         },
     }
@@ -1349,6 +1385,7 @@ fn envelope_reply(held: &Held) -> Reply {
         body: Body::Envelope(Arc::clone(&held.bytes)),
         etag: Some(held.seq),
         allow: None,
+        retry_after: None,
     }
 }
 
@@ -1381,17 +1418,17 @@ fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str
         return envelope_reply(&slot.held);
     }
     let wake = Arc::clone(&slot.wake);
+    let verdicts = slot.verdicts;
     let deadline = Instant::now().checked_add(shared.hold);
     let every = shared.tuning.liveness_every;
     #[cfg(test)]
     shared.waiting.fetch_add(1, Ordering::SeqCst);
     loop {
         take_from_store(shared, &mut state, name);
-        let newer = state
-            .vaults
-            .get(name)
-            .is_some_and(|slot| slot.held.seq > after);
-        if newer || shared.stopping.load(Ordering::SeqCst) {
+        let (newer, verdict) = state.vaults.get(name).map_or((false, false), |slot| {
+            (slot.held.seq > after, slot.verdicts != verdicts)
+        });
+        if newer || verdict || shared.stopping.load(Ordering::SeqCst) {
             break;
         }
         let slice = match deadline {
@@ -1533,6 +1570,7 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
             bytes: Arc::new(Vec::new()),
         },
         wake: Arc::new(Condvar::new()),
+        verdicts: 0,
     });
     slot.held = held;
     slot.wake.notify_all();
@@ -1685,14 +1723,30 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
         note(&format!("{name}: could not store a join request: {e}"));
         return Reply::text(500, "the server could not store the request");
     }
-    shared
-        .lock_server_state()
-        .joins
-        .insert(name.to_owned(), queue);
+    let mut state = shared.lock_server_state();
+    let queue = keep_verdicts(queue, state.joins.get(name).map(Vec::as_slice));
+    state.joins.insert(name.to_owned(), queue);
+    drop(state);
     if let Some(line) = noted {
         note(&format!("{name}: {line}"));
     }
     Reply::empty(204)
+}
+
+/// `queue`, decided from a copy of the queue held then, with each verdict the held queue took
+/// since: [`post_verdict`] takes only `server_state`, so one can land while a join's store is
+/// written. A verdict carries over only to the request of the same key and proof.
+fn keep_verdicts(mut queue: Vec<Queued>, held: Option<&[Queued]>) -> Vec<Queued> {
+    for queued in queue.iter_mut().filter(|queued| queued.refused.is_none()) {
+        let since = held.into_iter().flatten().find(|now| {
+            now.request.recipient == queued.request.recipient
+                && now.request.proof == queued.request.proof
+        });
+        if let Some(now) = since {
+            queued.refused.clone_from(&now.refused);
+        }
+    }
+    queue
 }
 
 /// What [`decide_join`] decided.
@@ -1745,14 +1799,18 @@ fn decide_join(
     let previous = queue.iter().position(ours).map(|at| queue.remove(at));
     if let Some(previous) = &previous {
         let gap = shared.tuning.join_change_gap;
-        if now
+        if let Some(since) = now
             .checked_sub(previous.changed)
-            .is_some_and(|since| since < gap.as_secs())
+            .filter(|since| *since < gap.as_secs())
         {
-            return Err(Reply::text(
+            // The seconds left of the gap: a client that waits them is taken (its person typed
+            // the join password again), where the queue's caps name no wait.
+            let mut reply = Reply::text(
                 429,
                 format!("this key's join request changed less than {gap:?} ago; ask again shortly"),
-            ));
+            );
+            reply.retry_after = Some(gap.as_secs() - since);
+            return Err(reply);
         }
     }
     if !make_room(
@@ -1792,6 +1850,7 @@ fn decide_join(
         asked: seq,
         changed: now,
         noted,
+        refused: None,
     });
     Ok(Decided::Next(queue, line))
 }
@@ -1831,6 +1890,64 @@ fn list_joins(shared: &Shared, name: &str) -> Reply {
         body: Body::Text(join_lines(queue)),
         etag: None,
         allow: None,
+        retry_after: None,
+    }
+}
+
+/// `POST /v1/<name>/join/verdict`: an admin Mac's `age1… refused <tag>` on the request of that
+/// key whose proof `tag` names ([`crate::join::proof_tag`]). Unauthenticated, it can only make
+/// that Mac ask its person for the join password again: it is kept beside that request alone,
+/// in memory, until the request changes, and a new one ends the vault's long-polls.
+fn post_verdict(shared: &Shared, name: &str, body: &[u8]) -> Reply {
+    let line = std::str::from_utf8(body)
+        .ok()
+        .map(|text| text.strip_suffix('\n').unwrap_or(text));
+    let Some((recipient, tag)) = line.and_then(crate::transport::parse_verdict_line) else {
+        return Reply::text(400, "a verdict is one line: `age1… refused <tag>`");
+    };
+    let mut state = shared.lock_server_state();
+    let State { vaults, joins } = &mut *state;
+    let Some(slot) = vaults.get_mut(name) else {
+        return Reply::text(404, format!("no vault named {name} here"));
+    };
+    let Some(queued) = joins.get_mut(name).and_then(|queue| {
+        queue.iter_mut().find(|queued| {
+            queued.request.recipient == recipient
+                && queued
+                    .request
+                    .proof
+                    .as_deref()
+                    .is_some_and(|proof| crate::join::proof_tag(proof) == tag)
+        })
+    }) else {
+        return Reply::text(404, "no join request of that key carries that proof");
+    };
+    if queued.refused.as_deref() != Some(tag.as_str()) {
+        queued.refused = Some(tag);
+        slot.verdicts += 1;
+        slot.wake.notify_all();
+    }
+    Reply::empty(204)
+}
+
+/// `GET /v1/<name>/join/verdict`: one `age1… refused <tag>` line per request a verdict refused.
+fn list_verdicts(shared: &Shared, name: &str) -> Reply {
+    let state = shared.lock_server_state();
+    if !state.vaults.contains_key(name) {
+        return Reply::text(404, format!("no vault named {name} here"));
+    }
+    let mut text = String::new();
+    for queued in state.joins.get(name).into_iter().flatten() {
+        if let Some(tag) = &queued.refused {
+            text.push_str(&format!("{} refused {tag}\n", queued.request.recipient));
+        }
+    }
+    Reply {
+        status: 200,
+        body: Body::Text(text),
+        etag: None,
+        allow: None,
+        retry_after: None,
     }
 }
 
@@ -1903,6 +2020,8 @@ struct Children(Arc<Mutex<ChildSet>>);
 struct ChildSet {
     closed: bool,
     caffeinate: Option<aterm_uds::spawnfd::Child>,
+    /// The last start of [`CAFFEINATE`] failed, so the log said so ([`tend_awake`]).
+    awake_failed: bool,
     dns_sd: Option<(aterm_uds::spawnfd::Child, Ipv4Addr)>,
 }
 
@@ -1926,26 +2045,26 @@ impl Children {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn keep_awake(&self) {
+    /// Keep the server's children up while it runs: the keep-awake assertion when
+    /// `keep_awake` ([`tend_awake`]) and the mDNS registration of `advertise`'s name and port
+    /// ([`reregister`]), each checked again every [`ADVERTISE_EVERY`].
+    fn tend(&self, keep_awake: bool, advertise: Option<(String, u16)>) {
         if !cfg!(target_os = "macos") {
-            note("keep-awake is macOS only; ignored");
+            if keep_awake {
+                note("keep-awake is macOS only; ignored");
+            }
+            if advertise.is_some() {
+                note("--advertise is macOS only (dns-sd); ignored");
+            }
             return;
         }
-        match quiet(CAFFEINATE, &caffeinate_args(std::process::id())) {
-            Ok(child) => self.lock().caffeinate = Some(child),
-            Err(e) => note(&format!("could not start {CAFFEINATE}: {e}")),
-        }
-    }
-
-    fn advertise(&self, name: &str, port: u16) {
-        if !cfg!(target_os = "macos") {
-            note("--advertise is macOS only (dns-sd); ignored");
+        if !keep_awake && advertise.is_none() {
             return;
         }
         let held = Arc::clone(&self.0);
-        let name = name.to_owned();
+        let pid = std::process::id();
         let spawned = std::thread::Builder::new()
-            .name("vault-advertise".to_owned())
+            .name("vault-tend".to_owned())
             .spawn(move || {
                 loop {
                     {
@@ -1953,13 +2072,51 @@ impl Children {
                         if set.closed {
                             return;
                         }
-                        reregister(&mut set, &name, port, lan_ipv4());
+                        if keep_awake {
+                            tend_awake(&mut set, &|| quiet(CAFFEINATE, &caffeinate_args(pid)));
+                        }
+                        if let Some((name, port)) = &advertise {
+                            reregister(&mut set, name, *port, lan_ipv4());
+                        }
                     }
                     std::thread::sleep(ADVERTISE_EVERY);
                 }
             });
         if let Err(e) = spawned {
-            note(&format!("could not start advertising: {e}"));
+            note(&format!(
+                "could not start keeping awake or advertising: {e}"
+            ));
+        }
+    }
+}
+
+/// Keep one keep-awake assertion ([`CAFFEINATE`] tied to the server's pid) running: a live one
+/// stays, and one that ended (a person's `killall caffeinate`) or never started is started
+/// again by `spawn`. The log says so only when that changes.
+fn tend_awake(set: &mut ChildSet, spawn: &dyn Fn() -> io::Result<aterm_uds::spawnfd::Child>) {
+    if let Some(child) = set.caffeinate.as_mut()
+        && matches!(child.try_wait(), Ok(None))
+    {
+        return;
+    }
+    let ended = set
+        .caffeinate
+        .take()
+        .map(|mut child| end(&mut child))
+        .is_some();
+    match spawn() {
+        Ok(child) => {
+            set.caffeinate = Some(child);
+            if ended || set.awake_failed {
+                note("keeping this Mac awake again");
+            }
+            set.awake_failed = false;
+        }
+        Err(e) => {
+            if !set.awake_failed {
+                note(&format!("could not start {CAFFEINATE}: {e}"));
+            }
+            set.awake_failed = true;
         }
     }
 }
@@ -1980,8 +2137,8 @@ fn reregister(set: &mut ChildSet, name: &str, port: u16, ip: Option<Ipv4Addr>) {
     };
     match quiet(DNS_SD, &dns_sd_args(name, port, ip)) {
         Ok(child) => {
-            note(&format!("advertising {name}.local at {ip}:{port}"));
             set.dns_sd = Some((child, ip));
+            note(&format!("advertising {name}.local at {ip}:{port}"));
         }
         Err(e) => note(&format!("could not start {DNS_SD}: {e}")),
     }
@@ -2106,6 +2263,7 @@ mod tests {
             asked: 1,
             changed: 0,
             noted: 0,
+            refused: None,
         }
     }
 
@@ -3437,17 +3595,30 @@ mod tests {
         );
         assert_eq!(held(&running).request.time, Some(START));
 
+        // A second short of the gap, a change is refused with that second as its Retry-After,
+        // which the client sits out once; on this clock, which has not moved, its retry is
+        // refused too.
         at(gap - 1);
-        let error = transport::post_join(&url(&running), &join_line(1, "m22b"))
-            .expect_err("changed too soon");
+        let paused = std::cell::RefCell::new(Vec::new());
+        let error = transport::post_join_pausing(&url(&running), &join_line(1, "m22b"), &|wait| {
+            paused.borrow_mut().push(wait)
+        })
+        .expect_err("changed too soon");
+        assert_eq!(*paused.borrow(), [Duration::from_secs(1)]);
         assert!(error.0.contains("429"), "{error}");
         assert!(error.0.contains("changed less than 10s ago"), "{error}");
         assert_eq!(std::fs::read(&joins).expect("joins"), first);
         assert_eq!(held(&running).request.host, "m22");
         assert_eq!(held(&running).request.time, Some(START));
 
-        at(gap);
-        transport::post_join(&url(&running), &join_line(1, "m22b")).expect("changed");
+        // The same change, its pause letting the clock reach the gap: the retry is taken.
+        paused.borrow_mut().clear();
+        transport::post_join_pausing(&url(&running), &join_line(1, "m22b"), &|wait| {
+            paused.borrow_mut().push(wait);
+            at(gap);
+        })
+        .expect("changed after its pause");
+        assert_eq!(*paused.borrow(), [Duration::from_secs(1)]);
         assert_eq!(held(&running).request.host, "m22b");
         assert_eq!(held(&running).request.time, Some(START + gap));
         assert_eq!(held(&running).noted, START, "noted again within the hour");
@@ -3778,6 +3949,40 @@ mod tests {
         }
         assert!(stored(&store) == Some(envelope(&OLD, 2)), "taken");
         assert!(!lock.exists(), "a PUT leaves no lock");
+
+        // A lock written before this boot has no running holder, whatever pid its line names
+        // (here a live one) or when its line never reached the disk; never one of another
+        // machine, nor an empty one written this boot.
+        let before_boot = std::time::UNIX_EPOCH + Duration::from_secs(86_400);
+        let mut seq = 2;
+        for (holder, written, cleared) in [
+            (format!("{host} {}", std::process::id()), before_boot, true),
+            (String::new(), before_boot, true),
+            (
+                format!("elsewhere.invalid {}", i32::MAX),
+                before_boot,
+                false,
+            ),
+            (String::new(), std::time::SystemTime::now(), false),
+        ] {
+            std::fs::write(&lock, &holder).expect("locked");
+            std::fs::File::options()
+                .write(true)
+                .open(&lock)
+                .and_then(|file| file.set_modified(written))
+                .expect("dated");
+            let taken = put(&running, &envelope(&OLD, seq + 1));
+            assert_eq!(
+                taken.is_ok(),
+                cleared,
+                "{holder:?} at {written:?}: {taken:?}"
+            );
+            if cleared {
+                seq += 1;
+            } else {
+                std::fs::remove_file(&lock).expect("unlocked");
+            }
+        }
         running.stop();
     }
 
@@ -3905,6 +4110,71 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_taken_while_a_join_is_stored_is_kept() {
+        let request = |n: u8, proof: &str| JoinRequest {
+            proof: Some(proof.to_owned()),
+            ..parse_join_line(&join_line(n, &format!("m{n}"))).expect("valid")
+        };
+        let decided = vec![
+            queued(request(1, "p1"), None),
+            queued(request(2, "p2"), None),
+        ];
+        let mut held = decided.clone();
+        held[0].refused = Some("t1".to_owned());
+        // The same key with a new proof (its person typed the password again) is not refused.
+        let mut retyped = queued(request(2, "p2-again"), None);
+        retyped.refused = Some("t2".to_owned());
+        held[1] = retyped;
+        let kept = keep_verdicts(decided.clone(), Some(&held));
+        assert_eq!(kept[0].refused.as_deref(), Some("t1"));
+        assert_eq!(kept[1].refused, None);
+        // CONTROL: with no queue held, nothing is refused.
+        assert!(
+            keep_verdicts(decided, None)
+                .iter()
+                .all(|q| q.refused.is_none())
+        );
+    }
+
+    #[test]
+    fn a_keep_awake_that_ends_is_started_again() {
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path");
+        let spawn = || quiet(sleep, &["60".to_owned()]);
+        let refused = || Err(io::Error::other("no such program"));
+        let children = Children::default();
+        let mut set = children.lock();
+        let pid = |set: &ChildSet| set.caffeinate.as_ref().map(aterm_uds::spawnfd::Child::id);
+
+        tend_awake(&mut set, &spawn);
+        let first = pid(&set).expect("started");
+        // A live one stays.
+        tend_awake(&mut set, &spawn);
+        assert_eq!(pid(&set), Some(first));
+        // Killed from outside, it is started again.
+        let killed = set.caffeinate.as_mut().expect("held");
+        killed.kill().expect("killed");
+        killed.wait().expect("reaped");
+        tend_awake(&mut set, &spawn);
+        let second = pid(&set).expect("started again");
+        assert_ne!(second, first);
+        assert!(aterm_uds::process::pid_alive(second));
+        // A start that fails leaves none and is tried again at the next look.
+        end(set.caffeinate.as_mut().expect("held"));
+        tend_awake(&mut set, &refused);
+        assert!(set.caffeinate.is_none() && set.awake_failed);
+        tend_awake(&mut set, &spawn);
+        let third = pid(&set).expect("started once it can be");
+        assert!(!set.awake_failed);
+        drop(set);
+        drop(children);
+        assert!(
+            !aterm_uds::process::pid_alive(third),
+            "it outlived the server"
+        );
+    }
+
+    #[test]
     fn a_client_that_never_finishes_its_head_is_cut_at_the_deadline() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let tuning = Tuning {
@@ -3953,6 +4223,7 @@ mod tests {
                     bytes: Arc::clone(&big),
                 },
                 wake: Arc::new(Condvar::new()),
+                verdicts: 0,
             },
         );
         let stream = sent(&running, b"GET /v1/alab HTTP/1.1\r\nHost: x\r\n\r\n");

@@ -158,6 +158,34 @@ pub fn shell_unquote(s: &str) -> String {
     out
 }
 
+/// A `targo` started at the checkout with `args` (more may follow) that builds as `targo` typed
+/// there does, so each reuses the other's build: the one that runs the lab (`$CARGO`, the store's
+/// `targo` past the shim), handed the shim's `build.build-dir`
+/// (`atpkg::build_cache::with_build_dir_from`), without which a nested build compiled the graph
+/// again into `<checkout>/target/debug` (`mac dmg`'s benches: 48 crates, 110 s, 1.0 GB,
+/// 2026-10-21); and without what `cargo run` said about the lab
+/// (`atpkg::build_cache::CARGO_RUN_ENV`), which build scripts track.
+#[must_use]
+pub fn targo(args: &[&str]) -> aterm_uds::spawnfd::Command {
+    let repo = &crate::paths::paths().repo;
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let args =
+        atpkg::build_cache::with_build_dir_from(&args, atpkg::build_cache::Tool::Targo, repo)
+            .unwrap_or(args);
+    let mut cmd =
+        aterm_uds::spawnfd::command(std::env::var_os("CARGO").unwrap_or_else(|| "targo".into()));
+    cmd.args(args).current_dir(repo);
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(atpkg::build_cache::said_by_cargo_run)
+        {
+            cmd.env_remove(name);
+        }
+    }
+    cmd
+}
+
 /// Atomically replaces `path` with `bytes` via [`crate::sys::put`].
 ///
 /// # Errors
@@ -340,6 +368,40 @@ pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_nested_targo_starts_at_the_checkout_without_what_cargo_said_about_the_lab() {
+        // CONTROL: cargo hands this test binary what it hands the lab under `targo run`
+        // (`OUT_DIR` too: aterm-lab has a build script).
+        for name in ["CARGO_PKG_NAME", "CARGO_MANIFEST_DIR", "OUT_DIR"] {
+            assert!(std::env::var_os(name).is_some(), "{name}");
+        }
+        let cmd = super::targo(&["--unverified", "build"]);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for name in ["CARGO_PKG_NAME", "CARGO_MANIFEST_DIR", "OUT_DIR"] {
+            assert!(removed.iter().any(|r| r == name), "{name} in {removed:?}");
+        }
+        assert!(
+            !removed.iter().any(|r| r == "PATH" || r == "HOME"),
+            "{removed:?}"
+        );
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(crate::paths::paths().repo.as_path())
+        );
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.ends_with(&["--unverified".to_owned(), "build".to_owned()]),
+            "{args:?}"
+        );
+    }
+
     #[test]
     fn archived_scratch_files_keep_times_but_refuse_other_names() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};

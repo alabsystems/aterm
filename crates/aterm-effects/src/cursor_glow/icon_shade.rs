@@ -154,17 +154,26 @@ impl CursorGlow {
         let mut piece_ramps = std::mem::take(&mut self.icon_ramps);
         let mut halo_pieces = std::mem::take(&mut self.icon_halos);
         let mut cut = std::mem::take(&mut self.icon_cut);
-        for (i, &icon) in self.word_icons.iter().enumerate() {
+        let mut i = 0;
+        while i < self.word_icons.len() {
+            let icon = self.word_icons[i];
             let icon = (icon.0 + ox, icon.1 + ox, icon.2 + oy, icon.3 + oy);
-            if icon.0 >= icon.1 || icon.2 >= icon.3 {
-                continue;
+            if icon.0 < icon.1 && icon.2 < icon.3 {
+                drawn_rows(icon, self.word_icon_src.get(i), (ox, oy), &mut bands);
+                lifted |= shade_stream(
+                    (&mut *over.0, &mut *over.1),
+                    &bands,
+                    (&mut pieces, &mut piece_ramps, &mut cut),
+                );
+                lifted |= shade_stream(
+                    (&mut *under.0, &mut *under.1),
+                    &bands,
+                    (&mut pieces, &mut piece_ramps, &mut cut),
+                );
+                lifted |= shade_halos(halos, &bands, (&mut halo_pieces, &mut cut));
+                lifted |= shade_patches(patches, &bands, (&mut patch_pieces, &mut cut));
             }
-            drawn_rows(icon, self.word_icon_src.get(i), (ox, oy), &mut bands);
-            for stream in [(&mut *over.0, &mut *over.1), (&mut *under.0, &mut *under.1)] {
-                lifted |= shade_stream(stream, &bands, (&mut pieces, &mut piece_ramps, &mut cut));
-            }
-            lifted |= shade_halos(halos, &bands, (&mut halo_pieces, &mut cut));
-            lifted |= shade_patches(patches, &bands, (&mut patch_pieces, &mut cut));
+            i += 1;
         }
         self.icon_scratch = bands;
         self.icon_quads = pieces;
@@ -189,16 +198,26 @@ fn lift_stars(
     if marks.is_empty() || icons.is_empty() {
         return false;
     }
+    #[inline]
+    const fn inside(b: PxBox, rect: PxBox) -> bool {
+        b.0 >= rect.0 && b.1 <= rect.1 && b.2 >= rect.2 && b.3 <= rect.3
+    }
     let mut lifted = false;
-    for mark in marks {
+    let mut mi = 0;
+    while mi < marks.len() {
+        let mark = &marks[mi];
+        mi += 1;
         let r = mark.reach / 2;
         let (x, y) = (mark.at.0 - ox, mark.at.1 - oy);
         let mut hit = false;
-        for &(x0, x1, y0, y1) in icons {
+        let mut ii = 0;
+        while ii < icons.len() {
+            let (x0, x1, y0, y1) = icons[ii];
             if x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1 {
                 hit = true;
                 break;
             }
+            ii += 1;
         }
         if !hit {
             continue;
@@ -209,11 +228,10 @@ fn lift_stars(
         if own.is_empty() {
             continue;
         }
-        let inside = |b: PxBox| {
-            b.0 >= mark.rect.0 && b.1 <= mark.rect.1 && b.2 >= mark.rect.2 && b.3 <= mark.rect.3
+        let rect = mark.rect;
+        let star_quad = |q: &GlowQuad| {
+            inside(quad_box(q), rect) && own.contains(&rk::stardust::sky_quad_key(q))
         };
-        let star_quad =
-            |q: &GlowQuad| inside(quad_box(q)) && own.contains(&rk::stardust::sky_quad_key(q));
         let (nq, nu, nh) = (over.0.len(), under.0.len(), halos.len());
         // A star's lights are quads of their own, never a ramp's rows.
         if nq > 0 {
@@ -223,8 +241,9 @@ fn lift_stars(
             under.1.retain_quads(under.0, |q| !star_quad(q));
         }
         if nh > 0 {
-            halos
-                .retain(|h| !(inside(halo_box(h)) && own.contains(&rk::stardust::sky_halo_key(h))));
+            halos.retain(|h| {
+                !(inside(halo_box(h), rect) && own.contains(&rk::stardust::sky_halo_key(h)))
+            });
         }
         lifted |= over.0.len() != nq || under.0.len() != nu || halos.len() != nh;
     }
@@ -281,8 +300,18 @@ fn drawn_rows_by(
     out: &mut Vec<PxBox>,
     (texel, edge): (impl Fn(i32, i32, i32, bool) -> i32, u8),
 ) {
-    let borrowed = src.map(|s| (&*s.art, s.dest, s.flip_x));
-    drawn_rows_ref(icon, borrowed, origin, out, (texel, edge));
+    let Some(s) = src else {
+        out.clear();
+        out.push(icon);
+        return;
+    };
+    drawn_rows_ref(
+        icon,
+        Some((&s.art, s.dest, s.flip_x)),
+        origin,
+        out,
+        (texel, edge),
+    );
 }
 
 fn drawn_rows_ref(
@@ -292,6 +321,13 @@ fn drawn_rows_ref(
     out: &mut Vec<PxBox>,
     (texel, edge): (impl Fn(i32, i32, i32, bool) -> i32, u8),
 ) {
+    #[inline]
+    const fn texel_drawn(kind: FxTexels, edge: u8, v: u32) -> bool {
+        match kind {
+            FxTexels::Index8 => v != 0,
+            FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => v >> 24 >= edge as u32,
+        }
+    }
     out.clear();
     let Some((art, dest, flip_x)) = src else {
         out.push(icon);
@@ -310,33 +346,34 @@ fn drawn_rows_ref(
     let (aw, ah) = (i32::from(art.w()), i32::from(art.h()));
     let (aw_max, ah_max) = (aw - 1, ah - 1);
     let kind = art.texels();
-    let drawn = |v: u32| match kind {
-        FxTexels::Index8 => v != 0,
-        FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => v >> 24 >= u32::from(edge),
-    };
     let (lo, hi) = (icon.0.max(bx0), icon.1.min(bx0 + w));
     let (y_lo, y_hi) = (icon.2.max(by0), icon.3.min(by0 + h));
     if lo >= hi || y_lo >= y_hi {
         return;
     }
     let mut prev_sy: Option<(usize, Option<(i32, i32)>)> = None;
-    for y in y_lo..y_hi {
+    let mut y = y_lo;
+    while y < y_hi {
         let dy = y - by0;
         let sy = texel(dy, ah, h, false).clamp(0, ah_max) as usize;
         let span = match prev_sy {
             Some((ps, span)) if ps == sy => span,
             _ => {
-                let opaque = |x: i32| {
-                    let sx = texel(x - bx0, aw, w, flip_x).clamp(0, aw_max) as usize;
-                    drawn(art.texel(sx, sy))
-                };
                 let mut first = lo;
-                while first < hi && !opaque(first) {
+                while first < hi {
+                    let sx = texel(first - bx0, aw, w, flip_x).clamp(0, aw_max) as usize;
+                    if texel_drawn(kind, edge, art.texel(sx, sy)) {
+                        break;
+                    }
                     first += 1;
                 }
                 let span = if first < hi {
                     let mut last = hi - 1;
-                    while last > first && !opaque(last) {
+                    while last > first {
+                        let sx = texel(last - bx0, aw, w, flip_x).clamp(0, aw_max) as usize;
+                        if texel_drawn(kind, edge, art.texel(sx, sy)) {
+                            break;
+                        }
                         last -= 1;
                     }
                     Some((first, last + 1))
@@ -347,13 +384,13 @@ fn drawn_rows_ref(
                 span
             }
         };
-        let Some((x0, x1)) = span else {
-            continue;
-        };
-        match out.last_mut() {
-            Some(b) if b.3 == y && b.0 == x0 && b.1 == x1 => b.3 = y + 1,
-            _ => out.push((x0, x1, y, y + 1)),
+        if let Some((x0, x1)) = span {
+            match out.last_mut() {
+                Some(b) if b.3 == y && b.0 == x0 && b.1 == x1 => b.3 = y + 1,
+                _ => out.push((x0, x1, y, y + 1)),
+            }
         }
+        y += 1;
     }
 }
 
@@ -397,7 +434,10 @@ fn cut_rect(rect: PxBox, bands: &[PxBox], out: &mut Vec<PxBox>) -> bool {
     }
     let mut hit = false;
     let mut y = y0;
-    for b in bands {
+    let mut bi = 0;
+    while bi < bands.len() {
+        let b = bands[bi];
+        bi += 1;
         if b.3 <= y0 {
             continue;
         }
@@ -482,11 +522,14 @@ fn shade_quads(
     }
     let bounds = bands_bounds(bands);
     let mut any = false;
-    for (i, q) in quads.iter().enumerate() {
+    let mut i = 0;
+    while i < quads.len() {
+        let q = &quads[i];
         if !reached(quad_box(q), bands, bounds, cut) {
             if any {
                 pieces.push(*q);
             }
+            i += 1;
             continue;
         }
         if !any {
@@ -495,6 +538,7 @@ fn shade_quads(
             any = true;
         }
         push_pieces(q, cut, pieces);
+        i += 1;
     }
     if any {
         std::mem::swap(quads, pieces);
@@ -529,18 +573,22 @@ fn shade_stream(
     }
     let bounds = bands_bounds(bands);
     let mut any_reached = false;
-    for q in quads.iter() {
-        if reached(quad_box(q), bands, bounds, cut) {
+    let mut qi = 0;
+    while qi < quads.len() {
+        if reached(quad_box(&quads[qi]), bands, bounds, cut) {
             any_reached = true;
             break;
         }
+        qi += 1;
     }
     if !any_reached {
-        for r in &ramps.items {
-            if ramp_reached(r, &ramps.ends, (bands, bounds), cut) {
+        let mut ri = 0;
+        while ri < ramps.items.len() {
+            if ramp_reached(&ramps.items[ri], &ramps.ends, (bands, bounds), cut) {
                 any_reached = true;
                 break;
             }
+            ri += 1;
         }
     }
     if !any_reached {
@@ -551,13 +599,17 @@ fn shade_stream(
     let mut any = false;
     ramps.in_order(quads.len(), |laid| match laid {
         Laid::Quads(run) => {
-            for q in &quads[run] {
+            let slice = &quads[run];
+            let mut si = 0;
+            while si < slice.len() {
+                let q = &slice[si];
                 if reached(quad_box(q), bands, bounds, cut) {
                     push_pieces(q, cut, pieces);
                     any = true;
                 } else {
                     pieces.push(*q);
                 }
+                si += 1;
             }
         }
         Laid::Ramp(k) => {
@@ -593,7 +645,10 @@ fn ramp_spans(ramp: &GlowRamp, bands: &[PxBox], mut each: impl FnMut((u16, u16))
         None
     };
     let mut span: Option<(u16, u16)> = None;
-    for b in bands {
+    let mut bi = 0;
+    while bi < bands.len() {
+        let b = bands[bi];
+        bi += 1;
         if !(b.0 < rb.1 && b.1 > rb.0 && b.3 > rb.2 && b.2 < rb.3) {
             continue;
         }
@@ -637,13 +692,15 @@ fn ramp_reached(
         if hit {
             return;
         }
-        for r in a..e {
+        let mut r = a;
+        while r < e {
             if let Some(q) = ramp.row_quad(ends, r)
                 && reached(quad_box(&q), bands, bounds, cut)
             {
                 hit = true;
                 break;
             }
+            r += 1;
         }
     });
     hit
@@ -665,24 +722,24 @@ fn shade_ramp(
         return false;
     }
     let (mut next, mut any) = (0u16, false);
-    let mut lay = |(a, e): (u16, u16), next: &mut u16, any: &mut bool| {
-        if a > *next {
-            piece_ramps.copy_rows(ramp, ends, pieces.len(), (*next, a - *next));
+    ramp_spans(ramp, bands, |(a, e)| {
+        if a > next {
+            piece_ramps.copy_rows(ramp, ends, pieces.len(), (next, a - next));
         }
-        for r in a..e {
-            let Some(q) = ramp.row_quad(ends, r) else {
-                continue;
-            };
-            if reached(quad_box(&q), bands, bounds, cut) {
-                push_pieces(&q, cut, pieces);
-                *any = true;
-            } else {
-                pieces.push(q);
+        let mut r = a;
+        while r < e {
+            if let Some(q) = ramp.row_quad(ends, r) {
+                if reached(quad_box(&q), bands, bounds, cut) {
+                    push_pieces(&q, cut, pieces);
+                    any = true;
+                } else {
+                    pieces.push(q);
+                }
             }
+            r += 1;
         }
-        *next = e;
-    };
-    ramp_spans(ramp, bands, |p| lay(p, &mut next, &mut any));
+        next = e;
+    });
     if next < ramp.h {
         piece_ramps.copy_rows(ramp, ends, pieces.len(), (next, ramp.h - next));
     }
@@ -692,6 +749,28 @@ fn shade_ramp(
 /// Lay `q`'s pieces outside the icon's drawn rows (`cut`, [`cut_rect`]'s),
 /// each continuing the quad's horizontal gradient.
 fn push_pieces(q: &GlowQuad, cut: &[PxBox], pieces: &mut Vec<GlowQuad>) {
+    #[inline]
+    const fn lerp_ch(c0: i32, c1: i32, wk: i32, k: i32, half_w_max: i32, w_max: i32) -> u32 {
+        let v = (c0 * wk + c1 * k + half_w_max) / w_max;
+        if v < 0 {
+            0
+        } else if v > 255 {
+            255
+        } else {
+            v as u32
+        }
+    }
+    #[inline]
+    const fn lerp_alpha(a0: i32, a1: i32, w: i32, k: i32, half_w: i32, w_max: i32) -> u8 {
+        let v = (a0 * (w - k) + a1 * k + half_w) / w_max;
+        if v < 0 {
+            0
+        } else if v > 255 {
+            255
+        } else {
+            v as u8
+        }
+    }
     let b = quad_box(q);
     let w = i32::from(q.w);
     let w_max = w.max(1);
@@ -713,12 +792,10 @@ fn push_pieces(q: &GlowQuad, cut: &[PxBox], pieces: &mut Vec<GlowQuad>) {
             (q.color2 & 0xff) as i32,
         ),
     );
-    let lerp_c = |k: i32| {
-        let wk = w_max - k;
-        let ch = |c0: i32, c1: i32| ((c0 * wk + c1 * k + half_w_max) / w_max).clamp(0, 255) as u32;
-        (ch(ca.0, cb.0) << 16) | (ch(ca.1, cb.1) << 8) | ch(ca.2, cb.2)
-    };
-    for &(xa, xb, ya, yb) in cut {
+    let mut ci = 0;
+    while ci < cut.len() {
+        let (xa, xb, ya, yb) = cut[ci];
+        ci += 1;
         let (ka, kb) = (xa - b.0, xb - b.0);
         let whole = ka == 0 && kb == w;
         let (color, color2, alpha, alpha2) = if flat || whole {
@@ -727,13 +804,24 @@ fn push_pieces(q: &GlowQuad, cut: &[PxBox], pieces: &mut Vec<GlowQuad>) {
             let (c1, c2) = if flat_c {
                 (q.color, q.color2)
             } else {
-                (lerp_c(ka), lerp_c(kb))
+                let wka = w_max - ka;
+                let wkb = w_max - kb;
+                (
+                    (lerp_ch(ca.0, cb.0, wka, ka, half_w_max, w_max) << 16)
+                        | (lerp_ch(ca.1, cb.1, wka, ka, half_w_max, w_max) << 8)
+                        | lerp_ch(ca.2, cb.2, wka, ka, half_w_max, w_max),
+                    (lerp_ch(ca.0, cb.0, wkb, kb, half_w_max, w_max) << 16)
+                        | (lerp_ch(ca.1, cb.1, wkb, kb, half_w_max, w_max) << 8)
+                        | lerp_ch(ca.2, cb.2, wkb, kb, half_w_max, w_max),
+                )
             };
             let (al1, al2) = if flat_a {
                 (q.alpha, q.alpha2)
             } else {
-                let a = |k: i32| (a0 * (w - k) + a1 * k + half_w) / w_max;
-                (a(ka).clamp(0, 255) as u8, a(kb).clamp(0, 255) as u8)
+                (
+                    lerp_alpha(a0, a1, w, ka, half_w, w_max),
+                    lerp_alpha(a0, a1, w, kb, half_w, w_max),
+                )
             };
             (c1, c2, al1, al2)
         };
@@ -763,12 +851,15 @@ fn shade_halos(
     }
     let (bx0, bx1, by0, by1) = bands_bounds(bands);
     let mut any = false;
-    for (i, h) in halos.iter().enumerate() {
+    let mut i = 0;
+    while i < halos.len() {
+        let h = &halos[i];
         let b = halo_box(h);
         if b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1 || !cut_rect(b, bands, cut) {
             if any {
                 pieces.push(*h);
             }
+            i += 1;
             continue;
         }
         if !any {
@@ -776,7 +867,10 @@ fn shade_halos(
             pieces.extend_from_slice(&halos[..i]);
             any = true;
         }
-        for &(xa, xb, ya, yb) in cut.iter() {
+        let mut ci = 0;
+        while ci < cut.len() {
+            let (xa, xb, ya, yb) = cut[ci];
+            ci += 1;
             pieces.push(RainHalo {
                 x: xa as u16,
                 y: ya as u16,
@@ -785,6 +879,7 @@ fn shade_halos(
                 ..*h
             });
         }
+        i += 1;
     }
     if any {
         std::mem::swap(halos, pieces);
@@ -805,13 +900,16 @@ fn shade_patches(
     }
     let (bx0, bx1, by0, by1) = bands_bounds(bands);
     let mut any = false;
-    for (i, p) in patches.iter().enumerate() {
+    let mut i = 0;
+    while i < patches.len() {
+        let p = &patches[i];
         let (x, y) = (i32::from(p.x), i32::from(p.y));
         let b = (x, x + i32::from(p.w), y, y + i32::from(p.h));
         if b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1 || !cut_rect(b, bands, cut) {
             if any {
                 pieces.push(*p);
             }
+            i += 1;
             continue;
         }
         if !any {
@@ -819,7 +917,10 @@ fn shade_patches(
             pieces.extend_from_slice(&patches[..i]);
             any = true;
         }
-        for &(xa, xb, ya, yb) in cut.iter() {
+        let mut ci = 0;
+        while ci < cut.len() {
+            let (xa, xb, ya, yb) = cut[ci];
+            ci += 1;
             pieces.push(FirePatch {
                 x: xa as u16,
                 y: ya as u16,
@@ -828,6 +929,7 @@ fn shade_patches(
                 ..*p
             });
         }
+        i += 1;
     }
     if any {
         std::mem::swap(patches, pieces);

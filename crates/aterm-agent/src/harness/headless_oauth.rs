@@ -1737,6 +1737,39 @@ pub(super) fn browser_cache_roots(home: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
+/// The chrome-headless-shell unpacked in the browser cache `root`: the newest
+/// `chrome-headless-shell-*` directory (by name) that holds one, the browser lane's
+/// (`verify provision`) or the harness's own ([`super::headless_fetch`]).
+pub(super) fn shell_in(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("chrome-headless-shell-"))
+        })
+        .collect();
+    dirs.sort();
+    dirs.reverse();
+    // Each pinned platform's executable in its unpacked archive, else one laid bare.
+    let subs: Vec<PathBuf> = aterm_uds::host::chrome::PINNED
+        .iter()
+        .map(|pin| aterm_uds::host::chrome::pinned_binary(Path::new(""), pin.platform))
+        .chain([PathBuf::from("chrome-headless-shell")])
+        .collect();
+    for dir in dirs {
+        for sub in &subs {
+            let candidate = dir.join(sub);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Find a headless-capable Chromium executable.
 #[must_use]
 pub fn find_headless_browser(home: Option<&Path>) -> Option<HeadlessBrowser> {
@@ -1750,35 +1783,11 @@ pub fn find_headless_browser(home: Option<&Path>) -> Option<HeadlessBrowser> {
         }
     }
     for root in browser_cache_roots(home) {
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        let mut dirs: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("chrome-headless-shell-"))
-            })
-            .collect();
-        dirs.sort();
-        dirs.reverse();
-        for dir in dirs {
-            for sub in [
-                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
-                "chrome-headless-shell-mac-x64/chrome-headless-shell",
-                "chrome-headless-shell-linux64/chrome-headless-shell",
-                "chrome-headless-shell",
-            ] {
-                let candidate = dir.join(sub);
-                if candidate.is_file() {
-                    return Some(HeadlessBrowser {
-                        path: candidate,
-                        is_headless_shell: true,
-                    });
-                }
-            }
+        if let Some(path) = shell_in(&root) {
+            return Some(HeadlessBrowser {
+                path,
+                is_headless_shell: true,
+            });
         }
     }
     if cfg!(target_os = "macos") {

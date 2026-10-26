@@ -795,6 +795,8 @@ impl App {
 
     /// Drains messages queued in the pre-`App` inbox and reconciles the exceptions digest row.
     pub(crate) fn drain_message_inbox(&mut self) {
+        #[cfg(unix)]
+        self.follow_join_requests();
         let queued = crate::message_inbox::take_queued();
         let exceptions = crate::message_inbox::take_queued_exceptions();
         let folders = crate::spawn_folder::take_noted();
@@ -818,6 +820,34 @@ impl App {
         let _ = self.keep_config_rows_settings_shows_as_records();
         if !folders.is_empty() {
             self.fold_folder_faults(&folders);
+        }
+        self.sync_messages();
+    }
+
+    /// An admin Mac's notices of the Macs asking to join that its approver left to a person,
+    /// as its record last changed ([`crate::secrets_asking`]): one per Mac, each ended once
+    /// that Mac no longer asks.
+    #[cfg(unix)]
+    fn follow_join_requests(&mut self) {
+        use crate::secrets_asking::{KEY_PREFIX, notice, reconcile, take_changed};
+        let Some(asking) = take_changed() else {
+            return;
+        };
+        let shown: Vec<String> = self
+            .messages
+            .live_rows()
+            .filter_map(|live| live.msg.key.clone())
+            .filter(|key| key.starts_with(KEY_PREFIX))
+            .collect();
+        let (post, gone) = reconcile(&shown, &asking);
+        let now = Instant::now();
+        for key in gone {
+            if let Some(id) = self.messages.live_by_key(&key).map(|live| live.id) {
+                self.messages.withdraw(id, now);
+            }
+        }
+        for asking in post {
+            self.post_unsynced(notice(asking), wall_stamp_now());
         }
         self.sync_messages();
     }
@@ -986,6 +1016,17 @@ impl App {
             Intent::StopPaste { session } => self.stop_paste(session),
             Intent::EndRecovered => self.end_recovered_sessions() > 0,
             Intent::ReviewVaultSync => self.review_vault_sync_in_window(wid),
+            Intent::ApproveJoin { recipient } => {
+                #[cfg(unix)]
+                {
+                    crate::secrets_asking::approve(recipient)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = recipient;
+                    false
+                }
+            }
             Intent::ShowTab { .. } => false,
             Intent::ShowSession {
                 window, session, ..

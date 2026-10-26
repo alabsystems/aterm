@@ -353,7 +353,11 @@ fn the_band_and_status_say_unchecked_until_a_witness_judges_and_faithful_only_on
 
 /// Start recording session 0 from its screen now: a keyframe of the live engine seeded on the spine.
 pub(crate) fn start_recording(app: &App) {
-    let s = app.pool.get(0).expect("session 0");
+    start_recording_session(app, 0);
+}
+
+fn start_recording_session(app: &App, session: u64) {
+    let s = app.pool.get(session).expect("recorded session");
     let (checkpoint, pre) = {
         let term = term_lock(s.live_term());
         (term.checkpoint(), SpinePre::take(&term))
@@ -365,7 +369,11 @@ pub(crate) fn start_recording(app: &App) {
 
 /// Feed `bytes` to session 0's engine and, as its reader does, through a spine mark into its recorder, as one slice at a later instant than any before it; that instant.
 pub(crate) fn slice(app: &App, bytes: &[u8]) -> Ticks {
-    let s = app.pool.get(0).expect("session 0");
+    slice_session(app, 0, bytes)
+}
+
+fn slice_session(app: &App, session: u64, bytes: &[u8]) -> Ticks {
+    let s = app.pool.get(session).expect("recorded session");
     let mut rec = s.ctx.temporal.lock().expect("recorder");
     let last = rec.latest_tick();
     while rec.now() <= last {}
@@ -382,6 +390,20 @@ pub(crate) fn slice(app: &App, bytes: &[u8]) -> Ticks {
         rec.apply_inline(msg);
     }
     rec.latest_tick()
+}
+
+fn advance_recording_clocks(app: &App, sessions: &[u64], ms: u64) {
+    for &session in sessions {
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .temporal
+            .lock()
+            .unwrap()
+            .sleep_for_test(std::time::Duration::from_millis(ms));
+    }
+    crate::turn_ledger::advance_for_test(ms);
 }
 
 /// Record a live witness of `term`'s screen on session 0's spine, at a later instant than any before it, as the reader does.
@@ -1786,14 +1808,14 @@ fn a_tab_menu_timeline_row_opens_rewind_at_its_instant() {
     app.tab_strip_rows = 1;
     start_recording(&app);
     let before = slice(&app, b"before the cd");
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    advance_recording_clocks(&app, &[0], 1000);
     let s = app.pool.get(0).expect("session 0");
     s.ctx
         .timeline
         .lock()
         .expect("timeline")
         .record_hand_row("cwd-change", "cwd=/tmp".into());
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    advance_recording_clocks(&app, &[0], 1000);
     let _ = slice(&app, b"\r\nafter the cd");
     assert!(app.open_active_tab_context_menu(WID));
     let entries = app.windows[&WID]
@@ -1817,6 +1839,490 @@ fn a_tab_menu_timeline_row_opens_rewind_at_its_instant() {
         "the screen as it was when the cd happened"
     );
     assert!(shown_text(&app).starts_with("before the cd") && !shown_text(&app).contains("after"));
+}
+
+/// A delayed timeline row belongs to the recorded pane whose menu displayed it,
+/// even when the same tab survives with a different focused terminal.
+#[cfg(unix)]
+#[test]
+fn a_tab_menu_rewind_row_does_not_retarget_a_sibling_after_focus_or_close() {
+    use crate::session_chrome::TabMenuEntry;
+
+    let mut violations = Vec::new();
+    for close_source in [false, true] {
+        let mut app = scripted_app();
+        app.tab_strip_rows = 1;
+        let source = 0;
+        let sibling = app.split_active_stub_tab(WID);
+        assert!(app.focus_pane_in(WID, crate::pane::FocusDir::Left));
+        let tab = app.windows[&WID].tab_set.active_id().unwrap();
+        let source_view = app.windows[&WID].tab_set.active().unwrap().focus;
+        assert_eq!(app.focused_session_id(WID), Some(source));
+        for session in [source, sibling] {
+            start_recording_session(&app, session);
+        }
+        let before_source = slice_session(&app, source, b"source before the event");
+        let before_sibling = slice_session(&app, sibling, b"sibling before the event");
+        advance_recording_clocks(&app, &[source, sibling], 1000);
+        app.pool
+            .get(source)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .record_hand_row("cwd-change", "cwd=/tmp/source".into());
+        advance_recording_clocks(&app, &[source, sibling], 1000);
+        let after_source = slice_session(&app, source, b"\x1b[2J\x1b[Hsource after the event");
+        let after_sibling = slice_session(&app, sibling, b"\x1b[2J\x1b[Hsibling after the event");
+        assert!(app.open_active_tab_context_menu(WID));
+        let menu = app.windows[&WID].tab_menu.as_ref().unwrap();
+        assert_eq!(menu.tab, tab);
+        let (origin, at_ms) = menu
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                TabMenuEntry::RewindTo {
+                    words,
+                    at_ms,
+                    origin,
+                } if words.starts_with("changed directory") => {
+                    Some((origin.expect("the source row is bound to its view"), *at_ms))
+                }
+                _ => None,
+            })
+            .expect("source's actual composed timeline row");
+        assert_eq!(origin.view, source_view);
+        assert_eq!(origin.session, source);
+
+        // The old dispatcher must have a usable sibling recording to expose the
+        // wrong target. Prove both real histories fold to their distinct before
+        // screens at the menu's wall-to-recorder target, before changing focus.
+        for (session, before, after, prefix) in [
+            (source, before_source, after_source, "source before"),
+            (sibling, before_sibling, after_sibling, "sibling before"),
+        ] {
+            let rec = app.pool.get(session).unwrap().ctx.temporal.lock().unwrap();
+            let back_us = crate::turn_ledger::now_ms()
+                .saturating_sub(at_ms)
+                .saturating_mul(1000);
+            let target = Ticks(rec.now().0.saturating_sub(back_us));
+            assert!(
+                before < target && target < after,
+                "recording {session}: target {target:?} lies between {before:?} and {after:?}"
+            );
+            let plan = rec
+                .replay_plan(Some(target))
+                .expect("both target instants replay");
+            drop(rec);
+            let folded = crate::rewind_worker::show_inline(crate::rewind_worker::Show {
+                session,
+                token: NO_TOKEN,
+                plan,
+                judge: None,
+                colors: None,
+            });
+            let text = crate::control::screen_text(&folded.term);
+            assert!(
+                text.starts_with(prefix) && !text.contains("after"),
+                "recording {session}: {text:?}"
+            );
+            assert!(
+                app.pool.rewind(session).is_none(),
+                "history preflight opens no review"
+            );
+        }
+        assert!(app.close_tab_menu(WID));
+        if close_source {
+            assert_eq!(app.close_active_tab_in(WID), None);
+            assert!(!app.view_store.contains(source_view));
+            assert!(app.pool.get(source).is_none());
+        } else {
+            assert!(app.focus_pane_in(WID, crate::pane::FocusDir::Right));
+        }
+        assert_eq!(app.windows[&WID].tab_set.active_id(), Some(tab));
+        assert_eq!(app.focused_session_id(WID), Some(sibling));
+        let sibling_state = |app: &App| {
+            let session = app.pool.get(sibling).unwrap();
+            let terminal = term_lock(session.live_term());
+            (
+                terminal.visible_content(),
+                terminal.content_seq(),
+                session.ctx.sink.input_epoch(),
+            )
+        };
+        let live_before = sibling_state(&app);
+        let root_before = app.windows[&WID].tab_set.active().unwrap().root.clone();
+        let config = app.native_config_service.snapshot();
+
+        app.dispatch_tab_menu_rewind(WID, tab, origin, at_ms);
+
+        if app.pool.rewind(sibling).is_some() {
+            violations.push(format!(
+                "close_source={close_source}: source timeline opened the sibling's Rewind"
+            ));
+        }
+        if close_source {
+            if app.focused_session_id(WID) != Some(sibling) || app.pool.rewind(source).is_some() {
+                violations.push(
+                    "closed source changed the surviving input target or opened a review".into(),
+                );
+            }
+        } else {
+            let source_opened = app.pool.rewind(source).is_some_and(|view| {
+                view.at == before_source
+                    && view.shown.as_ref().is_some_and(|term| {
+                        crate::control::screen_text(&term_lock(term)).starts_with("source before")
+                    })
+            });
+            if !source_opened || app.windows[&WID].tab_set.active().unwrap().focus != source_view {
+                violations.push(
+                    "retained source did not regain its exact view and recorded event".into(),
+                );
+            }
+        }
+        assert_eq!(
+            sibling_state(&app),
+            live_before,
+            "live sibling bytes and input stay untouched"
+        );
+        assert_eq!(
+            app.windows[&WID].tab_set.active().unwrap().root,
+            root_before
+        );
+        assert_eq!(app.frontmost_window, Some(WID));
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// Per-tab binding must not leak one shared session's view identity through its
+/// cache, and a surviving mirror cannot replace a closed menu source.
+#[cfg(unix)]
+#[test]
+fn a_tab_menu_rewind_owner_binds_each_shared_view_and_refuses_a_closed_original() {
+    use crate::session_chrome::{RewindMenuOrigin, TabMenuEntry};
+
+    let mut app = scripted_app();
+    app.tab_strip_rows = 1;
+    start_recording(&app);
+    let _ = slice(&app, b"source before the event");
+    advance_recording_clocks(&app, &[0], 1000);
+    app.pool
+        .get(0)
+        .unwrap()
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .record_hand_row("cwd-change", "cwd=/tmp/source".into());
+    advance_recording_clocks(&app, &[0], 1000);
+    let _ = slice(&app, b"\x1b[2J\x1b[Hsource after the event");
+    let source_tab = app.windows[&WID].tab_set.active_id().unwrap();
+    let source_view = app.windows[&WID].tab_set.active().unwrap().focus;
+    let mirror = app.open_active_session_in_new_window_logical().unwrap();
+    app.window_focus_event(WID, false);
+    app.window_focus_event(mirror, true);
+    let mirror_view = app.windows[&mirror].tab_set.active().unwrap().focus;
+    assert_ne!(source_view, mirror_view);
+    assert_eq!(app.pool.views(0), Some(2));
+    let row = |entries: &[TabMenuEntry]| {
+        entries
+            .iter()
+            .find_map(|entry| match entry {
+                TabMenuEntry::RewindTo {
+                    words,
+                    at_ms,
+                    origin,
+                } if words.starts_with("changed directory") => {
+                    Some((origin.expect("per-tab menu row is bound"), *at_ms))
+                }
+                _ => None,
+            })
+            .expect("the recorded session's timeline row")
+    };
+    let source_titles = app.tab_titles(WID);
+    let source_ext = app.tab_chrome_ext(WID, &source_titles);
+    let (origin, at_ms) = row(&source_ext[0].menu);
+    assert_eq!(
+        origin,
+        RewindMenuOrigin {
+            view: source_view,
+            session: 0
+        }
+    );
+    let mirror_titles = app.tab_titles(mirror);
+    let mirror_ext = app.tab_chrome_ext(mirror, &mirror_titles);
+    assert_eq!(
+        row(&mirror_ext[0].menu),
+        (
+            RewindMenuOrigin {
+                view: mirror_view,
+                session: 0
+            },
+            at_ms
+        )
+    );
+    let cached_owners = app.session_chrome[&0]
+        .ext
+        .menu
+        .iter()
+        .filter_map(|entry| match entry {
+            TabMenuEntry::RewindTo { origin, .. } => Some(*origin),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !cached_owners.is_empty(),
+        "the shared cache contains actual Rewind rows"
+    );
+    assert!(
+        cached_owners.iter().all(Option::is_none),
+        "the shared cache stores no view owner"
+    );
+
+    let sibling = app.split_active_stub_tab(WID);
+    assert!(app.focus_pane_in(WID, crate::pane::FocusDir::Left));
+    assert_eq!(app.close_active_tab_in(WID), None);
+    assert!(!app.view_store.contains(source_view));
+    assert!(app.view_store.contains(mirror_view));
+    assert_eq!(
+        app.pool.views(0),
+        Some(1),
+        "the original session remains alive in its mirror"
+    );
+    assert_eq!(app.focused_session_id(WID), Some(sibling));
+    assert_eq!(app.frontmost_window, Some(mirror));
+    {
+        let recorder = app.pool.get(0).unwrap().ctx.temporal.lock().unwrap();
+        let back_us = crate::turn_ledger::now_ms()
+            .saturating_sub(at_ms)
+            .saturating_mul(1000);
+        let target = Ticks(recorder.now().0.saturating_sub(back_us));
+        assert!(
+            recorder.replay_plan(Some(target)).is_some(),
+            "the surviving mirror still has usable source history"
+        );
+    }
+    assert!(app.begin_active_session_rename(mirror));
+    assert!(app.rename_field_edit(
+        mirror,
+        crate::app_search::SearchEdit::Insert("mirror draft".into())
+    ));
+    let now = std::time::Instant::now();
+    for window in app.windows.values_mut() {
+        window.fx.cursor_mut().glow.note_typed_cells(now, 1);
+        window.fx.cursor_mut().trail.note_typed(now);
+    }
+    let windows = |app: &App| {
+        app.windows
+            .iter()
+            .map(|(id, window)| {
+                (
+                    *id,
+                    (
+                        window.tab_set.clone(),
+                        window.layouts.clone(),
+                        window.front_content,
+                        window.rename_edit.clone(),
+                        window.fx.cursor().glow.move_licensed(now),
+                        window.fx.cursor().trail.move_licensed(now),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let sessions = |app: &App| {
+        app.pool
+            .iter()
+            .map(|session| {
+                let terminal = term_lock(session.live_term());
+                (
+                    session.id,
+                    (
+                        app.pool.views(session.id),
+                        terminal.visible_content(),
+                        terminal.content_seq(),
+                        session.ctx.sink.input_epoch(),
+                        app.pool.rewind(session.id).is_some(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before_windows = windows(&app);
+    let before_sessions = sessions(&app);
+    let config = app.native_config_service.snapshot();
+
+    app.dispatch_tab_menu_rewind(WID, source_tab, origin, at_ms);
+
+    assert_eq!(
+        windows(&app),
+        before_windows,
+        "stale delivery preserves both panes, drafts and licences"
+    );
+    assert_eq!(
+        sessions(&app),
+        before_sessions,
+        "stale delivery cannot rewind the still-live shared session"
+    );
+    assert_eq!(app.frontmost_window, Some(mirror));
+    assert_eq!(
+        app.active_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.id),
+        Some(0)
+    );
+    assert_eq!(app.native_config_service.snapshot(), config);
+    assert!(app.structural_invariants_ok());
+}
+
+/// A native sibling becoming focused must not hide a retained terminal menu's
+/// owner or give that delayed row authority over another window.
+#[cfg(unix)]
+#[test]
+fn a_tab_menu_rewind_row_refocuses_its_terminal_beside_a_native_view() {
+    use crate::native_app::{ActionInvocation, AppEvent, AppViewState, TextInputEvent};
+    use crate::session_chrome::TabMenuEntry;
+
+    let mut app = scripted_app();
+    app.tab_strip_rows = 1;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (instance, native) = app.active_native_view(WID).unwrap();
+    app.dispatch_native_event(
+        WID,
+        AppEvent::Action(ActionInvocation {
+            id: crate::native_ui::ActionId::new("settings/search"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    app.dispatch_native_event(
+        WID,
+        AppEvent::TextInput(TextInputEvent::Commit("native λ draft".into())),
+    )
+    .unwrap();
+    let (source, source_view) =
+        app.split_active_with_stub_terminal(WID, crate::tab_model::SplitAxis::Horizontal);
+    let tab = app.windows[&WID].tab_set.active_id().unwrap();
+    assert_eq!(app.focused_session_id(WID), Some(source));
+    start_recording_session(&app, source);
+    let before = slice_session(&app, source, b"mixed source before the event");
+    advance_recording_clocks(&app, &[source], 1000);
+    app.pool
+        .get(source)
+        .unwrap()
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .record_hand_row("cwd-change", "cwd=/tmp/mixed-source".into());
+    advance_recording_clocks(&app, &[source], 1000);
+    let _ = slice_session(&app, source, b"\x1b[2J\x1b[Hmixed source after the event");
+    assert!(app.open_active_tab_context_menu(WID));
+    let (origin, at_ms) = app.windows[&WID]
+        .tab_menu
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            TabMenuEntry::RewindTo {
+                words,
+                at_ms,
+                origin,
+            } if words.starts_with("changed directory") => {
+                Some((origin.expect("the terminal row is bound"), *at_ms))
+            }
+            _ => None,
+        })
+        .expect("the mixed tab's actual terminal timeline row");
+    assert_eq!(origin.view, source_view);
+    assert_eq!(origin.session, source);
+    assert!(app.close_tab_menu(WID));
+    assert!(app.focus_pane_in(WID, crate::pane::FocusDir::Left));
+    assert_eq!(app.active_native_view(WID), Some((instance, native)));
+
+    let front_session = app.next_session_id;
+    let front = app.insert_logical_window(crate::stub_session(front_session), 24, 80);
+    term_lock(app.pool.get(front_session).unwrap().live_term()).process(b"unrelated front window");
+    app.window_focus_event(WID, false);
+    app.window_focus_event(front, true);
+    let native_state = |app: &App| {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(native) else {
+            panic!("the retained native Settings view");
+        };
+        (
+            state.route,
+            state.search.clone(),
+            state.common.last_focus.clone(),
+            state.common.focus_visible,
+            state.page_scroll,
+            state.carried_field_drafts(),
+        )
+    };
+    let live_state = |app: &App, session| {
+        let session = app.pool.get(session).unwrap();
+        let terminal = term_lock(session.live_term());
+        (
+            terminal.visible_content(),
+            terminal.content_seq(),
+            session.ctx.sink.input_epoch(),
+        )
+    };
+    let native_before = native_state(&app);
+    assert_eq!(native_before.1, "native λ draft");
+    let native_binding = app.view_store.get(native).copied();
+    let native_generation = app.native_runtime.view_generation(native);
+    let root = app.windows[&WID].tab_set.get(tab).unwrap().root.clone();
+    let front_tabs = app.windows[&front].tab_set.clone();
+    let front_content = app.windows[&front].front_content;
+    let front_live = live_state(&app, front_session);
+    let source_live = live_state(&app, source);
+    let config = app.native_config_service.snapshot();
+
+    app.dispatch_tab_menu_rewind(WID, tab, origin, at_ms);
+
+    assert_eq!(app.windows[&WID].tab_set.active_id(), Some(tab));
+    assert_eq!(
+        app.windows[&WID].tab_set.active().unwrap().focus,
+        source_view
+    );
+    assert_eq!(app.focused_session_id(WID), Some(source));
+    let review = app
+        .pool
+        .rewind(source)
+        .expect("the captured terminal opens Rewind");
+    assert_eq!(review.at, before);
+    let shown = crate::control::screen_text(&term_lock(review.shown.as_ref().unwrap()));
+    assert!(shown.starts_with("mixed source before") && !shown.contains("after"));
+    assert_eq!(app.windows[&WID].tab_set.get(tab).unwrap().root, root);
+    assert_eq!(native_state(&app), native_before);
+    assert_eq!(app.view_store.get(native).copied(), native_binding);
+    assert_eq!(
+        app.native_runtime.view_generation(native),
+        native_generation
+    );
+    assert!(app.native_runtime.app(instance).is_some());
+    assert_eq!(live_state(&app, source), source_live);
+    assert_eq!(app.frontmost_window, Some(front));
+    assert_eq!(app.windows[&front].tab_set, front_tabs);
+    assert_eq!(app.windows[&front].front_content, front_content);
+    assert_eq!(live_state(&app, front_session), front_live);
+    assert!(app.pool.rewind(front_session).is_none());
+    assert_eq!(
+        app.active_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.id),
+        Some(front_session)
+    );
+    assert_eq!(app.native_config_service.snapshot(), config);
+    assert!(app.structural_invariants_ok());
 }
 
 /// Session 0's view with a fold thread that posts each fold to the test, so a fold stays in flight until the test hands it back.

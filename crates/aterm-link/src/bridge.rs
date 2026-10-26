@@ -37,8 +37,6 @@ use crate::wait_tally::Recorder;
 #[path = "bridge_mirror.rs"]
 mod mirror_run;
 
-const STANDBY_POLL: Duration = Duration::from_secs(1);
-
 /// Maximum time the publisher connection waits for the broker to answer a single request.
 pub(crate) const ACK_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -85,7 +83,7 @@ fn roster_refresh() -> Duration {
 
 const UNSERVED_PARK: Duration = Duration::from_secs(60);
 
-const GHOST_SWEEP: Duration = Duration::from_secs(60);
+pub(crate) const GHOST_SWEEP: Duration = Duration::from_secs(60);
 
 const PRESENCE_VIEW_REOPEN: Duration = astream_broker::IDLE_MARK_DEADLINE;
 
@@ -183,6 +181,29 @@ fn floors_of(by_topic: &BTreeMap<String, VecDeque<(u64, u64)>>) -> BTreeMap<Stri
 }
 
 const GHOST_AFTER: Duration = Duration::from_secs(300);
+
+/// How long a subject a departed session held stays charged to this node, once its
+/// presence row reads `exited` (or is gone) and nothing is owed on it, before the
+/// sweep gives it back ([`Bridge::reclaim_subjects`]). The presence rule is
+/// `last_only`, so no retention window asks for longer.
+pub(crate) const RECLAIM_AFTER: Duration = GHOST_AFTER;
+
+const RECLAIM_AFTER_SEAM: &str = "ATERM_LINK_RECLAIM_AFTER_MS";
+
+fn reclaim_after() -> Duration {
+    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        aterm_types::dev_seam!(RECLAIM_AFTER_SEAM)
+            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .map_or(RECLAIM_AFTER, Duration::from_millis)
+    })
+}
+
+/// How often the sweep runs while it owes one: [`GHOST_SWEEP`], or sooner when the
+/// reclaim's own wait is shorter.
+fn ghost_sweep() -> Duration {
+    GHOST_SWEEP.min(reclaim_after())
+}
 
 const SELF_ACK_KEEP: usize = 4096;
 
@@ -1026,6 +1047,23 @@ pub struct Bridge {
     ghost_due: Instant,
     ghosts: BTreeMap<String, Instant>,
     exits_owed: BTreeSet<String>,
+    /// The subjects a departed session held that this node may give back, each with the
+    /// offset of its newest record and since when it has been one ([`Bridge::reclaim_subjects`]).
+    reclaim: BTreeMap<String, (u64, Instant)>,
+    /// A session left the roster, or the bridge attached, since the last sweep: the next one
+    /// looks for subjects to give back.
+    reclaim_owed: bool,
+    /// This node holds a lane to another node's session. That session's leaving is no event
+    /// here, so every sweep looks for it while one is held: set by a record onto such a lane
+    /// ([`Bridge::note_remote_lane`]) and by each sweep's read of the lanes.
+    reclaim_remote: bool,
+    /// The log nothing is given back on: its retention cut refuses every retire (`cut: `).
+    /// Said once.
+    reclaim_cut: Option<astream_broker::LogIdentity>,
+    /// This connection's ring does not let the node read the lanes it writes (a permanent
+    /// refusal): nothing is given back until the next attach, which may bring another ring.
+    /// Said once an attach.
+    reclaim_unread: bool,
     say_drained_to: u64,
     say_checkpoint_tick: u64,
     say_replay: SayReplay,
@@ -1068,6 +1106,12 @@ pub struct Bridge {
     deliver_replay_at_once: bool,
     #[cfg(test)]
     moved_at_start: u64,
+    /// The next reclaim's read of the lanes this node writes is refused with this code.
+    #[cfg(test)]
+    reclaim_read_refused: Option<u8>,
+    /// A record written onto a subject just ahead of its retire, as a successor or a sender would.
+    #[cfg(test)]
+    written_before_retire: Option<(String, Vec<u8>)>,
     self_acked: BTreeSet<u64>,
     acked_entries: usize,
     acked_appendable: bool,
@@ -1165,6 +1209,21 @@ fn advance_frontier_cursors(
         }
     }
     checkpoint
+}
+
+/// `(node, sid)` a lane `writer` writes leads to: `/f/<fleet>/in/<node>/<sid>/<writer>/<kind>`.
+fn lane_addr(fleet: &str, writer: &str, lane: &str) -> Option<(String, String)> {
+    let segs: Vec<&str> = lane.split('/').collect();
+    (segs.len() == 8
+        && segs[1] == "f"
+        && segs[2] == fleet
+        && segs[3] == "in"
+        && segs[6] == writer
+        && segs[4].starts_with("n-")
+        && segs[5].starts_with("s-")
+        && subject::is_principal(segs[4])
+        && subject::is_principal(segs[5]))
+    .then(|| (segs[4].to_string(), segs[5].to_string()))
 }
 
 fn say_record(fleet: &str, subject: &str, raw: &[u8]) -> Option<(subject::SayAddr, Body)> {
@@ -1300,9 +1359,14 @@ impl Bridge {
             locals: BTreeMap::new(),
             per_sid: PerSession::default(),
             roster_due: now + roster_refresh(),
-            ghost_due: now + GHOST_SWEEP,
+            ghost_due: now + ghost_sweep(),
             ghosts: BTreeMap::new(),
             exits_owed: BTreeSet::new(),
+            reclaim: BTreeMap::new(),
+            reclaim_owed: false,
+            reclaim_remote: false,
+            reclaim_cut: None,
+            reclaim_unread: false,
             say_drained_to: 0,
             say_checkpoint_tick: 0,
             say_replay: SayReplay::new(now),
@@ -1345,6 +1409,10 @@ impl Bridge {
             deliver_replay_at_once: false,
             #[cfg(test)]
             moved_at_start: 0,
+            #[cfg(test)]
+            reclaim_read_refused: None,
+            #[cfg(test)]
+            written_before_retire: None,
             closers: Vec::new(),
             link: LinkReport::new(),
             quiet_dials: QuietDials::default(),
@@ -1657,6 +1725,7 @@ impl Bridge {
             && self.settle_one(waiting)
         {}
         let producer_id = self.producer_id;
+        self.note_remote_lane(subject);
         let Some(link) = self.conn.as_mut() else {
             return self.conclude(then, Err(broker_unreachable()));
         };
@@ -1721,6 +1790,16 @@ impl Bridge {
     }
 
     fn last_all(&mut self, filter: &str) -> io::Result<(Vec<BrokerRecord>, (u64, u64))> {
+        self.last_all_judged(filter, Some("read"))
+    }
+
+    /// [`Bridge::last_all`], each answer judged as `judged` says ([`Bridge::observe`]): `None` takes a
+    /// refusal for an answer, the link up.
+    fn last_all_judged(
+        &mut self,
+        filter: &str,
+        judged: Option<&'static str>,
+    ) -> io::Result<(Vec<BrokerRecord>, (u64, u64))> {
         let mut cursor = String::new();
         let mut first = None;
         let mut rows = Vec::new();
@@ -1732,7 +1811,7 @@ impl Bridge {
             })?;
             let started = fx.now();
             let answer = conn.last_page(filter, &cursor, remaining);
-            let (page, page_mark, resume) = self.observe(started, answer, Some("read"))?;
+            let (page, page_mark, resume) = self.observe(started, answer, judged)?;
             let mark = *first.get_or_insert(page_mark);
             remaining = remaining.saturating_sub(u32::try_from(page.len()).unwrap_or(u32::MAX));
             rows.extend(page);
@@ -1746,7 +1825,7 @@ impl Bridge {
                         "the last-value face of {filter} did not end within {} rows",
                         u32::MAX
                     ))),
-                    Some("read"),
+                    judged,
                 );
             }
             cursor = resume;
@@ -1757,22 +1836,31 @@ impl Bridge {
                 "the last-value walk of {filter} did not end within {} pages",
                 astream_broker::LAST_WALK_PAGES_MAX
             ))),
-            Some("read"),
+            judged,
         )
     }
 
     fn last_face(&mut self, filter: &str) -> io::Result<Vec<BrokerRecord>> {
+        self.last_face_judged(filter, Some("read"))
+    }
+
+    /// [`Bridge::last_face`], each answer judged as `judged` says ([`Bridge::last_all_judged`]).
+    fn last_face_judged(
+        &mut self,
+        filter: &str,
+        judged: Option<&'static str>,
+    ) -> io::Result<Vec<BrokerRecord>> {
         const STRETCH_MAX: u32 = transport::ROW_PAGE;
         let mut cut_under = false;
         let (rows, stretch) = loop {
-            let (rows, (from, _)) = self.last_all(filter)?;
+            let (rows, (from, _)) = self.last_all_judged(filter, judged)?;
             let fx = self.fx.clone();
             let conn = self.conn_now().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "the broker is unreachable")
             })?;
             let started = fx.now();
             let answer = transport::fetch_kept(conn, from, filter, STRETCH_MAX);
-            let ((stretch, (next, head)), floor) = self.observe(started, answer, Some("read"))?;
+            let ((stretch, (next, head)), floor) = self.observe(started, answer, judged)?;
             if floor.is_some() && !cut_under {
                 cut_under = true;
                 continue;
@@ -1783,7 +1871,7 @@ impl Bridge {
                     Err(io::Error::other(format!(
                         "the records on {filter} since its last-value walk did not fit one read"
                     ))),
-                    Some("read"),
+                    judged,
                 );
             }
             break (rows, stretch);
@@ -1894,8 +1982,19 @@ impl Bridge {
         self.publish_at(seq, subject, body).map(|(off, _)| off)
     }
 
+    /// A record onto `subject`: a lane this node writes to another node's session makes
+    /// every sweep look for that session's leaving ([`Bridge::reclaim_remote`]).
+    fn note_remote_lane(&mut self, subject: &str) {
+        if !self.reclaim_remote
+            && lane_addr(&self.cfg.fleet, &self.node, subject).is_some_and(|(n, _)| n != self.node)
+        {
+            self.reclaim_remote = true;
+        }
+    }
+
     fn publish_at(&mut self, seq: u64, subject: &str, body: &[u8]) -> io::Result<(u64, bool)> {
         let producer_id = self.producer_id;
+        self.note_remote_lane(subject);
         let first = self.unsent == Some(seq);
         let fx = self.fx.clone();
         let Some(conn) = self.conn_now() else {
@@ -2151,6 +2250,9 @@ impl Bridge {
     }
 
     fn publish_session_presence(&mut self, sid: &str, state: &str) -> bool {
+        // However the session left (its `session-exited` line, the roster, the ghost sweep, a
+        // quit), the next sweep looks for what it held ([`Bridge::reclaim_subjects`]).
+        self.reclaim_owed |= state == "exited";
         if self.bye == Some(Bye::Quit) && (state == "live" || self.withdrawn.contains(sid)) {
             return false;
         }
@@ -5004,6 +5106,8 @@ impl Bridge {
             .into_iter()
             .filter(|sid| unhosted.contains(sid))
             .collect();
+        // Before this sweep's own `exited` rows, which it did not read: they owe the next one.
+        self.reclaim_subjects(&rows);
         self.batched(|bridge| {
             for sid in owed {
                 bridge.publish_session_presence(&sid, "exited");
@@ -5014,6 +5118,315 @@ impl Bridge {
                 bridge.ghosts.remove(&sid);
             }
         });
+    }
+
+    /// GIVE A DEPARTED SESSION'S SUBJECTS BACK to this node's subject budget, with
+    /// astream's conditional retire (`Client::retire`). `presence` is this node's
+    /// presence face as the sweep read it.
+    ///
+    /// A session has departed when this node does not host it and its presence row on
+    /// its node reads `exited` or is gone. Of what this node is charged for, it held its
+    /// presence row here and each lane this node wrote to it (`/f/<F>/in/<node>/<sid>/<this
+    /// node>/<kind>`, on this node or another). A subject is given back once it has stood
+    /// so, its newest record unchanged, for [`reclaim_after`], and no reservation or
+    /// in-flight entry names it or (on this node) its session ([`StateDir::owed_publications`]):
+    /// its lanes first, then its presence row, which goes only once every lane went in the
+    /// same pass. Each retire names the newest record the sweep read, so a session revived
+    /// since (a successor's `live` row, under an update's handoff or the keeper's recovery)
+    /// makes it moot, and a record that lands later makes a new subject. A moot retire gives
+    /// nothing back and holds the row back: the next sweep reads the subject again.
+    ///
+    /// A sweep looks when a session of this node left, at every attach, while it tracks a
+    /// subject, and while this node holds a lane to another node's session
+    /// ([`Bridge::reclaim_remote`]), whose leaving is no event here.
+    ///
+    /// A departed sid's pin goes once nothing of it is held here: no lane this node wrote
+    /// to it and, on this node, no presence row. Every sweep looks at the pins of the nodes
+    /// it read, and one a session's leaving or an attach owed reads every pinned node, so a
+    /// pin a killed bridge left behind its retires goes at the next attach. No address
+    /// routes to a sid its node does not advertise `live` ([`Bridge::resolve_to`]).
+    fn reclaim_subjects(&mut self, presence: &[BrokerRecord]) {
+        let owed = std::mem::take(&mut self.reclaim_owed);
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::NoSubjectRetire) {
+            return;
+        }
+        let log = self
+            .conn
+            .as_ref()
+            .filter(|c| c.supports_retire())
+            .and_then(|c| c.seen_log_identity());
+        let Some(log) = log.filter(|log| self.reclaim_cut != Some(*log)) else {
+            return;
+        };
+        if self.attachment == Attachment::Observer
+            || self.reclaim_unread
+            || (!owed && !self.reclaim_remote && self.reclaim.is_empty())
+        {
+            return;
+        }
+        let fleet = self.cfg.fleet.clone();
+        let me = self.node.clone();
+        // A refusal of these reads is an answer: the link stays up.
+        let lanes = match self.lanes_this_node_writes() {
+            Ok(lanes) => lanes,
+            Err(e) if self.conn.is_some() && refused_for_good(&e) => {
+                stderr_line!(
+                    "aterm-link: this node's ring does not let it read the lanes it writes ({e}): \
+                     no departed session's subject is given back until the bridge attaches again"
+                );
+                self.reclaim_unread = true;
+                return;
+            }
+            Err(e) => {
+                if self.conn.is_some() {
+                    stderr_line!(
+                        "aterm-link: the reclaim could not read the lanes this node writes ({e}); \
+                         the next sweep reads them again"
+                    );
+                }
+                self.reclaim_owed |= owed;
+                return;
+            }
+        };
+        let mut rows: BTreeMap<(String, String), (u64, bool)> = BTreeMap::new();
+        let read = |rows: &mut BTreeMap<(String, String), (u64, bool)>, face: &[BrokerRecord]| {
+            for (off, subject, raw) in face {
+                let segs: Vec<&str> = subject.split('/').collect();
+                if segs.len() != 7 || segs[3] != "pub" || segs[6] != "presence" || segs[5] == "node"
+                {
+                    continue;
+                }
+                let exited =
+                    Body::decode(raw).0.unknown.get("state").map(String::as_str) == Some("exited");
+                rows.insert((segs[4].to_string(), segs[5].to_string()), (*off, exited));
+            }
+        };
+        read(&mut rows, presence);
+        let pins = self.state.pins();
+        let mut others: BTreeSet<String> = lanes
+            .iter()
+            .filter_map(|(_, lane, _)| lane_addr(&fleet, &me, lane))
+            .map(|(node, _)| node)
+            .filter(|node| *node != me)
+            .collect();
+        if owed {
+            others.extend(
+                pins.values()
+                    .filter(|n| **n != me && n.starts_with("n-") && subject::is_principal(n))
+                    .cloned(),
+            );
+        }
+        // A node whose rows this ring cannot read keeps every lane and pin to it.
+        let mut read_nodes: BTreeSet<String> = BTreeSet::from([me.clone()]);
+        for node in others {
+            match self.last_face_judged(&format!("/f/{fleet}/pub/{node}/*/presence"), None) {
+                Ok(face) => {
+                    read(&mut rows, &face);
+                    read_nodes.insert(node);
+                }
+                Err(_) if self.conn.is_some() => {}
+                Err(_) => {
+                    self.reclaim_owed |= owed;
+                    return;
+                }
+            }
+        }
+        let departed = |hosted: &BTreeSet<String>, node: &str, sid: &str| {
+            (node != me || !hosted.contains(sid))
+                && read_nodes.contains(node)
+                && rows
+                    .get(&(node.to_string(), sid.to_string()))
+                    .is_none_or(|(_, exited)| *exited)
+        };
+        let mut hosted: BTreeSet<String> = self.locals.values().cloned().collect();
+        // What a departed session holds that this node is charged for: `(node, sid) -> [(subject, newest)]`, its lanes first.
+        let mut held: BTreeMap<(String, String), Vec<(String, u64)>> = BTreeMap::new();
+        for (off, lane, _) in &lanes {
+            let Some(addr) = lane_addr(&fleet, &me, lane) else {
+                continue;
+            };
+            if departed(&hosted, &addr.0, &addr.1) {
+                held.entry(addr).or_default().push((lane.clone(), *off));
+            }
+        }
+        for ((node, sid), (off, _)) in &rows {
+            if *node == me && departed(&hosted, node, sid) {
+                let face = subject::session_face(&fleet, node, sid, "presence");
+                held.entry((node.clone(), sid.clone()))
+                    .or_default()
+                    .push((face, *off));
+            }
+        }
+        let now = self.fx.now();
+        let before = std::mem::take(&mut self.reclaim);
+        for (subject, off) in held.values().flatten() {
+            // A lane's clock starts again with each record on it; a presence row's runs
+            // while it stays departed, whatever `exited` row was written again.
+            let since = before
+                .get(subject)
+                .filter(|(was, _)| was == off || subject.ends_with("/presence"))
+                .map_or(now, |(_, since)| *since);
+            self.reclaim.insert(subject.clone(), (*off, since));
+        }
+        let due = |reclaim: &BTreeMap<String, (u64, Instant)>, subject: &str| {
+            reclaim
+                .get(subject)
+                .is_some_and(|(_, since)| now.saturating_duration_since(*since) >= reclaim_after())
+        };
+        held.retain(|_, subjects| subjects.iter().any(|(s, _)| due(&self.reclaim, s)));
+        // The subjects this pass gave back.
+        let mut retired: BTreeSet<String> = BTreeSet::new();
+        if !held.is_empty() {
+            if self.refresh_sessions().is_err() {
+                return;
+            }
+            hosted = self.locals.values().cloned().collect();
+            let owed = match self.state.owed_publications() {
+                Ok(owed) => owed,
+                Err(e) => {
+                    stderr_line!("aterm-link: the reclaim could not read what the node owes: {e}");
+                    return;
+                }
+            };
+            'groups: for ((node, sid), subjects) in held {
+                if node == me && (hosted.contains(&sid) || owed.sids.contains(&sid)) {
+                    continue;
+                }
+                let mut whole = true;
+                for (subject, off) in subjects {
+                    let presence = subject.ends_with("/presence");
+                    if (presence && !whole)
+                        || owed.subjects.contains(&subject)
+                        || !due(&self.reclaim, &subject)
+                    {
+                        whole = false;
+                        continue;
+                    }
+                    match self.retire_held(&subject, off, log) {
+                        Some(gave) => {
+                            self.reclaim.remove(&subject);
+                            self.indexed_subjects.remove(&subject);
+                            if gave {
+                                retired.insert(subject);
+                            } else {
+                                // Moot: a newer record (a revived session's row, a lane
+                                // written since) or none. The next sweep reads it again.
+                                whole = false;
+                            }
+                        }
+                        None if self.conn.is_none() || self.reclaim_cut.is_some() => {
+                            break 'groups;
+                        }
+                        None => {
+                            // Refused: asked again only after another whole wait.
+                            self.reclaim.insert(subject, (off, now));
+                            whole = false;
+                        }
+                    }
+                }
+                if whole {
+                    self.lanes_opened
+                        .remove(&format!("/f/{fleet}/in/{node}/{sid}/{me}"));
+                }
+            }
+            if !retired.is_empty() {
+                stderr_line!(
+                    "aterm-link: gave {} subjects of departed sessions back to this node's budget",
+                    retired.len()
+                );
+            }
+        }
+        let lanes_left: BTreeSet<(String, String)> = lanes
+            .iter()
+            .filter(|(_, lane, _)| !retired.contains(lane))
+            .filter_map(|(_, lane, _)| lane_addr(&fleet, &me, lane))
+            .collect();
+        self.reclaim_remote = lanes_left.iter().any(|(node, _)| *node != me);
+        let row_left = |sid: &str| {
+            rows.contains_key(&(me.clone(), sid.to_string()))
+                && !retired.contains(&subject::session_face(&fleet, &me, sid, "presence"))
+        };
+        let unpinned: BTreeSet<String> = pins
+            .iter()
+            .filter(|(sid, node)| {
+                departed(&hosted, node, sid)
+                    && !lanes_left.contains(&((*node).clone(), (*sid).clone()))
+                    && (**node != me || !row_left(sid))
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        if let Err(e) = self.state.unpin(&unpinned) {
+            stderr_line!(
+                "aterm-link: could not drop the pins of {} departed sessions: {e}; a later \
+                 sweep drops them",
+                unpinned.len()
+            );
+        }
+    }
+
+    /// The newest record of every lane this node writes (`/f/<F>/in/*/*/<this node>/*`), a
+    /// refusal taken for an answer ([`Bridge::last_face_judged`]).
+    fn lanes_this_node_writes(&mut self) -> io::Result<Vec<BrokerRecord>> {
+        #[cfg(test)]
+        if let Some(code) = self.reclaim_read_refused.take() {
+            return Err(astream_broker::BrokerRefusal {
+                code,
+                msg: "refused (test)".to_string(),
+            }
+            .into());
+        }
+        let filter = format!("/f/{}/in/*/*/{}/*", self.cfg.fleet, self.node);
+        self.last_face_judged(&filter, None)
+    }
+
+    /// Retire `subject` if its newest record is still the one at `off` on `log`: `Some(true)`
+    /// retired, `Some(false)` moot (a newer record, or none), `None` refused or not sent.
+    /// A log retention cut without carrying the index refuses every retire (`cut: `): it is
+    /// said once and nothing more is asked of that log ([`Bridge::reclaim_cut`]).
+    fn retire_held(
+        &mut self,
+        subject: &str,
+        off: u64,
+        log: astream_broker::LogIdentity,
+    ) -> Option<bool> {
+        #[cfg(test)]
+        if let Some((written, body)) = self
+            .written_before_retire
+            .take_if(|(s, _)| s.as_str() == subject)
+        {
+            self.publish(&written, &body).ok()?;
+        }
+        let producer = self.producer_id;
+        let fx = self.fx.clone();
+        let conn = self.conn_now()?;
+        let started = fx.now();
+        #[cfg(test)]
+        let answer = if fx.mutant(crate::sim::world::Mutant::RetireUnconditionally) {
+            conn.retire_subject(producer, subject)
+        } else {
+            conn.retire(producer, subject, off, log)
+        };
+        #[cfg(not(test))]
+        let answer = conn.retire(producer, subject, off, log);
+        match self.observe(started, answer, None) {
+            Ok((_, moot)) => Some(!moot),
+            Err(e)
+                if astream_broker::broker_refusal(&e)
+                    .is_some_and(astream_broker::BrokerRefusal::is_retire_cut) =>
+            {
+                stderr_line!(
+                    "aterm-link: this log's retention cut keeps every subject charged: no \
+                     departed session's subject is given back on it ({e})"
+                );
+                self.reclaim_cut = Some(log);
+                None
+            }
+            Err(e) => {
+                stderr_line!("aterm-link: could not give {subject} back: {e}");
+                None
+            }
+        }
     }
 
     fn retire_on_request(&mut self, sid: &str) {
@@ -5828,11 +6241,12 @@ impl Bridge {
                         None if self.node_seen(&n)? => {}
                         None => return Ok(Route::Unroutable),
                     }
-                    if !(hosted && n == self.node) {
-                        let seen = self.advertisers(&sid)?;
-                        if seen.exited.contains(&n) && !seen.live.contains(&n) {
-                            return Ok(Route::Unroutable);
-                        }
+                    // The named node must advertise the sid `live`. Its row reading `exited`
+                    // (the session ended or a quit withdrew it) or gone (its node gave the
+                    // row back to its budget, `Bridge::reclaim_subjects`, or never wrote
+                    // one) is no route: the post would land on a lane nobody reads.
+                    if !(hosted && n == self.node) && !self.advertisers(&sid)?.contains(&n) {
+                        return Ok(Route::Unroutable);
                     }
                     n
                 }
@@ -5871,11 +6285,12 @@ impl Bridge {
         }
         let advertisers = self.advertisers(sid);
         self.want_presence_view();
-        let seen = advertisers?;
-        let advertisers = seen.live;
+        let advertisers = advertisers?;
         Ok(match (&pinned, advertisers.len()) {
             (Some(node), _) if advertisers.iter().any(|n| n != node) => Err(Route::Ambiguous),
-            (Some(node), 0) if seen.exited.contains(node) => Err(Route::Unroutable),
+            // The pinned node no longer advertises the sid: its row reads `exited`, or is
+            // gone once its node gave it back to its budget.
+            (Some(_), 0) => Err(Route::Unroutable),
             (Some(node), _) => Ok(node.clone()),
             (None, 0) => Err(Route::Unroutable),
             (None, 1) => {
@@ -5954,10 +6369,10 @@ impl Bridge {
         }
     }
 
-    fn advertisers(&mut self, sid: &str) -> io::Result<Advertised> {
+    fn advertisers(&mut self, sid: &str) -> io::Result<BTreeSet<String>> {
         let filter = format!("/f/{}/pub/*/{sid}/presence", self.cfg.fleet);
         let rows = self.last_face(&filter)?;
-        let mut seen = Advertised::default();
+        let mut live = BTreeSet::new();
         for (_, subject, raw) in &rows {
             let segs: Vec<&str> = subject.split('/').collect();
             if segs.len() != 7 || segs.get(5) != Some(&sid) {
@@ -5970,13 +6385,11 @@ impl Bridge {
             let Some(node) = segs.get(4).filter(|n| subject::is_principal(n)) else {
                 continue;
             };
-            match body.unknown.get("state").map(String::as_str) {
-                Some("live") => seen.live.insert((*node).to_string()),
-                Some("exited") => seen.exited.insert((*node).to_string()),
-                _ => false,
-            };
+            if body.unknown.get("state").map(String::as_str) == Some("live") {
+                live.insert((*node).to_string());
+            }
         }
-        Ok(seen)
+        Ok(live)
     }
 
     fn on_event(&mut self, line: &str) {
@@ -6477,8 +6890,12 @@ impl Bridge {
         if !self.sync_say_face() {
             return false;
         }
+        // Every attach looks for what a departed session holds, an earlier run's too, and
+        // asks a ring that refused the lanes' read again: the attach may carry another.
+        self.reclaim_owed = true;
+        self.reclaim_unread = false;
         self.retire_ghost_presence();
-        self.ghost_due = self.fx.now() + GHOST_SWEEP;
+        self.ghost_due = self.fx.now() + ghost_sweep();
         self.resample_topics();
         true
     }
@@ -6886,10 +7303,11 @@ impl Bridge {
         match self.state.begin_run() {
             Ok(flushed) if flushed.full + flushed.ordered > 0 => stderr_line!(
                 "aterm-link: the run record says a bridge runs in this boot: {} barriers and {} \
-                 full flushes in {} us",
+                 full flushes in {} us{}",
                 flushed.ordered,
                 flushed.full,
-                self.fx.now().saturating_duration_since(began).as_micros()
+                self.fx.now().saturating_duration_since(began).as_micros(),
+                aterm_durable::durable_flushes_note()
             ),
             Ok(_) => {}
             Err(e) => stderr_line!(
@@ -6971,12 +7389,13 @@ impl Bridge {
         match self.state.end_run_clean() {
             Ok(flushed) => stderr_line!(
                 "aterm-link: the run stopped cleanly: {} state files and {} directories \
-                 flushed, then the run record: {} barriers and {} full flushes in {} us",
+                 flushed, then the run record: {} barriers and {} full flushes in {} us{}",
                 flushed.files,
                 flushed.dirs,
                 flushed.ordered,
                 flushed.full,
-                self.fx.now().saturating_duration_since(began).as_micros()
+                self.fx.now().saturating_duration_since(began).as_micros(),
+                aterm_durable::durable_flushes_note()
             ),
             Err(e) => stderr_line!(
                 "aterm-link: this run's state files could not all be flushed: {e}; no marker \
@@ -7238,7 +7657,7 @@ impl Bridge {
             && self.state.root().join("sweep-ghosts-now").exists();
         if sweep_now || (self.sweep_owed() && self.fx.now() >= self.ghost_due) {
             self.retire_ghost_presence();
-            self.ghost_due = self.fx.now() + GHOST_SWEEP;
+            self.ghost_due = self.fx.now() + ghost_sweep();
         }
         let expire_now = self.fault == Fault::ExpireDeadlinesAtOnceWhileMarked
             && self.state.root().join("expire-deadlines-now").exists();
@@ -7268,7 +7687,18 @@ impl Bridge {
     }
 
     fn sweep_owed(&self) -> bool {
-        !self.ghosts.is_empty() || !self.exits_owed.is_empty()
+        !self.ghosts.is_empty()
+            || !self.exits_owed.is_empty()
+            || self.reclaim_owed
+            || (self.reclaim_looks() && (self.reclaim_remote || !self.reclaim.is_empty()))
+    }
+
+    /// Whether the reclaim may give anything back on this link: not after this connection's
+    /// ring refused the lanes' read for good, nor on a log whose retention cut refuses every
+    /// retire ([`Bridge::reclaim_subjects`]).
+    fn reclaim_looks(&self) -> bool {
+        let log = self.conn.as_ref().and_then(|c| c.seen_log_identity());
+        !self.reclaim_unread && (log.is_none() || self.reclaim_cut != log)
     }
 
     fn duty_wait(&self, now: Instant) -> Duration {
@@ -7507,46 +7937,79 @@ fn hold_state_dir(
             reply.header()
         );
     }
-    let mut lane = push.get_ref();
-    lane.set_read_timeout(Some(STANDBY_POLL))?;
+    let queued = state.bridge_lock_wait()?;
+    stand_by(push.get_ref(), move || queued.wait())
+}
+
+/// The name of the thread a standing-by bridge waits for its lock on.
+const STANDBY_THREAD: &str = "aterm-link-standby";
+
+/// Stands by until `take` holds the state dir's lock or aterm says anything on `lane`, the
+/// bridge's push lane, with no timer between: the take runs on a thread of its own
+/// ([`STANDBY_THREAD`]) and closes a pipe once it answers, and this thread waits on the lane
+/// and that pipe at once ([`aterm_uds::ready::either`]), so the bridge goes on the moment the
+/// kernel hands it the lock ([`crate::state::BridgeLockWait::wait`]).
+///
+/// The lane ends the standby: its end (aterm closed the connection), a byte (aterm wrote before
+/// any subscription) or an error. That answer wins over a take that came at the same moment, and
+/// the lock the take holds goes back as its answer is dropped unread. A take still queued then
+/// waits on in the kernel until this process exits, which is what a bridge does on this error;
+/// one granted before that exit has no reader, so it lets go at once, and nothing runs under it.
+/// Nothing is read from the lane while the take wins, so the lane is as aterm left it.
+fn stand_by(
+    lane: &std::os::unix::net::UnixStream,
+    take: impl FnOnce() -> io::Result<BridgeLock> + Send + 'static,
+) -> io::Result<BridgeLock> {
+    use std::os::fd::AsFd as _;
+    let (woken, wake) = std::io::pipe()?;
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(STANDBY_THREAD.to_string())
+        .spawn(move || {
+            let _ = answer.send(take());
+            drop(wake);
+        })?;
     loop {
-        match std::io::Read::read(&mut lane, &mut [0u8; 1]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "aterm closed the bridge connection while this bridge stood by",
-                ))
+        let ready = aterm_uds::ready::either(lane.as_fd(), woken.as_fd())?;
+        if ready.first {
+            let mut lane = lane;
+            match std::io::Read::read(&mut lane, &mut [0u8; 1]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "aterm closed the bridge connection while this bridge stood by",
+                    ))
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aterm wrote on the push lane before this bridge subscribed",
+                    ))
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
             }
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "aterm wrote on the push lane before this bridge subscribed",
-                ))
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) => {}
-            Err(e) => return Err(e),
         }
-        match state.lock_bridge() {
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            taken => {
-                lane.set_read_timeout(None)?;
-                return taken;
-            }
-        }
+        return answered.recv().unwrap_or_else(|_| {
+            Err(io::Error::other(
+                "the standby's wait for the state dir's lock ended without an answer",
+            ))
+        });
     }
 }
 
-#[derive(Debug, Default)]
-struct Advertised {
-    live: BTreeSet<String>,
-    exited: BTreeSet<String>,
-}
+#[cfg(test)]
+#[path = "bridge_standby_tests.rs"]
+mod standby_tests;
 
 fn watch_ack(line: &str) -> Option<(u64, &str)> {
     let mut toks = line.split_whitespace();
@@ -9105,7 +9568,10 @@ mod tests {
         let kept = bridge
             .publish_own_off(&subject, b"v=1 t=1 from=s-gone text=second")
             .unwrap();
-        assert!(broker.retain_before(kept).unwrap() > 0, "the cut");
+        assert!(
+            broker.retain_before_carrying_state(kept).unwrap() > 0,
+            "the cut"
+        );
 
         bridge.answer_fetch(SID, gone);
         bridge.answer_fetch(SID, kept);
@@ -9815,6 +10281,9 @@ mod tests {
         refuse_take: Option<String>,
         takes: usize,
         landings: Vec<String>,
+        /// Sessions whose landing answers `done`, as the endpoint answers for a closed
+        /// session whose tail is all on the bus.
+        done: BTreeSet<String>,
     }
 
     impl FakeMirror {
@@ -9854,8 +10323,10 @@ mod tests {
             let mut words = Vec::new();
             for pair in toks.as_chunks::<2>().0 {
                 let at = aterm_slog::BusCursor::parse(pair[1]).expect("a cursor");
+                let done = self.done.contains(pair[0]);
                 let word = match self.logs.get_mut(pair[0]) {
                     Some(log) => match log.land(at) {
+                        Ok(_) if done => "done",
                         Ok(aterm_slog::Landed::Moved) => "ok",
                         Ok(aterm_slog::Landed::Stale) => "stale",
                         Err(aterm_slog::LandRefused::Fenced) => "fenced",
@@ -11599,11 +12070,26 @@ mod tests {
         astream_broker::BrokerHandle,
         astream_broker::Broker,
     ) {
+        rig_retained_by(sessions, retained.then(crate::broker_rules::default_rules))
+    }
+
+    /// [`rig_with_kept_broker`] over a broker retained by `rules` (none: unretained), set as
+    /// aterm sets its own at the open.
+    fn rig_retained_by(
+        sessions: &[(u64, &str)],
+        rules: Option<astream_broker::Retention>,
+    ) -> (
+        FakeVerbLane,
+        Bridge,
+        astream_broker::BrokerHandle,
+        astream_broker::Broker,
+    ) {
         let (lane, mut bridge) = FakeVerbLane::bridge(sessions);
         let socket = lane.dir.path().join("broker.sock");
         let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
-        if retained {
-            crate::broker_rules::retain(&broker).unwrap();
+        let retained = rules.is_some();
+        if let Some(rules) = rules {
+            broker.set_retention(rules).unwrap();
         }
         let server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
@@ -12766,7 +13252,7 @@ mod tests {
                 first.identity
             );
 
-            broker.retain_before(first_off + 1).unwrap();
+            broker.retain_before_carrying_state(first_off + 1).unwrap();
             let keys = state.join("keys");
             let permissions = std::fs::metadata(&keys).unwrap().permissions();
             std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -13401,6 +13887,18 @@ mod tests {
         let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
         let held = max - max / LANE_RESERVE_DIVISOR - 1;
         let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["s-a"], &[far, known], held);
+        // n-far advertises the sessions mailed there; its rows are its producer's, not this node's.
+        let (mut far_node, _) = bridge.connect().unwrap();
+        for (seq, sid) in (1..).zip(["s-x", "s-y", "s-z"]) {
+            far_node
+                .publish(
+                    9_000,
+                    seq,
+                    &subject::session_face("f", "n-far", sid, "presence"),
+                    b"v=1 t=1 inc=1 state=live",
+                )
+                .unwrap();
+        }
         *lane.outbox.lock().unwrap() = Some(
             "post sid=s-a id=1 to=@s-x@n-nowhere kind=note len=1\n1\
              post sid=s-a id=2 to=@s-y@n-far kind=note len=1\n2\
@@ -13696,12 +14194,12 @@ mod tests {
         };
         let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
         bridge.conn = Some(scripted(13).into());
-        let seen = bridge.advertisers("s-x").unwrap();
+        let live = bridge.advertisers("s-x").unwrap();
         assert_eq!(
-            seen.live,
-            BTreeSet::from(["n-a".to_string(), "n-c".to_string()])
+            live,
+            BTreeSet::from(["n-a".to_string(), "n-c".to_string()]),
+            "n-b's `exited` row past the walk is no advertiser"
         );
-        assert_eq!(seen.exited, BTreeSet::from(["n-b".to_string()]));
         bridge.conn = Some(scripted(12).into());
         assert!(
             bridge.advertisers("s-x").is_err(),
@@ -13818,7 +14316,7 @@ mod tests {
                 assert!(bridge.conn.is_none());
             } else {
                 assert_eq!(
-                    answer.unwrap().live,
+                    answer.unwrap(),
                     BTreeSet::from(["n-a".into(), "n-c".into()])
                 );
             }
@@ -17791,6 +18289,17 @@ mod tests {
         bridge.cfg.broker = socket;
         assert!(bridge.attach_broker());
         bridge.state.pin("s-w", "n-far").expect("pin");
+        bridge
+            .connect()
+            .unwrap()
+            .0
+            .publish(
+                9_000,
+                1,
+                &subject::session_face("f", "n-far", "s-w", "presence"),
+                b"v=1 t=1 inc=1 state=live",
+            )
+            .expect("n-far advertises s-w");
         let face = format!("/f/f/in/n-far/s-w/{}/ask", bridge.node);
         bridge.indexed_subjects.insert(face.clone());
         *lane.outbox.lock().unwrap() =
@@ -20089,5 +20598,9 @@ mod tests {
 
     mod mirror_conformance {
         include!("bridge_mirror_tests.rs");
+    }
+
+    mod reclaim {
+        include!("bridge_reclaim_tests.rs");
     }
 }

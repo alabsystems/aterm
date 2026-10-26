@@ -270,7 +270,9 @@ pub fn disk_await_liveness() -> aterm_spec::derive::Liveness {
 /// done; `sfit`, whether the last line to A went while the seat rule admitted it; `swall`,
 /// whether A's host kept A owed while it held it at a wall or a box; `swait`, whether a round ran
 /// out while A, not yet elected, was held so; `sret`, whether one ran out while A, gone back to
-/// the episode, was held so. `End`, `Expire`, `KeepA`, `TypeA` and `ElectNone`
+/// the episode, was held so; `sfreed`, whether the last episode ended asked with its session's
+/// rise uncredited (a look that reads the volume clear on that rise settles it, `Freed`, and the
+/// next one ends it). `End`, `Expire`, `KeepA`, `TypeA` and `ElectNone`
 /// record from their own state what their guards are meant to hold, and each of their mutants is
 /// the same step under a weaker guard, so a guard weakened in the step itself breaks the law too.
 #[must_use]
@@ -309,6 +311,7 @@ pub fn disk_free_ask_model() -> Model {
             var swall = 0;
             var swait = 0;
             var sret = 0;
+            var sfreed = 0;
 
             action Drop when (free > 0) { free = free - 1; }
             action Climb when (4 > free) { free = free + 1; }
@@ -443,7 +446,7 @@ pub fn disk_free_ask_model() -> Model {
                 wA = 0;
             }
             action Frees when (phase == 3 && rose == 0) { rose = 1; }
-            action Freed when (free <= 3 && phase == 3 && rose == 1) {
+            action Freed when (phase == 3 && rose == 1) {
                 phase = 4;
                 owner = 0;
                 pA = if (pA == 2) { 0 } else { pA };
@@ -463,7 +466,11 @@ pub fn disk_free_ask_model() -> Model {
                 raised = 1;
                 pA = if (pA == 2) { 0 } else { pA };
             }
-            action End when (phase > 0 && (free == 4 || (bar == 1 && free > 1))) {
+            action End when (
+                phase > 0 && (3 > phase || phase > 3 || rose == 0)
+                    && (free == 4 || (bar == 1 && free > 1))
+            ) {
+                sfreed = if (phase == 3 && rose == 1) { 1 } else { 0 };
                 phase = 0;
                 aged = 0;
                 bar = 0;
@@ -636,6 +643,27 @@ pub fn disk_free_ask_model() -> Model {
                 owner = 0;
                 pA = if (pA == 2) { 0 } else { pA };
             }
+            action EndUncredited when (
+                Buggy == 19 && phase > 0 && (free == 4 || (bar == 1 && free > 1))
+            ) {
+                sfreed = if (phase == 3 && rose == 1) { 1 } else { 0 };
+                phase = 0;
+                aged = 0;
+                bar = 0;
+                owner = 0;
+                pA = 0;
+                pB = 0;
+                pC = 0;
+                lA = 0;
+                lB = 0;
+                lC = 0;
+                asks = 0;
+                rose = 0;
+                raised = 0;
+                uA = 0;
+                past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+                wA = 0;
+            }
             action ExpireEarly when (
                 Buggy == 12 && phase > 3 && cool == 0 && done == 1 && free <= 2
             ) {
@@ -671,6 +699,7 @@ pub fn disk_free_ask_model() -> Model {
             invariant HeldIsWaitedFor: swait == 0;
             invariant ReturnedIsWaitedFor: sret == 0;
             invariant FreedOnlyByAgent: phase <= 3 || phase > 4 || rose == 1;
+            invariant FreedIsCredited: sfreed == 0;
             bound PhaseBox: phase <= 5;
             bound AsksBox: asks <= 3;
             bound FreeBox: free <= 4;

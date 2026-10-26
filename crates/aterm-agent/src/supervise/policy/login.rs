@@ -22,6 +22,17 @@ pub const RULE_LOGIN_DONE: &str = "login-done@v1";
 pub const RULE_LOGIN_BACK_OUT: &str = "login-back-out@v1";
 
 /// Returns whether the `/login` method picker can be answered with `method` ([`crate::supervise::IdleHost::login_method`]).
+///
+/// Only a picker the inline renderer draws is: what Claude Code's fullscreen renderer draws in
+/// its bottom panel past a method pick (the browser hand-off, its error, its success) has not
+/// been read in the real-Claude lab yet, so the Enter that opens the browser sign-in there is
+/// left to a person, as every other method is.
+///
+/// # Errors
+///
+/// Why the picker is the person's: no method is known, the method is not the subscription's, the
+/// picker is drawn in the fullscreen renderer's panel, its focus was moved off the first row, or
+/// it draws no row of the method.
 pub fn picks(picker: &LoginPicker, method: Option<LoginMethod>) -> Result<usize, String> {
     let Some(method) = method else {
         return Err("nothing says which method this session signs in with".to_string());
@@ -31,6 +42,13 @@ pub fn picks(picker: &LoginPicker, method: Option<LoginMethod>) -> Result<usize,
             "this session signs in with its {} method, which only you choose",
             method.word()
         ));
+    }
+    if picker.renderer == aterm_phase::PanelRenderer::Fullscreen {
+        return Err(
+            "it is drawn in Claude Code's fullscreen view, past whose method pick aterm \
+             reads nothing yet"
+                .to_string(),
+        );
     }
     if picker.focused != Some(0) {
         return Err("its focus was moved off the first row".to_string());

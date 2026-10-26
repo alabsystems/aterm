@@ -959,6 +959,28 @@ fn a_sid_the_reply_cap_may_have_hidden_says_so() {
         maybe.contains("37 on m7.local") && !maybe.contains("lab"),
         "{maybe}"
     );
+    let frozen = || HostReply {
+        label: "127.0.0.1:47603".into(),
+        remote: true,
+        unproven: false,
+        node: None,
+        answer: Err("connected, but no fleet handshake within 2.0s: an aterm stopped".to_owned()),
+    };
+    let unserved = sid_not_found(&[frozen()], "s-nope", true);
+    assert_eq!(
+        unserved,
+        "ERR 127.0.0.1:47603 did not answer: connected, but no fleet handshake within 2.0s: an \
+         aterm stopped, so no session @s-nope was read"
+    );
+    let beside = sid_not_found(&[whole(), frozen()], "s-nope", true);
+    assert!(
+        beside.starts_with(
+            "ERR 127.0.0.1:47603 did not answer: connected, but no fleet handshake within 2.0s: \
+             an aterm stopped, so @s-nope was not read there; no such session @s-nope on any \
+             instance that answered"
+        ),
+        "{beside}"
+    );
 
     let row = wire_row(&[
         ("sid", "s-00000000000000000007"),

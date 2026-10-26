@@ -121,6 +121,8 @@ pub(super) fn preflight(
         )));
     }
     if (!cask.naked
+        && !autodetect_naked(cask)
+        && git_raw_plan(cask).is_none()
         && !fetch::archive_supported(&download_name(cask))
         && !fetch::is_dmg(&download_name(cask)))
         || cask.artifacts.is_empty()
@@ -326,7 +328,11 @@ fn install_inner(
         }
     }
     let file = download_name(cask);
-    if (!cask.naked && !fetch::archive_supported(&file) && !fetch::is_dmg(&file))
+    if (!cask.naked
+        && !autodetect_naked(cask)
+        && git_raw_plan(cask).is_none()
+        && !fetch::archive_supported(&file)
+        && !fetch::is_dmg(&file))
         || cask.artifacts.is_empty()
     {
         return Err(InstallError::Unsupported(format!(
@@ -366,18 +372,32 @@ fn install_inner(
         return Ok(cask.version.clone());
     }
     prefix.ensure()?;
+    let git_plan = git_raw_plan(cask);
     let dest = prefix.cache().join(&file);
-    let expected = cask.sha256.as_deref().unwrap_or("no_check");
-    let reusable = cask.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
-    if !reusable {
+    if git_plan.is_none() {
+        let expected = cask.sha256.as_deref().unwrap_or("no_check");
+        let reusable = cask.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
+        if !reusable {
+            eprintln!("==> Fetching cask {} ({})", cask.token, cask.version);
+            fetch::curl_to_file(&cask.url, &dest, &[])?;
+        }
+        fetch::verify_sha256(&dest, expected)?;
+    } else {
         eprintln!("==> Fetching cask {} ({})", cask.token, cask.version);
-        fetch::curl_to_file(&cask.url, &dest, &[])?;
     }
-    fetch::verify_sha256(&dest, expected)?;
     let work =
         aterm_tempfile::TempDir::new_in(prefix.caskroom()).map_err(|e| format!("abrew: {e}"))?;
     let payload = work.path().join("payload");
-    if cask.naked {
+    // Explicit naked always stages the file itself; an
+    // autodetected naked download whose bytes say archive is
+    // extracted (or delegated) instead.
+    let naked = cask.naked || (autodetect_naked(cask) && !archive_magic(&dest));
+    if let Some(plan) = &git_plan {
+        std::fs::create_dir_all(&payload).map_err(|e| format!("abrew: {e}"))?;
+        for (source, cached) in fetch_git_raw(prefix, cask, plan)? {
+            fetch::copy_regular(&cached, &payload.join(&source))?;
+        }
+    } else if naked {
         std::fs::create_dir_all(&payload).map_err(|e| format!("abrew: {e}"))?;
         let cached_name = dest
             .file_name()
@@ -415,7 +435,7 @@ fn install_inner(
         }
         let _ = wants_exec;
     }
-    if !cask.naked {
+    if !naked && git_plan.is_none() {
         let extraction_error = |e: String| extraction_error(&cask.token, e);
         if let Some(nested) = &cask.nested {
             let outer = work.path().join("outer");
@@ -625,6 +645,172 @@ fn recorded_artifacts(
     let value = aterm_json::from_slice(&bytes)
         .map_err(|e| format!("abrew: invalid cask artifacts: {e}"))?;
     recorded_artifact_paths(prefix, &value)
+}
+
+/// Percent-encode one URL path segment (raw-blob URLs name the
+/// file exactly; brackets and spaces in font names must escape).
+fn pct_segment(seg: &str) -> String {
+    let mut out = String::new();
+    for b in seg.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The (source, raw URL) fetch plan for a GitHub git-checkout
+/// cask, when it is exactly raw-fetchable: a github.com
+/// owner/repo.git URL, a parsed branch+only_path, `no_check`
+/// (per-file bytes cannot carry the cask checksum), and every
+/// artifact source a single file inside only_path. The bytes
+/// are the same repo blobs brew's clone would stage; only the
+/// transport differs.
+pub(super) fn git_raw_plan(cask: &Cask) -> Option<Vec<(String, String)>> {
+    if cask.sha256.is_some() || cask.nested.is_some() {
+        return None;
+    }
+    let (branch, only_path) = cask.git_branch_path.as_ref()?;
+    let rest = cask.url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let (owner, repo_git) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() || !super::valid_component(owner) {
+        return None;
+    }
+    let repo = repo_git.strip_suffix(".git")?;
+    if !super::valid_component(repo) {
+        return None;
+    }
+    let mut plan: Vec<(String, String)> = Vec::new();
+    for artifact in &cask.artifacts {
+        let source = artifact_source(artifact)?;
+        if Path::new(source).components().count() != 1 {
+            return None;
+        }
+        let source = source.to_string();
+        if plan.iter().any(|(s, _)| *s == source) {
+            continue;
+        }
+        let mut url = format!(
+            "https://raw.githubusercontent.com/{}/{}/{}",
+            pct_segment(owner),
+            pct_segment(repo),
+            pct_segment(branch)
+        );
+        for seg in only_path.split('/') {
+            url.push('/');
+            url.push_str(&pct_segment(seg));
+        }
+        url.push('/');
+        url.push_str(&pct_segment(&source));
+        plan.push((source, url));
+    }
+    if plan.is_empty() { None } else { Some(plan) }
+}
+
+/// Fetch a git-checkout cask's files next to each other under
+/// the cache name `token-<source>`, refusing Git-LFS pointer
+/// files (their bytes are not the payload). Returns each
+/// source's cached path.
+pub(super) fn fetch_git_raw(
+    prefix: &Prefix,
+    cask: &Cask,
+    plan: &[(String, String)],
+) -> Result<Vec<(String, PathBuf)>, InstallError> {
+    let mut out = Vec::new();
+    for (source, url) in plan {
+        let dest = prefix.cache().join(format!("{}-{}", cask.token, source));
+        fetch::curl_to_file(url, &dest, &[])?;
+        let head = std::fs::read(&dest).map_err(|e| format!("abrew: {e}"))?;
+        if head.starts_with(b"version https://git-lfs.github.com") {
+            let _ = std::fs::remove_file(&dest);
+            return Err(InstallError::Unsupported(format!(
+                "cask {} ships Git-LFS payloads, which need a real git checkout",
+                cask.token
+            )));
+        }
+        out.push((source.clone(), dest));
+    }
+    Ok(out)
+}
+
+/// Brew autodetects the container from the download: a URL
+/// naming no known archive is a naked download — the file itself
+/// is the payload (most font casks ship one raw .ttf). Admission
+/// stays narrow: no explicit container, no archive or dmg name,
+/// no VCS (.git) or pkg URL, and exactly one distinct
+/// single-component artifact source for the one file to carry.
+/// Archive magic in the downloaded bytes still overrides this at
+/// staging (see `archive_magic`), exactly like brew's autodetect.
+fn autodetect_naked(cask: &Cask) -> bool {
+    if cask.naked || cask.nested.is_some() {
+        return false;
+    }
+    let file = download_name(cask);
+    if fetch::archive_supported(&file) || fetch::is_dmg(&file) {
+        return false;
+    }
+    let url_path = cask.url.split('?').next().unwrap_or(&cask.url);
+    if url_path.ends_with(".git") || url_path.to_ascii_lowercase().ends_with(".pkg") {
+        return false;
+    }
+    let mut source: Option<&str> = None;
+    for artifact in &cask.artifacts {
+        let Some(s) = artifact_source(artifact) else {
+            return false;
+        };
+        if Path::new(s).components().count() != 1 {
+            return false;
+        }
+        match source {
+            None => source = Some(s),
+            Some(prev) if prev != s => return false,
+            _ => {}
+        }
+    }
+    source.is_some()
+}
+
+/// One artifact's payload source, where it has one.
+fn artifact_source(a: &Artifact) -> Option<&str> {
+    match a {
+        Artifact::App(s, _)
+        | Artifact::Binary(s, _)
+        | Artifact::Font(s, _)
+        | Artifact::Pkg(s)
+        | Artifact::Manpage(s, _)
+        | Artifact::Suite(s, _)
+        | Artifact::KeyboardLayout(s, _)
+        | Artifact::ScreenSaver(s, _)
+        | Artifact::PrefPane(s, _)
+        | Artifact::Service(s, _)
+        | Artifact::Generic(s, _)
+        | Artifact::Library(s, _, _) => Some(s),
+        Artifact::Wrapper(_, exe, _, _) => Some(exe),
+        Artifact::Other(_) => None,
+    }
+}
+
+/// Whether a downloaded file's magic says archive (gzip/zstd/zip
+/// the vetted extractor speaks, or bzip2/xz it refuses): an
+/// autodetected-naked download with archive magic is extracted
+/// (or delegated) instead, like brew's container autodetect.
+fn archive_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 6];
+    if f.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    magic.starts_with(&[0x1f, 0x8b])
+        || magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+        || magic.starts_with(b"PK")
+        || magic.starts_with(b"BZh")
+        || magic == *b"\xfd7zXZ\0"
 }
 
 pub(super) fn download_name(cask: &Cask) -> String {
@@ -1598,6 +1784,79 @@ mod tests {
             std::fs::read(prefix.bin().join("personal")).unwrap(),
             b"keep"
         );
+    }
+
+    #[test]
+    fn git_raw_plan_maps_github_checkout_to_raw_blobs_only() {
+        let mut c = cask("https://github.com/google/fonts.git".to_string());
+        c.git_branch_path = Some(("main".into(), "ofl/abeezee".into()));
+        c.artifacts = vec![
+            Artifact::Font("ABeeZee-Regular.ttf".into(), None),
+            Artifact::Font("ABeeZee-Italic.ttf".into(), None),
+        ];
+        let plan = git_raw_plan(&c).expect("raw plan");
+        assert_eq!(
+            plan[0].1,
+            "https://raw.githubusercontent.com/google/fonts/main/ofl/abeezee/ABeeZee-Regular.ttf"
+        );
+        assert_eq!(plan.len(), 2);
+        // Bracketed variable-font names percent-encode.
+        c.artifacts = vec![Artifact::Font("42dotSans[wght].ttf".into(), None)];
+        assert!(
+            git_raw_plan(&c).unwrap()[0]
+                .1
+                .ends_with("42dotSans%5Bwght%5D.ttf")
+        );
+        // A cask checksum cannot cover per-file blobs.
+        c.sha256 = Some("0".repeat(64));
+        assert!(git_raw_plan(&c).is_none());
+        c.sha256 = None;
+        // Non-GitHub hosts and deeper paths delegate.
+        c.url = "https://gitlab.com/google/fonts.git".into();
+        assert!(git_raw_plan(&c).is_none());
+        c.url = "https://github.com/google/fonts.git".into();
+        c.artifacts = vec![Artifact::Font("sub/Foo.ttf".into(), None)];
+        assert!(git_raw_plan(&c).is_none());
+    }
+
+    #[test]
+    fn autodetect_naked_admits_single_raw_file_downloads_only() {
+        let font = |url: &str, source: &str| {
+            let mut c = cask(url.to_string());
+            c.artifacts = vec![Artifact::Font(source.to_string(), None)];
+            c
+        };
+        assert!(autodetect_naked(&font(
+            "https://example.com/Foo.ttf",
+            "Foo.ttf"
+        )));
+        // Known archives and images are not naked.
+        assert!(!autodetect_naked(&font(
+            "https://example.com/Foo.zip",
+            "Foo.ttf"
+        )));
+        assert!(!autodetect_naked(&font(
+            "https://example.com/Foo.dmg",
+            "Foo.ttf"
+        )));
+        // VCS checkouts and pkg downloads delegate.
+        assert!(!autodetect_naked(&font(
+            "https://github.com/example/fonts.git",
+            "Foo.ttf"
+        )));
+        assert!(!autodetect_naked(&font(
+            "https://example.com/Foo.pkg",
+            "Foo.ttf"
+        )));
+        // One file cannot carry a nested or second source.
+        assert!(!autodetect_naked(&font(
+            "https://example.com/Foo.ttf",
+            "dir/Foo.ttf"
+        )));
+        let mut two = font("https://example.com/Foo.ttf", "Foo.ttf");
+        two.artifacts
+            .push(Artifact::Font("Bar.ttf".to_string(), None));
+        assert!(!autodetect_naked(&two));
     }
 
     #[test]

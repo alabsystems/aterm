@@ -1461,7 +1461,7 @@ fn slice_twos_doors_hold_nothing_on_a_host_that_answers_none() {
     for door in [WakeDoor::Break, WakeDoor::Point, WakeDoor::Await] {
         assert_eq!(bare.wake_claim(1, 7, door), WakeClaim::Gone, "{door:?}");
     }
-    bare.wake_release(1, 7);
+    bare.wake_release(1, 7, WakeDoor::Break);
     bare.wake_told(1, 7, WakeDoor::Break);
     assert_eq!(bare.task_fact(Some(word)), NoteOutcome::NoTask);
     assert_eq!(bare.task_fact(None), NoteOutcome::NoTask);
@@ -1526,7 +1526,11 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
         same(every);
     }
     for claim in [
-        WakeClaim::Granted,
+        WakeClaim::Granted(WakeFacts::default()),
+        WakeClaim::Granted(WakeFacts {
+            ready_since_ms: Some(1_761_000_000_000),
+            slots: Some((1, 3)),
+        }),
         WakeClaim::Answered,
         WakeClaim::Busy,
         WakeClaim::Stale,
@@ -1598,7 +1602,7 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
             host.wake_claim(3, episode, WakeDoor::Break),
             WakeClaim::Busy
         );
-        host.wake_release(3, episode);
+        host.wake_release(3, episode, WakeDoor::Break);
         host.wake_told(3, episode, WakeDoor::Await);
         assert_eq!(host.task_fact(Some(word)), NoteOutcome::Fenced);
         assert_eq!(host.task_fact(None), NoteOutcome::Cleared);
@@ -1636,7 +1640,11 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
                 true,
                 format!("{at}\ndoor={:?}", WakeDoor::Break)
             ),
-            ("host.wake_release".to_string(), false, at.clone()),
+            (
+                "host.wake_release".to_string(),
+                false,
+                format!("{at}\ndoor={:?}", WakeDoor::Break)
+            ),
             (
                 "host.wake_told".to_string(),
                 false,

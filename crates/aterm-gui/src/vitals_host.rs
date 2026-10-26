@@ -623,6 +623,9 @@ pub(crate) struct VitalsHost {
     /// When the held snapshot landed (any new reading, whatever its jobs view): what the deck's
     /// live edge counts its beat and its staleness from (`crate::stats_live`).
     pub(crate) landed_at: Option<Instant>,
+    /// The wall clock of the snapshot held before it, unix ms: whether the held one opened a new
+    /// second of a Folded strip, which then slides (`crate::stats_live::opened_slot`).
+    pub(crate) landed_prev_at_ms: Option<i64>,
     /// The bars' cadence when it landed (`None` with no window showing them): a reading speaks
     /// for [`crate::stats_live::STALE_PERIODS`] of the slower of this and the cadence now.
     pub(crate) landed_period: Option<Duration>,
@@ -667,6 +670,7 @@ impl Default for VitalsHost {
             read_began: None,
             full_adopted_at: None,
             landed_at: None,
+            landed_prev_at_ms: None,
             landed_period: None,
             next_due: None,
             asked_at: None,
@@ -745,6 +749,7 @@ impl VitalsHost {
                     self.full_adopted_at = Some(now);
                 }
                 self.landed_at = Some(now);
+                self.landed_prev_at_ms = self.snapshot.as_ref().map(|held| held.at_unix_ms);
                 self.read_began = began;
                 self.snapshot = Some(snap);
                 true
@@ -1952,6 +1957,11 @@ impl Reader {
         let now = Instant::now();
         let split = self.split.due(req, now);
         let live_split = split && self.fixture.is_none();
+        // The reading's wall clock, read before the sweep lists the
+        // processes: one born at or after it is in no earlier sweep, which is
+        // how the reap credit tells a process born since the last reading
+        // (counted from its birth) from one older (counted from now).
+        let at_unix_ms = unix_ms_now();
         // Every whole reading reads the pid version of each process whose
         // start it cannot read (another user's), so the births kept for them
         // (`SplitReader::known`) hold from one reading to the next.
@@ -1965,7 +1975,7 @@ impl Reader {
         let coalitions = (live_split && sweep.is_some())
             .then(self.split.probe.coalitions)
             .flatten();
-        let mut sample = self.machine_sample(req);
+        let mut sample = self.machine_sample(req, at_unix_ms);
         sample.machine_only = false;
         sample.procs_truncated = sweep.as_ref().is_some_and(|s| s.truncated);
         let observed = sweep
@@ -2038,7 +2048,7 @@ impl Reader {
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
-        let mut sample = self.machine_sample(req);
+        let mut sample = self.machine_sample(req, unix_ms_now());
         sample.machine_only = true;
         let scene = self
             .fixture
@@ -2061,12 +2071,12 @@ impl Reader {
         snap
     }
 
-    fn machine_sample(&mut self, req: &Request) -> Sample {
+    /// The machine's counters, stamped `at_unix_ms` on the wall clock.
+    fn machine_sample(&mut self, req: &Request, at_unix_ms: i64) -> Sample {
         let since = self.epoch.elapsed();
         let shelf = &crate::disk_board::SHELF;
         let (volume, key) = home_volume(&self.home, shelf.watched());
         let load = aterm_sysprobe::load_average();
-        let at_unix_ms = unix_ms_now();
         Sample {
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
@@ -2147,11 +2157,13 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         start: p.start,
         ppid: p.ppid,
         cpu_ns: p.cpu_ns,
+        child_cpu_ns: p.child_cpu_ns,
         footprint: p.footprint,
         name: p.name.clone(),
         disk_written: p.disk_written,
         uid: p.uid,
         pgid: p.pgid,
+        sid: p.sid,
         state: match p.state {
             RunState::Running | RunState::Sleeping | RunState::Uninterruptible | RunState::Idle => {
                 ProcState::Run
@@ -2168,6 +2180,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         coalition: p.coalition,
         version: p.version,
         birth_ms: p.birth_ms,
+        reaps_unwaited: p.reaps_unwaited,
     }
 }
 
@@ -3326,6 +3339,7 @@ impl crate::App {
                             shell_pid,
                             label: format!("Tab {}", i + 1),
                             program: tl.agent().program.clone().unwrap_or_default(),
+                            tab_id: Some(tab.id.get()),
                         });
                         layout.push(PaneFact {
                             key: pane,
@@ -3374,6 +3388,7 @@ impl crate::App {
                     shell_pid: pid,
                     label: format!("Session {}", handle.local_id),
                     program: String::new(),
+                    tab_id: None,
                 });
             }
             session_ids.push((handle.local_id, handle.sid.as_str().to_string()));

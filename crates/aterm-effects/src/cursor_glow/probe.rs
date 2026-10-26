@@ -153,21 +153,37 @@ impl CursorGlow {
         /// The most rows one frame reads: a leap longer than this keeps its
         /// far rows unknown.
         const MAX_ROWS: i32 = 256;
+        #[inline]
+        const fn rgb(c: [u8; 3]) -> u32 {
+            ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
+        }
+        #[inline]
+        const fn extend_bounds(lo: &mut i32, hi: &mut i32, row: u16) {
+            let r = row as i32;
+            if r < *lo {
+                *lo = r;
+            }
+            if r > *hi {
+                *hi = r;
+            }
+        }
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
-        let mut take = |row: u16| {
-            lo = lo.min(i32::from(row));
-            hi = hi.max(i32::from(row));
-        };
-        for s in &self.sparks {
-            take(s.row);
+        let sparks = self.sparks.as_slice();
+        let mut si = 0;
+        while si < sparks.len() {
+            extend_bounds(&mut lo, &mut hi, sparks[si].row);
+            si += 1;
         }
-        for (row, _) in cur.into_iter().chain(self.last) {
-            take(row);
+        if let Some((row, _)) = cur {
+            extend_bounds(&mut lo, &mut hi, row);
+        }
+        if let Some((row, _)) = self.last {
+            extend_bounds(&mut lo, &mut hi, row);
         }
         if let Some((a, b)) = self.classic.row_range() {
-            take(a);
-            take(b);
+            extend_bounds(&mut lo, &mut hi, a);
+            extend_bounds(&mut lo, &mut hi, b);
         }
         let (r0, c0) = (i32::from(at.0), i32::from(at.1));
         let ft = &mut self.frame_text;
@@ -187,23 +203,28 @@ impl CursorGlow {
         if lo > hi {
             return;
         }
-        let line = |row: i32| &cells[(row - r0) as usize];
         let mut max_cols = 0usize;
-        for r in lo..=hi {
-            max_cols = max_cols.max(line(r).len());
+        let mut r = lo;
+        while r <= hi {
+            let len = cells[(r - r0) as usize].len();
+            if len > max_cols {
+                max_cols = len;
+            }
+            r += 1;
         }
         ft.cols = max_cols;
-        let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         let n_rows = (hi - lo + 1) as usize;
         ft.rows.reserve(n_rows);
         ft.pairs.reserve(n_rows * ft.cols);
-        for row in lo..=hi {
-            let line = line(row);
-            let glyph = |c: &aterm_core::terminal::RenderCell| c.ch != ' ' || c.wide;
+        let mut row = lo;
+        while row <= hi {
+            let line = cells[(row - r0) as usize].as_slice();
             let mut glyph_span: Option<(i32, i32)> = None;
             let n_cols = line.len().min(ft.cols);
-            for (c, cell) in line[..n_cols].iter().enumerate() {
-                let is_glyph = glyph(cell);
+            let mut c = 0;
+            while c < n_cols {
+                let cell = &line[c];
+                let is_glyph = cell.ch != ' ' || cell.wide;
                 if is_glyph {
                     let ci = c0 + c as i32;
                     glyph_span = Some(match glyph_span {
@@ -215,11 +236,13 @@ impl CursorGlow {
                     if is_glyph { Some(rgb(cell.fg)) } else { None },
                     rgb(cell.bg),
                 )));
+                c += 1;
             }
             if n_cols < ft.cols {
                 ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
             }
             ft.rows.push(glyph_span);
+            row += 1;
         }
     }
 

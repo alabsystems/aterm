@@ -386,14 +386,14 @@ mod tests {
     fn a_session_on_warp_passes_and_names_its_frame() {
         let out = session(
             &PASSING,
-            "GPU rendering on Microsoft Basic Render Driver (Dx12)\r\n",
+            "GPU rendering on Microsoft Basic Render Driver (D3d11)\r\n",
         );
         let (answers, stderr) = parse_session(&out);
         assert_eq!(answers.len(), VERBS.len());
         assert_eq!(answers[2].verb, format!("send {TYPED}"));
         let (detail, frame) = judge(&answers, &stderr).unwrap_or_else(|e| unreachable!("{e}"));
         assert!(
-            detail.contains("drew on Microsoft Basic Render Driver (Dx12)"),
+            detail.contains("drew on Microsoft Basic Render Driver (D3d11)"),
             "{detail}"
         );
         assert_eq!(frame.as_deref(), Some("C:\\lane\\smoke-aarch64\\frame.png"));
@@ -415,14 +415,14 @@ mod tests {
 
     #[test]
     fn a_session_fails_on_a_cpu_frame_a_real_gpu_or_a_wrong_answer() {
-        let warp = "GPU rendering on Microsoft Basic Render Driver (Dx12)\n";
+        let warp = "GPU rendering on Microsoft Basic Render Driver (D3d11)\n";
         let mut cpu = PASSING;
         cpu[10] = "OK backend=cpu rows=30";
         let (a, e) = parse_session(&session(&cpu, warp));
         assert!(judge(&a, &e).is_err_and(|e| e.contains("backend=cpu")));
         let (a, e) = parse_session(&session(
             &PASSING,
-            "GPU rendering on Some Real GPU (Dx12)\n",
+            "GPU rendering on Some Real GPU (D3d11)\n",
         ));
         assert!(judge(&a, &e).is_err_and(|e| e.contains("not on WARP")));
         let mut no_echo = PASSING;

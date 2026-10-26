@@ -155,6 +155,9 @@ pub const KINFO_EFLAG_AT: usize = 612;
 pub const P_CONTROLT: u32 = 0x2;
 /// `P_EXEC` in `p_flag`: the process ran a program since its fork.
 pub const P_EXEC: u32 = 0x4000;
+/// `P_NOCLDWAIT` in `p_flag`: the kernel reaps the process's children for it (it ignores
+/// `SIGCHLD` or set `SA_NOCLDWAIT`), adding each one's time to its reaped-children time twice.
+pub const P_NOCLDWAIT: u32 = 0x4000_0000;
 /// `EPROC_SLEADER` in `e_flag`: the process leads its session.
 pub const EPROC_SLEADER: u32 = 0x2;
 
@@ -306,6 +309,7 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("KERN_PROC_PID", KERN_PROC_PID as i64),
     ("P_CONTROLT", P_CONTROLT as i64),
     ("P_EXEC", P_EXEC as i64),
+    ("P_NOCLDWAIT", P_NOCLDWAIT as i64),
     ("EPROC_SLEADER", EPROC_SLEADER as i64),
     ("sizeof(struct kinfo_proc)", KINFO_SIZE as i64),
     (
@@ -648,6 +652,8 @@ pub struct Kinfo {
     pub session_leader: bool,
     /// `P_EXEC`: it ran a program since its fork.
     pub exec: bool,
+    /// `P_NOCLDWAIT`: the kernel reaps its children for it.
+    pub reaps_unwaited: bool,
     /// `p_comm`.
     pub comm: String,
 }
@@ -677,6 +683,7 @@ pub fn kinfo(b: &[u8]) -> Option<Kinfo> {
         tpgid: tty.and(u32_at(b, KINFO_TPGID_AT).filter(|g| *g != 0)),
         session_leader: u32_at(b, KINFO_EFLAG_AT)? & EPROC_SLEADER != 0,
         exec: flag & P_EXEC != 0,
+        reaps_unwaited: flag & P_NOCLDWAIT != 0,
         comm: String::from_utf8_lossy(&comm[..end]).into_owned(),
     })
 }

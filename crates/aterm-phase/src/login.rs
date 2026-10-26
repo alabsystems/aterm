@@ -3,6 +3,7 @@
 
 //! Reader for Claude Code's `/login` dialog states and interrupted-login walls.
 
+use crate::panel::PanelRenderer;
 use crate::text::{contains, trim, trim_end};
 
 /// One of the picker's methods, by the words its row opens with.
@@ -69,6 +70,9 @@ pub struct Picker {
     pub focused: Option<usize>,
     /// The dialog's title row, for a key's guard.
     pub title_row: String,
+    /// The renderer whose frame the dialog is drawn in: the inline renderer's `─` rule, or the
+    /// fullscreen renderer's bottom panel under its `▔` rule.
+    pub renderer: PanelRenderer,
 }
 
 impl Picker {
@@ -95,18 +99,43 @@ pub enum LoginScreen {
 }
 
 fn rule(row: &str) -> bool {
-    let t = trim(row);
-    t.chars().count() >= 20 && t.chars().all(|c| c == '─')
+    frame_rule(row) == Some(PanelRenderer::Inline)
 }
 
-/// Parses the `/login` dialog on `rows` if the screen ends with one.
+/// The renderer whose dialog frame `row` is the full-width rule of: the inline renderer's `─`
+/// rule, or the fullscreen renderer's `▔` rule, the top of its bottom panel, which carries
+/// Claude Code's right-aligned hint between its ends while one shows (`◐ medium · /effort`, as
+/// the picker first opens: [`crate::prompt::is_panel_rule`]).
+fn frame_rule(row: &str) -> Option<PanelRenderer> {
+    let t = trim(row);
+    if t.chars().count() >= 20 && t.chars().all(|c| c == '─') {
+        Some(PanelRenderer::Inline)
+    } else if crate::prompt::is_panel_rule(t) {
+        Some(PanelRenderer::Fullscreen)
+    } else {
+        None
+    }
+}
+
+/// The last full-width rule on `rows` ([`frame_rule`]) and the renderer it is drawn by.
+fn last_frame(rows: &[String]) -> Option<(usize, PanelRenderer)> {
+    rows.iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, r)| frame_rule(r).map(|renderer| (i, renderer)))
+}
+
+/// Parses the `/login` dialog on `rows` if the screen ends with one, in either renderer's frame:
+/// under the inline renderer's `─` rule, its title two columns in, or in the fullscreen
+/// renderer's bottom panel under its `▔` rule, its title three columns in.
 #[must_use]
 pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
-    let last_rule = rows.iter().rposition(|r| rule(r))?;
+    let (last_rule, renderer) = last_frame(rows)?;
     let below = &rows[last_rule + 1..];
     let title_at = below.iter().position(|r| !trim(r).is_empty())?;
     let title = &below[title_at];
-    if trim(title) != "Login" || !title.starts_with("  ") {
+    let column = title.len() - title.trim_start_matches(' ').len();
+    if trim(title) != "Login" || column != renderer.column() {
         return None;
     }
     let body: Vec<&str> = below[title_at + 1..]
@@ -152,6 +181,7 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
             methods,
             focused,
             title_row: title.clone(),
+            renderer,
         }));
     }
     if has(crate::anchor!("login.console_how")) {
@@ -166,7 +196,8 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
     Some(LoginScreen::Failed)
 }
 
-/// Whether the last thing said is `⎿  Login interrupted` under `❯ /login`.
+/// Whether the last thing said is `⎿  Login interrupted` under `❯ /login`, above the composer
+/// and any right-aligned hint drawn over its top rule (the fullscreen renderer's `/effort` hint).
 #[must_use]
 pub fn login_interrupted(rows: &[String]) -> bool {
     let said: Vec<&str> = rows
@@ -179,7 +210,14 @@ pub fn login_interrupted(rows: &[String]) -> bool {
         .rposition(|r| r.starts_with('❯') && !r.starts_with("❯ /login"))
         .and_then(|composer| composer.checked_sub(1))
         .filter(|&top| rule(said[top]))
-        .unwrap_or(said.len());
+        .map_or(said.len(), |top| {
+            let hints = said[..top]
+                .iter()
+                .rev()
+                .take_while(|r| crate::phase::is_hint(r, None))
+                .count();
+            top - hints
+        });
     let said = &said[..end];
     let Some(last) = said.last() else {
         return false;
@@ -209,17 +247,24 @@ pub struct LoginAtWall {
     pub left_before: bool,
 }
 
-/// Returns the lost-login wall above a standing or interrupted `/login`, if any.
+/// Returns the lost-login wall above a standing or interrupted `/login`, if any. The inline
+/// renderer draws the typed `❯ /login` above its dialog; the fullscreen renderer echoes it only
+/// once the dialog closes, so its panel stands right under what was said before it.
 #[must_use]
 pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
-    let from = if login_screen(rows).is_some() {
-        rows.iter().rposition(|r| rule(r))?
+    let (from, echoed) = if login_screen(rows).is_some() {
+        let (at, renderer) = last_frame(rows)?;
+        (at, renderer == PanelRenderer::Inline)
     } else if login_interrupted(rows) {
-        rows.iter().rposition(|r| interrupted_row(r))?
+        (rows.iter().rposition(|r| interrupted_row(r))?, true)
     } else {
         return None;
     };
-    let mut at = said_above(rows, from).filter(|&i| trim_end(&rows[i]) == LOGIN_ROW)?;
+    let mut at = if echoed {
+        said_above(rows, from).filter(|&i| trim_end(&rows[i]) == LOGIN_ROW)?
+    } else {
+        from
+    };
     let mut left_before = false;
     while let Some(out) = said_above(rows, at).filter(|&i| interrupted_row(&rows[i]))
         && let Some(typed) = said_above(rows, out).filter(|&i| trim_end(&rows[i]) == LOGIN_ROW)

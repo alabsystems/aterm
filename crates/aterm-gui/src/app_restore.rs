@@ -20,6 +20,12 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
+/// A window's tabs before a native restore stages its leaf, and which one was active.
+struct RestoreStagingMark {
+    active: Option<crate::tab_model::TabId>,
+    tabs: Vec<crate::tab_model::TabId>,
+}
+
 pub(crate) const RESTORE_SLICE_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// State machine that rebuilds a cold launch's restored window/tab layout in bounded slices.
@@ -3418,6 +3424,7 @@ impl App {
         wid: WindowId,
         descriptor: &restore::NativeLeafRestore,
     ) -> Result<BuiltRestoreLeaf, String> {
+        let mark = self.restore_staging_mark(wid);
         let mut reads_harness = false;
         match descriptor.restore_tag.as_str() {
             "system-state" => {
@@ -3444,14 +3451,14 @@ impl App {
                     crate::native_app::AppKind::Editor
                 };
                 if descriptor.config_editor {
-                    self.ensure_and_open_config_editor_in_window(wid)?;
+                    self.stage_config_editor_restore_view(wid)?;
                 } else {
                     self.stage_document_restore_view(wid, kind, uri)?;
                 }
             }
             _ => return Err("This app is unavailable in this build".to_string()),
         }
-        let (view, mut presentation, staging_tab) = self.detach_restore_staging_tab(wid)?;
+        let (view, mut presentation, staging_tab) = self.detach_restore_staging_tab(wid, &mark)?;
         if !self.apply_native_view_restore(view, descriptor) {
             self.remove_view_link(view);
             return Err("The saved view state did not match the reopened app".to_string());
@@ -3784,6 +3791,7 @@ impl App {
         placeholder: &restore::PlaceholderLeafRestore,
         capability: Option<crate::native_app::RecoveryCapability>,
     ) -> Result<BuiltRestoreLeaf, String> {
+        let mark = self.restore_staging_mark(wid);
         let presentation = crate::tab_model::TabPresentation {
             title: "Recovery".to_string(),
             icon: Some(crate::tab_model::TabIconKind::Recovery),
@@ -3812,13 +3820,31 @@ impl App {
             presentation,
         )
         .map_err(|error| format!("Recovery view could not be installed: {error:?}"))?;
-        self.detach_restore_staging_tab(wid)
+        self.detach_restore_staging_tab(wid, &mark)
             .map(|(view, presentation, tab)| (view, presentation, Some(tab)))
     }
 
+    /// What `wid` held before a native restore staged its leaf.
+    fn restore_staging_mark(&self, wid: WindowId) -> RestoreStagingMark {
+        let window = self.windows.get(&wid);
+        RestoreStagingMark {
+            active: window.and_then(|window| window.tab_set.active_id()),
+            tabs: window
+                .map(|window| window.tab_set.tabs().iter().map(|tab| tab.id).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Lift the single-leaf staging tab a native restore built out of `wid` and make the tab
+    /// active before staging (`mark`) active again, so removing it fronts no other tab
+    /// (`TabSet::remove` would front the tab before it). A native staging tab never had a
+    /// terminal projection slot, so the projection is as it was before staging. An active
+    /// tab `wid` already held before staging is the person's, never a staging tab: it is
+    /// left in place, the front goes back, and the restore fails.
     fn detach_restore_staging_tab(
         &mut self,
         wid: WindowId,
+        mark: &RestoreStagingMark,
     ) -> Result<
         (
             crate::tab_model::ViewId,
@@ -3832,10 +3858,26 @@ impl App {
             .get(&wid)
             .and_then(|window| window.tab_set.active_id())
             .ok_or_else(|| "native staging tab did not become active".to_string())?;
+        let restore_front = |window: &mut WindowState| {
+            if let Some(prior) = mark.active {
+                window.tab_set.switch_to(prior);
+            }
+        };
+        if mark.tabs.contains(&tab_id) {
+            if let Some(window) = self.windows.get_mut(&wid) {
+                restore_front(window);
+            }
+            self.resync_after_restore_candidate(wid);
+            return Err("the restore fronted an open tab instead of staging one".to_string());
+        }
         let tab = self
             .windows
             .get_mut(&wid)
-            .and_then(|window| window.tab_set.remove(tab_id))
+            .and_then(|window| {
+                let tab = window.tab_set.remove(tab_id)?;
+                restore_front(window);
+                Some(tab)
+            })
             .ok_or_else(|| "native staging tab disappeared".to_string())?;
         let views = tab.root.leaves();
         let [view] = views.as_slice() else {

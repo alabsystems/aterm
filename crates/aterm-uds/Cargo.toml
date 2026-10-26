@@ -15,7 +15,8 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # readers: `KERN_PROCARGS2`'s (`procargs`, re-exported) on Unix and Windows,
 # and its path rule and process reader on Windows; and on Unix astream-sys
 # (zero dependencies), whose owner-only rule `private_file` admits by and whose
-# boot reader names this boot.
+# boot reader names this boot, and aterm-durable (std plus astream-sys), which
+# finishes an `atomic_file` write.
 [dependencies]
 # aterm-vitals: the program check's reading and verdict types
 # (`program_check`), which this crate's reader fills. A pure model crate with
@@ -53,6 +54,12 @@ libc = { workspace = true }
 # is its one reader's (`boot_session`: the all-zero id refused); and
 # `keep_out_of_children` is its `close_on_fork` (`FD_CLOFORK`).
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
+# aterm-durable: how an `atomic_file` write is finished. The file takes the durable flush
+# (`durable`), and its directory the best-effort one after the rename
+# (`Flush::dir_best_effort`, astream-sys's `dir_flush_unavailable`): a directory that
+# cannot be flushed here is accepted, and `EIO` is returned. Std plus astream-sys, so no
+# new crate in this graph; it depends on nothing of this crate's, so no cycle.
+aterm-durable = { workspace = true }
 
 [dev-dependencies]
 # Test scratch directories (mode 0700, an unpredictable name); itself dependency-free.

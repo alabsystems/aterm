@@ -1010,7 +1010,9 @@ pub fn rank(a: (u64, bool, &str), b: (u64, bool, &str)) -> Ordering {
 /// off, settle, run out or end the episode, or give a parked one way to a new one. Only the
 /// elected session's host types anything ([`claim`]). A look that does not read the volume
 /// short steps an open episode too, unless it reads the volume clear of what the episode is
-/// held to ([`ends`]), which ends it.
+/// held to ([`ends`]), which ends it. A look that reads it clear by the asked session's own
+/// cleanup ([`freed_by_pick`]) settles the episode in that session's name first, and the next
+/// such look ends it: the session that freed the volume is credited however much it freed.
 #[must_use]
 pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     if look.level == Level::Unknown {
@@ -1022,7 +1024,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     } else {
         match lease.entry_at(look.key) {
             Some(e) if e.episode_ms.is_some() => {
-                if ends(e, look) {
+                if ends(e, look) && !freed_by_pick(e, look) {
                     let asks = e.asks;
                     e.close();
                     return Said::Ended { asks };
@@ -1163,6 +1165,14 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
                     sid: pick.sid,
                     freed: rose,
                 };
+            }
+            // A look that reads the volume clear and no rise of the session's: the episode ends,
+            // as at [`step`]'s head (a record of aterm's passes folded at this look can leave the
+            // rise short of what that head judged).
+            if !below && ends(entry, look) {
+                let asks = entry.asks;
+                entry.close();
+                return Said::Ended { asks };
             }
             entry.phase = Phase::Asked {
                 pick: pick.clone(),
@@ -1384,6 +1394,38 @@ pub fn take_over(lease: &mut Lease, r: &Roster<'_>) -> Vec<String> {
     took.sort();
     took.dedup();
     took
+}
+
+/// Whether `look` reads the asked session's own rise in `entry` (an episode `asked`): the best
+/// reading since its line, at this look too, past the line's figure by [`FREED_MIN`] once what
+/// aterm's own passes freed since, those this look reports among them, is taken out, exactly as
+/// [`step`] judges the rise that settles it. A look that reads the volume clear on such a rise
+/// settles the episode in the session's name before anything ends it.
+fn freed_by_pick(entry: &Entry, look: &Look<'_>) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::EndUncredited) {
+        return false;
+    }
+    let Phase::Asked {
+        typed_ms,
+        free_at,
+        best_free,
+        ..
+    } = &entry.phase
+    else {
+        return false;
+    };
+    let reported = look
+        .reclaimed
+        .iter()
+        .filter(|r| r.ended_ms >= *typed_ms)
+        .fold(0u64, |a, r| a.saturating_add(r.bytes));
+    (*best_free)
+        .max(look.free)
+        .saturating_sub(*free_at)
+        .saturating_sub(aterm_since(entry, *typed_ms))
+        .saturating_sub(reported)
+        >= FREED_MIN
 }
 
 /// Whether `look` reads `entry`'s open episode clear of what it is held to: free space at or
@@ -2182,6 +2224,10 @@ pub struct Line<'a> {
     pub holders: &'a [Hog],
     /// The asked session's checkout: a holder that serves it is said to be this tab's.
     pub checkout: Option<&'a Path>,
+    /// Another live session the look read works in [`Self::checkout`] too (several tabs in one
+    /// checkout): a holder that serves it is said to be this tab's checkout's, shared, never
+    /// this tab's alone, as other sessions build there.
+    pub shared: bool,
     /// `$HOME`, for `~/…`.
     pub home: Option<&'a Path>,
 }
@@ -2207,10 +2253,18 @@ const HOLDER_PATH_CAP: usize = 56;
 /// characters. A holder's path is said only in plain characters (letters, digits, `/._-~+@:,=`
 /// and spaces) and clipped; any other is said as "a build directory", so a folder's name
 /// carries nothing planted into an agent's prompt. A line too long for both holders names the
-/// largest alone, and one too long for that names it with its path clipped to the room left
-/// ([`clip_within`]), so a line whose pass left a holder never says it names none.
+/// largest alone. One too long for that says the volume's name clipped in its middle to the room
+/// the line leaves it ([`clip_within`]), or as "its volume", before it clips the holder: the
+/// holder is what the agent acts on, and the asked tab's own keeps its path and its mark. Only a
+/// line too long even then names the holder with its path clipped to the room left, so a line
+/// whose pass left a holder never says it names none, and every line keeps to the cap.
 #[must_use]
 pub fn line(l: &Line<'_>) -> String {
+    line_within(l, LINE_CAP)
+}
+
+/// [`line`] in at most `cap` characters.
+fn line_within(l: &Line<'_>, cap: usize) -> String {
     let used = l.total.saturating_sub(l.free);
     let pct = if l.total == 0 {
         100
@@ -2233,13 +2287,29 @@ pub fn line(l: &Line<'_>) -> String {
             human_bytes(l.floor)
         ),
     };
-    let fact = format!(
-        "the volume this tab works on ({}) is {pct}% full, {} free, {below}, and {why}.",
-        plain(&l.mount.display().to_string()).unwrap_or_else(|| "its volume".to_owned()),
-        human_bytes(l.free),
-    );
-    let said =
-        |named: &str| format!("{HEAD}{fact}{named} {SAFE} {CONFIRM} (rule {RULE_DISK_FREE})");
+    let volume = plain(&l.mount.display().to_string()).unwrap_or_else(|| UNSAID_VOLUME.to_owned());
+    let said_on = |volume: &str, named: &str| {
+        format!(
+            "{HEAD}the volume this tab works on ({volume}) is {pct}% full, {} free, {below}, and \
+             {why}.{named} {SAFE} {CONFIRM} (rule {RULE_DISK_FREE})",
+            human_bytes(l.free),
+        )
+    };
+    let said = |named: &str| said_on(&volume, named);
+    // The line with `named` and the volume's name in the room the rest leaves it: whole, clipped
+    // in its middle, or "its volume". `None`: not even "its volume" fits.
+    let fit = |named: &str| {
+        let whole = volume.chars().count();
+        let room = (cap + whole).checked_sub(said(named).chars().count())?;
+        if whole <= room {
+            return Some(said(named));
+        }
+        clip_within(&volume, room)
+            .filter(|_| volume != UNSAID_VOLUME)
+            .or_else(|| (UNSAID_VOLUME.chars().count() <= room).then(|| UNSAID_VOLUME.to_owned()))
+            .map(|shown| said_on(&shown, named))
+    };
+    let capped = |named: &str| fit(named).unwrap_or_else(|| said_on(UNSAID_VOLUME, named));
     let largest = |named: &[String]| format!(" Largest left: {}.", named.join("; "));
     let holders: Vec<String> = l
         .holders
@@ -2249,24 +2319,35 @@ pub fn line(l: &Line<'_>) -> String {
         .collect();
     for keep in (1..=holders.len()).rev() {
         let text = said(&largest(&holders[..keep]));
-        if text.chars().count() <= LINE_CAP {
+        if text.chars().count() <= cap {
             return text;
         }
     }
-    // Not even the largest fits as it is usually said: it is said with its path clipped to the
-    // room the line leaves it, so a line with a holder to name never says it has none, and the
-    // asked tab's own keeps its mark.
+    // Not even the largest fits as it is usually said. The volume's name gives way first: the
+    // holder is what the agent acts on, and the asked tab's own keeps its path and its mark.
     if let Some(first) = l.holders.first() {
-        let bare = said(&largest(&[holder(first, l, "")])).chars().count();
-        if let Some(shown) =
-            shown_path_within(holder_path(first), l.home, LINE_CAP.saturating_sub(bare))
+        if let Some(text) = holders
+            .first()
+            .and_then(|h| fit(&largest(std::slice::from_ref(h))))
         {
-            return said(&largest(&[holder(first, l, &shown)]));
+            return text;
         }
-        return said(" `aterm harness disk` lists the largest holders left.");
+        // Then its path, clipped to the room the line leaves it, so a line with a holder to name
+        // never says it has none.
+        let bare = said_on(UNSAID_VOLUME, &largest(&[holder(first, l, "")]))
+            .chars()
+            .count();
+        if let Some(shown) = shown_path_within(holder_path(first), l.home, cap.saturating_sub(bare))
+        {
+            return said_on(UNSAID_VOLUME, &largest(&[holder(first, l, &shown)]));
+        }
+        return capped(" `aterm harness disk` lists the largest holders left.");
     }
-    said(" aterm's report names no holder it can size: `aterm harness disk` lists them.")
+    capped(" aterm's report names no holder it can size: `aterm harness disk` lists them.")
 }
+
+/// How the line says a volume whose mount point it cannot say ([`plain`]) or fit ([`line`]).
+const UNSAID_VOLUME: &str = "its volume";
 
 /// The path holder `h` is said by: the checkout it builds for, or its own directory.
 fn holder_path(h: &Hog) -> &Path {
@@ -2274,8 +2355,10 @@ fn holder_path(h: &Hog) -> &Path {
 }
 
 /// Holder `h` as the line says it, its path ([`holder_path`]) said as `shown`:
-/// `<checkout>'s builds <size>`, or `<directory> <size>`, marked `(this tab's)` when it builds
-/// for the asked session's checkout.
+/// `<checkout>'s builds <size>`, or `<directory> <size>`, marked when it builds for the asked
+/// session's checkout: `(this tab's)`, or `(this tab's checkout, shared)` where another session
+/// works there too ([`Line::shared`]), so the agent is never told a build cache other sessions
+/// build in is its own.
 fn holder(h: &Hog, l: &Line<'_>, shown: &str) -> String {
     let mine = l
         .checkout
@@ -2285,11 +2368,12 @@ fn holder(h: &Hog, l: &Line<'_>, shown: &str) -> String {
         Some(s) if s != h.path => format!("{shown}'s builds"),
         _ => shown.to_owned(),
     };
-    format!(
-        "{place} {}{}",
-        human_bytes(h.bytes),
-        if mine { " (this tab's)" } else { "" }
-    )
+    let mark = match (mine, l.shared) {
+        (false, _) => "",
+        (true, false) => " (this tab's)",
+        (true, true) => " (this tab's checkout, shared)",
+    };
+    format!("{place} {}{mark}", human_bytes(h.bytes))
 }
 
 /// What a path any other character than the plain ones would spell is said as ([`plain`]).
@@ -2800,6 +2884,11 @@ pub mod fault {
         /// lock ([`super::Look::passing`]): space that pass freed, which no host has recorded yet,
         /// is credited to the asked session.
         SettleWhilePassing,
+        /// [`super::step`] ends an asked episode at a look that reads the volume clear whatever
+        /// the asked session freed, as before such looks settled it first: the session whose
+        /// cleanup alone lifted the volume past its floor and margin, the ask's whole success,
+        /// was never credited (no `freed` row, no owner's line saying it freed space).
+        EndUncredited,
     }
 
     thread_local! {

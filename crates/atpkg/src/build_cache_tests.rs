@@ -583,6 +583,40 @@ fn a_working_directory_reached_through_a_link_is_left_alone() {
     );
 }
 
+/// A tool that starts a nested `targo` at a checkout it names gets the shim's answer for a build
+/// typed there, whatever `$PWD` it inherited; a checkout named through a link is left alone.
+#[cfg(unix)]
+#[test]
+fn a_build_started_at_a_named_folder_gets_that_folders_answer() {
+    let f = Fixture::new("build-cache-named");
+    let ws = f.dir("home/ws");
+    let typed_in = f.dir("home/elsewhere");
+    let bench = strings(&["--unverified", "bench", "--no-run"]);
+    let env = HashMap::from([("PWD", typed_in.display().to_string())]);
+    let m = Machine {
+        home: Some(&f.home),
+        cwd: Some(&typed_in),
+        env: &|name| env.get(name).map(OsString::from),
+        read: &read_config,
+        writable: &writable,
+    };
+    // CONTROL: read with the inherited `$PWD`, the checkout looks reached through a link.
+    let read_pwd = Machine {
+        cwd: Some(&ws),
+        ..m
+    };
+    assert_eq!(with_build_dir(&bench, Tool::Targo, &read_pwd), None);
+    let mut cached = vec!["--config".to_owned(), f.value()];
+    cached.extend(bench.iter().cloned());
+    assert_eq!(
+        with_build_dir_at(&bench, Tool::Targo, &ws, &m),
+        Some(cached)
+    );
+    let link = f.root.join("home/link");
+    std::os::unix::fs::symlink(&ws, &link).unwrap();
+    assert_eq!(with_build_dir_at(&bench, Tool::Targo, &link, &m), None);
+}
+
 #[test]
 fn an_upstream_cargo_keeps_its_toolchain_first() {
     let f = Fixture::new("build-cache-cargo");

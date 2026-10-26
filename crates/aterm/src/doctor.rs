@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `aterm doctor` entry point, convergence runner, and macOS base init items (design:
-//! docs/DESIGN-init-system-2026-10-20.md).
+//! docs/DESIGN-init-system-2026-10-20.md). Every run is timed: each row carries the engine's
+//! time on it, the JSON's `phases` the run's, and one aterm.log line says the same totals.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -12,8 +13,8 @@ use std::sync::Arc;
 use aterm_cli::Mark;
 use aterm_cli::doctor::{self as cli, Args, Gathered, Section};
 use aterm_converge::{
-    Effect, Item, ItemReport, Journal, Layer, Mode, Outcome, Readiness, Remedy, Report, ReportMode,
-    Scope, StoodAside,
+    Effect, Item, ItemReport, Journal, Laps, Layer, Mode, Outcome, Readiness, Remedy, Report,
+    ReportMode, Scope, StoodAside,
 };
 use atpkg::converge::repair::{self, Ground, Pass};
 
@@ -36,7 +37,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
     };
     if let Some(action) = args.settings {
         let (text, code) = cli::settings(action, args.json);
-        return cli::answer(&text, code, true);
+        return cli::answer(&text, code, true, None);
     }
     let ground = atpkg::store::resolve_configured()
         .map(|layout| Arc::new(Ground::of_process(layout, Pass::Doctor)));
@@ -47,6 +48,8 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             .unwrap_or_default()
     };
     let state = aterm_types::dirs::account_state_dir();
+    // The run's phase totals go to aterm.log ([`run`]), never to this terminal.
+    aterm_gui::install_session_log();
     #[cfg(target_os = "macos")]
     let reading = aterm_machines::init::Doctor::new(Some(Arc::new(targo)));
     #[cfg(target_os = "macos")]
@@ -69,7 +72,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             develop,
         },
     );
-    cli::answer(&ran.text, ran.code, ran.json)
+    cli::answer(&ran.text, ran.code, ran.stdout, ran.hand_over)
 }
 
 /// The develop layer as `reading` composes it, for [`Develop::compose`].
@@ -115,15 +118,16 @@ pub(crate) type DevelopRows<'a> =
 /// What a doctor run reads and writes, injected so a test runs it over a scratch home
 /// and prefix.
 pub(crate) struct Ports<'a> {
-    /// Reads aterm-cli's facts, `true` handing the Developer Tools over first
-    /// ([`cli::gather`]); called once, after every `--only` word is known to name
-    /// something.
-    pub(crate) gather: &'a dyn Fn(bool) -> Gathered,
+    /// Reads aterm-cli's facts the `--only` words name, `true` leaving the Developer Tools
+    /// hand-over due after the report ([`cli::gather`]); called once, after every word is
+    /// known to name something.
+    pub(crate) gather: &'a dyn Fn(bool, &[String]) -> Gathered,
     /// The repair items' ground; `None` when no home folder, and so no store, can be found
     /// ([`aterm_types::dirs::home_dir`]).
     pub(crate) ground: Option<&'a Arc<Ground>>,
-    /// `aterm pkg doctor`'s rows, read after the repair.
-    pub(crate) packages: &'a dyn Fn() -> Vec<ItemReport>,
+    /// `aterm pkg doctor`'s rows, read on a thread of their own beside the gather, and
+    /// again after a repair that changed something; never when no word names one of them.
+    pub(crate) packages: &'a (dyn Fn() -> Vec<ItemReport> + Sync),
     /// The account's state root, whose journal records each change; `None` refuses
     /// every change (nothing is changed unrecorded).
     pub(crate) state: Option<&'a Path>,
@@ -136,13 +140,15 @@ pub(crate) struct Ports<'a> {
     pub(crate) develop: Option<Develop<'a>>,
 }
 
-/// A run's answer: the text (the report, the JSON, or the refusal), its exit status, and
-/// whether it is the JSON (stdout whatever the code).
+/// A run's answer: the text (the report, the JSON, or the refusal), its exit status,
+/// whether it is a report (stdout whatever the code; a refusal goes to stderr), and the
+/// Developer Tools hand-over due after it.
 #[derive(Debug)]
 pub(crate) struct Ran {
     pub(crate) text: String,
     pub(crate) code: u8,
-    pub(crate) json: bool,
+    pub(crate) stdout: bool,
+    pub(crate) hand_over: Option<cli::HandOver>,
 }
 
 /// How the repair items ran.
@@ -159,8 +165,11 @@ enum How {
     HeldBack(String),
 }
 
-/// Run `aterm doctor` as `args` asks over `ports`.
+/// Run `aterm doctor` as `args` asks over `ports`, each step a phase of the run: the early
+/// and the final packages read, the develop layer, the gather, the store lock, the census
+/// (the fact items) and the repairs.
 pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
+    let mut laps = Laps::start();
     let tokens = &args.only;
     let develop_word = |token: &str| {
         ports
@@ -172,13 +181,18 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         Some(ground) => aterm_converge::select(repair::items(ground), tokens),
         None => (Vec::new(), tokens.clone()),
     };
+    // Every word is judged against the names first, before anything is read; only a word no
+    // name covers has the packages' rows read to tell whether one of them answers to it.
     let mut unmatched: Vec<String> = missed
         .into_iter()
-        .filter(|token| !cli::names(token) && !develop_word(token))
+        .filter(|token| {
+            !cli::names(token) && !develop_word(token) && !atpkg::converge::names(token)
+        })
         .collect();
     let mut read_early = None;
     if !unmatched.is_empty() {
         let rows = (ports.packages)();
+        laps.lap("packages");
         unmatched.retain(|token| !rows.iter().any(|row| named_by(token, row)));
         read_early = Some(rows);
     }
@@ -191,7 +205,8 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
                 cli::GRAMMAR
             ),
             code: 2,
-            json: false,
+            stdout: false,
+            hand_over: None,
         };
     }
 
@@ -239,11 +254,49 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
                     cli::GRAMMAR
                 ),
                 code: 2,
-                json: false,
+                stdout: false,
+                hand_over: None,
             };
         }
     }
-    let gathered = (ports.gather)(own && !args.read_only && cli::hands_over(tokens));
+    laps.lap("develop");
+    // The packages' rows read from the start, beside everything else, when no word narrows
+    // the run or one names a packages row.
+    let packages = tokens.is_empty() || tokens.iter().any(|token| atpkg::converge::names(token));
+    std::thread::scope(|scope| {
+        let reading = (read_early.is_none() && packages).then(|| scope.spawn(ports.packages));
+        converge(args, ports, repairs, develop, laps, || {
+            read_early.or_else(|| {
+                reading.map(|read| {
+                    read.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+            })
+        })
+    })
+}
+
+/// The rest of [`run`] once every word names something: the facts gathered, the repairs run
+/// (under the store lock when they may change anything), the develop rows read, and the
+/// report rendered, each step a lap of `laps`. `early` is the packages' rows read before or
+/// beside it all, `None` when no word names one of them; its lap is only what is left of that
+/// read once the repairs are done.
+fn converge<'a>(
+    args: &Args,
+    ports: &Ports<'a>,
+    repairs: Vec<Box<dyn Item>>,
+    develop: Option<DevelopLayer<'a>>,
+    mut laps: Laps,
+    early: impl FnOnce() -> Option<Vec<ItemReport>>,
+) -> Ran {
+    let tokens = &args.only;
+    let own = ports.not_own_account.is_none();
+    // A document's reader is no person to bring to a pane: `--json` never hands over.
+    let gathered = (ports.gather)(
+        own && !args.read_only && !args.json && cli::hands_over(tokens),
+        tokens,
+    );
+    laps.lap("gather");
     let fact_tokens: Vec<String> = if tokens.is_empty() {
         Vec::new()
     } else {
@@ -270,6 +323,7 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         },
         _ => How::Applied,
     };
+    laps.lap("lock");
     let (facts, repairs) = match &how {
         How::StoodAside(line) => {
             let aside = StoodAside::Lock(line.clone());
@@ -306,7 +360,9 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
             })
     };
     let fact_rows = ran(&facts, "doctor.facts");
+    laps.lap("census");
     let repair_rows = ran(&repairs, "doctor.repairs");
+    laps.lap("repairs");
     if !fact_rows.iter().any(|row| row.id == cli::SHELL) {
         refused.push(unmeasured(
             cli::SHELL,
@@ -317,28 +373,20 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     }
     drop(lock);
 
-    // The develop rows, read once the store is free again (a checkout's `--check` may build
-    // its verifier first): each item probed, none applied, nothing journaled.
-    let develop_rows = develop.map_or_else(Vec::new, |layer| {
-        (layer.rows)(tokens).unwrap_or_else(|refusal| {
-            refused.push(unmeasured(
-                "doctor.develop",
-                "develop",
-                Some(Layer::Develop),
-                refusal,
-            ));
-            Vec::new()
-        })
-    });
-
-    let changed = fact_rows
+    // An apply that changed something, or failed partway, may have changed what the early
+    // read saw: the packages are read again after it. Either read is in before the develop
+    // rows start, so a build a checkout's `--check` runs is never counted as a lease or a
+    // live build.
+    let rewrote = fact_rows
         .iter()
         .chain(&repair_rows)
-        .any(|row| row.outcome == Outcome::Changed);
-    let mut packages = match read_early {
-        Some(rows) if !changed => rows,
-        _ => (ports.packages)(),
+        .any(|row| matches!(row.outcome, Outcome::Changed | Outcome::Failed));
+    let mut packages = match early() {
+        Some(rows) if !rewrote => rows,
+        Some(_) => (ports.packages)(),
+        None => Vec::new(),
     };
+    laps.lap("packages");
     let ran_ids: Vec<&str> = fact_rows
         .iter()
         .chain(&repair_rows)
@@ -351,6 +399,22 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     for row in &mut packages {
         row.essential = false;
     }
+
+    // The develop rows, read once the store is free again and the packages are read (a
+    // checkout's `--check` may build its verifier first): each item probed, none applied,
+    // nothing journaled.
+    let develop_rows = develop.map_or_else(Vec::new, |layer| {
+        (layer.rows)(tokens).unwrap_or_else(|refusal| {
+            refused.push(unmeasured(
+                "doctor.develop",
+                "develop",
+                Some(Layer::Develop),
+                refusal,
+            ));
+            Vec::new()
+        })
+    });
+    laps.lap("develop");
 
     let missing_store = unmeasured(
         "base.pkg.store",
@@ -390,6 +454,15 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         .collect();
     let readiness = Readiness::of(&rows, tokens);
     let code = u8::from(!readiness.all_green);
+    aterm_log::info!(
+        "aterm doctor{}: {} rows, exit {code}; {laps}",
+        if mode == Mode::Plan {
+            " (read only)"
+        } else {
+            ""
+        },
+        rows.len()
+    );
     if args.json {
         let mode = if mode == Mode::Plan {
             ReportMode::Check
@@ -398,16 +471,19 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         };
         let mut report = Report::new(mode, readiness.all_green, rows);
         report.readiness = Some(readiness);
+        report.phases = laps.phases();
         return match aterm_json::to_string(&report) {
             Ok(text) => Ran {
                 text: format!("{text}\n"),
                 code,
-                json: true,
+                stdout: true,
+                hand_over: None,
             },
             Err(why) => Ran {
                 text: format!("aterm doctor: cannot encode the report: {why}\n"),
                 code: 70,
-                json: false,
+                stdout: false,
+                hand_over: None,
             },
         };
     }
@@ -440,10 +516,13 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     Ran {
         text,
         code,
-        json: false,
+        stdout: true,
+        hand_over: gathered.hand_over(),
     }
 }
 
+/// Missing evidence as a row, not an empty successful report. No probe ran for it, so it took
+/// none of the run's time.
 fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> ItemReport {
     ItemReport {
         id: id.to_owned(),
@@ -461,6 +540,7 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
         explain: None,
         stood_aside: None,
         essential: false,
+        elapsed_ms: Some(0),
     }
 }
 

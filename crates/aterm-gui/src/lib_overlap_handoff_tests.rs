@@ -378,6 +378,113 @@ fn a_preparation_failure_closes_the_proof_channel_without_a_proof() {
 }
 
 #[test]
+fn a_deferred_settings_close_behind_the_front_tab_leaves_the_front() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.push_stub_tab(wid, stub_session(app.next_session_id));
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let settings_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    app.switch_tab_in(wid, 0);
+    let cancelled = arm_outgoing_handoff(&mut app);
+
+    assert!(
+        !app.close_settings_tabs(),
+        "the close waits for the handoff"
+    );
+    assert!(cancelled.try_recv().is_ok());
+    assert!(app.windows[&wid].tab_set.get(settings_tab).is_some());
+    assert_eq!(
+        app.windows[&wid].tab_set.active_index(),
+        Some(0),
+        "the deferred close leaves the person's front tab in front"
+    );
+    assert_eq!(app.focused_session_id(wid), Some(0));
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
+#[test]
+fn a_deferred_split_settings_close_replays_behind_the_front_tab() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    for ws in app.windows.values_mut() {
+        ws.os_window_for_test = true;
+        ws.focused = true;
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (_, settings) = app.active_native_view(wid).unwrap();
+    let settings_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    let (failed, failed_view) =
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+    app.switch_tab_in(wid, 0);
+    let term = app
+        .pool
+        .get(failed)
+        .expect("the split's terminal")
+        .term
+        .clone();
+    crate::term_lock(&term).process(
+        b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\make\r\n\x1b]133;C\x1b\\\
+          \x1b]133;D;2\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\",
+    );
+    let t0 = std::time::Instant::now();
+    app.observe_session_statuses(t0);
+    app.observe_session_statuses(t0 + std::time::Duration::from_secs(1));
+    let unseen = |app: &App| {
+        app.session_status
+            .indicators(failed)
+            .is_some_and(|bits| bits.status_attention)
+    };
+    assert!(unseen(&app), "PRECONDITION: a failure nobody has looked at");
+    let cancelled = arm_outgoing_handoff(&mut app);
+
+    assert!(
+        !app.close_settings_tabs(),
+        "the close waits for the handoff"
+    );
+    assert!(cancelled.try_recv().is_ok());
+    assert!(matches!(
+        app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
+        Some(crate::DeferredHandoffTeardown::Mutations(mutations))
+            if mutations.contains(&crate::DeferredHandoffMutation::CloseView {
+                window: wid,
+                tab: settings_tab,
+                view: settings,
+            })
+    ));
+    assert_eq!(app.windows[&wid].tab_set.active_index(), Some(0));
+    assert_eq!(
+        app.windows[&wid]
+            .tab_set
+            .get(settings_tab)
+            .map(|tab| tab.focus),
+        Some(failed_view),
+        "the deferred close gives the tab back the focus it borrowed"
+    );
+    app.pending_update_handoff = None;
+
+    assert_eq!(
+        app.replay_deferred_handoff_view_close(wid, settings_tab, settings),
+        None
+    );
+    assert_eq!(
+        app.windows[&wid]
+            .tab_set
+            .get(settings_tab)
+            .map(|tab| tab.root.len()),
+        Some(1),
+        "the replay closes the Settings leaf"
+    );
+    assert_eq!(
+        app.windows[&wid].tab_set.active_index(),
+        Some(0),
+        "the replayed close leaves the person's front tab in front"
+    );
+    assert_eq!(app.focused_session_id(wid), Some(0));
+    assert!(unseen(&app), "the split's terminal never came to the front");
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
+#[test]
 fn pending_handoff_defers_every_tab_close_without_dropping_pty_ownership() {
     for closer in ["close_tab_at", "cmd-w", "control verb"] {
         let mut app = App::headless_for_test();
@@ -2574,13 +2681,32 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
     ] {
         assert_eq!(update_handoff_wake_class(&tolerated), Class::Tolerated);
     }
+    let shortcut_source = App::headless_for_test();
     for revoking in [
+        Wake::NativeTabCommand {
+            window: WindowId(0),
+            command: crate::app_tabs::NativeTabCommand::Select(
+                shortcut_source.windows[&WindowId(0)]
+                    .tab_set
+                    .active_id()
+                    .unwrap(),
+            ),
+        },
         Wake::Exit {
             session: 1,
             window: WindowId(0),
         },
         Wake::CreateWindow,
-        Wake::DetachActiveTab,
+        Wake::TabWindowCommand(
+            shortcut_source
+                .tab_window_shortcut(WindowId(0), "n")
+                .unwrap(),
+        ),
+        Wake::TabWindowCommand(
+            shortcut_source
+                .tab_window_shortcut(WindowId(0), "o")
+                .unwrap(),
+        ),
         Wake::ConfirmedClose {
             replay: crate::close_confirm::CloseReplay::Quit,
         },

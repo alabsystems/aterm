@@ -632,6 +632,7 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
             name: access.name().into(),
             status: if done { "ok" } else { WAITING }.into(),
             detail,
+            elapsed_ms: None,
         }
     })
     .collect()

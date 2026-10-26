@@ -717,6 +717,66 @@ const fn view_verdict(bytes: &[u8]) -> Result<(ReceiptVerdict, Option<&[u8]>), R
     Err(ReceiptError::InvalidVerdict)
 }
 
+#[derive(Clone, Copy)]
+enum V1Key<'a> {
+    End,
+    Skip(Option<&'a [u8]>),
+    V(&'a [u8]),
+    T(&'a [u8]),
+    Re(&'a [u8]),
+    Verdict(&'a [u8]),
+    Dl(&'a [u8]),
+}
+
+const fn classify_v1_key(rem: &[u8], ack: bool) -> V1Key<'_> {
+    let &[b0, ref r1 @ ..] = rem else {
+        return V1Key::End;
+    };
+    match b0 {
+        b'\n' => V1Key::End,
+        b' ' => V1Key::Skip(Some(r1)),
+        b'v' => {
+            if let &[b'=', ref val @ ..] = r1 {
+                V1Key::V(val)
+            } else if let &[b'e', b'r', b'd', b'i', b'c', b't', b'=', ref val @ ..] = r1 {
+                if ack {
+                    V1Key::Verdict(val)
+                } else {
+                    V1Key::Skip(after_value(rem))
+                }
+            } else {
+                V1Key::Skip(after_value(rem))
+            }
+        }
+        b't' => {
+            if let &[b'=', ref val @ ..] = r1 {
+                V1Key::T(val)
+            } else {
+                V1Key::Skip(after_value(rem))
+            }
+        }
+        b'r' => {
+            if let &[b'e', b'=', ref val @ ..] = r1 {
+                V1Key::Re(val)
+            } else {
+                V1Key::Skip(after_value(rem))
+            }
+        }
+        b'd' => {
+            if let &[b'l', b'=', ref val @ ..] = r1 {
+                if !ack {
+                    V1Key::Dl(val)
+                } else {
+                    V1Key::Skip(after_value(rem))
+                }
+            } else {
+                V1Key::Skip(after_value(rem))
+            }
+        }
+        _ => V1Key::Skip(after_value(rem)),
+    }
+}
+
 impl V1Receipt {
     /// Read a §4.1 receipt `body` under `kind`, the last segment of its subject (`ack` or
     /// `expired`; anything else is [`ReceiptError::UnknownKind`]).
@@ -747,10 +807,10 @@ impl V1Receipt {
         let mut dl_ms: Option<u64> = None;
         let mut rest = Some(body);
         while let Some(rem) = rest {
-            rest = match *rem {
-                [] | [b'\n', ..] => None,
-                [b' ', ref tail @ ..] => Some(tail),
-                [b'v', b'=', ref val @ ..] => {
+            rest = match classify_v1_key(rem, ack) {
+                V1Key::End => None,
+                V1Key::Skip(next) => next,
+                V1Key::V(val) => {
                     if v1 {
                         return Err(ReceiptError::MissingOrDuplicateField("v"));
                     }
@@ -760,7 +820,7 @@ impl V1Receipt {
                     v1 = true;
                     next
                 }
-                [b't', b'=', ref val @ ..] => {
+                V1Key::T(val) => {
                     if sender_t_ms.is_some() {
                         return Err(ReceiptError::MissingOrDuplicateField("t"));
                     }
@@ -772,7 +832,7 @@ impl V1Receipt {
                         Err(e) => return Err(e),
                     }
                 }
-                [b'r', b'e', b'=', ref val @ ..] => {
+                V1Key::Re(val) => {
                     if re.is_some() {
                         return Err(ReceiptError::MissingOrDuplicateField("re"));
                     }
@@ -784,7 +844,7 @@ impl V1Receipt {
                         Err(e) => return Err(e),
                     }
                 }
-                [b'v', b'e', b'r', b'd', b'i', b'c', b't', b'=', ref val @ ..] if ack => {
+                V1Key::Verdict(val) => {
                     if verdict.is_some() {
                         return Err(ReceiptError::MissingOrDuplicateField("verdict"));
                     }
@@ -796,7 +856,7 @@ impl V1Receipt {
                         Err(e) => return Err(e),
                     }
                 }
-                [b'd', b'l', b'=', ref val @ ..] if !ack => {
+                V1Key::Dl(val) => {
                     if dl_ms.is_some() {
                         return Err(ReceiptError::MissingOrDuplicateField("dl"));
                     }
@@ -808,7 +868,6 @@ impl V1Receipt {
                         Err(e) => return Err(e),
                     }
                 }
-                _ => after_value(rem),
             };
         }
         if !v1 {

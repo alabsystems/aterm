@@ -172,9 +172,11 @@ impl CursorGlow {
         let mut rows = std::mem::take(&mut self.keep_rows_scratch);
         rows.clear();
         let mut last_ground: Option<(u32, bool)> = None;
-        for i in 0..ft.rows.len() {
+        let mut i = 0;
+        while i < ft.rows.len() {
             let row = ft.lo + i as i32;
             if matches!(cur, Some((cr, _)) if i32::from(cr) == row) {
+                i += 1;
                 continue;
             }
             let y0 = oy + row * ch;
@@ -184,8 +186,11 @@ impl CursorGlow {
             };
             let mut run: Option<i32> = None;
             let mut span: Option<(i32, i32)> = None;
-            for (idx, pair) in row_pairs.iter().copied().enumerate() {
+            let mut idx = 0;
+            while idx < row_pairs.len() {
+                let pair = row_pairs[idx];
                 let col = ft.col0 + idx as i32;
+                idx += 1;
                 let held = match pair {
                     Some((Some(_), _)) => true,
                     Some((None, ground)) => {
@@ -234,6 +239,7 @@ impl CursorGlow {
             if let Some((c0, c1)) = span {
                 rows.push((ox + c0 * cw, ox + c1 * cw, y0, y0 + ch));
             }
+            i += 1;
         }
         let icons = self
             .word_icons

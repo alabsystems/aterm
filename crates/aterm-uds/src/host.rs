@@ -7,6 +7,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub mod chrome;
 mod tools;
 pub use tools::TOOLS;
 

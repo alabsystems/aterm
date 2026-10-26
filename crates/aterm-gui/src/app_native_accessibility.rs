@@ -942,6 +942,8 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let mut app = App::headless_for_test();
+        // A person is at the screen, whose untouched countdown applies the review.
+        app.user_input_recent = |_| true;
         let wid = WindowId(0);
         let window = app.windows.get_mut(&wid).unwrap();
         window.rows = 24;
@@ -1334,7 +1336,7 @@ mod tests {
             .unwrap();
         vault.standing = Standing::NeedsYou;
         vault.now = Some("Awaiting code".into());
-        vault.note = Some("Approve on an admin Mac: INERT-CODE".into());
+        vault.note = Some("On an admin Mac: aterm secrets approve INERT-CODE".into());
         assert_deferred_setup_start(current, false);
     }
 

@@ -64,13 +64,37 @@ pub fn alab_advertised() -> &'static str {
 
 /// An error that names what failed, never a secret value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(pub String);
+pub struct Error(pub String, ErrorKind);
+
+/// What an [`Error`] tells a caller beyond its text, where the caller acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorKind {
+    /// Anything else.
+    #[default]
+    Other,
+    /// A connect to a private or link-local address (a vault on this LAN) found no route:
+    /// what macOS answers while aterm may not yet reach the local network (its Local Network
+    /// question is open, or was answered Don't Allow), and also what a LAN host that is down
+    /// gives, which nothing here tells apart. Asked again shortly, it may answer; it is no
+    /// evidence that no vault is there.
+    LocalNetworkPending,
+}
 
 impl Error {
     /// An error with this message.
     #[inline]
     pub fn new(message: impl Into<String>) -> Self {
-        Error(message.into())
+        Error(message.into(), ErrorKind::Other)
+    }
+
+    /// An error of `kind` with this message.
+    pub fn of_kind(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Error(message.into(), kind)
+    }
+
+    /// What kind of failure this is.
+    pub fn kind(&self) -> ErrorKind {
+        self.1
     }
 }
 
@@ -84,12 +108,21 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        Error(error.to_string())
+        Error::new(error.to_string())
     }
 }
 
 /// This crate's result.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Write one line to stderr, the log a launchd or systemd job keeps. A log that cannot take it
+/// (a full disk, a closed descriptor) loses the line rather than the job: `eprintln!` panics
+/// when its write fails, which would end a server or subscriber over a log line.
+#[cfg(unix)]
+pub(crate) fn log_line(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
 
 #[cfg(test)]
 mod tests {

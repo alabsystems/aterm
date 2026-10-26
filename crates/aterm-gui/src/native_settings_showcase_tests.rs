@@ -422,6 +422,14 @@ fn own_top(compiled: &crate::native_ui::CompiledUi, node: &crate::native_ui::Sem
 /// saying the same word.
 #[test]
 fn every_themes_screen_names_the_section_it_starts_in() {
+    super::at_each_text_scale(
+        &[1.0, 2.0],
+        "section names",
+        every_themes_screen_names_its_section,
+    );
+}
+
+fn every_themes_screen_names_its_section(scale: f32) {
     let mut inside = 0;
     let mut community = 0;
     for (width, height, pack) in [
@@ -431,6 +439,10 @@ fn every_themes_screen_names_the_section_it_starts_in() {
         (584.0, 350.0, true),
         (738.0, 418.0, true),
         (1_074.0, 684.0, true),
+        (164.0, 348.0, true),
+        (178.0, 348.0, true),
+        (244.0, 440.0, true),
+        (300.0, 516.0, true),
     ] {
         let cx = view_cx_at(width, height);
         let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -438,9 +450,20 @@ fn every_themes_screen_names_the_section_it_starts_in() {
             let _ = act(&mut runtime, instance, view, "settings/showcase/pack", None);
         }
         let cards = state(&runtime, view).showcase.cards.clone();
+        // The list captions its sections where its room holds a caption's band over its tallest
+        // row (`captions` in `section_items`); a shorter one names no section over its rows.
+        let mut tallest = 0.0_f32;
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+            for node in &compiled.semantics {
+                if node.role == SemanticRole::ListBoxOption && !node.offscreen {
+                    tallest = tallest.max(node.rect.height);
+                }
+            }
+        });
+        let row = showcase_page::chooser_row_height();
         each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let list = rect_of(compiled, "settings/showcase/list");
-            if list.height < 24.0 + 8.0 + 32.0 {
+            if list.height + 0.5 < row + tallest.max(row) {
                 return;
             }
             let first = compiled
@@ -467,6 +490,22 @@ fn every_themes_screen_names_the_section_it_starts_in() {
                 .iter()
                 .filter(drawn)
                 .any(|node| node.key.as_str() == "settings/showcase/pack");
+            // Anywhere on the screen, the disclosure and a COMMUNITY caption are one heading twice.
+            let on_screen = |node: &&crate::native_ui::SemanticNode| {
+                !node.offscreen && node.rect.y >= list.y - 0.5 && node.rect.y < list.bottom()
+            };
+            let community_caption = Section::Community.caption().unwrap_or_default();
+            assert!(
+                !(compiled
+                    .semantics
+                    .iter()
+                    .filter(on_screen)
+                    .any(|node| node.key.as_str() == "settings/showcase/pack")
+                    && compiled.semantics.iter().filter(on_screen).any(|node| {
+                        node.role == SemanticRole::Heading && node.label == community_caption
+                    })),
+                "{scale}\u{d7} {width}x{height} screen {top}: Community and COMMUNITY on one screen"
+            );
             if card.section == Section::Community {
                 community += 1;
             }
@@ -477,11 +516,11 @@ fn every_themes_screen_names_the_section_it_starts_in() {
                 .any(|node| node.role == SemanticRole::Heading && node.label == caption);
             assert!(
                 heading || card.section == Section::Community && disclosure,
-                "{width}x{height} screen {top}: {slug} with no {caption} over it"
+                "{scale}\u{d7} {width}x{height} screen {top}: {slug} with no {caption} over it"
             );
             assert!(
                 !(heading && disclosure && card.section == Section::Community),
-                "{width}x{height} screen {top}: Community over COMMUNITY"
+                "{scale}\u{d7} {width}x{height} screen {top}: Community over COMMUNITY"
             );
             inside += 1;
         });
@@ -3514,6 +3553,26 @@ fn focus_on(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, key: &
     state.common.focus_visible = true;
 }
 
+/// The strip's height as the page lays it out: pinned over the chooser, its node's; listed at the
+/// head of the chooser's list (a short page), its rows' stops from the first to the last, where a
+/// screen draws only those that fit it.
+fn strip_laid_height(
+    runtime: &NativeRuntime,
+    view: crate::native_app::ViewId,
+    compiled: &crate::native_ui::CompiledUi,
+) -> f32 {
+    let strip = state(runtime, view).scroll_plan().and_then(|plan| {
+        let stops: Vec<usize> = (0..plan.len())
+            .filter(|&stop| {
+                plan.identities(stop)
+                    .any(|key| key.as_str().starts_with(STATUS))
+            })
+            .collect();
+        Some(plan.span(*stops.first()?..*stops.last()? + 1))
+    });
+    strip.unwrap_or_else(|| rect_of(compiled, STATUS).height)
+}
+
 fn list_at_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         unreachable!()
@@ -3597,6 +3656,81 @@ fn writes(outcome: &crate::native_app::DispatchOutcome) -> bool {
             AppEffect::ConfigPatch { .. } | AppEffect::Themes { .. }
         )
     })
+}
+
+/// THE KEYBOARD'S THEME ROW IS ALWAYS WHOLE: the chooser pins its filter only where the room under
+/// it holds the tallest row the list lays out, so the row the keyboard is on (Catppuccin Mocha,
+/// its name on two lines in a narrow panel) is never cut by the list's edge. Negative control: in
+/// a 244pt window with the warning bar the filter stayed pinned over a room one line tall at
+/// 23 heights from 380 to 520, the focused row shown 40 of its 56pt.
+#[test]
+fn the_keyboards_theme_row_is_whole_under_a_pinned_filter() {
+    super::at_each_text_scale(&[1.0, 2.0], "focused row", |scale| {
+        let mut faults = Vec::new();
+        let mut seen = 0;
+        for (width, warning) in [(244.0, true), (244.0, false), (300.0, true)] {
+            for height in (380..=520).step_by(4).map(|height| height as f32) {
+                let cx = view_cx_at(width, height);
+                let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.config_watch_status =
+                        warning.then(|| "aterm.toml has an error on line 3".to_string());
+                }
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let row = format!("{ROW}catppuccin-mocha");
+                let _ = dispatch(
+                    &mut runtime,
+                    instance,
+                    view,
+                    AppEvent::FocusChanged(Some(UiKey::new(row.as_str()))),
+                );
+                let _ = dispatch(
+                    &mut runtime,
+                    instance,
+                    view,
+                    AppEvent::RevealControl(UiKey::new(row.as_str())),
+                );
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(node) = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == row && !node.peek)
+                else {
+                    let drawn: Vec<&str> = compiled
+                        .paint
+                        .iter()
+                        .filter(|node| node.key.as_str().starts_with(ROW) && !node.peek)
+                        .map(|node| node.key.as_str())
+                        .filter(|key| !key[ROW.len()..].contains('/'))
+                        .collect();
+                    faults.push(format!(
+                        "{scale}\u{d7} {width}x{height}: {row} is not drawn; {drawn:?}; focus {:?}",
+                        state(&runtime, view).common.last_focus
+                    ));
+                    continue;
+                };
+                seen += 1;
+                if (node.clip.y - node.rect.y).abs() > 0.5
+                    || (node.clip.height - node.rect.height).abs() > 0.5
+                {
+                    faults.push(format!(
+                        "{scale}\u{d7} {width}x{height} warning {warning}: {row} {:?} is cut to {:?}",
+                        node.rect, node.clip
+                    ));
+                }
+            }
+        }
+        assert!(seen > 50, "{scale}\u{d7}: the row is drawn ({seen})");
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
 }
 
 #[test]
@@ -6906,11 +7040,7 @@ fn the_strip_draws_its_title_and_every_button_whole() {
                     .collect();
                 assert!(cut.is_empty(), "{context}:\n{}", cut.join("\n"));
                 if step == "nord" || step == "studio" {
-                    trial_heights.insert(
-                        rect_of(&compiled, "settings/showcase/status")
-                            .height
-                            .to_bits(),
-                    );
+                    trial_heights.insert(strip_laid_height(&runtime, view, &compiled).to_bits());
                 }
             }
             assert_eq!(
@@ -7907,13 +8037,14 @@ const PAPER_THEME: &str =
     "name = Paper\nappearance = light\nforeground = #24292f\nbackground = #ffffff\n";
 
 /// THE CHOOSER'S END SITS ON ITS LIST'S BOTTOM EDGE: every stop of the Themes list stands on
-/// whole rows (a theme row, a caption band, the Community disclosure, a name on two lines), as
-/// the room does, so its last screen ends on the list's bottom edge, at 1× and 2× text, with
-/// Community closed and open and with a theme of the person's own, wherever the panel pins its
-/// filter over the list; short of it only by whole rows the stop before the screen could not
-/// bring with the caption it repeats. Negative
+/// whole rows (a theme row, a caption band, the Community disclosure, a name on two lines, the
+/// filter where the list lists it), as the room does, so its last screen ends on the list's
+/// bottom edge, at 1× and 2× text, with Community closed and open and with a theme of the
+/// person's own, whether the panel pins its filter over the list or lists it; short of it only by
+/// whole rows the stop before the screen could not bring with the caption it repeats. Negative
 /// control: a 40pt disclosure under 32pt rows left the end 24pt short at every size at 1×, and
-/// 44pt caption bands under 56pt rows 32pt to 48pt at 2×.
+/// 44pt caption bands under 56pt rows 32pt to 48pt at 2×; at 2× in an 80x24 window the listed
+/// filter's room was all the panel had, 98pt, every screen of 56pt rows 42pt short.
 #[test]
 fn the_choosers_end_sits_on_its_lists_bottom_edge() {
     let mut sizes = vec![
@@ -7989,15 +8120,6 @@ fn the_choosers_end_sits_on_its_lists_bottom_edge() {
                     })
                     .map(|node| node.clip.bottom())
                     .fold(list.y, f32::max);
-                // A chooser too short for its filter over a row lists the filter too: its room
-                // is all the panel has, no whole number of rows (2× text in an 80x24 window).
-                let filter_pinned = compiled.paint.iter().any(|node| {
-                    node.key.as_str() == "settings/showcase/filter"
-                        && node.rect.bottom() <= list.y + 0.5
-                });
-                if !filter_pinned {
-                    continue;
-                }
                 let band = list.bottom() - lowest;
                 ends += 1;
                 if band <= 0.5 {
@@ -8030,5 +8152,36 @@ fn the_choosers_end_sits_on_its_lists_bottom_edge() {
             ends > 50,
             "{scale}×: the chooser scrolls at these sizes ({ends} ends)"
         );
+    });
+}
+
+/// THE PAGE'S NAME IS PINNED OVER THE CHOOSER ONLY OVER ROOM FOR ITS TALLEST ROW: at 1× text in a
+/// 178x152 window every theme row is whole on some screen, the name listed with the rows where,
+/// pinned, it would leave less. Negative control: pinned over the chooser's 58pt list, the name
+/// left the two-line rows (Catppuccin Latte and Mocha, Solarized Dark and Light, 64pt) whole on no
+/// screen.
+#[test]
+fn the_themes_name_is_pinned_only_over_room_for_the_tallest_row() {
+    super::at_each_text_scale(&[1.0], "pinned name", |_| {
+        let cx = view_cx_at(178.0, 152.0);
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+        let mut rows = std::collections::BTreeMap::<String, bool>::new();
+        super::each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+            for node in compiled.paint.iter().filter(|node| {
+                let key = node.key.as_str();
+                key.starts_with(ROW) && !key[ROW.len()..].contains('/')
+            }) {
+                let whole = (node.clip.y - node.rect.y).abs() < 0.5
+                    && (node.clip.height - node.rect.height).abs() < 0.5;
+                *rows.entry(node.key.as_str().to_string()).or_default() |= whole;
+            }
+        });
+        assert!(rows.len() > 8, "premise: the walk draws the rows: {rows:?}");
+        let never: Vec<&String> = rows
+            .iter()
+            .filter(|(_, whole)| !**whole)
+            .map(|(key, _)| key)
+            .collect();
+        assert!(never.is_empty(), "never whole: {never:?}");
     });
 }

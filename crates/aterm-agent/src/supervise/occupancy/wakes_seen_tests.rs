@@ -7,7 +7,7 @@ use super::*;
 
 fn every_claim() -> Vec<WakeClaim> {
     [
-        WakeClaim::Granted,
+        WakeClaim::Granted(WakeFacts::default()),
         WakeClaim::Answered,
         WakeClaim::Busy,
         WakeClaim::Stale,
@@ -27,11 +27,15 @@ fn each_word_reads_back_as_what_wrote_it() {
         assert_eq!(WakeDoor::of_word(door.word()), Some(door));
     }
     let claims = every_claim();
-    let words: std::collections::BTreeSet<String> = claims.iter().map(|c| c.word()).collect();
+    let words: std::collections::BTreeSet<&str> = claims.iter().map(|c| c.word()).collect();
     assert_eq!(words.len(), claims.len(), "{words:?}");
     for claim in claims {
-        assert_eq!(WakeClaim::of_word(&claim.word()), Some(claim));
-        assert_eq!(claim.lets(), claim == WakeClaim::Granted, "{claim:?}");
+        assert_eq!(WakeClaim::of_word(claim.word()), Some(claim));
+        assert_eq!(
+            claim.lets(),
+            matches!(claim, WakeClaim::Granted(_)),
+            "{claim:?}"
+        );
     }
     for word in ["", "refused:", "refused:tired", "granted ", "Gone", "loop"] {
         assert_eq!(WakeClaim::of_word(word), None, "{word:?}");

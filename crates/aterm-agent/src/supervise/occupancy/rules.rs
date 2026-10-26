@@ -659,7 +659,7 @@ pub fn decide(
 }
 
 /// A wake's line as the decider books it: its ordinal, class and kinds; the clock and the slots
-/// are filled in by the write (the slice-2 plan's 2.8), which reads them.
+/// are filled in by the write (`Session::wake_line`), from the figures the host's claim judged.
 fn wake_line(wake: &WakeSeen) -> FactLine {
     templates::wake(wake.ord, wake.class, &wake.kinds, None, None)
 }
@@ -829,16 +829,17 @@ pub struct WouldRow {
 
 /// THE LINES A LOOP BEFORE THIS ONE BOOKED for session `sid` in the ledger text `body`, oldest
 /// first, which [`Books`] seeds from: each `fact-would@v1` row (what `observe` would have typed),
-/// and each `fact-hold@v1` row `typed` that names its rule (what `prompt` typed: the door's
-/// outcome rows). A row this build cannot read is passed over, and so is the task door's
-/// (`door=task`, [`super::door::is_task_row`]): a note is no line.
+/// and each `fact-hold@v1` or `fact-wake@v1` row `typed` that names its rule (what `prompt`
+/// typed: the door's outcome rows). A row this build cannot read is passed over, and so is the
+/// task door's (`door=task`, [`super::door::is_task_row`]): a note is no line.
 #[must_use]
 pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
-    let hold = crate::supervise::facts::FactKind::Hold.rule();
+    use crate::supervise::facts::FactKind;
+    let (hold, wake) = (FactKind::Hold.rule(), FactKind::Wake.rule());
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut rows = Vec::new();
     for line in body.lines() {
-        if !(line.contains(WOULD_RULE) || line.contains(hold))
+        if !(line.contains(WOULD_RULE) || line.contains(hold) || line.contains(wake))
             || want.as_deref().is_some_and(|sid| !line.contains(sid))
         {
             continue;
@@ -849,7 +850,7 @@ pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
         let booked = match text("rule_id") {
             Some(WOULD_RULE) => true,
-            Some(rule) => rule == hold && text("decision") == Some("typed"),
+            Some(rule) => (rule == hold || rule == wake) && text("decision") == Some("typed"),
             None => false,
         };
         if text("sid").map(str::to_string) != want || !booked {

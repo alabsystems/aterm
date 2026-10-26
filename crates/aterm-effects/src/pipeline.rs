@@ -137,6 +137,31 @@ fn term_cmd_done(term: &Terminal) -> Option<(u64, i32)> {
     Some((term.completed_command_seq(), m.exit_code?))
 }
 
+/// The sequence number of the most recent completed command with an exit code.
+#[inline]
+fn term_cmd_done_seq(term: &Terminal) -> Option<u64> {
+    let m = term.last_completed_command()?;
+    m.exit_code?;
+    Some(term.completed_command_seq())
+}
+
+#[inline]
+const fn clamp_rain_alpha(alpha: Option<u32>) -> Option<u8> {
+    let Some(a) = alpha else {
+        return None;
+    };
+    let floor = RAIN_ALPHA_FLOOR as u32;
+    let cap = RAIN_ALPHA_CAP as u32;
+    let clamped = if a < floor {
+        floor
+    } else if a > cap {
+        cap
+    } else {
+        a
+    };
+    Some(clamped as u8)
+}
+
 /// Close the terminal's damage session if it is still open.
 #[inline]
 fn close_open_damage_session(term: &mut Terminal) {
@@ -471,12 +496,14 @@ impl EffectsPipeline {
             let dt = self.clock - prev;
             let mut newest = self.t0 + self.clock;
             let inv_n = 1.0 / f64::from(n);
-            for i in 1..=n {
+            let mut i = 1;
+            while i <= n {
                 let at = self.t0 + prev + dt.mul_f64(f64::from(i) * inv_n);
                 self.cursor.cadence.on_keystroke(at);
                 self.cursor.momentum.on_key(at, MOMENTUM_GLOW_TAU_S);
                 self.cursor.glow.note_typed_cells(at, 1);
                 newest = at;
+                i += 1;
             }
             self.cursor.trail.note_typed_batch(newest, n);
         }
@@ -867,7 +894,7 @@ impl EffectsPipeline {
         color: Option<u32>,
         theme_cursor: u32,
     ) {
-        self.trail_body_color = color.map(|color| color & 0x00FF_FFFF);
+        self.trail_body_color = color.map(|c| c & 0x00FF_FFFF);
         self.trail_cfg = TrailConfig {
             enabled,
             duration: Duration::from_millis(duration_ms.clamp(30, 2000)),
@@ -1378,16 +1405,14 @@ impl EffectsPipeline {
         default_bg: u32,
         theme_fg: u32,
     ) {
-        let clamp_alpha =
-            |a: u32| a.clamp(u32::from(RAIN_ALPHA_FLOOR), u32::from(RAIN_ALPHA_CAP)) as u8;
         self.rain_cfg = RainConfig {
             enabled: self.rain_cfg.enabled,
             fps: fps.clamp(12, 60) as u8,
             density: density.clamp(1, 12) as u8,
             speed: speed.clamp(1, 10) as u8,
             trail: trail.clamp(1, 10) as u8,
-            alpha_override: alpha.map(clamp_alpha),
-            head_alpha_override: head_alpha.map(clamp_alpha),
+            alpha_override: clamp_rain_alpha(alpha),
+            head_alpha_override: clamp_rain_alpha(head_alpha),
             hue: if hue.eq_ignore_ascii_case("theme") {
                 RainHue::Theme
             } else if hue.eq_ignore_ascii_case("custom") {
@@ -1492,7 +1517,7 @@ impl EffectsPipeline {
             self.rain_latches.observe_without_engine(
                 term.render_identity(),
                 term.shell_state() == aterm_core::terminal::ShellState::Executing,
-                term_cmd_done(term).map(|(seq, _)| seq),
+                term_cmd_done_seq(term),
             );
             input.cursor_trail.clear();
             input.cursor_glow_add.clear();
@@ -1573,9 +1598,12 @@ impl EffectsPipeline {
             let slice = &render_row[..render_row.len().min(input.cols)];
             self.row_probe_scratch.clear();
             self.row_probe_scratch.reserve(input.cols);
-            for cell in slice {
+            let mut i = 0;
+            while i < slice.len() {
+                let cell = &slice[i];
                 self.row_probe_scratch
                     .push(if cell.wide { '\0' } else { cell.ch });
+                i += 1;
             }
             self.row_probe_scratch.resize(input.cols, ' ');
             Some((row, caret))
@@ -1631,13 +1659,16 @@ impl EffectsPipeline {
                 animate,
                 frame_cells: Some(&input.cells),
                 frame_cells_at: (0, 0),
-                row_probe: probe_row.map(|(row, caret)| native::RowProbe {
-                    row,
-                    caret,
-                    trust: crate::cursor_glow::ProbeTrust::Full,
-                    cols: &self.row_probe_scratch,
-                    flanks: None,
-                }),
+                row_probe: match probe_row {
+                    Some((row, caret)) => Some(native::RowProbe {
+                        row,
+                        caret,
+                        trust: crate::cursor_glow::ProbeTrust::Full,
+                        cols: &self.row_probe_scratch,
+                        flanks: None,
+                    }),
+                    None => None,
+                },
                 pending_keys,
                 print_anchor: None,
                 print_anchor_glyph: None,
@@ -1944,7 +1975,7 @@ impl EffectsPipeline {
             self.rain_latches.observe_without_engine(
                 rain_session,
                 shell_executing,
-                term_cmd_done(term).map(|(seq, _)| seq),
+                term_cmd_done_seq(term),
             );
             self.rain_scratch.clear();
             self.rain_add_scratch.clear();

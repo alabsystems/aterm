@@ -1641,6 +1641,23 @@ impl SettingsPreviewSpec {
         }
     }
 
+    /// The display faces drawn over the font (`display_font`), by name (`Pixel`,
+    /// `Chunky + Pixel`); `None` with none on.
+    fn display_layer_words(&self) -> Option<String> {
+        let names: Vec<&str> = self
+            .font_candidate
+            .display
+            .iter()
+            .filter_map(|id| {
+                aterm_render::DISPLAY_FACES
+                    .iter()
+                    .find(|face| face.id == *id)
+                    .map(|face| face.label)
+            })
+            .collect();
+        (!names.is_empty()).then(|| names.join(" + "))
+    }
+
     fn automatic_words(&self) -> String {
         if self.focused_value.starts_with("Automatic") {
             self.focused_value.clone()
@@ -3074,11 +3091,29 @@ impl SettingsPreviewSpec {
         };
         let raw = self.focused_value.as_str();
         let value = if let Some(family) = self.focused_font_slot() {
-            match self.unresolved_focused_slot() {
+            let words = match self.unresolved_focused_slot() {
                 Some("regular") => "Current font".to_string(),
                 Some("bold" | "italic" | "bold italic") => "Regular face".to_string(),
                 Some(_) => self.automatic_words(),
                 None => family.map_or_else(|| self.automatic_words(), family_words),
+            };
+            // A text font's caption names the display layer drawn over it (its bold,
+            // italic and bold italic too: the layer draws every style of the characters
+            // it covers), so what the specimen draws stays named while the faces card
+            // scrolls out of view. Symbols and emoji are not drawn over.
+            match self.display_layer_words() {
+                Some(display)
+                    if matches!(
+                        key,
+                        crate::prefs::EDIT_FONT_FAMILY
+                            | crate::prefs::EDIT_FONT_FAMILY_BOLD
+                            | crate::prefs::EDIT_FONT_FAMILY_ITALIC
+                            | crate::prefs::EDIT_FONT_FAMILY_BOLD_ITALIC
+                    ) =>
+                {
+                    format!("{display} over {words}")
+                }
+                _ => words,
             }
         } else if crate::prefs::edit_kind(key) == crate::prefs::EditKind::Bool {
             if raw.eq_ignore_ascii_case("true") {
@@ -8094,36 +8129,64 @@ mod tests {
         raster_of(&tree.tray(Theme::default(), 13.0).prims)
     }
 
-    /// How many pixels of two rasters differ by more than `levels` in some channel.
+    /// How many pixels of two rasters differ by more than `levels` in some channel. A run of
+    /// pixels alike in both is passed over by one slice compare (a memcmp, quick even in a debug
+    /// build), so only the few pixels a knob changes are read one by one: read pixel by pixel,
+    /// two whole cards cost more than rendering them.
     fn apart_by(left: &[u8], right: &[u8], levels: u8) -> usize {
-        left.chunks(4)
-            .zip(right.chunks(4))
-            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > levels))
-            .count()
+        const RUN: usize = 64 * 4;
+        left.chunks(RUN)
+            .zip(right.chunks(RUN))
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| {
+                a.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(b.as_chunks::<4>().0)
+                    .filter(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| p.abs_diff(*q) > levels))
+                    .count()
+            })
+            .sum()
     }
 
-    /// THE SCENE'S JUMPS SHOW EVERY JUMP KNOB THE TERMINAL WOULD (audit r14 PV7, r14b PV2-1):
-    /// on a dark and a light ground, for every style, Trail length (2 against a length past the
-    /// scene's reach), Ring on jumps and Phaser's accent paint the card visibly apart on the
-    /// frames after the Return or the Tab exactly where the engine says the scene's jumps draw
-    /// them (`GlowStyle::jump_reach`, `GlowStyle::reads_knob`), alike while only typing, and a
-    /// knob that shows on the Tab shows on the frame a pause holds. Before, the scene's only
-    /// completion was a 6-cell hop over letters, which Fire's flame leaves dark (its Length never
-    /// showed) and the header's reach ignored the Return.
+    /// THE SCENE'S JUMPS SHOW EVERY JUMP KNOB THE TERMINAL WOULD (audit r14 PV7, r14b PV2-1,
+    /// r17 CA4): on a dark and a light ground, for every style, Trail length (2 against a length
+    /// past the scene's reach), Ring on jumps and Phaser's accent paint the card visibly apart on
+    /// the frames after the Return or the Tab exactly where the engine says the scene's jumps
+    /// draw them (`GlowStyle::jump_reach`, `GlowStyle::reads_knob`), a ring as a mark of its own,
+    /// alike while only typing, and a knob that shows on the Tab shows on the frame a pause
+    /// holds. Before, the scene's only completion was a 6-cell hop over letters, which Fire's
+    /// flame leaves dark (its Length never showed) and the header's reach ignored the Return;
+    /// and on dark the landing light of Lumen, Comet, Sparkle, Phaser and Laser was a veil
+    /// alone, which a person toggling Ring on jumps could not see.
     #[test]
     fn the_scenes_jumps_show_every_jump_knob() {
         use aterm_effects::cursor_glow::TrailKnob;
+
+        /// The least of the card a landing ring changes by more than 32 levels.
+        const RING_SHOWS: usize = 100;
 
         let light = PreviewTerminalTheme::from_scheme(
             &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
         );
         let tab_ms = (CURSOR_SCENE_TAB.0 as u64 + 1) * KEY_MS;
-        let after: Vec<u64> = [MOTION_STEP_MS, 2 * MOTION_STEP_MS, 4 * MOTION_STEP_MS]
-            .into_iter()
-            .chain((0..3).map(|step| tab_ms + step * MOTION_STEP_MS))
-            .chain([5 * MOTION_STEP_MS])
-            .collect();
+        // The frames after the Return and after the Tab, then those while only typing: each
+        // knob setting's frames are rendered in this, the scene's own order, so the scene's one
+        // player plays on from the frame before rather than from the scene's start, and every
+        // frame is the one the card draws at that phase.
+        let after: Vec<u64> = [
+            MOTION_STEP_MS,
+            2 * MOTION_STEP_MS,
+            4 * MOTION_STEP_MS,
+            5 * MOTION_STEP_MS,
+        ]
+        .into_iter()
+        .chain((0..3).map(|step| tab_ms + step * MOTION_STEP_MS))
+        .collect();
         let typing_only: Vec<u64> = vec![6 * KEY_MS, CURSOR_SCENE_TAB.0 as u64 * KEY_MS];
+        let mut phases: Vec<u64> = after.iter().chain(&typing_only).copied().collect();
+        phases.sort_unstable();
+        assert!(after.is_sorted() && phases.windows(2).all(|pair| pair[0] < pair[1]));
         let one_row = {
             let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec::default()).normalized();
             spec.header_layout(VIEWPORT.width - 20.0).height + 15.0 + spec.typography_row_height()
@@ -8196,12 +8259,20 @@ mod tests {
                         continue;
                     }
                     for &height in &heights {
-                        let frame = |cursor: &CursorPreviewSpec, phase: u64| {
-                            card_pixels(on_ground(cursor.clone()).with_phase(phase), height)
+                        // One knob setting's frames at `phases`, played in order.
+                        let frames = |cursor: &CursorPreviewSpec| {
+                            phases
+                                .iter()
+                                .map(|&phase| {
+                                    let shown = on_ground(cursor.clone()).with_phase(phase);
+                                    (phase, card_pixels(shown, height))
+                                })
+                                .collect::<std::collections::BTreeMap<u64, Vec<u8>>>()
                         };
-                        let pairs: Vec<(Vec<u8>, Vec<u8>)> = after
+                        let (on_a, on_b) = (frames(&a), frames(&b));
+                        let pairs: Vec<(&Vec<u8>, &Vec<u8>)> = after
                             .iter()
-                            .map(|&phase| (frame(&a, phase), frame(&b, phase)))
+                            .map(|phase| (&on_a[phase], &on_b[phase]))
                             .collect();
                         let apart = pairs
                             .iter()
@@ -8220,9 +8291,18 @@ mod tests {
                                 "{raw} {side}: {knob:?} shows after a jump in a {height}pt card: \
                                  {apart} px more than 32 levels apart, {apart16} more than 16"
                             );
-                            for &phase in &typing_only {
+                            // A ring is a mark of its own, not a tint: Classic's square and
+                            // Water's ripples change some 160 to 270 px of the card, Fire's
+                            // flash 117, where the veil alone of Lumen, Comet, Sparkle, Phaser
+                            // and Laser on dark changed 19 to 30 and the knob read as broken.
+                            assert!(
+                                knob != TrailKnob::Ring || apart >= RING_SHOWS,
+                                "{raw} {side}: Ring on jumps draws a ring in a {height}pt card: \
+                                 {apart} px more than 32 levels apart, under {RING_SHOWS}"
+                            );
+                            for phase in &typing_only {
                                 assert_eq!(
-                                    apart_by(&frame(&a, phase), &frame(&b, phase), 32),
+                                    apart_by(&on_a[phase], &on_b[phase], 32),
                                     0,
                                     "{raw} {side}: {knob:?} is invisible while only typing \
                                      ({phase} ms)"

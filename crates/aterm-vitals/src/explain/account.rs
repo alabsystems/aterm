@@ -72,11 +72,14 @@ pub struct You {
     pub role: Role,
     /// Whether it is `minor` only because the figure is below the floor (a calm machine).
     pub calm: bool,
-    /// Its figure: CPU millicores (live), or footprint bytes; `None` where unread.
+    /// Its figure: CPU millicores (its split figure, reaped work included where read), or
+    /// footprint bytes; `None` where unread.
     pub figure: Option<i64>,
     /// That of the subject's figure, per mille.
     pub share_pm: Option<u16>,
-    /// On the CPU, for a caller in a tab, while there is any ([`Self::figure`]).
+    /// On the CPU, for a caller in a tab, while its figure is a lower bound ([`Self::figure`]):
+    /// while there is any, or while the reap credit's ledger knows it missed some of the tab's
+    /// work ([`super::CoalSplit::short_tabs`]), when it may read 0.
     pub unattributed_mc: Option<i64>,
 }
 
@@ -133,7 +136,7 @@ impl Account {
     #[must_use]
     pub fn bounded(&self, snap: &Snapshot) -> bool {
         let cut = snap.procs_truncated || self.facts.as_deref().is_some_and(|f| f.procs_truncated);
-        cut || self.you.unattributed_mc.is_some_and(|u| u > 0) || self.parts.is_none()
+        cut || self.you.unattributed_mc.is_some() || self.parts.is_none()
     }
 
     /// Returns whether the CPU's tab figure is a lower bound (`tab_mc=≥`).
@@ -295,6 +298,7 @@ fn cpu_you(
     }
     let whole = split.global_mc;
     let unattributed = split.unattributed_mc;
+    let short = split.short_tabs.iter().any(|k| panes.contains(k));
     let role_at = |extra: i64| {
         let fig = parts.tab + extra;
         let others = [
@@ -307,14 +311,21 @@ fn cpu_you(
         you_role(fig, whole, largest, above_floor(fig, whole))
     };
     let (role, calm) = role_at(0);
-    let bound = role_at(unattributed).0;
+    // What the tab may hold past its figure: the work in no figure, or, where the ledger knows it
+    // missed some of the tab's of a size it cannot tell, all the rest of aterm's side.
+    let extra = if short {
+        unattributed.max(parts.aterm_rest)
+    } else {
+        unattributed
+    };
+    let bound = role_at(extra).0;
     let mut you = You {
         tab,
         role,
         calm,
         figure: Some(parts.tab),
         share_pm: per_mille(parts.tab, whole),
-        unattributed_mc: (tab.is_some() && unattributed > 0).then_some(unattributed),
+        unattributed_mc: (tab.is_some() && (unattributed > 0 || short)).then_some(unattributed),
     };
     if tab.is_some() && bound != role {
         you.role = Role::Unavailable("not_sampled");

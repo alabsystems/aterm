@@ -3768,6 +3768,7 @@ fn repair_rows(
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         }]
     })
 }
@@ -3962,6 +3963,7 @@ fn repair_store_reconciling(
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         });
     }
     repair_store_verdict(&rows, leftovers)

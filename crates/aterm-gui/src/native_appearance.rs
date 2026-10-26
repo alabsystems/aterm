@@ -355,7 +355,9 @@ pub(crate) struct NativeRoles {
     pub(crate) accent_ink: [u8; 3],
     pub(crate) on_accent: [u8; 3],
     pub(crate) separator: [u8; 3],
-    /// A control's own boundary (a filter chip's rim).
+    /// A resting control's own boundary, 3:1 on the card and the page: the rim of a chip, a
+    /// Secondary or Setting button, a field, a slider or a boxed switch, whose fill stands only a
+    /// few percent off its ground ([`crate::native_ui`]'s `resting_rim`).
     pub(crate) control_edge: [u8; 3],
     pub(crate) control_track: [u8; 3],
     pub(crate) elevated: [u8; 3],

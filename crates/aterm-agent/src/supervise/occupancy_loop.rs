@@ -15,10 +15,12 @@ use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEvent, RowSaid};
 use super::super::occupancy::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict, WakeSight};
 use super::super::occupancy::said;
+use super::super::occupancy::templates;
+use super::super::occupancy::wakes::{Reconciled, reconcile_claim};
 use super::super::occupancy::wakes_seen::WakeState;
 use super::super::occupancy::{
     FactLine, FactWord, NoteOutcome, OccupancyReading, OccupancySaid, SaidHold, SaidReadyIdle,
-    SaidRule, SaidVerdict, SaidWake, WakeDoor, WakeSeen, WakesSeen,
+    SaidRule, SaidVerdict, SaidWake, WakeClaim, WakeDoor, WakeFacts, WakeSeen, WakesSeen,
 };
 use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
@@ -116,6 +118,10 @@ struct DoorWatch {
     /// The live wall the book was last read against ([`Session::book_read`]): each answer at or
     /// before it told heard there.
     heard_wall: Option<i64>,
+    /// The wake rows a loop before this one left (each episode's fact rows, oldest first), kept
+    /// from the loop's start for the claims of its doors the book still holds: reconciled at the
+    /// loop's first read of the book ([`Session::book_read`]), then dropped.
+    claims: Option<Vec<(u64, SeedOutcome)>>,
 }
 
 /// A line the managed guard alone holds at a break: the episode the task door notes
@@ -123,8 +129,9 @@ struct DoorWatch {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TaskDue {
     rule: RuleId,
-    /// The episode's ordinal in the hold ([`rules::Books::this_hold`]).
-    ordinal: usize,
+    /// Its fact word's ordinal ([`FactWord::ordinal`]): the episode's in the hold, from 1
+    /// ([`rules::Books::this_hold`]), or the wake's own.
+    word_ordinal: usize,
     episode: u64,
 }
 
@@ -146,8 +153,10 @@ struct DueLine {
     rule: RuleId,
     line: FactLine,
     episode: u64,
-    /// The episode's ordinal in the hold ([`rules::Books::this_hold`]).
+    /// The episode's ordinal in the hold ([`rules::Books::this_hold`]); a wake's, its own.
     ordinal: usize,
+    /// A wake's line: the wake the break's decider opened ([`rules::wake_opens`]).
+    wake: Option<WakeSeen>,
     hold: HoldSeen,
     /// The break's read, on the clock's milliseconds and as an instant.
     now_ms: i64,
@@ -262,6 +271,13 @@ impl<C: Ctl> Session<'_, C> {
         // `occupancy`, and a successor must not tell them twice.
         let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
         self.facts.state.seed(&facts, now_ms);
+        self.hold.door.claims = Some(
+            facts
+                .iter()
+                .filter(|(key, _, _)| key.kind == FactKind::Wake)
+                .map(|&(key, _, outcome)| (key.id, outcome))
+                .collect(),
+        );
         self.hold.door.task_custody =
             door::TaskCustody::from_ledger(body, self.setup.sid.as_deref());
         // And the stuck lines' place in the session's pace, under any key: a line typed before
@@ -490,14 +506,18 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// A READ OF THE BOOK (`IdleHost::wakes`, the session hosted from the first): the told wakes it
-    /// no longer names forgotten (told, taken or expired, a wake never opens again), each answer at
-    /// or before the last live-turn read's wall told heard ([`Self::tell_heard`]), and the book
-    /// kept for the break's decider with those answers taken out, so the decider never judges a
-    /// wake the told ones no longer hold.
+    /// A READ OF THE BOOK (`IdleHost::wakes`, the session hosted from the first): at the first, the
+    /// claims a loop before this one left reconciled ([`Self::reconcile_claims`]); the told wakes
+    /// it no longer names forgotten (told, taken or expired, a wake never opens again), each
+    /// answer at or before the last live-turn read's wall told heard ([`Self::tell_heard`]), and
+    /// the book kept for the break's decider with those answers taken out, so the decider never
+    /// judges a wake the told ones no longer hold.
     fn book_read(&mut self, host: &dyn IdleHost, seq: u64) {
         let mut seen = host.wakes();
         self.hold.door.hosting = true;
+        if let Some(rows) = self.hold.door.claims.take() {
+            Self::reconcile_claims(host, &mut seen, &rows);
+        }
         let listed: Vec<EpisodeKey> = seen
             .wakes
             .iter()
@@ -515,6 +535,33 @@ impl<C: Ctl> Session<'_, C> {
             self.hold.door.heard_wall = Some(live_wall);
         }
         self.hold.door.wakes = seen;
+    }
+
+    /// THE SEED'S RECONCILE (the slice-2 plan's S4): each wake of `seen` a loop's door holds claimed
+    /// (a loop before this one's: this loop claims nothing before its first read) is decided by its
+    /// episode's last row in `rows` ([`reconcile_claim`]). A line typed is told
+    /// (`IdleHost::wake_told` through the claim's door) and leaves the book; any other last row
+    /// (an intent the write never came back from, a skip) gives the claim back through that door
+    /// (`IdleHost::wake_release`, the one retell the book allows) and the wake reads ready. Under
+    /// any mode: nothing is typed, and the claim is the book's own.
+    fn reconcile_claims(host: &dyn IdleHost, seen: &mut WakesSeen, rows: &[(u64, SeedOutcome)]) {
+        seen.wakes.retain_mut(|wake| {
+            let WakeState::Claimed { door, .. } = wake.state else {
+                return true;
+            };
+            let episode = wake.episode();
+            match reconcile_claim(episode, rows) {
+                Reconciled::Told => {
+                    host.wake_told(wake.ord, episode, door);
+                    false
+                }
+                Reconciled::Released => {
+                    host.wake_release(wake.ord, episode, door);
+                    wake.state = WakeState::Ready;
+                    true
+                }
+            }
+        });
     }
 
     /// Each wake of `seen` the agent's own `await wake` answered at or before `live_wall` (unix
@@ -644,12 +691,7 @@ impl<C: Ctl> Session<'_, C> {
         self.hold.door.k_due = self.k_due_of(&verdicts, hold);
         let task = self.door_task_due(&verdicts, &guards, hold);
         for (rule, verdict) in verdicts {
-            // A wake's line is booked, never typed, until its write lands (the slice-2 plan's
-            // 2.8): under `prompt` too it is said as `observe` says it.
-            if prompt
-                && (rule != RuleId::Wake || armed(Fault::WakeTypedEarly))
-                && let Verdict::Due(line) = &verdict
-            {
+            if prompt && let Verdict::Due(line) = &verdict {
                 self.occupancy_due(screen.seq, rule, line, hold, (now_ms, now));
                 continue;
             }
@@ -775,7 +817,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Under `prompt`, a due line kept for the write at this same break
-    /// ([`Self::occupancy_write`]).
+    /// ([`Self::occupancy_write`]): a wake's, of the wake the break's decider opened, under its own
+    /// episode.
     fn occupancy_due(
         &mut self,
         seq: u64,
@@ -784,8 +827,16 @@ impl<C: Ctl> Session<'_, C> {
         hold: HoldSeen,
         (now_ms, now): (i64, Instant),
     ) {
-        let ordinal = self.hold.door.books.this_hold(rule);
-        let episode = rules::episode(rule, self.hold_wall_ms(hold.since_ms), ordinal);
+        let wake = self.hold.door.wake.clone().filter(|_| rule == RuleId::Wake);
+        let (ordinal, episode) = match (rule, &wake) {
+            (RuleId::Wake, Some(wake)) => (usize::from(wake.ord), wake.episode()),
+            (RuleId::Wake, None) => return,
+            _ => {
+                let ordinal = self.hold.door.books.this_hold(rule);
+                let episode = rules::episode(rule, self.hold_wall_ms(hold.since_ms), ordinal);
+                (ordinal, episode)
+            }
+        };
         if self
             .hold
             .door
@@ -799,6 +850,7 @@ impl<C: Ctl> Session<'_, C> {
             line: line.clone(),
             episode,
             ordinal,
+            wake,
             hold,
             now_ms,
             now,
@@ -832,7 +884,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         };
         let key = EpisodeKey {
-            kind: FactKind::Hold,
+            kind: due.rule.kind(),
             id: due.episode,
         };
         let line_gone = before == Some(Guard::HostLine);
@@ -849,6 +901,9 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             let wrote = if let Some(guard) = self.door_holds(screen, &due, cfg, host.as_ref())? {
                 Wrote::Held(guard)
+            } else if due.rule == RuleId::Wake {
+                // A wake's line takes its pace with its claim, after its intent row.
+                self.door_wake_types(&grant, screen, &due, key, host.as_ref(), review)?
             } else {
                 let mut pace = host.occupancy_pace(due.rule, self.hold_wall_ms(due.hold.since_ms));
                 if due.rule.slot() {
@@ -1044,6 +1099,151 @@ impl<C: Ctl> Session<'_, C> {
         Ok(Wrote::Typed)
     }
 
+    /// THE WAKE'S WRITE (the slice-2 plan's 2.8), every guard passed: the intent row, the host's
+    /// claim (`IdleHost::wake_claim(.., Break)`: its book, slice 1's refusals, the need re-read and
+    /// the wake lines' own pace), the fenced write of the line the claim's figures fill
+    /// ([`Self::wake_line`]), and after it the line's bookkeeping, its outcome row
+    /// (`fact-wake@v1 … door=break`) and the host told (`wake_told(.., Break)`). A claim the
+    /// agent's own `await wake` answered first is told by that answer: booked so
+    /// (`told door=await`), nothing typed. Any other answer, and a write that wrote nothing, is a
+    /// skip, the claim given back where the host may hold it ([`WakeClaim::releases`]). A wake's
+    /// line answers no hold (the model's `owed = held`, a wake's hold never old): no
+    /// `HoldEvent::HarnessLine`.
+    fn door_wake_types(
+        &mut self,
+        grant: &super::super::config::PromptGrant,
+        screen: &Screen,
+        due: &DueLine,
+        key: EpisodeKey,
+        host: &dyn IdleHost,
+        review: &mut dyn Review,
+    ) -> Result<Wrote, Fail> {
+        let Some(wake) = due.wake.clone() else {
+            return Ok(Wrote::Skipped(WakeClaim::Gone.word()));
+        };
+        let held_ms = due.now_ms.saturating_sub(due.hold.since_ms);
+        let (ord, episode) = (wake.ord, due.episode);
+        self.ledger_row(
+            door::INTENT_RULE,
+            Outcome::Waiting,
+            "",
+            &door::wake_intent_reason(ord, episode, held_ms),
+            due.seq,
+        );
+        let outcome_row = |s: &mut Self, told: Told, text: &str| {
+            let outcome = match told {
+                Told::Typed => Outcome::Typed,
+                Told::Skipped(_) => Outcome::Skipped,
+            };
+            s.ledger_row(
+                FactKind::Wake.rule(),
+                outcome,
+                text,
+                &door::wake_outcome_reason(ord, episode, held_ms, told),
+                due.seq,
+            );
+        };
+        let facts = match host.wake_claim(ord, episode, WakeDoor::Break) {
+            WakeClaim::Granted(facts) => facts,
+            WakeClaim::Answered => {
+                self.facts.state.told(key, self.hold_wall_ms(due.now_ms));
+                self.ledger_row(
+                    FactKind::Wake.rule(),
+                    Outcome::Waiting,
+                    "",
+                    &door::wake_heard_reason(ord, episode),
+                    due.seq,
+                );
+                return Ok(Wrote::Told);
+            }
+            held => {
+                if held.releases() {
+                    host.wake_release(ord, episode, WakeDoor::Break);
+                }
+                let why = held.word();
+                self.door_skipped(due, why, &|s, told| outcome_row(s, told, ""));
+                return Ok(Wrote::Skipped(why));
+            }
+        };
+        let line = self.wake_line(&wake, facts);
+        let text = if armed(Fault::TemplateEchoesLabel) {
+            let echoed = self.reader(&screen.rows).said_tail(&screen.rows);
+            format!(
+                "{} {}",
+                line.text(),
+                echoed.unwrap_or_default().replace('\n', " ")
+            )
+        } else {
+            line.text().to_string()
+        };
+        let point = self.turn_of(screen.clone());
+        let grant = super::super::config::BreakGrant::Occupancy(grant);
+        let why = match self.type_fact(grant, &point, &text, RuleId::Wake.name(), review)? {
+            Some(Written::Submitted) => None,
+            None => Some("unfenced"),
+            Some(Written::Not) => Some("not-written"),
+            Some(Written::Left) => Some("not-submitted"),
+        };
+        if let Some(why) = why {
+            host.wake_release(ord, episode, WakeDoor::Break);
+            self.door_skipped(due, why, &|s, told| outcome_row(s, told, &text));
+            return Ok(Wrote::Skipped(why));
+        }
+        if armed(Fault::DoorHostTyped) {
+            self.turn_end.host_typed(self.fx.mono(), HostTurn::Notice);
+        } else {
+            self.turn_end.fact_typed();
+        }
+        self.facts.state.told(key, self.hold_wall_ms(due.now_ms));
+        self.hold.door.books.woke(episode, due.now_ms);
+        self.break_lined(due.now_ms);
+        host.break_taken();
+        host.inform(&text);
+        outcome_row(self, Told::Typed, &text);
+        host.wake_told(ord, episode, WakeDoor::Break);
+        Ok(Wrote::Typed)
+    }
+
+    /// The wake's line as its write types it ([`templates::wake`]): its ordinal, class and kinds,
+    /// the local clock at its ready since (the claim's figure, else the book's at the break's
+    /// read; placed by the local zone's offset then, a probe the tape keeps) and, where its need
+    /// names build slots, the slots the host's claim re-read. Closed words and numbers only.
+    fn wake_line(&self, wake: &WakeSeen, facts: WakeFacts) -> FactLine {
+        let since_local = facts
+            .ready_since_ms
+            .or(wake.ready_since_ms)
+            .and_then(|since_ms| {
+                let unix = since_ms.div_euclid(1000);
+                let local = unix.saturating_add(self.local_offset_then(unix)?);
+                let minute = local.rem_euclid(86_400) / 60;
+                Some((
+                    u8::try_from(minute / 60).ok()?,
+                    u8::try_from(minute % 60).ok()?,
+                ))
+            });
+        let slots = facts.slots.filter(|_| wake.need_slots);
+        templates::wake(wake.ord, wake.class, &wake.kinds, since_local, slots)
+    }
+
+    /// THE WAKE FIRST (§2.1's rank 2, before the host's own step at rank 3): where the break's
+    /// decider left a wake's line due under `prompt` ([`door::host_step_may_go`] says the host's
+    /// step waits for it), its write goes now ([`Self::occupancy_write`]), before the host's step
+    /// (the upgrade's notice) and the stuck fact. True where it typed: the break's one line, so
+    /// the caller ends the break's step there. Any other due line, and none, waits for the host's
+    /// step and goes after it.
+    pub(super) fn wake_first(
+        &mut self,
+        screen: &Screen,
+        cfg: Option<&SupervisorConfig>,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        let due = self.hold.door.due.as_ref().map(|due| due.rule);
+        if door::host_step_may_go(due) {
+            return Ok(false);
+        }
+        self.occupancy_write(screen, None, cfg, review)
+    }
+
     /// A write that wrote nothing after its intent row (`OccupancyDoor`'s `Skip`): its outcome
     /// row `skipped why=<why>`, the episode untold, and tried again only past the session's pace.
     #[cfg_attr(
@@ -1130,7 +1330,7 @@ impl<C: Ctl> Session<'_, C> {
     /// told by a loop before this one, is no longer due.
     fn door_k_wrote(&mut self, due: &DueLine, wrote: Wrote) {
         let key = EpisodeKey {
-            kind: FactKind::Hold,
+            kind: due.rule.kind(),
             id: due.episode,
         };
         let k_due = &mut self.hold.door.k_due;
@@ -1381,8 +1581,9 @@ impl<C: Ctl> Session<'_, C> {
     /// The task door's line at a break: the first rule whose line the managed guard alone holds
     /// (`Guards::held_except`: every other guard clear, so the line would have been typed but
     /// for the manager), in an episode the door has not booked
-    /// ([`super::super::facts::FactsState::is_noted`]); `None` where none, and on a tape a build
-    /// before slice 2's doors recorded.
+    /// ([`super::super::facts::FactsState::is_noted`]): a wake's under its own episode, of the
+    /// wake the break's decider opened; `None` where none, and on a tape a build before slice 2's
+    /// doors recorded.
     pub(super) fn door_task_due(
         &self,
         verdicts: &[(RuleId, Verdict)],
@@ -1393,35 +1594,38 @@ impl<C: Ctl> Session<'_, C> {
             return None;
         }
         let hold_key = self.hold_wall_ms(hold.since_ms);
-        // A managed wake's note is the slice-2 plan's 2.8, with the wake's write.
-        verdicts
-            .iter()
-            .filter(|(rule, _)| *rule != RuleId::Wake || armed(Fault::WakeNotedEarly))
-            .find_map(|(rule, verdict)| {
-                let managed = match verdict {
-                    Verdict::Held(Guard::Managed) => true,
-                    Verdict::Due(_) => armed(Fault::NoteAndType) && self.turn_end.managed(),
-                    _ => false,
-                };
-                let alone = guards.held_except(Guard::Managed, *rule).is_none()
-                    || armed(Fault::NoteOnManagedAlone);
-                if !managed || !alone {
-                    return None;
+        verdicts.iter().find_map(|(rule, verdict)| {
+            let managed = match verdict {
+                Verdict::Held(Guard::Managed) => true,
+                Verdict::Due(_) => armed(Fault::NoteAndType) && self.turn_end.managed(),
+                _ => false,
+            };
+            let alone = guards.held_except(Guard::Managed, *rule).is_none()
+                || armed(Fault::NoteOnManagedAlone);
+            if !managed || !alone {
+                return None;
+            }
+            let (word_ordinal, episode) = match (rule, &self.hold.door.wake) {
+                (RuleId::Wake, Some(wake)) => (usize::from(wake.ord), wake.episode()),
+                (RuleId::Wake, None) => return None,
+                _ => {
+                    let ordinal = self.hold.door.books.this_hold(*rule);
+                    (
+                        ordinal.saturating_add(1),
+                        rules::episode(*rule, hold_key, ordinal),
+                    )
                 }
-                let ordinal = self.hold.door.books.this_hold(*rule);
-                let episode = rules::episode(*rule, hold_key, ordinal);
-                let key = EpisodeKey {
-                    kind: FactKind::Hold,
-                    id: episode,
-                };
-                (!self.facts.state.is_noted(key) || armed(Fault::NoteEachBreak)).then_some(
-                    TaskDue {
-                        rule: *rule,
-                        ordinal,
-                        episode,
-                    },
-                )
+            };
+            let key = EpisodeKey {
+                kind: rule.kind(),
+                id: episode,
+            };
+            (!self.facts.state.is_noted(key) || armed(Fault::NoteEachBreak)).then_some(TaskDue {
+                rule: *rule,
+                word_ordinal,
+                episode,
             })
+        })
     }
 
     /// The task door under `prompt` (the one caller of `IdleHost::task_fact` with a word, its
@@ -1445,7 +1649,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         let (Some(host), Some(word)) = (
             self.stall_host.clone(),
-            FactWord::new(task.rule, task.ordinal.saturating_add(1)),
+            FactWord::new(task.rule, task.word_ordinal),
         ) else {
             return;
         };
@@ -1475,7 +1679,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         if outcome != NoteOutcome::Fenced {
             let key = EpisodeKey {
-                kind: FactKind::Hold,
+                kind: rule.kind(),
                 id: episode,
             };
             self.facts.state.note(key, self.hold_wall_ms(now_ms));
@@ -1507,7 +1711,7 @@ impl<C: Ctl> Session<'_, C> {
             seq,
         );
         let key = EpisodeKey {
-            kind: FactKind::Hold,
+            kind: rule.kind(),
             id: episode,
         };
         self.facts.state.note(key, self.hold_wall_ms(now_ms));
@@ -1518,7 +1722,7 @@ impl<C: Ctl> Session<'_, C> {
         if armed(Fault::NoteUnderObserve)
             && let Some(host) = self.stall_host.clone()
         {
-            let _ = host.task_fact(FactWord::new(rule, task.ordinal.saturating_add(1)));
+            let _ = host.task_fact(FactWord::new(rule, task.word_ordinal));
         }
     }
 

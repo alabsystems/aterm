@@ -798,31 +798,31 @@ fn push_radial(
     let rx_px = px(rxi).max(1);
     let ry_px = px(ryi).max(1);
     let row_i32 = i32::from(place.row);
-    for band in -1i32..=1 {
+    let mut band = -1i32;
+    while band <= 1 {
         let r = row_i32 + band;
-        if r < 0 || r > i32::from(u16::MAX) {
-            continue;
+        if r >= 0 && r <= i32::from(u16::MAX) {
+            let row = r as u16;
+            let top = band_top + band * ch_px;
+            let y0 = top.max(y_min);
+            let y1 = (top + ch_px).min(y_max);
+            if y1 > y0 {
+                halos.push(RainHalo {
+                    row,
+                    x,
+                    y: px(y0),
+                    w,
+                    h: px(y1 - y0),
+                    color,
+                    cx: place.cx,
+                    cy: place.cy,
+                    rx: rx_px,
+                    ry: ry_px,
+                    mode,
+                });
+            }
         }
-        let row = r as u16;
-        let top = band_top + band * ch_px;
-        let y0 = top.max(y_min);
-        let y1 = (top + ch_px).min(y_max);
-        if y1 <= y0 {
-            continue;
-        }
-        halos.push(RainHalo {
-            row,
-            x,
-            y: px(y0),
-            w,
-            h: px(y1 - y0),
-            color,
-            cx: place.cx,
-            cy: place.cy,
-            rx: rx_px,
-            ry: ry_px,
-            mode,
-        });
+        band += 1;
     }
 }
 

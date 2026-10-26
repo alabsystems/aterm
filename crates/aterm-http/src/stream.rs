@@ -167,6 +167,27 @@ pub struct TcpConnector;
 
 impl Connect for TcpConnector {
     fn connect(&self, host: &str, port: u16, deadline: Deadline) -> io::Result<TcpStream> {
+        self.connect_noting(host, port, deadline, &mut |_, _| {})
+    }
+}
+
+impl TcpConnector {
+    /// [`Connect::connect`], telling `failed` the address of each connect that failed and
+    /// why, before the next address is tried: the error alone does not name the address it
+    /// came from, which a caller that judges a refusal by where it went (a LAN address, a
+    /// public one) needs. A connect's error returned is the last one `failed` was told; a
+    /// failed lookup, or a deadline spent before the next address, is told nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connect::connect`].
+    pub fn connect_noting(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: Deadline,
+        failed: &mut dyn FnMut(SocketAddr, &io::Error),
+    ) -> io::Result<TcpStream> {
         use std::net::ToSocketAddrs;
         connect_with(
             host,
@@ -174,11 +195,12 @@ impl Connect for TcpConnector {
             deadline,
             |host, port| (host, port).to_socket_addrs(),
             crate::local_network::denied,
+            failed,
         )
     }
 }
 
-/// [`TcpConnector::connect`] over `resolver`, a failed lookup asking `denied`
+/// [`TcpConnector::connect_noting`] over `resolver`, a failed lookup asking `denied`
 /// ([`refused_local`]).
 fn connect_with<F, I>(
     host: &str,
@@ -186,6 +208,7 @@ fn connect_with<F, I>(
     deadline: Deadline,
     resolver: F,
     denied: impl FnOnce(&str, Duration) -> bool,
+    failed: &mut dyn FnMut(SocketAddr, &io::Error),
 ) -> io::Result<TcpStream>
 where
     F: FnOnce(&str, u16) -> io::Result<I> + Send + 'static,
@@ -202,7 +225,11 @@ where
                 stream.set_nodelay(true)?;
                 return Ok(stream);
             }
-            Err(error) => last = Some(deadline.as_timeout(error, cap)),
+            Err(error) => {
+                let error = deadline.as_timeout(error, cap);
+                failed(addr, &error);
+                last = Some(error);
+            }
         }
     }
     Err(last.unwrap_or_else(|| {
@@ -251,6 +278,21 @@ fn refused_local(
     )
 }
 
+/// `error`, a failed lookup of `host`, with what Linux needs to resolve a local
+/// name when `host` is one: glibc asks mDNS only through Avahi's nss-mdns (or
+/// systemd-resolved with MulticastDNS on), which many installs lack, and then
+/// says only that the name is unknown. A lookup that timed out is left as it
+/// is, and so is its kind, which callers judge.
+fn without_mdns(host: &str, error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::TimedOut || !crate::local_network::is_local_name(host) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        format!("{error} ({})", crate::local_network::NO_MDNS),
+    )
+}
+
 /// Resolve `host:port` through `resolver` on a helper thread, waiting at most
 /// `within` for its answer.
 fn resolve_within<F, I>(
@@ -292,7 +334,16 @@ where
     {
         resolver(host, port)
             .map(Iterator::collect)
-            .map_err(|error| io::Error::new(error.kind(), format!("dns: {host}: {error}")))
+            .map_err(|error| {
+                let error = io::Error::new(error.kind(), format!("dns: {host}: {error}"));
+                // Only the resolver's own answer can lack mDNS: a helper that never started or a
+                // lookup that never answered keeps its words.
+                if cfg!(target_os = "linux") {
+                    without_mdns(host, error)
+                } else {
+                    error
+                }
+            })
     }
     let (tx, rx) = mpsc::sync_channel(1);
     let helper_host = host.to_owned();
@@ -739,6 +790,38 @@ mod tests {
         assert!(kept.to_string().contains("nodename nor servname"), "{kept}");
     }
 
+    /// A failed lookup of a local name says what Linux resolves one with, keeping
+    /// its words and kind; a timeout and any other name keep the lookup's error.
+    #[test]
+    fn a_local_name_linux_cannot_resolve_names_what_it_lacks() {
+        let unknown = |host: &str| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "dns: {host}: failed to lookup address information: Name or service not known"
+                ),
+            )
+        };
+        let named = without_mdns("alab-secrets.local", unknown("alab-secrets.local"));
+        assert_eq!(named.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            named.to_string(),
+            "dns: alab-secrets.local: failed to lookup address information: Name or service not \
+             known (this system resolves .local names over mDNS only through Avahi's nss-mdns or \
+             systemd-resolved with MulticastDNS on; a URL naming the server's address needs \
+             neither)"
+        );
+        let held = io::Error::new(io::ErrorKind::TimedOut, "dns: no answer within 8000ms");
+        for (host, error) in [
+            ("alab-secrets.local", held),
+            ("github.com", unknown("github.com")),
+        ] {
+            let (kind, text) = (error.kind(), error.to_string());
+            let kept = without_mdns(host, error);
+            assert_eq!((kept.kind(), kept.to_string()), (kind, text), "{host}");
+        }
+    }
+
     /// The wait to ask is [`DENIAL_WAIT`] with time to spare, never more than
     /// the deadline has left, and nothing once it has passed.
     #[test]
@@ -753,11 +836,13 @@ mod tests {
     }
 
     /// The connector's failed lookup goes through that naming, with at most
-    /// [`DENIAL_WAIT`] to ask; CONTROL: no refusal keeps the lookup's error.
+    /// [`DENIAL_WAIT`] to ask; CONTROL: no refusal keeps the lookup's error,
+    /// which on Linux alone then says what resolves a local name there.
     #[test]
     fn the_connector_names_a_refused_local_lookup() {
         let lookup = |_: &str, _: u16| {
-            Err::<std::iter::Empty<SocketAddr>, _>(io::Error::other(
+            Err::<std::iter::Empty<SocketAddr>, _>(io::Error::new(
+                io::ErrorKind::NotFound,
                 "nodename nor servname provided",
             ))
         };
@@ -771,6 +856,7 @@ mod tests {
                 waits.borrow_mut().push(within);
                 true
             },
+            &mut |_, _| {},
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::HostUnreachable, "{error}");
@@ -782,13 +868,21 @@ mod tests {
             Deadline::after(HANG_DETECTOR),
             lookup,
             |_, _| false,
+            &mut |_, _| {},
         )
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other, "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
         assert!(
             error
                 .to_string()
                 .starts_with("dns: alab-secrets.local: nodename"),
+            "{error}"
+        );
+        assert_eq!(
+            error
+                .to_string()
+                .ends_with(&format!("({})", crate::local_network::NO_MDNS)),
+            cfg!(target_os = "linux"),
             "{error}"
         );
     }
@@ -845,6 +939,40 @@ mod tests {
         assert_eq!(addrs, vec![addr]);
         let stream = TcpStream::connect_timeout(&addrs[0], HANG_DETECTOR).unwrap();
         assert_eq!(stream.peer_addr().unwrap(), addr);
+        drop(listener.accept().unwrap());
+    }
+
+    #[test]
+    fn a_failed_connect_names_the_address_it_went_to() {
+        // A port nothing listens on: bound, then released.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut told = Vec::new();
+        let error = TcpConnector
+            .connect_noting(
+                "127.0.0.1",
+                addr.port(),
+                Deadline::after(HANG_DETECTOR),
+                &mut |at, error| told.push((at, error.kind())),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(told, [(addr, io::ErrorKind::ConnectionRefused)]);
+        // A connect that succeeds tells nothing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        let mut quiet = true;
+        TcpConnector
+            .connect_noting(
+                "127.0.0.1",
+                open.port(),
+                Deadline::after(HANG_DETECTOR),
+                &mut |_, _| quiet = false,
+            )
+            .unwrap();
+        assert!(quiet);
         drop(listener.accept().unwrap());
     }
 

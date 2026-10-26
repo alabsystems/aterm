@@ -426,8 +426,13 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         crate::supervise::occupancy::WakeClaim::Gone
     }
 
-    act fn wake_release(&self, ord: u16, episode: u64) {
-        let _ = (ord, episode);
+    act fn wake_release(
+        &self,
+        ord: u16,
+        episode: u64,
+        door: crate::supervise::occupancy::WakeDoor,
+    ) {
+        let _ = (ord, episode, door);
     }
 
     fn wake_told(&self, ord: u16, episode: u64, door: crate::supervise::occupancy::WakeDoor) {

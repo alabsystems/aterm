@@ -26,6 +26,7 @@ use crate::Wake;
 use crate::system_state::ToolsInstall;
 
 mod probe;
+mod receipt;
 
 /// Where this launch's install stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -179,6 +180,8 @@ pub(crate) fn installing_now() -> bool {
 pub(crate) struct Terminal {
     session: u64,
     finished: bool,
+    recovered: bool,
+    receipt: Option<receipt::Receipt>,
 }
 
 fn waiting_shell_command() -> Vec<std::ffi::OsString> {
@@ -191,6 +194,28 @@ fn waiting_shell_command() -> Vec<std::ffi::OsString> {
 fn install_line(line: &str) -> String {
     // An interactive shell can survive failed exec. End it with that failure status, too.
     format!("exec {line}; exit $?")
+}
+
+fn recovery_refusal_line(error: &std::io::Error) -> String {
+    #[cfg(not(windows))]
+    {
+        let reason = error.to_string().replace(char::is_control, " ");
+        let reason = format!("'{}'", reason.replace('\'', "'\\''"));
+        let printf = crate::ai_screen::launch_line(
+            std::path::Path::new("/usr/bin/printf"),
+            &[
+                "'%s\\n'",
+                "'Installer not started: could not save its recovery state.'",
+                &reason,
+            ],
+        );
+        printf.map_or_else(|| "exit 1".into(), |line| format!("{line}; exit 1"))
+    }
+    #[cfg(windows)]
+    {
+        let _ = error;
+        "exit 1".into()
+    }
 }
 
 /// Tell the window whether the setup pass that just ended waits on Apple's Command Line Tools
@@ -271,12 +296,107 @@ impl App {
             .unwrap_or_else(|p| p.into_inner())
             .by_sid(&aterm_session::SessionId::new(sid))
             .map(|handle| handle.local_id);
-        if let Some(session) = session {
-            self.workstation_setup.developer_tools_session = Some(Terminal {
+        let Some(session) = session else {
+            return;
+        };
+        let Some(child) = self.pool.get(session) else {
+            return;
+        };
+        let recovery = self
+            .workstation_setup
+            .developer_tools_mark
+            .path
+            .as_deref()
+            .and_then(|mark| {
+                (child.pid == child.shell_identity.pid && child.ctx.self_id.as_str() == sid)
+                    .then(|| {
+                        receipt::Receipt::for_child(
+                            mark,
+                            sid,
+                            child.pid,
+                            child.shell_identity.birth,
+                        )
+                    })
+                    .flatten()
+            });
+        let recovery = match recovery {
+            Some(receipt) => receipt.write_exclusive().map(|()| Some(receipt)),
+            None if self.config.keeper_enabled() => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the installer child has no verified recovery identity or state directory",
+            )),
+            None => Ok(None),
+        };
+        let (receipt, line) = match recovery {
+            Ok(receipt) => (receipt, install_line(line)),
+            Err(error) => {
+                aterm_log::warn!(
+                    "System State: installer not started: could not save its recovery state: {error}"
+                );
+                (None, recovery_refusal_line(&error))
+            }
+        };
+        self.workstation_setup
+            .developer_tools_session
+            .push(Terminal {
                 session,
                 finished: false,
+                recovered: false,
+                receipt,
             });
-            self.type_into_new_session(sid, &install_line(line));
+        self.type_into_new_session(sid, &line);
+    }
+
+    /// Recover custody only for an adopted exact child with its own immutable record. This
+    /// restores neither setup admission nor a command: adoption never types installer bytes.
+    pub(crate) fn recover_developer_tools_install(&mut self, local: u64) {
+        if self
+            .workstation_setup
+            .developer_tools_session
+            .iter()
+            .any(|terminal| terminal.session == local)
+        {
+            return;
+        }
+        let Some(child) = self.pool.get(local) else {
+            return;
+        };
+        if child.handoff_local_id.is_none() || child.pid != child.shell_identity.pid {
+            return;
+        }
+        let Some(receipt) = self
+            .workstation_setup
+            .developer_tools_mark
+            .path
+            .as_deref()
+            .and_then(|mark| {
+                receipt::Receipt::for_child(
+                    mark,
+                    child.ctx.self_id.as_str(),
+                    child.pid,
+                    child.shell_identity.birth,
+                )
+            })
+            .filter(receipt::Receipt::matches)
+        else {
+            return;
+        };
+        let finished = child.child_exit.get().is_some()
+            || child
+                .child_reaped
+                .load(std::sync::atomic::Ordering::Acquire)
+            || child.pty_closed_at.get().is_some();
+        self.workstation_setup
+            .developer_tools_session
+            .push(Terminal {
+                session: local,
+                finished,
+                recovered: true,
+                receipt: Some(receipt),
+            });
+        self.workstation_setup.developer_tools = Install::Opened;
+        if !finished {
+            self.recover_access_dialog();
         }
     }
 
@@ -286,6 +406,13 @@ impl App {
     pub(crate) fn developer_tools_install_step(&self) -> Option<ToolsInstall> {
         if self.developer_tools_installing() {
             Some(ToolsInstall::Installing)
+        } else if self
+            .workstation_setup
+            .developer_tools_session
+            .iter()
+            .any(|terminal| terminal.recovered && !terminal.finished)
+        {
+            Some(ToolsInstall::Recovered)
         } else if self.developer_tools_install_active() {
             Some(ToolsInstall::Password)
         } else {
@@ -381,27 +508,34 @@ impl App {
     pub(crate) fn developer_tools_install_active(&self) -> bool {
         self.workstation_setup
             .developer_tools_session
-            .as_ref()
-            .is_some_and(|terminal| !terminal.finished)
+            .iter()
+            .any(|terminal| !terminal.finished)
     }
 
     /// Only the installer's own exit or final view detachment ends its prompt ownership.
     /// Returning true also keeps its completed terminal available for reading the result.
     pub(crate) fn finish_developer_tools_install(&mut self, session: u64) -> bool {
-        let Some(terminal) = self.workstation_setup.developer_tools_session.as_mut() else {
+        let Some(terminal) = self
+            .workstation_setup
+            .developer_tools_session
+            .iter_mut()
+            .find(|terminal| terminal.session == session)
+        else {
             return false;
         };
-        if terminal.session != session {
-            return false;
-        }
         terminal.finished = true;
+        if let Some(receipt) = terminal.receipt.take() {
+            receipt.remove_if_matching();
+        }
         self.release_unused_access_dialog(std::time::Instant::now());
         true
     }
 
     pub(crate) fn retire_developer_tools_install(&mut self, session: u64) {
         if self.finish_developer_tools_install(session) {
-            self.workstation_setup.developer_tools_session = None;
+            self.workstation_setup
+                .developer_tools_session
+                .retain(|terminal| terminal.session != session);
         }
     }
 

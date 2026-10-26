@@ -244,6 +244,12 @@ pub(crate) enum RampArm<'a> {
         expect(dead_code, reason = "only a build with the GL arm draws on it")
     )]
     Gl,
+    /// The D3D11 arm (Windows).
+    #[cfg_attr(
+        not(any(test, d3d11_arm)),
+        expect(dead_code, reason = "only a Windows build arms D3D11")
+    )]
+    D3d11,
     /// No GPU arm armed.
     #[cfg_attr(
         all(wgpu_arm, not(test)),
@@ -289,7 +295,7 @@ pub(crate) const fn ramp_cost(arm: RampArm<'_>) -> Option<FxRampCost> {
         RampArm::Wgpu(backend) if matches!(backend.as_bytes(), b"Metal") => {
             Some(WGPU_METAL_RAMP_COST)
         }
-        RampArm::Wgpu(_) | RampArm::Gl | RampArm::Unarmed => None,
+        RampArm::Wgpu(_) | RampArm::Gl | RampArm::D3d11 | RampArm::Unarmed => None,
     }
 }
 
@@ -313,13 +319,13 @@ pub(crate) fn ramps_open_fx(
     lit > 0 && cost.pays(fx_open, lit)
 }
 
-/// Palette entries per row of the GL arm's palette texture (`cell.glsl` fetches entry `j`
-/// at `(j % 1024, j / 1024)`).
-#[cfg(gl_arm)]
+/// Palette entries per row of the GL and D3D11 arms' palette texture (`cell.glsl` and
+/// `cell.hlsl` fetch entry `j` at `(j % 1024, j / 1024)`).
+#[cfg(any(gl_arm, d3d11_arm))]
 pub(crate) const FX_PALETTE_ROW: u32 = 1024;
 
-/// The GL arm's palette ring depth.
-#[cfg(gl_arm)]
+/// The GL and D3D11 arms' palette ring depth.
+#[cfg(any(gl_arm, d3d11_arm))]
 pub(crate) const FX_PALETTE_RING: usize = 3;
 
 /// Which of the two atlas textures an art lives in.
@@ -1227,6 +1233,8 @@ pub(crate) struct FxArmTex {
 /// generation (or when `fresh` says the texture is gone), then every resident
 /// art written since its last sync uploaded into its region; `before_write`
 /// runs first when those writes land in a texture earlier frames may sample.
+/// `Err` when the mint or an upload is refused (a removed D3D11 device), the
+/// texture then unsynced, so the next sync writes those arts again.
 pub(crate) fn sync_fx_tex(
     handle: crate::device_layer::DeviceHandle<'_>,
     slot: &mut Option<FxArmTex>,
@@ -1274,7 +1282,7 @@ pub(crate) fn sync_fx_tex(
             u32::from(r[2]),
             u32::from(r[3]),
         );
-        handle.upload_texture_region(&t.tex, x, y, w, h, art.data(), w * bpp);
+        handle.try_upload_texture_region(&t.tex, x, y, w, h, art.data(), w * bpp)?;
         bytes += art.data().len() as u64;
     }
     t.synced = side.seq();
@@ -2051,6 +2059,7 @@ mod tests {
         }
         for arm in [
             RampArm::Gl,
+            RampArm::D3d11,
             RampArm::Unarmed,
             RampArm::Wgpu("Dx12"),
             RampArm::Wgpu("Vulkan"),

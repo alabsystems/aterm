@@ -248,9 +248,12 @@ pub(crate) struct Device {
     pin_total: Mutex<u64>,
     /// WRITE ERRORS (sim item S7), once armed ([`Device::arm_write_errors`]).
     faults: Mutex<Option<Faults>>,
-    /// The path whose next durable replace fails after its rename, once
+    /// The path whose next durable or ordered replace fails after its rename, once
     /// ([`Device::fail_after_its_rename`]): a test's exact fault.
     after_once: Mutex<Option<PathBuf>>,
+    /// The directory whose next barrier fails before its effect, once: an ordered replace
+    /// [`Device::after_once`] named made its rename, and this is its directory's flush.
+    dir_once: Mutex<Option<PathBuf>>,
 }
 
 impl Device {
@@ -263,10 +266,13 @@ impl Device {
             pin_total: Mutex::new(0),
             faults: Mutex::new(None),
             after_once: Mutex::new(None),
+            dir_once: Mutex::new(None),
         }
     }
 
-    /// The next durable replace of `path` has its rename made and its directory flush fail (`EIO`), once.
+    /// The next replace of `path` has its rename made and its directory flush fail (`EIO`),
+    /// once, whichever tier it takes: a durable replace's own flush of its directory, or the
+    /// barrier of its directory that follows an ordered replace (a start's root barrier).
     pub(crate) fn fail_after_its_rename(&self, path: &Path) {
         *lock(&self.after_once) = Some(path.to_path_buf());
     }
@@ -343,6 +349,17 @@ impl Device {
 
     /// WHETHER `w` FAILS BEFORE ITS EFFECT ([`crate::fx::Disk::before`]).
     pub(crate) fn fails_before(&self, w: Write<'_>) -> Option<io::Error> {
+        if let Write::SyncDir {
+            path,
+            flush: Flush::Ordered,
+        } = w
+        {
+            let mut once = lock(&self.dir_once);
+            if once.as_deref() == Some(path) {
+                *once = None;
+                return Some(io::Error::from_raw_os_error(EIO));
+            }
+        }
         let mut faults = lock(&self.faults);
         let f = faults.as_mut().filter(|f| f.on)?;
         let takes_space = matches!(w, Write::Replace { .. } | Write::Append { .. });
@@ -384,14 +401,17 @@ impl Device {
     fn fails_after(&self, w: Write<'_>) -> Option<After> {
         if let Write::Replace {
             path,
-            flush: Some(Flush::Durable),
+            flush: Some(flush),
             ..
         } = w
         {
             let mut once = lock(&self.after_once);
             if once.as_deref() == Some(path) {
                 *once = None;
-                return Some(After::Renamed);
+                if flush.is_durable() {
+                    return Some(After::Renamed);
+                }
+                *lock(&self.dir_once) = path.parent().map(Path::to_path_buf);
             }
         }
         let mut faults = lock(&self.faults);

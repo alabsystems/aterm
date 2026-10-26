@@ -788,16 +788,17 @@ mod macos {
         PILL_PAD, format_tab_chrome, native_tab_cells, pill_share, tab_close_accessibility_label,
         tab_display_label, tab_help, titlebar_pill_layout,
     };
+    use crate::app_tabs::{NativeTabCommand, TabStripOrigin};
     use crate::appkit::{self, consts};
     use crate::menu::MenuAction;
-    use crate::session_chrome::{ConnVerb, TabChromeExt, TabMenuEntry};
+    use crate::session_chrome::{ConnVerb, RewindMenuOrigin, TabChromeExt, TabMenuEntry};
     use crate::tab_bar::{
         TAB_ICON_DESIGN_SIZE, TAB_ICON_NATIVE_SIZE, TAB_STATUS_KINDS, TabConnRole,
         TabIconPrimitive, TabStatusKind, TabStripMetadata, native_tab_content_layout,
         tab_icon_primitives, tab_status_center, tab_status_mark_scale,
     };
     use crate::tab_model::TabId;
-    use crate::{TabAction, Wake, WindowId};
+    use crate::{Wake, WindowId};
 
     /// Height (points) of the single chrome row.
     const STRIP_HEIGHT: f64 = 28.0;
@@ -1827,17 +1828,15 @@ mod macos {
         /// The window this tab belongs to, so a relayed `Wake` addresses the right
         /// window (a click on a non-frontmost window's strip acts on that window).
         window: WindowId,
-        /// This tab's 0-based index for the select/close/move relays, set at build.
+        /// This chip's position for its label and accessibility help, set at build.
         index: Cell<usize>,
-        /// This tab's stable [`crate::tab_model::TabId`]. The diff path re-stamps it
-        /// per position after a reorder; `TabView::show_context_menu` snapshots it
-        /// into `menu_tab`.
-        tab_id: Cell<TabId>,
+        /// The identities currently represented by this chip, re-stamped by the diff path.
+        origin: Cell<TabStripOrigin>,
+        /// The identities captured on mouse down, retained if the chip is rebound during a drag.
+        drag_origin: Cell<Option<TabStripOrigin>>,
         /// The identity captured when the context menu popped, which
         /// `tabMenuAction:` posts.
         menu_tab: Cell<Option<TabId>>,
-        /// Total tab count at build time, so a drag can clamp the destination index.
-        count: Cell<usize>,
         /// Whether this is the active tab: drives the accent in `drawRect:`.
         active: Cell<bool>,
         /// The canonical icon/status/close facts, pushed whole by `set_metadata`:
@@ -1903,8 +1902,8 @@ mod macos {
         /// The agent-upgrade rows of the same pop-time snapshot (session, build, word);
         /// a `tabMenuUpgrade:` click decodes its `tag` against it.
         menu_upgrade: RefCell<Vec<(String, String, aterm_messages::UpgradeWord)>>,
-        /// The Rewind timeline rows of the same snapshot, by when each happened; a `tabMenuRewind:` click decodes its `tag` against it.
-        menu_rewind: RefCell<Vec<u64>>,
+        /// The Rewind rows' captured terminal and instant; a `tabMenuRewind:` click decodes its `tag` against this pop-time snapshot.
+        menu_rewind: RefCell<Vec<(Option<RewindMenuOrigin>, u64)>>,
     }
 
     aterm_objc::declare_class! {
@@ -2005,6 +2004,7 @@ mod macos {
             /// Select the tab, open the context menu, or begin rename/drag on press.
             @sel(mouseDown:)
             fn mouseDown(&self, event: Id) {
+                self.ivars().drag_origin.set(None);
                 // SAFETY: `-modifierFlags` is a side-effect-free `NSUInteger` getter on the live event, on the main thread.
                 let ctrl = unsafe { appkit::send_usize(event, sel!(modifierFlags)) }
                     & consts::NS_EVENT_MODIFIER_FLAG_CONTROL
@@ -2019,7 +2019,7 @@ mod macos {
                     ivars.dragged.set(true);
                     let _ = ivars.proxy.send_event(Wake::BeginSessionRename {
                         window: ivars.window,
-                        tab: ivars.tab_id.get(),
+                        tab: self.tab_id(),
                     });
                     return;
                 }
@@ -2029,9 +2029,10 @@ mod macos {
                 let p = unsafe { point_in_view(self.as_id(), event) };
                 ivars.press_x.set(p.x);
                 ivars.dragged.set(false);
-                let _ = ivars.proxy.send_event(Wake::SelectTab {
+                ivars.drag_origin.set(Some(ivars.origin.get()));
+                let _ = ivars.proxy.send_event(Wake::NativeTabCommand {
                     window: ivars.window,
-                    index: ivars.index.get(),
+                    command: NativeTabCommand::Select(self.tab_id()),
                 });
             }
 
@@ -2062,28 +2063,21 @@ mod macos {
                 if dx.abs() < width * 0.5 {
                     return;
                 }
-                let from = ivars.index.get();
-                let count = ivars.count.get();
-                let to = if dx > 0.0 {
-                    (from + 1).min(count.saturating_sub(1))
-                } else {
-                    from.saturating_sub(1)
-                };
-                if to == from {
+                let Some(command) = ivars.drag_origin.get().and_then(|origin| origin.drag(dx > 0.0)) else {
                     return;
-                }
+                };
                 ivars.dragged.set(true);
-                let (tx, _rx) = std::sync::mpsc::channel();
-                let _ = ivars.proxy.send_event(Wake::TabCmd {
-                    action: TabAction::Move { from, to },
-                    by: crate::session_store::ExitActor::Human,
-                    reply: tx,
+                let _ = ivars.proxy.send_event(Wake::NativeTabCommand {
+                    window: ivars.window,
+                    command,
                 });
             }
 
-            /// Consume mouse-up without forwarding up the responder chain.
+            /// Retire the drag origin without forwarding mouse-up up the responder chain.
             @sel(mouseUp:)
-            fn mouseUp(&self, _event: Id) {}
+            fn mouseUp(&self, _event: Id) {
+                self.ivars().drag_origin.set(None);
+            }
 
             /// Reveal the close button and repaint the hover highlight on enter.
             @sel(mouseEntered:)
@@ -2117,23 +2111,23 @@ mod macos {
             @sel(accessibilityPerformPress)
             fn accessibilityPerformPress(&self) -> aterm_objc::Bool {
                 let ivars = self.ivars();
-                let _ = ivars.proxy.send_event(Wake::SelectTab {
+                let _ = ivars.proxy.send_event(Wake::NativeTabCommand {
                     window: ivars.window,
-                    index: ivars.index.get(),
+                    command: NativeTabCommand::Select(self.tab_id()),
                 });
                 aterm_objc::Bool::YES
             }
 
-            /// Post `Wake::CloseTab` when the close button is clicked.
+            /// Post the chip's stable identity when the close button is clicked.
             @sel(closeTab:)
             fn close_tab(&self, _sender: Id) {
                 let ivars = self.ivars();
                 if !ivars.metadata.get().closable {
                     return;
                 }
-                let _ = ivars.proxy.send_event(Wake::CloseTab {
+                let _ = ivars.proxy.send_event(Wake::NativeTabCommand {
                     window: ivars.window,
-                    index: ivars.index.get(),
+                    command: NativeTabCommand::Close(self.tab_id()),
                 });
             }
 
@@ -2213,13 +2207,14 @@ mod macos {
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let ivars = self.ivars();
                 let Ok(i) = usize::try_from(tag) else { return };
-                let Some(at_ms) = ivars.menu_rewind.borrow().get(i).copied() else {
+                let Some((Some(origin), at_ms)) = ivars.menu_rewind.borrow().get(i).copied() else {
                     return;
                 };
                 let Some(tab) = ivars.menu_tab.get() else { return };
                 let _ = ivars.proxy.send_event(Wake::TabMenuRewind {
                     window: ivars.window,
                     tab,
+                    origin,
                     at_ms,
                 });
             }
@@ -2436,7 +2431,7 @@ mod macos {
             }
         }
 
-        /// Build a tab view for `index`/`count` showing `title`.
+        /// Build a tab view at `index` showing `title`.
         #[allow(
             clippy::too_many_arguments,
             reason = "tab state (id/index/count/text/active/metadata/ext) plus its render context (mtm/proxy/window/geometry); both are needed at construction and splitting them only relocates the list"
@@ -2445,9 +2440,8 @@ mod macos {
             mtm: MainThread,
             proxy: EventLoopProxy<Wake>,
             window: WindowId,
-            tab: TabId,
+            origin: TabStripOrigin,
             index: usize,
-            count: usize,
             title: &str,
             tooltip: Option<&str>,
             active: bool,
@@ -2460,9 +2454,9 @@ mod macos {
                 proxy,
                 window,
                 index: Cell::new(index),
-                tab_id: Cell::new(tab),
+                origin: Cell::new(origin),
+                drag_origin: Cell::new(None),
                 menu_tab: Cell::new(None),
-                count: Cell::new(count),
                 active: Cell::new(active),
                 metadata: Cell::new(metadata),
                 hovered: Cell::new(false),
@@ -2839,12 +2833,12 @@ mod macos {
             }
         }
 
-        fn set_tab_id(&self, id: TabId) {
-            self.ivars().tab_id.set(id);
+        fn set_tab_origin(&self, origin: TabStripOrigin) {
+            self.ivars().origin.set(origin);
         }
 
         fn tab_id(&self) -> TabId {
-            self.ivars().tab_id.get()
+            self.ivars().origin.get().tab
         }
 
         /// Build and pop this tab's context menu at the pointer.
@@ -2859,7 +2853,7 @@ mod macos {
             if entries.is_empty() {
                 return;
             }
-            self.ivars().menu_tab.set(Some(self.ivars().tab_id.get()));
+            self.ivars().menu_tab.set(Some(self.tab_id()));
             *self.ivars().menu_conn.borrow_mut() = entries
                 .iter()
                 .filter_map(|e| match e {
@@ -2883,7 +2877,7 @@ mod macos {
             *self.ivars().menu_rewind.borrow_mut() = entries
                 .iter()
                 .filter_map(|e| match e {
-                    TabMenuEntry::RewindTo { at_ms, .. } => Some(*at_ms),
+                    TabMenuEntry::RewindTo { at_ms, origin, .. } => Some((*origin, *at_ms)),
                     _ => None,
                 })
                 .collect();
@@ -2951,13 +2945,13 @@ mod macos {
                             appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
-                        TabMenuEntry::RewindTo { words, .. } => {
+                        TabMenuEntry::RewindTo { words, origin, .. } => {
                             let Some(item) = item_with(words, sel!(tabMenuRewind:)) else {
                                 continue;
                             };
                             appkit::send_v_isize(item.id(), sel!(setTag:), rewind_index);
                             rewind_index += 1;
-                            appkit::send_v_bool(item.id(), sel!(setEnabled:), true);
+                            appkit::send_v_bool(item.id(), sel!(setEnabled:), origin.is_some());
                             appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
@@ -3563,6 +3557,11 @@ mod macos {
             })
         };
         let id_at = |i: usize| ids.get(i).copied().unwrap_or(TabId::from_stored(0));
+        let origin_at = |i: usize| TabStripOrigin {
+            tab: id_at(i),
+            previous: i.checked_sub(1).and_then(|index| ids.get(index).copied()),
+            next: ids.get(i + 1).copied(),
+        };
         let default_ext = TabChromeExt::default();
         let ext_at = |i: usize| ext.get(i).unwrap_or(&default_ext);
         let tooltip_at = |i: usize| tooltips.get(i).and_then(Option::as_deref);
@@ -3600,7 +3599,7 @@ mod macos {
                 for (i, (tab, title)) in tabs.iter().zip(titles).enumerate() {
                     tab.set_geometry(geometry_at(i, cells[i].0));
                     tab.set_context(title, tooltip_at(i));
-                    tab.set_tab_id(id_at(i));
+                    tab.set_tab_origin(origin_at(i));
                     tab.set_metadata(metadata_at(i));
                     tab.set_chrome_ext(ext_at(i));
                     tab.set_active(i == active);
@@ -3626,9 +3625,8 @@ mod macos {
                 mtm,
                 handle.proxy.clone(),
                 handle.window,
-                id_at(i),
+                origin_at(i),
                 i,
-                n,
                 title,
                 tooltip_at(i),
                 i == active,

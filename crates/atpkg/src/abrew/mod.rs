@@ -355,7 +355,7 @@ fn native_args(
             false,
         ),
         "options" => (&["--compact", "--installed"], 0, usize::MAX, true),
-        "linkage" => (&[], 1, usize::MAX, true),
+        "linkage" => (&["--test", "--strict", "--reverse"], 0, usize::MAX, true),
         "uses" | "dependents" => (&["--installed"], 1, usize::MAX, true),
         "home" | "homepage" => (&[], 0, usize::MAX, true),
         "cat" => (&["--cask", "--formula"], 1, 1, true),
@@ -379,7 +379,7 @@ fn native_args(
         "missing" => (&[], 0, usize::MAX, true),
         "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
         "autoremove" => (&["--dry-run", "-n"], 0, 1, true),
-        "pin" | "unpin" => (&[], 1, 1, true),
+        "pin" | "unpin" => (&[], 0, usize::MAX, true),
         "link" | "ln" | "unlink" => (&["--dry-run", "-n"], 1, 1, true),
         "switch" => (&[], 2, 2, true),
         "list" | "ls" => (
@@ -917,7 +917,15 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "update" => cmd_update(prefix, &api),
         "cleanup" => cmd_cleanup(prefix, &api, rest),
         "autoremove" => cmd_autoremove(prefix, &api, rest),
-        "pin" => each_name(rest, |n| prefix.pin(Formula::short_name(n))),
+        "pin" => {
+            if operands(rest).is_empty() {
+                eprintln!(
+                    "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
+                );
+                return ExitCode::from(1);
+            }
+            each_name(rest, |n| prefix.pin(Formula::short_name(n)))
+        }
         "unpin" => cmd_unpin(prefix, &api, rest),
         "link" | "ln" => cmd_link(prefix, &api, args, rest, true),
         "unlink" => cmd_link(prefix, &api, args, rest, false),
@@ -929,7 +937,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "leaves" => cmd_leaves(prefix, &api, rest),
         "missing" => cmd_missing(prefix, &api, rest),
         "options" => cmd_options(prefix, &api, args, rest),
-        "linkage" => cmd_linkage(prefix, rest),
+        "linkage" => cmd_linkage(prefix, &api, rest),
         "log" => cmd_log(prefix, rest),
         "tap" => cmd_tap(prefix, rest),
         "untap" => each_name(rest, |n| tap::remove(prefix, n)),
@@ -1353,6 +1361,10 @@ mod admission_tests {
             ("fetch", vec!["--cask", "homebrew/cask/firefox"]),
             ("--cellar", vec!["wget"]),
             ("--cellar", vec!["homebrew/core/wget"]),
+            ("pin", vec![]),
+            ("pin", vec!["wget", "curl"]),
+            ("unpin", vec![]),
+            ("unpin", vec!["wget", "curl"]),
             ("uninstall", vec!["--force", "wget"]),
             ("uninstall", vec!["-f", "wget"]),
             ("link", vec!["--dry-run", "wget"]),

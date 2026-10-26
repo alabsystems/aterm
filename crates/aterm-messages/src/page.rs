@@ -83,14 +83,15 @@ pub fn button_label(label: &str) -> String {
     }
 }
 
-/// Index of the primary action in `actions` (first actionable non-decline intent), if any.
+/// Index of the primary action in `actions` (first actionable non-decline intent), if any. An
+/// action pressed only by name ([`MessageActionView::by_name`]) is never the primary.
 #[must_use]
 pub fn primary_index(actions: &[MessageActionView]) -> Option<usize> {
     match actions.first() {
-        Some(first) if first.still_actionable => Some(0),
+        Some(first) if first.still_actionable && !first.by_name => Some(0),
         _ => actions
             .iter()
-            .position(|action| action.still_actionable && !action.declines),
+            .position(|action| action.still_actionable && !action.declines && !action.by_name),
     }
 }
 
@@ -285,6 +286,7 @@ impl MessagesState {
                 label: DISMISS_ALL_LABEL,
                 still_actionable: true,
                 declines: true,
+                by_name: false,
             });
         }
         entries.splice(0..0, to_look_at);
@@ -378,6 +380,8 @@ pub struct MessageActionView {
     pub still_actionable: bool,
     /// Whether this intent is a decline ([`Intent::is_decline`]).
     pub declines: bool,
+    /// Whether it is pressed only by name, never the primary ([`Intent::never_default`]).
+    pub by_name: bool,
 }
 
 impl MessageView {
@@ -448,6 +452,7 @@ impl MessageView {
                         label: intent.label(),
                         still_actionable: still_actionable(intent, open, host),
                         declines: intent.is_decline(),
+                        by_name: intent.never_default(),
                     })
                 })
                 .collect(),
@@ -458,6 +463,7 @@ impl MessageView {
                 label: DISMISS_LABEL,
                 still_actionable: true,
                 declines: true,
+                by_name: false,
             });
         }
         view
@@ -666,7 +672,8 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         Intent::NotNow { .. }
         | Intent::StopPaste { .. }
         | Intent::ShowSession { .. }
-        | Intent::EndRecovered => live,
+        | Intent::EndRecovered
+        | Intent::ApproveJoin { .. } => live,
         Intent::ShowTab { .. } => false,
         Intent::ApplyUpdate { build } => host.staged_build() == Some(*build),
         Intent::OpenPath { path } => host.is_regular_file(path),
@@ -747,6 +754,10 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::StopPaste { .. }, false) => "The paste had already finished".to_string(),
         (Intent::ReviewVaultSync, true) => "Opened System State".to_string(),
         (Intent::ReviewVaultSync, false) => "Could not open System State".to_string(),
+        (Intent::ApproveJoin { .. }, true) => {
+            "Approving that Mac; it joins once the vault is published".to_string()
+        }
+        (Intent::ApproveJoin { .. }, false) => "Could not approve that Mac".to_string(),
         (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
         (Intent::ShowSession { .. }, true) => "Showed session".to_string(),

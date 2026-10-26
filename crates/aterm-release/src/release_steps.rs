@@ -4364,6 +4364,22 @@ mod tests {
         );
     }
 
+    /// Every entry under `root` and its bytes, symlinks not followed: what a probe writes grows it.
+    fn tree_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                total += 1 + meta.len();
+                if meta.is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        total
+    }
+
     #[test]
     fn every_tree_the_release_writes_is_the_commits_bytes() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4393,18 +4409,22 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", &config)
             .env("XDG_CONFIG_HOME", root.join("xdg"))
             .stdin(Stdio::null());
-        let out = aterm_uds::deadline::outputs_until(
-            &mut [&mut child],
-            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        // The probe is a whole release's git work: the hang detector is a minute in which its
+        // fixture tree stops growing, not a minute for all of it.
+        let mut grown = || tree_bytes(&work);
+        let out = aterm_uds::deadline::output_while_progressing(
+            &mut child,
             aterm_spec::wait::MUST_HAPPEN,
-        )
-        .pop()
-        .expect("one probe");
+            &mut grown,
+        );
         let out = match out {
             Ok(out) => out,
             Err(error) => {
                 let kept = dir.keep();
-                panic!("CRLF probe: {error}; retained fixture {}", kept.display());
+                panic!(
+                    "CRLF probe: {error} (its fixture tree stopped growing); retained fixture {}",
+                    kept.display()
+                );
             }
         };
         let stdout = String::from_utf8_lossy(&out.stdout);

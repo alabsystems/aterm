@@ -3998,6 +3998,7 @@ fn repair_counts_an_unread_item_undone() {
         explain: None,
         stood_aside: None,
         essential: false,
+        elapsed_ms: None,
     };
     use aterm_converge::Outcome;
     for (outcome, undone) in [

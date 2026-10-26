@@ -491,11 +491,16 @@ fn bloom_halo_follows_a_gradient_quad_s_ramp() {
     let (rows, cols) = (8usize, 40usize);
     let (c0, c1) = (0x00E0_0000u32, 0x0000_00E0u32);
     for oracle in [false, true] {
-        if oracle && !cfg!(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)) {
+        if oracle
+            && !cfg!(all(
+                any(target_os = "macos", target_os = "linux", windows),
+                wgpu_arm
+            ))
+        {
             continue;
         }
         let (cpu, mut gpu) = backends(18.0, theme);
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm))]
         if oracle {
             crate::common::disarm_for_oracle(&mut gpu);
         }

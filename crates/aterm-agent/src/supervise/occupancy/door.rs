@@ -113,6 +113,24 @@ pub fn write_held(line: impl Into<BreakLine>, w: AtWrite) -> Option<Guard> {
     .find_map(|(holds, guard)| holds.then_some(guard))
 }
 
+/// WHETHER THE HOST'S OWN STEP MAY GO AT A BREAK (`IdleHost::at_background`: the upgrade's notice,
+/// §2.1's rank 3), the break's due line being `due`'s (the decider's pick, under `prompt`): not
+/// before a wake's line, which ranks first (the model's `2 > due || due > 2`). The wake's write
+/// goes first (`Session::wake_first`), and a line it types holds the host's step to the next break.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "OccupancyDoor",
+        action = "UpgradeTypes",
+        project = "conformance_occupancy::project"
+    )
+)]
+pub fn host_step_may_go(due: Option<RuleId>) -> bool {
+    use super::fault::{Fault, armed};
+    due != Some(RuleId::Wake) || armed(Fault::HostBeforeWake)
+}
+
 /// What the stuck fact's line comes to at a break ([`stuck_at_break`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StuckVerdict {
@@ -369,6 +387,35 @@ pub fn wake_heard_reason(ord: u16, episode: u64) -> String {
     )
 }
 
+/// The reason of a wake's `fact-intent@v1` row at a break (`waiting`, before the claim and the
+/// write): `kind=wake episode=<hex> ord=<n> held_ms=<n> door=break`, which [`seed_rows_in`] reads
+/// as the wake's intent.
+#[must_use]
+pub fn wake_intent_reason(ord: u16, episode: u64, held_ms: i64) -> String {
+    format!(
+        "kind={} episode={episode:016x} ord={ord} held_ms={held_ms} door={}",
+        FactKind::Wake.word(),
+        super::wakes_seen::WakeDoor::Break.word()
+    )
+}
+
+/// The reason of a wake's `fact-wake@v1` outcome row at a break, `typed` or `skipped`:
+/// `rule=wake@v1 episode=<hex> held_ms=<n> ord=<n> door=break`, and for a skip `why=<word>`.
+/// [`seed_rows_in`] reads its episode's outcome, [`super::rules::would_rows_in`] a typed one's
+/// place in the session's pace and [`break_lines_in`] its line.
+#[must_use]
+pub fn wake_outcome_reason(ord: u16, episode: u64, held_ms: i64, told: Told) -> String {
+    let words = format!(
+        "{} ord={ord} door={}",
+        super::rules::would_reason(RuleId::Wake, episode, held_ms, false),
+        super::wakes_seen::WakeDoor::Break.word()
+    );
+    match told {
+        Told::Typed => words,
+        Told::Skipped(why) => format!("{words} why={why}"),
+    }
+}
+
 /// The task door's mark: every row the occupancy loop books for a managed session's fact word
 /// carries it (intent, outcome, clear and, under `observe`, the would-be note), and no reader of
 /// the typed door's rows ([`seed_rows_in`], [`break_lines_in`], `rules::would_rows_in`, the
@@ -547,30 +594,36 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
 }
 
 /// When (unix ms, oldest first) each line an earlier loop typed at a break went, from ledger
-/// `body`, with its kind: session `sid`'s `fact-no-progress@v1` rows `typed` at `door=break` (a
-/// rider's `door=turn-end` row is no line of its own) and its `fact-hold@v1` rows `typed`. A
-/// successor paces the stuck line by them, as [`super::rules::would_rows_in`] seeds the door's
-/// own books.
+/// `body`, with its kind: session `sid`'s `fact-no-progress@v1` and `fact-wake@v1` rows `typed`
+/// at `door=break` (a rider's `door=turn-end` or `door=point` row is no line of its own) and its
+/// `fact-hold@v1` rows `typed`. A successor paces the stuck line by them, as
+/// [`super::rules::would_rows_in`] seeds the door's own books.
 #[must_use]
 pub fn break_lines_in(body: &str, sid: Option<&str>) -> Vec<(i64, FactKind)> {
-    let (stuck, hold) = (FactKind::NoProgress.rule(), FactKind::Hold.rule());
+    let (stuck, hold, wake) = (
+        FactKind::NoProgress.rule(),
+        FactKind::Hold.rule(),
+        FactKind::Wake.rule(),
+    );
     let want = sid.map(|s| s.trim_start_matches('@'));
     body.lines()
         .filter(|line| {
-            (line.contains(stuck) || line.contains(hold))
+            (line.contains(stuck) || line.contains(hold) || line.contains(wake))
                 && want.is_none_or(|sid| line.contains(sid))
         })
         .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
         .filter_map(|v| {
             let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+            let at_break = || {
+                text("reason").is_some_and(|r| {
+                    r.split(' ')
+                        .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
+                })
+            };
             let kind = match text("rule_id") {
                 Some(rule) if rule == hold => Some(FactKind::Hold),
-                Some(rule) if rule == stuck => text("reason")
-                    .is_some_and(|r| {
-                        r.split(' ')
-                            .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
-                    })
-                    .then_some(FactKind::NoProgress),
+                Some(rule) if rule == stuck => at_break().then_some(FactKind::NoProgress),
+                Some(rule) if rule == wake => at_break().then_some(FactKind::Wake),
                 _ => None,
             };
             if text("sid") != want || text("decision") != Some("typed") {

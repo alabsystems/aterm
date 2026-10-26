@@ -976,10 +976,11 @@ fn main(args: &[String]) -> ExitCode {
     }
 }
 
-/// The quiet machine for one lane (`docs/DESIGN-adaptive-build-2026-10-24.md`, QUIET-ADMIT):
-/// admitted alone among quiet claims once the load is low (saying once a minute what it waits
-/// for), or at once under `--admit now`; its own build runs under it too. A ledger that cannot be
-/// used is said, and the lane runs unadmitted.
+/// The quiet machine for one lane (`docs/DESIGN-adaptive-build-2026-10-24.md`, QUIET-ADMIT and
+/// QUIET-BOUND): admitted alone among quiet claims once the load is low, or at its bound whatever
+/// the load (saying once a minute what it waits for, and how it started), or at once under
+/// `--admit now`; its own build runs under it too. A ledger that cannot be used is said, and the
+/// lane runs unadmitted.
 ///
 /// # Errors
 /// An interrupt ended the wait (WAIT-INTERRUPT): why, and the run ends COULD NOT RUN.
@@ -989,13 +990,17 @@ fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Result<Option<aterm_capacit
         Ok(claim) => {
             let to = aterm_capacity::Live.read(None);
             eprintln!(
-                "  quiet machine: admitted{} at {}",
+                "  quiet machine: admitted{} at {}{}",
                 if claim.waited().as_secs() > 0 {
                     format!(" after {}", aterm_capacity::span(claim.waited()))
                 } else {
                     String::new()
                 },
-                to.brief()
+                to.brief(),
+                claim
+                    .quiet()
+                    .filter(|q| q.at_bound || !q.reserved.is_zero())
+                    .map_or_else(String::new, |q| format!(" ({q})"))
             );
             Ok(Some(claim))
         }

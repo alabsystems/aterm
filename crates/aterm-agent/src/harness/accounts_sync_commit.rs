@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Crash recovery for sync, renewal and pool materialization. The pending receipt fences readers;
+//! Crash recovery for account state, sync, renewal and pool materialization. The pending receipt fences readers;
 //! replay installs exact admitted images, including their already allocated generations.
 //! This is not atomicity for unrelated transactions or independent unlocked paired reads.
 
@@ -26,11 +26,11 @@ enum WakeRule {
 }
 
 struct Publication<'a> {
-    target: SyncTarget<'a>,
+    target: Option<SyncTarget<'a>>,
     wake: WakeRule,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Image {
     before: Option<String>,
@@ -59,8 +59,13 @@ impl Image {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
-    roster_path: String,
+    // A missing path admits only fixed paths below this Store; local_logins adds bindings.
+    // Some serializes identically to the original string field, preserving old digests.
+    roster_path: Option<String>,
     roster_mode: Option<u32>,
+    // Omitted in existing receipts so their digest preimages remain unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    local_logins: bool,
     state: Image,
     logins: Image,
     ledger: Image,
@@ -83,6 +88,10 @@ struct Receipt {
 struct StoredReceipt {
     receipt: Receipt,
     digest: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn receipt_digest(receipt: &Receipt) -> Result<String, String> {
@@ -132,20 +141,41 @@ fn durable_ancestry(dir: &Path) -> Result<(), String> {
 }
 
 impl Plan {
-    fn validate(&self, store: &Store, roster: &Path) -> Result<(), String> {
-        if absolute(roster)?.to_str() != Some(self.roster_path.as_str())
-            || self.roster_mode.is_some_and(|mode| mode & !0o777 != 0)
-        {
+    fn paths(&self, store: &Store, roster: Option<&Path>) -> Result<Vec<(usize, PathBuf)>, String> {
+        let mut paths = vec![(0, store.state_file()), (2, store.ledger_path())];
+        if let Some(admitted) = &self.roster_path {
+            if self.local_logins {
+                return Err("local login receipt cannot name an external roster".into());
+            }
+            let roster =
+                absolute(roster.ok_or("account recovery needs its admitted roster path")?)?;
+            if roster.to_str() != Some(admitted.as_str()) {
+                return Err("account sync recovery target differs from the admitted roster".into());
+            }
+            paths.insert(1, (1, store.logins_file()));
+            paths.push((3, roster));
+        } else {
+            if self.roster_mode.is_some()
+                || self.roster.before.is_some()
+                || self.roster.after.is_some()
+            {
+                return Err("local account receipt contains external roster images".into());
+            }
+            if self.local_logins {
+                paths.insert(1, (1, store.logins_file()));
+            } else if self.logins.before.is_some() || self.logins.after.is_some() {
+                return Err("state-only account receipt contains login images".into());
+            }
+        }
+        Ok(paths)
+    }
+
+    fn validate(&self, store: &Store, roster: Option<&Path>) -> Result<(), String> {
+        if self.roster_mode.is_some_and(|mode| mode & !0o777 != 0) {
             return Err("account sync recovery target differs from the admitted roster".into());
         }
-        let paths = [
-            store.state_file(),
-            store.logins_file(),
-            store.ledger_path(),
-            absolute(roster)?,
-        ];
         let mut names = BTreeSet::new();
-        for path in paths {
+        for (_, path) in self.paths(store, roster)? {
             let name = std::fs::canonicalize(&path).unwrap_or(absolute(&path)?);
             if !names.insert(name) {
                 return Err("account sync files must have distinct destinations".into());
@@ -165,18 +195,131 @@ impl Plan {
         if let Some(text) = &self.logins.after {
             Logins::from_json(text, 0).map_err(|why| why.why().to_owned())?;
         }
-        Roster::parse_for(
-            store.cli,
-            self.roster
-                .after
-                .as_deref()
-                .ok_or("sync lacks its new roster")?,
-        )?;
+        if self.roster_path.is_some() {
+            Roster::parse_for(
+                store.cli,
+                self.roster
+                    .after
+                    .as_deref()
+                    .ok_or("sync lacks its new roster")?,
+            )?;
+        }
         Ok(())
     }
 }
 
 impl Store {
+    /// State and history share the existing journal without requiring a roster or login file.
+    /// A roster-bound interrupted write still requires its caller-supplied recovery target.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "Torn",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "Edit",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "EventOnly",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateCommit",
+            action = "Write",
+            project = "aterm_agent::harness::accounts::sync_commit::state_commit_tests::state_commit_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateCommit",
+            action = "Retry",
+            project = "aterm_agent::harness::accounts::sync_commit::state_commit_tests::state_commit_transition"
+        )
+    )]
+    pub(super) fn transact_state_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.recover_sync_at(held, None, &mut |_| Ok(()))?;
+        let (mut state, read_note) = self.load(now)?;
+        *note = read_note;
+        if let Ok(id) = self.machine_id(&state.machine) {
+            state.machine = id;
+        }
+        let before = state.clone();
+        let events = edit(&mut state)?;
+        let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
+        let new_state = if state != before || (!events.is_empty() && old_state.is_none()) {
+            drop_stale_sessions(&mut state, now);
+            Some(state.to_json() + "\n")
+        } else {
+            old_state.clone()
+        };
+        let plan = Plan {
+            local_logins: false,
+            roster_path: None,
+            roster_mode: None,
+            state: Image {
+                before: old_state,
+                after: new_state,
+            },
+            logins: Image::default(),
+            ledger: self.ledger_image(&events)?,
+            roster: Image::default(),
+            wake: Some(events.iter().any(Event::wakes)),
+        };
+        self.publish_plan(held, None, plan, &events, || Ok(()))?;
+        Ok(events)
+    }
+
+    /// Publish local bindings, state and history without inventing a roster target.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountLocalCommit",
+            action = "Commit",
+            project = "aterm_agent::harness::accounts::sync_commit::local_commit_tests::local_transition"
+        )
+    )]
+    pub(super) fn transact_local_logins_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.recover_sync_at(held, None, &mut |_| Ok(()))?;
+        self.transact_images_held(
+            held,
+            now,
+            note,
+            Publication {
+                target: None,
+                wake: WakeRule::Events,
+            },
+            edit,
+            || Ok(()),
+        )
+    }
+
     /// Publish account records with the current roster as an unchanged admission image.
     /// A previous admitted commit completes before this edit sees its input snapshots.
     pub(in crate::harness) fn transact_roster_logins_within(
@@ -261,12 +404,12 @@ impl Store {
             now,
             note,
             Publication {
-                target: SyncTarget {
+                target: Some(SyncTarget {
                     path: &target,
                     before: Some(&text),
                     after: &text,
                     mode,
-                },
+                }),
                 wake,
             },
             |state, logins| edit(&raw, state, logins),
@@ -346,22 +489,48 @@ impl Store {
             .map_err(|why| format!("account sync receipt: {why}"))
     }
 
-    /// Resume only at the caller's resolved roster, never a path supplied by the receipt.
+    /// Resume state-only images at fixed store paths, never a receipt-supplied path.
     /// All images must still be admitted before any replacement is attempted.
+    pub(super) fn recover_state_within(
+        &self,
+        ladder: &[std::time::Duration],
+    ) -> Result<bool, String> {
+        self.recover_within(ladder, None, || {})
+    }
+
+    /// Resume a publication at the caller's roster, or state-only fixed store paths.
     pub(in crate::harness) fn recover_sync_within(
         &self,
         ladder: &[std::time::Duration],
         roster: &Path,
     ) -> Result<bool, String> {
+        self.recover_within(ladder, Some(roster), || {})
+    }
+
+    fn recover_within(
+        &self,
+        ladder: &[std::time::Duration],
+        roster: Option<&Path>,
+        after_peek: impl FnOnce(),
+    ) -> Result<bool, String> {
         if self.receipt()?.is_none_or(|receipt| receipt.plan.is_none()) {
             return Ok(false);
         }
+        after_peek();
         let held = self
             .acquire_within(ladder)
             .map_err(|why| why.to_string())?
             .ok_or_else(|| LOCK_HELD.to_owned())?;
-        let (target, _) = super::super::cli::roster_target(roster)?;
-        self.recover_sync_held(&held, &target)
+        // Another writer may have completed the peeked plan or admitted a new scope.
+        let Some(plan) = self.receipt()?.and_then(|receipt| receipt.plan) else {
+            return Ok(false);
+        };
+        if let Some(roster) = roster.filter(|_| plan.roster_path.is_some()) {
+            let (target, _) = super::super::cli::roster_target(roster)?;
+            self.recover_sync_held(&held, &target)
+        } else {
+            self.recover_sync_at(&held, None, &mut |_| Ok(()))
+        }
     }
 
     /// Recover while the caller retains the account writer lock.
@@ -383,8 +552,17 @@ impl Store {
     )]
     fn recover_sync_with(
         &self,
-        _held: &Lock,
+        held: &Lock,
         roster: &Path,
+        progress: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.recover_sync_at(held, Some(roster), progress)
+    }
+
+    fn recover_sync_at(
+        &self,
+        _held: &Lock,
+        roster: Option<&Path>,
         progress: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<bool, String> {
         let Some(mut receipt) = self.receipt()? else {
@@ -393,14 +571,8 @@ impl Store {
         let Some(plan) = &receipt.plan else {
             return Ok(false);
         };
-        let roster = absolute(roster)?;
-        plan.validate(self, &roster)?;
-        let paths = [
-            self.state_file(),
-            self.logins_file(),
-            self.ledger_path(),
-            roster,
-        ];
+        plan.validate(self, roster)?;
+        let paths = plan.paths(self, roster)?;
         let images = [&plan.state, &plan.logins, &plan.ledger, &plan.roster];
         let limits = [
             MAX_STATE_BYTES,
@@ -408,7 +580,9 @@ impl Store {
             MAX_LEDGER,
             MAX_ROSTER_BYTES,
         ];
-        for ((image, path), max) in images.iter().zip(&paths).zip(limits) {
+        for &(index, ref path) in &paths {
+            let image = images[index];
+            let max = limits[index];
             image.check(max)?;
             if !image.admits(&read(path, max)?) {
                 return Err(format!(
@@ -418,7 +592,9 @@ impl Store {
             }
         }
         progress(0)?;
-        for (index, ((image, path), max)) in images.iter().zip(&paths).zip(limits).enumerate() {
+        for &(index, ref path) in &paths {
+            let image = images[index];
+            let max = limits[index];
             let current = read(path, max)?;
             if !image.admits(&current) {
                 return Err(format!(
@@ -477,7 +653,7 @@ impl Store {
             now,
             note,
             Publication {
-                target,
+                target: Some(target),
                 wake: WakeRule::Always,
             },
             edit,
@@ -506,7 +682,6 @@ impl Store {
         advance_renewal_generations(&before.1, &mut logins, &events)?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
-        let old_ledger = read(&self.ledger_path(), MAX_LEDGER)?;
         let new_state = if state != before.0 || (!events.is_empty() && old_state.is_none()) {
             drop_stale_sessions(&mut state, now);
             Some(state.to_json() + "\n")
@@ -518,11 +693,53 @@ impl Store {
         } else {
             old_logins.clone()
         };
-        let new_ledger = if events.is_empty() {
-            old_ledger.clone()
+        let roster = target
+            .as_ref()
+            .map(|target| absolute(target.path))
+            .transpose()?;
+        let plan = Plan {
+            local_logins: target.is_none(),
+            roster_path: roster
+                .as_ref()
+                .map(|path| {
+                    path.to_str()
+                        .map(str::to_owned)
+                        .ok_or("roster path is not UTF-8")
+                })
+                .transpose()?,
+            roster_mode: target.as_ref().and_then(|target| target.mode),
+            state: Image {
+                before: old_state,
+                after: new_state,
+            },
+            logins: Image {
+                before: old_logins,
+                after: new_logins,
+            },
+            ledger: self.ledger_image(&events)?,
+            roster: target
+                .as_ref()
+                .map(|target| Image {
+                    before: target.before.map(str::to_owned),
+                    after: Some(target.after.into()),
+                })
+                .unwrap_or_default(),
+            wake: match wake {
+                WakeRule::Always => None,
+                WakeRule::Events => Some(events.iter().any(Event::wakes)),
+            },
+        };
+        self.publish_plan(held, roster.as_deref(), plan, &events, auxiliary)?;
+        Ok(events)
+    }
+
+    fn ledger_image(&self, events: &[Event]) -> Result<Image, String> {
+        let before = read(&self.ledger_path(), MAX_LEDGER)?;
+        let after = if events.is_empty() {
+            before.clone()
         } else {
-            let mut text = old_ledger.clone().unwrap_or_default();
-            for event in &events {
+            let mut text = before.clone().unwrap_or_default();
+            for event in events {
                 text.push_str(&event.to_json_line());
                 text.push('\n');
             }
@@ -535,32 +752,18 @@ impl Store {
             }
             Some(text)
         };
-        let roster = absolute(target.path)?;
-        let plan = Plan {
-            roster_path: roster.to_str().ok_or("roster path is not UTF-8")?.into(),
-            roster_mode: target.mode,
-            state: Image {
-                before: old_state,
-                after: new_state,
-            },
-            logins: Image {
-                before: old_logins,
-                after: new_logins,
-            },
-            ledger: Image {
-                before: old_ledger,
-                after: new_ledger,
-            },
-            roster: Image {
-                before: target.before.map(str::to_owned),
-                after: Some(target.after.into()),
-            },
-            wake: match wake {
-                WakeRule::Always => None,
-                WakeRule::Events => Some(events.iter().any(Event::wakes)),
-            },
-        };
-        plan.validate(self, &roster)?;
+        Ok(Image { before, after })
+    }
+
+    fn publish_plan(
+        &self,
+        held: &Lock,
+        roster: Option<&Path>,
+        plan: Plan,
+        events: &[Event],
+        auxiliary: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        plan.validate(self, roster)?;
         let changed = [&plan.state, &plan.logins, &plan.ledger, &plan.roster]
             .iter()
             .any(|image| image.before != image.after);
@@ -575,8 +778,10 @@ impl Store {
             return Err("account sync receipt exceeds its limit".into());
         }
         auxiliary()?;
-        if !changed {
-            return Ok(events);
+        // A bounded ledger can retain identical bytes after appending an identical event.
+        // That event still needs its receipt and notification, even without a changed image.
+        if !changed && events.is_empty() {
+            return Ok(());
         }
         // A durable clean receipt precedes the first retained witness: a crash between the
         // witness and pending intent still has a valid clean receipt and no changed authority.
@@ -589,12 +794,14 @@ impl Store {
             self.save_receipt(&clean)?;
         }
         durable_ancestry(&self.dir)?;
-        durable_ancestry(roster.parent().unwrap_or(Path::new(".")))?;
+        if let Some(roster) = roster {
+            durable_ancestry(roster.parent().unwrap_or(Path::new(".")))?;
+        }
         self.retain_witness(&self.dir.join(WITNESS))
             .map_err(|why| why.to_string())?;
         self.save_receipt(&receipt)?;
-        self.recover_sync_held(held, &roster)?;
-        Ok(events)
+        self.recover_sync_at(held, roster, &mut |_| Ok(()))?;
+        Ok(())
     }
 }
 
@@ -630,6 +837,70 @@ fn model_case_selection() {}
 #[allow(dead_code)]
 fn model_renewal_case_selection() {}
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountStateCommit",
+        action = "AnotherProvider",
+        reason = "Select a native provider fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountStateCommit",
+        action = "AnotherOperation",
+        reason = "Select a native state observation or notification fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountStateCommit",
+        action = "AnotherFault",
+        reason = "Select a native publication failure fixture."
+    )
+)]
+#[cfg(any(test, debug_assertions))]
+#[allow(dead_code)]
+fn model_state_case_selection() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLocalCommit",
+        action = "AnotherProvider",
+        reason = "Select a native provider fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLocalCommit",
+        action = "AnotherOperation",
+        reason = "Select a renewal or metadata observation fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLocalCommit",
+        action = "AnotherFault",
+        reason = "Select a publication failure fixture."
+    )
+)]
+#[cfg(any(test, debug_assertions))]
+#[allow(dead_code)]
+fn model_local_case_selection() {}
+
 #[cfg(test)]
 #[path = "accounts_sync_commit_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "accounts_state_commit_tests.rs"]
+mod state_commit_tests;
+
+#[cfg(test)]
+#[path = "accounts_local_commit_tests.rs"]
+mod local_commit_tests;

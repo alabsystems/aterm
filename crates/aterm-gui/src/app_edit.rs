@@ -28,6 +28,8 @@ pub(crate) enum Placement {
     FocusOrNewTab,
     /// Opens a fresh view in a new tab immediately to the right of the caller's tab.
     NewTabAfter { ticket: EditTicketId },
+    /// Opens a fresh view in a new tab at the end of the strip, even beside an open view.
+    NewTab,
 }
 
 /// Maximum number of resolved ticket outcomes retained for late waiters.
@@ -233,6 +235,11 @@ pub(crate) struct EditTickets {
     /// looking at it ([`App::close_edit_view_in_place`]): its ticket does not
     /// hand the window to the caller's tab.
     closing_behind: Option<ViewId>,
+    /// The window a whole-tab close is retiring leaves in
+    /// ([`App::close_active_native_tab_keeping`]): an `edit` view's ticket hands
+    /// that window, and no other, to the caller's tab. A window's own close and
+    /// a restore's discard hand none over.
+    retiring_in: Option<WindowId>,
     /// Test seam: serve `edit` on the headless test App, which production
     /// refuses (`ERR unsupported headless`).
     #[cfg(test)]
@@ -821,6 +828,19 @@ impl App {
             project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
         )
     )]
+    /// Run `retire` with the leaves it retires counted as closing in `wid`, the
+    /// one window an `edit` ticket may then hand to its caller's tab.
+    pub(crate) fn retiring_edit_leaves_in<R>(
+        &mut self,
+        wid: WindowId,
+        retire: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prior = self.native_documents.edits.retiring_in.replace(wid);
+        let retired = retire(self);
+        self.native_documents.edits.retiring_in = prior;
+        retired
+    }
+
     pub(crate) fn edit_view_retired(&mut self, view: ViewId) {
         let ending = self.native_documents.edits.endings.remove(&view);
         if let Some(ticket) = self.native_documents.edits.ticket_of_view(view) {
@@ -891,8 +911,14 @@ impl App {
             self.answer_uri_waiters_of(document, outcome);
         }
         self.settle_uncovered_edit_waiters();
+        // Only the window the edit tab closed in goes to the caller's tab, and only
+        // while it holds that tab: a tab moved to another window takes nothing back.
         if !behind
-            && let Some(ws) = self.windows.get_mut(&entry.window)
+            && let Some(ws) = self
+                .native_documents
+                .edits
+                .retiring_in
+                .and_then(|wid| self.windows.get_mut(&wid))
             && ws.tab_set.get(tab).is_none()
             && ws.tab_set.switch_to(entry.caller_tab)
         {
@@ -2995,6 +3021,88 @@ mod tests {
         assert!(app.view_store.get(edit_view).is_none());
         assert_eq!(active_tab(&app, wid), edit_tab);
         assert_eq!(app.windows[&wid].tab_set.active().unwrap().focus, beside);
+    }
+
+    #[test]
+    fn an_edit_tab_closed_from_behind_leaves_the_person_on_their_tab() {
+        let wid = WindowId(0);
+        for closer in ["close_tab_at", "close_editor_view"] {
+            let mut app = app();
+            let sid = caller(&mut app, wid);
+            let caller_tab = active_tab(&app, wid);
+            let elsewhere = {
+                caller(&mut app, wid);
+                active_tab(&app, wid)
+            };
+            select(&mut app, wid, caller_tab);
+            let g = fixture(&format!("closed-behind-{closer}"), b"base\n");
+            let (ticket, line) = edit(&mut app, sid, request(&g.uri, None));
+            let edit_view = view(&ok(&line));
+            let (_, answer) = wait(&mut app, AwaitKey::Ticket(ticket));
+            let edit_tab = tab_of(&app, wid, edit_view);
+            select(&mut app, wid, elsewhere);
+            if closer == "close_tab_at" {
+                let index = app.windows[&wid]
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == edit_tab)
+                    .unwrap();
+                assert!(!app.close_tab_at(wid, index));
+            } else {
+                app.close_editor_view(edit_view).unwrap();
+            }
+            assert!(app.view_store.get(edit_view).is_none(), "{closer}");
+            assert_eq!(outcome(&answer).result, EditResult::Closed, "{closer}");
+            assert_eq!(
+                active_tab(&app, wid),
+                elsewhere,
+                "{closer}: the person stays put; the caller's tab stays behind"
+            );
+            assert_eq!(app.structural_invariant_violation(), None, "{closer}");
+        }
+    }
+
+    #[test]
+    fn an_edit_tab_moved_to_another_window_closes_without_turning_its_old_window() {
+        let wid = WindowId(0);
+        for closer in ["close_tab_at", "close_editor_view"] {
+            let mut app = app();
+            let sid = caller(&mut app, wid);
+            let caller_tab = active_tab(&app, wid);
+            let elsewhere = {
+                caller(&mut app, wid);
+                active_tab(&app, wid)
+            };
+            select(&mut app, wid, caller_tab);
+            let g = fixture(&format!("moved-away-{closer}"), b"base\n");
+            let (ticket, line) = edit(&mut app, sid, request(&g.uri, None));
+            let edit_view = view(&ok(&line));
+            let (_, answer) = wait(&mut app, AwaitKey::Ticket(ticket));
+            assert_eq!(
+                app.windows[&wid].tab_set.active().map(|tab| tab.focus),
+                Some(edit_view),
+                "PRECONDITION: the edit tab in front"
+            );
+            let moved = app
+                .detach_active_tab_logical()
+                .expect("the edit tab moves to a window of its own");
+            select(&mut app, wid, elsewhere);
+
+            if closer == "close_tab_at" {
+                let _ = app.close_tab_at(moved, 0);
+            } else {
+                app.close_editor_view(edit_view).unwrap();
+            }
+            assert!(app.view_store.get(edit_view).is_none(), "{closer}");
+            assert_eq!(outcome(&answer).result, EditResult::Closed, "{closer}");
+            assert_eq!(
+                active_tab(&app, wid),
+                elsewhere,
+                "{closer}: the old window stays on the tab the person left it on"
+            );
+            assert_eq!(app.structural_invariant_violation(), None, "{closer}");
+        }
     }
 
     #[test]

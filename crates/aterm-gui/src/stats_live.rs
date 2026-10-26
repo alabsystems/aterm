@@ -6,13 +6,15 @@
 //! down the strip's rows to the % column (the value now) and a dot on the header line. While
 //! readings keep coming the dot beats once at each reading, a ring that widens and fades; when
 //! they stop for [`STALE_PERIODS`] cadences the line and the dot turn grey and hollow and nothing
-//! moves, so a frozen deck never looks live. Between readings the strips glide left with the wall
-//! clock: the open column grows from the right end and the oldest slides out at the left, so time
-//! visibly flows right to left (a Folded strip, the form a window draws unless Full is chosen,
-//! glides 1 pt a second: `stats_plan::FOLD_PITCH`). And the header over the strip carries a time
-//! scale (the planner's [`crate::stats_plan::RulerTick`]s).
+//! moves, so a frozen deck never looks live. The strips move left with time, so it visibly flows
+//! right to left: a Folded strip (the form a window draws unless Full is chosen) holds a
+//! reading's second in each cell (`stats_plan::FOLD_SLOT_S`, on the snapshot's [`SlotGrid`]), and
+//! each reading that opens a new slot slides it one whole cell left over the frames after it
+//! ([`Flow::Slide`]); a Full strip's ten minutes glide with the wall clock, the open column
+//! growing from the right end and the oldest sliding out at the left ([`Flow::Glide`]). And the
+//! header over the strip carries a time scale (the planner's [`crate::stats_plan::RulerTick`]s).
 //!
-//! The glide and the beat are [`MotionEffect::DeckLive`]: they run only in a focused, unoccluded
+//! The slide, the glide and the beat are [`MotionEffect::DeckLive`]: they run only in a focused, unoccluded
 //! window whose motion policy animates (never under Reduce Motion or the load-shed latch), and
 //! the beat ([`SeriousEffect::DeckBeat`]) only outside serious mode and while the deck card is
 //! presented alone (no lens or card folded over it). Without motion the columns stand in their
@@ -20,14 +22,16 @@
 //!
 //! Cost: every live frame falls on one grid, [`FRAME`] apart from the moment a reading lands,
 //! so a window presents at most four a second: the beat draws [`BEAT_FRAMES`] of them after each
-//! reading, and the glide moves on the grid's frames only when it has run a
-//! [`GLIDE_QUANTUM_PX`] and its open column has not ended. Such a frame re-rasters only the deck
+//! reading, the slide at most [`SLIDE_FRAMES`] (the same frames), and the glide moves on the
+//! grid's frames only when it has run a [`GLIDE_QUANTUM_PX`] and its open column has not ended.
+//! Every frame draws each cell edge on a whole device pixel. Such a frame re-rasters only the deck
 //! card's [`LiveLayer`] rects that changed (`App::splice_stats_deck`), never the whole card, from
 //! one layout that reads no words and plans no header line (`stats_deck::DeckStill`).
 
 use std::time::{Duration, Instant};
 
 use crate::motion::{MotionEffect, SeriousEffect};
+use aterm_vitals::SlotGrid;
 
 /// Cadences a reading may be missing for before the marker says the strips stopped (the gap
 /// rule's three, Stats Deck v2 §5.4).
@@ -45,16 +49,22 @@ pub(crate) const FRAME: Duration = Duration::from_millis(250);
 /// grid (750 ms).
 pub(crate) const BEAT_FRAMES: u32 = 3;
 
-/// How far the strips glide between two frames, device px: a whole pixel, so every frame
-/// draws each cell edge sharp and each move is one crisp step left (a quarter pixel, as first
-/// built, smeared the edges and moved too little to be seen; §11 of the design).
+/// How far the strips glide between two frames, device px: a whole pixel, so each move is one
+/// crisp step left (a quarter pixel, as first built, moved too little to be seen; §11 of the
+/// design). The painter draws every shift on a whole pixel ([`column_xs`]).
 pub(crate) const GLIDE_QUANTUM_PX: f64 = 1.0;
 
 /// The glide's shortest frame period: one frame of the grid.
 pub(crate) const GLIDE_STEP_MIN: Duration = FRAME;
 
-/// The glide's longest frame period.
-pub(crate) const GLIDE_STEP_MAX: Duration = Duration::from_secs(2);
+/// The glide's longest frame period: past the slowest strip's time to run a pixel (a Full slim
+/// strip at 1x, 7.5 s), so every step moves a whole pixel and none draws nothing new (at 2 s, a
+/// Full strip's steps were two thirds of a pixel; §12 of the design).
+pub(crate) const GLIDE_STEP_MAX: Duration = Duration::from_secs(10);
+
+/// The most frames of the grid one slide takes ([`slide_frames`]): the reading's own and the
+/// three after it, so it has come in 750 ms after the reading, on the beat's frames.
+pub(crate) const SLIDE_FRAMES: u32 = 4;
 
 /// The now marker's line sits this far right of the strip's last cell, pt.
 pub(crate) const LINE_DX: f64 = 1.5;
@@ -77,9 +87,12 @@ pub(crate) const STALE_DASH: f64 = 1.5;
 /// What the deck's live edge shows in one frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DeckLive {
-    /// The frame's wall clock, unix ms (quantized to the glide's step), while the strips glide;
-    /// `None` stands every column in its slot.
+    /// The frame's wall clock, unix ms (quantized to the glide's step), while Full's strips glide
+    /// ([`Flow::Glide`]); `None` stands every column in its slot.
     pub(crate) glide_ms: Option<i64>,
+    /// How far a Folded strip's slide has brought its newest slot in, `0..1` of a pitch
+    /// ([`Flow::Slide`]); `None` once it has come in, or with no slide.
+    pub(crate) slide: Option<f32>,
     /// How far through the newest reading's beat, `0..1` ([`beat_phase`] of its frame); `None`
     /// rings nothing.
     pub(crate) beat: Option<f32>,
@@ -92,6 +105,7 @@ impl DeckLive {
     /// default).
     pub(crate) const STILL: Self = Self {
         glide_ms: None,
+        slide: None,
         beat: None,
         fresh: true,
     };
@@ -99,6 +113,7 @@ impl DeckLive {
     /// Readings stopped (or never came).
     pub(crate) const STALE: Self = Self {
         glide_ms: None,
+        slide: None,
         beat: None,
         fresh: false,
     };
@@ -108,6 +123,7 @@ impl DeckLive {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.glide_ms.hash(&mut h);
+        self.slide.map(f32::to_bits).hash(&mut h);
         self.beat.map(f32::to_bits).hash(&mut h);
         self.fresh.hash(&mut h);
         h.finish() | 1
@@ -117,7 +133,8 @@ impl DeckLive {
 /// Which part of the deck card a live rect holds: what moves it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LiveLayer {
-    /// A strip's columns and gridlines: they move with [`DeckLive::glide_ms`].
+    /// A strip's columns and gridlines: they move with [`DeckLive::glide_ms`] and
+    /// [`DeckLive::slide`].
     Glide,
     /// The now marker and its beat: they move with [`DeckLive::beat`] and
     /// [`DeckLive::fresh`].
@@ -128,7 +145,7 @@ impl LiveLayer {
     /// Whether going from `was` to `now` changes what this layer draws.
     pub(crate) fn moved(self, was: &DeckLive, now: &DeckLive) -> bool {
         match self {
-            Self::Glide => was.glide_ms != now.glide_ms,
+            Self::Glide => was.glide_ms != now.glide_ms || was.slide != now.slide,
             Self::Marker => was.beat != now.beat || was.fresh != now.fresh,
         }
     }
@@ -154,11 +171,12 @@ pub(crate) fn open_frac(at_ms: i64, now_ms: i64, period_s: u32) -> f64 {
 /// last): its left edge in device px, or `None` when it lies wholly outside the strip. The strip
 /// starts at `x0`, its cells are `cell` wide on a `pitch`, and it ends at the open column's slot's
 /// right edge, which is now. At `f = 1` every column stands in its slot and the first is outside;
-/// below 1 each sits `(1 − f)` pitches right of its slot, so the open column shows only the part
-/// of its period that has run, and the strip's clip cuts what passes its ends.
+/// below 1 each sits `(1 − f)` pitches right of its slot, rounded to a whole device pixel so every
+/// cell edge is drawn sharp, so the open column shows only the part of its period that has run,
+/// and the strip's clip cuts what passes its ends.
 pub(crate) fn column_xs(x0: f32, pitch: f32, cell: f32, n: usize, f: f64) -> Vec<Option<f32>> {
     let right = x0 + n.saturating_sub(1) as f32 * pitch + cell;
-    let shift = (1.0 - f.clamp(0.0, 1.0)) as f32 * pitch;
+    let shift = ((1.0 - f.clamp(0.0, 1.0)) as f32 * pitch).round();
     (0..=n)
         .map(|k| {
             let x = x0 + (k as f32 - 1.0) * pitch + shift;
@@ -200,6 +218,24 @@ pub(crate) fn stale_after(period_now: Duration, period_then: Option<Duration>) -
     (period * STALE_PERIODS).max(STALE_FLOOR)
 }
 
+/// The frames a slide of `pitch_px` device px takes, at most [`SLIDE_FRAMES`]: no more than it
+/// has whole pixels, so each frame moves the strip at least one, and as many as that allows up to
+/// four, so each frame moves a quarter to a third of a pitch before rounding to whole pixels and
+/// always under half: the eye reads every move as leftward even over a strip of one heat step
+/// (a move of half a pitch or more reads either way, or backward).
+pub(crate) fn slide_frames(pitch_px: f64) -> u32 {
+    if !(pitch_px.is_finite() && pitch_px >= 1.0) {
+        return 1;
+    }
+    (pitch_px.floor() as u32).clamp(1, SLIDE_FRAMES)
+}
+
+/// How far a slide of `frames` frames has brought the newest slot in at frame `k` of its
+/// reading's grid (0, the reading's own): `(k + 1) / frames`, or `None` once it has come in.
+pub(crate) fn slide_phase(k: u32, frames: u32) -> Option<f32> {
+    (k.saturating_add(1) < frames).then(|| (k + 1) as f32 / frames as f32)
+}
+
 /// The glide's frame period for strips moving `px_per_s` device px a second: the time to move
 /// [`GLIDE_QUANTUM_PX`], held to [`GLIDE_STEP_MIN`]..=[`GLIDE_STEP_MAX`].
 pub(crate) fn glide_step(px_per_s: f64) -> Duration {
@@ -209,6 +245,22 @@ pub(crate) fn glide_step(px_per_s: f64) -> Duration {
     Duration::from_secs_f64(GLIDE_QUANTUM_PX / px_per_s).clamp(GLIDE_STEP_MIN, GLIDE_STEP_MAX)
 }
 
+/// How a window's strips move with time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Flow {
+    /// Nothing moves: the card draws no strip, or has not been laid out yet.
+    None,
+    /// Full's strips glide with the wall clock, a whole device pixel each `step` ([`glide_step`]),
+    /// and hold at `end_ms`, when the held snapshot's open column ends on the wall clock: past it
+    /// every column stands in its slot until a reading opens the next ([`open_frac`] is 1), so
+    /// the glide asks no frame that would draw nothing new. `None`: no bound.
+    Glide { step: Duration, end_ms: Option<i64> },
+    /// The held snapshot's reading opened a new second of a Folded strip, which slides one pitch
+    /// left over `frames` frames of the grid ([`slide_frames`]); 0, it opened none and nothing
+    /// moves until the next reading.
+    Slide { frames: u32 },
+}
+
 /// What decides one window's live edge at a moment.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LiveFacts {
@@ -216,16 +268,12 @@ pub(crate) struct LiveFacts {
     pub(crate) landed: Option<Instant>,
     /// How long it speaks for ([`stale_after`]).
     pub(crate) stale_after: Duration,
-    /// The strips may glide and the dot may beat ([`MotionEffect::DeckLive`]).
+    /// The strips may move and the dot may beat ([`MotionEffect::DeckLive`]).
     pub(crate) motion: bool,
     /// The dot may beat ([`SeriousEffect::DeckBeat`], and the card presented alone).
     pub(crate) beat: bool,
-    /// The glide's frame period ([`glide_step`]).
-    pub(crate) step: Duration,
-    /// When the held snapshot's open column ends on the wall clock, unix ms: past it every
-    /// column stands in its slot until a reading opens the next ([`open_frac`] is 1), so the
-    /// glide holds there and asks no frame that would draw nothing new. `None`: no bound.
-    pub(crate) glide_end_ms: Option<i64>,
+    /// How the strips move.
+    pub(crate) flow: Flow,
 }
 
 impl LiveFacts {
@@ -253,13 +301,19 @@ impl LiveFacts {
             return DeckLive::STILL;
         }
         let (k, into) = Self::frame_of(landed, now);
-        let frame_ms = now_ms - i64::try_from(into.as_millis()).unwrap_or(i64::MAX);
-        let step = i64::try_from(self.step.as_millis())
-            .unwrap_or(i64::MAX)
-            .max(1);
-        let glide = frame_ms.div_euclid(step) * step;
+        let (glide_ms, slide) = match self.flow {
+            Flow::None => (None, None),
+            Flow::Glide { step, end_ms } => {
+                let frame_ms = now_ms - i64::try_from(into.as_millis()).unwrap_or(i64::MAX);
+                let step = i64::try_from(step.as_millis()).unwrap_or(i64::MAX).max(1);
+                let glide = frame_ms.div_euclid(step) * step;
+                (Some(end_ms.map_or(glide, |end| glide.min(end))), None)
+            }
+            Flow::Slide { frames } => (None, slide_phase(k, frames)),
+        };
         DeckLive {
-            glide_ms: Some(self.glide_end_ms.map_or(glide, |end| glide.min(end))),
+            glide_ms,
+            slide,
             beat: beat_phase(k).filter(|_| self.beat),
             fresh: true,
         }
@@ -296,6 +350,13 @@ impl LiveFacts {
     }
 }
 
+/// Whether a reading at `at_ms` opened a slot of `grid` (the snapshot's, [`SlotGrid`]) that the
+/// reading before it, at `prev_ms`, had not: a Folded strip then slides a pitch left. The first
+/// reading opens none (nothing was drawn before it to slide from).
+pub(crate) fn opened_slot(prev_ms: Option<i64>, at_ms: i64, grid: SlotGrid) -> bool {
+    prev_ms.is_some_and(|prev| grid.opened(prev, at_ms) > 0)
+}
+
 /// The wall clock, unix ms; 0 where unreadable (the glide then stands at the reading's own
 /// moment: [`open_frac`] counts a clock behind the reading as the reading's).
 fn now_unix_ms() -> i64 {
@@ -328,17 +389,40 @@ impl crate::App {
             && ws.settings_card.is_none()
             && ws.badge_card.is_none();
         let beat = alone && self.serious_mode_policy().allows(SeriousEffect::DeckBeat);
-        let (px_per_s, glide_period_s) = ws.deck_glide.get();
+        let (px_per_s, glide_period_s, slide_pitch_px) = ws.deck_glide.get();
         let snap = self.vitals.snapshot.as_ref();
+        let flow = if slide_pitch_px > 0.0 {
+            let opened = snap.is_some_and(|snap| {
+                opened_slot(
+                    self.vitals.landed_prev_at_ms,
+                    snap.at_unix_ms,
+                    snap.slot_grid,
+                )
+            });
+            Flow::Slide {
+                frames: if opened {
+                    slide_frames(slide_pitch_px)
+                } else {
+                    0
+                },
+            }
+        } else if px_per_s > 0.0 {
+            Flow::Glide {
+                step: glide_step(px_per_s),
+                end_ms: snap.filter(|_| glide_period_s > 0).map(|snap| {
+                    open_start_ms(snap.at_unix_ms, glide_period_s)
+                        + i64::from(glide_period_s) * 1000
+                }),
+            }
+        } else {
+            Flow::None
+        };
         Some(LiveFacts {
             landed: snap.and(self.vitals.landed_at),
             stale_after: stale_after(period, self.vitals.landed_period),
             motion,
             beat,
-            step: glide_step(px_per_s),
-            glide_end_ms: snap.filter(|_| glide_period_s > 0).map(|snap| {
-                open_start_ms(snap.at_unix_ms, glide_period_s) + i64::from(glide_period_s) * 1000
-            }),
+            flow,
         })
     }
 

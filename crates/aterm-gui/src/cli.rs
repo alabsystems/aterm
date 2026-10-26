@@ -150,7 +150,7 @@ const HELP_HEAD: &str = concat!(
     shell_flag_help!(),
     "        --scale <f>                Force the render scale (font + padding); headless, it\n",
     "                                   sets the `image` capture DPI (2 = 2x Retina).\n",
-    "        --gpu                      GPU rendering, the default (Metal/GL/DX12; falls back\n",
+    "        --gpu                      GPU rendering, the default (Metal/GL/D3D11; falls back\n",
     "                                   to CPU). [config: gpu]\n",
     "        --cpu                      CPU rendering (the last of --cpu/--gpu wins).\n",
     "        --containment <mode>       user (default) | safety | containment; an invalid\n",

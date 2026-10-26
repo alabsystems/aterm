@@ -1214,6 +1214,7 @@ fn startup_review_keeps_previous_permission_policy_held_and_allows_only_check() 
 #[test]
 fn startup_review_focus_return_does_not_charge_time_without_an_inactive_tick() {
     let mut app = App::headless_for_test();
+    app.user_input_recent = |_| true;
     let (wid, _, _) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     let (send, receive) = mpsc::channel();
@@ -1500,11 +1501,55 @@ fn startup_review_apply_hands_the_complete_draft_and_credentials_once() {
     app.resolve_system_state_apply();
 }
 
+/// The first-launch countdown advances only while a person is at this screen: a keyboard,
+/// mouse or trackpad used within the last minute, and the screen neither locked nor switched
+/// away. A window that opened with nobody there (idle ten minutes, or locked) never applies by
+/// expiry; a person who used the trackpad five seconds ago gets the automatic Apply. A page with
+/// no review to count down reads neither.
+#[test]
+fn the_countdown_advances_only_while_a_person_is_at_the_screen() {
+    let expires = |input: fn(Duration) -> bool, away: fn() -> bool| {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+        app.user_input_recent = input;
+        app.screen_away = away;
+        let _ = page(&mut app);
+        let (send, receive) = mpsc::channel();
+        app.attach_system_state_offer(Request::new(Plan::default(), send));
+        assert!(app.commit_glassless_native_frame(wid));
+        let start = Instant::now();
+        for tick in 0..=31 {
+            app.tick_system_state(start + Duration::from_secs(tick));
+        }
+        receive.try_recv().is_ok()
+    };
+    assert!(expires(|within| within >= Duration::from_secs(5), || false));
+    assert!(!expires(
+        |within| within >= Duration::from_secs(10 * 60),
+        || false
+    ));
+    assert!(!expires(|_| true, || true));
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    app.user_input_recent = |_| unreachable!("no review: no input reading");
+    app.screen_away = || unreachable!("no review: no screen reading");
+    let _ = page(&mut app);
+    assert!(app.commit_glassless_native_frame(wid));
+    let start = Instant::now();
+    for tick in 0..=2 {
+        app.tick_system_state(start + Duration::from_secs(tick));
+    }
+}
+
 #[test]
 fn the_first_run_offer_applies_once_presented_and_waits_for_its_run() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    app.user_input_recent = |_| true;
     let (_, instance, view) = page(&mut app);
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
@@ -4274,6 +4319,7 @@ fn idle_ticks_keep_the_shown_frame() {
     window.rows = 60;
     window.cols = 120;
     window.os_window_for_test = true;
+    app.user_input_recent = |_| true;
     assert!(app.open_system_state_tab());
     let (_, view) = app.active_native_view(wid).unwrap();
     let (send, receive) = mpsc::channel();

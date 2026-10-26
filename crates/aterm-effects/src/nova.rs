@@ -328,9 +328,11 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     ];
     let inv_bands = 1.0 / bands as f32;
     let mut prev_y1f = 0.0f32;
-    for i in 0..bands {
+    let mut i = 0;
+    while i < bands {
+        i += 1;
         let y0f = prev_y1f;
-        let y1f = (extent * (i + 1) as f32 * inv_bands).round();
+        let y1f = (extent * i as f32 * inv_bands).round();
         prev_y1f = y1f;
         if y1f <= y0f {
             continue;
@@ -339,7 +341,10 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
         let y1 = (top + y1f) as i32;
         let dy = (y0f + y1f) * 0.5 - re;
         let dy2 = dy * dy;
-        for (ro2, ri2, color, cov) in rings {
+        let mut ri = 0;
+        while ri < rings.len() {
+            let (ro2, ri2, color, cov) = rings[ri];
+            ri += 1;
             let d2_o = ro2 - dy2;
             if d2_o <= 0.0 {
                 continue;
@@ -425,7 +430,8 @@ fn emit_rays(
     let rot_turn = f32::from(env.feats.rot) * 0.0625;
     let nrays_f = nrays as f32;
     let mut emitted_samples = 0usize;
-    for k in 0..nrays {
+    let mut k = 0;
+    while k < nrays {
         let (dy, dx) = if quasar {
             // Twin vertical polar jets.
             if k == 0 { (-1.0, 0.0) } else { (1.0, 0.0) }
@@ -435,21 +441,24 @@ fn emit_rays(
             let ang = std::f32::consts::TAU * (rot_turn + k as f32 / nrays_f);
             crate::supernova::sin_cos_f32(ang)
         };
+        k += 1;
         let major_x = dx.abs() >= dy.abs();
         let maj = dx.abs().max(dy.abs());
         let lm = len * maj;
         let inv_maj = 1.0 / maj;
         let (ux, uy) = (dx * inv_maj, dy * inv_maj);
         let mut prev_m1 = 0.0f32;
-        for j in 0..samples {
+        let mut j = 0;
+        while j < samples {
             let m0 = prev_m1;
             let m1 = (lm * (j + 1) as f32 * inv_samples).round();
             prev_m1 = m1;
+            let sf = (j as f32 + 0.5) * inv_samples;
+            j += 1;
             if m1 <= m0 {
                 continue;
             }
             let quads_before = sink.out.len();
-            let sf = (j as f32 + 0.5) * inv_samples;
             let th = 2.5 - 1.5 * sf;
             let cov = (fade * (1.0 - 0.65 * sf) * env.intensity).clamp(0.0, 1.0);
             let mm = 0.5 * (m0 + m1);
@@ -496,6 +505,8 @@ fn emit_rays(
 
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     const INV_FLASH_SPAN_MS: f32 = 1.0 / (FLASH_END_MS - DIP_MS) as f32;
+    const SEG_SPANS: [(f32, f32); 2] = [(0.0, 0.45), (0.45, 1.0)];
+    const SIDES: [f32; 2] = [-1.0, 1.0];
     let e = (t_ms.saturating_sub(DIP_MS)) as f32 * INV_FLASH_SPAN_MS;
     let envl = crate::supernova::sin_cos_f32(std::f32::consts::PI * e.clamp(0.0, 1.0)).0;
     let ch = env.cell_h as f32;
@@ -504,7 +515,10 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let beam = 0.30 * ch;
     let env_int = envl * env.intensity;
     let r_minus_beam = r - beam;
-    for (f0, f1) in [(0.0f32, 0.45f32), (0.45, 1.0)] {
+    let mut si = 0;
+    while si < SEG_SPANS.len() {
+        let (f0, f1) = SEG_SPANS[si];
+        si += 1;
         let q = 1.0 - (f0 + f1) * 0.5;
         let hw = 0.24 * ch * q * q + 0.8;
         let cov = env_int * (0.10 + 0.60 * q);
@@ -513,7 +527,10 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
         let x1 = cxf + hw;
         let off0 = beam + r_minus_beam * f0;
         let off1 = beam + r_minus_beam * f1;
-        for side in [-1.0f32, 1.0] {
+        let mut s_idx = 0;
+        while s_idx < SIDES.len() {
+            let side = SIDES[s_idx];
+            s_idx += 1;
             let ya = cyf + side * off0;
             let yb = cyf + side * off1;
             let (y0, y1) = if ya <= yb { (ya, yb) } else { (yb, ya) };
@@ -524,7 +541,10 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let cov = env_int * 0.85;
     let x0 = cxf - 1.05 * ch;
     let x1 = cxf + 1.05 * ch;
-    for side in [-1.0f32, 1.0] {
+    let mut s_idx = 0;
+    while s_idx < SIDES.len() {
+        let side = SIDES[s_idx];
+        s_idx += 1;
         let yb = cyf + side * beam;
         let (y0, y1) = if cyf <= yb { (cyf, yb) } else { (yb, cyf) };
         sink.chord(x0, x1, y0 as i32, y1 as i32, color, cov);
@@ -577,11 +597,14 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
     const INV_65535: f32 = 1.0 / 65535.0;
     const INV_255: f32 = 1.0 / 255.0;
-    for m in 0..u32::from(env.feats.debris) {
+    let debris_n = u64::from(env.feats.debris);
+    let mut m = 0u64;
+    while m < debris_n {
         if out.len() >= cap {
             break;
         }
-        let s = mix(env.seed ^ u64::from(m).wrapping_mul(0xA24B_AED4_963E_E407));
+        let s = mix(env.seed ^ m.wrapping_mul(0xA24B_AED4_963E_E407));
+        m += 1;
         let phase_idx = ((s >> 33) & 1) as usize;
         if alpha_pair[phase_idx] <= 0.01 {
             continue;
@@ -651,27 +674,32 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
     let mut emitted = 0usize;
-    for row in row0..=row1 {
+    let mut row = row0;
+    while row <= row1 {
         let ccy = (row * env.cell_h + half_ch) as f32;
         let dy = ccy - cyf;
         let dy2 = dy * dy;
+        let row_u = row as u16;
+        row += 1;
         if dy2 > max_d2 {
             continue;
         }
-        let row_u = row as u16;
-        for col in col0..=col1 {
+        let mut col = col0;
+        while col <= col1 {
             if emitted >= cap {
                 return;
             }
             let ccx = (col * env.cell_w + half_cw) as f32;
             let dx = ccx - cxf;
             let d2 = dx * dx + dy2;
+            let col_u = col as u16;
+            col += 1;
             if d2 < min_d2 || d2 > max_d2 {
                 continue;
             }
             out.push(WordDecoration {
                 row: row_u,
-                col: col as u16,
+                col: col_u,
                 dx: 0,
                 dy: 0,
                 glyph: DecoGlyph::RingArc,

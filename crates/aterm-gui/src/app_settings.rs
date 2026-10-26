@@ -396,6 +396,21 @@ impl App {
         }
     }
 
+    /// Ask a frame of every window that holds a native leaf's raster after a chrome font
+    /// landed: the leaves drawn without it are stale under their stamp
+    /// ([`crate::tray_raster::chrome_coverage_epoch`]) and draw again, the rest are kept.
+    pub(crate) fn redraw_native_leaves_for_landed_fonts(&self) {
+        for window in self.windows.values() {
+            if window
+                .leaf_render_cache
+                .values()
+                .any(|cache| cache.native.is_some())
+            {
+                window.request_redraw();
+            }
+        }
+    }
+
     /// Repaint every window whose Settings specimen was waiting on the font worker.
     pub(crate) fn repaint_settings_specimens(&mut self) {
         let phase_ms = u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1085,34 +1100,8 @@ impl App {
         }
         let mut removed = false;
         for (wid, tab, view) in targets {
-            let focused = self.windows.get_mut(&wid).is_some_and(|ws| {
-                if !ws.tab_set.switch_to(tab) {
-                    return false;
-                }
-                ws.tab_set
-                    .active_mut()
-                    .is_some_and(|active| active.set_focus(view))
-            });
-            if !focused {
-                continue;
-            }
-            self.resync_active_or_window(wid);
-            let split = self
-                .windows
-                .get(&wid)
-                .and_then(|ws| ws.tab_set.active())
-                .is_some_and(|active| active.root.len() > 1);
-            let result = if split {
-                self.close_focused_mixed_leaf(wid)
-            } else {
-                self.close_active_native_tab(wid)
-            };
-            match result {
-                Ok(()) => removed = true,
-                Err(_) => {
-                    self.sync_window(wid);
-                }
-            }
+            // A Settings tab behind the person's front tab closes without taking the front.
+            removed |= self.close_view_keeping_front(wid, tab, view).is_ok();
         }
         removed
     }
@@ -1378,9 +1367,10 @@ impl App {
                 if segment.solo {
                     return None;
                 }
+                let tab = ws.tab_set.tab_at(index)?;
                 Some(crate::a11y_tree::GridTab {
                     index,
-                    id: ws.tab_set.tab_at(index)?.id.get(),
+                    id: tab.id.get(),
                     title: ws.strip_titles_scratch.get(index).map_or_else(
                         || "aterm".to_string(),
                         |label| crate::chrome_label::capped_label(label).into_owned(),
@@ -1388,10 +1378,13 @@ impl App {
                     selected: active == Some(index),
                     start_col: segment.start_col,
                     end_col: segment.end_col,
-                    theme: ws
-                        .layouts
-                        .get(index)
-                        .and_then(|tree| self.session_choice(tree.focus()))
+                    // By the tab's own focused leaf: `layouts` counts only all-terminal tabs.
+                    theme: self
+                        .view_store
+                        .get(tab.focus)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        .and_then(|session| self.session_choice(session))
                         .map(|choice| choice.selector),
                 })
             })
@@ -4306,6 +4299,51 @@ mod tests {
         assert!(
             !app.windows[&wid].a11y_active,
             "the client detached; a re-attach re-fires InitialTreeRequested"
+        );
+    }
+
+    /// Each tab of the in-grid strip announces its own terminal's theme, though Settings and
+    /// mixed tabs have no all-terminal projection to count by.
+    #[cfg(a11y_tree)]
+    #[test]
+    fn the_tab_strip_names_each_tab_s_own_theme_past_native_and_mixed_tabs() {
+        use crate::session_theme::{SessionTheme, SessionThemeOrigin};
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (mixed, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let last = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(last));
+        let theme = |selector: &str| {
+            Some(SessionTheme {
+                selector: selector.to_string(),
+                origin: SessionThemeOrigin::Ctl,
+            })
+        };
+        app.set_session_theme(mixed, theme("Nord"));
+        app.set_session_theme(last, theme("Dracula"));
+        assert_eq!(
+            app.windows[&wid].layouts.len(),
+            2,
+            "fixture: only the first and last tabs are all-terminal"
+        );
+        app.splice_tab_strip_with(wid, 1);
+
+        let themes: Vec<_> = app
+            .grid_a11y_tabs(wid)
+            .into_iter()
+            .map(|tab| (tab.index, tab.theme))
+            .collect();
+        assert_eq!(
+            themes,
+            vec![
+                (0, None),
+                (1, Some("Nord".to_string())),
+                (2, Some("Dracula".to_string())),
+            ],
+            "the mixed tab reads its focused terminal's theme and the last tab its own"
         );
     }
 

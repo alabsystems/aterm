@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::font_file;
-use crate::{FaceRef, FaceTarget};
+use crate::{FaceRef, FaceTarget, NamedInstance};
 
 /// Production limits for one font-environment generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +73,8 @@ impl Stats {
 pub struct AdmittedFont {
     pub path: String,
     pub index: u32,
+    /// The named instance the request named ([`FaceRef::instance`]).
+    pub instance: Option<NamedInstance>,
     pub bytes: Arc<Vec<u8>>,
 }
 
@@ -81,27 +83,29 @@ impl AdmittedFont {
     #[inline]
     #[must_use]
     pub fn face(&self) -> FaceRef {
-        FaceRef::new(self.path.clone(), self.index)
+        FaceRef::new(self.path.clone(), self.index).with_instance(self.instance.clone())
     }
 }
 
 /// Which face of a resolved file a request takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FaceChoice {
-    /// The face at this index: a `name`-table match, or a compiled-in face.
-    At(u32),
+    /// The face at this index, at the named instance the request named: a
+    /// `name`-table match, or a compiled-in face.
+    At(u32, Option<NamedInstance>),
     /// The face nearest this style, chosen from the admitted bytes: a file
     /// found by its file name or named by path (`crate::best_face`).
     Nearest(FaceTarget),
 }
 
 impl FaceChoice {
-    fn index(self, bytes: &[u8]) -> u32 {
+    fn face(self, bytes: &[u8]) -> (u32, Option<NamedInstance>) {
         match self {
-            Self::At(index) => index,
-            Self::Nearest(target) => {
-                crate::best_face(bytes, None, target).map_or(0, |(_, index)| index)
-            }
+            Self::At(index, instance) => (index, instance),
+            Self::Nearest(target) => (
+                crate::best_face(bytes, None, target).map_or(0, |(_, index)| index),
+                None,
+            ),
         }
     }
 }
@@ -267,7 +271,7 @@ impl Catalog {
             } else if crate::is_generic_monospace_family(trimmed) {
                 results[index] = Some(
                     crate::default_primary_identity()
-                        .map(|face| (PathBuf::from(face.path), FaceChoice::At(face.index)))
+                        .map(|face| (PathBuf::from(face.path), FaceChoice::At(face.index, None)))
                         .ok_or_else(|| format!("{trimmed:?}: no default face loads")),
                 );
             } else if trimmed.contains(['/', '\\']) {
@@ -275,7 +279,7 @@ impl Catalog {
             } else if crate::bundled::is_identity(trimmed)
                 && let Some((id, _)) = crate::bundled::face_for_family(trimmed)
             {
-                results[index] = Some(Ok((PathBuf::from(id), FaceChoice::At(0))));
+                results[index] = Some(Ok((PathBuf::from(id), FaceChoice::At(0, None))));
             } else {
                 let normalized = normalize_family(trimmed);
                 if normalized.is_empty() {
@@ -311,15 +315,20 @@ impl Catalog {
             .map(|(want, _)| want.clone())
             .collect();
 
-        let mut settling: HashMap<Want, ((u32, bool), PathBuf, u32)> = HashMap::new();
+        type Settling = ((u32, bool), PathBuf, u32, Option<NamedInstance>);
+        let mut settling: HashMap<Want, Settling> = HashMap::new();
         let settle =
             |want: &Want,
              path: &Path,
              face: u32,
+             instance: &Option<NamedInstance>,
              results: &mut Vec<Option<Result<(PathBuf, FaceChoice), String>>>| {
                 if let Some(indexes) = wants.get(want) {
                     for &index in indexes {
-                        results[index] = Some(Ok((path.to_path_buf(), FaceChoice::At(face))));
+                        results[index] = Some(Ok((
+                            path.to_path_buf(),
+                            FaceChoice::At(face, instance.clone()),
+                        )));
                     }
                 }
             };
@@ -331,7 +340,7 @@ impl Catalog {
                 if unresolved.is_empty()
                     && !settling
                         .values()
-                        .any(|(_, best, _)| best.parent() == path.parent())
+                        .any(|(_, best, _, _)| best.parent() == path.parent())
                 {
                     continue;
                 }
@@ -376,44 +385,47 @@ impl Catalog {
                 self.stats.name_bytes += raw.len();
                 self.stats.aggregate_bytes += raw.len();
                 let bytes = Arc::new(raw);
-                let matches: Vec<(Want, u32, u32)> = unresolved
+                let matches: Vec<(Want, u32, u32, Option<NamedInstance>)> = unresolved
                     .iter()
                     .chain(
                         settling
                             .iter()
-                            .filter(|(_, (_, best, _))| best.parent() == path.parent())
+                            .filter(|(_, (_, best, _, _))| best.parent() == path.parent())
                             .map(|(want, _)| want),
                     )
                     .filter_map(|want| {
-                        crate::best_face(&bytes, Some(&want.0), want.1)
-                            .map(|(distance, face)| (want.clone(), distance, face))
+                        crate::best_named_face(&bytes, Some(&want.0), want.1).map(
+                            |(distance, face, instance)| (want.clone(), distance, face, instance),
+                        )
                     })
                     .collect();
                 if !matches.is_empty() {
                     self.bytes.insert(path.clone(), Arc::clone(&bytes));
                 }
-                for (want, distance, face) in matches {
+                for (want, distance, face, instance) in matches {
                     unresolved.remove(&want);
                     let rank = super::name_match_rank(distance, &path);
-                    let held =
-                        settling
-                            .entry(want)
-                            .or_insert(((u32::MAX, true), path.clone(), face));
+                    let held = settling.entry(want).or_insert((
+                        (u32::MAX, true),
+                        path.clone(),
+                        face,
+                        None,
+                    ));
                     if rank < held.0 {
-                        *held = (rank, path.clone(), face);
+                        *held = (rank, path.clone(), face, instance);
                     }
                 }
-                settling.retain(|want, (held, best, face)| {
+                settling.retain(|want, (held, best, face, instance)| {
                     let nearest = *held == super::NAME_MATCH_SETTLED;
                     if nearest {
-                        settle(want, best, *face, &mut results);
+                        settle(want, best, *face, instance, &mut results);
                     }
                     !nearest
                 });
             }
         }
-        for (want, (_, best, face)) in settling {
-            settle(&want, &best, face, &mut results);
+        for (want, (_, best, face, instance)) in settling {
+            settle(&want, &best, face, &instance, &mut results);
         }
 
         let truncated = self.stats.truncated();
@@ -421,7 +433,7 @@ impl Catalog {
             for index in indexes {
                 if results[index].is_none() {
                     let bundled = crate::bundled::face_for_family(requests[index].0.trim())
-                        .map(|(id, _)| (PathBuf::from(id), FaceChoice::At(0)));
+                        .map(|(id, _)| (PathBuf::from(id), FaceChoice::At(0, None)));
                     results[index] = prefix_hits
                         .get(&want)
                         .map(|path| (path.clone(), FaceChoice::Nearest(want.1)))
@@ -457,9 +469,11 @@ impl Catalog {
 
     fn admit(&mut self, path: &Path, choice: FaceChoice) -> Result<AdmittedFont, String> {
         if let Some(bytes) = self.bytes.get(path) {
+            let (index, instance) = choice.face(bytes);
             return Ok(AdmittedFont {
                 path: path.to_string_lossy().into_owned(),
-                index: choice.index(bytes),
+                index,
+                instance,
                 bytes: Arc::clone(bytes),
             });
         }
@@ -489,9 +503,11 @@ impl Catalog {
         self.stats.aggregate_bytes += raw.len();
         let bytes = Arc::new(raw);
         self.bytes.insert(path.to_path_buf(), Arc::clone(&bytes));
+        let (index, instance) = choice.face(&bytes);
         Ok(AdmittedFont {
             path: path.to_string_lossy().into_owned(),
-            index: choice.index(&bytes),
+            index,
+            instance,
             bytes,
         })
     }
@@ -521,7 +537,7 @@ pub fn resolve_and_admit(requests: &[(String, FaceTarget)]) -> Batch {
     resolve_and_admit_in_dirs(requests, &crate::font_search_dirs(), Limits::default())
 }
 
-fn resolve_and_admit_in_dirs(
+pub(crate) fn resolve_and_admit_in_dirs(
     requests: &[(String, FaceTarget)],
     dirs: &[PathBuf],
     limits: Limits,
@@ -560,6 +576,7 @@ fn resolve_and_admit_in_dirs(
                     Some(bytes) => Ok(AdmittedFont {
                         path: path.to_string_lossy().into_owned(),
                         index: 0,
+                        instance: None,
                         bytes: Arc::new(bytes.to_vec()),
                     }),
                     None => catalog.admit(&path, choice),
@@ -815,22 +832,34 @@ fn monospace_families_with_bundled(
             };
             let key = normalize_family(&family);
             if face_is_terminal_text(&face) {
-                let (bold, italic) = listed_style(&face);
-                if !bold && !italic {
+                let mut regular = false;
+                let mut list = |slot: Option<usize>, full: String| match slot {
+                    None => regular = true,
+                    Some(slot) => {
+                        styled[slot].insert(normalize_family(&full), full);
+                    }
+                };
+                let roles = variable_roles(&face);
+                if roles.is_empty() {
+                    let (bold, italic) = listed_style(&face);
+                    if let Some(full) = face_full_name(&face).filter(|_| bold || italic) {
+                        list(style_slot(bold, italic), full);
+                    } else if !bold && !italic {
+                        list(None, family.clone());
+                    }
+                } else {
+                    for (words, slot) in roles {
+                        list(slot, format!("{family} {words}"));
+                    }
+                    for (full, slot) in named_instance_listings(&face, &family) {
+                        list(slot, full);
+                    }
+                }
+                if regular {
                     ligatures.entry(key.clone()).or_insert_with(|| {
                         crate::ligature_shaping::face_has_ligature_features(&face)
                     });
                     installed.insert(key, family);
-                } else if let Some(full) = variable_role_words(&face)
-                    .map(|words| format!("{family} {words}"))
-                    .or_else(|| face_full_name(&face))
-                {
-                    let slot = match (bold, italic) {
-                        (true, false) => 0,
-                        (false, true) => 1,
-                        _ => 2,
-                    };
-                    styled[slot].insert(normalize_family(&full), full);
                 }
             } else if face.glyph_index('\u{e0a0}').is_some()
                 || family.to_ascii_lowercase().contains("symbol")
@@ -896,20 +925,99 @@ pub(crate) fn listed_style(face: &aterm_font::Face<'_>) -> (bool, bool) {
     (bold, italic)
 }
 
-/// The style words a variable styled face is offered and found by ("Italic",
-/// "Bold", "Bold Italic"): drawn in that role it draws its role's instance, so the
-/// name its table gives its `fvar` default ("SF Mono Light Italic") is not what it
-/// draws. `None` for a static face and an upright regular one.
-pub(crate) fn variable_role_words(face: &aterm_font::Face<'_>) -> Option<&'static str> {
-    if face.variation_axes().is_empty() {
-        return None;
-    }
-    match listed_style(face) {
+/// The styled slot (0 bold, 1 italic, 2 bold italic) a `(bold, italic)` style is
+/// listed in; `None` for the regular style, which a picker lists by family.
+const fn style_slot(bold: bool, italic: bool) -> Option<usize> {
+    match (bold, italic) {
         (false, false) => None,
-        (true, false) => Some("Bold"),
-        (false, true) => Some("Italic"),
-        (true, true) => Some("Bold Italic"),
+        (true, false) => Some(0),
+        (false, true) => Some(1),
+        (true, true) => Some(2),
     }
+}
+
+/// THE ROLES A VARIABLE FACE SERVES, by the style words it is offered and found by
+/// and the slot ([`style_slot`]) each is listed in: an upright face is its family's
+/// regular and, where its `wght` axis reaches bold, its "Bold"; a slanted face is its
+/// "Italic" and, likewise, its "Bold Italic". Drawn in a role, a face draws that role's
+/// instance (`Renderer::family_face_instance`), so the name its table gives its `fvar`
+/// default (`SF Mono Light Italic`) is not what any role draws, and `SF Mono Bold` is
+/// what the bold role draws. Empty for a static face.
+pub(crate) fn variable_roles(face: &aterm_font::Face<'_>) -> Vec<(&'static str, Option<usize>)> {
+    let Some(probe) = crate::variation::probe_face(face) else {
+        return Vec::new();
+    };
+    let (bold_default, italic) = listed_style(face);
+    let (regular, bold) = match probe
+        .axes
+        .iter()
+        .find(|axis| axis.tag == crate::variation::WGHT_TAG)
+    {
+        Some(wght) => (wght.min < 600.0, wght.max >= 600.0),
+        None => (!bold_default, bold_default),
+    };
+    let mut roles = Vec::new();
+    if regular {
+        roles.push((
+            if italic { "Italic" } else { "Regular" },
+            style_slot(false, italic),
+        ));
+    }
+    if bold {
+        roles.push((
+            if italic { "Bold Italic" } else { "Bold" },
+            style_slot(true, italic),
+        ));
+    }
+    roles
+}
+
+/// The named instances of variable face `face` a picker offers besides its roles
+/// ([`variable_roles`]), each by its family and the instance's name (`SF Mono Light
+/// Italic`) with the slot its own weight and slant list it in: every instance a name
+/// chooses ([`crate::NamedInstance`]) and no role answers to, so no two names offered
+/// draw the same. An upright instance below bold is a weight of the family, which a
+/// picker lists by family, as it lists a static family's Light.
+fn named_instance_listings(
+    face: &aterm_font::Face<'_>,
+    family: &str,
+) -> Vec<(String, Option<usize>)> {
+    let Some(probe) = crate::variation::probe_face(face) else {
+        return Vec::new();
+    };
+    let role_words: Vec<String> = variable_roles(face)
+        .into_iter()
+        .map(|(words, _)| normalize_family(words))
+        .collect();
+    let italic = face.is_italic() || face.is_oblique();
+    let wght = probe
+        .axes
+        .iter()
+        .position(|axis| axis.tag == crate::variation::WGHT_TAG);
+    let mut listed = Vec::new();
+    for record in crate::variation::instance_records(face) {
+        let Some(subfamily) = face_name(face, record.subfamily_name_id) else {
+            continue;
+        };
+        if role_words.contains(&normalize_family(&subfamily))
+            || crate::named_instance_of(face, &record.coords).is_none()
+        {
+            continue;
+        }
+        let bold = wght.map_or_else(
+            || listed_style(face).0,
+            |at| {
+                record
+                    .design_coords()
+                    .get(at)
+                    .is_some_and(|&weight| weight >= 600.0)
+            },
+        );
+        if let Some(slot) = style_slot(bold, italic) {
+            listed.push((format!("{family} {subfamily}"), Some(slot)));
+        }
+    }
+    listed
 }
 
 fn face_is_terminal_text(face: &aterm_font::Face<'_>) -> bool {

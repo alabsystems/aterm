@@ -449,6 +449,8 @@ mod dark_nudge_grid_tests;
 #[cfg(test)]
 mod face_identity_tests;
 #[cfg(test)]
+mod named_instance_tests;
+#[cfg(test)]
 mod raster_tests;
 #[cfg(test)]
 mod styled_instance_tests;
@@ -1191,6 +1193,82 @@ fn face_display_name(bytes: &[u8], index: u32) -> Option<String> {
     Some(public_face_name(&name).into_owned())
 }
 
+/// What face `index` of `bytes` is called drawn at the named instance `named`: its
+/// family and the instance's subfamily (`SF Mono Light Italic`); where no record names
+/// that instance, the name its table gives the `fvar` default at that default, else its
+/// family and the style it draws (a role's own instance, `SF Mono Bold Italic` named in
+/// the Italic row, is not the `fvar` default `SF Mono Light Italic` the table names).
+fn named_instance_display_name(bytes: &[u8], index: u32, named: &NamedInstance) -> Option<String> {
+    let face = aterm_font::Face::parse(bytes, index).ok()?;
+    if let Some(record) = variation::instance_records(&face)
+        .into_iter()
+        .find(|record| *record.coords == *named.coords)
+    {
+        let family = face_family_name(bytes, index)?;
+        let subfamily = font_catalog::face_name(&face, record.subfamily_name_id)?;
+        return Some(if subfamily.eq_ignore_ascii_case("regular") {
+            family
+        } else {
+            format!("{family} {subfamily}")
+        });
+    }
+    let default: Vec<i32> = face
+        .variation_axes()
+        .into_iter()
+        .map(|axis| (axis.def_value * 65536.0).round() as i32)
+        .collect();
+    if *default == *named.coords {
+        return face_display_name(bytes, index);
+    }
+    let family = face_family_name(bytes, index)?;
+    let bold = variation::probe_face(&face)
+        .and_then(|probe| {
+            let wght = probe
+                .axes
+                .iter()
+                .position(|axis| axis.tag == variation::WGHT_TAG)?;
+            named.design_coords().get(wght).copied()
+        })
+        .map_or_else(
+            || font_catalog::listed_style(&face).0,
+            |weight| weight >= 600.0,
+        );
+    Some(match (bold, face.is_italic() || face.is_oblique()) {
+        (false, false) => family,
+        (true, false) => format!("{family} Bold"),
+        (false, true) => format!("{family} Italic"),
+        (true, true) => format!("{family} Bold Italic"),
+    })
+}
+
+/// What face `index` of `bytes` drawn at `coords` is called where they are one of its
+/// named instances other than its regular one (`SF Mono Light Italic`); `None` at its
+/// regular instance and between named instances, where its role's words name it.
+fn other_named_instance_name(bytes: &[u8], index: u32, coords: &[(u32, f32)]) -> Option<String> {
+    let face = aterm_font::Face::parse(bytes, index).ok()?;
+    let probe = variation::probe_face(&face)?;
+    let value = |tag: u32, axis: &variation::VfAxis| {
+        coords
+            .iter()
+            .find(|(held, _)| *held == tag)
+            .map_or(axis.def, |&(_, value)| value)
+    };
+    let at = |record: &[f32]| {
+        probe
+            .axes
+            .iter()
+            .zip(record)
+            .all(|(axis, &want)| (value(axis.tag, axis) - want).abs() < 1e-3)
+    };
+    if probe.regular_coords.as_deref().is_some_and(at) {
+        return None;
+    }
+    let record = variation::instance_records(&face)
+        .into_iter()
+        .find(|record| record.coords.len() == probe.axes.len() && at(&record.design_coords()))?;
+    named_instance_display_name(bytes, index, &NamedInstance::from_fixed(record.coords))
+}
+
 fn face_family_name(bytes: &[u8], index: u32) -> Option<String> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     let face = aterm_font::Face::parse(bytes, index).ok()?;
@@ -1274,6 +1352,8 @@ pub struct Renderer {
     font: std::sync::Arc<crate::font::Font>,
     shaping_primary_bytes: Option<std::sync::Arc<[u8]>>,
     primary_index: u32,
+    /// The named instance the primary's font name chose ([`NamedInstance`]).
+    primary_named: Option<NamedInstance>,
     var_coords: VarCoords,
     geom_coords: VarCoords,
     vf_bold_coords: VarCoords,
@@ -1283,6 +1363,8 @@ pub struct Renderer {
     bold_font: Option<crate::font::Font>,
     bold_font_bytes: Option<std::sync::Arc<[u8]>>,
     bold_font_index: u32,
+    /// The named instance the injected bold face's font name chose ([`NamedInstance`]).
+    bold_font_named: Option<NamedInstance>,
     /// The instance the injected bold face draws at ([`FaceRole::Bold`];
     /// [`Self::refresh_family_instances`] keeps it current).
     bold_font_instance: FaceInstance,
@@ -2490,6 +2572,8 @@ struct StyledFace {
     id: StyledFaceId,
     yields_private_use: bool,
     lowered_asterisk: Option<bundled::LoweredAsterisk>,
+    /// The named instance this face's font name chose ([`NamedInstance`]).
+    named: Option<NamedInstance>,
     /// The instance this face draws at for its slot's role
     /// ([`Renderer::refresh_family_instances`] keeps it current).
     instance: FaceInstance,
@@ -5652,6 +5736,9 @@ pub struct FaceRef {
     pub path: String,
     /// The face's collection index in that file.
     pub index: u32,
+    /// The named instance of a variable face the font's name chose (`SF Mono Light
+    /// Italic`); `None` where the face's role picks its instance.
+    pub instance: Option<NamedInstance>,
 }
 
 impl FaceRef {
@@ -5660,8 +5747,82 @@ impl FaceRef {
         Self {
             path: path.into(),
             index,
+            instance: None,
         }
     }
+
+    /// This face drawn at `instance`.
+    #[must_use]
+    pub fn with_instance(mut self, instance: Option<NamedInstance>) -> Self {
+        self.instance = instance;
+        self
+    }
+}
+
+/// A NAMED INSTANCE OF A VARIABLE FACE THAT A FONT NAME CHOSE: `font_family_italic =
+/// "SF Mono Light Italic"` names SF Mono's italic file at its Light Italic instance, not
+/// the file. The face draws exactly this instance, as a static face draws itself: the
+/// role's weight (`font_weight`, `font_variation`, the dark-theme nudge, a bold role's
+/// class above regular) moves only a face its family or role chose. A name for the
+/// instance the role draws anyway (`SF Mono Regular`, `SF Mono Italic`) chooses no
+/// instance ([`named_instance_of`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NamedInstance {
+    /// The `fvar` record's design-space coords, one per axis in `fvar` order, in the
+    /// record's own 16.16 fixed.
+    coords: Box<[i32]>,
+}
+
+impl NamedInstance {
+    /// The instance at `coords` (16.16 fixed, `fvar` axis order).
+    #[must_use]
+    pub fn from_fixed(coords: impl Into<Box<[i32]>>) -> Self {
+        Self {
+            coords: coords.into(),
+        }
+    }
+
+    /// The instance's design-space coords, `fvar` axis order.
+    #[must_use]
+    pub fn design_coords(&self) -> Vec<f32> {
+        self.coords
+            .iter()
+            .map(|&raw| raw as f32 / 65536.0)
+            .collect()
+    }
+
+    /// The instance as `(tag, value)` pairs over `axes`, or `None` where they are not
+    /// this instance's axes (another face's bytes).
+    fn paired(&self, axes: &[variation::VfAxis]) -> Option<Vec<f32>> {
+        (axes.len() == self.coords.len()).then(|| {
+            axes.iter()
+                .zip(self.design_coords())
+                .map(|(axis, value)| variation::clamp_axis(axis, value))
+                .collect()
+        })
+    }
+}
+
+/// The instance `face` draws when a name names the instance `record_coords` of it: that
+/// instance, or `None` where it is the instance the face's role draws without one (its
+/// regular instance, [`variation::resolve_default_coords`]), so a name for it keeps
+/// following the role's weight.
+pub(crate) fn named_instance_of(
+    face: &aterm_font::Face<'_>,
+    record_coords: &[i32],
+) -> Option<NamedInstance> {
+    let probe = variation::probe_face(face)?;
+    if probe.axes.len() != record_coords.len() {
+        return None;
+    }
+    let automatic = variation::resolve_default_coords(&probe.axes, probe.regular_coords.as_deref());
+    let chosen = NamedInstance::from_fixed(record_coords.to_vec());
+    let same = chosen
+        .design_coords()
+        .iter()
+        .zip(&automatic)
+        .all(|(a, b)| (a - b).abs() < 1e-3);
+    (!same).then_some(chosen)
 }
 
 /// The style a resolution looks for inside a family.
@@ -5721,14 +5882,70 @@ impl FaceTarget {
         slanted == self.slanted && bold == (self.weight >= 600)
     }
 
-    /// [`Self::suits`] for face `index` of `bytes`.
+    /// Whether a face that draws `style` ([`DrawnStyle`]) draws this style.
+    #[inline]
     #[must_use]
-    pub fn suits_face_in(self, bytes: &[u8], index: u32) -> bool {
-        match aterm_font::Face::parse(bytes, index) {
-            Ok(face) => self.suits(&face),
-            Err(_) => true,
-        }
+    pub const fn suits_style(self, style: DrawnStyle) -> bool {
+        style.slanted == self.slanted && style.bold == (self.weight >= 600)
     }
+
+    /// The style face `index` of `bytes` draws in this style's role: a variable face at
+    /// the named instance its font name chose ([`FaceRef::instance`]), else at the
+    /// instance the role draws (its regular, or a bold role's bold), so the weight
+    /// drawn, not the face's `fvar` default's, says whether it is bold; `None` where the
+    /// bytes do not parse.
+    #[must_use]
+    pub fn drawn_style_in(
+        self,
+        bytes: &[u8],
+        index: u32,
+        named: Option<&NamedInstance>,
+    ) -> Option<DrawnStyle> {
+        let face = aterm_font::Face::parse(bytes, index).ok()?;
+        let weight = variation::probe_face(&face).and_then(|probe| {
+            let axes = &probe.axes;
+            let wght = axes
+                .iter()
+                .position(|axis| axis.tag == variation::WGHT_TAG)?;
+            let coords = match named {
+                Some(named) => named.paired(axes)?,
+                None => {
+                    let regular =
+                        variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
+                    if self.weight >= 600 {
+                        variation::bold_role_coords(axes, &regular)
+                    } else {
+                        regular
+                    }
+                }
+            };
+            coords.get(wght).copied()
+        });
+        Some(DrawnStyle {
+            bold: weight.map_or_else(
+                || face.is_bold() || face.weight().to_number() >= 600,
+                |weight| weight >= 600.0,
+            ),
+            slanted: face.is_italic() || face.is_oblique(),
+        })
+    }
+
+    /// [`Self::suits`] for face `index` of `bytes` as it draws in this style's role
+    /// ([`Self::drawn_style_in`]); a face that does not parse is not judged.
+    #[must_use]
+    pub fn suits_face_in(self, bytes: &[u8], index: u32, named: Option<&NamedInstance>) -> bool {
+        self.drawn_style_in(bytes, index, named)
+            .is_none_or(|style| self.suits_style(style))
+    }
+}
+
+/// The style a face draws in a role ([`FaceTarget::drawn_style_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawnStyle {
+    /// It draws at a bold weight (600 or more).
+    pub bold: bool,
+    /// It is italic or oblique.
+    pub slanted: bool,
 }
 
 /// Resolve a font family name (e.g. `"JetBrains Mono"`) to the face that draws `target` by scanning the standard font directories.
@@ -5832,10 +6049,14 @@ pub fn resolve_config_font(family: &str, target: FaceTarget) -> Result<FaceRef, 
 
 const NAME_SCAN_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum NameMatch {
-    /// The request names this face.
-    Face,
+    /// The request names this face, at this named instance where it names one of a
+    /// variable face ([`NamedInstance`]).
+    Face(Option<NamedInstance>),
+    /// The request names a role this variable face serves (`SF Mono Bold Italic`),
+    /// bold or not ([`font_catalog::variable_roles`]).
+    Role { bold: bool },
     /// The request names the face's family (`Menlo`).
     Family,
 }
@@ -5879,46 +6100,97 @@ fn face_name_match(face: &aterm_font::Face<'_>, want: &str) -> Option<NameMatch>
             }
         }
     }
-    // A variable styled face also answers to its family and the style it is
-    // drawn in (`SF Mono Italic`), the name a picker lists it by
-    // ([`font_catalog::variable_role_words`]).
-    if let Some(words) = font_catalog::variable_role_words(face) {
-        for id in [SUBFAMILY, TYPOGRAPHIC_SUBFAMILY] {
-            let normalized = normalize_family(words);
-            if !records.contains(&(id, normalized.clone())) {
-                records.push((id, normalized));
-            }
-        }
-    }
     let named = |id: u16| {
         records
             .iter()
             .filter(move |(i, _)| *i == id)
             .map(|(_, t)| t)
     };
-    if named(FULL_NAME)
+    let family_then = |rest: &str| {
+        named(FAMILY)
+            .chain(named(TYPOGRAPHIC_FAMILY))
+            .any(|family| want.strip_prefix(family.as_str()) == Some(rest))
+    };
+    // A variable face answers to its family and each role it serves (`SF Mono
+    // Italic`, `SF Mono Bold`), the names a picker lists it by
+    // ([`font_catalog::variable_roles`]): the role picks its instance.
+    if let Some((_, slot)) = font_catalog::variable_roles(face)
+        .into_iter()
+        .find(|(words, _)| family_then(&normalize_family(words)))
+    {
+        return Some(NameMatch::Role {
+            bold: matches!(slot, Some(0 | 2)),
+        });
+    }
+    // A variable face answers to each named instance's name, its family and the
+    // instance's subfamily (`SF Mono Light Italic`) or the instance's PostScript name,
+    // and then draws that instance.
+    for record in variation::instance_records(face) {
+        let subfamily = name_spellings(face, record.subfamily_name_id);
+        let postscript = record
+            .postscript_name_id
+            .map(|id| name_spellings(face, id))
+            .unwrap_or_default();
+        if subfamily
+            .iter()
+            .any(|sub| !sub.is_empty() && family_then(sub))
+            || postscript.iter().any(|ps| ps == want)
+        {
+            return Some(NameMatch::Face(named_instance_of(face, &record.coords)));
+        }
+    }
+    let face_named = named(FULL_NAME)
         .chain(named(POST_SCRIPT_NAME))
         .any(|t| t == want)
-    {
-        return Some(NameMatch::Face);
-    }
-    for (family, subfamily) in [
-        (FAMILY, SUBFAMILY),
-        (TYPOGRAPHIC_FAMILY, TYPOGRAPHIC_SUBFAMILY),
-    ] {
-        for f in named(family) {
-            if want
-                .strip_prefix(f.as_str())
-                .is_some_and(|rest| !rest.is_empty() && named(subfamily).any(|s| s == rest))
-            {
-                return Some(NameMatch::Face);
-            }
-        }
+        || [
+            (FAMILY, SUBFAMILY),
+            (TYPOGRAPHIC_FAMILY, TYPOGRAPHIC_SUBFAMILY),
+        ]
+        .into_iter()
+        .any(|(family, subfamily)| {
+            named(family).any(|f| {
+                want.strip_prefix(f.as_str())
+                    .is_some_and(|rest| !rest.is_empty() && named(subfamily).any(|s| s == rest))
+            })
+        });
+    if face_named {
+        // The name table names a variable face's `fvar` default instance.
+        let default = face
+            .variation_axes()
+            .into_iter()
+            .map(|axis| (axis.def_value * 65536.0).round() as i32)
+            .collect::<Vec<i32>>();
+        return Some(NameMatch::Face(
+            (!default.is_empty())
+                .then(|| named_instance_of(face, &default))
+                .flatten(),
+        ));
     }
     named(FAMILY)
         .chain(named(TYPOGRAPHIC_FAMILY))
         .any(|t| t == want)
         .then_some(NameMatch::Family)
+}
+
+/// Every spelling of `name` record `name_id`, normalized ([`normalize_family`]), with a
+/// hidden system name's public one ([`public_face_name`]).
+fn name_spellings(face: &aterm_font::Face<'_>, name_id: u16) -> Vec<String> {
+    let mut spellings = Vec::new();
+    for name in face.names() {
+        if name.name_id != name_id {
+            continue;
+        }
+        let Some(text) = name_record_text(&name) else {
+            continue;
+        };
+        for spelling in [text.trim(), &public_face_name(text.trim())] {
+            let normalized = normalize_family(spelling);
+            if !spellings.contains(&normalized) {
+                spellings.push(normalized);
+            }
+        }
+    }
+    spellings
 }
 
 /// The face of `bytes` that best answers a request, as `(distance, index)`.
@@ -5927,6 +6199,44 @@ pub(crate) fn best_face(
     want: Option<&str>,
     target: FaceTarget,
 ) -> Option<(u32, u32)> {
+    best_named_face(bytes, want, target).map(|(distance, index, _)| (distance, index))
+}
+
+/// The instance a role name (`SF Mono Bold Italic`, [`NameMatch::Role`]) chooses of `face`
+/// asked for `target`'s style: none where the role is that style, so the face follows
+/// the role's weight there; else the role's own instance, so a role named in another
+/// style's row draws what it names and that row says it is another style
+/// ([`FaceTarget::suits_face_in`]), as `Menlo Bold Italic` in the Italic row does.
+fn role_named_elsewhere(
+    face: &aterm_font::Face<'_>,
+    bold: bool,
+    target: FaceTarget,
+) -> Option<NamedInstance> {
+    let slanted = face.is_italic() || face.is_oblique();
+    if bold == (target.weight >= 600) && slanted == target.slanted {
+        return None;
+    }
+    let probe = variation::probe_face(face)?;
+    let regular = variation::resolve_default_coords(&probe.axes, probe.regular_coords.as_deref());
+    let coords = if bold {
+        variation::bold_role_coords(&probe.axes, &regular)
+    } else {
+        regular
+    };
+    Some(NamedInstance::from_fixed(
+        coords
+            .iter()
+            .map(|&value| (value * 65536.0).round() as i32)
+            .collect::<Vec<i32>>(),
+    ))
+}
+
+/// [`best_face`] with the named instance the request names of it ([`NamedInstance`]).
+pub(crate) fn best_named_face(
+    bytes: &[u8],
+    want: Option<&str>,
+    target: FaceTarget,
+) -> Option<(u32, u32, Option<NamedInstance>)> {
     let faces = aterm_font::fonts_in_collection(bytes).unwrap_or(1).max(1);
     let mut best: Option<(u32, u32)> = None;
     for index in 0..faces {
@@ -5935,14 +6245,17 @@ pub(crate) fn best_face(
         };
         let distance = match want.map(|want| face_name_match(&face, want)) {
             Some(None) => continue,
-            Some(Some(NameMatch::Face)) => return Some((0, index)),
+            Some(Some(NameMatch::Face(instance))) => return Some((0, index, instance)),
+            Some(Some(NameMatch::Role { bold })) => {
+                return Some((0, index, role_named_elsewhere(&face, bold, target)));
+            }
             Some(Some(NameMatch::Family)) | None => target.distance(&face),
         };
         if best.is_none_or(|(held, _)| distance < held) {
             best = Some((distance, index));
         }
     }
-    best
+    best.map(|(distance, index)| (distance, index, None))
 }
 
 fn face_in_file(path: &std::path::Path, target: FaceTarget) -> u32 {
@@ -5982,11 +6295,13 @@ fn resolve_by_name_table_in(
     want: &str,
     target: FaceTarget,
 ) -> Option<FaceRef> {
-    let mut best: Option<((u32, bool), std::path::PathBuf, u32)> = None;
+    /// The best match yet: its rank, file, face and the instance it names.
+    type Held = ((u32, bool), std::path::PathBuf, u32, Option<NamedInstance>);
+    let mut best: Option<Held> = None;
     for path in files {
         if best
             .as_ref()
-            .is_some_and(|(_, best, _)| best.parent() != path.parent())
+            .is_some_and(|(_, best, _, _)| best.parent() != path.parent())
         {
             continue;
         }
@@ -5994,17 +6309,20 @@ fn resolve_by_name_table_in(
         else {
             continue;
         };
-        if let Some((distance, index)) = best_face(&bytes, Some(want), target) {
+        if let Some((distance, index, instance)) = best_named_face(&bytes, Some(want), target) {
             let rank = name_match_rank(distance, &path);
-            if best.as_ref().is_none_or(|(held, _, _)| rank < *held) {
-                best = Some((rank, path, index));
+            if best.as_ref().is_none_or(|(held, _, _, _)| rank < *held) {
+                best = Some((rank, path, index, instance));
             }
             if rank == NAME_MATCH_SETTLED {
                 break;
             }
         }
     }
-    best.and_then(|(_, path, index)| path.to_str().map(|p| FaceRef::new(p, index)))
+    best.and_then(|(_, path, index, instance)| {
+        path.to_str()
+            .map(|p| FaceRef::new(p, index).with_instance(instance))
+    })
 }
 
 /// How a file whose `name` table matched a request ranks against the other matches in its directory, best (lowest) first.
@@ -6296,7 +6614,7 @@ fn deco_tables(bytes: &[u8], index: u32) -> Option<deco::DecoTables> {
 /// Resolve a font `family` to its [`FaceInfo`] (path, cell metrics at [`FaceInfo::PROBE_PX`], glyph count), or `None` if it does not resolve or parse.
 #[must_use]
 pub fn face_info(family: &str) -> Option<FaceInfo> {
-    let FaceRef { path, index } = resolve_family_or_bundled(family, FaceTarget::REGULAR)?;
+    let FaceRef { path, index, .. } = resolve_family_or_bundled(family, FaceTarget::REGULAR)?;
     let bytes = read_resolved_font(&path).ok()?;
     let font = crate::font::Font::from_bytes(
         &bytes[..],
@@ -6414,6 +6732,17 @@ impl Renderer {
 
     /// Build from face `index` of explicit font bytes (a collection's face, [`FaceRef::index`]) at a finite, positive pixel size.
     pub fn from_face(bytes: &[u8], index: u32, px: f32, theme: Theme) -> Result<Self, String> {
+        Self::from_named_face(bytes, index, None, px, theme)
+    }
+
+    /// [`Self::from_face`] drawing the primary at `named` ([`FaceRef::instance`]).
+    fn from_named_face(
+        bytes: &[u8],
+        index: u32,
+        named: Option<NamedInstance>,
+        px: f32,
+        theme: Theme,
+    ) -> Result<Self, String> {
         if !px.is_finite() || px <= 0.0 {
             return Err("font pixel size must be finite and positive".into());
         }
@@ -6436,6 +6765,7 @@ impl Renderer {
             font,
             shaping_primary_bytes: Some(primary_bytes),
             primary_index: index,
+            primary_named: named,
             var_coords: None,
             geom_coords: None,
             vf_bold_coords: None,
@@ -6445,6 +6775,7 @@ impl Renderer {
             bold_font: None,
             bold_font_bytes: None,
             bold_font_index: 0,
+            bold_font_named: None,
             bold_font_instance: FaceInstance::default(),
             bold_gid_cache: FxHashMap::default(),
             bold_yields_private_use: false,
@@ -6698,6 +7029,16 @@ impl Renderer {
 
     /// [`Self::set_bold_font`] for face `index` of `bytes`.
     pub fn set_bold_face(&mut self, bytes: &[u8], index: u32) -> Result<(), String> {
+        self.set_named_bold_face(bytes, index, None)
+    }
+
+    /// [`Self::set_bold_face`] drawn at `named` ([`FaceRef::instance`]).
+    pub fn set_named_bold_face(
+        &mut self,
+        bytes: &[u8],
+        index: u32,
+        named: Option<NamedInstance>,
+    ) -> Result<(), String> {
         let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
         let font = crate::font::Font::from_shared_slice(
             owned.clone(),
@@ -6711,6 +7052,7 @@ impl Renderer {
         self.bold_lowered_asterisk = bundled::lowered_asterisk(&owned);
         self.bold_font_bytes = Some(owned);
         self.bold_font_index = index;
+        self.bold_font_named = named;
         self.refresh_family_instances();
         self.refresh_drawn_faces();
         self.bold_gid_cache.clear();
@@ -6728,6 +7070,17 @@ impl Renderer {
 
     /// [`Self::set_styled_font_bytes`] for face `index` of `bytes`.
     pub fn set_styled_face(&mut self, slot: usize, bytes: &[u8], index: u32) -> Result<(), String> {
+        self.set_named_styled_face(slot, bytes, index, None)
+    }
+
+    /// [`Self::set_styled_face`] drawn at `named` ([`FaceRef::instance`]).
+    pub fn set_named_styled_face(
+        &mut self,
+        slot: usize,
+        bytes: &[u8],
+        index: u32,
+        named: Option<NamedInstance>,
+    ) -> Result<(), String> {
         if slot >= 3 {
             return Err(format!(
                 "styled slot {slot} out of range (0 = bold, 1 = italic, 2 = bold-italic)"
@@ -6749,6 +7102,7 @@ impl Renderer {
             index,
             gid_cache: FxHashMap::default(),
             id: next_styled_face_id(),
+            named,
             instance: FaceInstance::default(),
         });
         self.styled_retire_pending[slot] = None;
@@ -6893,6 +7247,16 @@ impl Renderer {
 
     /// [`Self::set_primary_font`] for face `index` of `bytes` (a collection's face, [`FaceRef::index`]).
     pub fn set_primary_face(&mut self, bytes: &[u8], index: u32) -> Result<(), String> {
+        self.set_named_primary_face(bytes, index, None)
+    }
+
+    /// [`Self::set_primary_face`] drawn at `named` ([`FaceRef::instance`]).
+    fn set_named_primary_face(
+        &mut self,
+        bytes: &[u8],
+        index: u32,
+        named: Option<NamedInstance>,
+    ) -> Result<(), String> {
         let (primary_bytes, font) = shared_parsed_face(bytes, index)?;
         let lm = font
             .horizontal_line_metrics(self.px)
@@ -6907,7 +7271,7 @@ impl Renderer {
             )
         });
         let resolved = self.compute_variations_for_face(
-            Some((bytes, index)),
+            Some((bytes, index, named.as_ref())),
             &self.cfg_font_variations,
             self.font_weight_dark_nudge,
         );
@@ -6929,6 +7293,7 @@ impl Renderer {
         self.font = font;
         self.shaping_primary_bytes = Some(primary_bytes);
         self.primary_index = index;
+        self.primary_named = named;
         self.var_coords = None;
         self.geom_coords = None;
         self.vf_bold_coords = None;
@@ -6973,8 +7338,12 @@ impl Renderer {
         bytes: &[u8],
         face: FaceRef,
     ) -> Result<(), String> {
-        let FaceRef { path, index } = face;
-        self.set_primary_face(bytes, index)?;
+        let FaceRef {
+            path,
+            index,
+            instance,
+        } = face;
+        self.set_named_primary_face(bytes, index, instance)?;
         self.primary_path = Some(path);
         self.admitted_sources_sealed = false;
         self.drawn_faces = None;
@@ -6993,7 +7362,7 @@ impl Renderer {
         px: f32,
         theme: Theme,
     ) -> Result<Self, String> {
-        let mut renderer = Self::from_face(bytes, face.index, px, theme)?;
+        let mut renderer = Self::from_named_face(bytes, face.index, face.instance, px, theme)?;
         renderer.primary_path = Some(face.path);
         (renderer.fallback_paths, renderer.fallback_user_prefix) = fallback_candidate_paths(&[]);
         (renderer.symbol_fallback_paths, renderer.symbol_user_prefix) =
@@ -7016,22 +7385,28 @@ impl Renderer {
     /// Like [`Renderer::from_system`], but tries an already-resolved face first (what the host's worker admitted for `font_family`: a file and its collection index, [`FaceRef`]), then the built-in [`FONT_CANDIDATES`].
     pub fn from_system_with_face(face: Option<&FaceRef>, px: f32, theme: Theme) -> Option<Self> {
         let candidates = face
-            .map(|face| (face.path.clone(), Some(face.index)))
+            .map(|face| (face.path.clone(), Some((face.index, face.instance.clone()))))
             .into_iter()
             .chain(primary_candidate_paths().into_iter().map(|p| (p, None)));
-        for (p, index) in candidates {
+        for (p, chosen) in candidates {
             if let Some((id, bytes)) = bundled::face_for_family(&p)
                 && let Ok(r) = Self::from_resolved_font_file(FaceRef::new(id, 0), bytes, px, theme)
             {
                 return Some(r);
             }
             if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p)) {
-                let index = index.unwrap_or_else(|| {
-                    best_face(&bytes, None, FaceTarget::REGULAR).map_or(0, |(_, index)| index)
+                let (index, instance) = chosen.unwrap_or_else(|| {
+                    (
+                        best_face(&bytes, None, FaceTarget::REGULAR).map_or(0, |(_, index)| index),
+                        None,
+                    )
                 });
-                if let Ok(r) =
-                    Self::from_resolved_font_file(FaceRef::new(p, index), &bytes, px, theme)
-                {
+                if let Ok(r) = Self::from_resolved_font_file(
+                    FaceRef::new(p, index).with_instance(instance),
+                    &bytes,
+                    px,
+                    theme,
+                ) {
                     return Some(r);
                 }
             }
@@ -7488,6 +7863,7 @@ impl Renderer {
                         id: next_styled_face_id(),
                         yields_private_use: bundled::yields_private_use(bytes),
                         lowered_asterisk: bundled::lowered_asterisk(bytes),
+                        named: None,
                         instance: FaceInstance::default(),
                     });
                 }
@@ -7511,6 +7887,7 @@ impl Renderer {
                         id: next_styled_face_id(),
                         yields_private_use: bundled::yields_private_use(&bytes),
                         lowered_asterisk: bundled::lowered_asterisk(&bytes),
+                        named: None,
                         instance: FaceInstance::default(),
                     });
                     break;
@@ -7654,7 +8031,9 @@ impl Renderer {
                     // name table names only its `fvar` default.
                     FacePick::InjectedBold { synthetic } => (
                         self.bold_font_bytes.as_deref().and_then(|bytes| {
-                            if self.bold_font_instance.drawn.is_some() {
+                            if let Some(named) = &self.bold_font_named {
+                                named_instance_display_name(bytes, self.bold_font_index, named)
+                            } else if self.bold_font_instance.drawn.is_some() {
                                 face_family_name(bytes, self.bold_font_index)
                                     .map(|family| format!("{family} Bold"))
                             } else {
@@ -7664,10 +8043,18 @@ impl Renderer {
                         synthetic,
                     ),
                     FacePick::Styled { slot, synthetic } => {
-                        let (coords, _, instanced) = self.styled_instance(slot, synthetic);
+                        let (coords, var_slot, instanced) = self.styled_instance(slot, synthetic);
                         let face = self.styled_faces[slot].as_ref();
                         match (face, coords) {
-                            (Some(face), Some(_)) => {
+                            // A face its name chose an instance of is called by that
+                            // instance's name where it draws it.
+                            (Some(face), _) if var_slot != 2 && face.named.is_some() => (
+                                face.named.as_ref().and_then(|named| {
+                                    named_instance_display_name(&face.bytes, face.index, named)
+                                }),
+                                instanced,
+                            ),
+                            (Some(face), Some(coords)) => {
                                 // The style the instance draws: the face's own, and bold
                                 // where its bold instance serves a bold-italic cell.
                                 let drawn = StyleBits(style.0 & !instanced.0);
@@ -7679,9 +8066,15 @@ impl Renderer {
                                     (true, false) => "Bold",
                                     _ => "Italic",
                                 };
+                                // At another named instance than its role's own (the
+                                // italic of a primary named `SF Mono Light`), that one's
+                                // name.
                                 (
-                                    face_family_name(&face.bytes, face.index)
-                                        .map(|family| format!("{family} {words}")),
+                                    other_named_instance_name(&face.bytes, face.index, &coords)
+                                        .or_else(|| {
+                                            face_family_name(&face.bytes, face.index)
+                                                .map(|family| format!("{family} {words}"))
+                                        }),
                                     instanced,
                                 )
                             }
@@ -7738,10 +8131,20 @@ impl Renderer {
             .shaping_primary_bytes
             .as_deref()
             .ok_or("font generation has no retained primary bytes")?;
-        let mut rebuilt = Self::from_face(primary, self.primary_index, px, theme)?;
+        let mut rebuilt = Self::from_named_face(
+            primary,
+            self.primary_index,
+            self.primary_named.clone(),
+            px,
+            theme,
+        )?;
 
         if let Some(bytes) = self.bold_font_bytes.as_deref() {
-            rebuilt.set_bold_face(bytes, self.bold_font_index)?;
+            rebuilt.set_named_bold_face(
+                bytes,
+                self.bold_font_index,
+                self.bold_font_named.clone(),
+            )?;
         }
         rebuilt.styled_faces = self.styled_faces.clone();
         rebuilt.styled_loaded = true;
@@ -7841,7 +8244,14 @@ impl Renderer {
             return self.rebuild_from_admitted(px, theme).ok();
         }
         let primary = self.shaping_primary_bytes.as_deref()?;
-        let mut fork = Self::from_face(primary, self.primary_index, px, theme).ok()?;
+        let mut fork = Self::from_named_face(
+            primary,
+            self.primary_index,
+            self.primary_named.clone(),
+            px,
+            theme,
+        )
+        .ok()?;
 
         fork.fallback_chain = self.fallback_chain.clone();
         fork.display_layer = self.display_layer.clone();
@@ -7870,7 +8280,8 @@ impl Renderer {
         fork.missing_font_classes = 0;
 
         if let Some(bytes) = self.bold_font_bytes.as_deref() {
-            let _ = fork.set_bold_face(bytes, self.bold_font_index);
+            let _ =
+                fork.set_named_bold_face(bytes, self.bold_font_index, self.bold_font_named.clone());
         }
         fork.styled_faces = self.styled_faces.clone();
         fork.primary_path = self.primary_path.clone();
@@ -8507,6 +8918,7 @@ impl Renderer {
                     id: next_styled_face_id(),
                     yields_private_use: bundled::yields_private_use(bytes),
                     lowered_asterisk: bundled::lowered_asterisk(bytes),
+                    named: None,
                     instance: FaceInstance::default(),
                 });
             }
@@ -8828,15 +9240,18 @@ impl Renderer {
         self.compute_variations_for_face(
             self.shaping_primary_bytes
                 .as_deref()
-                .map(|bytes| (bytes, self.primary_index)),
+                .map(|bytes| (bytes, self.primary_index, self.primary_named.as_ref())),
             requests,
             dark_nudge,
         )
     }
 
+    /// The instances face `index` of `bytes` draws in the regular role: its regular
+    /// instance under `requests` and the dark-theme nudge, or exactly the named instance
+    /// its font name chose ([`NamedInstance`]), which neither moves.
     fn compute_variations_for_face(
         &self,
-        face: Option<(&[u8], u32)>,
+        face: Option<(&[u8], u32, Option<&NamedInstance>)>,
         requests: &[(u32, f32)],
         dark_nudge: f32,
     ) -> ResolvedInstances {
@@ -8845,14 +9260,21 @@ impl Renderer {
             geometry: None,
             bold: None,
         };
-        let Some((bytes, index)) = face else {
+        let Some((bytes, index, named)) = face else {
             return unvaried;
         };
         let Some(probe) = variation::probe(bytes, index) else {
             return unvaried;
         };
         let axes = &probe.axes;
-        let base = variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
+        let (base, requests, dark_nudge) = match named.and_then(|named| named.paired(axes)) {
+            Some(named) => (named, &[][..], 0.0),
+            None => (
+                variation::resolve_default_coords(axes, probe.regular_coords.as_deref()),
+                requests,
+                dark_nudge,
+            ),
+        };
         let base = variation::apply_requests(axes, base, requests);
         let pair = |coords: &[f32]| -> Vec<(u32, f32)> {
             axes.iter().zip(coords).map(|(a, &v)| (a.tag, v)).collect()
@@ -8915,39 +9337,54 @@ impl Renderer {
     }
 
     /// The instance face `index` of `bytes` draws at in `role`, under the live
-    /// requests and dark-theme nudge: the primary's policy over that face's own `fvar`.
-    fn family_face_instance(&self, bytes: &[u8], index: u32, role: FaceRole) -> FaceInstance {
+    /// requests and dark-theme nudge: the primary's policy over that face's own `fvar`,
+    /// or the named instance its font name chose ([`NamedInstance`]).
+    fn family_face_instance(
+        &self,
+        bytes: &[u8],
+        index: u32,
+        named: Option<&NamedInstance>,
+        role: FaceRole,
+    ) -> FaceInstance {
         let Some(probe) = variation::probe(bytes, index) else {
             return FaceInstance::default();
         };
-        match role {
-            FaceRole::Regular => {
+        let axes = &probe.axes;
+        let instance = |coords: &[f32]| -> VarCoords {
+            let all_default = axes
+                .iter()
+                .zip(coords)
+                .all(|(axis, &value)| (value - axis.def).abs() < 1e-4);
+            (!all_default).then(|| {
+                axes.iter()
+                    .zip(coords)
+                    .map(|(axis, &value)| (axis.tag, value))
+                    .collect()
+            })
+        };
+        let (requests, dark_nudge) = self.role_requests();
+        match (role, named.and_then(|named| named.paired(axes))) {
+            (FaceRole::Regular, _) => {
                 let resolved = self.compute_variations_for_face(
-                    Some((bytes, index)),
-                    &self.cfg_font_variations,
-                    self.font_weight_dark_nudge,
+                    Some((bytes, index, named)),
+                    &requests,
+                    dark_nudge,
                 );
                 FaceInstance {
                     drawn: resolved.drawn,
                     bold: resolved.bold,
                 }
             }
-            FaceRole::Bold => {
-                let axes = &probe.axes;
+            // A bold face named at its instance draws that instance, its own bold.
+            (FaceRole::Bold, Some(named)) => FaceInstance {
+                drawn: instance(&named),
+                bold: None,
+            },
+            (FaceRole::Bold, None) => {
                 let base = variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
-                let base = variation::apply_requests(axes, base, &self.cfg_font_variations);
-                let bold = variation::bold_role_coords(axes, &base);
-                let all_default = axes
-                    .iter()
-                    .zip(&bold)
-                    .all(|(axis, &value)| (value - axis.def).abs() < 1e-4);
+                let base = variation::apply_requests(axes, base, &requests);
                 FaceInstance {
-                    drawn: (!all_default).then(|| {
-                        axes.iter()
-                            .zip(&bold)
-                            .map(|(axis, &value)| (axis.tag, value))
-                            .collect()
-                    }),
+                    drawn: instance(&variation::bold_role_coords(axes, &base)),
                     // A bold face serves the bold itself.
                     bold: None,
                 }
@@ -8955,18 +9392,44 @@ impl Renderer {
         }
     }
 
+    /// What a styled face its role weighs ([`FaceRole`]) is drawn under: the user's
+    /// variation requests and dark-theme nudge, or, where the primary's font name chose
+    /// its instance (`SF Mono Light`, [`NamedInstance`]), that instance on every axis and
+    /// no nudge, as the primary draws it: the regular text's weight is the role's, as a
+    /// static `JetBrainsMono-Light` finds its `LightItalic` sibling.
+    fn role_requests(&self) -> (Vec<(u32, f32)>, f32) {
+        if let Some(named) = &self.primary_named
+            && let Some(bytes) = self.shaping_primary_bytes.as_deref()
+            && let Some(probe) = variation::probe(bytes, self.primary_index)
+            && let Some(coords) = named.paired(&probe.axes)
+        {
+            let pinned = probe
+                .axes
+                .iter()
+                .zip(coords)
+                .map(|(axis, value)| (axis.tag, value))
+                .collect();
+            return (pinned, 0.0);
+        }
+        (
+            self.cfg_font_variations.clone(),
+            self.font_weight_dark_nudge,
+        )
+    }
+
     /// Re-resolve every styled slot's and the injected bold's instance; whether any
     /// moved (the caller drops the caches that baked the old one).
     fn refresh_family_instances(&mut self) -> bool {
         let mut moved = false;
         for slot in 0..3 {
-            let Some((bytes, index)) = self.styled_faces[slot]
+            let Some((bytes, index, named)) = self.styled_faces[slot]
                 .as_ref()
-                .map(|face| (face.bytes.clone(), face.index))
+                .map(|face| (face.bytes.clone(), face.index, face.named.clone()))
             else {
                 continue;
             };
-            let instance = self.family_face_instance(&bytes, index, FaceRole::of_slot(slot));
+            let instance =
+                self.family_face_instance(&bytes, index, named.as_ref(), FaceRole::of_slot(slot));
             if let Some(face) = self.styled_faces[slot].as_mut()
                 && face.instance != instance
             {
@@ -8977,7 +9440,14 @@ impl Renderer {
         let bold = self
             .bold_font_bytes
             .clone()
-            .map(|bytes| self.family_face_instance(&bytes, self.bold_font_index, FaceRole::Bold))
+            .map(|bytes| {
+                self.family_face_instance(
+                    &bytes,
+                    self.bold_font_index,
+                    self.bold_font_named.as_ref(),
+                    FaceRole::Bold,
+                )
+            })
             .unwrap_or_default();
         if self.bold_font_instance != bold {
             self.bold_font_instance = bold;

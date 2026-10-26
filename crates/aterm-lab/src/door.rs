@@ -218,6 +218,25 @@ impl<'a> Door<'a> {
         ))
     }
 
+    /// `aterm harness <args>` under the lab's jail and scratch (its state root the instance's), captured: the
+    /// harness's read views of this lab (`disk why`, `ledger disk`).
+    /// # Errors
+    /// The client could not start.
+    pub fn harness(&self, args: &[&str]) -> Result<Reply, String> {
+        let mut v = vec!["harness"];
+        v.extend_from_slice(args);
+        let out = self
+            .command(&v, "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("could not run {}: {e}", self.aterm.display()))?;
+        Ok(Reply {
+            code: out.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
     /// One authenticated control connection to the lab, in this process.
     /// # Errors
     /// A rule refused it, or the connection or its token failed.

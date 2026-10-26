@@ -7,9 +7,9 @@ use super::*;
 use crate::events::{Event, EventKind};
 use crate::explain::fixtures::{
     Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, build_start_1032, calm_1510,
-    delegated_1032, delegated_in_aterm_1032, finished_1032, lane_off_1032, liar_1032, reaped_1032,
-    reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab_ahead_1032, tab2_build_1048,
-    two_coalitions_1421, wrapped_1218,
+    claude_reaped_1032, delegated_1032, delegated_in_aterm_1032, finished_1032, lane_off_1032,
+    liar_1032, reaped_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab_ahead_1032,
+    tab2_build_1048, two_coalitions_1421, wrapped_1218,
 };
 use crate::explain::{CoalLane, LeadIdentity, Voucher};
 use crate::model::{MemCounters, MemSample, Pressure, Thermal, Vitals};
@@ -1069,6 +1069,80 @@ fn unattributed_work_bounds_the_tab_pair() {
     let you = j.get("you").expect("you");
     assert_eq!(you.get("cpu_at_least_mc"), Some(&Jv::Int(200)));
     assert_eq!(you.get("role"), Some(&Jv::why("not_sampled")));
+}
+
+/// The same build with claude its compilers' reaper (`claude_reaped_1032`): the reap credit
+/// puts their 3 cores in tab 1, which reads exact and the main cause, nothing unattributed.
+#[test]
+fn reaped_work_counts_in_its_tab() {
+    let w = mac();
+    let s = read(&claude_reaped_1032(), 3);
+    let c = ctx(&w, &s, true);
+    let t = why("why cpu", &c);
+    assert!(
+        lines(&t, "split")[0].starts_with("split tab_mc=3200 aterm_rest_mc=200 others_mc=730 "),
+        "{t}"
+    );
+    assert_eq!(
+        lines(&t, "you"),
+        ["you tab=1 role=main cpu_mc=3200 share_pm=508"]
+    );
+    assert!(
+        t.contains("; Tab 1's work; this tab is the main cause\n"),
+        "{t}"
+    );
+    assert!(t.contains("\ncause id=tab-work covers_mc=3200 "), "{t}");
+    assert!(!t.contains("finished_tab_work"), "{t}");
+    let j = render_json(&q("why cpu --json"), &c);
+    let split = j.get("split_mc").expect("split_mc");
+    assert_eq!(split.get("tab"), Some(&Jv::Int(3200)));
+    assert_eq!(split.get("aterm_rest"), Some(&Jv::Int(200)));
+    let you = j.get("you").expect("you");
+    assert_eq!(you.get("cpu_mc"), Some(&Jv::Int(3200)));
+    assert_eq!(you.get("unattributed_mc"), None);
+}
+
+/// The same build with aterm's coalition 100 millicores short of the ledger, as the counter runs
+/// short of its exited tasks' work, and one of claude's helpers (pid 1220) left for launchd and
+/// reaped by it, its tail since its last reading lost: nothing reads as unattributed, but the
+/// ledger knows it missed some of tab 1's work, so the tab's figure is a lower bound.
+#[test]
+fn work_the_ledger_missed_bounds_the_tab_though_none_is_unattributed() {
+    let w = mac();
+    let mut scene = claude_reaped_1032();
+    for c in scene.coalitions.iter_mut().filter(|c| c.id == 1342) {
+        c.mc -= 100;
+    }
+    let [mut base, mut sweep, now] = scene.samples();
+    // Idle while read: under claude, then under launchd.
+    for (reading, ppid) in [(&mut base, 1210), (&mut sweep, 1)] {
+        let procs = reading.procs.as_mut().expect("swept");
+        let mut helper = procs
+            .iter()
+            .find(|p| p.pid == 1210)
+            .cloned()
+            .expect("claude");
+        helper.pid = 1220;
+        helper.ppid = ppid;
+        helper.cpu_ns = Some(1_000_000_000);
+        helper.child_cpu_ns = Some(0);
+        procs.push(helper);
+    }
+    let s = last(&[base, sweep, now]);
+    let c = ctx(&w, &s, true);
+    let t = why("why cpu", &c);
+    assert!(
+        lines(&t, "split")[0].starts_with("split tab_mc=≥3200 aterm_rest_mc=≤100 "),
+        "{t}"
+    );
+    assert_eq!(
+        lines(&t, "you"),
+        ["you tab=1 role=main cpu_at_least_mc=3200 unattributed_mc=0"]
+    );
+    let you = render_json(&q("why cpu --json"), &c);
+    let you = you.get("you").expect("you");
+    assert_eq!(you.get("cpu_at_least_mc"), Some(&Jv::Int(3200)));
+    assert_eq!(you.get("unattributed_mc"), Some(&Jv::Int(0)));
 }
 
 #[test]

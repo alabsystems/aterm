@@ -2,12 +2,19 @@
 // Copyright 2026 Andrew Yates
 
 //! Multi-backend GPU resource and frame-encoding layer: [`DeviceHandle`] ([`DeviceHandle::Metal`]
-//! over [`crate::metal::resources::MetalResourceDevice`], `crate::gl::device::GlDevice`),
-//! [`LayerTexture`] (`LayerTexture::wgpu`, [`LayerTexture::metal`]), [`LayerBuffer`]
-//! (`LayerBuffer::wgpu`), [`LayerSampler`], [`FrameEncoder`] ([`FrameEncoder::Metal`]),
-//! [`FramePass`], [`TexelFormat`], [`ClearColor4`], [`FrameLoad`], [`metal_try_read_back`], and
-//! [`metal_stage_readback`].
+//! over [`crate::metal::resources::MetalResourceDevice`], `crate::gl::device::GlDevice`,
+//! `crate::d3d11::device::D3dDevice`), [`LayerTexture`] (`LayerTexture::wgpu`,
+//! [`LayerTexture::metal`]), [`LayerBuffer`] (`LayerBuffer::wgpu`), [`LayerSampler`],
+//! [`FrameEncoder`] ([`FrameEncoder::Metal`]), [`FramePass`], [`TexelFormat`], [`ClearColor4`],
+//! [`FrameLoad`], [`metal_try_read_back`], and [`metal_stage_readback`].
 
+#[cfg(d3d11_arm)]
+use crate::d3d11::{
+    device::D3dDevice,
+    encoder::{D3dFrame, D3dPass},
+    pipelines::D3dPipeline,
+    resources::{D3dBuffer, D3dBufferRole, D3dSampler, D3dTexture},
+};
 #[cfg(gl_arm)]
 use crate::gl::{
     device::GlDevice,
@@ -112,11 +119,12 @@ impl TexelFormat {
 /// What a texture is for, backend-neutrally.
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(
-    all(gl_arm, not(wgpu_arm)),
+    all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
     expect(
         dead_code,
-        reason = "GL textures declare no usage (every GLES texture can be sampled, drawn and \
-                  copied); the wgpu and Metal arms read it"
+        reason = "GL and D3D11 textures declare no usage (every GLES texture, and every \
+                  D3D11 texture the arm makes, can be sampled, drawn and copied); the wgpu \
+                  and Metal arms read it"
     )
 )]
 pub(crate) struct TexUsage {
@@ -141,7 +149,7 @@ impl TexUsage {
 
     /// The offscreen family: drawn into, blitted from, scroll-shifted.
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm)),
+        all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
         expect(dead_code, reason = "the wgpu and Metal arms' texture mints")
     )]
     pub(crate) const OFFSCREEN: Self = Self {
@@ -214,6 +222,8 @@ pub(crate) enum DeviceHandle<'a> {
     Metal(&'a MetalResourceDevice),
     #[cfg(gl_arm)]
     Gl(&'a GlDevice),
+    #[cfg(d3d11_arm)]
+    D3d11(&'a D3dDevice),
 }
 
 impl DeviceHandle<'_> {
@@ -268,6 +278,14 @@ impl DeviceHandle<'_> {
                 dev.texture_2d(format, width, height, alias)
                     .map(LayerTexture::Gl)
             }
+            #[cfg(d3d11_arm)]
+            Self::D3d11(dev) => {
+                // Every D3D11 texture the arm makes is bound as a shader
+                // resource and a render target, and any can be copied.
+                let _ = (label, usage);
+                dev.texture_2d(format, width, height, alias)
+                    .map(LayerTexture::D3d11)
+            }
         }
     }
 
@@ -285,7 +303,20 @@ impl DeviceHandle<'_> {
         self.try_create_texture_2d(label, format, width, height, usage, alias)
             .unwrap_or_else(|e| panic!("device layer: {label}: {e}"))
     }
+}
 
+/// The uploads that panic on a refused write, for callers with no error path.
+/// Every D3D11 upload takes [`DeviceHandle::try_upload_texture_region`]
+/// instead, since a removed device refuses writes under a frame.
+#[cfg_attr(
+    all(d3d11_arm, not(wgpu_arm)),
+    expect(
+        dead_code,
+        reason = "the shipped Windows build's uploads are all the D3D11 arm's, which take \
+                  `try_upload_texture_region`"
+    )
+)]
+impl DeviceHandle<'_> {
     /// Full-extent upload of level 0 (`queue.write_texture` / `replaceRegion:`).
     #[inline]
     pub(crate) fn upload_texture_full(
@@ -314,6 +345,11 @@ impl DeviceHandle<'_> {
     }
 
     /// Upload the `w × h` region at `(x, y)` of level 0 from `bytes`, rows `bytes_per_row` apart.
+    ///
+    /// # Panics
+    ///
+    /// Where [`Self::try_upload_texture_region`] answers `Err`, and on Metal
+    /// where the region leaves the texture or `bytes` is short of it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload_texture_region(
         &self,
@@ -325,8 +361,35 @@ impl DeviceHandle<'_> {
         bytes: &[u8],
         bytes_per_row: u32,
     ) {
+        if let Err(e) = self.try_upload_texture_region(tex, x, y, w, h, bytes, bytes_per_row) {
+            panic!("device layer: {e}");
+        }
+    }
+}
+
+impl DeviceHandle<'_> {
+    /// [`Self::upload_texture_region`], answering `Err` where the GL or D3D11
+    /// device refuses the write (a region outside the texture, or a removed
+    /// D3D11 device), so a caller on a device that can be lost under it
+    /// fails the frame instead of the process. wgpu and Metal answer `Ok`.
+    ///
+    /// # Panics
+    ///
+    /// On Metal, where the region leaves the texture or `bytes` is short of
+    /// it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_upload_texture_region(
+        &self,
+        tex: &LayerTexture,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        bytes: &[u8],
+        bytes_per_row: u32,
+    ) -> Result<(), String> {
         if w == 0 || h == 0 {
-            return;
+            return Ok(());
         }
         match (self, tex) {
             #[cfg(wgpu_arm)]
@@ -350,6 +413,7 @@ impl DeviceHandle<'_> {
                         depth_or_array_layers: 1,
                     },
                 );
+                Ok(())
             }
             #[cfg(target_os = "macos")]
             (Self::Metal(_), LayerTexture::Metal(texture)) => {
@@ -382,12 +446,15 @@ impl DeviceHandle<'_> {
                 // Managed 2-D textures, so `replaceRegion:` is legal; the region lies in the
                 // texture and the band length is asserted above.
                 unsafe { texture.upload(region, bytes, bytes_per_row as usize) };
+                Ok(())
             }
             #[cfg(gl_arm)]
             (Self::Gl(dev), LayerTexture::Gl(texture)) => {
-                if let Err(e) = dev.upload_region(texture, x, y, w, h, bytes, bytes_per_row) {
-                    panic!("device layer: {e}");
-                }
+                dev.upload_region(texture, x, y, w, h, bytes, bytes_per_row)
+            }
+            #[cfg(d3d11_arm)]
+            (Self::D3d11(dev), LayerTexture::D3d11(texture)) => {
+                dev.upload_region(texture, x, y, w, h, bytes, bytes_per_row)
             }
             #[cfg(multi_arm)]
             _ => crossed("texture", "another backend's upload"),
@@ -397,11 +464,12 @@ impl DeviceHandle<'_> {
     /// A per-frame instance-stream buffer.
     #[inline]
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm)),
+        all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
         expect(
             dead_code,
-            reason = "the GL arm mints its buffers on its device (`GlDevice::buffer`); the \
-                      wgpu and Metal arms and the GL replay test use the layer's"
+            reason = "the GL and D3D11 arms mint their buffers on their devices \
+                      (`GlDevice::buffer`, `D3dDevice::buffer`); the wgpu and Metal arms and \
+                      the replay tests use the layer's"
         )
     )]
     pub(crate) fn try_create_instance_buffer(
@@ -423,11 +491,12 @@ impl DeviceHandle<'_> {
     /// A uniform buffer (`UNIFORM | COPY_DST` on wgpu; a shared-storage `MTLBuffer` on Metal).
     #[inline]
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm)),
+        all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
         expect(
             dead_code,
-            reason = "the GL arm mints its buffers on its device (`GlDevice::buffer`); the \
-                      wgpu and Metal arms and the GL replay test use the layer's"
+            reason = "the GL and D3D11 arms mint their buffers on their devices \
+                      (`GlDevice::buffer`, `D3dDevice::buffer`); the wgpu and Metal arms and \
+                      the replay tests use the layer's"
         )
     )]
     pub(crate) fn try_create_uniform_buffer(
@@ -449,11 +518,12 @@ impl DeviceHandle<'_> {
     /// A readback staging buffer a texture is copied into for the CPU to read.
     #[inline]
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm)),
+        all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
         expect(
             dead_code,
-            reason = "the GL arm mints its buffers on its device (`GlDevice::buffer`); the \
-                      wgpu and Metal arms and the GL replay test use the layer's"
+            reason = "the GL and D3D11 arms mint their buffers on their devices \
+                      (`GlDevice::buffer`, `D3dDevice::buffer`); the wgpu and Metal arms and \
+                      the replay tests use the layer's"
         )
     )]
     pub(crate) fn try_create_readback_buffer(
@@ -516,6 +586,21 @@ impl DeviceHandle<'_> {
                 dev.buffer(role, usize::try_from(size).unwrap_or(usize::MAX))
                     .map(LayerBuffer::Gl)
             }
+            #[cfg(d3d11_arm)]
+            Self::D3d11(dev) => {
+                let _ = label;
+                let role = match role {
+                    BufferRole::Instance => D3dBufferRole::Instance,
+                    BufferRole::Uniform => D3dBufferRole::Uniform,
+                    BufferRole::Readback => {
+                        return Err("d3d11: a texture reads back through a staging texture \
+                                    (`D3dDevice::read_rgba8`), never a buffer"
+                            .to_owned());
+                    }
+                };
+                dev.buffer(role, usize::try_from(size).unwrap_or(usize::MAX))
+                    .map(LayerBuffer::D3d11)
+            }
         }
     }
 
@@ -524,11 +609,12 @@ impl DeviceHandle<'_> {
     /// # Safety
     /// None on wgpu; on Metal, no in-flight GPU work may alias `buf`.
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm)),
+        all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
         expect(
             dead_code,
-            reason = "the GL arm mints its buffers on its device (`GlDevice::buffer`); the \
-                      wgpu and Metal arms and the GL replay test use the layer's"
+            reason = "the GL and D3D11 arms mint their buffers on their devices \
+                      (`GlDevice::buffer`, `D3dDevice::buffer`); the wgpu and Metal arms and \
+                      the replay tests use the layer's"
         )
     )]
     pub(crate) unsafe fn write_buffer_from_zero(&self, buf: &LayerBuffer, bytes: &[u8]) {
@@ -550,6 +636,12 @@ impl DeviceHandle<'_> {
             }
             #[cfg(gl_arm)]
             (Self::Gl(dev), LayerBuffer::Gl(b)) => {
+                if let Err(e) = dev.write_buffer(b, bytes) {
+                    panic!("device layer: {e}");
+                }
+            }
+            #[cfg(d3d11_arm)]
+            (Self::D3d11(dev), LayerBuffer::D3d11(b)) => {
                 if let Err(e) = dev.write_buffer(b, bytes) {
                     panic!("device layer: {e}");
                 }
@@ -598,6 +690,11 @@ impl DeviceHandle<'_> {
                 let _ = label;
                 dev.sampler(kind).map(LayerSampler::Gl)
             }
+            #[cfg(d3d11_arm)]
+            Self::D3d11(dev) => {
+                let _ = label;
+                dev.sampler(kind).map(LayerSampler::D3d11)
+            }
         }
     }
 
@@ -633,6 +730,10 @@ impl DeviceHandle<'_> {
             Self::Metal(mint) => mint.device().max_buffer_length() as u64,
             #[cfg(gl_arm)]
             Self::Gl(_) => i32::MAX as u64,
+            // D3D11's guaranteed resource size floor
+            // (`D3D11_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION_A_TERM`).
+            #[cfg(d3d11_arm)]
+            Self::D3d11(_) => 128 << 20,
         }
     }
 
@@ -646,6 +747,8 @@ impl DeviceHandle<'_> {
             Self::Metal(_) => METAL_MAX_TEXTURE_DIM,
             #[cfg(gl_arm)]
             Self::Gl(dev) => dev.caps().max_texture_dim,
+            #[cfg(d3d11_arm)]
+            Self::D3d11(dev) => dev.caps().max_texture_dim,
         }
     }
 }
@@ -667,9 +770,33 @@ pub(crate) enum LayerTexture {
     Metal(SealedTexture),
     #[cfg(gl_arm)]
     Gl(GlTexture),
+    #[cfg(d3d11_arm)]
+    D3d11(D3dTexture),
 }
 
 impl LayerTexture {
+    /// The D3D11 texture.
+    #[inline]
+    #[cfg(d3d11_arm)]
+    pub(crate) fn d3d11(&self) -> &D3dTexture {
+        match self {
+            Self::D3d11(t) => t,
+            #[cfg(multi_arm)]
+            _ => crossed("texture", "a D3D11-only seam"),
+        }
+    }
+
+    /// [`Self::d3d11`], by value.
+    #[inline]
+    #[cfg(d3d11_arm)]
+    pub(crate) fn into_d3d11(self) -> D3dTexture {
+        match self {
+            Self::D3d11(t) => t,
+            #[cfg(multi_arm)]
+            _ => crossed("texture", "a D3D11-only seam"),
+        }
+    }
+
     /// The GL texture.
     #[inline]
     #[cfg(gl_arm)]
@@ -752,6 +879,8 @@ impl LayerTexture {
             Self::Metal(t) => t.width() as u32,
             #[cfg(gl_arm)]
             Self::Gl(t) => t.width,
+            #[cfg(d3d11_arm)]
+            Self::D3d11(t) => t.width,
         }
     }
 
@@ -765,6 +894,8 @@ impl LayerTexture {
             Self::Metal(t) => t.height() as u32,
             #[cfg(gl_arm)]
             Self::Gl(t) => t.height,
+            #[cfg(d3d11_arm)]
+            Self::D3d11(t) => t.height,
         }
     }
 }
@@ -778,6 +909,8 @@ pub(crate) enum LayerBuffer {
     Metal(SharedBuffer),
     #[cfg(gl_arm)]
     Gl(GlBuffer),
+    #[cfg(d3d11_arm)]
+    D3d11(D3dBuffer),
 }
 
 impl LayerBuffer {
@@ -845,9 +978,22 @@ pub(crate) enum LayerSampler {
     Metal(mtl::Obj),
     #[cfg(gl_arm)]
     Gl(GlSampler),
+    #[cfg(d3d11_arm)]
+    D3d11(D3dSampler),
 }
 
 impl LayerSampler {
+    /// The D3D11 sampler, by value.
+    #[inline]
+    #[cfg(d3d11_arm)]
+    pub(crate) fn into_d3d11(self) -> D3dSampler {
+        match self {
+            Self::D3d11(s) => s,
+            #[cfg(multi_arm)]
+            _ => crossed("sampler", "a D3D11-only seam"),
+        }
+    }
+
     /// The live wgpu sampler, by value.
     #[inline]
     #[cfg(gl_arm)]
@@ -932,6 +1078,10 @@ pub(crate) enum FrameView<'a> {
     /// The texture, and which of its views the pass draws through (see `GlTexture::views`).
     #[cfg(gl_arm)]
     Gl { tex: &'a GlTexture, srgb: bool },
+    /// The texture, and which of its views the pass draws through (see
+    /// `D3dTexture::views`).
+    #[cfg(d3d11_arm)]
+    D3d11 { tex: &'a D3dTexture, srgb: bool },
 }
 
 /// A render pipeline on one backend.
@@ -943,6 +1093,8 @@ pub(crate) enum FramePipeline<'a> {
     Metal(&'a mtl::Obj),
     #[cfg(gl_arm)]
     Gl(&'a GlPipeline),
+    #[cfg(d3d11_arm)]
+    D3d11(&'a D3dPipeline),
 }
 
 /// An atlas bind: wgpu bind group 1.
@@ -984,6 +1136,25 @@ pub(crate) enum FrameAtlas<'a> {
         sampler: &'a GlSampler,
         units: [u32; 3],
     },
+    /// The texture's shader-resource view and its sampler at one slot (the
+    /// row's `BindSpec::fragment_textures` slot: `t<n>` with `s<n>`).
+    #[cfg(d3d11_arm)]
+    D3d11 {
+        tex: &'a D3dTexture,
+        sampler: &'a D3dSampler,
+        unit: u32,
+    },
+    /// The fx bind on D3D11: the two atlases and this frame's palette texture
+    /// at slots `units` (`t0`, `t1`, `t2`), read by `Load` (the sampler binds
+    /// beside them, as on GL, and is never consulted).
+    #[cfg(d3d11_arm)]
+    D3d11Fx {
+        r8: &'a D3dTexture,
+        rgba: &'a D3dTexture,
+        palette: &'a D3dTexture,
+        sampler: &'a D3dSampler,
+        units: [u32; 3],
+    },
 }
 
 /// A bound instance stream.
@@ -995,6 +1166,8 @@ pub(crate) enum FrameStream<'a> {
     Metal(&'a mtl::Obj),
     #[cfg(gl_arm)]
     Gl(&'a GlBuffer),
+    #[cfg(d3d11_arm)]
+    D3d11(&'a D3dBuffer),
 }
 
 /// The shared 16-byte frame uniforms.
@@ -1013,6 +1186,10 @@ pub(crate) enum FrameUniforms<'a> {
     /// The block's buffer at its binding point.
     #[cfg(gl_arm)]
     Gl { buf: &'a GlBuffer, binding: u32 },
+    /// The constant buffer at its register (the row's
+    /// `BindSpec::vertex_uniform`), bound to both stages.
+    #[cfg(d3d11_arm)]
+    D3d11 { buf: &'a D3dBuffer, binding: u32 },
 }
 
 /// A texture for the mid-frame copy verbs (scroll shift).
@@ -1024,6 +1201,8 @@ pub(crate) enum FrameCopyTexture<'a> {
     Metal(&'a SealedTexture),
     #[cfg(gl_arm)]
     Gl(&'a GlTexture),
+    #[cfg(d3d11_arm)]
+    D3d11(&'a D3dTexture),
 }
 
 /// The committed frame.
@@ -1038,6 +1217,10 @@ pub(crate) enum SubmittedFrame {
     /// GL ran the commands as they were issued.
     #[cfg(gl_arm)]
     Gl(Result<(), String>),
+    /// The immediate context flushed the frame's commands; this is whether
+    /// the device was still there.
+    #[cfg(d3d11_arm)]
+    D3d11(Result<(), String>),
 }
 
 /// One frame's command encoder on one backend.
@@ -1053,6 +1236,8 @@ pub(crate) enum FrameEncoder<'s> {
     Metal(MtlCommandBuffer<'s>),
     #[cfg(gl_arm)]
     Gl(GlFrame<'s>),
+    #[cfg(d3d11_arm)]
+    D3d11(D3dFrame<'s>),
 }
 
 impl<'s> FrameEncoder<'s> {
@@ -1062,7 +1247,13 @@ impl<'s> FrameEncoder<'s> {
         Ok(Self::Gl(GlFrame::begin(dev)?))
     }
 
-    /// The wgpu arm (production off macOS).
+    /// The D3D11 arm: the device's immediate context, held for the frame.
+    #[cfg(d3d11_arm)]
+    pub(crate) fn d3d11(dev: &'s D3dDevice) -> Result<Self, String> {
+        Ok(Self::D3d11(D3dFrame::begin(dev)?))
+    }
+
+    /// The wgpu arm.
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(
         device: &wgpu::Device,
@@ -1190,6 +1381,24 @@ impl<'s> FrameEncoder<'s> {
                     (buf, binding),
                 )?))
             }
+            #[cfg(d3d11_arm)]
+            Self::D3d11(frame) => {
+                let _ = label;
+                let ((tex, srgb), (buf, binding)) = match (view, uniforms) {
+                    (FrameView::D3d11 { tex, srgb }, FrameUniforms::D3d11 { buf, binding }) => {
+                        ((tex, srgb), (buf, binding))
+                    }
+                    #[cfg(multi_arm)]
+                    _ => crossed("pass target or uniform block", "the D3D11 frame encoder"),
+                };
+                Ok(FramePass::D3d11(frame.begin_pass(
+                    tex,
+                    srgb,
+                    load,
+                    scissor,
+                    (buf, binding),
+                )?))
+            }
         }
     }
 
@@ -1265,6 +1474,15 @@ impl<'s> FrameEncoder<'s> {
                 };
                 frame.copy_rect(src, src_origin, dst, dst_origin, width, height)
             }
+            #[cfg(d3d11_arm)]
+            Self::D3d11(frame) => {
+                let (src, dst) = match (src, dst) {
+                    (FrameCopyTexture::D3d11(src), FrameCopyTexture::D3d11(dst)) => (src, dst),
+                    #[cfg(multi_arm)]
+                    _ => crossed("copy texture", "the D3D11 frame encoder"),
+                };
+                frame.copy_rect(src, src_origin, dst, dst_origin, width, height)
+            }
         }
     }
 
@@ -1280,6 +1498,8 @@ impl<'s> FrameEncoder<'s> {
             Self::Metal(cb) => SubmittedFrame::Metal(cb.commit()),
             #[cfg(gl_arm)]
             Self::Gl(frame) => SubmittedFrame::Gl(frame.submit()),
+            #[cfg(d3d11_arm)]
+            Self::D3d11(frame) => SubmittedFrame::D3d11(frame.submit()),
         }
     }
 }
@@ -1302,6 +1522,8 @@ pub(crate) enum FramePass<'e, 's> {
     Metal(MtlPassEncoder<'e, 's>),
     #[cfg(gl_arm)]
     Gl(GlPass<'e, 's>),
+    #[cfg(d3d11_arm)]
+    D3d11(D3dPass<'e, 's>),
 }
 
 impl FramePass<'_, '_> {
@@ -1315,6 +1537,8 @@ impl FramePass<'_, '_> {
             (Self::Metal(pass), FramePipeline::Metal(pso)) => pass.set_pipeline(pso),
             #[cfg(gl_arm)]
             (Self::Gl(pass), FramePipeline::Gl(p)) => pass.set_pipeline(p),
+            #[cfg(d3d11_arm)]
+            (Self::D3d11(pass), FramePipeline::D3d11(p)) => pass.set_pipeline(p),
             #[cfg(multi_arm)]
             _ => crossed("frame pipeline", "an open pass"),
         }
@@ -1373,6 +1597,26 @@ impl FramePass<'_, '_> {
                 pass.bind_texture(rgba, sampler, units[1], false);
                 pass.bind_texture(palette, sampler, units[2], false);
             }
+            #[cfg(d3d11_arm)]
+            (Self::D3d11(pass), FrameAtlas::D3d11 { tex, sampler, unit }) => {
+                // Frame atlases have no sRGB view; `raw` is moot.
+                pass.bind_texture(tex, sampler, unit, false);
+            }
+            #[cfg(d3d11_arm)]
+            (
+                Self::D3d11(pass),
+                FrameAtlas::D3d11Fx {
+                    r8,
+                    rgba,
+                    palette,
+                    sampler,
+                    units,
+                },
+            ) => {
+                pass.bind_texture(r8, sampler, units[0], false);
+                pass.bind_texture(rgba, sampler, units[1], false);
+                pass.bind_texture(palette, sampler, units[2], false);
+            }
             #[cfg(multi_arm)]
             _ => crossed("frame atlas", "an open pass"),
         }
@@ -1390,6 +1634,8 @@ impl FramePass<'_, '_> {
             (Self::Metal(pass), FrameStream::Metal(buf)) => pass.set_instance_stream(buf),
             #[cfg(gl_arm)]
             (Self::Gl(pass), FrameStream::Gl(buf)) => pass.set_stream(buf),
+            #[cfg(d3d11_arm)]
+            (Self::D3d11(pass), FrameStream::D3d11(buf)) => pass.set_stream(buf),
             #[cfg(multi_arm)]
             _ => crossed("frame stream", "an open pass"),
         }
@@ -1412,6 +1658,8 @@ impl FramePass<'_, '_> {
             ),
             #[cfg(gl_arm)]
             Self::Gl(pass) => pass.draw(6, instances),
+            #[cfg(d3d11_arm)]
+            Self::D3d11(pass) => pass.draw(6, instances),
         }
     }
 }
@@ -1585,6 +1833,24 @@ mod host_read_tests {
 pub(crate) fn gl_try_read_back(
     dev: &GlDevice,
     texture: &GlTexture,
+    width: u32,
+    height: u32,
+) -> Result<aterm_render::Frame, String> {
+    let (w, h) = (width as usize, height as usize);
+    let padded = crate::padded_bytes_per_row(w);
+    let bytes = dev.read_rgba8(texture, width, height, padded)?;
+    Ok(crate::frame_from_padded_rgba(&bytes, w, h, padded))
+}
+
+/// D3D11 arm of `try_read_back`: copy `texture`'s `width` x `height` RGBA8
+/// texels through a staging texture into rows of the wgpu arm's 256-byte
+/// stride and unpack them into an `aterm_render::Frame` with the shared byte
+/// contract ([`crate::frame_from_padded_rgba`]). The staging map waits for
+/// every draw into the texture, so the answer is the frame as rendered.
+#[cfg(d3d11_arm)]
+pub(crate) fn d3d11_try_read_back(
+    dev: &D3dDevice,
+    texture: &D3dTexture,
     width: u32,
     height: u32,
 ) -> Result<aterm_render::Frame, String> {

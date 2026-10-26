@@ -441,21 +441,28 @@ impl InkLedger {
         };
         let ctx = self.cell_room_ctx(base / Self::BANDS, Self::STEADY_FLOOR);
         let mut share = 1.0f32;
-        for (b, lift) in lifts.iter().enumerate() {
-            if *lift != [0.0; 3] {
-                share = share.min(self.room_with(base + b, lift.map(|l| l * cov), ctx));
+        let mut b = 0;
+        while b < Self::BANDS {
+            let lift = lifts[b];
+            if lift != [0.0; 3] {
+                let add = [lift[0] * cov, lift[1] * cov, lift[2] * cov];
+                share = share.min(self.room_with(base + b, add, ctx));
                 if share <= 0.0 {
                     return 0.0;
                 }
             }
+            b += 1;
         }
-        for (b, lift) in lifts.iter().enumerate() {
-            if *lift != [0.0; 3] {
+        let mut b = 0;
+        while b < Self::BANDS {
+            let lift = lifts[b];
+            if lift != [0.0; 3] {
                 let dst = &mut self.laid[base + b];
                 dst[0] += share * lift[0] * cov;
                 dst[1] += share * lift[1] * cov;
                 dst[2] += share * lift[2] * cov;
             }
+            b += 1;
         }
         cov * share
     }
@@ -471,17 +478,25 @@ impl InkLedger {
         if !self.on || rx <= 0.0 || ry <= 0.0 || (premul & 0x00FF_FFFF) == 0 {
             return 1.0;
         }
-        let peak = [16u32, 8, 0].map(|sh| ((premul >> sh) & 0xff) as f32);
+        let peak = [
+            ((premul >> 16) & 0xff) as f32,
+            ((premul >> 8) & 0xff) as f32,
+            (premul & 0xff) as f32,
+        ];
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch * (1.0 / Self::BANDS as f32);
         let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
         let row_dy2 = |row: i32| -> [f32; Self::BANDS] {
             let ry0 = oy + row as f32 * ch;
-            std::array::from_fn(|band| {
+            let mut out = [0.0f32; Self::BANDS];
+            let mut band = 0;
+            while band < Self::BANDS {
                 let y0 = ry0 + band as f32 * bh;
                 let dy = (cy.clamp(y0, y0 + bh) - cy) * inv_ry;
-                dy * dy
-            })
+                out[band] = dy * dy;
+                band += 1;
+            }
+            out
         };
         let weights = |col: i32, dy2: &[f32; Self::BANDS]| -> [Option<f32>; Self::BANDS] {
             let x0 = ox + col as f32 * cw;
@@ -490,80 +505,100 @@ impl InkLedger {
             if dx2 >= 1.0 {
                 return [None; Self::BANDS];
             }
-            std::array::from_fn(|band| {
+            let mut out = [None; Self::BANDS];
+            let mut band = 0;
+            while band < Self::BANDS {
                 let d2 = dx2 + dy2[band];
                 if d2 < 1.0 {
-                    Some((1.0 - d2) * (1.0 - d2))
-                } else {
-                    None
+                    let u = 1.0 - d2;
+                    out[band] = Some(u * u);
                 }
-            })
+                band += 1;
+            }
+            out
         };
         let reached = |(row, first, end): (i32, i32, i32)| {
             let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
             let lo = (((cx - rx - ox) * inv_cw).floor() as i32).max(first);
             let hi = (((cx + rx - ox) * inv_cw).floor() as i32 + 1).min(end);
-            let cols = if cy + ry > y0 && cy - ry < y1 {
-                lo..hi
+            let (c0, c1) = if cy + ry > y0 && cy - ry < y1 && lo < hi {
+                (lo, hi)
             } else {
-                0..0
+                (0, 0)
             };
-            (row, cols)
+            (row, c0, c1)
         };
-        let mut row_spans: [(i32, std::ops::Range<i32>, [f32; Self::BANDS]); 3] = [
-            (0, 0..0, [0.0; Self::BANDS]),
-            (0, 0..0, [0.0; Self::BANDS]),
-            (0, 0..0, [0.0; Self::BANDS]),
+        let mut row_spans: [(i32, i32, i32, [f32; Self::BANDS]); 3] = [
+            (0, 0, 0, [0.0; Self::BANDS]),
+            (0, 0, 0, [0.0; Self::BANDS]),
+            (0, 0, 0, [0.0; Self::BANDS]),
         ];
         let mut n_spans = 0usize;
         let mut share = 1.0f32;
-        'probe: for &line in &self.lines {
-            let Some(line) = line else {
+        let mut li = 0;
+        'probe: while li < self.lines.len() {
+            let Some(line) = self.lines[li] else {
+                li += 1;
                 continue;
             };
-            let (row, cols) = reached(line);
-            if cols.is_empty() {
+            li += 1;
+            let (row, c0, c1) = reached(line);
+            if c0 >= c1 {
                 continue;
             }
             let dy2 = row_dy2(row);
-            row_spans[n_spans] = (row, cols.clone(), dy2);
+            row_spans[n_spans] = (row, c0, c1, dy2);
             n_spans += 1;
-            for col in cols {
+            let mut col = c0;
+            while col < c1 {
                 let Some(base) = self.slot(row, col) else {
+                    col += 1;
                     continue;
                 };
                 let w_bands = weights(col, &dy2);
                 if w_bands == [None; Self::BANDS] {
+                    col += 1;
                     continue;
                 }
                 let ctx = self.cell_room_ctx(base / Self::BANDS, floor);
-                for (band, w) in w_bands.into_iter().enumerate() {
-                    if let Some(w) = w {
-                        share = share.min(self.room_with(base + band, peak.map(|p| p * w), ctx));
+                let mut band = 0;
+                while band < Self::BANDS {
+                    if let Some(w) = w_bands[band] {
+                        let add = [peak[0] * w, peak[1] * w, peak[2] * w];
+                        share = share.min(self.room_with(base + band, add, ctx));
                         if share <= 0.0 {
                             break 'probe;
                         }
                     }
+                    band += 1;
                 }
+                col += 1;
             }
         }
         if share <= 0.0 {
             return 0.0;
         }
-        for (row, cols, dy2) in &row_spans[..n_spans] {
-            for col in cols.clone() {
-                let Some(base) = self.slot(*row, col) else {
-                    continue;
-                };
-                for (band, w) in weights(col, dy2).into_iter().enumerate() {
-                    if let Some(w) = w {
-                        let dst = &mut self.laid[base + band];
-                        dst[0] += share * peak[0] * w;
-                        dst[1] += share * peak[1] * w;
-                        dst[2] += share * peak[2] * w;
+        let mut si = 0;
+        while si < n_spans {
+            let (row, c0, c1, dy2) = &row_spans[si];
+            let (row, mut col, c1) = (*row, *c0, *c1);
+            while col < c1 {
+                if let Some(base) = self.slot(row, col) {
+                    let w_bands = weights(col, dy2);
+                    let mut band = 0;
+                    while band < Self::BANDS {
+                        if let Some(w) = w_bands[band] {
+                            let dst = &mut self.laid[base + band];
+                            dst[0] += share * peak[0] * w;
+                            dst[1] += share * peak[1] * w;
+                            dst[2] += share * peak[2] * w;
+                        }
+                        band += 1;
                     }
                 }
+                col += 1;
             }
+            si += 1;
         }
         share
     }
@@ -580,38 +615,55 @@ impl InkLedger {
         const fn is_lit_additive(q: &GlowQuad) -> bool {
             q.alpha == 0 && (q.color | q.color2) & 0x00FF_FFFF != 0
         }
-        let mut reached = std::mem::take(&mut self.reached);
-        let (inv_cw, inv_ch) = (1.0 / cwi as f32, 1.0 / chi as f32);
-        let span = |lo: f32, len: u16, o: f32, inv_size: f32| {
+        #[inline]
+        fn span(lo: f32, len: u16, o: f32, inv_size: f32) -> (i32, i32) {
             let first = ((lo - o) * inv_size).floor() as i32;
             let last = ((lo + f32::from(len) - 1.0 - o) * inv_size).floor() as i32;
-            first..=last
-        };
+            (first, last)
+        }
+        #[inline]
+        const fn color_ends(c1: u32, c2: u32) -> [(f32, f32); 3] {
+            let r1 = ((c1 >> 16) & 0xff) as f32;
+            let g1 = ((c1 >> 8) & 0xff) as f32;
+            let b1 = (c1 & 0xff) as f32;
+            let r2 = ((c2 >> 16) & 0xff) as f32;
+            let g2 = ((c2 >> 8) & 0xff) as f32;
+            let b2 = (c2 & 0xff) as f32;
+            [(r1, r2 - r1), (g1, g2 - g1), (b1, b2 - b1)]
+        }
+        let mut reached = std::mem::take(&mut self.reached);
+        let (inv_cw, inv_ch) = (1.0 / cwi as f32, 1.0 / chi as f32);
         let stride_limit = if self.stride < i32::MAX as usize {
             self.stride as i32
         } else {
             i32::MAX
         };
-        for q in quads {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &quads[qi];
+            qi += 1;
             if !is_lit_additive(q) {
                 continue;
             }
-            let cols = span(f32::from(q.x), q.w.max(1), ox, inv_cw);
-            for row in span(f32::from(q.y), q.h.max(1), oy, inv_ch) {
-                let Some((slot_i, first, end)) = self.line_slot(row) else {
-                    continue;
-                };
-                let c0 = (*cols.start()).max(first).max(0);
-                let c1 = (*cols.end()).min(end - 1).min(stride_limit - 1);
-                for col in c0..=c1 {
-                    if self.caret == Some((row, col)) {
-                        continue;
-                    }
-                    let cell = slot_i * self.stride + col as usize;
-                    if !reached.contains(&cell) {
-                        reached.push(cell);
+            let (col_first, col_last) = span(f32::from(q.x), q.w.max(1), ox, inv_cw);
+            let (row_first, row_last) = span(f32::from(q.y), q.h.max(1), oy, inv_ch);
+            let mut row = row_first;
+            while row <= row_last {
+                if let Some((slot_i, first, end)) = self.line_slot(row) {
+                    let c0 = col_first.max(first).max(0);
+                    let c1 = col_last.min(end - 1).min(stride_limit - 1);
+                    let mut col = c0;
+                    while col <= c1 {
+                        if self.caret != Some((row, col)) {
+                            let cell = slot_i * self.stride + col as usize;
+                            if !reached.contains(&cell) {
+                                reached.push(cell);
+                            }
+                        }
+                        col += 1;
                     }
                 }
+                row += 1;
             }
         }
         if reached.is_empty() {
@@ -623,7 +675,10 @@ impl InkLedger {
         let mut px = std::mem::take(&mut self.px);
         px.clear();
         px.resize(reached.len() * area, [0.0; 3]);
-        for q in quads {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &quads[qi];
+            qi += 1;
             if !is_lit_additive(q) {
                 continue;
             }
@@ -632,63 +687,84 @@ impl InkLedger {
             let w = i32::from(q.w).max(1);
             let inv_denom = 1.0 / (2 * w) as f32;
             let flat = q.color == q.color2;
-            let ends = [16u32, 8, 0].map(|sh| {
-                let a = ((q.color >> sh) & 0xff) as f32;
-                let b = ((q.color2 >> sh) & 0xff) as f32;
-                (a, b - a)
-            });
+            let ends = color_ends(q.color, q.color2);
             let flat_c = [ends[0].0, ends[1].0, ends[2].0];
-            for (k, &cell) in reached.iter().enumerate() {
+            let mut k = 0;
+            while k < reached.len() {
+                let cell = reached[k];
                 let (cx0, cy0) = self.cell_origin(cell);
                 let (x0, x1) = (qx0.max(cx0), qx1.min(cx0 + cwi));
                 let (y0, y1) = (qy0.max(cy0), qy1.min(cy0 + chi));
-                if x0 >= x1 || y0 >= y1 {
-                    continue;
-                }
-                let k_base = k * area + ((y0 - cy0) * cwi) as usize;
-                let y_span = (y1 - y0) as usize;
-                if flat {
-                    let (rx0, rx1) = ((x0 - cx0) as usize, (x1 - cx0) as usize);
-                    for row in 0..y_span {
-                        let row_base = k_base + row * cwi_u;
-                        for px_cell in &mut px[row_base + rx0..row_base + rx1] {
-                            px_cell[0] += flat_c[0];
-                            px_cell[1] += flat_c[1];
-                            px_cell[2] += flat_c[2];
+                if x0 < x1 && y0 < y1 {
+                    let k_base = k * area + ((y0 - cy0) * cwi) as usize;
+                    let y_span = (y1 - y0) as usize;
+                    if flat {
+                        let (rx0, rx1) = ((x0 - cx0) as usize, (x1 - cx0) as usize);
+                        let mut row = 0;
+                        while row < y_span {
+                            let row_base = k_base + row * cwi_u;
+                            let row_slice = &mut px[row_base + rx0..row_base + rx1];
+                            let mut ri = 0;
+                            while ri < row_slice.len() {
+                                row_slice[ri][0] += flat_c[0];
+                                row_slice[ri][1] += flat_c[1];
+                                row_slice[ri][2] += flat_c[2];
+                                ri += 1;
+                            }
+                            row += 1;
+                        }
+                    } else {
+                        let mut x = x0;
+                        while x < x1 {
+                            let m = (2 * (x - qx0) + 1) as f32;
+                            let t = m * inv_denom;
+                            let c0 = ends[0].0 + ends[0].1 * t;
+                            let c1 = ends[1].0 + ends[1].1 * t;
+                            let c2 = ends[2].0 + ends[2].1 * t;
+                            let mut at = k_base + (x - cx0) as usize;
+                            let mut row = 0;
+                            while row < y_span {
+                                let p = &mut px[at];
+                                p[0] += c0;
+                                p[1] += c1;
+                                p[2] += c2;
+                                at += cwi_u;
+                                row += 1;
+                            }
+                            x += 1;
                         }
                     }
-                } else {
-                    for x in x0..x1 {
-                        let m = (2 * (x - qx0) + 1) as f32;
-                        let t = m * inv_denom;
-                        let c = ends.map(|(a, da)| a + da * t);
-                        let mut at = k_base + (x - cx0) as usize;
-                        for _ in 0..y_span {
-                            let p = &mut px[at];
-                            p[0] += c[0];
-                            p[1] += c[1];
-                            p[2] += c[2];
-                            at += cwi_u;
-                        }
-                    }
                 }
+                k += 1;
             }
         }
         let chi_u = chi as usize;
-        let band_ys: [(usize, usize); Self::BANDS] = std::array::from_fn(|band| {
-            (band * chi_u / Self::BANDS, (band + 1) * chi_u / Self::BANDS)
-        });
-        for k in 0..reached.len() {
+        let mut band_ys = [(0usize, 0usize); Self::BANDS];
+        let mut b = 0;
+        while b < Self::BANDS {
+            band_ys[b] = (b * chi_u / Self::BANDS, (b + 1) * chi_u / Self::BANDS);
+            b += 1;
+        }
+        let mut k = 0;
+        while k < reached.len() {
             let cell_base = k * area;
-            for (y0, y1) in band_ys {
+            let mut b = 0;
+            while b < Self::BANDS {
+                let (y0, y1) = band_ys[b];
                 let mut m = [0.0f32; 3];
-                for p in &px[cell_base + y0 * cwi_u..cell_base + y1 * cwi_u] {
+                let slice = &px[cell_base + y0 * cwi_u..cell_base + y1 * cwi_u];
+                let mut pi = 0;
+                while pi < slice.len() {
+                    let p = slice[pi];
                     m[0] = m[0].max(p[0]);
                     m[1] = m[1].max(p[1]);
                     m[2] = m[2].max(p[2]);
+                    pi += 1;
                 }
                 self.peaks.push(m);
+                b += 1;
             }
+            k += 1;
         }
         self.reached = reached;
         self.px = px;
@@ -715,9 +791,12 @@ impl InkLedger {
             return 1.0;
         }
         let mut share = 1.0f32;
-        'probe: for (k, &cell) in self.reached.iter().enumerate() {
+        let mut k = 0;
+        'probe: while k < self.reached.len() {
+            let cell = self.reached[k];
             let ctx = self.cell_room_ctx(cell, floor);
-            for band in 0..Self::BANDS {
+            let mut band = 0;
+            while band < Self::BANDS {
                 let add = self.peaks[k * Self::BANDS + band];
                 if add != [0.0; 3] {
                     share = share.min(self.room_with(cell * Self::BANDS + band, add, ctx));
@@ -725,17 +804,24 @@ impl InkLedger {
                         break 'probe;
                     }
                 }
+                band += 1;
             }
+            k += 1;
         }
         if share > 0.0 {
-            for (k, &cell) in self.reached.iter().enumerate() {
-                for band in 0..Self::BANDS {
+            let mut k = 0;
+            while k < self.reached.len() {
+                let cell = self.reached[k];
+                let mut band = 0;
+                while band < Self::BANDS {
                     let add = self.peaks[k * Self::BANDS + band];
                     let dst = &mut self.laid[cell * Self::BANDS + band];
                     dst[0] += share * add[0];
                     dst[1] += share * add[1];
                     dst[2] += share * add[2];
+                    band += 1;
                 }
+                k += 1;
             }
         }
         share
@@ -759,11 +845,13 @@ impl InkLedger {
         }
         self.dims.clear();
         let mut least = 1.0f32;
-        for k in 0..self.reached.len() {
+        let mut k = 0;
+        while k < self.reached.len() {
             let cell = self.reached[k];
             let ctx = self.cell_room_ctx(cell, floor);
             let mut share = 1.0f32;
-            for band in 0..Self::BANDS {
+            let mut band = 0;
+            while band < Self::BANDS {
                 let add = self.peaks[k * Self::BANDS + band];
                 if add != [0.0; 3] {
                     share = share.min(self.room_with(cell * Self::BANDS + band, add, ctx));
@@ -771,14 +859,17 @@ impl InkLedger {
                         break;
                     }
                 }
+                band += 1;
             }
             if share > 0.0 {
-                for band in 0..Self::BANDS {
+                let mut band = 0;
+                while band < Self::BANDS {
                     let add = self.peaks[k * Self::BANDS + band];
                     let dst = &mut self.laid[cell * Self::BANDS + band];
                     dst[0] += share * add[0];
                     dst[1] += share * add[1];
                     dst[2] += share * add[2];
+                    band += 1;
                 }
             }
             if share < 1.0 {
@@ -786,6 +877,7 @@ impl InkLedger {
                 self.note_cut(cell, share);
                 least = least.min(share);
             }
+            k += 1;
         }
         if self.dims.is_empty() {
             return 1.0;
@@ -793,8 +885,10 @@ impl InkLedger {
         let bounds = self.dims_bounds();
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.clear();
-        for i in range.clone() {
+        let mut i = range.start;
+        while i < range.end {
             let q = quads[i];
+            i += 1;
             let (x0, y0) = (i32::from(q.x), i32::from(q.y));
             let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
             if q.alpha != 0
@@ -910,14 +1004,37 @@ impl InkLedger {
     }
 
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
+        #[inline]
+        fn push_in(k: &mut Vec<i32>, v: i32, lo: i32, hi: i32) {
+            if v > lo && v < hi {
+                k.push(v);
+            }
+        }
+        #[inline]
+        fn push_edge(k: &mut Vec<i32>, (a, b): (i32, i32), f: i32, (lo, hi): (i32, i32)) {
+            push_in(k, a, lo, hi);
+            push_in(k, b, lo, hi);
+            let mut s = InkLedger::FEATHER_STEP;
+            while s < f {
+                push_in(k, a - s, lo, hi);
+                push_in(k, b + s, lo, hi);
+                s += InkLedger::FEATHER_STEP;
+            }
+            push_in(k, a - f, lo, hi);
+            push_in(k, b + f, lo, hi);
+        }
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
             (cw * Self::FEATHER_X).ceil() as i32,
             (ch * Self::FEATHER_Y).ceil() as i32,
         );
         let (kx, ky) = (&mut self.knots_x, &mut self.knots_y);
+        let dims = self.dims.as_slice();
         let mut meets = false;
-        for d in &self.dims {
+        let mut di = 0;
+        while di < dims.len() {
+            let d = &dims[di];
+            di += 1;
             let (dx0, dy0, dx1, dy1) = (d.x0 as i32, d.y0 as i32, d.x1 as i32, d.y1 as i32);
             if dx1 + fx <= x0 || dx0 - fx >= x1 || dy1 + fy <= y0 || dy0 - fy >= y1 {
                 continue;
@@ -929,25 +1046,8 @@ impl InkLedger {
                 ky.extend([y0, y1]);
                 meets = true;
             }
-            let edge = |k: &mut Vec<i32>, a: i32, b: i32, f: i32, lo: i32, hi: i32| {
-                let mut push = |v: i32| {
-                    if v > lo && v < hi {
-                        k.push(v);
-                    }
-                };
-                push(a);
-                push(b);
-                let mut s = Self::FEATHER_STEP;
-                while s < f {
-                    push(a - s);
-                    push(b + s);
-                    s += Self::FEATHER_STEP;
-                }
-                push(a - f);
-                push(b + f);
-            };
-            edge(kx, dx0, dx1, fx, x0, x1);
-            edge(ky, dy0, dy1, fy, y0, y1);
+            push_edge(kx, (dx0, dx1), fx, (x0, x1));
+            push_edge(ky, (dy0, dy1), fy, (y0, y1));
         }
         if !meets {
             return false;
@@ -968,33 +1068,36 @@ impl InkLedger {
         }
         let w = f32::from(q.w);
         let inv_w = 1.0 / w;
-        let ends = [16u32, 8, 0].map(|sh| {
-            let a = ((q.color >> sh) & 0xff) as f32;
-            let b = ((q.color2 >> sh) & 0xff) as f32;
-            (a, b - a)
-        });
+        let r1 = ((q.color >> 16) & 0xff) as f32;
+        let g1 = ((q.color >> 8) & 0xff) as f32;
+        let b1 = (q.color & 0xff) as f32;
+        let dr = ((q.color2 >> 16) & 0xff) as f32 - r1;
+        let dg = ((q.color2 >> 8) & 0xff) as f32 - g1;
+        let db = (q.color2 & 0xff) as f32 - b1;
         let colour = |x: i32, m: f32| {
             let t = (x - x0) as f32 * inv_w;
-            let ch = |idx: usize| {
-                let (a, da) = ends[idx];
-                let v = a + da * t;
-                ((v * m).round() as u32).min(255)
-            };
-            (ch(0) << 16) | (ch(1) << 8) | ch(2)
+            let r = (((r1 + dr * t) * m).round() as u32).min(255);
+            let g = (((g1 + dg * t) * m).round() as u32).min(255);
+            let b = (((b1 + db * t) * m).round() as u32).min(255);
+            (r << 16) | (g << 8) | b
         };
         let feather = self.feather();
         let ny = self.knots_y.len() - 1;
         let nx = self.knots_x.len() - 1;
         let x0_knot = self.knots_x[0];
-        for yi in 0..ny {
+        let mut yi = 0;
+        while yi < ny {
             let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
+            yi += 1;
             let ym = 0.5 * (ya + yb) as f32;
             let ya_u = ya as u16;
             let h_u = (yb - ya) as u16;
             let mut xa = x0_knot;
             let mut ca = colour(xa, self.mask_at_with(xa as f32, ym, feather));
-            for xi in 0..nx {
+            let mut xi = 0;
+            while xi < nx {
                 let xb = self.knots_x[xi + 1];
+                xi += 1;
                 let cb = colour(xb, self.mask_at_with(xb as f32, ym, feather));
                 if ca | cb != 0 {
                     out.push(GlowQuad {
@@ -1022,18 +1125,21 @@ impl InkLedger {
         from: usize,
         floor: f32,
     ) {
+        #[inline]
+        const fn halo_key(h: &RainHalo) -> (u16, u16, u16, u16, u32) {
+            (h.cx, h.cy, h.rx, h.ry, h.color)
+        }
         if !self.on || from >= halos.len() {
             return;
         }
-        let key = |h: &RainHalo| (h.cx, h.cy, h.rx, h.ry, h.color);
         let mut pieces = std::mem::take(&mut self.halo_pieces);
         pieces.clear();
         let mut i = from;
         let mut cut = false;
         while i < halos.len() {
-            let k = key(&halos[i]);
+            let k = halo_key(&halos[i]);
             let mut j = i + 1;
-            while j < halos.len() && key(&halos[j]) == k {
+            while j < halos.len() && halo_key(&halos[j]) == k {
                 j += 1;
             }
             self.dims.clear();
@@ -1052,7 +1158,10 @@ impl InkLedger {
             }
             let bounds = self.dims_bounds();
             let feather = self.feather();
-            for h in &halos[i..j] {
+            let mut hi = i;
+            while hi < j {
+                let h = &halos[hi];
+                hi += 1;
                 let (x0, y0) = (i32::from(h.x), i32::from(h.y));
                 let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
                 if h.w == 0
@@ -1069,13 +1178,17 @@ impl InkLedger {
                 cut = true;
                 let ny = self.knots_y.len() - 1;
                 let nx = self.knots_x.len() - 1;
-                for yi in 0..ny {
+                let mut yi = 0;
+                while yi < ny {
                     let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
+                    yi += 1;
                     let ym = 0.5 * (ya + yb) as f32;
                     let ya_u = ya as u16;
                     let h_u = (yb - ya) as u16;
-                    for xi in 0..nx {
+                    let mut xi = 0;
+                    while xi < nx {
                         let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
+                        xi += 1;
                         let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
                         let color = scale_rgb(h.color, m);
                         if color & 0x00FF_FFFF == 0 {
@@ -1104,14 +1217,22 @@ impl InkLedger {
         if rx <= 0.0 || ry <= 0.0 {
             return;
         }
-        let peak = [16u32, 8, 0].map(|sh| ((premul >> sh) & 0xff) as f32);
+        let peak = [
+            ((premul >> 16) & 0xff) as f32,
+            ((premul >> 8) & 0xff) as f32,
+            (premul & 0xff) as f32,
+        ];
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch * (1.0 / Self::BANDS as f32);
         let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
-        for line in self.lines {
-            let Some((row, first, end)) = line else {
+        let lines = self.lines;
+        let mut li = 0;
+        while li < lines.len() {
+            let Some((row, first, end)) = lines[li] else {
+                li += 1;
                 continue;
             };
+            li += 1;
             let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
             if !(cy + ry > y0 && cy - ry < y1) {
                 continue;
@@ -1121,58 +1242,74 @@ impl InkLedger {
             if lo >= hi {
                 continue;
             }
-            let dy2: [f32; Self::BANDS] = std::array::from_fn(|band| {
+            let mut dy2 = [0.0f32; Self::BANDS];
+            let mut band = 0;
+            while band < Self::BANDS {
                 let by0 = y0 + band as f32 * bh;
                 let dy = (cy.clamp(by0, by0 + bh) - cy) * inv_ry;
-                dy * dy
-            });
-            for col in lo..hi {
+                dy2[band] = dy * dy;
+                band += 1;
+            }
+            let mut col = lo;
+            while col < hi {
                 let Some(base) = self.slot(row, col) else {
+                    col += 1;
                     continue;
                 };
                 let x0 = ox + col as f32 * cw;
                 let dx = (cx.clamp(x0, x0 + cw) - cx) * inv_rx;
                 let dx2 = dx * dx;
                 if dx2 >= 1.0 {
+                    col += 1;
                     continue;
                 }
-                let weights: [Option<f32>; Self::BANDS] = std::array::from_fn(|band| {
+                let mut weights = [None; Self::BANDS];
+                let mut any_weight = false;
+                let mut band = 0;
+                while band < Self::BANDS {
                     let d2 = dx2 + dy2[band];
                     if d2 < 1.0 {
                         let u = 1.0 - d2;
-                        Some(u * u)
-                    } else {
-                        None
+                        weights[band] = Some(u * u);
+                        any_weight = true;
                     }
-                });
-                if weights == [None; Self::BANDS] {
+                    band += 1;
+                }
+                if !any_weight {
+                    col += 1;
                     continue;
                 }
                 let cell = base / Self::BANDS;
                 let ctx = self.cell_room_ctx(cell, floor);
                 let mut share = 1.0f32;
-                for (band, w) in weights.into_iter().enumerate() {
-                    if let Some(w) = w {
-                        share = share.min(self.room_with(base + band, peak.map(|p| p * w), ctx));
+                let mut band = 0;
+                while band < Self::BANDS {
+                    if let Some(w) = weights[band] {
+                        let add = [peak[0] * w, peak[1] * w, peak[2] * w];
+                        share = share.min(self.room_with(base + band, add, ctx));
                         if share <= 0.0 {
                             break;
                         }
                     }
+                    band += 1;
                 }
                 if share > 0.0 {
-                    for (band, w) in weights.into_iter().enumerate() {
-                        if let Some(w) = w {
+                    let mut band = 0;
+                    while band < Self::BANDS {
+                        if let Some(w) = weights[band] {
                             let dst = &mut self.laid[base + band];
                             dst[0] += share * peak[0] * w;
                             dst[1] += share * peak[1] * w;
                             dst[2] += share * peak[2] * w;
                         }
+                        band += 1;
                     }
                 }
                 if share < 1.0 {
                     self.dims.push(self.dim_of(cell, share));
                     self.note_cut(cell, share);
                 }
+                col += 1;
             }
         }
     }
@@ -1184,9 +1321,12 @@ impl InkLedger {
         if !self.on {
             return;
         }
-        for q in quads {
+        let mut i = 0;
+        while i < quads.len() {
+            let q = &mut quads[i];
             let share = self.admit_quads(std::slice::from_ref(q), floor);
             scale_additive(std::slice::from_mut(q), share);
+            i += 1;
         }
     }
 }
@@ -1243,15 +1383,25 @@ impl CursorGlow {
         if !on {
             return;
         }
+        #[inline]
+        const fn caret_i32(cur: Option<(u16, u16)>) -> Option<(i32, i32)> {
+            match cur {
+                Some((r, c)) => Some((r as i32, c as i32)),
+                None => None,
+            }
+        }
         let spans = self.probed_text_spans();
         let mut lines = [None; 3];
         for (slot, line) in lines.iter_mut().zip(spans.lines()) {
             *slot = Some(line);
         }
-        let caret_i32 = cur.map(|(r, c)| (i32::from(r), i32::from(c)));
+        let caret_i32 = caret_i32(cur);
         if let Some((row, col)) = caret_i32 {
             let mut typed: Option<(i32, i32)> = None;
-            for s in &self.sparks {
+            let sparks = self.sparks.as_slice();
+            let mut si = 0;
+            while si < sparks.len() {
+                let s = &sparks[si];
                 if s.typing && i32::from(s.row) == row {
                     let c = i32::from(s.col);
                     typed = Some(match typed {
@@ -1259,6 +1409,7 @@ impl CursorGlow {
                         None => (c, c),
                     });
                 }
+                si += 1;
             }
             let mut add = |line: (i32, i32, i32)| {
                 let mut i = 0;
@@ -1291,17 +1442,18 @@ impl CursorGlow {
                 Some(m) if i32::from(m.row) == row => Some(m),
                 _ => None,
             };
-            let captured = |nbr: fn(&RowProbe) -> NbrProbe| matches!(meta, Some(m) if nbr(m) == NbrProbe::Probed);
+            let above_captured = matches!(meta, Some(m) if m.above == NbrProbe::Probed);
+            let below_captured = matches!(meta, Some(m) if m.below == NbrProbe::Probed);
             let text = self.text_view();
             let mut neighbour = |nbr: i32| match text.frame_line(nbr) {
                 Some(Some((first, end))) => add((nbr, first, end)),
                 Some(None) => {}
                 None => add((nbr, lo, hi)),
             };
-            if row > 0 && !captured(|m| m.above) {
+            if row > 0 && !above_captured {
                 neighbour(row - 1);
             }
-            if row + 1 < geom.rows as i32 && !captured(|m| m.below) {
+            if row + 1 < geom.rows as i32 && !below_captured {
                 neighbour(row + 1);
             }
         }
@@ -1338,20 +1490,24 @@ impl CursorGlow {
         ledger.ink.resize(3 * geom.cols, ledger.pair.0);
         if !fire {
             let frame = &self.frame_text;
-            for (slot, line) in ledger.lines.iter().enumerate() {
-                let Some((row, first, end)) = *line else {
-                    continue;
-                };
-                for col in first.max(0)..end.min(geom.cols as i32) {
-                    if let Some((fg, bg)) = frame.pair(row, col) {
-                        let i = slot * geom.cols + col as usize;
-                        ledger.ink[i] = match fg {
-                            Some(c) => c,
-                            None => ledger.pair.0,
-                        };
-                        ledger.under[i] = bg;
+            let mut slot = 0;
+            while slot < ledger.lines.len() {
+                if let Some((row, first, end)) = ledger.lines[slot] {
+                    let mut col = first.max(0);
+                    let col_end = end.min(geom.cols as i32);
+                    while col < col_end {
+                        if let Some((fg, bg)) = frame.pair(row, col) {
+                            let i = slot * geom.cols + col as usize;
+                            ledger.ink[i] = match fg {
+                                Some(c) => c,
+                                None => ledger.pair.0,
+                            };
+                            ledger.under[i] = bg;
+                        }
+                        col += 1;
                     }
                 }
+                slot += 1;
             }
         }
         let want = InkLedger::QUAD_CELLS * geom.cw * geom.ch;
@@ -1444,8 +1600,15 @@ impl CursorGlow {
         if cw <= 0 || ch <= 0 || frame_text.rows.is_empty() {
             return;
         }
+        #[inline]
+        const fn caret_row_i32(caret: Option<(u16, u16)>) -> Option<i32> {
+            match caret {
+                Some((r, _)) => Some(r as i32),
+                None => None,
+            }
+        }
         let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
-        let caret_row = caret.map(|(r, _)| i32::from(r));
+        let caret_row = caret_row_i32(caret);
         let filled = |row: i32, col: i32| {
             Some(row) != caret_row
                 && matches!(
@@ -1475,12 +1638,15 @@ impl CursorGlow {
             None
         };
         let mut any_filled = false;
-        for h in halos.iter() {
+        let mut hi = 0;
+        while hi < halos.len() {
+            let h = &halos[hi];
             let (row, _, _, c0, c1) = span(h);
             if h.w > 0 && first_filled_col(row, c0, c1).is_some() {
                 any_filled = true;
                 break;
             }
+            hi += 1;
         }
         if !any_filled {
             return;
@@ -1510,7 +1676,8 @@ impl CursorGlow {
                 }
             }
             let mut start: Option<i32> = None;
-            for c in cf + 1..=c1 + 1 {
+            let mut c = cf + 1;
+            while c <= c1 + 1 {
                 let keep = c <= c1 && !filled(row, c);
                 match (keep, start) {
                     (true, None) => start = Some(c),
@@ -1528,6 +1695,7 @@ impl CursorGlow {
                     }
                     _ => {}
                 }
+                c += 1;
             }
         }
         self.ink_ledger.halo_pieces = all;
@@ -1541,6 +1709,11 @@ impl CursorGlow {
         geom: Geom,
         page: u32,
     ) -> u64 {
+        #[inline]
+        const fn smooth(k: f32) -> f32 {
+            let k = k.clamp(0.0, 1.0);
+            k * k * (3.0 - 2.0 * k)
+        }
         if quads.is_empty() {
             return 0;
         }
@@ -1559,10 +1732,6 @@ impl CursorGlow {
         );
         #[cfg(test)]
         let fi = if self.neighbour_hold_hard { 1e-3 } else { fi };
-        let smooth = |k: f32| {
-            let k = k.clamp(0.0, 1.0);
-            k * k * (3.0 - 2.0 * k)
-        };
         let inked = |row: i32, col: i32| {
             view.covers_cell(row, col)
                 || matches!(
@@ -1576,7 +1745,10 @@ impl CursorGlow {
         let inv_fx = 1.0 / fx;
         let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
         let mut print = 0u64;
-        for q in quads.iter_mut() {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &mut quads[qi];
+            qi += 1;
             if q.alpha != 0 || q.h == 0 {
                 continue;
             }
@@ -1601,15 +1773,16 @@ impl CursorGlow {
                 ((x1 + fx - ox) * inv_cw).floor() as i32,
             );
             let mut near = f32::INFINITY;
-            for c in c_lo.max(0)..=c_hi {
-                if !inked(row, c) {
-                    continue;
+            let mut c = c_lo.max(0);
+            while c <= c_hi {
+                if inked(row, c) {
+                    let (a, b) = (ox + c as f32 * cw, ox + (c + 1) as f32 * cw);
+                    near = near.min((a - x1).max(x0 - b).max(0.0));
+                    if near == 0.0 {
+                        break;
+                    }
                 }
-                let (a, b) = (ox + c as f32 * cw, ox + (c + 1) as f32 * cw);
-                near = near.min((a - x1).max(x0 - b).max(0.0));
-                if near == 0.0 {
-                    break;
-                }
+                c += 1;
             }
             if !near.is_finite() {
                 continue;

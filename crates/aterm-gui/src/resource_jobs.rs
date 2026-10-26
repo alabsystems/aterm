@@ -1036,6 +1036,7 @@ mod tests {
                 shell_pid: 200,
                 label: "Tab 1".into(),
                 program: "codex".into(),
+                tab_id: None,
             }],
             procs: observed.procs,
             delegated: observed.delegated,

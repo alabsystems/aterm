@@ -439,6 +439,8 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
         note_of(Setting::Repositories).map(|note| {
             if tools == Some(ToolsWait::Password) {
                 crate::system_state::TOOLS_PASSWORD_HEADLINE.to_owned()
+            } else if tools == Some(ToolsWait::Recovered) {
+                crate::system_state::TOOLS_RECOVERED_HEADLINE.to_owned()
             } else {
                 note
             }
@@ -452,6 +454,18 @@ impl App {
     /// plan's revision while the permission gate allows it, else none.
     pub(crate) fn access_revision(&self) -> Option<u64> {
         self.workstation_setup.access_revision()
+    }
+
+    /// Whether the latest answer taken here for this approval and row is Not
+    /// now, including an answer whose history write is still owed.
+    pub(crate) fn access_declined_here(&self, access: Access) -> bool {
+        self.access_revision().is_some_and(|revision| {
+            self.access_steps.recorded.iter().any(|record| {
+                record.revision == revision
+                    && record.access == access
+                    && record.outcome == AccessOutcome::Declined
+            })
+        })
     }
 
     /// The `[privacy]` switches leave the steps on: `enabled`, `check` and
@@ -555,6 +569,13 @@ impl App {
         }
         self.access_steps.dialog = MacosDialog::when_none_up(Duration::ZERO);
         self.access_steps.dialog.is_some()
+    }
+
+    /// Restore custody of an existing gesture without opening another prompt.
+    pub(crate) fn recover_access_dialog(&mut self) {
+        if self.access_steps.reach.holds_dialog && self.access_steps.dialog.is_none() {
+            self.access_steps.dialog = Some(MacosDialog::up());
+        }
     }
 
     /// A person's own press brings their chosen page forward immediately;
@@ -773,7 +794,12 @@ impl App {
     /// now under the revision's key, `devtools_helper::declined_for`): that holds the window's
     /// page back and keeps a regressed grant off the menu line for the revision. Read once per
     /// key and again after a decline this process notes; never without an approved revision.
+    /// Local answers precede that marker cache, so a failed save still holds
+    /// and a later local outcome replaces only that local hold.
     pub(crate) fn fda_declined_in_revision(&mut self) -> bool {
+        if self.access_declined_here(Access::FullDiskAccess) {
+            return true;
+        }
         if self.access_revision().is_none() {
             return false;
         }

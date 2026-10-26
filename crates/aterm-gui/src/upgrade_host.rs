@@ -141,7 +141,7 @@ pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>
     WordWriter::new(move |ask: &WordAsk| {
         // The word only records the request and wakes the host's lane
         // (`upgrade_drive::ask_for`), dialling no socket; the relaunch line that
-        // lane types arms the tap itself (`harness_host::usage_tap_armed`).
+        // lane types arms the tap itself (`harness_host::window_drive_opts`).
         let opts = upgrade_drive::Opts {
             only_sid: Some(ask.tab.clone()),
             aterm_state: None,

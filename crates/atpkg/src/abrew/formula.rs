@@ -476,6 +476,9 @@ pub struct Cask {
     pub variations: Vec<(String, Variation)>,
     /// `container type: :naked`.
     pub naked: bool,
+    /// (branch, only_path) when `url_specs` is exactly a git
+    /// branch + subdirectory checkout (raw-fetchable file set).
+    pub git_branch_path: Option<(String, String)>,
     /// `container nested: "<path>"`.
     pub nested: Option<String>,
 }
@@ -896,6 +899,35 @@ impl Cask {
         let mut artifacts = parse_artifacts(v.get("artifacts"));
         let naked = matches!(v.get("container"), Some(Value::Object(fields))
             if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("naked"));
+        // A git checkout limited to one branch and subdirectory,
+        // the Google-Fonts shape. Anything richer (tag, revision,
+        // a download strategy field) leaves the field unset and
+        // the cask delegated as before.
+        let git_branch_path = match v.get("url_specs") {
+            Some(Value::Object(fields))
+                if fields
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "branch" | "only_path" | "verified")) =>
+            {
+                match (
+                    fields.get("branch").and_then(Value::as_str),
+                    fields.get("only_path").and_then(Value::as_str),
+                ) {
+                    (Some(branch), Some(path))
+                        if !branch.is_empty()
+                            && !branch.contains('/')
+                            && !path.is_empty()
+                            && std::path::Path::new(path)
+                                .components()
+                                .all(|c| matches!(c, std::path::Component::Normal(_))) =>
+                    {
+                        Some((branch.to_string(), path.to_string()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let dmg = matches!(v.get("container"), Some(Value::Object(fields))
             if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("dmg"));
         let nested = match v.get("container") {
@@ -994,6 +1026,7 @@ impl Cask {
             depends_cask,
             variations,
             naked,
+            git_branch_path,
             nested,
         })
     }

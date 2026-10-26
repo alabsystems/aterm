@@ -208,8 +208,7 @@ pub(super) fn tabs_page(
         SettingsRoute::Tabs.label(),
         tabs_page_subtitle(width),
     );
-    let room = (settings_list_body_height(state, width, viewport) - heading_height)
-        .max(scaled_control_height());
+    let room = page_list_room(state, width, viewport, heading_height);
     let cards = tabs_cards(
         tabs,
         width,

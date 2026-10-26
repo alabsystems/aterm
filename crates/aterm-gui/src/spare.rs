@@ -2848,8 +2848,7 @@ impl Wake {
             | Wake::FabricRead
             | Wake::PillAct { .. }
             | Wake::CreateWindow
-            | Wake::DetachActiveTab
-            | Wake::ViewActiveSessionInNewWindow
+            | Wake::TabWindowCommand(_)
             | Wake::TabMenuAction { .. }
             | Wake::TabCmd { .. }
             | Wake::TabCmdAimed { .. }
@@ -2959,11 +2958,9 @@ impl Wake {
             #[cfg(unix)]
             Wake::ExitSignal { .. } => None,
             #[cfg(target_os = "macos")]
-            Wake::SelectTab { .. } => None,
-            #[cfg(target_os = "macos")]
-            Wake::CloseTab { .. } => None,
-            #[cfg(target_os = "macos")]
             Wake::TabContextMenuOpening { .. } => None,
+            #[cfg(any(target_os = "macos", all(test, unix)))]
+            Wake::NativeTabCommand { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::TabMenuConnection { .. } => None,
             #[cfg(target_os = "macos")]

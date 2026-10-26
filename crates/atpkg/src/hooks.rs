@@ -701,8 +701,10 @@ fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Record `real` as wired, best-effort (0600, temp + rename). Already recorded means no
-/// write, so the ordinary pass touches nothing.
+/// Record `real` as wired, best-effort, through the workspace's careful writer
+/// ([`aterm_uds::atomic_file::write`]: a `0600` temp durably flushed, renamed over the ledger,
+/// its directory flushed). Already recorded means no write, so the ordinary pass touches
+/// nothing.
 #[cfg(unix)]
 fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTreeSet<String>) {
     let entry = real.to_string_lossy().into_owned();
@@ -716,7 +718,7 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
         return;
     }
     let body: String = ledger.iter().map(|path| format!("{path}\n")).collect();
-    let _ = atomic_write(&rc_ledger_path(home), &body);
+    let _ = aterm_uds::atomic_file::write(&rc_ledger_path(home), body.as_bytes(), 0o600);
 }
 
 /// Ensure existing rc files under `home` source the `shell.d` hooks.
@@ -1389,16 +1391,6 @@ pub(crate) fn fish_quote(p: &Path) -> String {
 
 fn ps_quote(bin_dir: &Path) -> String {
     bin_dir.to_string_lossy().replace('\'', "''")
-}
-
-/// Write `content` to `dest` atomically (temp `0600` + rename), so a reader never sees a
-/// half-written hook.
-#[cfg(unix)]
-fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
-    let tmp = stage_hook(dest, content)?;
-    fs::rename(&tmp, dest).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
 }
 
 fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {

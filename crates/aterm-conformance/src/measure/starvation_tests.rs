@@ -125,6 +125,28 @@ fn a_starved_pass_is_unproved_and_a_sound_take_is_decided_by_its_pixels() {
 }
 
 #[test]
+fn a_starved_latency_miss_is_unproved_and_a_bound_met_under_stalls_stands() {
+    // A stall only adds latency: it may take a red away, never a green.
+    for starved in [Starved::Yes, Starved::No, Starved::Unknown] {
+        assert_eq!(
+            latency_verdict(ShapeVerdict::Pass, starved),
+            Disposition::Pass
+        );
+    }
+    assert_eq!(
+        latency_verdict(ShapeVerdict::Fail, Starved::Yes),
+        Disposition::Unproved
+    );
+    // A take nothing sampled is no excuse for a miss.
+    for starved in [Starved::No, Starved::Unknown] {
+        assert_eq!(
+            latency_verdict(ShapeVerdict::Fail, starved),
+            Disposition::Fail
+        );
+    }
+}
+
+#[test]
 fn a_clamped_tier_is_named_and_repeating_its_take_is_still_zero_evidence() {
     for _ in 0..8 {
         let s = classify(&SchedInputs {

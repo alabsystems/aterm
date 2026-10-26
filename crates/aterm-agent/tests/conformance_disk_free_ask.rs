@@ -1247,6 +1247,62 @@ fn space_aterms_own_passes_free_on_either_host_never_settles_the_asked_sessions_
     }
 }
 
+/// A's line goes, and A's cleanup alone lifts the volume past the first host's floor and its
+/// margin while the second host's pass holds the lock: the first host's look waits for that pass's
+/// record, the second host's look records it and settles the episode in A's name, and the first
+/// host's next look ends it.
+fn cleared(w: &mut World) -> Result<(), String> {
+    w.to(0)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.turn_break(0)?;
+    w.wait(60_000)?;
+    w.begin(1)?;
+    w.pass(1, 1)?;
+    w.to(4)?;
+    w.look(0)?;
+    w.end(1)?;
+    w.wait(60_000)?;
+    w.look(0)?;
+    Ok(())
+}
+
+/// The ask's whole success is credited: an asked session whose cleanup clears the volume past
+/// the margin settles the episode in its name (`Freed`) before any look ends it (`End`), so its
+/// `freed` row and the owner's line saying it freed space are never skipped.
+#[test]
+fn a_session_whose_cleanup_clears_the_volume_is_credited_before_its_episode_ends() {
+    let mut w = World::new("cleared");
+    cleared(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .skip_while(|t| !t.contains("turn break @s-a: typed=Some"))
+        .filter_map(|t| {
+            t.strip_prefix("host ")
+                .and_then(|t| t.split_once(" look: "))
+        })
+        .map(|(_, t)| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Asked", "Freed", "Ended"],
+        "a look while a pass runs waits, the next credits A, the one after ends: {:#?}",
+        w.trail
+    );
+    for action in ["OpenH", "ElectA", "TypeA", "Frees", "Freed", "End"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+    assert_eq!(w.s["phase"], 0, "{:#?}", w.trail);
+}
+
 /// The second host, whose floor is the lower, opens an episode; the first reads it short too and
 /// raises the floor it is held to; the volume then clears the second's floor by its margin, and
 /// the second's looks step the episode on without ending it, until it clears the first's.
@@ -2719,6 +2775,17 @@ fn a_lease_that_credits_aterms_own_passes_to_the_asked_session_is_rejected() {
     let caught = ask::fault::with(ask::fault::Fault::CreditAterm, || aterm_passes(&mut w))
         .expect_err("the checker must reject a settle on space aterm freed");
     assert!(caught.contains("`Freed` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL of `FreedIsCredited`: a look that ends an asked episode once it reads the
+/// volume clear, whatever the asked session freed (`Fault::EndUncredited`, the step before such
+/// looks settled it first), ends the episode A's cleanup cleared, and the checker rejects that end.
+#[test]
+fn a_look_that_ends_an_episode_its_asked_session_cleared_uncredited_is_rejected() {
+    let mut w = World::new("uncredited");
+    let caught = ask::fault::with(ask::fault::Fault::EndUncredited, || cleared(&mut w))
+        .expect_err("the checker must reject an end that skips the asked session's credit");
+    assert!(caught.contains("`End` is not enabled"), "{caught}");
 }
 
 /// NEGATIVE CONTROL of `FreedOnlyByAgent`, for a pass still running: a look that settles while

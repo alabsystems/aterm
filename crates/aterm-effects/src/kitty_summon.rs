@@ -165,7 +165,10 @@ impl TypedKittySummon {
         lexicon.scan_into_with_scratch(&buf[start..], opts, chars, matches, scratch);
         let end = self.chars.len();
         let mut hit = None;
-        for m in &self.matches {
+        let matches = self.matches.as_slice();
+        let mut i = 0;
+        while i < matches.len() {
+            let m = &matches[i];
             if m.end == end {
                 if m.class == Class::Profanity {
                     hit = Some(Class::Profanity);
@@ -173,6 +176,7 @@ impl TypedKittySummon {
                 }
                 hit = Some(m.class);
             }
+            i += 1;
         }
         let Some(class) = hit else {
             return TypedHit::NONE;

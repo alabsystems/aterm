@@ -6,7 +6,7 @@
 // project in 2026 (`unsafe extern`, as edition 2024 requires). See ../LICENSE-MIT and
 // ../LICENSE-APACHE for upstream licenses.
 
-//! Win32, COM, and DXGI declarations for aterm's Windows targets ([`com`], [`dxgi`]).
+//! Win32, COM, DXGI, Direct3D 11 and DirectComposition declarations for aterm's Windows targets ([`com`], [`dxgi`], [`d3d11`], [`dcomp`]).
 
 #![no_std]
 #![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
@@ -48,4 +48,6 @@ macro_rules! link {
 pub mod Win32;
 pub mod com;
 pub mod core;
+pub mod d3d11;
+pub mod dcomp;
 pub mod dxgi;

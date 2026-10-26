@@ -164,13 +164,28 @@ launch runs this first (atpkg's `grok` twin, grok-alab), so nothing opens a page
     `/usr/bin/sandbox-exec` (LaunchServices, Apple events, `open` and app launches denied),
     after a try of the sandbox: a missing or refusing sandbox runs nothing (exit 69). Its page
     must be https on auth.x.ai or accounts.x.ai.
-  - Its page and code become one need, `NEEDS YOU: approve Grok Build sign-in, code <code>, at
-    <url>`, printed here as a link and published on this session (attention `signin:grok`).
-    aterm opens no page: you open it and approve the code.
+  - aterm approves its page itself first, in a headless browser, as the Grok row that signs the
+    default home in (the roster's row with no `dir` once renewals' bindings apply, else the
+    pool's active row): in the row's browser profile, and only a page that shows the code grok
+    printed; where a mailbox is configured for the row's email, it types that email and reads
+    x.ai's mailed code from it. That runs where the row has an email and a profile or a mailbox,
+    under the machine's one sign-in lock, for 5 of the code's 15 minutes; with no headless
+    browser installed, the pinned chrome-headless-shell is fetched first, held to its size and
+    sha256. Its refusal (another code, another account, or grok naming another email than the
+    row's once it ran) ends the sign-in with nothing placed and nobody asked; the next launch
+    from a terminal then skips it once and asks you. Ctrl-C stops every step, the fetch too.
+  - Only where that stops for a person, or no route is ready, the page and code become one need
+    that leads with the step that makes every later sign-in automatic, printed here as a link
+    (NEEDS YOU: once, so Grok Build signs in by itself from now on: run aterm harness accounts
+    browser <label> --cli grok at this machine's desk and sign in there, or put <label>'s
+    mailbox in the vault (ai-mailbox.toml); or approve this sign-in now: code <code> at <url>)
+    and published on this session (attention `signin:grok`, which starts `once: sign <label> in
+    at the desk; or code <code> at <url>`). With no Chromium that opens a window installed, the
+    mailbox comes first. aterm opens no page on your desk: you open it and approve the code.
   - Once grok says it signed in, its login is written 0600 to `${GROK_HOME:-~/.grok}/auth.json`
     (one already there that is not refused is kept), the need comes down, and the accounts
-    ledger (`ledger accounts --cli grok`) keeps the page's host, the flow and the outcome only.
-    It waits 15 minutes at most.
+    ledger (`ledger accounts --cli grok`) keeps the page's host, the flow, the outcome and what
+    each rung found, never the page, the code or the email. It waits 15 minutes at most.
   - After a sign-in that ended without a login (an expired code), a launch from a terminal
     starts a new one; a background caller waits 6 hours. It never retries by itself.
   Exit 0 signed in, 69 not signed in, 75 another sign-in runs (no `--wait`).
@@ -1722,31 +1737,41 @@ fn run_accounts_all(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let kept: Vec<Cli> = Cli::ALL
+    let mut fallback = None;
+    let kept: Vec<_> = Cli::ALL
         .into_iter()
-        .filter(|cli| match cli {
-            Cli::Claude => env.accounts_roster().is_some_and(|p| p.is_file()),
-            _ => env.accounts_roster_for(*cli).is_some_and(|p| p.is_file()),
+        .filter_map(|cli| {
+            let path = env.accounts_roster_for(cli)?;
+            let records = match env.accounts_store_for(cli) {
+                Some(store) => store.read_account_records(Some(&path), env.now),
+                None if path.try_exists().unwrap_or(true) => {
+                    Err(accounts::RosterReadError::Records(no_home_for(cli)))
+                }
+                None => return None,
+            };
+            if records
+                .as_ref()
+                .is_ok_and(|records| !records.roster_present)
+            {
+                if cli == Cli::Claude {
+                    fallback = Some((path, records));
+                }
+                return None;
+            }
+            Some((cli, path, records))
         })
         .collect();
     if kept.is_empty() {
+        if let Some((path, records)) = fallback {
+            return run_accounts_report_snapshot(Cli::Claude, env, json, &path, records, out, err);
+        }
         return run_accounts(&AccountsCmd::Report { json }, env, host, out, err);
     }
     let mut pools = Vec::new();
     let mut code = ExitCode::SUCCESS;
-    for cli in kept {
+    for (cli, path, records) in kept {
         let mut report = Vec::new();
-        let form = AccountsCmd::Report { json };
-        let ran = if cli == Cli::Claude {
-            run_accounts(&form, env, host, &mut report, err)
-        } else {
-            let of = AccountsOf {
-                cli,
-                form,
-                vendor: accounts::Vendor::default(),
-            };
-            run_accounts_of(&of, env, host, &mut report, err)
-        };
+        let ran = run_accounts_report_snapshot(cli, env, json, &path, records, &mut report, err);
         if ran != ExitCode::SUCCESS {
             code = ran;
         }
@@ -1755,7 +1780,7 @@ fn run_accounts_all(
             let value =
                 aterm_json::from_str::<aterm_json::Value>(&text).unwrap_or(aterm_json::Value::Null);
             pools.push(aterm_json::json!({"cli": cli.id(), "report": value}));
-        } else {
+        } else if !text.is_empty() {
             let _ = writeln!(out, "cli: {}", cli.id());
             let _ = out.write_all(text.as_bytes());
         }
@@ -2047,10 +2072,11 @@ fn usage_label(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> String {
             return None;
         };
         let pid = env.claude_pid?;
-        let roster = Roster::load(&env.accounts_roster()?)
+        let roster = env
+            .accounts_store()
+            .read_roster(env.accounts_roster().as_deref(), env.now)
             .ok()
             .filter(Roster::several)?;
-        let roster = env.accounts_store().bound(&roster, env.now).ok()?;
         let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(pid)?)?;
         let started = process.started(pid)?;
         let entry = footer::session_of_pid(&env.claude_dir()?, pid, Some(started))?;
@@ -2753,12 +2779,13 @@ pub fn limits_json(view: &LimitsView) -> String {
 
 fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
     let roster_path = env.accounts_roster()?;
-    let raw = Roster::load(&roster_path)
-        .ok()
-        .filter(|r| !r.rows.is_empty())?;
     let store = env.accounts_store();
-    let roster = store.bound(&raw, env.now).ok()?;
-    let (state, _) = store.load(env.now).ok()?;
+    let accounts::AccountRecords { roster, state, .. } = store
+        .read_account_records(Some(&roster_path), env.now)
+        .ok()?;
+    if roster.rows.is_empty() {
+        return None;
+    }
     let enrolled = accounts::enrolled(&roster);
     let sid = target.trim_start_matches('@');
     let on_acct = state
@@ -4074,19 +4101,30 @@ fn run_disk(
 }
 
 /// The newest `max` lines of the JSONL file at `path`, streamed through a ring of at most [`READ_MAX_ROWS`] so the file is never held whole.
+/// # Errors
+/// An existing path is linked or not a regular file, cannot be opened or read, or a line
+/// is not UTF-8.
 pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
-    let file = match std::fs::File::open(path) {
+    let file = match astream_sys::open_nonblocking(path, astream_sys::Links::Refuse) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(path) {
+                Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+                _ => Err(e),
+            };
+        }
         Err(e) => return Err(e),
     };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("ledger is not a regular file"));
+    }
     let keep = max.min(READ_MAX_ROWS);
     let mut ring: VecDeque<String> = VecDeque::with_capacity(keep.saturating_add(1));
     if keep == 0 {
         return Ok(Vec::new());
     }
     for line in io::BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
@@ -4484,6 +4522,13 @@ fn run_upgrade_models(
         );
         return ExitCode::from(2);
     };
+    let accounts = super::tap::LaunchPolicy::read(
+        false,
+        || None,
+        env.accounts_roster().as_deref(),
+        &env.accounts_store(),
+        Some(env.now),
+    );
     let opts = super::upgrade_drive::Opts {
         home,
         state: env.state.clone(),
@@ -4496,7 +4541,7 @@ fn run_upgrade_models(
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
+        several_logins: accounts.several_logins,
         usage_credits: SupervisorConfig::from_path(env.config.as_deref())
             .0
             .usage_credits,
@@ -4547,7 +4592,7 @@ fn run_upgrade(
 
 /// The options of an `aterm harness upgrade` pass under `policy`, for session `sid` (every
 /// session where empty), its relaunch lines offered the usage tap for the aterm `exe` names
-/// ([`super::tap::Armed::arm`], the block the window's lane arms by too).
+/// ([`super::tap::LaunchPolicy::read`], the block the window's lane reads by too).
 fn upgrade_opts(
     env: &Env,
     sid: &str,
@@ -4558,6 +4603,13 @@ fn upgrade_opts(
         .home
         .clone()
         .ok_or("upgrade needs the home directory (Claude's sessions live under it)")?;
+    let accounts = super::tap::LaunchPolicy::read(
+        policy.usage_tap_on(),
+        exe,
+        env.accounts_roster().as_deref(),
+        &env.accounts_store(),
+        Some(env.now),
+    );
     Ok(super::upgrade_drive::Opts {
         home,
         state: env.state.clone(),
@@ -4570,15 +4622,9 @@ fn upgrade_opts(
         background: false,
         aterm_state: env.aterm_state.clone(),
         ask: policy.upgrade_ask,
-        several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
+        several_logins: accounts.several_logins,
         usage_credits: policy.usage_credits,
-        usage_tap: super::tap::Armed::arm(
-            policy.usage_tap_on(),
-            exe,
-            env.accounts_roster().as_deref(),
-            &env.accounts_store(),
-            Some(env.now),
-        ),
+        usage_tap: accounts.usage_tap,
         instances: crate::harness::upgrade_drive::Instances::Machine,
         agents_off: policy.off.clone(),
         land: false,
@@ -5758,11 +5804,11 @@ fn cli_flag(cli: Cli) -> String {
     }
 }
 
-fn accounts_none_listed(cli: Cli, path: &Path) -> String {
+fn accounts_none_listed(cli: Cli, path: &Path, present: bool) -> String {
     format!(
         "no accounts listed\nroster: {}{}\nlist one: {ACCOUNTS_ADD_LINE}{}\n",
         path.display(),
-        if path.exists() {
+        if present {
             " (no rows)"
         } else {
             " (no such file)"
@@ -5778,15 +5824,49 @@ struct HeldBy {
 }
 
 impl HeldBy {
-    fn of(env: &Env) -> HeldBy {
-        let several = accounts::several_listed(env.accounts_roster().as_deref());
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountReportAttribution",
+            action = "Read",
+            project = "aterm_agent::harness::cli::tests::report_read::attribution_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountReportAttribution",
+            action = "SnapshotMany",
+            reason = "Fixture selection chooses the captured roster's cardinality"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountReportAttribution",
+            action = "DiskMany",
+            reason = "Fixture selection chooses a different current on-disk roster"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountReportAttribution",
+            action = "OtherProfile",
+            reason = "Fixture selection supplies a different default-home profile identity"
+        )
+    )]
+    fn for_roster(cli: Cli, env: &Env, roster: &Roster) -> HeldBy {
+        if cli != Cli::Claude {
+            return Self::untapped();
+        }
         HeldBy {
-            tap: stats_tap(env, |_| true),
+            tap: stats_tap_for(env, true),
             key: env
                 .home
                 .as_deref()
                 .and_then(profile::default_home_key)
-                .filter(|_| !several),
+                .filter(|_| !roster.several()),
         }
     }
 
@@ -5968,14 +6048,14 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
 
 fn accounts_text(
     cli: Cli,
-    path: &Path,
+    (path, present): (&Path, bool),
     roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> String {
     if roster.rows.is_empty() {
-        let mut text = accounts_none_listed(cli, path);
+        let mut text = accounts_none_listed(cli, path, present);
         let own = usage_words(&state.account(ACCOUNTS_OWN_LABEL), now);
         if !own.is_empty() {
             text.push_str(&format!(
@@ -6200,16 +6280,19 @@ fn put_time(o: &mut Map, key: &str, t: Option<i64>) {
     o.insert(format!("{key}_rfc3339"), Value::from(t.map(rfc3339_utc)));
 }
 
-fn accounts_json_head(path: &Path, now: i64) -> Map {
+fn accounts_json_head(path: Option<&Path>, now: i64) -> Map {
     let mut o = Map::new();
     o.insert("schema".to_owned(), Value::from(1u64));
     o.insert("kind".to_owned(), Value::from("accounts".to_owned()));
     put_time(&mut o, "as_of", Some(now));
-    o.insert("roster".to_owned(), Value::from(path.display().to_string()));
+    o.insert(
+        "roster".to_owned(),
+        Value::from(path.map(|path| path.display().to_string())),
+    );
     o
 }
 
-fn accounts_refused_json(path: &Path, why: &str, now: i64) -> String {
+fn accounts_refused_json(path: Option<&Path>, why: &str, now: i64) -> String {
     let mut o = accounts_json_head(path, now);
     o.insert("refused".to_owned(), Value::from(why.to_owned()));
     o.insert("accounts".to_owned(), Value::Array(Vec::new()));
@@ -6225,7 +6308,7 @@ fn accounts_json(
     by: HeldBy,
     now: i64,
 ) -> String {
-    let mut o = accounts_json_head(path, now);
+    let mut o = accounts_json_head(Some(path), now);
     o.insert("refused".to_owned(), Value::Null);
     // Where the rows come from (Claude Code's pool): `discovered` for a list found on this Mac.
     if let Some(origin) = origin {
@@ -6455,69 +6538,121 @@ fn run_accounts_report(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    if write_accounts_report(cli, env, json, out, err).is_some() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The rows, admitted state and login presence used to format an account report.
+/// A dashboard can reuse this observation without reading account records again.
+pub(super) struct ReportedAccounts {
+    /// The effective roster represented in this form of the report.
+    pub(super) roster: Roster,
+    /// State after the report's default-home identity filter.
+    pub(super) state: accounts::State,
+    /// Login presence observed once for the represented roster.
+    pub(super) enrolled: BTreeSet<String>,
+}
+
+/// Writes the account report and retains its admitted projection for another view.
+/// Returns `None` only when the required configuration or account read is unavailable;
+/// an empty or own-login-only text report still returns `Some` with an empty roster.
+pub(super) fn write_accounts_report(
+    cli: Cli,
+    env: &Env,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Option<ReportedAccounts> {
     let Some(path) = env.accounts_roster_for(cli) else {
         let _ = accounts_read_roster_for(cli, env, err);
-        return ExitCode::from(1);
+        if json {
+            let _ = writeln!(
+                out,
+                "{}",
+                accounts_refused_json(None, "no config directory is known", env.now)
+            );
+        }
+        return None;
     };
     let Some(store) = env.accounts_store_for(cli) else {
-        let _ = writeln!(err, "aterm harness accounts: {}", no_home_for(cli));
-        return ExitCode::from(1);
-    };
-    if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, &path) {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts: {why}; account commit remains pending"
-        );
+        let why = no_home_for(cli);
+        let _ = writeln!(err, "aterm harness accounts: {why}");
         if json {
-            let _ = writeln!(out, "{}", accounts_refused_json(&path, &why, env.now));
+            let _ = writeln!(out, "{}", accounts_refused_json(Some(&path), &why, env.now));
         }
-        return ExitCode::from(1);
+        return None;
+    };
+    write_accounts_report_snapshot(
+        cli,
+        env,
+        json,
+        &path,
+        store.read_account_records(Some(&path), env.now),
+        out,
+        err,
+    )
+}
+
+fn run_accounts_report_snapshot(
+    cli: Cli,
+    env: &Env,
+    json: bool,
+    path: &Path,
+    records: Result<accounts::AccountRecords, accounts::RosterReadError>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if write_accounts_report_snapshot(cli, env, json, path, records, out, err).is_some() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
-    let roster = match Roster::load_for(cli, &path) {
-        Ok(roster) => roster,
+}
+
+fn write_accounts_report_snapshot(
+    cli: Cli,
+    env: &Env,
+    json: bool,
+    path: &Path,
+    records: Result<accounts::AccountRecords, accounts::RosterReadError>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Option<ReportedAccounts> {
+    let records = match records {
+        Ok(records) => records,
         Err(why) => {
-            let _ = writeln!(err, "{}", accounts_refusal(&path, &why));
+            let why = match why {
+                accounts::RosterReadError::Roster(why) => {
+                    let _ = writeln!(err, "{}", accounts_refusal(path, &why));
+                    why
+                }
+                accounts::RosterReadError::Records(why) => {
+                    let why =
+                        format!("{why}; account state is unknown; account identities are unknown");
+                    let _ = writeln!(err, "aterm harness accounts: {why}");
+                    why
+                }
+            };
             if json {
-                let _ = writeln!(out, "{}", accounts_refused_json(&path, &why, env.now));
+                let _ = writeln!(out, "{}", accounts_refused_json(Some(path), &why, env.now));
             }
-            return ExitCode::from(1);
+            return None;
         }
     };
-    let (state, note) = match store.load(env.now) {
-        Ok(read) => read,
-        Err(why) => {
-            let why = format!(
-                "{why}; account state is unknown ({} is left as it is)",
-                store.state_file().display()
-            );
-            let _ = writeln!(err, "aterm harness accounts: {why}");
-            if json {
-                let _ = writeln!(out, "{}", accounts_refused_json(&path, &why, env.now));
-            }
-            return ExitCode::from(1);
-        }
-    };
-    if let Some(note) = note {
+    for note in &records.notes {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
-    let (logins, note) = match store.load_logins(env.now) {
-        Ok(read) => read,
-        Err(why) => {
-            let why = format!("{why}; account identities are unknown");
-            let _ = writeln!(err, "aterm harness accounts: {why}");
-            if json {
-                let _ = writeln!(out, "{}", accounts_refused_json(&path, &why, env.now));
-            }
-            return ExitCode::from(1);
-        }
-    };
-    if let Some(note) = note {
-        let _ = writeln!(err, "aterm harness accounts: {note}");
-    }
-    let by = match cli {
-        Cli::Claude => HeldBy::of(env),
-        _ => HeldBy::untapped(),
-    };
+    let accounts::AccountRecords {
+        mut roster,
+        roster_present,
+        state,
+        logins,
+        ..
+    } = records;
+    let by = HeldBy::for_roster(cli, env, &roster);
     let own = cli == Cli::Claude
         && roster.rows.is_empty()
         && state
@@ -6526,15 +6661,21 @@ fn run_accounts_report(
             .is_some_and(|account| account.sample.is_some());
     let state = by.admit(state);
     if own && !json {
-        let _ = write!(out, "{}", accounts_none_listed(cli, &path));
+        let _ = write!(out, "{}", accounts_none_listed(cli, path, roster_present));
         let _ = writeln!(out, "{}", accounts_own_reading(&state, by, env.now));
-        return ExitCode::SUCCESS;
+        return Some(ReportedAccounts {
+            roster,
+            state,
+            enrolled: BTreeSet::new(),
+        });
     }
-    let roster = accounts::bound(&if own { Roster::own() } else { roster }, &logins);
+    if own {
+        roster = accounts::bound(&Roster::own(), &logins);
+    }
     let enrolled = accounts::enrolled_for(cli, &roster);
     let read = (&state, &logins);
     let origin = (cli == Cli::Claude && !own).then(|| {
-        super::accounts_sync::fleet_origin(env.home.as_deref(), env.config.as_deref(), &path)
+        super::accounts_sync::fleet_origin(env.home.as_deref(), env.config.as_deref(), path)
     });
     let _ = if json {
         writeln!(
@@ -6542,7 +6683,7 @@ fn run_accounts_report(
             "{}",
             accounts_json(
                 cli,
-                (&path, origin.as_ref()),
+                (path, origin.as_ref()),
                 &roster,
                 read,
                 &enrolled,
@@ -6551,7 +6692,14 @@ fn run_accounts_report(
             )
         )
     } else {
-        let mut text = accounts_text(cli, &path, &roster, read, &enrolled, env.now);
+        let mut text = accounts_text(
+            cli,
+            (path, roster_present),
+            &roster,
+            read,
+            &enrolled,
+            env.now,
+        );
         // Where the rows come from, where a fleet writes them: found on this Mac, a source a
         // sync was handed, a configured source or the vault.
         if let Some(origin) =
@@ -6561,7 +6709,11 @@ fn run_accounts_report(
         }
         write!(out, "{text}")
     };
-    ExitCode::SUCCESS
+    Some(ReportedAccounts {
+        roster,
+        state,
+        enrolled,
+    })
 }
 
 fn run_accounts_add(
@@ -7737,22 +7889,68 @@ fn renew_one(
     }
 }
 
-fn accounts_transact_logins(
+// Keep a sign-in's binding observation and history in one recoverable commit.
+// The caller's policy and parent checks execute inside the writer lock before admission.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSignInObservationCommit",
+        action = "Observe",
+        project = "aterm_agent::harness::cli::tests::signin_policy::observation_commit_transition"
+    )
+)]
+fn accounts_observe_signin(
     store: &accounts::Store,
+    roster_path: &Path,
     now: i64,
     err: &mut dyn Write,
     edit: impl FnOnce(
+        &Roster,
         &mut accounts::State,
         &mut accounts::Logins,
     ) -> Result<Vec<accounts::Event>, String>,
 ) -> Result<Vec<accounts::Event>, String> {
     let mut note = None;
-    let done = store.transact_logins(now, &mut note, edit);
+    let done = store.transact_pool_logins_within(
+        &accounts::LOCK_LADDER,
+        roster_path,
+        now,
+        &mut note,
+        edit,
+    );
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
     done
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInObservationCommit",
+        action = "AnotherProvider",
+        reason = "Choose a native provider fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInObservationCommit",
+        action = "AnotherOperation",
+        reason = "Choose a sign-in observation or browser history fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInObservationCommit",
+        action = "AnotherFault",
+        reason = "Choose a publication obstruction fixture."
+    )
+)]
+#[cfg(any(test, debug_assertions))]
+#[allow(dead_code)]
+fn signin_observation_environment() {}
 
 fn run_accounts_renew(
     env: &Env,
@@ -8320,6 +8518,16 @@ fn reconcile_staging_overlay_suffixes(
     Ok(())
 }
 
+fn signin_policy_current(
+    cli: Cli,
+    row: &accounts::Row,
+    roster_path: &Path,
+    own_dir: Option<&str>,
+) -> Result<(), String> {
+    let current = Roster::load_for(cli, roster_path)?;
+    signin_policy_matches(row, &current, own_dir)
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -8328,13 +8536,11 @@ fn reconcile_staging_overlay_suffixes(
         project = "aterm_agent::harness::cli::tests::signin_policy::policy_transition"
     )
 )]
-fn signin_policy_current(
-    cli: Cli,
+fn signin_policy_matches(
     row: &accounts::Row,
-    roster_path: &Path,
+    current: &Roster,
     own_dir: Option<&str>,
 ) -> Result<(), String> {
-    let current = Roster::load_for(cli, roster_path)?;
     let same = current.row(&row.label).is_some_and(|r| {
         r.email == row.email
             && r.identity_email == row.identity_email
@@ -8468,19 +8674,20 @@ fn bind_signed_in(
                             ),
                         );
                     }
-                    let recorded = accounts_transact_logins(store, now, err, |_, logins| {
-                        plan.parent.require_current(logins, label)?;
-                        policy_unchanged()?;
-                        Ok(if different {
-                            accounts::note_wrong_account(logins, label, now)
-                        } else {
-                            vec![
-                                accounts::Event::new(now, accounts::Kind::SignIn, label)
-                                    .because("provider identity unavailable"),
-                            ]
+                    let recorded =
+                        accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                            plan.parent.require_current(logins, label)?;
+                            signin_policy_matches(row, raw, own_dir)?;
+                            Ok(if different {
+                                accounts::note_wrong_account(logins, label, now)
+                            } else {
+                                vec![
+                                    accounts::Event::new(now, accounts::Kind::SignIn, label)
+                                        .because("provider identity unavailable"),
+                                ]
+                            })
                         })
-                    })
-                    .is_ok();
+                        .is_ok();
                     say(
                         err,
                         &format!(
@@ -8541,11 +8748,11 @@ fn bind_signed_in(
         roster_path,
         now,
         &mut note,
-        |_, state, logins| {
+        |raw, state, logins| {
             // Roster writers use this store lock. Recheck after the provider probe
             // and before creating any recoverable completion checkpoint.
             plan.parent.require_current(logins, label)?;
-            policy_unchanged()?;
+            signin_policy_matches(row, raw, own_dir)?;
             if !email.is_empty() {
                 accounts::write_renewal_checkpoint_for(
                     cli,
@@ -8689,9 +8896,9 @@ pub(super) fn renew_one_for(
     }
     let record = |err: &mut dyn Write, kind: accounts::Kind| {
         let event = accounts::Event::new(now, kind, label).because(&drove.why(plan.route.flow));
-        accounts_transact_logins(store, now, err, |_, logins| {
+        accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
             plan.parent.require_current(logins, label)?;
-            policy_unchanged()?;
+            signin_policy_matches(row, raw, own_dir)?;
             let action = match &drove.outcome {
                 Outcome::NeedsSignIn(_) => Some(accounts::SignInAction::Browser),
                 Outcome::NeedsYou(_) | Outcome::Hung => Some(accounts::SignInAction::Login),
@@ -8720,11 +8927,12 @@ pub(super) fn renew_one_for(
         }
         Outcome::SignedIn { email: Some(_), .. } => {
             let _ = writeln!(out, "{label}: REFUSED: wrong account");
-            let recorded = accounts_transact_logins(store, now, err, |_, logins| {
-                plan.parent.require_current(logins, label)?;
-                policy_unchanged()?;
-                Ok(accounts::note_wrong_account(logins, label, now))
-            });
+            let recorded =
+                accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                    plan.parent.require_current(logins, label)?;
+                    signin_policy_matches(row, raw, own_dir)?;
+                    Ok(accounts::note_wrong_account(logins, label, now))
+                });
             if cli != Cli::Codex && recorded.is_ok() {
                 drop_staging(&plan.staging, err);
             }
@@ -9313,7 +9521,8 @@ fn run_accounts_browser(
     };
     let event = accounts::Event::new(now, accounts::Kind::SignIn, label)
         .because(&format!("{site} window {} {state}", end.word()));
-    let recorded = accounts_transact_logins(&store, now, err, |_, _| Ok(vec![event])).is_ok();
+    let recorded =
+        accounts_observe_signin(&store, &path, now, err, |_, _, _| Ok(vec![event])).is_ok();
     let flag = cli_flag(cli);
     let unrecorded = if recorded {
         ""
@@ -9645,7 +9854,8 @@ fn accounts_stats_refused(
 }
 
 /// Reads each pool row's usage and saved state. Unreadable rosters, state or bindings refuse
-/// before invoking a usage reader; a later state read failure also refuses the report.
+/// before invoking a usage reader. After a successful refresh, a new complete
+/// snapshot supplies the displayed policy, bindings and state.
 fn run_accounts_stats_of(
     cli: Cli,
     env: &Env,
@@ -9656,27 +9866,33 @@ fn run_accounts_stats_of(
 ) -> ExitCode {
     let product = cli.connector().product;
     let (Some(store), Some(user_home)) = (env.accounts_store_for(cli), env.home.as_deref()) else {
-        let _ = writeln!(
+        return accounts_stats_refused(
+            cli,
+            env.now,
+            json,
+            &format!("no home is known, so {product}'s pool is not found"),
+            out,
             err,
-            "aterm harness accounts stats: no home is known, so {product}'s pool is not found"
         );
-        return ExitCode::from(1);
     };
-    let pool = (|| {
-        let path = env
-            .accounts_roster_for(cli)
-            .ok_or_else(|| no_home_for(cli))?;
-        let raw = Roster::load_for(cli, &path)?;
-        let (logins, _) = store.load_logins(env.now)?;
-        let _ = store.load(env.now)?;
-        Ok::<_, String>((raw, logins))
-    })();
-    let (raw, logins) = match pool {
-        Ok(pool) => pool,
+    let read_records = || {
+        let path = env.accounts_roster_for(cli).ok_or_else(|| {
+            format!(
+                "no config directory is known for {}",
+                cli.accounts().roster_file
+            )
+        })?;
+        store
+            .read_account_records(Some(&path), env.now)
+            .map_err(|why| match why {
+                accounts::RosterReadError::Roster(why)
+                | accounts::RosterReadError::Records(why) => why,
+            })
+    };
+    let mut records = match read_records() {
+        Ok(records) => records,
         Err(why) => return accounts_stats_refused(cli, env.now, json, &why, out, err),
     };
-    let roster = accounts::bound(&raw, &logins);
-    let enrolled = accounts::enrolled_for(cli, &roster);
     if let (Some(read), Some(config_dir)) = (
         host.usage_reader(),
         env.config.as_deref().and_then(Path::parent),
@@ -9687,14 +9903,24 @@ fn run_accounts_stats_of(
             home: user_home,
             now: env.now,
         };
-        if let Err(why) = super::accounts_pool::record_usage(&seat, cli, &roster, &enrolled, read) {
+        let enrolled = accounts::enrolled_for(cli, &records.roster);
+        if let Err(why) =
+            super::accounts_pool::record_usage(&seat, cli, &records.roster, &enrolled, read)
+        {
             return accounts_stats_refused(cli, env.now, json, &why, out, err);
         }
+        records = match read_records() {
+            Ok(records) => records,
+            Err(why) => return accounts_stats_refused(cli, env.now, json, &why, out, err),
+        };
     }
-    let state = match store.load(env.now) {
-        Ok((state, _)) => state,
-        Err(why) => return accounts_stats_refused(cli, env.now, json, &why, out, err),
-    };
+    let accounts::AccountRecords {
+        roster,
+        state,
+        logins,
+        ..
+    } = records;
+    let enrolled = accounts::enrolled_for(cli, &roster);
     let home = match cli {
         Cli::Codex => super::codex_rollout::codex_home(
             env.codex_home.as_deref(),
@@ -9883,29 +10109,29 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         .map(|own| profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth))
         .map_or(Err(profile::NoProfile::NoHome), |file| profile::read(&file));
     let key = read.as_ref().ok().and_then(|p| p.key);
-    let label = stats_label(env, key);
     let store = env.accounts_store();
-    let (state, state_unread) = match store.load(env.now) {
-        Ok((state, _)) => (state, false),
-        Err(_) => (accounts::State::default(), true),
-    };
+    let records = store.read_account_records(env.accounts_roster().as_deref(), env.now);
+    let state_unread = records.is_err();
+    let accounts::AccountRecords {
+        roster,
+        state,
+        logins,
+        ..
+    } = records.unwrap_or_default();
+    let label = stats_label(env, key, &roster);
     let machine = (!state_unread)
         .then(|| store.machine_id(&state.machine).ok())
         .flatten();
-    let tap = stats_tap(env, |roster| roster.row(&label).is_some());
-    let raw_roster = env
-        .accounts_roster()
-        .and_then(|path| Roster::load(&path).ok())
-        .unwrap_or_default();
-    let (logins, logins_unread) = match store.load_logins(env.now) {
-        Ok((logins, _)) => (logins, false),
-        Err(_) => (accounts::Logins::default(), true),
-    };
-    let roster = accounts::bound(&raw_roster, &logins);
+    let tap = stats_tap_for(
+        env,
+        !state_unread
+            && (roster.row(&label).is_some()
+                || roster.rows.is_empty() && label == ACCOUNTS_OWN_LABEL),
+    );
     let several = roster.several();
     let login = roster
         .row(&label)
-        .filter(|row| !logins_unread && row.email.is_some())
+        .filter(|row| row.email.is_some())
         .map(|row| {
             let admitted = HeldBy { tap, key }.admit(state.clone());
             account_stats::Login {
@@ -9933,7 +10159,9 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
                 .iter()
                 .filter(|c| c.profile.is_some() && c.profile == env.claude_profile)
                 .collect();
-            let sessions = if several {
+            let sessions = if state_unread {
+                Err("state-unread")
+            } else if several {
                 Err("several-logins")
             } else {
                 Ok(here.len())
@@ -9950,7 +10178,7 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         label: &label,
         profile: &read,
         account: state.accounts.get(&label),
-        state_unread: state_unread || logins_unread,
+        state_unread,
         several,
         api_key_seen,
         tap,
@@ -9983,15 +10211,9 @@ fn stats_default_home(env: &Env) -> bool {
     env.claude_profile.is_some() && env.claude_profile == default_profile
 }
 
-fn stats_tap(env: &Env, records: impl FnOnce(&Roster) -> bool) -> super::account_stats::Tap {
+fn stats_tap_for(env: &Env, served: bool) -> super::account_stats::Tap {
     use super::account_stats::Tap;
     let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
-    let served = accounts::tap_roster(
-        env.accounts_roster().as_deref(),
-        &env.accounts_store(),
-        env.now,
-    )
-    .is_some_and(|roster| records(&roster));
     match (policy.usage_tap, policy.usage_tap_on(), served) {
         (false, ..) => Tap::Off,
         (true, false, _) => Tap::HarnessOff,
@@ -10000,15 +10222,7 @@ fn stats_tap(env: &Env, records: impl FnOnce(&Roster) -> bool) -> super::account
     }
 }
 
-fn stats_label(env: &Env, key: Option<profile::AccountKey>) -> String {
-    let raw = env
-        .accounts_roster()
-        .and_then(|path| Roster::load(&path).ok())
-        .unwrap_or_default();
-    let roster = env
-        .accounts_store()
-        .bound(&raw, env.now)
-        .unwrap_or_default();
+fn stats_label(env: &Env, key: Option<profile::AccountKey>, roster: &Roster) -> String {
     if stats_default_home(env) {
         return roster
             .row_for_login(None)
@@ -10023,7 +10237,7 @@ fn stats_label(env: &Env, key: Option<profile::AccountKey>) -> String {
         })
     });
     match (row, key) {
-        (Some(row), _) if accounts::enrolled(&roster).contains(&row.label) => row.label.clone(),
+        (Some(row), _) if accounts::enrolled(roster).contains(&row.label) => row.label.clone(),
         (_, Some(key)) => format!("home-{}", key.short()),
         (_, None) => "home".to_owned(),
     }
@@ -10135,14 +10349,22 @@ fn run_signin(
         env.home.as_deref().unwrap_or(Path::new("/")),
     );
     let mut ledger = |why: &str| {
-        let event = accounts::Event::new(
+        let mut event = accounts::Event::new(
             limit::unix_now(),
             accounts::Kind::SignIn,
             gate::LEDGER_ACCOUNT,
-        )
-        .because(why);
+        );
+        // A sign-in row keeps its rungs whole, as an automatic sign-in's routes are kept
+        // (`accounts::note_sign_in_attempt`), not cut at `because`'s 200 bytes.
+        event.why = super::one_line(why, accounts::LEDGER_WHY_MAX);
         let _ = store.append(&[event]);
     };
+    let mut auto = gate::LiveAuto::new(
+        env.accounts_roster_for(Cli::Grok),
+        env.accounts_store_for(Cli::Grok),
+        env.home.clone(),
+        limit::unix_now(),
+    );
     let ended = gate::run(
         &gate::Gate {
             state: &env.state,
@@ -10156,6 +10378,7 @@ fn run_signin(
             stopped: &stopped,
             now: &now,
         },
+        &mut auto,
         &mut owner,
         &mut ledger,
     );

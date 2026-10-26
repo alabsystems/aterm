@@ -13,6 +13,7 @@ use crate::model::{Membership, Sample, Snapshot, TabRoot};
 pub mod account;
 pub mod detect;
 pub mod episodes;
+pub mod reap;
 pub mod split;
 
 #[cfg(any(test, debug_assertions))]
@@ -25,6 +26,7 @@ pub use detect::{
     ACTIVITIES, Activity, ActivityId, Candidate, CauseId, Context, Evidence, Term, WakeFact, detect,
 };
 pub use episodes::{ClauseHold, DeckCause, Episodes, OpenCause, deck_cause};
+pub use reap::{ReapLedger, ReapTotals, Scope};
 pub use split::{CoalBase, SplitIn, WINDOW_MAX_NS, split};
 
 /// A map keyed by the kernel's integer ids (pids, coalition ids, a pid and
@@ -438,32 +440,43 @@ pub struct CoalSplit {
     pub services_mc: i64,
     /// What no part holds, signed and never clamped.
     pub unaccounted_mc: i64,
-    /// Each tab's live work over the window, by its key ([`TabRoot::tab`]; a tab split into panes
-    /// is one), in the host's order: its processes alive at both ends of it, delegated members
-    /// included.
+    /// Each tab's work over the window, by its key ([`TabRoot::tab`]; a tab split into panes is
+    /// one), in the host's order: where the reap credit's ledger read both ends of the window
+    /// ([`reap`]), its members' own CPU and their reaped children's (finished work included),
+    /// else its processes alive at both ends of it; delegated members' live work included.
     pub tabs: Vec<(u64, i64)>,
-    /// The live work over the window of aterm's processes in no tab (itself, its helpers, and a
-    /// delegated job's members whose tab closed), so of [`Self::aterm_mc`] plus
-    /// [`Self::delegated_mc`], not of aterm's coalitions alone.
+    /// The same over the window for aterm's processes in no tab (itself, its helpers, what
+    /// closed tabs left, and a delegated job's members whose tab closed), so of
+    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`], not of aterm's coalitions alone.
     pub own_mc: i64,
-    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every live figure
+    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every figure
     /// ([`Self::own_mc`] and [`Self::tabs`]), never below 0: work in no
-    /// process alive at both ends of the window, so in no tab's figure.
-    /// Taken from the parts' nanoseconds and rounded once, so the parts'
-    /// own rounding never reads as a millicore of it; 0 where aterm's
-    /// coalitions held only live figures' work ([`Self::skew_mc`]).
+    /// figure, so in no tab's: with the reap credit, a process that left for
+    /// launchd before a sweep read it, a member's tail before launchd reaped
+    /// it, the counters' skew; without it, every process not alive at both
+    /// ends of the window. Taken from the parts' nanoseconds and rounded
+    /// once, so the parts' own rounding never reads as a millicore of it; 0
+    /// where aterm's coalitions held only the figures' work
+    /// ([`Self::skew_mc`]).
     pub unattributed_mc: i64,
-    /// What aterm's coalitions' counters ran past their live members' own
-    /// times over a window in which none of them made or reaped a member
-    /// (the kernel's task counters at both ends) and the sweep found every
-    /// live member (as many as the counters hold) in a live figure: no
-    /// process came or went, so none of it is finished work, only the skew
-    /// between a coalition's counter and its members' times, which the
-    /// headless run read at 2.70–3.78 ms, each giving back what the counter
-    /// fell behind in the windows before (RD §3.5, §7.3). Rounded once from
-    /// ns, as [`Self::unattributed_mc`] (which reads 0 then); 0 in any
-    /// other window, and by subtraction.
+    /// What aterm's coalitions' counters ran past their members' figures
+    /// over a window in which none of them made or reaped a member (the
+    /// kernel's task counters at both ends) and the sweep found every live
+    /// member (as many as the counters hold) in a figure that read it at
+    /// both ends of the window: no process came or went, so none of it is
+    /// finished work, only the skew between a coalition's counter and its
+    /// members' times, which the headless run read at 2.70–3.78 ms, each
+    /// giving back what the counter fell behind in the windows before (RD
+    /// §3.5, §7.3). Rounded once from ns, as [`Self::unattributed_mc`]
+    /// (which reads 0 then); 0 in any other window, and by subtraction.
     pub skew_mc: i64,
+    /// The tabs, by key, whose figure the reap credit's ledger knows is short of their work over
+    /// the window, so only a lower bound however little is [`Self::unattributed_mc`] ([`reap`]'s
+    /// missed steps): a member's tail where launchd reaped it, work taken out against members
+    /// gone with their parent that the reaper's reaped time fell short of, a member of aterm's
+    /// back from a delegated job, a process first read since the last reading. None by
+    /// subtraction, which reads no finished work.
+    pub short_tabs: Vec<u64>,
     /// Every listed coalition that answered, busiest first (none by subtraction), rounded as a set
     /// so they add up to the parts' total (`global_mc - unaccounted_mc`); a part's rows may still
     /// differ from the part, rounded once, by a millicore or two.
@@ -474,7 +487,7 @@ pub struct CoalSplit {
 /// [`CoalSplit::global_mc`] exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Parts {
-    /// The tab's live work.
+    /// The tab's work ([`CoalSplit::tabs`]).
     pub tab: i64,
     /// aterm's coalitions and the delegated work, less the tab's.
     pub aterm_rest: i64,
@@ -482,7 +495,7 @@ pub struct Parts {
     pub others: i64,
     /// Services.
     pub services: i64,
-    /// The signed residual: the split's, plus any of the tab's live figure past aterm's.
+    /// The signed residual: the split's, plus any of the tab's figure past aterm's.
     pub unaccounted: i64,
 }
 
@@ -721,6 +734,9 @@ pub(crate) struct WhyState {
     facts: Option<Arc<WhyFacts>>,
     episodes: Episodes,
     clause: ClauseHold,
+    /// The tabs' and aterm's CPU, live and reaped, read at each whole
+    /// reading while splits are taken ([`reap`]).
+    reap: ReapLedger,
     /// Whether a read misread the record's layout ([`misread`]): the lane
     /// stays off for good, since the kernel's layout does not change under a
     /// running process.
@@ -754,6 +770,7 @@ impl WhyState {
             self.episodes = Episodes::default();
             self.clause = ClauseHold::default();
         }
+        self.step_reap(s, lane, attribution);
         let fresh = match s.coal_lane {
             CoalLane::On if self.misread => by_subtraction(s, snap, CoalLane::Off),
             CoalLane::On => self.by_coalitions(s, attribution),
@@ -785,6 +802,42 @@ impl WhyState {
             None => {}
         }
         self.facts.clone()
+    }
+
+    /// Steps the reap credit's ledger on sample `s`'s sweep: on a split
+    /// tick, and on every whole reading between split ticks under 60 s
+    /// apart, so a member is seen as soon as a sweep can see it; never with
+    /// the lane off, where no split reads it.
+    fn step_reap(
+        &mut self,
+        s: &Sample,
+        lane: CoalLane,
+        attribution: Option<(&[Membership], &[Option<usize>])>,
+    ) {
+        let (Some(procs), Some(uid), Some((members, owners))) =
+            (s.procs.as_deref(), s.self_uid, attribution)
+        else {
+            return;
+        };
+        let taking = s.coalitions.is_some()
+            || self
+                .base
+                .as_ref()
+                .is_some_and(|b| s.at_ns.saturating_sub(b.at_ns) <= WINDOW_MAX_NS);
+        if !lane.on() || !taking {
+            return;
+        }
+        let delegated: Vec<bool> = owners.iter().map(Option::is_some).collect();
+        self.reap.step(&reap::StepIn {
+            at_ns: s.at_ns,
+            at_unix_ms: s.at_unix_ms,
+            procs,
+            members,
+            delegated: &delegated,
+            tabs: &s.tabs,
+            self_uid: uid,
+            truncated: s.procs_truncated,
+        });
     }
 
     /// `facts` with the causes that hold over their window, the episodes
@@ -851,7 +904,8 @@ impl WhyState {
             &s.tabs,
             &self.identities,
         );
-        let now = CoalBase::of(s, read, procs, uid)?;
+        let mut now = CoalBase::of(s, read, procs, uid)?;
+        now.reap = self.reap.stepped_at(s.at_ns).then(|| self.reap.totals());
         let base = self.base.replace(now)?;
         let now = self.base.as_ref()?;
         let window_ns = now.window_after(&base)?;
@@ -868,6 +922,7 @@ impl WhyState {
             names: &self.names,
             live: &live,
             listed: read.listed,
+            reap: Some(&self.reap),
         });
         Some(WhyFacts {
             at_ns: s.at_ns,

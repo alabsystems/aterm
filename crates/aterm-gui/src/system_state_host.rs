@@ -222,6 +222,11 @@ const CHANGING_READS: u8 = 10;
 /// whenever its window regains focus (§3.6).
 pub(crate) const TOKEN_LOOK: Duration = Duration::from_secs(60);
 
+/// How recently a keyboard, mouse or trackpad must have been used for the first-launch
+/// countdown to advance ([`App::person_at_this_screen`]): twice the countdown, so a person who
+/// opened aterm and reads the review without touching anything still gets its automatic Apply.
+pub(crate) const COUNTDOWN_PRESENT_WITHIN: Duration = Duration::from_secs(60);
+
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observe {
@@ -643,7 +648,8 @@ impl App {
     }
 
     /// A Messages press that names System State (`Intent::ReviewVaultSync`, on a vault line an
-    /// earlier build filed): open or focus the page in `wid`, whose Secrets row is the remedy.
+    /// earlier build filed, or the note that setup waits for its review): open or focus the
+    /// page in `wid`, whose rows are the remedy.
     pub(crate) fn review_vault_sync_in_window(&mut self, wid: crate::WindowId) -> bool {
         self.open_system_state_tab_in_window(wid)
     }
@@ -868,7 +874,10 @@ impl App {
         if self.system_state_access_step() != self.system_state_host.access_step {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
-        let active = self.system_state_presented_active(instance);
+        // `active` only advances the review's countdown, so the input and screen readings (an
+        // IOKit and a window server read on this thread) are made only while a review is offered.
+        let active = self.system_state_presented_active(instance)
+            && (self.system_state_host.pending.is_none() || self.person_at_this_screen());
         // The village walks only on a page someone can see, and only where a
         // view someone sees draws it.
         let seen = self.system_state_seen_views(instance);
@@ -1073,6 +1082,15 @@ impl App {
             self.system_state_host.shown = false;
             self.system_state_host.next_tick = Some(Instant::now());
         }
+    }
+
+    /// Whether a person is at this Mac's screen: a keyboard, mouse or trackpad was used within
+    /// [`COUNTDOWN_PRESENT_WITHIN`], and this login's screen is neither locked nor switched away
+    /// for another login. The first-launch countdown advances only then, so a window that opened
+    /// with nobody there (an update's relaunch, a launch from another Mac) never applies by
+    /// expiry.
+    fn person_at_this_screen(&self) -> bool {
+        (self.user_input_recent)(COUNTDOWN_PRESENT_WITHIN) && !(self.screen_away)()
     }
 
     /// Whether the page has been presented in a focused window and is still

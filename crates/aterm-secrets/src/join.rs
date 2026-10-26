@@ -77,6 +77,13 @@ impl Key {
     }
 }
 
+/// What names a proof in an admin Mac's verdict on it (`POST <url>/join/verdict`): the first 8
+/// bytes of its SHA-256, in lowercase hex. It is no secret: the join listing shows the proof.
+pub fn proof_tag(proof: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, proof.as_bytes());
+    aterm_codec::hex::encode_lower(&digest.as_ref()[..8])
+}
+
 /// A new password: 20 random characters (100 bits) in four dash-separated groups of five.
 pub fn generate() -> std::io::Result<SecretBytes> {
     const ALPHABET: &[u8; 32] = b"abcdefghijkmnpqrstuvwxyz23456789";

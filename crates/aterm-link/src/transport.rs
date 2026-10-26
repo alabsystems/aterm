@@ -369,7 +369,9 @@ mod tests {
         let offs: Vec<u64> = (1..=3u64)
             .map(|seq| conn.publish(91, seq, ev, b"v=2 x").expect("publish").0)
             .collect();
-        broker.retain_before(offs[1]).expect("the cut");
+        broker
+            .retain_before_carrying_state(offs[1])
+            .expect("the cut");
 
         let refused = conn
             .fetch(offs[0], ev, 8)

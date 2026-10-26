@@ -225,17 +225,22 @@ fn paint_eye_dots(
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let half_inv_sx = 0.5 / xform.scale_x.max(f32::EPSILON);
     let half_inv_sy = 0.5 / xform.scale_y.max(f32::EPSILON);
+    #[inline]
     const fn fx(v: f32) -> u16 {
         (v * (FIXED_ONE as f32))
             .round()
             .clamp(0.0, FIXED_ONE as f32) as u16
     }
-    for (i, path) in eye_meta.paths.iter().enumerate() {
+    let mut i = 0;
+    while i < eye_meta.paths.len() {
+        let path = &eye_meta.paths[i];
         let Some((x0, y0, x1, y1)) = bounds[i] else {
+            i += 1;
             continue;
         };
         let r_i = ratios[i];
         if r_i < EYE_DOT_FAR_OCCLUDED_RATIO {
+            i += 1;
             continue;
         }
         let compressed = r_i < EYE_DOT_FAR_COMPRESS_RATIO;
@@ -259,23 +264,26 @@ fn paint_eye_dots(
             ky
         };
         let mut allowed_w = f32::MAX;
-        for (j, other) in bounds.iter().enumerate() {
-            let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
+        let mut j = 0;
+        while j < bounds.len() {
+            let Some((ox0, _, ox1, _)) = bounds[j] else {
+                j += 1;
                 continue;
             };
             if j == i || ratios[j] < EYE_DOT_FAR_OCCLUDED_RATIO {
+                j += 1;
                 continue;
             }
             let gap = (ox0 - x1).max(x0 - ox1);
-            if gap <= 0.0 {
-                continue;
+            if gap > 0.0 {
+                let closing = (x1 - x0 + ox1 - ox0) * 0.5;
+                if closing > 0.0 {
+                    kx = kx.min(1.0 + (gap - min_gap) / closing);
+                }
+                let dist = ((ox0 + ox1) * 0.5 - cx).abs() * xform.scale_x;
+                allowed_w = allowed_w.min((dist - EYE_DOT_GAP_PX).max(0.0));
             }
-            let closing = (x1 - x0 + ox1 - ox0) * 0.5;
-            if closing > 0.0 {
-                kx = kx.min(1.0 + (gap - min_gap) / closing);
-            }
-            let dist = ((ox0 + ox1) * 0.5 - cx).abs() * xform.scale_x;
-            allowed_w = allowed_w.min((dist - EYE_DOT_GAP_PX).max(0.0));
+            j += 1;
         }
         let floor_k = core_min_w_px / w_px.max(f32::EPSILON);
         let kx_floor = floor_k.min(1.0);
@@ -335,6 +343,7 @@ fn paint_eye_dots(
                 h_px * ky,
             );
         }
+        i += 1;
     }
 }
 
@@ -438,7 +447,11 @@ fn paint_pose_onto(
     let mouth_lod = h < MOUTH_DETAIL_MIN_H;
     let pose_idx = pose as usize;
     let eye_meta = &PET_EYE_META[pose_idx];
-    for layer in PET_GLYPHS[pose_idx].layers {
+    let layers = PET_GLYPHS[pose_idx].layers;
+    let mut i = 0;
+    while i < layers.len() {
+        let layer = &layers[i];
+        i += 1;
         // LOD cull by authored role: whisker/blush/pattern are sub-pixel charm;
         // iris/catch-light/pupil (`Detail`) are what the dot and its
         // device-sized reflection replace.

@@ -1670,10 +1670,12 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
         "atomic" => StartRules {
             flush_record: false,
             flush_root: false,
+            ..StartRules::ALL
         },
         "no_root" => StartRules {
             flush_record: true,
             flush_root: false,
+            ..StartRules::ALL
         },
         _ => StartRules::ALL,
     };
@@ -1780,6 +1782,123 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
             assert!(
                 broken > 0,
                 "CONTROL {control}: never a clean record over a change"
+            );
+        }
+    }
+}
+
+/// Once an attach is admitted, its start's OPEN taken and its incarnation after it, a power cut never leaves the clean stop's record standing: the attach may have presented posts to a broker on another volume, and a clean record would vouch for the clean stop's in-flight entries behind them. Boot 1 stops cleanly; a second start in the same boot or the next finishes, is killed at a write, or has its record's rename made and its directory flush fail (in the same boot the durable replace's own flush of the root, in the next boot the root's barrier after the ordered replace, [`Device::fail_after_its_rename`]; the law checks the fault failed the start); a successor starts; a tearing power cut follows. Controls: a visible OPEN of this boot replaced by the barrier (B07 as first merged), and an admission that takes no incarnation (a new boot's first lease is what puts an ordered OPEN on the media).
+#[test]
+fn once_an_attach_is_admitted_a_power_cut_never_reads_the_clean_stop() {
+    use crate::state::{Flushed, StartRules, StateDir};
+    let boot = |n| crate::state::IncSeam {
+        boot: Some(Some(crate::durability::test_boot(n))),
+        off_volume: false,
+        kill_at: None,
+        mutant: 0,
+        span: None,
+    };
+    for control in ["", "visible_open", "no_incarnation"] {
+        let rules = StartRules {
+            this_boot_in_full: control != "visible_open",
+            ..StartRules::ALL
+        };
+        let attach = |st: &StateDir| -> Result<Flushed, &'static str> {
+            let began = st.begin_run_with(rules).map_err(|_| "its start failed")?;
+            if control != "no_incarnation" {
+                st.take_incarnation(0)
+                    .map_err(|_| "its incarnation failed")?;
+            }
+            Ok(began)
+        };
+        let (mut admitted, mut broken, mut ordered) = (0u64, 0u64, 0u64);
+        for reboot in [false, true] {
+            let b = if reboot { 2 } else { 1 };
+            for seed in 1..=16u64 {
+                for fault in 0..=5u64 {
+                    let dir = aterm_tempfile::Builder::new()
+                        .prefix("sim-admit")
+                        .tempdir_in("/tmp")
+                        .expect("scratch");
+                    let root = dir.path();
+                    let mut device = Device::new(root);
+                    device.tears = true;
+                    let core = super::Core::new(
+                        seed,
+                        bus::Broker::new(Tier::Strict, Escalation::aterm()),
+                        device,
+                    );
+                    let on = |pid, n| {
+                        let process = super::Process::new(std::sync::Arc::clone(&core), pid);
+                        let st = StateDir::open_on(root, crate::fx::Disk::Sim(process))
+                            .expect("the state dir on the device");
+                        st.set_inc_seam(boot(n));
+                        st
+                    };
+                    let first = on(1, 1);
+                    first.begin_run().expect("boot 1's run");
+                    first.take_incarnation(0).expect("boot 1's incarnation");
+                    write_every_torn_kind(&first);
+                    first.end_run_clean().expect("its clean stop");
+                    drop(first);
+                    if reboot {
+                        core.device.power_cut(&mut Rng::new(seed));
+                    }
+                    let second = on(2, b);
+                    match fault {
+                        0 => {}
+                        5 => core.device.fail_after_its_rename(&root.join("run")),
+                        k => core.arm_kill(2, k),
+                    }
+                    let tried =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attach(&second)));
+                    core.disarm_kill();
+                    if fault == 5 {
+                        assert!(
+                            matches!(tried, Ok(Err("its start failed"))),
+                            "control {control:?}, reboot={reboot}, seed {seed}: the fault named \
+                             fails the second start, whichever tier it takes: {tried:?}"
+                        );
+                    }
+                    let mut any = match tried {
+                        Err(payload) => {
+                            assert!(payload.is::<super::SimKill>(), "a real panic in the start");
+                            false
+                        }
+                        Ok(began) => began.is_ok(),
+                    };
+                    drop(second);
+                    let successor = on(3, b);
+                    if let Ok(began) = attach(&successor) {
+                        any = true;
+                        ordered += u64::from((began.ordered, began.full) == (2, 0));
+                    }
+                    drop(successor);
+                    core.device.power_cut(&mut Rng::new(seed * 64 + fault));
+                    let next = StateDir::open(root).expect("the next boot's look");
+                    next.set_inc_seam(boot(b + 1));
+                    if any {
+                        admitted += 1;
+                        broken += u64::from(matches!(next.last_run(), Ok(Some(run)) if run.clean));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "admission, control {control:?}: {admitted} schedules admitted an attach, {broken} \
+             of them read the clean stop after the cut; {ordered} successors admitted by the \
+             barrier"
+        );
+        if control.is_empty() {
+            assert_eq!(
+                broken, 0,
+                "an admitted attach under the clean stop's record"
+            );
+            assert!(admitted > 0 && ordered > 0, "the law was exercised");
+        } else {
+            assert!(
+                broken > 0,
+                "CONTROL {control}: an admitted attach never under the clean stop's record"
             );
         }
     }
@@ -2311,4 +2430,105 @@ fn the_round_refines_its_exactly_once_model() {
                 .map_or("", String::as_str)
         );
     }
+}
+
+/// The sessions the reclaim scenario opens beside aterm's two.
+const RECLAIM_SESSIONS: u64 = 8;
+
+/// What the node may still hold past its baseline once the reclaim ran: the subjects a
+/// departed session never held that its traffic opened on the node's own faces.
+const RECLAIM_SLACK: u64 = 4;
+
+/// **A DEPARTED SESSION'S SUBJECTS GO BACK TO THE NODE'S BUDGET** (sim item B02): eight
+/// sessions open, each mails the next and is mailed by the peer, all leave, and once the
+/// reclaim's wait has passed the node holds what it held before them, within a constant;
+/// every law of a world and every retire's ([`super::world::run_reclaim`]) holds, on every
+/// tier. NEGATIVE CONTROL: a sweep that gives nothing back ([`Mutant::NoSubjectRetire`])
+/// keeps two subjects or more of each session.
+#[test]
+fn a_departed_sessions_subjects_go_back_to_the_budget() {
+    let n = RECLAIM_SESSIONS;
+    let runs = aterm_spec::check::each(&[Tier::Strict, Tier::Ordered, Tier::Relaxed], |tier| {
+        super::world::run_reclaim(&Opts::reclaiming(3, *tier), n as usize, false)
+    });
+    for (tier, out) in [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .iter()
+        .zip(&runs)
+    {
+        assert!(
+            out.violations.is_empty(),
+            "{tier}: {:#?}\n{}",
+            out.violations,
+            out.trace.join("\n")
+        );
+        assert!(
+            out.peak >= out.baseline + 2 * n,
+            "{tier}: the sessions spent {} subjects, not their rows and lanes: {out:?}",
+            out.peak - out.baseline
+        );
+        assert!(
+            out.after <= out.baseline + RECLAIM_SLACK,
+            "{tier}: {} subjects past the baseline stayed spent once the sessions left: {:?}",
+            out.after - out.baseline,
+            (out.baseline, out.peak, out.after)
+        );
+        eprintln!(
+            "{tier}: spent {} -> {} with {n} sessions -> {} once they left",
+            out.baseline, out.peak, out.after
+        );
+    }
+    let off = super::world::run_reclaim(
+        &Opts::reclaiming(3, Tier::Relaxed).with(Mutant::NoSubjectRetire),
+        n as usize,
+        false,
+    );
+    assert!(off.violations.is_empty(), "{:#?}", off.violations);
+    assert!(
+        off.after >= off.baseline + 2 * n,
+        "CONTROL NoSubjectRetire: the node held {} subjects past its baseline with nothing \
+         given back, not two a session",
+        off.after - off.baseline
+    );
+}
+
+/// **A SESSION REVIVED BETWEEN THE SWEEP'S READ AND ITS RETIRE KEEPS ITS ROW AND ITS
+/// MAIL** (sim item B02): a successor's `live` row reaches the broker just ahead of the
+/// retire of the `exited` row the sweep read, and aterm serves the session again. The
+/// conditional retire is moot, the row stays in the index, and the peer's mail to it
+/// since is delivered. NEGATIVE CONTROL: a sweep that gives the row back with the
+/// unconditional `/a/retire` ([`Mutant::RetireUnconditionally`]) takes the successor's
+/// `live` row out of the index.
+#[test]
+fn a_session_revived_between_the_read_and_the_retire_keeps_its_row_and_its_mail() {
+    let out = super::world::run_reclaim(&Opts::reclaiming(5, Tier::Strict), 3, true);
+    let sid = out
+        .revived
+        .clone()
+        .unwrap_or_else(|| panic!("no retire met the revival:\n{}", out.trace.join("\n")));
+    assert!(
+        out.violations.is_empty(),
+        "{sid}: {:#?}\n{}",
+        out.violations,
+        out.trace.join("\n")
+    );
+    assert!(
+        out.trace
+            .iter()
+            .any(|l| l.contains(&format!("{sid}/presence if @")) && l.ends_with(" moot")),
+        "the retire of {sid}'s row was not moot:\n{}",
+        out.trace.join("\n")
+    );
+    let off = super::world::run_reclaim(
+        &Opts::reclaiming(5, Tier::Strict).with(Mutant::RetireUnconditionally),
+        3,
+        true,
+    );
+    assert!(off.revived.is_some(), "CONTROL: no retire met the revival");
+    assert!(
+        off.violations
+            .iter()
+            .any(|v| v.starts_with("reclaim:") && v.contains("Some(\"live\")")),
+        "CONTROL RetireUnconditionally: the successor's live row was not given back: {:#?}",
+        off.violations
+    );
 }

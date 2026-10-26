@@ -473,7 +473,7 @@ aterm-dbus = { workspace = true }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "linux")))'.dependencies]
 # aterm-window's raw-window-handle traits, for the presenters that take a window
-# through them here: wgpu's surface (`aterm_gpu::WindowTarget`), the GDI CPU
+# through them here: the GPU window surface (`aterm_gpu::WindowTarget`), the GDI CPU
 # presenter's HWND (`present/win32.rs`) and the other Win32 HWND reads. `rwh_06` is not an aterm-window default: on
 # macOS the Metal presenter and the AppKit chrome take the content view through
 # first-party `aterm_objc::HasNsView`, and on Linux the GL arm and the X11 and

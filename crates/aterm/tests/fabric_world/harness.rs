@@ -387,6 +387,18 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 /// Owed-answer horizon (`ATERM_FABRIC_STALE_AFTER_MS`) set by [`prepare_gui_environment`].
 pub const STALE_HORIZON: (&str, Duration) = ("ATERM_FABRIC_STALE_AFTER_MS", VERB_DEADLINE);
 
+/// Takes `cmd`'s process tree out of this test binary's: it, and every process it starts,
+/// take the durable flushes aterm ships, full flushes (`F_FULLFSYNC`), not the plain
+/// `fsync(2)` the binary's load-time mark asks for (`aterm_durable::plain_durable_flushes_in_tests!`).
+/// A line that counts or times their flushes then carries no
+/// [`aterm_durable::PLAIN_DURABLE_FLUSHES`]. Off Apple targets every build flushes as it ships.
+pub fn ship_durable_flushes(cmd: &mut aterm_uds::spawnfd::Command) {
+    #[cfg(target_vendor = "apple")]
+    cmd.env_remove(aterm_durable::seam::TEST_PLAIN_FSYNC_ENV);
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = cmd;
+}
+
 /// Arms a `--headless` launch with a lifeline held for the life of this test process.
 pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
     use aterm_uds::spawnfd::InheritNothing as _;
@@ -1666,6 +1678,18 @@ pub fn alive(pid: i32) -> bool {
 impl World {
     /// Relaunches `aterm` against the same scratch world.
     pub fn relaunch_gui(w: &World) -> OwnedChild {
+        Self::relaunch_gui_by(w, false)
+    }
+
+    /// [`World::relaunch_gui`] taking the durable flushes aterm ships: the instance, and the
+    /// bridge it starts, flush in full (`F_FULLFSYNC`) where this test binary's process tree
+    /// takes a plain `fsync(2)` ([`ship_durable_flushes`]), so what their lines time is what
+    /// ships.
+    pub fn relaunch_gui_shipping_flushes(w: &World) -> OwnedChild {
+        Self::relaunch_gui_by(w, true)
+    }
+
+    fn relaunch_gui_by(w: &World, shipping_flushes: bool) -> OwnedChild {
         let fabric_cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd"))
             .expect("the boot recorded its fabric command");
         let out = std::fs::OpenOptions::new()
@@ -1687,6 +1711,9 @@ impl World {
             .stdin(OwnedStdio::null())
             .stdout(out)
             .stderr(err);
+        if shipping_flushes {
+            ship_durable_flushes(&mut cmd);
+        }
         let lifeline =
             aterm_uds::lifeline::Lifeline::arm(&mut cmd, &w.tmp).expect("relaunch lifeline");
         *w.lifeline

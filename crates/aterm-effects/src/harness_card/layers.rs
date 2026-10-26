@@ -398,30 +398,34 @@ impl RimArt {
             };
             mids.push((q.x0 + q.x1, q.y0 + q.y1));
             let (rx0, rx1) = ((q.x0 + rim) as usize, (q.x1 + rim) as usize);
-            for y in q.y0..q.y1 {
+            let mut y = q.y0;
+            while y < q.y1 {
                 let row = (y + rim) as usize * wu;
                 let x0 = row + rx0;
                 let x1 = row + rx1;
                 debug_assert!(all_zero(&data[x0..x1]), "rim strips overlap on row {y}");
                 data[x0..x1].fill(k);
+                y += 1;
             }
         });
         if !ok {
             return None;
         }
         let art = fx_art::bitmap(FxTexels::Index8, w16, h16, data)?;
-        let cover = fx_art::cover(&art, RIM_COVER_MAX)
-            .iter()
-            .map(|t| {
-                let px = fx_art::cover_px(*t, (w16, h16), (w16, h16), false);
-                Rect {
-                    x0: i64::from(px.x0) - rim,
-                    y0: i64::from(px.y0) - rim,
-                    x1: i64::from(px.x1) - rim,
-                    y1: i64::from(px.y1) - rim,
-                }
-            })
-            .collect();
+        let raw_cover = fx_art::cover(&art, RIM_COVER_MAX);
+        let mut cover_vec = Vec::with_capacity(raw_cover.len());
+        let mut ci = 0;
+        while ci < raw_cover.len() {
+            let px = fx_art::cover_px(raw_cover[ci], (w16, h16), (w16, h16), false);
+            cover_vec.push(Rect {
+                x0: i64::from(px.x0) - rim,
+                y0: i64::from(px.y0) - rim,
+                x1: i64::from(px.x1) - rim,
+                y1: i64::from(px.y1) - rim,
+            });
+            ci += 1;
+        }
+        let cover = cover_vec.into_boxed_slice();
         Some(Self {
             art,
             origin: (-rim, -rim),
@@ -447,16 +451,17 @@ impl StarArt {
         art_size(side, side)?;
         let laid = star_pieces(arm, gold);
         let mut tapers = [0.0; STAR_TAPER_STEPS as usize];
-        let rects: Vec<(PxRect, u8)> = laid
-            .iter()
-            .map(|p| {
-                if let StarPart::Tip { step, taper } = p.part {
-                    tapers[usize::from(step)] = taper;
-                }
-                let r = PxRect::new(p.x, p.y, p.x + p.w, p.y + p.h);
-                (r, p.part.id())
-            })
-            .collect();
+        let mut rects = Vec::with_capacity(laid.len());
+        let mut li = 0;
+        while li < laid.len() {
+            let p = &laid[li];
+            li += 1;
+            if let StarPart::Tip { step, taper } = p.part {
+                tapers[usize::from(step)] = taper;
+            }
+            let r = PxRect::new(p.x, p.y, p.x + p.w, p.y + p.h);
+            rects.push((r, p.part.id()));
+        }
         let pieces = fx_art::pieces(&rects)?;
         debug_assert!(
             pieces.depth() <= STAR_DEPTH_MAX,

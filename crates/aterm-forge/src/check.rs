@@ -325,9 +325,11 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
         }
     }
 
-    let (mut live_all, mut live_some, mut live_build) = (0usize, 0usize, 0usize);
+    let (mut live_all, mut live_some, mut live_build, mut live_lane) =
+        (0usize, 0usize, 0usize, 0usize);
     if !missing_on_disk {
         let mut build_probe: Option<Result<Resolved, String>> = None;
+        let mut lane_probe: Option<Result<Vec<Resolved>, String>> = None;
         for e in &patches {
             let live = live_in.get(e.key.as_str()).map_or(0, Vec::len);
             if live == cells.len() && !cells.is_empty() {
@@ -369,19 +371,54 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
                             e.name, cell.name
                         );
                     } else {
-                        fails += 1;
-                        let _ = writeln!(
-                            log,
-                            "  ✗ FAIL [OB-12] DEAD PATCH: `{}` is patched to `{}` but resolves \
-                             in NO cell — not in any `--edges normal` graph and not in the build \
-                             closure of `{}`. cargo reports this as a warning at exit 0, so \
-                             nothing else in this repository would notice. Fix: run `targo tree \
-                             --edges all -i {}` to see whether anything still requires it, then \
-                             either delete `[patch.crates-io].{}` (with its vendored copy, its \
-                             NOTICE line and its vendor/forge.toml block) or restore the \
-                             dependency edge that used it.",
-                            e.name, e.path, cell.name, e.name, e.key
-                        );
+                        let lane = lane_probe.get_or_insert_with(|| workspace_closure(cargo, root));
+                        match lane {
+                            Ok(trees)
+                                if trees.iter().any(|(g, p)| classify(g, p, &e.name, &scope).0) =>
+                            {
+                                live_lane += 1;
+                                notes += 1;
+                                let _ = writeln!(
+                                    log,
+                                    "    • NOTE [OB-12] `{}` is live only OUTSIDE the cells: the \
+                                     workspace's resolve with every feature, edge and target \
+                                     reaches it, so cargo uses the patch, but no cell compiles \
+                                     it; what reaches it is a feature, a dev or build edge or a \
+                                     target that no cell's graph takes (aterm-gpu's \
+                                     `wgpu-oracle` lane is one). Not a failure; recorded so a \
+                                     patch that left every shipped graph is visible.",
+                                    e.name
+                                );
+                            }
+                            Ok(_) => {
+                                fails += 1;
+                                let _ = writeln!(
+                                    log,
+                                    "  ✗ FAIL [OB-12] DEAD PATCH: `{}` is patched to `{}` but \
+                                     resolves in NO cell and nowhere in the workspace — not in \
+                                     any `--edges normal` graph, not in the build closure of \
+                                     `{}`, and not in the workspace's resolve with every \
+                                     feature. cargo reports this as a warning at exit 0, so \
+                                     nothing else in this repository would notice. Fix: run \
+                                     `targo tree --edges all -i {}` to see whether anything \
+                                     still requires it, then either delete \
+                                     `[patch.crates-io].{}` (with its vendored copy, its NOTICE \
+                                     line and its vendor/forge.toml block) or restore the \
+                                     dependency edge that used it.",
+                                    e.name, e.path, cell.name, e.name, e.key
+                                );
+                            }
+                            Err(why) => {
+                                fails += 1;
+                                could_not_run.get_or_insert(why.clone());
+                                let _ = writeln!(
+                                    log,
+                                    "  ✗ FAIL [OB-12] `{}` is in no cell's graph and the \
+                                     workspace's resolve could not be read to check it: {why}",
+                                    e.name
+                                );
+                            }
+                        }
                     }
                     for sib in &bsibs {
                         fails += 1;
@@ -652,6 +689,7 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
                 live_all,
                 live_some,
                 live_build,
+                live_lane,
                 carved: carved.len(),
                 notes,
                 unverified: &attested.unverified,
@@ -688,6 +726,9 @@ struct GreenCounts<'a> {
     live_some: usize,
     /// Live in no normal graph, only in the first cell's build closure.
     live_build: usize,
+    /// Live in no cell at all, only in the workspace's resolve with every
+    /// feature ([`workspace_closure`]): a test or oracle lane's dependency.
+    live_lane: usize,
     carved: usize,
     notes: usize,
     /// The forks attest's `[OB-7]` could not diff ([`attest::Attestation::unverified`]).
@@ -707,8 +748,8 @@ fn green_verdict(c: &GreenCounts) -> String {
     };
     format!(
         "forge check: GREEN — {} vendored fork(s) + {} absorbed crate(s) + {} first-party patch \
-         target(s): {} live in all {} cells, {} in some, {} build-only; no unpatched sibling; \
-         {} carved path(s) absent; {attested}; {} note(s).",
+         target(s): {} live in all {} cells, {} in some, {} build-only, {} lane-only; no \
+         unpatched sibling; {} carved path(s) absent; {attested}; {} note(s).",
         c.forks,
         c.absorbed,
         c.first_party,
@@ -716,6 +757,7 @@ fn green_verdict(c: &GreenCounts) -> String {
         c.cells,
         c.live_some,
         c.live_build,
+        c.live_lane,
         c.carved,
         c.notes
     )
@@ -1058,6 +1100,60 @@ fn build_closure(cargo: &Cargo, root: &Path, cell: &Cell) -> Result<Resolved, St
     resolve::parse_tree(&text)
 }
 
+/// Every workspace member's resolve with every feature, the normal, build and
+/// dev edges and every target: what Cargo.lock is resolved from. A patch it
+/// reaches is one cargo uses even when no cell compiles it.
+fn workspace_closure(cargo: &Cargo, root: &Path) -> Result<Vec<Resolved>, String> {
+    let mut cmd = cargo.command("tree", root);
+    cmd.arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .arg("--workspace")
+        .arg("--all-features")
+        .arg("--edges")
+        .arg("normal,build,dev")
+        .arg("--target")
+        .arg("all")
+        .arg("--prefix")
+        .arg("depth")
+        .arg("--locked")
+        .arg("--offline");
+    let out = cmd.output_owned().map_err(|e| {
+        format!(
+            "could not execute `targo tree`: {e} — install the Trust toolchain (`aterm pkg \
+             install trust`), or set CARGO to the targo to use"
+        )
+    })?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    parse_forest(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `cargo tree --workspace --prefix depth` output: one tree per member, each
+/// starting at a depth-0 line.
+fn parse_forest(text: &str) -> Result<Vec<Resolved>, String> {
+    let mut trees = Vec::new();
+    let mut tree = String::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let root = line
+            .strip_prefix('0')
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()));
+        if root && !tree.is_empty() {
+            trees.push(resolve::parse_tree(&tree)?);
+            tree.clear();
+        }
+        tree.push_str(line);
+        tree.push('\n');
+    }
+    if !tree.is_empty() {
+        trees.push(resolve::parse_tree(&tree)?);
+    }
+    if trees.is_empty() {
+        return Err("`targo tree --workspace` printed no member's tree".to_string());
+    }
+    Ok(trees)
+}
+
 /// Canonicalise for comparison, falling back to the literal path when the
 /// filesystem cannot.
 fn canon(p: &Path) -> PathBuf {
@@ -1226,6 +1322,7 @@ mod tests {
                 live_all: 0,
                 live_some: 0,
                 live_build: 0,
+                live_lane: 0,
                 carved: 0,
                 notes: unverified.len(),
                 unverified,
@@ -1303,6 +1400,24 @@ reason = \"no arch intrinsics reach the shipped build\"
         ] {
             assert!(parse_carve_ledger(text, Path::new("f")).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn a_workspace_forest_is_read_as_one_tree_per_member() {
+        let text = "\
+0a v0.1.0 (/w/crates/a)
+1x v1.0.0
+2y v1.0.0
+
+0b v0.1.0 (/w/crates/b)
+1z v2.0.0 (/w/crates/z)
+";
+        let trees = parse_forest(text).expect("two members");
+        let roots: Vec<&str> = trees.iter().map(|(g, _)| g.root.name.as_str()).collect();
+        assert_eq!(roots, ["a", "b"]);
+        assert!(trees[1].0.nodes.iter().any(|n| n.name == "z"));
+        assert!(!trees[0].0.nodes.iter().any(|n| n.name == "z"));
+        assert!(parse_forest("").is_err(), "no tree is no resolve");
     }
 
     #[test]
@@ -1495,9 +1610,16 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
             (
                 "tree",
                 "while [ $# -gt 0 ]; do\n\
-                 case $1 in -p) pkg=$2 ;; --target) triple=$2 ;; --edges) edges=$2 ;; esac\n\
+                 case $1 in -p) pkg=$2 ;; --target) triple=$2 ;; --edges) edges=$2 ;; \
+                 --workspace) ws=1 ;; esac\n\
                  shift\n\
                  done\n\
+                 if [ -n \"$ws\" ]; then\n\
+                 echo '0aterm v0.1.0'; echo '1bar v1.0.0'; echo; echo '0lane v0.1.0'\n\
+                 [ -f lane ] && echo \"1foo v1.0.0 ($(pwd -P)/crates/foo)\"\n\
+                 [ -f registry ] && echo '1foo v1.0.0'\n\
+                 exit 0\n\
+                 fi\n\
                  case \"$pkg $edges\" in broken*|'nobuild normal,build') exit 101 ;; esac\n\
                  echo \"0$pkg v0.1.0\"\n\
                  case \"$pkg $edges\" in\n\
@@ -1540,6 +1662,27 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
             let v = report_over(&cargo, root, &cells);
             assert_eq!((v.ok, v.could_not_run.is_some()), want, "{}", v.log);
             assert!(v.ok || v.log.contains("FAIL [OB-12]"), "{}", v.log);
+        }
+        // A patch no cell reaches is dead unless the workspace's resolve with
+        // every feature reaches it at the patch's path (a lane's feature); the
+        // registry's package there is not the patch.
+        for (marker, want_ok) in [("registry", false), ("lane", true)] {
+            std::fs::write(root.join(marker), "").expect("marker");
+            let v = report_over(&cargo, root, std::slice::from_ref(&bare));
+            assert_eq!(
+                (v.ok, v.could_not_run.is_some()),
+                (want_ok, false),
+                "{}",
+                v.log
+            );
+            assert_eq!(
+                v.log.contains("live only OUTSIDE the cells"),
+                want_ok,
+                "{}",
+                v.log
+            );
+            assert_eq!(v.log.contains("DEAD PATCH"), !want_ok, "{}", v.log);
+            std::fs::remove_file(root.join(marker)).expect("marker");
         }
         let cells: Vec<Cell> = [&native, &web, &broken, &tool, &bare, &mixed]
             .into_iter()

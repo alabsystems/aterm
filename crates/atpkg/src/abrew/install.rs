@@ -159,16 +159,22 @@ pub fn plan(
     dependency_plan(
         name,
         opts.ignore_dependencies,
+        false,
         |n| catalog.formula(n).map_err(InstallError::from),
         |n| prefix.installed_one(Kind::Formula, n).is_some(),
     )
 }
 
-/// Resolves the full runtime dependency closure for `fetch` regardless of installed state.
+/// Resolves the full dependency closure for `fetch` regardless of
+/// installed state. Brew's `fetch --deps` expands build
+/// dependencies too (they are downloaded, never installed), so
+/// the fetch plan walks both lists where the install plan walks
+/// runtime dependencies only.
 pub(super) fn fetch_plan(api: &Api, name: &str) -> Result<Vec<Formula>, InstallError> {
     dependency_plan(
         name,
         false,
+        true,
         |n| api.formula(n).map_err(InstallError::from),
         |_| false,
     )
@@ -177,6 +183,7 @@ pub(super) fn fetch_plan(api: &Api, name: &str) -> Result<Vec<Formula>, InstallE
 fn dependency_plan(
     name: &str,
     ignore_dependencies: bool,
+    include_build: bool,
     mut read: impl FnMut(&str) -> Result<Formula, InstallError>,
     mut skip: impl FnMut(&str) -> bool,
 ) -> Result<Vec<Formula>, InstallError> {
@@ -188,6 +195,7 @@ fn dependency_plan(
     fn walk(
         name: &str,
         ignore_dependencies: bool,
+        include_build: bool,
         read: &mut impl FnMut(&str) -> Result<Formula, InstallError>,
         skip: &mut impl FnMut(&str) -> bool,
         state: &mut PlanState,
@@ -221,8 +229,22 @@ fn dependency_plan(
         }
         if !ignore_dependencies {
             state.visiting.push(short.clone());
-            for d in &f.dependencies {
-                walk(d, ignore_dependencies, read, skip, state, false)?;
+            let deps = f.dependencies.iter().chain(
+                include_build
+                    .then_some(&f.build_dependencies)
+                    .into_iter()
+                    .flatten(),
+            );
+            for d in deps {
+                walk(
+                    d,
+                    ignore_dependencies,
+                    include_build,
+                    read,
+                    skip,
+                    state,
+                    false,
+                )?;
             }
             state.visiting.pop();
         }
@@ -237,6 +259,7 @@ fn dependency_plan(
     walk(
         name,
         ignore_dependencies,
+        include_build,
         &mut read,
         &mut skip,
         &mut state,
@@ -1847,7 +1870,7 @@ pub fn uninstall(
 }
 
 /// Downloads and verifies `f`'s bottle or source tarball into the cache without installing.
-pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<(), InstallError> {
+pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<PathBuf, InstallError> {
     if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
         return Err(InstallError::Unsupported(
             "unsupported formula name/version".to_string(),
@@ -1876,8 +1899,7 @@ pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<(), InstallError> {
         fetch::curl_to_file(&url, &dest, &hrefs)?;
     }
     fetch::verify_digest_strict(&dest, &sha)?;
-    println!("Downloaded to {}", dest.display());
-    Ok(())
+    Ok(dest)
 }
 
 /// Loads runtime dependency lists for all installed formulae.
@@ -1929,12 +1951,17 @@ mod tests {
             let dependencies = match name {
                 "app" => vec!["dep", "shared"],
                 "dep" => vec!["leaf", "shared"],
-                "leaf" | "shared" => vec![],
+                "leaf" | "shared" | "tool" => vec![],
                 _ => return Err(InstallError::Failed("captured unknown".into())),
             };
             Ok(Formula {
                 name: name.into(),
                 dependencies: dependencies.into_iter().map(str::to_string).collect(),
+                build_dependencies: if name == "app" {
+                    vec!["tool".to_string()]
+                } else {
+                    Vec::new()
+                },
                 ..Formula::default()
             })
         };
@@ -1942,6 +1969,7 @@ mod tests {
         let mut install_reads = Vec::new();
         let install = dependency_plan(
             "app",
+            false,
             false,
             |n| {
                 install_reads.push(n.to_string());
@@ -1956,6 +1984,7 @@ mod tests {
         let fetch = dependency_plan(
             "homebrew/core/app",
             false,
+            true,
             |n| {
                 fetch_reads.push(n.to_string());
                 read(n)
@@ -1963,15 +1992,16 @@ mod tests {
             |_| false,
         )
         .unwrap();
-        assert_eq!(names(fetch), ["leaf", "shared", "dep", "app"]);
-        assert_eq!(fetch_reads, ["app", "dep", "leaf", "shared"]);
+        assert_eq!(names(fetch), ["leaf", "shared", "dep", "tool", "app"]);
+        assert_eq!(fetch_reads, ["app", "dep", "leaf", "shared", "tool"]);
         assert_eq!(
-            names(dependency_plan("app", true, read, |_| false).unwrap()),
+            names(dependency_plan("app", true, false, read, |_| false).unwrap()),
             ["app"]
         );
         assert!(
             dependency_plan(
                 "other/tap/app",
+                false,
                 false,
                 |_| panic!("qualified name must be refused before reading"),
                 |_| false
@@ -1986,14 +2016,15 @@ mod tests {
             })
         };
         assert!(
-            matches!(dependency_plan("app", false, cycle, |_| false), Err(InstallError::Failed(message)) if message.contains("dependency cycle"))
+            matches!(dependency_plan("app", false, false, cycle, |_| false), Err(InstallError::Failed(message)) if message.contains("dependency cycle"))
         );
         assert!(
-            matches!(dependency_plan("app", false, |_| Ok(Formula { disable: true, ..Formula::default() }), |_| false), Err(InstallError::Failed(message)) if message.contains("disabled"))
+            matches!(dependency_plan("app", false, false, |_| Ok(Formula { disable: true, ..Formula::default() }), |_| false), Err(InstallError::Failed(message)) if message.contains("disabled"))
         );
         assert_eq!(
             dependency_plan(
                 "app",
+                false,
                 false,
                 |_| Err(InstallError::Failed("captured read failure".into())),
                 |_| false

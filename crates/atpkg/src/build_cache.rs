@@ -194,6 +194,51 @@ pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
     )
 }
 
+/// [`with_build_dir`] on this process's machine for a nested `targo` it starts at `cwd`, a
+/// checkout it names: what the shim hands a build typed there (Trust's `$CARGO` is the store's
+/// `targo` itself, past the shim); `None` off macOS.
+#[must_use]
+pub fn with_build_dir_from(args: &[String], tool: Tool, cwd: &Path) -> Option<Vec<String>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let home = aterm_types::dirs::home_dir();
+    let m = Machine {
+        home: home.as_deref(),
+        cwd: None,
+        env: &|name| std::env::var_os(name),
+        read: &read_config,
+        writable: &writable,
+    };
+    with_build_dir_at(args, tool, cwd, &m)
+}
+
+/// [`with_build_dir`] for a command started at `cwd`, a folder the caller names, on `m` (whose
+/// own `cwd` it replaces). The inherited `$PWD` says where the caller was typed, not where this
+/// command starts, so it is not read; a folder named through a link is left alone, as one reached
+/// through a link is.
+#[must_use]
+pub fn with_build_dir_at(
+    args: &[String],
+    tool: Tool,
+    cwd: &Path,
+    m: &Machine<'_>,
+) -> Option<Vec<String>> {
+    if std::fs::canonicalize(cwd).ok()? != cwd {
+        return None;
+    }
+    let env = |name: &str| if name == "PWD" { None } else { (m.env)(name) };
+    with_build_dir(
+        args,
+        tool,
+        &Machine {
+            cwd: Some(cwd),
+            env: &env,
+            ..*m
+        },
+    )
+}
+
 /// [`Machine::writable`] on the real filesystem.
 fn writable(dir: &Path) -> Option<bool> {
     dir.is_dir()

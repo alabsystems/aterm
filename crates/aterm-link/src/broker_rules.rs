@@ -43,21 +43,37 @@ pub fn default_rules() -> Retention {
     rules().unwrap_or_else(|e| unreachable!("the default retention rules are refused: {e}"))
 }
 
+/// [`default_rules`] with the bulk stream's, the mail lanes' and every other subject's bytes
+/// scaled to `ev`, `mail` and `default`: the same filters, classes, reader and ages, so a test
+/// reaches the bounds the tick cuts at with a few records.
+///
+/// # Panics
+/// Never: astream checks the rules' filters, classes and readers, the same constants as
+/// [`default_rules`]', and takes any byte bound.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn rules_scaled(ev: u64, mail: u64, default: u64) -> Retention {
+    rules_with(ev, mail, default)
+        .unwrap_or_else(|e| unreachable!("the scaled retention rules are refused: {e}"))
+}
+
 fn rules() -> io::Result<Retention> {
+    rules_with(EV_BYTES, MAIL_BYTES, DEFAULT_BYTES)
+}
+
+fn rules_with(ev: u64, mail: u64, default: u64) -> io::Result<Retention> {
     Retention::new(
         vec![
-            Rule::prefix(EV_FILTER)?
-                .max_age(MAX_AGE)
-                .max_bytes(EV_BYTES),
+            Rule::prefix(EV_FILTER)?.max_age(MAX_AGE).max_bytes(ev),
             Rule::hold(PRESENCE_FILTER)?.last_only(),
             Rule::hold(MAIL_FILTER)?
                 .until_read(MAIL_READER)?
                 .max_age(MAX_AGE)
-                .max_bytes(MAIL_BYTES),
+                .max_bytes(mail),
         ],
         Rule::default_keeping_all()
             .max_age(MAX_AGE)
-            .max_bytes(DEFAULT_BYTES),
+            .max_bytes(default),
     )
 }
 
@@ -90,12 +106,13 @@ pub fn summary() -> String {
     )
 }
 
-/// Retain `broker`'s log by [`default_rules`], from this open.
+/// Retain `broker`'s log by [`default_rules`], from this open: called at once after the open,
+/// with no flush first. astream sets the rules between the writer's batches, so they wait out
+/// the batch the open's fired wills are in rather than meeting it in its write window.
 ///
 /// # Errors
-/// Astream's refusal: a poisoned log, a flush that failed, or a held store that cannot be written.
+/// Astream's refusal: a poisoned log, or a held store that cannot be written.
 pub fn retain(broker: &astream_broker::Broker) -> io::Result<()> {
-    broker.flush_durable()?;
     broker.set_retention(default_rules())
 }
 
@@ -209,7 +226,12 @@ mod tests {
 
     /// THE RULES ARE SET PAST A BATCH IN FLIGHT ([`retain`]): a batch held in
     /// its write window (the log lock released, the batch not committed), where
-    /// a broker's open puts the wills it fires, and `retain` called there.
+    /// a broker's open puts the wills it fires, and `retain` called there. It
+    /// waits for the batch (astream counts it, `retention_waits` 0 → 1) and does
+    /// not answer inside it; resumed, the batch commits and the rules are set.
+    /// Against an astream whose `set_retention` meets the batch instead, `retain`
+    /// answers inside the window, refused "a batch is being written outside the
+    /// log lock", and the first assertion after the wait fails.
     #[cfg(unix)]
     #[test]
     fn the_rules_are_set_past_a_batch_in_flight() {
@@ -232,7 +254,7 @@ mod tests {
                 pause.wait_at_most(aterm_spec::wait::MUST_HAPPEN),
                 "the batch reaches its write window"
             );
-            let before = broker.writer_round_trips();
+            assert_eq!(broker.stats().retention_waits, 0, "PRECONDITION");
             let (tx, rx) = std::sync::mpsc::channel();
             let b = &broker;
             scope.spawn(move || {
@@ -243,12 +265,12 @@ mod tests {
                 if let Ok(answer) = rx.try_recv() {
                     break Some(answer);
                 }
-                if broker.writer_round_trips() > before {
+                if broker.stats().retention_waits == 1 {
                     break None;
                 }
                 assert!(
                     started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-                    "retain neither queued nor answered"
+                    "retain neither waited nor answered"
                 );
                 std::thread::yield_now();
             };
@@ -261,6 +283,7 @@ mod tests {
                 .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                 .expect("retain answers once the batch goes on");
             assert!(answer.is_ok(), "{answer:?}");
+            assert_eq!(broker.stats().retention_waits, 1, "one wait, the batch's");
             publisher
                 .join()
                 .expect("the publisher")

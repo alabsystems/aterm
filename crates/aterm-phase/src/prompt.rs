@@ -3521,6 +3521,50 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.303-login-interrupted.txt");
     pub const LOGIN_RELOOPED: &str = include_str!("fixtures/claude-2.1.303-login-relooped.txt");
     pub const LOGIN_SUCCESS: &str = include_str!("fixtures/claude-2.1.303-login-success.txt");
+    pub const LOGIN_PICKER_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-plain.txt");
+    pub const LOGIN_PICKER_WARNED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker.txt");
+    pub const LOGIN_PICKER_CONSOLE_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-console-focused.txt");
+    pub const LOGIN_PICKER_PLATFORM_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-platform-focused.txt");
+    pub const LOGIN_PICKER_NO_LOGIN_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-no-login.txt");
+    pub const LOGIN_PICKER_AT_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-at-expired.txt");
+    pub const LOGIN_INTERRUPTED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-interrupted.txt");
+    pub const LOGIN_INTERRUPTED_AT_WALL_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-interrupted-at-wall.txt");
+    pub const LOGIN_INTERRUPTED_AT_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-interrupted-at-expired.txt");
+    pub const LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-fullscreen-at-expired.txt");
+    pub const LOGIN_PICKER_FULLSCREEN_HINT_AT_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-fullscreen-effort-hint-at-expired.txt");
+    pub const LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-picker-fullscreen-again-at-expired.txt");
+    pub const LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-interrupted-fullscreen-at-expired.txt");
+    pub const LOGIN_EXPIRED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-login-expired.txt");
+    pub const WALL_NOT_LOGGED_IN_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-not-logged-in.txt");
+    pub const WALL_NOT_LOGGED_IN_NO_LOGIN_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-not-logged-in-no-login.txt");
+    pub const WALL_INVALID_API_KEY_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-invalid-api-key.txt");
+    pub const WALL_OAUTH_REVOKED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-oauth-revoked.txt");
+    pub const WALL_401_RUN_LOGIN_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-401-please-run-login.txt");
+    pub const WALL_SUBSCRIPTION_DISABLED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-subscription-access-disabled.txt");
+    pub const FOOTER_NOT_LOGGED_IN_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-footer-not-logged-in-no-statusline.txt");
+    pub const API_RETRYING_401_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-retrying-401-api-key.txt");
     pub const GOAL_ACTIVE_SUGGESTION: &str =
         include_str!("fixtures/claude-goal-active-suggestion.txt");
     pub const MEMORY_BANNER_BUSY: &str = include_str!("fixtures/memory-banner-busy.txt");

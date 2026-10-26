@@ -2687,7 +2687,16 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|codex|agy|muse|grok> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
+/// `spawn`'s usage reply, naming the worker words a spawn starts
+/// ([`aterm_agent::harness::worker::started_words`]).
+pub(crate) fn spawn_usage() -> String {
+    format!(
+        "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] \
+         [connected=controlled|controller place=window|tab of=<sid> | agent=<{}> [model=<m>] \
+         [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n",
+        aterm_agent::harness::worker::started_words()
+    )
+}
 
 /// Parsed `agent=<word>` worker specification for `spawn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2921,7 +2930,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
         return refusal;
     }
     let Ok(form) = parse_spawn_args(rest) else {
-        return SPAWN_USAGE.to_string();
+        return spawn_usage();
     };
     if let Some(refusal) = spawn_cwd_refusal(&form) {
         return refusal;
@@ -3958,15 +3967,19 @@ mod spawn_parse_tests {
         ] {
             assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
         }
-        assert!(super::SPAWN_USAGE.contains(
-            "agent=<claude|codex|agy|muse|grok> [model=<m>] [autopilot=<land|cruise>] \
-             [from=<sid>] len=<n>"
-        ));
+        let usage = super::spawn_usage();
+        assert!(
+            usage.contains(
+                "agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
+                 [from=<sid>] len=<n>"
+            ) || aterm_phase::Program::Grok.supervisable(),
+            "{usage}"
+        );
     }
 
     /// `agent=grok` IS A WORKER WORD: `spawn agent=grok` parses to a Grok Build worker with its
     /// model, Autopilot and starter, as every other row's word does (it was `ERR usage` while
-    /// `WORKERS` had no Grok row), and the usage line names it.
+    /// `WORKERS` had no Grok row); the usage line names it only once a spawn starts it.
     #[test]
     fn agent_grok_parses_as_a_grok_build_worker() {
         assert_eq!(
@@ -3990,10 +4003,11 @@ mod spawn_parse_tests {
             "grok",
             "the frame's replies name grok, not the claude fallback"
         );
-        assert!(
-            super::SPAWN_USAGE.contains("|grok>"),
-            "{}",
-            super::SPAWN_USAGE
+        let usage = super::spawn_usage();
+        assert_eq!(
+            usage.contains("|grok>"),
+            aterm_phase::Program::Grok.supervisable(),
+            "{usage}"
         );
     }
 

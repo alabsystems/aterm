@@ -15754,6 +15754,97 @@ fn compact_is_one_pane_and_medium_keeps_labeled_navigation() {
     }
 }
 
+/// EVERY RAIL ROW REACHES A SCREEN READER, AND ASKING TO SEE ONE SCROLLS IT WHOLE INTO THE RAIL
+/// (audit r14b SYS, r17 CA2): at every window height the rail's semantic tree lists all its rows,
+/// one its bottom edge cuts to a sliver (painted only as a picture) off its screen as much as one
+/// past it, and a screen reader's ScrollIntoView on either draws it whole without moving the
+/// keyboard. Before, the rail never said its list held every row, so a sliver (Messages at
+/// y=826 over a list ending at 840 on a 180x60 Security page) had no node while About, wholly
+/// past the edge, had one, and ScrollIntoView on an off-screen row scrolled nothing.
+#[test]
+fn every_rail_row_reaches_a_screen_reader_and_scrolls_whole_into_the_rail_when_asked() {
+    let rows: Vec<UiKey> = navigation_groups()
+        .into_iter()
+        .flat_map(|(_, routes)| routes)
+        .map(|route| UiKey::new(format!("settings/nav{}", route.path())))
+        .collect();
+    let mut slivers = 0;
+    let mut past = 0;
+    for height in (560..=900).step_by(4) {
+        let cx = view_cx_at(1_284.0, height as f32);
+        let (mut runtime, instance, view) = setup();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Security);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let list = compiled
+            .semantic(&UiKey::new("settings/navigation/list"))
+            .expect("the rail's list")
+            .rect;
+        let mut asked = Vec::new();
+        for row in &rows {
+            let node = compiled
+                .semantic(row)
+                .unwrap_or_else(|| panic!("{height}pt: {row:?} reaches a screen reader"));
+            if node.offscreen && node.rect.y < list.bottom() - 0.01 {
+                slivers += 1;
+                asked.push(row.clone());
+            } else if node.offscreen {
+                // A row wholly past the edge is asked to be seen on the first height only.
+                past += 1;
+                if past == 1 {
+                    asked.push(row.clone());
+                }
+            }
+        }
+        for row in asked {
+            let (mut runtime, instance, view) = setup();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            compile_settings_view(&runtime, instance, view, &cx);
+            let focus = |runtime: &NativeRuntime| {
+                let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                    unreachable!();
+                };
+                state.common.last_focus.clone()
+            };
+            let before = focus(&runtime);
+            runtime
+                .dispatch(instance, view, AppEvent::RevealControl(row.clone()))
+                .expect("dispatched");
+            let shown = compile_settings_view(&runtime, instance, view, &cx);
+            let painted = shown
+                .paint
+                .iter()
+                .find(|node| node.key == row)
+                .unwrap_or_else(|| panic!("{height}pt: {row:?} is drawn once asked to be seen"));
+            assert!(
+                painted.clip == painted.rect
+                    && shown.semantic(&row).is_some_and(|node| !node.offscreen),
+                "{height}pt: {row:?} is whole on the rail's screen once asked to be seen: {:?} in {:?}",
+                painted.rect,
+                painted.clip
+            );
+            assert_eq!(
+                focus(&runtime),
+                before,
+                "{height}pt: seeing {row:?} moves no focus"
+            );
+        }
+    }
+    assert!(
+        slivers >= 1,
+        "PRECONDITION: the rail's edge cuts some row to a sliver"
+    );
+    assert!(
+        past >= 1,
+        "PRECONDITION: some row stands past the rail's edge"
+    );
+}
+
 fn whole_rail_rows(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, LogicalRect)> {
     let list = compiled
         .semantic(&UiKey::new("settings/navigation/list"))
@@ -17534,8 +17625,34 @@ fn an_unknown_font_name_is_marked_not_found_on_its_row() {
     assert_eq!(fixed.feedback.as_deref(), Some("Color theme set to Nord"));
 }
 
+/// A style row naming a face of another style says what that face is: `Menlo Italic` in
+/// the Bold row is an italic face, and a bold italic face in the Italic row is a bold
+/// italic face. Before, the row said what the face was not ("not an italic face"), false
+/// of a bold italic face.
 #[test]
-fn a_style_row_naming_a_face_of_another_style_says_so() {
+fn a_style_row_naming_a_face_of_another_style_says_what_it_is() {
+    let mut italic_row = SettingsViewState::new(&Config {
+        font_family_italic: Some("SF Mono Bold Italic".to_string()),
+        ..Config::default()
+    });
+    let refusal = crate::native_font_catalog::FontRefusal {
+        key: prefs::EDIT_FONT_FAMILY_ITALIC,
+        family: "SF Mono Bold Italic".to_string(),
+        reason: crate::native_font_catalog::FontRefusalReason::WrongStyle(
+            aterm_render::DrawnStyle {
+                bold: true,
+                slanted: true,
+            },
+        ),
+        from_theme: None,
+    };
+    assert!(italic_row.replace_font_refusals(vec![refusal], true));
+    assert_eq!(
+        italic_row.feedback.as_deref(),
+        Some(
+            "\u{201c}SF Mono Bold Italic\u{201d} is a bold italic face. Italic text is drawn in it."
+        )
+    );
     let mut state = SettingsViewState::new(&Config {
         font_family_bold: Some("Menlo Italic".to_string()),
         ..Config::default()
@@ -17543,13 +17660,18 @@ fn a_style_row_naming_a_face_of_another_style_says_so() {
     let refusal = crate::native_font_catalog::FontRefusal {
         key: prefs::EDIT_FONT_FAMILY_BOLD,
         family: "Menlo Italic".to_string(),
-        reason: crate::native_font_catalog::FontRefusalReason::WrongStyle,
+        reason: crate::native_font_catalog::FontRefusalReason::WrongStyle(
+            aterm_render::DrawnStyle {
+                bold: false,
+                slanted: true,
+            },
+        ),
         from_theme: None,
     };
     assert!(state.replace_font_refusals(vec![refusal], true));
     assert_eq!(
         state.feedback.as_deref(),
-        Some("\u{201c}Menlo Italic\u{201d} is not a bold face. Bold text is drawn in it.")
+        Some("\u{201c}Menlo Italic\u{201d} is an italic face. Bold text is drawn in it.")
     );
     let (index, field) = state
         .legacy
@@ -17570,7 +17692,7 @@ fn a_style_row_naming_a_face_of_another_style_says_so() {
     let label = compiled
         .semantic(&UiKey::new("settings/label/font_family_bold"))
         .unwrap();
-    assert!(label.label.contains("Not a bold face"), "{}", label.label);
+    assert!(label.label.contains("Italic face"), "{}", label.label);
     let control = compiled
         .semantic(&UiKey::new("settings/control/font_family_bold"))
         .unwrap();
@@ -17622,6 +17744,65 @@ fn the_full_display_face_line_goes_when_the_mix_changes_elsewhere() {
         .dispatch(instance, view, AppEvent::ConfigChanged(unset))
         .unwrap();
     assert_eq!(feedback(&runtime), None);
+}
+
+/// The preview's caption names the display faces it draws over the font, so with
+/// `display_font = "pixel"` the face the specimen draws stays named while the Display
+/// faces card scrolls until only Bubble's row is in view; the bold, italic and bold
+/// italic rows' captions name it too, as the layer draws every style of what it covers,
+/// and a symbol font's does not. Before, the caption said "Font: Menlo" over Pixel's
+/// glyphs and nothing in view named Pixel.
+#[test]
+fn the_font_caption_names_the_display_faces_it_draws() {
+    let caption = |config: Config, key: &str| {
+        let state = SettingsViewState::new(&config);
+        renderer_preview_spec_for_key_with_font(
+            &state,
+            key,
+            0,
+            crate::native_app::ViewMotionCx::default(),
+            12.0,
+            1.0,
+            None,
+        )
+        .unwrap()
+        .header_layout(2_000.0)
+        .says
+    };
+    let menlo = |display: Option<&str>| Config {
+        font_family: Some("Menlo".to_string()),
+        font_family_italic: Some("Menlo Italic".to_string()),
+        symbol_font: Some("Menlo".to_string()),
+        display_font: display.map(str::to_string),
+        ..Config::default()
+    };
+    for (display, key, says) in [
+        (
+            Some("pixel"),
+            prefs::EDIT_FONT_FAMILY,
+            "Font: Pixel over Menlo",
+        ),
+        (
+            Some("engraved+pixel"),
+            prefs::EDIT_FONT_FAMILY,
+            "Font: Pixel + Engraved over Menlo",
+        ),
+        (None, prefs::EDIT_FONT_FAMILY, "Font: Menlo"),
+        (
+            Some("pixel"),
+            prefs::EDIT_FONT_FAMILY_ITALIC,
+            "Italic font: Pixel over Menlo Italic",
+        ),
+        (
+            None,
+            prefs::EDIT_FONT_FAMILY_ITALIC,
+            "Italic font: Menlo Italic",
+        ),
+        (Some("pixel"), prefs::EDIT_SYMBOL_FONT, "Symbol font: Menlo"),
+    ] {
+        let said = caption(menlo(display), key);
+        assert!(said.starts_with(says), "{key} {display:?}: {said}");
+    }
 }
 
 #[test]
@@ -28120,6 +28301,7 @@ fn sample_messages() -> MessagesState {
         label,
         still_actionable,
         declines: false,
+        by_name: false,
     };
     let mut entries = vec![
         entry(
@@ -28326,6 +28508,62 @@ fn scroll_messages_through(
         }
     }
     panic!("the list never reached its end");
+}
+
+/// EVERY ROW OF THE MESSAGES FILTERS IS WHOLE WHERE A SCREEN DRAWS IT, AND ON SOME SCREEN: a card of
+/// filters taller than the room the list gives it is listed a row at a time, in every width.
+/// Negative control: at 2× in a 220x12 window the card was one stop, so its second row of chips
+/// stood 2pt under the list's edge (56 of 58pt) and no screen showed it whole.
+#[test]
+fn every_messages_filter_row_is_whole_on_a_short_window() {
+    at_each_text_scale(&[2.0], "short messages filters", |_| {
+        let mut rows_apart = false;
+        for (width, height) in [(1_564.0, 180.0), (1_564.0, 194.0), (738.0, 180.0)] {
+            let (mut runtime, instance, view) = setup_with_messages();
+            // Two tags, so the chips stand on two rows rather than giving way to a pop-up.
+            let mut messages = sample_messages();
+            for entry in &mut messages.entries {
+                if matches!(entry.tag.as_str(), "update" | "toolchain") {
+                    entry.tag = "crash".to_string();
+                }
+            }
+            messages.tags = vec![("crash".to_string(), 3), ("config".to_string(), 37)];
+            assert!(runtime.replace_settings_messages(messages, 8));
+            let cx = view_cx_at(width, height);
+            let mut whole = std::collections::BTreeMap::<String, bool>::new();
+            scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
+                for node in compiled.paint.iter().filter(|node| {
+                    let key = node.key.as_str();
+                    !node.peek
+                        && node.fade.is_none()
+                        && node.clip.height > 0.5
+                        && (key.starts_with("settings/messages/filter/")
+                            || key.starts_with("settings/messages/filters/row/"))
+                }) {
+                    let key = node.key.as_str();
+                    let cut = (node.clip.y - node.rect.y).abs() > 0.5
+                        || (node.clip.height - node.rect.height).abs() > 0.5;
+                    assert!(
+                        !cut,
+                        "{width}x{height} screen {k}: {key} {:?} is cut to {:?}",
+                        node.rect, node.clip
+                    );
+                    *whole.entry(key.to_string()).or_default() |= !cut;
+                }
+            });
+            rows_apart |= whole.keys().any(|key| key.ends_with("/row/1"));
+            let never: Vec<&String> = whole
+                .iter()
+                .filter(|(_, whole)| !**whole)
+                .map(|(key, _)| key)
+                .collect();
+            assert!(never.is_empty(), "{width}x{height}: never whole {never:?}");
+        }
+        assert!(
+            rows_apart,
+            "premise: a window sets the filters on more rows than one"
+        );
+    });
 }
 
 #[test]
@@ -29086,6 +29324,7 @@ fn the_primary_is_the_first_intent_a_press_can_still_perform() {
         label,
         still_actionable: false,
         declines: false,
+        by_name: false,
     };
     let entry = MessageView {
         actions: vec![dead(0, "Install now"), dead(1, "Open log")],
@@ -29108,6 +29347,7 @@ fn a_decline_is_never_promoted_to_the_primary() {
             label,
             still_actionable,
             declines,
+            by_name: false,
         }
     };
     let cx = view_cx();
@@ -29199,6 +29439,7 @@ fn the_footer_primary_is_a_position_in_the_offered_intents() {
         label,
         still_actionable,
         declines: false,
+        by_name: false,
     };
     let state = sample_messages();
     let footer = |actions: Vec<MessageActionView>| {
@@ -33861,13 +34102,38 @@ fn the_about_hero_names_its_author_and_the_card_lists_what_it_cannot() {
         let (mut runtime, instance, view) = setup();
         go_to_route(&mut runtime, instance, view, SettingsRoute::About);
         let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(164.0, 558.0));
-        assert!(compiled.semantic(&UiKey::new("about/byline")).is_none());
         let rows = provenance(&mut runtime, instance, view, 164.0, 558.0);
-        for fact in ["author", "company", "site"] {
-            assert!(
-                rows.contains(fact),
-                "164x558 at 2x: {fact} is listed: {rows:?}"
-            );
+        // The hero names its author where its byline is whole; the card lists what it does not.
+        match compiled.semantic(&UiKey::new("about/byline")) {
+            Some(byline) => {
+                let audit = compiled
+                    .text_fit_audit_line(&UiKey::new("about/byline"))
+                    .expect("the byline is painted");
+                assert!(audit.contains(" overflow=false "), "164x558 at 2x: {audit}");
+                assert!(
+                    !rows.contains("author"),
+                    "164x558 at 2x: the byline names the author"
+                );
+                for (fact, words) in [
+                    ("company", crate::build_info::COMPANY),
+                    ("site", aterm_types::identity::SITE),
+                ] {
+                    assert_eq!(
+                        rows.contains(fact),
+                        !byline.label.contains(words),
+                        "164x558 at 2x: {fact} is listed where the byline {:?} lacks it: {rows:?}",
+                        byline.label
+                    );
+                }
+            }
+            None => {
+                for fact in ["author", "company", "site"] {
+                    assert!(
+                        rows.contains(fact),
+                        "164x558 at 2x: {fact} is listed: {rows:?}"
+                    );
+                }
+            }
         }
     });
 }
@@ -40897,4 +41163,24 @@ fn the_heading_sits_in_one_place_on_every_page() {
             faults.join("\n")
         );
     });
+}
+
+/// A FIELD'S PLACEHOLDER THAT NO FIRST WORDS FIT TAKES ITS FEWEST LINES, NEVER EVERY WORD: where
+/// even its first word with an ellipsis takes more lines than the field holds, the placeholder is
+/// that shortest form. Negative control: "ai-fleet.toml beside aterm.toml" fell back to every word,
+/// five lines at 2× text in a 22-column window, a 196pt field taller than the 152pt window.
+#[test]
+fn a_placeholder_no_first_words_fit_takes_its_fewest_lines() {
+    let measure = |line: &str| line.chars().count() as f32 * 10.0;
+    let placeholder = "ai-fleet.toml beside aterm.toml";
+    let whole = wrap_to_box(placeholder, 60.0, &measure);
+    let shortest = wrap_to_box("ai-fleet.toml\u{2026}", 60.0, &measure);
+    assert!(
+        shortest.len() > 1 && whole.len() > shortest.len(),
+        "premise: no form fits one line, and every word takes most: {whole:?} {shortest:?}"
+    );
+    assert_eq!(
+        word_placeholder_lines(placeholder, 60.0, &measure, 1),
+        shortest
+    );
 }

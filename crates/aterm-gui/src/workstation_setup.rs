@@ -455,8 +455,8 @@ pub(crate) struct Host {
     proxy_registered: bool,
     /// The Command Line Tools install a setup run asked for this launch.
     pub(crate) developer_tools: crate::clt_install::Install,
-    /// Its dedicated terminal's child owns the prompt slot until exit or final detachment.
-    pub(crate) developer_tools_session: Option<crate::clt_install::Terminal>,
+    /// Its dedicated children, including recovered ones: any live child owns the prompt slot.
+    pub(crate) developer_tools_session: Vec<crate::clt_install::Terminal>,
     /// Whether the tab opened on this Mac before: aterm opens it by itself once per Mac.
     pub(crate) developer_tools_mark: crate::clt_install::Mark,
     /// Whether Apple's installer runs now ([`crate::clt_install::installing_now`]); none in a
@@ -488,7 +488,7 @@ impl Host {
             permissions: PermissionGate::default(),
             proxy_registered: false,
             developer_tools: crate::clt_install::Install::default(),
-            developer_tools_session: None,
+            developer_tools_session: Vec::new(),
             developer_tools_mark: crate::clt_install::Mark::for_launch(),
             developer_tools_probe: (!headless && !cfg!(test))
                 .then_some(crate::clt_install::installing_now as fn() -> bool),
@@ -1030,6 +1030,7 @@ mod tests {
         for (elsewhere, on_page) in [(false, false), (true, false), (false, true)] {
             let mut app = App::headless_for_test();
             app.headless = false;
+            app.user_input_recent = |_| true;
             let wid = crate::WindowId(0);
             app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
             let (send, receive) = std::sync::mpsc::channel();

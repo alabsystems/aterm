@@ -191,6 +191,12 @@ fn claim_line(c: &Record, trees: Option<&HashMap<u32, TreeUse>>, now: u64) -> St
     if let Some(q) = c.need.quiet {
         parts.push(format!("quiet at load {q:.1}"));
     }
+    if let Some(left) = c.reserves(now) {
+        parts.push(format!(
+            "reserves the machine: claimed work that asked after it waits, {} more at most",
+            span(left)
+        ));
+    }
     parts.push(format!("\"{}\"", c.need.what));
     if !c.checkout.is_empty() {
         parts.push(format!("in {}", c.checkout));
@@ -263,6 +269,14 @@ fn json_of(
                     m.insert("cores".to_owned(), Value::from(c.need.cores));
                     m.insert("disk".to_owned(), Value::from(c.need.disk));
                     m.insert("quiet".to_owned(), Value::from(c.need.quiet));
+                    m.insert("next_ms".to_owned(), Value::from(c.next_ms));
+                    m.insert(
+                        "reserves_ms".to_owned(),
+                        Value::from(
+                            c.reserves(now)
+                                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                        ),
+                    );
                     m.insert(
                         "volume".to_owned(),
                         Value::from(c.need.path.as_ref().map(|p| p.display().to_string())),

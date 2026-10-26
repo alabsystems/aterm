@@ -6,8 +6,9 @@
 
 use super::*;
 
-/// The window widths a 22-, 24-, 30-, 36- and 42-column terminal window gives Settings.
-pub(super) const NARROW_WIDTHS: [f32; 5] = [178.0, 192.0, 234.0, 276.0, 318.0];
+/// The window widths the window's least (164pt, a 20-column terminal window) and a 22-, 24-, 30-,
+/// 36- and 42-column terminal window give Settings.
+pub(super) const NARROW_WIDTHS: [f32; 6] = [164.0, 178.0, 192.0, 234.0, 276.0, 318.0];
 pub(super) const NARROW_HEIGHTS: [f32; 2] = [348.0, 516.0];
 
 /// The windows an 80×24, 102×29, 150×48, 167×36 and 220×60 terminal window gives Settings.
@@ -1600,7 +1601,10 @@ fn the_packages_service_line_paints_its_value_in_the_column_it_was_measured_for(
 }
 
 /// A MESSAGES FILTER CHIP BREAKS A WORD ONLY WHERE ITS ROOM CANNOT HOLD IT (item 101),
-/// from 22 to 42 columns at 1×, 1.5× and 2×, and no line starts or ends in ` · `.
+/// from 22 to 42 columns at 1×, 1.5× and 2×, and no line starts or ends in ` · `: its padding
+/// gives way to a word before the word breaks, down to its least. Negative control: at 2× in a
+/// 22-column window the Problems chip, as wide as its row (126pt), broke "Prob-" / "lems" in the
+/// 106pt its 10pt ends left.
 #[test]
 fn a_messages_chip_breaks_a_word_only_where_its_room_cannot_hold_it() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "Messages chips", |scale| {
@@ -1642,10 +1646,12 @@ fn a_messages_chip_breaks_a_word_only_where_its_room_cannot_hold_it() {
                     .split([' ', '\u{b7}'])
                     .filter(|w| !w.is_empty())
                 {
-                    if measure(word) <= room {
+                    let least = node.rect.width - 2.0 * crate::native_ui::CENTRED_LABEL_LEAST_END;
+                    if measure(word) <= room.max(least) {
                         assert!(
                             lines.iter().any(|line| line.split(' ').any(|w| w == word)),
-                            "{at}: {word:?} fits the {room}pt room but {painted:?}"
+                            "{at}: {word:?} fits the {room}pt room ({least}pt at the chip's \
+                             least ends) but {painted:?}"
                         );
                     }
                 }
@@ -2395,15 +2401,93 @@ fn cut_inside_a_word(painted: &str, whole: &str) -> bool {
     })
 }
 
+/// Every block of words `screen` sets on lines: its key, its painted lines, what it says (a
+/// group's label, else its lines at the widest), and the words it paints where nothing wraps
+/// them (a button's visual label at the widest, else what it says).
+fn wrapped_blocks(
+    screen: &crate::native_ui::CompiledUi,
+    whole: &std::collections::HashMap<String, String>,
+) -> Vec<(String, Vec<String>, String, String)> {
+    let mut wholes = std::collections::HashMap::<&str, &str>::new();
+    let mut lines_of =
+        std::collections::BTreeMap::<String, std::collections::BTreeMap<usize, String>>::new();
+    let mut blocks = Vec::new();
+    for node in screen.paint.iter().filter(|node| !node.peek) {
+        let key = node.key.as_str();
+        match &node.content {
+            UiContent::Group(GroupSpec {
+                label: Some(label), ..
+            }) => {
+                wholes.insert(key, label.as_str());
+            }
+            UiContent::Text(text) => {
+                if let Some((block, line)) = key
+                    .rsplit_once("/line-")
+                    .and_then(|(block, n)| Some((block, n.parse::<usize>().ok()?)))
+                {
+                    lines_of
+                        .entry(block.to_string())
+                        .or_default()
+                        .insert(line, text.text.clone());
+                }
+            }
+            UiContent::Button(button) => {
+                let painted = button
+                    .spec
+                    .visual_label
+                    .as_deref()
+                    .unwrap_or(&button.spec.label);
+                let unbroken = whole.get(key).map_or_else(
+                    || button.spec.label.clone(),
+                    |words| words.replace('\n', " "),
+                );
+                blocks.push((
+                    key.to_string(),
+                    painted.split('\n').map(str::to_string).collect(),
+                    button.spec.label.clone(),
+                    unbroken,
+                ));
+            }
+            _ => {}
+        }
+    }
+    for (block, lines) in lines_of {
+        let said = wholes
+            .get(block.as_str())
+            .filter(|label| !label.is_empty())
+            .map(|label| (*label).to_string())
+            .unwrap_or_else(|| {
+                (0..)
+                    .map_while(|line| whole.get(&format!("{block}/line-{line}")))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+        // Only lines that follow one another: a block cut by its screen's edge pairs no others.
+        let mut run: Vec<String> = Vec::new();
+        let mut last = None;
+        for (line, text) in lines {
+            if last.is_some_and(|last| last + 1 != line) {
+                blocks.push((
+                    block.clone(),
+                    std::mem::take(&mut run),
+                    said.clone(),
+                    said.clone(),
+                ));
+            }
+            run.push(text);
+            last = Some(line);
+        }
+        blocks.push((block, run, said.clone(), said));
+    }
+    blocks
+}
+
 /// The places on `screen` where words wrapped onto lines break inside a word with no mark.
 fn broken_inside_a_word(
     screen: &crate::native_ui::CompiledUi,
     whole: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
-    let mut wholes = std::collections::HashMap::<&str, &str>::new();
-    let mut blocks =
-        std::collections::BTreeMap::<String, std::collections::BTreeMap<usize, String>>::new();
-    let mut broken = Vec::new();
     let inside = |before: &str, after: &str, whole: &str| {
         let before = before.trim_end();
         let after = after.trim_start();
@@ -2425,58 +2509,53 @@ fn broken_inside_a_word(
             && !whole.contains(&spaced)
             && aterm_grapheme::token_kind(&joined) == aterm_grapheme::TokenKind::Word
     };
-    for node in screen.paint.iter().filter(|node| !node.peek) {
-        let key = node.key.as_str();
-        match &node.content {
-            UiContent::Group(GroupSpec {
-                label: Some(label), ..
-            }) => {
-                wholes.insert(key, label.as_str());
+    let mut broken = Vec::new();
+    for (key, lines, said, _) in wrapped_blocks(screen, whole) {
+        for pair in lines.windows(2) {
+            if inside(&pair[0], &pair[1], &said) {
+                broken.push(format!("{key}: {:?} / {:?} of {said:?}", pair[0], pair[1]));
             }
-            UiContent::Text(text) => {
-                if let Some((block, line)) = key
-                    .rsplit_once("/line-")
-                    .and_then(|(block, n)| Some((block, n.parse::<usize>().ok()?)))
-                {
-                    blocks
-                        .entry(block.to_string())
-                        .or_default()
-                        .insert(line, text.text.clone());
-                }
-            }
-            UiContent::Button(button) => {
-                let painted = button
-                    .spec
-                    .visual_label
-                    .as_deref()
-                    .unwrap_or(&button.spec.label);
-                let lines = painted.split('\n').collect::<Vec<_>>();
-                for pair in lines.windows(2) {
-                    if inside(pair[0], pair[1], &button.spec.label) {
-                        broken.push(format!("{key}: {painted:?} of {:?}", button.spec.label));
-                    }
-                }
-            }
-            _ => {}
         }
     }
-    for (block, lines) in &blocks {
-        let said = wholes
-            .get(block.as_str())
-            .filter(|label| !label.is_empty())
-            .map(|label| (*label).to_string())
-            .unwrap_or_else(|| {
-                (0..)
-                    .map_while(|line| whole.get(&format!("{block}/line-{line}")))
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            });
-        for (line, text) in lines {
-            if let Some(next) = lines.get(&(line + 1))
-                && inside(text, next, &said)
-            {
-                broken.push(format!("{block}: {text:?} / {next:?} of {said:?}"));
+    broken
+}
+
+/// The places on `screen` where a word is broken with a hyphen it does not have off its
+/// syllables ([`aterm_grapheme::hyphen_points`]): "Choo-" / "se\u{2026}", "Che-" / "ck".
+fn broken_off_a_syllable(
+    screen: &crate::native_ui::CompiledUi,
+    whole: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut broken = Vec::new();
+    for (key, lines, _, unbroken) in wrapped_blocks(screen, whole) {
+        for pair in lines.windows(2) {
+            let Some(before) = pair[0].trim_end().strip_suffix('-') else {
+                continue;
+            };
+            let stem = before.rsplit(char::is_whitespace).next().unwrap_or(before);
+            let first = pair[1].split_whitespace().next().unwrap_or_default();
+            let next = first.strip_suffix('-').unwrap_or(first);
+            if stem.is_empty() || next.is_empty() {
+                continue;
+            }
+            let joined = format!("{stem}{next}");
+            if unbroken.contains(&format!("{stem}-{next}")) {
+                continue;
+            }
+            let Some((token, at)) = unbroken
+                .split_whitespace()
+                .find_map(|token| token.find(&joined).map(|at| (token, at)))
+            else {
+                continue;
+            };
+            if aterm_grapheme::token_kind(token) != aterm_grapheme::TokenKind::Word {
+                continue;
+            }
+            if !aterm_grapheme::hyphen_points(token).contains(&(at + stem.len())) {
+                broken.push(format!(
+                    "{key}: {:?} / {:?} breaks {token:?} off its syllables",
+                    pair[0], pair[1]
+                ));
             }
         }
     }
@@ -2571,6 +2650,8 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
                         let failures = compiled.fit_failures();
                         assert!(failures.is_empty(), "{context} screen {top}: {failures:#?}");
                         let broken = broken_inside_a_word(compiled, &whole);
+                        assert!(broken.is_empty(), "{context} screen {top}: {broken:#?}");
+                        let broken = broken_off_a_syllable(compiled, &whole);
                         assert!(broken.is_empty(), "{context} screen {top}: {broken:#?}");
                         for node in &compiled.paint {
                             let key = node.key.as_str();

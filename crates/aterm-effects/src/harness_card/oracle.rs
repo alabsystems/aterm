@@ -104,7 +104,10 @@ pub(super) fn lay_toned(
         return;
     };
     let mut run: Option<Rect> = None;
-    for &raw in on_trail {
+    let mut ti = 0;
+    while ti < on_trail.len() {
+        let raw = on_trail[ti];
+        ti += 1;
         let c = raw.meet(q);
         if c.is_empty() {
             continue;
@@ -159,7 +162,11 @@ pub(super) fn lay_star(
     let full = paint(cov.floor());
     let mut ended = false;
     let arm32 = i32::try_from(arm).unwrap_or(i32::MAX);
-    for piece in star_pieces(arm32, gold).iter() {
+    let pieces = star_pieces(arm32, gold);
+    let mut pi = 0;
+    while pi < pieces.len() {
+        let piece = &pieces[pi];
+        pi += 1;
         let p = match piece.part {
             StarPart::Body => full,
             StarPart::Core if added => paint((cov * STAR_CORE_ADD).floor()),
@@ -212,8 +219,9 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     let frame = at.art.frame(pose);
     let inks = KittyInk::new(cx.scene.coat, cx.scene.eye, cx.scene.dark);
     let p = at.p;
-    for (r, row) in frame.iter().enumerate() {
-        let px = row.as_bytes();
+    let mut r = 0;
+    while r < frame.len() {
+        let px = frame[r].as_bytes();
         let mut c = 0;
         while c < px.len() {
             let ch = px[c];
@@ -242,6 +250,7 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
             }
             c = end;
         }
+        r += 1;
     }
     debug_assert!(KITTY_PALETTE[0] == b'.');
 }
@@ -338,15 +347,27 @@ pub(super) fn frame_fp(under: &[GlowQuad], over: &[GlowQuad], clock: Clock) -> u
         return 0;
     }
     let mut h = mix(0x4841_524E_4553_5321 ^ under.len() as u64);
-    for q in under {
-        for w in q.damage_words() {
-            h = mix(h ^ w);
+    let mut i = 0;
+    while i < under.len() {
+        let dw = under[i].damage_words();
+        let words = dw.as_slice();
+        let mut wi = 0;
+        while wi < words.len() {
+            h = mix(h ^ words[wi]);
+            wi += 1;
         }
+        i += 1;
     }
-    for q in over {
-        for w in q.damage_words() {
-            h = mix(h ^ w);
+    let mut i = 0;
+    while i < over.len() {
+        let dw = over[i].damage_words();
+        let words = dw.as_slice();
+        let mut wi = 0;
+        while wi < words.len() {
+            h = mix(h ^ words[wi]);
+            wi += 1;
         }
+        i += 1;
     }
     if let Some(t) = clock.t_ms {
         h = mix(h ^ (1 + t / super::FRAME_MS));

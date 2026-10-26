@@ -1013,8 +1013,9 @@ impl Bridge {
                 if first {
                     stderr_line!(
                         "aterm-link: mirror: the floor of the node's total is on the media at \
-                         {floor}, this open's first: 2 full flushes in {} us",
-                        self.fx.now().saturating_duration_since(began).as_micros()
+                         {floor}, this open's first: 2 full flushes in {} us{}",
+                        self.fx.now().saturating_duration_since(began).as_micros(),
+                        aterm_durable::durable_flushes_note()
                     );
                 }
                 if let Some(m) = self.mirror.as_deref_mut() {

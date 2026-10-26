@@ -94,6 +94,23 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_FABRIC_COMMAND",
 ];
 
+/// The variables that mean an agent is running this command: its tools carry them.
+pub const AGENT_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CODEX_THREAD_ID",
+    "CODEX_SANDBOX",
+    "ATERM_AI_REVIEW",
+];
+
+/// The first [`AGENT_MARKERS`] variable set, if any.
+#[must_use]
+pub fn agent_marker(var: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
+    AGENT_MARKERS
+        .iter()
+        .copied()
+        .find(|k| var(k).is_some_and(|v| !v.is_empty()))
+}
+
 /// Returns `true` if `key` matches a deny-listed AI or provisioning environment variable.
 #[must_use]
 #[inline]

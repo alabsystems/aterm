@@ -86,8 +86,10 @@ impl RainBaker {
             return false;
         }
         let end = (self.next_tile + MAX_RAIN_BAKES_PER_TICK).min(ROM_GLYPHS);
-        for tile in self.next_tile..end {
+        let mut tile = self.next_tile;
+        while tile < end {
             self.bake_tile(rom, tile);
+            tile += 1;
         }
         self.next_tile = end;
         self.version = self.version.wrapping_add(1);
@@ -152,25 +154,33 @@ impl RainBaker {
             self.col_seg.clear();
             self.col_off.clear();
             self.col_off.push(0);
-            for x in 0..cw {
+            let mut x = 0;
+            while x < cw {
                 let (c, d) = (x * MASTER_W, (x + 1) * MASTER_W);
                 let (mx0, mx1) = (c / cw, (d - 1) / cw);
-                for mx in mx0..=mx1 {
+                let mut mx = mx0;
+                while mx <= mx1 {
                     let wx = (d.min((mx + 1) * cw) - c.max(mx * cw)) as u32;
                     self.col_seg.push((mx as u32, wx));
+                    mx += 1;
                 }
                 self.col_off.push(self.col_seg.len() as u32);
+                x += 1;
             }
         }
 
         let mut rgba = [255u8, 255, 255, 0].repeat(cw * ch);
-        for y in 0..ch {
-            let (a, b) = (y * MASTER_H, (y + 1) * MASTER_H);
+        let mut y = 0;
+        while y < ch {
+            let cur_y = y;
+            y += 1;
+            let (a, b) = (cur_y * MASTER_H, (cur_y + 1) * MASTER_H);
             let (my0, my1) = (a / ch, (b - 1) / ch);
             let my_end = my1.min(MASTER_H - 1);
             let mut col_wy = [0u32; MASTER_W];
             let mut any_lit = false;
-            for my in my0..=my_end {
+            let mut my = my0;
+            while my <= my_end {
                 let mut row = rom.row(tile, my);
                 if row != 0 {
                     any_lit = true;
@@ -183,20 +193,26 @@ impl RainBaker {
                         }
                     }
                 }
+                my += 1;
             }
             if !any_lit {
                 continue;
             }
-            let row_off = y * cw;
-            for x in 0..cw {
+            let row_off = cur_y * cw;
+            let mut x = 0;
+            while x < cw {
                 let mut num: u32 = 0;
                 let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
-                for &(mx, wx) in seg {
+                let mut si = 0;
+                while si < seg.len() {
+                    let (mx, wx) = seg[si];
                     num += wx * col_wy[mx as usize];
+                    si += 1;
                 }
                 if num > 0 {
                     rgba[(row_off + x) * 4 + 3] = ((num * 255 + DEN / 2) / DEN) as u8;
                 }
+                x += 1;
             }
         }
         self.tiles[tile] =

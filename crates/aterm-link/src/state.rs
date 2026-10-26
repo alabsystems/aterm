@@ -3,7 +3,7 @@
 
 //! Persistent bridge state directory (`StateDir`): atomic file replacement, quarantine, and session cursors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -257,19 +257,13 @@ pub(crate) fn sync_dir_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result
     tolerate_dir_flush(sync_dir_required_as(dir, flush))
 }
 
+/// Go on where the directory's entries cannot be flushed here, by astream's one rule
+/// (`astream_sys::dir_flush_unavailable`, the broker's own judgement); every other failure
+/// is returned. A required flush ([`sync_dir_required_as`], the clean-stop path) takes no
+/// tolerance.
 fn tolerate_dir_flush(result: io::Result<()>) -> io::Result<()> {
     match result {
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::Unsupported
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::NotFound
-            ) =>
-        {
-            Ok(())
-        }
+        Err(e) if astream_sys::dir_flush_unavailable(&e) => Ok(()),
         other => other,
     }
 }
@@ -737,6 +731,15 @@ fn is_face(subject: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && !matches!(b, b'*' | b'>'))
 }
 
+/// What the node still owes a publication ([`StateDir::owed_publications`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Owed {
+    /// Sessions with a post or a receipt reserved.
+    pub sids: BTreeSet<String>,
+    /// Subjects a reservation or an in-flight entry names.
+    pub subjects: BTreeSet<String>,
+}
+
 /// One record in flight onto this node's own lanes ([`StateDir::in_flight`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InFlight {
@@ -950,6 +953,8 @@ pub(crate) struct StartRules {
     pub flush_record: bool,
     /// The root, whose entry the rename moved, is flushed after it by the start's tier, and must succeed before the admission is cached.
     pub flush_root: bool,
+    /// A record of this boot is replaced in full, an open one too: its visible OPEN may be a failed replacement of this boot's durable CLEAN.
+    pub this_boot_in_full: bool,
 }
 
 impl StartRules {
@@ -957,10 +962,11 @@ impl StartRules {
     pub(crate) const ALL: Self = Self {
         flush_record: true,
         flush_root: true,
+        this_boot_in_full: true,
     };
 }
 
-/// How the last bridge of this dir stopped, and in which boot (`run`: open ordered ahead of every later write, clean durable, [`StateDir::begin_run`]).
+/// How the last bridge of this dir stopped, and in which boot (`run`). CLEAN is written durably. OPEN is written by the barrier only over an earlier boot's record, with this boot named too and every existing torn kind's directory on the root's device, and in full everywhere else, this boot's record among them ([`StateDir::begin_run`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LastRun {
     /// The boot it ran in, as the kernel names it.
@@ -1065,6 +1071,36 @@ pub struct BridgeLock(std::fs::File);
 impl Drop for BridgeLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
+    }
+}
+
+/// The bridge lock's file on a descriptor of its own, not yet holding the lock
+/// ([`StateDir::bridge_lock_wait`]).
+pub(crate) struct BridgeLockWait(std::fs::File);
+
+impl BridgeLockWait {
+    /// Waits in the kernel's queue for the lock, with no timer: `flock(2)` without `LOCK_NB`
+    /// returns once the holder lets go, by its `LOCK_UN` or by the close of the last
+    /// descriptor on its open file description, which is how a crash, a `SIGKILL` and a clean
+    /// exit all let go. An interrupted wait waits again. A file system that takes no lock
+    /// answers as [`StateDir::lock_bridge`] does there: the take is the lock.
+    ///
+    /// # Errors
+    /// `flock(2)`'s errno other than `EINTR` and an unsupported lock.
+    pub(crate) fn wait(self) -> io::Result<BridgeLock> {
+        loop {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the guard's own take: BridgeLock's Drop releases by LOCK_UN"
+            )]
+            let taken = self.0.lock();
+            match taken {
+                Ok(()) => return Ok(BridgeLock(self.0)),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(BridgeLock(self.0)),
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -1759,8 +1795,9 @@ impl StateDir {
         finished
     }
 
-    /// Take this state dir for one bridge's life.
-    pub fn lock_bridge(&self) -> io::Result<BridgeLock> {
+    /// The bridge lock's file, opened (created) for one take: a regular file, never followed
+    /// through a link, and opened without waiting on whatever else the name might hold.
+    fn open_bridge_lock(&self) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.path("lock");
         let file = std::fs::OpenOptions::new()
@@ -1777,6 +1814,19 @@ impl StateDir {
                 format!("the bridge lock {} is not a regular file", path.display()),
             ));
         }
+        Ok(file)
+    }
+
+    /// [`StateDir::lock_bridge`]'s lock, opened on a descriptor of its own for a wait in the
+    /// kernel's queue ([`BridgeLockWait::wait`]): what a bridge that found the dir held stands
+    /// by on.
+    pub(crate) fn bridge_lock_wait(&self) -> io::Result<BridgeLockWait> {
+        self.open_bridge_lock().map(BridgeLockWait)
+    }
+
+    /// Take this state dir for one bridge's life.
+    pub fn lock_bridge(&self) -> io::Result<BridgeLock> {
+        let file = self.open_bridge_lock()?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: BridgeLock's Drop releases by LOCK_UN"
@@ -2132,6 +2182,38 @@ impl StateDir {
         }
         out.sort_by_key(|(seq, _)| *seq);
         Ok(out)
+    }
+
+    /// WHAT THE NODE STILL OWES A PUBLICATION: the sessions with a post or a receipt
+    /// reserved (`sent/<sid>.<id>`, `acks/<sid>.<rid>`), and every subject such a
+    /// reservation or an in-flight entry names. A departed session's subjects are
+    /// given back to the subject budget only once none of this names them
+    /// (`Bridge::reclaim_subjects`). A reservation that does not parse still names its
+    /// session.
+    ///
+    /// # Errors
+    /// A directory or an entry that cannot be read, or an in-flight entry that does not parse.
+    pub(crate) fn owed_publications(&self) -> io::Result<Owed> {
+        let mut owed = Owed::default();
+        for kind in [TornKind::Sent, TornKind::Acks] {
+            for (name, rel) in self.kind_files(kind)? {
+                if let Some((sid, _)) = name.rsplit_once('.') {
+                    owed.sids.insert(sid.to_string());
+                }
+                let pin = self
+                    .read_reservation(&rel)?
+                    .and_then(|text| PublishPin::parse(&text).ok());
+                for identity in pin.into_iter().flat_map(|p| [p.identity, p.original]) {
+                    owed.subjects.extend(identity.map(|i| i.subject));
+                }
+            }
+        }
+        owed.subjects.extend(
+            self.in_flight()?
+                .into_iter()
+                .map(|(_, entry)| entry.subject),
+        );
+        Ok(owed)
     }
 
     /// Record one own-lane record as in flight, before it is published.
@@ -2627,7 +2709,7 @@ impl StateDir {
         Ok(())
     }
 
-    /// A bridge's run begins, after its sweep ([`StateDir::set_aside_torn`]) and before it writes any file of a [`TornKind`].
+    /// A bridge's run begins, after its sweep ([`StateDir::set_aside_torn`]) and before it writes any file of a [`TornKind`]: `run` says OPEN of this boot, its temp flushed before its rename and the root flushed after it. Both flushes are barriers only where the record it replaces names an earlier boot, this boot is named too, and every torn kind's directory that exists is on the root's device; anywhere else, both are full flushes: over a record of this boot (open or clean), over no record, where either boot is unnamed, and where a torn kind's directory is on another device or does not read.
     pub(crate) fn begin_run(&self) -> io::Result<Flushed> {
         self.begin_run_by(StartRules::ALL)
     }
@@ -2681,7 +2763,7 @@ impl StateDir {
                 .unwrap_or_else(|e| e.into_inner())
                 .extend(here.into_iter().map(|(_, _, rel)| rel).chain(pin));
         }
-        let tier = self.open_tier(last, now);
+        let tier = self.open_tier(last, now, rules.this_boot_in_full);
         let mut flushed = Flushed::default();
         let mut bytes = open.render().into_bytes();
         bytes.push(b'\n');
@@ -2725,10 +2807,19 @@ impl StateDir {
         Ok(flushed)
     }
 
-    fn open_tier(&self, last: Option<LastRun>, now: Option<[u8; 16]>) -> aterm_durable::Flush {
+    /// The start's tier: the barrier only over an earlier named boot's record, this boot named too, with every torn kind's directory on the root's device. There a cut that loses OPEN loses every later write on the device with it, and this boot's first incarnation flushes `inc` in full before the attach presents anything to a broker, which puts OPEN on the media. Over a record of this boot, in full: a visible OPEN may be a failed replacement of this boot's CLEAN, and a same-boot lease flushes nothing later, so a lost OPEN would leave CLEAN vouching for its in-flight entries, which the next boot would republish behind later posts a broker on another volume kept.
+    fn open_tier(
+        &self,
+        last: Option<LastRun>,
+        now: Option<[u8; 16]>,
+        this_boot_in_full: bool,
+    ) -> aterm_durable::Flush {
         use aterm_durable::Flush;
-        let ordered =
-            last.is_some_and(|run| now.is_some() && run.boot.is_some() && run.boot != now);
+        let ordered = last.is_some_and(|run| {
+            now.is_some()
+                && run.boot.is_some()
+                && (run.boot != now || !(this_boot_in_full || run.clean))
+        });
         if !ordered {
             return Flush::Durable;
         }
@@ -3164,6 +3255,24 @@ impl StateDir {
         Ok(node.to_string())
     }
 
+    /// Drop the pins of `sids`, in one durable write when any has one: nothing of those
+    /// departed sessions is held here any more (`Bridge::reclaim_subjects`).
+    pub(crate) fn unpin(&self, sids: &BTreeSet<String>) -> io::Result<()> {
+        if sids.is_empty() {
+            return Ok(());
+        }
+        let lines = self.pin_lines();
+        let kept: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.split_once(' ').is_none_or(|(s, _)| !sids.contains(s)))
+            .collect();
+        if kept.len() == lines.len() {
+            return Ok(());
+        }
+        self.write_durable("pins", &kept.join("\n"))
+    }
+
     /// One session's broadcast cursors.
     #[must_use]
     pub fn topics(&self, sid: &str) -> BTreeMap<String, TopicCursor> {
@@ -3514,6 +3623,24 @@ mod tests {
         assert_eq!(
             sync_dir(&dir.join("file").join("dir")).map_err(|e| e.kind()),
             Err(io::ErrorKind::NotADirectory)
+        );
+    }
+
+    /// A tolerated flush goes on exactly where astream's rule says the entries cannot be
+    /// flushed: the volume's `ENOTSUP` (Darwin's 45, which std leaves uncategorized, so a
+    /// list of kinds alone missed it) is tolerated, and `EIO` is returned.
+    #[test]
+    fn a_tolerated_flush_goes_on_past_enotsup_and_returns_eio() {
+        let enotsup = if cfg!(target_vendor = "apple") {
+            45
+        } else {
+            95
+        };
+        assert!(tolerate_dir_flush(Err(io::Error::from_raw_os_error(enotsup))).is_ok());
+        assert_eq!(
+            tolerate_dir_flush(Err(io::Error::from_raw_os_error(libc::EIO)))
+                .map_err(|e| e.raw_os_error()),
+            Err(Some(libc::EIO))
         );
     }
 
@@ -6105,7 +6232,7 @@ mod tests {
     }
 
     #[test]
-    fn a_start_is_ordered_by_the_barrier_save_over_a_clean_stop_of_this_boot() {
+    fn a_start_is_ordered_by_the_barrier_only_over_an_earlier_boots_record() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("start-tier")
             .tempdir_in("/tmp")

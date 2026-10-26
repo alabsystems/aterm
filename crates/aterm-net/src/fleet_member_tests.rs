@@ -1329,6 +1329,32 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         said.contains("nor by its issuer's book read just now") && !said.contains("again"),
         "{said}"
     );
+    let node = || n.node().to_owned();
+    let why = || "timed out".to_owned();
+    for refusal in [
+        Undriven::Unproven(Unproven::Unbound(node())),
+        Undriven::Unproven(Unproven::OtherKey(node())),
+        Undriven::Unlisted(node()),
+        Undriven::Rekeyed(node()),
+        Undriven::Unchecked {
+            node: node(),
+            why: why(),
+        },
+        Undriven::Unread {
+            node: node(),
+            why: why(),
+        },
+        Undriven::Unjoined(node()),
+    ] {
+        let said = refusal.to_string();
+        assert!(
+            said.contains("the dialled Mac")
+                && !said.contains("this Mac")
+                && !said.contains("this machine")
+                && !said.contains(" here"),
+            "the driving Mac reads it too: {said}"
+        );
+    }
     let stranger = identity(&node_of(0xe5), 5);
     assert_eq!(
         driver_as_of(

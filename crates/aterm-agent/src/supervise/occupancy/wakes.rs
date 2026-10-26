@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::declarer::AgentId;
 use super::wake_atoms::PATH_MAX;
 use super::wakes_seen::{
-    AtomKind, Declarer, ExpireWhy, Prio, WakeClaim, WakeDoor, WakeSeen, WakeState, WakesSeen,
-    head_key, wake_episode,
+    AtomKind, Declarer, ExpireWhy, Prio, WakeClaim, WakeDoor, WakeFacts, WakeSeen, WakeState,
+    WakesSeen, head_key, wake_episode,
 };
 use crate::supervise::facts::SeedOutcome;
 
@@ -1244,7 +1244,8 @@ impl WakeBook {
         self.get_mut(ord).is_some_and(|wake| wake.heard_at(now_ms))
     }
 
-    /// A LOOP'S DOOR CLAIMS wake `ord` of `episode` for its one write at `now_ms`.
+    /// A LOOP'S DOOR CLAIMS wake `ord` of `episode` for its one write at `now_ms`, granted with
+    /// the book's figure (its ready since; the host fills in the slots it re-reads).
     /// A time-only wake is `Gone` to a loop's door: only its await may answer it.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -1269,21 +1270,25 @@ impl WakeBook {
             door,
             at_ms: now_ms,
         };
+        let granted = WakeClaim::Granted(WakeFacts {
+            ready_since_ms: wake.ready_since_ms,
+            slots: None,
+        });
         match wake.state {
             WakeState::Ready => {
                 wake.state = claimed;
-                WakeClaim::Granted
+                granted
             }
             WakeState::Answered { at_ms } if now_ms.saturating_sub(at_ms) >= UNHEARD_MS => {
                 wake.state = claimed;
-                WakeClaim::Granted
+                granted
             }
             WakeState::Answered { .. } => WakeClaim::Answered,
             WakeState::Answering { .. } | WakeState::Claimed { .. } => WakeClaim::Busy,
             WakeState::Pending => WakeClaim::Unmet,
             WakeState::Told { .. } if armed(Fault::ClaimTwice) => {
                 wake.state = claimed;
-                WakeClaim::Granted
+                granted
             }
             WakeState::Told { .. } | WakeState::Taken | WakeState::Expired { .. } => {
                 WakeClaim::Gone
@@ -1291,8 +1296,9 @@ impl WakeBook {
         }
     }
 
-    /// THE LOOP RELEASES its claim on `ord` of `episode`, its line not typed: ready again (or
-    /// answered again, for a retell's claim).
+    /// THE LOOP RELEASES `door`'s claim on `ord` of `episode`, its line not typed: ready again (or
+    /// answered again, for a retell's claim). A claim another door holds is not this door's to
+    /// give back.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1301,9 +1307,9 @@ impl WakeBook {
             project = "conformance_wakes::project"
         )
     )]
-    pub fn release(&mut self, ord: u16, episode: u64) -> bool {
+    pub fn release(&mut self, ord: u16, episode: u64, door: WakeDoor) -> bool {
         match self.get_mut(ord).filter(|w| w.episode() == episode) {
-            Some(wake) if matches!(wake.state, WakeState::Claimed { .. }) => {
+            Some(wake) if matches!(wake.state, WakeState::Claimed { door: d, .. } if d == door) => {
                 wake.unclaimed();
                 true
             }

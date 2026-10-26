@@ -6,9 +6,9 @@
 //!
 //! Joining is System State's Secrets vault row's. On a launch whose setup is finished, or
 //! that runs none, and every [`MEND_EVERY`] after, a configured Mac's subscriber is read off
-//! the event loop ([`mend`]) and installed again from this aterm when its plist runs a copy
-//! that is gone or does not last, or when this window owes the Mac one ([`OWED_RECORD`]) and
-//! it has none or one that stays down; never over the person's off, and only while System
+//! the event loop ([`mend`]) and installed again when its plist runs a copy that is gone or
+//! does not last (from this aterm), or when this window owes the Mac one ([`OWED_RECORD`]) and
+//! it has none (from this aterm) or one that stays down (keeping a lasting program it names); never over the person's off, and only while System
 //! State's plan in force keeps the vault in sync ([`MendReach::wanted`]). Nothing is asked or
 //! posted.
 
@@ -334,8 +334,9 @@ pub(crate) struct MendReach {
     pub(crate) while_wanted: Box<MendGuard>,
     /// This Mac's vault configuration, or why it cannot be read.
     pub(crate) configured: Box<dyn Fn() -> Result<Configured, String> + Send>,
-    /// Install the subscriber from this aterm ([`plan`]'s `install`): `false` when it was left
-    /// off, the person having turned it off since the read.
+    /// Install the subscriber again ([`plan`]'s `install`), from this aterm unless its plist
+    /// names a lasting program, which it keeps: `false` when it was left off, the person
+    /// having turned it off since the read.
     pub(crate) install: Box<dyn Fn() -> Result<bool, Unsynced> + Send>,
     /// Forget this Mac's [`OWED_RECORD`] line ([`plan`]'s `paid`).
     pub(crate) paid: Box<dyn Fn() + Send>,
@@ -369,7 +370,7 @@ pub(crate) fn mend(reach: &MendReach) -> Option<Settled> {
                     "secrets vault: the subscriber runs {program}, which is gone or does not last; installing it from this aterm"
                 ),
                 Plist::Down => aterm_log::info!(
-                    "secrets vault: the subscriber stays down; installing it again from this aterm"
+                    "secrets vault: the subscriber stays down; installing it again (it keeps a program it names that lasts)"
                 ),
                 Plist::Absent | Plist::Sound | Plist::Unread(_) => {}
             }
@@ -435,10 +436,10 @@ pub(crate) fn mends_again(before: Option<&Settled>, settled: Option<&Settled>) -
 
 /// Start the mend: a windowed macOS instance, off the event loop, at once and every
 /// [`MEND_EVERY`], each change it finds logged once. `config_path` is `aterm.toml`'s, beside
-/// which [`OWED_RECORD`] lives. Never joined.
-pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) {
+/// which [`OWED_RECORD`] lives. Whether the thread started; never joined.
+pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) -> bool {
     if headless || !cfg!(target_os = "macos") {
-        return;
+        return false;
     }
     #[cfg(target_os = "macos")]
     {
@@ -464,12 +465,19 @@ pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) {
                 }
             },
         );
-        if let Err(error) = spawned {
-            aterm_log::warn!("secrets vault: the mend did not start: {error}");
+        match spawned {
+            Ok(_) => true,
+            Err(error) => {
+                aterm_log::warn!("secrets vault: the mend did not start: {error}");
+                false
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = config_path;
+    {
+        let _ = config_path;
+        false
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -494,7 +502,8 @@ fn live_mend_reach(config_path: Option<PathBuf>) -> MendReach {
 
 /// The subscriber (`aterm secrets watch`), as `aterm secrets agent on` installs it: a
 /// launchd user agent running this aterm's bundle executable, when that is a copy that
-/// lasts ([`lasting_program`]). A repair, never a person's On
+/// lasts ([`lasting_program`]), unless the job runs another aterm that lasts, which it keeps
+/// (`aterm_secrets::service::kept_program`, a held snapshot). A repair, never a person's On
 /// (`aterm_secrets::service::repair_subscriber`): an `agent off` since the read keeps it off
 /// (`false`), and its record stays.
 #[cfg(target_os = "macos")]
@@ -519,7 +528,12 @@ struct LiveSubscriber<'a>(&'a Path);
 #[cfg(target_os = "macos")]
 impl SubscriberInstaller for LiveSubscriber<'_> {
     fn repair(&self) -> Result<Option<String>, Unsynced> {
-        subscriber_program().and_then(|program| {
+        let job = aterm_secrets::service::Job::Subscriber;
+        let program = match aterm_secrets::service::kept_program(self.0, job) {
+            Some(program) => Ok(program),
+            None => subscriber_program(),
+        };
+        program.and_then(|program| {
             aterm_secrets::service::repair_subscriber(
                 self.0,
                 &program,

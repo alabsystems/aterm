@@ -259,6 +259,9 @@ enum Leg {
     Again(io::Error),
     /// A connect phase that already said why on stderr.
     Code(ExitCode),
+    /// A leg over a drive that ctl's own `--timeout` ran out within: the wait's end, with the rows
+    /// read, or before the baseline this error.
+    Cut(io::Error),
 }
 
 type LegFn = dyn Fn(&str, &str, Duration) -> Leg + Send + Sync;
@@ -295,20 +298,63 @@ const DRIVEN_LEG_MAX: Duration = Duration::from_secs(20);
 
 const DRIVEN_SLACK: Duration = Duration::from_secs(8);
 
+/// What a wait over a drive keeps of ctl's own `--timeout` past the wait its last leg asks the
+/// peer for, room for that leg's dial, handshake and reply: a second, at most a quarter of it.
+fn cut_reserve(flag: Duration) -> Duration {
+    Duration::from_secs(1).min(flag / 4)
+}
+
 /// Backoff before retrying an unserved leg ([`Leg::Again`], [`Legs::again`]).
 const AGAIN_AFTER: Duration = Duration::from_secs(1);
 
 /// The longest a group asks again ([`Leg::Again`], [`Legs::again`]).
 const AGAIN_FOR: Duration = Duration::from_secs(60);
 
-fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Duration) -> Leg {
-    let within = wait + DRIVEN_SLACK;
+/// One leg over a drive, within its wait and [`DRIVEN_SLACK`], or what is left of ctl's own
+/// `--timeout` (`cut`: when it runs out, and the `--timeout`) where that is shorter; a peer that
+/// took the connection and sent no handshake within it keeps that cause (exit 2).
+fn driven_leg(
+    drive: crate::FleetDriveFn,
+    (host, request): (&str, &str),
+    wait: Duration,
+    cut: Option<(Instant, Duration)>,
+) -> Leg {
+    use crate::remote::Within;
+    use io::ErrorKind::{TimedOut, WouldBlock};
+    let own = wait + DRIVEN_SLACK;
+    let left = cut.map(|(at, flag)| (at.saturating_duration_since(Instant::now()), flag));
+    let (within, said) = match left {
+        Some((left, flag)) if left < own => (left, Within::Timeout(flag, own)),
+        _ => (own, Within::Drive(own)),
+    };
+    if within.is_zero() {
+        return Leg::Cut(crate::remote::closed(host, request, said, TimedOut.into()));
+    }
+    let ends = Instant::now() + within;
+    match driven_exchange(drive, (host, request), within, said) {
+        Leg::Failed(e) | Leg::Again(e)
+            if matches!(said, Within::Timeout(..))
+                && !crate::is_unserved(&e)
+                && (Instant::now() >= ends || matches!(e.kind(), WouldBlock | TimedOut)) =>
+        {
+            Leg::Cut(e)
+        }
+        leg => leg,
+    }
+}
+
+fn driven_exchange(
+    drive: crate::FleetDriveFn,
+    (host, request): (&str, &str),
+    within: Duration,
+    cut: crate::remote::Within,
+) -> Leg {
     let mut link = match drive(host, within) {
         Ok(link) => link,
         Err(refused) if refused.again => return Leg::Again(io::Error::other(refused)),
         Err(refused) => return Leg::Failed(io::Error::other(refused)),
     };
-    let (label, cut) = (link.label, crate::remote::Within::Drive(within));
+    let label = link.label;
     if let Err(e) = io::Write::write_all(&mut link.stream, request.as_bytes())
         .and_then(|()| io::Write::flush(&mut link.stream))
     {
@@ -550,15 +596,12 @@ fn run_group(
                 continue;
             }
             Leg::Code(code) => return End::Code(code),
+            Leg::Cut(e) => return ran_out(baseline_read, rows, e),
             Leg::Again(e) => {
                 let now = Instant::now();
                 let since = *unserved_since.get_or_insert(now);
                 if until.is_some_and(|until| now >= until) {
-                    return if baseline_read {
-                        End::TimedOut(rows.into_iter().flatten().collect())
-                    } else {
-                        End::Failed(e)
-                    };
+                    return ran_out(baseline_read, rows, e);
                 }
                 let (after, most) = legs.again;
                 if now.saturating_duration_since(since) >= most {
@@ -567,6 +610,9 @@ fn run_group(
                 std::thread::sleep(until.map_or(after, |until| {
                     until.saturating_duration_since(now).min(after)
                 }));
+                if until.is_some_and(|until| Instant::now() >= until) {
+                    return ran_out(baseline_read, rows, e);
+                }
                 continue;
             }
             Leg::HungUp { server, listener } => {
@@ -640,6 +686,16 @@ fn run_group(
             return End::TimedOut(latest);
         }
         let _ = tx.send(Report::Rows(index, latest));
+    }
+}
+
+/// A wait whose deadline ran out at a leg the peer did not answer (`e`): with the rows read, or
+/// before the baseline that leg's cause.
+fn ran_out(baseline_read: bool, rows: Vec<Option<String>>, e: io::Error) -> End {
+    if baseline_read {
+        End::TimedOut(rows.into_iter().flatten().collect())
+    } else {
+        End::Failed(e)
     }
 }
 
@@ -749,6 +805,15 @@ pub(crate) fn run_driven(
     host: &str,
     drive: crate::FleetDriveFn,
 ) -> io::Result<ExitCode> {
+    print_waited(driven_wait(parts, total, host, drive)?)
+}
+
+fn driven_wait(
+    parts: &[String],
+    total: Option<Option<Duration>>,
+    host: &str,
+    drive: crate::FleetDriveFn,
+) -> io::Result<Waited> {
     let request = parse(parts)?;
     if let Some(local) = request
         .targets
@@ -768,12 +833,20 @@ pub(crate) fn run_driven(
             ),
         ));
     }
+    let start = Instant::now();
+    // ctl's own `--timeout` is one deadline over every leg: their dials, handshakes and replies.
+    let cut = total.flatten().map(|flag| (start + flag, flag));
     let total = match (request.timeout, total) {
         (Some(verb), _) => Some(verb),
         (None, Some(flag)) => flag,
         (None, None) => Some(DEFAULT_TOTAL),
     };
-    let until = total.map(|t| Instant::now() + t);
+    // Its last leg asks for a wait that ends inside it, so the rows it reads are the peer's.
+    let until = total.map(|t| start + t).map(|until| {
+        cut.map_or(until, |(_, flag)| {
+            until.min(start + flag.saturating_sub(cut_reserve(flag)))
+        })
+    });
     let targets = request
         .targets
         .iter()
@@ -787,7 +860,7 @@ pub(crate) fn run_driven(
     let legs = Legs {
         max: DRIVEN_LEG_MAX,
         send: Arc::new(move |_: &str, request: &str, wait: Duration| {
-            driven_leg(drive, &host, request, wait)
+            driven_leg(drive, (&host, request), wait, cut)
         }),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
@@ -795,14 +868,14 @@ pub(crate) fn run_driven(
         sock: String::new(),
         targets,
     }];
-    print_waited(wait_task_groups(
+    wait_task_groups(
         groups,
         request.combine,
         request.facts,
         until,
         &redial::Redial::none(),
         &legs,
-    )?)
+    )
 }
 
 fn print_waited(waited: Waited) -> io::Result<ExitCode> {
@@ -1472,7 +1545,7 @@ mod tests {
         let legs = scripted(vec![(
             x,
             "await task @s-a any timeout=0\n",
-            refused("ERR denied: node ab12cd34 is not one this Mac lets drive it"),
+            refused("ERR denied: node ab12cd34 is not one the dialled Mac lets drive it"),
         )]);
         let refusal = wait_task_groups(
             one_group(x, &["s-a"]),
@@ -1654,5 +1727,106 @@ mod tests {
         .unwrap();
         assert_eq!(local[0].sock, "/tmp/default.sock");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const BUSY: &str = "@s-a1 rev=3 state=working agent=busy attention=- result_bytes=0";
+    const NEEDS_YOU: &str = "@s-a1 rev=3 state=working agent=idle attention=needs-you \
+                             result_bytes=0";
+
+    const HANDSHAKE: Duration = Duration::from_millis(30);
+
+    struct Peer {
+        sent: Vec<u8>,
+        deadline: Instant,
+        reply: Option<io::Cursor<Vec<u8>>>,
+    }
+
+    // A driven Mac's `await task`: its timeout= runs from the request's arrival, a handshake
+    // after the dial, and the connection gives up at the dial's deadline.
+    impl io::Read for Peer {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.reply.is_none() {
+                let sent = String::from_utf8_lossy(&self.sent).into_owned();
+                let ms = sent
+                    .split_whitespace()
+                    .find_map(|word| word.strip_prefix("timeout="))
+                    .and_then(|ms| ms.parse().ok())
+                    .unwrap_or(0);
+                let answers = Instant::now() + HANDSHAKE + Duration::from_millis(ms);
+                if answers > self.deadline {
+                    std::thread::sleep(self.deadline.saturating_duration_since(Instant::now()));
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                std::thread::sleep(answers.saturating_duration_since(Instant::now()));
+                let row = if ms == 0 { BUSY } else { NEEDS_YOU };
+                self.reply = Some(io::Cursor::new(
+                    format!("OK 1 status=timeout\n{row}\n").into_bytes(),
+                ));
+            }
+            self.reply.as_mut().map_or(Ok(0), |reply| reply.read(buf))
+        }
+    }
+
+    impl io::Write for Peer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn peer(_: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+        Ok(crate::DriveLink {
+            stream: Box::new(Peer {
+                sent: Vec::new(),
+                deadline: Instant::now() + within,
+                reply: None,
+            }),
+            label: "lab-mini".to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_wait_its_own_timeout_ends_reads_the_peers_rows_of_its_last_leg() {
+        let second = Some(Some(Duration::from_secs(1)));
+        match driven_wait(&parts("await task @s-a1"), second, "lab-mini", peer) {
+            Ok(Waited::Rows { rows, answered }) => {
+                assert_eq!((rows, answered), (vec![NEEDS_YOU.to_owned()], false));
+            }
+            Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn a_handshake_a_later_leg_never_gets_keeps_its_cause_under_ctls_timeout() {
+        static DIALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn frozen_later(
+            host: &str,
+            within: Duration,
+        ) -> Result<crate::DriveLink, crate::DriveRefused> {
+            if DIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                return peer(host, within);
+            }
+            std::thread::sleep(within);
+            Err(crate::DriveRefused {
+                unserved: true,
+                ..crate::DriveRefused::once(format!(
+                    "127.0.0.1:7100: connected, but no fleet handshake within {:.1}s",
+                    within.as_secs_f64()
+                ))
+            })
+        }
+        let second = Some(Some(Duration::from_secs(1)));
+        let refused = run_driven(&parts("await task @s-a1"), second, "lab-mini", frozen_later)
+            .expect_err("unserved");
+        assert_eq!(crate::exit_for(&refused), ExitCode::from(2), "{refused}");
+        assert!(
+            refused.to_string().contains("no fleet handshake"),
+            "{refused}"
+        );
     }
 }

@@ -1141,7 +1141,8 @@ impl Star {
         let inv_nominal = 1.0 / nominal;
         let inv_depth = 1.0 / depth;
         let mut best: Option<f32> = None;
-        for k in k0..=k1 {
+        let mut k = k0;
+        while k <= k1 {
             let c = ((k as f32 + 0.5) * inv_nominal - floor) * inv_depth;
             if c > 0.0
                 && c < 1.0
@@ -1153,6 +1154,7 @@ impl Star {
                     None => dt,
                 });
             }
+            k += 1;
         }
         best
     }
@@ -1189,7 +1191,11 @@ impl Star {
         }
         let age_ms = self.age_s(now) * 1000.0;
         let mut best: Option<f32> = None;
-        for v in [self.v0.0.abs(), self.v0.1.abs()] {
+        let vs = [self.v0.0.abs(), self.v0.1.abs()];
+        let mut vi = 0;
+        while vi < vs.len() {
+            let v = vs[vi];
+            vi += 1;
             if !v.is_finite() || v <= 0.0 {
                 continue;
             }
@@ -1507,10 +1513,12 @@ impl GlyphProbe {
     pub fn probe_row(&mut self, row: i32, occupied: &[bool]) {
         let slot = self.slot_for(row, occupied.len());
         let r = &mut self.rows[slot];
-        for (col, &on) in occupied.iter().enumerate() {
-            if on {
+        let mut col = 0;
+        while col < occupied.len() {
+            if occupied[col] {
                 r.ink[col >> 6] |= 1u64 << (col & 63);
             }
+            col += 1;
         }
     }
 
@@ -1520,9 +1528,10 @@ impl GlyphProbe {
     pub fn probe_row_ink(&mut self, row: i32, cells: &[CellInk]) {
         let slot = self.slot_for(row, cells.len());
         let r = &mut self.rows[slot];
-        for (col, &cell) in cells.iter().enumerate() {
+        let mut col = 0;
+        while col < cells.len() {
             let bit = 1u64 << (col & 63);
-            match cell {
+            match cells[col] {
                 CellInk::Blank => {}
                 CellInk::Glyph => r.ink[col >> 6] |= bit,
                 CellInk::Rule => {
@@ -1530,6 +1539,7 @@ impl GlyphProbe {
                     r.rule[col >> 6] |= bit;
                 }
             }
+            col += 1;
         }
     }
 
@@ -1538,9 +1548,10 @@ impl GlyphProbe {
     pub fn probe_row_chars(&mut self, row: i32, chars: &[char]) {
         let slot = self.slot_for(row, chars.len());
         let r = &mut self.rows[slot];
-        for (col, &ch) in chars.iter().enumerate() {
+        let mut col = 0;
+        while col < chars.len() {
             let bit = 1u64 << (col & 63);
-            match cell_ink(ch) {
+            match cell_ink(chars[col]) {
                 CellInk::Blank => {}
                 CellInk::Glyph => r.ink[col >> 6] |= bit,
                 CellInk::Rule => {
@@ -1548,6 +1559,7 @@ impl GlyphProbe {
                     r.rule[col >> 6] |= bit;
                 }
             }
+            col += 1;
         }
     }
 
@@ -1845,7 +1857,9 @@ impl SkyMark {
     ) -> Option<Self> {
         let mut rect = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
         let mut any = false;
-        for q in quads {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &quads[qi];
             if q.w > 0 && q.h > 0 {
                 let (x, y) = (i32::from(q.x), i32::from(q.y));
                 rect = (
@@ -1856,8 +1870,11 @@ impl SkyMark {
                 );
                 any = true;
             }
+            qi += 1;
         }
-        for h in halos {
+        let mut hi = 0;
+        while hi < halos.len() {
+            let h = &halos[hi];
             if h.w > 0 && h.h > 0 {
                 let (x, y) = (i32::from(h.x), i32::from(h.y));
                 rect = (
@@ -1868,17 +1885,22 @@ impl SkyMark {
                 );
                 any = true;
             }
+            hi += 1;
         }
         if !any {
             return None;
         }
         let k0 = keys.len() as u32;
         keys.reserve(quads.len() + halos.len());
-        for q in quads {
-            keys.push(sky_quad_key(q));
+        let mut qi = 0;
+        while qi < quads.len() {
+            keys.push(sky_quad_key(&quads[qi]));
+            qi += 1;
         }
-        for h in halos {
-            keys.push(sky_halo_key(h));
+        let mut hi = 0;
+        while hi < halos.len() {
+            keys.push(sky_halo_key(&halos[hi]));
+            hi += 1;
         }
         Some(Self {
             at,
@@ -2050,7 +2072,9 @@ impl Stardust {
     #[inline]
     pub fn catch(&mut self, x: f32, y: f32, born: Instant, at: Instant) -> bool {
         let mut found = None;
-        for s in &mut self.stars {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let s = &self.stars[i];
             if s.gold
                 && s.class == StarClass::M1
                 && s.lane.is_sky()
@@ -2059,13 +2083,15 @@ impl Stardust {
                 && s.x == x
                 && s.y == y
             {
-                found = Some(s);
+                found = Some(i);
                 break;
             }
+            i += 1;
         }
-        let Some(star) = found else {
+        let Some(idx) = found else {
             return false;
         };
+        let star = &mut self.stars[idx];
         let before = star.finish;
         star.finish_by(at, CATCH_FINISH_MS / 1000.0);
         star.finish != before
@@ -2085,8 +2111,10 @@ impl Stardust {
         let (along_x, along_y) = (vx * SHED_ALONG_SHARE, vy * SHED_ALONG_SHARE);
         let scale = px_scale(ctx.geom.ch as f32);
         let tint = spectrum_snap(spec.tint_t);
-        for k in 0..spec.n {
+        let mut k = 0;
+        while k < spec.n {
             let seed = mix32(spec.seed ^ u32::from(k).wrapping_mul(0x9E37_79B9));
+            k += 1;
             if !light_keeps(seed, ctx.cfg) {
                 continue;
             }
@@ -2120,10 +2148,12 @@ impl Stardust {
         let inv_n = 1.0 / (n as f32);
         let inv_cw = 1.0 / (ctx.geom.cw as f32).max(1.0);
         let (rise_up, rise_down) = fan_rise(spec.reach, spec.at_px, ctx.geom);
-        for k in 0..n {
+        let mut k = 0;
+        while k < n {
             let seed = mix32(spec.seed ^ (k as u32).wrapping_mul(0x85EB_CA6B));
             let class = fan_class(k, spec.hero);
             if class == StarClass::M3 && !light_keeps(seed, ctx.cfg) {
+                k += 1;
                 continue;
             }
             let a = ((k as f32 + hash01(seed)) * inv_n) * std::f32::consts::TAU;
@@ -2152,6 +2182,7 @@ impl Stardust {
                 at,
                 ctx,
             );
+            k += 1;
         }
     }
 
@@ -2160,7 +2191,8 @@ impl Stardust {
         let n = MINI_FAN_M2_N + MINI_FAN_M3_N;
         const INV_N: f32 = 1.0 / (MINI_FAN_M2_N + MINI_FAN_M3_N) as f32;
         let scale = px_scale(ctx.geom.ch as f32);
-        for k in 0..n {
+        let mut k = 0;
+        while k < n {
             let s = mix32(seed ^ u32::from(k).wrapping_mul(0xC2B2_AE35));
             let class = if k < MINI_FAN_M2_N {
                 StarClass::M2
@@ -2168,6 +2200,7 @@ impl Stardust {
                 StarClass::M3
             };
             if class == StarClass::M3 && !light_keeps(s, ctx.cfg) {
+                k += 1;
                 continue;
             }
             let a = ((f32::from(k) + hash01(s)) * INV_N) * std::f32::consts::TAU;
@@ -2192,6 +2225,7 @@ impl Stardust {
                 at,
                 ctx,
             );
+            k += 1;
         }
     }
 
@@ -2199,7 +2233,9 @@ impl Stardust {
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.reduced = ctx.cfg.reduced_motion;
         self.cell_h = ctx.geom.ch as f32;
-        for g in self.glints.drain(..) {
+        let mut gi = 0;
+        while gi < self.glints.len() {
+            let g = self.glints[gi];
             frame.cues.push(SoundCue {
                 kind: SoundKind::Stardust {
                     twinkle_hz: g.f.round().clamp(0.0, 255.0) as u8,
@@ -2210,7 +2246,9 @@ impl Stardust {
                 dir: 0,
                 shifted: false,
             });
+            gi += 1;
         }
+        self.glints.clear();
         self.cull(ctx.now);
         self.marks.clear();
         self.mark_lights.clear();
@@ -2231,17 +2269,26 @@ impl Stardust {
         let mut haloed = 0usize;
         let n = self.stars.len();
         let mut classes = 0u8;
-        for star in &self.stars {
-            classes |= 1u8 << (star.class as u8);
+        let mut si = 0;
+        while si < self.stars.len() {
+            classes |= 1u8 << (self.stars[si].class as u8);
+            si += 1;
         }
         let ch = ctx.geom.ch as f32;
         let mut i = 0usize;
-        for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
+        const ALL_CLASSES: [StarClass; 3] = [StarClass::M1, StarClass::M2, StarClass::M3];
+        let mut ci = 0;
+        while ci < ALL_CLASSES.len() {
+            let class = ALL_CLASSES[ci];
+            ci += 1;
             if classes & (1u8 << (class as u8)) == 0 {
                 continue;
             }
             let arms = class.arms(ch);
-            for star in &self.stars {
+            let mut si = 0;
+            while si < self.stars.len() {
+                let star = &self.stars[si];
+                si += 1;
                 if star.class != class {
                     continue;
                 }
@@ -2303,15 +2350,19 @@ impl Stardust {
         if self.reduced {
             return false;
         }
-        for s in &self.stars {
-            if s.brisk(now) {
+        let mut si = 0;
+        while si < self.stars.len() {
+            if self.stars[si].brisk(now) {
                 return true;
             }
+            si += 1;
         }
-        for v in &self.veil {
-            if v.age_s(now) < EDGE_IN_S {
+        let mut vi = 0;
+        while vi < self.veil.len() {
+            if self.veil[vi].age_s(now) < EDGE_IN_S {
                 return true;
             }
+            vi += 1;
         }
         false
     }
@@ -2334,10 +2385,13 @@ impl Stardust {
         const FADE_FROM_FIELD: f32 = FIELD_LIFE_S - FADE_LEAD_S;
         const FIELD_HOLD_S: f32 = FIELD_HOLD_MS / 1000.0;
         const FIELD_MELT_START: f32 = FIELD_LIFE_S * (1.0 - EXPIRY_MELT_SHARE);
-        for v in &self.veil {
+        let mut vi = 0;
+        while vi < self.veil.len() {
             if cad.at_tail_floor() {
                 return cad.take();
             }
+            let v = &self.veil[vi];
+            vi += 1;
             let idle = v.idle_s(now);
             let age = v.age_s(now);
             if let Some(f) = v.finish {
@@ -2362,10 +2416,13 @@ impl Stardust {
             cad.tail(fade_life - idle);
             cad.tail(FIELD_LIFE_S - age);
         }
-        for s in &self.stars {
+        let mut si = 0;
+        while si < self.stars.len() {
             if cad.at_tail_floor() {
                 return cad.take();
             }
+            let s = &self.stars[si];
+            si += 1;
             let age = s.age_s(now);
             let life = s.life_s();
             cad.tail(life - age);
@@ -2527,7 +2584,8 @@ impl Stardust {
         let earned = matches!(class, TypedClass::Capital | TypedClass::Bang);
         let (row, head) = ctx.caret;
         let n_cells = cells.max(1);
-        for k in 0..n_cells {
+        let mut k = 0;
+        while k < n_cells {
             let col = head.saturating_sub(n_cells - k);
             let cell = (row, col);
             let h = cell_hash(row, col, 0);
@@ -2616,6 +2674,7 @@ impl Stardust {
                 );
             }
 
+            k += 1;
             if mended {
                 continue;
             }
@@ -2666,13 +2725,15 @@ impl Stardust {
         }
         if self.stars.len() + EXHAUST_HEADROOM > STAR_CAP {
             let mut live = 0usize;
-            for s in &self.stars {
-                if s.finish.is_none() {
+            let mut si = 0;
+            while si < self.stars.len() {
+                if self.stars[si].finish.is_none() {
                     live += 1;
                     if live + EXHAUST_HEADROOM > STAR_CAP {
                         return;
                     }
                 }
+                si += 1;
             }
         }
         let (row, col) = ctx.caret;
@@ -2691,10 +2752,13 @@ impl Stardust {
         let Some(c) = col.checked_sub(1) else {
             return;
         };
-        for r in px_row(y - rise, g)..=px_row(y, g) {
+        let mut r = px_row(y - rise, g);
+        let r_end = px_row(y, g);
+        while r <= r_end {
             if self.probe.sky_at(r, c, g.rows) != Some(false) {
                 return;
             }
+            r += 1;
         }
         let reach = self.blank_frontier_px(x, (y - rise, y), want, ctx);
         if reach < 0.5 {
@@ -2725,13 +2789,15 @@ impl Stardust {
     #[inline]
     fn deal_backspace(&mut self, at: Instant, ctx: &Ctx<'_>) {
         let (row, col) = ctx.caret;
-        for k in 0..(ERASE_M3_N + ERASE_M2_N) {
+        let mut k = 0;
+        while k < ERASE_M3_N + ERASE_M2_N {
             let class = if k < ERASE_M3_N {
                 StarClass::M3
             } else {
                 StarClass::M2
             };
             self.throw_erase(class, (row, col), k, at, ctx);
+            k += 1;
         }
     }
 
@@ -2740,7 +2806,8 @@ impl Stardust {
         let n = (cells / KILL_CELLS_PER_STAR).clamp(1, KILL_STAR_MAX);
         let (row, col) = ctx.caret;
         let last = ctx.geom.cols.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
-        for k in 0..n {
+        let mut k = 0;
+        while k < n {
             let class = if k % (ERASE_M3_N + ERASE_M2_N) == ERASE_M3_N {
                 StarClass::M2
             } else {
@@ -2750,6 +2817,7 @@ impl Stardust {
                 .saturating_add(k * KILL_CELLS_PER_STAR + KILL_CELLS_PER_STAR / 2)
                 .min(last);
             self.throw_erase(class, (row, at_col), k, at, ctx);
+            k += 1;
         }
     }
 
@@ -2808,10 +2876,13 @@ impl Stardust {
         };
         if grabbed.is_some() {
             let g = ctx.geom;
-            for (i, s) in self.stars.iter_mut().enumerate() {
+            let mut i = 0;
+            while i < self.stars.len() {
+                let s = &mut self.stars[i];
                 if grabbed != Some(Some(i)) && s.lane.is_sky() && star_over_cell(s, spec.cell, g) {
                     s.finish_by(at, EVICT_FINISH_MS / 1000.0);
                 }
+                i += 1;
             }
         }
         let mut class = spec.class;
@@ -2948,8 +3019,7 @@ impl Stardust {
         let x_hi = (cx + SKY_JITTER_CW * g.cw as f32).round();
         let y_lo = (top - SKY_TOP_CH * ch).round();
         let y_hi = (top - SKY_BOTTOM_CH * ch).min(cell_top - 1.0).round();
-        let glass = |x: f32, y: f32| on_glass((x as i32, y as i32), g);
-        if !glass(x, y) {
+        if !on_glass((x as i32, y as i32), g) {
             return None;
         }
         if !self.pixel_taken(x, y) {
@@ -2965,15 +3035,20 @@ impl Stardust {
             (-1.0, 1.0),
             (1.0, 1.0),
         ];
-        for (dx, dy) in NUDGE {
+        let mut ni = 0;
+        while ni < NUDGE.len() {
+            let (dx, dy) = NUDGE[ni];
             let (nx, ny) = (x + dx, y + dy);
-            if (x_lo..=x_hi).contains(&nx)
-                && (y_lo..=y_hi).contains(&ny)
-                && glass(nx, ny)
+            if nx >= x_lo
+                && nx <= x_hi
+                && ny >= y_lo
+                && ny <= y_hi
+                && on_glass((nx as i32, ny as i32), g)
                 && !self.pixel_taken(nx, ny)
             {
                 return Some((nx, ny));
             }
+            ni += 1;
         }
         None
     }
@@ -3075,16 +3150,37 @@ impl Stardust {
             return None;
         }
         let mut pos = None;
-        for (i, s) in self.stars.iter().enumerate() {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let s = &self.stars[i];
             if s.lane.is_sky() && !s.dead(at) && star_over_cell(s, from, g) {
                 pos = Some(i);
                 break;
             }
+            i += 1;
         }
         Some(pos)
     }
 
-    fn settle(&self, star: &mut Star, fixed: bool, ctx: &Ctx<'_>) -> bool {
+    const fn settle(&self, star: &mut Star, fixed: bool, ctx: &Ctx<'_>) -> bool {
+        #[inline]
+        const fn settle_clear(
+            probe: &GlyphProbe,
+            p: (i32, i32),
+            geom: Geom,
+            home: Option<(i32, i32)>,
+        ) -> bool {
+            if !on_glass(p, geom) {
+                return false;
+            }
+            if let Some((hr, hc)) = home
+                && px_row(p.1 as f32, geom) == hr
+                && px_col(p.0 as f32, geom) == hc
+            {
+                return true;
+            }
+            !matches!(probe.at_px(p.0, p.1, geom), Some(true))
+        }
         const NUDGE: [(i32, i32); 12] = [
             (0, -1),
             (0, 1),
@@ -3101,32 +3197,30 @@ impl Stardust {
         ];
         let geom = ctx.geom;
         let origin = star.origin();
-        let home = if star.lane != StarLane::Exhaust && star.lane.throw_ms().is_some() {
+        let home = if !matches!(star.lane, StarLane::Exhaust) && star.lane.throw_ms().is_some() {
             Some((px_row(origin.1 as f32, geom), px_col(origin.0 as f32, geom)))
         } else {
             None
-        };
-        let clear = |p: (i32, i32)| {
-            on_glass(p, geom)
-                && (home == Some((px_row(p.1 as f32, geom), px_col(p.0 as f32, geom)))
-                    || self.probe.at_px(p.0, p.1, geom) != Some(true))
         };
         let motion = star.lane.motion();
         let k = motion.k_at(motion.end_ms(star.life_s() * 1000.0));
         let thrown = star.rest();
         let rest = clamp_to_glass(thrown, geom);
-        if clear(rest) {
-            if rest != thrown {
+        if settle_clear(&self.probe, rest, geom, home) {
+            if rest.0 != thrown.0 || rest.1 != thrown.1 {
                 star.aim(rest, k);
             }
             return true;
         }
-        for (dx, dy) in NUDGE {
+        let mut ni = 0;
+        while ni < NUDGE.len() {
+            let (dx, dy) = NUDGE[ni];
             let p = (rest.0 + dx, rest.1 + dy);
-            if clear(p) {
+            if settle_clear(&self.probe, p, geom, home) {
                 star.aim(p, k);
                 return true;
             }
+            ni += 1;
         }
         if !fixed {
             return false;
@@ -3142,7 +3236,7 @@ impl Stardust {
                 origin.0 + (dx * t).round() as i32,
                 origin.1 + (dy * t).round() as i32,
             );
-            if clear(cand) {
+            if settle_clear(&self.probe, cand, geom, home) {
                 p = cand;
                 break;
             }
@@ -3211,15 +3305,19 @@ impl Stardust {
     #[inline]
     fn adopt_field(&mut self, cell: (u16, u16), at: Instant, geom: Geom) -> bool {
         let mut found = None;
-        for s in &mut self.stars {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let s = &self.stars[i];
             if s.lane.is_sky() && star_over_cell(s, cell, geom) {
-                found = Some(s);
+                found = Some(i);
                 break;
             }
+            i += 1;
         }
-        let Some(s) = found else {
+        let Some(idx) = found else {
             return false;
         };
+        let s = &mut self.stars[idx];
         s.lane = StarLane::Field;
         s.home_row = Some(cell.0);
         s.lit = at;
@@ -3232,7 +3330,10 @@ impl Stardust {
         let (row, col) = caret;
         let col_i32 = i32::from(col);
         let span_s = span_ms * (1.0 / 1000.0);
-        for s in &mut self.stars {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let s = &mut self.stars[i];
+            i += 1;
             if s.lane != StarLane::Field {
                 continue;
             }
@@ -3240,35 +3341,48 @@ impl Stardust {
                 s.finish_by(at, span_s);
             }
         }
-        for v in &mut self.veil {
+        let mut j = 0;
+        while j < self.veil.len() {
+            let v = &mut self.veil[j];
             if v.row == row && v.col >= col {
                 v.finish_by(at, span_s);
             }
+            j += 1;
         }
     }
 
     #[inline]
     fn relight_field(&mut self, caret: (u16, u16), at: Instant, geom: Geom) {
-        for s in &mut self.stars {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let s = &mut self.stars[i];
             if s.lane == StarLane::Field && in_sky_of_row(s.y, caret.0, geom) {
                 s.lit = at;
             }
+            i += 1;
         }
-        for v in &mut self.veil {
+        let mut j = 0;
+        while j < self.veil.len() {
+            let v = &mut self.veil[j];
             if v.row == caret.0 {
                 v.lit = at;
             }
+            j += 1;
         }
     }
 
     #[inline]
     fn ember(&mut self, at: Instant) {
         const EMBER_S: f32 = FOCUS_EMBER_MS / 1000.0;
-        for s in &mut self.stars {
-            s.finish_by(at, EMBER_S);
+        let mut i = 0;
+        while i < self.stars.len() {
+            self.stars[i].finish_by(at, EMBER_S);
+            i += 1;
         }
-        for v in &mut self.veil {
-            v.finish_by(at, EMBER_S);
+        let mut j = 0;
+        while j < self.veil.len() {
+            self.veil[j].finish_by(at, EMBER_S);
+            j += 1;
         }
     }
 
@@ -3280,13 +3394,16 @@ impl Stardust {
         }
         let mut live = 0usize;
         let mut oldest: Option<(usize, Instant)> = None;
-        for (i, s) in self.stars.iter().enumerate() {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let s = &self.stars[i];
             if s.finish.is_none() {
                 live += 1;
                 if !matches!(oldest, Some((_, born)) if s.born >= born) {
                     oldest = Some((i, s.born));
                 }
             }
+            i += 1;
         }
         if live >= STAR_CAP
             && let Some((idx, _)) = oldest
@@ -3295,13 +3412,16 @@ impl Stardust {
         }
         if self.stars.len() >= STAR_POOL_MAX {
             let mut nearest_end: Option<(usize, f32)> = None;
-            for (i, s) in self.stars.iter().enumerate() {
+            let mut j = 0;
+            while j < self.stars.len() {
+                let s = &self.stars[j];
                 if let Some(f) = s.finish {
                     let u = f.u(now);
                     if !matches!(nearest_end, Some((_, best)) if u.total_cmp(&best).is_lt()) {
-                        nearest_end = Some((i, u));
+                        nearest_end = Some((j, u));
                     }
                 }
+                j += 1;
             }
             self.stars.remove(match nearest_end {
                 Some((i, _)) => i,
@@ -3333,8 +3453,10 @@ impl Stardust {
             return;
         }
         let n = cells.max(1);
-        for k in 0..n {
+        let mut k = 0;
+        while k < n {
             let col = head.saturating_sub(n - k);
+            k += 1;
             if usize::from(col) >= g.cols {
                 continue;
             }
@@ -3352,7 +3474,9 @@ impl Stardust {
             };
             let mut matched = None;
             let mut oldest: Option<(usize, Instant)> = None;
-            for (i, v) in self.veil.iter().enumerate() {
+            let mut i = 0;
+            while i < self.veil.len() {
+                let v = &self.veil[i];
                 if v.row == row && v.col == col {
                     matched = Some(i);
                     break;
@@ -3360,6 +3484,7 @@ impl Stardust {
                 if !matches!(oldest, Some((_, best)) if v.lit >= best) {
                     oldest = Some((i, v.lit));
                 }
+                i += 1;
             }
             if let Some(i) = matched {
                 self.veil[i] = veil;
@@ -3387,7 +3512,10 @@ impl Stardust {
         let cw = g.cw as i32;
         let intensity = clamp01(ctx.cfg.intensity);
         let cap = halos.len() + AURORA_HALO_BUDGET;
-        for v in &self.veil {
+        let mut vi = 0;
+        while vi < self.veil.len() {
+            let v = &self.veil[vi];
+            vi += 1;
             let env = v.envelope(ctx.now, ctx.cfg.reduced_motion);
             if env < CHROMA_CULL_ALPHA {
                 continue;
@@ -3619,7 +3747,7 @@ impl Paint {
         };
         let watch_len = if d == 1 { 5 } else { SETTLE_PIXELS };
         let mut watch = [((0i32, 0i32), 0u32); SETTLE_PIXELS];
-        for (slot, (dx, dy)) in watch[..watch_len].iter_mut().zip([
+        let watch_offsets = [
             (0, 0),
             (d, 0),
             (-d, 0),
@@ -3629,9 +3757,13 @@ impl Paint {
             (-1, 0),
             (0, 1),
             (0, -1),
-        ]) {
+        ];
+        let mut wi = 0;
+        while wi < watch_len {
+            let (dx, dy) = watch_offsets[wi];
             let p = (self.x + dx, self.y + dy);
-            *slot = (p, index.ground(ctx.cfg.theme_bg, frame, p.0, p.1));
+            watch[wi] = (p, index.ground(ctx.cfg.theme_bg, frame, p.0, p.1));
+            wi += 1;
         }
         let ground = watch[0].1;
         let q0 = frame.out.len();
@@ -3706,16 +3838,20 @@ impl Paint {
         let disc = premul_rgb(self.tint, cov_byte(self.c * M3_CROSS_ADD));
         let a = self.arm;
         push_fx_rect(out, geom, self.x, self.y, 1, 1, core);
-        for (x, y, w, h) in [
+        let rects = [
             (self.x - a, self.y, a, 1),
             (self.x + 1, self.y, a, 1),
             (self.x, self.y - a, 1, a),
             (self.x, self.y + 1, 1, a),
-        ] {
+        ];
+        let mut i = 0;
+        while i < rects.len() {
             if out.len() >= quad_cap {
                 return;
             }
+            let (x, y, w, h) = rects[i];
             push_fx_rect(out, geom, x, y, w, h, disc);
+            i += 1;
         }
     }
 
@@ -3724,16 +3860,20 @@ impl Paint {
         let d = star_body_px(self.arm) + 1;
         let l = stub_len_px(geom.ch as f32);
         let c = premul_rgb(self.tint, cov_byte(self.c * STUB_COV_SHARE));
-        for (x, y, w, h) in [
+        let rects = [
             (self.x - d - (l - 1), self.y, l, 1),
             (self.x + d, self.y, l, 1),
             (self.x, self.y - d - (l - 1), 1, l),
             (self.x, self.y + d, 1, l),
-        ] {
+        ];
+        let mut i = 0;
+        while i < rects.len() {
             if out.len() >= quad_cap {
                 return;
             }
+            let (x, y, w, h) = rects[i];
             push_fx_rect(out, geom, x, y, w, h, c);
+            i += 1;
         }
     }
 
@@ -3806,10 +3946,13 @@ impl Paint {
         let step = (self.arm - self.arm_lo).max(0);
         match self.class {
             StarClass::M3 => {
-                let ink = |cov: u8, cap: f32| {
-                    let a = stacked_ink_alpha(cov, InkRole::OverText).min(cap as u32);
+                #[inline]
+                const fn m3_ink(rgb: u32, cov: u8, cap: f32) -> u32 {
+                    let a_raw = stacked_ink_alpha(cov, InkRole::OverText);
+                    let cap_u = cap as u32;
+                    let a = if a_raw < cap_u { a_raw } else { cap_u };
                     rgb | (a << 24)
-                };
+                }
                 let r = (mass.round() as i32).max(1);
                 push_halo_quads(
                     frame.halos,
@@ -3817,27 +3960,31 @@ impl Paint {
                     halo_cap,
                     (self.x, self.y),
                     (r, r),
-                    ink(cov_byte(self.c * self.core), LIGHT_ALPHA_CAP),
+                    m3_ink(rgb, cov_byte(self.c * self.core), LIGHT_ALPHA_CAP),
                     HaloMode::Over,
                 );
                 if frame.halos.len() + M3_NEEDLE_HALOS > halo_cap {
                     return;
                 }
                 let n = r + 1 + step;
-                let tip = ink(
+                let tip = m3_ink(
+                    rgb,
                     cov_byte(self.c * M3_CROSS_ADD),
                     InkRole::OverText.alpha_cap(),
                 );
-                for radii in [(n, 1), (1, n)] {
+                let radii_pair = [(n, 1), (1, n)];
+                let mut ri = 0;
+                while ri < radii_pair.len() {
                     push_halo_quads(
                         frame.halos,
                         geom,
                         halo_cap,
                         (self.x, self.y),
-                        radii,
+                        radii_pair[ri],
                         tip,
                         HaloMode::Over,
                     );
+                    ri += 1;
                 }
             }
             StarClass::M1 | StarClass::M2 => {
@@ -4403,9 +4550,12 @@ impl SkyIndex {
     #[inline]
     fn open(&mut self, geom: Geom, from: (usize, usize)) {
         if self.quad_head.len() == SKY_INDEX_SLOTS {
-            for &s in &self.dirty {
-                self.quad_head[s as usize] = SKY_INDEX_END;
-                self.halo_head[s as usize] = SKY_INDEX_END;
+            let mut i = 0;
+            while i < self.dirty.len() {
+                let s = self.dirty[i] as usize;
+                self.quad_head[s] = SKY_INDEX_END;
+                self.halo_head[s] = SKY_INDEX_END;
+                i += 1;
             }
         } else {
             self.quad_head = vec![SKY_INDEX_END; SKY_INDEX_SLOTS];
@@ -4468,9 +4618,11 @@ impl SkyIndex {
             return;
         }
         let idx = i as u32;
-        for cy in cy0..=cy1 {
+        let mut cy = cy0;
+        while cy <= cy1 {
             let cy_term = (cy as u32).wrapping_mul(0x85EB_CA6B);
-            for cx in cx0..=cx1 {
+            let mut cx = cx0;
+            while cx <= cx1 {
                 let s = Self::slot_with_cy(cx, cy_term);
                 if self.quad_head[s] == SKY_INDEX_END && self.halo_head[s] == SKY_INDEX_END {
                     self.dirty.push(s as u32);
@@ -4484,7 +4636,9 @@ impl SkyIndex {
                     self.halo_node.push((idx, next));
                     self.halo_head[s] = self.halo_node.len() as u32 - 1;
                 }
+                cx += 1;
             }
+            cy += 1;
         }
     }
 
@@ -4678,21 +4832,27 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
     }
     let table = relative_luminance_table();
     let star_quads = &frame.out[q0..];
+    let star_halos = &frame.halos[h0..];
     let maskable = star_quads.len() <= u32::BITS as usize;
     let own_at_max = |(x, y): (i32, i32)| -> (u32, u32, u32, u8) {
         let mut own = 0u32;
         let mut qmask = 0u32;
-        for (idx, q) in star_quads.iter().enumerate() {
+        let mut idx = 0;
+        while idx < star_quads.len() {
+            let q = &star_quads[idx];
             if quad_covers(q, x, y) {
                 own = add_sat(own, q.color & 0x00FF_FFFF);
                 if maskable {
                     qmask |= 1u32 << idx;
                 }
             }
+            idx += 1;
         }
         let mut halo_color = 0u32;
         let mut halo_wt = 0u8;
-        for h in &frame.halos[h0..] {
+        let mut hi = 0;
+        while hi < star_halos.len() {
+            let h = &star_halos[hi];
             let wt = halo_weight_at(h, x, y);
             if wt > 0 {
                 own = add_sat(own, premul_rgb(h.color, wt));
@@ -4700,19 +4860,21 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
                 halo_wt = wt;
                 break;
             }
+            hi += 1;
         }
         (own, qmask, halo_color, halo_wt)
     };
     let mut over = [((0i32, 0i32), 0u32, 0u32, 0u32, 0u8); SETTLE_PIXELS];
     let mut over_len = 0usize;
-    for &(p, ground) in watch {
+    let mut wi = 0;
+    while wi < watch.len() {
+        let (p, ground) = watch[wi];
         let (own, qmask, halo_color, halo_wt) = own_at_max(p);
-        if !under_ceil_with(table, add_sat(ground, own))
-            && let Some(slot) = over.get_mut(over_len)
-        {
-            *slot = (p, ground, qmask, halo_color, halo_wt);
+        if !under_ceil_with(table, add_sat(ground, own)) && over_len < over.len() {
+            over[over_len] = (p, ground, qmask, halo_color, halo_wt);
             over_len += 1;
         }
+        wi += 1;
     }
     if over_len == 0 {
         return;
@@ -4727,10 +4889,13 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
                 own = add_sat(own, premul_rgb(star_quads[idx].color, k));
             }
         } else {
-            for q in star_quads {
+            let mut qi = 0;
+            while qi < star_quads.len() {
+                let q = &star_quads[qi];
                 if quad_covers(q, x, y) {
                     own = add_sat(own, premul_rgb(q.color, k));
                 }
+                qi += 1;
             }
         }
         if halo_wt > 0 {
@@ -4739,23 +4904,32 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         own
     };
     let fits = |k: u8| {
-        for &(p, ground, qmask, halo_color, halo_wt) in over {
+        let mut oi = 0;
+        while oi < over.len() {
+            let (p, ground, qmask, halo_color, halo_wt) = over[oi];
             if !under_ceil_with(
                 table,
                 add_sat(ground, own_at(k, p, qmask, halo_color, halo_wt)),
             ) {
                 return false;
             }
+            oi += 1;
         }
         true
     };
     let k = fit_byte(u8::MAX - 1, fits);
-    for q in &mut frame.out[q0..] {
+    let mut qi = q0;
+    while qi < frame.out.len() {
+        let q = &mut frame.out[qi];
         q.color = premul_rgb(q.color, k);
         q.color2 = premul_rgb(q.color2, k);
+        qi += 1;
     }
-    for h in &mut frame.halos[h0..] {
+    let mut hi = h0;
+    while hi < frame.halos.len() {
+        let h = &mut frame.halos[hi];
         h.color = premul_rgb(h.color, k);
+        hi += 1;
     }
 }
 
@@ -5038,21 +5212,24 @@ pub(crate) fn push_twinkle_over_twin(
         }
         lut
     };
-    let lay_alpha = &LAY_ALPHA;
-    let lay_of = |cap_a: u32| -> u32 { (rgb & 0x00FF_FFFF) | lay_alpha[cap_a as usize] };
+    let rgb_body = rgb & 0x00FF_FFFF;
     let core_cap = u32::from(cov).clamp(1, InkRole::Leading.alpha_cap() as u32);
     let arm_cap = u32::from(cov).clamp(1, InkRole::OverText.alpha_cap() as u32);
-    let core_ink = lay_of(core_cap);
+    let core_ink = rgb_body | LAY_ALPHA[core_cap as usize];
     let arm_ink = if arm_cap == core_cap {
         core_ink
     } else {
-        lay_of(arm_cap)
+        rgb_body | LAY_ALPHA[arm_cap as usize]
     };
-    let px = |v: f32| (v.round() as i32).max(1);
-    let waist = px((mass * STAR_WAIST).max(1.0));
-    let body = px((mass * STAR_TAPER_BODY).max(1.0));
-    let core = px((mass * STAR_CORE).max(1.0));
-    let arm_px = px(mass) + step;
+    #[inline]
+    const fn star_px(v: f32) -> i32 {
+        let r = v.round() as i32;
+        if r > 1 { r } else { 1 }
+    }
+    let waist = star_px((mass * STAR_WAIST).max(1.0));
+    let body = star_px((mass * STAR_TAPER_BODY).max(1.0));
+    let core = star_px((mass * STAR_CORE).max(1.0));
+    let arm_px = star_px(mass) + step;
     push_halo_quads(
         halos,
         geom,
@@ -5099,11 +5276,14 @@ pub(crate) fn push_twinkle_over_twin(
         HaloMode::Over,
     );
     if gold {
-        let d = px(mass * STAR_GLINT);
+        let d = star_px(mass * STAR_GLINT);
         let gcap = ((f32::from(cov) * STAR_GLINT_COV) as u32)
             .clamp(1, InkRole::OverText.alpha_cap() as u32);
-        let glint = (rgb & 0x00FF_FFFF) | (gcap << 24);
-        for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
+        let glint = rgb_body | (gcap << 24);
+        let offsets = [(-d, -d), (d, -d), (-d, d), (d, d)];
+        let mut gi = 0;
+        while gi < offsets.len() {
+            let (ox, oy) = offsets[gi];
             push_halo_quads(
                 halos,
                 geom,
@@ -5113,6 +5293,7 @@ pub(crate) fn push_twinkle_over_twin(
                 glint,
                 HaloMode::Over,
             );
+            gi += 1;
         }
     }
 }

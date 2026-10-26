@@ -209,6 +209,60 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         .map_err(|e| format!("abrew: cannot move download to {}: {e}", dest.display()))
 }
 
+/// The download size a HEAD request reports (final redirect
+/// target's Content-Length), for upgrade dry-run tables. Best
+/// effort: any failure simply omits the size, like brew when a
+/// bottle has no recorded size. Headers ride a private curlrc,
+/// as in [`curl_to_file`].
+pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
+    check_url(url).ok()?;
+    let work = aterm_tempfile::tempdir().ok()?;
+    let mut args: Vec<String> = vec![
+        "-fsSIL".into(),
+        "--connect-timeout".into(),
+        "30".into(),
+        "--max-time".into(),
+        "60".into(),
+    ];
+    args.extend(proto_args(url).into_iter().map(str::to_owned));
+    if !headers.is_empty() {
+        let cfg = work.path().join("curlrc");
+        let mut body = String::new();
+        for h in headers {
+            body.push_str(&format!(
+                "header = \"{}\"\n",
+                h.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+        }
+        std::fs::write(&cfg, body).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600));
+        }
+        args.push("-K".into());
+        args.push(cfg.to_string_lossy().into_owned());
+    }
+    args.push("--url".into());
+    args.push(url.to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_capture(aterm_uds::os_path!("curl"), &refs).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .next_back()
+}
+
 /// SHA-256 of a file, lowercase hex (ring, streamed).
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     let mut f = std::fs::File::open(path)

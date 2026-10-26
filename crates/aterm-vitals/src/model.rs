@@ -3,12 +3,15 @@
 
 //! System vitals model: absorbs [`Sample`] readings into an immutable [`Snapshot`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::history::{self, Filling, FreeHistory, Rates};
 use crate::peaks::{DailyMax, NET_LEARN_S, PEAK_DAYS, Peaks, PlanDay, PlanWeek, TOKENS_LEARN_S};
-use crate::ring::{BUCKET_MS, BucketRing, Cell, NOW_WINDOW_MS, Recent, columns_of};
+use crate::ring::{
+    BUCKET_MS, BucketRing, Cell, NOW_WINDOW_MS, Reading, Recent, SLOT_GUARD_MS, SLOT_MS, SlotGrid,
+    columns_of, slots_of,
+};
 use crate::trend::{History, Trend, TrendView};
 
 /// One logical core's cumulative ticks.
@@ -38,8 +41,11 @@ pub struct ProcSample {
     pub start: Option<u64>,
     /// Its parent's pid.
     pub ppid: u32,
-    /// Cumulative CPU time, ns; `None` where the OS refused it.
+    /// Cumulative CPU time, ns; `None` where the OS refused it. A zombie's is its final one.
     pub cpu_ns: Option<u64>,
+    /// Cumulative CPU time of the children it has reaped, ns: at each reap the kernel adds the
+    /// child's own time and its reaped children's (macOS); `None` where unread, and off macOS.
+    pub child_cpu_ns: Option<u64>,
     /// Physical footprint, bytes; `None` where unreadable.
     pub footprint: Option<u64>,
     /// The short command name.
@@ -50,6 +56,8 @@ pub struct ProcSample {
     pub uid: Option<u32>,
     /// Its process group (0: unknown).
     pub pgid: u32,
+    /// Its session's id, its leader's pid (0: unknown).
+    pub sid: u32,
     /// Its scheduler state.
     pub state: ProcState,
     /// Cumulative runnable (running or queued) time in ns, or `None` if unreadable.
@@ -66,6 +74,11 @@ pub struct ProcSample {
     /// When it started, unix ms (a fork's time, which an exec keeps); the host reads it on
     /// every whole reading (one with a sweep), `None` where unread.
     pub birth_ms: Option<i64>,
+    /// Whether the kernel reaps its children for it (macOS `P_NOCLDWAIT`: it ignores `SIGCHLD`
+    /// or set `SA_NOCLDWAIT`), adding each child's time to its [`Self::child_cpu_ns`] twice; read
+    /// for one with reaped time and for one whose usage goes unread that parents one whose usage
+    /// is read, `None` otherwise and off macOS.
+    pub reaps_unwaited: Option<bool>,
 }
 
 /// Process scheduler state (`Run` means neither stopped nor zombie).
@@ -369,6 +382,10 @@ pub struct TabRoot {
     pub key: u64,
     /// Key of the tab this pane belongs to (the least key among its panes, or its own).
     pub tab: u64,
+    /// The host's identity for that tab (its `TabId`: never reused while aterm runs, and kept
+    /// when the tab moves to another window), which a pane shared into another tab does not
+    /// carry; `None` for a session in no tab.
+    pub tab_id: Option<u64>,
     /// Its shell's pid; 0 when it has none (a native tab).
     pub shell_pid: u32,
     /// Its label, `Tab 2`.
@@ -725,7 +742,9 @@ pub struct Sample {
     pub tabs: Vec<TabRoot>,
     /// Explicit jobs whose process identities were validated in this sweep.
     pub delegated: Vec<DelegatedJob>,
-    /// Wall-clock timestamp of the sample in Unix ms.
+    /// Wall-clock timestamp of the sample in Unix ms: on a reading with a process sweep, read
+    /// before the sweep lists the processes, so a process born at or after one reading's is in no
+    /// earlier reading's sweep ([`crate::explain::reap`]).
     pub at_unix_ms: i64,
     /// Monotonic timestamp of the sample in ms (pauses during system sleep).
     pub mono_ms: u64,
@@ -1402,6 +1421,8 @@ pub struct Series {
     pub capacity: Option<f64>,
     /// One hour of 10 s cells, oldest first; the last is the open bucket [`ResourceView::ring_k`].
     pub ring: Arc<[Cell]>,
+    /// Its last minute of readings, oldest first ([`ResourceView::heat_slots`]).
+    pub recent: Arc<[Reading]>,
     /// Whether this series binds now (its share of capacity is the row's).
     pub binds: bool,
 }
@@ -1423,6 +1444,8 @@ pub struct ResourceView {
     pub ring: Arc<[Cell]>,
     /// Bucket index of the last cell in `ring` (Unix seconds `[10 * ring_k, 10 * ring_k + 10)`).
     pub ring_k: i64,
+    /// The first series' last minute of readings, oldest first ([`Self::heat_slots`]).
+    pub recent: Arc<[Reading]>,
     /// Memory's pressure, cell for cell with `ring`: the worst level read in each bucket, `None`
     /// (hollow) where none was read; empty on every other row ([`Self::pressure_columns`]).
     pub pressure: Arc<[Option<Pressure>]>,
@@ -1503,6 +1526,26 @@ impl ResourceView {
         out
     }
 
+    /// The last `n` slots of `grid` as heat, ending at the one holding `at_ms` ([`slots_of`]
+    /// over each series' readings, an empty slot spoken for by a reading at most `cover_ms` after
+    /// the one before it), the second series merged in as in [`Self::heat_columns`]: a strip
+    /// drawn reading by reading, on the snapshot's [`Snapshot::slot_grid`].
+    #[must_use]
+    pub fn heat_slots(&self, grid: SlotGrid, n: usize, at_ms: i64, cover_ms: i64) -> Vec<HeatCell> {
+        let cells = |s: &Series| {
+            self.heat_of_columns(slots_of(&s.recent, at_ms, grid, n, cover_ms), s.capacity)
+        };
+        let mut out = cells(&self.first());
+        if let Some(second) = self.second.as_ref() {
+            for (a, b) in out.iter_mut().zip(cells(second)) {
+                a.heat = larger(a.heat, b.heat);
+                a.max = larger(a.max, b.max);
+                a.over |= b.over;
+            }
+        }
+        out
+    }
+
     fn heat_of_columns(&self, cols: Vec<Cell>, capacity: Option<f64>) -> Vec<HeatCell> {
         let ceiling = self.basis.heat_ceiling();
         cols.into_iter()
@@ -1521,6 +1564,7 @@ impl ResourceView {
             now: self.now,
             capacity: self.capacity,
             ring: Arc::clone(&self.ring),
+            recent: Arc::clone(&self.recent),
             binds: self.second.as_ref().is_none_or(|s| !s.binds),
         }
     }
@@ -1550,6 +1594,7 @@ impl ResourceView {
             basis,
             ring: first.ring,
             ring_k,
+            recent: first.recent,
             second: second.map(|s| Series {
                 binds: second_binds,
                 ..s
@@ -1735,6 +1780,10 @@ pub struct Snapshot {
     pub machine_only: bool,
     /// The sample's wall clock, unix ms.
     pub at_unix_ms: i64,
+    /// Where a strip drawn reading by reading puts its slots: a second each, their edges between
+    /// the recent readings ([`SlotGrid::clear_of`]), so each reading a second stands alone in
+    /// its own slot.
+    pub slot_grid: SlotGrid,
     /// The deck's rows, in [`Resource::ALL`] order.
     pub resources: [ResourceView; 7],
     /// The home volume's free space over the last 24 hours.
@@ -2173,13 +2222,37 @@ pub struct Vitals {
     tabs: HashMap<u64, ScopeState>,
     detector: crate::events::Detector,
     why: crate::explain::WhyState,
+    /// The last [`SLOT_TIMES`] readings' wall clocks, unix ms, oldest first.
+    slot_times: VecDeque<i64>,
+    /// Where the strips' reading slots stand ([`Snapshot::slot_grid`]).
+    slot_grid: SlotGrid,
 }
+
+/// The readings [`Vitals`] places its slot grid's edges between: eight seconds at the focused
+/// cadence, four at the lens's.
+const SLOT_TIMES: usize = 8;
 
 impl Vitals {
     /// A model that has read nothing.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The slot grid with a reading at `at_ms` in it: the one before while that reading stands
+    /// clear of its slot's edges, else the grid clear of the last [`SLOT_TIMES`] readings. Its
+    /// edges then move only when the readings' place in the second has drifted near one, and
+    /// move to the middle of the widest gap between them, so a strip keeps each reading in a
+    /// slot of its own.
+    fn slot_grid(&mut self, at_ms: i64) -> SlotGrid {
+        self.slot_times.push_back(at_ms);
+        while self.slot_times.len() > SLOT_TIMES {
+            self.slot_times.pop_front();
+        }
+        if !self.slot_grid.clear(at_ms, SLOT_GUARD_MS) {
+            self.slot_grid = SlotGrid::clear_of(self.slot_times.make_contiguous(), SLOT_MS);
+        }
+        self.slot_grid
     }
 
     /// The peaks learned so far, for the host to persist.
@@ -2377,6 +2450,7 @@ impl Vitals {
             delegated: pass.delegated,
             machine_only: s.machine_only,
             at_unix_ms: s.at_unix_ms,
+            slot_grid: self.slot_grid(s.at_unix_ms),
             resources,
             free_history: self.rows.free.clone(),
             facts,
@@ -2525,7 +2599,16 @@ impl Vitals {
         self.last_read_at = next_read_at;
         global.procs = u32::try_from(procs.len()).unwrap_or(u32::MAX);
         let Some(wall_ns) = wall_ns else {
-            return ProcPass::default();
+            // No window yet, but the explanations' reap credit takes its first members here.
+            return ProcPass {
+                attribution: Some(attribute_delegated(
+                    procs,
+                    s.self_pid,
+                    &s.tabs,
+                    &s.delegated,
+                )),
+                ..ProcPass::default()
+            };
         };
         let dt_s = wall_ns as f32 / 1e9;
 
@@ -3323,6 +3406,7 @@ fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) ->
         now: ring.now_mean(now, window_ms),
         capacity,
         ring: ring.cells().into(),
+        recent: ring.readings().into(),
         binds: false,
     }
 }
@@ -3605,6 +3689,7 @@ mod tests {
             shell_pid: shell,
             label: label.into(),
             program: program.into(),
+            tab_id: Some(key),
         }
     }
 
@@ -6354,5 +6439,100 @@ mod tests {
             s.resources[Disk.index()].aterm.missing,
             Some(NoFigure::NotReadHere)
         );
+    }
+
+    /// Readings paced from the moment each was asked drift through the second. The snapshot's
+    /// slot grid keeps its edges between them, so each reading of a second's cadence opens one
+    /// slot, and each pair of the lens's half-second cadence one, even as their place in the
+    /// second drifts past the wall clock's edge and jitters by tens of ms; on the wall clock's
+    /// own seconds the same readings open none and then two.
+    #[test]
+    fn the_slot_grid_keeps_a_reading_a_slot_as_readings_drift() {
+        let blank = |at_ms: i64| Sample {
+            at_unix_ms: at_ms,
+            cadence_ms: 1000,
+            ..Sample::default()
+        };
+        // A small fixed jitter, ±20 ms.
+        let jitter = |i: i64| ((i * 7_919) % 41) - 20;
+        for (cadence, per_slot) in [(1_003_i64, 1_i64), (501, 2)] {
+            let mut v = Vitals::new();
+            let times: Vec<i64> = (0..400)
+                .map(|i| T0 + 900 + i * cadence + jitter(i))
+                .collect();
+            let (mut opened, mut seconds) = (Vec::new(), Vec::new());
+            let mut prev: Option<i64> = None;
+            for &t in &times {
+                let snap = v.absorb(&blank(t));
+                assert!(snap.slot_grid.clear(t, SLOT_GUARD_MS) || prev.is_none());
+                if let Some(p) = prev {
+                    opened.push(snap.slot_grid.opened(p, t));
+                    seconds.push(SlotGrid::SECONDS.opened(p, t));
+                }
+                prev = Some(t);
+            }
+            let at = format!("cadence {cadence} ms");
+            // At a second's cadence every reading opens a slot; at the lens's, never two readings
+            // in a row open none (the strip never stands a second).
+            let steady = |opened: &[i64]| {
+                opened.iter().all(|&o| o == 0 || o == 1)
+                    && if per_slot == 1 {
+                        opened.iter().all(|&o| o == 1)
+                    } else {
+                        !opened.windows(2).any(|w| w == [0, 0])
+                    }
+            };
+            assert!(steady(&opened), "{at}: {opened:?}");
+            let span_s = (times[times.len() - 1] - times[0]) / SLOT_MS;
+            let sum = opened.iter().sum::<i64>();
+            assert!(
+                (sum - span_s).abs() <= 1,
+                "{at}: {sum} slots over {span_s} s"
+            );
+            assert!(
+                !steady(&seconds),
+                "CONTROL {at}: on the wall clock's seconds the strip stutters: {seconds:?}"
+            );
+        }
+    }
+
+    /// A strip drawn reading by reading reads the snapshot's last minute of readings: each 1 s
+    /// slot holds its second's reading, the second series merges in as in the bucketed strip,
+    /// and a series not read at the snapshot's moment leaves its last slot unread.
+    #[test]
+    fn a_snapshot_carries_its_readings_for_a_strip_slot_by_slot() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..12 {
+            s = v.absorb(&at(t * 1000, 1000));
+        }
+        let gpu = &s.resources[Gpu.index()];
+        assert_eq!(gpu.recent.len(), 12, "a reading a second, all kept");
+        assert!(gpu.recent.windows(2).all(|w| w[0].at_ms < w[1].at_ms));
+        let slots = gpu.heat_slots(s.slot_grid, 5, s.at_unix_ms, 15_000);
+        assert!(
+            slots
+                .iter()
+                .all(|c| c.heat.is_some_and(|h| (h - 0.12).abs() < 1e-6)),
+            "{slots:?}"
+        );
+        // Network: the larger of receive and send, slot by slot, as the bucketed strip says.
+        let net = &s.resources[Network.index()];
+        let by_slot = net.heat_slots(s.slot_grid, 3, s.at_unix_ms, 15_000);
+        let by_col = net.heat_columns(10, 1, s.at_unix_ms);
+        let last = by_slot.last().and_then(|c| c.heat);
+        assert!(
+            last.zip(by_col[0].heat)
+                .is_some_and(|(a, b)| (a - b).abs() < 1e-6),
+            "{by_slot:?} {by_col:?}"
+        );
+        // The GPU unread at the next reading: its last slot is unread, never zero; the slots
+        // before it keep their readings.
+        let mut blind = at(12_000, 1000);
+        blind.gpu = None;
+        let s = v.absorb(&blind);
+        let slots = s.resources[Gpu.index()].heat_slots(s.slot_grid, 3, s.at_unix_ms, 15_000);
+        assert_eq!(slots[2].heat, None, "{slots:?}");
+        assert!(slots[..2].iter().all(|c| c.heat.is_some()), "{slots:?}");
     }
 }

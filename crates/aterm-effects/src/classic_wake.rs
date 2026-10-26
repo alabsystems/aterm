@@ -13,9 +13,9 @@ use aterm_render::{
 };
 
 use crate::cursor_glow::{
-    BedScratch, BedShape, CursorGlow, Geom, GlowConfig, InkLedger, LIGHT_BODY_ALPHA_CAP,
-    LIGHT_MARK_QUADS, LightGround, TextView, clip_stream_to, hsv2rgb, lay_dark_bed, push_halo_rows,
-    push_ink_ellipse, push_soft_veil, split_air_runs,
+    BedScratch, BedShape, CursorGlow, Geom, GlowConfig, InkLedger, InkRole, LIGHT_BODY_ALPHA_CAP,
+    LIGHT_INK_ALPHA_CAP, LIGHT_MARK_QUADS, LightGround, TextView, clip_stream_to, hsv2rgb,
+    lay_dark_bed, push_halo_rows, push_ink_ellipse, push_soft_veil, reink_quads, split_air_runs,
 };
 use crate::effect_util::{lerp_rgb, push_fx_rect as push_rect};
 use crate::trail_sweep::line_cells_tail;
@@ -154,13 +154,16 @@ fn tracer_on_caret_row(
     let (ox, oy) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
     let (cw, ch) = (geom.cw as f32, geom.ch as f32);
     dense.clear();
-    for w in verts.windows(2) {
-        let (a, b) = (w[0], w[1]);
+    let mut vi = 0;
+    while vi + 1 < verts.len() {
+        let (a, b) = (verts[vi], verts[vi + 1]);
+        vi += 1;
         let n = (crate::color_math::hypot_f32(b.x - a.x, b.y - a.y) * (1.0 / TRACER_STEP_PX))
             .ceil()
             .max(1.0) as u32;
         let inv_n = 1.0 / n as f32;
-        for i in 0..n {
+        let mut i = 0;
+        while i < n {
             let t = i as f32 * inv_n;
             dense.push(BeamVertex {
                 x: a.x + (b.x - a.x) * t,
@@ -168,44 +171,50 @@ fn tracer_on_caret_row(
                 color: lerp_rgb(a.color, b.color, t),
                 cov: (f32::from(a.cov) + (f32::from(b.cov) - f32::from(a.cov)) * t).round() as u8,
             });
+            i += 1;
         }
     }
-    if let Some(&last_v) = verts.last() {
-        dense.push(last_v);
-    }
+    dense.push(verts[verts.len() - 1]);
     let reach = half + TRACER_CLEAR_PX;
     let reach2 = reach * reach;
     let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
     let mut crosses = false;
-    'verts: for v in dense.iter() {
+    let mut di = 0;
+    'verts: while di < dense.len() {
+        let v = &dense[di];
+        di += 1;
         let (row, col) = (
             ((v.y - oy) * inv_ch).floor() as i32,
             ((v.x - ox) * inv_cw).floor() as i32,
         );
-        for r in row - 1..=row + 1 {
-            if Some(r) == caret_row {
-                continue;
-            }
-            for c in col - 1..=col + 1 {
-                if !(text.covers_cell(r, c) || text.covers_cell(r, c - 1)) {
-                    continue;
+        let mut r = row - 1;
+        while r <= row + 1 {
+            if Some(r) != caret_row {
+                let mut c = col - 1;
+                while c <= col + 1 {
+                    if text.covers_cell(r, c) || text.covers_cell(r, c - 1) {
+                        let (x0, y0) = (ox + c as f32 * cw, oy + r as f32 * ch);
+                        let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
+                        let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
+                        if dx * dx + dy * dy < reach2 {
+                            crosses = true;
+                            break 'verts;
+                        }
+                    }
+                    c += 1;
                 }
-                let (x0, y0) = (ox + c as f32 * cw, oy + r as f32 * ch);
-                let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
-                let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
-                if dx * dx + dy * dy < reach2 {
-                    crosses = true;
-                    break 'verts;
-                }
             }
+            r += 1;
         }
     }
     if !crosses {
         return;
     }
     let Some(row) = caret_row else {
-        for v in dense.iter_mut() {
-            v.cov = 0;
+        let mut vi = 0;
+        while vi < dense.len() {
+            dense[vi].cov = 0;
+            vi += 1;
         }
         std::mem::swap(verts, dense);
         return;
@@ -232,7 +241,10 @@ fn tracer_on_caret_row(
     };
     let span = leave.min(room).max(1.0);
     let inv_span = 1.0 / span;
-    for v in dense.iter_mut() {
+    let mut vi = 0;
+    while vi < dense.len() {
+        let v = &mut dense[vi];
+        vi += 1;
         let k = if v.y - half < top || v.y + half > bottom {
             0.0
         } else {
@@ -544,10 +556,22 @@ impl ClassicWake {
             }
             self.emit_light_ring(now, cfg, geom, cur, halos);
             halos.truncate(CursorGlow::MAX_HALOS);
+            if out.laid() < Self::MAX_QUADS {
+                let from = out.quads().len();
+                self.emit_light_ring_rim(now, cfg, geom, out.quads());
+                let to = out.quads().len();
+                ink.ledger
+                    .admit_masked(out.quads(), from..to, InkLedger::FLYING_FLOOR);
+            }
+            out.keep_laid(Self::MAX_QUADS);
         }
 
         let mut fp: u64 = 0;
-        for q in out.quads().iter() {
+        let out_quads = out.quads().as_slice();
+        let mut qi = 0;
+        while qi < out_quads.len() {
+            let q = &out_quads[qi];
+            qi += 1;
             fp = fp.wrapping_mul(1_000_003).wrapping_add(
                 ((q.row as u64) << 40)
                     ^ ((q.x as u64) << 28)
@@ -557,7 +581,11 @@ impl ClassicWake {
                     ^ ((q.color as u64) << 20),
             );
         }
-        for q in under.quads().iter() {
+        let under_quads = under.quads().as_slice();
+        let mut uqi = 0;
+        while uqi < under_quads.len() {
+            let q = &under_quads[uqi];
+            uqi += 1;
             fp = fp.wrapping_mul(1_000_003).wrapping_add(
                 ((q.row as u64) << 40)
                     ^ ((q.x as u64) << 28)
@@ -571,14 +599,27 @@ impl ClassicWake {
             );
         }
         if !halos.is_empty() {
-            for h in halos.iter() {
-                for word in h.damage_words() {
-                    fp = fp.wrapping_mul(1_000_003).wrapping_add(word);
+            let mut hi = 0;
+            while hi < halos.len() {
+                let words = halos[hi].damage_words();
+                hi += 1;
+                let mut wi = 0;
+                while wi < words.len() {
+                    fp = fp.wrapping_mul(1_000_003).wrapping_add(words[wi]);
+                    wi += 1;
                 }
             }
         }
-        for ramps in [&*out.ramps(), &*under.ramps()] {
-            for r in &ramps.items {
+        let ramp_streams = [&*out.ramps(), &*under.ramps()];
+        let mut si = 0;
+        while si < ramp_streams.len() {
+            let ramps = ramp_streams[si];
+            si += 1;
+            let items = ramps.items.as_slice();
+            let mut ri = 0;
+            while ri < items.len() {
+                let r = &items[ri];
+                ri += 1;
                 fp = fp.wrapping_mul(1_000_003).wrapping_add(
                     (u64::from(r.at) << 32)
                         ^ (u64::from(r.row) << 40)
@@ -590,7 +631,11 @@ impl ClassicWake {
                         ^ (u64::from(r.join) << 56),
                 );
                 let ink = r.ink as usize;
-                for e in ramps.ends[ink..ink + r.end_count()].as_chunks::<2>().0 {
+                let chunks = ramps.ends[ink..ink + r.end_count()].as_chunks::<2>().0;
+                let mut ci = 0;
+                while ci < chunks.len() {
+                    let e = &chunks[ci];
+                    ci += 1;
                     fp = fp
                         .wrapping_mul(1_000_003)
                         .wrapping_add(u64::from(e[0]) << 32 | u64::from(e[1]));
@@ -651,11 +696,15 @@ impl ClassicWake {
         if !self.path_scratch.is_empty() {
             let n = self.path_scratch.len() as f32;
             let (rows_i32, cols_i32) = (geom.rows as i32, geom.cols as i32);
-            for (i, &(r, c)) in self.path_scratch.iter().enumerate() {
+            let mut i = 0;
+            while i < self.path_scratch.len() {
+                let (r, c) = self.path_scratch[i];
+                let idx = i;
+                i += 1;
                 if r < 0 || c < 0 || r >= rows_i32 || c >= cols_i32 {
                     continue;
                 }
-                let pos = (i as f32 + 1.0) / n;
+                let pos = (idx as f32 + 1.0) / n;
                 let born_cov = ((40.0 + 175.0 * pos) * boost).min(255.0) as u8;
                 self.sparks.push(Spark {
                     row: r as u16,
@@ -721,7 +770,10 @@ impl ClassicWake {
         let mut prev: Option<(u16, u16)> = None;
         let mut head_cov = 0u8;
         let mut last_tf: Option<((Instant, u32, bool), f32)> = None;
-        for s in &self.sparks {
+        let mut spark_idx = 0;
+        while spark_idx < self.sparks.len() {
+            let s = &self.sparks[spark_idx];
+            spark_idx += 1;
             let key = (s.born, s.life.to_bits(), s.typing);
             let tf = match last_tf {
                 Some((prev_key, cached)) if prev_key == key => cached,
@@ -802,7 +854,10 @@ impl ClassicWake {
         let straighten = (geom.cw as f32).max(chf) * 0.8;
         let clip = geom.beam_clip();
 
-        for r in &self.comet_runs[..live] {
+        let mut ri = 0;
+        while ri < live {
+            let r = &self.comet_runs[ri];
+            ri += 1;
             if r.len() < 2 {
                 let s0 = r[0];
                 push_rect(
@@ -858,9 +913,17 @@ impl ClassicWake {
         };
         let mut last: Option<(u32, bool, u32, u32)> = None;
         let mut lit = std::mem::take(&mut scratch.air);
-        for run in &self.comet_runs[..live] {
+        let mut ri = 0;
+        while ri < live {
+            let run = &self.comet_runs[ri];
+            ri += 1;
             crate::cursor_glow::air_lit(run, geom, &text, (air.is_some(), false), &mut lit);
-            for (s, &in_air) in run.iter().zip(&lit) {
+            let n_samples = run.len().min(lit.len());
+            let mut si = 0;
+            while si < n_samples {
+                let s = &run[si];
+                let in_air = lit[si];
+                si += 1;
                 let rgb = self.comet_color(cfg, s.pos);
                 let (bed_c, rail_c) = match last {
                     Some((prev, was_air, b, r)) if prev == rgb && was_air == in_air => (b, r),
@@ -908,13 +971,16 @@ impl ClassicWake {
         let straighten = (geom.cw as f32).max(chf) * 0.8;
         let clip = geom.beam_clip();
         let caret_cell = cur.map(|(cr, cc)| CursorGlow::caret_box(geom, cr, cc));
-        for (i, r) in self.air_runs[..n].iter().enumerate() {
+        let mut i = 0;
+        while i < n {
+            let r = &self.air_runs[i];
             let stub = if caret && i + 1 == n && matches!(r.as_slice(), [knee, _] if knee.cov == 0)
             {
                 caret_cell
             } else {
                 None
             };
+            i += 1;
             let from = out.mark();
             if r.len() < 2 {
                 let s0 = r[0];
@@ -1000,10 +1066,13 @@ impl ClassicWake {
         };
         let mut verts = std::mem::take(&mut self.light_verts);
         let mut last_ink: Option<(u32, u32)> = None;
-        for run in &self.comet_runs[..live] {
+        let mut ri = 0;
+        while ri < live {
             if under.laid() >= Self::MAX_QUADS {
                 break;
             }
+            let run = &self.comet_runs[ri];
+            ri += 1;
             verts.clear();
             let mut ink = |s: &CometSample| {
                 let raw = self.comet_color(cfg, s.pos);
@@ -1037,7 +1106,10 @@ impl ClassicWake {
                     let len2 = dx * dx + dy * dy;
                     let across_rows = ay != by && len2 > 0.0;
                     let inv_len2 = if across_rows { 1.0 / len2 } else { 0.0 };
-                    for s in run {
+                    let mut si = 0;
+                    while si < run.len() {
+                        let s = &run[si];
+                        si += 1;
                         let mut v = ink(s);
                         if across_rows {
                             let t =
@@ -1115,13 +1187,15 @@ impl ClassicWake {
         );
         let boost = self.typing_boost();
         let k_f = k as f32;
-        for layer in 0..k {
+        let mut layer = 0;
+        while layer < k {
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
             let grow = r * (k - layer) / k;
             let cov = (base_cov * (layer as f32 + 1.0) / k_f * fade * cfg.intensity * boost)
                 .min(255.0) as u8;
+            layer += 1;
             if cov == 0 {
                 continue;
             }
@@ -1237,7 +1311,31 @@ impl ClassicWake {
         let Some((ring, t, cov)) = self.ring_now(now, cfg) else {
             return;
         };
-        let premul = premul_rgb(cfg.accent, cov);
+        Self::ring_square(ring, t, premul_rgb(cfg.accent, cov), geom, out);
+    }
+
+    /// The light ring's own mark: the dark ring's square, laid over the paper in the accent's
+    /// ink under the over-text ceiling, as Water's light ripples are. The soft veil
+    /// ([`Self::emit_light_ring`]), capped to keep the theme's text legible, barely tints the
+    /// paper on its own.
+    fn emit_light_ring_rim(
+        &self,
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+        out: &mut Vec<GlowQuad>,
+    ) {
+        let Some((ring, t, cov)) = self.ring_now(now, cfg) else {
+            return;
+        };
+        let from = out.len();
+        Self::ring_square(ring, t, premul_rgb(0x00FF_FFFF, cov), geom, out);
+        let ink = InkRole::OverText.ink(cfg.accent);
+        reink_quads(&mut out[from..], LIGHT_INK_ALPHA_CAP as u8, |_| ink);
+    }
+
+    /// A ring's square outline at `t` of its life, growing from 0.6 to 1.6 rows about its cell.
+    fn ring_square(ring: Ring, t: f32, premul: u32, geom: Geom, out: &mut Vec<GlowQuad>) {
         let s = ((0.6 + 1.0 * t) * chf_of(geom)) as i32;
         let th = (geom.ch as i32 / 8).max(2);
         let (cx, cy) = geom.cell_center(ring.row, ring.col);
@@ -1951,7 +2049,27 @@ mod tests {
         let mut rig = Rig::default();
         rig.tick(Some((1, 4)), t0, &c, g);
         let fp = rig.tick(Some((4, 30)), ms(t0, 16), &c, g);
-        assert!(rig.out.is_empty(), "a light ground emits no additive quad");
+        // The ring's own square, laid in ink over the paper (r17 CA4: the veil alone changed
+        // some 20 px of a card by more than 32 levels).
+        assert!(!rig.out.is_empty(), "a light-ground landing lays its ring");
+        let (rx, ry) = g.cell_center(4, 30);
+        let s = (0.6 * g.ch as f32) as i32 + 1;
+        for q in &rig.out {
+            assert!(
+                q.alpha > 0 && f32::from(q.alpha) <= LIGHT_INK_ALPHA_CAP,
+                "a light ground emits no additive quad, and its ring stays under the over-text \
+                 ceiling: {q:?}"
+            );
+            let (x0, y0) = (i32::from(q.x), i32::from(q.y));
+            let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
+            assert!(
+                x0 >= rx as i32 - s - 1
+                    && x1 <= rx as i32 + s + 1
+                    && y0 >= ry as i32 - s - 1
+                    && y1 <= ry as i32 + s + 1,
+                "the ring's square stands about the landing: {q:?}"
+            );
+        }
         assert!(!rig.under.is_empty(), "a light-ground jump is visible");
         assert_ne!(fp, 0, "a frame of ink and veils alone still fingerprints");
         for q in &rig.under {

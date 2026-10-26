@@ -60,6 +60,13 @@ pub mod atomic_file;
 #[cfg(unix)]
 pub mod account;
 
+/// Test support (test and debug builds, macOS and Linux): the call a thread of this process sleeps in, as the kernel has it ([`asleep::asleep`]), which tells a thread queued for a file lock (`flock(2)`) from one that polls.
+#[cfg(all(
+    any(test, debug_assertions),
+    any(target_os = "macos", target_os = "linux")
+))]
+pub mod asleep;
+
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;
@@ -113,6 +120,9 @@ pub mod program_check;
 /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: a child that inherits nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;
 pub mod rand;
+/// Unix-only: one wait on two descriptors with no timeout, ended by whichever is readable, at its end or in error first, reading neither (the standby bridge's wait for its lock or its aterm's word, an [`exitwatch::ExitMoment`]'s for the exit or its cancel).
+#[cfg(unix)]
+pub mod ready;
 /// Unix-only: the process-wide reaper of children nobody else waits for (a dropped `spawnfd` child still running, a PTY shell past its deadline).
 #[cfg(unix)]
 pub mod reaper;

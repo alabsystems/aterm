@@ -808,3 +808,22 @@ src/seamless_carry.rs	a_name_the_seam_did_not_read_fails	seamless-carry-sweep
 src/seamless_carry.rs	a_sweep_that_read_no_planted_path_is_vacuous	seamless-carry-sweep	
 src/seamless_carry.rs	the_index_is_read_with_each_file_beside_it	seamless-carry-sweep	
 ```
+
+## 19. Added 2026-10-25: the login a Claude Code capture's header names
+
+Measuring Claude Code 2.1.310's lost logins needed labs with no `apiKeyHelper` (the key removed
+from the scratch settings) and with a dead scratch `.credentials.json`; `fixture_header` named
+every capture that was not under `claude --subscriber` as taken under "a fake `apiKeyHelper`
+key", so those captures' MEASURED headers said a login the lab did not launch with. The header
+now reads the launcher, the scratch settings and the scratch credentials file through
+`claude_login`. One new test, read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+verbs-claude-login	contract	verbs::claude_login, verbs::ClaudeLogin::phrase, verbs::fixture_header	∀ launcher, settings, stored: claude_login(launcher, settings, stored) = ClaudeLogin::OAuthToken if launcher contains `CLAUDE_CODE_OAUTH_TOKEN`; else ApiKeyHelper if J::parse(settings) is an object whose `apiKeyHelper` is a string; else StoredCredentials if stored; else NoLogin. Settings that do not parse, or name `apiKeyHelper` as a non-string, are no helper. The four logins' phrases are distinct, and fixture_header names exactly claude_login(the tab's claude.sh, the run's scratch settings, whether home/.claude/.credentials.json exists).phrase().	verbs.rs::a_header_names_the_login_the_lab_launched_with	JSON parsing, substring search, an enum with &'static str phrases	1,3
+```
+
+```tsv
+file	test	primary	also
+src/verbs.rs	a_header_names_the_login_the_lab_launched_with	verbs-claude-login	
+```

@@ -1080,5 +1080,20 @@ fn has_history(paths: &Paths) -> Result<bool> {
     )
 }
 
+/// Whether this installation keeps Commons control state for its default network: a claim, a
+/// pin, or control or application history, of any authority, or a `commons` directory that is
+/// a symlink (what it held cannot be told from here). A device key alone is not control state.
+/// Reads names only; creates and repairs nothing.
+/// # Errors
+/// One of those names could not be read.
+pub(crate) fn retains_control(paths: &Paths) -> Result<bool> {
+    Ok(
+        fsx::kind(&paths.dir.join("commons.claim"))? != fsx::Kind::Missing
+            || fsx::kind(&paths.dir.join("commons"))? == fsx::Kind::Symlink
+            || fsx::kind(&paths.dir.join("commons/default.pin"))? != fsx::Kind::Missing
+            || has_history(paths)?,
+    )
+}
+
 #[cfg(test)]
 mod tests;

@@ -443,6 +443,197 @@ fn migrate_active_tab_moves_view_to_next_window() {
         "closing the emptied source does NOT detach the already-moved view"
     );
     assert!(app.structural_invariants_ok());
+
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey};
+
+    if !crate::app_input::HARDCODED_SUPER_CHORDS {
+        return;
+    }
+    let mut ownership_failures = Vec::new();
+    for native in [false, true] {
+        for remaining_tab in [false, true] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            if native {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                if !remaining_tab {
+                    assert_eq!(
+                        app.apply_tab_cmd(crate::TabAction::Close(Some(0))),
+                        Ok((0, 1))
+                    );
+                }
+            } else if remaining_tab {
+                let session = app.next_session_id;
+                app.push_stub_tab(source, stub_session(session));
+            }
+            let moved = app.windows[&source].tab_set.active().unwrap().clone();
+            let moved_kind = *app.view_store.get(moved.focus).unwrap();
+            assert_eq!(
+                matches!(moved_kind, crate::tab_model::View::Native(_)),
+                native
+            );
+            let retained = app.windows[&source]
+                .tab_set
+                .tabs()
+                .iter()
+                .filter(|tab| tab.id != moved.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(!retained.is_empty(), remaining_tab);
+            let other_session = app.next_session_id;
+            let destination = app.insert_logical_window(stub_session(other_session), 40, 120);
+            app.frontmost_window = Some(destination);
+            app.sync_active_session();
+            let mut expected_destination = app.windows[&destination].tab_set.tabs().to_vec();
+            expected_destination.push(moved.clone());
+            let pool_before = app
+                .pool
+                .iter()
+                .map(|session| (session.id, app.pool.views(session.id)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            app.windows.get_mut(&source).unwrap().mods =
+                ModifiersState::SUPER | ModifiersState::SHIFT;
+
+            for state in [ElementState::Pressed, ElementState::Released] {
+                app.on_key(
+                    source,
+                    KeyEvent::synthetic_for_test(
+                        PhysicalKey::Code(KeyCode::KeyM),
+                        Key::Character("M".into()),
+                        None,
+                        KeyLocation::Standard,
+                        state,
+                        false,
+                    ),
+                );
+            }
+
+            let destination_state = app.windows.get(&destination);
+            for (correct, detail) in [
+                (
+                    destination_state.map(|ws| ws.tab_set.tabs())
+                        == Some(expected_destination.as_slice()),
+                    "the event window's exact tab must append after the destination's retained tabs",
+                ),
+                (
+                    destination_state.and_then(|ws| ws.tab_set.active_id()) == Some(moved.id),
+                    "the moved tab must be active at the destination",
+                ),
+                (
+                    app.frontmost_window == Some(destination),
+                    "focus must follow the moved tab to its destination",
+                ),
+                (
+                    if remaining_tab {
+                        app.windows.get(&source).map(|ws| ws.tab_set.tabs())
+                            == Some(retained.as_slice())
+                    } else {
+                        !app.windows.contains_key(&source)
+                    },
+                    "only an emptied event window may close; its other tabs must remain",
+                ),
+                (
+                    app.focused_session_id(destination) == moved_kind.terminal_session(),
+                    "the destination's input route must match the moved terminal or native view",
+                ),
+            ] {
+                if !correct {
+                    ownership_failures.push(format!(
+                        "native={native} remaining_tab={remaining_tab}: {detail}"
+                    ));
+                }
+            }
+            if let Some(session) = moved_kind.terminal_session() {
+                let terminal = term_lock(&app.pool.get(session).unwrap().term);
+                if (terminal.rows(), terminal.cols()) != (40, 120) {
+                    ownership_failures.push(format!(
+                        "native={native} remaining_tab={remaining_tab}: moved terminal did not take the destination grid"
+                    ));
+                }
+            }
+            assert_eq!(app.view_store.get(moved.focus), Some(&moved_kind));
+            assert_eq!(
+                app.pool
+                    .iter()
+                    .map(|session| (session.id, app.pool.views(session.id)))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                pool_before,
+                "migration preserves every pooled session and its view count"
+            );
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(ownership_failures.is_empty(), "{ownership_failures:#?}");
+}
+
+#[test]
+fn ledger_shortcut_exports_the_event_windows_session() {
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
+    };
+
+    let mut ownership_failures = Vec::new();
+    for configured in [true, false] {
+        if !configured && !crate::app_input::HARDCODED_SUPER_CHORDS {
+            continue;
+        }
+        let mut app = App::headless_for_test();
+        let source = WindowId(0);
+        let source_sid = app.pool.get(0).unwrap().ctx.self_id.as_str().to_string();
+        let other_session = app.next_session_id;
+        let other = app.insert_logical_window(stub_session(other_session), 24, 80);
+        let other_sid = app.pool.get(other_session).unwrap().ctx.self_id.as_str();
+        assert_ne!(source_sid, other_sid);
+        app.frontmost_window = Some(other);
+        app.sync_active_session();
+        let source_tabs = app.windows[&source].tab_set.clone();
+        let other_tabs = app.windows[&other].tab_set.clone();
+        app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+            &[("f4".to_string(), "open_ledger".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let (code, key, mods) = if configured {
+            (
+                KeyCode::F4,
+                Key::Named(NamedKey::F4),
+                ModifiersState::empty(),
+            )
+        } else {
+            (
+                KeyCode::KeyL,
+                Key::Character("L".into()),
+                ModifiersState::SUPER | ModifiersState::SHIFT,
+            )
+        };
+        app.windows.get_mut(&source).unwrap().mods = mods;
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_key(
+                source,
+                KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    key.clone(),
+                    None,
+                    KeyLocation::Standard,
+                    state,
+                    false,
+                ),
+            );
+        }
+        if app.last_ledger_plan.as_ref().map(|plan| plan.sid.as_str()) != Some(source_sid.as_str())
+        {
+            ownership_failures.push(format!(
+                "configured={configured}: ledger did not name the event window's session"
+            ));
+        }
+        assert_eq!(app.frontmost_window, Some(other));
+        assert_eq!(app.windows[&source].tab_set, source_tabs);
+        assert_eq!(app.windows[&other].tab_set, other_tabs);
+        assert!(app.structural_invariants_ok());
+    }
+    assert!(ownership_failures.is_empty(), "{ownership_failures:#?}");
 }
 
 #[test]
@@ -550,6 +741,1160 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
         "the last viewer leaving drops the session"
     );
     assert_eq!(app.pool.iter().count(), 0, "the pool is empty");
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_tab_window_commands_keep_their_source_through_commit() {
+    for (key, native) in [("n", false), ("N", true), ("o", false)] {
+        let mut app = App::headless_for_test();
+        let source = WindowId(0);
+        if native {
+            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        } else {
+            let session = app.next_session_id;
+            app.push_stub_tab(source, stub_session(session));
+        }
+        let source_tabs = app.windows[&source].tab_set.clone();
+        let target = source_tabs.active().unwrap().clone();
+        let target_kind = *app.view_store.get(target.focus).unwrap();
+        let sid_b = app.next_session_id;
+        let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+        let other_tabs = app.windows[&other].tab_set.clone();
+        let other_layouts = app.windows[&other].layouts.clone();
+        let other_content = app.windows[&other].front_content;
+        let other_terminal = |app: &App| {
+            let session = app.pool.get(sid_b).unwrap();
+            let terminal = term_lock(&session.term);
+            (
+                terminal.visible_content(),
+                terminal.content_seq(),
+                session.ctx.sink.input_epoch(),
+            )
+        };
+        let other_before = other_terminal(&app);
+        let config = app.native_config_service.snapshot();
+        let pool_before = app
+            .pool
+            .iter()
+            .map(|s| (s.id, app.pool.views(s.id)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let capture_front = if key == "o" { source } else { other };
+        app.frontmost_window = Some(capture_front);
+        app.sync_active_session();
+
+        app.incoming_handoff_pending = true;
+        let gate = crate::spawn::DeferredReaderGate::closed();
+        app.handoff_reader_gate = Some(gate.clone());
+        let dropped = app.tab_window_shortcut(source, key).unwrap();
+        assert!(
+            app.admit_wake_before_commit(crate::Wake::TabWindowCommand(dropped))
+                .is_none()
+        );
+        assert!(
+            app.handoff_committed_wakes.is_empty(),
+            "before Commit the command is dropped"
+        );
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(app.windows[&source].tab_set, source_tabs);
+
+        gate.release();
+        let command = app.tab_window_shortcut(source, key).unwrap();
+        assert!(
+            app.admit_wake_before_commit(crate::Wake::TabWindowCommand(command))
+                .is_none()
+        );
+        assert_eq!(app.handoff_committed_wakes.len(), 1);
+        assert_eq!(
+            app.frontmost_window,
+            Some(capture_front),
+            "capture and admission do not move focus"
+        );
+        app.frontmost_window = Some(other);
+        app.sync_active_session();
+        app.incoming_handoff_pending = false;
+        let crate::Wake::TabWindowCommand(held) = app.handoff_committed_wakes.pop().unwrap() else {
+            panic!("the actual structural wake was retained");
+        };
+        let created = app
+            .apply_tab_window_command_logical(held)
+            .expect("the retained source still owns its target");
+        assert!(created > other);
+        assert_eq!(
+            app.frontmost_window,
+            Some(created),
+            "successful commands front their new window"
+        );
+        let arrived = app.windows[&created].tab_set.active().unwrap();
+        if key.eq_ignore_ascii_case("n") {
+            assert_eq!(
+                arrived, &target,
+                "detach moves the exact stable tab and focused leaf"
+            );
+            assert_eq!(
+                app.windows[&source].tab_set.tabs(),
+                &source_tabs.tabs()[..1]
+            );
+            assert_eq!(
+                app.pool
+                    .iter()
+                    .map(|s| (s.id, app.pool.views(s.id)))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                pool_before
+            );
+        } else {
+            let session = target_kind.terminal_session().unwrap();
+            assert_ne!(arrived.id, target.id);
+            assert_ne!(
+                arrived.focus, target.focus,
+                "the shared session gets its own view identity"
+            );
+            assert_eq!(app.focused_session_id(created), Some(session));
+            assert_eq!(app.pool.views(session), Some(2));
+            assert_eq!(app.windows[&source].tab_set, source_tabs);
+            assert_eq!(
+                app.pool.iter().count(),
+                pool_before.len(),
+                "sharing creates no session"
+            );
+            assert_eq!(app.pool.views(sid_b), Some(1));
+        }
+        assert_eq!(app.view_store.get(target.focus), Some(&target_kind));
+        assert_eq!(app.windows[&other].tab_set, other_tabs);
+        assert_eq!(app.windows[&other].layouts, other_layouts);
+        assert_eq!(app.windows[&other].front_content, other_content);
+        assert_eq!(other_terminal(&app), other_before);
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_tab_window_commands_refuse_stale_source_content_without_effects() {
+    for key in ["n", "O"] {
+        for change in [
+            "source closed",
+            "active tab changed",
+            "focused leaf changed",
+        ] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            let session = app.next_session_id;
+            app.push_stub_tab(source, stub_session(session));
+            app.split_active_stub_tab(source);
+            let sid_b = app.next_session_id;
+            let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+            let command = app.tab_window_shortcut(source, key).unwrap();
+            app.incoming_handoff_pending = true;
+            let gate = crate::spawn::DeferredReaderGate::closed();
+            gate.release();
+            app.handoff_reader_gate = Some(gate);
+            assert!(
+                app.admit_wake_before_commit(crate::Wake::TabWindowCommand(command))
+                    .is_none()
+            );
+            assert_eq!(app.handoff_committed_wakes.len(), 1);
+
+            app.incoming_handoff_pending = false;
+            match change {
+                "source closed" => assert_eq!(app.close_window_logical(source), CloseOutcome::Stay),
+                "active tab changed" => app.switch_tab_in(source, 0),
+                "focused leaf changed" => {
+                    assert!(app.focus_pane_in(source, crate::pane::FocusDir::Left))
+                }
+                _ => unreachable!(),
+            }
+            let windows = |app: &App| {
+                app.windows
+                    .iter()
+                    .map(|(id, ws)| {
+                        (
+                            *id,
+                            (ws.tab_set.clone(), ws.layouts.clone(), ws.front_content),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let pool = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|s| {
+                        let terminal = term_lock(&s.term);
+                        (
+                            s.id,
+                            (
+                                app.pool.views(s.id),
+                                terminal.visible_content(),
+                                terminal.content_seq(),
+                                terminal.rows(),
+                                terminal.cols(),
+                                s.ctx.sink.input_epoch(),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before_windows = windows(&app);
+            let before_pool = pool(&app);
+            let before_views = app
+                .view_store
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let next = (app.next_window_id, app.next_session_id);
+            let config = app.native_config_service.snapshot();
+            assert_eq!(app.frontmost_window, Some(other));
+            let crate::Wake::TabWindowCommand(held) = app.handoff_committed_wakes.pop().unwrap()
+            else {
+                panic!("the actual structural wake was retained");
+            };
+            assert_eq!(
+                app.apply_tab_window_command_logical(held),
+                None,
+                "{key}: {change}"
+            );
+            assert_eq!(windows(&app), before_windows, "{key}: {change}");
+            assert_eq!(pool(&app), before_pool, "{key}: {change}");
+            assert_eq!(
+                app.view_store
+                    .iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                before_views
+            );
+            assert_eq!((app.next_window_id, app.next_session_id), next);
+            assert_eq!(app.frontmost_window, Some(other));
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert!(app.structural_invariants_ok());
+        }
+    }
+
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let command = app.tab_window_shortcut(WindowId(0), "o").unwrap();
+    let before = (
+        app.windows[&WindowId(0)].tab_set.clone(),
+        app.next_window_id,
+        app.pool.iter().count(),
+    );
+    assert_eq!(
+        app.apply_tab_window_command_logical(command),
+        None,
+        "a native page has no terminal session to share"
+    );
+    assert_eq!(
+        (
+            app.windows[&WindowId(0)].tab_set.clone(),
+            app.next_window_id,
+            app.pool.iter().count()
+        ),
+        before
+    );
+    assert!(app.tab_window_shortcut(WindowId(u64::MAX), "n").is_none());
+    assert!(app.tab_window_shortcut(WindowId(0), "x").is_none());
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn tab_window_command_rollback_restores_the_source_and_previous_front() {
+    for (key, native) in [("n", false), ("n", true), ("o", false)] {
+        let mut app = App::headless_for_test();
+        let source = WindowId(0);
+        if native {
+            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        } else {
+            let session = app.next_session_id;
+            app.push_stub_tab(source, stub_session(session));
+        }
+        let sid_b = app.next_session_id;
+        let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+        let source_tabs = app.windows[&source].tab_set.clone();
+        let other_tabs = app.windows[&other].tab_set.clone();
+        let source_front = (
+            app.windows[&source].front_content,
+            app.focused_session_id(source),
+            app.active_native_view(source),
+        );
+        let pool = |app: &App| {
+            app.pool
+                .iter()
+                .map(|s| (s.id, app.pool.views(s.id)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before_pool = pool(&app);
+        let before_views = app
+            .view_store
+            .iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let config = app.native_config_service.snapshot();
+        let command = app.tab_window_shortcut(source, key).unwrap();
+        let created = app.apply_tab_window_command_logical(command).unwrap();
+        assert_eq!(app.frontmost_window, Some(created));
+        assert!(app.windows.contains_key(&created));
+        app.rollback_tab_window_command(command, created, Some(other));
+        assert!(!app.windows.contains_key(&created));
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(app.windows[&source].tab_set, source_tabs);
+        assert_eq!(
+            (
+                app.windows[&source].front_content,
+                app.focused_session_id(source),
+                app.active_native_view(source)
+            ),
+            source_front,
+            "rollback republishes the source's cached terminal/native route"
+        );
+        assert_eq!(app.windows[&other].tab_set, other_tabs);
+        assert_eq!(app.frontmost_window, Some(other));
+        assert_eq!(
+            app.active_handle.lock().unwrap().as_ref().map(|s| s.id),
+            Some(sid_b),
+            "rollback restores the previous input owner, not the source"
+        );
+        assert_eq!(pool(&app), before_pool);
+        assert_eq!(
+            app.view_store
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            before_views
+        );
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[cfg(unix)]
+fn hold_tab_menu_action(
+    app: &mut App,
+    window: WindowId,
+    tab: crate::tab_model::TabId,
+    action: crate::menu::MenuAction,
+) {
+    app.incoming_handoff_pending = true;
+    let gate = crate::spawn::DeferredReaderGate::closed();
+    gate.release();
+    app.handoff_reader_gate = Some(gate);
+    assert!(
+        app.admit_wake_before_commit(crate::Wake::TabMenuAction {
+            window,
+            tab,
+            action
+        })
+        .is_none()
+    );
+    assert_eq!(app.handoff_committed_wakes.len(), 1);
+    app.incoming_handoff_pending = false;
+}
+
+#[cfg(unix)]
+fn tab_menu_metadata(app: &App, session: u64) -> (Option<String>, Option<String>, Vec<String>) {
+    let ctx = &app.pool.get(session).unwrap().ctx;
+    let metadata = ctx.meta.lock().unwrap();
+    let fields = (
+        metadata.presentation_value("title"),
+        metadata.presentation_value("role"),
+    );
+    drop(metadata);
+    let events = ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .since(None)
+        .filter(|event| event.kind == "meta-change")
+        .map(|event| event.payload.to_string())
+        .collect();
+    (fields.0, fields.1, events)
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_tab_menu_preflight_settles_only_the_named_source_rename() {
+    use crate::menu::MenuAction;
+    use crate::session_timeline::MetaField;
+
+    let mut violations = Vec::new();
+    for action in [
+        MenuAction::CloseTab,
+        MenuAction::SetRole,
+        MenuAction::HarnessLog,
+    ] {
+        for field in [MetaField::Title, MetaField::Role] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            app.tab_strip_rows = 1;
+            let target = app.windows[&source].tab_set.active_id().unwrap();
+            hold_tab_menu_action(&mut app, source, target, action);
+            let sid_b = app.next_session_id;
+            let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+            app.window_focus_event(source, false);
+            app.window_focus_event(other, true);
+            assert!(app.begin_session_meta_edit(source, target, field));
+            assert!(app.rename_field_edit(
+                source,
+                crate::app_search::SearchEdit::Insert("source draft".into())
+            ));
+            assert!(app.begin_active_session_rename(other));
+            assert!(app.rename_field_edit(
+                other,
+                crate::app_search::SearchEdit::Insert("other draft".into())
+            ));
+            assert_eq!(app.front_rename_edit(), Some(other));
+            let source_draft = app.windows[&source].rename_edit.clone();
+            let other_draft = app.windows[&other].rename_edit.clone();
+            assert!(!source_draft.as_ref().unwrap().text.is_empty());
+            assert!(!other_draft.as_ref().unwrap().text.is_empty());
+            let before_meta = (tab_menu_metadata(&app, 0), tab_menu_metadata(&app, sid_b));
+            let at = Instant::now();
+            for ws in app.windows.values_mut() {
+                ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
+                ws.fx.cursor_mut().trail.note_typed(at);
+                assert!(ws.fx.cursor().glow.move_licensed(at));
+                assert!(ws.fx.cursor().trail.move_licensed(at));
+            }
+            let terminals = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|session| {
+                        let terminal = term_lock(&session.term);
+                        (
+                            session.id,
+                            (
+                                terminal.visible_content(),
+                                terminal.content_seq(),
+                                session.ctx.sink.input_epoch(),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before_terminals = terminals(&app);
+            let focus_order = app.focus_order.clone();
+            let crate::Wake::TabMenuAction {
+                window,
+                tab,
+                action: delivered,
+            } = app.handoff_committed_wakes.pop().unwrap()
+            else {
+                panic!("tab menu wake retained");
+            };
+            assert_eq!((window, tab, delivered), (source, target, action));
+            assert_eq!(app.prepare_tab_menu_action(window, tab, delivered), Some(0));
+            let after_source = tab_menu_metadata(&app, 0);
+            let stored = if field == MetaField::Title {
+                &after_source.0
+            } else {
+                &after_source.1
+            };
+            if stored.as_deref() != Some("source draft")
+                || after_source.2.len() != before_meta.0.2.len() + 1
+            {
+                violations.push(format!(
+                    "{action:?}/{field:?}: source metadata was not committed exactly once"
+                ));
+            }
+            if app.windows[&source].rename_edit.is_some() {
+                violations.push(format!("{action:?}/{field:?}: source draft stayed open"));
+            }
+            if app.windows[&other].rename_edit != other_draft
+                || tab_menu_metadata(&app, sid_b) != before_meta.1
+            {
+                violations.push(format!(
+                    "{action:?}/{field:?}: unrelated front draft or metadata changed"
+                ));
+            }
+            assert!(!app.windows[&source].fx.cursor().glow.move_licensed(at));
+            assert!(!app.windows[&source].fx.cursor().trail.move_licensed(at));
+            if !app.windows[&other].fx.cursor().glow.move_licensed(at)
+                || !app.windows[&other].fx.cursor().trail.move_licensed(at)
+            {
+                violations.push(format!(
+                    "{action:?}/{field:?}: unrelated movement licence changed"
+                ));
+            }
+            assert_eq!(terminals(&app), before_terminals);
+            assert_eq!(app.frontmost_window, Some(other));
+            assert_eq!(app.focus_order, focus_order);
+            assert_eq!(
+                app.active_handle
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|session| session.id),
+                Some(sid_b)
+            );
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_tab_menu_preflight_preserves_replacement_drafts_and_licenses() {
+    use crate::menu::MenuAction;
+
+    let mut violations = Vec::new();
+    for action in [MenuAction::CopySessionId, MenuAction::CloseTab] {
+        for change in ["removed", "moved", "source closed"] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            app.tab_strip_rows = 1;
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            let target = app.windows[&source].tab_set.active_id().unwrap();
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            app.switch_tab_in(source, 1);
+            hold_tab_menu_action(&mut app, source, target, action);
+            let sid_b = app.next_session_id;
+            let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+            match change {
+                "removed" => assert!(!app.close_tab_at(source, 1)),
+                "moved" => {
+                    app.frontmost_window = Some(source);
+                    app.sync_active_session();
+                    let moved = app.detach_active_tab_logical().unwrap();
+                    assert_eq!(app.windows[&moved].tab_set.active_id(), Some(target));
+                }
+                "source closed" => assert_eq!(app.close_window_logical(source), CloseOutcome::Stay),
+                _ => unreachable!(),
+            }
+            app.window_focus_event(other, true);
+            assert_eq!(app.tab_index_for_id(source, target), None);
+            for window in app.windows.keys().copied().collect::<Vec<_>>() {
+                assert!(app.begin_active_session_rename(window));
+                assert!(app.rename_field_edit(
+                    window,
+                    crate::app_search::SearchEdit::Insert("unsubmitted replacement".into())
+                ));
+                assert!(
+                    !app.windows[&window]
+                        .rename_edit
+                        .as_ref()
+                        .unwrap()
+                        .text
+                        .is_empty()
+                );
+            }
+            assert_eq!(app.front_rename_edit(), Some(other));
+            let at = Instant::now();
+            for ws in app.windows.values_mut() {
+                ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
+                ws.fx.cursor_mut().trail.note_typed(at);
+                assert!(ws.fx.cursor().glow.move_licensed(at));
+                assert!(ws.fx.cursor().trail.move_licensed(at));
+            }
+            let windows = |app: &App| {
+                app.windows
+                    .iter()
+                    .map(|(id, ws)| {
+                        (
+                            *id,
+                            (
+                                ws.tab_set.clone(),
+                                ws.rename_edit.clone(),
+                                ws.fx.cursor().glow.move_licensed(at),
+                                ws.fx.cursor().trail.move_licensed(at),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let sessions = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|session| {
+                        let metadata = tab_menu_metadata(app, session.id);
+                        let terminal = term_lock(&session.term);
+                        (
+                            session.id,
+                            (
+                                terminal.visible_content(),
+                                terminal.content_seq(),
+                                session.ctx.sink.input_epoch(),
+                                metadata,
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before_windows = windows(&app);
+            let before_sessions = sessions(&app);
+            let focus_order = app.focus_order.clone();
+            let crate::Wake::TabMenuAction {
+                window,
+                tab,
+                action: delivered,
+            } = app.handoff_committed_wakes.pop().unwrap()
+            else {
+                panic!("tab menu wake retained");
+            };
+            assert_eq!((window, tab, delivered), (source, target, action));
+            assert_eq!(app.prepare_tab_menu_action(window, tab, delivered), None);
+            if windows(&app) != before_windows {
+                violations.push(format!(
+                    "{action:?}/{change}: stale target changed a draft, licence or window"
+                ));
+            }
+            if sessions(&app) != before_sessions {
+                violations.push(format!(
+                    "{action:?}/{change}: stale target changed metadata, logs or terminal input"
+                ));
+            }
+            assert_eq!(app.frontmost_window, Some(other));
+            assert_eq!(app.focus_order, focus_order);
+            assert_eq!(
+                app.active_handle
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|session| session.id),
+                Some(sid_b)
+            );
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_tab_menu_rename_preflight_is_idempotent_in_its_source_window() {
+    use crate::menu::MenuAction;
+    use crate::session_timeline::MetaField;
+
+    for field in [MetaField::Title, MetaField::Role] {
+        let mut app = App::headless_for_test();
+        let source = WindowId(0);
+        app.tab_strip_rows = 1;
+        let target = app.windows[&source].tab_set.active_id().unwrap();
+        hold_tab_menu_action(&mut app, source, target, MenuAction::RenameSession);
+        let sid_b = app.next_session_id;
+        let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+        app.window_focus_event(source, false);
+        app.window_focus_event(other, true);
+        assert!(app.begin_session_meta_edit(source, target, field));
+        assert!(app.rename_field_edit(
+            source,
+            crate::app_search::SearchEdit::Insert("source draft".into())
+        ));
+        assert!(app.begin_active_session_rename(other));
+        assert!(app.rename_field_edit(
+            other,
+            crate::app_search::SearchEdit::Insert("other draft".into())
+        ));
+        assert_eq!(app.front_rename_edit(), Some(other));
+        let drafts = (
+            app.windows[&source].rename_edit.clone(),
+            app.windows[&other].rename_edit.clone(),
+        );
+        let metadata = (tab_menu_metadata(&app, 0), tab_menu_metadata(&app, sid_b));
+        let at = Instant::now();
+        for ws in app.windows.values_mut() {
+            ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
+            ws.fx.cursor_mut().trail.note_typed(at);
+            assert!(ws.fx.cursor().glow.move_licensed(at));
+            assert!(ws.fx.cursor().trail.move_licensed(at));
+        }
+        let focus_order = app.focus_order.clone();
+        let crate::Wake::TabMenuAction {
+            window,
+            tab,
+            action,
+        } = app.handoff_committed_wakes.pop().unwrap()
+        else {
+            panic!("tab menu wake retained");
+        };
+        assert_eq!(app.prepare_tab_menu_action(window, tab, action), Some(0));
+        assert_eq!(
+            (
+                app.windows[&source].rename_edit.clone(),
+                app.windows[&other].rename_edit.clone()
+            ),
+            drafts
+        );
+        assert_eq!(
+            (tab_menu_metadata(&app, 0), tab_menu_metadata(&app, sid_b)),
+            metadata
+        );
+        assert!(!app.windows[&source].fx.cursor().glow.move_licensed(at));
+        assert!(!app.windows[&source].fx.cursor().trail.move_licensed(at));
+        assert!(app.windows[&other].fx.cursor().glow.move_licensed(at));
+        assert!(app.windows[&other].fx.cursor().trail.move_licensed(at));
+        assert_eq!(app.frontmost_window, Some(other));
+        assert_eq!(app.focus_order, focus_order);
+        assert_eq!(
+            app.active_handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|session| session.id),
+            Some(sid_b)
+        );
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_native_tab_select_and_close_follow_the_stable_source_tab() {
+    use crate::app_tabs::NativeTabCommand;
+
+    for native in [false, true] {
+        for close in [false, true] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            app.tab_strip_rows = 1;
+            if native {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            } else {
+                app.push_stub_tab(source, stub_session(app.next_session_id));
+            }
+            let target = app.windows[&source].tab_set.active().unwrap().clone();
+            let target_session = app
+                .view_store
+                .get(target.focus)
+                .copied()
+                .unwrap()
+                .terminal_session();
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            let sid_b = app.next_session_id;
+            let other = app.insert_logical_window(stub_session(sid_b), 40, 120);
+            let command = if close {
+                NativeTabCommand::Close(target.id)
+            } else {
+                NativeTabCommand::Select(target.id)
+            };
+            app.incoming_handoff_pending = true;
+            let gate = crate::spawn::DeferredReaderGate::closed();
+            gate.release();
+            app.handoff_reader_gate = Some(gate);
+            assert!(
+                app.admit_wake_before_commit(crate::Wake::NativeTabCommand {
+                    window: source,
+                    command
+                })
+                .is_none()
+            );
+            assert_eq!(app.handoff_committed_wakes.len(), 1);
+            app.move_tab(source, 0, 2);
+            assert_eq!(
+                app.tab_index_for_id(source, target.id),
+                Some(0),
+                "the old index now names another tab"
+            );
+            let reordered = app.windows[&source].tab_set.tabs().to_vec();
+            let source_active = app.windows[&source].tab_set.active_id();
+            let b_tab = app.windows[&other].tab_set.active_id().unwrap();
+            assert!(app.begin_session_rename(other, b_tab));
+            assert!(app.rename_field_edit(
+                other,
+                crate::app_search::SearchEdit::Insert("B draft".into())
+            ));
+            let b_before = (
+                app.windows[&other].tab_set.clone(),
+                app.windows[&other].layouts.clone(),
+                app.windows[&other].front_content,
+                app.windows[&other].rename_edit.clone(),
+            );
+            let b_terminal = |app: &App| {
+                let s = app.pool.get(sid_b).unwrap();
+                let t = term_lock(&s.term);
+                (
+                    t.visible_content(),
+                    t.content_seq(),
+                    s.ctx.sink.input_epoch(),
+                )
+            };
+            let b_bytes = b_terminal(&app);
+            let pool_before = app
+                .pool
+                .iter()
+                .map(|s| (s.id, app.pool.views(s.id)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let config = app.native_config_service.snapshot();
+            app.incoming_handoff_pending = false;
+            let crate::Wake::NativeTabCommand { window, command } =
+                app.handoff_committed_wakes.pop().unwrap()
+            else {
+                panic!("native tab wake retained");
+            };
+            assert_eq!(window, source);
+            assert!(app.apply_native_tab_command(window, command));
+            if close {
+                assert_eq!(
+                    app.windows[&source].tab_set.tabs(),
+                    reordered
+                        .iter()
+                        .filter(|tab| tab.id != target.id)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    app.windows[&source].tab_set.active_id(),
+                    source_active,
+                    "closing the targeted background tab preserves the active sibling"
+                );
+                assert!(
+                    !app.view_store.contains(target.focus),
+                    "the intended view closed"
+                );
+                if let Some(session) = target_session {
+                    assert!(app.pool.get(session).is_none());
+                }
+                let mut expected = pool_before;
+                if let Some(session) = target_session {
+                    expected.remove(&session);
+                }
+                assert_eq!(
+                    app.pool
+                        .iter()
+                        .map(|s| (s.id, app.pool.views(s.id)))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    expected
+                );
+            } else {
+                assert_eq!(app.windows[&source].tab_set.tabs(), reordered);
+                assert_eq!(app.windows[&source].tab_set.active_id(), Some(target.id));
+                assert_eq!(app.focused_session_id(source), target_session);
+                if native {
+                    assert_eq!(
+                        app.active_native_view(source).map(|(_, view)| view),
+                        Some(target.focus)
+                    );
+                }
+                assert_eq!(
+                    app.pool
+                        .iter()
+                        .map(|s| (s.id, app.pool.views(s.id)))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    pool_before
+                );
+            }
+            assert_eq!(
+                (
+                    app.windows[&other].tab_set.clone(),
+                    app.windows[&other].layouts.clone(),
+                    app.windows[&other].front_content,
+                    app.windows[&other].rename_edit.clone()
+                ),
+                b_before
+            );
+            assert_eq!(b_terminal(&app), b_bytes);
+            assert_eq!(app.frontmost_window, Some(other));
+            assert_eq!(
+                app.active_handle.lock().unwrap().as_ref().map(|s| s.id),
+                Some(sid_b)
+            );
+            assert!(!app.windows[&source].pending_close);
+            assert!(!app.windows[&other].pending_close);
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert!(app.structural_invariants_ok());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_native_tab_commands_preserve_replacement_drafts_and_licenses() {
+    use crate::app_tabs::NativeTabCommand;
+
+    for close in [false, true] {
+        for change in ["removed", "moved to another window", "source closed"] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            app.tab_strip_rows = 1;
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            let target = app.windows[&source].tab_set.active_id().unwrap();
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            app.switch_tab_in(source, 1);
+            let other = app.insert_logical_window(stub_session(app.next_session_id), 40, 120);
+            let command = if close {
+                NativeTabCommand::Close(target)
+            } else {
+                NativeTabCommand::Select(target)
+            };
+            app.incoming_handoff_pending = true;
+            let gate = crate::spawn::DeferredReaderGate::closed();
+            gate.release();
+            app.handoff_reader_gate = Some(gate);
+            assert!(
+                app.admit_wake_before_commit(crate::Wake::NativeTabCommand {
+                    window: source,
+                    command
+                })
+                .is_none()
+            );
+            app.incoming_handoff_pending = false;
+            match change {
+                "removed" => assert!(!app.close_tab_at(source, 1)),
+                "moved to another window" => {
+                    app.frontmost_window = Some(source);
+                    app.sync_active_session();
+                    let moved = app.detach_active_tab_logical().unwrap();
+                    assert_eq!(app.windows[&moved].tab_set.active_id(), Some(target));
+                    app.frontmost_window = Some(other);
+                    app.sync_active_session();
+                }
+                "source closed" => assert_eq!(app.close_window_logical(source), CloseOutcome::Stay),
+                _ => unreachable!(),
+            }
+            assert_eq!(app.tab_index_for_id(source, target), None);
+            for window in [source, other] {
+                if let Some(tab) = app
+                    .windows
+                    .get(&window)
+                    .and_then(|ws| ws.tab_set.active_id())
+                {
+                    assert!(app.begin_session_rename(window, tab));
+                    assert!(app.rename_field_edit(
+                        window,
+                        crate::app_search::SearchEdit::Insert("unsubmitted".into())
+                    ));
+                }
+            }
+            let at = Instant::now();
+            for ws in app.windows.values_mut() {
+                ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
+                ws.fx.cursor_mut().trail.note_typed(at);
+                assert!(ws.fx.cursor().glow.move_licensed(at));
+                assert!(ws.fx.cursor().trail.move_licensed(at));
+            }
+            let windows = |app: &App| {
+                app.windows
+                    .iter()
+                    .map(|(id, ws)| {
+                        (
+                            *id,
+                            (
+                                ws.tab_set.clone(),
+                                ws.layouts.clone(),
+                                ws.front_content,
+                                ws.rename_edit.clone(),
+                                ws.pending_close,
+                                ws.fx.cursor().glow.move_licensed(at),
+                                ws.fx.cursor().trail.move_licensed(at),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let pool = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|s| {
+                        let title = s.ctx.meta.lock().unwrap().presentation_value("title");
+                        let t = term_lock(&s.term);
+                        (
+                            s.id,
+                            (
+                                app.pool.views(s.id),
+                                t.visible_content(),
+                                t.content_seq(),
+                                s.ctx.sink.input_epoch(),
+                                title,
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before_windows = windows(&app);
+            let before_pool = pool(&app);
+            let views = app
+                .view_store
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let next = (app.next_window_id, app.next_session_id);
+            let config = app.native_config_service.snapshot();
+            let crate::Wake::NativeTabCommand { window, command } =
+                app.handoff_committed_wakes.pop().unwrap()
+            else {
+                panic!("native tab wake retained");
+            };
+            assert!(
+                !app.apply_native_tab_command(window, command),
+                "close={close}, {change}"
+            );
+            assert_eq!(
+                windows(&app),
+                before_windows,
+                "stale commands do not settle a replacement's draft or fence its licence"
+            );
+            assert_eq!(pool(&app), before_pool);
+            assert_eq!(
+                app.view_store
+                    .iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                views
+            );
+            assert_eq!((app.next_window_id, app.next_session_id), next);
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert_eq!(app.frontmost_window, Some(other));
+            assert!(app.structural_invariants_ok());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_tab_drags_require_the_original_adjacent_pair_in_its_window() {
+    use crate::app_tabs::TabStripOrigin;
+
+    for forward in [false, true] {
+        for change in [
+            "live pair",
+            "neighbor removed",
+            "source removed",
+            "separated",
+            "reversed",
+        ] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            app.tab_strip_rows = 1;
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            app.push_stub_tab(source, stub_session(app.next_session_id));
+            let tabs = app.windows[&source].tab_set.tabs();
+            let origin = TabStripOrigin {
+                tab: tabs[1].id,
+                previous: Some(tabs[0].id),
+                next: Some(tabs[2].id),
+            };
+            let command = origin.drag(forward).unwrap();
+            let other = app.insert_logical_window(stub_session(app.next_session_id), 40, 120);
+            app.push_stub_tab(other, stub_session(app.next_session_id));
+            app.incoming_handoff_pending = true;
+            let gate = crate::spawn::DeferredReaderGate::closed();
+            gate.release();
+            app.handoff_reader_gate = Some(gate);
+            assert!(
+                app.admit_wake_before_commit(crate::Wake::NativeTabCommand {
+                    window: source,
+                    command
+                })
+                .is_none()
+            );
+            app.incoming_handoff_pending = false;
+            match change {
+                "neighbor removed" => {
+                    assert!(!app.close_tab_at(source, if forward { 2 } else { 0 }))
+                }
+                "source removed" => assert!(!app.close_tab_at(source, 1)),
+                "reversed" => app.move_tab(source, 1, if forward { 2 } else { 0 }),
+                "live pair" | "separated" => {
+                    app.push_stub_tab(source, stub_session(app.next_session_id));
+                    if change == "separated" {
+                        app.move_tab(source, 3, if forward { 2 } else { 1 });
+                    } else if forward {
+                        app.move_tab(source, 0, 3);
+                    } else {
+                        app.move_tab(source, 3, 0);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            for window in [source, other] {
+                let tab = app.windows[&window].tab_set.active_id().unwrap();
+                assert!(app.begin_session_rename(window, tab));
+                assert!(app.rename_field_edit(
+                    window,
+                    crate::app_search::SearchEdit::Insert("draft".into())
+                ));
+            }
+            let at = Instant::now();
+            for ws in app.windows.values_mut() {
+                ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
+                ws.fx.cursor_mut().trail.note_typed(at);
+                assert!(ws.fx.cursor().glow.move_licensed(at));
+                assert!(ws.fx.cursor().trail.move_licensed(at));
+            }
+            let snapshot = |app: &App| {
+                app.windows
+                    .iter()
+                    .map(|(id, ws)| {
+                        (
+                            *id,
+                            (
+                                ws.tab_set.clone(),
+                                ws.layouts.clone(),
+                                ws.front_content,
+                                ws.rename_edit.clone(),
+                                ws.fx.cursor().glow.move_licensed(at),
+                                ws.fx.cursor().trail.move_licensed(at),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot(&app);
+            let sessions = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|s| {
+                        let t = term_lock(&s.term);
+                        (
+                            s.id,
+                            (
+                                app.pool.views(s.id),
+                                t.visible_content(),
+                                t.content_seq(),
+                                s.ctx.sink.input_epoch(),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let pool_before = sessions(&app);
+            let config = app.native_config_service.snapshot();
+            let source_active = app.windows[&source].tab_set.active_id();
+            let mut expected_order = app.windows[&source]
+                .tab_set
+                .tabs()
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>();
+            if change == "live pair" {
+                let index = expected_order
+                    .iter()
+                    .position(|id| *id == origin.tab)
+                    .unwrap();
+                expected_order.swap(index, if forward { index + 1 } else { index - 1 });
+            }
+            let crate::Wake::NativeTabCommand { window, command } =
+                app.handoff_committed_wakes.pop().unwrap()
+            else {
+                panic!("native tab wake retained");
+            };
+            assert_eq!(
+                app.apply_native_tab_command(window, command),
+                change == "live pair",
+                "forward={forward}, {change}"
+            );
+            if change == "live pair" {
+                assert_eq!(
+                    app.windows[&source]
+                        .tab_set
+                        .tabs()
+                        .iter()
+                        .map(|tab| tab.id)
+                        .collect::<Vec<_>>(),
+                    expected_order
+                );
+                assert_eq!(app.windows[&source].tab_set.active_id(), source_active);
+                assert!(
+                    app.windows[&source].rename_edit.is_none(),
+                    "an accepted native action settles its source edit"
+                );
+                assert_eq!(snapshot(&app)[&other], before[&other]);
+            } else {
+                assert_eq!(
+                    snapshot(&app),
+                    before,
+                    "stale pair refuses before draft or licence side effects"
+                );
+            }
+            assert_eq!(sessions(&app), pool_before);
+            assert_eq!(app.frontmost_window, Some(other));
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert!(app.structural_invariants_ok());
+        }
+    }
 }
 
 #[test]
@@ -866,6 +2211,141 @@ fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
         "a top/bottom split of a 24-row pane is fine"
     );
     assert!(app.structural_invariants_ok());
+
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
+    };
+
+    let layout = |app: &App, window: WindowId| {
+        let ws = &app.windows[&window];
+        (ws.layouts.clone(), ws.tab_set.clone(), ws.tabs.active)
+    };
+    let mut ownership_failures = Vec::new();
+    for direction in [pane::SplitDir::Vertical, pane::SplitDir::Horizontal] {
+        let (need_rows, need_cols) = pane::split_needs(direction);
+        let tight = match direction {
+            pane::SplitDir::Vertical => (24, need_cols - 1),
+            pane::SplitDir::Horizontal => (need_rows - 1, 80),
+        };
+        let roomy = (24, 80);
+        assert!(!pane::split_fits_in(direction, tight.0, tight.1));
+        assert!(pane::split_fits_in(direction, roomy.0, roomy.1));
+        for configured in [true, false] {
+            if !configured && !crate::app_input::HARDCODED_SUPER_CHORDS {
+                continue;
+            }
+            for source_blocked in [true, false] {
+                let mut app = App::headless_for_test();
+                let (source, other) = (WindowId(0), WindowId(1));
+                let (source_size, other_size) = if source_blocked {
+                    (tight, roomy)
+                } else {
+                    (roomy, tight)
+                };
+                if source_blocked {
+                    assert!(app.apply_term_resize(source, source_size.0, source_size.1));
+                }
+                app.install_window_state(other, stub_session(99), other_size.0, other_size.1);
+                assert_eq!(app.frontmost_window, Some(other));
+                assert_eq!(app.focused_pane_cells(source), Some(source_size));
+                assert_eq!(app.focused_pane_cells(other), Some(other_size));
+                let action = match direction {
+                    pane::SplitDir::Vertical => "split_vertical",
+                    pane::SplitDir::Horizontal => "split_horizontal",
+                };
+                app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+                    &[("f4".to_string(), action.to_string())]
+                        .into_iter()
+                        .collect(),
+                ));
+                let (code, key, mods) = if configured {
+                    (
+                        KeyCode::F4,
+                        Key::Named(NamedKey::F4),
+                        ModifiersState::empty(),
+                    )
+                } else {
+                    (
+                        KeyCode::KeyD,
+                        Key::Character("d".into()),
+                        if direction == pane::SplitDir::Horizontal {
+                            ModifiersState::SUPER | ModifiersState::SHIFT
+                        } else {
+                            ModifiersState::SUPER
+                        },
+                    )
+                };
+                app.windows.get_mut(&source).unwrap().mods = mods;
+                let source_before = layout(&app, source);
+                let other_before = layout(&app, other);
+                let sessions: Vec<_> = app.pool.iter().map(|session| session.id).collect();
+                let next_id = app.next_session_id;
+                let messages = app
+                    .messages
+                    .live_rows()
+                    .map(|row| row.msg.clone())
+                    .collect::<Vec<_>>();
+                assert!(
+                    app.proxy.is_none(),
+                    "the keyboard proof never launches a shell"
+                );
+                for state in [ElementState::Pressed, ElementState::Released] {
+                    app.on_key(
+                        source,
+                        KeyEvent::synthetic_for_test(
+                            PhysicalKey::Code(code),
+                            key.clone(),
+                            None,
+                            KeyLocation::Standard,
+                            state,
+                            false,
+                        ),
+                    );
+                }
+
+                if source_blocked {
+                    let have = format!("{}\u{00d7}{}", source_size.1, source_size.0);
+                    let need = format!("{need_cols}\u{00d7}{need_rows}");
+                    if !app.messages.live_rows().any(|row| {
+                        row.msg.severity == aterm_messages::Severity::Error
+                            && row.msg.detail.first().is_some_and(|detail| {
+                                detail.contains(&have) && detail.contains(&need)
+                            })
+                    }) {
+                        ownership_failures.push(format!(
+                            "{direction:?} configured={configured}: no refusal for the source pane's {have} allocation"
+                        ));
+                    }
+                } else if app
+                    .messages
+                    .live_rows()
+                    .map(|row| row.msg.clone())
+                    .collect::<Vec<_>>()
+                    != messages
+                {
+                    ownership_failures.push(format!(
+                        "{direction:?} configured={configured}: the valid source was refused using the front window's allocation"
+                    ));
+                }
+                assert_eq!(layout(&app, source), source_before);
+                assert_eq!(layout(&app, other), other_before);
+                assert_eq!(
+                    app.pool
+                        .iter()
+                        .map(|session| session.id)
+                        .collect::<Vec<_>>(),
+                    sessions
+                );
+                assert_eq!(app.next_session_id, next_id);
+                assert_eq!(app.frontmost_window, Some(other));
+                assert_eq!(app.focused_pane_cells(source), Some(source_size));
+                assert_eq!(app.focused_pane_cells(other), Some(other_size));
+                assert!(app.structural_invariants_ok());
+            }
+        }
+    }
+    assert!(ownership_failures.is_empty(), "{ownership_failures:#?}");
 }
 
 #[test]

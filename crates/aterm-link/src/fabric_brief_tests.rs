@@ -467,7 +467,9 @@ fn a_window_below_the_retained_floor_reads_from_it() {
         })
         .collect();
     assert!(offs.len() >= 2, "{offs:?}");
-    broker.retain_before(offs[1]).expect("the cut");
+    broker
+        .retain_before_carrying_state(offs[1])
+        .expect("the cut");
 
     let mut c = cfg();
     c.broker = sock.to_string_lossy().into_owned();

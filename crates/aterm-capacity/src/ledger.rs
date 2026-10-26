@@ -12,11 +12,12 @@ use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use aterm_json::{Map, Value};
 use aterm_toolchain::record_lock::RecordLock;
 
-use crate::Need;
+use crate::{Need, Patience};
 
 /// The most of a claim file any reader takes, and where its lock's range starts on Windows: the record lies before it.
 pub const RECORD_MAX: u64 = 16 * 1024;
@@ -88,6 +89,9 @@ pub struct Record {
     /// ([`crate::Claim::wrote`]): the free space a waiter reads has already lost it, so its
     /// disk reservation is the need less this. `None` where its holder measures nothing.
     pub wrote: Option<u64>,
+    /// When a quiet claim was first next for the quiet machine, unix ms: short of the load with
+    /// no other quiet claim held or waiting ahead of it. Its [`Patience`] counts from here.
+    pub next_ms: Option<u64>,
 }
 
 impl Record {
@@ -116,6 +120,13 @@ impl Record {
         o.insert("cores".to_owned(), Value::from(self.need.cores));
         o.insert("disk".to_owned(), Value::from(self.need.disk));
         o.insert("quiet".to_owned(), Value::from(self.need.quiet));
+        if let Some(p) = self.need.patience {
+            let mut q = Map::new();
+            q.insert("reserve_ms".to_owned(), Value::from(millis(p.reserve)));
+            q.insert("start_ms".to_owned(), Value::from(millis(p.start)));
+            q.insert("hold_ms".to_owned(), Value::from(millis(p.hold)));
+            o.insert("patience".to_owned(), Value::Object(q));
+        }
         o.insert(
             "volume".to_owned(),
             Value::from(self.need.path.as_deref().and_then(Path::to_str).map(cut)),
@@ -129,6 +140,35 @@ impl Record {
         o.insert("admitted_ms".to_owned(), Value::from(held.admitted_ms));
         o.insert("cores".to_owned(), Value::from(held.cores));
         line_of(o)
+    }
+
+    /// The line a quiet waiter adds when it is first next for the quiet machine ([`Self::next_ms`]).
+    pub(crate) fn next_line(ms: u64) -> String {
+        let mut o = Map::new();
+        o.insert("next_ms".to_owned(), Value::from(ms));
+        line_of(o)
+    }
+
+    /// How much longer, at most, this quiet claim holds back claimed work that asked after it, at
+    /// `now` (unix ms): once next for its [`Patience::reserve`], while it waits, and for its
+    /// [`Patience::hold`] after it starts, which it does by its [`Patience::start`]. `None` when
+    /// it reserves nothing now: no patience, never next, not next long enough, admitted before
+    /// it reserved, or its reservation spent.
+    #[must_use]
+    pub fn reserves(&self, now: u64) -> Option<Duration> {
+        let p = self.need.patience?;
+        self.need.quiet?;
+        let next = self.next_ms?;
+        let from = next.saturating_add(millis(p.reserve));
+        let bound = next.saturating_add(millis(p.start));
+        let started = match self.held {
+            Some(h) if h.admitted_ms < from => return None,
+            Some(h) => h.admitted_ms.min(bound),
+            None if now < from => return None,
+            None => bound,
+        };
+        let end = started.saturating_add(millis(p.hold));
+        (now < end).then(|| Duration::from_millis(end - now))
     }
 
     /// The line a credit adds ([`crate::Claim::credit`]): the latest one read whole stands.
@@ -159,6 +199,13 @@ impl Record {
         }
         let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
         let start_ms = num(&head, "start_ms")?;
+        let patience = head.get("patience").and_then(|p| {
+            Some(Patience {
+                reserve: Duration::from_millis(num(p, "reserve_ms")?),
+                start: Duration::from_millis(num(p, "start_ms")?),
+                hold: Duration::from_millis(num(p, "hold_ms")?),
+            })
+        });
         let need = Need {
             what: head.get("what").and_then(Value::as_str)?.to_owned(),
             mem: num(&head, "mem")?,
@@ -166,20 +213,26 @@ impl Record {
             cores: u32::try_from(num(&head, "cores")?).ok()?,
             disk: num(&head, "disk")?,
             quiet: head.get("quiet").and_then(Value::as_f64),
+            patience,
             path: head
                 .get("volume")
                 .and_then(Value::as_str)
                 .map(PathBuf::from),
             checkout: None,
         };
+        // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
+        // the admission, then the measured writes' (written over in place) and each credit,
+        // whichever came first.
+        let after: Vec<Value> = lines
+            .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+            .collect();
         let held = held.then(|| {
-            lines
-                .next()
-                .and_then(|l| aterm_json::from_str::<Value>(l).ok())
-                .and_then(|v| {
+            after
+                .iter()
+                .find_map(|v| {
                     Some(Held {
-                        admitted_ms: num(&v, "admitted_ms")?,
-                        cores: u32::try_from(num(&v, "cores")?).ok()?,
+                        admitted_ms: num(v, "admitted_ms")?,
+                        cores: u32::try_from(num(v, "cores")?).ok()?,
                     })
                 })
                 .unwrap_or(Held {
@@ -187,11 +240,7 @@ impl Record {
                     cores: need.cores,
                 })
         });
-        // The lines after the admission, in the order they were added: the measured writes'
-        // (written over in place) and each credit, whichever came first.
-        let after: Vec<Value> = lines
-            .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
-            .collect();
+        let next_ms = after.iter().find_map(|v| num(v, "next_ms"));
         let credit = after
             .iter()
             .filter_map(|v| {
@@ -217,8 +266,14 @@ impl Record {
             held,
             credit,
             wrote,
+            next_ms,
         })
     }
+}
+
+/// `d` in whole milliseconds, as a record keeps it.
+pub(crate) fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// `text` cut on a character boundary short of [`TEXT_MAX`] bytes.
@@ -248,6 +303,9 @@ fn next_seq() -> u64 {
 pub(crate) struct Laid {
     lock: RecordLock,
     path: PathBuf,
+    /// The grant its file has written ([`Ledger::admit`]): a rename that failed after it is tried
+    /// again under that grant, without writing another.
+    granted: Option<Held>,
 }
 
 impl Laid {
@@ -390,6 +448,7 @@ impl Ledger {
             held: None,
             credit: Vec::new(),
             wrote: None,
+            next_ms: None,
         };
         let stem = record.stem();
         let taking = self.dir.join(format!("{stem}{TAKING}"));
@@ -415,18 +474,29 @@ impl Ledger {
                 });
             }
         };
-        let mut laid = Laid { lock, path: taking };
+        let mut laid = Laid {
+            lock,
+            path: taking,
+            granted: None,
+        };
         laid.lock.write_all(record.head_line().as_bytes())?;
         std::fs::rename(&laid.path, &path)?;
         laid.path = path;
         Ok((record, laid))
     }
 
-    /// Mark `laid` admitted with `held`: its grant written, then the file named a claim.
+    /// Mark `laid` admitted with `held`: its grant written, then the file named a claim. The grant
+    /// is written once: where the rename failed (the file removed meanwhile), the next call tries
+    /// it again under the grant the file has, whatever `held` it is given.
     pub(crate) fn admit(&self, laid: &mut Laid, record: &mut Record, held: Held) -> io::Result<()> {
-        if record.held.is_none() {
-            laid.lock.write_all(Record::held_line(held).as_bytes())?;
-        }
+        let held = match laid.granted {
+            Some(first) => first,
+            None => {
+                laid.lock.write_all(Record::held_line(held).as_bytes())?;
+                laid.granted = Some(held);
+                held
+            }
+        };
         let claim = self.dir.join(format!("{}{CLAIM}", record.stem()));
         std::fs::rename(&laid.path, &claim)?;
         laid.path = claim;

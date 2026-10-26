@@ -898,16 +898,28 @@ impl MatrixRain {
             default_bg as u8,
         ];
         let last_col = cols.saturating_sub(1);
-        for r in 0..rows {
+        let mut r = 0;
+        while r < rows {
             if line_sizes.get(r) != Some(&LineSize::SingleWidth) {
                 self.clear_occ_span(r, 0, last_col);
             }
+            r += 1;
         }
 
-        for r in 0..rows {
-            let row_cells: &[RenderCell] = cells.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let mut r = 0;
+        while r < rows {
+            let row_cells: &[RenderCell] = if r < cells.len() {
+                cells[r].as_slice()
+            } else {
+                &[]
+            };
             let mut run: Option<(usize, usize)> = None;
-            for (c, cell) in row_cells.iter().enumerate().take(cols) {
+            let col_limit = row_cells.len().min(cols);
+            let mut c = 0;
+            while c < col_limit {
+                let cell = &row_cells[c];
+                c += 1;
+                let col = c - 1;
                 let meaningful = cell.ch != ' '
                     || cell.wide
                     || cell.underline != UnderlineStyle::None
@@ -917,7 +929,7 @@ impl MatrixRain {
                 if !meaningful {
                     continue;
                 }
-                let (lo, hi) = (c.saturating_sub(1), c + 1);
+                let (lo, hi) = (col.saturating_sub(1), col + 1);
                 match run {
                     Some((start, end)) if lo <= end + 1 => run = Some((start, hi)),
                     Some((start, end)) => {
@@ -931,12 +943,16 @@ impl MatrixRain {
                 self.clear_occ_neighborhood_span(r, start, end);
             }
             if let Some(spans) = images.get(r) {
-                for (c, _) in spans {
-                    if *c < cols {
-                        self.clear_occ_neighborhood_span(r, c.saturating_sub(1), *c + 1);
+                let mut si = 0;
+                while si < spans.len() {
+                    let c = spans[si].0;
+                    if c < cols {
+                        self.clear_occ_neighborhood_span(r, c.saturating_sub(1), c + 1);
                     }
+                    si += 1;
                 }
             }
+            r += 1;
         }
         self.mask_framed_regions(cells, rows, cols);
         self.have_scanned = true;
@@ -962,14 +978,19 @@ impl MatrixRain {
         }
         self.material_sample_needed = false;
         self.material_scratch.clear();
-        'rows: for r in (0..rows).rev() {
+        let mut r = rows;
+        'rows: while r > 0 {
+            r -= 1;
             if Self::row_banded(r, rows, cursor, hidden_band) {
                 continue;
             }
             let Some(row_cells) = cells.get(r) else {
                 continue;
             };
-            for cell in row_cells.iter().rev() {
+            let mut ci = row_cells.len();
+            while ci > 0 {
+                ci -= 1;
+                let cell = &row_cells[ci];
                 if cell.ch != ' ' && !cell.wide && rom::material_bitmap(cell.ch).is_some() {
                     self.material_scratch.push(cell.ch);
                     if self.material_scratch.len() == MATERIAL_CAP {
@@ -987,7 +1008,9 @@ impl MatrixRain {
         debug_assert!(n <= MATERIAL_CAP);
 
         self.material_slots_scratch.clear();
-        for index in (0..n).rev() {
+        let mut index = n;
+        while index > 0 {
+            index -= 1;
             let ch = self.material_scratch[index];
             if !self.material_slots_scratch.contains(&ch) {
                 self.material_slots_scratch.push(ch);
@@ -1021,11 +1044,13 @@ impl MatrixRain {
         }
 
         self.material.clear();
-        for index in 0..n {
+        let mut index = 0;
+        while index < n {
             let ch = self.material_scratch[index];
             if let Ok(slot) = self.material_chars.binary_search(&ch) {
                 self.material.push(slot as u8);
             }
+            index += 1;
         }
     }
 
@@ -1502,8 +1527,11 @@ impl MatrixRain {
         let fp = self.field_params(rows);
         self.col_params_cache.clear();
         self.col_params_cache.reserve(usize::from(cols));
-        for c in 0..u32::from(cols) {
+        let cols_u32 = u32::from(cols);
+        let mut c = 0;
+        while c < cols_u32 {
             self.col_params_cache.push(col_params(&fp, c));
+            c += 1;
         }
     }
 
@@ -1526,18 +1554,25 @@ impl MatrixRain {
         }
         self.row_starts.clear();
         self.row_starts.resize(rows + 1, 0);
-        for q in quads.iter() {
-            self.row_starts[usize::from(q.row) + 1] += 1;
+        let mut qi = 0;
+        while qi < quads.len() {
+            self.row_starts[usize::from(quads[qi].row) + 1] += 1;
+            qi += 1;
         }
-        for r in 0..rows {
+        let mut r = 0;
+        while r < rows {
             self.row_starts[r + 1] += self.row_starts[r];
+            r += 1;
         }
         self.sort_scratch.clear();
         self.sort_scratch.extend_from_slice(quads);
-        for q in &self.sort_scratch {
+        let mut si = 0;
+        while si < self.sort_scratch.len() {
+            let q = self.sort_scratch[si];
             let slot = &mut self.row_starts[usize::from(q.row)];
-            quads[*slot as usize] = *q;
+            quads[*slot as usize] = q;
             *slot += 1;
+            si += 1;
         }
     }
 
@@ -1568,8 +1603,10 @@ impl MatrixRain {
             glyph_epoch: glyph_epoch(self.tick, self.mq),
             dither_epoch: dither_epoch(self.tick, self.dq),
         };
-        for i in 0..self.col_order.len() {
+        let mut i = 0;
+        while i < self.col_order.len() {
             let col = self.col_order[i];
+            i += 1;
             let q0 = quads.len();
             let h0 = self.halo_cands.len();
             if !self.emit_column(&ctx, col, quads) {
@@ -1598,19 +1635,22 @@ impl MatrixRain {
         let r_hi = cv.head_row.min(rows.saturating_sub(1));
         let r_lo = cv.head_row.saturating_sub(cp.l);
         if r_lo <= r_hi && r_lo < rows {
-            for r in r_lo..=r_hi {
+            let mut r = r_lo;
+            while r <= r_hi {
+                let cur_r = r;
+                r += 1;
                 // Cheapest reject first: an occupied cell needs no trail math.
-                if !self.occ_bit(r, col) {
+                if !self.occ_bit(cur_r, col) {
                     continue;
                 }
-                let Some(lvl0) = trail_level(&cp, cv.eff_tick, cv.k, r) else {
+                let Some(lvl0) = trail_level(&cp, cv.eff_tick, cv.k, cur_r) else {
                     continue;
                 };
-                let is_head = r == cv.head_row;
-                let Some(lvl) = self.drained_level(ctx, &cp, lvl0, r, is_head) else {
+                let is_head = cur_r == cv.head_row;
+                let Some(lvl) = self.drained_level(ctx, &cp, lvl0, cur_r, is_head) else {
                     continue;
                 };
-                if !self.cell_unmasked(r, col, ctx.input) {
+                if !self.cell_unmasked(cur_r, col, ctx.input) {
                     continue;
                 }
                 if quads.len() >= ctx.cap {
@@ -1629,9 +1669,9 @@ impl MatrixRain {
                         ms
                     }
                 };
-                quads.push(self.cell_quad(ctx, col, r, lvl, head_flash, ms));
+                quads.push(self.cell_quad(ctx, col, cur_r, lvl, head_flash, ms));
                 if head_flash && cv.bright {
-                    self.halo_cands.push((r as u16, col));
+                    self.halo_cands.push((cur_r as u16, col));
                 }
             }
         }
@@ -1797,7 +1837,8 @@ impl MatrixRain {
         self.frame_candidates.clear();
         self.frame_regions.clear();
 
-        for r in 0..rows {
+        let mut r = 0;
+        while r < rows {
             let row = if r < cells.len() {
                 cells[r].as_slice()
             } else {
@@ -1806,18 +1847,23 @@ impl MatrixRain {
 
             let mut prefix_built = false;
             let mut write = 0usize;
-            for i in 0..self.frame_candidates.len() {
+            let cand_len = self.frame_candidates.len();
+            let mut i = 0;
+            while i < cand_len {
                 let mut candidate = self.frame_candidates[i];
+                i += 1;
                 let left = cell_ch_at(row, candidate.left);
                 let right = cell_ch_at(row, candidate.right);
                 if frame_bottom_left(left) && frame_bottom_right(right) && r > candidate.top + 1 {
                     if !prefix_built {
                         self.frame_horizontal_prefix.resize(cols + 1, 0);
                         self.frame_horizontal_prefix[0] = 0;
-                        for col in 0..cols {
+                        let mut col = 0;
+                        while col < cols {
                             self.frame_horizontal_prefix[col + 1] = self.frame_horizontal_prefix
                                 [col]
                                 + usize::from(frame_horizontal(cell_ch_at(row, col)));
+                            col += 1;
                         }
                         prefix_built = true;
                     }
@@ -1861,13 +1907,17 @@ impl MatrixRain {
 
             let mut open_left = None;
             let mut has_horizontal = false;
-            for (col, cell) in row.iter().enumerate().take(cols) {
-                let ch = cell.ch;
+            let col_limit = row.len().min(cols);
+            let mut col = 0;
+            while col < col_limit {
+                let ch = row[col].ch;
+                let cur_col = col;
+                col += 1;
                 if !in_box_drawing_block(ch) {
                     continue;
                 }
                 if frame_top_left(ch) {
-                    open_left = Some(col);
+                    open_left = Some(cur_col);
                     has_horizontal = false;
                     continue;
                 }
@@ -1877,7 +1927,7 @@ impl MatrixRain {
                 if frame_horizontal(ch) {
                     has_horizontal = true;
                 }
-                if col >= left + 2 && frame_top_right(ch) {
+                if cur_col >= left + 2 && frame_top_right(ch) {
                     if has_horizontal {
                         if self.frame_candidates.len() == MAX_FRAME_CANDIDATES {
                             self.occ.fill(0);
@@ -1888,7 +1938,7 @@ impl MatrixRain {
                         self.frame_candidates.push(FrameCandidate {
                             top: r,
                             left,
-                            right: col,
+                            right: cur_col,
                             side_rows: 0,
                             gap_rows: 0,
                         });
@@ -1897,13 +1947,18 @@ impl MatrixRain {
                     has_horizontal = false;
                 }
             }
+            r += 1;
         }
 
-        for i in 0..self.frame_regions.len() {
+        let mut i = 0;
+        while i < self.frame_regions.len() {
             let region = self.frame_regions[i];
-            for row in region.top + 1..region.bottom {
+            let mut row = region.top + 1;
+            while row < region.bottom {
                 self.clear_occ_span(row, region.left + 1, region.right.saturating_sub(1));
+                row += 1;
             }
+            i += 1;
         }
     }
 
@@ -2035,7 +2090,9 @@ impl MatrixRain {
         let ch_plus_half = ch + half_ch;
         let len = self.halo_cands.len();
         let mut idx = (self.tick / u64::from(self.dq.max(1))) as usize % len;
-        for _ in 0..len {
+        let mut step = 0;
+        while step < len {
+            step += 1;
             let (r, c) = self.halo_cands[idx];
             idx += 1;
             if idx == len {

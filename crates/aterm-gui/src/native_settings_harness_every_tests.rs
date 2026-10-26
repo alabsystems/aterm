@@ -687,9 +687,10 @@ fn the_every_rows_open_timer_shows_its_last_choice_to_a_press_and_to_the_keyboar
     let cut_at_the_seat = std::sync::Mutex::new(0_usize);
     let whole_at_the_seat = std::sync::Mutex::new(0_usize);
     at_each_text_scale(&[2.0], "the every row's open timer", |scale| {
-        // The lab's narrow page's list rooms, once under a heading row at 504 × 600, 628, 660
-        // and 900pt, now its toolbar holds the page's title.
-        for height in [527.0, 555.0, 587.0, 827.0] {
+        // The lab's narrow windows, 504 wide: 628 and 900 are where opening the Timer re-padded
+        // the SESSIONS card under a seat that already drew `at 18:00` whole (audit r17 CA3),
+        // 664, 700 and 740 where it did so by other amounts, 600 where the seat cuts it.
+        for height in [600.0, 628.0, 664.0, 700.0, 740.0, 900.0] {
             let control = height > 800.0;
             let context = format!("{scale}\u{d7} 504\u{d7}{height}");
             let cx = view_cx_at(504.0, height);

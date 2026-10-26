@@ -729,6 +729,39 @@ fn a_leads_pid_version_reaches_the_split_from_the_sweep() {
     }
 }
 
+/// A reading's wall clock is read before its sweep lists the processes, so a process born at
+/// or after one reading's is in no earlier sweep, which is how the reap credit tells one born
+/// since the last reading (counted from its birth) from one older (counted from its first).
+#[test]
+fn a_readings_wall_clock_is_read_before_its_sweep() {
+    thread_local! {
+        static LISTED_MS: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+    const STAMPED: CoalProbe = CoalProbe {
+        sweep: |_, _| {
+            // A stamp taken once the sweep is done reads past the moment it began.
+            let began = unix_ms_now();
+            let hang = Instant::now() + Duration::from_secs(60);
+            while unix_ms_now() <= began {
+                assert!(Instant::now() < hang, "the wall clock stood still a minute");
+                std::thread::yield_now();
+            }
+            LISTED_MS.set(Some(began));
+            Some(aterm_sysprobe::Sweep::default())
+        },
+        ..STAND_IN
+    };
+    let mut reader = Reader::new(Arc::default());
+    reader.split = SplitReader::new(STAMPED, gauge());
+    let snap = reader.read(&bars());
+    let listed = LISTED_MS.get().expect("swept");
+    assert!(
+        snap.at_unix_ms <= listed,
+        "stamped {} once the sweep that began at {listed} was done",
+        snap.at_unix_ms
+    );
+}
+
 #[test]
 fn the_coalitions_reach_the_model_field_for_field() {
     let s = coal_sample(CoalitionRead {
@@ -1268,6 +1301,7 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
             shell_pid: 99_999,
             label: "Tab 1".into(),
             program: String::new(),
+            tab_id: None,
         }],
         ..live.clone()
     };

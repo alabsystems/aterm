@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use aterm_models_misc::{
-    end_by_proof_model, explain_honesty_model, scope_balance_model, stuck_verdict_model,
+    end_by_proof_model, explain_honesty_model, reap_credit_model, scope_balance_model,
+    stuck_verdict_model,
 };
 use aterm_spec::{interp, verify};
 
@@ -249,5 +250,61 @@ fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
     assert_eq!(
         s["none"], 0,
         "a core no coalition held is never nothing needed"
+    );
+}
+
+#[test]
+fn the_reap_credit_holds_and_each_law_has_its_own_mutant() {
+    let model = reap_credit_model();
+    assert!(
+        interp::violated_invariants(&interp::with_buggy(&model, 0)).is_empty(),
+        "the healthy ledger"
+    );
+    for (dial, laws) in [
+        (1, &["RateNeverBelowLive", "TabCounterMonotone"][..]),
+        (2, &["RateNeverBelowLive", "ZombieReadOnce"]),
+        (3, &["PendingDropsOnForeignReap"]),
+        (4, &["CountedOnce"]),
+    ] {
+        let broken = interp::violated_invariants(&interp::with_buggy(&model, dial));
+        assert_eq!(broken.into_iter().collect::<Vec<_>>(), laws, "Buggy {dial}");
+    }
+
+    // m works, moves to launchd, works on, is read there as a zombie and reaped by launchd:
+    // the counter keeps all of it, and nothing waits against p.
+    let orphan = [
+        "MWork",
+        "Tick",
+        "Reparent",
+        "MWork",
+        "Tick",
+        "Exit",
+        "Tick",
+        "ForeignReap",
+        "Tick",
+    ];
+    let mut s = model.init_state();
+    for action in orphan {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!((s["c"], s["w"], s["pend"], s["fr"]), (2, 2, 0, 1));
+    let naive = interp::with_buggy(&model, 1);
+    let mut s = naive.init_state();
+    for action in orphan {
+        assert!(naive.fire(action, &mut s), "{action}");
+    }
+    assert_eq!((s["cp"], s["c"]), (2, 0), "the naive sum dips to nothing");
+
+    // m works and is reaped by p, whose reaped time holds it: counted once, through pending.
+    let mut s = model.init_state();
+    for action in ["MWork", "MChildWork", "Tick", "Exit", "PReap"] {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!((s["c"], s["pk"]), (2, 2));
+    assert!(model.fire("Tick", &mut s));
+    assert_eq!(
+        (s["c"], s["pend"], s["pendp"]),
+        (2, 0, 0),
+        "absorbed at once"
     );
 }

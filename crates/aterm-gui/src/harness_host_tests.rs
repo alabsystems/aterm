@@ -6601,6 +6601,8 @@ impl Acting {
                 task_fact: Acts::inert().task_fact,
                 wakes: Acts::inert().wakes,
                 wake_told: Acts::inert().wake_told,
+                wake_claim: Acts::inert().wake_claim,
+                wake_release: Acts::inert().wake_release,
                 wakes_left: Acts::inert().wakes_left,
                 resume: Arc::new(move |_, _, carry: CarryPoint| {
                     a9.landing.lock().unwrap().push(carry.land);
@@ -8454,7 +8456,7 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
             true
         };
         account_wall_at(
-            (&home, &state, roster),
+            (&home, &accounts::Store::at(&state), roster),
             "s-live",
             &agent,
             &settled,
@@ -8524,6 +8526,9 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
 const ACCT_NOW: i64 = 1_790_000_000;
 const ACCT_TALK_A: &str = "0badf00d-1111-2222-3333-444455556666";
 const ACCT_TALK_B: &str = "0badf00d-1111-2222-3333-444455557777";
+
+#[path = "harness_account_read_tests.rs"]
+mod account_read_tests;
 
 struct Accts {
     tmp: aterm_tempfile::TempDir,
@@ -12064,25 +12069,78 @@ fn an_outcome_the_lock_kept_out_comes_before_any_claim() {
 }
 
 #[test]
-fn a_claim_whose_transaction_failed_after_its_save_is_ended() {
+fn an_unreadable_claim_history_refuses_without_spending_the_attempt() {
     let (sid, other_sid) = ("s-reset-saved", "s-reset-saved-2");
     let ask = reset_ask(None);
     let a = Accts::new();
     walled(&a, sid, ACCT_TALK_A, LONG_WALL);
     walled(&a, other_sid, ACCT_TALK_B, LONG_WALL);
-    // A missing snapshot beside a ledger is unknown. Start from readable state
-    // so the ledger directory fails the append after the claim was saved.
-    a.store().save(&a.state()).unwrap();
-    std::fs::create_dir_all(a.store().ledger_path()).unwrap();
+    // History is read before state and history are admitted together. A bad
+    // history path must leave the readable snapshot and the attempt untouched.
+    let before = a.state();
+    a.store().save(&before).unwrap();
+    let store = a.store();
+    let state = std::fs::read(store.state_file()).unwrap();
+    let ledger = store.ledger_path();
+    std::fs::create_dir_all(&ledger).unwrap();
     let idle = a.worker(sid, &resetting());
     assert_eq!(idle.reset_claimed(&ask, &mut None), Err(NoReset::State));
-    let claim = a.state().reset.expect("saved before its row failed");
-    assert_eq!(claim.sid, sid);
-    assert_eq!(claim.done.as_deref(), Some("kept"), "ended at once");
+    assert!(a.state().reset.is_none(), "no claim was admitted");
+    assert_eq!(a.state(), before, "the refused claim changed no state");
+    assert_eq!(std::fs::read(store.state_file()).unwrap(), state);
+    assert!(!store.dir.join("sync-commit.json").exists());
     let other = a.worker(other_sid, &resetting());
+    assert_eq!(other.reset_claimed(&ask, &mut None), Err(NoReset::State));
+    assert_eq!(a.state(), before, "another worker cannot bypass the fault");
+    std::fs::rename(&ledger, ledger.with_extension("obstruction")).unwrap();
+    assert!(other.reset_claimed(&ask, &mut None).is_ok());
+    let claim = a
+        .state()
+        .reset
+        .expect("the repaired store admits the next caller");
+    assert_eq!(claim.sid, other_sid);
+    assert!(claim.done.is_none());
+    assert_eq!(idle.reset_claimed(&ask, &mut None), Err(NoReset::Held));
+}
+
+#[test]
+fn a_claim_whose_transaction_failed_after_its_save_lets_no_second_reset_run() {
+    let (sid, other_sid) = ("s-reset-fenced", "s-reset-fenced-2");
+    let ask = reset_ask(None);
+    let a = Accts::new();
+    walled(&a, sid, ACCT_TALK_A, LONG_WALL);
+    walled(&a, other_sid, ACCT_TALK_B, LONG_WALL);
+    // The claim's receipt is saved, then its publication stops at the state's witness (a
+    // directory in its place): the claim is committed, and every read waits for its recovery.
+    let store = a.store();
+    store.save(&a.state()).unwrap();
+    let witness = store.state_witness_file();
+    let saved = a.tmp.path().join("saved-witness");
+    std::fs::rename(&witness, &saved).unwrap();
+    std::fs::create_dir(&witness).unwrap();
+    let idle = a.worker(sid, &resetting());
+    assert_eq!(idle.reset_claimed(&ask, &mut None), Err(NoReset::State));
+    assert!(store.load(a.clock()).is_err(), "fenced until it recovers");
+    let other = a.worker(other_sid, &resetting());
+    assert!(
+        other.reset_claimed(&ask, &mut None).is_err(),
+        "no go while the claim is unread"
+    );
+    std::fs::remove_dir(&witness).unwrap();
+    std::fs::rename(&saved, &witness).unwrap();
     assert_eq!(
         other.reset_claimed(&ask, &mut None),
-        Err(NoReset::Attempted)
+        Err(NoReset::Held),
+        "the recovered claim holds the wall"
+    );
+    let claim = a.state().reset.expect("recovered as its session's");
+    assert_eq!(claim.sid, sid);
+    a.now
+        .store(ACCT_NOW + accounts::RESET_CLAIM_S, Ordering::SeqCst);
+    assert_eq!(
+        other.reset_claimed(&ask, &mut None),
+        Err(NoReset::Attempted),
+        "the wall had its one attempt"
     );
 }
 
@@ -14175,11 +14233,11 @@ fn the_usage_recorder_reads_the_roster_through_this_machines_logins() {
     std::fs::write(store.logins_file(), "{\"schema\":9}").unwrap();
     assert_eq!(
         usage_roster(Some(&path), &store, (false, true), now).err(),
-        Some("roster-refused")
+        Some("account-state-refused")
     );
     assert_eq!(
         usage_roster(Some(&path), &store, (false, false), now).err(),
-        Some("off")
+        Some("account-state-refused")
     );
 }
 
@@ -14360,6 +14418,120 @@ fn the_hosts_own_look_is_made_at_its_start_and_after_every_wake() {
     assert_eq!(activations(), 1, "a wait the shutdown ended hands nothing");
     assert_eq!(accounts_told(&notes).len(), 3, "and looks at nothing");
     host.shutdown_and_join();
+}
+
+/// A ROW NAMED IN THE ROSTER'S FILE IS NEWS OF THE ACCOUNTS: no store transaction wakes the host
+/// for a row written into `accounts.toml` by hand or by `aterm harness accounts add`, so the
+/// activation thread reads the file after every wait, and a file that reads
+/// otherwise than at its last look counts one news ([`IdleHost::account_stamp`]), on which a
+/// session's loop decides again the dialog of its own `/login` over the login the row names.
+/// CONTROLS: waits over an unchanged file count none, and a removed roster is news too. A roster
+/// path that is a FIFO with no writer, or a link to a device, is read as a file that does not
+/// read (`accounts::roster_text`), never blocked on or read without end: the thread's loop runs
+/// on under a one-minute hang detector, the FIFO is news once, and the device, read the same,
+/// is none.
+#[test]
+fn a_row_named_in_the_roster_file_is_news_of_the_accounts() {
+    let a = Accts::new();
+    let host = HostHandle::start(at_wall_only(), false, true, a.hooks());
+    let (done, finished) = std::sync::mpsc::channel();
+    let (looped, acct) = (host.clone(), Arc::clone(&a));
+    let worker = std::thread::spawn(move || {
+        let news = || looped.shared.switches.accounts_news.load(Ordering::SeqCst);
+        let mut waits = 0;
+        activation_loop(&looped, || {
+            waits += 1;
+            match waits {
+                1 => assert_eq!(news(), 0, "the first look records the file"),
+                2 => {
+                    assert_eq!(news(), 0, "an unchanged roster: no news");
+                    let mut rows = std::fs::read_to_string(acct.roster_path()).unwrap();
+                    rows.push_str(
+                        "\n[[account]]\nlabel = \"late\"\nclass = \"dedicated\"\nemail = \
+                         \"late@example.com\"\n",
+                    );
+                    std::fs::write(acct.roster_path(), rows).unwrap();
+                }
+                3 => assert_eq!(news(), 1, "the row named after the last look"),
+                4 => {
+                    assert_eq!(news(), 1, "read again unchanged: no more news");
+                    std::fs::remove_file(acct.roster_path()).unwrap();
+                }
+                #[cfg(unix)]
+                5 => {
+                    assert_eq!(news(), 2, "a roster removed is news too");
+                    let name =
+                        std::ffi::CString::new(acct.roster_path().as_os_str().as_encoded_bytes())
+                            .unwrap();
+                    // SAFETY: one NUL-terminated scratch path; mkfifo retains no pointer.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                #[cfg(unix)]
+                6 => {
+                    assert_eq!(news(), 3, "a FIFO is a roster that does not read: news");
+                    std::fs::remove_file(acct.roster_path()).unwrap();
+                    std::os::unix::fs::symlink("/dev/zero", acct.roster_path()).unwrap();
+                }
+                _ => {
+                    let want = if cfg!(unix) { 3 } else { 2 };
+                    assert_eq!(news(), want, "a device reads as the FIFO did: no news");
+                    looped.shared.lock().shutting_down = true;
+                }
+            }
+            false
+        });
+        let _ = done.send(waits);
+    });
+    match finished.recv_timeout(aterm_spec::wait::MUST_HAPPEN) {
+        Ok(waits) => {
+            worker.join().unwrap();
+            assert_eq!(waits, if cfg!(unix) { 7 } else { 5 });
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("the loop ended uncounted"));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("not within a minute: the activation thread blocked on the roster's read");
+        }
+    }
+    host.shutdown_and_join();
+}
+
+/// CONTROL OF THE ABOVE: a host that reads no roster (muted, as a headless instance the policy
+/// does not supervise is; or the accounts, the logins and the usage notes all off) opens no roster
+/// file at all, its seat never asked for one, and an edit of the file there is no news.
+#[test]
+fn a_host_that_reads_no_roster_takes_no_news_of_it() {
+    let mut off = on();
+    off.set("accounts", "off").unwrap();
+    off.set("logins", "off").unwrap();
+    let mut unsupervised = on();
+    unsupervised.set("headless", "false").unwrap();
+    for (cfg, headless, why) in [(off, false, "off"), (unsupervised, true, "muted")] {
+        let a = Accts::new();
+        let host = HostHandle::start(cfg, headless, true, a.hooks());
+        assert_eq!(host.shared.switches.mute(), why == "muted", "{why}");
+        a.at_seat_read(1, |a| a.said.lock().unwrap().push("seat".to_string()));
+        let news = || host.shared.switches.accounts_news.load(Ordering::SeqCst);
+        let mut waits = 0;
+        activation_loop(&host, || {
+            waits += 1;
+            match waits {
+                1 => std::fs::write(a.roster_path(), "").unwrap(),
+                2 => std::fs::remove_file(a.roster_path()).unwrap(),
+                _ => host.shared.lock().shutting_down = true,
+            }
+            false
+        });
+        assert_eq!(waits, 3, "{why}");
+        assert_eq!(news(), 0, "{why}: no news of a roster nothing reads");
+        assert_eq!(
+            a.said(),
+            Vec::<String>::new(),
+            "{why}: no seat asked for, no file read"
+        );
+        host.shutdown_and_join();
+    }
 }
 
 struct ActivationShutdown(HostHandle);
@@ -15636,6 +15808,102 @@ fn a_workers_book_read_and_tells_name_its_own_session() {
     assert_eq!(
         *asked.lock().unwrap(),
         ["wakes s-book", "told s-book #2 9 await", "left s-book"]
+    );
+}
+
+/// A worker's wake claim asks its session's book under the owner's `prompt` alone (the GUI's own
+/// gate of W1, beside the loop's grant), with the refusal the worker judges for every fact line;
+/// its release names its own session. NEGATIVE CONTROL: under `observe` the claim is
+/// `refused:off` and the book is never asked.
+#[test]
+fn a_workers_wake_claim_asks_its_book_under_prompt_alone() {
+    use aterm_agent::supervise::occupancy::{PaceRefusal, WakeClaim, WakeDoor, WakeFacts};
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    let (claimed, released) = (Arc::clone(&asked), Arc::clone(&asked));
+    hooks.acts = Acts {
+        wake_claim: Arc::new(move |sid, ord, episode, door, refused| {
+            claimed.lock().unwrap().push(format!(
+                "claim {sid} #{ord} {episode} {} {}",
+                door.word(),
+                refused.map_or("-", PaceRefusal::word)
+            ));
+            WakeClaim::Granted(WakeFacts::default())
+        }),
+        wake_release: Arc::new(move |sid, ord, episode, door| {
+            released
+                .lock()
+                .unwrap()
+                .push(format!("release {sid} #{ord} {episode} {}", door.word()));
+        }),
+        ..Acts::inert()
+    };
+    let idle = idle_host("s-claim", Program::Claude, switched(&on()), hooks);
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Observe);
+    assert_eq!(
+        idle.wake_claim(1, 9, WakeDoor::Break),
+        WakeClaim::Refused(PaceRefusal::Off)
+    );
+    assert_eq!(*asked.lock().unwrap(), Vec::<String>::new(), "CONTROL");
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Prompt);
+    assert!(idle.wake_claim(1, 9, WakeDoor::Break).lets());
+    idle.wake_release(1, 9, WakeDoor::Break);
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Observe);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["claim s-claim #1 9 break -", "release s-claim #1 9 break"]
+    );
+}
+
+/// A worker's wake claim carries the slice-1 refusal it judges for every fact line
+/// ([`a_fact_lines_pace_is_refused_where_the_worker_takes_no_step`]'s): a worker beside a proven
+/// self-claim, one whose host owns the turn end, and one owed a relaunch's carry-on each pass
+/// their refusal to the book's claim, which gives the claim back on it. NEGATIVE CONTROL: a plain
+/// worker passes none.
+#[test]
+fn a_workers_wake_claim_carries_the_refusal_it_judges_for_every_fact_line() {
+    use aterm_agent::supervise::occupancy::{PaceRefusal, WakeClaim, WakeDoor, WakeFacts};
+    let asked: Arc<Mutex<Vec<Option<PaceRefusal>>>> = Arc::default();
+    let worker = |agent: Program| {
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        let seen = Arc::clone(&asked);
+        hooks.acts = Acts {
+            wake_claim: Arc::new(move |_, _, _, _, refused| {
+                seen.lock().unwrap().push(refused);
+                WakeClaim::Granted(WakeFacts::default())
+            }),
+            ..Acts::inert()
+        };
+        idle_host("s-claim", agent, switched(&on()), hooks)
+    };
+    let plain = worker(Program::Claude);
+    let beside = worker(Program::Claude);
+    *beside.beside.lock().unwrap() = Some("a self-claim".to_string());
+    let owns = worker(Program::Claude);
+    owns.owns.store(true, Ordering::SeqCst);
+    assert!(owns.owns_turn_end());
+    assert!(host_carries_relaunch(Program::Agy));
+    let carry = worker(Program::Agy);
+    with_kept_of(&carry.kept, |k| k.carry_asked = true);
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Prompt);
+    for idle in [&plain, &beside, &owns, &carry] {
+        let _ = idle.wake_claim(1, 9, WakeDoor::Break);
+    }
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Observe);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [
+            None,
+            Some(PaceRefusal::Beside),
+            Some(PaceRefusal::Owns),
+            Some(PaceRefusal::CarryOwed),
+        ]
     );
 }
 
@@ -26787,6 +27055,39 @@ fn a_struck_login_signed_back_in_at_the_tab_is_ok_again() {
     );
 }
 
+/// A roster row's login has no method for the `/login` picker to pick: the loop backs out of its
+/// picker (`PickerGate::Roster`), and a row named after the picker's gate was read leaves the
+/// picker unpicked, never opens its browser sign-in. Control: the same subscription profile on a
+/// login no row renews is a subscription.
+#[test]
+fn a_renewable_login_has_no_method_to_pick() {
+    let a = Accts::new();
+    std::fs::write(
+        a.tmp.path().join("home").join(".claude.json"),
+        r#"{"oauthAccount":{"organizationType":"claude_max"}}"#,
+    )
+    .unwrap();
+    a.spawn("s-pick", ACCT_TALK_A, "main");
+    let idle = a.worker("s-pick", &on());
+    assert_eq!(idle.login_label(), None, "the fixture's rows have no email");
+    assert_eq!(
+        idle.login_method(),
+        Some(aterm_phase::LoginMethod::Subscription),
+        "CONTROL: a login no row renews, on a known plan"
+    );
+    std::fs::write(
+        a.roster_path(),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"owner@example.com\"\n",
+    )
+    .unwrap();
+    assert_eq!(idle.login_label().as_deref(), Some("main"), "renewable now");
+    assert_eq!(
+        idle.login_method(),
+        None,
+        "a roster row's login is never picked"
+    );
+}
+
 #[test]
 fn a_renewable_login_s_end_is_recorded_and_its_renewal_followed() {
     let a = Accts::new();
@@ -26995,6 +27296,122 @@ fn renew_own(a: &Accts) -> String {
         })
         .expect("renewed");
     staging
+}
+
+#[test]
+fn the_normal_roster_read_recovers_lifecycle_records_and_preserves_conflicts() {
+    for case in 0..5 {
+        let a = Accts::new();
+        let login = renew_own(&a);
+        let store = a.store();
+        let row = a.roster().row("main").unwrap().clone();
+        let raw = std::fs::read(a.roster_path()).unwrap();
+        let who = accounts::ProcessLogin {
+            login: Some(login),
+            default_home: true,
+            stored_login: true,
+        };
+        let witness = store.logins_witness_file();
+        let retained = witness.with_extension("retained");
+        std::fs::rename(&witness, &retained).unwrap();
+        std::fs::create_dir(&witness).unwrap();
+        assert!(
+            store
+                .observe_login_within(
+                    &[],
+                    a.clock(),
+                    accounts::LoginObservation {
+                        roster_path: &a.roster_path(),
+                        row: &row,
+                        who: &who,
+                    },
+                    |state, logins| Ok(accounts::note_login_end(state, logins, "main", a.clock()))
+                )
+                .is_err()
+        );
+        assert!(store.load(a.clock()).is_err());
+        std::fs::rename(&witness, witness.with_extension("obstruction")).unwrap();
+        std::fs::rename(&retained, &witness).unwrap();
+        let seat = AccountSeat {
+            roster: Some(a.roster_path()),
+            state: a.state_root(),
+            home: a.tmp.path().join("home"),
+            now: a.clock(),
+            ladder: &[],
+        };
+        match case {
+            1 => {
+                std::fs::write(
+                    a.roster_path(),
+                    OWN_ROW.replace("owner@example.com", "changed@example.com"),
+                )
+                .unwrap();
+            }
+            2 => std::fs::write(a.roster_path(), "[[broken").unwrap(),
+            3 => std::fs::rename(a.roster_path(), a.roster_path().with_extension("retained"))
+                .unwrap(),
+            _ => {}
+        }
+        let held = (case == 4).then(|| store.acquire().unwrap());
+        let records = || {
+            [
+                store.state_file(),
+                store.logins_file(),
+                store.ledger_path(),
+                store.dir.join("sync-commit.json"),
+                a.roster_path(),
+            ]
+            .map(|path| std::fs::read(path).ok())
+        };
+        if case > 0 {
+            let before = records();
+            assert!(matches!(
+                roster_read(&seat),
+                Err(RosterUnread::LoginsUnread)
+            ));
+            assert_eq!(records(), before, "case {case}");
+            assert!(
+                account_roster_or_own(&seat).is_none(),
+                "no own-login fallback"
+            );
+        }
+        drop(held);
+        if (1..4).contains(&case) {
+            std::fs::write(a.roster_path(), &raw).unwrap();
+        }
+        let roster = roster_read(&seat).expect("normal read completes the admitted observation");
+        assert_eq!(roster.row("main"), Some(&row));
+        assert_eq!(
+            store.load(a.clock()).unwrap().0.account("main").auth,
+            accounts::Auth::SignedOut
+        );
+        assert_eq!(
+            store
+                .load_logins(a.clock())
+                .unwrap()
+                .0
+                .get("main")
+                .unwrap()
+                .ended_at,
+            Some(a.clock())
+        );
+        assert_eq!(
+            store
+                .tail(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == accounts::Kind::LoginEnded)
+                .count(),
+            1
+        );
+        let completed = records();
+        assert!(roster_read(&seat).is_ok());
+        assert_eq!(
+            records(),
+            completed,
+            "a second read neither replays nor records again"
+        );
+    }
 }
 
 #[test]
@@ -33549,6 +33966,38 @@ fn the_owners_disk_watch_removes_only_on_a_device_it_can_name() {
     assert_eq!(
         disk_private_with(false, Some(&account), &account, product),
         None
+    );
+}
+
+#[test]
+fn the_watch_seam_lifts_only_the_private_roots_reason() {
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-hh-disk-watch-seam-")
+        .tempdir()
+        .expect("temp dir");
+    let account = tmp.path().join("account");
+    let scratch = tmp.path().join("scratch");
+    let image = tmp.path().join("image");
+    for dir in [&account, &scratch, &image] {
+        std::fs::create_dir(dir).expect("home");
+    }
+    let dev = |p: &Path| -> Option<u64> { Some(if p.ends_with("image") { 2 } else { 1 }) };
+    assert!(disk_private_root(true, false), "a private root, no seam");
+    assert!(!disk_private_root(true, true), "the seam admitted");
+    assert!(!disk_private_root(false, false) && !disk_private_root(false, true));
+    let judged = |seam: bool, home: &Path| {
+        disk_private_with(disk_private_root(true, seam), Some(&account), home, &dev)
+    };
+    assert_eq!(judged(false, &image), Some(DiskPrivate::StateRoot));
+    assert_eq!(
+        judged(true, &image),
+        None,
+        "a home on a volume of its own is the owner's watch under the seam"
+    );
+    assert_eq!(
+        judged(true, &scratch),
+        Some(DiskPrivate::ScratchHome),
+        "a scratch home on the account home's volume stays private under the seam"
     );
 }
 

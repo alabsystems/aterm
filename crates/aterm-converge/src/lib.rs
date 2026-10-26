@@ -16,8 +16,8 @@ pub use engine::NoJournal;
 pub use engine::{Journal, ReadOnly, Refusal, named_by, order, run, run_scoped, run_with};
 pub use journal::FileJournal;
 pub use model::{
-    Class, Effect, Explain, ItemReport, Layer, Mode, Outcome, Probe, Read, Readiness, Remedy,
-    Report, ReportMode, Requires, SCHEMA, StoodAside,
+    Class, Effect, Explain, ItemReport, Laps, Layer, Mode, Outcome, Phases, Probe, Read, Readiness,
+    Remedy, Report, ReportMode, Requires, SCHEMA, StoodAside, millis,
 };
 pub use scope::{
     NOT_AT_CONSOLE, Scope, held_back, left_as_is, not_own_account, select, selects, standing_aside,

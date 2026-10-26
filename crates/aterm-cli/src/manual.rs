@@ -84,7 +84,9 @@ const TOPICS: &[Topic] = &[
   aterm doctor --check         check only the macOS settings profile
   aterm doctor --apply         apply or repair only the macOS settings profile
   aterm doctor --restore       restore the preferences saved before setup
-  Add --json for a structured report on stdout, including on failure.
+  The report goes to stdout, including on failure; --json makes it structured.
+  At the Mac's console, bare doctor then opens Developer Tools if aterm is
+  missing there; --json, piped output, SSH and coding agents never open a pane.
 
 On a develop machine (~/.config/aterm/init.toml records [develop] checkouts) doctor,
 bare or --read-only, also reads the develop items: each checkout against origin as
@@ -627,43 +629,8 @@ CONFIGURATION — `[ai]` in `aterm.toml`
     },
     Topic {
         name: "init",
-        tagline: "configure this macOS login and optional GitHub repository bootstrap",
-        body: Some(
-            r#"init — configure this macOS login to the workstation standard (`aterm init`).
-
-  aterm init [--plan | --check] [--json] [--develop | --no-develop] [--only <item,...>]
-                                    (`aterm init --help` has each flag and exit code)
-
-Run as yourself, without sudo. It first restores what aterm lays for this account
-(also over SSH), then, at the Mac's console, applies the workstation settings: Caps
-Lock as Control, natural scrolling off, widgets off, a Dock of aterm, System Settings
-and Safari, Messages and FaceTime signed out, and rustup's minimal profile without
-offline `rust-docs`. Clearing Notification Center's widgets needs Full Disk Access
-(aterm's in an aterm tab, else the terminal's): without it they are left alone and
-the row says so. `--develop`, run in an aterm checkout, records it in init.toml's
-`[develop]` table; later runs fast-forward it when that loses nothing and run its own
-`targo --unverified --locked verify provision`.
-
-Optional GitHub bootstrap (`~/.config/aterm/init.toml`):
-  [github]
-  account = "octocat"
-  owner = "octocat"
-  token_file = "~/.secrets/github-token" # 0600 file; optional token_key = "GH_TOKEN"
-
-It verifies the token and stores it in the login keychain with CLT git's `osxkeychain`
-helper (a keychain token GitHub already signs in as `account` is kept instead). When
-git's own lookups already hand that token back for every repository (the secrets
-vault's helper does when `token_file` is its `~/.secrets/gh_access_token`) and GitHub
-signs it in as `account`, git's credential settings and the keychain are left as they
-are. It clones `owner`'s repositories the token can reach into `~/<repo>`. A clean
-checkout behind GitHub's default branch is fast-forwarded from origin, running no
-hook; any other is left as it is, saying why. With no secrets vault configured,
-`init` joins the ALab vault (`http://alab-secrets.local:7484/v1/alab`) when it answers
-on this network, asking only its join password, or the vault `--vault <url|path>`
-names; with neither it asks nothing, and a vault join an admin has yet to approve
-finishes by itself (`aterm help secrets`).
-"#,
-        ),
+        tagline: "set up this Mac from a terminal (SSH, CLI-only Macs); aterm.app's first launch does it by itself",
+        body: None, // generated — see `init_page()`
     },
     Topic {
         name: "secrets",
@@ -1708,8 +1675,8 @@ fn overview_page() -> String {
                 "configure and manage a lab of Macs over SSH (init | scan | enroll | status | plan | apply | person)"
             }
             crate::Verb::Init => {
-                "configure this macOS login's keyboard, widgets, Dock and messaging accounts; \
-                 `--develop` for a checkout's tools"
+                "set up this Mac from a terminal (SSH, CLI-only Macs); aterm.app's first launch \
+                 does it by itself"
             }
             crate::Verb::Secrets => {
                 "one credentials file for every machine: the vault, its server and ~/.secrets \
@@ -4268,6 +4235,19 @@ fn page_of(t: &str) -> &str {
     }
 }
 
+/// `aterm help init`: the page `aterm init --help` prints, one source for both
+/// ([`aterm_machines::init::usage`]).
+#[cfg(target_os = "macos")]
+fn init_page() -> String {
+    aterm_machines::init::usage()
+}
+
+/// `aterm help init` where `aterm init` does not run.
+#[cfg(not(target_os = "macos"))]
+fn init_page() -> String {
+    "init — set up this Mac from a terminal; macOS only.\n".to_owned()
+}
+
 /// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's
 /// sid inside an aterm session ([`in_session`]); every page ends its last line.
 pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
@@ -4305,10 +4285,11 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("fabric") => (FABRIC_PAGE.to_string(), 0),
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
         Some("kitty") => (kitty_page(), 0),
+        Some("init") => (init_page(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
                 let body = t.body.unwrap_or_else(|| {
-                    unreachable!("introspection, rust, sys, theme and agh are generated")
+                    unreachable!("introspection, rust, sys, theme, init and agh are generated")
                 });
                 (format!("{body}\n"), 0)
             }

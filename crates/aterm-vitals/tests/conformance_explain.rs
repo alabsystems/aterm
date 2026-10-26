@@ -9,9 +9,9 @@ use aterm_models_misc::explain_honesty_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
 use aterm_vitals::explain::fixtures::{
-    Scene, USERSPACE_MS, calm_1510, exited_skewed_1510, finished_1032, idle_skewed_1510,
-    lane_off_1032, liar_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab2_build_1048,
-    wrapped_1218,
+    Scene, USERSPACE_MS, calm_1510, claude_reaped_1032, exited_skewed_1510, exited_unseen_1510,
+    finished_1032, idle_skewed_1510, lane_off_1032, liar_1032, reaped_1510, spotlight_1032,
+    spotlight_late_1032, tab2_build_1048, wrapped_1218,
 };
 use aterm_vitals::explain::{
     ActivityId, CauseId, ClauseHold, CoalSplit, Context, Fault, OpenCause, Role, WhySubject,
@@ -195,8 +195,29 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             },
         ),
         (
+            "a build its reaper's reaped time holds",
+            window(claude_reaped_1032()),
+            1,
+            Truth {
+                tab: 2,
+                live: 3,
+                bound: 3,
+                ..T1032
+            },
+        ),
+        (
             "a tab's git exited past the counters' skew",
             window(exited_skewed_1510()),
+            1,
+            Truth {
+                live: 1,
+                bound: 1,
+                ..T1510
+            },
+        ),
+        (
+            "a task no member reaped exited past the counters' skew",
+            window(exited_unseen_1510()),
             1,
             Truth {
                 live: 0,
@@ -380,8 +401,8 @@ fn a_residual_left_uncovered_is_caught_by_lost_work_never_nothing_needed() {
 fn a_fixed_tolerance_is_caught_by_role_needs_bound() {
     let (_, samples, tab, truth) = cases()
         .into_iter()
-        .find(|c| c.0.starts_with("a tab's git exited"))
-        .expect("the exit past the skew");
+        .find(|c| c.0.starts_with("a task no member reaped"))
+        .expect("the unseen exit past the skew");
     let model = explain_honesty_model();
     let snap = read(&samples, Some(Fault::FixedTolerance));
     let healthy = interp::with_buggy(&model, 0);

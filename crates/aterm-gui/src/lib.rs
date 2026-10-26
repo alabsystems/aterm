@@ -286,7 +286,10 @@ mod overview;
 mod overview_fabric;
 pub(crate) use amacs_files::save_words;
 mod clt_install;
+#[cfg(unix)]
+mod secrets_asking;
 mod secrets_join;
+mod secrets_lanes;
 mod system_state;
 mod system_state_access;
 mod system_state_host;
@@ -300,11 +303,12 @@ pub use system_state::{
     SETUP_ROW, STARTUP_RETRY_NOTE, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus,
     SetupStatusRow, VAULT_NOT_JOINED_NOTE, VAULT_UNREAD_NOTE, calm_setup_row,
     journal_refused_entry, pass_rows, restore_rows, setup_not_started_entry, setup_set_aside_entry,
+    setup_unfinished_entry,
 };
 #[cfg(unix)]
 pub use system_state::{
-    clear_setup_not_started, clear_setup_set_aside, note_journal_refused, note_setup_not_started,
-    note_setup_set_aside,
+    clear_setup_not_started, clear_setup_set_aside, clear_setup_unfinished, note_journal_refused,
+    note_setup_not_started, note_setup_set_aside, note_setup_unfinished,
 };
 /// Mend this Mac's vault subscriber off the event loop, at once and every
 /// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
@@ -343,10 +347,21 @@ pub(crate) fn secrets_sync_while_wanted(work: &mut dyn FnMut()) -> bool {
 }
 
 fn mend_secrets_subscriber_once(headless: bool) {
-    static MENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !headless && !MENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        secrets_join::spawn_mend_lane(headless, app_config::config_path());
-    }
+    static LANES: secrets_lanes::Lanes = secrets_lanes::Lanes::new();
+    LANES.start(
+        headless || !cfg!(target_os = "macos"),
+        || secrets_join::spawn_mend_lane(headless, app_config::config_path()),
+        || {
+            #[cfg(unix)]
+            {
+                secrets_asking::spawn_lane(headless)
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        },
+    );
 }
 
 pub use clt_install::offer_developer_tools_install;
@@ -3496,17 +3511,11 @@ enum Wake {
         sig: i32,
     },
     CreateWindow,
-    DetachActiveTab,
-    ViewActiveSessionInNewWindow,
-    #[cfg(target_os = "macos")]
-    SelectTab {
+    TabWindowCommand(app_tabs::TabWindowCommand),
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    NativeTabCommand {
         window: WindowId,
-        index: usize,
-    },
-    #[cfg(target_os = "macos")]
-    CloseTab {
-        window: WindowId,
-        index: usize,
+        command: app_tabs::NativeTabCommand,
     },
     TabMenuAction {
         window: WindowId,
@@ -3532,11 +3541,12 @@ enum Wake {
         to: String,
         word: aterm_messages::UpgradeWord,
     },
-    /// A tab menu's timeline row: open Rewind on that tab at the instant `at_ms` (`turn_ledger::now_ms`'s clock).
+    /// A tab menu's timeline row retains the terminal view and recording it described.
     #[cfg(target_os = "macos")]
     TabMenuRewind {
         window: WindowId,
         tab: tab_model::TabId,
+        origin: session_chrome::RewindMenuOrigin,
         at_ms: u64,
     },
     #[cfg(target_os = "macos")]
@@ -3709,6 +3719,7 @@ enum Wake {
         clean: bool,
     },
     PkgPersonPass(messages_host::PersonPass),
+    /// A chrome font finished loading off the event loop ([`tray_raster::chrome_coverage_epoch`]).
     SemanticFontReady,
     FontFamiliesListed(Arc<aterm_render::font_catalog::MonospaceFamilies>),
 }
@@ -4412,17 +4423,24 @@ impl Backend {
         }
     }
 
-    fn set_bold_font(&mut self, bytes: &[u8], index: u32) -> Result<(), String> {
+    fn set_bold_font(&mut self, bytes: &[u8], face: &aterm_render::FaceRef) -> Result<(), String> {
+        let named = face.instance.clone();
         match self {
-            Backend::Cpu(r) => r.set_bold_face(bytes, index),
-            Backend::Gpu(g) => g.set_bold_face(bytes, index),
+            Backend::Cpu(r) => r.set_named_bold_face(bytes, face.index, named),
+            Backend::Gpu(g) => g.set_bold_face(bytes, face.index, named),
         }
     }
 
-    fn set_styled_font(&mut self, slot: usize, bytes: &[u8], index: u32) -> Result<(), String> {
+    fn set_styled_font(
+        &mut self,
+        slot: usize,
+        bytes: &[u8],
+        face: &aterm_render::FaceRef,
+    ) -> Result<(), String> {
+        let named = face.instance.clone();
         match self {
-            Backend::Cpu(r) => r.set_styled_face(slot, bytes, index),
-            Backend::Gpu(g) => g.set_styled_face(slot, bytes, index),
+            Backend::Cpu(r) => r.set_named_styled_face(slot, bytes, face.index, named),
+            Backend::Gpu(g) => g.set_styled_face(slot, bytes, face.index, named),
         }
     }
 
@@ -4641,9 +4659,9 @@ fn apply_font_config_to_backend(
             }
         };
         let result = if slot == 0 {
-            backend.set_bold_font(&bytes, face.index)
+            backend.set_bold_font(&bytes, face)
         } else {
-            backend.set_styled_font(slot, &bytes, face.index)
+            backend.set_styled_font(slot, &bytes, face)
         };
         if let Err(error) = result {
             crate::logging::stderr_line!(
@@ -6806,6 +6824,13 @@ struct WindowState {
     consumed_press_keys: std::collections::HashSet<aterm_window::keyboard::PhysicalKey>,
     overlay_consumed_keys: std::collections::HashSet<aterm_types::keyboard::Key>,
     focused: bool,
+    /// THE OS KEY WINDOW (§14.11 of `docs/DESIGN-harness-autopilot-2026-10-15.md`): whether the
+    /// OS made this window its key window. Only the window's own focus events
+    /// ([`App::window_focus_event`], from `WindowEvent::Focused`) and the attach-time `has_focus()`
+    /// adoption ([`App::adopt_initial_focus`]) write it; a controller's `focus in|out` moves
+    /// [`Self::focused`] through `on_focus` and never this. The look reads it
+    /// (`App::window_looked_at`), so only his own return to the window is a look.
+    os_key: bool,
     drag_hover: bool,
     blink_phase: bool,
     next_blink: Option<Instant>,
@@ -7015,13 +7040,14 @@ struct WindowState {
     deck_laid: std::cell::RefCell<Option<crate::stats_deck::DeckLaid>>,
     deck_still: std::cell::RefCell<crate::stats_deck::DeckStill>,
     /// The deck's live edge as its last layout drew it ([`crate::stats_live`]): its key, what
-    /// the card's raster holds, the card's rects that move with it, and how fast its strips
-    /// glide (device px a second) with that strip's column period (s).
+    /// the card's raster holds, the card's rects that move with it, how fast its Full strips
+    /// glide (device px a second) with that strip's column period (s), and how far each reading
+    /// slides its Folded strips (device px).
     deck_live_drawn: std::cell::Cell<Option<u64>>,
     deck_live_card: std::cell::Cell<(u64, crate::stats_live::DeckLive)>,
     deck_live_rects:
         std::cell::RefCell<Vec<(crate::stats_live::LiveLayer, crate::stats_paint::Rect)>>,
-    deck_glide: std::cell::Cell<(f64, u32)>,
+    deck_glide: std::cell::Cell<(f64, u32, f64)>,
     stats_hits: std::cell::RefCell<Vec<crate::stats_paint::Hit>>,
     lens_card: Option<SettingsCard>,
     stats_lens: crate::stats_lens::LensSlot,
@@ -7862,6 +7888,7 @@ impl WindowState {
             consumed_press_keys: std::collections::HashSet::new(),
             overlay_consumed_keys: std::collections::HashSet::new(),
             focused: true,
+            os_key: true,
             drag_hover: false,
             blink_phase: true,
             next_blink: None,
@@ -8067,7 +8094,7 @@ impl WindowState {
             deck_live_drawn: std::cell::Cell::new(None),
             deck_live_card: std::cell::Cell::new((0, crate::stats_live::DeckLive::STILL)),
             deck_live_rects: std::cell::RefCell::new(Vec::new()),
-            deck_glide: std::cell::Cell::new((0.0, 0)),
+            deck_glide: std::cell::Cell::new((0.0, 0, 0.0)),
             stats_hits: std::cell::RefCell::new(Vec::new()),
             lens_card: None,
             stats_lens: crate::stats_lens::LensSlot::default(),
@@ -8542,12 +8569,13 @@ const fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         | Wake::MenuAction { .. }
         | Wake::ConfirmedClose { .. }
         | Wake::CreateWindow
-        | Wake::DetachActiveTab
-        | Wake::ViewActiveSessionInNewWindow
+        | Wake::TabWindowCommand(_)
         | Wake::WorkstationSetup(_)
         | Wake::InitialSetupApplyResolved
         | Wake::TabSpawned(_)
         | Wake::WorkerLaunch { .. } => UpdateHandoffEventClass::Revoking,
+        #[cfg(any(target_os = "macos", all(test, unix)))]
+        Wake::NativeTabCommand { .. } => UpdateHandoffEventClass::Revoking,
         #[cfg(target_os = "macos")]
         Wake::StatusAction { .. }
         | Wake::Askpass(_)
@@ -9394,6 +9422,9 @@ struct App {
     typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice,
     lock_modifiers: fn() -> aterm_types::keyboard::Modifiers,
     user_input_recent: fn(std::time::Duration) -> bool,
+    /// Whether this login's screen is out of a person's reach, locked or switched away
+    /// ([`platform::screen_away_source`]).
+    screen_away: fn() -> bool,
     option_only: platform::OptionOnly,
     #[cfg(target_os = "macos")]
     app_menu_bar: app_menu_bar::MenuBarReader,
@@ -10458,12 +10489,13 @@ impl App {
         let reach = self.devtools_helper.reach();
         let key = self.access_marks().devtools;
         let declined = !origin.owner_press()
-            && devtools_helper::declined_for(
-                origin,
-                &key,
-                (reach.last_declined)().as_ref(),
-                (reach.declined)().is_some(),
-            );
+            && (self.access_declined_here(aterm_types::macos_setup::Access::DeveloperTools)
+                || devtools_helper::declined_for(
+                    origin,
+                    &key,
+                    (reach.last_declined)().as_ref(),
+                    (reach.declined)().is_some(),
+                ));
         let fda = self.consent_panel_facts();
         let facts = devtools_helper::Facts {
             grant: reading.grant,
@@ -11847,12 +11879,14 @@ impl App {
         let facts = devtools_helper::FdaFacts {
             fda: fda_read,
             declined: !press
-                && (devtools_helper::declined_for(
-                    origin,
-                    &shown_key,
-                    (fda.last_declined)().as_ref(),
-                    (fda.declined)().is_some(),
-                ) || self.consent_card_host.marker == Some(consent_card::Marker::NotNow)),
+                && (self.access_declined_here(aterm_types::macos_setup::Access::FullDiskAccess)
+                    || devtools_helper::declined_for(
+                        origin,
+                        &shown_key,
+                        (fda.last_declined)().as_ref(),
+                        (fda.declined)().is_some(),
+                    )
+                    || self.consent_card_host.marker == Some(consent_card::Marker::NotNow)),
             grant_stable: (reach.grant_stable)(),
             recent: !press && (fda.opened_within)(window).is_some(),
             devtools_recent: devtools_ago.is_some(),
@@ -14780,6 +14814,7 @@ impl App {
             typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice::default(),
             lock_modifiers: keymap::no_lock_modifiers,
             user_input_recent: platform::no_recent_user_input_event,
+            screen_away: platform::screen_never_away,
             option_only: platform::no_option_only,
             #[cfg(target_os = "macos")]
             app_menu_bar: app_menu_bar::no_app_menu_bar,
@@ -15017,6 +15052,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn focus_pane(&mut self, dir: pane::FocusDir) {
         let Some(owner) = self.frontmost_window else {
             return;
@@ -15080,9 +15116,8 @@ impl App {
             .map(PaneFocusTarget::View)
     }
 
-    fn focus_pane_would_move(&self, dir: pane::FocusDir) -> bool {
-        self.frontmost_window
-            .is_some_and(|owner| self.pane_focus_neighbor(owner, dir).is_some())
+    fn focus_pane_would_move(&self, owner: WindowId, dir: pane::FocusDir) -> bool {
+        self.pane_focus_neighbor(owner, dir).is_some()
     }
 
     fn reset_pane_space_decorations(&mut self, wid: WindowId) {
@@ -15094,10 +15129,15 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn toggle_pane_zoom(&mut self) {
         let Some(owner) = self.frontmost_window else {
             return;
         };
+        self.toggle_pane_zoom_in(owner);
+    }
+
+    fn toggle_pane_zoom_in(&mut self, owner: WindowId) {
         let terminal_projection = self.active_tree(owner).is_some();
         let toggled = if terminal_projection {
             self.active_tree_mut(owner).is_some_and(|tree| {
@@ -15552,7 +15592,6 @@ impl App {
                 self.frontmost_window = Some(wid);
                 self.sync_active_session();
             }
-            self.note_done_seen(wid);
             if self.pending_deminiaturize_focus == Some(wid) {
                 self.pending_deminiaturize_focus = None;
             }
@@ -15562,7 +15601,15 @@ impl App {
             self.tab_spawns.note_focus_loss(wid);
             self.claude_glass_focus(wid, false);
         }
+        // The OS's key window, which only this event and the attach-time adoption write (§14.11).
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.os_key = focused;
+        }
         self.on_focus(wid, focused);
+        if focused {
+            // After the key window is stored: the look needs it (§14.11), so his return is the look.
+            self.note_done_seen(wid);
+        }
         if gained {
             self.system_state_focus_returned(wid);
         }
@@ -16966,8 +17013,7 @@ impl App {
                 continue;
             }
             let (titles, metadata) = self.refresh_window_tabs(wid);
-            let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
+            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
             let needs_redraw = self
                 .windows
                 .get(&wid)
@@ -18720,32 +18766,19 @@ impl App {
             } => {
                 let _ = reply.send(self.try_dims_snapshot(session, &term));
             }
-            #[cfg(target_os = "macos")]
-            Wake::SelectTab { window, index } => {
-                self.clear_tab_surface_move_license(Some(window));
-                self.settle_rename_edit(window);
-                self.switch_tab_in(window, index);
-            }
-            #[cfg(target_os = "macos")]
-            Wake::CloseTab { window, index } => {
-                self.clear_tab_surface_move_license(Some(window));
-                self.settle_rename_edit(window);
-                if self.close_tab_at(window, index)
-                    && let Some(ws) = self.windows.get_mut(&window)
+            #[cfg(any(target_os = "macos", all(test, unix)))]
+            Wake::NativeTabCommand { window, command } => {
+                if self.apply_native_tab_command(window, command)
+                    && matches!(command, app_tabs::NativeTabCommand::Close(_))
                 {
-                    ws.pending_close = true;
+                    self.escalate_pending_close(el);
                 }
-                self.escalate_pending_close(el);
             }
             Wake::TabMenuAction {
                 window,
                 tab,
                 action,
             } => {
-                self.clear_tab_surface_move_license(Some(window));
-                if self.divert_menu_action_around_rename(action) {
-                    return;
-                }
                 self.dispatch_tab_menu_action(el, window, tab, action);
             }
             #[cfg(target_os = "macos")]
@@ -18768,8 +18801,13 @@ impl App {
                 word,
             } => self.dispatch_tab_menu_upgrade(window, tab, sid, to, word),
             #[cfg(target_os = "macos")]
-            Wake::TabMenuRewind { window, tab, at_ms } => {
-                self.dispatch_tab_menu_rewind(window, tab, at_ms);
+            Wake::TabMenuRewind {
+                window,
+                tab,
+                origin,
+                at_ms,
+            } => {
+                self.dispatch_tab_menu_rewind(window, tab, origin, at_ms);
             }
             #[cfg(target_os = "macos")]
             Wake::BeginSessionRename { window, tab } => {
@@ -18903,7 +18941,10 @@ impl App {
             Wake::FontCatalogPrepared(completion) => {
                 self.finish_font_catalog_generation(*completion);
             }
-            Wake::SemanticFontReady => self.repaint_settings_specimens(),
+            Wake::SemanticFontReady => {
+                self.repaint_settings_specimens();
+                self.redraw_native_leaves_for_landed_fonts();
+            }
             Wake::FontFamiliesListed(families) => self.publish_settings_font_families(families),
             Wake::NativeUpdateFinished { ticket, status } => {
                 self.finish_native_update_check(ticket, status);
@@ -19790,8 +19831,7 @@ impl App {
             #[cfg(unix)]
             Wake::ExitSignal { sig } => self.on_exit_signal(el, sig),
             Wake::CreateWindow => self.open_new_window(),
-            Wake::DetachActiveTab => self.detach_active_tab(el),
-            Wake::ViewActiveSessionInNewWindow => self.open_active_session_in_new_window(el),
+            Wake::TabWindowCommand(command) => self.apply_tab_window_command(el, command),
             Wake::Hop { .. } => {}
         }
     }
@@ -26623,6 +26663,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         typing_sound_auditioned: config.trail_sound_voice(),
         lock_modifiers: keymap::lock_modifier_source(headless),
         user_input_recent: platform::user_input_source(headless),
+        screen_away: platform::screen_away_source(headless),
         option_only: platform::option_only_source(headless),
         #[cfg(target_os = "macos")]
         app_menu_bar: app_menu_bar::reader(windowed),
@@ -26897,6 +26938,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         perf_env_at_flip: 1.0,
         event_loop_failed: false,
     };
+    app.recover_developer_tools_install(0);
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::AppBuilt);
     {
         let word_proxy = proxy.clone();

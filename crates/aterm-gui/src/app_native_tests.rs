@@ -1829,6 +1829,156 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
 }
 
 #[test]
+fn configured_settings_and_about_shortcuts_keep_the_receiving_window() {
+    use crate::app_input::{PhysicalReleaseTrace, take_physical_release_trace};
+    use crate::native_app::AppViewState;
+    use crate::native_settings::SettingsRoute;
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
+    };
+
+    let settings_state = |app: &App, view| {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
+            panic!("Settings view remains attached")
+        };
+        (
+            state.route,
+            state.editing_field.clone(),
+            state.field_inputs.clone(),
+            state.carried_field_drafts(),
+            state.common.last_focus.clone(),
+        )
+    };
+    let topology = |app: &App, window| {
+        let tabs = &app.windows[&window].tab_set;
+        (
+            tabs.active_id(),
+            tabs.tabs()
+                .iter()
+                .map(|tab| (tab.id, tab.root.clone(), tab.focus))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let key = |state, repeat| {
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::F4),
+            Key::Named(NamedKey::F4),
+            None,
+            KeyLocation::Standard,
+            state,
+            repeat,
+        )
+    };
+    let mut failures = Vec::new();
+    for (binding, route) in [
+        ("toggle_settings", SettingsRoute::Home),
+        ("toggle_about", SettingsRoute::About),
+    ] {
+        for existing_settings in [false, true] {
+            let mut app = App::headless_for_test();
+            let source = WindowId(0);
+            let previous = existing_settings.then(|| {
+                assert!(app.open_settings_tab_in_window(source, SettingsRoute::Appearance));
+                let (instance, view) = app.active_native_view(source).unwrap();
+                (
+                    app.windows[&source].tab_set.active_id().unwrap(),
+                    instance,
+                    view,
+                )
+            });
+            let source_tabs = app.windows[&source].tab_set.tabs().to_vec();
+            let session = app.next_session_id;
+            let front = app.insert_logical_window(crate::stub_session(session), 24, 100);
+            assert!(app.open_settings_tab_in_window(front, SettingsRoute::TextFonts));
+            let (front_instance, front_view) = app.active_native_view(front).unwrap();
+            app.act_app(crate::app_control::ActRequest {
+                view: front_view,
+                ui_key: format!("settings/control/{}", crate::prefs::EDIT_FONT_PX),
+                action: format!("settings/set/{}", crate::prefs::EDIT_FONT_PX),
+                value: None,
+            })
+            .unwrap();
+            app.dispatch_native_view_event(
+                front,
+                front_view,
+                AppEvent::TextInput(crate::native_app::TextInputEvent::Commit("9".to_string())),
+            )
+            .unwrap();
+            let front_before = settings_state(&app, front_view);
+            assert_eq!(front_before.0, SettingsRoute::TextFonts);
+            assert_eq!(front_before.1.as_deref(), Some(crate::prefs::EDIT_FONT_PX));
+            assert_eq!(front_before.2[crate::prefs::EDIT_FONT_PX].value(), "9");
+            assert_eq!(front_before.3.carried.len(), 1);
+            let front_topology = topology(&app, front);
+            let config = app.native_config_service.snapshot();
+            app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+                &[("f4".to_string(), binding.to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+            app.windows.get_mut(&source).unwrap().mods = ModifiersState::empty();
+            assert_eq!(app.frontmost_window, Some(front));
+            app.on_key(source, key(ElementState::Pressed, false));
+
+            let opened = app.active_native_view(source).and_then(|(instance, view)| {
+                matches!(app.native_runtime.view_state(view), Some(AppViewState::Settings(state)) if state.route == route)
+                    .then_some((app.windows[&source].tab_set.active_id().unwrap(), instance, view))
+            });
+            if opened.is_none() || previous.is_some_and(|previous| Some(previous) != opened) {
+                failures.push(format!("{binding} existing={existing_settings}: did not open or reuse the receiving window's view"));
+            }
+            if app.windows[&source].tab_set.len()
+                != source_tabs.len() + usize::from(!existing_settings)
+            {
+                failures.push(format!(
+                    "{binding} existing={existing_settings}: wrong receiving window tab count"
+                ));
+            }
+            for tab in &source_tabs {
+                let retained = app.windows[&source].tab_set.get(tab.id).unwrap();
+                assert_eq!(retained.root, tab.root);
+                assert_eq!(retained.focus, tab.focus);
+            }
+            if settings_state(&app, front_view) != front_before
+                || topology(&app, front) != front_topology
+            {
+                failures.push(format!("{binding} existing={existing_settings}: changed the unrelated window's route, field, draft or topology"));
+            }
+            assert_eq!(
+                app.active_native_view(front),
+                Some((front_instance, front_view))
+            );
+            assert!(matches!(
+                app.physical_press_owners.get(&PhysicalKey::Code(KeyCode::F4)),
+                Some(crate::PhysicalPressOwner::Consumed { window }) if *window == source
+            ));
+            let source_after = topology(&app, source);
+            let front_after = topology(&app, front);
+            let front_state_after = settings_state(&app, front_view);
+            app.on_key(front, key(ElementState::Pressed, true));
+            assert_eq!(topology(&app, source), source_after);
+            assert_eq!(topology(&app, front), front_after);
+            assert_eq!(settings_state(&app, front_view), front_state_after);
+            app.on_key(front, key(ElementState::Released, false));
+            assert!(matches!(
+                take_physical_release_trace(),
+                Some(PhysicalReleaseTrace::Consumed { press_window, arrival_window })
+                    if press_window == source && arrival_window == front
+            ));
+            assert!(
+                !app.physical_press_owners
+                    .contains_key(&PhysicalKey::Code(KeyCode::F4))
+            );
+            assert_eq!(app.frontmost_window, Some(front));
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert!(app.structural_invariants_ok());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn idle_reconcile_park_never_materializes_a_destination_or_warning_path() {
     let mut app = App::headless_for_test();
     assert!(!app.has_pending_native_update_reconcile());
@@ -2058,6 +2208,87 @@ fn native_appearance_inputs_have_distinct_cache_revisions() {
     ] {
         assert_ne!(native_appearance_revision(preferences), revision);
     }
+}
+
+/// A chrome face that lands after a native view drew redraws the view, so its next frame
+/// draws what lacked the face (a first open's Japanese) instead of keeping the blank raster,
+/// and the landing asks a frame of the window holding the view. Before, the stamp named no
+/// font readiness, so the blank raster was kept until something else changed.
+#[test]
+fn a_chrome_face_that_lands_redraws_the_native_views_it_would_ink() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    let Some(live) = crate::tray_raster::install_unparsed_cjk_chain_for_test() else {
+        aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
+    };
+    let (_, view) = app.active_native_view(wid).expect("the Settings view");
+    let full_rasters = |app: &App| {
+        app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("the view's raster")
+            .full_rasters
+    };
+    assert!(app.prepare_native_input_scratch(wid));
+    let drawn = full_rasters(&app);
+    assert!(app.prepare_native_input_scratch(wid));
+    assert_eq!(
+        full_rasters(&app),
+        drawn,
+        "CONTROL: an unchanged view keeps its raster"
+    );
+
+    assert!(crate::tray_raster::warm_chrome_coverage_for_test(&live) >= 1);
+    let requests = app.windows[&wid].redraw_requests_for_test.get();
+    app.redraw_native_leaves_for_landed_fonts();
+    assert_eq!(
+        app.windows[&wid].redraw_requests_for_test.get(),
+        requests + 1,
+        "the window holding the view is asked for a frame"
+    );
+    assert!(app.prepare_native_input_scratch(wid));
+    assert!(
+        full_rasters(&app) > drawn,
+        "the view draws again with the landed face"
+    );
+    crate::tray_raster::clear_ui_fonts_for_test();
+}
+
+/// The first present draws before the chrome fonts are installed (they follow it, so the
+/// first frame is not kept waiting); installing them asks a frame of the window holding a
+/// native page, and the page draws again with them. Before, the page drawn without the UI
+/// faces was kept until something else changed it.
+#[test]
+fn installing_the_chrome_fonts_redraws_a_native_page_drawn_before_them() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    crate::tray_raster::clear_ui_fonts_for_test();
+    let (_, view) = app.active_native_view(wid).expect("the Settings view");
+    let full_rasters = |app: &App| {
+        app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("the view's raster")
+            .full_rasters
+    };
+    assert!(app.prepare_native_input_scratch(wid));
+    let drawn = full_rasters(&app);
+    let requests = app.windows[&wid].redraw_requests_for_test.get();
+    app.sync_chrome_fonts();
+    assert!(
+        app.windows[&wid].redraw_requests_for_test.get() > requests,
+        "the install asks a frame"
+    );
+    assert!(app.prepare_native_input_scratch(wid));
+    assert!(
+        full_rasters(&app) > drawn,
+        "the page draws again with the UI faces"
+    );
+    let redrawn = full_rasters(&app);
+    assert!(app.prepare_native_input_scratch(wid));
+    assert_eq!(full_rasters(&app), redrawn, "and then keeps its raster");
 }
 
 #[test]
@@ -9523,6 +9754,68 @@ fn a_persons_kill_reaches_the_clipboard_and_a_controllers_does_not() {
     );
     assert_eq!(board().as_deref(), Some("one"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn killing_a_buffer_behind_the_front_leaves_its_neighbours_failure_unseen() {
+    use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let (mut app, first_view, first_document, _) = editor_app(dir.path(), "first.txt", "one\n");
+    let wid = WindowId(0);
+    for ws in app.windows.values_mut() {
+        ws.os_window_for_test = true;
+        ws.focused = true;
+    }
+    let failed = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(failed));
+    let second = dir.path().join("second.txt");
+    std::fs::write(&second, "two\n").unwrap();
+    let second_uri = crate::native_document_host::path_to_file_uri(&second).unwrap();
+    app.open_document_tab(crate::native_app::AppKind::Editor, &second_uri)
+        .unwrap();
+    let (_, second_view) = app.active_native_view(wid).unwrap();
+    // A terminal, first.txt, the failing terminal, second.txt: closing first.txt on its own
+    // would front the failing terminal.
+    assert_eq!(app.windows[&wid].tab_set.active_index(), Some(3));
+    let term = app.pool.get(failed).expect("the failing tab").term.clone();
+    crate::term_lock(&term).process(
+        b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\make\r\n\x1b]133;C\x1b\\\
+          \x1b]133;D;2\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\",
+    );
+    let t0 = std::time::Instant::now();
+    app.observe_session_statuses(t0);
+    app.observe_session_statuses(t0 + std::time::Duration::from_secs(1));
+    let unseen = |app: &App| {
+        app.session_status
+            .indicators(failed)
+            .is_some_and(|bits| bits.status_attention)
+    };
+    assert!(unseen(&app), "PRECONDITION: a failure nobody has looked at");
+    let first_uri = app
+        .document_store
+        .canonical_uri(first_document)
+        .unwrap()
+        .to_string();
+
+    for key in [
+        editor_key(Key::Character('x'), Modifiers::CTRL),
+        editor_key(Key::Character('k'), Modifiers::empty()),
+    ] {
+        assert!(app.native_input_event(wid, &key));
+    }
+    app.dispatch_native_event(wid, AppEvent::InsertText(first_uri))
+        .unwrap();
+    assert!(app.native_input_event(
+        wid,
+        &editor_key(Key::Named(NamedKey::Enter), Modifiers::empty())
+    ));
+    assert!(app.view_store.get(first_view).is_none(), "first.txt killed");
+    assert_eq!(
+        app.active_native_view(wid).map(|(_, view)| view),
+        Some(second_view)
+    );
+    assert!(unseen(&app), "the failing terminal never came to the front");
+    assert_eq!(app.structural_invariant_violation(), None);
 }
 
 #[test]

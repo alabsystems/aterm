@@ -9,13 +9,17 @@ use std::time::{Duration, Instant};
 
 /// Write `bytes` to `path` with `mode`, whole ([`write_checked`] with no check).
 /// # Errors
-/// No entropy for the temporary name, a clash on every name tried, or a write's own error; `path`
-/// is left as it was.
+/// No entropy for the temporary name, a clash on every name tried, or a write's own error: `path`
+/// is left as it was. Or the directory's flush after the rename failed: `path` holds `bytes`,
+/// but its entry may not survive a power loss.
 pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     write_checked(path, bytes, mode, || Ok(()))
 }
 
-/// Write `bytes` to `path` with `mode`.
+/// Write `bytes` to `path` with `mode`: a temporary file beside it, durably flushed
+/// ([`aterm_durable::durable`]), renamed over it, and the directory's entries flushed after
+/// the rename. That flush is best-effort ([`aterm_durable::Flush::dir_best_effort`]): a
+/// directory whose entries cannot be flushed here is no error, and any other failure is.
 /// # Errors
 /// As [`fn@write`], and `check`'s error.
 pub fn write_checked(
@@ -24,6 +28,37 @@ pub fn write_checked(
     mode: u32,
     check: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    write_flushing_dir(path, bytes, mode, check, |dir| {
+        aterm_durable::Flush::Durable.dir(dir)
+    })
+}
+
+/// [`write_checked`] with the directory's flush (`flush_dir`) handed in, so a test can make
+/// it fail; its outcome is classified here either way.
+fn write_flushing_dir(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    check: impl FnOnce() -> io::Result<()>,
+    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    write_landing(path, bytes, mode, check, flush_dir)?
+}
+
+/// What a careful write's rename left ([`write_landing`]): `path` holds the bytes either way.
+/// `Err` is the directory's flush after the rename, failed other than as unavailable, so the
+/// entry may not survive a power loss.
+type Landed = io::Result<()>;
+
+/// [`write_flushing_dir`], telling a failure before the rename (the outer `Err`: `path` is as
+/// it was) from one after it ([`Landed`]).
+fn write_landing(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    check: impl FnOnce() -> io::Result<()>,
+    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Landed> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -31,25 +66,24 @@ pub fn write_checked(
     let result = (|| {
         f.write_all(bytes)?;
         f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-        astream_sys::full_sync(&f)?;
+        aterm_durable::durable(&f)?;
         drop(f);
         check()?;
         std::fs::rename(&tmp, path)
     })();
-    match result {
-        Ok(()) => {
-            if let Some(dir) = path.parent()
-                && let Ok(dir) = std::fs::File::open(dir)
-            {
-                let _ = astream_sys::full_sync(&dir);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    // Unavailable (a volume that cannot flush a directory, a directory this process may
+    // write but not open) is accepted: the bytes are flushed on their own handle, and the
+    // rename has landed. A failed flush is returned as it came, its errno kept for a caller
+    // that classifies it.
+    Ok(aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()))
 }
 
 /// A NEW file beside `path` to write it through.
@@ -274,13 +308,59 @@ impl ConfigFile {
     }
 }
 
+/// [`ConfigEdit::replace`]'s error once the edit is in place: the target holds the new text,
+/// but the directory's flush after the rename failed (other than as unavailable,
+/// [`aterm_durable::DirFlushed::classify`]), so the edit is in effect and may not survive a
+/// power loss. It travels inside the [`io::Error`] `replace` returns, which keeps the
+/// flush's kind; [`io::Error::get_ref`] and a downcast find it.
+#[derive(Debug)]
+pub struct EditLanded {
+    /// The file that holds the new text.
+    pub target: PathBuf,
+    /// Where the text it replaced was saved; `None` when there was no file.
+    pub bak: Option<PathBuf>,
+    /// The directory flush's error, as it came.
+    pub flush: io::Error,
+}
+
+impl std::fmt::Display for EditLanded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the edit is in place in {}", self.target.display())?;
+        if let Some(bak) = &self.bak {
+            write!(f, " (the previous text saved as {})", bak.display())?;
+        }
+        write!(
+            f,
+            ", but flushing its directory failed, so it may not survive a power loss: {}",
+            self.flush
+        )
+    }
+}
+
+impl std::error::Error for EditLanded {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.flush)
+    }
+}
+
 impl ConfigEdit<'_> {
     /// Replace the text.
     /// # Errors
     /// The target's bytes changed since [`ConfigFile::open`] read them — found before the `.bak` is
-    /// written, or before the rename — or a write's own error; in every case the target is left as
-    /// it is.
+    /// written, or before the rename — or a write's own error: the target is left as it is. Or
+    /// the directory's flush after the rename failed other than as unavailable: the edit is in
+    /// effect, and the error carries [`EditLanded`] under the flush's kind.
     pub fn replace(self, text: &str) -> io::Result<Option<PathBuf>> {
+        self.replace_flushing_dir(text, |dir| aterm_durable::Flush::Durable.dir(dir))
+    }
+
+    /// [`Self::replace`] with the directory's flush after the rename (`flush_dir`) handed in,
+    /// so a test can make it fail.
+    fn replace_flushing_dir(
+        self,
+        text: &str,
+        flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<Option<PathBuf>> {
         let file = self.file;
         file.unchanged()?;
         let (bak, mode) = match &file.before {
@@ -295,7 +375,23 @@ impl ConfigEdit<'_> {
         };
         #[cfg(test)]
         tests::race();
-        write_checked(&file.target, text.as_bytes(), mode, || file.unchanged())?;
+        write_landing(
+            &file.target,
+            text.as_bytes(),
+            mode,
+            || file.unchanged(),
+            flush_dir,
+        )?
+        .map_err(|flush| {
+            io::Error::new(
+                flush.kind(),
+                EditLanded {
+                    target: file.target.clone(),
+                    bak: bak.clone(),
+                    flush,
+                },
+            )
+        })?;
         Ok(bak)
     }
 }

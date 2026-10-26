@@ -5405,6 +5405,44 @@ fn a_font_row_raised_over_a_terminal_is_a_record_once_settings_comes_to_front() 
     assert_eq!(app.message_band_rows, 1, "the misspelled key's row alone");
 }
 
+/// A SETTINGS TAB CLOSED FROM BEHIND SHOWED NOTHING: `settings close` with a terminal in front
+/// leaves the font problem a band row, since Settings never came to the front to show it.
+#[test]
+fn closing_settings_from_behind_keeps_the_config_row_it_never_showed() {
+    use crate::message_reporters::{ConfigFamily, ConfigWarnings};
+    let scope: Vec<&'static str> = ConfigFamily::ALL.iter().map(|f| f.key()).collect();
+    let fonts = ConfigFamily::Fonts.key();
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    app.switch_tab_in(WindowId(0), 0);
+    assert!(!app.settings_in_front());
+    let mut warns = ConfigWarnings::default();
+    warns.push_shown_in_settings(
+        ConfigFamily::Fonts,
+        "config font_family: \"NoSuchFontXYZ\" does not resolve to a font file; keeping the \
+         current working face"
+            .to_string(),
+    );
+    app.note_config_settings_shows(&scope, &warns.settings_shown_keys());
+    let messages = warns.into_messages_routed(app.settings_in_front());
+    app.replace_config_messages(messages);
+    assert!(
+        app.messages.live_by_key(fonts).is_some(),
+        "PRECONDITION: over a terminal the problem is a band row"
+    );
+
+    assert!(app.close_settings_tabs());
+    assert_eq!(
+        app.windows[&WindowId(0)].tab_set.len(),
+        1,
+        "Settings closed"
+    );
+    assert!(
+        app.messages.live_by_key(fonts).is_some(),
+        "Settings never came to the front: the row stands"
+    );
+}
+
 /// A CHANGE OF TAB GIVES BACK A ROW ITS QUIET STILL HELD (t-3): the tab brought to the
 /// front, a terminal or Settings, is laid out without it at once. CONTROL: with no change of
 /// tab the row waits its quiet.

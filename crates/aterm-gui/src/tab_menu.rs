@@ -26,7 +26,7 @@ pub(crate) struct TabMenu {
     /// The tab's position when the menu popped: the paint anchor only.
     pub index: usize,
     /// The composed model, snapshotted at pop time so the card never reflows under
-    /// the pointer; actions resolve their payloads fresh at dispatch.
+    /// the pointer; actions validate their captured targets at dispatch.
     pub entries: Vec<TabMenuEntry>,
     /// The strip column the press landed on: the card's left edge, before clamping.
     pub anchor_col: u16,
@@ -142,7 +142,10 @@ pub(crate) const fn is_selectable(entry: &TabMenuEntry) -> bool {
         TabMenuEntry::Action { enabled: true, .. }
             | TabMenuEntry::ConnectionAction { enabled: true, .. }
             | TabMenuEntry::Upgrade { .. }
-            | TabMenuEntry::RewindTo { .. }
+            | TabMenuEntry::RewindTo {
+                origin: Some(_),
+                ..
+            }
     )
 }
 
@@ -402,7 +405,8 @@ pub(crate) fn paint(
         let (fg, bold) = match entry {
             TabMenuEntry::Header(_) | TabMenuEntry::Event { .. } => (c.band.label, false),
             TabMenuEntry::Action { enabled: false, .. }
-            | TabMenuEntry::ConnectionAction { enabled: false, .. } => (c.disabled, false),
+            | TabMenuEntry::ConnectionAction { enabled: false, .. }
+            | TabMenuEntry::RewindTo { origin: None, .. } => (c.disabled, false),
             TabMenuEntry::Action { .. }
             | TabMenuEntry::ConnectionAction { .. }
             | TabMenuEntry::Upgrade { .. }
@@ -466,7 +470,13 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
         match e {
             TabMenuEntry::Header(t) => (0u8, t.as_str()).hash(&mut h),
             TabMenuEntry::Event { words, at_ms } => (5u8, words.as_str(), *at_ms).hash(&mut h),
-            TabMenuEntry::RewindTo { words, at_ms } => (6u8, words.as_str(), *at_ms).hash(&mut h),
+            TabMenuEntry::RewindTo {
+                words,
+                at_ms,
+                origin,
+            } => {
+                (6u8, words.as_str(), *at_ms, *origin).hash(&mut h);
+            }
             TabMenuEntry::Separator => 1u8.hash(&mut h),
             TabMenuEntry::Action { label, enabled, .. } => {
                 (2u8, label.as_str(), *enabled).hash(&mut h);

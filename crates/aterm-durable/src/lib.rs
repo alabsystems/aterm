@@ -146,6 +146,18 @@ impl Flush {
         self.file(&File::open(dir)?)
     }
 
+    /// [`Flush::dir`] for a writer that goes on where the directory's entries cannot be
+    /// flushed here ([`DirFlushed::Unavailable`], astream's `dir_flush_unavailable`). Any
+    /// other failure, `EIO` among them, is still an error: the entry may not survive a power
+    /// loss. A writer whose promise rests on the entry's flush takes [`Flush::dir`] instead.
+    ///
+    /// # Errors
+    /// The directory's open or flush failed other than as unavailable.
+    #[inline]
+    pub fn dir_best_effort(self, dir: &Path) -> io::Result<DirFlushed> {
+        DirFlushed::classify(self.dir(dir))
+    }
+
     /// [`Flush::Ordered`] when `written` and `later` are on one device, else [`Flush::Durable`].
     #[must_use]
     pub fn ordered_if_same_device(written: &Path, later: &Path) -> Self {
@@ -154,6 +166,41 @@ impl Flush {
         } else {
             Self::Durable
         }
+    }
+}
+
+/// What a best-effort flush of a directory did ([`Flush::dir_best_effort`]).
+#[derive(Debug)]
+#[must_use = "a directory whose entries were not flushed is the caller's to note or to accept"]
+pub enum DirFlushed {
+    /// The flush returned: the directory's entries are on stable media, or ordered, as the
+    /// flush promises.
+    Flushed,
+    /// The entries cannot be flushed here (`astream_sys::dir_flush_unavailable`): a volume
+    /// that refuses to flush a directory, a directory this process may write but not open,
+    /// or one that is gone. The error says which.
+    Unavailable(io::Error),
+}
+
+impl DirFlushed {
+    /// Classify a directory flush's outcome by astream's one rule
+    /// (`astream_sys::dir_flush_unavailable`), for a writer that opens and flushes the
+    /// directory itself.
+    ///
+    /// # Errors
+    /// `flushed`'s error when it is a failed flush rather than an unavailable one.
+    pub fn classify(flushed: io::Result<()>) -> io::Result<Self> {
+        match flushed {
+            Ok(()) => Ok(Self::Flushed),
+            Err(e) if astream_sys::dir_flush_unavailable(&e) => Ok(Self::Unavailable(e)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether the flush returned.
+    #[must_use]
+    pub const fn is_flushed(&self) -> bool {
+        matches!(self, Self::Flushed)
     }
 }
 
@@ -180,10 +227,43 @@ pub fn durable_data(file: &File) -> io::Result<()> {
 #[inline]
 fn full_or_fsync(file: &File, full: fn(&File) -> io::Result<()>) -> io::Result<()> {
     #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-    if cfg!(test) || astream_sys::test_plain_fsync() {
+    if durable_flushes_are_plain() {
         return primitive::fsync(file);
     }
     full(file)
+}
+
+/// Whether this process's durable flushes are plain `fsync(2)`s, not the full flushes
+/// (`F_FULLFSYNC`) aterm ships: a test binary that asked, and every process it starts, in a
+/// debug build on Apple targets ([`plain_durable_flushes_in_tests!`]). Always `false` in a
+/// release build and off Apple targets.
+#[must_use]
+pub fn durable_flushes_are_plain() -> bool {
+    #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+    {
+        cfg!(test) || astream_sys::test_plain_fsync()
+    }
+    #[cfg(not(all(any(test, debug_assertions), target_vendor = "apple")))]
+    {
+        false
+    }
+}
+
+/// What a line that counts or times durable flushes ends with where they are plain
+/// `fsync(2)`s ([`durable_flushes_note`]).
+pub const PLAIN_DURABLE_FLUSHES: &str =
+    " (each full flush a plain fsync(2): a test's process tree)";
+
+/// [`PLAIN_DURABLE_FLUSHES`] where [`durable_flushes_are_plain`], else nothing: the end of a
+/// line that counts or times durable flushes, so a test's plain `fsync(2)`s never read as
+/// the full flushes aterm ships.
+#[must_use]
+pub fn durable_flushes_note() -> &'static str {
+    if durable_flushes_are_plain() {
+        PLAIN_DURABLE_FLUSHES
+    } else {
+        ""
+    }
 }
 
 /// Make the durable flushes of this test binary, and of every process it starts, plain
@@ -408,8 +488,14 @@ pub mod seam {
         });
     }
 
+    /// The environment variable [`plain_durable_flushes`] sets, on Apple targets, the only
+    /// ones that read it. A process a test starts without it takes the durable flushes aterm
+    /// ships ([`crate::durable_flushes_are_plain`] is `false` there).
+    #[cfg(target_vendor = "apple")]
+    pub use astream_sys::TEST_PLAIN_FSYNC_ENV;
+
     /// Mark this process, and every process it starts, as a test's
-    /// (`astream_sys::TEST_PLAIN_FSYNC_ENV`).
+    /// (`TEST_PLAIN_FSYNC_ENV`, on Apple targets).
     /// # Safety
     /// No other thread may be running: it sets an environment variable.
     pub unsafe fn plain_durable_flushes() {
@@ -423,6 +509,8 @@ pub mod seam {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::DirFlushed;
     use super::{Flush, durable, durable_data, durable_dir, ordered, ordered_dir, primitive, seam};
     use std::io::Write as _;
 
@@ -529,6 +617,73 @@ mod tests {
             primitive::barrier(&handle).expect("the barrier on a directory");
             primitive::full(&handle).expect("the full flush on a directory");
         }
+    }
+
+    /// `ENOTSUP` as this platform numbers it: Darwin's 45, which std leaves uncategorized,
+    /// and Linux's 95, which std reads as `Unsupported`.
+    #[cfg(unix)]
+    fn enotsup() -> std::io::Error {
+        std::io::Error::from_raw_os_error(if cfg!(target_vendor = "apple") {
+            45
+        } else {
+            95
+        })
+    }
+
+    /// A directory flush that fails with `EIO` is an error to a best-effort writer too; one
+    /// the volume refuses with `ENOTSUP` is unavailable, carrying the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_best_effort_dir_flush_reports_eio_and_reads_enotsup_as_unavailable() {
+        let eio = DirFlushed::classify(Err(std::io::Error::from_raw_os_error(5)));
+        assert_eq!(
+            eio.map(|d| d.is_flushed()).map_err(|e| e.raw_os_error()),
+            Err(Some(5)),
+            "EIO is a failed flush"
+        );
+        match DirFlushed::classify(Err(enotsup())) {
+            Ok(DirFlushed::Unavailable(e)) => {
+                assert_eq!(e.raw_os_error(), enotsup().raw_os_error());
+            }
+            other => panic!("ENOTSUP is the volume's refusal, not {other:?}"),
+        }
+        assert!(DirFlushed::classify(Ok(())).unwrap().is_flushed());
+    }
+
+    /// Over real directories: a directory flushes either way; one that is gone, and one this
+    /// process may write but not open (`0300`, unless it runs as root), are unavailable to the
+    /// best-effort flush and an error to the required one.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_directory_flushes_and_an_unopenable_one_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch();
+        for flush in [Flush::Durable, Flush::Ordered] {
+            let flushed = flush.dir_best_effort(dir.path()).unwrap();
+            assert!(flushed.is_flushed(), "{flush:?}: {flushed:?}");
+        }
+        let unavailable = |path: &std::path::Path| match Flush::Durable.dir_best_effort(path) {
+            Ok(DirFlushed::Unavailable(e)) => e.kind(),
+            other => panic!("{} is unavailable, not {other:?}", path.display()),
+        };
+        let gone = dir.path().join("gone");
+        assert!(
+            Flush::Durable.dir(&gone).is_err(),
+            "the required flush refuses"
+        );
+        assert_eq!(unavailable(&gone), std::io::ErrorKind::NotFound);
+
+        let write_only = dir.path().join("write-only");
+        std::fs::create_dir(&write_only).unwrap();
+        std::fs::set_permissions(&write_only, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&write_only).is_err() {
+            assert!(Flush::Durable.dir(&write_only).is_err(), "required");
+            assert_eq!(
+                unavailable(&write_only),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        std::fs::set_permissions(&write_only, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     /// The barrier itself.

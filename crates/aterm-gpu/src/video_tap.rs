@@ -464,7 +464,7 @@ enum SlotBuf {
         probe: Option<crate::metal::encoder::CbProbe>,
     },
     /// GL slot holding the destination's padded rows (`gl_present.rs`).
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     Gl(Vec<u8>),
 }
 
@@ -493,14 +493,14 @@ impl SlotBuf {
             Self::Metal { .. } => {
                 unreachable!("a Metal slot never reaches the wgpu map/harvest path")
             }
-            #[cfg(gl_arm)]
+            #[cfg(any(gl_arm, d3d11_arm))]
             Self::Gl(_) => unreachable!("a GL slot never reaches the wgpu map/harvest path"),
         }
     }
 
     /// Whether this slot stages through the GL arm.
     #[inline]
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     const fn is_gl(&self) -> bool {
         matches!(self, Self::Gl(_))
     }
@@ -839,7 +839,7 @@ impl VideoTap {
             self.resized_early_stop = true;
             return None;
         }
-        #[cfg(gl_arm)]
+        #[cfg(any(gl_arm, d3d11_arm))]
         if self.ring_is_gl() {
             self.resized_early_stop = true;
             return None;
@@ -1207,7 +1207,7 @@ impl VideoTap {
     }
 
     /// Build a GL-arm tap.
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn new_gl(
         src_w: u32,
         src_h: u32,
@@ -1264,16 +1264,17 @@ impl VideoTap {
 
     /// Whether this ring stages through the GL arm.
     #[inline]
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn ring_is_gl(&self) -> bool {
         self.slots.first().is_some_and(|s| s.buffer.is_gl())
     }
 
-    /// Enqueue GL present destination bytes (`dims`, padded to [`padded_row_bytes`], `Rgba8Unorm`) under [`Self::enqueue_copy`] rules.
-    #[cfg(gl_arm)]
+    /// Enqueue GL or D3D11 present destination bytes (`dims`, padded to [`padded_row_bytes`], `Rgba8Unorm`, or a D3D11 EDR chain's `Rgba16Float`) under [`Self::enqueue_copy`] rules.
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn gl_enqueue_frame(
         &mut self,
         (w, h): (u32, u32),
+        format: crate::device_layer::TexelFormat,
         padded_rgba: &[u8],
         color_space: CaptureColorSpace,
         sdr_white_scale: f32,
@@ -1281,10 +1282,7 @@ impl VideoTap {
         if self.resized_early_stop {
             return;
         }
-        if !self.ring_is_gl()
-            || (w, h) != (self.src_w, self.src_h)
-            || self.format != crate::device_layer::TexelFormat::Rgba8Unorm
-        {
+        if !self.ring_is_gl() || (w, h) != (self.src_w, self.src_h) || self.format != format {
             self.resized_early_stop = true;
             return;
         }
@@ -1331,7 +1329,7 @@ impl VideoTap {
     }
 
     /// [`Self::after_present`] for a GL ring.
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn gl_after_present(&mut self, t_us: u64) {
         self.adopt_converted();
         for slot in &mut self.slots {
@@ -1376,7 +1374,7 @@ impl VideoTap {
     }
 
     /// Finalize a GL ring.
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn gl_finish(mut self) -> UnsettledTake {
         for s in &mut self.slots {
             if !matches!(s.state, SlotState::Free) {
@@ -1390,7 +1388,7 @@ impl VideoTap {
     }
 
     /// Hand one slot's raw padded bytes to the conversion lane, or convert inline (GL twin of `metal_convert_or_dispatch`).
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     fn convert_raw(
         &mut self,
         raw: Vec<u8>,
@@ -1424,7 +1422,7 @@ impl VideoTap {
     }
 
     /// Inline conversion of raw padded bytes; a malformed slot is one drop.
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     fn convert_inline(
         &mut self,
         raw: &[u8],
@@ -1522,7 +1520,7 @@ impl VideoTap {
                     }
                     #[cfg(target_os = "macos")]
                     SlotBuf::Metal { .. } => {}
-                    #[cfg(gl_arm)]
+                    #[cfg(any(gl_arm, d3d11_arm))]
                     SlotBuf::Gl(_) => {}
                 }
                 let transition =
@@ -2022,8 +2020,8 @@ impl RawCapture {
         })
     }
 
-    /// A tightly packed 8-bit sRGB `Rgba8Unorm` destination, as the GL arm reads its resident virtual target back.
-    #[cfg(gl_arm)]
+    /// A tightly packed 8-bit sRGB `Rgba8Unorm` destination, as the GL and D3D11 arms read their resident virtual targets back.
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn rgba8_srgb(
         bytes: Vec<u8>,
         width: u32,
@@ -2393,8 +2391,8 @@ impl PresentedFrameTap {
         );
     }
 
-    /// The GL one-shot.
-    #[cfg(all(gl_arm, not(wgpu_arm)))]
+    /// The GL one-shot (also the D3D11 arm's).
+    #[cfg(all(any(gl_arm, d3d11_arm), not(wgpu_arm)))]
     pub(crate) fn new_gl(
         src_w: u32,
         src_h: u32,
@@ -2429,16 +2427,17 @@ impl PresentedFrameTap {
 
     /// Whether this one-shot stages through the GL arm.
     #[inline]
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) const fn tap_is_gl(&self) -> bool {
         self.buffer.is_gl()
     }
 
     /// GL enqueue (see `VideoTap::gl_enqueue_frame`).
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn gl_enqueue_frame(
         &mut self,
         (w, h): (u32, u32),
+        format: crate::device_layer::TexelFormat,
         padded_rgba: &[u8],
         color_space: CaptureColorSpace,
         sdr_white_scale: f32,
@@ -2448,11 +2447,9 @@ impl PresentedFrameTap {
         }
         let refusal = if !self.buffer.is_gl() {
             Some("presented snapshot: the renderer changed arms mid-capture".to_string())
-        } else if (w, h) != (self.src_w, self.src_h)
-            || self.format != crate::device_layer::TexelFormat::Rgba8Unorm
-        {
+        } else if (w, h) != (self.src_w, self.src_h) || self.format != format {
             Some(format!(
-                "presented snapshot: destination changed from {}x{} {:?} to {w}x{h} Rgba8Unorm",
+                "presented snapshot: destination changed from {}x{} {:?} to {w}x{h} {format:?}",
                 self.src_w, self.src_h, self.format,
             ))
         } else {
@@ -2487,7 +2484,7 @@ impl PresentedFrameTap {
     }
 
     /// The GL one-shot's post-present hook.
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn gl_after_present(&mut self, t_us: u64) -> Result<(), String> {
         match self.state {
             PresentedFrameState::Armed => {
@@ -2529,7 +2526,7 @@ impl PresentedFrameTap {
     }
 
     /// [`Self::finish`] for a GL one-shot.
-    #[cfg(gl_arm)]
+    #[cfg(any(gl_arm, d3d11_arm))]
     pub(crate) fn gl_finish(&mut self) -> Result<(), String> {
         match self.state {
             PresentedFrameState::Armed => {
@@ -2602,7 +2599,7 @@ impl PresentedFrameTap {
                 return None;
             }
         };
-        #[cfg(gl_arm)]
+        #[cfg(any(gl_arm, d3d11_arm))]
         if self.buffer.is_gl() {
             self.result = Some(Err(
                 "presented snapshot: the renderer changed arms mid-capture (GL staging, \
@@ -2678,7 +2675,7 @@ impl PresentedFrameTap {
                     }
                     #[cfg(target_os = "macos")]
                     SlotBuf::Metal { .. } => {}
-                    #[cfg(gl_arm)]
+                    #[cfg(any(gl_arm, d3d11_arm))]
                     SlotBuf::Gl(_) => {}
                 }
                 let outcome = self.apply_transition(PresentedFrameEvent::StartMap, Some(t_us));

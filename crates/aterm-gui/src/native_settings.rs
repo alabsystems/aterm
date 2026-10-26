@@ -1607,6 +1607,9 @@ pub(crate) struct SettingsViewState {
     navigation_scroll: Cell<f32>,
     navigation_scroll_limit: Cell<f32>,
     navigation_revealed: RefCell<Option<UiKey>>,
+    /// A rail row a screen reader asked to see (its ScrollIntoView), scrolled whole into the
+    /// rail at the next build without moving the keyboard.
+    navigation_reveal: RefCell<Option<UiKey>>,
     scroll_record: RefCell<Option<scroll::ScrollRecord>>,
     /// The heights Tab Control's live rows were laid out at, held while the person reads
     /// ([`tabs_page::LiveRowHeights`]).
@@ -1618,10 +1621,17 @@ pub(crate) struct SettingsViewState {
     page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
     /// The reach the search last decided, with everything that decision read ([`SearchQuery::of`]).
     search_reach: RefCell<Option<ReachMemo>>,
-    /// The page's name and its height where nothing over its list names it
-    /// ([`pinned_heading`]): the first list the page seats leads with it
+    /// What leads the page's list, each with its height, where nothing over the list holds it
+    /// ([`pinned_heading`]): the toolbar where it leads the list ([`compact_toolbar_lists`]),
+    /// then the page's name where nothing over the list names it. The first list the page seats
+    /// leads with them ([`SettingsViewState::take_list_head`]).
+    list_head: RefCell<Vec<(UiNode, f32)>>,
+    /// Whether a list took the toolbar from the list's head this build
     /// ([`SettingsViewState::take_list_head`]).
-    list_head: RefCell<Option<(UiNode, f32)>>,
+    toolbar_head_taken: Cell<bool>,
+    /// Whether the page drawn last took the toolbar to lead its list ([`page_children`]): only
+    /// then does the toolbar leave the window's top.
+    toolbar_listed_drawn: Cell<bool>,
     /// Where the bar settled ([`page`]) by the inputs, chrome, bar and record of the frame that
     /// seated it, and by the record it left, kept for the frame's inputs.
     bar_seats: RefCell<Vec<(BarAt, BarSeat)>>,
@@ -1827,6 +1837,7 @@ impl SettingsViewState {
             navigation_scroll: Cell::new(0.0),
             navigation_scroll_limit: Cell::new(0.0),
             navigation_revealed: RefCell::new(None),
+            navigation_reveal: RefCell::new(None),
             scroll_record: RefCell::new(None),
             live_row_heights: RefCell::default(),
             page_chrome: Cell::new(PageChrome::FULL),
@@ -1834,7 +1845,9 @@ impl SettingsViewState {
             page_chromes: RefCell::new(Vec::new()),
             page_chrome_memo: RefCell::new(None),
             search_reach: RefCell::new(None),
-            list_head: RefCell::new(None),
+            list_head: RefCell::new(Vec::new()),
+            toolbar_head_taken: Cell::new(false),
+            toolbar_listed_drawn: Cell::new(false),
             bar_seats: RefCell::new(Vec::new()),
             showcase_blocks: RefCell::new(None),
             showcase_sheet: RefCell::new(None),
@@ -2344,11 +2357,12 @@ impl SettingsViewState {
                     fresh.family,
                     font_refusal_consequence(fresh.key)
                 ),
-                crate::native_font_catalog::FontRefusalReason::WrongStyle => {
-                    let (face, text) = font_slot_style(fresh.key);
+                crate::native_font_catalog::FontRefusalReason::WrongStyle(drawn) => {
+                    let text = font_slot_text(fresh.key);
                     format!(
-                        "\u{201c}{}\u{201d} is not {face}. {text} is drawn in it.",
-                        fresh.family
+                        "\u{201c}{}\u{201d} is {}. {text} is drawn in it.",
+                        fresh.family,
+                        drawn_face_words(drawn).0
                     )
                 }
             };
@@ -9722,11 +9736,24 @@ fn fold_font_name(name: &str) -> String {
         .collect()
 }
 
-fn font_slot_style(key: &str) -> (&'static str, &'static str) {
+/// What a face that draws `style` is, in a sentence and as a row's label (`an italic
+/// face`, `Italic face`): a style row naming a face of another style says what that face
+/// is, never "not an italic face" of a bold italic one.
+fn drawn_face_words(style: aterm_render::DrawnStyle) -> (&'static str, &'static str) {
+    match (style.bold, style.slanted) {
+        (false, false) => ("a regular face", "Regular face"),
+        (true, false) => ("a bold face", "Bold face"),
+        (false, true) => ("an italic face", "Italic face"),
+        (true, true) => ("a bold italic face", "Bold italic face"),
+    }
+}
+
+/// The text a style row's face draws (`Italic text`).
+fn font_slot_text(key: &str) -> &'static str {
     match key {
-        prefs::EDIT_FONT_FAMILY_ITALIC => ("an italic face", "Italic text"),
-        prefs::EDIT_FONT_FAMILY_BOLD_ITALIC => ("a bold italic face", "Bold italic text"),
-        _ => ("a bold face", "Bold text"),
+        prefs::EDIT_FONT_FAMILY_ITALIC => "Italic text",
+        prefs::EDIT_FONT_FAMILY_BOLD_ITALIC => "Bold italic text",
+        _ => "Bold text",
     }
 }
 
@@ -11502,15 +11529,24 @@ fn settings_tree(
         .flatten();
     let (body, root_feedback) = match width {
         SettingsWidth::Compact => {
+            // The toolbar stands over the page, unless the page's list took it to lead with
+            // ([`compact_toolbar_lists`]): the seat drawn last is the chrome the page chose.
+            let listed =
+                compact_toolbar_lists(state, cx.viewport) && state.toolbar_listed_drawn.get();
+            let children = if listed {
+                vec![page]
+            } else {
+                vec![
+                    compact_toolbar(state, cx.viewport, compact_status_docked),
+                    page,
+                ]
+            };
             let body = UiNode::new(
                 "settings/body",
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
             .layout(Layout::column().height(Length::Fill).clipped())
-            .children(vec![
-                compact_toolbar(state, cx.viewport, compact_status_docked),
-                page,
-            ]);
+            .children(children);
             (body, feedback)
         }
         SettingsWidth::Medium | SettingsWidth::Wide => {
@@ -12088,6 +12124,8 @@ fn compact_toolbar_leading(
     (slots.leading, slots.leading_width)
 }
 
+const COMPACT_TOOLBAR_KEY: &str = "settings/compact-toolbar";
+
 fn compact_toolbar(
     state: &SettingsViewState,
     viewport: LogicalRect,
@@ -12200,10 +12238,15 @@ fn compact_toolbar(
         }
     }
     let toolbar = UiNode::new(
-        "settings/compact-toolbar",
+        COMPACT_TOOLBAR_KEY,
         UiContent::Group(GroupSpec::new("Settings toolbar").style(StyleRef::Secondary)),
     );
-    let header = compact_header_height(state, viewport);
+    // Its own height, over the page or leading its list ([`compact_toolbar_lists`]).
+    let header = if status_docked {
+        compact_docked_header_height(state, viewport)
+    } else {
+        compact_undocked_toolbar_height(state, viewport)
+    };
     let Some(under) = under else {
         return toolbar
             .layout(
@@ -13607,6 +13650,11 @@ fn compact_status_dock_required(state: &SettingsViewState, viewport: LogicalRect
     if STATUS_UNDOCKED.with(Cell::get) {
         return false;
     }
+    // A toolbar that leads the page's list takes no status: the status stands in its bar under
+    // the page, so it never moves the page by taking the toolbar back over it.
+    if state.page_chrome.get().toolbar_listed && compact_toolbar_can_list(state, viewport) {
+        return false;
+    }
     let at = (
         viewport,
         state.status_bar_most.get(),
@@ -13913,10 +13961,13 @@ fn compact_status_dock_required_at(
         SettingsWidth::Compact,
         PageLayout::shown(state).maximum(SettingsWidth::Compact),
     );
-    let stacked_content =
-        (viewport.height - compact_toolbar_height() - status_height - insets.top - insets.bottom)
-            .max(0.0)
-            / settings_text_scale();
+    let stacked_content = (viewport.height
+        - compact_undocked_toolbar_height(state, viewport)
+        - status_height
+        - insets.top
+        - insets.bottom)
+        .max(0.0)
+        / settings_text_scale();
     let floor = if status_height <= scaled_control_height() + 0.01 || plain {
         compact_page_floor(state)
     } else if state.reset_all_confirmation && reset_all_reach_sentence(state).is_some() {
@@ -13950,12 +14001,66 @@ const fn compact_page_floor(state: &SettingsViewState) -> f32 {
 
 const COMPACT_BODY_LEAST: f32 = 220.0;
 
+/// The height the compact header stands over the page: none where the toolbar leads the page's
+/// list ([`compact_toolbar_lists`]).
 fn compact_header_height(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
     if compact_status_dock_required(state, viewport) {
         compact_docked_header_height(state, viewport)
+    } else if compact_toolbar_lists(state, viewport) {
+        0.0
+    } else {
+        compact_undocked_toolbar_height(state, viewport)
+    }
+}
+
+/// Whether a compact window is short enough to list its toolbar ([`PageChrome::ladder`]): too
+/// short for a heading row, where the page's name already leads its list.
+fn compact_window_lists_toolbar(width: SettingsWidth, viewport: LogicalRect) -> bool {
+    width == SettingsWidth::Compact && compact_page_omits_heading(viewport.height)
+}
+
+/// THE TOOLBAR SCROLLS AWAY WITH THE PAGE WHERE ITS ROW CUTS WHAT THE PAGE LISTS: a short compact
+/// window's chrome, shed last ([`PageChrome::toolbar_listed`]), leads the page's list with the
+/// toolbar, so the list has the window's height; at 2× text a 178x152 window's list kept 100pt
+/// under a 52pt toolbar, under a control 130pt tall ("Coding Agent Harness") that no screen showed
+/// whole, and a 164x98 window's 46pt under no 2× control at all. Only the narrowest window's
+/// toolbar, its leading button and Search icons alone ([`compact_toolbar_wordless`]), or one that
+/// takes more than half the window, leads a list: one the person types in stays over the page. A
+/// status never docks in a toolbar that leads the list ([`compact_status_dock_required`]).
+fn compact_toolbar_lists(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    state.page_chrome.get().toolbar_listed && compact_toolbar_can_list(state, viewport)
+}
+
+fn compact_toolbar_can_list(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    compact_window_lists_toolbar(SettingsWidth::for_viewport(viewport.width), viewport)
+        && !state.compact_navigation
+        && (compact_toolbar_wordless(state, viewport)
+            || 2.0 * compact_undocked_toolbar_height(state, viewport) > viewport.height)
+        && !compact_search_shows_its_field(state)
+        && !reset_all_question_takes_page(state, viewport)
+}
+
+/// The compact toolbar's height where no status docks in it ([`compact_toolbar_wordless`]).
+fn compact_undocked_toolbar_height(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
+    if compact_toolbar_wordless(state, viewport) {
+        compact_toolbar_height_at_scale(1.0)
     } else {
         compact_toolbar_height()
     }
+}
+
+/// WORDS SET THE COMPACT TOOLBAR'S HEIGHT, NOT ICONS: one whose leading button and Search are
+/// icons alone keeps its height at every text size, since its icons do not grow with the text,
+/// so a narrow window at 2× gives its page the 28pt a toolbar grown for words it does not hold
+/// took (80pt of a 152pt window over a 72pt list).
+fn compact_toolbar_wordless(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    let slots = compact_toolbar_slots(state, viewport, false);
+    !slots.titled
+        && matches!(slots.search, CompactSearch::Button(_))
+        && !compact_search_shows_its_field(state)
+        && compact_leading_forms(state)
+            .pop()
+            .is_some_and(|icon| icon.spec == slots.leading)
 }
 
 fn compact_docked_header_height(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
@@ -14547,21 +14652,27 @@ fn navigation(
                 .is_empty()
                 .then(|| UiKey::new(format!("settings/nav{}", state.route.path())))
         });
-    if *state.navigation_revealed.borrow() != target {
-        if let Some(index) = target.as_ref().and_then(|target| {
+    let reveal = |offset: &mut f32, target: Option<&UiKey>| {
+        if let Some(index) = target.and_then(|target| {
             items
                 .iter()
                 .position(|(_, _, key)| key.as_ref() == Some(target))
         }) {
             let top = tops[index];
             let bottom = top + items[index].1;
-            if top < offset {
-                offset = top;
-            } else if bottom > offset + list_height {
-                offset = (bottom - list_height).min(limit);
+            if top < *offset {
+                *offset = top;
+            } else if bottom > *offset + list_height {
+                *offset = (bottom - list_height).min(limit);
             }
         }
+    };
+    if *state.navigation_revealed.borrow() != target {
+        reveal(&mut offset, target.as_ref());
         *state.navigation_revealed.borrow_mut() = target;
+    }
+    if let Some(asked) = state.navigation_reveal.borrow_mut().take() {
+        reveal(&mut offset, Some(&asked));
     }
     state.navigation_scroll.set(offset);
     state.navigation_scroll_limit.set(limit);
@@ -14596,6 +14707,7 @@ fn navigation(
             .clipped(),
     )
     .room(list_height, false)
+    .lists_every_row()
     .children(children);
     let body = if limit > 0.0 {
         #[allow(
@@ -14852,6 +14964,14 @@ fn page(
                 )
             })
         };
+        // A page whose list did not take the toolbar it was told to lead with holds nothing:
+        // the toolbar stays over it ([`compact_toolbar_lists`]).
+        let (holds, cuts) =
+            if chrome.toolbar_listed && compact_toolbar_can_list(state, cx.viewport) && !built.2 {
+                (false, (usize::MAX, usize::MAX))
+            } else {
+                (holds, cuts)
+            };
         state.measuring_calm.set(false);
         (built, holds, cuts)
     };
@@ -14978,7 +15098,15 @@ fn page(
         }
         let mut chosen = None;
         let mut full_cuts = None;
-        for chrome in PageChrome::ladder(width, cx.viewport) {
+        // The rungs that keep the toolbar over the page: the toolbar is listed only where that
+        // brings a stop no rung keeping it shows whole onto a screen (below).
+        let kept_toolbar = || {
+            PageChrome::ladder(width, cx.viewport)
+                .into_iter()
+                .filter(|rung| !rung.toolbar_listed)
+                .collect::<Vec<_>>()
+        };
+        for chrome in kept_toolbar() {
             let (built, holds, cuts) = match spare.take() {
                 Some((was, seated)) if was == chrome => seated,
                 _ => seat(chrome, bars),
@@ -15007,7 +15135,7 @@ fn page(
         if let (Some(built), (0, 0)) = (built, cuts) {
             return (chrome, Some(built));
         }
-        let ladder = PageChrome::ladder(width, cx.viewport);
+        let ladder = kept_toolbar();
         let further = ladder
             .iter()
             .position(|rung| *rung == chrome)
@@ -15044,6 +15172,16 @@ fn page(
             }
             if trial_cuts == (0, 0) || (better && listing && trial_cuts.0 == 0) {
                 break;
+            }
+        }
+        // Last, the toolbar listed over the best of them, where that cuts fewer stops
+        // ([`compact_toolbar_lists`]).
+        if best.2.0 > 0 && compact_toolbar_can_list(state, cx.viewport) {
+            let trial = best.0.listing_toolbar();
+            let (trial_built, _, trial_cuts) = seat(trial, bars);
+            last = trial;
+            if trial_cuts.0 < best.2.0 {
+                best = (trial, Some(trial_built), trial_cuts);
             }
         }
         match best {
@@ -15650,7 +15788,7 @@ fn page(
     if doomed.is_some()
         || (gives_way && state.keyboard_short_of(record.as_ref()) && state.keyboard_cut())
     {
-        let ladder = PageChrome::ladder(width, cx.viewport);
+        let ladder = PageChrome::ladder_for(state, width, cx.viewport);
         let at = ladder
             .iter()
             .position(|rung| rung.giving_bar_room() == chrome.giving_bar_room())
@@ -15698,7 +15836,8 @@ fn page(
             None => {}
         }
     }
-    let (mut children, layout) = drawn.unwrap_or_else(|| seat_drawn(chrome));
+    let (mut children, layout, toolbar_listed) = drawn.unwrap_or_else(|| seat_drawn(chrome));
+    state.toolbar_listed_drawn.set(toolbar_listed);
     state.status_lists.replace(None);
     if remembered != Some(chrome) {
         state.page_chrome_memo.replace(Some((inputs, chrome)));
@@ -15742,7 +15881,26 @@ fn lists_themes(state: &SettingsViewState, width: SettingsWidth) -> bool {
         && !(width == SettingsWidth::Compact && state.compact_navigation)
 }
 
+/// The page's children and layout, and whether its list took the toolbar to lead with
+/// ([`compact_toolbar_lists`]).
 fn page_children(
+    state: &SettingsViewState,
+    update: &UpdateProjection,
+    packages: &PackagesProjection,
+    messages: &MessagesState,
+    harness: &HarnessProjection,
+    cx: &ViewCx<'_>,
+    width: SettingsWidth,
+) -> (Vec<UiNode>, PageLayout, bool) {
+    // A name the last page built left for a list it did not seat is never another page's.
+    state.list_head.replace(Vec::new());
+    state.toolbar_head_taken.set(false);
+    let (children, layout) =
+        page_children_laid(state, update, packages, messages, harness, cx, width);
+    (children, layout, state.toolbar_head_taken.get())
+}
+
+fn page_children_laid(
     state: &SettingsViewState,
     update: &UpdateProjection,
     packages: &PackagesProjection,
@@ -15753,8 +15911,6 @@ fn page_children(
 ) -> (Vec<UiNode>, PageLayout) {
     #[cfg(test)]
     crate::work_counts::settings_page_built();
-    // A name the last page built left for a list it did not seat is never another page's.
-    state.list_head.replace(None);
     let global_search = !state.search.trim().is_empty();
     let shown = PageLayout::shown(state);
     if global_search {
@@ -16171,19 +16327,34 @@ const fn widest_page_maximum(width: SettingsWidth) -> f32 {
     }
 }
 
+/// The column a compact page needs per unit of text size: what a 22-column window gives at 2×
+/// (178pt less 14pt a side), where every page's words fit whole or break at a syllable.
+const COMPACT_COLUMN_PER_SCALE: f32 = 75.0;
+
+/// The least side inset a compact page keeps where its column takes the rest of the window.
+const COMPACT_LEAST_SIDE_INSET: f32 = 6.0;
+
+/// A COMPACT PAGE'S SIDE INSETS GIVE WAY TO ITS COLUMN: never narrower than its words need at the
+/// text size ([`COMPACT_COLUMN_PER_SCALE`]) where the window holds that, down to
+/// [`COMPACT_LEAST_SIDE_INSET`]. At 2× the narrowest window (164pt) keeps the 22-column window's
+/// 150pt column, where 14pt a side left 136pt and shredded every word wider than its box ("Choo-"
+/// / "se…", "Monocr-" / "aft").
+fn compact_side_inset(viewport_width: f32) -> f32 {
+    let natural = if viewport_width < 300.0 && settings_text_scale() > 1.25 {
+        14.0
+    } else {
+        16.0
+    };
+    let column = COMPACT_COLUMN_PER_SCALE * settings_text_scale();
+    ((viewport_width - column) / 2.0).clamp(COMPACT_LEAST_SIDE_INSET, natural)
+}
+
 fn page_insets(viewport_width: f32, width: SettingsWidth, maximum: f32) -> Insets {
     let navigation = settings_navigation_width(width);
     let (minimum, vertical) = match width {
         SettingsWidth::Wide => (40.0, 32.0),
         SettingsWidth::Medium => (24.0, 24.0),
-        SettingsWidth::Compact => (
-            if viewport_width < 300.0 && settings_text_scale() > 1.25 {
-                14.0
-            } else {
-                16.0
-            },
-            20.0,
-        ),
+        SettingsWidth::Compact => (compact_side_inset(viewport_width), 20.0),
     };
     let canvas = (viewport_width - navigation).max(0.0);
     if width == SettingsWidth::Compact {
@@ -16238,6 +16409,9 @@ pub(crate) struct PageChrome {
     inset: Option<f32>,
     bar_room_given: bool,
     preview_listed: bool,
+    /// The compact toolbar leads the page's list, scrolling away with it, where it can
+    /// ([`compact_toolbar_lists`]): the last chrome a short window sheds.
+    toolbar_listed: bool,
 }
 
 impl PageChrome {
@@ -16246,6 +16420,7 @@ impl PageChrome {
         inset: None,
         bar_room_given: false,
         preview_listed: false,
+        toolbar_listed: false,
     };
 
     const fn giving_bar_room(self) -> Self {
@@ -16262,10 +16437,19 @@ impl PageChrome {
         }
     }
 
+    const fn listing_toolbar(self) -> Self {
+        Self {
+            toolbar_listed: true,
+            ..self
+        }
+    }
+
     /// The chrome a page on `viewport` may keep, fullest first: the subtitle where the window
     /// shows one, then the insets to 12pt and to 4pt where the window's own are more. Under the
     /// page, and over it only where no heading row sits there, so a heading is where the window
-    /// puts it on every page ([`heading_top_inset`]).
+    /// puts it on every page ([`heading_top_inset`]). Last, in a compact window too short for a
+    /// heading row, the toolbar: listed at the head of the page's list, it gives the list its row
+    /// ([`compact_toolbar_lists`]).
     fn ladder(width: SettingsWidth, viewport: LogicalRect) -> Vec<Self> {
         let natural = responsive_page_insets(viewport.width, viewport.height, width, FORM_MEASURE);
         let (heading, subtitle) = window_page_chrome(width, viewport);
@@ -16289,6 +16473,25 @@ impl PageChrome {
                     ..Self::FULL
                 });
             }
+        }
+        if compact_window_lists_toolbar(width, viewport)
+            && let Some(leanest) = ladder.last().copied()
+        {
+            ladder.push(leanest.listing_toolbar());
+        }
+        ladder
+    }
+
+    /// [`Self::ladder`] as `state` can draw it: its listed toolbar only where the toolbar can
+    /// lead the list ([`compact_toolbar_can_list`]), so no seat is tried that draws a rung again.
+    fn ladder_for(
+        state: &SettingsViewState,
+        width: SettingsWidth,
+        viewport: LogicalRect,
+    ) -> Vec<Self> {
+        let mut ladder = Self::ladder(width, viewport);
+        if !compact_toolbar_can_list(state, viewport) {
+            ladder.retain(|rung| !rung.toolbar_listed);
         }
         ladder
     }
@@ -16490,13 +16693,23 @@ fn pinned_heading(
     // cannot hold the title leads its list with its name, in the toolbar title's type on the
     // lines its column needs, scrolling away with the list as a navigation bar's large title
     // does; pinned, those lines would take a row's room from every screen.
-    let unnamed = width == SettingsWidth::Compact && !compact_toolbar_titles(width, viewport);
-    state.list_head.replace((!heading && unnamed).then(|| {
-        page_name_node(
-            title,
-            settings_page_content_width(viewport.width, width, FORM_MEASURE),
-        )
-    }));
+    // Where the toolbar leads the list ([`compact_toolbar_lists`]) it leads it in the list's
+    // column, and the name follows it where the toolbar there does not carry the title.
+    let column = settings_page_content_width(viewport.width, width, FORM_MEASURE);
+    let mut head = Vec::new();
+    let mut unnamed = width == SettingsWidth::Compact && !compact_toolbar_titles(width, viewport);
+    if compact_toolbar_lists(state, viewport) {
+        let bar = LogicalRect::new(0.0, 0.0, column, viewport.height);
+        unnamed = !compact_toolbar_slots(state, bar, false).titled;
+        head.push((
+            compact_toolbar(state, bar, false),
+            compact_undocked_toolbar_height(state, bar),
+        ));
+    }
+    if !heading && unnamed {
+        head.push(page_name_node(title, column));
+    }
+    state.list_head.replace(head);
     if !heading {
         return (Vec::new(), 0.0);
     }
@@ -16562,11 +16775,19 @@ pub(super) fn page_name_node(title: &str, width: f32) -> (UiNode, f32) {
 }
 
 impl SettingsViewState {
-    /// The page's name its list leads with where nothing over the list names it
-    /// ([`pinned_heading`]), and its height: taken by the first list the page seats.
-    pub(super) fn take_list_head(&self) -> Option<(UiNode, f32)> {
-        self.list_head.take()
+    /// What the page's list leads with where nothing over the list holds it ([`pinned_heading`]),
+    /// each with its height: taken by the first list the page seats.
+    pub(super) fn take_list_head(&self) -> Vec<(UiNode, f32)> {
+        let head = self.list_head.take();
+        if head.iter().any(|(node, _)| is_compact_toolbar(node)) {
+            self.toolbar_head_taken.set(true);
+        }
+        head
     }
+}
+
+fn is_compact_toolbar(node: &UiNode) -> bool {
+    node.key.as_str() == COMPACT_TOOLBAR_KEY
 }
 
 fn settings_list_body_height(
@@ -16578,6 +16799,19 @@ fn settings_list_body_height(
     let taken = settings_status_bars_taken(state, width, viewport);
     let cost = settings_status_bar_kept(state, width, viewport);
     (body - (cost - taken).max(0.0)).max(0.0) + plain_status_extra(state, width, viewport)
+}
+
+/// THE ROOM A PAGE'S LIST HAS under what the page pins over it (`pinned`), never more than the
+/// page has: a room raised to a control's height drew a 128pt list in a 72pt page (2× text in a
+/// 178x152 window), past the window's edge, and told the chrome ladder the page held, so it
+/// never gave the list the room it kept for a status's bar.
+fn page_list_room(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+    pinned: f32,
+) -> f32 {
+    (settings_list_body_height(state, width, viewport) - pinned).max(0.0)
 }
 
 fn plain_status_extra(
@@ -20047,13 +20281,25 @@ fn display_faces_head(
     )
     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
     .paint_only();
+    // Its line holds it whole as a stacked row's does ([`seat_stacked_reset`]): no wider than the
+    // line, and at its end only where the gap before it still fits (Reset ran 12pt past the card
+    // at 1.5× text in the narrowest window).
+    let mut reset = reset;
+    if let Length::Fixed(width) = reset.layout.width {
+        reset.layout.width = Length::Fixed(width.min(text_width));
+    }
+    let children = if fixed_width(&reset) + 12.0 > text_width + 0.01 {
+        vec![reset]
+    } else {
+        vec![spacer, reset]
+    };
     (
         (caption, height),
         Some((
             line(
                 "settings/group-heading-line/display-faces",
                 reset_height,
-                vec![spacer, reset],
+                children,
             ),
             reset_height,
         )),
@@ -20129,11 +20375,14 @@ fn cursor_styles_page(
     };
     let saved = saved_cursor_style(state);
     let styles = listed_cursor_styles(state);
+    // The rows are split for the leanest chrome that keeps the toolbar over the page: where they
+    // fit there it stays; a page that lists it lists them whole too.
     let row_room = {
         let chrome = state.page_chrome.get();
+        let head = state.list_head.take();
         let leanest = PageChrome::ladder(width, cx.viewport)
-            .last()
-            .copied()
+            .into_iter()
+            .rfind(|rung| !rung.toolbar_listed)
             .unwrap_or(PageChrome::FULL)
             .giving_bar_room()
             .listing_preview();
@@ -20149,6 +20398,7 @@ fn cursor_styles_page(
             route_subtitle(route),
         );
         state.page_chrome.set(chrome);
+        state.list_head.replace(head);
         (body - used).max(scaled_control_height())
     };
     let mut group_runs: Vec<(f32, Vec<f32>, f32)> = Vec::new();
@@ -21150,8 +21400,7 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         SettingsRoute::Wallpaper.label(),
         route_subtitle(SettingsRoute::Wallpaper),
     );
-    let room =
-        (settings_list_body_height(state, width, viewport) - used).max(scaled_control_height());
+    let room = page_list_room(state, width, viewport, used);
     let current = state.raw_value(prefs::EDIT_WALLPAPER);
     let line_height = page_subtitle_height();
     let mut rows: Vec<(UiNode, f32)> = Vec::new();
@@ -21750,8 +21999,7 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
     const WHAT_MANUAL_IS: &str = "Edit aterm.toml directly, with completion and error checking.";
     let gap = settings_page_gap(state, width, cx.viewport);
     let (mut out, used) = pinned_heading(state, width, cx.viewport, gap, "Manual", WHAT_MANUAL_IS);
-    let room =
-        (settings_list_body_height(state, width, cx.viewport) - used).max(scaled_control_height());
+    let room = page_list_room(state, width, cx.viewport, used);
     let text_width =
         (settings_page_content_width(cx.viewport.width, width, PageLayout::Form.maximum(width))
             - 28.0)
@@ -23732,11 +23980,12 @@ fn settings_fields_page(
             (body - used, gap),
         );
     }
-    // The page's name, where nothing over the list names it, leads it.
-    if let Some((name, height)) = state.take_list_head() {
-        plan.insert_card(0, height, Vec::new());
-        plan.set_ids_of(0, vec![name.key.clone()]);
-        stops.insert(0, FieldStop::Card(name));
+    // The toolbar where it leads the list, and the page's name where nothing over the list names
+    // it, lead it.
+    for (at, (node, height)) in state.take_list_head().into_iter().enumerate() {
+        plan.insert_card(at, height, scroll::focus_keys(&node));
+        plan.set_ids_of(at, vec![node.key.clone()]);
+        stops.insert(at, FieldStop::Card(node));
     }
     scroll::seat_room_under_status(
         state,
@@ -25032,17 +25281,18 @@ fn parent_or_motion_inactivity(
                 "Not found".to_string(),
                 format!("Font not found: \u{201c}{}\u{201d}", refusal.family),
             ),
-            crate::native_font_catalog::FontRefusalReason::WrongStyle => {
-                let (face, text) = font_slot_style(key);
+            crate::native_font_catalog::FontRefusalReason::WrongStyle(drawn) => {
+                let text = font_slot_text(key);
+                let (face, label) = drawn_face_words(drawn);
                 EffectDisclosure::new(
                     EffectNoteKind::Inactive,
                     format!(
-                        "\u{201c}{}\u{201d} is not {face}; {} is drawn in it",
+                        "\u{201c}{}\u{201d} is {face}; {} is drawn in it",
                         refusal.family,
                         text.to_lowercase()
                     ),
-                    format!("Not {face}"),
-                    format!("\u{201c}{}\u{201d} is not {face}", refusal.family),
+                    label.to_string(),
+                    format!("\u{201c}{}\u{201d} is {face}", refusal.family),
                 )
             }
         });
@@ -30318,7 +30568,7 @@ fn fields_page_list_room(
         state.route.label(),
         settings_fields_subtitle(state.route, false, false),
     );
-    (settings_list_body_height(state, width, viewport) - pinned).max(0.0)
+    page_list_room(state, width, viewport, pinned)
 }
 
 fn macos_access_lead(
@@ -31730,11 +31980,15 @@ fn word_placeholder_lines(
     if whole.len() <= most {
         return whole;
     }
+    // Its first words that fit the field's most lines, cut with an ellipsis; where even the
+    // first word with its ellipsis takes more, the form that takes the fewest lines, never every
+    // word: "ai-fleet.toml beside aterm.toml" on five lines made a 196pt field at 2× text in a
+    // 22-column window, no screen of a 152pt window whole.
     let words: Vec<&str> = plain.split_whitespace().collect();
-    (1..words.len())
+    let cut: Vec<Vec<String>> = (1..words.len())
         .rev()
-        .find_map(|n| {
-            let lines = wrap_to_box(
+        .map(|n| {
+            wrap_to_box(
                 &format!(
                     "{}{}",
                     words[..n].join(" "),
@@ -31742,10 +31996,16 @@ fn word_placeholder_lines(
                 ),
                 room,
                 measure,
-            );
-            (lines.len() <= most).then_some(lines)
+            )
         })
-        .unwrap_or(whole)
+        .collect();
+    if let Some(lines) = cut.iter().find(|lines| lines.len() <= most) {
+        return lines.clone();
+    }
+    std::iter::once(whole)
+        .chain(cut)
+        .min_by_key(Vec::len)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32121,8 +32381,7 @@ fn about_page(
     let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
     let gap = settings_page_gap(state, width, viewport);
     let (heading, heading_height) = pinned_heading(state, width, viewport, gap, "About", "");
-    let room = (settings_list_body_height(state, width, viewport) - heading_height)
-        .max(scaled_control_height());
+    let room = page_list_room(state, width, viewport, heading_height);
     let value = |wanted: &str, fallback: &str| {
         about
             .semantic_rows()
@@ -34633,8 +34892,7 @@ fn update_page(
     let (heading, heading_height) =
         pinned_heading(state, width, viewport, gap, "Software Update", subtitle);
     let card_titled = !page_named(width, viewport);
-    let room = (settings_list_body_height(state, width, viewport) - heading_height)
-        .max(scaled_control_height());
+    let room = page_list_room(state, width, viewport, heading_height);
     let overhang = settings_list_overhang(state, width, viewport);
     let compact_section_height = room;
 
@@ -37336,9 +37594,15 @@ fn messages_plan_opening(
         );
         compact_page_budget(state, viewport).content_height - heading
     });
-    // The page's name, where nothing over its list names it ([`pinned_heading`]), leads it.
-    if let Some(name) = compact.then(|| state.list_head.borrow().clone()).flatten() {
-        header.insert(0, name);
+    // The toolbar where it leads the list, and the page's name where nothing over its list names
+    // it ([`pinned_heading`]), lead it.
+    if compact {
+        for (at, node) in state.list_head.borrow().iter().cloned().enumerate() {
+            if is_compact_toolbar(&node.0) {
+                state.toolbar_head_taken.set(true);
+            }
+            header.insert(at, node);
+        }
     }
     header.extend(messages_filter_items(
         state,
@@ -37457,6 +37721,15 @@ fn messages_plan_opening(
     {
         plan.scrolls = true;
         plan.room = whole;
+    }
+    if !compact && plan.scrolls {
+        // The header scrolls with the list here, as a compact page's does: a card of filters
+        // taller than the list's room is listed a row of chips at a time, so no screen cuts one.
+        let room = plan.room;
+        plan.header = std::mem::take(&mut plan.header)
+            .into_iter()
+            .flat_map(|item| scroll::row_parts(item, room, room, MESSAGES_ROW_GAP))
+            .collect();
     }
     plan.tall = plan
         .body
@@ -37609,7 +37882,27 @@ fn messages_page(
     });
     if scrolls {
         let mut children: Vec<UiNode> = controls.into_iter().collect();
-        children.extend(list);
+        // The list is never taller than the room the screen leaves it: an entry taller than
+        // that (its head at 2× in a 152pt window) is cut by the list's edge, not drawn past the
+        // window's with its thumb.
+        let section = room.max(0.0);
+        let left = section
+            - children
+                .iter()
+                .map(|node| fixed_height(node) + gap)
+                .sum::<f32>();
+        children.extend(list.map(|mut list| {
+            if fixed_height(&list) > left + 0.01 {
+                let left = left.max(0.0);
+                list.layout.height = Length::Fixed(left);
+                for child in &mut list.children {
+                    if matches!(child.layout.height, Length::Fixed(height) if height > left) {
+                        child.layout.height = Length::Fixed(left);
+                    }
+                }
+            }
+            list
+        }));
         let (mut out, _) = pinned_heading(
             state,
             width,
@@ -37630,7 +37923,7 @@ fn messages_page(
             .layout(
                 Layout::column()
                     .width(Length::Fill)
-                    .height(Length::Fixed(room.max(messages_row_height())))
+                    .height(Length::Fixed(section))
                     .gap(gap)
                     .clipped(),
             )
@@ -38247,6 +38540,19 @@ fn packages_program_line_row(line: &ProgramLine, row_height: f32, width: f32) ->
 const PACKAGES_ACTION_WIDTH: f32 = 196.0;
 const PACKAGES_ACTION_GAP: f32 = 8.0;
 const PACKAGES_HERO_PAD_X: f32 = 22.0;
+const PACKAGES_HERO_PAD_Y: f32 = 20.0;
+
+/// THE HERO'S SIDES GIVE WAY AS EVERY CARD'S DO ([`card_side_padding`]): its own where the card's
+/// words have room, a narrow card's where they do not, so a narrow window's actions take the
+/// card's width. At 2× text in a 22-column window its 22pt sides left Check & Update Now 106pt,
+/// four lines and 163pt, taller than any screen of a 152pt window.
+fn packages_hero_pad_x(card_width: f32) -> f32 {
+    if card_side_padding(card_width) < ABOUT_METADATA_CARD_PADDING {
+        NARROW_CARD_PADDING
+    } else {
+        PACKAGES_HERO_PAD_X
+    }
+}
 
 const PACKAGE_CONSENT_NOTE: &str = "Keeping ALab tools up to date covers ALab tools and the coding agents aterm manages, and takes effect at once; Check & Update Now works either way. aterm installs ALab tools by default; Remove ALab Tools undoes that. Installing ALab tools lets aterm download them \u{2014} several GB \u{2014} at the next check, and new ones as they join.";
 const PACKAGE_CONSENT_LINES: [&str; 2] = [
@@ -38272,9 +38578,21 @@ fn packages_page(
     let headline_height = 42.0_f32.max(30.0 * text_scale);
     let detail_height = 24.0_f32.max(20.0 * text_scale);
     let action_control_height = 36.0_f32.max(32.0 * text_scale);
-    let hero_inner =
-        settings_page_content_width(viewport_width, width, PageLayout::Form.maximum(width))
-            - 2.0 * PACKAGES_HERO_PAD_X;
+    let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
+    let gap = settings_page_gap(state, width, viewport);
+    let (mut out, heading_height) = pinned_heading(
+        state,
+        width,
+        viewport,
+        gap,
+        "Packages",
+        packages_page_subtitle(),
+    );
+    let room = page_list_room(state, width, viewport, heading_height);
+    let card_width =
+        settings_page_content_width(viewport_width, width, PageLayout::Form.maximum(width));
+    let hero_pad = packages_hero_pad_x(card_width);
+    let hero_inner = card_width - 2.0 * hero_pad;
     let action_labels = [
         "Check & Update Now",
         "Install ALab Tools Now",
@@ -38293,13 +38611,36 @@ fn packages_page(
     let stack_actions = !even_actions && !natural_actions;
 
     let can_act = !packages.tool_observed || (packages.available && packages.manager_enabled);
+    // A BUTTON NO SCREEN HOLDS WHOLE SAYS LESS: an action takes its brief form where its words
+    // take more lines than the list's room holds under the card's edge (Install ALab Tools Now on
+    // four lines at 2× text in a 22-column window, 163pt, where the window is 152pt), and where no
+    // form fits, the one on the fewest lines.
     let words = |label: &str| {
         let short: &[&str] = match label {
             "Check & Update Now" => &["Check & Update"],
             "Install ALab Tools Now" => &["Install ALab Tools"],
             _ => &[],
         };
-        button_words(label, short, hero_inner)
+        let fits = |(_, lines): &(String, usize)| {
+            crate::native_ui::native_button_height_for_lines(*lines, action_control_height)
+                <= room - PACKAGES_HERO_PAD_Y + 0.01
+        };
+        let chosen = button_words(label, short, hero_inner);
+        if fits(&chosen) {
+            return chosen;
+        }
+        let forms: Vec<(String, usize)> = short
+            .iter()
+            .map(|form| button_words(form, &[], hero_inner))
+            .collect();
+        if let Some(form) = forms.iter().find(|form| fits(form)) {
+            return form.clone();
+        }
+        // None fits: the form on the fewest lines.
+        std::iter::once(chosen)
+            .chain(forms)
+            .min_by_key(|(_, lines)| *lines)
+            .unwrap_or_default()
     };
     let action_button = |key: &str, label: &str, busy: PackagesBusy, primary: bool| {
         let (visual, lines) = words(label);
@@ -38455,14 +38796,14 @@ fn packages_page(
     let hero = SplitCard {
         key: "packages/hero".to_string(),
         spec: GroupSpec::new("Package status").style(StyleRef::Primary),
-        padding: Insets::symmetric(PACKAGES_HERO_PAD_X, 20.0),
+        padding: Insets::symmetric(hero_pad, PACKAGES_HERO_PAD_Y),
         gap: 8.0,
         head: Vec::new(),
         repeat: Vec::new(),
         rows: hero_rows,
     };
 
-    let consent_text_width = hero_inner + 2.0 * PACKAGES_HERO_PAD_X - 40.0;
+    let consent_text_width = card_width - 40.0;
     let switch_inline = width == SettingsWidth::Compact
         && compact_row_inline(&EditKind::Bool, consent_text_width, true);
     let switch_width = if switch_inline {
@@ -38596,18 +38937,6 @@ fn packages_page(
         rows: activity_rows,
     };
 
-    let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
-    let gap = settings_page_gap(state, width, viewport);
-    let (mut out, heading_height) = pinned_heading(
-        state,
-        width,
-        viewport,
-        gap,
-        "Packages",
-        packages_page_subtitle(),
-    );
-    let room = (settings_list_body_height(state, width, viewport) - heading_height)
-        .max(scaled_control_height());
     out.push(scroll::list_page_peeking(
         state,
         "packages/list",

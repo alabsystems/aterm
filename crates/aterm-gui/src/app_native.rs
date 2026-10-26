@@ -2225,6 +2225,8 @@ impl App {
         self.font_weight_dark_nudge.to_bits().hash(&mut paint);
         native_appearance_revision(crate::native_appearance::current_preferences())
             .hash(&mut paint);
+        // The faces chrome text can ink now: a face that lands redraws what lacked it.
+        crate::tray_raster::chrome_coverage_epoch().hash(&mut paint);
         let motion = self.native_view_motion_cx(wid, view);
         native_motion_revision(motion).hash(&mut paint);
         motion.automatic_tab_color.hash(&mut paint);
@@ -2638,6 +2640,8 @@ impl App {
         &self,
         instance: crate::tab_model::AppInstanceId,
         view: crate::tab_model::ViewId,
+        viewport: crate::native_ui::LogicalRect,
+        toolbar: crate::native_ui::EditorToolbar,
     ) -> Option<crate::native_ui::EditorPalette> {
         let crate::native_app::AppViewState::Editor(state) =
             self.native_runtime.view_state(view)?
@@ -2653,14 +2657,22 @@ impl App {
             return None;
         }
         let listed = assist.typed || state.config_completion_interaction == Some(context);
+        // The panel on the rows the view paints its help line on.
+        let palette = |candidates: Option<usize>, help: &str| {
+            crate::native_ui::editor_help_palette(viewport, toolbar, candidates, help).0
+        };
         if listed {
-            (assist.help.is_some() || !assist.completions.is_empty())
-                .then(|| crate::native_ui::EditorPalette::Rows(assist.completions.len().max(1)))
+            (assist.help.is_some() || !assist.completions.is_empty()).then(|| {
+                palette(
+                    Some(assist.completions.len().max(1)),
+                    crate::native_app::config_assist_help(&assist),
+                )
+            })
         } else {
             assist
                 .resting_help
-                .is_some()
-                .then_some(crate::native_ui::EditorPalette::Help)
+                .as_deref()
+                .map(|help| palette(None, help))
         }
     }
 
@@ -2689,25 +2701,7 @@ impl App {
         {
             return Ok(false);
         }
-        let palette_candidates = self
-            .native_runtime
-            .view_state(view)
-            .and_then(|state| match state {
-                crate::native_app::AppViewState::Editor(state) => state.buffer.as_ref(),
-                _ => None,
-            })
-            .and_then(|buffer| match &buffer.minibuffer {
-                crate::native_editor::Minibuffer::Command { query, .. } => {
-                    Some(crate::native_ui::EditorPalette::Rows(
-                        crate::native_editor::command_completions(query)
-                            .len()
-                            .max(1),
-                    ))
-                }
-                _ => None,
-            })
-            .or_else(|| self.shown_config_assist_rows(instance, view))
-            .unwrap_or(crate::native_ui::EditorPalette::None);
+        let viewport = self.native_ui_viewport_for(wid, view)?;
         let toolbar = match (
             self.native_runtime.app(instance),
             self.native_runtime.view_state(view),
@@ -2719,7 +2713,25 @@ impl App {
             (Some(crate::native_app::NativeApp::Editor(editor)), _) => editor.toolbar(),
             _ => crate::native_ui::EditorToolbar::default(),
         };
-        let viewport = self.native_ui_viewport_for(wid, view)?;
+        let palette_candidates = self
+            .native_runtime
+            .view_state(view)
+            .and_then(|state| match state {
+                crate::native_app::AppViewState::Editor(state) => state.buffer.as_ref(),
+                _ => None,
+            })
+            .and_then(|buffer| match &buffer.minibuffer {
+                crate::native_editor::Minibuffer::Command { query, .. } => {
+                    Some(crate::native_ui::EditorPalette::from(
+                        crate::native_editor::command_completions(query)
+                            .len()
+                            .max(1),
+                    ))
+                }
+                _ => None,
+            })
+            .or_else(|| self.shown_config_assist_rows(instance, view, viewport, toolbar))
+            .unwrap_or(crate::native_ui::EditorPalette::None);
         // The rows under the footer the next frame paints: its status wraps in this editor.
         let editor_rect = crate::native_ui::editor_text_viewport_rect_with_palette(
             viewport,

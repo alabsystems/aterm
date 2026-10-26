@@ -1566,12 +1566,13 @@ impl fmt::Display for Unproven {
             }
             Self::Unbound(node) => write!(
                 f,
-                "node {} is bound to no key here: it is bound when it joins the issuer again",
+                "node {} is bound to no key on the dialled Mac: it is bound when it joins the \
+                 issuer again",
                 short(node)
             ),
             Self::OtherKey(node) => write!(
                 f,
-                "the peer claims node {} and proved another key than this machine binds to it",
+                "the peer claims node {} and proved another key than the dialled Mac binds to it",
                 short(node)
             ),
         }
@@ -1625,38 +1626,40 @@ impl fmt::Display for Undriven {
             Self::Unproven(why) => write!(f, "{why}"),
             Self::Unlisted(node) => write!(
                 f,
-                "node {} is not one this Mac lets drive it (aterm fleet allow drive --from, \
-                 there)",
+                "node {} is not one the dialled Mac lets drive it (aterm fleet allow drive \
+                 --from, there)",
                 short(node)
             ),
             Self::Rekeyed(node) => write!(
                 f,
-                "node {} proved another key than the one it held when this Mac's person let it \
-                 drive: it drives again only once they run aterm fleet allow drive --from, there",
+                "node {} proved another key than the one it held when the dialled Mac's person \
+                 let it drive: it drives again only once they run aterm fleet allow drive --from, \
+                 there",
                 short(node)
             ),
             Self::Unchecked { node, why } => write!(
                 f,
-                "node {} is bound here only by this Mac's copy of its issuer's book, which is \
-                 over {} s old, and this Mac could not read that book again to check it ({}): it \
-                 drives again once this Mac reaches its issuer (aterm fleet peers, there, says why \
-                 it does not)",
+                "node {} is bound on the dialled Mac only by its copy of its issuer's book, \
+                 which is over {} s old, and it could not read that book again to check it ({}): \
+                 it drives again once the dialled Mac reaches its issuer (aterm fleet peers, \
+                 there, says why it does not)",
                 short(node),
                 COPY_DRIVES_FOR.as_secs(),
                 aterm_codec::tty::one_line(why, 160)
             ),
             Self::Unread { node, why } => write!(
                 f,
-                "node {} is bound to no key by this Mac's copy of its issuer's book, and this Mac \
-                 could not read that book again to find whether it joined since ({}): it drives \
-                 once this Mac reaches its issuer (aterm fleet peers, there, says why it does not)",
+                "node {} is bound to no key by the dialled Mac's copy of its issuer's book, and \
+                 it could not read that book again to find whether it joined since ({}): it \
+                 drives once the dialled Mac reaches its issuer (aterm fleet peers, there, says \
+                 why it does not)",
                 short(node),
                 aterm_codec::tty::one_line(why, 160)
             ),
             Self::Unjoined(node) => write!(
                 f,
-                "node {} is bound to no key here, nor by its issuer's book read just now: it drives \
-                 once it joins the issuer",
+                "node {} is bound to no key on the dialled Mac, nor by its issuer's book read \
+                 just now: it drives once it joins the issuer",
                 short(node)
             ),
         }
@@ -2022,6 +2025,10 @@ pub const NOT_THE_ISSUER: &str = "it is no fleet's issuer: it holds no join code
                                   no members (a join code comes from the fleet's issuer, in the \
                                   file its `aterm fleet init` names)";
 
+/// How the refusal of a registration that names the issuer's own node starts ([`serve_join`]): a
+/// member's `join` reads it as this machine carrying its issuer's node.
+pub const OWN_NODE: &str = "the registration names the issuer's own node";
+
 /// The refusal of a join proved under a fleet left or rotated before it was recorded, in the
 /// joining machine's words.
 pub const MOVED_ON: &str = "the issuer left the fleet, or rotated its secret, while the join was \
@@ -2076,11 +2083,10 @@ pub fn serve_join<S: Read + Write>(
             .map_err(|why| format!("the issuer cannot name itself: {why}"))
             .and_then(|issuer| {
                 if reg.node == issuer.node {
-                    return Err(
-                        "the registration names the issuer's own node, and the issuer does not \
-                         join itself (a Mac cloned or restored from the issuer carries its node)"
-                            .to_owned(),
-                    );
+                    return Err(format!(
+                        "{OWN_NODE}, and the issuer does not join itself (a Mac cloned or \
+                         restored from the issuer carries its node)"
+                    ));
                 }
                 let peer = Peer {
                     node: Some(reg.node),
@@ -3134,6 +3140,11 @@ impl fmt::Display for Unreached {
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
                     write!(f, "{addr} did not answer in time")
                 }
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => write!(
+                    f,
+                    "{addr} reset the connection: its fleet listener closing or restarting; try \
+                     again"
+                ),
                 io::ErrorKind::HostUnreachable => write!(
                     f,
                     "no route to {}: off the LAN, or not allowed in Privacy & Security › Local \

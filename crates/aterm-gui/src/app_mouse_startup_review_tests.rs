@@ -45,8 +45,9 @@ fn present_mixed(app: &mut App, window: WindowId) {
 
 fn review_beside_terminal() -> Review {
     let mut app = App::headless_for_test();
-    // A real windowed offer with inert headless platform ports.
+    // A real windowed offer with inert headless platform ports, and a person at the screen.
     app.headless = false;
+    app.user_input_recent = |_| true;
     let window = WindowId(0);
     let state = app.windows.get_mut(&window).unwrap();
     state.os_window_for_test = true;

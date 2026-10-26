@@ -158,14 +158,17 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
 ];
 
 #[cfg(target_os = "macos")]
+pub(crate) use imp::reaps_unwaited_all;
+
+#[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::sync::OnceLock;
 
     use crate::jobs::darwin::{
-        KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_PGID_AT, KINFO_PID_AT, KINFO_PPID_AT,
-        KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT, KINFO_STAT_AT, KINFO_TDEV_AT,
-        KINFO_TPGID_AT, NODEV,
+        KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT,
+        KINFO_PPID_AT, KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT, KINFO_STAT_AT,
+        KINFO_TDEV_AT, KINFO_TPGID_AT, NODEV, P_NOCLDWAIT,
     };
 
     use super::{Locale, Record};
@@ -352,14 +355,36 @@ mod imp {
     }
 
     pub(super) fn records() -> Option<Vec<Record>> {
+        let buf = table()?;
+        let (records, _) = buf.as_chunks::<KINFO_SIZE>();
+        records.iter().map(|r| parse(r)).collect()
+    }
+
+    /// Each process's pid, its parent's, and whether the kernel reaps its children for it
+    /// (`P_NOCLDWAIT`), in one read of the table.
+    pub(crate) fn reaps_unwaited_all() -> Option<Vec<(u32, u32, bool)>> {
+        let buf = table()?;
+        let (records, _) = buf.as_chunks::<KINFO_SIZE>();
+        records
+            .iter()
+            .map(|r| {
+                let flag = u32_at(r, KINFO_FLAG_AT)?;
+                let ppid = u32_at(r, KINFO_PPID_AT)?;
+                Some((u32_at(r, KINFO_PID_AT)?, ppid, flag & P_NOCLDWAIT != 0))
+            })
+            .collect()
+    }
+
+    /// The whole table's `kinfo_proc` records (`KERN_PROC_ALL`), a whole number of them.
+    fn table() -> Option<Vec<u8>> {
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
         for _ in 0..4 {
             let len = sysctl_len(&mut mib[..3])?;
             let mut buf = vec![0u8; len + len / 8 + KINFO_SIZE * 16];
             match sysctl_into(&mut mib[..3], &mut buf) {
                 Ok(n) if n % KINFO_SIZE == 0 => {
-                    let (records, _) = buf[..n].as_chunks::<KINFO_SIZE>();
-                    return records.iter().map(|r| parse(r)).collect();
+                    buf.truncate(n);
+                    return Some(buf);
                 }
                 Ok(_) => return None,
                 Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {}

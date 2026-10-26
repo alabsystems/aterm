@@ -14,8 +14,8 @@ use crate::admit::{Other, counted, decide};
 use crate::floor::{self, GIB};
 use crate::reading::{Proc, Procs, TreeUse};
 use crate::{
-    Admit, Error, Fixed, Ledger, Need, Pace, Polled, Reading, Record, Short, Volume, Waiter,
-    admit_until, admit_with, never,
+    Admit, Error, Fixed, Ledger, Need, Pace, Patience, Polled, Reading, Record, Short, Volume,
+    Waiter, admit_until, admit_with, never,
 };
 
 /// A scratch ledger, removed when the test ends.
@@ -627,6 +627,7 @@ fn record(pid: u32, start_ms: u64, need: Need, held: Option<u32>) -> Record {
         }),
         credit: Vec::new(),
         wrote: None,
+        next_ms: None,
     }
 }
 
@@ -1077,6 +1078,408 @@ fn the_quiet_bound_is_per_core() {
     assert_eq!((need.mem, need.cores, need.disk), (0, 0, 0));
 }
 
+/// A patience of `reserve`, `start` and `hold` seconds.
+fn patience(reserve: u64, start: u64, hold: u64) -> Patience {
+    Patience {
+        reserve: Duration::from_secs(reserve),
+        start: Duration::from_secs(start),
+        hold: Duration::from_secs(hold),
+    }
+}
+
+/// [`mac48`] at a load of 40, no core idle.
+fn busy48() -> Fixed {
+    let mut r = Reading::of_gib(48, 40, 14);
+    r.load1 = Some(40.0);
+    r.load5 = Some(40.0);
+    Fixed::new(r)
+}
+
+/// A quiet claim's reservation, on its record: none until it has been next for its reserve
+/// age, then while it waits, and for its hold once it starts, which it does by its bound; none
+/// for a claim that started before it reserved, nor for one with no patience (the old rule) or
+/// never next. Times are unix ms, next at 1 000 000.
+#[test]
+fn a_reservation_lasts_from_its_age_into_the_works_first_minutes() {
+    let next = 1_000_000;
+    let mut r = record(
+        10,
+        0,
+        Need::new("measure")
+            .quiet(28.0)
+            .patience(patience(120, 600, 900)),
+        None,
+    );
+    assert_eq!(r.reserves(next + 500_000), None, "never next");
+    r.next_ms = Some(next);
+    assert_eq!(
+        r.reserves(next + 119_999),
+        None,
+        "younger than its reserve age"
+    );
+    assert_eq!(
+        r.reserves(next + 120_000),
+        Some(Duration::from_secs(1380)),
+        "from its age: until its bound and its hold after"
+    );
+    assert_eq!(r.reserves(next + 1_499_999), Some(Duration::from_millis(1)));
+    assert_eq!(r.reserves(next + 1_500_000), None, "spent, waiting or not");
+    r.held = Some(crate::Held {
+        admitted_ms: next + 300_000,
+        cores: 0,
+    });
+    assert_eq!(
+        r.reserves(next + 400_000),
+        Some(Duration::from_secs(800)),
+        "started at 5 minutes: its hold from then"
+    );
+    assert_eq!(r.reserves(next + 1_200_000), None, "its hold is over");
+    r.held = Some(crate::Held {
+        admitted_ms: next + 60_000,
+        cores: 0,
+    });
+    assert_eq!(
+        r.reserves(next + 400_000),
+        None,
+        "started before it reserved"
+    );
+    r.held = None;
+    r.need.patience = None;
+    assert_eq!(
+        r.reserves(next + 400_000),
+        None,
+        "the old rule reserves nothing"
+    );
+}
+
+/// What a reservation holds back: claimed work (memory, cores or disk) that asked after the
+/// quiet claim, from a process of no kin to it. Work that asked first keeps its place; a quiet
+/// claim, a need of nothing and the quiet claim's own kin pass.
+#[test]
+fn a_reservation_holds_back_later_claimed_work_outside_its_kin() {
+    let next = 1_000_000;
+    let mut quiet = record(
+        10,
+        500,
+        Need::new("measure")
+            .quiet(28.0)
+            .patience(patience(120, 600, 900)),
+        None,
+    );
+    quiet.next_ms = Some(next);
+    let now = next + 200_000;
+    let ahead = [&quiet];
+    let none = |_: u32| false;
+    let later = |need: Need| record(20, 900, need, None);
+    let (r, left) =
+        crate::admit::reserving(&later(Need::new("trust").mem_gib(8)), &ahead, &none, now)
+            .expect("held back");
+    assert_eq!((r.pid, left), (10, Duration::from_secs(1300)));
+    for need in [
+        Need::new("guest jobs").cores(8),
+        Need::new("verify").disk(GIB, "/vol"),
+    ] {
+        assert!(crate::admit::reserving(&later(need), &ahead, &none, now).is_some());
+    }
+    let first = record(20, 100, Need::new("trust").mem_gib(8), None);
+    assert!(
+        crate::admit::reserving(&first, &ahead, &none, now).is_none(),
+        "asked first"
+    );
+    for need in [Need::new("paint").quiet(28.0), Need::new("nothing")] {
+        assert!(crate::admit::reserving(&later(need), &ahead, &none, now).is_none());
+    }
+    let kin = |pid: u32| pid == 10;
+    assert!(
+        crate::admit::reserving(&later(Need::new("trust").mem_gib(8)), &ahead, &kin, now).is_none()
+    );
+    assert!(
+        crate::admit::reserving(
+            &later(Need::new("trust").mem_gib(8)),
+            &ahead,
+            &none,
+            next + 60_000
+        )
+        .is_none(),
+        "not yet of age"
+    );
+}
+
+/// Through the ledger: a quiet claim with a patience waits for the load, and once it has been
+/// next for its bound (none here) it starts whatever the load and says so. Its patience counts
+/// from when it is next: behind another quiet claim (a stand-in's) it waits however long that
+/// holds, then starts only after a look of its own short of the load alone. Negative control:
+/// the same claim with no patience, the old rule, still waits past the bound.
+#[cfg(unix)]
+#[test]
+fn a_patient_quiet_claim_starts_at_its_bound_and_the_old_rule_still_waits() {
+    let s = scratch("bound");
+    let (mut child, holder) = standin_quiet(&s, 14.0);
+    let m = busy48();
+    let need = Need::new("measure")
+        .cores(4)
+        .quiet(14.0)
+        .patience(patience(0, 0, 60));
+    let (w, short) = waits(enter(&s, &m, need), &m);
+    assert!(short.shorts.contains(&Short::Quiet {
+        pid: holder,
+        what: "stand-in A".to_owned(),
+        held: true
+    }));
+    let (w, _) = waits(w, &m);
+    assert_eq!(w.record().next_ms, None, "not next behind the stand-in");
+    std::fs::write(s.dir.path().join("die"), "").expect("told to die");
+    let _ = child.wait().expect("the stand-in's end");
+    let (w, short) = waits(w, &m);
+    assert_eq!(
+        short.shorts,
+        vec![Short::Load {
+            load1: 40.0,
+            max: 14.0
+        }]
+    );
+    assert!(w.record().next_ms.is_some(), "next from this look");
+    assert_eq!(
+        s.ledger.list().expect("listed")[0].next_ms,
+        w.record().next_ms,
+        "other sessions read when"
+    );
+    let claim = admitted(w, &m);
+    let q = claim.quiet().expect("how it started");
+    assert!(
+        q.at_bound && q.load1 == Some(40.0) && (q.max - 14.0).abs() < 1e-9,
+        "{q:?}"
+    );
+    names(&q.to_string(), &["at its bound", "load 40.0 > 14.0"]);
+    assert_eq!(
+        claim.cores(),
+        4,
+        "its share at load 40 (CORES-GRANT): 14 / (1 + 40/14), rounded, all it asked"
+    );
+    assert_eq!(
+        s.ledger.list().expect("listed")[0],
+        claim.record().clone(),
+        "its admission reads back past its next line"
+    );
+    drop(claim);
+    let mut old = enter(&s, &m, Need::new("old").quiet(14.0));
+    for _ in 0..3 {
+        let (w, short) = waits(old, &m);
+        assert_eq!(short.shorts.len(), 1, "{short}");
+        assert_eq!(w.record().next_ms, None);
+        old = w;
+    }
+}
+
+/// The quiet waiter a reservation's line names, and its own line: once next, it says when it
+/// reserves the machine and when it starts whatever the load.
+#[test]
+fn a_patient_waiters_line_says_when_it_reserves_and_starts() {
+    let s = scratch("line");
+    let m = busy48();
+    let need = Need::new("measure")
+        .quiet(14.0)
+        .patience(patience(120, 600, 900));
+    let (w, short) = waits(enter(&s, &m, need), &m);
+    let line = w.line(&short);
+    names(
+        &line,
+        &[
+            "load 40.0 > 14.0",
+            "it reserves the machine in 2m00s",
+            "starts whatever the load in 10m00s",
+        ],
+    );
+}
+
+/// Set, the patient stand-in's ledger is under this directory.
+#[cfg(unix)]
+const PATIENT: &str = "ATERM_CAPACITY_TEST_PATIENT";
+/// Set, the patient stand-in's quiet claim has no patience: the old rule.
+#[cfg(unix)]
+const PATIENT_OLD: &str = "ATERM_CAPACITY_TEST_PATIENT_OLD";
+#[cfg(unix)]
+const PATIENT_TEST: &str = "tests::standin_waits_patiently_for_a_quiet_machine";
+
+/// Run by [`claimed_work_waits_behind_a_reserving_quiet_waiter_naming_it`] in a process of its
+/// own: a quiet claim of bound 14 on a machine at load 40, reserving from its first look and
+/// starting only after ten hang detectors (unless [`PATIENT_OLD`] says it has no patience), in
+/// the ledger under the directory [`PATIENT`] names. It looks once, writes `waiting` with its
+/// wait line, and naps until told to stop: no later look takes the ledger's lock while the test
+/// looks. A test that ended without telling it leaves no stop file to read, so it also ends,
+/// failing, once its parent is gone or after two hang detectors.
+#[cfg(unix)]
+#[test]
+fn standin_waits_patiently_for_a_quiet_machine() {
+    let Some(dir) = std::env::var_os(PATIENT).map(PathBuf::from) else {
+        return;
+    };
+    let mut need = Need::new("timed stand-in").quiet(14.0);
+    if std::env::var_os(PATIENT_OLD).is_none() {
+        need = need.patience(Patience {
+            reserve: Duration::ZERO,
+            start: MUST_HAPPEN * 10,
+            hold: MUST_HAPPEN,
+        });
+    }
+    let waiting = dir.join("waiting");
+    let stop = dir.join("stop");
+    let parent = std::os::unix::process::parent_id();
+    let born = std::time::Instant::now();
+    let ended = admit_until(
+        &Ledger::at(dir.join("ledger")),
+        &busy48(),
+        need,
+        Admit::Wait,
+        Pace {
+            poll: MUST_HAPPEN * 2,
+            line_every: Duration::from_secs(60),
+        },
+        &mut |line| {
+            if !waiting.exists() {
+                // Written aside and renamed in, so the test never reads the file between its
+                // creation and its line.
+                let part = waiting.with_extension("part");
+                std::fs::write(&part, line).expect("said waiting");
+                std::fs::rename(&part, &waiting).expect("said waiting");
+            }
+        },
+        &|| {
+            stop.exists()
+                || std::os::unix::process::parent_id() != parent
+                || born.elapsed() >= MUST_HAPPEN * 2
+        },
+    );
+    assert!(stop.exists(), "ended untold: {ended:?}");
+    assert!(
+        matches!(ended, Err(Error::Stopped { signal: None, .. })),
+        "it waited until told to stop: {ended:?}"
+    );
+}
+
+/// A running [`standin_waits_patiently_for_a_quiet_machine`]: told to stop and waited for when
+/// dropped still running (a test that failed before [`Patient::stop`]), so none outlives its test.
+#[cfg(unix)]
+struct Patient {
+    child: aterm_uds::spawnfd::Child,
+    pid: u32,
+    dir: PathBuf,
+}
+
+#[cfg(unix)]
+impl Patient {
+    /// End it, which it does of itself once told, and expect it to have waited until then.
+    fn stop(mut self) {
+        std::fs::write(self.dir.join("stop"), "").expect("told to stop");
+        let status = self.child.wait().expect("the stand-in's end");
+        assert!(status.success(), "the stand-in waited until told: {status}");
+        let _ = std::fs::remove_file(self.dir.join("stop"));
+        let _ = std::fs::remove_file(self.dir.join("waiting"));
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Patient {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = std::fs::write(self.dir.join("stop"), "");
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Start [`standin_waits_patiently_for_a_quiet_machine`] on `s`'s ledger, with no patience when
+/// `old`, and wait for its wait line.
+#[cfg(unix)]
+fn patient(s: &Scratch, old: bool) -> Patient {
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+    if old {
+        cmd.env(PATIENT_OLD, "1");
+    }
+    let child = cmd
+        .args(["--exact", PATIENT_TEST, "--test-threads=1", "--nocapture"])
+        .env(PATIENT, s.dir.path())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the patient stand-in");
+    let pid = child.id();
+    let patient = Patient {
+        child,
+        pid,
+        dir: s.dir.path().to_path_buf(),
+    };
+    let waiting = s.dir.path().join("waiting");
+    let line = until_within(MUST_HAPPEN, "the stand-in to wait", || {
+        std::fs::read_to_string(&waiting).ok()
+    });
+    names(&line, &["timed stand-in", "load 40.0 > 14.0"]);
+    patient
+}
+
+/// A claimed heavy stand-in for a Trust check that asks while another process's quiet claim
+/// reserves the machine waits, naming that quiet waiter, however much memory is free; the same
+/// claim from a descendant of the quiet waiter (its own timed work, which no claim of its
+/// ancestors holds back) is admitted, as is one from its ancestor (the run its timed work is part
+/// of, which the reservation spares). Negative control: behind the same quiet waiter with no
+/// patience, the old rule, it is admitted at once.
+#[cfg(unix)]
+#[test]
+fn claimed_work_waits_behind_a_reserving_quiet_waiter_naming_it() {
+    let s = scratch("reserving");
+    let m = mac48();
+    let me = std::process::id();
+    let p = |pid, ppid| Proc {
+        pid,
+        ppid,
+        ..Proc::default()
+    };
+    let timed = patient(&s, false);
+    let quiet = timed.pid;
+    m.set_procs(Some(Procs::of(vec![p(quiet, 1), p(me, 1)])));
+    let (w, short) = waits(enter(&s, &m, Need::new("trust check").mem_gib(4)), &m);
+    match &short.shorts[..] {
+        [
+            Short::Reserved {
+                pid,
+                what,
+                held: false,
+                left,
+            },
+        ] => {
+            assert_eq!((*pid, what.as_str()), (quiet, "timed stand-in"));
+            assert!(*left > MUST_HAPPEN * 9, "{left:?}");
+        }
+        other => panic!("expected the reservation alone, got {other:?}"),
+    }
+    assert_eq!(
+        short.holders.iter().map(|h| h.pid).collect::<Vec<_>>(),
+        [quiet]
+    );
+    names(
+        &w.line(&short),
+        &[
+            "capacity: trust check waits",
+            &format!("pid {quiet} (\"timed stand-in\") reserves the machine"),
+            "while it waits for a quiet machine",
+            &format!("pid {quiet} waits ahead for the quiet machine"),
+        ],
+    );
+    m.set_procs(Some(Procs::of(vec![p(quiet, 1), p(me, quiet)])));
+    let mine = admitted(w, &m);
+    drop(mine);
+    m.set_procs(Some(Procs::of(vec![p(me, 1), p(quiet, me)])));
+    let ancestor = admitted(enter(&s, &m, Need::new("verify").disk(GIB, "/")), &m);
+    drop(ancestor);
+    timed.stop();
+    let old = patient(&s, true);
+    m.set_procs(None);
+    let claim = admitted(enter(&s, &m, Need::new("trust check").mem_gib(4)), &m);
+    drop(claim);
+    old.stop();
+}
+
 /// Two readings in one line: a figure that held is said once, one that moved as from→to, and a
 /// figure the OS does not report is left out.
 #[test]
@@ -1102,33 +1505,123 @@ fn two_readings_read_as_one_line() {
     assert!(!bare.contains("GiB"), "{bare}");
 }
 
-/// Cores are granted, never waited for: as many idle as were asked for, less what claims
-/// admitted within the load average's reach were granted, and at least one.
+/// A machine of 14 cores at a 5-minute (and 1-minute) load of `load`, with room for any memory.
+fn cores14_at(load: f64) -> Reading {
+    Reading {
+        load1: Some(load),
+        load5: Some(load),
+        ..Reading::of_gib(48, 40, 14)
+    }
+}
+
+/// CORES-GRANT's acceptance: cores are granted, never waited for, as a share of the machine
+/// weighed against the work that runs on it. On 14 cores at a 5-minute load of 60, two claims
+/// that each ask for lima's 8 are each granted the stated share, the cores over the parties: the
+/// two claims and the 60 of load no claim holds, in machines' worth. CAP-1's first rule (the idle
+/// cores) granted each 1. Alone at that load a claim gets 3; on an idle machine, the whole
+/// machine.
 #[test]
-fn cores_are_granted_from_the_idle_ones() {
-    let mut r = Reading::of_gib(48, 40, 14);
-    r.load5 = Some(4.5);
-    let need = Need::new("guest").cores(8);
-    assert_eq!(decide(&need, (1, 1, 0), &r, &[], 1), Ok(8));
-    let recent = record(10, 1_000, Need::new("vm").cores(6), Some(6));
-    let o = [Other {
-        record: &recent,
+fn two_claims_at_load_60_on_14_cores_each_get_their_share() {
+    let s = scratch("share");
+    let m = Fixed::new(cores14_at(60.0));
+    let stated = (14.0_f64 / (2.0 + 60.0 / 14.0)).round() as u32;
+    assert_eq!(stated, 2, "the share this test states");
+    let a = enter(&s, &m, Need::new("lima guest").cores(8));
+    let b = enter(&s, &m, Need::new("windows guest").cores(8));
+    let a = admitted(a, &m);
+    assert_eq!(
+        a.cores(),
+        stated,
+        "the first, beside the second not yet admitted"
+    );
+    let b = admitted(b, &m);
+    assert_eq!(
+        b.cores(),
+        stated,
+        "the second, beside the first's jobs held"
+    );
+    drop((a, b));
+    let alone = admitted(enter(&s, &m, Need::new("alone").cores(8)), &m);
+    assert_eq!(alone.cores(), 3, "14 / (1 + 60/14), rounded");
+    drop(alone);
+    m.set(cores14_at(0.0));
+    let whole = admitted(enter(&s, &m, Need::new("whole").cores(14)), &m);
+    assert_eq!(whole.cores(), 14, "the whole machine, at load 0");
+}
+
+/// A claim's share is of the room, the cores less what the held claims were granted: on an
+/// idle 14-core machine lima's 8 leave Windows its 6, and a third claim gets 1. A held claim's
+/// jobs leave the unclaimed load as they reach the 5-minute load, and a claim of cores not yet
+/// admitted, whatever it waits for, is a party. A grant is 1 only where the work really is that
+/// contended (a load of about 117 alone), never more than asked, and 0 when none was asked; a
+/// load that reads as no number is the load unread.
+#[test]
+fn a_grant_is_a_share_of_the_room_the_held_claims_leave() {
+    let idle = cores14_at(0.0);
+    let lima = record(10, 1_000, Need::new("lima").cores(8), Some(8));
+    let windows = record(11, 1_000, Need::new("windows").cores(6), Some(6));
+    let other = |r| Other {
+        record: r,
         used: TreeUse::default(),
         credited: TreeUse::default(),
-    }];
+    };
+    let want = |n| Need::new("guest").cores(n);
+    let held = [other(&lima)];
+    assert_eq!(decide(&want(6), (1, 1, 0), &idle, &held, 2_000), Ok(6));
+    let both = [other(&lima), other(&windows)];
     assert_eq!(
-        decide(&need, (1, 1, 0), &r, &o, 2_000),
+        decide(&want(8), (1, 1, 0), &idle, &both, 2_000),
+        Ok(1),
+        "the room is spent"
+    );
+
+    let six = record(12, 0, Need::new("held").cores(6), Some(6));
+    let held = [other(&six)];
+    let at20 = cores14_at(20.0);
+    assert_eq!(
+        decide(&want(8), (1, 1, 0), &at20, &held, 1),
         Ok(3),
-        "9 idle less 6"
+        "8 of room over 1 + 20/14: its jobs not yet in the load"
     );
     assert_eq!(
-        decide(&need, (1, 1, 0), &r, &o, 1_000 + 300_001),
-        Ok(8),
-        "in the load now"
+        decide(&want(8), (1, 1, 0), &at20, &held, 3_600_000),
+        Ok(4),
+        "8 over 1 + 14/14: its 6 jobs are in the load now"
     );
-    r.load5 = Some(60.0);
-    assert_eq!(decide(&need, (1, 1, 0), &r, &[], 1), Ok(1), "at least one");
-    assert_eq!(decide(&Need::new("none"), (1, 1, 0), &r, &[], 1), Ok(0));
+
+    let waiting = record(13, 0, Need::new("waits").cores(8), None);
+    assert_eq!(
+        decide(&want(14), (1, 1, 0), &idle, &[other(&waiting)], 1),
+        Ok(7),
+        "half, beside a claim of cores not yet admitted"
+    );
+    assert_eq!(
+        decide(&want(8), (1, 1, 0), &cores14_at(11.0), &[], 1),
+        Ok(8)
+    );
+    assert_eq!(
+        decide(&want(8), (1, 1, 0), &cores14_at(116.0), &[], 1),
+        Ok(2)
+    );
+    assert_eq!(
+        decide(&want(8), (1, 1, 0), &cores14_at(118.0), &[], 1),
+        Ok(1)
+    );
+    let unread = Reading {
+        load5: None,
+        ..idle.clone()
+    };
+    assert_eq!(decide(&want(8), (1, 1, 0), &unread, &[], 1), Ok(8));
+    let nan = Reading {
+        load5: Some(f64::NAN),
+        ..idle.clone()
+    };
+    assert_eq!(decide(&want(8), (1, 1, 0), &nan, &[], 1), Ok(8));
+    assert_eq!(
+        decide(&want(8), (1, 1, 0), &cores14_at(f64::INFINITY), &[], 1),
+        Ok(1)
+    );
+    assert_eq!(decide(&Need::new("none"), (1, 1, 0), &idle, &[], 1), Ok(0));
 }
 
 /// A margin is asked of the room and never reserved. On a 48 GiB machine with 30 GiB available
@@ -1316,6 +1809,96 @@ fn a_stopped_wait_leaves_the_queue_naming_what_it_was_short_of() {
     drop(a);
 }
 
+/// A waiter whose claim file is removed while it waits (the ledger's directory cleaned) is in no
+/// other session's queue and can never be named a claim: its wait ends at its next look, naming
+/// the removal. Negative control: with its file in place, the same wait is still waiting three
+/// lines on, when the test ends it. Unix only: on Windows a file a handle holds open may keep its
+/// name after it is removed.
+#[cfg(unix)]
+#[test]
+fn a_waiter_whose_claim_file_is_removed_ends_its_wait() {
+    for remove in [true, false] {
+        let s = scratch("removed");
+        let m = mac48();
+        let a = admitted(enter(&s, &m, Need::new("A").mem_gib(30)), &m);
+        let lines = std::cell::Cell::new(0_u32);
+        let ended = admit_until(
+            &s.ledger,
+            &m,
+            Need::new("B").mem_gib(20),
+            Admit::Wait,
+            Pace {
+                poll: Duration::from_millis(10),
+                line_every: Duration::ZERO,
+            },
+            &mut |_| {
+                lines.set(lines.get() + 1);
+                if remove {
+                    for e in s.ledger.dir().read_dir().expect("the ledger").flatten() {
+                        if e.file_name().to_string_lossy().ends_with(".wait") {
+                            std::fs::remove_file(e.path()).expect("B's file removed");
+                        }
+                    }
+                }
+            },
+            &|| lines.get() >= 3,
+        );
+        match (remove, ended) {
+            (true, Err(Error::Ledger(e))) => {
+                names(&e.to_string(), &[".wait", "was removed while it waited"]);
+                assert_eq!(lines.get(), 1, "it ended at the look after");
+            }
+            (false, Err(Error::Stopped { signal: None, .. })) => {}
+            (_, other) => panic!("removed {remove}: {other:?}"),
+        }
+        drop(a);
+    }
+}
+
+/// A claim's grant is written once: an admission whose rename fails (here the ledger's directory
+/// made unwritable; in use, the file removed meanwhile) and is tried again writes no second grant
+/// and keeps the first, and the claim then reads back with it.
+#[cfg(unix)]
+#[test]
+fn a_retried_admission_writes_its_grant_once() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = scratch("grant");
+    let (mut record, mut laid) = s
+        .ledger
+        .lay(&Need::new("A").mem_gib(1), 1_000)
+        .expect("laid");
+    let first = crate::Held {
+        admitted_ms: 2_000,
+        cores: 2,
+    };
+    let dir = s.ledger.dir().to_path_buf();
+    let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m));
+    mode(0o500).expect("the ledger made unwritable");
+    for admitted_ms in [2_000, 3_000] {
+        let held = crate::Held {
+            admitted_ms,
+            cores: 2,
+        };
+        let refused = s.ledger.admit(&mut laid, &mut record, held);
+        assert!(refused.is_err(), "the rename was refused");
+    }
+    mode(0o700).expect("the ledger made writable");
+    let text = std::fs::read_to_string(laid.path()).expect("the claim file");
+    assert_eq!(text.matches("admitted_ms").count(), 1, "{text}");
+    s.ledger
+        .admit(
+            &mut laid,
+            &mut record,
+            crate::Held {
+                admitted_ms: 4_000,
+                cores: 3,
+            },
+        )
+        .expect("admitted");
+    assert_eq!(record.held, Some(first));
+    assert_eq!(s.ledger.list().expect("listed"), [record]);
+}
+
 /// A record reads back as it was written, and its admission line with it.
 #[test]
 fn a_record_reads_back() {
@@ -1328,7 +1911,8 @@ fn a_record_reads_back() {
             .mem(15 * GIB + 7)
             .margin(8 * GIB)
             .cores(2)
-            .quiet(4.0),
+            .quiet(4.0)
+            .patience(patience(1, 2, 3)),
     );
     let laid = w.record().clone();
     let c = admitted(w, &m);

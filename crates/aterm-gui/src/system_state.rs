@@ -103,8 +103,8 @@ pub struct SetupStatus {
     /// permissions nobody approved: no Needs you, no diamond, no menu line. Filled by the worker.
     pub unanswered: bool,
     /// Where an install of Apple's Command Line Tools stands, which the GitHub repositories row
-    /// waits on while they are missing (§3.3): its tab asks for the person's password, or the
-    /// installer runs. `None`: neither, so the row's Install… button opens the tab. Filled by
+    /// waits on while they are missing (§3.3): its tab asks for the person's password, was
+    /// restored, or the installer runs. `None`: none, so the row's Install… opens the tab. Filled by
     /// the window (`App::developer_tools_install_step`), never by the worker.
     pub developer_tools: Option<ToolsInstall>,
 }
@@ -116,6 +116,9 @@ pub enum ToolsInstall {
     /// Its terminal tab waits for the person's password: they are needed now, and typing it is
     /// the one thing that changes the outcome.
     Password,
+    /// A live installer tab was restored. Its exact prompt is not known: the person continues
+    /// there, or closes it before retrying, and no second installer is opened.
+    Recovered,
     /// The installer runs (its on-demand placeholder, or Apple's own installer, is there): the
     /// row waits, calmly, and moves on once the tools arrive.
     Installing,
@@ -852,6 +855,39 @@ pub fn clear_setup_set_aside() {
     crate::message_inbox::queue_exception_clear(setup_set_aside_entry("").key());
 }
 
+/// The exceptions digest's entry for setup an update successor did not offer (§3.3): an update
+/// may relaunch aterm with nobody at this Mac, so a setup nobody reviewed waits for the person,
+/// a fact for later whose one navigation opens System State, where they review and apply it.
+#[must_use]
+pub fn setup_unfinished_entry() -> aterm_messages::exceptions::Entry {
+    use aterm_messages::need::{Reason, Then, Why};
+    aterm_messages::exceptions::Entry::new(
+        aterm_messages::exceptions::Family::Setup,
+        "",
+        "unfinished",
+        "Mac setup is unfinished",
+        Why::OnlyYou(Reason::new(
+            "this Mac's setup needs your review, and an update relaunched aterm without it",
+        )),
+        Then::step("Open System State to review and apply it"),
+    )
+    .show(aterm_messages::Intent::ReviewVaultSync)
+    .log_line("System State: an update relaunched aterm; setup waits for its review")
+}
+
+/// Raise [`setup_unfinished_entry`] in the exceptions digest.
+#[cfg(unix)]
+pub fn note_setup_unfinished() {
+    crate::message_inbox::queue_exception(setup_unfinished_entry());
+}
+
+/// A setup run was admitted, or the review is on the page: [`setup_unfinished_entry`] leaves the
+/// exceptions digest.
+#[cfg(unix)]
+pub fn clear_setup_unfinished() {
+    crate::message_inbox::queue_exception_clear(setup_unfinished_entry().key());
+}
+
 /// The rows of `outcome` that came out `how`, in its order.
 fn outcome_rows(outcome: &RestoreOutcome, how: PutBack) -> Vec<Option<Setting>> {
     outcome
@@ -1216,6 +1252,16 @@ pub(crate) enum SystemStateAction {
 
 /// The key of the Secrets vault row's Turn On Sync button.
 const TURN_ON_SYNC: &str = "system-state/row/secrets/sync-on";
+
+/// Whether `status` reads the Secrets row as waiting for input here: it needs the person and
+/// carries no note (a note is a code an admin Mac approves, or a step elsewhere).
+fn vault_waits_for_input(status: &SetupStatus) -> bool {
+    status.observed.iter().any(|row| {
+        row.subject == Subject::Setting(Setting::Secrets)
+            && matches!(row.standing, Standing::NeedsYou | Standing::Failed)
+            && row.note.is_none()
+    })
+}
 
 /// The slug a row's keys carry (`system-state/row/<slug>`).
 pub(crate) fn row_slug(subject: Subject) -> &'static str {
@@ -1582,6 +1628,8 @@ fn row_view_as(
                 Some(PASSWORD_NOTE.to_owned())
             } else if tools == Some(ToolsWait::Password) {
                 Some(TOOLS_PASSWORD_NOTE.to_owned())
+            } else if tools == Some(ToolsWait::Recovered) {
+                Some(TOOLS_RECOVERED_NOTE.to_owned())
             } else {
                 explained()
             };
@@ -1682,6 +1730,14 @@ pub(crate) const TOOLS_PASSWORD_HEADLINE: &str =
 pub(crate) const TOOLS_PASSWORD_NOTE: &str =
     "Waiting for your password in the Command Line Tools tab";
 
+/// The headline for a restored live installer tab: its command may not have started before
+/// recovery, so no particular prompt is claimed.
+pub(crate) const TOOLS_RECOVERED_HEADLINE: &str = "Continue in the Command Line Tools tab";
+
+/// The recovered tab remains the place to continue, or the person closes it before retrying.
+pub(crate) const TOOLS_RECOVERED_NOTE: &str =
+    "Installer tab restored. Continue there, or close it to retry.";
+
 /// The GitHub repositories row's calm note while Apple's Command Line Tools install
 /// ([`ToolsInstall::Installing`]): nobody needs to act, and the row moves on once they arrive.
 pub(crate) const INSTALLING_TOOLS_NOTE: &str = "Installing Apple's Command Line Tools…";
@@ -1698,6 +1754,8 @@ pub(crate) enum ToolsWait {
     Missing,
     /// Their tab asks for the person's password.
     Password,
+    /// Their live tab was restored; no particular prompt is known.
+    Recovered,
     /// The installer runs.
     Installing,
 }
@@ -1714,6 +1772,7 @@ impl SetupStatus {
         .then_some(match self.developer_tools {
             None => ToolsWait::Missing,
             Some(ToolsInstall::Password) => ToolsWait::Password,
+            Some(ToolsInstall::Recovered) => ToolsWait::Recovered,
             Some(ToolsInstall::Installing) => ToolsWait::Installing,
         })
     }
@@ -1981,18 +2040,21 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             ..Headline::line(NOT_STARTED)
         };
     }
-    // The Command Line Tools tab asks for the password the install needs (§3.3): the person is
-    // needed there now, as for the debugger step's dialog.
+    // The Command Line Tools tab needs the person (§3.3): at its known password prompt, or
+    // continuing its restored session without claiming which prompt it has reached.
     let repositories = Subject::Setting(Setting::Repositories);
     if rows.iter().any(|row| {
         row.subject == repositories && row.managed && row.standing == Some(Standing::NeedsYou)
-    }) && status.tools_wait(
-        status
-            .observations_for(plan.map(|plan| plan.vault_url.as_str()))
-            .find(|observation| observation.subject == repositories),
-    ) == Some(ToolsWait::Password)
-    {
-        return Headline::line(TOOLS_PASSWORD_HEADLINE);
+    }) {
+        match status.tools_wait(
+            status
+                .observations_for(plan.map(|plan| plan.vault_url.as_str()))
+                .find(|observation| observation.subject == repositories),
+        ) {
+            Some(ToolsWait::Password) => return Headline::line(TOOLS_PASSWORD_HEADLINE),
+            Some(ToolsWait::Recovered) => return Headline::line(TOOLS_RECOVERED_HEADLINE),
+            _ => {}
+        }
     }
     let needs: Vec<&RowView> = rows
         .iter()
@@ -2928,6 +2990,11 @@ impl SystemStateApp {
         if !status.running() {
             self.stopping = false;
         }
+        // A vault that comes to wait for input here (a join password an admin Mac refused)
+        // opens its fields again, even where the person closed them on an earlier reading.
+        if vault_waits_for_input(&status) && !vault_waits_for_input(&self.status) {
+            self.vault_open = None;
+        }
         self.status = status;
         changed
     }
@@ -3409,7 +3476,8 @@ impl SystemStateApp {
     }
 
     /// Whether the vault's fields show: as the person last set the
-    /// disclosure, else open while the vault waits for input here.
+    /// disclosure ([`vault_waits_for_input`] clears it on a reading that
+    /// comes to wait), else open while the vault waits for input here.
     fn vault_shown(&self) -> bool {
         self.vault_open.unwrap_or_else(|| {
             // As the vault reads, whatever the review shows of it: a vault that waits for a
@@ -4314,6 +4382,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 Access::Debugger.name()
             )),
             Headline::line(TOOLS_PASSWORD_HEADLINE),
+            Headline::line(TOOLS_RECOVERED_HEADLINE),
             Headline {
                 open: Some(Access::Debugger),
                 ..Headline::line(needs.clone())
@@ -4738,7 +4807,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 }
             })
             .collect();
-        let mut list = UiNode::new(
+        let list = UiNode::new(
             "system-state/groups",
             UiContent::Group(GroupSpec {
                 label: Some("Mac setup".to_owned()),
@@ -4765,10 +4834,8 @@ impl<'a, 'b> Page<'a, 'b> {
                 .clipped(),
         )
         .room(room, scrolls)
+        .lists_every_row()
         .children(children);
-        if let Some(room) = list.room.as_mut() {
-            room.lists_all = true;
-        }
         if !scrolls {
             return list;
         }
@@ -5901,7 +5968,7 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token: renew 
 /// `join-refused`, `vault-not-joined`, `vault-held`, `newer`, `restoring`, the first launch's
 /// review, `review`, `review-stopped` and `review-widened` ([`fixture_review`]), `cancelled`
 /// and `review-closed` after it, the review of the groups the ALab signal adds, `widen-review`,
-/// and Apple's Command Line Tools: `clt-password`, `clt-installing` and `clt-missing`.
+/// and Apple's Command Line Tools: `clt-password`, `clt-recovered`, `clt-installing` and `clt-missing`.
 /// Each draws only what the worker gives the page: the readings `init_observe` and the
 /// worker's probes make, and the rows a run, a Check or a Restore reports.
 /// Debug and dev-seam builds only: a release build carries none of
@@ -6068,7 +6135,8 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             let mut tools = access(Access::DeveloperTools, Waiting, None);
             tools.note = Some("Readable once Full Disk Access is on".to_owned());
             let mut vault = setting(Setting::Secrets, NeedsYou, Some("Awaiting code"));
-            vault.note = Some("Approve on an admin Mac: 7QK2-M9WD-4HTX-PL3B".to_owned());
+            vault.note =
+                Some("On an admin Mac: aterm secrets approve 7QK2-M9WD-4HTX-PL3B".to_owned());
             status.observed = with(in_place(), vec![fda, tools, vault]);
         }
         "vault" => {
@@ -6626,10 +6694,11 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
             status.observed = with(status.observed, vec![fda]);
         }
-        "clt-password" | "clt-installing" | "clt-missing" => {
+        "clt-password" | "clt-recovered" | "clt-installing" | "clt-missing" => {
             // The GitHub repositories wait on Apple's Command Line Tools (§3.3), which the
             // window installs in a terminal tab of its own: the tab asking for the password
-            // (`clt-password`), Apple's installer running (`clt-installing`), or the tools
+            // (`clt-password`), its restored live tab (`clt-recovered`), Apple's installer
+            // running (`clt-installing`), or the tools
             // missing with no tab open and nothing installing them (`clt-missing`), where the
             // row offers Install….
             let mut repositories = setting(Setting::Repositories, NeedsYou, None);
@@ -6638,6 +6707,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(in_place(), vec![untold_lan(), repositories]);
             status.developer_tools = match name {
                 "clt-password" => Some(ToolsInstall::Password),
+                "clt-recovered" => Some(ToolsInstall::Recovered),
                 "clt-installing" => Some(ToolsInstall::Installing),
                 _ => None,
             };

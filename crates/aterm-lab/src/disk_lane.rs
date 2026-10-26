@@ -29,32 +29,47 @@ const DISK: &[&str] = &[
 
 const CHECKOUTS: &[&str] = &["idle", "recent-index", "edited", "locked", "linked"];
 
-struct Image {
+/// A sparse APFS image attached at a mount point of the lab's own, detached (and its file
+/// removed) when it drops.
+pub(crate) struct Image {
     file: PathBuf,
     mnt: PathBuf,
 }
 
 impl Image {
     fn attach(dir: &Path) -> Result<Image, String> {
-        let file = dir.join("lane.sparseimage");
-        let mnt = dir.join("mnt");
-        std::fs::create_dir_all(&mnt).map_err(|e| format!("cannot make {}: {e}", mnt.display()))?;
+        Image::attach_at(
+            &dir.join("lane.sparseimage"),
+            &dir.join("mnt"),
+            IMAGE,
+            "atermdisklane",
+        )
+    }
+
+    /// Make the sparse APFS image `file` (named `….sparseimage`) of `size` (`hdiutil`'s spelling,
+    /// `16g`) and attach it at `mnt`, made if missing, unseen by Finder and Spotlight
+    /// ([`NEVER_INDEX`]).
+    /// # Errors
+    /// `hdiutil` refused, or the mount point could not be made.
+    pub(crate) fn attach_at(
+        file: &Path,
+        mnt: &Path,
+        size: &str,
+        volname: &str,
+    ) -> Result<Image, String> {
+        std::fs::create_dir_all(mnt).map_err(|e| format!("cannot make {}: {e}", mnt.display()))?;
         run(
             "/usr/bin/hdiutil",
             &[
-                "create",
-                "-quiet",
-                "-size",
-                IMAGE,
-                "-fs",
-                "APFS",
-                "-type",
-                "SPARSE",
-                "-volname",
-                "atermdisklane",
+                "create", "-quiet", "-size", size, "-fs", "APFS", "-type", "SPARSE", "-volname",
+                volname,
             ],
             Some(&file.with_extension("")),
         )?;
+        let image = Image {
+            file: file.to_path_buf(),
+            mnt: mnt.to_path_buf(),
+        };
         run(
             "/usr/bin/hdiutil",
             &[
@@ -65,21 +80,63 @@ impl Image {
                 "-mountpoint",
                 &mnt.to_string_lossy(),
             ],
-            Some(&file),
+            Some(file),
         )?;
-        Ok(Image { file, mnt })
+        std::fs::write(mnt.join(NEVER_INDEX), b"")
+            .map_err(|e| format!("cannot write {}: {e}", mnt.join(NEVER_INDEX).display()))?;
+        Ok(image)
+    }
+
+    /// Leave the image attached when this drops ([`detach_at`] takes it down later).
+    pub(crate) fn leave(self) {
+        std::mem::forget(self);
     }
 }
 
 impl Drop for Image {
     fn drop(&mut self) {
-        let _ = run(
+        if let Err(e) = detach_at(&self.mnt, &self.file) {
+            eprintln!("aterm-lab: {e}");
+        }
+    }
+}
+
+/// The file at a volume's root that keeps Spotlight from indexing it.
+pub(crate) const NEVER_INDEX: &str = ".metadata_never_index";
+
+/// Whether a volume is mounted at `p`: it lies on another device than its parent folder.
+pub(crate) fn mounted_at(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::symlink_metadata(p), p.parent()) {
+        (Ok(m), Some(up)) => std::fs::symlink_metadata(up).is_ok_and(|u| u.dev() != m.dev()),
+        _ => false,
+    }
+}
+
+/// Detach whatever image is attached at `mnt` (forced: a process the lab ended may still hold a
+/// file there) and remove its `file`.
+/// # Errors
+/// A volume is still mounted at `mnt` (what `hdiutil` said): its `file` stays, so a later detach
+/// finds it, and nothing under `mnt` may be removed meanwhile, as it lies on that volume.
+pub(crate) fn detach_at(mnt: &Path, file: &Path) -> Result<(), String> {
+    if mounted_at(mnt) {
+        let said = run(
             "/usr/bin/hdiutil",
-            &["detach", "-quiet", "-force", &self.mnt.to_string_lossy()],
+            &["detach", "-quiet", "-force", &mnt.to_string_lossy()],
             None,
         );
-        let _ = std::fs::remove_file(&self.file);
+        if mounted_at(mnt) {
+            return Err(format!(
+                "cannot detach the image at {} ({}): hdiutil detach -force {} takes it down",
+                mnt.display(),
+                said.err()
+                    .unwrap_or_else(|| "hdiutil said nothing".to_owned()),
+                crate::util::shell_quote(&mnt.to_string_lossy())
+            ));
+        }
     }
+    let _ = std::fs::remove_file(file);
+    Ok(())
 }
 
 fn run(program: &str, args: &[&str], last: Option<&Path>) -> Result<(), String> {
@@ -103,7 +160,10 @@ fn run(program: &str, args: &[&str], last: Option<&Path>) -> Result<(), String> 
     }
 }
 
-fn fill(path: &Path, bytes: u64) -> Result<(), String> {
+/// Write `bytes` of a fixed byte to `path` (its folders made), flushed in order.
+/// # Errors
+/// The file or a folder could not be made or written.
+pub(crate) fn fill(path: &Path, bytes: u64) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -120,7 +180,19 @@ fn fill(path: &Path, bytes: u64) -> Result<(), String> {
     aterm_durable::ordered(&f).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn lay_target(dir: &Path) -> Result<(), String> {
+/// Lay a cargo target directory at `dir` (its markers, a `debug` profile with its locks), its
+/// `deps/` and `incremental/` each holding [`CACHE_BYTES`].
+/// # Errors
+/// A file could not be written.
+pub(crate) fn lay_target(dir: &Path) -> Result<(), String> {
+    lay_target_sized(dir, CACHE_BYTES, CACHE_BYTES)
+}
+
+/// [`lay_target`] with `deps` bytes in its `deps/` (in files of at most 512 MiB) and
+/// `incremental` bytes in its `incremental/`.
+/// # Errors
+/// A file could not be written.
+pub(crate) fn lay_target_sized(dir: &Path, deps: u64, incremental: u64) -> Result<(), String> {
     let debug = dir.join("debug");
     for d in [
         ".fingerprint/lay-1",
@@ -144,14 +216,39 @@ fn lay_target(dir: &Path) -> Result<(), String> {
         debug.join(".fingerprint/lay-1/lib-lay"),
         b"0123456789abcdef",
     )?;
-    fill(&debug.join("deps/liblay.rlib"), CACHE_BYTES)?;
+    let piece: u64 = 512 << 20;
+    let mut left = deps;
+    let mut k = 0;
+    while left > 0 || k == 0 {
+        let name = if k == 0 {
+            "deps/liblay.rlib".to_owned()
+        } else {
+            format!("deps/liblay-{k}.rlib")
+        };
+        let n = left.min(piece);
+        fill(&debug.join(name), n)?;
+        left -= n;
+        k += 1;
+    }
     fill(
         &debug.join("incremental/lay-1/s-1/query-cache.bin"),
-        CACHE_BYTES,
+        incremental,
     )
 }
 
-fn lay_checkout(dir: &Path) -> Result<(), String> {
+/// Lay a checkout at `dir`: a `.git` with an index, a cargo package, and its `target/`
+/// ([`lay_target`]).
+/// # Errors
+/// A file could not be written.
+pub(crate) fn lay_checkout(dir: &Path) -> Result<(), String> {
+    lay_source(dir)?;
+    lay_target(&dir.join("target"))
+}
+
+/// The source half of [`lay_checkout`]: a `.git` with an index and a cargo package, no build.
+/// # Errors
+/// A file could not be written.
+pub(crate) fn lay_source(dir: &Path) -> Result<(), String> {
     let write =
         |p: PathBuf, b: &[u8]| std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()));
     std::fs::create_dir_all(dir.join(".git/logs"))
@@ -160,8 +257,7 @@ fn lay_checkout(dir: &Path) -> Result<(), String> {
     write(dir.join(".git/index"), b"DIRC")?;
     write(dir.join(".git/logs/HEAD"), b"0 1 a\n")?;
     write(dir.join("Cargo.toml"), b"[package]\nname = \"lay\"\n")?;
-    write(dir.join("src/main.rs"), b"fn main() {}\n")?;
-    lay_target(&dir.join("target"))
+    write(dir.join("src/main.rs"), b"fn main() {}\n")
 }
 
 fn backdate(root: &Path, days: u64) -> Result<(), String> {
@@ -193,18 +289,20 @@ fn touch_now(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot touch {}: {e}", path.display()))
 }
 
-fn free_on(path: &Path) -> Option<u64> {
+/// The free bytes of the volume `path` is on.
+pub(crate) fn free_on(path: &Path) -> Option<u64> {
     aterm_agent::harness::disk::free_bytes(path)
 }
 
 /// The lane's verdict: each check named, each a pass or why not.
 #[derive(Default)]
-struct Verdict {
-    rows: Vec<(String, Result<(), String>)>,
+pub(crate) struct Verdict {
+    pub(crate) rows: Vec<(String, Result<(), String>)>,
 }
 
 impl Verdict {
-    fn check(&mut self, name: &str, ok: bool, why: impl FnOnce() -> String) {
+    /// Print and keep the check `name`: a pass when `ok`, else a failure saying `why`.
+    pub(crate) fn check(&mut self, name: &str, ok: bool, why: impl FnOnce() -> String) {
         let r = if ok { Ok(()) } else { Err(why()) };
         println!(
             "  {} {name}{}",
@@ -216,7 +314,8 @@ impl Verdict {
         self.rows.push((name.to_owned(), r));
     }
 
-    fn passed(&self) -> bool {
+    /// Every check passed.
+    pub(crate) fn passed(&self) -> bool {
         self.rows.iter().all(|(_, r)| r.is_ok())
     }
 }
@@ -286,6 +385,7 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         .join("gone/ws/.cargo-build");
     lay_target(&mirror)?;
     std::fs::create_dir_all(home.join(".local/bin")).map_err(|e| format!("bin: {e}"))?;
+    // No tool is built there: the link dangles, which keeps linked/'s build and nothing else.
     std::os::unix::fs::symlink(
         home.join("linked/target/debug/tool"),
         home.join(".local/bin/tool"),
@@ -327,7 +427,16 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
                 "--lines".into(),
                 "32".into(),
             ],
-            env: world.env(),
+            // The window is the owner's disk watch on the image, its home a volume of its own,
+            // though it runs under a private state root, which alone keeps it from the watch.
+            env: world
+                .env()
+                .into_iter()
+                .chain([(
+                    aterm_agent::harness::disk::WATCH_SEAM.to_owned(),
+                    "1".to_owned(),
+                )])
+                .collect(),
             cwd: home.clone(),
             sandbox: None,
             reroute: false,
@@ -432,6 +541,17 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
     for (t, p) in &removed {
         println!("  removed tier={t} {p}");
     }
+    for r in rows
+        .lines()
+        .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+        .filter(|r| r["kind"].as_str() == Some("stopped"))
+    {
+        println!(
+            "  stopped tier={} {}",
+            r["tier"].as_u64().unwrap_or(0),
+            r["text"].as_str().unwrap_or("")
+        );
+    }
     v.check(
         "the journal's removals run in tier order",
         !tiers.is_empty() && tiers.windows(2).all(|w| w[0] <= w[1]),
@@ -452,7 +572,18 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
             .any(|(t, p)| *t == 3 && p.ends_with("idle/target"))
             && home.join("idle/target/debug/.cargo-lock").exists()
             && !home.join("idle/target/debug/deps").exists(),
-        || format!("{removed:?}"),
+        || {
+            let report = inst.cli(Some(home), &["harness", "disk"]);
+            let kept: Vec<&str> = report
+                .stdout
+                .lines()
+                .filter(|l| l.contains("tier 3") && l.contains("idle/target"))
+                .collect();
+            format!(
+                "{removed:?}; `aterm harness disk` (exit {}) on it now: {kept:?}",
+                report.code
+            )
+        },
     );
     v.check(
         "doc/ and criterion/ at idle/target's root untouched",

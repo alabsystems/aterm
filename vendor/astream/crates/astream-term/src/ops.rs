@@ -14,6 +14,7 @@
 //! full xterm.
 
 use crate::screen::{Charset, Color};
+use std::fmt;
 
 /// One normalized terminal operation: the top-level mutation a VT dispatch made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,4 +162,464 @@ impl ScreenOp {
             _ => None,
         }
     }
+}
+
+/// Four-byte magic prefix (`"ASOP"`) of a binary [`ScreenOp`] batch frame.
+pub const OPS_WIRE_MAGIC: [u8; 4] = *b"ASOP";
+
+/// Format version of a binary [`ScreenOp`] batch frame.
+pub const OPS_WIRE_VERSION: u8 = 1;
+
+/// Maximum number of [`ScreenOp`] entries in one encoded wire batch (`1_048_576`).
+pub const MAX_OPS_PER_BATCH: usize = 1 << 20;
+
+/// Maximum number of DEC private mode parameters in one [`ScreenOp::SetMode`]
+/// (`129`, matching the canonical VT parser's `CSI_PARAM_MAX + 1` ceiling).
+pub const MAX_MODE_PARAMS: usize = 129;
+
+/// Refusal returned by [`encode_ops`] or [`decode_ops`] on malformed or oversized input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpsWireError {
+    /// Input ended before the header or current operation payload completed.
+    Truncated,
+    /// Header magic did not match [`OPS_WIRE_MAGIC`].
+    BadMagic([u8; 4]),
+    /// Header version did not match [`OPS_WIRE_VERSION`].
+    UnsupportedVersion(u8),
+    /// Operation tag byte does not name a known [`ScreenOp`] variant.
+    UnknownOpTag(u8),
+    /// `Print` carried a `u32` that is not a valid Unicode scalar value.
+    InvalidChar(u32),
+    /// Boolean field carried a byte other than `0` or `1`.
+    InvalidBool(u8),
+    /// [`Color`] tag byte was neither `0` (`Default`) nor `1` (`Indexed`).
+    InvalidColorTag(u8),
+    /// [`Charset`] tag byte was neither `0` (`Ascii`) nor `1` (`DecSpecial`).
+    InvalidCharsetTag(u8),
+    /// Batch exceeded [`MAX_OPS_PER_BATCH`].
+    TooManyOps(usize),
+    /// [`ScreenOp::SetMode`] exceeded [`MAX_MODE_PARAMS`].
+    TooManyModeParams(usize),
+    /// Extra trailing bytes remained after decoding the declared operation count.
+    TrailingBytes(usize),
+}
+
+impl fmt::Display for OpsWireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpsWireError::Truncated => write!(f, "truncated ScreenOp wire frame"),
+            OpsWireError::BadMagic(m) => write!(f, "bad ScreenOp wire magic: {m:?}"),
+            OpsWireError::UnsupportedVersion(v) => {
+                write!(f, "unsupported ScreenOp wire version {v}")
+            }
+            OpsWireError::UnknownOpTag(t) => write!(f, "unknown ScreenOp wire tag 0x{t:02x}"),
+            OpsWireError::InvalidChar(c) => {
+                write!(f, "invalid Unicode scalar 0x{c:x} in ScreenOp::Print")
+            }
+            OpsWireError::InvalidBool(b) => write!(f, "invalid bool byte 0x{b:02x} in ScreenOp"),
+            OpsWireError::InvalidColorTag(t) => {
+                write!(f, "invalid Color wire tag 0x{t:02x} in ScreenOp::SetSgr")
+            }
+            OpsWireError::InvalidCharsetTag(t) => {
+                write!(
+                    f,
+                    "invalid Charset wire tag 0x{t:02x} in ScreenOp::Designate"
+                )
+            }
+            OpsWireError::TooManyOps(n) => {
+                write!(
+                    f,
+                    "ScreenOp batch length {n} exceeds MAX_OPS_PER_BATCH ({MAX_OPS_PER_BATCH})"
+                )
+            }
+            OpsWireError::TooManyModeParams(n) => {
+                write!(
+                    f,
+                    "SetMode parameter count {n} exceeds MAX_MODE_PARAMS ({MAX_MODE_PARAMS})"
+                )
+            }
+            OpsWireError::TrailingBytes(n) => {
+                write!(f, "{n} unexpected trailing byte(s) after ScreenOp batch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpsWireError {}
+
+fn put_u16_le(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32_le(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_color(out: &mut Vec<u8>, c: Color) {
+    match c {
+        Color::Default => out.push(0),
+        Color::Indexed(idx) => {
+            out.push(1);
+            out.push(idx);
+        }
+    }
+}
+
+fn take_u8(rest: &[u8]) -> Result<(u8, &[u8]), OpsWireError> {
+    let &[b, ref tail @ ..] = rest else {
+        return Err(OpsWireError::Truncated);
+    };
+    Ok((b, tail))
+}
+
+fn take_bool(rest: &[u8]) -> Result<(bool, &[u8]), OpsWireError> {
+    let (b, tail) = take_u8(rest)?;
+    match b {
+        0 => Ok((false, tail)),
+        1 => Ok((true, tail)),
+        other => Err(OpsWireError::InvalidBool(other)),
+    }
+}
+
+fn take_u16_le(rest: &[u8]) -> Result<(u16, &[u8]), OpsWireError> {
+    let &[b0, b1, ref tail @ ..] = rest else {
+        return Err(OpsWireError::Truncated);
+    };
+    Ok((u16::from_le_bytes([b0, b1]), tail))
+}
+
+fn take_u32_le(rest: &[u8]) -> Result<(u32, &[u8]), OpsWireError> {
+    let &[b0, b1, b2, b3, ref tail @ ..] = rest else {
+        return Err(OpsWireError::Truncated);
+    };
+    Ok((u32::from_le_bytes([b0, b1, b2, b3]), tail))
+}
+
+fn take_color(rest: &[u8]) -> Result<(Color, &[u8]), OpsWireError> {
+    let (tag, tail) = take_u8(rest)?;
+    match tag {
+        0 => Ok((Color::Default, tail)),
+        1 => {
+            let (idx, tail2) = take_u8(tail)?;
+            Ok((Color::Indexed(idx), tail2))
+        }
+        other => Err(OpsWireError::InvalidColorTag(other)),
+    }
+}
+
+/// Encode a slice of normalized [`ScreenOp`]s into a self-describing, versioned
+/// binary batch (`"ASOP"` + `v1` + `count: u32 LE` + tagged ops) suitable for
+/// publishing over `astream-broker` to cross-machine viewers.
+///
+/// # Errors
+/// Returns [`OpsWireError::TooManyOps`] if `ops.len() > MAX_OPS_PER_BATCH`, or
+/// [`OpsWireError::TooManyModeParams`] if any [`ScreenOp::SetMode`] carries more
+/// than [`MAX_MODE_PARAMS`] parameters.
+pub fn encode_ops(ops: &[ScreenOp]) -> Result<Vec<u8>, OpsWireError> {
+    if ops.len() > MAX_OPS_PER_BATCH {
+        return Err(OpsWireError::TooManyOps(ops.len()));
+    }
+    let mut out = Vec::with_capacity(9usize.saturating_add(ops.len().saturating_mul(3)));
+    out.extend_from_slice(&OPS_WIRE_MAGIC);
+    out.push(OPS_WIRE_VERSION);
+    put_u32_le(&mut out, ops.len() as u32);
+    for op in ops {
+        match op {
+            ScreenOp::Print(ch) => {
+                out.push(0x01);
+                put_u32_le(&mut out, *ch as u32);
+            }
+            ScreenOp::CarriageReturn => out.push(0x02),
+            ScreenOp::LineFeed => out.push(0x03),
+            ScreenOp::Tab => out.push(0x04),
+            ScreenOp::Backspace => out.push(0x05),
+            ScreenOp::CursorUp(n) => {
+                out.push(0x06);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::CursorDown(n) => {
+                out.push(0x07);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::CursorForward(n) => {
+                out.push(0x08);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::CursorBack(n) => {
+                out.push(0x09);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::MoveTo(r, c) => {
+                out.push(0x0A);
+                put_u16_le(&mut out, *r);
+                put_u16_le(&mut out, *c);
+            }
+            ScreenOp::EraseDisplay(m) => {
+                out.push(0x0B);
+                put_u16_le(&mut out, *m);
+            }
+            ScreenOp::EraseLine(m) => {
+                out.push(0x0C);
+                put_u16_le(&mut out, *m);
+            }
+            ScreenOp::EraseChars(n) => {
+                out.push(0x0D);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::InsertChars(n) => {
+                out.push(0x0E);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::DeleteChars(n) => {
+                out.push(0x0F);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::InsertLines(n) => {
+                out.push(0x10);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::DeleteLines(n) => {
+                out.push(0x11);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::ReverseIndex => out.push(0x12),
+            ScreenOp::SetSgr { fg, bg, attrs } => {
+                out.push(0x13);
+                put_color(&mut out, *fg);
+                put_color(&mut out, *bg);
+                out.push(*attrs);
+            }
+            ScreenOp::SetMode { params, set } => {
+                if params.len() > MAX_MODE_PARAMS {
+                    return Err(OpsWireError::TooManyModeParams(params.len()));
+                }
+                out.push(0x14);
+                out.push(u8::from(*set));
+                put_u16_le(&mut out, params.len() as u16);
+                for &p in params {
+                    put_u16_le(&mut out, p);
+                }
+            }
+            ScreenOp::SaveCursor => out.push(0x15),
+            ScreenOp::RestoreCursor => out.push(0x16),
+            ScreenOp::SetScrollRegion { top, bottom } => {
+                out.push(0x17);
+                put_u16_le(&mut out, *top);
+                put_u16_le(&mut out, *bottom);
+            }
+            ScreenOp::SetInsertMode(set) => {
+                out.push(0x18);
+                out.push(u8::from(*set));
+            }
+            ScreenOp::SetNewlineMode(set) => {
+                out.push(0x19);
+                out.push(u8::from(*set));
+            }
+            ScreenOp::Designate { g1, charset } => {
+                out.push(0x1A);
+                out.push(u8::from(*g1));
+                out.push(match charset {
+                    Charset::Ascii => 0,
+                    Charset::DecSpecial => 1,
+                });
+            }
+            ScreenOp::LockShift { g1 } => {
+                out.push(0x1B);
+                out.push(u8::from(*g1));
+            }
+            ScreenOp::SetLeftRightMargins { left, right } => {
+                out.push(0x1C);
+                put_u16_le(&mut out, *left);
+                put_u16_le(&mut out, *right);
+            }
+            ScreenOp::ScrollUp(n) => {
+                out.push(0x1D);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::ScrollDown(n) => {
+                out.push(0x1E);
+                put_u16_le(&mut out, *n);
+            }
+            ScreenOp::Reset => out.push(0x1F),
+            ScreenOp::Resize(cols, rows) => {
+                out.push(0x20);
+                put_u16_le(&mut out, *cols);
+                put_u16_le(&mut out, *rows);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode a binary [`ScreenOp`] batch frame produced by [`encode_ops`].
+///
+/// Hostile-input safe: rejects truncated frames, bad magic/version, surrogate
+/// codepoints, out-of-range tags, oversized counts, and trailing bytes without
+/// panicking or pre-allocating beyond the remaining input bytes.
+pub fn decode_ops(bytes: &[u8]) -> Result<Vec<ScreenOp>, OpsWireError> {
+    let &[m0, m1, m2, m3, ver, ref after_ver @ ..] = bytes else {
+        return Err(OpsWireError::Truncated);
+    };
+    let magic = [m0, m1, m2, m3];
+    if magic != OPS_WIRE_MAGIC {
+        return Err(OpsWireError::BadMagic(magic));
+    }
+    if ver != OPS_WIRE_VERSION {
+        return Err(OpsWireError::UnsupportedVersion(ver));
+    }
+    let (count_u32, mut rest) = take_u32_le(after_ver)?;
+    let count = count_u32 as usize;
+    if count > MAX_OPS_PER_BATCH {
+        return Err(OpsWireError::TooManyOps(count));
+    }
+    // Every encoded op takes at least 1 tag byte, so bounding capacity by
+    // `rest.len()` prevents a tiny header with a huge declared `count` from
+    // pre-allocating megabytes before failing with `Truncated`.
+    let mut ops = Vec::with_capacity(count.min(rest.len()));
+    let mut i = 0usize;
+    while i < count {
+        let (tag, tail) = take_u8(rest)?;
+        let (op, next) = match tag {
+            0x01 => {
+                let (raw, t) = take_u32_le(tail)?;
+                let Some(ch) = char::from_u32(raw) else {
+                    return Err(OpsWireError::InvalidChar(raw));
+                };
+                (ScreenOp::Print(ch), t)
+            }
+            0x02 => (ScreenOp::CarriageReturn, tail),
+            0x03 => (ScreenOp::LineFeed, tail),
+            0x04 => (ScreenOp::Tab, tail),
+            0x05 => (ScreenOp::Backspace, tail),
+            0x06 => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::CursorUp(n), t)
+            }
+            0x07 => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::CursorDown(n), t)
+            }
+            0x08 => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::CursorForward(n), t)
+            }
+            0x09 => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::CursorBack(n), t)
+            }
+            0x0A => {
+                let (r, t1) = take_u16_le(tail)?;
+                let (c, t2) = take_u16_le(t1)?;
+                (ScreenOp::MoveTo(r, c), t2)
+            }
+            0x0B => {
+                let (m, t) = take_u16_le(tail)?;
+                (ScreenOp::EraseDisplay(m), t)
+            }
+            0x0C => {
+                let (m, t) = take_u16_le(tail)?;
+                (ScreenOp::EraseLine(m), t)
+            }
+            0x0D => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::EraseChars(n), t)
+            }
+            0x0E => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::InsertChars(n), t)
+            }
+            0x0F => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::DeleteChars(n), t)
+            }
+            0x10 => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::InsertLines(n), t)
+            }
+            0x11 => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::DeleteLines(n), t)
+            }
+            0x12 => (ScreenOp::ReverseIndex, tail),
+            0x13 => {
+                let (fg, t1) = take_color(tail)?;
+                let (bg, t2) = take_color(t1)?;
+                let (attrs, t3) = take_u8(t2)?;
+                (ScreenOp::SetSgr { fg, bg, attrs }, t3)
+            }
+            0x14 => {
+                let (set, t1) = take_bool(tail)?;
+                let (len_u16, mut t2) = take_u16_le(t1)?;
+                let plen = len_u16 as usize;
+                if plen > MAX_MODE_PARAMS {
+                    return Err(OpsWireError::TooManyModeParams(plen));
+                }
+                let mut params = Vec::with_capacity(plen.min(t2.len() / 2));
+                let mut p_idx = 0usize;
+                while p_idx < plen {
+                    let (p, next_t) = take_u16_le(t2)?;
+                    params.push(p);
+                    t2 = next_t;
+                    p_idx = p_idx.saturating_add(1);
+                }
+                (ScreenOp::SetMode { params, set }, t2)
+            }
+            0x15 => (ScreenOp::SaveCursor, tail),
+            0x16 => (ScreenOp::RestoreCursor, tail),
+            0x17 => {
+                let (top, t1) = take_u16_le(tail)?;
+                let (bottom, t2) = take_u16_le(t1)?;
+                (ScreenOp::SetScrollRegion { top, bottom }, t2)
+            }
+            0x18 => {
+                let (set, t) = take_bool(tail)?;
+                (ScreenOp::SetInsertMode(set), t)
+            }
+            0x19 => {
+                let (set, t) = take_bool(tail)?;
+                (ScreenOp::SetNewlineMode(set), t)
+            }
+            0x1A => {
+                let (g1, t1) = take_bool(tail)?;
+                let (cs_tag, t2) = take_u8(t1)?;
+                let charset = match cs_tag {
+                    0 => Charset::Ascii,
+                    1 => Charset::DecSpecial,
+                    other => return Err(OpsWireError::InvalidCharsetTag(other)),
+                };
+                (ScreenOp::Designate { g1, charset }, t2)
+            }
+            0x1B => {
+                let (g1, t) = take_bool(tail)?;
+                (ScreenOp::LockShift { g1 }, t)
+            }
+            0x1C => {
+                let (left, t1) = take_u16_le(tail)?;
+                let (right, t2) = take_u16_le(t1)?;
+                (ScreenOp::SetLeftRightMargins { left, right }, t2)
+            }
+            0x1D => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::ScrollUp(n), t)
+            }
+            0x1E => {
+                let (n, t) = take_u16_le(tail)?;
+                (ScreenOp::ScrollDown(n), t)
+            }
+            0x1F => (ScreenOp::Reset, tail),
+            0x20 => {
+                let (cols, t1) = take_u16_le(tail)?;
+                let (rows, t2) = take_u16_le(t1)?;
+                (ScreenOp::Resize(cols, rows), t2)
+            }
+            other => return Err(OpsWireError::UnknownOpTag(other)),
+        };
+        ops.push(op);
+        rest = next;
+        i = i.saturating_add(1);
+    }
+    if !rest.is_empty() {
+        return Err(OpsWireError::TrailingBytes(rest.len()));
+    }
+    Ok(ops)
 }

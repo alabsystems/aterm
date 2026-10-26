@@ -1324,14 +1324,19 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     }
 }
 
-/// Attempt a full flush of this directory's metadata.
+/// Attempt a full flush of this directory's metadata, its outcome ignored (every error, `EIO`
+/// included): the store's own steps (a discard here; a mark, a lay-aside or a swap through
+/// [`sync_dir_ordered`]) report no failed flush of a store directory. A writer that replaces a
+/// record reports one instead, through [`aterm_durable::Flush::dir_best_effort`] (`status`,
+/// the signature floor, the vendor lane).
 pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(handle) = std::fs::File::open(dir) {
         let _ = crate::platform::sync_durable(&handle);
     }
 }
 
-/// Attempt an ordered flush of `dir`, not a full one ([`aterm_durable::ordered`]).
+/// Attempt an ordered flush of `dir`, not a full one ([`aterm_durable::ordered`]), its outcome
+/// ignored as [`sync_dir`]'s is.
 pub(crate) fn sync_dir_ordered(dir: &Path) {
     if let Ok(handle) = std::fs::File::open(dir) {
         let _ = aterm_durable::ordered(&handle);

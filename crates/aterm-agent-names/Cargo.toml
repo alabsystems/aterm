@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-agent-names"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm — the one agent name table: which coding agent a program's name names (`agent_of`), its product name, and the runtimes an agent runs under. No screen reader: aterm-phase maps it onto its readers, and a crate deny.toml keeps from the reader (aterm-machines' console presence) names an agent by it."
+
+[lints]
+workspace = true
+
+# None, by design: pure functions over a program's name.
+[dependencies]

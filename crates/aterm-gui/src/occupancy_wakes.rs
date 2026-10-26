@@ -13,7 +13,9 @@
 //! `off`. Nothing here types into a session: the
 //! `await wake` answer is the agent's own reply on its own connection, told only once it is on
 //! the wire ([`hang`], S2), and the K Entry and the `wake #<n> ready` event go up only under the
-//! owner's `prompt` ([`crate::occupancy_host::prompt_now`], W4 and W5). A file atom's path is
+//! owner's `prompt` ([`crate::occupancy_host::prompt_now`], W4 and W5). A loop's claim on a wake
+//! for its typed line (W1, [`claim_for`]) is granted only under the owner's `prompt`, asked again
+//! under the lock, and carries numbers alone back to the loop. A file atom's path is
 //! admitted lexically before anything at it is read, and admitted again before every read, which
 //! never follows a link ([`files`]); its reads run outside the books' lock.
 
@@ -33,8 +35,9 @@ use aterm_agent::supervise::occupancy::wakes::{
     WakeReq,
 };
 use aterm_agent::supervise::occupancy::wakes_seen::{
-    Declarer, ExpireWhy, WakeDoor, WakeState, WakesSeen,
+    Declarer, ExpireWhy, WakeClaim, WakeDoor, WakeFacts, WakeState, WakesSeen,
 };
+use aterm_agent::supervise::occupancy::{PaceGrant, PaceRefusal};
 use aterm_agent::supervise::{Guard, Occupancy};
 use aterm_types::MutexExt as _;
 use aterm_vitals::model::{SlotsView, Snapshot};
@@ -232,6 +235,9 @@ pub(crate) trait Env: Send + Sync {
     fn sys(&self, fresh: Option<Duration>) -> Option<SysRead>;
     /// A build slot reserved for `sid`'s answer ([`crate::occupancy_host::Pace::reserve`]).
     fn reserve(&self, sid: &str, age_ms: i64, usable: u16, now_ms: i64) -> Reserve;
+    /// The wake lines' pace for `sid`'s claimed wake, a slot reserved with it where `slot`
+    /// ([`crate::occupancy_host::Pace::ask_wake`]).
+    fn wake_pace(&self, sid: &str, slot: bool, age_ms: i64, usable: u16, now_ms: i64) -> PaceGrant;
     /// `sid`'s loop's last word: its open hold's start, unix ms, and the guard holding its line;
     /// `None` where no loop told this window a word.
     fn said(&self, sid: &str) -> Option<Said>;
@@ -1120,6 +1126,99 @@ impl WakeHost {
         }
     }
 
+    /// `sid`'S LOOP CLAIMS wake `ord` of `episode` for `door`'s line (`IdleHost::wake_claim`, the
+    /// slice-2 plan's W1), judged in order under the lock: the book's own claim
+    /// ([`WakeBook::claim`]: answered first, another door's, pending, or gone); the owner's mode
+    /// asked again (anything but `prompt` is `refused:off`); `refused`, slice 1's refusal the
+    /// worker judged; its need re-read on a machine snapshot pulled fresh for it (`Stale` with
+    /// none fresh, `Unmet` where its latch no longer holds it); and the wake lines' pace, a slot
+    /// reserved where its need names slots ([`Env::wake_pace`]). Granted, the wake stays claimed
+    /// by `door` and the answer carries the figures its line types; any other answer gives the
+    /// claim back before the lock is let go. Under `off` nothing is claimed (`Gone`). The book
+    /// never takes a claim back on a timer: the loop tells it or gives it back.
+    pub(crate) fn claim_for(
+        &self,
+        env: &dyn Env,
+        sid: &str,
+        ord: u16,
+        episode: u64,
+        door: WakeDoor,
+        refused: Option<PaceRefusal>,
+    ) -> WakeClaim {
+        let needs = self
+            .lock()
+            .shelves
+            .get(sid)
+            .and_then(|shelf| shelf.book.get(ord))
+            .is_some_and(|wake| wake.need.is_some());
+        let sys = if needs && env.mode() == Occupancy::Prompt {
+            env.sys(Some(crate::sys_host::AWAIT_PERIOD))
+        } else {
+            None
+        };
+        let now_ms = env.now_ms();
+        let mut books = self.lock();
+        if books.off(env) {
+            return WakeClaim::Gone;
+        }
+        let mode = env.mode();
+        let hold_since = env.said(sid).and_then(|(since, _)| since);
+        let Some(shelf) = books.shelves.get_mut(sid) else {
+            return WakeClaim::Gone;
+        };
+        let claim = shelf.book.claim(ord, episode, door, now_ms);
+        let WakeClaim::Granted(facts) = claim else {
+            return claim;
+        };
+        let judged = if mode == Occupancy::Prompt {
+            claim_judged(
+                env,
+                shelf,
+                (sid, ord),
+                refused,
+                sys.as_ref(),
+                hold_since,
+                now_ms,
+            )
+            .map(|slots| WakeClaim::Granted(WakeFacts { slots, ..facts }))
+        } else {
+            Err(WakeClaim::Refused(PaceRefusal::Off))
+        };
+        match judged {
+            Ok(granted) => granted,
+            Err(held) => {
+                shelf.book.release(ord, episode, door);
+                held
+            }
+        }
+    }
+
+    /// `sid`'S LOOP GIVES BACK `door`'s claim on wake `ord` of `episode`
+    /// (`IdleHost::wake_release`): ready again (or answered again, for a retell's claim), honoured
+    /// only where the book holds it claimed by that door; nothing under the owner's `off`. A
+    /// parked wait hears it.
+    pub(crate) fn release_for(
+        &self,
+        env: &dyn Env,
+        sid: &str,
+        ord: u16,
+        episode: u64,
+        door: WakeDoor,
+    ) {
+        let mut books = self.lock();
+        if books.off(env) {
+            return;
+        }
+        let released = books
+            .shelves
+            .get_mut(sid)
+            .is_some_and(|shelf| shelf.book.release(ord, episode, door));
+        drop(books);
+        if released {
+            self.changed.notify_all();
+        }
+    }
+
     /// `sid`'S LOOP WENT (its worker ended): no door is left to tell an answer heard, so each
     /// answer written is told now, as an unhosted session's is at its write.
     pub(crate) fn left(&self, env: &dyn Env, sid: &str) {
@@ -1648,6 +1747,57 @@ fn slot_granted(
     env.reserve(sid, age_ms, usable, now_ms) == Reserve::Granted
 }
 
+/// WHAT HOLDS A CLAIMED WAKE'S LINE past the book ([`WakeHost::claim_for`]): `refused`, slice 1's
+/// refusal; then, where the wake has a need, its re-read on `sys` (a snapshot pulled fresh for
+/// the claim: `Stale` where none is fresh or a slot need's slots are unread, `Unmet` where the
+/// need's latch no longer holds); then the wake lines' pace, aged from `hold_since` (the session's
+/// open hold, else the wake's ready since). `Ok` with the slots its line types where its need
+/// names them; `Err` with the answer that holds it.
+fn claim_judged(
+    env: &dyn Env,
+    shelf: &mut Shelf,
+    (sid, ord): (&str, u16),
+    refused: Option<PaceRefusal>,
+    sys: Option<&SysRead>,
+    hold_since: Option<i64>,
+    now_ms: i64,
+) -> Result<Option<(u16, u16)>, WakeClaim> {
+    if let Some(why) = refused {
+        return Err(WakeClaim::Refused(why));
+    }
+    let Some(wake) = shelf.book.get(ord) else {
+        return Err(WakeClaim::Gone);
+    };
+    let (needs, need_slots) = (
+        wake.need.is_some(),
+        wake.need.as_ref().is_some_and(SysWait::names_slots),
+    );
+    let since_ms = wake.ready_since_ms.unwrap_or(now_ms);
+    let mut slots = None;
+    if needs {
+        let Some(read) = sys.filter(|read| read.fresh) else {
+            return Err(WakeClaim::Stale);
+        };
+        shelf.read_sys(Some(read));
+        if !shelf.book.get(ord).is_some_and(|wake| shelf.need_met(wake)) {
+            return Err(WakeClaim::Unmet);
+        }
+        if need_slots {
+            let Some(seen) = slots_seen(&read.snap) else {
+                return Err(WakeClaim::Stale);
+            };
+            slots = Some(seen);
+        }
+    }
+    let usable = slots.map_or(0, |(usable, _)| usable);
+    let age_ms = hold_since.unwrap_or(since_ms);
+    match env.wake_pace(sid, need_slots, age_ms, usable, now_ms) {
+        grant if grant.lets() => Ok(slots),
+        PaceGrant::Reserved => Err(WakeClaim::Reserved),
+        _ => Err(WakeClaim::Machine),
+    }
+}
+
 /// `#<n>` as an ordinal.
 fn ordinal(word: &str) -> Option<u16> {
     let digits = word.strip_prefix('#')?;
@@ -1798,6 +1948,10 @@ impl Env for Live {
 
     fn reserve(&self, sid: &str, age_ms: i64, usable: u16, now_ms: i64) -> Reserve {
         crate::occupancy_host::reserve_for_await(sid, age_ms, usable, now_ms)
+    }
+
+    fn wake_pace(&self, sid: &str, slot: bool, age_ms: i64, usable: u16, now_ms: i64) -> PaceGrant {
+        crate::occupancy_host::pace_for_wake(sid, slot, age_ms, usable, now_ms)
     }
 
     fn said(&self, sid: &str) -> Option<Said> {
@@ -2200,6 +2354,22 @@ pub(crate) fn seen_for(sid: &str) -> WakesSeen {
 /// `sid`'s loop told wake `ord` of `episode` through `door` ([`WakeHost::told_for`]).
 pub(crate) fn told_for(sid: &str, ord: u16, episode: u64, door: WakeDoor) {
     host().told_for(&Live, sid, ord, episode, door);
+}
+
+/// `sid`'s loop claims wake `ord` of `episode` for `door`'s line ([`WakeHost::claim_for`]).
+pub(crate) fn claim_for(
+    sid: &str,
+    ord: u16,
+    episode: u64,
+    door: WakeDoor,
+    refused: Option<PaceRefusal>,
+) -> WakeClaim {
+    host().claim_for(&Live, sid, ord, episode, door, refused)
+}
+
+/// `sid`'s loop gives back `door`'s claim on wake `ord` of `episode` ([`WakeHost::release_for`]).
+pub(crate) fn release_for(sid: &str, ord: u16, episode: u64, door: WakeDoor) {
+    host().release_for(&Live, sid, ord, episode, door);
 }
 
 /// `sid`'s loop went ([`WakeHost::left`]).

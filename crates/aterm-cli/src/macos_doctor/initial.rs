@@ -1002,6 +1002,12 @@ fn save_explicit_workstation_plan_with(
     root: &Path,
     mut before: impl FnMut(ExplicitWrite) -> Result<(), String>,
 ) -> Result<ExplicitRun, String> {
+    // Admission can retire a Restore's baseline. Check its pending originals
+    // before any record changes, for both doctor Apply and init's whole profile.
+    let required = super::required_restore_originals(root)?;
+    if !required.is_empty() {
+        super::load_backup_preserving_restore(&root.join("original-preferences.json"), &required)?;
+    }
     // A System State Stop asked for the run this revives is part of its record.
     fold_stop_request(root)?;
     let stop = stopped_at(root)?;
@@ -3299,6 +3305,73 @@ pub fn setup_records_held() -> bool {
     state_root().is_ok_and(|root| HeldLock::profile_active(&root).unwrap_or(false))
 }
 
+/// aterm's macOS grants as `aterm init`'s Permissions phase lists them, read as System State's
+/// Access rows read them (without a prompt): Full Disk Access, Developer Tools, debugger
+/// access, and Accessibility for a run that signs out (`sign_out`).
+pub(super) fn init_grants(
+    sign_out: bool,
+) -> Vec<(
+    aterm_types::macos_setup::Access,
+    aterm_machines::init::Grant,
+)> {
+    use aterm_types::macos_setup::Access;
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    selection.set(Setting::Messages, sign_out);
+    let grants = access::read(selection, &[]);
+    let app = i32::try_from(std::process::id())
+        .ok()
+        .and_then(aterm_containment::responsible_app)
+        .map_or_else(|| "aterm".to_owned(), |app| app.display_name);
+    [
+        Access::FullDiskAccess,
+        Access::DeveloperTools,
+        Access::Debugger,
+        Access::Accessibility,
+    ]
+    .into_iter()
+    .filter(|access| sign_out || *access != Access::Accessibility)
+    .map(|access| {
+        let row = access::observation(access, &grants, selection);
+        let why = row.detail.or(row.note);
+        (access, init_grant(access, row.standing, why, &app))
+    })
+    .collect()
+}
+
+/// One grant as `aterm init` lists it ([`init_grants`]): `standing` as System State reads it,
+/// `why` its detail. Full Disk Access and Accessibility are read for the app macOS holds
+/// responsible for this process (`app`: aterm in aterm's tab, Terminal under Terminal), which
+/// is the one this run's items need and the one to switch on; Developer Tools is read from
+/// aterm's own entry, and the debugger is this Mac's.
+fn init_grant(
+    access: aterm_types::macos_setup::Access,
+    standing: aterm_types::macos_setup::Standing,
+    why: Option<String>,
+    app: &str,
+) -> aterm_machines::init::Grant {
+    use aterm_machines::init::Grant;
+    use aterm_types::macos_setup::{Access, Standing};
+    match standing {
+        Standing::InPlace => Grant::On,
+        Standing::NeedsYou | Standing::Differs => Grant::NeedsYou(match access {
+            Access::Debugger => "aterm.app's Permissions turns it on with one administrator \
+                                 password (`aterm help permissions`)"
+                .to_owned(),
+            Access::FullDiskAccess | Access::Accessibility => format!(
+                "System Settings \u{25b8} Privacy & Security \u{25b8} {}: switch on {app}",
+                access.name()
+            ),
+            _ => format!(
+                "System Settings \u{25b8} Privacy & Security \u{25b8} {}: switch on aterm",
+                access.name()
+            ),
+        }),
+        Standing::NotNeeded => Grant::NotNeeded(why.unwrap_or_else(|| "not needed".into())),
+        _ => Grant::Unread(why.unwrap_or_else(|| "Not readable here".into())),
+    }
+}
+
 pub fn initial_setup_snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     initial_setup_snapshot_offering(None)
 }
@@ -3386,7 +3459,9 @@ fn decision_at(root: &Path) -> Result<Decision, String> {
 ///   not finished: the sign-outs after a preferences pass that failed, or the preferences
 ///   before the sign-outs' pass.
 ///
-/// A failed state read leaves the completion record unchanged for the next attempt.
+/// A pass checkpoints each selected Mac stage it fully verified before the decision,
+/// so a later bookkeeping failure cannot repeat its effects. A partial stage receives
+/// no completion credit. A failed state read changes no completion record.
 pub(super) fn record_applied(root: &Path, set: Selection) -> Result<(), String> {
     record_applied_with(root, set, decision_record)
 }
@@ -3405,6 +3480,27 @@ fn record_applied_with(
         )),
         (_, None) => None,
     };
+    if let Some((mut verified, plan)) = progress.zip(plan.as_ref())
+        && verified.belongs_to(plan)
+    {
+        for stage in [Stage::Workstation, Stage::Accounts] {
+            let required = filtered(plan.selection, |setting| {
+                stage.settings().contains(&setting)
+                    && (stage != Stage::Workstation
+                        || verified.only.is_none_or(|only| only.contains(setting)))
+            });
+            if !required.is_empty()
+                && Setting::ALL
+                    .into_iter()
+                    .all(|setting| !required.contains(setting) || set.contains(setting))
+            {
+                verified.done |= stage.bit();
+            }
+        }
+        if Some(verified) != progress {
+            save_progress(root, verified)?;
+        }
+    }
     let stage_owed = progress.zip(plan.as_ref()).is_some_and(|(progress, plan)| {
         progress.belongs_to(plan)
             && [
@@ -3913,6 +4009,7 @@ fn snapshot_from_observation(
                 } else {
                     String::new()
                 },
+                elapsed_ms: None,
             }
         })
         .collect();
@@ -4822,6 +4919,7 @@ mod parked_secrets_route_tests {
                 name: Stage::Secrets.name().into(),
                 status: status.into(),
                 detail: "injected vault result".into(),
+                elapsed_ms: None,
             }]
         };
         assert_eq!(read(1_000).retry_due(), None, "no previous attempt");
@@ -4964,6 +5062,7 @@ fn item_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
                     (None, None) => None,
                 })
                 .unwrap_or_else(|| "verified".into()),
+            elapsed_ms: row.elapsed_ms,
         })
         .collect()
 }
@@ -5036,6 +5135,7 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
                     name: Stage::Secrets.name().into(),
                     status: status.into(),
                     detail: note.into(),
+                    elapsed_ms: None,
                 }]);
             }
         }
@@ -5103,6 +5203,7 @@ fn readiness_row(name: &str, ready: bool, detail: String) -> Row {
         name: name.into(),
         status: if ready { "ok" } else { "blocked" }.into(),
         detail,
+        elapsed_ms: None,
     }
 }
 
@@ -5224,11 +5325,14 @@ fn execute_pass(
     let mut vault = SetupNext::Retry;
     // The rows of `report` a stage's own page stands for (`Report::page`).
     let mut pages: Vec<(std::ops::Range<usize>, PassPage)> = Vec::new();
+    // Each stage's rows its producer did not time carry the stage's time.
+    let mut clock = RowClock::start();
     // Whether this pass's Repositories stage, if it ran, waits on the Command Line Tools: the
     // window hears an ask once the pass is over, a withdrawal at once
     // ([`SetupHooks::developer_tools`]).
     let mut developer_tools = None;
     for stage in Stage::ALL {
+        clock.lap(&mut report.rows);
         if !stage.selected(&plan) || progress.done & stage.bit() != 0 {
             continue;
         }
@@ -5237,7 +5341,9 @@ fn execute_pass(
                 name: "System State".into(),
                 status: "stopped".into(),
                 detail: "stopped before this step; nothing more runs until the plan changes".into(),
+                elapsed_ms: None,
             });
+            clock.lap(&mut report.rows);
             if developer_tools == Some(true) {
                 (hooks.developer_tools)(progress.revision, false);
             }
@@ -5264,6 +5370,7 @@ fn execute_pass(
                             name: Stage::Secrets.name().into(),
                             status: "unverified".into(),
                             detail,
+                            elapsed_ms: None,
                         }]
                     });
                     let at = report.rows.len();
@@ -5282,6 +5389,7 @@ fn execute_pass(
                     .into(),
                     detail: "waiting for the selected secrets vault to synchronize credentials"
                         .into(),
+                    elapsed_ms: None,
                 }];
                 next = next.and(SetupNext::of(&rows));
                 report.rows.extend(rows);
@@ -5365,6 +5473,7 @@ fn execute_pass(
                             name: stage.name().into(),
                             status: "unverified".into(),
                             detail,
+                            elapsed_ms: None,
                         }),
                     }
                     Ok(rows)
@@ -5374,6 +5483,7 @@ fn execute_pass(
                     name: stage.name().into(),
                     status: "unverified".into(),
                     detail,
+                    elapsed_ms: None,
                 }]),
             },
             Stage::Repositories => host.repositories(repository_vault.as_ref()),
@@ -5401,6 +5511,7 @@ fn execute_pass(
                     name: stage.name().into(),
                     status: "error".into(),
                     detail,
+                    elapsed_ms: None,
                 };
                 page = Some(step_page(&row, stage.page_rows(&subjects)));
                 (false, vec![row])
@@ -5424,6 +5535,17 @@ fn execute_pass(
         let left = SetupNext::of(&rows);
         if ready {
             progress.done |= stage.bit();
+        }
+        if matches!(stage, Stage::Workstation | Stage::Accounts) {
+            // The inner pass can checkpoint verified effects before a later
+            // summary or held-item write fails. Keep that exact run's evidence
+            // when publishing this stage's result, including its error result.
+            let recorded = self::progress(root)?
+                .filter(|recorded| {
+                    recorded.revision == progress.revision && recorded.belongs_to(&plan)
+                })
+                .ok_or("setup progress changed while the Mac settings step ran")?;
+            progress.done |= recorded.done & (Stage::Workstation.bit() | Stage::Accounts.bit());
         }
         if stage == Stage::Secrets {
             vault = left;
@@ -5452,6 +5574,7 @@ fn execute_pass(
             running: false,
         });
     }
+    clock.lap(&mut report.rows);
     let stages_finished = Stage::ALL
         .iter()
         .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0);
@@ -5463,7 +5586,9 @@ fn execute_pass(
             status: "stopped".into(),
             detail: "stopped before deferred settings; nothing more runs until the plan changes"
                 .into(),
+            elapsed_ms: None,
         });
+        clock.lap(&mut report.rows);
         if developer_tools == Some(true) {
             (hooks.developer_tools)(progress.revision, false);
         }
@@ -5498,6 +5623,7 @@ fn execute_pass(
                 name: "Settings waiting for Full Disk Access".into(),
                 status: "unverified".into(),
                 detail,
+                elapsed_ms: None,
             };
             let at = report.rows.len();
             pages.push((
@@ -5520,9 +5646,11 @@ fn execute_pass(
             name: "System State".into(),
             status: "stopped".into(),
             detail: "stopped after this pass; nothing more runs until the plan changes".into(),
+            elapsed_ms: None,
         });
         next = SetupNext::Done;
     }
+    clock.lap(&mut report.rows);
     // Only now, with nothing of this pass left to run (no sign-out to drive Messages over the
     // password prompt), and never for a stopped run.
     if developer_tools == Some(true) {
@@ -5703,6 +5831,9 @@ mod tests {
         configured_unreadable: bool,
         checked_url: Option<String>,
         native_repositories: Option<(aterm_machines::port::Fake, aterm_machines::items::Ctx)>,
+        /// The live Accounts stage adapter over an inert account machine.
+        native_accounts: Option<(aterm_machines::port::Fake, NativeHost)>,
+        native_accounts_now: Option<std::time::SystemTime>,
         /// Whether the last native Repositories stage stopped for want of the Command Line
         /// Tools, read as the live host reads it ([`repositories::want_developer_tools`]).
         developer_tools_wanted: bool,
@@ -5750,6 +5881,7 @@ mod tests {
                     name: stage.name().into(),
                     status: WAITING.into(),
                     detail: "injected wait for a person".into(),
+                    elapsed_ms: None,
                 }]);
             }
             Ok(vec![readiness_row(
@@ -5765,6 +5897,20 @@ mod tests {
             self.workstation(root, None)
         }
         fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+            if let Some((sys, host)) = &mut self.native_accounts {
+                self.calls.push(Stage::Accounts);
+                return apply_part_with(
+                    root,
+                    sys,
+                    host,
+                    "inert-init-completion",
+                    self.native_accounts_now.unwrap_or(
+                        std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_800_000_000),
+                    ),
+                    Part::Accounts { on_screen },
+                );
+            }
             if !on_screen && self.accounts_pending {
                 return Ok(Some(Report {
                     action: Action::Apply,
@@ -5772,6 +5918,7 @@ mod tests {
                         name: Stage::Accounts.name().into(),
                         status: WAITING.into(),
                         detail: "injected: waits for System State on screen".into(),
+                        elapsed_ms: None,
                     }],
                     manual_steps: Vec::new(),
                     backup: root.join("original-preferences.json"),
@@ -7984,6 +8131,42 @@ mod tests {
         }
     }
 
+    /// EVERY ROW OF A SETUP PASS CARRIES ITS TIME in the JSON: a stage's rows, its error and
+    /// the repositories' wait on the vault alike (presence only, never a budget).
+    #[test]
+    fn every_setup_row_carries_its_time_in_the_json() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &Plan::default()).unwrap();
+        let mut host = Fake {
+            failure: Some(Stage::Permissions),
+            pending: Some(Stage::Secrets),
+            ..Fake::default()
+        };
+        let report = execute_initial(&mut host, root.path(), &mut None)
+            .unwrap()
+            .unwrap();
+        for (name, status) in [
+            (Stage::Permissions.name(), "error"),
+            (Stage::Repositories.name(), "blocked"),
+        ] {
+            assert!(
+                report
+                    .rows
+                    .iter()
+                    .any(|row| row.name == name && row.status == status),
+                "{name}: {}",
+                report.to_text()
+            );
+        }
+        let json: aterm_json::Value = aterm_json::from_str(&report.to_json()).unwrap();
+        let rows = json["settings"].as_array().unwrap();
+        assert_eq!(rows.len(), report.rows.len());
+        assert!(
+            rows.iter().all(|row| row["elapsed_ms"].as_u64().is_some()),
+            "{json}"
+        );
+    }
+
     #[test]
     fn pending_vault_blocks_only_repositories_and_retries_without_repeating_finished_stages() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -9133,6 +9316,8 @@ mod tests {
 
         for legacy_mismatch in [false, true] {
             let (root, _, mut doctor) = widgets_owed_before_restore();
+            let withheld = root.path().join("withheld-preferences.json");
+            let owed = std::fs::read(&withheld).unwrap();
             let path = root.path().join("automatic-plan.json");
             let retained = root.path().join("automatic-plan-retained.json");
             std::fs::rename(&path, &retained).unwrap();
@@ -9147,13 +9332,16 @@ mod tests {
             }
             assert!(progress(root.path()).unwrap().unwrap().admitted);
             doctor.grant();
-            let followed = doctor.follow_up(root.path()).unwrap();
+            assert!(
+                doctor.follow_up(root.path()).is_err(),
+                "an unconfirmed run must not reset its deferred retry record"
+            );
             assert_eq!(doctor.notification_center_writes(), 0);
-            assert!(followed.is_none());
             assert!(!doctor.notification_center_cleared());
-            assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
+            assert_eq!(std::fs::read(&withheld).unwrap(), owed);
 
             std::fs::rename(retained, path).unwrap();
+            assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
             assert!(doctor.follow_up(root.path()).unwrap().is_some());
             assert_eq!(doctor.notification_center_writes(), 1);
             assert!(doctor.notification_center_cleared());
@@ -10294,6 +10482,7 @@ mod tests {
             name: "row".into(),
             status: status.into(),
             detail: String::new(),
+            elapsed_ms: None,
         };
         assert_eq!(SetupNext::of(&[row("ok"), row("applied")]), SetupNext::Done);
         assert_eq!(SetupNext::of(&[row("ok"), row(WAITING)]), SetupNext::Park);
@@ -11023,6 +11212,7 @@ mod tests {
                     name: Stage::Secrets.name().into(),
                     status: "error".into(),
                     detail: "injected failed write of the scratch vault".into(),
+                    elapsed_ms: None,
                 }];
                 secrets_retry::record(root, revision, pace, false, &mut rows).unwrap();
             }
@@ -11191,7 +11381,8 @@ mod tests {
                     interactive: false,
                     wait: std::time::Duration::ZERO,
                     confirm: &|_| false,
-                    password: &|| None,
+                    password: aterm_secrets::client::JoinPassword::Given(None),
+                    fetched: None,
                     requested: &|| {},
                     say: &|_| {},
                 },
@@ -12629,6 +12820,7 @@ mod tests {
                 name: Stage::Secrets.name().into(),
                 status: "error".into(),
                 detail: "injected failed change before upgrade".into(),
+                elapsed_ms: None,
             }];
             secrets_retry::record(root.path(), 7, &old, false, &mut failed).unwrap();
         }
@@ -13202,6 +13394,7 @@ mod tests {
             name: "GitHub repositories from synced development credentials".into(),
             status: "error".into(),
             detail: "GET /user: connection refused".into(),
+            elapsed_ms: None,
         };
         let mut page = items_page(Stage::Repositories, &[item]).unwrap();
         assert_eq!(page.outcome.unfinished, [(Setting::Repositories, failed)]);
@@ -13213,6 +13406,7 @@ mod tests {
             name: Stage::Repositories.name().into(),
             status: "error".into(),
             detail: "the stage's own line".into(),
+            elapsed_ms: None,
         };
         let mut page = items_page(Stage::Repositories, &[stage]).unwrap();
         assert_eq!(page.rows[0].detail, "", "no words of the stage's own");
@@ -16220,6 +16414,395 @@ mod tests {
         // The explicit pass set every Mac preference and signed out (`execute(Apply)`).
         record_applied(root, Selection::all().workstation()).unwrap();
         complete_explicit_workstation_plan(root, explicit).unwrap();
+    }
+
+    /// `aterm init`'s pass of the whole profile holds the records the first launch holds and
+    /// records what it verified, as `aterm doctor --apply` does: the next launch neither resets
+    /// the Dock nor signs out again. Without that record the launch's offer runs both.
+    #[test]
+    fn a_whole_init_pass_leaves_the_next_launch_nothing_it_ran() {
+        use aterm_machines::init::Held as _;
+        let ran_by_the_launch = |init: bool| {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let root = scratch.path();
+            if init {
+                let hold = super::super::init_hold_at(root, true, &|line| {
+                    panic!("nothing else holds the records: {line}")
+                })
+                .unwrap();
+                Box::new(hold).verified().unwrap();
+            }
+            launch_startup(root).map(|revision| run_pass(root, revision).calls)
+        };
+        let calls = ran_by_the_launch(true);
+        assert!(
+            calls.as_ref().is_none_or(|calls| {
+                !calls.contains(&Stage::Workstation) && !calls.contains(&Stage::Accounts)
+            }),
+            "the next launch reset the Dock or signed out again: {calls:?}"
+        );
+        let calls = ran_by_the_launch(false).expect("a fresh Mac's launch offers its setup");
+        assert!(
+            calls.contains(&Stage::Workstation) && calls.contains(&Stage::Accounts),
+            "{calls:?}"
+        );
+    }
+
+    fn automatic_completion_account_retry(block_after_signout: bool) {
+        use crate::macos_doctor::accounts_visibility_tests::{
+            Account, system, system_after_signout,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        // Secrets keeps the same admitted run unfinished after Accounts verifies.
+        let plan = selected(&[Setting::Messages, Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let _profile = HeldLock::take(root.path()).unwrap();
+        let held = root.path().join(HELD_RECORD);
+        let account = Arc::new(Account {
+            signed_in: AtomicBool::new(true),
+            unreadable: false,
+            signouts: AtomicUsize::new(0),
+        });
+        if !block_after_signout {
+            std::fs::create_dir(&held).unwrap();
+        }
+        let blocker = held.clone();
+        let machine = system_after_signout(None, &account, move || {
+            assert!(
+                block_after_signout,
+                "an unreadable cache must stop before the effect"
+            );
+            std::fs::create_dir(&blocker).unwrap();
+        });
+        let mut first = Fake {
+            pending: Some(Stage::Secrets),
+            native_accounts: Some((
+                system(None, &account),
+                NativeHost::over(
+                    Box::new(machine),
+                    Box::new(aterm_machines::init::prepare_workstation_selected),
+                ),
+            )),
+            native_accounts_now: Some(std::time::SystemTime::now()),
+            ..Fake::default()
+        };
+        let (report, _) = execute_initial_for_revision(
+            &mut first,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(held.is_dir());
+        assert!(
+            report.rows.iter().any(|row| {
+                row.name == Stage::Accounts.name()
+                    && row.status == "error"
+                    && row.detail.contains(HELD_RECORD)
+            }),
+            "{}",
+            report.to_text()
+        );
+        assert_eq!(
+            account.signouts.load(Ordering::SeqCst),
+            usize::from(block_after_signout)
+        );
+        assert_eq!(
+            first_run_complete(root.path()).unwrap(),
+            block_after_signout
+        );
+        assert_eq!(revision_at(root.path()).unwrap(), revision);
+        assert!(
+            !finished_at(root.path()).unwrap(),
+            "Secrets is still pending"
+        );
+
+        std::fs::remove_dir(&held).unwrap();
+        if block_after_signout {
+            // The first pass verified the sign-out and published Applied. A person's
+            // later login is not work for the cache write's retry to undo.
+            assert!(!account.signed_in.load(Ordering::SeqCst));
+            account.signed_in.store(true, Ordering::SeqCst);
+        }
+        let retry_at = std::fs::metadata(root.path().join("automatic-attempt.json"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            + std::time::Duration::from_secs(60);
+        let mut retry = Fake {
+            pending: Some(Stage::Secrets),
+            native_accounts: Some((
+                system(None, &account),
+                NativeHost::over(
+                    Box::new(system(None, &account)),
+                    Box::new(aterm_machines::init::prepare_workstation_selected),
+                ),
+            )),
+            native_accounts_now: Some(retry_at),
+            ..Fake::default()
+        };
+        execute_initial_for_revision(
+            &mut retry,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revision_at(root.path()).unwrap(), revision);
+        assert_eq!(
+            account.signouts.load(Ordering::SeqCst),
+            1,
+            "retry the record, never repeat a verified sign-out"
+        );
+        assert_eq!(
+            account.signed_in.load(Ordering::SeqCst),
+            block_after_signout,
+            "an earlier cache read error still leaves the account to be signed out"
+        );
+    }
+
+    #[test]
+    fn automatic_completion_held_save_failure_preserves_a_later_login() {
+        automatic_completion_account_retry(true);
+    }
+
+    #[test]
+    fn automatic_completion_held_read_failure_still_retries_the_unperformed_signout() {
+        automatic_completion_account_retry(false);
+    }
+
+    #[test]
+    fn automatic_completion_partial_account_pass_does_not_complete_the_other_account() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Messages, Setting::FaceTime, Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap().unwrap();
+        let _profile = HeldLock::take(root.path()).unwrap();
+        let before = progress(root.path()).unwrap().unwrap();
+        record_applied(root.path(), selected(&[Setting::Messages]).selection).unwrap();
+        assert_eq!(
+            progress(root.path()).unwrap(),
+            Some(before),
+            "one completed account cannot credit the other account or an independent stage"
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InitCompletion {
+        BeforeVerification,
+        AfterApplied,
+        SummaryError,
+        Complete,
+    }
+
+    fn init_completion_account_pass(cut: InitCompletion) -> (usize, bool) {
+        use crate::macos_doctor::accounts_visibility_tests::{Account, system};
+        use aterm_machines::init::Held as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut held =
+            Some(super::super::init_hold_at(root.path(), true, &|line| panic!("{line}")).unwrap());
+        let account = Arc::new(Account {
+            signed_in: AtomicBool::new(true),
+            unreadable: false,
+            signouts: AtomicUsize::new(0),
+        });
+        let native = || {
+            NativeHost::over(
+                Box::new(system(None, &account)),
+                Box::new(aterm_machines::init::prepare_workstation_selected),
+            )
+        };
+        if cut != InitCompletion::BeforeVerification {
+            // The Desktop lane's real account items, with all subprocesses and
+            // account state supplied by the same inert machine as the resumed pass.
+            let mut desktop = native();
+            desktop.select(Selection::all().workstation());
+            let rows = desktop
+                .workstation(WorkstationGroup::Accounts, true)
+                .unwrap();
+            assert!(rows.iter().all(|(_, row)| row_ready(row)), "{rows:?}");
+            assert_eq!(account.signouts.load(Ordering::SeqCst), 1);
+            assert!(!account.signed_in.load(Ordering::SeqCst));
+            match cut {
+                InitCompletion::AfterApplied => {
+                    // The actual first completion write of InitHold::verified;
+                    // the process ends before its final Progress write.
+                    record_applied(root.path(), Selection::all().workstation()).unwrap();
+                }
+                InitCompletion::SummaryError => {
+                    let before = progress(root.path()).unwrap().unwrap();
+                    let written =
+                        record_applied_with(root.path(), Selection::all().workstation(), |root| {
+                            let read = decision_record(root)?;
+                            std::fs::rename(
+                                root.join("first-run.json"),
+                                root.join("first-run.saved"),
+                            )
+                            .unwrap();
+                            std::fs::create_dir(root.join("first-run.json")).unwrap();
+                            Ok(read)
+                        });
+                    assert!(written.is_err(), "the actual summary publication must fail");
+                    std::fs::remove_dir(root.path().join("first-run.json")).unwrap();
+                    std::fs::rename(
+                        root.path().join("first-run.saved"),
+                        root.path().join("first-run.json"),
+                    )
+                    .unwrap();
+                    let mut expected = before;
+                    expected.done |= Stage::Workstation.bit() | Stage::Accounts.bit();
+                    assert_eq!(
+                        progress(root.path()).unwrap(),
+                        Some(expected),
+                        "verified work survives a failed summary without changing other run fields"
+                    );
+                }
+                InitCompletion::Complete => Box::new(held.take().unwrap()).verified().unwrap(),
+                InitCompletion::BeforeVerification => unreachable!(),
+            }
+            // A later login is the person's change, after the verified sign-out.
+            account.signed_in.store(true, Ordering::SeqCst);
+        }
+        drop(held);
+        assert!(
+            !root.path().join(HELD_RECORD).exists(),
+            "raw init keeps no automatic item cache"
+        );
+        let before = account.signouts.load(Ordering::SeqCst);
+        let mut resumed = Fake {
+            native_accounts: Some((system(None, &account), native())),
+            ..Fake::default()
+        };
+        if let Some(revision) = launch_startup(root.path()) {
+            let _profile = HeldLock::take(root.path()).unwrap();
+            execute_initial_for_revision(
+                &mut resumed,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("the actual admitted startup pass resumes");
+        }
+        (
+            account.signouts.load(Ordering::SeqCst) - before,
+            account.signed_in.load(Ordering::SeqCst),
+        )
+    }
+
+    #[test]
+    fn init_completion_interrupted_after_applied_keeps_verified_signouts() {
+        assert_eq!(
+            init_completion_account_pass(InitCompletion::AfterApplied),
+            (0, true),
+            "the next launch must preserve the person's later login"
+        );
+    }
+
+    #[test]
+    fn init_completion_summary_error_keeps_verified_signouts() {
+        assert_eq!(
+            init_completion_account_pass(InitCompletion::SummaryError),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn init_completion_success_keeps_verified_signouts() {
+        assert_eq!(
+            init_completion_account_pass(InitCompletion::Complete),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn init_completion_before_verification_still_runs_accounts() {
+        assert_eq!(
+            init_completion_account_pass(InitCompletion::BeforeVerification),
+            (1, false)
+        );
+    }
+
+    #[test]
+    fn init_completion_partial_pass_does_not_credit_the_whole_profile() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let _held =
+            super::super::init_hold_at(root.path(), true, &|line| panic!("{line}")).unwrap();
+        let mut expected = progress(root.path()).unwrap().unwrap();
+        record_applied(root.path(), preferences(Selection::all())).unwrap();
+        expected.done |= Stage::Workstation.bit();
+        assert_eq!(
+            progress(root.path()).unwrap(),
+            Some(expected),
+            "verified preferences cannot complete Accounts or change other run fields"
+        );
+    }
+
+    /// `aterm init` behind a first-launch pass that holds the profile lock says one line and
+    /// waits; once the pass lets the lock go, init holds it and runs.
+    #[test]
+    fn init_waits_with_one_line_while_a_first_launch_pass_holds_the_records() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        let pass = super::super::HeldLock::take(root).unwrap();
+        let (heard, said) = std::sync::mpsc::channel::<String>();
+        let waiting = std::thread::scope(|threads| {
+            let init = threads.spawn(|| {
+                super::super::init_hold_at(root, false, &|line| {
+                    heard.send(line.to_owned()).unwrap();
+                })
+                .map(|_| ())
+            });
+            // A hang detector: init says it waits while the pass holds the records.
+            let line = said
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("init said it waits");
+            assert!(
+                !init.is_finished(),
+                "init ran while the pass held the records"
+            );
+            drop(pass);
+            init.join().unwrap().unwrap();
+            line
+        });
+        assert_eq!(waiting, super::super::INIT_WAITS);
+        assert!(said.try_recv().is_err(), "one line, not one per look");
+        assert!(super::super::HeldLock::try_take(root).unwrap().is_some());
+    }
+
+    /// `aterm init`'s grant rows name the app a grant must go to: Full Disk Access and
+    /// Accessibility were read for the app macOS holds responsible (Terminal, under Terminal),
+    /// Developer Tools from aterm's own entry; a grant read as unknown is unread, not missing.
+    #[test]
+    fn init_grant_rows_name_the_app_the_reading_measured() {
+        use aterm_machines::init::Grant;
+        use aterm_types::macos_setup::{Access, Standing};
+        let how = |access, app| match init_grant(access, Standing::NeedsYou, None, app) {
+            Grant::NeedsYou(how) => how,
+            other => panic!("{access:?}: {other:?}"),
+        };
+        assert!(how(Access::FullDiskAccess, "Terminal").ends_with("switch on Terminal"));
+        assert!(how(Access::Accessibility, "Terminal").ends_with("switch on Terminal"));
+        assert!(how(Access::FullDiskAccess, "aterm").ends_with("switch on aterm"));
+        assert!(how(Access::DeveloperTools, "Terminal").ends_with("switch on aterm"));
+        assert_eq!(
+            init_grant(Access::FullDiskAccess, Standing::InPlace, None, "Terminal"),
+            Grant::On
+        );
+        assert!(matches!(
+            init_grant(Access::Debugger, Standing::Unknown, None, "Terminal"),
+            Grant::Unread(_)
+        ));
     }
 
     /// `aterm doctor --apply` while a staged run waits for the launch's offer (here the run a

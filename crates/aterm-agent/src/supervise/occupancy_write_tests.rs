@@ -9,10 +9,12 @@ use super::*;
 use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::fault::{self, Fault};
 use crate::supervise::occupancy::templates;
+use crate::supervise::occupancy::wakes::WakeBook;
 use crate::supervise::occupancy::wakes_seen::{AtomKind, Declarer, Prio, WakeState};
 use crate::supervise::occupancy::{
     FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, PaceRefusal, RuleId,
-    SaidReadyIdle, SaidVerdict, SaidWake, SlotsSeen, WakeClaim, WakeDoor, WakeSeen, WakesSeen,
+    SaidReadyIdle, SaidVerdict, SaidWake, SlotsSeen, WakeClaim, WakeDoor, WakeFacts, WakeSeen,
+    WakesSeen,
 };
 use crate::supervise::policy::turn_end::{HostTurn, RULE_LAND};
 
@@ -63,6 +65,13 @@ struct DoorHost {
     wake_reads: Mutex<usize>,
     /// The book keeps a wake the loop told, as a window that took the tell not does.
     keeps_told: AtomicBool,
+    /// The host's answers to the wake door's claims ([`IdleHost::wake_claim`]), in order; none
+    /// left, the window's book's ([`DoorHost::real`]) where set, else granted with the scripted
+    /// book's ready since.
+    claims: Mutex<VecDeque<WakeClaim>>,
+    /// The window's own book, where a test runs the door against it: its reads, claims, releases
+    /// and tells are the book's, at the run's wall ([`DoorHost::facts_at`]).
+    real: Mutex<Option<WakeBook>>,
 }
 
 impl DoorHost {
@@ -146,14 +155,46 @@ impl IdleHost for DoorHost {
     }
     fn wakes(&self) -> WakesSeen {
         *self.wake_reads.lock().expect("wake_reads") += 1;
+        if let Some(book) = self.real.lock().expect("real").as_ref() {
+            return book.seen();
+        }
         self.wakes.lock().expect("wakes").clone()
     }
-    fn wake_claim(&self, ord: u16, _: u64, door: WakeDoor) -> WakeClaim {
+    fn wake_claim(&self, ord: u16, episode: u64, door: WakeDoor) -> WakeClaim {
         self.called(format!("wake_claim #{ord} {}", door.word()));
-        WakeClaim::Gone
+        if let Some(claim) = self.claims.lock().expect("claims").pop_front() {
+            return claim;
+        }
+        let now_ms = *self.facts_at.lock().expect("facts_at");
+        if let Some(book) = self.real.lock().expect("real").as_mut() {
+            return book.claim(ord, episode, door, now_ms);
+        }
+        let ready_since_ms = self
+            .wakes
+            .lock()
+            .expect("wakes")
+            .wakes
+            .iter()
+            .find(|w| w.ord == ord)
+            .and_then(|w| w.ready_since_ms);
+        WakeClaim::Granted(WakeFacts {
+            ready_since_ms,
+            slots: None,
+        })
     }
-    fn wake_told(&self, ord: u16, _: u64, door: WakeDoor) {
+    fn wake_release(&self, ord: u16, episode: u64, door: WakeDoor) {
+        self.called(format!("wake_release #{ord} {}", door.word()));
+        if let Some(book) = self.real.lock().expect("real").as_mut() {
+            book.release(ord, episode, door);
+        }
+    }
+    fn wake_told(&self, ord: u16, episode: u64, door: WakeDoor) {
         self.called(format!("wake_told #{ord} {}", door.word()));
+        let now_ms = *self.facts_at.lock().expect("facts_at");
+        if let Some(book) = self.real.lock().expect("real").as_mut() {
+            book.told(ord, episode, door, now_ms);
+            return;
+        }
         if self.keeps_told.load(Ordering::SeqCst) {
             return;
         }
@@ -195,7 +236,8 @@ struct Logged<'m> {
     seen: Vec<(String, DoorRows)>,
 }
 
-/// How many of the door's rows the ledger held: intents, and outcomes typed.
+/// How many of the door's rows the ledger held: intents, and outcomes typed (the wake door's
+/// `fact-wake@v1` rows among them).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DoorRows {
     intents: usize,
@@ -210,7 +252,8 @@ impl Ctl for Logged<'_> {
             typed: rows
                 .iter()
                 .filter(|r| r.0 == HOLD && r.1 == "typed")
-                .count(),
+                .count()
+                + wakes_typed(&self.ledger),
         };
         let words: Vec<&str> = args
             .iter()
@@ -243,6 +286,20 @@ impl Ctl for Logged<'_> {
 
 const INTENT: &str = "fact-intent@v1";
 const HOLD: &str = "fact-hold@v1";
+const WAKE_FACT: &str = "fact-wake@v1";
+
+/// How many `fact-wake@v1` rows `typed` the ledger at `path` holds: the wake door's outcomes.
+fn wakes_typed(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| {
+            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+            text("rule_id") == Some(WAKE_FACT) && text("decision") == Some("typed")
+        })
+        .count()
+}
 
 /// The typed door's fact rows in the ledger at `path`: its intents, its would-be lines and its
 /// outcomes, and never the task door's ([`task_rows`]).
@@ -3786,77 +3843,6 @@ fn the_books_reads_are_paced_at_breaks_and_live_reads() {
     assert_eq!(reads(&live_20s, true, false), 0, "no hold read: not hosted");
 }
 
-/// THE PROMPT HALF OF T-OBS2 AS 2.7 LEAVES IT: under `prompt` a ready wake's line is a would row
-/// and nothing more (its write is the slice-2 plan's 2.8): nothing typed, no `status` read, and
-/// no pace, break or claim asked of the host. NEGATIVE CONTROL: `WakeTypedEarly` types it.
-#[test]
-fn under_prompt_a_due_wake_is_booked_and_typed_nowhere_yet() {
-    let run = || {
-        let host = Arc::new(DoorHost::default());
-        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
-        Script {
-            host,
-            ..Script::new("write-wake-prompt", Occupancy::Prompt, &[0, 5 * 60, 6 * 60])
-        }
-        .run(&mut |s, i| {
-            if i == 2 {
-                s.took(7, Some(&policy(Occupancy::Prompt)), &mut Heard::default());
-            }
-        })
-    };
-    let ran = run();
-    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
-    assert!(
-        !ran.requests().iter().any(|r| r == "status"),
-        "{:?}",
-        ran.requests()
-    );
-    assert!(
-        !ran.calls.iter().any(|c| c.starts_with("occupancy_pace")
-            || c == "break_taken"
-            || c.starts_with("wake_claim")),
-        "{:?}",
-        ran.calls
-    );
-    assert_eq!(rule_said(&ran, WAKE), ["would"]);
-    let early = fault::with(Fault::WakeTypedEarly, run);
-    assert!(
-        early.writes().iter().any(|w| w.contains("wake #1")),
-        "CONTROL: {:?}",
-        early.writes()
-    );
-}
-
-/// A managed worker's ready wake under `prompt` is held by the manager and noted nowhere yet (a
-/// managed wake's note comes with its write, the slice-2 plan's 2.8): no task-record fact, and
-/// nothing typed. NEGATIVE CONTROL: `WakeNotedEarly` notes it.
-#[test]
-fn a_managed_workers_due_wake_is_noted_nowhere_yet() {
-    let run = || {
-        let host = Arc::new(DoorHost::default());
-        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
-        Script {
-            host,
-            ..Script::new(
-                "write-wake-managed",
-                Occupancy::Prompt,
-                &[0, 5 * 60, 6 * 60],
-            )
-        }
-        .run(&mut |s, _| s.turn_end.set_managed(true))
-    };
-    let ran = run();
-    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
-    assert_eq!(task_facts(&ran), Vec::<String>::new());
-    assert_eq!(rule_said(&ran, WAKE), ["held:managed"]);
-    let early = fault::with(Fault::WakeNotedEarly, run);
-    assert!(
-        task_facts(&early).iter().any(|f| f.contains("wake@v1")),
-        "CONTROL: {:?}",
-        early.calls
-    );
-}
-
 /// A wake's line feeds no K clock of the loop's (the window's wake K clock is its own): a
 /// managed worker's ready wake held K looks and more raises no ready-idle line in the told word.
 /// NEGATIVE CONTROL: `WakeFeedsK` raises it, naming the wake.
@@ -4187,3 +4173,6 @@ fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
     assert!(ran.in_flight, "the continuation is still owed its answer");
     assert!(ran.land, "the land act is still owed its answer");
 }
+
+#[path = "occupancy_wake_write_tests.rs"]
+mod wake_write;

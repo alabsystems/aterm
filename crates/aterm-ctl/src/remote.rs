@@ -46,8 +46,7 @@ pub struct DriveRefused {
     pub left: Option<Left>,
     /// The request was not sent because an aterm on its way took the connection and sent no fleet
     /// handshake within the deadline: the peer, or this machine's issuer, read for which Mac the
-    /// word names (a refusal that says `try again once it answers`): exit 2, as for an instance
-    /// that accepted and did not serve.
+    /// word names: exit 2, as for an instance that accepted and did not serve.
     pub unserved: bool,
 }
 
@@ -105,14 +104,14 @@ const DRIVE_WITHIN: Duration = Duration::from_secs(28);
 pub(crate) enum Within {
     /// The drive's own: [`DRIVE_WITHIN`], or an `await task` leg's wait and its slack.
     Drive(Duration),
-    /// The caller's `--timeout`, shorter than [`DRIVE_WITHIN`].
-    Timeout(Duration),
+    /// The caller's `--timeout` (the first), shorter than the drive's own (the second).
+    Timeout(Duration, Duration),
 }
 
 impl Within {
     const fn get(self) -> Duration {
         match self {
-            Self::Drive(within) | Self::Timeout(within) => within,
+            Self::Drive(within) | Self::Timeout(within, _) => within,
         }
     }
 }
@@ -121,7 +120,7 @@ impl Within {
 /// `--timeout 0`).
 fn drive_within(total: Option<Option<Duration>>) -> Within {
     match total {
-        Some(Some(total)) if total < DRIVE_WITHIN => Within::Timeout(total),
+        Some(Some(total)) if total < DRIVE_WITHIN => Within::Timeout(total, DRIVE_WITHIN),
         _ => Within::Drive(DRIVE_WITHIN),
     }
 }
@@ -451,7 +450,7 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
                      busy to answer, or the network between is down)",
                     within.as_secs()
                 ),
-                Within::Timeout(within) => {
+                Within::Timeout(within, own) => {
                     let turn = if verb == "turn" {
                         format!(
                             "a `turn` there answers once it settles or its timeout= runs out, \
@@ -464,7 +463,7 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
                         "no answer came from {label} within this call's --timeout of {} s \
                          ({turn}a longer --timeout, or 0, waits up to the drive's own {} s)",
                         within.as_secs(),
-                        DRIVE_WITHIN.as_secs()
+                        own.as_secs()
                     )
                 }
             },

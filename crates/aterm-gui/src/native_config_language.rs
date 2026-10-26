@@ -5473,10 +5473,13 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · an out-of-range/non-finite value is ignored, not clamped; resolution falls through to the next valid precedence source"
         }
         crate::prefs::EDIT_FONT_VARIATION => {
-            " · each entry is tag=value with a 1–4 byte OpenType axis tag; malformed entries are ignored"
+            " · each entry is tag=value with a 1–4 byte OpenType axis tag; malformed entries are ignored; a font named at one of its instances (SF Mono Light) ignores it"
+        }
+        crate::prefs::EDIT_FONT_WEIGHT_DARK_NUDGE => {
+            " · a font named at one of its instances (SF Mono Light) keeps that weight in a dark theme"
         }
         crate::prefs::EDIT_FONT_WEIGHT => {
-            " · applies only when the selected font provides a wght axis; static fonts ignore it"
+            " · applies only when the selected font provides a wght axis; static fonts, and a font named at one of its instances (SF Mono Light), ignore it"
         }
         crate::prefs::EDIT_FONT_FEATURES => {
             " · tokens are tag / +tag / -tag / tag=unsigned-value with 1–4 byte ASCII tags; malformed tokens are ignored"

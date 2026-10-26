@@ -112,6 +112,10 @@ pub(crate) enum Mutant {
     CleanStopOverAnOwedRecovery,
     /// Each try of the recovery's moves publishes a copy of every file again.
     CopyOnEveryTry,
+    /// The sweep gives no departed session's subject back (`Bridge::reclaim_subjects`).
+    NoSubjectRetire,
+    /// The sweep gives a subject back with the unconditional `/a/retire`, whatever landed on it since it read it.
+    RetireUnconditionally,
 }
 
 /// What one run is.
@@ -189,6 +193,22 @@ impl Opts {
             write_errors: (seed / 8) % 2 == 1,
             quits: false,
             journal: false,
+        }
+    }
+
+    /// The reclaim scenario's world on `tier` ([`run_reclaim`]): one device that keeps
+    /// every write, a broker that answers at once and rolls nothing back, no faults.
+    pub(crate) fn reclaiming(seed: u64, tier: Tier) -> Self {
+        Self {
+            tier: Some(tier),
+            steps: 0,
+            power_cuts: false,
+            bus_losses: false,
+            hold_acks: false,
+            refused_batches: false,
+            write_errors: false,
+            mirror: false,
+            ..Self::seed(seed)
         }
     }
 
@@ -644,12 +664,39 @@ impl World {
         if self.ep.locals().len() >= 4 {
             return;
         }
+        self.open_session();
+    }
+
+    /// A session joins, whatever aterm already hosts: its local id.
+    fn open_session(&mut self) -> u64 {
         let local = self.next_local;
         self.next_local += 1;
         let sid = format!("s-n{local}e{}", self.epoch);
         self.ep.create(local, &sid, self.stamp());
         self.note(format!("session {local} {sid} opens"));
         self.push_event(&format!("EVENT * session-created {sid}"));
+        local
+    }
+
+    /// Session `local` leaves, and aterm says so on the push lane.
+    fn exit_local(&mut self, local: u64) {
+        if let Some(sid) = self.ep.exit(local) {
+            self.stats.exits += 1;
+            self.note(format!("session {local} {sid} exits"));
+            self.push_event(&format!("EVENT {local} session-exited {sid}"));
+        }
+    }
+
+    /// Session `sid`, gone, is served again under a new local id ([`Endpoint::revive`]).
+    fn revive(&mut self, sid: &str) -> bool {
+        let local = self.next_local;
+        if !self.ep.revive(sid, local) {
+            return false;
+        }
+        self.next_local += 1;
+        self.note(format!("session {local} {sid} revived"));
+        self.push_event(&format!("EVENT * session-created {sid}"));
+        true
     }
 
     /// A tab closes: a session leaves, and aterm says so on the push lane.
@@ -857,6 +904,11 @@ impl World {
         let Some((_, sid)) = self.rng.pick(&sessions).cloned() else {
             return;
         };
+        self.peer_mail_to(sid);
+    }
+
+    /// The peer posts a note to session `sid`.
+    fn peer_mail_to(&mut self, sid: String) {
         let marker = self.next_marker();
         self.peer_seq += 1;
         let subject = crate::subject::post_lane(FLEET, NODE, &sid, PEER, "note");
@@ -895,8 +947,13 @@ impl World {
             1 | 2 => (format!("@{to_sid}"), "ask", Some(to_sid)),
             _ => (format!("@{to_sid}"), "note", Some(to_sid)),
         };
+        self.post_as(local, &from, &to, kind, target);
+    }
+
+    /// Session `local` (`from`) posts `kind` to `to` (session `target`, if one).
+    fn post_as(&mut self, local: u64, from: &str, to: &str, kind: &str, target: Option<String>) {
         let marker = self.next_marker();
-        let Some(id) = self.ep.post(local, &to, kind, &marker) else {
+        let Some(id) = self.ep.post(local, to, kind, &marker) else {
             return;
         };
         self.stats.posts += 1;
@@ -905,7 +962,7 @@ impl World {
             marker,
             Sent {
                 to: target,
-                post: Some((from, id)),
+                post: Some((from.to_string(), id)),
             },
         );
         self.push_event(&format!("EVENT {local} post {id}"));
@@ -1661,6 +1718,9 @@ impl World {
                 ));
             }
         }
+        for (off, subject, removed) in self.core.broker.take_retired() {
+            bad.extend(self.judge_retire(off, &subject, &removed));
+        }
         let idle_held = std::mem::take(&mut *lock(&self.core.idle_held));
         for (off, subject, body) in idle_held {
             let (body, _) = Body::decode(&body);
@@ -1678,6 +1738,64 @@ impl World {
                 self.violations.push(b);
             }
         }
+    }
+
+    /// THE RECLAIM, AT EVERY RETIRE (sim item B02): the node gives back only what a
+    /// departed session held. Its presence row goes only while it reads `exited` (so a
+    /// successor's `live` row written since the sweep read it stays), and nothing of a
+    /// session aterm hosts goes. `removed` is the body of the newest record the retire at
+    /// `off` took out of the index.
+    fn judge_retire(&self, off: u64, subject: &str, removed: &[u8]) -> Option<String> {
+        let hosted = |sid: &str| lock(&self.ep.state).sessions.values().any(|x| x.sid == sid);
+        let segs: Vec<&str> = subject.split('/').collect();
+        match segs.as_slice() {
+            ["", "f", fleet, "pub", node, sid, "presence"]
+                if *fleet == FLEET && *node == NODE && *sid != "node" =>
+            {
+                let state = Body::decode(removed).0.unknown.get("state").cloned();
+                (hosted(sid) || state.as_deref() != Some("exited")).then(|| {
+                    format!(
+                        "reclaim: @{off} gave {sid}'s presence row back, which read {state:?}{}",
+                        if hosted(sid) {
+                            ", a session aterm hosts"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+            }
+            ["", "f", fleet, "in", node, sid, src, _]
+                if *fleet == FLEET && *node == NODE && *src == NODE && hosted(sid) =>
+            {
+                Some(format!(
+                    "reclaim: @{off} gave {subject} back, a lane to a session aterm hosts"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// THE INDEX, ONCE SETTLED: every hosted session's presence row is in the last-value
+    /// index and reads `live`, what another node routes by; none was given back.
+    fn presence_indexed(&self) -> Vec<String> {
+        let sids: Vec<String> = lock(&self.ep.state)
+            .sessions
+            .values()
+            .map(|x| x.sid.clone())
+            .collect();
+        sids.into_iter()
+            .filter_map(|sid| {
+                let face = crate::subject::session_face(FLEET, NODE, &sid, "presence");
+                let state = self
+                    .core
+                    .broker
+                    .last_row(&face)
+                    .map(|(_, body)| Body::decode(&body).0.unknown.get("state").cloned());
+                (state != Some(Some("live".to_string()))).then(|| {
+                    format!("presence: {sid} is hosted and the last-value index holds {state:?}")
+                })
+            })
+            .collect()
     }
 
     /// THE CHECKS THAT HOLD ONCE SETTLED.
@@ -1853,6 +1971,7 @@ impl World {
         }
         let (presence, left) = self.presence_gaps();
         bad.extend(presence);
+        bad.extend(self.presence_indexed());
         self.stats.ghosts_left = left.len() as u64;
         let sibling = self.sibling();
         let sibling_row = sibling
@@ -2090,6 +2209,126 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         stats: w.stats,
         model: (w.tap.opened, w.tap.checked, w.tap.fired.clone()),
         journal: w.core.broker.take_journal(),
+    }
+}
+
+/// What [`run_reclaim`] found.
+#[derive(Debug)]
+pub(crate) struct Reclaimed {
+    pub(crate) violations: Vec<String>,
+    /// The subjects the node spent ([`bus::Broker::spent`]): settled with aterm's two
+    /// sessions; with the scenario's sessions open, each having mailed another and been
+    /// mailed by the peer; and once they left and the reclaim's wait passed.
+    pub(crate) baseline: u64,
+    pub(crate) peak: u64,
+    pub(crate) after: u64,
+    /// The session revived between the sweep's read and its retire, once it was.
+    pub(crate) revived: Option<String>,
+    pub(crate) trace: Vec<String>,
+    /// The broker's journal ([`Opts::journal`]).
+    pub(crate) journal: Vec<bus::Event>,
+}
+
+/// THE RECLAIM SCENARIO (sim item B02): aterm opens `n` sessions beside its two, each
+/// mails the next and is mailed by the peer, all `n` leave, and the bridge runs until
+/// its reclaim's wait has passed twice over. With `revive`, the first of them is served
+/// again just as the sweep retires its presence row: a successor's `live` row reaches
+/// the broker first ([`bus::Revive`]), and aterm hosts the session again, rows and posts
+/// as it left them; the peer then mails it. Every law of a world holds throughout, and at
+/// every retire [`World::judge_retire`]'s. Faults are the opts' (none, for the committed
+/// runs).
+pub(crate) fn run_reclaim(opts: &Opts, n: usize, revive: bool) -> Reclaimed {
+    let _slot = WorldSlot::take();
+    let mut w = World::new(opts.clone());
+    let me = producer(NODE);
+    w.launch();
+    w.settle();
+    let baseline = w.core.broker.spent(me);
+    let opened: Vec<u64> = (0..n).map(|_| w.open_session()).collect();
+    w.settle();
+    let sids: Vec<String> = opened.iter().filter_map(|l| w.ep.sid(*l)).collect();
+    for (i, &local) in opened.iter().enumerate() {
+        let to = sids[(i + 1) % sids.len()].clone();
+        w.post_as(local, &sids[i], &format!("@{to}"), "note", Some(to));
+        w.peer_mail_to(sids[i].clone());
+    }
+    w.settle();
+    let peak = w.core.broker.spent(me);
+    // Each exit's `session-exited` line reaches the bridge before its next roster read, as
+    // a closed tab's does on a real instance.
+    for &local in &opened {
+        w.exit_local(local);
+        w.pass();
+    }
+    w.settle();
+    let revivable = sids.first().cloned().filter(|_| revive);
+    if let Some(sid) = &revivable {
+        w.peer_seq += 1;
+        let body = format!(
+            "v=1 t={} inc=0 epoch=- gen=- state=live hold=0",
+            w.core.wall_ms()
+        );
+        lock(&w.core.broker.state).revive = Some(bus::Revive {
+            subject: crate::subject::session_face(FLEET, NODE, sid, "presence"),
+            body: body.into_bytes(),
+            producer: producer(PEER),
+            seq: w.peer_seq,
+            landed: None,
+        });
+    }
+    let until = w.core.elapsed() + 2 * (crate::bridge::RECLAIM_AFTER + crate::bridge::GHOST_SWEEP);
+    let mut revived = None;
+    for _ in 0..100_000 {
+        if w.core.elapsed() >= until {
+            break;
+        }
+        if w.live.is_none() {
+            w.launch();
+            continue;
+        }
+        match w.core.readable().first() {
+            Some(&(conn, _)) => {
+                w.core.pump(conn);
+            }
+            None => w.pass(),
+        }
+        w.collect_notes();
+        w.check_always();
+        let landed = lock(&w.core.broker.state)
+            .revive
+            .as_ref()
+            .and_then(|r| r.landed);
+        if let (Some(sid), Some(_), None) = (&revivable, landed, &revived) {
+            if w.revive(sid) {
+                revived = Some(sid.clone());
+            }
+        }
+    }
+    if w.core.elapsed() < until {
+        w.violations
+            .push("liveness: the reclaim's wait never passed".to_string());
+    }
+    w.settle();
+    if let Some(sid) = &revived {
+        w.peer_mail_to(sid.clone());
+        w.settle();
+    }
+    w.collect_notes();
+    w.check_settled();
+    let after = w.core.broker.spent(me);
+    let trace = w.core.trace();
+    let journal = w.core.broker.take_journal();
+    if let Some(live) = w.live.take() {
+        live.process.kill();
+    }
+    Reclaimed {
+        violations: w.violations,
+        baseline,
+        peak,
+        after,
+        revived,
+        trace,
+        journal,
     }
 }
 

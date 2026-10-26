@@ -9,7 +9,10 @@ use super::Rig;
 use super::instance::{
     Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, uint_field, unanswered,
 };
-use super::starvation::ShapeVerdict;
+use super::starvation::{
+    Disposition, Sampler, SchedInputs, SchedReading, ShapeVerdict, Starvation, classify,
+    latency_verdict,
+};
 
 /// What a row does with the open view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +56,13 @@ pub struct RewindReport {
     pub frames: u64,
     pub timer_wakes: u64,
     pub wakes: String,
+    /// The row's own judgment ([`judge`]).
     pub verdict: ShapeVerdict,
+    /// Over a step row's steps, how late the driver's ticks woke, against the row's bound; none
+    /// for an idle row.
+    pub starvation: Option<Starvation>,
+    /// The verdict with the take's standing ([`dispose`]).
+    pub disposition: Disposition,
 }
 
 impl std::fmt::Display for RewindReport {
@@ -62,14 +71,19 @@ impl std::fmt::Display for RewindReport {
             RewindScene::Steps { max_p99_us, .. } => write!(
                 f,
                 "REWIND steps={} booked={} p99_us={} max_p99_us={max_p99_us} chain_bytes={} \
-                 keyframes={} states={} verdict={:?}",
+                 keyframes={} states={} verdict={:?} starved={:?} reason=\"{}\" disposition={:?}",
                 self.steps,
                 self.booked,
                 self.p99_us,
                 self.row.chain_bytes,
                 self.keyframes,
                 self.states,
-                self.verdict
+                self.verdict,
+                self.starvation.as_ref().map(Starvation::label),
+                self.starvation
+                    .as_ref()
+                    .map_or_else(|| "no reading".to_string(), ToString::to_string),
+                self.disposition
             ),
             RewindScene::Idle { window } => write!(
                 f,
@@ -92,20 +106,48 @@ impl std::fmt::Display for RewindReport {
 /// The row's bound: a step row passes when every step was booked and the p99 is within its bound; an idle row when the view woke the app for nothing and drew no frame.
 #[must_use]
 pub fn judge(row: &RewindRow, report: &RewindReport) -> ShapeVerdict {
+    verdict(whole(row, report) && within(row, report))
+}
+
+/// Everything the row asks but a step's latency: one chain, and every step booked or an idle view that woke and drew nothing.
+fn whole(row: &RewindRow, report: &RewindReport) -> bool {
     let one_chain = report.keyframes == 1;
-    let pass = match row.scene {
-        RewindScene::Steps { steps, max_p99_us } => {
-            one_chain
-                && steps > 0
-                && report.booked == u64::from(steps)
-                && report.p99_us <= max_p99_us
+    match row.scene {
+        RewindScene::Steps { steps, .. } => {
+            one_chain && steps > 0 && report.booked == u64::from(steps)
         }
         RewindScene::Idle { .. } => one_chain && report.done_wakes == 0 && report.frames == 0,
-    };
+    }
+}
+
+/// A step row's p99 within its bound.
+const fn within(row: &RewindRow, report: &RewindReport) -> bool {
+    match row.scene {
+        RewindScene::Steps { max_p99_us, .. } => report.p99_us <= max_p99_us,
+        RewindScene::Idle { .. } => true,
+    }
+}
+
+const fn verdict(pass: bool) -> ShapeVerdict {
     if pass {
         ShapeVerdict::Pass
     } else {
         ShapeVerdict::Fail
+    }
+}
+
+/// The row's disposition: what the row asks besides latency fails it whatever the machine did,
+/// and a p99 past the bound fails it unless the driver was descheduled for as long as the bound
+/// while it stepped, which makes the take no evidence ([`latency_verdict`]).
+#[must_use]
+pub fn dispose(row: &RewindRow, report: &RewindReport) -> Disposition {
+    if !whole(row, report) {
+        return Disposition::Fail;
+    }
+    match &report.starvation {
+        Some(starvation) => latency_verdict(verdict(within(row, report)), starvation.label()),
+        None if within(row, report) => Disposition::Pass,
+        None => Disposition::Fail,
     }
 }
 
@@ -146,6 +188,25 @@ pub fn chain_text(bytes: usize) -> String {
         out.push_str(&line);
     }
     out
+}
+
+/// A step take's standing: starved when the driver woke as late as the row's bound `max_p99_us`.
+/// The take's wall is no part of it: a subject slow to show its steps spends that wall itself, so
+/// a take near its budget is no evidence against the miss.
+#[must_use]
+pub fn steps_standing(sched: &SchedReading, max_p99_us: u64) -> Starvation {
+    let (ticks, late_max_us) = sched.deciding();
+    classify(&SchedInputs {
+        ticks,
+        late_max_us,
+        sampling_hole_us: 0,
+        nominal_dt_us: 0,
+        wall_us: 0,
+        budget_us: 0,
+        late_threshold_us: max_p99_us,
+        produced_take: true,
+        qos: sched.qos,
+    })
 }
 
 /// Measure one row: record `row.chain_bytes` of output in one chain, open the view on it, then step or idle.
@@ -199,9 +260,11 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
         timer_wakes: 0,
         wakes: String::new(),
         verdict: ShapeVerdict::Fail,
+        starvation: None,
+        disposition: Disposition::Fail,
     };
     match row.scene {
-        RewindScene::Steps { steps, .. } => {
+        RewindScene::Steps { steps, max_p99_us } => {
             // A subject that books no step-to-shown sample (0.138.0 predates it) has no answer to
             // this row: the wait below would only run out its minute.
             let booked = ctl.ok(&["metrics", "percentiles"])?;
@@ -210,6 +273,9 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
             }
             let half = u64::from(steps / 2).max(1);
             let stride = (states.saturating_sub(1) / half).max(1);
+            // Ticks a quarter of the bound apart, so a stall as long as the bound covers one.
+            let mut sampler =
+                Sampler::start(Duration::from_micros(max_p99_us / 4).max(Duration::from_millis(1)));
             for i in 0..steps {
                 let by = if u64::from(i) < half {
                     format!("-{stride}")
@@ -224,6 +290,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
                 })?;
                 report.steps += 1;
             }
+            report.starvation = Some(steps_standing(&sampler.finish(), max_p99_us));
             let metrics = ctl.ok(&["metrics", "percentiles"])?;
             report.booked = uint_field(&metrics, "n_rewind_shown").unwrap_or(0);
             report.p99_us = ms_field_us(&metrics, "rewind_shown_p99_ms").ok_or_else(|| {
@@ -251,6 +318,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
     }
     let _ = ctl.ok(&["rewind", "close"]);
     report.verdict = judge(row, &report);
+    report.disposition = dispose(row, &report);
     Ok(report)
 }
 
@@ -286,6 +354,8 @@ mod tests {
             timer_wakes: 0,
             wakes: "Control:2".to_string(),
             verdict: ShapeVerdict::Fail,
+            starvation: None,
+            disposition: Disposition::Fail,
         }
     }
 
@@ -319,6 +389,75 @@ mod tests {
             ShapeVerdict::Fail,
             "a re-keyframe split the chain: the row measured a shorter one"
         );
+    }
+
+    /// The driver's reading over 100 steps: `late_ms` its worst wake.
+    fn sched(late_ms: u64) -> SchedReading {
+        let mut r = SchedReading::default();
+        let tick = Duration::from_millis(2);
+        for n in 1..=2_000 {
+            let late = if n == 900 { late_ms } else { 0 };
+            r.book(tick * n, tick * n + Duration::from_millis(late), false);
+        }
+        r
+    }
+
+    #[test]
+    fn a_step_row_missed_while_the_driver_stalled_as_long_as_its_bound_is_unproved() {
+        let starved = steps_standing(&sched(9), 8_000);
+        assert!(matches!(
+            starved,
+            Starvation::Descheduled {
+                threshold_us: 8_000,
+                ..
+            }
+        ));
+        let kept = steps_standing(&sched(7), 8_000);
+        assert!(matches!(kept, Starvation::KeptCadence { .. }));
+        // The desk run under 28 busy loops at load 77.6 to 86.2 (QUIET-BOUND).
+        let slow = |starvation| RewindReport {
+            p99_us: 12_580,
+            starvation: Some(starvation),
+            ..report(STEPS)
+        };
+        assert_eq!(
+            dispose(&STEPS, &slow(starved.clone())),
+            Disposition::Unproved
+        );
+        assert_eq!(
+            dispose(&STEPS, &slow(kept.clone())),
+            Disposition::Fail,
+            "proven red: a miss on a driver that kept its cadence is the subject's"
+        );
+        assert_eq!(
+            dispose(
+                &STEPS,
+                &RewindReport {
+                    starvation: Some(starved.clone()),
+                    ..report(STEPS)
+                }
+            ),
+            Disposition::Pass,
+            "a bound met under stalls is met"
+        );
+        assert_eq!(
+            dispose(
+                &STEPS,
+                &RewindReport {
+                    keyframes: 2,
+                    starvation: Some(starved),
+                    ..report(STEPS)
+                }
+            ),
+            Disposition::Fail,
+            "a stall never excuses a split chain"
+        );
+        let unread = RewindReport {
+            p99_us: 12_580,
+            ..report(STEPS)
+        };
+        assert_eq!(dispose(&STEPS, &unread), Disposition::Fail);
+        assert_eq!(dispose(&IDLE, &report(IDLE)), Disposition::Pass);
     }
 
     #[test]

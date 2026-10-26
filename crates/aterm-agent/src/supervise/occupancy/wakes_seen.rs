@@ -40,11 +40,22 @@ impl WakeDoor {
     }
 }
 
+/// WHAT A GRANTED CLAIM CARRIES: the wake's figures as the host judged them at the claim, which its
+/// line types ([`super::templates::wake`]). Numbers only: no label, path or pattern of the wake's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WakeFacts {
+    /// When its condition first held, unix ms, as the book holds it.
+    pub ready_since_ms: Option<i64>,
+    /// The build slots the host's fresh read proved usable, of how many, where its need names
+    /// slots.
+    pub slots: Option<(u16, u16)>,
+}
+
 /// THE HOST'S ANSWER TO A CLAIM ON A WAKE (`IdleHost::wake_claim`, an act).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeClaim {
-    /// Claimed for the asking door: its line may go.
-    Granted,
+    /// Claimed for the asking door: its line may go, with the figures the host judged it on.
+    Granted(WakeFacts),
     /// The agent's own `await wake` answered it first: told, with nothing to type.
     Answered,
     /// Another door holds its claim.
@@ -67,30 +78,33 @@ impl WakeClaim {
     /// Whether the claiming door may tell it.
     #[must_use]
     pub const fn lets(self) -> bool {
-        matches!(self, WakeClaim::Granted)
+        matches!(self, WakeClaim::Granted(_))
     }
 
-    /// Its word (`skipped why=<word>`, the tape's).
+    /// Its word (`skipped why=<word>`, the tape's): a granted claim's figures are not in it.
     #[must_use]
-    pub fn word(self) -> String {
+    pub const fn word(self) -> &'static str {
         match self {
-            WakeClaim::Granted => "granted".to_string(),
-            WakeClaim::Answered => "answered".to_string(),
-            WakeClaim::Busy => "busy".to_string(),
-            WakeClaim::Stale => "stale".to_string(),
-            WakeClaim::Unmet => "unmet".to_string(),
-            WakeClaim::Reserved => "reserved".to_string(),
-            WakeClaim::Machine => "machine".to_string(),
-            WakeClaim::Refused(why) => format!("refused:{}", why.word()),
-            WakeClaim::Gone => "gone".to_string(),
+            WakeClaim::Granted(_) => "granted",
+            WakeClaim::Answered => "answered",
+            WakeClaim::Busy => "busy",
+            WakeClaim::Stale => "stale",
+            WakeClaim::Unmet => "unmet",
+            WakeClaim::Reserved => "reserved",
+            WakeClaim::Machine => "machine",
+            WakeClaim::Refused(PaceRefusal::Off) => "refused:off",
+            WakeClaim::Refused(PaceRefusal::Beside) => "refused:beside",
+            WakeClaim::Refused(PaceRefusal::Owns) => "refused:owns",
+            WakeClaim::Refused(PaceRefusal::CarryOwed) => "refused:carry-owed",
+            WakeClaim::Gone => "gone",
         }
     }
 
-    /// The answer `word` names ([`Self::word`]).
+    /// The answer `word` names ([`Self::word`]); `granted` with no figures.
     #[must_use]
     pub fn of_word(word: &str) -> Option<Self> {
         Some(match word {
-            "granted" => WakeClaim::Granted,
+            "granted" => WakeClaim::Granted(WakeFacts::default()),
             "answered" => WakeClaim::Answered,
             "busy" => WakeClaim::Busy,
             "stale" => WakeClaim::Stale,
@@ -100,6 +114,22 @@ impl WakeClaim {
             "gone" => WakeClaim::Gone,
             _ => WakeClaim::Refused(PaceRefusal::of_word(word.strip_prefix("refused:")?)?),
         })
+    }
+
+    /// Whether the loop gives the claim back after it (`IdleHost::wake_release`): an answer
+    /// that held the line on the wake's own figures or the host's pace, which a host may have
+    /// claimed and refused. Not another door's claim (`busy`), an answer already told
+    /// (`answered`), or a wake gone.
+    #[must_use]
+    pub const fn releases(self) -> bool {
+        matches!(
+            self,
+            WakeClaim::Stale
+                | WakeClaim::Unmet
+                | WakeClaim::Reserved
+                | WakeClaim::Machine
+                | WakeClaim::Refused(_)
+        )
     }
 }
 

@@ -55,6 +55,12 @@ aterm-update-core = { workspace = true }
 # The machines controller's SSH-key writes as its machine user (port/github_rest.rs): agh's
 # client sends only GET and HEAD, so they go over aterm-http, as agh's own transport does.
 aterm-http = { workspace = true }
+# `aterm init`'s one aterm.log line of phase totals (the facade; the aterm crate installs the
+# logger).
+aterm-log = { workspace = true }
+# The one agent name table (`agent_of`): `console::presence` names an agent ancestor by it.
+# Not aterm-phase, which holds the screen reader deny.toml keeps to aterm-gui and aterm-agent.
+aterm-agent-names = { workspace = true }
 
 # Dev only (AGENTS.md: `aterm` is the one shipped executable): the crate as a standalone
 # executable, `aterm-machines-dev machines <verb>`, so the agent can be enrolled into a test VM

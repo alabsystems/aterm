@@ -105,6 +105,7 @@ fn view(now: f64, cap: f64, cells: &[Bucket], aterm: ScopeFig, tab: ScopeFig) ->
         capacity: Some(cap),
         heat_now: Some((now / cap) as f32),
         over: cells.last().is_some_and(|c| c.1),
+        recent: readings_of(&ring, AT),
         ring: ring.into(),
         ring_k: AT.div_euclid(10_000),
         aterm,
@@ -114,21 +115,22 @@ fn view(now: f64, cap: f64, cells: &[Bucket], aterm: ScopeFig, tab: ScopeFig) ->
 }
 
 fn series(now: f64, cap: f64, cells: &[Bucket], binds: bool) -> Series {
+    let ring: Vec<Cell> = cells
+        .iter()
+        .map(|&(h, over)| {
+            let v = h.map(|h| h * cap);
+            Cell {
+                mean: v,
+                max: v,
+                over,
+            }
+        })
+        .collect();
     Series {
         now: Some(now),
         capacity: Some(cap),
-        ring: cells
-            .iter()
-            .map(|&(h, over)| {
-                let v = h.map(|h| h * cap);
-                Cell {
-                    mean: v,
-                    max: v,
-                    over,
-                }
-            })
-            .collect::<Vec<_>>()
-            .into(),
+        recent: readings_of(&ring, AT),
+        ring: ring.into(),
         binds,
     }
 }
@@ -607,24 +609,32 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
             "{form:?}: hot-hard says {how} what light says: {ladder:?}"
         );
         // What a strip of this form at this width draws: its columns and the one the glide
-        // slides out, 10 s each (a bucket each) in both forms here; Folded's strip spans 80 s,
-        // Full's ten minutes (§11 of the live edge's design).
+        // slides out. Full's are 10 s buckets over ten minutes; Folded's (Mid here) are the
+        // last 20 s, a second's reading each (§12 of the live edge's design).
         let strip = match form {
             DeckForm::Full => crate::stats_plan::plan_full(OWNER_W, &m).strip,
             DeckForm::Folded => crate::stats_plan::plan_folded(OWNER_W, &m).blocks[0].strip,
         };
-        assert_eq!(strip.period_s, 10, "{form:?}: a column is a bucket");
+        let (period, drawn_cols) = if form == DeckForm::Full {
+            (10, SPAN + 1)
+        } else {
+            (crate::stats_plan::FOLD_SLOT_S, 21)
+        };
+        assert_eq!(strip.period_s, period, "{form:?}: what a column holds");
         let drawn = strip.cols as usize + 1;
-        assert_eq!(
-            drawn,
-            if form == DeckForm::Full { SPAN + 1 } else { 9 },
-            "{form:?}"
-        );
+        assert_eq!(drawn, drawn_cols, "{form:?}");
         for (o, runs) in &said {
             // The legend shows a mark only while a strip draws it.
-            let over_drawn = owner_scene(*o).resources[..3]
-                .iter()
-                .any(|v| v.ring.iter().rev().take(drawn).any(|c| c.over));
+            let scene = owner_scene(*o);
+            let over_drawn = scene.resources[..3].iter().any(|v| {
+                if form == DeckForm::Full {
+                    v.ring.iter().rev().take(drawn).any(|c| c.over)
+                } else {
+                    v.heat_slots(scene.slot_grid, drawn, AT, SLOT_COVER_MS)
+                        .iter()
+                        .any(|c| c.over)
+                }
+            });
             assert_eq!(
                 runs.iter().any(|r| r == "over max"),
                 over_drawn,

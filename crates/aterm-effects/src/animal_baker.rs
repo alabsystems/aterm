@@ -101,7 +101,11 @@ fn paint_species_onto(
     }
     let xform = PathTransform::fit(w, h);
     let fine_lod = h < FINE_DETAIL_MIN_H;
-    for layer in ANIMAL_GLYPHS[species as usize].layers {
+    let layers = ANIMAL_GLYPHS[species as usize].layers;
+    let mut i = 0;
+    while i < layers.len() {
+        let layer = &layers[i];
+        i += 1;
         if fine_lod
             && matches!(
                 layer.role,

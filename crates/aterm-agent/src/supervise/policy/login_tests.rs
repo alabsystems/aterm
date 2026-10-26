@@ -6,7 +6,11 @@ use std::time::Instant;
 
 use aterm_phase::prompt::fixtures::{
     LOGIN_CONSOLE_MENU, LOGIN_ERROR, LOGIN_HANDOFF, LOGIN_OPENING, LOGIN_PICKER,
-    LOGIN_PICKER_CONSOLE, LOGIN_PICKER_WARNED, LOGIN_SUCCESS, screen,
+    LOGIN_PICKER_2_1_310, LOGIN_PICKER_AT_EXPIRED_2_1_310, LOGIN_PICKER_CONSOLE,
+    LOGIN_PICKER_CONSOLE_2_1_310, LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310, LOGIN_PICKER_FULLSCREEN_HINT_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_NO_LOGIN_2_1_310, LOGIN_PICKER_PLATFORM_2_1_310, LOGIN_PICKER_WARNED,
+    LOGIN_PICKER_WARNED_2_1_310, LOGIN_SUCCESS, screen,
 };
 use aterm_phase::{LoginScreen, PromptV2};
 
@@ -15,6 +19,37 @@ use crate::supervise::config::Approve;
 use crate::supervise::policy::approval::{ApprovalCtx, decide};
 use crate::supervise::policy::turn_end::TurnEndReading;
 use aterm_phase::wall::WallKind;
+
+/// Every measured picker as it opens, its focus on the subscription's row: 2.1.303's, then
+/// 2.1.310's, the fullscreen renderer's bottom panel last, as it first opens (Claude Code's
+/// `/effort` hint in its rule), once that hint is gone, and typed again over a left `/login`
+/// (aterm_phase's `login_tests` holds both builds' readings).
+const OPENED: [&str; 9] = [
+    LOGIN_PICKER,
+    LOGIN_PICKER_WARNED,
+    LOGIN_PICKER_2_1_310,
+    LOGIN_PICKER_WARNED_2_1_310,
+    LOGIN_PICKER_NO_LOGIN_2_1_310,
+    LOGIN_PICKER_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_FULLSCREEN_HINT_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310,
+];
+
+/// The pickers of [`OPENED`] drawn in the fullscreen renderer's bottom panel, past whose method
+/// pick nothing has been measured: no method's Enter is pressed there ([`picks`]).
+const FULLSCREEN: [&str; 3] = [
+    LOGIN_PICKER_FULLSCREEN_HINT_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310,
+    LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310,
+];
+
+/// Every measured picker whose focus arrow keys moved off the first row (no method picked).
+const MOVED: [&str; 3] = [
+    LOGIN_PICKER_CONSOLE,
+    LOGIN_PICKER_CONSOLE_2_1_310,
+    LOGIN_PICKER_PLATFORM_2_1_310,
+];
 
 fn picker_of(text: &str) -> (Vec<String>, PromptV2, LoginPicker) {
     let rows = screen(text);
@@ -53,29 +88,52 @@ fn ctx(approve: Approve) -> ApprovalCtx {
     }
 }
 
-/// Selects the subscription row only when focus is still on the opening row.
+/// Selects the subscription row only when focus is still on the opening row of a picker the
+/// inline renderer draws. CONTROL: the fullscreen renderer's picker, opened alike, is the
+/// person's, since nothing past its method pick has been read in the real-Claude lab.
 #[test]
 fn a_subscription_session_chooses_the_subscription_row_where_the_dialog_opens_it() {
-    for text in [LOGIN_PICKER, LOGIN_PICKER_WARNED] {
+    for text in OPENED {
         let (_, prompt, picker) = picker_of(text);
         let d = pick_method(&prompt, &picker, Some(LoginMethod::Subscription));
-        assert_eq!(focus_steps(&d), Some(0), "{d:?}");
+        if FULLSCREEN.contains(&text) {
+            assert!(matches!(&d, Decision::Escalate { .. }), "{d:?}: {text}");
+            let inline = LoginPicker {
+                renderer: aterm_phase::PanelRenderer::Inline,
+                ..picker
+            };
+            let d = pick_method(&prompt, &inline, Some(LoginMethod::Subscription));
+            assert_eq!(
+                focus_steps(&d),
+                Some(0),
+                "its frame alone holds it: {d:?}: {text}"
+            );
+        } else {
+            assert_eq!(focus_steps(&d), Some(0), "{d:?}: {text}");
+        }
     }
-    let (_, prompt, picker) = picker_of(LOGIN_PICKER_CONSOLE);
-    let d = pick_method(&prompt, &picker, Some(LoginMethod::Subscription));
-    assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+    for text in MOVED {
+        let (_, prompt, picker) = picker_of(text);
+        let d = pick_method(&prompt, &picker, Some(LoginMethod::Subscription));
+        assert!(matches!(d, Decision::Escalate { .. }), "{d:?}: {text}");
+    }
 }
 
 #[test]
 fn an_unknown_console_or_platform_method_is_the_owners() {
-    let (_, prompt, picker) = picker_of(LOGIN_PICKER);
-    for method in [
-        None,
-        Some(LoginMethod::Console),
-        Some(LoginMethod::Platform),
-    ] {
-        let d = pick_method(&prompt, &picker, method);
-        assert!(matches!(d, Decision::Escalate { .. }), "{method:?}: {d:?}");
+    for text in OPENED {
+        let (_, prompt, picker) = picker_of(text);
+        for method in [
+            None,
+            Some(LoginMethod::Console),
+            Some(LoginMethod::Platform),
+        ] {
+            let d = pick_method(&prompt, &picker, method);
+            assert!(
+                matches!(d, Decision::Escalate { .. }),
+                "{method:?}: {d:?}: {text}"
+            );
+        }
     }
 }
 
@@ -198,51 +256,69 @@ fn the_picker_gate_backs_out_only_of_its_own_login_nobody_needs() {
 /// tab, a roster row's (which aterm's sign-in ladder signs in), or one a followed renewal replaced
 /// — is backed out of with the picker's own Esc, the focus where it stands, whatever `approve`
 /// says; nobody is asked to close it. Negative controls: the same picker of aterm's own `/login`
-/// otherwise gets the method's Enter, and a person's own picker is nobody's to answer or close.
+/// otherwise gets the method's Enter where it opened in the inline renderer (and is the owner's
+/// once arrow keys moved its focus, or in the fullscreen renderer's panel), and a person's own
+/// picker is nobody's to answer or close. Both measured builds' pickers (2.1.303, 2.1.310) are
+/// judged alike, and the Esc alike in both renderers' frames.
 #[test]
 fn the_picker_aterm_opened_and_nobody_needs_is_backed_out_of() {
-    let (rows, _, picker) = picker_of(LOGIN_PICKER);
-    let read = aterm_phase::read(Some("claude"), &rows, Some(2));
-    for approve in [Approve::None, Approve::Safe, Approve::All] {
-        let base = ApprovalCtx {
-            login_method: Some(LoginMethod::Subscription),
-            ..ctx(approve)
-        };
-        for gate in ["back", "roster", "renewed"] {
-            let nobody = ApprovalCtx {
-                login_back: gate == "back",
-                login_roster: gate == "roster",
-                login_renewed: gate == "renewed",
+    for text in OPENED.into_iter().chain(MOVED) {
+        let opened = OPENED.contains(&text);
+        let (rows, _, picker) = picker_of(text);
+        let read = aterm_phase::read(Some("claude"), &rows, Some(2));
+        for approve in [Approve::None, Approve::Safe, Approve::All] {
+            let base = ApprovalCtx {
+                login_method: Some(LoginMethod::Subscription),
+                ..ctx(approve)
+            };
+            for gate in ["back", "roster", "renewed"] {
+                let nobody = ApprovalCtx {
+                    login_back: gate == "back",
+                    login_roster: gate == "roster",
+                    login_renewed: gate == "renewed",
+                    ..base.clone()
+                };
+                let d = decide(&read, &rows, &nobody);
+                let Decision::Approve {
+                    rule_id,
+                    choice: Choice::FocusKey { steps, key, .. },
+                    guard,
+                    ..
+                } = &d
+                else {
+                    panic!("{gate} {approve:?}: {d:?}: {text}");
+                };
+                assert_eq!(
+                    (*rule_id, *steps, *key),
+                    (RULE_LOGIN_BACK_OUT, 0, "esc"),
+                    "{gate} {approve:?}: {text}"
+                );
+                assert_eq!(
+                    guard,
+                    &row_guard(&picker.title_row),
+                    "{gate} {approve:?}: {text}"
+                );
+            }
+            let ours = ApprovalCtx {
+                login_carry: true,
                 ..base.clone()
             };
-            let d = decide(&read, &rows, &nobody);
-            let Decision::Approve {
-                rule_id,
-                choice: Choice::FocusKey { steps, key, .. },
-                guard,
-                ..
-            } = &d
-            else {
-                panic!("{gate} {approve:?}: {d:?}");
-            };
-            assert_eq!(
-                (*rule_id, *steps, *key),
-                (RULE_LOGIN_BACK_OUT, 0, "esc"),
-                "{gate} {approve:?}"
+            let d = decide(&read, &rows, &ours);
+            if opened && !FULLSCREEN.contains(&text) {
+                assert_eq!(focus_steps(&d), Some(0), "{approve:?}: {d:?}: {text}");
+            } else {
+                assert!(
+                    matches!(&d, Decision::Escalate { .. }),
+                    "a focus moved off the opening row, or the fullscreen panel: {approve:?}: \
+                     {d:?}: {text}"
+                );
+            }
+            let d = decide(&read, &rows, &base);
+            assert!(
+                matches!(&d, Decision::Escalate { .. }),
+                "a person's picker: {approve:?}: {d:?}: {text}"
             );
-            assert_eq!(guard, &row_guard(&picker.title_row), "{gate} {approve:?}");
         }
-        let ours = ApprovalCtx {
-            login_carry: true,
-            ..base.clone()
-        };
-        let d = decide(&read, &rows, &ours);
-        assert_eq!(focus_steps(&d), Some(0), "{approve:?}: {d:?}");
-        let d = decide(&read, &rows, &base);
-        assert!(
-            matches!(&d, Decision::Escalate { .. }),
-            "a person's picker: {approve:?}: {d:?}"
-        );
     }
 }
 
@@ -250,15 +326,22 @@ fn the_picker_aterm_opened_and_nobody_needs_is_backed_out_of() {
 /// hand-off and the error state; no such row once the dialog has signed in, or with no dialog.
 #[test]
 fn the_dialogs_esc_is_fenced_on_its_cancel_row() {
-    for text in [LOGIN_PICKER, LOGIN_HANDOFF, LOGIN_ERROR, LOGIN_OPENING] {
+    let dialogs = [LOGIN_HANDOFF, LOGIN_ERROR, LOGIN_OPENING];
+    for text in OPENED.into_iter().chain(MOVED).chain(dialogs) {
         let row = cancel_row(&screen(text)).map(|r| r.trim().to_string());
         assert_eq!(row.as_deref(), Some("Esc to cancel"), "{text}");
     }
-    assert_eq!(cancel_row(&screen(LOGIN_SUCCESS)), None);
-    assert_eq!(
-        cancel_row(&screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED)),
-        None
-    );
+    use aterm_phase::prompt::fixtures as f;
+    for text in [
+        LOGIN_SUCCESS,
+        f::LOGIN_EXPIRED,
+        f::LOGIN_EXPIRED_2_1_310,
+        f::LOGIN_INTERRUPTED_2_1_310,
+        f::LOGIN_INTERRUPTED_AT_WALL_2_1_310,
+        f::WALL_NOT_LOGGED_IN_2_1_310,
+    ] {
+        assert_eq!(cancel_row(&screen(text)), None, "{text}");
+    }
 }
 
 fn dialog(text: &str) -> LoginScreen {
@@ -283,25 +366,28 @@ fn walled() -> TurnEndState {
 fn each_dialog_state_gets_its_act() {
     let fresh = TurnEndState::default();
     let lost = walled();
-    for text in [
+    let short = [
         LOGIN_OPENING,
         LOGIN_HANDOFF,
-        LOGIN_PICKER,
         LOGIN_CONSOLE_MENU,
         LOGIN_ERROR,
-        LOGIN_SUCCESS,
-    ] {
-        assert_eq!(dialog_act(&fresh, &dialog(text)), TurnEndAction::Nothing);
+    ];
+    for text in OPENED.into_iter().chain(MOVED).chain(short) {
+        assert_eq!(
+            dialog_act(&fresh, &dialog(text)),
+            TurnEndAction::Nothing,
+            "{text}"
+        );
+        assert_eq!(
+            dialog_act(&lost, &dialog(text)),
+            TurnEndAction::Nothing,
+            "{text}"
+        );
     }
-    for text in [
-        LOGIN_OPENING,
-        LOGIN_HANDOFF,
-        LOGIN_PICKER,
-        LOGIN_CONSOLE_MENU,
-        LOGIN_ERROR,
-    ] {
-        assert_eq!(dialog_act(&lost, &dialog(text)), TurnEndAction::Nothing);
-    }
+    assert_eq!(
+        dialog_act(&fresh, &dialog(LOGIN_SUCCESS)),
+        TurnEndAction::Nothing
+    );
     let success = dialog(LOGIN_SUCCESS);
     let enter = dialog_act(&lost, &success);
     assert!(
@@ -369,24 +455,81 @@ fn the_success_enter_goes_once() {
 /// Pre-success login dialog screens report `dialog_stands` as true.
 #[test]
 fn the_dialog_short_of_its_success_stands() {
-    for text in [
-        LOGIN_PICKER,
+    let dialogs = [
         LOGIN_OPENING,
         LOGIN_HANDOFF,
         LOGIN_CONSOLE_MENU,
         LOGIN_ERROR,
-    ] {
+    ];
+    for text in OPENED.into_iter().chain(MOVED).chain(dialogs) {
         assert!(
             dialog_stands(&screen(text)),
             "{}",
             &text[..text.find('\n').unwrap_or(0)]
         );
     }
+    use aterm_phase::prompt::fixtures as f;
     for text in [
         LOGIN_SUCCESS,
-        aterm_phase::prompt::fixtures::LOGIN_EXPIRED,
-        aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED,
+        f::LOGIN_EXPIRED,
+        f::LOGIN_INTERRUPTED,
+        f::LOGIN_EXPIRED_2_1_310,
+        f::LOGIN_INTERRUPTED_2_1_310,
+        f::LOGIN_INTERRUPTED_AT_WALL_2_1_310,
+        f::LOGIN_INTERRUPTED_AT_EXPIRED_2_1_310,
+        f::LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310,
     ] {
-        assert!(!dialog_stands(&screen(text)));
+        assert!(!dialog_stands(&screen(text)), "{text}");
     }
+}
+
+/// NO MEASURED CLAUDE CODE SCREEN OF A LOST LOGIN IS A SIGN-IN MENU
+/// ([`TurnEndReading::sign_in_menu_drawn`], which an account move's relaunch is made over): the
+/// `/login` dialog of either measured build (2.1.303, 2.1.310), its picker, Console's menu, the
+/// browser hand-off, its error and its success, is the dialog's (`dialog_act`), and every lost
+/// login with the composer back (`Not logged in`, `Invalid API key`, `OAuth token revoked`, the
+/// 401's `Please run /login`, `Login expired`, the footer's own `Not logged in · Run /login`) has
+/// a composer to type into. CONTROL: agy's measured sign-in menu, drawn in place of its composer,
+/// is one.
+#[test]
+fn no_measured_claude_login_screen_is_a_sign_in_menu() {
+    use aterm_phase::prompt::fixtures as f;
+    let claude = Some(aterm_phase::Program::Claude.name());
+    let dialogs = [
+        LOGIN_OPENING,
+        LOGIN_HANDOFF,
+        LOGIN_CONSOLE_MENU,
+        LOGIN_ERROR,
+        LOGIN_SUCCESS,
+    ];
+    let walls = [
+        f::LOGIN_EXPIRED,
+        f::LOGIN_INTERRUPTED,
+        f::FOOTER_NOT_LOGGED_IN_MEASURED,
+        f::LOGIN_EXPIRED_2_1_310,
+        f::LOGIN_INTERRUPTED_2_1_310,
+        f::LOGIN_INTERRUPTED_AT_WALL_2_1_310,
+        f::LOGIN_INTERRUPTED_AT_EXPIRED_2_1_310,
+        f::LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310,
+        f::WALL_NOT_LOGGED_IN_2_1_310,
+        f::WALL_NOT_LOGGED_IN_NO_LOGIN_2_1_310,
+        f::WALL_INVALID_API_KEY_2_1_310,
+        f::WALL_OAUTH_REVOKED_2_1_310,
+        f::WALL_401_RUN_LOGIN_2_1_310,
+        f::FOOTER_NOT_LOGGED_IN_2_1_310,
+    ];
+    for text in OPENED.into_iter().chain(MOVED).chain(dialogs).chain(walls) {
+        for col in [None, Some(2)] {
+            assert!(
+                !TurnEndReading::sign_in_menu_drawn(claude, &screen(text), col),
+                "{col:?}: {text}"
+            );
+        }
+    }
+    let agy = screen(aterm_phase::agy::fixtures::SIGNED_OUT);
+    assert!(TurnEndReading::sign_in_menu_drawn(
+        Some(aterm_phase::Program::Agy.name()),
+        &agy,
+        None
+    ));
 }

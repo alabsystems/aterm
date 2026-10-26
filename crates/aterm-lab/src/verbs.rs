@@ -919,17 +919,63 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
         );
     }
     let launcher = fs::read_to_string(run.run.join("claude.sh")).unwrap_or_default();
-    let login = if launcher.contains("CLAUDE_CODE_OAUTH_TOKEN") {
-        "a fake claude.ai OAuth token (`claude --subscriber`)"
-    } else {
-        "a fake `apiKeyHelper` key"
-    };
+    let settings = scratch_text(&run.settings());
+    let stored = run.w.join("home/.claude/.credentials.json").exists();
+    let login = claude_login(&launcher, &settings, stored).phrase();
     format!(
         "# claude-code {} · MEASURED {day}, `aterm ctl text` of a private headless aterm ({size}, aterm {av}) running the real \
          Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, {login} and \
          `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · {what}",
         run.claude_ver
     )
+}
+
+/// How the lab's Claude Code signs in ([`claude_login`]), each named in a fixture header by its
+/// [`Self::phrase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeLogin {
+    /// The fake claude.ai OAuth token the tab's launcher sets (`claude --subscriber`).
+    OAuthToken,
+    /// The fake key of the `apiKeyHelper` the scratch settings name.
+    ApiKeyHelper,
+    /// A scratch `.credentials.json`, with no helper and no token.
+    StoredCredentials,
+    /// None of them.
+    NoLogin,
+}
+
+impl ClaudeLogin {
+    /// The words a fixture header names this login by.
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::OAuthToken => "a fake claude.ai OAuth token (`claude --subscriber`)",
+            Self::ApiKeyHelper => "a fake `apiKeyHelper` key",
+            Self::StoredCredentials => {
+                "no `apiKeyHelper` and no OAuth token but a scratch `.credentials.json`"
+            }
+            Self::NoLogin => "no login (no `apiKeyHelper`, no OAuth token)",
+        }
+    }
+}
+
+/// How the lab's Claude Code signs in: the fake claude.ai OAuth token `launcher` (the tab's
+/// `claude.sh`) sets (`claude --subscriber`), else the fake `apiKeyHelper` key the scratch
+/// `settings` name, else a scratch `.credentials.json` (`stored`), else none.
+#[must_use]
+pub fn claude_login(launcher: &str, settings: &str, stored: bool) -> ClaudeLogin {
+    let helper = J::parse(settings)
+        .ok()
+        .is_some_and(|s| s.get("apiKeyHelper").and_then(J::as_str).is_some());
+    if launcher.contains("CLAUDE_CODE_OAUTH_TOKEN") {
+        ClaudeLogin::OAuthToken
+    } else if helper {
+        ClaudeLogin::ApiKeyHelper
+    } else if stored {
+        ClaudeLogin::StoredCredentials
+    } else {
+        ClaudeLogin::NoLogin
+    }
 }
 
 /// `header [tag] "<what>"`.
@@ -1215,6 +1261,50 @@ pub fn security_masked(run: &Run) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_names_the_login_the_lab_launched_with() {
+        let token = "exec env CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-LAB claude\n";
+        let plain = "exec env claude\n";
+        let helper = r#"{"apiKeyHelper": "/lab/key.sh", "env": {}}"#;
+        let none = r#"{"env": {}}"#;
+        for (launcher, settings, stored, want) in [
+            (token, helper, false, ClaudeLogin::OAuthToken),
+            (token, none, true, ClaudeLogin::OAuthToken),
+            (plain, helper, true, ClaudeLogin::ApiKeyHelper),
+            (plain, none, true, ClaudeLogin::StoredCredentials),
+            (plain, none, false, ClaudeLogin::NoLogin),
+            (plain, "", false, ClaudeLogin::NoLogin),
+            (plain, "{", true, ClaudeLogin::StoredCredentials),
+            (
+                plain,
+                r#"{"apiKeyHelper": null}"#,
+                false,
+                ClaudeLogin::NoLogin,
+            ),
+            (
+                plain,
+                r#"{"apiKeyHelper": 7}"#,
+                true,
+                ClaudeLogin::StoredCredentials,
+            ),
+        ] {
+            assert_eq!(
+                claude_login(launcher, settings, stored),
+                want,
+                "{launcher} {settings} {stored}"
+            );
+        }
+        let all = [
+            ClaudeLogin::OAuthToken,
+            ClaudeLogin::ApiKeyHelper,
+            ClaudeLogin::StoredCredentials,
+            ClaudeLogin::NoLogin,
+        ];
+        let phrases: std::collections::BTreeSet<&str> =
+            all.iter().map(|login| login.phrase()).collect();
+        assert_eq!(phrases.len(), all.len(), "each login a header tells apart");
+    }
 
     #[test]
     fn the_capture_pii_guard_looks_for_the_account_home_and_a_scratch_home() {

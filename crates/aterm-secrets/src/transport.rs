@@ -3,10 +3,12 @@
 
 //! HTTP and local-path vault transport.
 
-use crate::Error;
 use crate::envelope::MAX_ENVELOPE;
+use crate::{Error, ErrorKind};
 use aterm_http::{Client, ProxyMode, Trust, Uri};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Where a vault is.
@@ -36,14 +38,30 @@ pub const FETCH_MARGIN: Duration = Duration::from_secs(5);
 /// nobody has is not there after about five seconds, which this outlasts so that answer is
 /// heard as one.
 pub const LOOK_CONNECT: Duration = Duration::from_secs(8);
+/// A look's DNS lookup, connect and TLS handshake ([`get_within`]): a vault on the LAN answers
+/// in milliseconds.
+pub const PROBE_CONNECT: Duration = Duration::from_secs(1);
+/// The longest `Retry-After` a [`post_join`] sits out before it asks once more: the server's
+/// join change gap, which a key's changed request (its join password typed again) waits for.
+/// The server's other `429`s, its caps on the queue, carry none.
+const JOIN_RETRY_MOST: Duration = Duration::from_secs(10);
 /// The deadline of a publish (up to 16 MiB on a LAN) and of the join exchanges.
 const EXCHANGE: Duration = Duration::from_secs(120);
+/// The deadline of a join verdict's one-line exchange ([`post_verdict`], [`list_verdicts`]):
+/// a waiting subscriber reads it before each long-poll, and the approver posts it within its
+/// pass, so neither waits out a [`EXCHANGE`] on a vault that does not answer.
+const VERDICT_EXCHANGE: Duration = Duration::from_secs(10);
 /// The largest answer read from a PUT or a join POST (a one-line reason).
 const REASON_BODY: usize = 64 * 1024;
 /// The largest join queue read (256 lines of under 256 bytes, with room to spare).
 const JOINS_BODY: usize = 1 << 20;
 /// The most characters of a server's reason quoted in an error.
 const REASON_CHARS: usize = 200;
+/// The most characters of this machine's own failure to reach a server quoted in an error (an
+/// I/O error: the system's and aterm-http's words, which may end with a remedy, a Linux `.local`
+/// lookup's), longer than a server's one-line reason. Any other transport error may quote what
+/// the server sent (a malformed answer's bytes) and keeps [`REASON_CHARS`].
+const ERROR_CHARS: usize = 512;
 
 /// Parse what a person typed.
 pub fn parse_source(
@@ -182,6 +200,15 @@ fn join_url(url: &str) -> String {
     }
 }
 
+/// `<url>/join/verdict`, the admin Macs' verdicts on join requests ([`post_verdict`]).
+fn verdict_url(url: &str) -> String {
+    let url = base(url);
+    match url.split_once('?') {
+        Some((path, query)) => format!("{path}/join/verdict?{query}"),
+        None => format!("{url}/join/verdict"),
+    }
+}
+
 /// How human-readable output names a URL: scheme, host and path.
 pub fn describe(url: &str) -> String {
     match Uri::parse(base(url)) {
@@ -197,10 +224,15 @@ pub fn describe(url: &str) -> String {
 
 /// A server's reason.
 pub fn reason(body: &[u8]) -> String {
-    let line = body.split(|&b| b == b'\n').next().unwrap_or_default();
+    one_line(body, REASON_CHARS)
+}
+
+/// The first line of `bytes`, at most `cap` characters, each byte outside printable ASCII a `?`.
+fn one_line(bytes: &[u8], cap: usize) -> String {
+    let line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     line.iter()
-        .take(REASON_CHARS)
+        .take(cap)
         .map(|&b| {
             if (0x20..0x7f).contains(&b) {
                 char::from(b)
@@ -228,15 +260,100 @@ fn refused(what: &str, url: &str, status: u16, body: &[u8]) -> Error {
 
 fn client(timeout: Duration) -> Client {
     Client::new(Trust::PlatformVerifier, ProxyMode::Direct, timeout)
+        .with_connector(Arc::new(LanNoting))
 }
 
-/// A failure to talk to the server.
+/// aterm-http's own connector, which also keeps where a connect found no route to a LAN
+/// address ([`local_network_gate`]) in the error it returns ([`NoRoute`]), for
+/// [`transport_error`] to tell.
+#[derive(Debug)]
+struct LanNoting;
+
+impl aterm_http::Connect for LanNoting {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: aterm_http::Deadline,
+    ) -> std::io::Result<std::net::TcpStream> {
+        let mut last = None;
+        aterm_http::TcpConnector
+            .connect_noting(host, port, deadline, &mut |addr, error| {
+                last = local_network_gate(addr.ip(), error).then_some(addr);
+            })
+            .map_err(|error| match last {
+                // The error is that connect's own, not a deadline spent after it.
+                Some(addr) if local_network_gate(addr.ip(), &error) => {
+                    std::io::Error::new(error.kind(), NoRoute { addr, error })
+                }
+                _ => error,
+            })
+    }
+}
+
+/// A connect that found no route to a LAN address: the error, and where it went.
+#[derive(Debug)]
+struct NoRoute {
+    addr: SocketAddr,
+    error: std::io::Error,
+}
+
+impl std::fmt::Display for NoRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (to {})", self.error, self.addr.ip())
+    }
+}
+
+impl std::error::Error for NoRoute {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Whether a connect to `ip` that failed with `error` is what macOS's Local Network gate
+/// answers aterm: no route (`EHOSTUNREACH`, `ENETUNREACH`) to a private or link-local
+/// address (IPv4 RFC 1918 or 169.254/16, IPv6 unique local or link-local, either one mapped).
+/// A LAN host that is down answers the same.
+fn local_network_gate(ip: IpAddr, error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{HostUnreachable, NetworkUnreachable};
+    let lan = match ip.to_canonical() {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+    };
+    lan && matches!(error.kind(), HostUnreachable | NetworkUnreachable)
+}
+
+/// A failure to talk to the server. No route to a LAN address is
+/// [`ErrorKind::LocalNetworkPending`], and says where the gate is.
 fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
-    Error::new(format!(
+    let text = format!(
         "{what} {}: {}",
         describe(url),
-        reason(error.to_string().as_bytes())
-    ))
+        one_line(
+            error.to_string().as_bytes(),
+            match error {
+                aterm_http::Error::Io(_) => ERROR_CHARS,
+                _ => REASON_CHARS,
+            }
+        )
+    );
+    if no_route_to_lan(error) {
+        return Error::of_kind(
+            ErrorKind::LocalNetworkPending,
+            format!(
+                "{text}; macOS lets aterm reach the local network only once allowed (Privacy & Security > Local Network)"
+            ),
+        );
+    }
+    Error::new(text)
+}
+
+/// Whether `error` is a connect that found no route to a LAN address ([`NoRoute`]).
+fn no_route_to_lan(error: &aterm_http::Error) -> bool {
+    matches!(
+        error,
+        aterm_http::Error::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<NoRoute>())
+    )
 }
 
 /// Fetch bytes at `source` ([`FETCH_MARGIN`], [`Fetched::NoNewer`], [`Fetched::Missing`]).
@@ -293,6 +410,14 @@ pub fn get_bounded(
     )
 }
 
+/// One GET of the vault at `url` as a look, never a long-poll: all of it within `total`, with
+/// no [`FETCH_MARGIN`], its lookup and connect within [`PROBE_CONNECT`] (or `total`, if
+/// shorter).
+pub fn get_within(url: &str, total: Duration) -> crate::Result<Answer> {
+    get_via(&client(total), url, None, Some(PROBE_CONNECT.min(total)))
+        .map_err(|unheard| unheard.why)
+}
+
 /// [`get_bounded`] through `client` (its timeout is the request's deadline).
 fn get_via(
     client: &Client,
@@ -340,15 +465,16 @@ fn get_via(
 /// answer as `TimedOut` (a definite "no such name" is another kind), a connect macOS refuses an
 /// app it has not let onto the LAN fails `HostUnreachable`, and so does a lookup of a `.local`
 /// name mDNSResponder refuses that app, which aterm-http names so (`getaddrinfo` reports the
-/// refusal as "no such name").
+/// refusal as "no such name"); no route to a LAN address ([`no_route_to_lan`]) is held too.
 fn held(error: &aterm_http::Error) -> bool {
-    matches!(
-        error,
-        aterm_http::Error::Io(error) if matches!(
-            error.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::HostUnreachable
+    no_route_to_lan(error)
+        || matches!(
+            error,
+            aterm_http::Error::Io(error) if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::HostUnreachable
+            )
         )
-    )
 }
 
 /// The seq an `ETag` names: `"<seq>"`, as the server sends it; anything else names none.
@@ -473,9 +599,10 @@ fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
 /// other's version (a revocation, say). It is an exclusive create, which a shared mount (SMB,
 /// NFSv3 and later) also serializes; it holds `<host> <pid>` and goes when the publish ends. A
 /// server takes it too, over the vault file in its store, and only a server clears one left by
-/// a holder on its machine that no longer runs ([`PublishLock::take_clearing_dead`]); machines
-/// that share the mount and a host name are not told apart. Any other lock a killed publisher
-/// left refuses every publish until a person removes it.
+/// a holder on its machine that no longer runs, or written before its machine's boot
+/// ([`PublishLock::take_clearing_dead`]); machines that share the mount and a host name are not
+/// told apart. Any other lock a killed publisher left refuses every publish until a person
+/// removes it.
 #[cfg(unix)]
 pub(crate) struct PublishLock(std::path::PathBuf);
 
@@ -575,9 +702,12 @@ pub(crate) fn held_by(holder: &str) -> String {
     }
 }
 
-/// Remove `lock` when it is a plain file whose holder line names this machine's host name and a
-/// pid the kernel says no process has, and the path still holds the file judged (kept open
-/// until the remove, so its inode cannot be reused meanwhile).
+/// Remove `lock` when it is a plain file whose holder is gone, and the path still holds the file
+/// judged (kept open until the remove, so its inode cannot be reused meanwhile). A holder is
+/// gone when its line names this machine's host name and a pid the kernel says no process has,
+/// or the file was written before this boot ([`before_this_boot`]), which no running process
+/// can have done: a power loss mid-publish leaves such a lock, naming a pid this boot may have
+/// handed to another process, or with a holder line that never reached the disk.
 #[cfg(unix)]
 fn remove_dead(lock: &std::path::Path) -> bool {
     use std::io::Read as _;
@@ -597,25 +727,49 @@ fn remove_dead(lock: &std::path::Path) -> bool {
     if !judged.is_file() || (&file).take(256).read_to_string(&mut line).is_err() {
         return false;
     }
-    let Some((host, pid)) = line.trim_end().rsplit_once(' ') else {
-        return false;
+    let before_boot = judged.modified().is_ok_and(before_this_boot);
+    let dead = match line.trim_end().rsplit_once(' ') {
+        Some((host, pid)) => {
+            let ours = !host.is_empty()
+                && [
+                    aterm_uds::process::host_name(),
+                    aterm_uds::process::kernel_host_name(),
+                ]
+                .iter()
+                .any(|name| name.as_deref() == Some(host));
+            let gone = pid.parse::<i32>().is_ok_and(|pid| {
+                aterm_uds::process::process_presence(pid)
+                    == aterm_uds::process::ProcessPresence::Absent
+            });
+            ours && (gone || before_boot)
+        }
+        None => line.trim().is_empty() && before_boot,
     };
-    let ours = !host.is_empty()
-        && [
-            aterm_uds::process::host_name(),
-            aterm_uds::process::kernel_host_name(),
-        ]
-        .iter()
-        .any(|name| name.as_deref() == Some(host));
-    let gone = pid.parse::<i32>().is_ok_and(|pid| {
-        aterm_uds::process::process_presence(pid) == aterm_uds::process::ProcessPresence::Absent
-    });
     // A person may have put another lock there since it was read.
     let same = std::fs::symlink_metadata(lock)
         .is_ok_and(|now| (now.dev(), now.ino()) == (judged.dev(), judged.ino()));
-    let removed = ours && gone && same && std::fs::remove_file(lock).is_ok();
+    let removed = dead && same && std::fs::remove_file(lock).is_ok();
     drop(file);
     removed
+}
+
+/// How far before this boot's start a file must have been written to be judged older than the
+/// boot ([`before_this_boot`]): room for a clock set forward after the boot (a network time
+/// fix), which makes the start computed now later than the clock read at the boot.
+#[cfg(unix)]
+const BOOT_SLACK: Duration = Duration::from_secs(10 * 60);
+
+/// Whether `written` (a file's modification time) is before this boot began, by more than
+/// [`BOOT_SLACK`]. `false` where the time since boot cannot be read.
+#[cfg(unix)]
+fn before_this_boot(written: std::time::SystemTime) -> bool {
+    let booted = aterm_uds::process::continuous_ms()
+        .and_then(|up| std::time::SystemTime::now().checked_sub(Duration::from_millis(up)));
+    booted.is_some_and(|booted| {
+        written
+            .checked_add(BOOT_SLACK)
+            .is_some_and(|by| by < booted)
+    })
 }
 
 #[cfg(unix)]
@@ -655,27 +809,57 @@ fn write_path(path: &std::path::Path, _envelope: &[u8]) -> crate::Result<()> {
     )))
 }
 
-/// `POST <url>/join` with one request line (`age1… <host> <code>`).
+/// `POST <url>/join` with one request line (`age1… <host> <code>`). A `429` with a
+/// `Retry-After` of at most [`JOIN_RETRY_MOST`] (the server's gap after a key changed its
+/// request, as a join password typed again does) is sat out, and the line sent once more.
 pub fn post_join(url: &str, line: &str) -> crate::Result<()> {
+    post_join_pausing(url, line, &std::thread::sleep)
+}
+
+/// [`post_join`], sitting out a `Retry-After` with `pause`.
+pub(crate) fn post_join_pausing(
+    url: &str,
+    line: &str,
+    pause: &dyn Fn(Duration),
+) -> crate::Result<()> {
     let line = line.trim_end_matches('\n');
     parse_join_line(line)?;
     let target = join_url(url);
-    let response = client(EXCHANGE)
-        .post(&target)
-        .header("Content-Type", "text/plain; charset=utf-8")
-        .limit(REASON_BODY)
-        .send(format!("{line}\n").as_bytes())
-        .map_err(|e| transport_error("asking to join at", &target, &e))?;
-    if response.is_success() {
-        Ok(())
-    } else {
-        Err(refused(
-            "asking to join at",
-            &target,
-            response.status(),
-            response.body(),
-        ))
+    let mut retried = false;
+    loop {
+        let response = client(EXCHANGE)
+            .post(&target)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .limit(REASON_BODY)
+            .send(format!("{line}\n").as_bytes())
+            .map_err(|e| transport_error("asking to join at", &target, &e))?;
+        if response.is_success() {
+            return Ok(());
+        }
+        match retry_after(&response) {
+            Some(wait) if response.status() == 429 && !retried && wait <= JOIN_RETRY_MOST => {
+                retried = true;
+                pause(wait);
+            }
+            _ => {
+                return Err(refused(
+                    "asking to join at",
+                    &target,
+                    response.status(),
+                    response.body(),
+                ));
+            }
+        }
     }
+}
+
+/// A response's `Retry-After` in its delay-seconds form (an HTTP date is not read).
+fn retry_after(response: &aterm_http::Response) -> Option<Duration> {
+    let value = response.header("Retry-After")?.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok().map(Duration::from_secs)
 }
 
 /// `GET <url>/join`: the pending request lines ([`parse_join_line`]).
@@ -701,6 +885,68 @@ pub fn list_joins(url: &str) -> crate::Result<Vec<String>> {
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+/// `POST <url>/join/verdict` with one line, `age1… refused <tag>`: an admin Mac's word that the
+/// request of that key whose proof `tag` names ([`crate::join::proof_tag`]) did not prove the
+/// join password. The server keeps it beside the request, unauthenticated: a forged one can
+/// only make the joining Mac ask its person for the password again.
+pub fn post_verdict(url: &str, recipient: &str, tag: &str) -> crate::Result<()> {
+    let line = format!("{recipient} refused {tag}");
+    if parse_verdict_line(&line).is_none() {
+        return Err(Error::new("a verdict is `age1… refused <16 hex digits>`"));
+    }
+    let target = verdict_url(url);
+    let response = client(VERDICT_EXCHANGE)
+        .post(&target)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .limit(REASON_BODY)
+        .send(format!("{line}\n").as_bytes())
+        .map_err(|e| transport_error("posting a join verdict at", &target, &e))?;
+    if response.is_success() {
+        return Ok(());
+    }
+    Err(refused(
+        "posting a join verdict at",
+        &target,
+        response.status(),
+        response.body(),
+    ))
+}
+
+/// `GET <url>/join/verdict`: each `(age1…, tag)` an admin Mac refused ([`post_verdict`]). A
+/// server that keeps no verdicts (an older one answers `404`) has none.
+pub fn list_verdicts(url: &str) -> crate::Result<Vec<(String, String)>> {
+    let target = verdict_url(url);
+    let response = client(VERDICT_EXCHANGE)
+        .get(&target)
+        .limit(JOINS_BODY)
+        .send(&[])
+        .map_err(|e| transport_error("reading join verdicts at", &target, &e))?;
+    match response.status() {
+        200 => {}
+        404 => return Ok(Vec::new()),
+        status => {
+            return Err(refused(
+                "reading join verdicts at",
+                &target,
+                status,
+                response.body(),
+            ));
+        }
+    }
+    let text = std::str::from_utf8(response.body())
+        .map_err(|_| Error::new("the join verdicts are not UTF-8 text"))?;
+    Ok(text.lines().filter_map(parse_verdict_line).collect())
+}
+
+/// A verdict line, `age1… refused <tag>` (`tag` 16 lowercase hex digits).
+pub fn parse_verdict_line(line: &str) -> Option<(String, String)> {
+    let mut words = line.split(' ');
+    let (recipient, word, tag) = (words.next()?, words.next()?, words.next()?);
+    let tag_ok = tag.len() == 16 && tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (words.next().is_none() && recipient.starts_with("age1") && word == "refused" && tag_ok)
+        .then(|| (recipient.to_owned(), tag.to_owned()))
 }
 
 /// One join request.
@@ -981,6 +1227,24 @@ mod tests {
         assert_eq!(reason(b""), "");
     }
 
+    /// This machine's own failure to reach a server keeps a remedy a server's reason would have
+    /// no room for (a Linux `.local` lookup's), within its own cap.
+    #[test]
+    fn a_failure_to_reach_the_server_keeps_its_remedy() {
+        let hint = format!(
+            "dns: alab-secrets.local: Name or service not known ({})",
+            "x".repeat(250)
+        );
+        let error = aterm_http::Error::Io(std::io::Error::other(hint.clone()));
+        let said = transport_error("fetching", "http://alab-secrets.local:7484/v1/alab", &error).0;
+        assert!(said.ends_with(&format!("{})", "x".repeat(250))), "{said}");
+        assert_eq!(one_line(&[b'x'; 900], ERROR_CHARS).len(), ERROR_CHARS);
+        // What the server sent keeps a server's cap.
+        let sent = aterm_http::Error::Protocol("y".repeat(900));
+        let said = transport_error("fetching", "http://alab-secrets.local:7484/v1/alab", &sent).0;
+        assert!(said.len() < 300, "{said}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_path_is_fetched_and_published_atomically_and_world_readably() {
@@ -1109,37 +1373,174 @@ mod tests {
     /// A one-shot HTTP stub: answers `response` to the first request and hands back the
     /// request head it read.
     fn stub(response: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        let (url, server) = stub_each(vec![response]);
+        (
+            url,
+            std::thread::spawn(move || server.join().expect("stub").remove(0)),
+        )
+    }
+
+    /// An HTTP stub that answers each of `responses` to one request in turn and hands back
+    /// the request heads it read.
+    fn stub_each(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/v1/alab", listener.local_addr().expect("addr"));
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(HANG_DETECTOR))
-                .expect("timeout");
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while !head.ends_with(b"\r\n\r\n") {
-                if stream.read(&mut byte).expect("read") == 0 {
-                    break;
+            let mut heads = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(HANG_DETECTOR))
+                    .expect("timeout");
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).expect("read") == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
                 }
-                head.push(byte[0]);
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                stream.read_exact(&mut body).expect("body");
+                stream.write_all(&response).expect("write");
+                heads.push(head);
             }
-            let head = String::from_utf8_lossy(&head).into_owned();
-            let length = head
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            let mut body = vec![0u8; length];
-            stream.read_exact(&mut body).expect("body");
-            stream.write_all(&response).expect("write");
-            head
+            heads
         });
         (url, server)
+    }
+
+    fn too_many(retry_after: Option<u64>) -> Vec<u8> {
+        let header =
+            retry_after.map_or_else(String::new, |secs| format!("Retry-After: {secs}\r\n"));
+        format!("HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: 9\r\n\r\nslow down")
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_join_sits_out_the_change_gap_once_and_no_other_refusal() {
+        let line = format!("{} m22 abcd-ef23-ghij-k234", recipient());
+        let no_content = b"HTTP/1.1 204 No Content\r\n\r\n".to_vec();
+        let paused = std::cell::RefCell::new(Vec::new());
+        let pause = |wait: Duration| paused.borrow_mut().push(wait);
+        // The gap's 429 names the seconds left: sat out, and the line sent again.
+        let (url, server) = stub_each(vec![too_many(Some(7)), no_content.clone()]);
+        post_join_pausing(&url, &line, &pause).expect("taken after the wait");
+        let heads = server.join().expect("stub");
+        assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .all(|head| head.starts_with("POST /v1/alab/join "))
+        );
+        assert_eq!(*paused.borrow(), [Duration::from_secs(7)]);
+        // Only once: a second 429 is the answer.
+        paused.borrow_mut().clear();
+        let (url, server) = stub_each(vec![too_many(Some(1)), too_many(Some(1))]);
+        let error = post_join_pausing(&url, &line, &pause).expect_err("refused twice");
+        assert!(error.0.contains("429"), "{error}");
+        assert_eq!(server.join().expect("stub").len(), 2);
+        assert_eq!(*paused.borrow(), [Duration::from_secs(1)]);
+        // CONTROL: the queue's caps name no wait, and a wait past the gap is no gap's: each
+        // refused at once, with no pause.
+        paused.borrow_mut().clear();
+        for refusal in [too_many(None), too_many(Some(30))] {
+            let (url, server) = stub_each(vec![refusal]);
+            let error = post_join_pausing(&url, &line, &pause).expect_err("refused");
+            assert!(error.0.contains("429: slow down"), "{error}");
+            assert_eq!(server.join().expect("stub").len(), 1);
+        }
+        assert!(paused.borrow().is_empty());
+    }
+
+    /// The Local Network gate is told by where a connect went and how it failed: no route to a
+    /// LAN address, and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn no_route_to_a_lan_address_is_the_local_network_gate() {
+        let lan = [
+            "10.0.0.5",
+            "172.16.4.2",
+            "172.31.255.254",
+            "192.168.1.20",
+            "169.254.10.1",
+            "fe80::1",
+            "fd12:3456::1",
+            "::ffff:192.168.1.20",
+        ];
+        let elsewhere = [
+            "8.8.8.8",
+            "192.0.2.1",
+            "172.32.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "::1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+        ];
+        let gated = [libc::EHOSTUNREACH, libc::ENETUNREACH];
+        let other = [
+            libc::ECONNREFUSED,
+            libc::ETIMEDOUT,
+            libc::ECONNRESET,
+            libc::EADDRNOTAVAIL,
+        ];
+        for (addresses, on_lan) in [(&lan, true), (&elsewhere, false)] {
+            for address in addresses {
+                let ip: IpAddr = address.parse().expect(address);
+                for (errnos, no_route) in [(&gated[..], true), (&other[..], false)] {
+                    for &errno in errnos {
+                        let error = std::io::Error::from_raw_os_error(errno);
+                        assert_eq!(
+                            local_network_gate(ip, &error),
+                            on_lan && no_route,
+                            "{address} errno {errno}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_connect_with_no_route_on_the_lan_is_told_as_pending_and_others_are_not() {
+        let addr: SocketAddr = "192.168.1.20:7484".parse().expect("addr");
+        let unreachable = || std::io::Error::from(std::io::ErrorKind::HostUnreachable);
+        let gated = aterm_http::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            NoRoute {
+                addr,
+                error: unreachable(),
+            },
+        ));
+        let url = "http://alab-secrets.local:7484/v1/alab?token=x";
+        let error = transport_error("fetching", url, &gated);
+        assert_eq!(error.kind(), ErrorKind::LocalNetworkPending);
+        assert!(
+            error
+                .0
+                .starts_with("fetching http://alab-secrets.local:7484/v1/alab: "),
+            "{error}"
+        );
+        assert!(error.0.contains("192.168.1.20"), "{error}");
+        assert!(error.0.contains("Local Network"), "{error}");
+        assert!(!error.0.contains("token"), "{error}");
+        // CONTROL: the same failure with no LAN address behind it is any other error.
+        let plain = aterm_http::Error::Io(unreachable());
+        assert_eq!(
+            transport_error("fetching", url, &plain).kind(),
+            ErrorKind::Other
+        );
     }
 
     #[test]
@@ -1316,6 +1717,30 @@ mod tests {
             left[1] > LOOK_CONNECT,
             "the request's own deadline: {left:?}"
         );
+    }
+
+    /// A look ([`get_within`]) gives up on a server that takes its connect and never answers
+    /// at its own total, with no [`FETCH_MARGIN`] after it. Negative control: a look on a
+    /// fetch's deadline (the total plus the margin) is still waiting at the margin.
+    #[test]
+    fn a_look_gives_up_on_a_silent_server_at_its_total_with_no_margin() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
+        let total = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let error = get_within(&url, total).expect_err("a server that never answers");
+        let took = started.elapsed();
+        println!(
+            "MEASURE a look at a silent server gave up after {} ms (total {} ms)",
+            took.as_millis(),
+            total.as_millis()
+        );
+        assert!(error.0.contains("deadline"), "{error:?}");
+        assert!(
+            took < FETCH_MARGIN,
+            "the look waited the fetch margin past its total: {took:?}"
+        );
+        drop(silent);
     }
 
     /// `text` with its last character changed to another bech32 one: a broken checksum.

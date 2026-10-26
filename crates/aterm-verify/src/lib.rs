@@ -348,18 +348,11 @@ pub fn parse_build_jobs(raw: Option<&OsStr>) -> Option<u32> {
         .filter(|&n| n > 0)
 }
 
-/// What `cargo run` hands the verify process about ITSELF (the `verify` alias is `run -q -p aterm-verify`).
-pub const CARGO_RUN_ENV: [&str; 6] = [
-    "CARGO_MANIFEST_DIR",
-    "CARGO_MANIFEST_PATH",
-    "CARGO_PKG_*",
-    "CARGO_CRATE_NAME",
-    "CARGO_BIN_NAME",
-    "CARGO_PRIMARY_PACKAGE",
-];
+/// What `cargo run` hands the verify process about ITSELF (the `verify` alias is `run -q -p aterm-verify`): `aterm_toolchain::build_cache::CARGO_RUN_ENV`.
+pub const CARGO_RUN_ENV: [&str; 7] = aterm_toolchain::build_cache::CARGO_RUN_ENV;
 
 /// Variables removed from every child's inherited environment.
-pub const CHILD_ENV_REMOVED: [&str; 6] = CARGO_RUN_ENV;
+pub const CHILD_ENV_REMOVED: [&str; 7] = CARGO_RUN_ENV;
 
 /// The run's toolchain, discovered once from `env` under the pin `root` declares and the atpkg prefix atpkg itself would read.
 #[must_use]
@@ -696,18 +689,23 @@ const fn stopping() -> bool {
 const ENDING: &str = "the run was interrupted before this stage started, so it decided nothing";
 
 /// What the run's quiet claim did for a timed stage, for its time line: `first` when the stage's
-/// admission made it.
+/// admission made it. A claim whose patience ran out says it started at its bound, under what
+/// load, and how long it reserved the machine ([`aterm_capacity::QuietStart`]).
 fn admission(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit, first: bool) -> String {
     let bound = claim.record().need.quiet.unwrap_or_default();
+    let how = claim
+        .quiet()
+        .filter(|q| q.at_bound || !q.reserved.is_zero())
+        .map_or_else(String::new, |q| format!(", {q}"));
     match mode {
         aterm_capacity::Admit::Now => {
             format!("admitted by --admit now (quiet is load <= {bound:.1})")
         }
         aterm_capacity::Admit::Wait if !first => {
-            format!("still on the run's quiet machine (load <= {bound:.1})")
+            format!("still on the run's quiet machine (load <= {bound:.1}{how})")
         }
         aterm_capacity::Admit::Wait if claim.waited() >= Duration::from_secs(1) => format!(
-            "waited {} for a quiet machine (load <= {bound:.1})",
+            "waited {} for a quiet machine (load <= {bound:.1}){how}",
             aterm_capacity::span(claim.waited())
         ),
         aterm_capacity::Admit::Wait => format!("a quiet machine (load <= {bound:.1})"),
@@ -715,9 +713,10 @@ fn admission(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit, first: 
 }
 
 /// Run a timed stage on the run's quiet machine ([`Quiet`]): the first one's claim is admitted
-/// before it starts, waiting with no deadline and saying once a minute what it waits for, and let
-/// go when the last one's `f` returns. A ledger that cannot be used is said, and the stage runs
-/// unadmitted, as a run with no claim does. Also what the claim did, for the stage's time line.
+/// before it starts, waiting for the load within its patience ([`aterm_capacity::QUIET_PATIENCE`])
+/// and saying once a minute what it waits for, and let go when the last one's `f` returns. A
+/// ledger that cannot be used is said, and the stage runs unadmitted, as a run with no claim does.
+/// Also what the claim did, for the stage's time line.
 ///
 /// # Errors
 /// Why `f` never ran: an interrupt ended the wait, which ends the run

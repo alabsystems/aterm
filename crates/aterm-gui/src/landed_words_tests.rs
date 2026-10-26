@@ -678,6 +678,53 @@ fn a_timed_write_stamps_each_strip_once() {
     );
 }
 
+/// The same economy with the strip on and a Settings tab ahead of the agent's tab: the restamp
+/// counts tabs as the frame does, not as the all-terminal projection does.
+#[test]
+fn the_hover_asks_no_redraw_past_a_settings_tab_ahead_of_its_own() {
+    let (mut app, sid, _host) = desk("land");
+    let wid = WindowId(0);
+    app.tab_strip_rows = 1;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let settings = app.windows[&wid]
+        .tab_set
+        .active_index()
+        .expect("Settings is active");
+    app.move_tab(wid, settings, 0);
+    app.switch_tab_in(wid, 1);
+    assert_eq!(app.focused_session_id(wid), Some(0));
+    assert_eq!(
+        (
+            app.windows[&wid].tab_set.active_index(),
+            app.windows[&wid].tabs.active
+        ),
+        (Some(1), 0),
+        "PRECONDITION: the canonical and all-terminal indices differ"
+    );
+    app.windows.get_mut(&wid).expect("window").present = Some(crate::PresentTarget::Cpu {
+        surface: crate::present::CpuSurface::Scripted(Default::default()),
+    });
+    tell(&mut app, &sid, Some(TaskFace::Open));
+    app.redraw_window(wid);
+    assert!(
+        app.windows[&wid]
+            .last_present
+            .as_ref()
+            .is_some_and(|key| key.tab_strip != 0),
+        "PRECONDITION: a frame with the strip was presented"
+    );
+    let _ = crate::work_counts::take_hover_redraws();
+    tell(&mut app, &sid, Some(TaskFace::Landed));
+    let agent_tip = crate::work_counts::last_tooltips_pushed(wid)
+        .and_then(|tips| tips.get(1).cloned().flatten())
+        .unwrap_or_default();
+    assert!(
+        agent_tip.contains("driven by aterm (land, landed)"),
+        "PRECONDITION: the agent tab's hover was stamped: {agent_tip}"
+    );
+    assert_eq!(crate::work_counts::take_hover_redraws(), 0);
+}
+
 #[test]
 fn the_hover_asks_no_redraw_where_the_strip_did_not_move() {
     let (mut app, sid, _host) = desk("land");

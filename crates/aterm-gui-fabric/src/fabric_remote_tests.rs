@@ -196,20 +196,29 @@ fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
     let refused = refusal_to(&ctx, None, "send").expect("held");
     assert!(
         refused.starts_with("ERR halted reason=- origin=remote (held by mac-03 (node 03030303)")
-            && refused.contains("`aterm fleet peers rm 03030303` once that Mac left the fleet")
+            && refused.contains(&format!(
+                "`aterm ctl --host <this session's Mac> hold {sid} off` run on mac-03 (node \
+                 03030303), or the person at this session's Mac"
+            ))
+            && refused.contains("`aterm fleet peers rm 03030303` there once that node left")
             && refused.contains(&format!("`aterm ctl hold {sid} off` on this session's Mac")),
         "the refusal names who holds it and what lifts it: {refused}"
     );
+    let either_end = |reply: &str| !reply.contains(" here") && !reply.contains("this Mac");
+    assert!(either_end(&refused), "{refused}");
     for (holder, says) in [
-        (Holder::Drives, "which still drives this Mac"),
+        (Holder::Drives, "which still drives this session's Mac"),
         (
             Holder::Again("nothing listens".into()),
-            "which may still drive this Mac: its place did not prove it just now (nothing listens)",
+            "which may still drive this session's Mac: its place did not prove it just now \
+             (nothing listens)",
         ),
     ] {
         match off(holder) {
             Some(RemoteOff::Stands(reply)) => assert!(
-                reply.starts_with("ERR halted reason=- origin=remote") && reply.contains(says),
+                reply.starts_with("ERR halted reason=- origin=remote")
+                    && reply.contains(says)
+                    && either_end(&reply),
                 "{reply}"
             ),
             other => panic!("a node that may still drive keeps its hold: {other:?}"),

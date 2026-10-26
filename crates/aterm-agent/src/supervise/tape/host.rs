@@ -29,7 +29,7 @@ use crate::supervise::occupancy::wakes_seen::{
 };
 use crate::supervise::occupancy::{
     FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen,
-    WakeClaim, WakeDoor, WakesSeen,
+    WakeClaim, WakeDoor, WakeFacts, WakesSeen,
 };
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
@@ -1070,17 +1070,46 @@ impl TapeValue for WakesSeen {
     }
 }
 
-/// `wake_claim`'s answer on a tape: its word ([`WakeClaim::word`]), as a JSON string. A word this
+/// A granted claim's figures as a tape holds them ([`WakeFacts`]): numbers only.
+#[derive(Serialize, Deserialize)]
+struct WakeFactsWire {
+    ready_since_ms: Option<i64>,
+    slots: Option<(u16, u16)>,
+}
+
+/// `wake_claim`'s granted answer as a tape holds it: `{"granted": <figures>}`.
+#[derive(Serialize, Deserialize)]
+struct GrantedWire {
+    granted: WakeFactsWire,
+}
+
+/// `wake_claim`'s answer on a tape: its word ([`WakeClaim::word`]), as a JSON string, and a
+/// granted one's as `{"granted": {"ready_since_ms": .., "slots": [usable, n]}}`. A word this
 /// build does not know is refused. No absent form: a build without the door claimed nothing, so a
 /// replay that reaches the door diverges there.
 impl TapeValue for WakeClaim {
     fn to_tape(&self) -> Vec<u8> {
-        json(&self.word())
+        match self {
+            WakeClaim::Granted(facts) => json(&GrantedWire {
+                granted: WakeFactsWire {
+                    ready_since_ms: facts.ready_since_ms,
+                    slots: facts.slots,
+                },
+            }),
+            _ => json(&self.word()),
+        }
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        WakeClaim::of_word(&of_json::<String>(bytes)?)
-            .ok_or(bad("a wake claim's answer this build does not know"))
+        if let Ok(word) = of_json::<String>(bytes) {
+            return WakeClaim::of_word(&word)
+                .ok_or(bad("a wake claim's answer this build does not know"));
+        }
+        let GrantedWire { granted } = of_json(bytes)?;
+        Ok(WakeClaim::Granted(WakeFacts {
+            ready_since_ms: granted.ready_since_ms,
+            slots: granted.slots,
+        }))
     }
 }
 

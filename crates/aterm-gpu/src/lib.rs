@@ -23,7 +23,7 @@ pub fn set_verbose(on: bool) {
 
 /// Whether the host passed `--verbose`.
 #[inline]
-#[cfg(any(wgpu_arm, all(gl_arm, not(target_arch = "wasm32"))))]
+#[cfg(any(wgpu_arm, d3d11_arm, all(gl_arm, not(target_arch = "wasm32"))))]
 pub(crate) fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -44,6 +44,8 @@ pub use format_plan::{
 /// Finite integer compute jobs on Metal shared buffers (`compute`).
 #[cfg(all(target_os = "macos", any(test, feature = "compute")))]
 pub mod compute;
+#[cfg(d3d11_arm)]
+mod d3d11;
 #[cfg(gl_arm)]
 mod gl;
 #[cfg(all(test, target_os = "macos", not(gl_arm)))]
@@ -262,10 +264,10 @@ static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// ([`GpuContext::one_at_a_time`]); a thread that makes a device while another holds the turn
 /// waits for that thread to exit. A debug aterm makes its device on a startup worker that exits,
 /// or on its main thread, so its turn is never contended.
-#[cfg(all(windows, any(test, debug_assertions)))]
+#[cfg(all(windows, wgpu_arm, any(test, debug_assertions)))]
 static GPU_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(all(windows, any(test, debug_assertions)))]
+#[cfg(all(windows, wgpu_arm, any(test, debug_assertions)))]
 std::thread_local! {
     /// This thread's hold on [`GPU_TURN`], released when the thread (a test) exits.
     static HELD_GPU_TURN: std::cell::OnceCell<std::sync::MutexGuard<'static, ()>> =
@@ -273,7 +275,7 @@ std::thread_local! {
 }
 
 /// Gives the calling thread [`GPU_TURN`] until it exits, at once if it holds it.
-#[cfg(all(windows, any(test, debug_assertions)))]
+#[cfg(all(windows, wgpu_arm, any(test, debug_assertions)))]
 fn take_gpu_turn() {
     HELD_GPU_TURN.with(|held| {
         held.get_or_init(|| {
@@ -486,6 +488,26 @@ impl GpuContext {
         })
     }
 
+    /// Creates the production Windows [`GpuContext`] after probing a headless Direct3D 11
+    /// device; `Err` (no Direct3D 11 adapter) sends the frontend to the CPU renderer.
+    #[cfg(all(not(wgpu_arm), d3d11_arm))]
+    pub fn new() -> Result<Self, String> {
+        let probe = d3d11::device::D3dDevice::headless()?;
+        let adapter_name = probe.caps().adapter.clone();
+        drop(probe);
+        let visual_swapchain = visual_swapchain_requested();
+        VISUAL_SWAPCHAIN_ACTIVE.store(visual_swapchain, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self {
+            adapter_name,
+            backend: "D3d11".to_owned(),
+            // The arm runs the native plan: sRGB views of `R8G8B8A8_TYPELESS` storage.
+            srgb_offscreen: true,
+            device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            device_loss_msg: std::sync::Arc::default(),
+            visual_swapchain,
+        })
+    }
+
     /// Acquires a headless wgpu [`GpuContext`].
     #[cfg(wgpu_arm)]
     pub fn new() -> Result<Self, String> {
@@ -522,7 +544,7 @@ impl GpuContext {
     pub(crate) fn one_at_a_time(desc: wgpu::InstanceDescriptor) -> Result<Self, String> {
         // The turn before `GPU_INIT`: a thread that holds the turn never waits for `GPU_INIT` on
         // one that holds it and waits for the turn.
-        #[cfg(all(windows, any(test, debug_assertions)))]
+        #[cfg(all(windows, wgpu_arm, any(test, debug_assertions)))]
         take_gpu_turn();
         let _one_at_a_time = GPU_INIT
             .lock()
@@ -615,7 +637,7 @@ impl GpuContext {
 
     /// Latches a window surface configuration failure as a device loss with reason `why`.
     #[inline]
-    #[cfg(wgpu_arm)]
+    #[cfg(any(wgpu_arm, d3d11_arm))]
     pub(crate) fn latch_surface_loss(&self, why: String) {
         let _ = self.device_loss_msg.set(why);
         self.device_lost

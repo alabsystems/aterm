@@ -145,12 +145,20 @@ fn a_reading_speaks_for_three_of_the_slower_cadence() {
 
 #[test]
 fn the_glide_steps_a_whole_pixel_within_its_bounds() {
-    // A Folded strip at 2x, 2 px a second: a whole pixel every 500 ms, every other frame of
-    // the grid; at 1x, 1 px a second: a pixel a second.
+    // A Full strip at 1119 pt 2x, 2 px a second: a whole pixel every 500 ms, every other frame
+    // of the grid; at 1x, 1 px a second: a pixel a second.
     assert_eq!(glide_step(2.0), Duration::from_millis(500));
     assert_eq!(glide_step(1.0), Duration::from_secs(1));
     assert_eq!(glide_step(4.0), FRAME);
-    // Fast strips are held to the grid's four frames a second, slow ones to one each 2 s.
+    // The slowest strip drawn (Full slim at 1x: 20 cells of 4 pt over ten minutes) still steps
+    // a whole pixel, never a fraction of one.
+    let slim = 20.0 * 4.0 / 600.0;
+    assert!(
+        (glide_step(slim).as_secs_f64() * slim - 1.0).abs() < 1e-3,
+        "{:?}",
+        glide_step(slim)
+    );
+    // Fast strips are held to the grid's four frames a second, slow ones to one each 10 s.
     assert_eq!(glide_step(100.0), GLIDE_STEP_MIN);
     assert_eq!(GLIDE_STEP_MIN, FRAME);
     assert_eq!(glide_step(0.01), GLIDE_STEP_MAX);
@@ -166,8 +174,10 @@ fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
         stale_after: Duration::from_secs(3),
         motion,
         beat,
-        step: Duration::from_millis(250),
-        glide_end_ms: None,
+        flow: Flow::Glide {
+            step: Duration::from_millis(250),
+            end_ms: None,
+        },
     }
 }
 
@@ -237,7 +247,10 @@ fn the_glide_holds_at_the_open_columns_end() {
     let ms0 = OPEN + 9_400;
     let end = OPEN + 10_000;
     let f = LiveFacts {
-        glide_end_ms: Some(end),
+        flow: Flow::Glide {
+            step: FRAME,
+            end_ms: Some(end),
+        },
         ..facts(t0, true, false)
     };
     let ms = Duration::from_millis;
@@ -262,7 +275,10 @@ fn the_glide_holds_at_the_open_columns_end() {
     );
     // Unbounded, the same clock would glide on.
     let on = LiveFacts {
-        glide_end_ms: None,
+        flow: Flow::Glide {
+            step: FRAME,
+            end_ms: None,
+        },
         ..f
     };
     assert_eq!(
@@ -271,16 +287,145 @@ fn the_glide_holds_at_the_open_columns_end() {
     );
 }
 
+/// A reading that opens a new second slides a Folded strip one pitch left over the frames of
+/// the grid after it, the beat's own: the reading's frame brings the newest slot a quarter in,
+/// and 750 ms on it has come in and nothing moves until the next reading. A reading that opens
+/// no new second (the lens's half-second cadence) moves nothing.
+#[test]
+fn a_reading_that_opens_a_second_slides_the_strip_in_on_the_beats_frames() {
+    let t0 = Instant::now();
+    let ms0 = OPEN + 1_234;
+    let slide = |frames, beat| LiveFacts {
+        flow: Flow::Slide { frames },
+        ..facts(t0, true, beat)
+    };
+    let f = slide(slide_frames(6.0), true);
+    let at = |k: u32| f.live(t0 + FRAME * k, ms0 + 250 * i64::from(k));
+    assert_eq!(
+        [0, 1, 2, 3, 4].map(|k| at(k).slide),
+        [Some(0.25), Some(0.5), Some(0.75), None, None]
+    );
+    assert!(
+        (0..3).all(|k| at(k).beat == beat_phase(k)),
+        "on the beat's frames"
+    );
+    assert!(
+        (0..5).all(|k| at(k).glide_ms.is_none()),
+        "a Folded strip never glides with the clock"
+    );
+    // Its frames are the beat's: four, then only the grey.
+    let mut now = t0;
+    let mut frames = Vec::new();
+    while let Some(next) = f.next_change(now, wall(t0, ms0, now)) {
+        frames.push(next - t0);
+        now = next;
+    }
+    assert_eq!(
+        frames,
+        [FRAME, FRAME * 2, FRAME * 3, f.stale_after],
+        "the slide's frames, then the grey"
+    );
+    // Without the beat (serious mode, a lens over the deck) the slide still asks its frames.
+    let quiet = slide(slide_frames(6.0), false);
+    assert_eq!(quiet.next_change(t0, ms0), Some(t0 + FRAME));
+    assert_eq!(
+        quiet.next_change(t0 + FRAME * 3, ms0 + 750),
+        Some(t0 + quiet.stale_after)
+    );
+    // A reading in the same second as the last: nothing slides, nothing is asked but the grey.
+    let none = slide(0, false);
+    assert!((0..5).all(|k| none.live(t0 + FRAME * k, ms0).slide.is_none()));
+    assert_eq!(none.next_change(t0, ms0), Some(t0 + none.stale_after));
+    // Without motion the strip stands in its slots.
+    let still = LiveFacts { motion: false, ..f };
+    assert_eq!(still.live(t0, ms0), DeckLive::STILL);
+}
+
+/// Each frame of a slide moves the strip at least a whole device pixel and under half a pitch,
+/// so it reads as a step left even over a strip of one heat step, where a move of half a pitch
+/// or more reads either way; and it takes at most the grid's four frames.
+#[test]
+fn every_frame_of_a_slide_moves_a_pixel_and_under_half_a_pitch() {
+    for pitch in 1..=24_u32 {
+        let p = f64::from(pitch);
+        let frames = slide_frames(p);
+        assert!(
+            (1..=SLIDE_FRAMES).contains(&frames) && frames <= pitch,
+            "{pitch} px: {frames}"
+        );
+        // The shift, device px, before the reading (the last reading's strip, one pitch right
+        // of the new one's slots) and at each of the slide's frames, as `column_xs` rounds it.
+        let mut shifts = vec![p];
+        shifts.extend((0..frames).map(|k| {
+            let f = slide_phase(k, frames).map_or(1.0, f64::from);
+            ((1.0 - f) * p).round()
+        }));
+        assert_eq!(shifts.last(), Some(&0.0), "{pitch} px: it comes in");
+        for w in shifts.windows(2) {
+            let moved = w[0] - w[1];
+            assert!(
+                moved >= 1.0,
+                "{pitch} px: a frame moved {moved}: {shifts:?}"
+            );
+            if pitch >= 3 {
+                assert!(
+                    moved < p / 2.0,
+                    "{pitch} px: a frame moved {moved}: {shifts:?}"
+                );
+            }
+        }
+    }
+    // The column positions the painter draws are the same whole pixels.
+    for f in [0.25, 0.5, 0.75] {
+        let xs = column_xs(10.0, 6.0, 4.0, 5, f);
+        assert!(xs.iter().flatten().all(|x| x.fract() == 0.0), "{f}: {xs:?}");
+    }
+    for p in [f64::NAN, 0.0, -3.0, 0.5] {
+        assert_eq!(slide_frames(p), 1, "{p}");
+    }
+}
+
+#[test]
+fn a_reading_opens_a_second_once() {
+    let secs = SlotGrid::SECONDS;
+    assert!(
+        !opened_slot(None, OPEN, secs),
+        "the first reading slides nothing"
+    );
+    assert!(!opened_slot(Some(OPEN + 100), OPEN + 900, secs));
+    assert!(opened_slot(Some(OPEN + 900), OPEN + 1_100, secs));
+    assert!(opened_slot(Some(OPEN - 5_000), OPEN, secs));
+    assert!(
+        !opened_slot(Some(OPEN + 2_000), OPEN + 1_000, secs),
+        "a clock set back"
+    );
+    // On the snapshot's grid, its slots starting half a second in: readings at 900 and 1100 ms
+    // share one, 400 and 600 do not.
+    let half = SlotGrid {
+        origin_ms: 500,
+        ..secs
+    };
+    assert!(!opened_slot(Some(OPEN + 900), OPEN + 1_100, half));
+    assert!(opened_slot(Some(OPEN + 400), OPEN + 600, half));
+    // The strip's slot is the grid's.
+    assert_eq!(
+        i64::from(crate::stats_plan::FOLD_SLOT_S) * 1000,
+        aterm_vitals::ring::SLOT_MS
+    );
+}
+
+/// How the strips move in [`frames_over`]: a Full glide of `px/s` on `period` s columns, or a
+/// Folded slide of a pitch of `px`.
+#[derive(Clone, Copy, Debug)]
+enum Moves {
+    Glide(f64, u32),
+    Slide(f64),
+}
+
 /// Frames the live edge asks of one window over `secs` seconds of readings every `cadence`,
-/// its strips gliding `px_per_s` on `period_s` columns, counting each reading's own frame,
-/// and the frames that would have drawn nothing new.
-fn frames_over(
-    cadence: Duration,
-    px_per_s: f64,
-    period_s: u32,
-    beat: bool,
-    secs: u32,
-) -> (usize, Vec<String>) {
+/// its strips moving as `moves` says, counting each reading's own frame, and the frames that
+/// would have drawn nothing new.
+fn frames_over(cadence: Duration, moves: Moves, beat: bool, secs: u32) -> (usize, Vec<String>) {
     let t0 = Instant::now();
     let ms0 = OPEN + 3_456;
     let readings =
@@ -290,13 +435,26 @@ fn frames_over(
     for r in 0..readings {
         let landed = t0 + cadence * r;
         let at_ms = wall(t0, ms0, landed);
+        let prev_ms = r.checked_sub(1).map(|p| wall(t0, ms0, t0 + cadence * p));
+        let flow = match moves {
+            Moves::Glide(px_per_s, period_s) => Flow::Glide {
+                step: glide_step(px_per_s),
+                end_ms: Some(open_start_ms(at_ms, period_s) + i64::from(period_s) * 1000),
+            },
+            Moves::Slide(pitch_px) => Flow::Slide {
+                frames: if opened_slot(prev_ms, at_ms, SlotGrid::SECONDS) {
+                    slide_frames(pitch_px)
+                } else {
+                    0
+                },
+            },
+        };
         let f = LiveFacts {
             landed: Some(landed),
             stale_after: stale_after(cadence, None),
             motion: true,
             beat,
-            step: glide_step(px_per_s),
-            glide_end_ms: Some(open_start_ms(at_ms, period_s) + i64::from(period_s) * 1000),
+            flow,
         };
         frames += 1;
         let until = landed + cadence;
@@ -322,20 +480,22 @@ fn frames_over(
 fn the_live_edge_asks_at_most_four_frames_a_second() {
     let ms = Duration::from_millis;
     for cadence in [ms(1_000), ms(500), ms(2_000)] {
-        for (px_per_s, period_s) in [
-            (0.2, 30),
-            (0.27, 30),
-            (0.5, 20),
-            (1.2, 10),
-            (2.0, 10),
-            (40.0, 10),
+        for moves in [
+            Moves::Glide(0.2, 30),
+            Moves::Glide(0.27, 30),
+            Moves::Glide(0.5, 20),
+            Moves::Glide(1.2, 10),
+            Moves::Glide(2.0, 10),
+            Moves::Glide(40.0, 10),
+            Moves::Slide(3.0),
+            Moves::Slide(6.0),
+            Moves::Slide(10.0),
         ] {
             for beat in [true, false] {
                 let secs = 30;
-                let (frames, idle) = frames_over(cadence, px_per_s, period_s, beat, secs);
+                let (frames, idle) = frames_over(cadence, moves, beat, secs);
                 let per_s = frames as f64 / f64::from(secs);
-                let what =
-                    format!("{cadence:?} readings, {px_per_s} px/s on {period_s} s, beat {beat}");
+                let what = format!("{cadence:?} readings, {moves:?}, beat {beat}");
                 assert!(per_s <= 4.0, "{what}: {per_s} frames a second");
                 assert!(idle.is_empty(), "{what}: {idle:?}");
                 if beat && cadence == ms(1_000) {
@@ -395,11 +555,15 @@ fn the_card_key_and_the_layers_follow_what_moved() {
         glide_ms: Some(OPEN),
         ..still
     };
+    let slide = DeckLive {
+        slide: Some(0.5),
+        ..still
+    };
     let beat = DeckLive {
         beat: Some(0.5),
         ..still
     };
-    let keys = [still, DeckLive::STALE, glide, beat].map(|l| l.key());
+    let keys = [still, DeckLive::STALE, glide, beat, slide].map(|l| l.key());
     for (i, a) in keys.iter().enumerate() {
         assert_ne!(*a, 0);
         for b in keys.iter().skip(i + 1) {
@@ -408,6 +572,8 @@ fn the_card_key_and_the_layers_follow_what_moved() {
     }
     assert!(LiveLayer::Glide.moved(&still, &glide));
     assert!(!LiveLayer::Marker.moved(&still, &glide));
+    assert!(LiveLayer::Glide.moved(&still, &slide));
+    assert!(!LiveLayer::Marker.moved(&still, &slide));
     assert!(LiveLayer::Marker.moved(&still, &beat));
     assert!(!LiveLayer::Glide.moved(&still, &beat));
     assert!(LiveLayer::Marker.moved(&still, &DeckLive::STALE));
@@ -722,13 +888,13 @@ fn the_time_scale_at_the_mockups_widths() {
             (10, "10 min ago".into(), vec![60, 300]),
             (10, "10 min ago".into(), vec![60, 300]),
             (30, "10 min ago".into(), vec![120]),
-            (10, "2.5 min ago".into(), vec![60]),
-            (10, "80 s ago".into(), vec![30]),
-            (10, "1 min ago".into(), vec![30]),
+            (1, "30 s ago".into(), vec![10, 20]),
+            (1, "–20 s".into(), vec![10]),
+            (1, "20 s ago".into(), vec![10]),
         ]
     );
     // The owner's default window (Folded at about 600 pt): the label stands beside block A's
-    // strip and the strip's whole header is the scale's, "–30 s" centred over its middle.
+    // strip and the strip's whole header is the scale's, "–10 s" centred over its middle.
     let (head, strip) = head_of(DeckForm::Folded, 600.0, &m).expect("the table is drawn");
     assert_eq!(head.time_tick, Some(strip.x));
     let mid = &head.ruler[0];
@@ -762,11 +928,54 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     let _attached = crate::stats_deck::tests::attach_stats();
     let t0 = Instant::now();
     let (mut app, wid) = live_app(t0);
+    // Before the deck is laid out it has said nothing of its strips: the beat rings, nothing
+    // moves.
     let facts = app.live_facts(wid).expect("the deck draws");
     assert!(facts.motion && facts.beat, "{facts:?}");
     assert_eq!(facts.landed, Some(t0));
+    assert_eq!(facts.flow, Flow::None);
     let live = facts.live(t0, OPEN);
-    assert!(live.fresh && live.glide_ms.is_some() && live.beat == beat_phase(0));
+    assert!(live.fresh && live.glide_ms.is_none() && live.slide.is_none());
+    assert_eq!(live.beat, beat_phase(0));
+    // A Folded strip of 6 px a slot, after a reading that opened a second: it slides on the
+    // beat's frames.
+    let at_ms = app.vitals.snapshot.as_ref().expect("a snapshot").at_unix_ms;
+    app.vitals.landed_prev_at_ms = Some(at_ms - 1000);
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.deck_glide.set((0.0, 0, 6.0));
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(facts.flow, Flow::Slide { frames: 4 });
+    let live = facts.live(t0, OPEN);
+    assert!(live.fresh && live.glide_ms.is_none() && live.slide == Some(0.25));
+    // A reading inside the second the last one opened (the lens reads every half second) opens
+    // none: the beat rings, the strip stands.
+    let mut half = (**app.vitals.snapshot.as_ref().expect("a snapshot")).clone();
+    half.at_unix_ms = at_ms + 600;
+    app.vitals.snapshot = Some(std::sync::Arc::new(half));
+    app.vitals.landed_prev_at_ms = Some(at_ms + 100);
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(facts.flow, Flow::Slide { frames: 0 });
+    assert_eq!(facts.live(t0, OPEN).slide, None);
+    // Slots are the snapshot's grid's, not the wall clock's seconds: with its edges half a
+    // second in, readings at 900 and 1100 ms share a slot.
+    let mut edged = (**app.vitals.snapshot.as_ref().expect("a snapshot")).clone();
+    edged.at_unix_ms = at_ms + 1_100;
+    edged.slot_grid.origin_ms = 500;
+    app.vitals.snapshot = Some(std::sync::Arc::new(edged));
+    app.vitals.landed_prev_at_ms = Some(at_ms + 900);
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(facts.flow, Flow::Slide { frames: 0 });
+    app.vitals.landed_prev_at_ms = Some(at_ms + 400);
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(facts.flow, Flow::Slide { frames: 4 }, "CONTROL");
+    // A Full strip glides on the wall clock instead.
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.deck_glide.set((0.6, 10, 0.0));
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert!(matches!(facts.flow, Flow::Glide { .. }), "{facts:?}");
+    let live = facts.live(t0, OPEN);
+    assert!(live.fresh && live.glide_ms.is_some() && live.slide.is_none());
+    assert_eq!(live.beat, beat_phase(0));
     // The grid's next frame, which beats.
     let next = app.stats_live_deadline(t0);
     assert!(

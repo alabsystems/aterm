@@ -290,8 +290,11 @@ pub const fn material_bitmap(c: char) -> Option<[u8; 8]> {
 #[must_use]
 pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     let mut master = rasterize_master();
-    for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
-        let _ = author_material_glyph(&mut master, glyph_index, ch);
+    let limit = chars.len().min(ROM_GLYPHS);
+    let mut glyph_index = 0;
+    while glyph_index < limit {
+        let _ = author_material_glyph(&mut master, glyph_index, chars[glyph_index]);
+        glyph_index += 1;
     }
     master
 }
@@ -305,7 +308,11 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool 
     }
     let glyph = &mut master.rows[slot * MASTER_H..(slot + 1) * MASTER_H];
     glyph.fill(0);
-    for (sy, bits) in bitmap.into_iter().enumerate() {
+    let mut sy = 0;
+    while sy < 8 {
+        let bits = bitmap[sy];
+        let cur_sy = sy;
+        sy += 1;
         if bits == 0 {
             continue;
         }
@@ -316,7 +323,7 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool 
             b &= b - 1;
             row_mask |= 0b11 << (4 + sx * 2);
         }
-        let y0 = 4 + sy * 5;
+        let y0 = 4 + cur_sy * 5;
         glyph[y0..y0 + 5].fill(row_mask);
     }
     true

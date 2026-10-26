@@ -38,7 +38,7 @@ fn arms(theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = common::backends(18.0, theme);
     #[allow(unused_mut, reason = "the oracle build adds an arm")]
     let mut out = vec![("native", cpu, gpu)];
-    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux", windows)))]
     {
         let (cpu, mut gpu) = common::backends(18.0, theme);
         common::disarm_for_oracle(&mut gpu);
@@ -60,7 +60,13 @@ fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
         arm == "native",
         "{arm}: the frame's arm"
     );
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    assert_eq!(
+        gpu.last_frame_on_d3d11(),
+        arm == "native",
+        "{arm}: the frame's arm"
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let _ = (arm, gpu);
 }
 

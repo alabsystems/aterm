@@ -558,7 +558,9 @@ fn a_restart_reads_the_held_store_the_floors_and_the_rules_back() {
 }
 
 /// What a reader can see of the crash law's log: the records, the mail held and retained,
-/// the floors, `Last`, the inbox group's resume point and the store's counts.
+/// the floors, `Last`, the inbox group's resume point, the store's counts, and the subject
+/// budget its one producer is charged (`Last`'s carried charges: what a `Retire` credits
+/// back).
 #[derive(Debug, PartialEq, Eq)]
 struct Snap {
     base: u64,
@@ -569,6 +571,7 @@ struct Snap {
     last: Vec<(String, u64)>,
     group: u64,
     held: (usize, u64),
+    budget: (usize, usize),
 }
 
 fn snap(log: &mut BrokerLog) -> Snap {
@@ -592,6 +595,7 @@ fn snap(log: &mut BrokerLog) -> Snap {
         last: last.iter().map(|r| (r.subject.clone(), r.seq.0)).collect(),
         group: log.group_start(INBOX).0,
         held: (stats.held_records, stats.held_bytes),
+        budget: (log.subjects_per_producer(1), log.will_reserved_subjects(1)),
     }
 }
 
@@ -640,6 +644,11 @@ fn reference(sealed: bool) -> (Snap, Snap) {
     assert_eq!(after.base, 15);
     assert_eq!(after.mail, vec![4, 13]);
     assert_eq!(after.oldest, [2, 0, 15]);
+    assert_eq!(
+        after.budget,
+        (4, 0),
+        "ev, mail, presence and the second mail stay charged to their producer"
+    );
     assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
     (before, after)
 }

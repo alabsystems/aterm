@@ -22,6 +22,13 @@
 //! * `/a/retire` (a publish, any sequence): moot for an absent target, refused
 //!   for a reserved or malformed one, one charged to another producer
 //!   (`charged: `), or one a will can still append to (`will: `);
+//! * `Retire`, the conditional one (`proto::Request::Retire`): its subject's
+//!   newest record must be the one it names on this log. One it names on
+//!   another log or generation, above the subject's newest record, or (for an
+//!   absent subject) at or above the head is refused (`log: `); one newer
+//!   than it names, or an absent subject, makes it moot (deduped, at that
+//!   record or the head); otherwise it is the `/a/retire` above, with the
+//!   same refusals;
 //! * `Will`: refused for a subject a publish could not take, a second producer
 //!   on a connection that holds one, a sequence in the ack half
 //!   (`ERR_RECORD_REFUSED`), and a new subject past the budget; otherwise a
@@ -85,6 +92,9 @@ use astream_wire::Filter;
 use super::{lock, Process, Rng};
 use crate::fx::BusCloser;
 use crate::transport::Conn;
+
+/// The simulated log's id: a `Hello` names it with the generation ([`State::identity`]).
+pub(crate) const LOG_ID: [u8; 16] = [0x5a; 16];
 
 /// The tier the simulated broker serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,7 +295,26 @@ pub(crate) struct State {
     pub(crate) race: Option<Race>,
     /// THE DOOR'S JOURNAL ([`Event`]), in a world that keeps one.
     pub(crate) journal: Option<Vec<Event>>,
+    /// A SESSION REVIVED between a sweep's read and its retire ([`Revive`]), in the world that arms one.
+    pub(crate) revive: Option<Revive>,
+    /// Every retire since the world last read them: `(its offset, its subject, the
+    /// newest record's body it took out of the index)` ([`Broker::take_retired`]).
+    retired: Vec<(u64, String, Vec<u8>)>,
     notes: Vec<String>,
+}
+
+/// A SESSION REVIVED BETWEEN A SWEEP'S READ AND ITS RETIRE: when the node's conditional
+/// `Retire` of `subject` reaches the broker, `producer` has written `body` there first,
+/// as a successor serving the session again would (an update's handoff, the keeper's
+/// recovery).
+#[derive(Clone, Debug)]
+pub(crate) struct Revive {
+    pub(crate) subject: String,
+    pub(crate) body: Vec<u8>,
+    pub(crate) producer: u64,
+    pub(crate) seq: u64,
+    /// Where the successor's row landed, once it has.
+    pub(crate) landed: Option<u64>,
 }
 
 /// A SIBLING THAT RACES ONE OF THE NODE'S ATTACHES ( `super::world::Opts::race`).
@@ -337,6 +366,8 @@ pub(crate) enum ArmMutant {
     RetireIgnoresCharge,
     /// `/a/retire` takes a reserved or malformed target.
     RetireAnyTarget,
+    /// The conditional `Retire` retires its subject's newest record whatever offset and log it names.
+    RetireIgnoresItsCondition,
     /// `Hello` advertises no retention rules on a retained broker.
     Unretained,
     /// `Hello` names no lineage for a log that never moved.
@@ -423,7 +454,7 @@ impl Broker {
                 tier,
                 table,
                 oracle: Escalation::aterm(),
-                id: [0x5a; 16],
+                id: LOG_ID,
                 generation: 0,
                 lineage: Vec::new(),
                 log: Vec::new(),
@@ -446,6 +477,8 @@ impl Broker {
                 mutant: ArmMutant::None,
                 race: None,
                 journal: None,
+                revive: None,
+                retired: Vec::new(),
                 notes: Vec::new(),
             }),
         }
@@ -475,6 +508,25 @@ impl Broker {
     /// The trace lines the broker noted since the last take.
     pub(crate) fn take_notes(&self) -> Vec<String> {
         std::mem::take(&mut lock(&self.state).notes)
+    }
+
+    /// Every retire since the last call: `(offset, subject, the body of the newest record it took out of the index)`.
+    pub(crate) fn take_retired(&self) -> Vec<(u64, String, Vec<u8>)> {
+        std::mem::take(&mut lock(&self.state).retired)
+    }
+
+    /// `subject`'s newest record in the last-value index, `(offset, body)`; `None` once retired.
+    pub(crate) fn last_row(&self, subject: &str) -> Option<(u64, Vec<u8>)> {
+        let s = lock(&self.state);
+        let (off, _) = *s.index.get(subject)?;
+        let rec = s.log.get(usize::try_from(off).ok()?)?;
+        Some((off, rec.body.clone()))
+    }
+
+    /// The subjects charged to `producer` plus its wills' reservations: what its `Budget` spends.
+    pub(crate) fn spent(&self, producer: u64) -> u64 {
+        let s = lock(&self.state);
+        (s.charged_to(producer) + s.reserved.get(&producer).map_or(0, |held| held.len())) as u64
     }
 
     /// A WORLD PRODUCER's write (a peer node, a person).
@@ -1158,10 +1210,7 @@ impl State {
     }
 
     fn retire(&mut self, producer: u64, body: &[u8]) -> Result<(u64, bool), Box<Response>> {
-        use astream_broker::proto::{
-            ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_CHARGED_PREFIX,
-            RETIRE_WILL_PREFIX,
-        };
+        use astream_broker::proto::{ERR_BAD_SUBJECT, ERR_RECORD_REFUSED};
         let Ok(target) = std::str::from_utf8(body) else {
             return Err(refused(
                 ERR_RECORD_REFUSED,
@@ -1191,6 +1240,86 @@ impl State {
         let Some(&(_, charged)) = self.index.get(target) else {
             return Ok((self.log.len() as u64, true));
         };
+        self.retire_charged(producer, target, charged)
+    }
+
+    /// THE CONDITIONAL RETIRE (`Request::Retire`, astream's
+    /// `stage_retire_conditional`): `target`'s newest record must be the one at
+    /// `offset` on `log`.
+    fn retire_if(
+        &mut self,
+        producer: u64,
+        target: &str,
+        offset: u64,
+        log: LogIdentity,
+    ) -> Result<(u64, bool), Box<Response>> {
+        use astream_broker::proto::{
+            ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_LOG_PREFIX,
+        };
+        if astream_broker::store::is_hidden_subject(target)
+            || target.starts_with("/a/")
+            || target == "/a"
+        {
+            return Err(refused(
+                ERR_RECORD_REFUSED,
+                format!("reserved subject {target}"),
+            ));
+        }
+        if astream_wire::Subject::new(target).is_err() {
+            return Err(refused(ERR_BAD_SUBJECT, format!("bad subject {target:?}")));
+        }
+        let head = self.log.len() as u64;
+        let conditional = self.mutant != ArmMutant::RetireIgnoresItsCondition;
+        let not_this = |why: String| {
+            Err(refused(
+                ERR_RETIRE_REFUSED,
+                format!("{RETIRE_LOG_PREFIX}{why}"),
+            ))
+        };
+        if conditional && log != self.identity() {
+            return not_this(format!(
+                "the request names {log}, the log is {}",
+                self.identity()
+            ));
+        }
+        match self.index.get(target).copied() {
+            Some((newest, charged)) => {
+                if conditional && offset > newest {
+                    return not_this(format!(
+                        "{offset} is past {target}'s newest record, {newest}"
+                    ));
+                }
+                if conditional && offset < newest {
+                    return Ok((newest, true));
+                }
+                self.retire_charged(producer, target, charged)
+            }
+            None if conditional && offset >= head => {
+                not_this(format!("{offset} is at or above the head, {head}"))
+            }
+            None => Ok((head, true)),
+        }
+    }
+
+    /// The identity a `Hello` names.
+    pub(crate) fn identity(&self) -> LogIdentity {
+        LogIdentity {
+            id: self.id,
+            generation: self.generation,
+        }
+    }
+
+    /// Retire `target`, charged to `charged`, for `producer`: refused for another
+    /// producer's subject, or one a will can still append to.
+    fn retire_charged(
+        &mut self,
+        producer: u64,
+        target: &str,
+        charged: u64,
+    ) -> Result<(u64, bool), Box<Response>> {
+        use astream_broker::proto::{
+            ERR_RETIRE_REFUSED, RETIRE_CHARGED_PREFIX, RETIRE_WILL_PREFIX,
+        };
         if charged != producer && self.mutant != ArmMutant::RetireIgnoresCharge {
             return Err(refused(
                 ERR_RETIRE_REFUSED,
@@ -1203,16 +1332,56 @@ impl State {
                 format!("{RETIRE_WILL_PREFIX}{target} is targeted by a will that can still append"),
             ));
         }
-        self.index.remove(target);
+        let removed = self
+            .index
+            .remove(target)
+            .and_then(|(newest, _)| self.log.get(usize::try_from(newest).ok()?))
+            .map(|rec| rec.body.clone())
+            .unwrap_or_default();
         let off = self.append(Rec {
             subject: astream_broker::RETIRE_SUBJECT.to_string(),
-            body: body.to_vec(),
+            body: target.as_bytes().to_vec(),
             key: None,
             kind: Kind::Retire,
             escalated: false,
             principal: self.principal(producer).map(str::to_string),
         });
+        self.retired.push((off, target.to_string(), removed));
         Ok((off, false))
+    }
+
+    /// Before `req` is served: a retire (conditional or `/a/retire`) of the subject a
+    /// [`Revive`] names finds the successor's row written first, journalled as the world
+    /// producer's write it is.
+    fn before(&mut self, req: &Request) {
+        let target = match req {
+            Request::Retire { subject, .. } => subject.as_bytes(),
+            Request::Publish { subject, body, .. } if subject == astream_broker::RETIRE_SUBJECT => {
+                body.as_slice()
+            }
+            _ => return,
+        };
+        let Some(r) = self
+            .revive
+            .clone()
+            .filter(|r| r.landed.is_none() && r.subject.as_bytes() == target)
+        else {
+            return;
+        };
+        self.note_event(|| Event::Publish {
+            producer: r.producer,
+            seq: r.seq,
+            subject: r.subject.clone(),
+            body: r.body.clone(),
+        });
+        let landed = self
+            .publish(r.producer, r.seq, &r.subject, &r.body)
+            .map_or(u64::MAX, |(off, _)| off);
+        self.notes
+            .push(format!("revive {} @{landed} before its retire", r.subject));
+        if let Some(r) = self.revive.as_mut() {
+            r.landed = Some(landed);
+        }
     }
 
     fn fire(&mut self, i: usize) {
@@ -1312,10 +1481,7 @@ impl State {
         };
         Response::Nonce {
             nonce: vec![0; 32],
-            log: Some(LogIdentity {
-                id: self.id,
-                generation: self.generation,
-            }),
+            log: Some(self.identity()),
             ext: NonceExt {
                 durability: Some(ServedInfo {
                     requested: tier,
@@ -1371,6 +1537,21 @@ impl State {
                     self.notes.push(format!(
                         "publish c{conn} seq={producer_seq} {subject} @{offset}{}",
                         if deduped { " dup" } else { "" }
+                    ));
+                    vec![Response::PublishAck { offset, deduped }]
+                }
+                Err(e) => vec![*e],
+            },
+            Request::Retire {
+                producer_id,
+                subject,
+                offset: at,
+                log,
+            } => match self.retire_if(producer_id, &subject, at, log) {
+                Ok((offset, deduped)) => {
+                    self.notes.push(format!(
+                        "retire c{conn} {subject} if @{at} -> @{offset}{}",
+                        if deduped { " moot" } else { "" }
                     ));
                     vec![Response::PublishAck { offset, deduped }]
                 }
@@ -1649,9 +1830,9 @@ fn subject_error(subject: &str) -> Option<Box<Response>> {
 
 fn oversized_name(req: &Request) -> Option<String> {
     let names: Vec<(&str, &str)> = match req {
-        Request::Publish { subject, .. } | Request::Will { subject, .. } => {
-            vec![("subject", subject)]
-        }
+        Request::Publish { subject, .. }
+        | Request::Will { subject, .. }
+        | Request::Retire { subject, .. } => vec![("subject", subject)],
         Request::Subscribe { filter, .. } | Request::Fetch { filter, .. } => {
             vec![("filter", filter)]
         }
@@ -1862,6 +2043,7 @@ impl std::io::Write for SimStream {
                 );
                 let responses = match req {
                     Some(req) => {
+                        s.before(&req);
                         s.note_event(|| Event::Request(self.conn, req.clone()));
                         s.handle(self.conn, req)
                     }

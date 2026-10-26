@@ -187,7 +187,7 @@ fn run_as(
     let ran = super::run(
         &args(words),
         &Ports {
-            gather: &|fix| {
+            gather: &|fix, _| {
                 gathers.borrow_mut().push(fix);
                 facts(shell)
             },
@@ -271,6 +271,40 @@ fn read_only_changes_nothing_in_the_home_the_store_or_the_state_root() {
         before.0,
         "bare doctor repairs:\n{}",
         bare.text
+    );
+}
+
+/// `--json` TIMES THE RUN: every row, a fact's, a repair's, a package's and the missing
+/// evidence's alike, carries its time, and `phases` names each step of the run, read-only and
+/// applying (presence only, never a budget). An old report without either still reads.
+#[test]
+fn every_json_row_carries_its_time_and_the_run_its_phases() {
+    let scratch = broken("timed");
+    for words in [&["--read-only", "--json"][..], &["--json"]] {
+        let json = report(&run(&scratch, Mark::Ok, words, true));
+        assert_eq!(
+            json.phases.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["census", "develop", "gather", "lock", "packages", "repairs"],
+            "{words:?}"
+        );
+        assert!(
+            json.items.iter().any(|row| row.family == "pkg"),
+            "{words:?}"
+        );
+        let untimed: Vec<&str> = json
+            .items
+            .iter()
+            .filter(|row| row.elapsed_ms.is_none())
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(untimed.is_empty(), "{words:?}: {untimed:?}");
+    }
+    let missing = report(&injected(Mark::Ok, &["--read-only", "--json"], &[]));
+    assert!(
+        missing
+            .items
+            .iter()
+            .any(|row| row.id == "base.pkg.store" && row.elapsed_ms == Some(0))
     );
 }
 
@@ -399,9 +433,13 @@ fn a_usable_shell_does_not_hide_failed_repairs_or_manual_steps() {
     let ran = run(&scratch, Mark::Fail, &[], true);
     assert_eq!(ran.code, 1, "{}", ran.text);
     assert!(ran.text.contains("readiness: NOT READY"), "{}", ran.text);
+    assert!(
+        ran.stdout,
+        "a NOT READY report goes to stdout too: `aterm doctor | less` reads it"
+    );
     let json = run(&scratch, Mark::Fail, &["--json"], true);
     assert_eq!(json.code, 1);
-    assert!(json.json, "the schema goes to stdout whatever the code");
+    assert!(json.stdout, "the schema goes to stdout whatever the code");
     assert!(!report(&json).complete);
 
     let broken = broken("exit-broken");
@@ -470,7 +508,7 @@ fn readiness_distinguishes_confirmed_state_from_plans_manual_steps_and_unknowns(
     let note = super::run(
         &args(&["--read-only", "--json", "--only", "privacy"]),
         &Ports {
-            gather: &|_| {
+            gather: &|_, _| {
                 Gathered::of_facts(&[
                     ("shell:", Mark::Ok, "/bin/sh (executable)"),
                     ("privacy:", Mark::Note, "not applicable to this host"),
@@ -491,7 +529,7 @@ fn injected(shell: Mark, words: &[&str], rows: &[ItemReport]) -> Ran {
     super::run(
         &args(words),
         &Ports {
-            gather: &|_| facts(shell),
+            gather: &|_, _| facts(shell),
             ground: None,
             packages: &|| rows.to_vec(),
             state: None,
@@ -641,8 +679,9 @@ fn only_narrows_the_run_and_a_word_naming_nothing_is_refused() {
 /// `--ONLY IS CHECKED BEFORE ANYTHING IS READ`: a word that names nothing is refused
 /// before the facts are gathered, so `--only privacy,typo` never opens the Developer Tools
 /// pane on its way to exit 2; a word that names a row of another platform's doctor is
-/// still a name. The hand-over runs only where the run may fix and its words reach the
-/// Developer Tools row: never for `--read-only`, never for `--only pkg`.
+/// still a name. The hand-over is left due only where the run may fix, prints a report a
+/// person reads, and its words reach the Developer Tools row: never for `--read-only`,
+/// never for `--json` (a document's reader), never for `--only pkg`.
 #[test]
 fn only_is_checked_before_the_facts_are_gathered_and_hands_over_only_where_it_reaches() {
     let scratch = Scratch::new("hand-over");
@@ -655,6 +694,7 @@ fn only_is_checked_before_the_facts_are_gathered_and_hands_over_only_where_it_re
     );
     assert_eq!(refused.code, 2, "{}", refused.text);
     assert!(refused.text.contains("no-such-thing"), "{}", refused.text);
+    assert!(!refused.stdout, "a usage refusal goes to stderr");
     assert_eq!(
         gathers,
         Vec::<bool>::new(),
@@ -669,11 +709,119 @@ fn only_is_checked_before_the_facts_are_gathered_and_hands_over_only_where_it_re
         (&["--only", "base.shell.conpty"][..], false),
         (&["--read-only"][..], false),
         (&["--read-only", "--only", "privacy"][..], false),
+        (&["--json"][..], false),
+        (&["--json", "--only", "base.privacy.devtools"][..], false),
     ] {
         let (ran, gathers) = run_as(&scratch, Mark::Ok, words, false, None);
         assert!(ran.code <= 1, "{words:?}: {}", ran.text);
         assert_eq!(gathers, vec![hand_over], "{words:?}: gathered once");
     }
+}
+
+/// A run's reads over `scratch`: what it answered, the `--only` words each gather was
+/// handed, and how many times the packages were read.
+fn reads(scratch: &Scratch, words: &[&str]) -> (Ran, Vec<Vec<String>>, usize) {
+    let ground = scratch.ground();
+    let state = scratch.root.join("state");
+    let gathers = std::sync::Mutex::new(Vec::new());
+    let packages = std::sync::atomic::AtomicUsize::new(0);
+    let ran = super::run(
+        &args(words),
+        &Ports {
+            gather: &|_, only| {
+                gathers.lock().unwrap().push(only.to_vec());
+                facts(Mark::Ok)
+            },
+            ground: Some(&ground),
+            packages: &|| {
+                packages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                scratch.packages()
+            },
+            state: Some(&state),
+            not_own_account: None,
+            develop: None,
+        },
+    );
+    (ran, gathers.into_inner().unwrap(), packages.into_inner())
+}
+
+/// `--ONLY NARROWS WHAT IS READ, NOT ONLY WHAT IS PRINTED`: the help's "shell usability
+/// alone" check reads no package row (no word names one) and hands the gather its words, so
+/// it reads only the shell's facts; a word is judged by the names alone, so a packages row
+/// this machine does not report is still a name. NEGATIVE CONTROL: with no words the
+/// packages are read once, and a repair that changed something reads them again after it
+/// (the first read, made beside the repairs, may be stale).
+#[test]
+fn only_reads_what_its_words_name() {
+    let scratch = Scratch::new("only-reads");
+    let (ran, gathers, packages) = reads(&scratch, &["--read-only", "--only", "base.shell.starts"]);
+    assert_eq!(ran.code, 0, "{}", ran.text);
+    assert_eq!(packages, 0, "no word names a packages row");
+    assert_eq!(gathers, [["base.shell.starts"]]);
+
+    let (ran, _, packages) = reads(
+        &scratch,
+        &["--read-only", "--only", "base.pkg.toolset.platform"],
+    );
+    assert!(
+        ran.code <= 1,
+        "a name, read and not reported here: {}",
+        ran.text
+    );
+    assert_eq!(packages, 1);
+
+    let (ran, gathers, packages) = reads(&scratch, &["--read-only"]);
+    assert!(ran.code <= 1, "{}", ran.text);
+    assert_eq!(packages, 1, "no words: read once");
+    assert_eq!(gathers, [Vec::<String>::new()]);
+
+    let broken = broken("only-reads-changed");
+    let (ran, _, packages) = reads(&broken, &["--json"]);
+    assert!(
+        report(&ran)
+            .items
+            .iter()
+            .any(|row| row.outcome == Outcome::Changed),
+        "{}",
+        ran.text
+    );
+    assert_eq!(packages, 2, "read again after the repair changed something");
+}
+
+/// THE PACKAGES ARE READ BESIDE THE GATHER, NOT AFTER IT: each waits on the same two-party
+/// barrier, which only a run that starts both at once passes. The one-minute wait is the
+/// hang detector a serial run trips (the gather then the repairs then the packages: the
+/// gather's wait never returns).
+#[test]
+fn the_packages_are_read_beside_the_gather() {
+    let scratch = Scratch::new("beside");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ground = scratch.ground();
+        let both = std::sync::Barrier::new(2);
+        let ran = super::run(
+            &args(&["--read-only"]),
+            &Ports {
+                gather: &|_, _| {
+                    both.wait();
+                    facts(Mark::Ok)
+                },
+                ground: Some(&ground),
+                packages: &|| {
+                    both.wait();
+                    Vec::new()
+                },
+                state: None,
+                not_own_account: None,
+                develop: None,
+            },
+        );
+        let _ = tx.send(ran.code);
+    });
+    let code = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the gather and the packages' read never met: one waited for the other");
+    assert!(code <= 1);
 }
 
 /// OUTSIDE THE ACCOUNT'S OWN SHELL (root, another `$HOME`, an isolated instance's private
@@ -999,7 +1147,7 @@ fn run_developing(
     let ran = super::run(
         &args(words),
         &Ports {
-            gather: &|fix| {
+            gather: &|fix, _| {
                 gathers.borrow_mut().push(fix);
                 facts(Mark::Ok)
             },

@@ -67,6 +67,10 @@ pub struct UpOpts {
     /// instance rerouting, so `claude --by-name` runs stub → twin → store as the owner's sessions
     /// do.
     pub reroute: bool,
+    /// `LAB_HOME_IMAGE=<size>` (`16g`): the scratch's `home/` is a sparse APFS image of that size,
+    /// a volume of its own, which the `down` that removes the scratch detaches
+    /// ([`home_image_refused`], [`detach_home_image`]).
+    pub home_image: Option<String>,
 }
 
 impl UpOpts {
@@ -96,8 +100,83 @@ impl UpOpts {
             clock: set("LAB_CLOCK"),
             window: false,
             reroute: set("LAB_REROUTE"),
+            home_image: Some(var("LAB_HOME_IMAGE")).filter(|v| !v.is_empty()),
         }
     }
+}
+
+/// The most a lab's home image may be ([`UpOpts::home_image`]), in GiB.
+pub const HOME_IMAGE_MAX_GIB: u64 = 64;
+
+/// What the host must keep free beyond a home image's size before `up` makes one: the image is
+/// sparse, so it takes the host's space only as the lab fills it, and a lab that fills it must not
+/// be what fills the host.
+pub const HOME_IMAGE_SPARE_GIB: u64 = 8;
+
+/// The size of a home image `size` names (`<n>g` or `<n>m`, `hdiutil`'s spelling), in bytes, or
+/// why it is refused: none, a size of no image, or one past [`HOME_IMAGE_MAX_GIB`].
+pub fn home_image_bytes(size: &str) -> Result<u64, String> {
+    let (n, shift) = match (size.strip_suffix('g'), size.strip_suffix('m')) {
+        (Some(n), _) => (n, 30),
+        (_, Some(n)) => (n, 20),
+        _ => return Err(format!("LAB_HOME_IMAGE={size}: a size is <n>g or <n>m")),
+    };
+    let n: u64 = n
+        .parse()
+        .ok()
+        .filter(|_| n.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| format!("LAB_HOME_IMAGE={size}: a size is <n>g or <n>m"))?;
+    let bytes = n.saturating_mul(1u64 << shift);
+    if !((1 << 30)..=HOME_IMAGE_MAX_GIB << 30).contains(&bytes) {
+        return Err(format!(
+            "LAB_HOME_IMAGE={size}: an image is 1 GiB to {HOME_IMAGE_MAX_GIB} GiB"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Why `up` makes no home image of `size` with `free` bytes free on the host's volume (`None`:
+/// unknown): a size [`home_image_bytes`] refuses, or less free than the image could take plus
+/// [`HOME_IMAGE_SPARE_GIB`].
+pub fn home_image_refused(size: &str, free: Option<u64>) -> Option<String> {
+    let bytes = match home_image_bytes(size) {
+        Ok(b) => b,
+        Err(e) => return Some(e),
+    };
+    let need = bytes.saturating_add(HOME_IMAGE_SPARE_GIB << 30);
+    match free {
+        Some(f) if f >= need => None,
+        free => Some(format!(
+            "LAB_HOME_IMAGE={size}: the host has {} free, and a home image of {} GiB needs {} GiB \
+             free so the lab cannot be what fills the host",
+            free.map_or_else(
+                || "an unknown amount".to_owned(),
+                |f| format!("{} GiB", f >> 30)
+            ),
+            bytes >> 30,
+            need >> 30
+        )),
+    }
+}
+
+/// The home image `up` attaches for the run in `run_dir` (`home.sparseimage` there), at its
+/// scratch's `home/` ([`Run::home_image`]).
+fn home_image_file(run_dir: &Path) -> PathBuf {
+    run_dir.join("home.sparseimage")
+}
+
+/// Detach the home image of the run in `run_dir` from its scratch's `home/`, when one is attached
+/// there, and remove its file ([`crate::disk_lane::detach_at`]). Only a scratch that may go is
+/// detached ([`sweep_copies`], [`abort`]'s removal): a copy a scratch hold ([`HELD`]) keeps in
+/// place lies on the image, and detaching the image takes the copy's directory away as surely as
+/// removing it would.
+/// # Errors
+/// A volume is still mounted there.
+fn detach_home_image(run_dir: &Path) -> Result<(), String> {
+    crate::disk_lane::detach_at(
+        &run_dir.join("scratch").join("home"),
+        &home_image_file(run_dir),
+    )
 }
 
 /// The managed Claude Code, launched by path (not through its shim) ([`pkg_which`]), or
@@ -450,8 +529,16 @@ fn copies_may_go(dir: &Path, ran: bool, now: std::time::SystemTime) -> bool {
     ran || fs::symlink_metadata(dir).is_err() || aterm_uds::deadline::copy_may_go(dir, now)
 }
 
-/// The words for a directory of copies kept because none was shown to run.
+/// The words for a directory of copies kept because none was shown to run, or a scratch kept
+/// because its home is a volume still attached ([`detach_home_image`]).
 pub(crate) fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
+    if crate::disk_lane::mounted_at(&dir.join("home")) {
+        return format!(
+            "KEPT {}: its home is an image still attached; {LAB} {verb} {tag} detaches it and \
+             removes it",
+            dir.display()
+        );
+    }
     format!(
         "KEPT {}: a program copied there was started and never showed it ran, so macOS may \
          still be assessing its first exec; {LAB} {verb} {tag} removes it once {} minutes have \
@@ -463,9 +550,10 @@ pub(crate) fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
 
 /// Remove the directories of copies in `run_dir` that may go at `now` ([`copies_may_go`]): the
 /// lab's program's (`relay/`, `bin/`), the clock's clone of Claude Code (`clock/`), an older lab
-/// program's twin probe (`twin-src/`), and the scratch with its holds ([`scratch_may_go`]).
-/// Returns the ones kept. `unstamped`: a stamp [`stamp_holds`] owed was not written, so what it
-/// stamps stays unless shown to run or gone.
+/// program's twin probe (`twin-src/`), and the scratch with its holds ([`scratch_may_go`]), its
+/// home image detached first ([`detach_home_image`]; a scratch whose image stays attached is
+/// kept). Returns the ones kept. `unstamped`: a stamp [`stamp_holds`] owed was not written, so
+/// what it stamps stays unless shown to run or gone.
 fn sweep_copies(
     run_dir: &Path,
     relay_ran: bool,
@@ -491,6 +579,14 @@ fn sweep_copies(
         ),
     ] {
         if !may_go {
+            kept.push(at(d));
+            continue;
+        }
+        // A home image comes down only with the scratch it holds: once no hold keeps a copy on it.
+        if d == "scratch"
+            && let Err(e) = detach_home_image(run_dir)
+        {
+            eprintln!("aterm-lab: {e}");
             kept.push(at(d));
             continue;
         }
@@ -571,7 +667,13 @@ fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
     if run.sockdir.starts_with("/tmp/at.") {
         let _ = fs::remove_dir_all(&run.sockdir);
     }
-    if unproven || held {
+    // A home image stays attached while its scratch stays: a copy a hold keeps lies on it, and
+    // the `down` that removes the scratch detaches it ([`sweep_copies`]).
+    let attached = !(unproven || held)
+        && detach_home_image(&run.run)
+            .map_err(|e| eprintln!("aterm-lab: {e}"))
+            .is_err();
+    if unproven || held || attached {
         // its wait runs from here; one that cannot be stamped is stamped by the next down or up
         let _ = stamp_holds(&run.run);
         let env = run.run.join("env.sh");
@@ -580,7 +682,8 @@ fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
         }
         // `down` loads `env.sh`; when it could not be written, the next `up` sweeps (`room_for`)
         let verb = if env.is_file() { "down" } else { "up" };
-        eprintln!("aterm-lab: {}", kept_copies(&run.run, verb, &run.tag));
+        let dir = if attached { &run.w } else { &run.run };
+        eprintln!("aterm-lab: {}", kept_copies(dir, verb, &run.tag));
     } else {
         let _ = fs::remove_dir_all(&run.run);
     }
@@ -1091,9 +1194,30 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     run.seam = if o.restore { "1" } else { "0" }.into();
     run.window = if o.window { "1" } else { "0" }.into();
     let w = run.w.clone();
+    if let Some(size) = &o.home_image {
+        if let Some(why) =
+            home_image_refused(size, aterm_agent::harness::disk::free_bytes(&p.state))
+        {
+            return Err(Fail::exit(3, why));
+        }
+        let home = w.join("home");
+        let file = home_image_file(&run.run);
+        let image = crate::disk_lane::Image::attach_at(&file, &home, size, "atermlabhome")
+            .map_err(|e| abort(&run, &[], &format!("the home image: {e}")))?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+            .map_err(|e| abort(&run, &[], &format!("the home image's root: {e}")))?;
+        image.leave();
+        run.home_image = file.to_string_lossy().into_owned();
+        run.save();
+    }
     for d in crate::protected::SCRATCH_DIRS {
-        fs::create_dir_all(w.join(d))
-            .map_err(|e| Fail::die(format!("cannot make {}: {e}", w.join(d).display())))?;
+        fs::create_dir_all(w.join(d)).map_err(|e| {
+            abort(
+                &run,
+                &[],
+                &format!("cannot make {}: {e}", w.join(d).display()),
+            )
+        })?;
     }
     if o.reroute {
         let laid = crate::reroute_prefix::lay(
@@ -1681,6 +1805,8 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     for d in ["shim", "gbin"] {
         let _ = fs::remove_dir_all(r.run.join(d));
     }
+    // Once the logs above are kept (the transcripts they copy lie on a home image), and only with
+    // the scratch, once no hold keeps a copy there: the sweep detaches a home image.
     clear_run_dir(
         &r.run,
         relay_ran,
@@ -2352,6 +2478,30 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_home_image_is_sized_in_hdiutils_spelling_and_needs_room_past_itself() {
+        assert_eq!(home_image_bytes("16g"), Ok(16 << 30));
+        assert_eq!(home_image_bytes("2048m"), Ok(2 << 30));
+        for bad in [
+            "", "g", "16", "16G", "-1g", "+1g", "1.5g", "16gb", "16é", "512m", "65g",
+        ] {
+            assert!(home_image_bytes(bad).is_err(), "{bad:?}");
+        }
+        assert!(home_image_bytes(&format!("{}g", u64::MAX)).is_err());
+        let need = (16 + HOME_IMAGE_SPARE_GIB) << 30;
+        assert_eq!(home_image_refused("16g", Some(need)), None);
+        let short = home_image_refused("16g", Some(need - 1)).expect("refused");
+        assert!(short.contains("needs 24 GiB"), "{short}");
+        assert!(
+            home_image_refused("16g", None).is_some(),
+            "unknown free space"
+        );
+        assert!(
+            home_image_refused("16", Some(u64::MAX)).is_some(),
+            "no size"
+        );
     }
 
     #[test]
@@ -3027,6 +3177,56 @@ mod tests {
             }
             let _ = fs::remove_dir_all(root.path().join("runs"));
         }
+    }
+
+    /// A home image (`LAB_HOME_IMAGE`) holds the scratch's `home/`, so it comes down only with the
+    /// scratch: an aborted up whose scratch a hold keeps leaves it attached, as does a down before
+    /// the hold is spent, and the down that removes the scratch detaches it and removes its file.
+    /// Before this `abort` and `down` detached it whatever was held, taking a held copy's
+    /// directory away while macOS might still be assessing its first exec.
+    #[test]
+    fn a_home_image_comes_down_only_with_its_scratch() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut run = half_made(root.path());
+        // The lab program's copy showed it ran, so only the scratch's hold keeps the run.
+        fs::write(run.run.join(BIN_RAN), "").unwrap();
+        let image = home_image_file(&run.run);
+        fs::write(&image, "a stand-in for the image's file").unwrap();
+        run.home_image = image.to_string_lossy().into_owned();
+        run.save();
+        let clone = run.w.join("home/clone");
+        fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        fs::write(&clone, "data, not an executable").unwrap();
+        hold_scratch(&run.run, "reroute").unwrap();
+        let hold = run.run.join(HELD).join("reroute");
+        aterm_uds::deadline::stamp_exec(&hold);
+        let failed = abort(&run, &[], "probe failed");
+        assert_eq!(failed.msg.as_deref(), Some("probe failed"));
+        assert!(clone.is_file(), "an aborted up keeps a held scratch");
+        assert!(image.is_file(), "and its home image");
+        let now = std::time::SystemTime::now();
+        let unstamped = !stamp_holds(&run.run);
+        clear_run_dir(&run.run, false, unstamped, &run.tag, now);
+        assert!(
+            clone.is_file(),
+            "a down before the hold is spent keeps the scratch"
+        );
+        assert!(image.is_file(), "and its home image");
+        assert!(run.run.join("env.sh").is_file(), "and its record");
+        // A deterministic restart observation spends the awake-clock stamp.
+        fs::write(
+            hold.join(aterm_uds::deadline::EXEC_STAMP),
+            u64::MAX.to_string(),
+        )
+        .unwrap();
+        let unstamped = !stamp_holds(&run.run);
+        clear_run_dir(&run.run, false, unstamped, &run.tag, now);
+        assert!(!clone.exists(), "the down that removes the scratch");
+        assert!(
+            !image.exists(),
+            "detaches its home image and removes its file"
+        );
+        assert!(room_for(&run, now).is_ok(), "custody is resolved");
     }
 
     #[test]

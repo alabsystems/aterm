@@ -574,12 +574,18 @@ const MAX_HOPS: usize = 40;
 /// `path` with every link on it resolved, one component at a time.
 #[must_use]
 pub fn resolve_local(path: &Path, table: &Table) -> Option<PathBuf> {
-    resolve_local_reading(path, table).ok().flatten()
+    resolve_local_reading(path, table, false).ok().flatten()
 }
 
 /// A local resolution, a positively remote/automounted path (`Ok(None)`),
-/// or an unknown reading.
-fn resolve_local_reading(path: &Path, table: &Table) -> std::io::Result<Option<PathBuf>> {
+/// or an unknown reading. `dangling`: a component that is not there ends the walk with the
+/// place it names, the rest of the path beneath it as written (nothing past it exists to
+/// follow); otherwise it is an unknown reading.
+fn resolve_local_reading(
+    path: &Path,
+    table: &Table,
+    dangling: bool,
+) -> std::io::Result<Option<PathBuf>> {
     use std::collections::VecDeque;
     use std::path::Component;
     if !table.complete || !path.is_absolute() {
@@ -611,12 +617,26 @@ fn resolve_local_reading(path: &Path, table: &Table) -> std::io::Result<Option<P
         if !local_at(&next, table)? {
             return Ok(None);
         }
-        let meta = std::fs::symlink_metadata(&next).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!("{} could not be resolved: {error}", next.display()),
-            )
-        })?;
+        let meta = match std::fs::symlink_metadata(&next) {
+            Ok(meta) => meta,
+            Err(error) if dangling && error.kind() == std::io::ErrorKind::NotFound => {
+                let mut named = next;
+                for part in todo {
+                    if part == ".." {
+                        named.pop();
+                    } else {
+                        named.push(part);
+                    }
+                }
+                return Ok(Some(named));
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{} could not be resolved: {error}", next.display()),
+                ));
+            }
+        };
         if !meta.file_type().is_symlink() {
             at = next;
             continue;
@@ -666,7 +686,7 @@ fn local_at(path: &Path, table: &Table) -> std::io::Result<bool> {
     Ok(m.local && !m.automounted)
 }
 
-/// Clause 5's facts: where every link in `dirs` resolves.
+/// Clause 5's facts: where every link in `dirs` resolves, and where one that dangles points.
 ///
 /// # Errors
 /// A folder could not be listed, exceeded [`MAX_LINKS`], or a link failed to resolve.
@@ -678,7 +698,7 @@ pub fn inbound_links(dirs: &[PathBuf], table: Option<&Table>) -> Result<Vec<Path
     };
     let mut out = Vec::new();
     for dir in dirs {
-        let placed = match resolve_local_reading(dir, table) {
+        let placed = match resolve_local_reading(dir, table, false) {
             Ok(Some(placed)) => placed,
             Ok(None) => {
                 return Err(format!(
@@ -720,7 +740,7 @@ pub fn inbound_links(dirs: &[PathBuf], table: Option<&Table>) -> Result<Vec<Path
                             to.display()
                         ));
                     }
-                    if resolve_local_reading(&to, table)
+                    if resolve_local_reading(&to, table, false)
                         .map_err(|error| error.to_string())?
                         .is_none()
                     {
@@ -743,7 +763,7 @@ pub fn inbound_links(dirs: &[PathBuf], table: Option<&Table>) -> Result<Vec<Path
             } else {
                 placed.join(to)
             });
-            match resolve_local_reading(&link, table).map_err(|error| error.to_string())? {
+            match resolve_local_reading(&link, table, true).map_err(|error| error.to_string())? {
                 Some(real) => out.push(real),
                 None => {
                     return Err(format!(

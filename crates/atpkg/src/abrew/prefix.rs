@@ -452,6 +452,19 @@ impl Prefix {
 
     #[must_use]
     /// Returns the tap-qualified name for `inst`.
+    /// The name as a user specifies it: the full name with an
+    /// official tap prefix stripped (brew's full_name omits the
+    /// core/cask tap).
+    pub fn specified_name(&self, inst: &Installed) -> String {
+        let full = self.full_name(inst);
+        for tap in ["homebrew/core/", "homebrew/cask/"] {
+            if let Some(rest) = full.strip_prefix(tap) {
+                return rest.to_string();
+            }
+        }
+        full
+    }
+
     pub fn full_name(&self, inst: &Installed) -> String {
         let dir = match inst.kind {
             Kind::Formula => self.keg(&inst.name, &inst.version),

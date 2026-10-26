@@ -63,7 +63,11 @@ fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32
         }
     };
     let mut progress = Progress::resume(sys, &layout.run_dir(run));
-    let mut facts = crate::facts::gather(sys);
+    let mut facts = if matches!(envelope.action, Action::Facts) {
+        crate::facts::gather(sys)
+    } else {
+        crate::facts::gather_without_keyboards(sys)
+    };
     facts.cached = super::hello::cached(sys, layout);
     let mut report = HostReport {
         schema: crate::SCHEMA,
@@ -80,7 +84,9 @@ fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32
     let outcome = match envelope.action {
         Action::Plan | Action::Apply => {
             report.mode = envelope.action.mode().unwrap_or(Mode::Plan);
-            baseline_run(sys, layout, &envelope, facts, run, &mut progress)
+            let rows = baseline_run(sys, layout, &envelope, &mut facts, run, &mut progress);
+            report.facts = facts.clone();
+            rows
         }
         Action::Facts => {
             report.mode = Mode::Plan;
@@ -265,7 +271,7 @@ fn baseline_run(
     sys: &dyn System,
     layout: &Layout,
     e: &Envelope,
-    facts: HostFacts,
+    facts: &mut HostFacts,
     run: &str,
     progress: &mut Progress<'_>,
 ) -> Result<Vec<ItemReport>, String> {
@@ -274,6 +280,13 @@ fn baseline_run(
         .as_deref()
         .ok_or_else(|| "the envelope carries no baseline".to_owned())?;
     let baseline = crate::baseline::parse(text)?;
+    if baseline
+        .keyboard
+        .as_ref()
+        .is_some_and(|table| table.caps_lock.is_some())
+    {
+        facts.keyboards = crate::facts::inventory_keyboards(sys);
+    }
     let mut users: Vec<User> = Vec::with_capacity(baseline.users.len());
     for name in &baseline.users {
         users.push(crate::facts::user(sys, name)?);
@@ -283,8 +296,8 @@ fn baseline_run(
         .as_ref()
         .and_then(|c| crate::facts::user(sys, c).ok());
     let ctx = Ctx {
-        disrupt: may_disrupt(e, &facts),
-        facts,
+        disrupt: may_disrupt(e, facts),
+        facts: facts.clone(),
         users,
         console,
         host_name: e.host_name.clone(),
@@ -333,6 +346,7 @@ fn row(id: &str, family: &str, title: String) -> ItemReport {
         explain: None,
         stood_aside: None,
         essential: false,
+        elapsed_ms: None,
     }
 }
 

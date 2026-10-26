@@ -13,6 +13,7 @@ fn startup_answering(
 ) -> LiveSetupStartup<impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer> {
     LiveSetupStartup {
         offer,
+        review: Review::Offered,
         receipt: None,
         authorization: None,
         last_failure: None,

@@ -1,0 +1,14 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the stub's 401 (`invalid x-api-key`) on a turn under the fake `apiKeyHelper` key: Claude Code retries it (`401 invalid x-api-key · Retrying in Ns · attempt k/10`), the composer under it, 2.1.310
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+
+✻ 401 invalid x-api-key · Retrying in 8s · attempt 6/10
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt

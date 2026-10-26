@@ -32,7 +32,7 @@ pub use reading::{OccupancyReading, SlotsSeen};
 pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, WakeSight, decide};
 pub use said::{OccupancySaid, SaidHold, SaidReadyIdle, SaidRule, SaidVerdict, SaidWake};
 pub use templates::FactLine;
-pub use wakes_seen::{WakeClaim, WakeDoor, WakeSeen, WakesSeen};
+pub use wakes_seen::{WakeClaim, WakeDoor, WakeFacts, WakeSeen, WakesSeen};
 
 #[cfg(any(test, debug_assertions))]
 pub use door_environment::occupancy_door_environment;
@@ -146,16 +146,16 @@ pub mod fault {
         /// kind told from one wake's typed row, as the hold's is held: a successor never tells
         /// the session's next wake.
         KindWideWakeSeed,
-        /// The break's write takes a due wake's line under `prompt` as any rule's, before the
-        /// write that lands it (the slice-2 plan's 2.8).
-        WakeTypedEarly,
-        /// The task door notes a managed session's wake line as any rule's, before the write that
-        /// lands it (the slice-2 plan's 2.8).
-        WakeNotedEarly,
         /// The loop's K clock is fed a wake's line, as the window's own wake K clock is.
         WakeFeedsK,
         /// A read of the book keeps the told wakes it no longer names.
         WakeToldKept,
+        /// [`host_step_may_go`](super::door::host_step_may_go) lets the host's own step (the
+        /// upgrade's notice) go before a due wake's line (§2.1's ranks 2 and 3 turned).
+        HostBeforeWake,
+        /// The wake's line carries words the agent wrote beside its template's closed words: its
+        /// last words on the screen, where the label it declared shows.
+        TemplateEchoesLabel,
     }
 
     thread_local! {
@@ -225,10 +225,10 @@ pub(crate) mod fault {
         NoteOnManagedAlone,
         ManagedUnread,
         KindWideWakeSeed,
-        WakeTypedEarly,
-        WakeNotedEarly,
         WakeFeedsK,
         WakeToldKept,
+        HostBeforeWake,
+        TemplateEchoesLabel,
     }
 
     /// The shipped build: never armed.

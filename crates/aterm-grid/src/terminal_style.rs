@@ -171,6 +171,9 @@ pub struct SavedCursorState {
     pub pending_wrap: bool,
     /// Underline color at save time (SGR 58/59).
     pub underline_color: Option<u32>,
+    /// A resize changed the screen's size since the save, so the reflow may have moved a
+    /// pending wrap off the line end it was armed at.
+    pub resized: bool,
 }
 
 #[cfg(test)]

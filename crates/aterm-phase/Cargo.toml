@@ -16,10 +16,12 @@ description = "aterm — the worker-phase reader: busy | prompt | limited | idle
 [lints]
 workspace = true
 
-# No dependencies, by design: the reader is pure functions over `&[String]` rows, linked by
+# One dependency, by design: the reader is pure functions over `&[String]` rows, linked by
 # `aterm-agent` (`aterm drive`) and `aterm-gui` (the server's agent verdict, relayed by the
-# fabric as `phase=`).
+# fabric as `phase=`). It names a program's agent by aterm-agent-names, the one name table,
+# which a crate deny.toml keeps from the reader reads directly.
 [dependencies]
+aterm-agent-names = { workspace = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }

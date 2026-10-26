@@ -143,6 +143,17 @@ pub const fn segment_depth_advance(matched_depth: u64, candidate_depth: u64) -> 
     }
 }
 
+/// `sync_clamp_parent_count` as `sync_island.rs` defines it in Clean:
+/// `if len < cap then len else cap`.
+#[must_use]
+pub const fn sync_clamp_parent_count(len: u64, cap: u64) -> u64 {
+    if len < cap {
+        len
+    } else {
+        cap
+    }
+}
+
 #[cfg(test)]
 #[path = "../twin_answers.rs"]
 mod twin_answers;
@@ -234,6 +245,12 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::segment_depth_advance(a, b)), want);
+        let want = "000011012";
+        assert_eq!(
+            answers(|[a, b]| crate::sync::sync_clamp_parent_count(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::sync_clamp_parent_count(a, b)), want);
     }
 
     // Not vacuous: `heal_frontier_monotone` with its branches swapped answers otherwise.

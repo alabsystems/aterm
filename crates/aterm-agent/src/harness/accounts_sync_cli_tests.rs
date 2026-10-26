@@ -599,13 +599,18 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
 
 #[test]
 fn unreadable_pool_state_and_bindings_are_refused_by_inventory_and_dashboard() {
-    for damaged in ["state", "logins"] {
+    for (damaged, kept) in ["state", "logins"]
+        .into_iter()
+        .flat_map(|damaged| [(damaged, false), (damaged, true)])
+    {
         let bed = Bed::new("dashboard-refused");
-        fs::write(
-            bed.roster(Cli::Kimi),
-            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
-        )
-        .unwrap();
+        if kept {
+            fs::write(
+                bed.roster(Cli::Kimi),
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+            )
+            .unwrap();
+        }
         let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
         store.ensure().unwrap();
         let path = if damaged == "state" {
@@ -621,6 +626,41 @@ fn unreadable_pool_state_and_bindings_are_refused_by_inventory_and_dashboard() {
         assert!(!html.contains("<code>main</code>"), "{html}");
         assert_eq!(fs::read(&path).unwrap(), b"{");
     }
+}
+
+#[test]
+fn pool_inventory_recovers_an_admitted_login_before_reading_the_card() {
+    let bed = Bed::new("dashboard-recovery");
+    fs::write(
+        bed.roster(Cli::Kimi),
+        "[[account]]\nlabel='main'\nclass='dedicated'\nemail='owner@example.com'\nregion='global'\n",
+    )
+    .unwrap();
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let renew = |dir: &str| {
+        store.transact_logins(NOW, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state, logins, "main", None, dir, None, NOW,
+            ))
+        })
+    };
+    renew("/old").unwrap();
+    let witness = store.state_witness_file();
+    let retained = witness.with_extension("retained");
+    fs::rename(&witness, &retained).unwrap();
+    fs::create_dir(&witness).unwrap();
+    assert!(renew("/new").is_err());
+    assert!(store.load(NOW).is_err(), "publication was admitted");
+    fs::rename(&witness, witness.with_extension("obstruction")).unwrap();
+    fs::rename(&retained, &witness).unwrap();
+
+    let pools = cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW);
+    assert_eq!(cli_pools_words(&pools).as_deref(), Some("kimi 1"));
+    assert_eq!(
+        pools[0].rows.as_ref().unwrap().rows[0].dir.as_deref(),
+        Some("/new")
+    );
+    assert_eq!(pools[0].state.account("main").auth, accounts::Auth::Ok);
 }
 
 /// A Grok row's background renewal starts on macOS too, now that its sign-in runs under the

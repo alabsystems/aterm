@@ -71,6 +71,14 @@ fn state(book: &WakeBook, ord: u16) -> WakeState {
     book.get(ord).expect("in the book").state
 }
 
+/// A loop door's claim on `ord` granted by the book: its ready since, no slots (the host's).
+fn granted(book: &WakeBook, ord: u16) -> WakeClaim {
+    WakeClaim::Granted(WakeFacts {
+        ready_since_ms: book.get(ord).expect("in the book").ready_since_ms,
+        slots: None,
+    })
+}
+
 fn ready() -> (WakeBook, u16, u64) {
     let (mut book, ord) = declared("label=t when=file:~/scratch.noindex/x/flag");
     let seen = Lv {
@@ -485,7 +493,7 @@ fn a_claim_after_told_is_refused() {
     );
     assert_eq!(
         book.claim(ord, episode, WakeDoor::Break, T0),
-        WakeClaim::Granted
+        granted(&book, ord)
     );
     assert_eq!(
         book.claim(ord, episode, WakeDoor::Point, T0),
@@ -495,11 +503,22 @@ fn a_claim_after_told_is_refused() {
         !book.told(ord, episode, WakeDoor::Point, T0),
         "not its claim"
     );
-    assert!(book.release(ord, episode));
+    assert!(
+        !book.release(ord, episode, WakeDoor::Point),
+        "not its claim to give back"
+    );
+    assert!(matches!(
+        state(&book, ord),
+        WakeState::Claimed {
+            door: WakeDoor::Break,
+            ..
+        }
+    ));
+    assert!(book.release(ord, episode, WakeDoor::Break));
     assert_eq!(state(&book, ord), WakeState::Ready);
     assert_eq!(
         book.claim(ord, episode, WakeDoor::Point, T0),
-        WakeClaim::Granted
+        granted(&book, ord)
     );
     assert!(book.told(ord, episode, WakeDoor::Point, T0 + 5));
     assert_eq!(
@@ -509,7 +528,10 @@ fn a_claim_after_told_is_refused() {
             at_ms: T0 + 5
         }
     );
-    assert!(!book.release(ord, episode), "a told wake is not released");
+    assert!(
+        !book.release(ord, episode, WakeDoor::Point),
+        "a told wake is not released"
+    );
     assert_eq!(
         book.claim(ord, episode, WakeDoor::Break, T0 + 6),
         WakeClaim::Gone
@@ -517,7 +539,7 @@ fn a_claim_after_told_is_refused() {
     let twice = fault::with(Fault::ClaimTwice, || {
         book.claim(ord, episode, WakeDoor::Break, T0 + 6)
     });
-    assert_eq!(twice, WakeClaim::Granted, "two tells");
+    assert_eq!(twice, granted(&book, ord), "two tells");
 
     let (mut book, ord) = declared("label=t when=file:~/a");
     let episode = book.get(ord).expect("declared").episode();
@@ -603,10 +625,10 @@ fn a_failed_answer_is_ready_again() {
     );
     assert_eq!(
         book.claim(ord, episode, WakeDoor::Break, T0 + 3 + UNHEARD_MS),
-        WakeClaim::Granted,
+        granted(&book, ord),
         "the one retell"
     );
-    assert!(book.release(ord, episode));
+    assert!(book.release(ord, episode, WakeDoor::Break));
     assert_eq!(state(&book, ord), answered);
     assert!(book.heard(ord, T0 + 9));
     assert_eq!(
@@ -631,12 +653,12 @@ fn an_answer_begins_on_a_ready_wake_and_is_heard_on_an_answered_one() {
     assert_eq!(state(&book, ord), WakeState::Ready);
     assert_eq!(
         book.claim(ord, episode, WakeDoor::Break, T0 + 2),
-        WakeClaim::Granted
+        granted(&book, ord)
     );
     assert!(!book.heard(ord, T0 + 3), "a door's claim is no answer");
     assert!(!book.answer_begin(ord, T0 + 3), "a door holds it");
     assert!(matches!(state(&book, ord), WakeState::Claimed { .. }));
-    assert!(book.release(ord, episode));
+    assert!(book.release(ord, episode, WakeDoor::Break));
 
     assert!(book.answer_begin(ord, T0 + 4));
     assert!(!book.heard(ord, T0 + 4), "its reply not written yet");
@@ -690,7 +712,7 @@ fn reconcile_with_a_typed_row_is_told() {
         let (mut book, ord, episode) = ready();
         assert_eq!(
             book.claim(ord, episode, WakeDoor::Break, T0 + 2),
-            WakeClaim::Granted
+            granted(&book, ord)
         );
         (book, ord, episode)
     };
@@ -875,7 +897,7 @@ fn a_held_wake_ends_at_its_by_or_with_its_agent() {
             let (mut book, ord, episode) = held(claim);
             assert_eq!(book.on_look(&lv, at), [(ord, Change::Expired(why))]);
             book.answer_done(ord, true, true, at + 1);
-            assert!(!book.release(ord, episode));
+            assert!(!book.release(ord, episode, WakeDoor::Break));
             assert!(!book.told(ord, episode, WakeDoor::Break, at + 1));
             assert_eq!(state(&book, ord), WakeState::Expired { why }, "{claim}");
             assert!(book.seen().wakes.is_empty());

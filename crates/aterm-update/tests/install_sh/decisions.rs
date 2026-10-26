@@ -1080,6 +1080,132 @@ fn the_console_owner_is_dev_consoles_uid() {
     assert_eq!(recs[call].out.trim(), owner.to_string());
 }
 
+/// The run opens the app it installed only for a person at this Mac's screen (the installing
+/// account owns `/dev/console`, never root) whose stdout is a terminal, with no SSH session, CI or
+/// `--no-open` (`NO_OPEN`); every other run keeps the printed launch line. An `open` that fails
+/// ends on that launch line too.
+#[test]
+fn the_app_opens_itself_only_for_a_person_at_the_screen() {
+    let scratch = Scratch::new();
+    let stubs = scratch.mkdir("stubs");
+    scratch.stand_in(
+        "stubs/open",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$OPEN_LOG\"\nexit \"${OPEN_RC:-0}\"\n",
+    );
+    let app = "/Applications/aterm.app";
+    /// (environment, console owner, euid, stdout a terminal, open's status) -> (opens, says the
+    /// launch command)
+    type Row = (
+        (&'static str, &'static str, &'static str, &'static str, u8),
+        (&'static str, bool),
+    );
+    let opened = ("1", false);
+    let closed = ("0", false);
+    let rows: &[Row] = &[
+        (("", "501", "501", "1", 0), opened),
+        (
+            (
+                "SSH_CONNECTION='10.0.0.2 52000 10.0.0.1 22'",
+                "501",
+                "501",
+                "1",
+                0,
+            ),
+            closed,
+        ),
+        (("SSH_TTY=/dev/ttys004", "501", "501", "1", 0), closed),
+        (("CI=true", "501", "501", "1", 0), closed),
+        (("NO_OPEN=1", "501", "501", "1", 0), closed),
+        (("", "501", "501", "0", 0), closed),
+        (("", "502", "501", "1", 0), closed),
+        (("", "", "501", "1", 0), closed),
+        (("", "0", "0", "1", 0), closed),
+        (("", "501", "501", "1", 1), ("1", true)),
+    ];
+    let mut lib = Lib::new();
+    lib.env(
+        "PATH",
+        &format!("{}:{}", s(&stubs), crate::support::system_path()),
+    );
+    let calls: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, ((env, console, euid, tty, rc), _))| {
+            let log = scratch.join(&format!("open.{n}"));
+            lib.call(
+                format!(
+                    "export OPEN_LOG={log} OPEN_RC={rc}; : >\"$OPEN_LOG\"\n\
+                     ( if {env} app_opens_here '{console}' '{euid}' '{tty}'; then \
+                     open_installed_app {app} 1; fi )\n\
+                     OPENS=\"$(wc -l <\"$OPEN_LOG\" | tr -d ' ')\"; ARGV=\"$(cat \"$OPEN_LOG\")\"",
+                    log = q(s(&log))
+                ),
+                &["OPENS", "ARGV"],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((input, (opens, launch_line)), i) in rows.iter().zip(calls) {
+        let rec = &recs[i];
+        assert_eq!(rec.rc, 0, "{input:?}: {}", rec.err);
+        assert_eq!(rec.var("OPENS"), *opens, "{input:?}: {}", rec.out);
+        assert_eq!(
+            rec.out.lines().count(),
+            usize::from(*opens == "1"),
+            "{input:?}: one line when it opens, none when it leaves the launch line to install_app: {}",
+            rec.out
+        );
+        assert_eq!(
+            rec.out.contains(&format!("open {app}")),
+            *launch_line,
+            "{input:?}: {}",
+            rec.out
+        );
+        if *opens == "1" {
+            assert_eq!(
+                rec.var("ARGV"),
+                app,
+                "{input:?}: open gets the installed app alone"
+            );
+        }
+    }
+}
+
+/// A run that ends after install_app left its launch line to the opening (`APP_TO_OPEN`) and
+/// before the opening ran (a later half failing under `set -e`, a Ctrl-C) still prints that line,
+/// from the app half's EXIT cleanup; a run that opened the app, which clears `APP_TO_OPEN`, does
+/// not print it again.
+#[test]
+fn a_run_cut_before_the_opening_still_prints_the_launch_line() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let rows = [("/Applications/aterm.app", true), ("", false)];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(app, _)| {
+            lib.call(
+                format!(
+                    "( MNT= STAGE= STAGE_DIR= OLD= DEST=\"$TMPDIR/dest\"; \
+                     make_download_dir install_app_cleanup; APP_TO_OPEN={}; exit 3 ) || true",
+                    q(app)
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((app, says), call) in rows.iter().zip(calls) {
+        let rec = &recs[call];
+        assert_eq!(rec.rc, 0, "{app:?}: {}", rec.err);
+        assert_eq!(
+            rec.out.contains("launch:  open /Applications/aterm.app"),
+            *says,
+            "{app:?}: {}",
+            rec.out
+        );
+    }
+}
+
 /// The manifest parse reads the current keys; the retired Intel pair's keys are neither required nor read, so they can never masquerade as a zip.
 #[test]
 fn the_manifest_parse_ignores_the_retired_intel_pair() {

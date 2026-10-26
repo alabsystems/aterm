@@ -1499,12 +1499,15 @@ impl App {
 
     /// Attach-time focus adoption.
     pub(crate) fn adopt_initial_focus(&mut self, wid: WindowId, os_focus: Option<bool>) {
-        if let Some(focused) = os_focus
-            && self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.focused != focused)
-        {
+        let Some(focused) = os_focus else {
+            return;
+        };
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        // What the OS says of its key window is the look's input too (§14.11).
+        ws.os_key = focused;
+        if ws.focused != focused {
             self.on_focus(wid, focused);
         }
     }

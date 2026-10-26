@@ -481,7 +481,7 @@ fn keep_worker_texts(run: &Run, door: &Door, sids: &[String]) {
 }
 
 /// Every transcript under the scratch Claude home (`projects/*/*.jsonl`), each read through no link.
-fn transcripts(run: &Run) -> Vec<(PathBuf, Vec<Row>)> {
+pub(crate) fn transcripts(run: &Run) -> Vec<(PathBuf, Vec<Row>)> {
     let root = run.w.join("home/.claude/projects");
     let mut out = Vec::new();
     for dir in fs::read_dir(&root).into_iter().flatten().flatten() {

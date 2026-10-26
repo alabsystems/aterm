@@ -1136,6 +1136,76 @@ pub fn layout_visible_blocks(
     }
 }
 
+/// HOW FAR A READER AT `source_anchor` / `visual_row` HAS SHOWN THE DOCUMENT, as a source
+/// offset: through the last block whose bottom is inside a viewport `viewport_width` by
+/// `viewport_height` at `ty`, or into the block the viewport ends in by the share of its
+/// rows shown; the whole document once its last block is shown whole. The reader's
+/// progress counts this, so the end of a document reads 100% however far its last row is
+/// from the top.
+#[must_use]
+pub fn source_shown_through(
+    document: &MarkdownDocument,
+    source_anchor: usize,
+    visual_row: usize,
+    viewport_width: f32,
+    viewport_height: f32,
+    ty: ReaderType,
+) -> usize {
+    let layout = layout_visible_blocks(
+        document,
+        source_anchor,
+        visual_row,
+        viewport_width,
+        viewport_height,
+        ty,
+    );
+    let mut shown = source_anchor.min(document.source_len);
+    for block in &layout.blocks {
+        if block.y >= viewport_height {
+            break;
+        }
+        if block.y + block.height <= viewport_height + 0.5 {
+            shown = if block.index + 1 == document.blocks.len() {
+                document.source_len
+            } else {
+                block.source.end
+            };
+            continue;
+        }
+        let measure = measure_block(&document.blocks[block.index], viewport_width, ty);
+        let inset = (measure.height - measure.rows as f32 * measure.row_h).max(0.0) / 2.0;
+        let rows = ((viewport_height - block.y - inset).max(0.0) / measure.row_h.max(1.0)) as usize;
+        let through = block
+            .visual_row
+            .saturating_add(rows)
+            .min(block.total_visual_rows);
+        let into = block.source.len() * through / block.total_visual_rows.max(1);
+        shown = shown.max(block.source.start + into);
+        break;
+    }
+    shown.min(document.source_len)
+}
+
+/// [`source_shown_through`] for the source pane, which shows `rows` source lines from the
+/// line at `source_anchor`.
+#[must_use]
+pub fn source_lines_shown_through(
+    document: &MarkdownDocument,
+    source_anchor: usize,
+    rows: usize,
+) -> usize {
+    let current = document
+        .source_line_starts
+        .partition_point(|start| *start <= source_anchor)
+        .saturating_sub(1);
+    document
+        .source_line_starts
+        .get(current.saturating_add(rows.max(1)))
+        .copied()
+        .unwrap_or(document.source_len)
+        .min(document.source_len)
+}
+
 /// Number of reader rows in one block in a column `viewport_width` wide at `ty`.
 #[inline]
 #[must_use]

@@ -12,7 +12,7 @@ use std::process::ExitCode;
 /// The hello this host answers.
 #[must_use]
 pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
-    let facts = crate::facts::gather(sys);
+    let facts = crate::facts::gather_without_keyboards(sys);
     let hardware = crate::hardware::describe(&facts)
         .map(|d| d.parts().to_vec())
         .unwrap_or_default();
@@ -90,6 +90,11 @@ mod tests {
         fake.alive(77);
         fake.file("/A/state/last_run", b"1799999000-40\n");
         let h = hello(&fake, &layout);
+        assert!(
+            !fake.calls().iter().any(|call| call.contains("hidutil")),
+            "hello has no keyboard fact to report and must not search live devices: {:?}",
+            fake.calls()
+        );
         assert_eq!(h.schema, 1);
         assert_eq!(h.floors.len(), 1);
         assert_eq!(h.floors[0].serial, 41);

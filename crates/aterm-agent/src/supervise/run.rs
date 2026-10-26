@@ -6228,6 +6228,11 @@ impl<C: Ctl> Session<'_, C> {
                 self.say_hold(screen.seq, Some(HoldSaid::NoHostStep), review);
             }
             self.hold_background(screen, at, waited, settled, cfg, review);
+            // A due wake's line (§2.1 rank 2) first: typed, it is the break's one line.
+            if self.wake_first(screen, cfg, review)? {
+                *since = None;
+                return Ok(());
+            }
             // The stuck fact's own line (the occupancy design's §2.1 rank 4), before the nudges.
             let stuck = self.stuck_break(screen, (at, waited), false, cfg, review)?;
             if stuck {
@@ -6269,6 +6274,12 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.withheld = None;
         self.hold_said = None;
+        // A due wake's line (§2.1 rank 2) before the host's own step (rank 3, the upgrade's
+        // notice): typed, it is the break's one line, and the host's step waits a break.
+        if self.wake_first(screen, cfg, review)? {
+            *since = None;
+            return Ok(());
+        }
         let mut line_gone = None;
         if let Some((line, kind)) = host.at_background() {
             review.note(&format!("HOST seq={} background {line}", screen.seq));

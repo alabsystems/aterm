@@ -17,8 +17,8 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
         [--no-agent] [--no-wait]         join a vault (neither: the ALab vault; a trailing
                                          #<signer key> pins its signer, else confirm the
                                          fingerprint at a terminal), waiting up to 10 min
-                                         for approval unless --no-wait, and install the
-                                         subscriber unless --no-agent
+                                         for approval at a terminal unless --no-wait, and
+                                         install the subscriber unless --no-agent
   aterm secrets sync                     fetch and apply the latest version now
   aterm secrets watch                    the subscriber (agent on installs it): apply each
                                          new version; on an admin of a <url> vault, also
@@ -49,7 +49,8 @@ admin (a machine in [admins]):
                                          or piped), new (generated), open (none: every
                                          machine that asks is let in), off (close the vault
                                          or drop the password: machines wait for approval
-                                         by code); for a <url>, set, new and open also
+                                         by code); show and new print it only at a
+                                         terminal; for a <url>, set, new and open also
                                          install the subscriber where it does not run,
                                          unless --no-agent
   aterm secrets requests                 machines asking to join, with their codes
@@ -58,9 +59,10 @@ admin (a machine in [admins]):
                                          every one, asked at a terminal), or a key by name
                                          (how a machine joins a <path> vault)
   aterm secrets revoke <host|code> [--drop-sections]
-                                         permanently retire its Commons membership,
-                                         then remove it from the vault; a section naming only it
-                                         must be empty unless --drop-sections drops it too
+                                         remove it from the vault (first retiring its Commons
+                                         membership, where the vault has Commons control); a
+                                         section naming only it must be empty unless
+                                         --drop-sections drops it too
   aterm secrets retire <host|code|age1...>... permanently retire Commons membership alone;
                                          a full age key can name a device already removed
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
@@ -78,9 +80,10 @@ server and services:
                                          advertises <name>.local over mDNS: by default, on
                                          every address at port 7484, the ALab vault's name
                                          (--no-advertise: none)
-  aterm secrets agent [on|off|status] [--program <path>]
+  aterm secrets agent [on|off|status] [--program <path>] [--force]
                                          the subscriber as a launchd or systemd user job
-                                         (--program: the aterm it runs, else this aterm)
+                                         (--program: the aterm it runs, else this aterm;
+                                         on leaves one running as set up, unless --force)
   aterm secrets server [on|off|status] [--program <path>] [serve flags]
                                          serve as a launchd or systemd user job
 ";
@@ -184,6 +187,7 @@ enum Command {
     Agent {
         action: Action,
         program: Option<String>,
+        force: bool,
     },
     Server {
         action: Action,
@@ -610,13 +614,14 @@ fn parse(words: &[String]) -> Result<Command, String> {
             Ok(Command::Serve(rest.to_vec()))
         }
         "agent" => {
-            let f = flags(rest, &["--program"], &[])?;
+            let f = flags(rest, &["--program"], &["--force"])?;
             if f.operands.len() > 1 {
                 return Err("agent takes on, off or status".into());
             }
             Ok(Command::Agent {
                 action: action(f.operands.first(), "agent")?,
                 program: f.one("--program"),
+                force: f.has("--force"),
             })
         }
         "server" => {
@@ -653,7 +658,8 @@ mod unix {
         Action, Command, Fill, Password, SERVE_SWITCHES, SERVE_VALUED, flags, serve_settings,
     };
     use crate::client::{
-        self, Approval, JoinOptions, JoinOutcome, Membership, Paths, Published, SyncOutcome,
+        self, Approval, JoinEvent, JoinOptions, JoinOutcome, JoinPassword, Membership, Paths,
+        Published, SyncOutcome,
     };
     use crate::service::{self, Job};
     use crate::text::Audience;
@@ -693,7 +699,16 @@ mod unix {
     pub(super) fn run(command: Command) -> crate::Result<ExitCode> {
         let paths = Paths::live()?;
         let state = || service::state(&paths.home, Job::Subscriber);
-        let install = || install_subscriber(&paths, None);
+        // A command that needs an approver turns the subscriber on (clearing an off record)
+        // but keeps a program the job names that lasts ([`service::kept_program`]): only
+        // `agent on` and a join move it to this aterm.
+        let install = || {
+            let program = match service::kept_program(&paths.home, Job::Subscriber) {
+                Some(program) => program,
+                None => service::program_for_service()?,
+            };
+            install_subscriber(&paths, Some(program))
+        };
         let subscriber = Subscriber {
             state: &state,
             install: &install,
@@ -709,7 +724,9 @@ mod unix {
             } => join(&paths, &source, name, agent, wait, password_stdin),
             Command::Sync => sync(&paths),
             Command::Watch => {
-                client::watch(&paths, &|line| eprintln!("{} {line}", stamp()))?;
+                client::watch(&paths, &|line| {
+                    crate::log_line(&format!("{} {line}", stamp()));
+                })?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Ls => {
@@ -795,10 +812,14 @@ mod unix {
                 ))
             }
             Command::Serve(args) => serve(&paths, &args),
-            Command::Agent { action, program } => services(
+            Command::Agent {
+                action,
+                program,
+                force,
+            } => services(
                 &paths,
                 Job::Subscriber,
-                action,
+                (action, force),
                 program,
                 vec!["secrets".into(), "watch".into()],
             ),
@@ -809,7 +830,7 @@ mod unix {
             } => {
                 let mut args = vec!["secrets".to_string(), "serve".to_string()];
                 args.extend(serve);
-                services(&paths, Job::Server, action, program, args)
+                services(&paths, Job::Server, (action, false), program, args)
             }
         }
     }
@@ -843,6 +864,62 @@ mod unix {
 
     fn interactive() -> bool {
         std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    }
+
+    /// How long `join` waits for the approval: ten minutes at a terminal, unless `--no-wait`.
+    /// Without one (a script, an agent's tool) it returns at once with the approve command, and
+    /// the subscriber finishes the join.
+    pub(super) fn join_wait(wait: bool, interactive: bool) -> Duration {
+        if wait && interactive {
+            Duration::from_secs(600)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// What `password show` refuses with where nobody reads the terminal: the join password
+    /// admits a machine within seconds, so it never lands in a file or an agent's transcript.
+    const SHOWN_AT_A_TERMINAL: &str = "the join password is shown only at a terminal; approve the new Mac with aterm secrets approve <code>";
+
+    /// What `password new` says in place of the password it made where nobody reads the
+    /// terminal ([`SHOWN_AT_A_TERMINAL`]).
+    const NEW_SHOWN_AT_A_TERMINAL: &str =
+        "a new join password is set; it is shown only at a terminal (aterm secrets password there)";
+
+    /// `password show`: `password` on `out` when it is a terminal and no agent runs this
+    /// ([`aterm_types::domain::agent_marker`]), else nothing on it and a refusal.
+    pub(super) fn show_password(
+        out: &mut dyn Write,
+        at_terminal: bool,
+        agent: Option<&str>,
+        password: &SecretBytes,
+    ) -> crate::Result<ExitCode> {
+        if !at_terminal || agent.is_some() {
+            eprintln!("{SHOWN_AT_A_TERMINAL}");
+            return Ok(ExitCode::FAILURE);
+        }
+        out.write_all(password.as_slice())?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// `password new`'s password on `out`, as [`show_password`] shows one: only at a terminal
+    /// no agent runs, else nothing on it and a line saying where it is shown.
+    pub(super) fn tell_new_password(
+        out: &mut dyn Write,
+        at_terminal: bool,
+        agent: Option<&str>,
+        password: &SecretBytes,
+    ) -> std::io::Result<()> {
+        if !at_terminal || agent.is_some() {
+            eprintln!("{NEW_SHOWN_AT_A_TERMINAL}");
+            return Ok(());
+        }
+        out.write_all(b"join password: ")?;
+        out.write_all(password.as_slice())?;
+        out.write_all(b"\n")?;
+        out.flush()
     }
 
     /// Print what a publish did, including any key rotation, held requests, or local sync warning.
@@ -1235,16 +1312,46 @@ mod unix {
         }
     }
 
-    /// `status`'s line for an admin of a vault that approves by `approval`.
+    /// `status`'s approver line: `approving`, whether and how this Mac approves as `status` reads
+    /// it, and `stuck`, what stops the running subscriber's approver: what it recorded
+    /// ([`client::approver_stuck`]) or, for an approver from before that record, the release of
+    /// its program as `status` reads it ([`client::approver_cannot_read`]). A subscriber stuck on
+    /// what `status` cannot read either still says so.
+    pub(super) fn approver_status(
+        approving: &crate::Result<Option<Approval>>,
+        subscriber: &crate::Result<service::State>,
+        stuck: Option<&str>,
+    ) -> Option<String> {
+        match (approving, subscriber, stuck) {
+            (Ok(Some(approval)), _, _) => Some(approver_line(*approval, subscriber, stuck)),
+            // `status` cannot read this Mac's role either, so the line claims no approval.
+            (Err(_), Ok(service::State::Installed { pid: Some(pid), .. }), Some(why)) => {
+                Some(format!(
+                    "approver: the subscriber (pid {pid}) cannot tell whether this Mac approves joins: {why}"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `status`'s line for an admin of a vault that approves by `approval`, `stuck` what stops
+    /// the running subscriber's approver ([`approver_status`]).
     pub(super) fn approver_line(
         approval: Approval,
         subscriber: &crate::Result<service::State>,
+        stuck: Option<&str>,
     ) -> String {
         match subscriber {
-            Ok(service::State::Installed { pid: Some(pid), .. }) => format!(
-                "approver: running in the subscriber (pid {pid}), so {} is let in within seconds",
-                joiner(approval)
-            ),
+            Ok(service::State::Installed { pid: Some(pid), .. }) => match stuck {
+                Some(why) => format!(
+                    "approver: running in the subscriber (pid {pid}) but not approving: {why}; until it approves again, {} waits for approval by code",
+                    joiner(approval)
+                ),
+                None => format!(
+                    "approver: running in the subscriber (pid {pid}), so {} is let in within seconds",
+                    joiner(approval)
+                ),
+            },
             Ok(service::State::Installed { pid: None, .. }) => format!(
                 "approver: not running (the subscriber is installed but not running), so {}",
                 waits(approval)
@@ -1334,8 +1441,16 @@ mod unix {
         if status.config.is_some() {
             let state = (subscriber.state)();
             println!("subscriber: {}", service_words(&state));
-            if let Ok(Some(approval)) = client::approving_here(paths) {
-                println!("{}", approver_line(approval, &state));
+            let stuck = match &state {
+                Ok(service::State::Installed { pid: Some(pid), .. }) => {
+                    client::approver_stuck(paths, *pid)
+                        .or_else(|| client::approver_cannot_read(paths, *pid))
+                }
+                _ => None,
+            };
+            let approving = client::approving_here(paths);
+            if let Some(line) = approver_status(&approving, &state, stuck.as_deref()) {
+                println!("{line}");
             }
         }
         if !matches!(
@@ -1361,9 +1476,9 @@ mod unix {
         }
     }
 
-    fn install_subscriber(paths: &Paths, program: Option<String>) -> crate::Result<String> {
+    fn install_subscriber(paths: &Paths, program: Option<PathBuf>) -> crate::Result<String> {
         let program = match program {
-            Some(program) => PathBuf::from(program),
+            Some(program) => program,
             None => service::program_for_service()?,
         };
         service::install(
@@ -1393,19 +1508,20 @@ mod unix {
                 "The vault is signed by {fingerprint}. Compare it with `aterm secrets status` on an admin Mac. Trust it? [y/N] "
             )))
         };
-        let given = Cell::new(false);
         let from_pipe = piped.is_some();
-        let password = || -> Option<SecretBytes> {
-            let password = match &piped {
-                Some(piped) => Some(piped.clone()),
-                None if !interactive => None,
-                None => ask_hidden(
-                    "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, any other waits for approval by code): ",
-                )
-                .filter(|typed| !typed.as_slice().trim_ascii().is_empty()),
-            };
+        let given = Cell::new(from_pipe);
+        let ask_password = || -> Option<SecretBytes> {
+            let password = ask_hidden(
+                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, any other waits for approval by code): ",
+            )
+            .filter(|typed| !typed.as_slice().trim_ascii().is_empty());
             given.set(password.is_some());
             password
+        };
+        let password = match piped {
+            Some(piped) => JoinPassword::Given(Some(piped)),
+            None if interactive => JoinPassword::Ask(&ask_password),
+            None => JoinPassword::Given(None),
         };
         let installed = Cell::new(false);
         let install_failed = Cell::new(false);
@@ -1423,7 +1539,7 @@ mod unix {
                 }
             }
         };
-        let say = |line: &str| eprintln!("{line}");
+        let say = |event: &JoinEvent<'_>| eprintln!("{event}");
         let before = client::config(paths).ok().flatten();
         let outcome = client::join(
             paths,
@@ -1431,13 +1547,10 @@ mod unix {
                 source: source.to_string(),
                 host: name.clone(),
                 interactive,
-                wait: if wait {
-                    Duration::from_secs(600)
-                } else {
-                    Duration::ZERO
-                },
+                wait: join_wait(wait, interactive),
                 confirm: &confirm,
-                password: &password,
+                password,
+                fetched: None,
                 requested: &install,
                 say: &say,
             },
@@ -1939,10 +2052,9 @@ mod unix {
             Password::Show => match admin.doc.join_password() {
                 Some(password) => {
                     let mut out = std::io::stdout().lock();
-                    out.write_all(password.as_slice())?;
-                    out.write_all(b"\n")?;
-                    out.flush()?;
-                    Ok(ExitCode::SUCCESS)
+                    let at_terminal = out.is_terminal();
+                    let agent = aterm_types::domain::agent_marker(&|key| std::env::var(key).ok());
+                    show_password(&mut out, at_terminal, agent, &password)
                 }
                 None if admin.doc.open() => {
                     if let Some(words) = lets_in_words(queued, &admin.doc) {
@@ -1997,10 +2109,9 @@ mod unix {
                 }
                 approver(&doc);
                 let mut out = std::io::stdout().lock();
-                out.write_all(b"join password: ")?;
-                out.write_all(password.as_slice())?;
-                out.write_all(b"\n")?;
-                out.flush()?;
+                let at_terminal = out.is_terminal();
+                let agent = aterm_types::domain::agent_marker(&|key| std::env::var(key).ok());
+                tell_new_password(&mut out, at_terminal, agent, &password)?;
                 Ok(code)
             }
             Password::Set => {
@@ -2339,12 +2450,12 @@ mod unix {
             .store
             .as_deref()
             .map_or_else(|| paths.served(), |dir| store_dir(paths, dir));
-        eprintln!(
+        crate::log_line(&format!(
             "{} serving on {}, store {}",
             stamp(),
             settings.listen,
             store.display()
-        );
+        ));
         crate::server::serve(crate::server::Options {
             listen: settings.listen,
             store,
@@ -2356,10 +2467,12 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
+    /// `agent` or `server` `on|off|status`; `on` with `force` restarts a job that runs as it
+    /// would be installed ([`service::reinstall`]).
     fn services(
         paths: &Paths,
         job: Job,
-        action: Action,
+        (action, force): (Action, bool),
         program: Option<String>,
         args: Vec<String>,
     ) -> crate::Result<ExitCode> {
@@ -2372,7 +2485,12 @@ mod unix {
                 if !Path::new(&program).is_absolute() {
                     return Err(Error::new("--program must be an absolute path"));
                 }
-                println!("{}", service::install(&paths.home, job, &program, &args)?);
+                let install = if force {
+                    service::reinstall
+                } else {
+                    service::install
+                };
+                println!("{}", install(&paths.home, job, &program, &args)?);
             }
             Action::Off => {
                 if service::turn_off(&paths.home, job)? {
@@ -2998,6 +3116,82 @@ mod tests {
             })
         );
         assert!(parse(&words("server on --bogus")).is_err());
+    }
+
+    #[test]
+    fn agent_on_force_restarts_and_plain_on_does_not() {
+        assert_eq!(
+            parse(&words("agent on --force")),
+            Ok(Command::Agent {
+                action: Action::On,
+                program: None,
+                force: true,
+            })
+        );
+        assert_eq!(
+            parse(&words("agent on")),
+            Ok(Command::Agent {
+                action: Action::On,
+                program: None,
+                force: false,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_join_without_a_terminal_does_not_wait_for_its_approval() {
+        assert_eq!(unix::join_wait(true, false), std::time::Duration::ZERO);
+        assert_eq!(unix::join_wait(false, true), std::time::Duration::ZERO);
+        // CONTROL: at a terminal, a join waits ten minutes for the approval.
+        assert_eq!(
+            unix::join_wait(true, true),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_join_password_is_shown_only_at_a_terminal_no_agent_runs() {
+        let password = crate::SecretBytes::from("pear-otter-quilt".as_bytes());
+        for (at_terminal, agent) in [
+            (false, None),
+            (true, Some("CLAUDECODE")),
+            (false, Some("CODEX")),
+        ] {
+            let mut out = Vec::new();
+            let code = unix::show_password(&mut out, at_terminal, agent, &password).expect("runs");
+            assert_eq!(code, ExitCode::FAILURE, "{at_terminal} {agent:?}");
+            assert!(
+                out.is_empty(),
+                "{at_terminal} {agent:?}: {} bytes",
+                out.len()
+            );
+        }
+        // CONTROL: a person at a terminal sees it.
+        let mut out = Vec::new();
+        let code = unix::show_password(&mut out, true, None, &password).expect("runs");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(out, b"pear-otter-quilt\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_join_password_is_told_only_at_a_terminal_no_agent_runs() {
+        let password = crate::SecretBytes::from("pear-otter-quilt".as_bytes());
+        for (at_terminal, agent) in [(false, None), (true, Some("CLAUDECODE"))] {
+            let mut out = Vec::new();
+            unix::tell_new_password(&mut out, at_terminal, agent, &password).expect("runs");
+            assert!(
+                out.is_empty(),
+                "{at_terminal} {agent:?}: {} bytes",
+                out.len()
+            );
+        }
+        // CONTROL: a person at a terminal reads the password the vault now takes.
+        let mut out = Vec::new();
+        unix::tell_new_password(&mut out, true, None, &password).expect("runs");
+        assert_eq!(out, b"join password: pear-otter-quilt\n");
     }
 
     #[test]
@@ -3843,10 +4037,36 @@ mod tests {
         .expect("published");
         assert_eq!(installs.get(), 2, "nor is one put in there");
 
-        let line = |approval, state| unix::approver_line(approval, &state);
+        let line = |approval, state| unix::approver_line(approval, &state, None);
         let ok = line(Approval::Password, Ok(installed(Some(42))));
         assert!(ok.contains("running in the subscriber (pid 42)"), "{ok}");
         assert!(ok.contains("types the join password is let in"), "{ok}");
+        let why = "admin locker: alab-vault-admin/4 is newer";
+        let said = unix::approver_line(Approval::Open, &Ok(installed(Some(42))), Some(why));
+        assert!(
+            said.contains("(pid 42) but not approving: admin locker: alab-vault-admin/4 is newer;"),
+            "{said}"
+        );
+        assert!(
+            said.contains("a machine that asks to join waits for approval by code"),
+            "{said}"
+        );
+        // A status that cannot read what stopped the approver still says it is stuck, and
+        // says nothing where no record is, or no subscriber runs.
+        let status = |approving, state, stuck| unix::approver_status(&approving, &state, stuck);
+        let unreadable = || Err(crate::Error::new(why));
+        let stuck = status(unreadable(), Ok(installed(Some(42))), Some(why)).expect("a line");
+        assert!(
+            stuck.contains("(pid 42) cannot tell whether this Mac approves joins: admin locker"),
+            "{stuck}"
+        );
+        assert_eq!(status(unreadable(), Ok(installed(Some(42))), None), None);
+        assert_eq!(status(unreadable(), Ok(installed(None)), Some(why)), None);
+        assert_eq!(status(Ok(None), Ok(installed(Some(42))), Some(why)), None);
+        assert_eq!(
+            status(Ok(Some(Approval::Password)), Ok(installed(Some(42))), None),
+            Some(ok.clone())
+        );
         for (state, why) in [
             (
                 Ok(crate::service::State::Absent),

@@ -14,7 +14,7 @@ use aterm_vitals::model::{
     Hog, LinkKind, LinkSample, MemSample, MemView, NoFigure, PlanFact, Pressure, ProcLimits,
     ProcScope, ScopeFig, Series, TabView, VolumeSample,
 };
-use aterm_vitals::{Cell, Filling, Rates, TrendView};
+use aterm_vitals::{Cell, Filling, Rates, Reading, TrendView};
 
 /// 10:42:17 on the mockups' day, unix ms.
 pub(crate) const AT: i64 = 1_792_000_800_000 + 42 * 60_000 + 17_000;
@@ -175,12 +175,33 @@ fn not_per_app() -> ScopeFig {
     }
 }
 
+/// The readings behind `ring`'s last minute (its last cell the bucket holding `at`), one a
+/// second as the probe takes them while a focused window shows the deck, the newest at `at`:
+/// each its bucket's mean, over where its bucket is; none where its bucket was not read.
+pub(crate) fn readings_of(ring: &[Cell], at: i64) -> Arc<[Reading]> {
+    let last_k = at.div_euclid(10_000);
+    (0..60_i64)
+        .rev()
+        .filter_map(|back| {
+            let t = at - back * 1000;
+            let back_k = usize::try_from(last_k - t.div_euclid(10_000)).ok()?;
+            let cell = ring.get(ring.len().checked_sub(1 + back_k)?)?;
+            Some(Reading {
+                at_ms: t,
+                v: cell.mean?,
+                over: cell.over,
+            })
+        })
+        .collect()
+}
+
 fn series(now: f64, capacity: f64) -> Series {
     Series {
         now: Some(now),
         capacity: Some(capacity),
         ring: Arc::from(Vec::new()),
         binds: false,
+        ..Series::default()
     }
 }
 
@@ -203,6 +224,7 @@ fn row(now: f64, cap: f64, st: &Story, i: usize, aterm: ScopeFig, tab: ScopeFig)
         capacity: Some(cap),
         heat_now: Some((now / cap) as f32),
         over: over.last().copied().unwrap_or(false),
+        recent: readings_of(&ring, AT),
         ring: ring.into(),
         ring_k: AT.div_euclid(10_000),
         aterm,
@@ -1221,7 +1243,19 @@ fn strips(w: f64, form: DeckForm, m: &FaceMetrics) -> Vec<StripRows> {
 #[test]
 fn a_gap_is_never_drawn_as_step_zero() {
     let m = FaceMetrics::helvetica_neue();
-    let snap = scene(Scene::FirstRun);
+    let first = scene(Scene::FirstRun);
+    // A Folded strip draws a reading a second: punch a 16 s hole in every row's readings, past
+    // what a later reading may speak for, so its slots stand unread.
+    let mut holed = first.clone();
+    for view in &mut holed.resources {
+        let kept: Vec<Reading> = view
+            .recent
+            .iter()
+            .copied()
+            .filter(|r| !(AT - 18_000 < r.at_ms && r.at_ms < AT - 2_000))
+            .collect();
+        view.recent = kept.into();
+    }
     let inks = super::tests::dark_inks();
     let heat: Vec<[u8; 4]> = inks
         .heat
@@ -1230,7 +1264,7 @@ fn a_gap_is_never_drawn_as_step_zero() {
         .map(|&c| rgba(c, 0xFF))
         .collect();
     let hollow = rgba(inks.hollow, 0xFF);
-    let (mut outlines, mut ticks) = (0, 0);
+    let (mut outlines, mut ticks, mut unread) = (0, 0, [0_usize; 2]);
     for (form, w, s) in [
         (DeckForm::Full, 1119.0, 2.0),
         (DeckForm::Full, 1119.0, 1.0),
@@ -1239,17 +1273,27 @@ fn a_gap_is_never_drawn_as_step_zero() {
         (DeckForm::Folded, 450.0, 1.0),
         (DeckForm::Folded, 350.0, 1.0),
     ] {
-        let input = scene_input(&snap, form);
+        let snap = if form == DeckForm::Folded {
+            &holed
+        } else {
+            &first
+        };
+        let input = scene_input(snap, form);
         let words = DeckWords::new(&input, &m);
         let laid = lay(&geom(w, s, form), &input, &words, &m, true);
         for (strip, rows, at) in strips(w, form, &m) {
             let (pitch, cw) = (px(strip.pitch, s), px(strip.cell, s));
             for (r, res) in at {
-                if words::strip_words(res, &snap).is_some() {
+                if words::strip_words(res, snap).is_some() {
                     continue;
                 }
                 let n = strip.cols as usize;
-                let cols = snap.resources[res.index()].heat_columns(strip.period_s, n, AT);
+                let view = &snap.resources[res.index()];
+                let cols = if strip.period_s == plan::FOLD_SLOT_S {
+                    view.heat_slots(snap.slot_grid, n, AT, SLOT_COVER_MS)
+                } else {
+                    view.heat_columns(strip.period_s, n, AT)
+                };
                 let (y, h) = (px(rows.top(r), s), px(rows.cell, s));
                 for (i, col) in cols.iter().enumerate() {
                     if col.heat.is_some() {
@@ -1289,6 +1333,7 @@ fn a_gap_is_never_drawn_as_step_zero() {
                     assert!(if small { tick } else { outline }, "{at}: {cw}×{h} px");
                     outlines += usize::from(outline);
                     ticks += usize::from(tick);
+                    unread[usize::from(form == DeckForm::Folded)] += 1;
                 }
             }
         }
@@ -1296,6 +1341,10 @@ fn a_gap_is_never_drawn_as_step_zero() {
     assert!(
         outlines > 0 && ticks > 0,
         "CONTROL: both forms drawn ({outlines}, {ticks})"
+    );
+    assert!(
+        unread.iter().all(|&n| n > 0),
+        "CONTROL: each form drew an unread column or slot ({unread:?})"
     );
 }
 

@@ -581,24 +581,38 @@ impl App {
         self.pool.get(session).is_some_and(recording)
     }
 
-    /// A tab menu's timeline row on `tab` of window `wid`: show that tab and open Rewind on its focused pane at the instant `at_ms` ([`crate::turn_ledger::now_ms`]'s clock), or say why not.
+    /// Open a tab menu's captured terminal view at the row's instant (`turn_ledger::now_ms`'s clock), refusing a source that left its original window and tab.
     pub(crate) fn dispatch_tab_menu_rewind(
         &mut self,
         wid: WindowId,
         tab: crate::tab_model::TabId,
+        origin: crate::session_chrome::RewindMenuOrigin,
         at_ms: u64,
     ) {
         let Some(index) = self.tab_index_for_id(wid, tab) else {
             return;
         };
-        let Some(session) = self.tab_terminal_session(wid, index) else {
+        if !self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.tab_set.get(tab))
+            .is_some_and(|tab| tab.root.contains(origin.view))
+            || self
+                .view_store
+                .get(origin.view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                != Some(origin.session)
+            || self.pool.get(origin.session).is_none()
+        {
             return;
-        };
+        }
         self.switch_tab_in(wid, index);
+        self.focus_session_pane(wid, origin.session, origin.view);
         let back_us = crate::turn_ledger::now_ms()
             .saturating_sub(at_ms)
             .saturating_mul(1000);
-        let at = self.pool.get(session).map(|s| {
+        let at = self.pool.get(origin.session).map(|s| {
             let now = s
                 .ctx
                 .temporal
@@ -610,7 +624,7 @@ impl App {
         let Some(at) = at else {
             return;
         };
-        if let Err(why) = self.rewind_open(session, Target::At(at), None) {
+        if let Err(why) = self.rewind_open(origin.session, Target::At(at), None) {
             self.post_message(crate::message_reporters::rewind_failed(&why));
         }
     }

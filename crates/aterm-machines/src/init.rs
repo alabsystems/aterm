@@ -3,81 +3,82 @@
 
 //! The local, per-user macOS setup, sharing the machines probe/apply/read-back engine.
 
+use crate::console::Presence;
 use crate::engine::{Journal, Place};
 use crate::items::defaults::Target;
 use crate::items::{Ctx, Item};
 use crate::model::{Effect, HostFacts, ItemReport, Mode, Outcome, PValue, Probe, Read};
 use crate::port::{Cmd, Live, System};
-use aterm_converge::{Class, Layer, Remedy, Report, ReportMode, Requires};
-use aterm_types::macos_setup::{Selection, Setting};
+use aterm_converge::{Class, Laps, Layer, Remedy, Report, ReportMode, Requires};
+use aterm_types::macos_setup::{Access, Selection, Setting};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// `aterm init` usage, printed by `--help` and after a usage error.
-pub const USAGE: &str = "\
-aterm init [--plan | --check] [--json] [--develop | --no-develop]
-           [--only <item,...>] [--vault <url|path>]
-    Set up this Mac for this account, applying and reading back each item;
-    safe to run again. Run as the logged-in user, without sudo.
+/// `aterm init` usage, printed by `--help`, after a usage error and as `aterm help init`: what
+/// runs by itself, the three opt-ins and the exit meanings, each setting in its System State
+/// label ([`Setting::label`]), the one source both surfaces read.
+#[must_use]
+pub fn usage() -> String {
+    // Each flag's settings by label, as many to a line as fit in 90 columns past its indent.
+    let rows = |settings: &[Setting]| {
+        let mut lines: Vec<String> = Vec::new();
+        for label in settings.iter().map(|setting| setting.label()) {
+            match lines.last_mut() {
+                Some(line) if 16 + line.len() + 2 + label.len() <= 90 => {
+                    line.push_str("; ");
+                    line.push_str(label);
+                }
+                _ => lines.push(label.to_owned()),
+            }
+        }
+        lines.join("\n                ")
+    };
+    format!(
+        "\
+aterm init [--plan | --check] [--json] [--verbose] [--only <id,...>] [--vault <url|path>]
+           [--profile] [--sign-out] [--clone] [--develop | --no-develop]
+  aterm.app's first launch does this setup by itself; init is for SSH and CLI-only Macs.
+  Run it as yourself, without sudo; safe to run again. Over SSH too: what `aterm doctor`
+  restores, and Apple's Command Line Tools if missing (one sudo password). Then, for a
+  person at this Mac's console (else one deferred row: SSH, an agent, no terminal):
+    {spotlight}
+    {secrets} (asking only the ALab vault's join password, or --vault's)
+    {permissions} (a row for each grant to switch on)
+  and these three, all of them unless a flag names the ones to run:
+    --profile   {profile}
+    --sign-out  {sign_out}
+    --clone     {clone}
+                (~/.config/aterm/init.toml [github]: account, owner, token_file)
+  --plan reports, --check only reads, --json prints the report, --verbose every row (else
+  the changed, failed and needs-you rows, then a tally); --only runs the ids or families
+  named (base, workstation, init.spotlight, ...); --develop records this checkout as a
+  develop machine, fetched and provisioned each run, and --no-develop drops it.
+  Exit: 0 done (what waits on an admin or a person at the console included); 75 waits on
+  a lock or another step, 77 on a permission, 69 on the network; 1 otherwise; 2 usage.
+",
+        spotlight = Setting::Spotlight.label(),
+        secrets = Setting::Secrets.label(),
+        permissions = Setting::Permissions.label(),
+        profile = rows(&PROFILE),
+        sign_out = rows(&SIGN_OUT),
+        clone = rows(&[Setting::Repositories]),
+    )
+}
 
-    First the base items, over SSH too: what bare `aterm doctor` restores (the
-    installed commands and their ~/.local/bin links, the shell integration, the
-    reroute stubs, the rustup link, exec roots), the AI CLI account roster
-    (when there is a fleet accounts source), and Apple's Command Line Tools
-    when missing (base.clt: one sudo password prompt in this terminal).
+/// The settings `--profile` applies: every workstation preference.
+const PROFILE: [Setting; 6] = [
+    Setting::CapsLock,
+    Setting::NaturalScrolling,
+    Setting::TrackpadScrolling,
+    Setting::Desktop,
+    Setting::Widgets,
+    Setting::Dock,
+];
 
-    Then, only when this account is the one logged in at this Mac's console
-    (over SSH too), this login's settings: Caps Lock as Control; natural
-    scrolling off, trackpad scrolling on; desktop icons shown; widgets hidden
-    (Notification Center's only with Full Disk Access); a Dock of only aterm,
-    System Settings and Safari; Messages and FaceTime signed out (which may need
-    Accessibility and Automation permission for aterm); Rust kept out of
-    Spotlight (rustup's minimal profile, no rust-docs, build caches in .noindex
-    folders). It joins the secrets vault (aterm help secrets): the ALab vault
-    when it answers on this network (asking only its join password), else the
-    one --vault names; with neither, it asks nothing. A [github] table in
-    ~/.config/aterm/init.toml keeps its token in the login keychain (unless
-    git's own helpers, such as the secrets vault's, already hand it back),
-    clones the owner's repositories into ~ and fast-forwards each clean
-    checkout that is behind (aterm help init).
-
-    Last, on a develop machine (one `aterm init --develop` recorded), the
-    develop items.
-
-    --plan    Report the changes without making them.
-    --check   Read only; exit nonzero if anything still needs attention.
-    --json    Print the per-item report as JSON.
-    --develop Record this Mac as a develop machine ([develop] in init.toml)
-              and run base and develop only. Each recorded aterm checkout is
-              fetched and fast-forwarded when it is clean, on its default
-              branch and has no commit of its own (else left as it is, saying
-              why; never a reset, stash, push or hook), with its vendor/astream
-              submodule where that loses nothing; its submodule.recurse is set
-              true. In each checkout not left as it is, init then runs the
-              checkout's own `targo --unverified --locked verify provision`. Run
-              inside a checkout to record it (a linked worktree is refused);
-              elsewhere it records the [github] owner's aterm checkouts in ~.
-    --no-develop  Remove the [develop] table and run base only; the tools stay
-              as cache.
-    --only    Run only the items named: a base id such as base.clt or
-              base.shell.rc, a family such as shell or pkg, or base;
-              workstation (every console-only step); a develop id such as
-              develop.checkout or develop.checkout@~/aterm, a family (profile,
-              checkout, tooling), or develop.
-    --vault   Join this secrets vault (a URL, #<signer> pin allowed, or a
-              path) when this Mac has none: read once at once, and asked for
-              again while nothing answers there.
-    --help    Show this help without inspecting or changing the Mac.
-
-    Exit: 0 done, a vault join an admin has yet to approve included (the
-    subscriber finishes it); when only items that stood aside are left, 75 if
-    one waits on a lock (such as an install pass's store lock) or on another
-    step (GitHub's sign-in on that join: run init again once it is approved),
-    else 77 if one waits on a permission you grant, else 69 (the network); 1
-    anything else; 2 usage.
-";
+/// The settings `--sign-out` applies.
+const SIGN_OUT: [Setting; 2] = [Setting::Messages, Setting::FaceTime];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Action {
@@ -98,14 +99,69 @@ struct Options {
     develop: Option<bool>,
     /// `--vault`: the vault to join when this Mac has none.
     vault: Option<String>,
+    /// `--verbose`: print every row as it finishes, not only the changed, failed and needs-you
+    /// rows.
+    verbose: bool,
+    /// The groups `--profile`, `--sign-out` and `--clone` picked; `None` when no flag did, and
+    /// every group runs (no question: setup is on by default).
+    choice: Option<Choice>,
+    /// The `--only` words that name no base or develop item: workstation items, which only a
+    /// built workstation knows ([`converge`] refuses a word that names none).
+    station: Vec<String>,
 }
 
 impl Options {
     /// Whether this run converges the workstation layer.
     fn workstation(&self) -> bool {
         (self.only.is_empty() && self.develop.is_none())
+            || !self.station.is_empty()
             || self.only.iter().any(|word| word == "workstation")
     }
+
+    /// Whether this run may join a vault: a workstation run its `--only` words, if any, do not
+    /// narrow to other items (`--only init.spotlight` looks for no vault).
+    fn joins(&self) -> bool {
+        self.workstation()
+            && (self.only.is_empty()
+                || self.only.iter().any(|word| {
+                    word.starts_with("init.secrets@")
+                        || aterm_converge::selects(
+                            word,
+                            "init.secrets@",
+                            crate::init_secrets::FAMILY,
+                            Some(Layer::Workstation),
+                        )
+                }))
+    }
+}
+
+/// The workstation groups a run applies: every one, or the ones `--profile`, `--sign-out` and
+/// `--clone` name. Nothing asks: first-run setup is on by default and the person turns a part
+/// off later (owner ruling 2026-10-25, AGENTS.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Choice {
+    /// The workstation preferences ([`PROFILE`]).
+    profile: bool,
+    /// The Messages and FaceTime sign-outs ([`SIGN_OUT`]).
+    sign_out: bool,
+    /// GitHub and the repositories ([`Setting::Repositories`]).
+    clone: bool,
+}
+
+impl Choice {
+    /// Every group, the default.
+    const ALL: Self = Self {
+        profile: true,
+        sign_out: true,
+        clone: true,
+    };
+
+    /// No group.
+    const NONE: Self = Self {
+        profile: false,
+        sign_out: false,
+        clone: false,
+    };
 }
 
 fn options(args: &[OsString]) -> Result<Options, String> {
@@ -154,6 +210,15 @@ fn options(args: &[OsString]) -> Result<Options, String> {
         match arg.to_str() {
             Some("--help" | "-h") => options.help = true,
             Some("--json") => options.json = true,
+            Some("--verbose") => options.verbose = true,
+            Some(flag @ ("--profile" | "--sign-out" | "--clone")) => {
+                let choice = options.choice.get_or_insert(Choice::NONE);
+                match flag {
+                    "--profile" => choice.profile = true,
+                    "--sign-out" => choice.sign_out = true,
+                    _ => choice.clone = true,
+                }
+            }
             Some(flag @ ("--develop" | "--no-develop")) => {
                 let develop = flag == "--develop";
                 if options.develop.is_some_and(|asked| asked != develop) {
@@ -178,10 +243,23 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     if options.develop.is_some() && options.only.iter().any(|word| word == "workstation") {
         return Err("--develop and --no-develop cannot be combined with --only workstation".into());
     }
+    if options.choice.is_some() && (options.develop.is_some() || !options.only.is_empty()) {
+        return Err(
+            "--profile, --sign-out and --clone pick within the whole run; --only and --develop \
+             narrow it: use one"
+                .into(),
+        );
+    }
+    Ok(options)
+}
+
+/// Refuse `--vault` for a run that leaves the workstation layer out, once [`Options::station`]
+/// is known.
+fn vault_reaches(options: &Options) -> Result<(), String> {
     if options.vault.is_some() && !options.workstation() {
         return Err("--vault joins in the workstation layer, which this run leaves out".into());
     }
-    Ok(options)
+    Ok(())
 }
 
 /// Base layer `aterm init` runs before its own items.
@@ -245,30 +323,120 @@ impl Base {
     }
 }
 
-/// Run `aterm init`.
-pub fn main_entry(
-    args: Vec<OsString>,
-    base: &dyn Fn(bool) -> Base,
-    full_disk_access: &dyn Fn() -> Option<bool>,
-) -> ExitCode {
-    let options = match options(&args) {
+/// What `aterm init` takes from the `aterm` that runs it ([`main_entry`]).
+pub struct Host<'a> {
+    /// The base layer, `true` for a run that applies ([`Base`]).
+    pub base: &'a dyn Fn(bool) -> Base,
+    /// Whether this process holds Full Disk Access, as the runner measures it.
+    pub full_disk_access: &'a dyn Fn() -> Option<bool>,
+    /// This Mac's setup records, shared with the first launch ([`Records`]).
+    pub records: &'a dyn Records,
+    /// aterm's macOS grants, as the Permissions phase reads them ([`Grants`]).
+    pub grants: Grants,
+}
+
+/// This Mac's setup records (`profile.lock` and the initial-setup record), which `aterm init`
+/// shares with the first launch's setup and `aterm doctor --apply`: a pass that changes the
+/// workstation holds them, so two surfaces never relaunch the Dock over each other, and a whole
+/// profile it verified is recorded, so the first launch neither runs nor offers it again.
+pub trait Records: Sync {
+    /// Hold the records for a workstation pass, waiting while another setup holds them
+    /// (`wait` hears one line as that wait starts). `whole`: the pass applies every preference
+    /// and both sign-outs, recorded as the plan the way `aterm doctor --apply` records it.
+    ///
+    /// # Errors
+    /// The records cannot be held or written; nothing was changed.
+    fn hold(&self, whole: bool, wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String>;
+}
+
+/// A hold on the setup records ([`Records::hold`]), let go when dropped.
+pub trait Held {
+    /// Retain the selected preference items left for a later permission grant.
+    ///
+    /// # Errors
+    /// The record cannot be written; the preference pass must not start.
+    fn withheld(&self, _ids: &[String]) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record the whole profile verified, as `aterm doctor --apply` records its pass; only for a
+    /// hold taken `whole`.
+    ///
+    /// # Errors
+    /// The record cannot be written.
+    fn verified(self: Box<Self>) -> Result<(), String>;
+}
+
+/// No setup records: a test's run, which shares nothing with a first launch.
+pub struct NoRecords;
+
+impl Records for NoRecords {
+    fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+        Ok(Box::new(NoRecords))
+    }
+}
+
+impl Held for NoRecords {
+    fn verified(self: Box<Self>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// aterm's macOS grants as `aterm init`'s Permissions phase reads them, without a prompt: each
+/// of [`Access::ALL`] the phase lists, for a run that signs out (`true`, which needs
+/// Accessibility too).
+pub type Grants = fn(bool) -> Vec<(Access, Grant)>;
+
+/// How one of aterm's macOS grants reads ([`Grants`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Grant {
+    /// On.
+    On,
+    /// Only the person can switch it on: what to do, in one line.
+    NeedsYou(String),
+    /// Not needed on this Mac or for this run, saying why.
+    NotNeeded(String),
+    /// It could not be read, saying why.
+    Unread(String),
+}
+
+/// No grant read: a run that lists none.
+#[must_use]
+pub fn no_grants(_sign_out: bool) -> Vec<(Access, Grant)> {
+    Vec::new()
+}
+
+/// Run `aterm init`. Every row carries its time, the JSON's `phases` the run's (this login's
+/// context, the questions, the base and workstation layers), and one aterm.log line says the
+/// same totals.
+pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
+    let mut options = match options(&args) {
         Ok(options) => options,
         Err(why) => {
-            eprintln!("aterm init: {why}\n{USAGE}");
+            eprintln!("aterm init: {why}\n{}", usage());
             return ExitCode::from(2);
         }
     };
     if options.help {
-        print!("{USAGE}");
+        print!("{}", usage());
         return ExitCode::SUCCESS;
     }
-    let composed = base(false);
+    let mut laps = Laps::start();
+    let composed = (host.base)(false);
+    // A word no base item or develop selector names is a workstation word, which only a built
+    // workstation knows ([`converge`]); a develop run builds none.
     let unnamed = unnamed(&composed, &options.only);
-    if !unnamed.is_empty() {
+    if !unnamed.is_empty() && options.develop.is_some() {
         eprintln!(
-            "aterm init: --only {} names no item ({ONLY_WORDS})\n{USAGE}",
-            unnamed.join(",")
+            "aterm init: --only {} names no item ({ONLY_WORDS})\n{}",
+            unnamed.join(","),
+            usage()
         );
+        return ExitCode::from(2);
+    }
+    options.station = unnamed;
+    if let Err(why) = vault_reaches(&options) {
+        eprintln!("aterm init: {why}\n{}", usage());
         return ExitCode::from(2);
     }
     if !crate::sessions::is_live_account() {
@@ -278,19 +446,27 @@ pub fn main_entry(
     // The look for the ALab vault overlaps reading the Mac (its context and the develop
     // layer); the secrets step takes its answer as the workstation groups are prepared, which
     // is before the base layer runs, so every question comes before any change.
-    let ahead =
-        (options.action == Action::Apply && options.workstation() && options.vault.is_none())
-            .then(crate::init_secrets::look_ahead)
-            .flatten();
-    let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode| {
-        prepare_groups(sys, ctx, mode, ahead.clone(), options.vault.as_deref())
+    let ahead = (options.action == Action::Apply && options.joins() && options.vault.is_none())
+        .then(crate::init_secrets::look_ahead)
+        .flatten();
+    let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
+        prepare_groups(
+            sys,
+            ctx,
+            mode,
+            ahead.clone(),
+            options.vault.as_deref(),
+            reading,
+            host.grants,
+        )
     };
     let sys = Live::new().with_full_disk_access(if options.workstation() {
-        full_disk_access()
+        (host.full_disk_access)()
     } else {
         None
     });
     let cwd = std::env::current_dir().ok();
+    let printer = Printer::new(options.verbose, options.json);
     let result = sys
         .journal()
         .map_err(Refused::Failed)
@@ -299,34 +475,35 @@ pub fn main_entry(
                 &sys,
                 &options,
                 &Front {
-                    base: &|applies| base(applies),
+                    base: &|applies| (host.base)(applies),
                     groups: &groups,
                     targo: composed.targo.clone(),
                     cwd: cwd.as_deref(),
+                    records: host.records,
+                    on_row: &|row| printer.row(row),
                 },
                 journal.as_mut(),
+                &mut laps,
             )
         });
+    printer.flush();
     let rows = match result {
         Ok(rows) => rows,
         Err(Refused::Usage(why)) => {
-            eprintln!("aterm init: {why}\n{USAGE}");
+            eprintln!("aterm init: {why}\n{}", usage());
             return ExitCode::from(2);
         }
         Err(Refused::Failed(why)) => {
+            aterm_log::info!("aterm init: no report; {laps}");
             eprintln!("aterm init: {why}");
             return ExitCode::FAILURE;
         }
     };
     let complete = complete(&rows, options.action);
     let code = status(&rows, options.action);
+    aterm_log::info!("aterm init: {} rows, exit {code}; {laps}", rows.len());
     if options.json {
-        let mode = match options.action {
-            Action::Apply => ReportMode::Apply,
-            Action::Plan => ReportMode::Plan,
-            Action::Check => ReportMode::Check,
-        };
-        match aterm_json::to_string(&Report::new(mode, complete, rows)) {
+        match report_json(options.action, complete, rows, &laps) {
             Ok(report) => println!("{report}"),
             Err(why) => {
                 eprintln!("aterm init: cannot encode report: {why}");
@@ -334,35 +511,153 @@ pub fn main_entry(
             }
         }
     } else {
-        for row in &rows {
-            let word = if waiting(row) {
-                "waiting"
-            } else {
-                word(row.outcome)
-            };
-            println!("{word}: {}", row.title);
-            if let (Some(from), Some(to)) = (&row.from, &row.to) {
-                println!("    {from} → {to}");
-            } else if let (Outcome::Ok, Some(Layer::Develop), Some(now)) =
-                (row.outcome, row.layer, &row.to)
-            {
-                println!("    {now}");
-            }
-            if let Some(why) = &row.why {
-                println!("    {why}");
-            }
-        }
-        let summary = match (options.action, complete) {
-            (Action::Plan, true) => "plan ready; no changes applied",
-            (_, true) if rows.iter().any(waits_by_itself) => {
-                "done; the vault join finishes by itself once an admin approves it"
-            }
-            (_, true) => "all requested settings verified",
-            (_, false) => "settings still need attention; see the rows above",
-        };
-        println!("aterm init: {summary}");
+        println!("{}", tally(&rows, options.action));
     }
     ExitCode::from(code)
+}
+
+/// How `aterm init` prints each row as it finishes ([`Front::on_row`]): the changed, failed and
+/// needs-you rows, or with `--verbose` every row, each with its id; none with `--json`, which
+/// prints the whole report at the end. A row that finishes while another lane's question or
+/// attached program (a join password, `sudo`) owns the terminal waits for it
+/// ([`crate::port::terminal_free`]), so no row lands inside a prompt.
+struct Printer {
+    verbose: bool,
+    json: bool,
+    /// Rendered rows not printed yet.
+    later: Mutex<Vec<String>>,
+}
+
+impl Printer {
+    fn new(verbose: bool, json: bool) -> Self {
+        Self {
+            verbose,
+            json,
+            later: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn row(&self, row: &ItemReport) {
+        self.row_to(row, &mut std::io::stdout().lock());
+    }
+
+    /// Print what is held back once the run is over.
+    fn flush(&self) {
+        self.flush_to(&mut std::io::stdout().lock());
+    }
+
+    /// Write `row`, with every row held back before it, to `out`, unless a question or an
+    /// attached program owns the terminal; then hold it back too.
+    fn row_to(&self, row: &ItemReport, out: &mut dyn std::io::Write) {
+        if self.json || !(self.verbose || shown(row)) {
+            return;
+        }
+        let mut later = self.later.lock().unwrap_or_else(PoisonError::into_inner);
+        later.push(rendered(row));
+        // The terminal stays the printer's while it writes, so no prompt starts mid-row.
+        if let Some(_free) = crate::port::terminal_free() {
+            Self::write(&mut later, out);
+        }
+    }
+
+    fn flush_to(&self, out: &mut dyn std::io::Write) {
+        Self::write(
+            &mut self.later.lock().unwrap_or_else(PoisonError::into_inner),
+            out,
+        );
+    }
+
+    /// One write for `rows`, which it empties: the lanes finish rows at the same time.
+    fn write(rows: &mut Vec<String>, out: &mut dyn std::io::Write) {
+        if rows.is_empty() {
+            return;
+        }
+        let _ = out.write_all(rows.concat().as_bytes());
+        let _ = out.flush();
+        rows.clear();
+    }
+}
+
+/// Whether the default output prints `row`: a change, a failure, or what a person or another
+/// step still has to do; the rows already right (or not for this Mac) only count in the tally.
+fn shown(row: &ItemReport) -> bool {
+    !matches!(row.outcome, Outcome::Ok | Outcome::NotApplicable)
+}
+
+/// `row` as `aterm init` prints it: its word, title and id, then what changed or why.
+fn rendered(row: &ItemReport) -> String {
+    use std::fmt::Write as _;
+    let word = if waiting(row) {
+        "waiting"
+    } else {
+        word(row.outcome)
+    };
+    let mut text = format!("{word}: {} ({})\n", row.title, row.id);
+    if let (Some(from), Some(to)) = (&row.from, &row.to) {
+        let _ = writeln!(text, "    {from} \u{2192} {to}");
+    } else if let (Outcome::Ok, Some(Layer::Develop), Some(now)) = (row.outcome, row.layer, &row.to)
+    {
+        let _ = writeln!(text, "    {now}");
+    }
+    if let Some(why) = &row.why {
+        let _ = writeln!(text, "    {why}");
+    }
+    text
+}
+
+/// The one line `aterm init` ends with: how many rows read right, changed, failed or wait, and
+/// the first that needs the person, by name.
+fn tally(rows: &[ItemReport], action: Action) -> String {
+    let count = |pick: fn(&ItemReport) -> bool| rows.iter().filter(|row| pick(row)).count();
+    let mut parts = vec![format!(
+        "{} ok",
+        count(|row| matches!(row.outcome, Outcome::Ok | Outcome::NotApplicable))
+    )];
+    for (n, what) in [
+        (count(|row| row.outcome == Outcome::Changed), "changed"),
+        (count(|row| row.outcome == Outcome::Planned), "to change"),
+        (
+            count(|row| matches!(row.outcome, Outcome::Failed | Outcome::Unknown)),
+            "failed",
+        ),
+        (
+            count(waits_by_itself),
+            "waiting for an admin's approval (it finishes by itself)",
+        ),
+        (count(waits_on_a_step), "waiting on another step"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    }
+    let needs: Vec<&ItemReport> = rows.iter().filter(|row| needs_you(row)).collect();
+    if let Some(first) = needs.first() {
+        parts.push(format!("{} needs you: {}", needs.len(), first.title));
+    }
+    let tail = if action == Action::Plan {
+        " (nothing changed)"
+    } else {
+        ""
+    };
+    format!("aterm init: {}{tail}", parts.join(" \u{b7} "))
+}
+
+/// Whether `row` waits on something other than a person: a lock, the network, or another row
+/// that does ([`waits_by_itself`] apart).
+fn waits_on_a_step(row: &ItemReport) -> bool {
+    row.outcome == Outcome::Blocked
+        && !waits_by_itself(row)
+        && row
+            .stood_aside
+            .as_ref()
+            .is_some_and(|aside| !matches!(aside, aterm_converge::StoodAside::Permission(_)))
+}
+
+/// Whether only the person can finish `row`: a step of theirs, a grant, or a precondition no
+/// other step lifts.
+fn needs_you(row: &ItemReport) -> bool {
+    matches!(row.outcome, Outcome::Person | Outcome::Deferred)
+        || (row.outcome == Outcome::Blocked && !waits_by_itself(row) && !waits_on_a_step(row))
 }
 
 /// The develop layer as `aterm doctor` reads it on this Mac ([`crate::init_develop::doctor`]),
@@ -454,8 +749,10 @@ impl<S: System> Doctor<S> {
 
 /// What `--only` takes, for its refusal.
 const ONLY_WORDS: &str = "a base id such as base.clt or base.shell.rc, a family such as shell \
-                          or pkg, or base; workstation; a develop id such as \
-                          develop.checkout@~/aterm, a family such as checkout, or develop";
+                          or pkg, or base; a workstation id such as init.spotlight or \
+                          init.trackpad, a family such as keyboard, or workstation; a develop id \
+                          such as develop.checkout@~/aterm, a family such as checkout, or \
+                          develop";
 
 /// Return `--only` words that match no base item, `workstation`, or develop selector.
 fn unnamed(base: &Base, only: &[String]) -> Vec<String> {
@@ -486,26 +783,47 @@ struct Front<'a> {
     groups: &'a Prepare<'a>,
     targo: Option<crate::init_develop::Targo>,
     cwd: Option<&'a Path>,
+    /// This Mac's setup records, held over the Desktop lane of a pass that changes preferences.
+    records: &'a dyn Records,
+    /// Hears each row as its item finishes, from whichever lane ran it ([`run_layers`]).
+    on_row: &'a (dyn Fn(&ItemReport) + Sync),
 }
 
-/// Converge the requested base, workstation, and develop layers.
+/// Converge the requested base, workstation, and develop layers, each step a phase of `laps`:
+/// this login's context (and the develop layer's profile), the questions asked before any
+/// change (the vault's join password), then the layers ([`run_layers`]).
 fn converge(
     sys: &dyn System,
     options: &Options,
     front: &Front<'_>,
-    journal: &mut dyn Journal,
+    journal: &mut (dyn Journal + Send),
+    laps: &mut Laps,
 ) -> Result<Vec<ItemReport>, Refused> {
     let mode = if options.action == Action::Apply {
         Mode::Apply
     } else {
         Mode::Plan
     };
+    // The opt-in flags are a person's picks at this Mac's console: from an agent's tool call, a
+    // script, a launch agent or a remote shell nobody there made them, and the person's own Mac
+    // waits for them anyway, so the run refuses before it reads the Mac.
+    if options.choice.is_some()
+        && let Some(why) = crate::console::presence(sys).why()
+    {
+        return Err(Refused::Usage(format!(
+            "--profile, --sign-out and --clone are picks for a person at this Mac's console \
+             ({why}): run them there, or leave them out"
+        )));
+    }
     let only = &options.only;
     let workstation = options.workstation();
-    let ctx = if workstation {
+    let (ctx, keyboards) = if workstation {
         local_context(sys)?
     } else {
-        context_for_selected(sys, WorkstationGroup::All, Selection::none())?
+        (
+            context_for_selected(sys, WorkstationGroup::All, Selection::none())?,
+            None,
+        )
     };
     let asked = only.iter().any(|word| crate::init_develop::names(word));
     let develop = if options.develop.is_some() || only.is_empty() || asked {
@@ -550,11 +868,102 @@ fn converge(
             }
         )));
     }
-    let groups = if workstation {
-        (front.groups)(sys, &ctx, mode)?
+    laps.lap("context");
+    let (groups, choice) = if workstation {
+        (front.groups)(
+            sys,
+            &ctx,
+            mode,
+            &Reading {
+                keyboards: keyboards.as_deref(),
+                only,
+                choice: options.choice,
+            },
+        )?
     } else {
-        Vec::new()
+        (Vec::new(), Choice::NONE)
     };
+    // A workstation word names an item of the workstation this run built; away from the
+    // console one row stands for every one of them.
+    let unknown: Vec<&str> = options
+        .station
+        .iter()
+        .filter(|word| {
+            ctx.console.is_some()
+                && !groups.iter().any(|(items, place)| {
+                    items.iter().any(|item| {
+                        aterm_converge::selects(word, &item.id(), item.family(), Some(place.layer))
+                    })
+                })
+        })
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Refused::Usage(format!(
+            "--only {} names no item ({ONLY_WORDS})",
+            unknown.join(",")
+        )));
+    }
+    // A pass that changes the preferences or signs out holds the setup records the first
+    // launch holds for the same pass, over the Desktop lane alone: the base layer, the vault and
+    // the clones never wait behind a first-launch pass, and System State's presses and the
+    // subscriber's repair wait only while preferences change. A whole profile the lane verified
+    // is recorded for the first launch.
+    let whole = choice.profile && choice.sign_out && only.is_empty();
+    let holds = mode == Mode::Apply
+        && groups.iter().any(|(items, place)| {
+            place.class == Class::Preference
+                && items.iter().any(|item| {
+                    only.is_empty()
+                        || only.iter().any(|word| {
+                            aterm_converge::selects(
+                                word,
+                                &item.id(),
+                                item.family(),
+                                Some(place.layer),
+                            )
+                        })
+                })
+        });
+    let records = front.records;
+    let desktop: &Around<'_> = &|lane| {
+        if !holds {
+            return lane();
+        }
+        let held = records.hold(whole, &|line| eprintln!("aterm init: {line}"))?;
+        let withheld: Vec<String> = groups
+            .iter()
+            .filter(|(_, place)| {
+                place.layer == Layer::Workstation && place.class == Class::Preference
+            })
+            .flat_map(|(items, place)| items.iter().map(move |item| (item, place)))
+            .filter_map(|(item, place)| {
+                let id = item.id();
+                (item.withheld().is_some()
+                    && (only.is_empty()
+                        || only.iter().any(|word| {
+                            aterm_converge::selects(word, &id, item.family(), Some(place.layer))
+                        })))
+                .then_some(id)
+            })
+            .collect();
+        if !withheld.is_empty() {
+            held.withheld(&withheld)?;
+        }
+        let rows = lane()?;
+        if whole
+            && rows
+                .iter()
+                .filter(|row| {
+                    row.layer == Some(Layer::Workstation) && row.class == Some(Class::Preference)
+                })
+                .all(|row| counts(row, Action::Apply))
+        {
+            held.verified()?;
+        }
+        Ok(rows)
+    };
+    laps.lap("questions");
     Ok(run_layers(
         sys,
         &ctx,
@@ -567,7 +976,30 @@ fn converge(
         },
         mode,
         journal,
+        laps,
+        &Hooks {
+            on_row: front.on_row,
+            desktop,
+        },
     )?)
+}
+
+/// The one envelope every `--json` surface prints (`aterm pkg doctor --json` too), with the
+/// run's phases.
+fn report_json(
+    action: Action,
+    complete: bool,
+    rows: Vec<ItemReport>,
+    laps: &Laps,
+) -> Result<String, String> {
+    let mode = match action {
+        Action::Apply => ReportMode::Apply,
+        Action::Plan => ReportMode::Plan,
+        Action::Check => ReportMode::Check,
+    };
+    let mut report = Report::new(mode, complete, rows);
+    report.phases = laps.phases();
+    aterm_json::to_string(&report).map_err(|why| why.to_string())
 }
 
 /// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`): a run
@@ -1104,7 +1536,7 @@ pub fn prepare_workstation_selected(
     }
     let ctx = context_for_selected(sys, group, selected)?;
     if ctx.console.is_none() {
-        return Err("run as the user currently logged in at this Mac's console".into());
+        return Err(outside_console_session(sys));
     }
     let (settings, items) = workstation_items_selected(&ctx, group, selected)?
         .into_iter()
@@ -1126,9 +1558,18 @@ pub fn prepare_workstation_selected(
 pub fn initial_setup_context(sys: &dyn System) -> Result<Ctx, String> {
     let ctx = context_for_selected(sys, WorkstationGroup::Accounts, Selection::none())?;
     if ctx.console.is_none() {
-        return Err("run as the user currently logged in at this Mac's console".into());
+        return Err(outside_console_session(sys));
     }
     Ok(ctx)
+}
+
+/// The refusal of a step that reads or changes the console owner's own session from outside it
+/// ([`crate::console::away`]): an SSH login of that same account is told so, not sent to log in.
+fn outside_console_session(sys: &dyn System) -> String {
+    let why = crate::console::away(sys)
+        .and_then(Presence::why)
+        .unwrap_or("its console changed hands while this read it");
+    format!("run as the user logged in at this Mac's console, in its own session ({why})")
 }
 
 /// Run the selected Spotlight policy through the same probe/apply/read-back engine.
@@ -1282,41 +1723,111 @@ fn workstation_items_selected(
 /// Items that share one place in the desired state.
 type Group = (Vec<Box<dyn Item>>, Place);
 
-/// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in).
-type Prepare<'a> = dyn Fn(&dyn System, &Ctx, Mode) -> Result<Vec<Group>, String> + 'a;
+/// What [`converge`] read and was told before the workstation's groups are built.
+struct Reading<'a> {
+    /// Why the keyboard list could not be read ([`local_context`]): only the Caps Lock rows go
+    /// unread.
+    keyboards: Option<&'a str>,
+    /// The run's `--only` words.
+    only: &'a [String],
+    /// What `--profile`, `--sign-out` and `--clone` picked, when one was given.
+    choice: Option<Choice>,
+}
+
+/// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in), with
+/// the groups it picked.
+type Prepare<'a> =
+    dyn Fn(&dyn System, &Ctx, Mode, &Reading<'_>) -> Result<(Vec<Group>, Choice), String> + 'a;
 
 /// Prepare workstation groups, reading optional profiles and prompting for vault credentials
 /// before probing; the look for the ALab vault answers with `ahead`'s, and `vault` is
-/// `--vault`'s.
+/// `--vault`'s. Who is at this run ([`crate::console::presence`]) decides whether it may
+/// change the person's own Mac: over SSH, or under another login's console, nothing of the
+/// workstation is read; from an agent's tool call or with no terminal, the vault's item is
+/// built as a plan builds it (never a prompt, never the network, `--vault` included) and
+/// [`groups`] leaves the person's rows to them. The vault is read only when this run names its
+/// item. Every group runs unless a flag names the ones to (nothing asks), and for a person at
+/// the console the Permissions phase lists aterm's grants. A group that cannot be built is one
+/// row saying why ([`Unbuilt`]); the others run.
 fn prepare_groups(
     sys: &dyn System,
     ctx: &Ctx,
     mode: Mode,
     ahead: Option<Arc<crate::init_secrets::Lookahead>>,
     vault: Option<&str>,
-) -> Result<Vec<Group>, String> {
-    if ctx.console.is_none() {
-        return Ok(vec![(
-            vec![Box::new(WorkstationAtConsole)],
-            workstation_place(Class::Person),
-        )]);
-    }
-    let secrets = crate::init_secrets::items(
-        sys,
-        ctx,
-        crate::init_secrets::live(ctx, ahead)?,
-        mode,
-        vault,
-    )?;
-    groups(sys, ctx, secrets)
+    reading: &Reading<'_>,
+    grants: Grants,
+) -> Result<(Vec<Group>, Choice), String> {
+    prepare_groups_with(sys, ctx, mode, vault, reading, grants, |ctx| {
+        crate::init_secrets::live(ctx, ahead)
+    })
 }
 
-/// The optional workstation items cannot be enumerated without reading their inputs.
-struct WorkstationAtConsole;
+/// [`prepare_groups`] with the vault's port from `secrets` (a test's scripted one).
+fn prepare_groups_with(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    vault: Option<&str>,
+    reading: &Reading<'_>,
+    grants: Grants,
+    secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
+) -> Result<(Vec<Group>, Choice), String> {
+    let presence = crate::console::presence(sys);
+    if ctx.console.is_none() {
+        return Ok((vec![away_from_console(presence)], Choice::NONE));
+    }
+    let person = presence == Presence::AtConsole;
+    let asks = if person { mode } else { Mode::Plan };
+    let names_vault = reading.only.is_empty()
+        || ctx.users.iter().any(|user| {
+            reading.only.iter().any(|word| {
+                word == "workstation"
+                    || aterm_converge::selects(
+                        word,
+                        &crate::init_secrets::item_id(user),
+                        crate::init_secrets::FAMILY,
+                        Some(Layer::Workstation),
+                    )
+            })
+        });
+    let secrets = if names_vault {
+        crate::init_secrets::items(sys, ctx, secrets(ctx)?, asks, vault)?
+    } else {
+        crate::init_secrets::Secrets {
+            items: Vec::new(),
+            waited_on: None,
+        }
+    };
+    let github = built(
+        "init.github",
+        "init",
+        Setting::Repositories.label(),
+        crate::init_github::items(sys, ctx, secrets.waited_on.as_deref()),
+    );
+    let choice = reading.choice.unwrap_or(Choice::ALL);
+    let mut groups = groups(ctx, presence, secrets, github, reading.keyboards, choice);
+    if person {
+        groups.push((
+            permissions(grants, choice.sign_out),
+            workstation_place(Class::Person),
+        ));
+    }
+    Ok((groups, choice))
+}
 
-impl Item for WorkstationAtConsole {
+/// The id of the one row that stands for the workstation rows a person at this Mac's console
+/// makes ([`AwayFromConsole`]).
+const AWAY: &str = "init.workstation";
+
+/// The optional workstation items cannot be enumerated without reading their inputs, and are
+/// the person's to make: one deferred row, saying why, until a person runs init at this Mac's
+/// console.
+struct AwayFromConsole(Presence);
+
+impl Item for AwayFromConsole {
     fn id(&self) -> String {
-        "init.workstation".into()
+        AWAY.into()
     }
     fn family(&self) -> &'static str {
         "init"
@@ -1325,40 +1836,262 @@ impl Item for WorkstationAtConsole {
         "Workstation setup at this Mac's console".into()
     }
     fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
-        Probe::Blocked {
-            why: aterm_converge::NOT_AT_CONSOLE.into(),
-        }
+        Probe::Deferred { why: self.why() }
     }
     fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        Err(aterm_converge::NOT_AT_CONSOLE.into())
+        Err(self.why())
     }
 }
 
-/// Workstation item groups in run order, each paired with its [`Place`].
+impl AwayFromConsole {
+    /// The presence's line; the engine's own where the console was lost after it was read.
+    fn why(&self) -> String {
+        self.0
+            .needs_person()
+            .unwrap_or_else(|| aterm_converge::NOT_AT_CONSOLE.into())
+    }
+}
+
+/// [`AwayFromConsole`] in its place: read in any shell of the account, so the engine never
+/// turns it into its own `Blocked` console row; applied by nobody.
+fn away_from_console(presence: Presence) -> Group {
+    (
+        vec![Box::new(AwayFromConsole(presence))],
+        Place {
+            requires: Requires::Account,
+            ..workstation_place(Class::Person)
+        },
+    )
+}
+
+/// Whether `row` is the deferred stand-in for the workstation rows ([`AwayFromConsole`]).
+fn waits_for_a_person(row: &ItemReport) -> bool {
+    row.id == AWAY && row.outcome == Outcome::Deferred
+}
+
+/// A group whose items could not be built (an init.toml that cannot be read, a keyboard list
+/// in words this build does not read): one row says why, and every other group still runs.
+struct Unbuilt {
+    id: String,
+    family: &'static str,
+    title: &'static str,
+    why: String,
+}
+
+impl Item for Unbuilt {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+    fn family(&self) -> &'static str {
+        self.family
+    }
+    fn title(&self) -> String {
+        self.title.into()
+    }
+    fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
+        Probe::Unusable {
+            why: self.why.clone(),
+        }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err(self.why.clone())
+    }
+}
+
+/// The items `items` built, or the one [`Unbuilt`] row (`id`, `family`, `title`) saying why
+/// they could not be.
+fn built(
+    id: &str,
+    family: &'static str,
+    title: &'static str,
+    items: Result<Vec<Box<dyn Item>>, String>,
+) -> Vec<Box<dyn Item>> {
+    items.unwrap_or_else(|why| {
+        vec![Box::new(Unbuilt {
+            id: id.to_owned(),
+            family,
+            title,
+            why,
+        })]
+    })
+}
+
+/// Workstation item groups in run order, each paired with its [`Place`]: for a person at the
+/// console (`presence`), the groups `choice` picks and Rust in Spotlight, with the keyboard list
+/// unread (`keyboards`) the Caps Lock rows one row saying why; anywhere else one deferred row
+/// stands for the person's own Mac ([`AwayFromConsole`]). Then the vault, and its GitHub profile
+/// (`github`, already built) when `choice` clones.
 fn groups(
-    sys: &dyn System,
     ctx: &Ctx,
+    presence: Presence,
     secrets: crate::init_secrets::Secrets,
-) -> Result<Vec<Group>, String> {
+    github: Vec<Box<dyn Item>>,
+    keyboards: Option<&str>,
+    choice: Choice,
+) -> Vec<Group> {
     let place = workstation_place;
-    Ok(vec![
-        (
-            crate::init_preferences::items(ctx)?,
+    let person = presence == Presence::AtConsole;
+    let mut groups = Vec::new();
+    if !person {
+        groups.push(away_from_console(presence));
+    }
+    if person && choice.profile {
+        let preferences = match keyboards {
+            None => built(
+                "init.preferences",
+                "init",
+                "Workstation preferences",
+                crate::init_preferences::items(ctx),
+            ),
+            Some(why) => {
+                let mut rest = Selection::all();
+                rest.set(Setting::CapsLock, false);
+                let mut rows = built(
+                    "init.preferences",
+                    "init",
+                    "Workstation preferences",
+                    crate::init_preferences::selected_items(ctx, rest),
+                );
+                rows.insert(
+                    0,
+                    Box::new(Unbuilt {
+                        id: "keyboard.caps-lock".into(),
+                        family: "keyboard",
+                        title: Setting::CapsLock.label(),
+                        why: why.to_owned(),
+                    }),
+                );
+                rows
+            }
+        };
+        groups.push((preferences, place(Class::Preference)));
+        groups.push((
+            built(
+                "init.trackpad",
+                "trackpad",
+                Setting::NaturalScrolling.label(),
+                crate::init_trackpad::items(ctx),
+            ),
             place(Class::Preference),
-        ),
-        (crate::init_trackpad::items(ctx)?, place(Class::Preference)),
-        (
-            crate::init_trackpad::behavior_items(ctx)?,
+        ));
+        groups.push((
+            built(
+                "init.trackpad.behavior",
+                "trackpad",
+                Setting::TrackpadScrolling.label(),
+                crate::init_trackpad::behavior_items(ctx),
+            ),
             place(Class::Preference),
-        ),
-        (crate::init_spotlight::items(ctx)?, place(Class::Asked)),
-        (crate::init_accounts::items(ctx)?, place(Class::Preference)),
-        (secrets.items, place(Class::Install)),
-        (
-            crate::init_github::items(sys, ctx, secrets.waited_on.as_deref())?,
-            place(Class::Install),
-        ),
-    ])
+        ));
+    }
+    if person {
+        groups.push((
+            built(
+                "init.spotlight",
+                "spotlight",
+                Setting::Spotlight.label(),
+                crate::init_spotlight::items(ctx),
+            ),
+            place(Class::Asked),
+        ));
+    }
+    if person && choice.sign_out {
+        groups.push((
+            built(
+                "init.accounts",
+                "init",
+                "Sign out of Messages and FaceTime",
+                crate::init_accounts::items(ctx),
+            ),
+            place(Class::Preference),
+        ));
+    }
+    groups.push((secrets.items, place(Class::Install)));
+    if choice.clone {
+        groups.push((github, place(Class::Install)));
+    }
+    groups
+}
+
+/// The Permissions phase's rows: Full Disk Access, Developer Tools and debugger access, and
+/// Accessibility for a run that signs out (`sign_out`), read once for all of them by `grants`
+/// when the first is probed.
+fn permissions(grants: Grants, sign_out: bool) -> Vec<Box<dyn Item>> {
+    let readings = Arc::new(Readings {
+        grants,
+        sign_out,
+        read: std::sync::OnceLock::new(),
+    });
+    [
+        Access::FullDiskAccess,
+        Access::DeveloperTools,
+        Access::Debugger,
+        Access::Accessibility,
+    ]
+    .into_iter()
+    .filter(|access| sign_out || *access != Access::Accessibility)
+    .map(|access| {
+        Box::new(Permission {
+            access,
+            readings: Arc::clone(&readings),
+        }) as Box<dyn Item>
+    })
+    .collect()
+}
+
+/// aterm's grants, read once for every row of the Permissions phase ([`permissions`]).
+struct Readings {
+    grants: Grants,
+    sign_out: bool,
+    read: std::sync::OnceLock<Vec<(Access, Grant)>>,
+}
+
+/// One of aterm's macOS grants in the Permissions phase: only the person switches it on, in
+/// System Settings, so its row names where; a run counts it done but `--check` does not
+/// ([`counts`]). A grant that cannot be read here is not applicable to the run, saying why.
+struct Permission {
+    access: Access,
+    readings: Arc<Readings>,
+}
+
+/// The id prefix of the Permissions phase's rows ([`Permission`]).
+const PERMISSION: &str = "init.permissions.";
+
+impl Item for Permission {
+    fn id(&self) -> String {
+        format!("{PERMISSION}{}", self.access.word())
+    }
+    fn family(&self) -> &'static str {
+        "permissions"
+    }
+    fn title(&self) -> String {
+        self.access.name().into()
+    }
+    fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
+        let readings = self
+            .readings
+            .read
+            .get_or_init(|| (self.readings.grants)(self.readings.sign_out));
+        match readings.iter().find(|(access, _)| *access == self.access) {
+            Some((_, Grant::On)) => Probe::Ok { now: "On".into() },
+            Some((_, Grant::NeedsYou(how))) => Probe::Person {
+                step: self.id(),
+                how: how.clone(),
+            },
+            Some((_, Grant::NotNeeded(why))) => Probe::NotApplicable { why: why.clone() },
+            // A grant this process cannot read (outside aterm.app, or one that reads only once
+            // Full Disk Access is on) is no failure of the run: aterm.app's Permissions reads it.
+            Some((_, Grant::Unread(why))) => Probe::NotApplicable {
+                why: format!("{why}; aterm.app's Permissions reads it"),
+            },
+            None => Probe::NotApplicable {
+                why: "not read on this Mac".into(),
+            },
+        }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err("only you can switch it on, in System Settings".into())
+    }
 }
 
 fn workstation_place(class: Class) -> Place {
@@ -1378,7 +2111,7 @@ fn run(
     base: Base,
     groups: &[Group],
     mode: Mode,
-    journal: &mut dyn Journal,
+    journal: &mut (dyn Journal + Send),
 ) -> Result<Vec<ItemReport>, String> {
     run_layers(
         sys,
@@ -1392,6 +2125,8 @@ fn run(
         },
         mode,
         journal,
+        &mut Laps::start(),
+        &Hooks::QUIET,
     )
 }
 
@@ -1401,7 +2136,140 @@ struct Narrowing<'a> {
     record: bool,
 }
 
-/// Run `base` items, release the store lock, and then run `base.clt`, `groups`, and `develop`.
+/// What a run's caller hears and wraps while its lanes go ([`run_layers`]).
+struct Hooks<'a> {
+    /// Hears each row as its item finishes, from whichever lane ran it.
+    on_row: &'a (dyn Fn(&ItemReport) + Sync),
+    /// Runs the Desktop lane, handed to it as a call: [`converge`] holds the setup records
+    /// around it ([`Records`]), so only that lane waits behind a first-launch pass.
+    desktop: &'a Around<'a>,
+}
+
+impl Hooks<'_> {
+    /// Hear nothing, and run the Desktop lane as it is.
+    #[cfg(test)]
+    const QUIET: Hooks<'static> = Hooks {
+        on_row: &|_| {},
+        desktop: &|lane| lane(),
+    };
+}
+
+/// One lane's run, handed to [`Hooks::desktop`] to call.
+type LaneRun<'a> = dyn Fn() -> Result<Vec<ItemReport>, String> + 'a;
+
+/// What runs a lane around its call ([`Hooks::desktop`]).
+type Around<'a> = dyn Fn(&LaneRun<'_>) -> Result<Vec<ItemReport>, String> + Sync + 'a;
+
+/// The lanes of one run ([`run_layers`]), each its items in order, all at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// After the base layer, on the calling thread: Rust in Spotlight (rustup, once the base
+    /// layer let the store lock go) and aterm's grants.
+    Base,
+    /// Apple's Command Line Tools, the vault, GitHub and the develop layer: installs and the
+    /// network.
+    Network,
+    /// The preferences, the trackpad and the sign-outs: every Dock relaunch and every UI
+    /// automation stays in this one lane.
+    Desktop,
+}
+
+/// The lane a workstation group runs in, by its place's class.
+const fn lane(class: Class) -> Lane {
+    match class {
+        Class::Preference => Lane::Desktop,
+        Class::Install | Class::Elevate => Lane::Network,
+        _ => Lane::Base,
+    }
+}
+
+/// Opens once, for every thread waiting on it: the base layer let the store lock go.
+#[derive(Default)]
+struct Latch {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Latch {
+    fn open(&self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.opened.notify_all();
+    }
+
+    fn wait(&self) {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        drop(
+            self.opened
+                .wait_while(open, |open| !*open)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+}
+
+/// Opens its latch when dropped, a panic's unwinding included, so no lane waits on a base
+/// layer that ended.
+struct Opens<'a>(&'a Latch);
+
+impl Drop for Opens<'_> {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// The id of the Network lane's gate ([`AfterBase`]), whose row [`run_layers`] drops.
+const AFTER_BASE: &str = "init.after-base";
+
+/// Holds the Network lane, after the vault's join, until the base layer let the store lock go
+/// ([`Latch`]): `base.clt` and the develop layer's tools may take it.
+struct AfterBase<'a>(&'a Latch);
+
+impl Item for AfterBase<'_> {
+    fn id(&self) -> String {
+        AFTER_BASE.into()
+    }
+    fn family(&self) -> &'static str {
+        "init"
+    }
+    fn title(&self) -> String {
+        "the base layer let the store lock go".into()
+    }
+    fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
+        self.0.wait();
+        Probe::Ok { now: self.title() }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// One run's journal, shared by its lanes: each record is written under its lock (the file
+/// journal's own lock keeps other processes' records whole).
+struct Shared<'a, 'j>(&'a Mutex<&'j mut (dyn Journal + Send)>);
+
+impl Journal for Shared<'_, '_> {
+    fn before_change(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        revert: Option<&str>,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .before_change(id, from, to, revert)
+    }
+}
+
+/// Run `base` items, release the store lock, and then run `base.clt`, `groups`, and `develop`
+/// in three lanes at once ([`Lane`]): the Desktop lane and the vault's join in the Network lane
+/// start at once, the rest of the Network lane (`base.clt`, GitHub, the develop layer) once
+/// the base layer let the store lock go ([`AfterBase`]), and the Base lane follows the base
+/// layer. Each row reaches `hooks.on_row` as its item finishes, and the Desktop lane runs
+/// inside `hooks.desktop`; the rows come back in composition order whichever lane finished
+/// first. The phases `base` (the base layer) and `workstation` (the rest, until every lane is
+/// done) of `laps` add up to the run's wall time; a lane's own time is the sum of its rows'
+/// `elapsed_ms`.
 #[expect(
     clippy::too_many_arguments,
     reason = "one run's whole composition, each part its own input"
@@ -1414,8 +2282,11 @@ fn run_layers(
     develop: &[(Box<dyn Item>, Place)],
     narrowing: &Narrowing<'_>,
     mode: Mode,
-    journal: &mut dyn Journal,
+    journal: &mut (dyn Journal + Send),
+    laps: &mut Laps,
+    hooks: &Hooks<'_>,
 ) -> Result<Vec<ItemReport>, String> {
+    let on_row = hooks.on_row;
     let scope = aterm_converge::Scope {
         at_console: ctx.console.is_some(),
         ..aterm_converge::Scope::EVERY
@@ -1423,48 +2294,125 @@ fn run_layers(
     let Base {
         items, held, clt, ..
     } = base;
-    let mut rows = aterm_converge::run_scoped(&items, mode, scope, journal, &mut |_| {})
-        .map_err(|refused| refused.to_string())?;
-    drop(held);
-    let clt = clt
-        .as_ref()
-        .map(|clt| (clt as &dyn Item, crate::init_clt::place()));
-    let bound = crate::engine::bind(
-        clt.into_iter()
-            .chain(groups.iter().flat_map(|(items, place)| {
-                items.iter().map(move |item| (item.as_ref(), place.clone()))
-            }))
-            .chain(
-                develop
-                    .iter()
-                    .map(|(item, place)| (item.as_ref(), place.clone())),
-            ),
-        sys,
-        ctx,
-    );
-    let bound = if narrowing.only.is_empty() {
-        bound
-    } else {
-        let mut words = narrowing.only.to_vec();
-        if narrowing.record {
-            words.push(crate::init_develop::RECORD.to_owned());
+    let order: Vec<String> = clt
+        .iter()
+        .map(Item::id)
+        .chain(
+            groups
+                .iter()
+                .flat_map(|(items, _)| items.iter().map(|item| item.id())),
+        )
+        .chain(develop.iter().map(|(item, _)| item.id()))
+        .collect();
+    let released = Latch::default();
+    let gate = AfterBase(&released);
+    let (mut spotlight, mut network, mut desktop, mut later) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (items, place) in groups {
+        for item in items {
+            let at = (item.as_ref(), place.clone());
+            match lane(place.class) {
+                Lane::Base => spotlight.push(at),
+                Lane::Desktop => desktop.push(at),
+                // The vault's join starts at once; what may take the store lock waits behind
+                // the gate.
+                Lane::Network if item.family() == crate::init_secrets::FAMILY => network.push(at),
+                Lane::Network => later.push(at),
+            }
         }
-        aterm_converge::select(bound, &words).0
+    }
+    let gated: Vec<(&dyn Item, Place)> = clt
+        .as_ref()
+        .map(|clt| (clt as &dyn Item, crate::init_clt::place()))
+        .into_iter()
+        .chain(later)
+        .chain(
+            develop
+                .iter()
+                .map(|(item, place)| (item.as_ref(), place.clone())),
+        )
+        .collect();
+    if !gated.is_empty() {
+        network.push((&gate as &dyn Item, crate::init_clt::place()));
+        network.extend(gated);
+    }
+    let journal = Mutex::new(journal);
+    let run = |lane: &[(&dyn Item, Place)]| -> Result<Vec<ItemReport>, String> {
+        if lane.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bound = crate::engine::bind(lane.iter().cloned(), sys, ctx);
+        let bound = if narrowing.only.is_empty() {
+            bound
+        } else {
+            let mut words = narrowing.only.to_vec();
+            if narrowing.record {
+                words.push(crate::init_develop::RECORD.to_owned());
+            }
+            words.push(AFTER_BASE.to_owned());
+            aterm_converge::select(bound, &words).0
+        };
+        let mut rows =
+            aterm_converge::run_scoped(&bound, mode, scope, &mut Shared(&journal), &mut |row| {
+                if row.id != AFTER_BASE {
+                    on_row(row);
+                }
+            })
+            .map_err(|refused| refused.to_string())?;
+        rows.retain(|row| row.id != AFTER_BASE);
+        Ok(rows)
     };
-    rows.extend(
-        aterm_converge::run_scoped(&bound, mode, scope, journal, &mut |_| {})
-            .map_err(|refused| refused.to_string())?,
-    );
+    let network_lane = || run(&network);
+    let desktop_lane = || (hooks.desktop)(&|| run(&desktop));
+    let (base_rows, lanes) = std::thread::scope(|threads| {
+        let network_thread = std::thread::Builder::new()
+            .name("aterm-init-network".into())
+            .spawn_scoped(threads, network_lane)
+            .ok();
+        let desktop_thread = std::thread::Builder::new()
+            .name("aterm-init-desktop".into())
+            .spawn_scoped(threads, desktop_lane)
+            .ok();
+        let opens = Opens(&released);
+        let base_rows =
+            aterm_converge::run_scoped(&items, mode, scope, &mut Shared(&journal), &mut |row| {
+                on_row(row);
+            })
+            .map_err(|refused| refused.to_string());
+        drop(held);
+        drop(opens);
+        laps.lap("base");
+        let spotlight_rows = run(&spotlight);
+        // A lane whose thread could not start runs here, after the others.
+        let joined = |thread: Option<std::thread::ScopedJoinHandle<'_, _>>,
+                      inline: &dyn Fn() -> Result<Vec<ItemReport>, String>| {
+            match thread {
+                Some(thread) => thread
+                    .join()
+                    .unwrap_or_else(|_| Err("a setup lane stopped unexpectedly".into())),
+                None => inline(),
+            }
+        };
+        let network_rows = joined(network_thread, &network_lane);
+        let desktop_rows = joined(desktop_thread, &desktop_lane);
+        (base_rows, [spotlight_rows, network_rows, desktop_rows])
+    });
+    let mut rows = base_rows?;
+    let mut rest = Vec::new();
+    for lane in lanes {
+        rest.extend(lane?);
+    }
+    rest.sort_by_key(|row| order.iter().position(|id| *id == row.id));
+    rows.extend(rest);
+    laps.lap("workstation");
     Ok(rows)
 }
 
-/// Collect only what this setup uses, avoiding fleet, TCC database and unrelated app probes.
-fn local_context(sys: &dyn System) -> Result<Ctx, String> {
-    context_for(sys, WorkstationGroup::All)
-}
-
-fn context_for(sys: &dyn System, group: WorkstationGroup) -> Result<Ctx, String> {
-    context_for_selected(sys, group, Selection::all())
+/// Collect only what this setup uses, avoiding fleet, TCC database and unrelated app probes,
+/// with why the keyboard list could not be read apart ([`context_reading`]): it leaves only
+/// the Caps Lock rows unread, never the run.
+fn local_context(sys: &dyn System) -> Result<(Ctx, Option<String>), String> {
+    context_reading(sys, WorkstationGroup::All, Selection::all())
 }
 
 fn context_for_selected(
@@ -1472,6 +2420,17 @@ fn context_for_selected(
     group: WorkstationGroup,
     selected: Selection,
 ) -> Result<Ctx, String> {
+    let (ctx, keyboards) = context_reading(sys, group, selected)?;
+    keyboards.map_or(Ok(ctx), Err)
+}
+
+/// [`context_for_selected`]'s reading, with why the keyboard list (`hidutil list`) could not
+/// be read, if it could not, apart: the context then lists no keyboard.
+fn context_reading(
+    sys: &dyn System,
+    group: WorkstationGroup,
+    selected: Selection,
+) -> Result<(Ctx, Option<String>), String> {
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
     }
@@ -1485,9 +2444,10 @@ fn context_for_selected(
             sys.euid()
         ));
     }
-    let at_console = sys
-        .stat(Path::new("/dev/console"))
-        .is_ok_and(|console| console.uid == user.uid);
+    // This login's own console session: it owns `/dev/console` and this process runs in its
+    // graphic session, not over SSH (`console::remote`). Otherwise (another login's console,
+    // nobody's, a remote shell) nothing of the console session is read.
+    let at_console = !crate::console::remote(sys);
     let facts = HostFacts {
         arch: read(sys, &Cmd::new("/usr/bin/uname").arg("-m"))?
             .trim()
@@ -1501,41 +2461,53 @@ fn context_for_selected(
         ..HostFacts::default()
     };
     if !at_console {
-        return Ok(Ctx {
-            facts,
-            users: vec![user],
-            console: None,
-            host_name: String::new(),
-            cache_dir: PathBuf::new(),
-            disrupt: true,
-        });
+        return Ok((
+            Ctx {
+                facts,
+                users: vec![user],
+                console: None,
+                host_name: String::new(),
+                cache_dir: PathBuf::new(),
+                disrupt: true,
+            },
+            None,
+        ));
     }
     let keyboards = if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock)
     {
-        Vec::new()
+        Ok(Vec::new())
     } else {
         let command = crate::facts::hidutil_keyboards();
-        let keyboard_list = sys
-            .run_complete_stdout(&command)
-            .map_err(|e| format!("{}: {e}", command.display()))?;
-        if !keyboard_list.success() {
-            return Err(format!(
-                "{}: {}",
-                command.display(),
-                keyboard_list.describe()
-            ));
-        }
-        crate::facts::parse_hidutil_keyboards_complete(&keyboard_list.out())?
+        sys.run_complete_stdout(&command)
+            .map_err(|e| format!("{}: {e}", command.display()))
+            .and_then(|keyboard_list| {
+                if keyboard_list.success() {
+                    crate::facts::parse_hidutil_keyboards_complete(&keyboard_list.out())
+                } else {
+                    Err(format!(
+                        "{}: {}",
+                        command.display(),
+                        keyboard_list.describe()
+                    ))
+                }
+            })
+    };
+    let (keyboards, unread) = match keyboards {
+        Ok(keyboards) => (keyboards, None),
+        Err(why) => (Vec::new(), Some(why)),
     };
     let facts = HostFacts { keyboards, ..facts };
-    Ok(Ctx {
-        facts,
-        users: vec![user.clone()],
-        console: Some(user),
-        host_name: String::new(),
-        cache_dir: PathBuf::new(),
-        disrupt: true,
-    })
+    Ok((
+        Ctx {
+            facts,
+            users: vec![user.clone()],
+            console: Some(user),
+            host_name: String::new(),
+            cache_dir: PathBuf::new(),
+            disrupt: true,
+        },
+        unread,
+    ))
 }
 
 fn read(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
@@ -1553,13 +2525,24 @@ fn complete(rows: &[ItemReport], action: Action) -> bool {
 }
 
 /// Whether `row` counts as done for `action`: a row that waits on an admin's approval does
-/// ([`waits_by_itself`]).
+/// ([`waits_by_itself`]). For a run that is not `--check`, a grant only the person switches on
+/// ([`is_grant`]) and the workstation rows deferred to a person at this Mac's console
+/// ([`waits_for_a_person`]) are not this run's to finish, so an apply or a plan completes with
+/// them, naming them; `--check` still reads them as not verified.
 fn counts(row: &ItemReport, action: Action) -> bool {
     matches!(
         row.outcome,
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     ) || (action == Action::Plan && row.outcome == Outcome::Planned)
         || waits_by_itself(row)
+        || (action != Action::Check && (is_grant(row) || waits_for_a_person(row)))
+}
+
+/// Whether `row` is one of the Permissions phase's grants ([`Permission`]) waiting for the
+/// person: only they switch it on, so an apply or a plan is done with it, naming it; `--check`
+/// still reads it as not in place.
+fn is_grant(row: &ItemReport) -> bool {
+    row.id.starts_with(PERMISSION) && row.outcome == Outcome::Person
 }
 
 const fn word(outcome: Outcome) -> &'static str {
@@ -1635,6 +2618,25 @@ mod tests {
             from: "a".into(),
             to: "b".into(),
         }
+    }
+
+    /// [`prepare_groups`] for an apply with no flag, no `--only`, no vault look and no grant.
+    fn prepared(sys: &dyn System, ctx: &Ctx) -> Vec<Group> {
+        prepare_groups(
+            sys,
+            ctx,
+            Mode::Apply,
+            None,
+            None,
+            &Reading {
+                keyboards: None,
+                only: &[],
+                choice: None,
+            },
+            no_grants,
+        )
+        .unwrap()
+        .0
     }
 
     #[test]
@@ -2523,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn what_the_base_layer_holds_is_released_before_a_workstation_item_is_read() {
+    fn what_the_base_layer_holds_is_released_before_an_item_that_may_take_it_is_read() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         struct Held(Arc<AtomicBool>);
@@ -2574,7 +3576,7 @@ mod tests {
                 released: Arc::clone(&released),
                 saw: Arc::clone(&saw),
             }) as Box<dyn Item>],
-            place(Class::Preference),
+            place(Class::Install),
         )];
         let alice = at_console(user("alice", 501));
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -2658,14 +3660,16 @@ mod tests {
             },
         );
         let groups = groups(
-            &sys,
             &alice,
+            Presence::AtConsole,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,
             },
-        )
-        .unwrap();
+            crate::init_github::items(&sys, &alice, None).unwrap(),
+            None,
+            Choice::ALL,
+        );
         let bound = crate::engine::bind(
             groups.iter().flat_map(|(items, place)| {
                 items.iter().map(move |item| (item.as_ref(), place.clone()))
@@ -2838,10 +3842,7 @@ mod tests {
             Options {
                 action: Action::Check,
                 json: true,
-                help: false,
-                only: Vec::new(),
-                develop: None,
-                vault: None,
+                ..Options::default()
             }
         );
         let vault = |args: &[&str]| {
@@ -2861,7 +3862,10 @@ mod tests {
         assert!(vault(&["--vault="]).is_err());
         assert!(vault(&["--vault", "--plan"]).is_err(), "a flag is no vault");
         assert!(
-            vault(&["--vault=~/vault.txt", "--only", "base"]).is_err(),
+            vault_reaches(
+                &options(&["--vault=~/vault.txt".into(), "--only".into(), "base".into()]).unwrap()
+            )
+            .is_err(),
             "the vault joins in the workstation layer"
         );
         assert_eq!(
@@ -2970,43 +3974,46 @@ mod tests {
         assert!(sys.calls().is_empty());
     }
 
+    /// Alice's own shell, at a terminal in the console's graphic session, with the console
+    /// owned by `console_uid`: what `local_context` reads to resolve her.
+    fn alice_at(console_uid: u32) -> Fake {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+        sys.on(
+            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+            Ran::ok("GroupMembership: alice\n"),
+        );
+        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys.stat_of(
+            "/dev/console",
+            Stat {
+                uid: console_uid,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+        sys.on(
+            &crate::facts::hidutil_keyboards().display(),
+            Ran::ok("Services:\n\nDevices:\n"),
+        );
+        sys
+    }
+
     #[test]
-    fn under_another_console_owner_a_base_item_applies_and_a_workstation_item_is_blocked() {
-        let alice_at = |console_uid: u32| {
-            let mut sys = Fake::root();
-            sys.euid = 501;
-            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-            sys.on(
-                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-                Ran::ok("GroupMembership: alice\n"),
-            );
-            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
-            sys.stat_of(
-                "/dev/console",
-                Stat {
-                    uid: console_uid,
-                    gid: 20,
-                    mode: 0o600,
-                    dir: false,
-                    symlink: false,
-                    len: 0,
-                },
-            );
-            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
-            sys.on(
-                &crate::facts::hidutil_keyboards().display(),
-                Ran::ok("Services:\n\nDevices:\n"),
-            );
-            sys
-        };
+    fn under_another_console_owner_a_base_item_applies_and_a_workstation_item_waits() {
         let refused = prepare_workstation(&alice_at(502), WorkstationGroup::Preferences)
             .err()
             .expect("refused away from the console");
         assert!(refused.contains("at this Mac's console"), "{refused}");
         for (console_uid, at_console) in [(502, false), (501, true)] {
             let sys = alice_at(console_uid);
-            let ctx = local_context(&sys).unwrap();
+            let (ctx, _) = local_context(&sys).unwrap();
             assert_eq!(ctx.console.is_some(), at_console);
             let applied = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let base = Base {
@@ -3025,8 +4032,12 @@ mod tests {
                 )]
             } else {
                 let before = sys.calls();
-                let groups = prepare_groups(&sys, &ctx, Mode::Apply, None, None).unwrap();
-                assert_eq!(sys.calls(), before, "no workstation preparation over SSH");
+                let groups = prepared(&sys, &ctx);
+                assert_eq!(
+                    sys.calls(),
+                    before,
+                    "no workstation preparation off the console"
+                );
                 assert_eq!(groups[0].0[0].id(), "init.workstation");
                 groups
             };
@@ -3039,12 +4050,16 @@ mod tests {
             if at_console {
                 assert_eq!(rows[1].outcome, Outcome::Changed, "{rows:?}");
             } else {
-                assert_eq!(rows[1].outcome, Outcome::Blocked, "{rows:?}");
-                assert_eq!(rows[1].why.as_deref(), Some(aterm_converge::NOT_AT_CONSOLE));
+                // Another login's workstation waits for a person at its console: the base
+                // layer's run is done, and only `--check` reads the deferred row as unmet.
+                assert_eq!(rows[1].outcome, Outcome::Deferred, "{rows:?}");
+                assert_eq!(rows[1].why, Presence::OtherLogin.needs_person());
                 assert!(!sys.calls().iter().any(|call| call.contains("defaults")
                     || call.contains("hidutil")
                     || call.contains("accounts.data")));
-                assert_eq!(status(&rows, Action::Apply), 1);
+                assert_eq!(status(&rows, Action::Apply), 0);
+                assert_eq!(status(&rows, Action::Plan), 0);
+                assert_eq!(status(&rows, Action::Check), 1);
             }
         }
         assert!(
@@ -3052,6 +4067,152 @@ mod tests {
                 .unwrap_err()
                 .contains("without sudo")
         );
+    }
+
+    /// An SSH session of the console's own login is not the person at it: nothing of the
+    /// console session is read, and the workstation waits for them as under another login.
+    #[test]
+    fn over_ssh_the_console_owners_workstation_waits_for_a_person_at_it() {
+        for (remote_login, graphic, at_console) in [
+            (true, Some(true), false),
+            (false, Some(false), false),
+            (false, Some(true), true),
+        ] {
+            let mut sys = alice_at(501);
+            sys.remote_login = remote_login;
+            sys.graphic_session = graphic;
+            let (ctx, _) = local_context(&sys).unwrap();
+            assert_eq!(
+                ctx.console.is_some(),
+                at_console,
+                "{remote_login} {graphic:?}"
+            );
+            if at_console {
+                continue;
+            }
+            // `aterm doctor`'s and System State's preparation says why, not to log in.
+            let refused = prepare_workstation(&sys, WorkstationGroup::Preferences)
+                .err()
+                .expect("refused outside the console's session");
+            assert!(
+                refused.contains(Presence::Remote.why().unwrap()),
+                "{refused}"
+            );
+            let groups = prepared(&sys, &ctx);
+            let rows = run(
+                &sys,
+                &ctx,
+                Base::none(),
+                &groups,
+                Mode::Apply,
+                &mut NoJournal,
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].outcome, Outcome::Deferred);
+            assert_eq!(rows[0].why, Presence::Remote.needs_person());
+            assert_eq!(status(&rows, Action::Apply), 0);
+            assert!(
+                !sys.calls().iter().any(|call| call.contains("hidutil")),
+                "{:?}",
+                sys.calls()
+            );
+        }
+    }
+
+    /// From an agent's tool call (no terminal) or an agent's tab, in the console's own
+    /// session, init runs the base layer and the vault and GitHub profile the person recorded,
+    /// and leaves the person's rows (preferences, Dock, sign-outs, rustup's profile) to them:
+    /// no `killall`, no sign-out, no `rustup set profile`, and the vault is never probed or
+    /// asked. Control: a person at the console gets those rows.
+    #[test]
+    fn without_a_person_at_the_console_init_leaves_the_persons_rows_to_them() {
+        let bound_classes = |sys: &Fake, groups: &[Group], ctx: &Ctx| {
+            crate::engine::bind(
+                groups.iter().flat_map(|(items, place)| {
+                    items.iter().map(move |item| (item.as_ref(), place.clone()))
+                }),
+                sys,
+                ctx,
+            )
+            .iter()
+            .map(|b| (b.id(), b.class()))
+            .collect::<Vec<_>>()
+        };
+        let personal = [Class::Preference, Class::Asked];
+        for (terminal, agent, presence) in [
+            (false, None, Presence::NoTerminal),
+            (true, Some("Claude Code"), Presence::AgentTab),
+            (true, None, Presence::AtConsole),
+        ] {
+            let mut sys = alice_at(501);
+            sys.terminal = terminal;
+            sys.agent = agent;
+            assert_eq!(crate::console::presence(&sys), presence);
+            let (ctx, _) = local_context(&sys).unwrap();
+            assert!(ctx.console.is_some(), "the console's own session");
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            let port = Arc::clone(&vault);
+            let groups = prepare_groups_with(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                None,
+                &Reading {
+                    keyboards: None,
+                    only: &[],
+                    choice: None,
+                },
+                no_grants,
+                move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap()
+            .0;
+            let bound = bound_classes(&sys, &groups, &ctx);
+            if presence == Presence::AtConsole {
+                assert!(
+                    bound
+                        .iter()
+                        .any(|(id, _)| id == "init.spotlight.rustup-profile@alice"),
+                    "{bound:?}"
+                );
+                assert!(
+                    bound.iter().any(|(_, class)| *class == Class::Preference),
+                    "{bound:?}"
+                );
+                assert_eq!(vault.probes(), 1, "a person's run looks for the ALab vault");
+                continue;
+            }
+            assert!(
+                !bound.iter().any(|(_, class)| personal.contains(class)),
+                "{bound:?}"
+            );
+            assert_eq!(vault.probes(), 0, "nobody to ask: no look for the vault");
+            let rows = run(
+                &sys,
+                &ctx,
+                Base::none(),
+                &groups,
+                Mode::Apply,
+                &mut NoJournal,
+            )
+            .unwrap();
+            let away = rows
+                .iter()
+                .find(|row| row.id == AWAY)
+                .expect("the stand-in");
+            assert_eq!(away.outcome, Outcome::Deferred);
+            assert_eq!(away.why, presence.needs_person());
+            let calls = sys.calls();
+            for change in ["killall", "osascript", "set profile", "defaults write"] {
+                assert!(
+                    !calls.iter().any(|call| call.contains(change)),
+                    "{change}: {calls:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3073,6 +4234,7 @@ mod tests {
             explain: None,
             stood_aside: aside,
             essential: false,
+            elapsed_ms: None,
         };
         let lock = || Some(StoodAside::Lock("held".into()));
         let offline = || Some(StoodAside::Offline("down".into()));
@@ -3152,8 +4314,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_keyboard_list_at_the_console_is_refused_before_preferences_or_accounts_are_read()
-     {
+    /// A keyboard list macOS answers in words this build does not read leaves only the Caps
+    /// Lock rows unread: one row says why, and every other preference is still built and run.
+    /// System State's own reading still refuses it.
+    fn an_unreadable_keyboard_list_leaves_only_the_caps_lock_rows_unread() {
         let current_user = || {
             let mut sys = Fake::root();
             sys.euid = 501;
@@ -3185,20 +4349,53 @@ mod tests {
         ] {
             let sys = current_user();
             sys.on(&command.display(), Ran::ok(invalid));
-            assert!(local_context(&sys).is_err());
+            let (ctx, unread) = local_context(&sys).unwrap();
+            let why = unread.expect("the list is not read");
+            assert!(ctx.console.is_some() && ctx.facts.keyboards.is_empty());
             assert!(
                 !sys.calls()
                     .iter()
                     .any(|call| call.contains("defaults") || call.contains("accounts.data"))
             );
+            let groups = groups(
+                &ctx,
+                Presence::AtConsole,
+                crate::init_secrets::Secrets {
+                    items: Vec::new(),
+                    waited_on: None,
+                },
+                Vec::new(),
+                Some(&why),
+                Choice::ALL,
+            );
+            let preferences: Vec<&dyn Item> = groups
+                .iter()
+                .filter(|(_, place)| place.class == Class::Preference)
+                .flat_map(|(items, _)| items.iter().map(AsRef::as_ref))
+                .collect();
+            let keyboard: Vec<&&dyn Item> = preferences
+                .iter()
+                .filter(|item| item.family() == "keyboard")
+                .collect();
+            assert_eq!(keyboard.len(), 1, "one Caps Lock row");
+            assert_eq!(
+                keyboard[0].probe(&sys, &ctx),
+                Probe::Unusable { why: why.clone() }
+            );
+            assert!(
+                preferences.len() > 1 && preferences.iter().any(|item| item.family() == "trackpad"),
+                "the other preferences are built"
+            );
+            assert!(context_for_selected(&sys, WorkstationGroup::All, Selection::all()).is_err());
         }
         let sys = current_user();
         sys.on(&command.display(), Ran::ok("Services:\n\nDevices:\n"));
-        assert!(local_context(&sys).unwrap().facts.keyboards.is_empty());
+        let (ctx, unread) = local_context(&sys).unwrap();
+        assert!(unread.is_none() && ctx.facts.keyboards.is_empty());
         let sys = current_user();
         sys.on(&command.display(), Ran::ok("Services:\n"));
         sys.refuse_complete_stdout(&command.display(), "incomplete captured service list");
-        assert!(local_context(&sys).is_err());
+        assert!(local_context(&sys).unwrap().1.is_some());
     }
 
     #[test]
@@ -3219,6 +4416,7 @@ mod tests {
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         };
         assert!(!complete(&[], Action::Apply));
         for outcome in [
@@ -3312,6 +4510,15 @@ mod tests {
             sys: &dyn System,
             options: &Options,
         ) -> Result<Vec<ItemReport>, Refused> {
+            self.converge_timed(sys, options, &mut Laps::start())
+        }
+
+        fn converge_timed(
+            &self,
+            sys: &dyn System,
+            options: &Options,
+            laps: &mut Laps,
+        ) -> Result<Vec<ItemReport>, Refused> {
             use std::sync::atomic::Ordering;
             let base = |_: bool| {
                 self.bases.fetch_add(1, Ordering::SeqCst);
@@ -3324,12 +4531,15 @@ mod tests {
                 }
                 base
             };
-            let groups = |_: &dyn System, _: &Ctx, _: Mode| {
+            let groups = |_: &dyn System, _: &Ctx, _: Mode, _: &Reading<'_>| {
                 self.workstations.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![(
-                    vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
-                    place(Class::Preference),
-                )])
+                Ok((
+                    vec![(
+                        vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
+                        place(Class::Preference),
+                    )],
+                    Choice::ALL,
+                ))
             };
             converge(
                 sys,
@@ -3339,8 +4549,11 @@ mod tests {
                     groups: &groups,
                     targo: None,
                     cwd: Some(Path::new("/Users//alice/aterm")),
+                    records: &NoRecords,
+                    on_row: &|_| {},
                 },
                 &mut NoJournal,
+                laps,
             )
         }
 
@@ -3351,6 +4564,36 @@ mod tests {
                 self.workstations.load(Ordering::SeqCst),
             )
         }
+    }
+
+    /// `--json` TIMES THE RUN: its `phases` name this login's context, the questions, the
+    /// base layer and the workstation layer, and every row, the base item's and the
+    /// workstation item's alike, carries its time (presence only, never a budget).
+    #[test]
+    fn a_json_report_carries_each_phase_and_every_row_its_time() {
+        let sys = alice_with_checkout(501, None);
+        let mut laps = Laps::start();
+        let rows = Composed::with_base()
+            .converge_timed(&sys, &Options::default(), &mut laps)
+            .unwrap();
+        let complete = complete(&rows, Action::Apply);
+        let text = report_json(Action::Apply, complete, rows, &laps).unwrap();
+        let report: Report = aterm_json::from_str(&text).unwrap();
+        assert_eq!(
+            report.phases.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["base", "context", "questions", "workstation"],
+            "{text}"
+        );
+        for layer in [Layer::Base, Layer::Workstation] {
+            assert!(
+                report.items.iter().any(|row| row.layer == Some(layer)),
+                "{layer:?}: {text}"
+            );
+        }
+        assert!(
+            report.items.iter().all(|row| row.elapsed_ms.is_some()),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3594,7 +4837,7 @@ mod tests {
                     assert!(record.is_empty(), "{only:?}: {rows:?}");
                     assert_eq!(status(&rows, Action::Apply), 0);
                 }
-                let ctx = local_context(&sys).unwrap();
+                let (ctx, _) = local_context(&sys).unwrap();
                 let composed = crate::init_develop::compose(
                     &sys,
                     &ctx,
@@ -3791,5 +5034,853 @@ mod tests {
                 "{profile:?} {asked} {home}"
             );
         }
+    }
+
+    /// Lanes meeting in their probes: [`Meet::arrive`] returns once `count` lanes stand in it
+    /// at the same time, and fails after a minute (a hang detector): lanes run one after
+    /// another never all arrive.
+    struct Meet {
+        here: Mutex<u32>,
+        all: std::sync::Condvar,
+        count: u32,
+    }
+
+    impl Meet {
+        fn new(count: u32) -> Arc<Self> {
+            Arc::new(Self {
+                here: Mutex::new(0),
+                all: std::sync::Condvar::new(),
+                count,
+            })
+        }
+
+        fn arrive(&self) {
+            let mut here = self.here.lock().unwrap();
+            *here += 1;
+            self.all.notify_all();
+            let (here, waited) = self
+                .all
+                .wait_timeout_while(here, std::time::Duration::from_secs(60), |here| {
+                    *here < self.count
+                })
+                .unwrap();
+            assert!(
+                !waited.timed_out(),
+                "only {} of {} lanes ran at once",
+                *here,
+                self.count
+            );
+        }
+    }
+
+    /// A base item that meets the other lanes in its probe.
+    struct MeetsBase(Arc<Meet>);
+
+    impl aterm_converge::Item for MeetsBase {
+        fn id(&self) -> String {
+            "base.pkg.shims".into()
+        }
+        fn family(&self) -> &'static str {
+            "pkg"
+        }
+        fn layer(&self) -> Layer {
+            Layer::Base
+        }
+        fn class(&self) -> Class {
+            Class::Relay
+        }
+        fn title(&self) -> String {
+            self.id()
+        }
+        fn probe(&self) -> Probe {
+            self.0.arrive();
+            ok()
+        }
+        fn apply(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn explain(&self, probe: &Probe) -> aterm_converge::Explain {
+            aterm_converge::Explain {
+                why: format!("{probe:?}"),
+                remedy: Remedy::Repair,
+            }
+        }
+    }
+
+    /// A workstation item whose probe runs `then` before it reads right.
+    struct Then {
+        id: &'static str,
+        family: &'static str,
+        then: Box<dyn Fn() + Send + Sync>,
+    }
+
+    impl Item for Then {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        fn family(&self) -> &'static str {
+            self.family
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+            (self.then)();
+            ok()
+        }
+        fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn then(
+        id: &'static str,
+        family: &'static str,
+        then: impl Fn() + Send + Sync + 'static,
+    ) -> Box<dyn Item> {
+        Box::new(Then {
+            id,
+            family,
+            then: Box::new(then),
+        })
+    }
+
+    /// The base layer, the vault's join and the preferences run at once: each lane's first
+    /// item meets the other two, which a serial run never lets happen.
+    #[test]
+    fn the_base_vault_and_preference_lanes_run_at_once() {
+        let meet = Meet::new(3);
+        let base = Base {
+            items: vec![Box::new(MeetsBase(Arc::clone(&meet)))],
+            held: None,
+            clt: None,
+            targo: None,
+        };
+        let (dock, vault) = (Arc::clone(&meet), Arc::clone(&meet));
+        let groups = vec![
+            (
+                vec![then("init.test.dock", "dock", move || dock.arrive())],
+                place(Class::Preference),
+            ),
+            (
+                vec![then(
+                    "init.test.vault",
+                    crate::init_secrets::FAMILY,
+                    move || vault.arrive(),
+                )],
+                place(Class::Install),
+            ),
+        ];
+        let alice = at_console(user("alice", 501));
+        let rows = run(
+            &Fake::root(),
+            &alice,
+            base,
+            &groups,
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["base.pkg.shims", "init.test.dock", "init.test.vault"]
+        );
+    }
+
+    /// Each row reaches `on_row` as its item finishes, while the run goes on: the preference
+    /// waits for the vault's row to have been printed. The rows come back in composition
+    /// order all the same.
+    #[test]
+    fn each_row_streams_as_it_finishes_and_the_rows_return_in_composition_order() {
+        let streamed: Arc<(Mutex<Vec<String>>, std::sync::Condvar)> = Arc::default();
+        let seen = Arc::clone(&streamed);
+        let groups = vec![
+            (
+                vec![then("init.test.dock", "dock", move || {
+                    let (rows, more) = &*seen;
+                    let (rows, waited) = more
+                        .wait_timeout_while(
+                            rows.lock().unwrap(),
+                            std::time::Duration::from_secs(60),
+                            |rows| !rows.iter().any(|id| id == "init.test.vault"),
+                        )
+                        .unwrap();
+                    assert!(
+                        !waited.timed_out(),
+                        "the vault's row never streamed: {rows:?}"
+                    );
+                })],
+                place(Class::Preference),
+            ),
+            (
+                vec![then("init.test.vault", crate::init_secrets::FAMILY, || {})],
+                place(Class::Install),
+            ),
+        ];
+        let alice = at_console(user("alice", 501));
+        let on_row = |row: &ItemReport| {
+            let (rows, more) = &*streamed;
+            rows.lock().unwrap().push(row.id.clone());
+            more.notify_all();
+        };
+        let rows = run_layers(
+            &Fake::root(),
+            &alice,
+            Base::none(),
+            &groups,
+            &[],
+            &Narrowing {
+                only: &[],
+                record: false,
+            },
+            Mode::Apply,
+            &mut NoJournal,
+            &mut Laps::start(),
+            &Hooks {
+                on_row: &on_row,
+                desktop: &|lane| lane(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *streamed.0.lock().unwrap(),
+            ["init.test.vault", "init.test.dock"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["init.test.dock", "init.test.vault"]
+        );
+    }
+
+    fn report(id: &str, outcome: Outcome) -> ItemReport {
+        ItemReport {
+            id: id.into(),
+            family: "test".into(),
+            title: id.into(),
+            outcome,
+            from: None,
+            to: None,
+            why: None,
+            revert: None,
+            effect: Effect::Now,
+            detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
+            elapsed_ms: None,
+        }
+    }
+
+    /// What the default output prints for `rows`: each shown row, then the tally.
+    fn printed(rows: &[ItemReport], action: Action) -> String {
+        let mut text: String = rows.iter().filter(|row| shown(row)).map(rendered).collect();
+        text.push_str(&tally(rows, action));
+        text.push('\n');
+        text
+    }
+
+    /// A run with every row right prints one line; a changed row adds its row and what
+    /// changed, and a row only the person can finish is named in the tally.
+    #[test]
+    fn a_run_with_every_row_right_prints_one_line() {
+        let mut rows: Vec<ItemReport> = (0..45)
+            .map(|n| report(&format!("init.test.{n}"), Outcome::Ok))
+            .collect();
+        let quiet = printed(&rows, Action::Apply);
+        assert_eq!(quiet, "aterm init: 45 ok\n");
+        rows[3] = ItemReport {
+            from: Some("on".into()),
+            to: Some("off".into()),
+            ..report("init.test.changed", Outcome::Changed)
+        };
+        let changed = printed(&rows, Action::Apply);
+        assert_eq!(changed.lines().count(), 3, "{changed}");
+        assert!(
+            changed.ends_with("aterm init: 44 ok \u{b7} 1 changed\n"),
+            "{changed}"
+        );
+        rows[5] = ItemReport {
+            title: "Full Disk Access".into(),
+            why: Some("switch it on".into()),
+            ..report("init.permissions.full-disk", Outcome::Person)
+        };
+        let person = printed(&rows, Action::Apply);
+        assert_eq!(person.lines().count(), 5, "{person}");
+        assert!(
+            person.ends_with("43 ok \u{b7} 1 changed \u{b7} 1 needs you: Full Disk Access\n"),
+            "{person}"
+        );
+    }
+
+    /// A row that finishes while another lane's question or attached program (a join
+    /// password, `sudo`) owns the terminal is held back, and printed with the next row or once
+    /// the run is over; an ok row is never printed by default.
+    #[test]
+    fn a_row_waits_while_a_prompt_owns_the_terminal() {
+        let printer = Printer::new(false, false);
+        let changed = ItemReport {
+            from: Some("on".into()),
+            to: Some("off".into()),
+            ..report("init.test.changed", Outcome::Changed)
+        };
+        let mut during = Vec::new();
+        crate::port::owning_terminal(|| printer.row_to(&changed, &mut during));
+        assert!(during.is_empty(), "{}", String::from_utf8_lossy(&during));
+        let mut after = Vec::new();
+        printer.row_to(&report("init.test.ok", Outcome::Ok), &mut after);
+        printer.flush_to(&mut after);
+        assert_eq!(String::from_utf8(after).unwrap(), rendered(&changed));
+    }
+
+    /// `aterm init --help` and `aterm help init` read one page: every System State setting by
+    /// its label, in at most 25 lines.
+    #[test]
+    fn the_usage_names_every_setting_by_its_label_in_25_lines() {
+        let usage = usage();
+        for setting in Setting::ALL {
+            assert!(usage.contains(setting.label()), "{setting:?}: {usage}");
+        }
+        assert!(usage.lines().count() <= 25, "{usage}");
+        assert!(usage.contains("first launch"), "{usage}");
+    }
+
+    /// First-run setup is on by default (owner ruling 2026-10-25): a person at the console with
+    /// no flag gets every group, the preferences and both sign-outs included, and is asked
+    /// nothing; a flag runs only the group it names.
+    #[test]
+    fn a_person_at_the_console_gets_every_group_and_is_asked_nothing() {
+        let prepared_with = |choice: Option<Choice>| {
+            let mut sys = alice_at(501);
+            sys.terminal = true;
+            sys.agent = None;
+            assert_eq!(crate::console::presence(&sys), Presence::AtConsole);
+            let (ctx, _) = local_context(&sys).unwrap();
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            let (groups, picked) = prepare_groups_with(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                None,
+                &Reading {
+                    keyboards: None,
+                    only: &[],
+                    choice,
+                },
+                no_grants,
+                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap();
+            let preferences: Vec<String> = groups
+                .iter()
+                .filter(|(_, place)| place.class == Class::Preference)
+                .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+                .collect();
+            let asked: Vec<String> = sys
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("ask"))
+                .collect();
+            (preferences, picked, asked)
+        };
+        let signs_out = |id: &String| id.contains(".signed-out@");
+        let (preferences, picked, asked) = prepared_with(None);
+        assert_eq!(picked, Choice::ALL);
+        assert!(asked.is_empty(), "nothing is asked: {asked:?}");
+        assert!(
+            preferences.iter().filter(|id| signs_out(id)).count() == 2
+                && preferences.iter().any(|id| !signs_out(id)),
+            "{preferences:?}"
+        );
+        let sign_out = Choice {
+            sign_out: true,
+            ..Choice::NONE
+        };
+        let (preferences, picked, asked) = prepared_with(Some(sign_out));
+        assert_eq!(picked, sign_out);
+        assert!(asked.is_empty(), "{asked:?}");
+        assert!(
+            preferences.len() == 2 && preferences.iter().all(signs_out),
+            "{preferences:?}"
+        );
+    }
+
+    /// The setup records a first launch shares: a pass that changes the preferences holds
+    /// them, `whole` for every preference and both sign-outs, and records only a whole pass
+    /// it verified.
+    #[derive(Default)]
+    struct Recorded {
+        holds: Mutex<Vec<bool>>,
+        verified: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Records for Recorded {
+        fn hold(&self, whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+            self.holds.lock().unwrap().push(whole);
+            Ok(Box::new(Verifies(Arc::clone(&self.verified))))
+        }
+    }
+
+    struct Verifies(Arc<std::sync::atomic::AtomicU32>);
+
+    impl Held for Verifies {
+        fn verified(self: Box<Self>) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// One converge of alice's Mac at her console with a terminal, the groups `groups` builds
+    /// and `records` for the setup records.
+    fn converge_with(
+        sys: &Fake,
+        options: &Options,
+        groups: &dyn Fn(&Ctx) -> Vec<Group>,
+        records: &dyn Records,
+    ) -> Result<Vec<ItemReport>, Refused> {
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+            Ok((groups(ctx), reading.choice.unwrap_or(Choice::ALL)))
+        };
+        converge(
+            sys,
+            options,
+            &Front {
+                base: &|_| Base::none(),
+                groups: &prepare,
+                targo: None,
+                cwd: None,
+                records,
+                on_row: &|_| {},
+            },
+            &mut NoJournal,
+            &mut Laps::start(),
+        )
+    }
+
+    /// Only the Desktop lane waits behind a first-launch pass that holds the setup records: the
+    /// base layer and the vault's join run meanwhile. Here the hold returns only once the base
+    /// item and the vault's join stand in it too (a hang detector), which a hold taken before
+    /// the run never lets happen.
+    #[test]
+    fn only_the_desktop_lane_waits_behind_the_setup_records() {
+        struct Behind(Arc<Meet>, Mutex<Vec<String>>);
+        impl Records for Behind {
+            fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+                self.1.lock().unwrap().push("held".into());
+                self.0.arrive();
+                Ok(Box::new(NoRecords))
+            }
+        }
+        let meet = Meet::new(3);
+        let records = Behind(Arc::clone(&meet), Mutex::default());
+        let base_meet = Arc::clone(&meet);
+        let base = move |_: bool| Base {
+            items: vec![Box::new(MeetsBase(Arc::clone(&base_meet)))],
+            held: None,
+            clt: None,
+            targo: None,
+        };
+        let vault = Arc::clone(&meet);
+        let groups = move |_: &Ctx| {
+            let vault = Arc::clone(&vault);
+            vec![
+                (
+                    vec![Listed::boxed("init.test.dock", vec![ok()])],
+                    place(Class::Preference),
+                ),
+                (
+                    vec![then(
+                        "init.test.vault",
+                        crate::init_secrets::FAMILY,
+                        move || vault.arrive(),
+                    )],
+                    place(Class::Install),
+                ),
+            ]
+        };
+        let prepare =
+            |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| Ok((groups(ctx), Choice::ALL));
+        let sys = alice_with_checkout(501, None);
+        let rows = converge(
+            &sys,
+            &Options::default(),
+            &Front {
+                base: &base,
+                groups: &prepare,
+                targo: None,
+                cwd: None,
+                records: &records,
+                on_row: &|_| {},
+            },
+            &mut NoJournal,
+            &mut Laps::start(),
+        )
+        .unwrap();
+        assert_eq!(*records.1.lock().unwrap(), ["held"]);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["base.pkg.shims", "init.test.dock", "init.test.vault"]
+        );
+    }
+
+    #[test]
+    fn a_whole_profile_pass_records_what_it_verified_and_a_part_records_nothing() {
+        let dock = |_: &Ctx| {
+            vec![(
+                vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
+                place(Class::Preference),
+            )]
+        };
+        let unverified = |_: &Ctx| {
+            vec![(
+                vec![Listed::boxed("init.test.dock", vec![change(), change()])],
+                place(Class::Preference),
+            )]
+        };
+        let profile = Options {
+            choice: Some(Choice {
+                profile: true,
+                ..Choice::NONE
+            }),
+            ..Options::default()
+        };
+        for (options, groups, holds, verified) in [
+            (
+                &Options::default(),
+                &dock as &dyn Fn(&Ctx) -> Vec<Group>,
+                [true],
+                1,
+            ),
+            (&Options::default(), &unverified, [true], 0),
+            (&profile, &dock, [false], 0),
+        ] {
+            let sys = alice_with_checkout(501, None);
+            let records = Recorded::default();
+            converge_with(&sys, options, groups, &records).unwrap();
+            assert_eq!(*records.holds.lock().unwrap(), holds, "{options:?}");
+            assert_eq!(
+                records.verified.load(std::sync::atomic::Ordering::SeqCst),
+                verified,
+                "{options:?}"
+            );
+        }
+    }
+
+    struct WithheldRecords {
+        events: Arc<Mutex<Vec<String>>>,
+        refuses: bool,
+    }
+
+    impl Records for WithheldRecords {
+        fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+            Ok(Box::new(Self {
+                events: Arc::clone(&self.events),
+                refuses: self.refuses,
+            }))
+        }
+    }
+
+    impl Held for WithheldRecords {
+        fn withheld(&self, ids: &[String]) -> Result<(), String> {
+            self.events.lock().unwrap().extend(ids.iter().cloned());
+            if self.refuses {
+                Err("withheld record is unwritable".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn verified(self: Box<Self>) -> Result<(), String> {
+            self.events.lock().unwrap().push("verified".into());
+            Ok(())
+        }
+    }
+
+    fn init_withheld_pass(
+        only: Vec<String>,
+        refuses: bool,
+    ) -> (Result<Vec<ItemReport>, Refused>, Vec<String>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let records = WithheldRecords {
+            events: Arc::clone(&events),
+            refuses,
+        };
+        let lane = Arc::clone(&events);
+        let groups = move |ctx: &Ctx| {
+            let mut widgets = Selection::none();
+            widgets.set(Setting::Widgets, true);
+            let mut items: Vec<_> = crate::init_preferences::selected_items(ctx, widgets)
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.withheld().is_some())
+                .collect();
+            assert_eq!(
+                items.len(),
+                1,
+                "the real Notification Center item waits for FDA"
+            );
+            let lane = Arc::clone(&lane);
+            items.push(then("init.test.after-withheld", "test", move || {
+                lane.lock().unwrap().push("desktop".into());
+            }));
+            vec![(items, place(Class::Preference))]
+        };
+        let result = converge_with(
+            &alice_with_checkout(501, None),
+            &Options {
+                station: unnamed(&Base::none(), &only),
+                only,
+                ..Options::default()
+            },
+            &groups,
+            &records,
+        );
+        let events = events.lock().unwrap().clone();
+        (result, events)
+    }
+
+    #[test]
+    fn init_withheld_items_are_retained_before_the_desktop_lane_verifies() {
+        let (rows, events) = init_withheld_pass(Vec::new(), false);
+        let rows = rows.unwrap();
+        assert_eq!(rows[0].id, "consumer.widgets.notification-center@alice");
+        assert_eq!(rows[0].outcome, Outcome::Ok);
+        assert_eq!(
+            events,
+            [
+                "consumer.widgets.notification-center@alice",
+                "desktop",
+                "verified"
+            ]
+        );
+    }
+
+    #[test]
+    fn init_withheld_record_failure_prevents_the_desktop_lane() {
+        let (result, events) = init_withheld_pass(Vec::new(), true);
+        assert!(
+            result.is_err(),
+            "an unrecorded permission follow-up cannot be verified"
+        );
+        assert_eq!(events, ["consumer.widgets.notification-center@alice"]);
+    }
+
+    #[test]
+    fn init_withheld_items_outside_the_narrowed_pass_are_not_recorded() {
+        let (result, events) = init_withheld_pass(vec!["init.test.after-withheld".into()], false);
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "init.test.after-withheld");
+        assert_eq!(events, ["desktop"]);
+    }
+
+    /// `--only init.spotlight` names Rust in Spotlight's rows alone: no base item, no other
+    /// workstation row, no look for a vault and no hold on the setup records.
+    #[test]
+    fn only_init_spotlight_runs_the_spotlight_rows_alone() {
+        let parsed = options(&["--only".into(), "init.spotlight".into()]).unwrap();
+        assert_eq!(parsed.only, ["init.spotlight"]);
+        let options = Options {
+            station: unnamed(&Base::none(), &parsed.only),
+            ..parsed
+        };
+        assert!(options.workstation() && !options.joins());
+        for only in [
+            &[][..],
+            &["secrets"],
+            &["init.secrets@alice"],
+            &["workstation"],
+        ] {
+            let only: Vec<String> = only.iter().map(|word| (*word).to_owned()).collect();
+            let joins = Options {
+                station: unnamed(&Base::none(), &only),
+                only,
+                ..Options::default()
+            };
+            assert!(joins.joins(), "{joins:?}");
+        }
+        let sys = alice_with_checkout(501, None);
+        let groups = |ctx: &Ctx| {
+            vec![
+                (
+                    vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
+                    place(Class::Preference),
+                ),
+                (
+                    crate::init_spotlight::items(ctx).unwrap(),
+                    place(Class::Asked),
+                ),
+            ]
+        };
+        let records = Recorded::default();
+        let rows = converge_with(&sys, &options, &groups, &records).unwrap();
+        assert!(
+            !rows.is_empty() && rows.iter().all(|row| row.id.starts_with("init.spotlight.")),
+            "{rows:?}"
+        );
+        assert!(records.holds.lock().unwrap().is_empty());
+        let unknown = Options {
+            only: vec!["init.spotlite".into()],
+            station: vec!["init.spotlite".into()],
+            ..Options::default()
+        };
+        assert!(matches!(
+            converge_with(&sys, &unknown, &groups, &records),
+            Err(Refused::Usage(_))
+        ));
+    }
+
+    /// The opt-in flags are a person's picks at this Mac's console: with no terminal, or from a
+    /// coding agent's tab, the run refuses them, saying why, before it reads the Mac; a person
+    /// at the console runs them.
+    #[test]
+    fn the_opt_in_flags_are_refused_where_no_person_is_at_the_console() {
+        let options = Options {
+            choice: Some(Choice {
+                sign_out: true,
+                ..Choice::NONE
+            }),
+            ..Options::default()
+        };
+        let groups = |_: &Ctx| {
+            vec![(
+                vec![Listed::boxed("init.test.dock", vec![ok()])],
+                place(Class::Preference),
+            )]
+        };
+        for (terminal, agent, presence) in [
+            (false, None, Presence::NoTerminal),
+            (true, Some("Claude Code"), Presence::AgentTab),
+            (true, None, Presence::AtConsole),
+        ] {
+            let mut sys = alice_with_checkout(501, None);
+            sys.terminal = terminal;
+            sys.agent = agent;
+            let ran = converge_with(&sys, &options, &groups, &NoRecords);
+            match presence.why() {
+                None => assert!(ran.is_ok(), "{ran:?}"),
+                Some(why) => {
+                    assert!(
+                        matches!(&ran, Err(Refused::Usage(said)) if said.contains(why)),
+                        "{ran:?}"
+                    );
+                    assert!(
+                        !sys.calls().iter().any(|call| call.contains("/usr/bin/id")),
+                        "the Mac was read: {:?}",
+                        sys.calls()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_init_toml_leaves_one_unread_row_and_the_rest_run() {
+        let sys = alice_with_checkout(501, Some("[github\n"));
+        let (ctx, _) = local_context(&sys).unwrap();
+        let read = crate::init_github::items(&sys, &ctx, None);
+        assert!(
+            read.as_ref().is_err_and(|why| why.contains("init.toml")),
+            "the group cannot be built"
+        );
+        let github = built("init.github", "init", Setting::Repositories.label(), read);
+        let groups = groups(
+            &ctx,
+            Presence::AtConsole,
+            crate::init_secrets::Secrets {
+                items: Vec::new(),
+                waited_on: None,
+            },
+            github,
+            None,
+            Choice::ALL,
+        );
+        let applied = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let base = Base {
+            items: vec![Box::new(BaseItem {
+                probes: Mutex::new(vec![ok()]),
+                applied,
+            })],
+            held: None,
+            clt: None,
+            targo: None,
+        };
+        let rows = run(&sys, &ctx, base, &groups, Mode::Plan, &mut NoJournal).unwrap();
+        assert_eq!(rows[0].id, "base.pkg.shims");
+        let github: Vec<&ItemReport> = rows.iter().filter(|row| row.id == "init.github").collect();
+        assert_eq!(github.len(), 1, "{rows:?}");
+        assert_eq!(github[0].outcome, Outcome::Unknown);
+        assert!(
+            github[0]
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains("init.toml"))
+        );
+        assert!(
+            rows.iter().any(|row| row.class == Some(Class::Preference)),
+            "{rows:?}"
+        );
+    }
+
+    /// The Permissions phase: a row for each grant aterm needs, Accessibility only for a run
+    /// that signs out; a grant only the person switches on names how, and an apply is done
+    /// with it while `--check` is not. A grant this process cannot read (an aterm outside
+    /// aterm.app reads none) fails nothing: the run exits 0.
+    #[test]
+    fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
+        fn read(sign_out: bool) -> Vec<(Access, Grant)> {
+            assert!(!sign_out, "this run does not sign out");
+            vec![
+                (
+                    Access::FullDiskAccess,
+                    Grant::NeedsYou("switch on aterm".into()),
+                ),
+                (Access::DeveloperTools, Grant::On),
+                (
+                    Access::Debugger,
+                    Grant::Unread("tccd did not answer".into()),
+                ),
+            ]
+        }
+        let rows = permissions(read, false);
+        assert_eq!(
+            rows.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            [
+                "init.permissions.full-disk-access",
+                "init.permissions.developer-tools",
+                "init.permissions.debugger"
+            ]
+        );
+        let sys = Fake::root();
+        let alice = at_console(user("alice", 501));
+        assert!(matches!(
+            rows[0].probe(&sys, &alice),
+            Probe::Person { how, .. } if how == "switch on aterm"
+        ));
+        assert!(matches!(rows[1].probe(&sys, &alice), Probe::Ok { .. }));
+        assert!(matches!(
+            rows[2].probe(&sys, &alice),
+            Probe::NotApplicable { why } if why.contains("tccd did not answer")
+        ));
+        assert_eq!(permissions(no_grants, true).len(), 4);
+        let reported = run(
+            &sys,
+            &alice,
+            Base::none(),
+            &[(rows, workstation_place(Class::Person))],
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        let person = reported
+            .iter()
+            .find(|row| row.outcome == Outcome::Person)
+            .expect("the grant only the person switches on");
+        assert!(counts(person, Action::Apply) && !counts(person, Action::Check));
+        assert!(tally(&reported, Action::Apply).ends_with("needs you: Full Disk Access"));
+        assert_eq!(status(&reported, Action::Apply), 0, "{reported:?}");
     }
 }

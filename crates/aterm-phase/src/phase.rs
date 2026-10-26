@@ -1735,7 +1735,7 @@ pub(crate) fn leading_spaces(row: &str) -> usize {
 }
 
 /// A right-aligned hint.
-fn is_hint(row: &str, width: Option<usize>) -> bool {
+pub(crate) fn is_hint(row: &str, width: Option<usize>) -> bool {
     let lead = leading_spaces(row);
     let end = crate::text::trim_end(row).chars().count();
     end > lead && (lead >= HINT_COLUMN || (lead >= 6 && width.is_some_and(|w| end + 3 >= w)))

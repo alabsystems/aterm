@@ -731,25 +731,512 @@ fn block_command_line(
     }
 }
 
-const WRAPPERS: [&str; 7] = ["sudo", "env", "time", "nice", "command", "nohup", "exec"];
-const WRAPPER_FLAGS_WITH_VALUE: [&str; 4] = ["-u", "-n", "-g", "-a"];
+/// How a wrapper reads one of its own flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Takes {
+    /// No value (`sudo -n`).
+    Nothing,
+    /// A value, attached (`-uroot`, `--user=root`) or the next word (`-u root`).
+    Value,
+    /// sudo's `-h`: a host, attached or the next word unless that word is a flag; without one it
+    /// is help, which runs no program.
+    HostOrHelp,
+    /// Only an attached value (`--preserve-env[=list]`), never the next word.
+    Attached,
+    /// env's `-S`: a value whose words env reads as more of its own arguments.
+    Split,
+}
+
+/// One wrapper's own grammar: the flags it reads before the program it runs. A flag missing from
+/// its tables, including one that runs no named program (`sudo -l`, `command -v`), keeps only the
+/// wrapper's name, never a later word.
+struct Wrapper {
+    name: &'static str,
+    short: &'static [(char, Takes)],
+    long: &'static [(&'static str, Takes)],
+    /// `NAME=value` words may sit between its flags and the program (sudo, env, the shell's `time`).
+    assignments: bool,
+    /// nice's old `-N` adjustment.
+    numeric: bool,
+    /// env's lone `-`, the old spelling of `-i`.
+    lone_dash: bool,
+}
+
+const WRAPPERS: [Wrapper; 7] = [
+    Wrapper {
+        name: "sudo",
+        short: &[
+            ('u', Takes::Value),
+            ('g', Takes::Value),
+            ('h', Takes::HostOrHelp),
+            ('p', Takes::Value),
+            ('C', Takes::Value),
+            ('D', Takes::Value),
+            ('r', Takes::Value),
+            ('t', Takes::Value),
+            ('T', Takes::Value),
+            ('R', Takes::Value),
+            ('U', Takes::Value),
+            ('A', Takes::Nothing),
+            ('B', Takes::Nothing),
+            ('b', Takes::Nothing),
+            ('E', Takes::Nothing),
+            ('H', Takes::Nothing),
+            ('k', Takes::Nothing),
+            ('n', Takes::Nothing),
+            ('N', Takes::Nothing),
+            ('P', Takes::Nothing),
+            ('S', Takes::Nothing),
+            ('s', Takes::Nothing),
+            ('i', Takes::Nothing),
+        ],
+        long: &[
+            ("user", Takes::Value),
+            ("group", Takes::Value),
+            ("host", Takes::Value),
+            ("prompt", Takes::Value),
+            ("close-from", Takes::Value),
+            ("chdir", Takes::Value),
+            ("role", Takes::Value),
+            ("type", Takes::Value),
+            ("command-timeout", Takes::Value),
+            ("chroot", Takes::Value),
+            ("other-user", Takes::Value),
+            ("askpass", Takes::Nothing),
+            ("bell", Takes::Nothing),
+            ("background", Takes::Nothing),
+            ("preserve-env", Takes::Attached),
+            ("set-home", Takes::Nothing),
+            ("reset-timestamp", Takes::Nothing),
+            ("non-interactive", Takes::Nothing),
+            ("no-update", Takes::Nothing),
+            ("preserve-groups", Takes::Nothing),
+            ("stdin", Takes::Nothing),
+            ("shell", Takes::Nothing),
+            ("login", Takes::Nothing),
+        ],
+        assignments: true,
+        numeric: false,
+        lone_dash: false,
+    },
+    Wrapper {
+        name: "env",
+        short: &[
+            ('u', Takes::Value),
+            ('C', Takes::Value),
+            ('P', Takes::Value),
+            ('S', Takes::Split),
+            ('i', Takes::Nothing),
+            ('0', Takes::Nothing),
+            ('v', Takes::Nothing),
+        ],
+        long: &[
+            ("unset", Takes::Value),
+            ("chdir", Takes::Value),
+            ("split-string", Takes::Split),
+            ("ignore-environment", Takes::Nothing),
+            ("null", Takes::Nothing),
+        ],
+        assignments: true,
+        numeric: false,
+        lone_dash: true,
+    },
+    Wrapper {
+        name: "time",
+        short: &[
+            ('o', Takes::Value),
+            ('f', Takes::Value),
+            ('p', Takes::Nothing),
+            ('a', Takes::Nothing),
+            ('l', Takes::Nothing),
+            ('v', Takes::Nothing),
+            ('q', Takes::Nothing),
+        ],
+        long: &[
+            ("output", Takes::Value),
+            ("format", Takes::Value),
+            ("append", Takes::Nothing),
+            ("portability", Takes::Nothing),
+            ("verbose", Takes::Nothing),
+            ("quiet", Takes::Nothing),
+        ],
+        assignments: true,
+        numeric: false,
+        lone_dash: false,
+    },
+    Wrapper {
+        name: "nice",
+        short: &[('n', Takes::Value)],
+        long: &[("adjustment", Takes::Value)],
+        assignments: false,
+        numeric: true,
+        lone_dash: false,
+    },
+    Wrapper {
+        name: "command",
+        short: &[('p', Takes::Nothing)],
+        long: &[],
+        assignments: false,
+        numeric: false,
+        lone_dash: false,
+    },
+    Wrapper {
+        name: "nohup",
+        short: &[],
+        long: &[],
+        assignments: false,
+        numeric: false,
+        lone_dash: false,
+    },
+    Wrapper {
+        name: "exec",
+        short: &[
+            ('a', Takes::Value),
+            ('c', Takes::Nothing),
+            ('l', Takes::Nothing),
+        ],
+        long: &[],
+        assignments: false,
+        numeric: false,
+        lone_dash: false,
+    },
+];
 const KEYWORD_OPENERS: [&str; 6] = ["for", "while", "if", "until", "case", "{"];
 const WORD_TRIM: [char; 8] = ['\'', '"', '`', ';', '(', ')', '&', '|'];
 
-fn env_split_string(flag: &str) -> Option<Option<&str>> {
-    if let Some(rest) = flag.strip_prefix("--split-string") {
-        return match rest.strip_prefix('=') {
-            Some(attached) => Some(Some(attached)),
-            None => rest.is_empty().then_some(None),
+fn wrapper_named(name: &str) -> Option<&'static Wrapper> {
+    WRAPPERS.iter().find(|wrapper| wrapper.name == name)
+}
+
+/// What a wrapper's grammar read before the program it runs.
+enum Unwrap<W> {
+    /// This word names the program.
+    Program(W),
+    /// env's `-S` value, from this byte of this word: env reads its words before the rest.
+    Split(W, usize),
+    /// A flag the grammar does not know, one that runs no named program, or no program at all.
+    Closed,
+}
+
+/// What one flag word read.
+enum Flag<W> {
+    Read,
+    /// `--`: the flags end.
+    End,
+    /// env's `-S` value: in the next word when it carries one, else in the flag's own word from
+    /// this byte.
+    Split(Option<W>, usize),
+    Closed,
+}
+
+/// Reads `wrapper`'s flags and assignments off `words` up to the word naming the program it runs.
+fn unwrap<W: AsRef<str>>(wrapper: &Wrapper, words: &mut impl Iterator<Item = W>) -> Unwrap<W> {
+    let mut flags = true;
+    while let Some(word) = words.next() {
+        let text = word.as_ref();
+        if flags && text.starts_with('-') {
+            match read_flag(wrapper, text, words) {
+                Flag::Read => continue,
+                Flag::End => {
+                    flags = false;
+                    continue;
+                }
+                Flag::Split(Some(value), from) => return Unwrap::Split(value, from),
+                Flag::Split(None, from) => return Unwrap::Split(word, from),
+                Flag::Closed => return Unwrap::Closed,
+            }
+        }
+        if is_assignment(text) {
+            if !wrapper.assignments {
+                return Unwrap::Closed;
+            }
+            flags = false;
+            continue;
+        }
+        if text.starts_with('-') || basename(text).is_none() {
+            return Unwrap::Closed;
+        }
+        return Unwrap::Program(word);
+    }
+    Unwrap::Closed
+}
+
+fn read_flag<W: AsRef<str>>(
+    wrapper: &Wrapper,
+    flag: &str,
+    words: &mut impl Iterator<Item = W>,
+) -> Flag<W> {
+    if flag == "--" {
+        return Flag::End;
+    }
+    if flag == "-" {
+        return if wrapper.lone_dash {
+            Flag::Read
+        } else {
+            Flag::Closed
         };
     }
-    let cluster = flag.strip_prefix('-').filter(|c| !c.starts_with('-'))?;
-    let at = cluster.find('S')?;
-    if !cluster[..at].chars().all(|c| matches!(c, 'i' | 'v' | '0')) {
-        return None;
+    if wrapper.numeric && old_adjustment(flag) {
+        return Flag::Read;
     }
-    let attached = &cluster[at + 1..];
-    Some((!attached.is_empty()).then_some(attached))
+    if let Some(long) = flag.strip_prefix("--") {
+        let (name, attached) = match long.find('=') {
+            Some(eq) => (&long[..eq], Some(2 + eq + 1)),
+            None => (long, None),
+        };
+        return match wrapper.long.iter().find(|(known, _)| *known == name) {
+            Some(&(_, takes)) => flag_value(takes, attached, words),
+            None => Flag::Closed,
+        };
+    }
+    for (at, c) in flag.char_indices().skip(1) {
+        let Some(&(_, takes)) = wrapper.short.iter().find(|(known, _)| *known == c) else {
+            return Flag::Closed;
+        };
+        if takes != Takes::Nothing {
+            let rest = at + c.len_utf8();
+            return flag_value(takes, (rest < flag.len()).then_some(rest), words);
+        }
+    }
+    Flag::Read
+}
+
+/// Reads the value of a flag that `takes` one; `attached` is where it starts in the flag's word.
+fn flag_value<W: AsRef<str>>(
+    takes: Takes,
+    attached: Option<usize>,
+    words: &mut impl Iterator<Item = W>,
+) -> Flag<W> {
+    match (takes, attached) {
+        (Takes::Nothing, None)
+        | (Takes::Attached, _)
+        | (Takes::Value | Takes::HostOrHelp, Some(_)) => Flag::Read,
+        (Takes::Nothing, Some(_)) => Flag::Closed,
+        (Takes::Split, Some(from)) => Flag::Split(None, from),
+        (Takes::Value, None) => words.next().map_or(Flag::Closed, |_| Flag::Read),
+        (Takes::HostOrHelp, None) => match words.next() {
+            Some(host) if !host.as_ref().starts_with('-') => Flag::Read,
+            _ => Flag::Closed,
+        },
+        (Takes::Split, None) => words
+            .next()
+            .map_or(Flag::Closed, |value| Flag::Split(Some(value), 0)),
+    }
+}
+
+/// nice's old `-N`, `--N` and `-+N` adjustment.
+fn old_adjustment(flag: &str) -> bool {
+    let number = flag[1..].strip_prefix(['-', '+']).unwrap_or(&flag[1..]);
+    !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+}
+
+/// One word of a command line: as typed (quotes and all; `None` for a word read out of an env
+/// `-S` value) and as read (the shell's quote and operator characters trimmed off its ends, and
+/// any control character dropped).
+struct Word<'a> {
+    raw: Option<&'a str>,
+    text: std::borrow::Cow<'a, str>,
+}
+
+impl<'a> Word<'a> {
+    fn typed(raw: &'a str) -> Self {
+        Word {
+            raw: Some(raw),
+            text: clean(raw),
+        }
+    }
+}
+
+impl AsRef<str> for Word<'_> {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+fn clean(word: &str) -> std::borrow::Cow<'_, str> {
+    let word = word.trim_matches(WORD_TRIM);
+    if word.chars().any(char::is_control) {
+        word.chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .into()
+    } else {
+        word.into()
+    }
+}
+
+/// `segment`'s words as the program it runs reads them. The shell takes each redirection
+/// (`>log`, `2> err`, `<<<word`, `&>x`, the `>log` of `make>log`) and its target out of the words
+/// before any program sees them, so they are left out. A word that holds a command or process
+/// substitution (`$(..)`, a backtick, `<(..)`) ends the words: what it expands to, and so where
+/// every later word falls, is not known from the line.
+fn argv(segment: &str) -> impl Iterator<Item = Word<'_>> {
+    let mut words = shell_words(segment);
+    std::iter::from_fn(move || {
+        loop {
+            let word = words.next()?;
+            if expands(word) {
+                return None;
+            }
+            let start = match redirection(word) {
+                None => return Some(Word::typed(word)),
+                Some(Redirect::Attached(start)) => start,
+                Some(Redirect::Next(start)) => match words.next() {
+                    Some(target) if expands(target) => return None,
+                    _ => start,
+                },
+                Some(Redirect::Unread) => return None,
+            };
+            if start > 0 {
+                return Some(Word::typed(&word[..start]));
+            }
+        }
+    })
+    .fuse()
+}
+
+/// The characters of one shell word the shell itself reads, with the quote each is under (`None`
+/// bare, `Some('"')` in double quotes). Quote characters, what single or `$'..'` quotes hold,
+/// what a backslash escapes and what a pwsh backtick escapes inside a Windows path are left out:
+/// none of them is a redirection or a substitution.
+fn shell_chars(raw: &str) -> impl Iterator<Item = (usize, char, Option<char>)> + '_ {
+    let mut quote: Option<char> = None;
+    let mut chars = raw.char_indices();
+    std::iter::from_fn(move || {
+        loop {
+            let (at, c) = chars.next()?;
+            match (quote, c) {
+                (Some('\'' | '$'), '\'') | (Some('"'), '"') => quote = None,
+                (Some('$' | '"') | None, '\\') => {
+                    chars.next();
+                }
+                (Some('\'' | '$'), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '$') if raw[at + 1..].starts_with('\'') => {
+                    chars.next();
+                    quote = Some('$');
+                }
+                (None, '`') if windows_path_so_far(&raw[..at]) => {
+                    chars.next();
+                }
+                _ => return Some((at, c, quote)),
+            }
+        }
+    })
+}
+
+/// Whether `raw` holds a command or process substitution: `$(..)`, a backtick, `<(..)`, `>(..)`.
+fn expands(raw: &str) -> bool {
+    shell_chars(raw).any(|(at, c, quote)| {
+        let opens = raw[at + c.len_utf8()..].starts_with('(');
+        c == '`' || (c == '$' && opens) || (quote.is_none() && matches!(c, '<' | '>') && opens)
+    })
+}
+
+/// A redirection in one shell word.
+enum Redirect {
+    /// From this byte (its fd number, `{name}` or `&` included), with its target in the word.
+    Attached(usize),
+    /// From this byte, with its target the next word.
+    Next(usize),
+    /// `>!` with its target apart: zsh reads the next word as the target, bash a file named `!`.
+    Unread,
+}
+
+fn redirection(raw: &str) -> Option<Redirect> {
+    let (op, ..) =
+        shell_chars(raw).find(|&(_, c, quote)| quote.is_none() && matches!(c, '<' | '>'))?;
+    let head = &raw[..op];
+    let fd = !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit());
+    let named = head
+        .strip_prefix('{')
+        .and_then(|head| head.strip_suffix('}'))
+        .is_some_and(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+    let start = if fd || named {
+        0
+    } else {
+        head.strip_suffix('&').map_or(op, str::len)
+    };
+    let mut end = raw[op..]
+        .find(|c| !matches!(c, '<' | '>' | '&' | '|' | '!'))
+        .map_or(raw.len(), |len| op + len);
+    if &raw[op..end] == "<<" && raw[end..].starts_with('-') {
+        end += 1;
+    }
+    Some(if end < raw.len() {
+        Redirect::Attached(start)
+    } else if raw[op..end].contains('!') {
+        Redirect::Unread
+    } else {
+        Redirect::Next(start)
+    })
+}
+
+/// `raw` as the shell hands it on, its quotes and escapes taken off; `None` when a quote is left
+/// open or a backslash ends it.
+fn shell_unquote(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\\') => out.push(chars.next()?),
+            (Some('"'), '\\') => {
+                let next = chars.next()?;
+                if !matches!(next, '$' | '`' | '"' | '\\') {
+                    out.push('\\');
+                }
+                out.push(next);
+            }
+            _ => out.push(c),
+        }
+    }
+    quote.is_none().then_some(out)
+}
+
+/// The words env's `-S` reads, from byte `from` of `word` as read: what was typed there, with
+/// the shell's quotes and escapes taken off. `None` when that is not known, or when it holds a
+/// quote, a backslash, a `$` or a `#`, which env reads by its own rules (a quoted word, an
+/// escape, a variable, a comment), so its words are not the ones a split on spaces finds.
+fn split_value(word: &Word<'_>, from: usize) -> Option<String> {
+    let typed: String = shell_unquote(word.raw?)?
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let value = typed.strip_prefix(word.text.get(..from)?)?;
+    (!value.contains(['\'', '"', '\\', '$', '#'])).then(|| value.to_owned())
+}
+
+/// A segment's words, with an env `-S` value's words read before the rest.
+struct Spliced<I> {
+    split: Option<(String, usize)>,
+    rest: I,
+}
+
+impl<'a, I: Iterator<Item = Word<'a>>> Iterator for Spliced<I> {
+    type Item = Word<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((value, at)) = &mut self.split {
+            if let Some(skip) = value[*at..].find(|c: char| !c.is_whitespace()) {
+                let start = *at + skip;
+                let end = value[start..]
+                    .find(char::is_whitespace)
+                    .map_or(value.len(), |len| start + len);
+                *at = end;
+                return Some(Word {
+                    raw: None,
+                    text: value[start..end].trim_matches(WORD_TRIM).to_owned().into(),
+                });
+            }
+            self.split = None;
+        }
+        self.rest.next()
+    }
 }
 
 fn basename(word: &str) -> Option<&str> {
@@ -785,24 +1272,15 @@ fn is_assignment(word: &str) -> bool {
 fn leading_word(segment: &str) -> Option<&str> {
     let mut words = shell_words(segment)
         .map(|w| w.trim_matches(WORD_TRIM))
-        .filter(|w| !is_assignment(w) && (*w == "{" || w.chars().any(char::is_alphanumeric)))
-        .peekable();
-    let first = words.next()?;
-    let base = basename(first).unwrap_or(first);
-    if !WRAPPERS.contains(&base) {
-        return Some(first);
-    }
-    while let Some(next) = words.peek() {
-        if WRAPPER_FLAGS_WITH_VALUE.contains(next) {
-            words.next();
-            words.next();
-        } else if next.starts_with('-') {
-            words.next();
-        } else {
-            break;
+        .filter(|w| !is_assignment(w) && (*w == "{" || w.chars().any(char::is_alphanumeric)));
+    let mut first = words.next()?;
+    while let Some(wrapper) = wrapper_named(basename(first).unwrap_or(first)) {
+        match unwrap(wrapper, &mut words) {
+            Unwrap::Program(word) => first = word,
+            Unwrap::Split(..) | Unwrap::Closed => break,
         }
     }
-    words.next()
+    Some(first)
 }
 
 fn shell_words(segment: &str) -> impl Iterator<Item = &str> {
@@ -858,87 +1336,41 @@ fn windows_path_so_far(head: &str) -> bool {
 pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     const MAX_CHARS: usize = 48;
 
-    fn clean(word: &str) -> std::borrow::Cow<'_, str> {
-        let word = word.trim_matches(WORD_TRIM);
-        if word.chars().any(char::is_control) {
-            word.chars()
-                .filter(|c| !c.is_control())
-                .collect::<String>()
-                .into()
-        } else {
-            word.into()
-        }
-    }
     let segments = split_list(cmdline);
     let segment = segments
         .iter()
         .map(|(_, text)| *text)
         .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&w)))
         .unwrap_or_else(|| running_segment(cmdline, &segments));
-    let mut words = shell_words(segment)
-        .map(clean)
-        .filter(|w| !w.is_empty())
-        .peekable();
-
-    while words
-        .peek()
-        .is_some_and(|w| is_assignment(w) || !w.chars().any(char::is_alphanumeric))
-    {
-        words.next();
-    }
-    let mut program_word = words.next()?;
-    let mut split: Option<String> = None;
-    if WRAPPERS.contains(&basename(&program_word)?) {
-        let env = basename(&program_word) == Some("env");
-        while let Some(next) = words.peek() {
-            let split_flag = env
-                .then(|| env_split_string(next))
-                .flatten()
-                .map(|attached| attached.map(str::to_string));
-            if let Some(attached) = split_flag {
-                words.next();
-                split = match attached {
-                    Some(attached) => Some(attached),
-                    None => Some(words.next()?.into_owned()),
-                };
-                break;
-            } else if WRAPPER_FLAGS_WITH_VALUE.contains(&next.as_ref()) {
-                words.next();
-                words.next();
-            } else if next.starts_with('-') || is_assignment(next) {
-                words.next();
-            } else {
-                break;
-            }
-        }
-        if split.is_none() {
-            program_word = words.next()?;
-        }
-    }
-    let split_words = split.as_deref().map(|string| {
-        string
-            .split_whitespace()
-            .map(|w| w.trim_matches(WORD_TRIM))
-            .filter(|w| !w.is_empty() && !w.starts_with('-') && !is_assignment(w))
-            .collect::<Vec<_>>()
-    });
-    let program = match &split_words {
-        Some(split_words) => basename(split_words.first()?)?,
-        None => basename(&program_word)?,
+    let mut words = Spliced {
+        split: None,
+        rest: argv(segment),
     };
+    let mut program_word =
+        words.find(|w| !is_assignment(&w.text) && w.text.chars().any(char::is_alphanumeric))?;
+    while let Some(wrapper) = basename(&program_word.text).and_then(wrapper_named) {
+        match unwrap(wrapper, &mut words) {
+            Unwrap::Program(word) => program_word = word,
+            Unwrap::Split(value, from) if words.split.is_none() => {
+                let Some(value) = split_value(&value, from) else {
+                    return Some(wrapper.name.to_owned());
+                };
+                words.split = Some((value, 0));
+            }
+            Unwrap::Split(..) | Unwrap::Closed => return Some(wrapper.name.to_owned()),
+        }
+    }
+    let program = basename(&program_word.text)?;
     let program_end = program
         .char_indices()
         .nth(MAX_CHARS)
         .map_or(program.len(), |(end, _)| end);
     let mut detail = program[..program_end].to_string();
     if let Some((_, vocabulary)) = SUBCOMMANDS.iter().find(|(p, _)| *p == program) {
-        let sub = match &split_words {
-            Some(split_words) => split_words.get(1).map(|w| std::borrow::Cow::Borrowed(*w)),
-            None => words.find(|w| !w.starts_with('-')),
-        };
-        if let Some(sub) = sub.filter(|s| vocabulary.contains(&s.as_ref())) {
+        let sub = words.find(|w| !w.text.is_empty() && !w.text.starts_with('-'));
+        if let Some(sub) = sub.filter(|s| vocabulary.contains(&&*s.text)) {
             detail.push(' ');
-            detail.push_str(&sub);
+            detail.push_str(&sub.text);
         }
     }
     if let Some((end, _)) = detail.char_indices().nth(MAX_CHARS) {
@@ -960,6 +1392,9 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
     let mut start = 0;
     let mut op = ListOp::Seq;
     let mut quote: Option<u8> = None;
+    // A here-document's lines, after the line that opens it, are its text and its delimiter,
+    // never a command.
+    let mut heredoc = false;
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
@@ -985,6 +1420,16 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
                 quote = Some(c);
                 i += 1;
                 continue;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                let here_string = bytes.get(i + 2) == Some(&b'<');
+                heredoc |= !here_string;
+                i += if here_string { 3 } else { 2 };
+                continue;
+            }
+            b'\n' if heredoc => {
+                segments.push((op, &cmdline[start..i]));
+                return segments;
             }
             b';' | b'\n' => Some((ListOp::Seq, 1)),
             b'&' if bytes.get(i + 1) == Some(&b'&') => Some((ListOp::And, 2)),

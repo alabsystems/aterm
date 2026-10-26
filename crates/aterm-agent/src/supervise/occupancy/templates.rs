@@ -10,8 +10,9 @@
 //! A [`FactLine`] is made here and nowhere else (its constructor is private), to judge and book
 //! what `prompt` would type (`fact-would@v1`).
 //!
-//! `wake@v1`'s line (the slice-2 plan's 2.8 types it) is made here for the decider's verdict
-//! already: under `observe` it is booked, never typed.
+//! `wake@v1`'s line is made here for the decider's verdict (its clock and slots left out), and
+//! again for the write under `prompt` with the figures the host's claim judged (the slice-2 plan's
+//! 2.8): the local clock at its ready since and the build slots its need names.
 //!
 //! `wait-nudge` leaves out §3.2's `(2 workflows, 3 shells)`: no reader counts a
 //! session's workflows yet, and a count the harness cannot measure is not typed.

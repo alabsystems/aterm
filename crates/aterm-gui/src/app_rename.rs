@@ -639,7 +639,7 @@ mod tests {
         let fingerprint = |app: &mut App| {
             let titles = app.tab_titles(wid);
             let metadata = app.tab_strip_metadata(wid);
-            app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, 0)
+            app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata)
         };
         let idle = fingerprint(&mut app);
         assert!(app.begin_active_session_rename(wid));

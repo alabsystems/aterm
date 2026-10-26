@@ -391,6 +391,74 @@ fn a_delegated_member_in_aterms_coalition_is_not_moved_again() {
     assert_eq!(f.split.parts(Some(1)), parts(700, 200, 730, 2170, 0));
 }
 
+/// Tab 1's delegated job holding scene `scene`'s process `pid` alone.
+fn job_of(scene: &Scene, pid: u32) -> crate::model::DelegatedJob {
+    let birth = scene
+        .procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .map(|p| p.birth_ms)
+        .expect("the scene's process");
+    let key = crate::delegated::ProcessKey {
+        pid,
+        start: u64::try_from(birth).unwrap_or(0),
+    };
+    crate::model::DelegatedJob {
+        root: key,
+        tab: Some(1),
+        members: vec![key],
+    }
+}
+
+/// A member of the tab's a delegated job takes over inside the window counts once: in the tab's
+/// ledger counter up to the reading before the job held it, then live from there (200, not 360).
+#[test]
+fn a_member_a_job_takes_over_inside_the_window_counts_once() {
+    let scene = spotlight_1032();
+    let job = job_of(&scene, 1210);
+    let f = facts_edited(&scene, |_, now| now.delegated.push(job));
+    assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2170, 0));
+    assert!(f.split.short_tabs.is_empty(), "nothing missed");
+}
+
+/// A job's member outside aterm's processes stays out of the tab once the job lets go: its work
+/// is its own coalition's, never counted by the tab's ledger too (200, not 300).
+#[test]
+fn a_member_outside_aterm_a_job_let_go_stays_out_of_the_tab() {
+    let f = facts_edited(&delegated_1032(500, 100), |_, now| now.delegated.clear());
+    assert_eq!(f.split.parts(Some(1)), parts(200, 200, 1330, 2170, 0));
+}
+
+/// A job's member that exits inside the window took its work there out of every figure of the
+/// tab (the job's reads members alive at both ends), so the window is marked short of the tab's
+/// work, never read as exact.
+#[test]
+fn a_jobs_member_gone_inside_the_window_marks_it_short() {
+    let mut scene = delegated_1032(500, 100);
+    for p in scene.procs.iter_mut().filter(|p| p.pid == 4010) {
+        *p = p.clone().gone();
+    }
+    let f = facts_edited(&scene, |_, now| now.delegated.clear());
+    assert_eq!(f.split.parts(Some(1)).tab, 200);
+    assert_eq!(f.split.short_tabs, vec![1]);
+}
+
+/// One of the tab's processes a job let go counts in the tab again from the reading before,
+/// the last a job's figure read, and the window is marked short of the tab's work: the job's
+/// work from the window's start to that reading is in no figure.
+#[test]
+fn a_member_of_the_tab_a_job_let_go_counts_there_again_and_marks_the_window_short() {
+    let mut scene = spotlight_1032();
+    scene.delegated.push(job_of(&scene, 1210));
+    let f = facts_edited(&scene, |_, now| now.delegated.clear());
+    assert_eq!(
+        f.split.parts(Some(1)).tab,
+        40,
+        "its last second, 200 ms of 5 s"
+    );
+    assert_eq!(f.split.short_tabs, vec![1]);
+}
+
 #[test]
 fn with_the_lane_off_the_split_is_the_built_one_by_subtraction() {
     for lane in [CoalLane::Unsupported, CoalLane::Off] {
@@ -621,8 +689,10 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     }
 }
 
+/// A tab's process counts only its growth between two readings that read its same start: the
+/// window's three readings are 0, 4 and 5 s, and claude (pid 1210) does 200 mc over the 5 s.
 #[test]
-fn a_tab_pid_reused_inside_the_window_is_not_the_tabs_live_work() {
+fn a_tab_pid_reused_inside_the_window_counts_only_what_one_start_read() {
     let scene = spotlight_1032();
     assert_eq!(
         facts(&scene).split.parts(Some(1)),
@@ -636,9 +706,15 @@ fn a_tab_pid_reused_inside_the_window_is_not_the_tabs_live_work() {
             }
         }
     });
-    assert_eq!(f.split.parts(Some(1)), parts(0, 400, 730, 2170, 0));
+    assert_eq!(
+        f.split.parts(Some(1)),
+        parts(160, 240, 730, 2170, 0),
+        "the first claude's 4 s count; its last second, which nothing read, does not; the new \
+         one, older than the window, counts from the reading that first read it"
+    );
 
-    for (missing_base, missing_now) in [(true, false), (false, true), (true, true)] {
+    for (missing_base, missing_now, tab) in [(true, false, 40), (false, true, 160), (true, true, 0)]
+    {
         let f = facts_edited(&scene, |base, now| {
             for (sample, missing) in [(base, missing_base), (now, missing_now)] {
                 if missing {
@@ -650,8 +726,9 @@ fn a_tab_pid_reused_inside_the_window_is_not_the_tabs_live_work() {
         });
         assert_eq!(
             f.split.parts(Some(1)),
-            parts(0, 400, 730, 2170, 0),
-            "an unknown start cannot prove the same live process across the window"
+            parts(tab, 400 - tab, 730, 2170, 0),
+            "an unknown start proves no process across the readings beside it \
+             (missing at the base {missing_base}, at the end {missing_now})"
         );
     }
 }

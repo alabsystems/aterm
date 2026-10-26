@@ -10,14 +10,37 @@ use super::{CursorStyle, SavedCursorState};
 use crate::vt_level::VtLevel;
 use aterm_types::CharacterSetState;
 
-/// Whether `col` of `row` is a line's end, where a printed glyph arms the
-/// deferred wrap: the row's last column, or the right margin under DECSLRM.
-/// DECRC puts a saved wrap back only there, so a wrap DECSC saved on the right
-/// margin survives the round trip while a resize that moved the edge leaves
-/// none pending mid-line.
-pub(super) fn at_a_line_end(grid: &crate::grid::Grid, row: u16, col: u16) -> bool {
+/// Whether `col` of `row` is a line's end, where a printed glyph arms the deferred wrap: the
+/// row's last column, or the right margin under DECSLRM.
+fn at_a_line_end(grid: &crate::grid::Grid, row: u16, col: u16) -> bool {
     let max_col = grid.effective_cols_for_row(row).saturating_sub(1);
     col >= max_col || col == grid.horizontal_margins().right
+}
+
+/// Put the cursor where DECRC or `?1049l` restores `state`, at `(row, col)` (the slot after any
+/// origin-mode clamp), and put the slot's pending wrap back wherever the column lands, as xterm
+/// (`do_wrap = sc->wrap_flag`) and Ghostty (`restoreCursor`) do: a wrap saved before the margins
+/// moved still sends the next glyph to the next line. The exception is a slot a resize marked
+/// (`SavedCursorState::resized`) whose cursor lands off a line end. The reflow moved that wrap
+/// mid-line, so the cursor moves on to the next cell of its row with no wrap pending, as
+/// Ghostty's `Screen.resize` moves a saved wrap, and the next glyph neither overwrites the one
+/// the wrap was armed on nor joins the next row to the line.
+pub(super) fn place_restored_cursor(
+    grid: &mut crate::grid::Grid,
+    state: &SavedCursorState,
+    row: u16,
+    col: u16,
+) {
+    grid.set_cursor_following_content(row, col);
+    if !state.pending_wrap {
+        return;
+    }
+    let landed = grid.cursor();
+    if state.resized && !at_a_line_end(grid, landed.row, landed.col) {
+        grid.set_cursor_following_content(landed.row, landed.col.saturating_add(1));
+    } else {
+        grid.set_pending_wrap(true);
+    }
 }
 
 impl CursorStateHandler<'_> {
@@ -42,6 +65,7 @@ impl CursorStateHandler<'_> {
             charset: *self.charset,
             pending_wrap: self.grid.pending_wrap(),
             underline_color: *self.underline_color,
+            resized: false,
         });
     }
 
@@ -78,11 +102,7 @@ impl CursorStateHandler<'_> {
             } else {
                 (state.cursor.row, state.cursor.col)
             };
-            self.grid.set_cursor_following_content(row, col);
-            if state.pending_wrap {
-                self.grid
-                    .set_pending_wrap(at_a_line_end(self.grid, row, col));
-            }
+            place_restored_cursor(self.grid, &state, row, col);
             self.style.update_cached_colors();
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -597,6 +617,102 @@ mod erase_pending_wrap_tests {
             term.process(format!("\x1b[?6l\x1b[3{final_byte}").as_bytes());
             assert_eq!(cursor(&term), (0, 2), "CSI 3 {final_byte} without DECOM");
         }
+    }
+
+    /// xterm's `CursorRestoreFlags` ends `do_wrap = sc->wrap_flag` and Ghostty's `restoreCursor`
+    /// restores `pending_wrap`: a saved wrap comes back wherever the column lands.
+    #[test]
+    fn decrc_puts_a_saved_wrap_back_wherever_the_column_lands() {
+        for (bytes, row1, what) in [
+            (
+                &b"\x1b[?69h\x1b[1;4sabcd\x1b7\x1b[?69l\x1b8X"[..],
+                "X         ",
+                "saved on a right margin a DECLRMM reset moved aside",
+            ),
+            (
+                b"\x1b[?69h\x1b[1;4sabcd\x1b[?69l\x1b7\x1b8X",
+                "X         ",
+                "left mid-line by a DECLRMM reset, then saved",
+            ),
+            (
+                b"\x1b[?69h\x1b[;2sab\x1b7\x1b[2;0s\x1b8X",
+                " X        ",
+                "saved before a DECSLRM moved the margins",
+            ),
+        ] {
+            let mut term = Terminal::new(3, 10);
+            term.process(bytes);
+            assert_eq!(row_glyphs(&term, 1), row1, "{what}");
+        }
+    }
+
+    /// A resize changes neither the slot's pending wrap nor, across a width round trip, its cell
+    /// (SPECS `saved-cursor-follows-content`): back at the width it was saved at, DECRC puts the
+    /// wrap back and the next glyph continues the line on the next row. A reflow that leaves the
+    /// wrap mid-line sends the next glyph to the cell after the saved one, on the same row
+    /// (Ghostty `Screen.resize`), not over the saved glyph and not onto the next row.
+    #[test]
+    fn a_saved_wrap_survives_a_width_round_trip_and_a_widening_takes_the_next_column() {
+        let mut term = Terminal::new(3, 10);
+        term.process(b"abcdefghij\x1b7");
+        term.resize(3, 6);
+        term.resize(3, 10);
+        term.process(b"\x1b[3;1H\x1b8X");
+        assert_eq!(row_glyphs(&term, 0), "abcdefghij");
+        assert_eq!(row_glyphs(&term, 1), "X         ");
+        assert_eq!(
+            term.grid().row_is_wrapped(1),
+            Some(true),
+            "X continues the line"
+        );
+        let mut term = Terminal::new(3, 5);
+        term.process(b"abcde\x1b7");
+        term.resize(3, 10);
+        term.process(b"\x1b[3;1H\x1b8X");
+        assert_eq!(
+            row_glyphs(&term, 0),
+            "abcdeX    ",
+            "the e stays and X follows it"
+        );
+        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
+        assert_eq!(term.grid().row_is_wrapped(1), Some(false));
+    }
+
+    /// Any change of size marks the slot, a rows-only one included, since it resets the DECSLRM
+    /// margins (Ghostty's `Screen.resize` checks a saved wrap whatever changed). A same-size
+    /// resize marks nothing, so DECRC still puts back, as xterm does, a wrap that a DECLRMM reset
+    /// left mid-line.
+    #[test]
+    fn only_a_resize_that_changes_the_size_moves_a_mid_line_saved_wrap() {
+        for (rows, row0, row1, what) in [
+            (
+                3,
+                "abcd      ",
+                "X         ",
+                "same size: the wrap comes back",
+            ),
+            (4, "abcdX     ", "          ", "rows only: the next column"),
+        ] {
+            let mut term = Terminal::new(3, 10);
+            term.process(b"\x1b[?69h\x1b[1;4sabcd\x1b7\x1b[?69l");
+            term.resize(rows, 10);
+            term.process(b"\x1b8X");
+            assert_eq!(row_glyphs(&term, 0), row0, "{what}");
+            assert_eq!(row_glyphs(&term, 1), row1, "{what}");
+        }
+    }
+
+    /// `?1049l` restores the main slot as DECRC does: after a widening under the alternate
+    /// screen left the saved wrap mid-line, the shell's prompt follows the output on its row.
+    #[test]
+    fn a_1049l_after_a_widening_puts_the_prompt_after_the_output() {
+        let mut term = Terminal::new(4, 5);
+        term.process(b"abcde\x1b[?1049h");
+        term.resize(4, 10);
+        term.process(b"\x1b[?1049l$ ");
+        assert_eq!(row_glyphs(&term, 0), "abcde$    ");
+        assert_eq!(cursor(&term), (0, 7));
+        assert!(!term.grid().pending_wrap());
     }
 
     #[test]

@@ -392,8 +392,10 @@ impl OutputStreak {
     pub fn reset(&mut self) {
         let seed = self.seed;
         let mut observed_rows = std::mem::take(&mut self.observed_rows);
-        for row in &mut observed_rows {
-            row.clear();
+        let mut i = 0;
+        while i < observed_rows.len() {
+            observed_rows[i].clear();
+            i += 1;
         }
         *self = Self {
             observed_rows,
@@ -405,8 +407,10 @@ impl OutputStreak {
     #[inline]
     pub fn rebase(&mut self) {
         self.last_token = None;
-        for row in &mut self.observed_rows {
-            row.clear();
+        let mut i = 0;
+        while i < self.observed_rows.len() {
+            self.observed_rows[i].clear();
+            i += 1;
         }
         self.observed_viewport = None;
     }
@@ -487,8 +491,14 @@ impl OutputStreak {
         {
             let old_anchor = &self.observed_rows[anchor_row];
             let mut extent: Option<(usize, usize)> = None;
-            for (col, cell) in row.iter().enumerate() {
-                let old = old_anchor.get(col).copied().unwrap_or(ObservedGlyph::BLANK);
+            let mut col = 0;
+            while col < row.len() {
+                let cell = &row[col];
+                let old = if col < old_anchor.len() {
+                    old_anchor[col]
+                } else {
+                    ObservedGlyph::BLANK
+                };
                 let new = ObservedGlyph::of(cell);
                 let continuation = cell.wide && matches!(extent, Some((_, end)) if end + 1 == col);
                 if (new.has_ink() && old != new) || continuation {
@@ -497,10 +507,13 @@ impl OutputStreak {
                         _ => (col, col),
                     });
                 }
+                col += 1;
             }
             if let Some((start, end)) = extent {
                 let mut moved_row = false;
-                for (index, old) in self.observed_rows.iter().enumerate() {
+                let mut index = 0;
+                while index < self.observed_rows.len() {
+                    let old = &self.observed_rows[index];
                     if index != anchor_row
                         && ObservedGlyph::same_row(old, row)
                         && !ObservedGlyph::same_row(old, &visible[index])
@@ -508,6 +521,7 @@ impl OutputStreak {
                         moved_row = true;
                         break;
                     }
+                    index += 1;
                 }
                 if moved_row {
                     None
@@ -526,12 +540,18 @@ impl OutputStreak {
         };
         self.observed_rows.resize_with(visible.len(), Vec::new);
         self.observed_viewport = Some(viewport);
-        for (old, row) in self.observed_rows.iter_mut().zip(visible) {
+        let mut r = 0;
+        while r < visible.len() {
+            let old = &mut self.observed_rows[r];
+            let row = &visible[r];
             old.clear();
             old.reserve(row.len());
-            for cell in row {
-                old.push(ObservedGlyph::of(cell));
+            let mut c = 0;
+            while c < row.len() {
+                old.push(ObservedGlyph::of(&row[c]));
+                c += 1;
             }
+            r += 1;
         }
         if baseline {
             self.comets = Default::default();
@@ -917,7 +937,9 @@ impl OutputStreak {
             let inv_tail_denom = 1.0 / tail_f.max(1.0);
             let tail_start = (head - tail_f).max(c.from_col as f32);
             let y = i32::from(c.row) * ch_i;
-            for col in tail_start.floor() as i32..=head.round() as i32 {
+            let mut col = tail_start.floor() as i32;
+            let col_end = head.round() as i32;
+            while col <= col_end {
                 let u = ((head - col as f32) * inv_tail_denom).clamp(0.0, 1.0);
                 let shape = (1.0 - u) * (1.0 - u);
                 self.push_cell(
@@ -931,6 +953,7 @@ impl OutputStreak {
                     c.hue + u * HUE_SPAN,
                     shape * life,
                 );
+                col += 1;
             }
             fp = fp
                 .wrapping_mul(1_000_003)
@@ -944,9 +967,11 @@ impl OutputStreak {
             let hue_step = HUE_SPAN / geom.cols.max(1) as f32;
             let y = i32::from(r.row) * ch_i;
             let shape = 0.55 * fade;
-            for col in r.from_col..=r.to_col {
+            let mut col = r.from_col;
+            while col <= r.to_col {
                 let t = r.hue + col as f32 * hue_step;
                 self.push_cell(out, geom, cfg, amp, (cw_i, ch_i), y, col, t, shape);
+                col += 1;
             }
             fp = fp
                 .wrapping_mul(31)

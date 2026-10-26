@@ -141,7 +141,7 @@ impl SessionEvent {
 /// the screen does not settle — and the glyph is not consulted — until it has
 /// cleared. The profile is ignored entirely once the session has emitted an
 /// OSC-133/633 `A`, `C` or `D` mark (see the module doc).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Profile {
     /// End-of-line markers that mean "prompt ready" (matched against the trimmed
     /// last non-empty line).
@@ -164,6 +164,92 @@ impl Profile {
                 "%".to_string(),
                 "#".to_string(),
             ],
+        }
+    }
+
+    /// Claude Code's `❯` idle composer box only — omits `$`/`%`/`#` so settled
+    /// tool output ending in a percentage or hash never false-triggers
+    /// [`SessionEvent::PromptReady`].
+    #[must_use]
+    pub fn claude() -> Self {
+        Profile {
+            prompt_markers: vec!["❯".to_string()],
+        }
+    }
+
+    /// Codex CLI profile: no glyph marker (`»` remains visible while Codex works,
+    /// so its boundary wake is [`SessionEvent::Quiesced`] alone).
+    #[must_use]
+    pub const fn codex() -> Self {
+        Profile {
+            prompt_markers: Vec::new(),
+        }
+    }
+
+    /// Interactive REPL profile (`>>>`, `...`, `irb>`, `iex>`, `sqlite>`) — omits
+    /// `$`/`%`/`#` so settled mid-evaluation progress lines ending in `%` or `#`
+    /// never false-trigger [`SessionEvent::PromptReady`] (`DESIGN-drive-pipe.md`
+    /// §5, §9 Rung 3).
+    #[must_use]
+    pub fn repl() -> Self {
+        Profile {
+            prompt_markers: vec![
+                ">>>".to_string(),
+                "...".to_string(),
+                "irb>".to_string(),
+                "iex>".to_string(),
+                "sqlite>".to_string(),
+            ],
+        }
+    }
+
+    /// Emacs interactive buffers and minibuffer prompts (`ELISP>` IELM,
+    /// `Eval:` `M-:`, `M-x` command prompt, `eshell>` Eshell) — omits `$`/`%`/`#`
+    /// so settled buffer lines do not false-trigger [`SessionEvent::PromptReady`]
+    /// (`DESIGN-drive-pipe.md` §9 Rung 3).
+    #[must_use]
+    pub fn emacs() -> Self {
+        Profile {
+            prompt_markers: vec![
+                "ELISP>".to_string(),
+                "Eval:".to_string(),
+                "M-x".to_string(),
+                "eshell>".to_string(),
+            ],
+        }
+    }
+
+    /// Bare POSIX/csh/root shell prompt glyphs (`$`, `%`, `#`) for unintegrated
+    /// shells that emit no OSC-133/633 marks.
+    #[must_use]
+    pub fn shell() -> Self {
+        Profile {
+            prompt_markers: vec!["$".to_string(), "%".to_string(), "#".to_string()],
+        }
+    }
+
+    /// Empty profile: disable glyph-based [`SessionEvent::PromptReady`] entirely
+    /// (relying solely on OSC-133/633 marks and [`SessionEvent::Quiesced`]).
+    #[must_use]
+    pub const fn none() -> Self {
+        Profile {
+            prompt_markers: Vec::new(),
+        }
+    }
+
+    /// Look up a built-in [`Profile`] by name (`"common"`, `"claude"`, `"codex"`,
+    /// `"repl"`, `"emacs"`, `"shell"`, or `"none"`).
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name {
+            "common" => Some(Self::common()),
+            "claude" => Some(Self::claude()),
+            "codex" => Some(Self::codex()),
+            "repl" => Some(Self::repl()),
+            "emacs" => Some(Self::emacs()),
+            "shell" => Some(Self::shell()),
+            "none" => Some(Self::none()),
+            _ => None,
         }
     }
 }
@@ -691,6 +777,25 @@ impl EventClassifier {
             &self.profile,
             self.integrated,
         )
+    }
+
+    /// Discard any partial mid-record OSC-133/633 mark carry and reset the
+    /// underlying [`Folder`]'s mid-escape VT parser state while preserving the
+    /// painted screen, `integrated` latch, and offset counters.
+    ///
+    /// Call this when a retention `Gap` indicates one or more `Out` records
+    /// were skipped between deliveries, so a torn pre-gap OSC/CSI prefix can
+    /// neither splice onto post-gap bytes to forge a phantom mark nor trap the
+    /// screen fold inside an unterminated OSC string.
+    pub fn reset_escape(&mut self) {
+        self.carry.clear();
+        self.folder.reset_escape();
+    }
+
+    /// Borrow the folded [`Screen`] accumulated across classified deliveries.
+    #[must_use]
+    pub const fn screen(&self) -> &Screen {
+        self.folder.screen()
     }
 
     /// Whether the session has emitted an OSC-133/633 `A`, `C` or `D`

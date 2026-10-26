@@ -15,7 +15,7 @@ mod measuring {
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::rewind::{RewindRow, RewindScene, measure};
-    use aterm_conformance::measure::starvation::ShapeVerdict;
+    use aterm_conformance::measure::starvation::Disposition;
 
     /// A full chain: the recorder re-keyframes at a quarter of its 8 MiB budget, so 2 MiB of output is the longest a step folds through.
     const CHAIN: usize = 2_000_000;
@@ -53,13 +53,17 @@ mod measuring {
                 ));
             }
         };
-        if report.verdict == ShapeVerdict::Pass {
-            Outcome::Pass(report.to_string())
-        } else {
-            Outcome::Fail(format!(
+        match report.disposition {
+            Disposition::Pass => Outcome::Pass(report.to_string()),
+            Disposition::Fail => Outcome::Fail(format!(
                 "REWIND CONFORMANCE FAILED: a step took past its bound to be shown, or an idle \
                  view woke the app.\n  {report}"
-            ))
+            )),
+            Disposition::Unproved => Outcome::CouldNotRun(format!(
+                "REWIND UNPROVED: a step took past its bound to be shown while the driver was \
+                 held off its core as long as the bound, so the take is not evidence about the \
+                 step; take it on an unloaded machine.\n  {report}"
+            )),
         }
     }
 

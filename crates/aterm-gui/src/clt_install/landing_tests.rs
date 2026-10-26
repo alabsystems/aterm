@@ -12,6 +12,9 @@ use aterm_types::macos_setup::{Plan, Setting};
 
 const LINE: &str = "aterm init --only base.clt";
 
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
+
 thread_local! {
     static INSTALL_LAN_TRIGGERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INSTALL_EXTERNAL_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };

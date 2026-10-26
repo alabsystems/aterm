@@ -14291,14 +14291,18 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         "ERR denied\n"
     );
     assert_eq!(run(edge, &format!("hold {sid} off")), "ERR denied\n");
-    assert_eq!(
-        run(Scope::Owner, &format!("@1 hold {sid} on reason=x")),
-        "ERR denied\n"
-    );
-    assert_eq!(
-        run(Scope::Bridge, &format!("@1 hold {sid} on reason=x")),
-        "ERR denied\n"
-    );
+    for (scope, line) in [
+        (Scope::Owner, format!("@1 hold {sid} on reason=x")),
+        (Scope::Owner, format!("@{sid} hold on")),
+        (Scope::Bridge, format!("@1 hold {sid} on reason=x")),
+    ] {
+        assert_eq!(
+            run(scope, &line),
+            "ERR usage: hold names its session as its argument, never a selector: hold <sid> \
+             on|off [reason=<pct>] [origin=fleet|local]\n",
+            "{line}"
+        );
+    }
     assert!(crate::fabric::halt_refusal(&ctx, "key").is_none());
 
     assert_eq!(
@@ -19679,10 +19683,12 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "await task @s-00000000000000cc".to_owned(),
         "await task @1".to_owned(),
     ] {
+        let refused = gate(&line);
         assert!(
-            gate(&line).is_err(),
-            "{line:?} was admitted: {:?}",
-            gate(&line)
+            refused.as_ref().is_err_and(|why| {
+                !why.contains("this Mac") && !why.contains("this aterm") && !why.contains(" here")
+            }),
+            "{line:?}: the driving Mac reads the refusal too: {refused:?}"
         );
     }
     for word in ["gemini", "Gemini", "gemini-cli"] {
@@ -19696,19 +19702,46 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
             "{line}: the retired Gemini CLI is refused by name"
         );
     }
+    assert_eq!(
+        gate(&format!("hold @{W} on")).err().as_deref(),
+        Some(
+            "a drive's hold names a session the driven Mac hosts by its bare sid, with no @: \
+             hold s-… on|off [reason=<pct>]"
+        ),
+        "the form a hold takes"
+    );
     for line in [
-        format!("hold @{W} on"),
-        "hold s-00000000000000cc off".to_owned(),
+        format!("@{W} hold on"),
+        format!("@{W} hold {W} on"),
+        "@s-00000000000000cc hold on".to_owned(),
+        format!("@1 hold {W} off"),
     ] {
         assert_eq!(
             gate(&line).err().as_deref(),
             Some(
-                "a drive's hold names a session this Mac hosts by its bare sid, with no @: hold \
-                 s-… on|off [reason=<pct>]"
+                "a drive's hold names its session as its argument, never a selector: hold s-… \
+                 on|off [reason=<pct>]"
             ),
             "{line}: the form a hold takes"
         );
     }
+    let unhosted = gate("@s-00000000000000cc status").err();
+    assert!(
+        unhosted.as_deref().is_some_and(|why| !why.contains('@')),
+        "{unhosted:?}"
+    );
+    assert_eq!(
+        gate("hold s-00000000000000cc off").err(),
+        unhosted,
+        "a bare sid it does not host: no session, as for every verb"
+    );
+    let usage = gate("spawn agent=bogus len=5").err().unwrap_or_default();
+    assert!(
+        usage.starts_with("a drive spawns only a worker: spawn agent=<claude|codex|agy|muse")
+            && !usage.contains("len=")
+            && usage.contains("|grok") == aterm_phase::Program::Grok.supervisable(),
+        "{usage}"
+    );
     let long = format!("{:?}", gate(&format!("@{W} turn timeout=22001 hi")));
     assert!(
         long.contains("give it a shorter timeout=, or say settle=submitted")

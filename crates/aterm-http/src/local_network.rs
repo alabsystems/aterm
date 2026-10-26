@@ -21,6 +21,12 @@ use std::time::Duration;
 pub const REFUSED: &str =
     "macOS does not let this app use the local network (Local Network privacy)";
 
+/// What a failed lookup of a `.local` name adds on Linux (`dns: <host>: … (…)`), where glibc
+/// resolves one over mDNS only through a resolver many installs lack.
+pub(crate) const NO_MDNS: &str = "this system resolves .local names over mDNS only through \
+     Avahi's nss-mdns or systemd-resolved with MulticastDNS on; a URL naming the server's \
+     address needs neither";
+
 /// Whether `host` is a local DNS name (`.local`, or `.local.`), the one kind of
 /// name Local Network privacy gates (TN3179: a non-local name resolves through
 /// the system resolver without it).

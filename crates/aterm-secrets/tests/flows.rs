@@ -144,7 +144,8 @@ fn join_with(
             interactive: false,
             wait: Duration::ZERO,
             confirm: &|_| panic!("an unattended join never asks"),
-            password: &|| password.map(SecretBytes::from),
+            password: aterm_secrets::client::JoinPassword::Ask(&|| password.map(SecretBytes::from)),
+            fetched: None,
             requested: &|| requested.set(requested.get() + 1),
             say: &|_| {},
         },
@@ -427,7 +428,8 @@ fn the_server_and_every_reader_refuse_a_key_the_vault_never_endorsed() {
                 *shown.borrow_mut() = fingerprint.to_string();
                 true
             },
-            password: &|| None,
+            password: aterm_secrets::client::JoinPassword::Given(None),
+            fetched: None,
             requested: &|| {},
             say: &|_| {},
         },
@@ -935,7 +937,10 @@ fn a_join_whose_subscriber_applied_the_approval_first_is_done() {
             interactive: false,
             wait: Duration::from_secs(60),
             confirm: &|_| panic!("an unattended join never asks"),
-            password: &|| Some(SecretBytes::from(password.as_slice())),
+            password: aterm_secrets::client::JoinPassword::Ask(&|| {
+                Some(SecretBytes::from(password.as_slice()))
+            }),
+            fetched: None,
             requested: &subscriber,
             say: &|_| {},
         },
@@ -1098,7 +1103,7 @@ fn a_probe_names_a_vault_only_under_its_signer() {
     let lab = Lab::new("probed");
     let mut pin = [0u8; 32];
     assert_eq!(
-        client::probe(&lab.url, &pin, Duration::ZERO).expect("answered"),
+        client::probe(&lab.url, &pin, HANG_DETECTOR).expect("answered"),
         ProbeOutcome::Absent,
         "an empty server holds no vault"
     );
@@ -1107,18 +1112,85 @@ fn a_probe_names_a_vault_only_under_its_signer() {
     let signer = aterm_secrets::b64::decode_padded(&created.signer).expect("base64");
     pin.copy_from_slice(&signer);
     let ProbeOutcome::Found(probed) =
-        client::probe(&lab.url, &pin, Duration::ZERO).expect("answered")
+        client::probe(&lab.url, &pin, HANG_DETECTOR).expect("answered")
     else {
         panic!("a vault");
     };
     assert_eq!(probed.seq, 1);
     assert_eq!(probed.fingerprint, created.fingerprint);
-    let other = client::probe(&lab.url, &[7u8; 32], Duration::ZERO);
+    let other = client::probe(&lab.url, &[7u8; 32], HANG_DETECTOR);
     assert!(
-        matches!(other, Ok(ProbeOutcome::NotThisVault(_))),
-        "{other:?}"
+        matches!(other, Ok(ProbeOutcome::AnotherVault(_))),
+        "a vault under another signer: {other:?}"
     );
-    assert!(client::probe("http://127.0.0.1:9/v1/probed", &pin, Duration::ZERO).is_err());
+    assert!(client::probe("http://127.0.0.1:9/v1/probed", &pin, HANG_DETECTOR).is_err());
+}
+
+/// Only an envelope of the asked-for name whose signature holds is another vault: the same
+/// bytes under another name, or with a signature that fails, are no vault at all.
+#[test]
+fn another_vault_is_a_signed_envelope_of_the_asked_name() {
+    let lab = Lab::new("alab");
+    let admin = lab.home("ma");
+    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let signer = aterm_secrets::b64::decode_padded(&created.signer).expect("base64");
+    let pin: [u8; 32] = signer.as_slice().try_into().expect("32 bytes");
+    let ProbeOutcome::Found(probed) =
+        client::probe(&lab.url, &pin, HANG_DETECTOR).expect("answered")
+    else {
+        panic!("a vault");
+    };
+    let served = |body: Vec<u8>| -> &'static [u8] {
+        let mut reply =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        reply.extend_from_slice(&body);
+        Box::leak(reply.into_boxed_slice())
+    };
+    let ask = |reply: &'static [u8]| {
+        let (url, heard) = answer_once(reply);
+        let answered = client::probe(&url, &[7u8; 32], HANG_DETECTOR);
+        heard
+            .recv_timeout(HANG_DETECTOR)
+            .expect("the probe reached the stub");
+        answered
+    };
+    let answered = ask(served(probed.envelope.clone()));
+    assert!(
+        matches!(answered, Ok(ProbeOutcome::AnotherVault(_))),
+        "{answered:?}"
+    );
+    // One bit of its signature changed: it still parses, and no longer verifies.
+    let text = String::from_utf8(probed.envelope.clone()).expect("text");
+    let (head, line) = text.trim_end().rsplit_once('\n').expect("a signature line");
+    let encoded = line.strip_prefix("signature: ").expect("signature last");
+    let mut signature = aterm_secrets::b64::decode_padded(encoded).expect("base64");
+    signature[0] ^= 1;
+    let forged = format!(
+        "{head}\nsignature: {}\n",
+        aterm_secrets::b64::encode_padded(&signature)
+    );
+    aterm_secrets::envelope::parse(forged.as_bytes()).expect("a forged envelope parses");
+    let answered = ask(served(forged.into_bytes()));
+    assert!(
+        matches!(answered, Ok(ProbeOutcome::NotThisVault(_))),
+        "{answered:?}"
+    );
+    // A vault of another name served at this address is no answer about the one asked for.
+    let elsewhere = Lab::new("elsewhere");
+    let made =
+        client::create(&elsewhere.home("mb"), &elsewhere.url, None, Some("mb")).expect("create");
+    let signer = aterm_secrets::b64::decode_padded(&made.signer).expect("base64");
+    let its_pin: [u8; 32] = signer.as_slice().try_into().expect("32 bytes");
+    let ProbeOutcome::Found(named) =
+        client::probe(&elsewhere.url, &its_pin, HANG_DETECTOR).expect("answered")
+    else {
+        panic!("a vault");
+    };
+    let answered = ask(served(named.envelope));
+    assert!(
+        matches!(answered, Ok(ProbeOutcome::NotThisVault(_))),
+        "{answered:?}"
+    );
 }
 
 fn new_key() -> String {
@@ -1645,7 +1717,10 @@ fn a_join_with_the_password_says_how_to_fix_a_mistyped_one_before_it_waits() {
                 interactive,
                 wait: Duration::from_secs(1),
                 confirm: &|_| panic!("a pinned source is not confirmed"),
-                password: &|| Some(SecretBytes::from(&b"a-mistyped-join-password"[..])),
+                password: aterm_secrets::client::JoinPassword::Ask(&|| {
+                    Some(SecretBytes::from(&b"a-mistyped-join-password"[..]))
+                }),
+                fetched: None,
                 requested: &|| {},
                 say: &|line| said.borrow_mut().push(line.to_string()),
             },
@@ -1840,7 +1915,7 @@ fn answer_once(reply: &'static [u8]) -> (String, std::sync::mpsc::Receiver<Strin
 fn a_probe_answered_by_something_else_is_not_the_vault() {
     let probed = |reply: &'static [u8]| {
         let (url, heard) = answer_once(reply);
-        let answered = client::probe(&url, &[7u8; 32], Duration::ZERO);
+        let answered = client::probe(&url, &[7u8; 32], HANG_DETECTOR);
         let head = heard
             .recv_timeout(HANG_DETECTOR)
             .expect("the probe reached the stub");

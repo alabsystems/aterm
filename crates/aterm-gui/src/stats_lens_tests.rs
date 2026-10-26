@@ -1111,7 +1111,7 @@ fn why_now_bounds_the_tab_and_orders_the_split() {
             6900,
         );
     }
-    let cases: [(fixtures::Scene, &[u64], &[&str]); 9] = [
+    let cases: [(fixtures::Scene, &[u64], &[&str]); 10] = [
         (
             fixtures::finished_1032(),
             &[1],
@@ -1120,6 +1120,14 @@ fn why_now_bounds_the_tab_and_orders_the_split() {
                 "busy: aterm 3.40, Tab 1 at least 0.20 \u{b7} macOS services 2.17 \u{b7} others 0.73.",
                 "this tab uses at least 0.2 of 6.3 cores; whether it is the cause is not read now",
                 "no step offered yet",
+            ],
+        ),
+        (
+            fixtures::claude_reaped_1032(),
+            &[1],
+            &[
+                "Why: Tab 1's work, 3.20 cores.",
+                "this tab is the main cause",
             ],
         ),
         (

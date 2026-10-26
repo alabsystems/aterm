@@ -737,7 +737,10 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         assert!(named.contains(&format!(":{each}")), "{ambiguous:?}");
     }
     for each in [closed_port, silent_port] {
-        assert!(!named.contains(&format!(":{each}")), "{ambiguous:?}");
+        assert!(
+            !named.contains(&format!(":{each}")),
+            "an unbound hand entry is not a bound-tier candidate: {ambiguous:?}"
+        );
     }
     let one = ctl_in(
         &member.0,
@@ -1042,7 +1045,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let refused = drive_refused(&stranger.0, &target, &[&at, "status"]);
     assert!(
         refused.contains("ERR denied: node ")
-            && refused.contains("is not one this Mac lets drive it"),
+            && refused.contains("is not one the dialled Mac lets drive it"),
         "{refused}"
     );
 
@@ -1400,7 +1403,7 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
         );
         assert_eq!(field(&status(&held, &sid), "hold_by"), Some("remote"));
     };
-    stands("which still drives this Mac");
+    stands("which still drives this session's Mac");
 
     let cfg = driver.tmp.join("cfg/aterm/aterm.toml");
     let text = std::fs::read_to_string(&cfg).expect("the driver's config");
@@ -1416,8 +1419,8 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     std::fs::write(&cfg, unlistened).expect("write the driver's config");
     fleet_reads(&driver, &driver_sid, "off");
     stands(&format!(
-        "which may still drive this Mac: its place did not prove it just now (nothing listens on \
-         127.0.0.1:{member_port}"
+        "which may still drive this session's Mac: its place did not prove it just now (nothing \
+         listens on 127.0.0.1:{member_port}"
     ));
     let (off, _) = drive_ok(&driver.tmp, &target, &["hold", &sid, "off"]);
     assert_eq!(

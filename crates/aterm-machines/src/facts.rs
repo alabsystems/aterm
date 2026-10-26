@@ -29,9 +29,34 @@ pub fn gather(sys: &dyn System) -> HostFacts {
     gather_with_cache(sys, &default_cache_dir())
 }
 
+/// Gather the host's facts without inventorying live keyboards.
+///
+/// Callers that do not expand a keyboard baseline use this form: a live HID
+/// search can wait on the device or Bluetooth stack and must not be part of
+/// an unrelated hello, status or uninstall path. [`inventory_keyboards`]
+/// remains the explicit read for a keyboard-specific run.
+#[must_use]
+pub fn gather_without_keyboards(sys: &dyn System) -> HostFacts {
+    gather_with_cache_without_keyboards(sys, &default_cache_dir())
+}
+
 /// Gather the host's facts, listing `cache_dir` for `cached`.
 #[must_use]
 pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
+    gather_with_cache_inner(sys, cache_dir, true)
+}
+
+/// [`gather_with_cache`] without the live keyboard inventory.
+#[must_use]
+pub fn gather_with_cache_without_keyboards(sys: &dyn System, cache_dir: &Path) -> HostFacts {
+    gather_with_cache_inner(sys, cache_dir, false)
+}
+
+fn gather_with_cache_inner(
+    sys: &dyn System,
+    cache_dir: &Path,
+    include_keyboards: bool,
+) -> HostFacts {
     let accounts = run(sys, &dscl(["-list", "/Users", "UniqueID"]))
         .filter(Ran::success)
         .map(|r| parse_dscl_list(&r.out()))
@@ -102,10 +127,11 @@ pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
         full_disk_access: sys.full_disk_access().or(tcc_open),
         console_user: console_user(sys, &accounts),
         users: people(sys, &accounts),
-        keyboards: run(sys, &hidutil_keyboards())
-            .filter(Ran::success)
-            .map(|r| parse_hidutil_keyboards(&r.out()))
-            .unwrap_or_default(),
+        keyboards: if include_keyboards {
+            inventory_keyboards(sys)
+        } else {
+            Vec::new()
+        },
         cached: cached(sys, cache_dir),
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
     }
@@ -217,6 +243,18 @@ fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, S
     } else {
         Ok(out)
     }
+}
+
+/// Inventory the keyboards macOS currently routes keys through.
+///
+/// This is an explicit live-device read, reserved for runs that expand a
+/// keyboard baseline or explicitly request the complete host facts.
+#[must_use]
+pub fn inventory_keyboards(sys: &dyn System) -> Vec<Keyboard> {
+    run(sys, &hidutil_keyboards())
+        .filter(Ran::success)
+        .map(|r| parse_hidutil_keyboards(&r.out()))
+        .unwrap_or_default()
 }
 
 /// The `hidutil list` run that names the keyboards.
@@ -955,6 +993,19 @@ UserShell: /bin/zsh
             vec!["0b1f8c6a2d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeef".to_owned()]
         );
         assert_eq!(f.agent_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn facts_without_keyboards_never_search_live_devices() {
+        let sys = vm();
+        let f = gather_with_cache_without_keyboards(&sys, Path::new("/c"));
+        assert!(f.keyboards.is_empty());
+        assert!(
+            !sys.calls().iter().any(|call| call.contains("hidutil")),
+            "calls: {:?}",
+            sys.calls()
+        );
+        assert_eq!(inventory_keyboards(&sys).len(), 2);
     }
 
     #[test]

@@ -34,6 +34,9 @@
 //! the head, at least one past every escalated ack); a `Hello`'s generation,
 //! lineage, served tier, request set and retention rules, never its nonce,
 //! log id or health. A tail's `Mark`s are skipped: the model sends none.
+//! Since the log ids differ, a conditional `Retire` naming the model's log is
+//! sent to the real arm naming the real log at the same generation
+//! (`Real::on_this_log`); one naming any other log goes as it is.
 //!
 //! The scripts are hand-written ones per verb and edge ([`scripts`],
 //! [`long`]) and the door's journal of the seeded [`WORLDS`] ([`replay`]):
@@ -73,9 +76,17 @@
 //!   past `LAST_RESUME_ROUNDS` (64) rounds the answer is an error. The model
 //!   scans without a bound; no script's index holds 65,536 entries.
 //! * A replica's refusals, and verbs the bridge never sends (`ForkSubscribe`,
-//!   `ProcessAndProduce`, `Replicate`, the conditional `Retire`).
+//!   `ProcessAndProduce`, `Replicate`).
 //! * Concurrency: one request at a time; batches and the order of an ack
 //!   against a tail's read are the held-ack worlds'.
+//! * A conditional `Retire` inside a GROUP-COMMIT BATCH: astream answers one
+//!   naming a record staged in the same batch moot, one for an absent subject
+//!   at the head readers saw before the batch, and one whose subject a retire
+//!   not yet visible took at that retire's offset; the model commits each
+//!   request alone. Only a client that guesses an offset before its ack names
+//!   an uncommitted record, and the bridge sends each retire alone with no ack
+//!   owed, so a pipelined script never names one subject twice or draws a
+//!   moot answer for an absent one.
 //! * Off Apple, the Ordered tier: astream serves it Strict (`NotApple`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -336,10 +347,34 @@ impl Real {
         );
     }
 
+    /// `req` as this arm takes it: a conditional `Retire` that names the model's log
+    /// ([`bus::LOG_ID`], what a script or a world's bridge read off the model's `Hello`)
+    /// names this broker's log at the same generation, which the `Hello`s are compared on.
+    fn on_this_log(&self, req: &Request) -> Request {
+        match req {
+            Request::Retire {
+                producer_id,
+                subject,
+                offset,
+                log,
+            } if log.id == bus::LOG_ID => Request::Retire {
+                producer_id: *producer_id,
+                subject: subject.clone(),
+                offset: *offset,
+                log: astream_broker::LogIdentity {
+                    id: self.broker().log_identity().id,
+                    generation: log.generation,
+                },
+            },
+            other => other.clone(),
+        }
+    }
+
     fn write(&mut self, c: u64, reqs: &[Request]) {
+        let reqs: Vec<Request> = reqs.iter().map(|r| self.on_this_log(r)).collect();
         let conn = self.conns.get_mut(&c).expect("a live real connection");
         let mut bytes = Vec::new();
-        for r in reqs {
+        for r in &reqs {
             write_frame(&mut bytes, &encode_request(r)).expect("frame to memory");
         }
         conn.stream
@@ -889,6 +924,27 @@ pub(crate) mod scripts {
         retire_at(producer, 0, target)
     }
 
+    /// The conditional `Retire` of `target` if its newest record is at `offset` on log `id`, generation `generation`.
+    pub(crate) fn retire_on(
+        producer: u64,
+        target: &str,
+        offset: u64,
+        id: [u8; 16],
+        generation: u64,
+    ) -> Request {
+        Request::Retire {
+            producer_id: producer,
+            subject: target.to_string(),
+            offset,
+            log: astream_broker::LogIdentity { id, generation },
+        }
+    }
+
+    /// [`retire_on`] the log each arm serves ([`super::bus::LOG_ID`] on both, `Real::on_this_log`).
+    pub(crate) fn retire_if(producer: u64, target: &str, offset: u64, generation: u64) -> Request {
+        retire_on(producer, target, offset, super::bus::LOG_ID, generation)
+    }
+
     pub(crate) fn fetch(from: u64, filter: &str, max: u32) -> Request {
         Request::Fetch {
             from_offset: from,
@@ -1053,6 +1109,83 @@ pub(crate) mod scripts {
             Step::Start,
             Step::Dial(4),
             Step::Send(4, Request::Hello),
+        ]);
+        s.extend(look(4));
+        s
+    }
+
+    /// THE CONDITIONAL `Retire` the bridge gives a departed session's subjects back by: retired at
+    /// the newest record it names; moot for an absent subject or a newer record; refused when it
+    /// names another log, another generation, an offset past the newest record or, for an absent
+    /// subject, at or above the head; charged to another producer; while a will can still
+    /// append; a reserved, malformed or overlong subject; pipelined; across a restart and a move.
+    /// The offsets in the comments are what each arm answers.
+    pub(crate) fn conditional() -> Vec<Step> {
+        let foreign = [0x11; 16];
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(P, seq(1, 1), PRES_A, "exited")), // @0
+            Step::Send(1, publish(Q, seq(1, 1), PRES_B, "live")),   // @1
+            Step::Send(1, publish(P, seq(1, 2), LANE, "m1")),       // @2
+            Step::Send(1, publish(P, seq(1, 3), PRES_C, "live")),   // @3
+            Step::Send(1, budget(P)),
+            Step::Send(1, budget(Q)),
+            Step::Send(1, retire_if(P, PRES_A, 0, 0)), // retired @4
+            Step::Send(1, retire_if(P, PRES_A, 0, 0)), // moot: absent, at the head 5
+            Step::Send(1, retire_if(P, PRES_A, 5, 0)), // absent, at the head: log:
+            Step::Send(1, retire_if(P, PRES_B, 1, 0)), // charged to Q
+            Step::Send(1, retire_if(Q, PRES_B, 0, 0)), // moot: a newer record @1
+            Step::Send(1, publish(P, seq(1, 4), LANE, "m2")), // @5
+            Step::Send(1, retire_if(P, LANE, 2, 0)),   // moot @5
+            Step::Send(1, retire_if(P, LANE, 6, 0)),   // past the newest record: log:
+            Step::Send(1, retire_if(P, LANE, 5, 1)),   // another generation: log:
+            Step::Send(1, retire_on(P, LANE, 5, foreign, 0)), // another log: log:
+            Step::Send(1, retire_if(P, "/a/commit", 0, 0)),
+            Step::Send(1, retire_if(P, "/a/retire", 0, 0)),
+            Step::Send(1, retire_if(P, "/a", 0, 0)),
+            Step::Send(1, retire_if(P, "no-slash", 0, 0)),
+            Step::Send(1, retire_if(P, "/f/f/*", 0, 0)),
+            Step::Send(1, retire_if(P, &format!("/f/{}", "x".repeat(4100)), 0, 0)),
+            Step::Dial(2),
+            Step::Send(2, will(P, will_at(2), PRES_C, "gone")), // @6
+            Step::Send(1, retire_if(P, PRES_C, 3, 0)),          // will:
+            Step::Send(1, retire_if(Q, PRES_C, 3, 0)),          // charged to P
+            Step::End(2),                                       // fires @7
+            Step::Send(1, retire_if(P, PRES_C, 3, 0)),          // moot @7
+            Step::Send(1, retire_if(P, PRES_C, 7, 0)),          // retired @8
+            // Pipelined, only answers a group-commit batch cannot change (the module doc's
+            // WHAT IT DOES NOT COVER): no subject twice, no moot answer for an absent one.
+            Step::Pipeline(
+                1,
+                vec![
+                    retire_if(P, LANE, 5, 0),            // retired @9
+                    publish(P, seq(2, 1), LANE_B, "m3"), // @10
+                    retire_if(P, PRES_B, 1, 0),          // charged to Q
+                    retire_if(Q, PRES_B, 0, 0),          // moot @1
+                ],
+            ),
+            Step::Send(1, retire_if(P, LANE, 5, 0)), // moot: absent, at the head 11
+            Step::Send(1, budget(P)),
+            Step::Send(1, budget(Q)),
+        ];
+        s.extend(look(1));
+        s.extend([
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Dial(3),
+            Step::Send(3, Request::Hello),
+            Step::Send(3, retire_if(P, PRES_A, 0, 0)),
+            Step::Send(3, publish(P, seq(2, 2), LANE, "m4")), // @11
+            Step::Send(3, budget(P)),
+        ]);
+        s.extend(look(3));
+        s.extend([
+            Step::Reboot,
+            Step::Dial(4),
+            Step::Send(4, Request::Hello),
+            Step::Send(4, retire_if(P, LANE, 11, 0)), // the log moved: log:
+            Step::Send(4, retire_if(P, LANE, 11, 1)), // retired @12
         ]);
         s.extend(look(4));
         s
@@ -1381,6 +1514,7 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
             ("publishing", scripts::publishing()),
             ("binary payload", scripts::binary_payload()),
             ("retiring", scripts::retiring()),
+            ("retiring conditionally", scripts::conditional()),
             ("wills", scripts::wills()),
             ("groups", scripts::groups()),
             ("restarts", scripts::restarts()),
@@ -1479,6 +1613,40 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
     );
 }
 
+/// **WHAT A RECLAIMING BRIDGE SENT, ASTREAM ANSWERS AS THE MODEL DID** (sim item B02):
+/// the door's journal of the reclaim scenario ([`super::world::run_reclaim`]: three
+/// sessions leave, the bridge gives their lanes and rows back, and one is revived just
+/// ahead of its row's retire, a successor's row written first) replayed on both arms on
+/// every tier the host serves, each conditional `Retire` answered alike, retired or moot.
+#[test]
+fn what_a_reclaiming_bridge_sent_astream_answers_as_the_model_did() {
+    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed] {
+        let opts = super::world::Opts {
+            journal: true,
+            ..super::world::Opts::reclaiming(5, tier)
+        };
+        let out = super::world::run_reclaim(&opts, 3, true);
+        assert!(
+            out.violations.is_empty() && out.revived.is_some(),
+            "{tier}: the reclaim scenario: {:#?}",
+            out.violations
+        );
+        let steps = replay(&out.journal);
+        let retires = steps
+            .iter()
+            .filter(|s| matches!(s, Step::Send(_, Request::Retire { .. })))
+            .count();
+        assert!(
+            retires >= 6,
+            "{tier}: the journal holds {retires} conditional retires, not three sessions' lanes and rows"
+        );
+        if served_here(tier) {
+            run_on(tier, opts.retained, ArmMutant::None, &steps)
+                .unwrap_or_else(|e| panic!("the model diverged: {e}"));
+        }
+    }
+}
+
 /// THE DRIFT each fix in `bus.rs` this test found once undid, as an
 /// [`ArmMutant`], with the script that must catch it and what it gets wrong.
 fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
@@ -1527,6 +1695,11 @@ fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
             ArmMutant::RetireAnyTarget,
             scripts::retiring(),
             "a retire of a reserved or malformed target",
+        ),
+        (
+            ArmMutant::RetireIgnoresItsCondition,
+            scripts::conditional(),
+            "a conditional retire of a record newer than it names, or on another log",
         ),
         (
             ArmMutant::WillTakesAnySubject,

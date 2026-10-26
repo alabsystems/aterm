@@ -183,17 +183,14 @@ pub fn cmd_browser(args: &[String]) -> Res {
     Ok(code)
 }
 
-/// `verify browser-site <site>` here, by the targo that runs the lab
-/// (`$CARGO`; the lab's own PATH holds no toolchain), its output shown as it
-/// comes: the row.
+/// `verify browser-site <site>` here, by the targo that runs the lab, in the
+/// shim's build cache (`crate::util::targo`), its output shown as it comes: the
+/// row.
 fn lay_site(site: &Path) -> Row {
     println!("\n=== this Mac: both web modules built and bound (verify browser-site) ===");
     let t0 = Instant::now();
-    let targo = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
-    let mut cmd = aterm_uds::spawnfd::command(&targo);
-    cmd.args(["--unverified", "verify", "browser-site"])
-        .arg(site)
-        .current_dir(&crate::paths::paths().repo)
+    let mut cmd = crate::util::targo(&["--unverified", "verify", "browser-site"]);
+    cmd.arg(site)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -215,7 +212,7 @@ fn lay_site(site: &Path) -> Row {
             name,
             verdict: Verdict::NotRun,
             secs,
-            detail: format!("could not run {}: {e}", targo.to_string_lossy()),
+            detail: format!("could not run {}: {e}", cmd.get_program().to_string_lossy()),
         },
     }
 }

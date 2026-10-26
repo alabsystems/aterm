@@ -173,6 +173,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
 }
 
 /// Writes `bytes` to `path` at `mode` only if `path` does not exist.
+///
+/// The directory's flush after the link is best-effort and never reported, unlike
+/// [`write_atomic`]'s: once the link has made `path`, an error would tell the caller nothing
+/// was placed while its next try answers "taken", a claim no caller owns.
 pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
@@ -200,8 +204,12 @@ pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
     };
     if !matches!(placed, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
-    } else if let Some(parent) = path.parent() {
-        let _ = aterm_durable::durable_dir(parent);
+    } else {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let _never_reported = aterm_durable::Flush::Durable.dir_best_effort(dir);
     }
     placed
 }

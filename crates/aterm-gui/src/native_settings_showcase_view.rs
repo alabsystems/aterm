@@ -203,7 +203,16 @@ fn list_rows(state: &SettingsViewState, height: f32, pins: ChooserPins) -> f32 {
     ((height - around + 0.01) / row_height()).floor().max(0.0)
 }
 
+/// The panel `room` holds cut to whole rows under what it pins (`pins`); one too short for its
+/// pinned head over a row lists the head too ([`chooser_panel`]), its rows still whole, so no
+/// screen of the list ends short (98pt of 56pt rows at 2× in an 80x24 window: every screen 42pt
+/// short).
 fn whole_rows_height(state: &SettingsViewState, room: f32, pins: ChooserPins) -> f32 {
+    let pins = if list_rows(state, room, pins) < 1.0 {
+        ChooserPins::NONE
+    } else {
+        pins
+    };
     let around = 2.0 * PANEL_INSET + chooser_pinned_height(state, pins);
     let rows = list_rows(state, room, pins).max(1.0);
     (around + rows * row_height()).min(room)
@@ -415,7 +424,27 @@ pub(crate) fn themes_page(
     // else names it, is pinned over the page where the body still holds the chooser's filter
     // under it, as short windows shed chrome before content; else the chooser's list leads with
     // it wherever it lists its filter too ([`chooser_panel`]).
-    let mut name = state.take_list_head();
+    // The toolbar, where it leads the page's list ([`super::compact_toolbar_lists`]), leads the
+    // chooser's list only where that list leads with the demo and strip too, nothing pinned over
+    // it: anywhere else it stays over the page, and the page's name with it.
+    let mut head = state.take_list_head();
+    let toolbar = head
+        .iter()
+        .position(|(node, _)| super::is_compact_toolbar(node))
+        .map(|at| head.remove(at));
+    state.toolbar_head_taken.set(false);
+    let mut name = head.pop();
+    // Pinned, the name leaves the chooser its filter and its tallest row under it
+    // ([`chooser_floor`]): at 1× text in a 178x152 window a name pinned over a 58pt list left a
+    // two-line row (64pt) no screen showed whole.
+    let floor = || {
+        let rows = chooser_rows_tallest(
+            state,
+            (page_width - 2.0 * PANEL_INSET).max(0.0),
+            chooser_is_narrow(page_width),
+        );
+        chooser_floor(state, rows)
+    };
     if let Some((node, height)) = name.take_if(|(_, height)| {
         let filter = 2.0 * PANEL_INSET
             + chooser_pinned_height(
@@ -425,7 +454,7 @@ pub(crate) fn themes_page(
                     footer: false,
                 },
             );
-        body - used - *height - gap >= filter - 0.01
+        toolbar.is_none() && body - used - *height - gap >= filter.max(floor()) - 0.01
     }) {
         out.push(node);
         used += height + gap;
@@ -552,11 +581,19 @@ pub(crate) fn themes_page(
                         ListItem::Split(card) => card.first_stop_height(list_room),
                         ListItem::Card(_, height) => height,
                     };
-                    let sizing = LeadSizing::new(frame, first, list_room);
-                    let lead = vec![
-                        (demo_node(spec, sizing.chosen), sizing.chosen),
-                        (strip_box, strip),
-                    ];
+                    // The demo is sized for the screen the toolbar leaves it under it.
+                    let over = toolbar
+                        .as_ref()
+                        .map_or(0.0, |(_, height)| height + DEMO_STRIP_GAP);
+                    let sizing = LeadSizing::new(frame, first, over, list_room);
+                    state.toolbar_head_taken.set(toolbar.is_some());
+                    let lead = toolbar
+                        .into_iter()
+                        .chain([
+                            (demo_node(spec, sizing.chosen), sizing.chosen),
+                            (strip_box, strip),
+                        ])
+                        .collect();
                     out.push(if state.showcase.sheet_open {
                         sheet_panel(state, page_width, room, (lead, Some(sizing)))
                     } else {
@@ -578,9 +615,17 @@ pub(crate) fn themes_page(
                         head: true,
                         footer: false,
                     };
-                    let panel_height = whole_rows_height(state, panel_height, pins)
-                        .max(least)
-                        .min(panel_height);
+                    // A panel that holds its pinned filter over its tallest row keeps that room;
+                    // one that does not lists the filter, its rows whole, at least its floor.
+                    let panel_height = if rows.is_none() || panel_height + 0.5 >= least {
+                        whole_rows_height(state, panel_height, pins)
+                            .max(least)
+                            .min(panel_height)
+                    } else {
+                        whole_rows_height(state, panel_height, ChooserPins::NONE)
+                            .max(floor)
+                            .min(panel_height)
+                    };
                     state.note_pinned_status_room(&strip_box, panel_height);
                     pin(state, &strip_box);
                     out.push(strip_box);
@@ -605,19 +650,22 @@ pub(crate) fn themes_page(
 
 /// How the demo that leads a stacked list over the strip is sized by the list's room: the demo's
 /// heights by its rows, the height of the strip's first stop (its words over its first line of
-/// buttons, as the list lists it), and the height chosen.
+/// buttons, as the list lists it), what leads the list over the demo (the toolbar where it
+/// leads the list, and its gap), and the height chosen.
 #[derive(Clone, Copy)]
 struct LeadSizing {
     heights: [f32; 6],
     strip: f32,
+    over: f32,
     chosen: f32,
 }
 
 impl LeadSizing {
-    fn new(frame: &SettingsPreviewSpec, strip: f32, list_room: f32) -> Self {
+    fn new(frame: &SettingsPreviewSpec, strip: f32, over: f32, list_room: f32) -> Self {
         let mut sizing = Self {
             heights: std::array::from_fn(|rows| frame.demo_height(rows + 1)),
             strip,
+            over,
             chosen: 0.0,
         };
         sizing.chosen = sizing.demo_in(list_room);
@@ -625,9 +673,11 @@ impl LeadSizing {
     }
 
     /// The tallest demo that leaves the strip's first stop a place beside it in a list
-    /// `list_room` tall; where even one row leaves it none, the tallest that list's screen holds,
-    /// so the first screen is never one row of demo over a blank; else one row's.
+    /// `list_room` tall under what leads it; where even one row leaves it none, the tallest that
+    /// list's screen holds, so the first screen is never one row of demo over a blank; else one
+    /// row's.
     fn demo_in(self, list_room: f32) -> f32 {
+        let list_room = (list_room - self.over).max(0.0);
         let tallest = |under: f32| {
             self.heights
                 .iter()
@@ -724,26 +774,40 @@ fn chooser_pinned_height(state: &SettingsViewState, pins: ChooserPins) -> f32 {
     head + footer
 }
 
-/// The tallest stop of the chooser's rows at `inner` listed with no captions, each a stop of
-/// its own.
+/// What [`build_list_blocks`] takes for a query to list every row the list can list.
+const EVERY_ROW: &str = "\u{0}every row";
+
+/// The tallest stop of the chooser's rows in a panel `inner` wide, listed with no captions, each a
+/// stop of its own: at `inner`, and where the list scrolls at the width its thumb's gutter leaves
+/// it, which wraps a name a line taller (Catppuccin Mocha in a 244pt window), so a pinned filter
+/// never leaves a room one row tall over a row two rows tall, drawn as no row at all; and of every
+/// row the list can list, the closed Community section's too, so opening it, or trying a theme
+/// in it, never reshapes the page under the person.
 fn chooser_rows_tallest(state: &SettingsViewState, inner: f32, narrow: bool) -> f32 {
-    with_blocks(state, (inner, narrow, ""), false, |entry| {
-        entry
-            .blocks
-            .iter()
-            .map(|(_, height, _)| *height)
-            .fold(0.0, f32::max)
-    })
+    [inner, (inner - THUMB_GUTTER).max(0.0)]
+        .into_iter()
+        .map(|width| {
+            with_blocks(state, (width, narrow, EVERY_ROW), false, |entry| {
+                entry
+                    .blocks
+                    .iter()
+                    .map(|(_, height, _)| *height)
+                    .fold(0.0, f32::max)
+            })
+        })
+        .fold(0.0, f32::max)
+}
+
+/// A head field's height where the chooser lists it: a row less the gap under it.
+fn listed_head_field_height() -> f32 {
+    (row_height() - PANEL_GAP).max(0.0)
 }
 
 fn chooser_tallest_stop(state: &SettingsViewState, pins: ChooserPins, rows: f32) -> f32 {
-    let head = if pins.head {
+    let head = if pins.head || chooser_head_heights(state).is_empty() {
         0.0
     } else {
-        chooser_head_heights(state)
-            .into_iter()
-            .map(|height| height + PANEL_GAP)
-            .fold(0.0, f32::max)
+        listed_head_field_height() + PANEL_GAP
     };
     let footer = if pins.footer { 0.0 } else { field_height() };
     rows.max(head).max(footer)
@@ -802,7 +866,13 @@ fn chooser_items(
         chooser_head(state, width)
     }
     .into_iter()
-    .map(|(node, height)| gapped(node, height, PANEL_GAP));
+    .map(|(mut node, _)| {
+        // Listed, the head's fields stand on the list's grid as every stop does ([`on_grid`]):
+        // a row each, its gap under it, so a room cut to whole rows holds them.
+        let height = listed_head_field_height();
+        node.layout.height = Length::Fixed(height);
+        gapped(node, height, PANEL_GAP)
+    });
     lead.into_iter()
         .map(|(node, height)| lead_item(node, height, DEMO_STRIP_GAP, width))
         .chain(head.map(|(mut node, height)| {
@@ -1893,12 +1963,19 @@ fn chooser_panel(
         .unwrap_or(ChooserPins::NONE);
     let room = room_for(pins);
     let lead: Vec<(UiNode, f32)> = match name.filter(|_| !pins.head) {
-        Some(title) => std::iter::once(super::page_name_node(
-            title,
-            (inner - THUMB_GUTTER).max(0.0),
-        ))
-        .chain(lead)
-        .collect(),
+        // Under the toolbar where it leads the list.
+        Some(title) => {
+            let mut lead = lead;
+            let at = usize::from(
+                lead.first()
+                    .is_some_and(|(node, _)| super::is_compact_toolbar(node)),
+            );
+            lead.insert(
+                at,
+                super::page_name_node(title, (inner - THUMB_GUTTER).max(0.0)),
+            );
+            lead
+        }
         None => lead,
     };
     let laid = ListRoom {
@@ -2700,6 +2777,9 @@ fn build_list_blocks(
     painted: bool,
 ) -> Vec<(UiNode, f32, Option<String>)> {
     let showcase = &state.showcase;
+    // Every row the list can list, the Community section's too, as an empty filter lists them.
+    let every = query == EVERY_ROW;
+    let query = if every { "" } else { query };
     let slab = slab_column(state, width, narrow);
     let tags = TagWidths::now();
     let mut blocks: Vec<(UiNode, f32, Option<String>)> = Vec::new();
@@ -2723,7 +2803,11 @@ fn build_list_blocks(
             ));
         }
     }
-    let visible = showcase.visible_for(query);
+    let visible = if every {
+        (0..showcase.cards.len()).collect()
+    } else {
+        showcase.visible_for(query)
+    };
     let community_total = showcase
         .cards
         .iter()

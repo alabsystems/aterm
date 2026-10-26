@@ -135,8 +135,11 @@ impl CatBaker {
         self.scratch = None;
         self.eye_mask_scratch = None;
         let mut cleared_any = false;
-        for s in &mut self.slots {
-            cleared_any |= s.take().is_some();
+        let slots = self.slots.as_mut_slice();
+        let mut i = 0;
+        while i < slots.len() {
+            cleared_any |= slots[i].take().is_some();
+            i += 1;
         }
         if cleared_any {
             self.version = self.version.wrapping_add(1);
@@ -489,14 +492,17 @@ pub(crate) fn paint_dark_masked_disc(
             let dx2_v = dx0 + 0.50;
             let dx2 = [dx0_2, dx1 * dx1, dx2_v * dx2_v, dx3_2];
             let mut hit = 0u32;
-            for &dy2 in &dy2 {
-                if dy2 <= rr {
-                    let rem = rr - dy2;
+            let mut ky = 0;
+            while ky < 4 {
+                let dy2_k = dy2[ky];
+                if dy2_k <= rr {
+                    let rem = rr - dy2_k;
                     hit += u32::from(dx2[0] <= rem)
                         + u32::from(dx2[1] <= rem)
                         + u32::from(dx2[2] <= rem)
                         + u32::from(dx2[3] <= rem);
                 }
+                ky += 1;
             }
             if hit > 0 {
                 tile.over(x, y, col, alpha * (hit as f32 * 0.0625));
@@ -922,7 +928,10 @@ pub(crate) fn paint_outline_halo(
         return;
     };
     let halo = (xform.scale_x.min(xform.scale_y) * 0.04).clamp(0.75, 1.25);
-    for (dx, dy) in [(halo, 0.0), (-halo, 0.0), (0.0, halo), (0.0, -halo)] {
+    let offsets = [(halo, 0.0), (-halo, 0.0), (0.0, halo), (0.0, -halo)];
+    let mut k = 0;
+    while k < 4 {
+        let (dx, dy) = offsets[k];
         fill_path_fixed(
             tile,
             layer.paths,
@@ -934,6 +943,7 @@ pub(crate) fn paint_outline_halo(
                 ..xform
             },
         );
+        k += 1;
     }
 }
 

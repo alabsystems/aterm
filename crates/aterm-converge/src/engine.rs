@@ -3,11 +3,14 @@
 
 //! Convergence engine ordering and executing items through probe, plan, apply, and read-back.
 
-use crate::model::{Explain, ItemReport, Mode, Outcome, Probe, Remedy, Requires, StoodAside};
+use crate::model::{
+    Explain, ItemReport, Mode, Outcome, Probe, Remedy, Requires, StoodAside, millis,
+};
 use crate::scope::Scope;
 use crate::{Activation, Item};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Where the engine records a value before it changes it.
 pub trait Journal {
@@ -178,7 +181,9 @@ pub fn run_with(
     run_scoped(items, mode, Scope::EVERY, journal, on_row)
 }
 
-/// Run `items` within `scope` and pass each completed row to `on_row`.
+/// Run `items` within `scope` and pass each completed row to `on_row`. Every row carries
+/// the time the engine spent on it ([`ItemReport::elapsed_ms`]) by the time `on_row` sees it.
+///
 /// # Errors
 /// As [`run`].
 pub fn run_scoped(
@@ -207,13 +212,14 @@ pub fn run_scoped(
     let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
     for (position, &index) in order.iter().enumerate() {
         let item = items[index].as_ref();
+        let started = Instant::now();
         let activation = activations[index].as_deref();
         let item_mode = if mode == Mode::Apply && !scope.applies(item.class()) {
             Mode::Plan
         } else {
             mode
         };
-        let (row, awaits) =
+        let (mut row, awaits) =
             if item.requires() == Requires::Console && !scope.admits(Requires::Console) {
                 let why = scope.not_own_account.map_or_else(
                     || crate::scope::NOT_AT_CONSOLE.to_owned(),
@@ -258,6 +264,7 @@ pub fn run_scoped(
                     ),
                 }
             };
+        row.elapsed_ms = Some(millis(started.elapsed()));
         if awaits && let Some(activation) = activation {
             awaiting.push((activation.id(), rows.len(), index));
         } else if item_mode == Mode::Apply
@@ -296,6 +303,9 @@ pub fn run_scoped(
     Ok(rows)
 }
 
+/// Run `activation` once for the rows `awaiting` it, then read back those rows and the
+/// `passive` ones. Each row's read-back adds to its time, and the activation's own time is
+/// charged once, to the first awaiting row, so a report's rows never count it twice.
 fn settle(
     activation: &dyn Activation,
     awaiting: &[(usize, usize)],
@@ -306,6 +316,7 @@ fn settle(
     on_row: &mut dyn FnMut(&ItemReport),
 ) {
     let mut invoked = false;
+    let started = Instant::now();
     let activated: Result<Vec<(String, String)>, (bool, String)> = if awaiting.is_empty() {
         Ok(Vec::new())
     } else {
@@ -321,6 +332,7 @@ fn settle(
                 }),
         }
     };
+    let mut shared = Some(started.elapsed());
     let mut completing: Vec<_> = awaiting
         .iter()
         .map(|&(at, index)| (at, index, false))
@@ -330,11 +342,13 @@ fn settle(
     for (at, index, passive) in completing {
         let item = items[index].as_ref();
         let row = &mut rows[at];
+        let started = Instant::now();
         if passive {
             if invoked {
                 let last = read_back_as(item, row, Outcome::Ok, "rechecked after activation");
                 finish(item, row, &last);
             }
+            add_elapsed(row, started.elapsed());
             on_row(row);
             continue;
         }
@@ -359,8 +373,18 @@ fn settle(
             }
         };
         finish(item, row, &last);
+        add_elapsed(
+            row,
+            started
+                .elapsed()
+                .saturating_add(shared.take().unwrap_or_default()),
+        );
         on_row(row);
     }
+}
+
+fn add_elapsed(row: &mut ItemReport, took: std::time::Duration) {
+    row.elapsed_ms = Some(row.elapsed_ms.unwrap_or(0).saturating_add(millis(took)));
 }
 
 fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
@@ -435,6 +459,7 @@ fn blank(item: &dyn Item) -> ItemReport {
         explain: None,
         stood_aside: None,
         essential: item.essential(),
+        elapsed_ms: None,
     }
 }
 
@@ -2097,5 +2122,154 @@ pub(crate) mod tests {
                 .iter()
                 .any(|event| event == "apply d")
         );
+    }
+
+    /// A workstation item: it runs only at the console, and is never probed elsewhere.
+    struct AtConsole;
+
+    impl Item for AtConsole {
+        fn id(&self) -> String {
+            "t.console".into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn layer(&self) -> Layer {
+            Layer::Workstation
+        }
+        fn class(&self) -> Class {
+            Class::Preference
+        }
+        fn requires(&self) -> Requires {
+            Requires::Console
+        }
+        fn title(&self) -> String {
+            "at the console".into()
+        }
+        fn probe(&self) -> Probe {
+            panic!("a console item away from the console is never probed")
+        }
+        fn apply(&self) -> Result<(), String> {
+            Err("apply must not be reached".into())
+        }
+        fn explain(&self, probe: &Probe) -> Explain {
+            explained(probe)
+        }
+    }
+
+    /// EVERY ROW CARRIES THE TIME THE ENGINE SPENT ON IT, by the time `on_row` streams it:
+    /// done, changed, planned, blocked, stood aside after its apply and before it, waiting
+    /// on a prerequisite that stood aside, a console item away from the console (which
+    /// nothing probes), and the rows a shared activation completes after it runs (the
+    /// applied one and the one only rechecked). Presence only: what a row costs is the
+    /// host's, never a budget.
+    #[test]
+    fn every_row_carries_the_time_the_engine_spent_on_it() {
+        let lock = StoodAside::Lock("another atpkg run held the store".into());
+        let scripted = |id, probes| Scripted {
+            id,
+            ..Scripted::new(probes, Ok(()))
+        };
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let items = || -> Vec<Box<dyn Item>> {
+            let mut items: Vec<Box<dyn Item>> = vec![
+                Box::new(scripted("t.ok", vec![ok()])),
+                Box::new(scripted("t.changes", vec![change(), ok()])),
+                Box::new(Named {
+                    id: "t.blocked",
+                    probe: Probe::Blocked {
+                        why: "no disk".into(),
+                    },
+                    after: vec![],
+                }),
+                Box::new(Aside(
+                    scripted("t.aside", vec![change(), ok()]),
+                    lock.clone(),
+                )),
+                Box::new(Named {
+                    id: "t.waits",
+                    probe: ok(),
+                    after: vec!["t.aside".into()],
+                }),
+                Box::new(AtConsole),
+                Box::new(Writer {
+                    probes: std::sync::Mutex::new(vec![ok()]),
+                    ..Writer::new("t.rechecked", &events, Some(&dock))
+                }),
+                Box::new(Writer::new("t.activated", &events, Some(&dock))),
+            ];
+            items.extend(crate::scope::standing_aside(
+                vec![Box::new(scripted("t.held", vec![change()]))],
+                &lock,
+            ));
+            items
+        };
+        let away = Scope {
+            at_console: false,
+            ..Scope::EVERY
+        };
+        for (mode, outcomes) in [
+            (
+                Mode::Apply,
+                [
+                    Outcome::Ok,
+                    Outcome::Changed,
+                    Outcome::Blocked,
+                    Outcome::Blocked,
+                    Outcome::Blocked,
+                    Outcome::Blocked,
+                    Outcome::Ok,
+                    Outcome::Changed,
+                    Outcome::Blocked,
+                ],
+            ),
+            (
+                Mode::Plan,
+                [
+                    Outcome::Ok,
+                    Outcome::Planned,
+                    Outcome::Blocked,
+                    Outcome::Planned,
+                    Outcome::Ok,
+                    Outcome::Blocked,
+                    Outcome::Ok,
+                    Outcome::Planned,
+                    Outcome::Planned,
+                ],
+            ),
+        ] {
+            let mut streamed = Vec::new();
+            let rows = run_scoped(&items(), mode, away, &mut NoJournal, &mut |row| {
+                streamed.push((row.id.clone(), row.elapsed_ms));
+            })
+            .unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+                outcomes,
+                "{mode:?}"
+            );
+            if mode == Mode::Apply {
+                // The two kinds of standing aside, the row waiting on one, and the shared
+                // activation that ran.
+                assert!(rows[3].stood_aside.is_some() && rows[4].stood_aside.is_some());
+                assert!(rows[8].stood_aside.is_some());
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event == "activate relaunch.dock")
+                );
+            }
+            assert!(
+                rows.iter().all(|r| r.elapsed_ms.is_some()),
+                "{mode:?}: {rows:?}"
+            );
+            streamed.sort();
+            let mut expected: Vec<_> = rows.iter().map(|r| (r.id.clone(), r.elapsed_ms)).collect();
+            expected.sort();
+            assert_eq!(streamed, expected, "{mode:?}");
+        }
     }
 }

@@ -42,7 +42,7 @@ impl Terminal {
                 alt.resize_no_reflow_with_policy(rows, cols, policy);
             }
         }
-        self.take_back_saved_cursors();
+        self.take_back_saved_cursors(cols_changed || self.grid.rows() != rows_before);
         self.take_back_main_anchors(anchors);
         self.finalize_resize(cols_changed, rows_before, origin);
     }
@@ -78,8 +78,9 @@ impl Terminal {
         }
     }
 
-    /// Take the lent saved cursor positions back from the grids.
-    fn take_back_saved_cursors(&mut self) {
+    /// Take the lent saved cursor positions back from the grids, marking each slot `resized` when
+    /// the resize changed the screen's size (DECRC reads it in `place_restored_cursor`).
+    fn take_back_saved_cursors(&mut self, resized: bool) {
         let active = self.grid.take_lent_saved_cursor();
         let inactive = self
             .alt_grid
@@ -91,9 +92,13 @@ impl Terminal {
             (&mut self.cursor_save.main, &mut self.cursor_save.alt)
         };
         for (slot, carried) in [(active_slot, active), (inactive_slot, inactive)] {
-            if let (Some(saved), Some(cursor)) = (slot.as_mut(), carried) {
+            let Some(saved) = slot.as_mut() else {
+                continue;
+            };
+            if let Some(cursor) = carried {
                 saved.cursor = cursor;
             }
+            saved.resized |= resized;
         }
     }
 
@@ -146,7 +151,7 @@ impl Terminal {
             }
             pending
         };
-        self.take_back_saved_cursors();
+        self.take_back_saved_cursors(cols_changed || self.grid.rows() != rows_before);
         self.take_back_main_anchors(anchors);
         self.finalize_resize(cols_changed, rows_before, origin);
         pending
@@ -167,7 +172,8 @@ impl Terminal {
             Some(&mut self.grid)
         };
         let next = target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed));
-        self.take_back_saved_cursors();
+        // The resize that detached the scrollback marked the slots; the re-attach changes no size.
+        self.take_back_saved_cursors(false);
         self.take_back_main_anchors(anchors);
         next
     }

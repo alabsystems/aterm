@@ -646,7 +646,9 @@ pub(crate) fn air_lit(
     let reach = i32::from(!alone);
     out.reserve(run.len());
     let mut prev_cell: Option<((i32, i32), bool)> = None;
-    for s in run {
+    let mut ri = 0;
+    while ri < run.len() {
+        let s = &run[ri];
         let cell = (
             ((s.y - oyf) * inv_ch).floor() as i32,
             ((s.x - oxf) * inv_cw).floor() as i32,
@@ -664,17 +666,20 @@ pub(crate) fn air_lit(
             }
         };
         out.push(ok);
+        ri += 1;
     }
     if alone {
         return;
     }
     let mut before = true;
     let len = out.len();
-    for i in 0..len {
+    let mut i = 0;
+    while i < len {
         let own = out[i];
         let after = if i + 1 < len { out[i + 1] } else { true };
         out[i] = own && before && after;
         before = own;
+        i += 1;
     }
 }
 
@@ -739,19 +744,50 @@ pub(crate) fn lay_dark_bed(
             ((x - oxf) * inv_cw).floor() as i32,
         )
     };
+    #[inline]
     const fn smooth(t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     }
+    const HEAD_FEATHER_KNOTS: [(f32, f32); DARK_BED_HEAD_FEATHER_KNOTS + 1] = {
+        let mut out = [(0.0f32, 0.0f32); DARK_BED_HEAD_FEATHER_KNOTS + 1];
+        let mut j = 0;
+        while j <= DARK_BED_HEAD_FEATHER_KNOTS {
+            let u = j as f32 / DARK_BED_HEAD_FEATHER_KNOTS as f32;
+            out[j] = (u, 1.0 - smooth(u));
+            j += 1;
+        }
+        out
+    };
+    #[inline]
+    fn feather_over(
+        verts: &mut Vec<RibbonVertex>,
+        (from, dir, feather_span, taper_from): (f32, f32, f32, f32),
+        at: impl Fn(f32, f32) -> RibbonVertex,
+    ) {
+        while verts.len() > 1 && matches!(verts.last(), Some(v) if (v.x - from) * dir >= 0.0) {
+            verts.pop();
+        }
+        let mut j = 0;
+        while j < HEAD_FEATHER_KNOTS.len() {
+            let (u, w) = HEAD_FEATHER_KNOTS[j];
+            verts.push(at(from + feather_span * u, taper_from * w));
+            j += 1;
+        }
+    }
     let mut at = 0usize;
-    for (index, run) in runs.iter().enumerate() {
+    let mut index = 0;
+    while index < runs.len() {
+        let run = &runs[index];
         if run.is_empty() {
+            index += 1;
             continue;
         }
         let wedge_cells = match wedges.get(index) {
             Some(&w) => w,
             None => shape.wedge,
         };
+        index += 1;
         let ink = &inks[at..at + run.len()];
         let rail = rails.get(at..at + run.len());
         at += run.len();
@@ -793,12 +829,19 @@ pub(crate) fn lay_dark_bed(
         };
         taper.clear();
         taper.reserve(run.len());
-        for s in run {
-            taper.push(taper_at(s.x));
+        let mut ti = 0;
+        while ti < run.len() {
+            taper.push(taper_at(run[ti].x));
+            ti += 1;
         }
         if ledger.is_on() {
             let mut prev: Option<((i32, i32), u32)> = None;
-            for ((s, &rgb), &k) in run.iter().zip(ink).zip(taper.iter()) {
+            let mut li = 0;
+            while li < run.len() {
+                let s = &run[li];
+                let rgb = ink[li];
+                let k = taper[li];
+                li += 1;
                 let a = shape.at(s.cov, chf, k).0 as u8;
                 let composite = aterm_render::over_premul(page, premul_rgb(rgb, a), a);
                 let here = cell_of(s.x, s.y);
@@ -830,8 +873,11 @@ pub(crate) fn lay_dark_bed(
             };
             verts.clear();
             verts.push(vertex(tail_x, &first, ink[0], 0.0));
-            for ((s, &rgb), &k) in run.iter().zip(ink).zip(taper.iter()) {
-                verts.push(vertex(s.x, s, rgb, k));
+            let mut vi = 0;
+            while vi < run.len() {
+                let s = &run[vi];
+                verts.push(vertex(s.x, s, ink[vi], taper[vi]));
+                vi += 1;
             }
             let (head_row, head_col) = cell_of(last.x, last.y);
             let air_head = run.len() > 1 && !text.over_text(head_row, head_col);
@@ -845,29 +891,10 @@ pub(crate) fn lay_dark_bed(
             let feather_span = dir * cwf * DARK_BED_HEAD_FEATHER_CELLS;
             let from = head_x - feather_span;
             let taper_from = taper_at(from);
-            const HEAD_FEATHER_KNOTS: [(f32, f32); DARK_BED_HEAD_FEATHER_KNOTS + 1] = {
-                let mut out = [(0.0f32, 0.0f32); DARK_BED_HEAD_FEATHER_KNOTS + 1];
-                let mut j = 0;
-                while j <= DARK_BED_HEAD_FEATHER_KNOTS {
-                    let u = j as f32 / DARK_BED_HEAD_FEATHER_KNOTS as f32;
-                    out[j] = (u, 1.0 - smooth(u));
-                    j += 1;
-                }
-                out
-            };
-            let feather_over =
-                |verts: &mut Vec<RibbonVertex>, at: &dyn Fn(f32, f32) -> RibbonVertex| {
-                    while verts.len() > 1
-                        && matches!(verts.last(), Some(v) if (v.x - from) * dir >= 0.0)
-                    {
-                        verts.pop();
-                    }
-                    for &(u, w) in &HEAD_FEATHER_KNOTS {
-                        verts.push(at(from + feather_span * u, taper_from * w));
-                    }
-                };
+            let feather_geom = (from, dir, feather_span, taper_from);
             if left {
-                feather_over(verts, &|x, k| vertex(x, &last, ink[ink.len() - 1], k));
+                let last_ink = ink[ink.len() - 1];
+                feather_over(verts, feather_geom, |x, k| vertex(x, &last, last_ink, k));
             }
             if shape.dim > 0.0 {
                 ribbon_beam_into(
@@ -909,8 +936,11 @@ pub(crate) fn lay_dark_bed(
                 };
                 verts.clear();
                 verts.push(rail_vertex(tail_x, &first, rail[0], 0.0));
-                for ((s, &rgb), &k) in run.iter().zip(rail).zip(taper.iter()) {
-                    verts.push(rail_vertex(s.x, s, rgb, k));
+                let mut rvi = 0;
+                while rvi < run.len() {
+                    let s = &run[rvi];
+                    verts.push(rail_vertex(s.x, s, rail[rvi], taper[rvi]));
+                    rvi += 1;
                 }
                 verts.push(rail_vertex(
                     head_x,
@@ -919,8 +949,9 @@ pub(crate) fn lay_dark_bed(
                     taper_at(head_x),
                 ));
                 if left {
-                    feather_over(verts, &|x, k| {
-                        rail_vertex(x, &last, rail[rail.len() - 1], k)
+                    let last_rail = rail[rail.len() - 1];
+                    feather_over(verts, feather_geom, |x, k| {
+                        rail_vertex(x, &last, last_rail, k)
                     });
                 }
                 let from = under.mark();
@@ -965,8 +996,10 @@ pub(crate) fn lay_dark_bed(
                 }
                 let stretch = &run[start..i];
                 let mut reach_sum = 0.0f32;
-                for s in stretch {
-                    reach_sum += shape.at(s.cov, chf, 1.0).1;
+                let mut sti = 0;
+                while sti < stretch.len() {
+                    reach_sum += shape.at(stretch[sti].cov, chf, 1.0).1;
+                    sti += 1;
                 }
                 let reach = reach_sum / stretch.len() as f32;
                 let vertex = |s: &CometSample, rgb: u32, x: f32, y: f32| BeamVertex {
@@ -980,8 +1013,12 @@ pub(crate) fn lay_dark_bed(
                     let (a, b) = (run[start - 1], run[start]);
                     tube.push(vertex(&b, ink[start], 0.5 * (a.x + b.x), 0.5 * (a.y + b.y)));
                 }
-                for (s, &rgb) in stretch.iter().zip(&ink[start..i]) {
-                    tube.push(vertex(s, rgb, s.x, s.y));
+                let ink_stretch = &ink[start..i];
+                let mut sti = 0;
+                while sti < stretch.len() {
+                    let s = &stretch[sti];
+                    tube.push(vertex(s, ink_stretch[sti], s.x, s.y));
+                    sti += 1;
                 }
                 if i < run.len() {
                     let (a, b) = (run[i - 1], run[i]);
@@ -1025,7 +1062,8 @@ pub(crate) fn lay_dark_bed(
                     let (ca, cb) = (LAYER_COV[usize::from(a.cov)], LAYER_COV[usize::from(b.cov)]);
                     tube.clear();
                     tube.extend([at(0.0, 0), at(f, ca), at(1.0 - f, cb), at(1.0, 0)]);
-                    for k in 0..LEAP_LAYERS {
+                    let mut k = 0;
+                    while k < LEAP_LAYERS {
                         let shrink = 1.0 - k as f32 * (1.0 / LEAP_LAYERS as f32);
                         comet_beam_over(
                             &mut *under,
@@ -1035,6 +1073,7 @@ pub(crate) fn lay_dark_bed(
                             1,
                             0.0,
                         );
+                        k += 1;
                     }
                 }
             }
@@ -1107,8 +1146,11 @@ fn wedge_runs(
         dst.clear();
         n - 1
     };
-    for (index, run) in runs.iter().enumerate() {
+    let mut index = 0;
+    while index < runs.len() {
+        let run = &runs[index];
         let Some(&head) = run.last() else {
+            index += 1;
             continue;
         };
         let mut same_row = true;
@@ -1124,12 +1166,14 @@ fn wedge_runs(
             let at = next(out);
             out[at].extend_from_slice(run);
             lengths.push(wedge);
+            index += 1;
             continue;
         }
         let kinds = match typing.get(index) {
             Some(v) => v.as_slice(),
             None => &[],
         };
+        index += 1;
         let typed = |i: usize| {
             !shape.leap_path
                 || match kinds.get(i) {
@@ -1164,15 +1208,18 @@ fn wedge_runs(
                 (cells * 4.0).ceil().max(1.0) as usize
             };
             let mut cov = head.cov;
-            for s in piece {
-                cov = cov.max(s.cov);
+            let mut pi = 0;
+            while pi < piece.len() {
+                cov = cov.max(piece[pi].cov);
+                pi += 1;
             }
             lengths.push(cells);
             let span = cells * cwf;
             let inv_knots = 1.0 / knots as f32;
             let dst = &mut out[at];
             dst.reserve(knots + 1);
-            for k in (0..=knots).rev() {
+            let mut k = knots;
+            loop {
                 let u = k as f32 * inv_knots;
                 dst.push(CometSample {
                     x: head.x + back * (span * u),
@@ -1180,6 +1227,10 @@ fn wedge_runs(
                     cov,
                     pos: 1.0 - u,
                 });
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
             }
             start = end;
         }
@@ -1190,11 +1241,13 @@ fn wedge_runs(
 /// Clip the quads `out[from..]` to `(x0, y0, x1, y1)`, dropping any wholly outside.
 pub(crate) fn clip_quads_to(out: &mut Vec<GlowQuad>, from: usize, rect: (i32, i32, i32, i32)) {
     let mut kept = from;
-    for i in from..out.len() {
+    let mut i = from;
+    while i < out.len() {
         if let Some(c) = clip_quad(out[i], rect) {
             out[kept] = c;
             kept += 1;
         }
+        i += 1;
     }
     out.truncate(kept);
 }
@@ -1237,26 +1290,28 @@ pub(crate) fn clip_stream_to(
             }
             r.keep_rows((cy0 - ry0) as u16, (cy1 - cy0) as u16);
             if (cx0, cx1) != (rx0, rx1) {
-                for k in 0..r.h {
-                    if r.continues(k) {
-                        continue;
+                let mut k = 0;
+                while k < r.h {
+                    if !r.continues(k) {
+                        let e = r.ink as usize + 2 * usize::from(r.end_row(k));
+                        if let Some(q) = r.row_quad(ends, k) {
+                            let c = clip_quad(q, rect).expect("a row inside the clip keeps a quad");
+                            ends[e] = aterm_render::glow_end(c.color, c.alpha);
+                            ends[e + 1] = aterm_render::glow_end(c.color2, c.alpha2);
+                            darkened += usize::from(ends[e] | ends[e + 1] == 0);
+                        }
                     }
-                    let e = r.ink as usize + 2 * usize::from(r.end_row(k));
-                    let Some(q) = r.row_quad(ends, k) else {
-                        continue;
-                    };
-                    let c = clip_quad(q, rect).expect("a row inside the clip keeps a quad");
-                    ends[e] = aterm_render::glow_end(c.color, c.alpha);
-                    ends[e + 1] = aterm_render::glow_end(c.color2, c.alpha2);
-                    darkened += usize::from(ends[e] | ends[e + 1] == 0);
+                    k += 1;
                 }
             }
             (r.x, r.w) = (cx0 as u16, (cx1 - cx0) as u16);
             true
         },
     );
-    for _ in 0..darkened {
+    let mut d = 0;
+    while d < darkened {
         out.quads().push(GlowQuad::default());
+        d += 1;
     }
 }
 
@@ -1338,25 +1393,27 @@ pub(crate) fn split_air_runs(
         );
         text.over_text(row, col)
     };
-    let knee = |t: &CometSample, a: &CometSample| {
+    #[inline]
+    const fn knee(t: &CometSample, a: &CometSample, half_cw: f32, half_ch: f32) -> CometSample {
+        #[inline]
+        const fn exit(d: f32, half: f32) -> f32 {
+            let ad = d.abs();
+            if ad > 1e-3 { half / ad } else { f32::INFINITY }
+        }
         let (dx, dy) = (a.x - t.x, a.y - t.y);
-        let exit = |d: f32, half: f32| {
-            if d.abs() > 1e-3 {
-                half / d.abs()
-            } else {
-                f32::INFINITY
-            }
-        };
-        let k = exit(dx, cwf * 0.5).min(exit(dy, chf * 0.5)).min(1.0);
+        let k = exit(dx, half_cw).min(exit(dy, half_ch)).min(1.0);
         CometSample {
             x: t.x + dx * k,
             y: t.y + dy * k,
             cov: 0,
             pos: a.pos,
         }
-    };
+    }
+    let (half_cw, half_ch) = (cwf * 0.5, chf * 0.5);
     let mut n = 0usize;
-    for (ri, run) in runs.iter().enumerate() {
+    let mut ri = 0;
+    while ri < runs.len() {
+        let run = &runs[ri];
         let head = caret && ri + 1 == runs.len();
         let row_kinds = match typed {
             Some(kinds) => Some(match kinds.get(ri) {
@@ -1365,6 +1422,7 @@ pub(crate) fn split_air_runs(
             }),
             None => None,
         };
+        ri += 1;
         let lit = |i: usize| match row_kinds {
             Some(kinds) => match kinds.get(i) {
                 Some(&k) => k,
@@ -1389,11 +1447,11 @@ pub(crate) fn split_air_runs(
             let out = &mut air[n];
             out.clear();
             if start > 0 {
-                out.push(knee(&run[start - 1], &run[start]));
+                out.push(knee(&run[start - 1], &run[start], half_cw, half_ch));
             }
             out.extend_from_slice(&run[start..i]);
             if i < run.len() {
-                out.push(knee(&run[i], &run[i - 1]));
+                out.push(knee(&run[i], &run[i - 1], half_cw, half_ch));
             }
             n += 1;
         }
@@ -1440,19 +1498,26 @@ pub(crate) fn bridge_word_gaps(
     };
     let reach = BED_WORD_GAP_COLS + 1;
     let mut at = 0usize;
-    for run in runs {
+    let mut ri = 0;
+    while ri < runs.len() {
+        let run = &runs[ri];
+        ri += 1;
         let base = at;
         at += run.len();
         if inks.len() < at {
             return;
         }
-        for (i, s) in run.iter().enumerate() {
+        let mut i = 0;
+        while i < run.len() {
+            let s = &run[i];
             let (row, col) = cell_of(s);
             if lettered(row, col) {
+                i += 1;
                 continue;
             }
             let mut left = None;
-            for d in 1..=reach {
+            let mut d = 1;
+            while d <= reach {
                 let c = col - d;
                 if c < 0 {
                     break;
@@ -1461,19 +1526,24 @@ pub(crate) fn bridge_word_gaps(
                     left = Some(c);
                     break;
                 }
+                d += 1;
             }
             let Some(a) = left else {
+                i += 1;
                 continue;
             };
             let max_b = (col + reach).min(a + 1 + BED_WORD_GAP_COLS);
             let mut right = None;
-            for c in col + 1..=max_b {
+            let mut c = col + 1;
+            while c <= max_b {
                 if lettered(row, c) {
                     right = Some(c);
                     break;
                 }
+                c += 1;
             }
             let Some(b) = right else {
+                i += 1;
                 continue;
             };
             let on = |c: i32| {
@@ -1487,6 +1557,7 @@ pub(crate) fn bridge_word_gaps(
                 None
             };
             let (Some(ja), Some(jb)) = (on(a), on(b)) else {
+                i += 1;
                 continue;
             };
             let (xa, xb) = (run[ja].x, run[jb].x);
@@ -1497,6 +1568,7 @@ pub(crate) fn bridge_word_gaps(
             };
             let (ca, cb) = (inks[base + ja], inks[base + jb]);
             inks[base + i] = crate::effect_util::lerp_rgb(ca, cb, u);
+            i += 1;
         }
     }
 }
@@ -1507,18 +1579,25 @@ impl CursorGlow {
     /// Trail length cut.
     pub(super) fn gather_leap_spans(&mut self) {
         self.leap_spans.clear();
-        for spark in &self.sparks {
+        let sparks = self.sparks.as_slice();
+        let mut si = 0;
+        while si < sparks.len() {
+            let spark = &sparks[si];
+            si += 1;
             if spark.typing {
                 continue;
             }
             let mut found = false;
-            for (born, row, first, last) in &mut self.leap_spans {
+            let mut li = 0;
+            while li < self.leap_spans.len() {
+                let (born, row, first, last) = &mut self.leap_spans[li];
                 if *born == spark.born && *row == spark.row {
                     *first = (*first).min(spark.col);
                     *last = (*last).max(spark.col);
                     found = true;
                     break;
                 }
+                li += 1;
             }
             if !found {
                 self.leap_spans
@@ -1542,12 +1621,19 @@ impl CursorGlow {
         caret: Option<(u16, u16)>,
         under: &mut RampSink<'_>,
     ) {
+        #[inline]
+        const fn caret_i32(caret: Option<(u16, u16)>) -> Option<(i32, i32)> {
+            match caret {
+                Some((r, c)) => Some((r as i32, c as i32)),
+                None => None,
+            }
+        }
         let (ink, page) = Self::bed_pair(cfg);
         let budget = dim_budget(dark_bed_budget(ink), page, shape.dim);
         let mut scratch = std::mem::take(&mut self.bed_scratch);
         scratch.inks.clear();
         scratch.rails.clear();
-        scratch.caret = caret.map(|(r, c)| (i32::from(r), i32::from(c)));
+        scratch.caret = caret_i32(caret);
         let mut wedges = std::mem::take(&mut self.wedge_runs);
         self.leap_spans.clear();
         if shape.leap_path {
@@ -1588,7 +1674,10 @@ impl CursorGlow {
         let air_text = TextView::new(self.probed_text_spans(), Some(&self.frame_text));
         let mut lit = std::mem::take(&mut scratch.air);
         let mut last: Option<(u32, bool, u32, u32)> = None;
-        for run in runs {
+        let mut ri = 0;
+        while ri < runs.len() {
+            let run = &runs[ri];
+            ri += 1;
             air_lit(
                 run,
                 geom,
@@ -1596,7 +1685,11 @@ impl CursorGlow {
                 (air.is_some(), self.bed_air_alone()),
                 &mut lit,
             );
-            for (s, &in_air) in run.iter().zip(&lit) {
+            let mut si = 0;
+            while si < run.len() {
+                let s = &run[si];
+                let in_air = lit[si];
+                si += 1;
                 let raw = color(self, s.pos);
                 let (bed_c, rail_c) = match last {
                     Some((prev, was_air, b, r)) if prev == raw && was_air == in_air => (b, r),

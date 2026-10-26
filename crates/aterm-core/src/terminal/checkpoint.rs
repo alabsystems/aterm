@@ -130,6 +130,26 @@ impl SavedCursorPendingWrap {
     }
 }
 
+/// Whether a resize changed the screen's size since a DECSC slot was saved
+/// (`SavedCursorState::resized`): a bare `bool` on the wire, absent when false, which is all an
+/// older producer wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct SavedCursorResized(bool);
+
+impl SavedCursorResized {
+    #[inline]
+    const fn new(value: bool) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    const fn get(self) -> bool {
+        self.0
+    }
+}
+
 /// Wire-stable DECSC/DECRC slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -145,6 +165,11 @@ pub struct SavedCursorRepr {
     pub charset: CharacterSetState,
     pub pending_wrap: SavedCursorPendingWrap,
     pub underline_color: Option<u32>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "is_unresized")
+    )]
+    pub resized: SavedCursorResized,
 }
 
 impl SavedCursorRepr {
@@ -162,6 +187,7 @@ impl SavedCursorRepr {
             charset: saved.charset,
             pending_wrap: SavedCursorPendingWrap::new(saved.pending_wrap),
             underline_color: saved.underline_color,
+            resized: SavedCursorResized::new(saved.resized),
         }
     }
 
@@ -180,6 +206,7 @@ impl SavedCursorRepr {
             charset: self.charset,
             pending_wrap: self.pending_wrap.get(),
             underline_color: self.underline_color,
+            resized: self.resized.get(),
         }
     }
 }
@@ -1107,6 +1134,15 @@ fn is_zero_above(n: &u16) -> bool {
 }
 
 #[cfg(feature = "serde")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_unresized(resized: &SavedCursorResized) -> bool {
+    !resized.get()
+}
+
+#[cfg(feature = "serde")]
 impl CheckpointMeta {
     /// Project a full checkpoint into its carryable meta half.
     #[must_use]
@@ -1825,6 +1861,44 @@ mod tests {
         t.resize(56, 149);
         t.process(b"\x1b[?1049l");
         assert_eq!(t.cursor().row, 55, "the reveal moved it back");
+    }
+
+    /// The wire carries whether a resize changed the size since the save, so a hydrated terminal
+    /// restores a saved wrap the reflow left mid-line as the one it came from does.
+    #[test]
+    fn the_wire_carries_a_resize_since_the_save() {
+        let mut t = Terminal::new(3, 5);
+        t.process(b"abcde\x1b7");
+        assert_eq!(t.cursor_save.main.map(|saved| saved.resized), Some(false));
+        t.resize(3, 10);
+        assert_eq!(t.cursor_save.main.map(|saved| saved.resized), Some(true));
+        let cp = t.checkpoint_carry(0).expect("Ground");
+        assert_eq!(
+            cp.saved_cursor_main.map(|saved| saved.resized.get()),
+            Some(true)
+        );
+        #[cfg(feature = "serde")]
+        let cp = CheckpointMeta::from_checkpoint(&cp).into_checkpoint(cp.grid.clone(), None);
+        let mut adopted = Terminal::new(3, 10);
+        adopted.restore_checkpoint(&cp);
+        for (at, mut restored) in [
+            ("from_checkpoint", Terminal::from_checkpoint(&cp)),
+            ("restore", adopted),
+            ("source", t),
+        ] {
+            restored.process(b"\x1b8X");
+            assert_eq!(
+                restored.row_text(0).unwrap_or_default().trim_end(),
+                "abcdeX",
+                "{at}: X follows the e"
+            );
+            restored.process(b"\x1b7");
+            assert_eq!(
+                restored.cursor_save.main.map(|saved| saved.resized),
+                Some(false),
+                "{at}: a new save starts unresized"
+            );
+        }
     }
 
     #[test]

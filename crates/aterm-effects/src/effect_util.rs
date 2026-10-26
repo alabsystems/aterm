@@ -164,35 +164,38 @@ pub(crate) fn push_soft_disc(
     }
     let inv_rx = 1.0 / rx;
     let inv_ry = 1.0 / ry;
-    for y in y0..y1 {
+    let mut y = y0;
+    while y < y1 {
         let dy = (y as f32 + 0.5 - cy) * inv_ry;
         let dy2 = dy * dy;
         let rest = 1.0 - dy2;
-        if rest <= 0.0 {
-            continue;
-        }
-        let span = rx * crate::color_math::sqrt_f32(rest);
-        let step = span * (1.0 / SEGMENTS as f32);
-        let level = |x: f32| {
-            let u = x * inv_rx;
-            let w = (1.0 - u * u - dy2).max(0.0);
-            let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
-            premul_rgb(color, cov)
-        };
-        let knot = |k: usize| -span + k as f32 * step;
-        let x0 = knot(0);
-        let mut ia = (cx + x0).round() as i32;
-        let mut a = level(x0);
-        for k in 0..2 * SEGMENTS {
-            let xb = knot(k + 1);
-            let ib = (cx + xb).round() as i32;
-            let b = level(xb);
-            if ib > ia && (a != 0 || b != 0) {
-                push_fx_ramp(out, geom, ia, y, ib - ia, 1, (a, 0), (b, 0));
+        if rest > 0.0 {
+            let span = rx * crate::color_math::sqrt_f32(rest);
+            let step = span * (1.0 / SEGMENTS as f32);
+            let level = |x: f32| {
+                let u = x * inv_rx;
+                let w = (1.0 - u * u - dy2).max(0.0);
+                let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
+                premul_rgb(color, cov)
+            };
+            let knot = |k: usize| -span + k as f32 * step;
+            let x0 = knot(0);
+            let mut ia = (cx + x0).round() as i32;
+            let mut a = level(x0);
+            let mut k = 0;
+            while k < 2 * SEGMENTS {
+                let xb = knot(k + 1);
+                k += 1;
+                let ib = (cx + xb).round() as i32;
+                let b = level(xb);
+                if ib > ia && (a != 0 || b != 0) {
+                    push_fx_ramp(out, geom, ia, y, ib - ia, 1, (a, 0), (b, 0));
+                }
+                ia = ib;
+                a = b;
             }
-            ia = ib;
-            a = b;
         }
+        y += 1;
     }
 }
 
@@ -778,7 +781,11 @@ pub(crate) fn push_twinkle_star(
             fallback.as_slice()
         }
     };
-    for (i, p) in pieces.iter().enumerate() {
+    let mut i = 0;
+    while i < pieces.len() {
+        let p = &pieces[i];
+        let is_subsequent = i > 0;
+        i += 1;
         let paint = match p.part {
             StarPart::Body => body_paint,
             StarPart::Core => core_paint,
@@ -799,7 +806,7 @@ pub(crate) fn push_twinkle_star(
             }
             StarPart::Glint => glint_paint,
         };
-        if i > 0 && out.len() >= max_quads {
+        if is_subsequent && out.len() >= max_quads {
             return false;
         }
         push_fx_rect(out, geom, sx + p.x, sy + p.y, p.w, p.h, paint);

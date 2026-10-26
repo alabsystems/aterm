@@ -85,6 +85,32 @@ pub struct Machine<'a> {
 /// Environment variable carrying the build directory to `targo trust` ([`BuildDir::TrustEnv`]).
 pub const BUILD_DIR_ENV: &str = "CARGO_BUILD_BUILD_DIR";
 
+/// What `cargo run` hands the process it runs about ITSELF (`targo --unverified verify` and `lab`
+/// are `run -q -p …`), which build scripts track (ring's tracks `CARGO_MANIFEST_DIR` and
+/// `OUT_DIR`, the latter set for a package with a build script, as `aterm-lab` is): a nested
+/// build that inherits them rebuilds at every switch between it and a typed one (18 packages up to
+/// aterm-gui; `lab mac dmg`'s bench build, 7.6 s, 2026-10-21; `lab mac nux`'s `ship dev-app`
+/// rebuilt ring up to aterm after a typed one over the lab's `OUT_DIR`, 2026-10-25). A name ending
+/// in `*` is a prefix.
+pub const CARGO_RUN_ENV: [&str; 7] = [
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    "CARGO_PKG_*",
+    "CARGO_CRATE_NAME",
+    "CARGO_BIN_NAME",
+    "CARGO_PRIMARY_PACKAGE",
+    "OUT_DIR",
+];
+
+/// Whether the environment variable `name` is one of [`CARGO_RUN_ENV`].
+#[must_use]
+pub fn said_by_cargo_run(name: &str) -> bool {
+    CARGO_RUN_ENV.iter().any(|p| {
+        p.strip_suffix('*')
+            .map_or(name == *p, |prefix| name.starts_with(prefix))
+    })
+}
+
 /// Where [`decide`] puts a command's build intermediates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildDir {
@@ -445,6 +471,31 @@ pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn only_what_cargo_run_says_about_its_child_is_dropped() {
+        for name in [
+            "CARGO_MANIFEST_DIR",
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION_MAJOR",
+            "CARGO_BIN_NAME",
+            "OUT_DIR",
+        ] {
+            assert!(said_by_cargo_run(name), "{name}");
+        }
+        // The caller's own layout and toolchain choices, and a near miss, stay.
+        for name in [
+            "CARGO",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            BUILD_DIR_ENV,
+            "CARGO_PKG",
+            "XCARGO_PKG_NAME",
+            "OUT_DIRS",
+        ] {
+            assert!(!said_by_cargo_run(name), "{name}");
+        }
+    }
 
     /// `unix`, a fixture's absolute path, as this platform spells one (`C:\w\repo` on
     /// Windows, where `/w/repo` is not absolute).

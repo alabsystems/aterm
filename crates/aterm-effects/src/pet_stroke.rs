@@ -101,7 +101,7 @@ impl StrokeDetector {
             crate::color_math::hypot_f32(point.0 - previous.point.0, point.1 - previous.point.1)
                 / body_width;
         let speed = distance / elapsed.as_secs_f32();
-        if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
+        if !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
             self.travel = 0.0;
             return false;
         }

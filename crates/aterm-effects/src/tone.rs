@@ -103,6 +103,7 @@ pub fn for_each_ngram_bucket(text: &str, f: impl FnMut(usize)) -> usize {
 }
 
 /// Feed every hashed n-gram bucket of `chars` to `f`; returns how many were emitted.
+#[inline]
 pub fn for_each_ngram_bucket_chars(
     chars: impl IntoIterator<Item = char>,
     mut f: impl FnMut(usize),
@@ -416,22 +417,34 @@ impl ToneModel {
         let raw = raw(bytes)?;
         let deq_row = |scale: f32, byte: u8| f32::from(byte as i8) * scale;
         let mut emb = Vec::with_capacity(raw.emb.len());
-        for &b in raw.emb {
-            emb.push(deq_row(raw.emb_scale, b));
+        let mut bi = 0;
+        while bi < raw.emb.len() {
+            emb.push(deq_row(raw.emb_scale, raw.emb[bi]));
+            bi += 1;
         }
         let mut w1 = [[0.0f32; HIDDEN]; EMBED];
-        for (r, row) in w1.iter_mut().enumerate() {
+        let mut r = 0;
+        while r < EMBED {
             let base = r * HIDDEN;
-            for (c, slot) in row.iter_mut().enumerate() {
-                *slot = deq_row(raw.w1_scale, raw.w1[base + c]);
+            let row = &mut w1[r];
+            let mut c = 0;
+            while c < HIDDEN {
+                row[c] = deq_row(raw.w1_scale, raw.w1[base + c]);
+                c += 1;
             }
+            r += 1;
         }
         let mut w2 = [[0.0f32; TONE_COUNT]; HIDDEN];
-        for (r, row) in w2.iter_mut().enumerate() {
+        let mut r = 0;
+        while r < HIDDEN {
             let base = r * TONE_COUNT;
-            for (c, slot) in row.iter_mut().enumerate() {
-                *slot = deq_row(raw.w2_scale, raw.w2[base + c]);
+            let row = &mut w2[r];
+            let mut c = 0;
+            while c < TONE_COUNT {
+                row[c] = deq_row(raw.w2_scale, raw.w2[base + c]);
+                c += 1;
             }
+            r += 1;
         }
         Ok(ToneModel {
             emb,
@@ -449,6 +462,7 @@ impl ToneModel {
     }
 
     /// Compute the raw output logits into `s.logits` directly from `chars`, returning `false` when fewer than [`MIN_NGRAMS`] character n-grams were emitted.
+    #[inline]
     fn compute_logits_chars(
         &self,
         chars: impl IntoIterator<Item = char>,
@@ -473,22 +487,28 @@ impl ToneModel {
             return false;
         };
         let n = for_each_ngram_bucket_chars(chars, |bucket| {
-            for (acc, &w) in s.sum.iter_mut().zip(&emb_rows[bucket & (BUCKETS - 1)]) {
-                *acc += w;
+            let row = &emb_rows[bucket & (BUCKETS - 1)];
+            let mut i = 0;
+            while i < EMBED {
+                s.sum[i] += row[i];
+                i += 1;
             }
         });
         if n < MIN_NGRAMS {
             return false;
         }
         let inv = 1.0 / n as f32;
-        for e in &mut s.sum {
-            *e *= inv;
-        }
         s.hid = self.b1;
-        for (row, &e) in self.w1.iter().zip(&s.sum) {
-            for (h, &w) in s.hid.iter_mut().zip(row) {
-                *h += e * w;
+        let mut r = 0;
+        while r < EMBED {
+            let row = &self.w1[r];
+            let e = s.sum[r] * inv;
+            let mut c = 0;
+            while c < HIDDEN {
+                s.hid[c] += e * row[c];
+                c += 1;
             }
+            r += 1;
         }
         true
     }
@@ -496,14 +516,18 @@ impl ToneModel {
     /// Apply tanh to `s.hid` in place and compute the output logits into `s.logits`.
     #[inline]
     fn logits_from_pre_activations(&self, s: &mut ToneScratch) {
-        for h in &mut s.hid {
-            *h = h.tanh();
-        }
         s.logits = self.b2;
-        for (row, &h) in self.w2.iter().zip(&s.hid) {
-            for (l, &w) in s.logits.iter_mut().zip(row) {
-                *l += h * w;
+        let mut r = 0;
+        while r < HIDDEN {
+            let row = &self.w2[r];
+            let hv = s.hid[r].tanh();
+            s.hid[r] = hv;
+            let mut c = 0;
+            while c < TONE_COUNT {
+                s.logits[c] += hv * row[c];
+                c += 1;
             }
+            r += 1;
         }
     }
 

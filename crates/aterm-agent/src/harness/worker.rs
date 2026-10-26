@@ -235,6 +235,18 @@ pub fn worker_cli(agent: Program) -> Option<&'static WorkerCli> {
     WORKERS.iter().find(|w| w.agent == agent)
 }
 
+/// The words of the [`WORKERS`] a `spawn` starts, as a usage line names them (`claude|…`): none
+/// whose end nothing sees ([`WorkerCli::end_unseen`]), which `spawn` refuses.
+#[must_use]
+pub fn started_words() -> String {
+    WORKERS
+        .iter()
+        .filter(|w| w.end_unseen().is_none())
+        .map(|w| w.word)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Program, environment, and argv flags carried from a starter onto a worker's launch line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Starter {

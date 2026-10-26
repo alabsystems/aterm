@@ -501,9 +501,9 @@ impl TrickFlash {
                 cell
             } else {
                 let key = (loc.row, col);
-                let lookup = match ink.get(search_from).map(|c| (c.row, c.col)) {
-                    Some(pos) if pos == key => Ok(0),
-                    Some(pos) if pos > key => Err(0),
+                let lookup = match ink.get(search_from) {
+                    Some(c) if (c.row, c.col) == key => Ok(0),
+                    Some(c) if (c.row, c.col) > key => Err(0),
                     _ => ink[search_from..].binary_search_by_key(&key, |c| (c.row, c.col)),
                 };
                 match lookup {
@@ -762,7 +762,6 @@ fn find_in_row(
     let (caret_plus_back, caret_plus_two_back) = (caret + back, caret + two_back);
     let three_plus_two_back = 3 + two_back;
     let reach = i64::from(TYPED_EDIT_REACH_COLS) + two_back + 2;
-    let cursor = cursor_col.map(i64::from);
     let max_start = match usize::try_from(caret + reach) {
         Ok(m) => m.saturating_add(1).min(cells.len()),
         Err(_) => 0,
@@ -827,7 +826,8 @@ fn find_in_row(
             Anchor::Exact
         } else if (start - two_back..=end_1_two_back).contains(&caret) {
             Anchor::Inside
-        } else if matches!(cursor, Some(at) if (end_1..=end + three_plus_two_back).contains(&at)) {
+        } else if matches!(cursor_col, Some(at) if (end_1..=end + three_plus_two_back).contains(&i64::from(at)))
+        {
             Anchor::Slack
         } else {
             continue;

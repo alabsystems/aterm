@@ -56,6 +56,8 @@ mod codex_rig;
 #[cfg(target_os = "macos")]
 mod crash;
 #[cfg(target_os = "macos")]
+mod disk_ask_lane;
+#[cfg(target_os = "macos")]
 mod disk_lane;
 #[cfg(target_os = "macos")]
 mod door;
@@ -118,7 +120,11 @@ mod linux_vz_host;
 #[cfg(target_os = "macos")]
 mod linux_xwire;
 #[cfg(target_os = "macos")]
+mod look_away;
+#[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+mod mac_nux;
 #[cfg(target_os = "macos")]
 mod meta_keys;
 #[cfg(target_os = "macos")]
@@ -266,6 +272,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_AGY LAB_MUSE
                                  LAB_ATERM=/physical/path LAB_STATE=/abs/outside/homes
                                  LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V ATERM_OCCUPANCY_NUDGE_S=N'
+                                 LAB_HOME_IMAGE=<n>g|<n>m: the scratch home on a sparse APFS image of that size (1 GiB to 64 GiB)
                                  LAB_REROUTE=1: the lab's Claude Code store build cloned into the jail's own atpkg
                                  prefix with its twin and reroute stub, the instance rerouting; `claude --by-name`)
   claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [--by-name] [-- claude args]
@@ -429,6 +436,11 @@ Outside any lab (no jail, no stub):
                                  a passing run's record goes to docs/measured/)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
+  disk-ask [tag] [--keep]        three real Claude Code tabs in a lab whose HOME is a 16 GiB sparse APFS image below its
+                                 floor once aterm's own pass is spent: verify the disk-free@v1 ask types its line to the
+                                 one tab whose checkout holds the most, naming that build as the tab's own, its cleanup
+                                 lifts the volume, the ledger and `aterm harness disk why` credit it, and, the volume
+                                 filled short again, the cooldown opens no episode and no tab gets a second line (~12 min)
   slot-capture [--watch DUR [--dir DIR]]
                                  verify `build-slot` record parsing in a scratch BUILD_SLOT_DIR, or watch ~/.cache/build-slot vs the holder scan
   slot-lane [--aterm PATH] [--keep]
@@ -457,6 +469,12 @@ Outside any lab (no jail, no stub):
                                  private two-tab delegated resource attribution check
   presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T X\"] [--trials N] [--keep]
                                  OPENS A WINDOW (with --window): verify zero re-grid flap across fenced/harness turns and chrome pairs (~3 min)
+  look-away [--aterm PATH] [--keep]
+                                 OPENS A WINDOW (~30 s): its front tab's task is marked done while Calculator, opened and
+                                 quit by PID here, is the active app; wants the Done for you row to stand (done=1), still
+                                 to stand after `ctl focus in` and another done, to go once aterm is active again, and a
+                                 done while aterm is active seen as it lands even after `ctl focus out` (§14.11;
+                                 --aterm main's build is the negative control)
   meta-keys --window [--layout ID]... [--aterm PATH] [--keep] | meta-keys --plan [--layout ID]... | meta-keys --restore
                                  OPENS A WINDOW (with --window): verify Option chords and dead keys across U.S., German, and French layouts (~1 min)
   predict-live --window|--headless [--aterm PATH] [--shell zsh|bash]... [--rtt MS]... [--mode on|off]...
@@ -495,8 +513,13 @@ Outside any lab (no jail, no stub):
                                  run <cmd> behind a pass-through PTY and record `<t_ns> I|O <hex>` chunks to <log>
   link [--rtt MS] [--take FILE] -- <cmd> [args...]
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
-  mac dmg [--image REF] [--fda] [--keep]
-                                 run dmg_acceptance benches inside a fresh SIP-enabled macOS tart VM (`mac help`)
+  mac dmg [--image REF] [--fda] [--keep] | mac nux [--app PATH] [--scenario ROW,...] [--standard-user]
+      [--record FILE] | mac clean
+                                 the macOS tart guest lane, each run in a fresh clone of a kept SIP-on base: `dmg`, the
+                                 dmg_acceptance benches; `nux`, what a person meets on a new Mac (init, doctor, first
+                                 launch, terminal and app launch, vault, a vault of the guest's own, successor,
+                                 install.sh) timed in the guest; `clean`, delete the kept bases (`mac help`; tart
+                                 fetched when absent)
   linux [--gpu] up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|gpu-host|vz-agent|clean|destroy
                                  manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64, or with
                                  --gpu its krunkit instance on this Mac's GPU (`linux help`)
@@ -504,9 +527,10 @@ Outside any lab (no jail, no stub):
                                  manage and run the Windows 11 arm64 QEMU VM runtime lane on aarch64 and Prism x86_64 (`windows help`)
 
 Every verb that opens a window (--window, and the Linux lane's GUI rows) first waits for a quiet machine: alone
-among quiet claims in the per-user capacity ledger, once the 1-minute load is low, saying once a minute what it
-waits for; `--admit now` (or `--admit=now`), given to any verb, starts it at once, and a lane's VM boot without
-waiting for disk.
+among quiet claims in the per-user capacity ledger, until the 1-minute load is low or, next in line, its patience
+runs out. Once a minute it says what it waits for, when it holds back claimed work that asks after it, and when it
+starts whatever the load. `--admit now` (or `--admit=now`), given to any verb, starts it at once, and a lane's VM
+boot without waiting for disk.
 
 Exit: 0 pass, 1 a finding or a refusal (also an unknown command and, on many verbs, a bad argument), 2 usage,
 3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
@@ -677,6 +701,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "nudge-trial" => nudge::cmd_nudge_trial(args),
         "restore" => restore::cmd_restore(args),
         "forever" => forever::cmd_forever(args),
+        "look-away" => look_away::cmd_look_away(args),
         "crash" => crash::cmd_crash(args),
         "sleep" => sleep::cmd_sleep(args),
         "workers" => workers::cmd_workers(args),
@@ -687,6 +712,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
+        "disk-ask" => disk_ask_lane::cmd_disk_ask(args),
         "slot-capture" => slot_lane::cmd_slot_capture(args),
         "slot-lane" => slot_lane::cmd_slot_lane(args),
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),

@@ -19,22 +19,7 @@ pub const STATUS_BUDGET: Duration = Duration::from_secs(20);
 /// The label accounts v2 gives the machine's own row (`harness::cli::ACCOUNTS_OWN_LABEL`).
 pub const OWN_LABEL: &str = "main";
 
-/// The variables that mean an agent is running this command: its tools carry them.
-pub const AGENT_MARKERS: &[&str] = &[
-    "CLAUDECODE",
-    "CODEX_THREAD_ID",
-    "CODEX_SANDBOX",
-    "ATERM_AI_REVIEW",
-];
-
-/// The first [`AGENT_MARKERS`] variable set, if any.
-#[must_use]
-pub fn agent_marker(var: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
-    AGENT_MARKERS
-        .iter()
-        .copied()
-        .find(|k| var(k).is_some_and(|v| !v.is_empty()))
-}
+pub use aterm_types::domain::{AGENT_MARKERS, agent_marker};
 
 /// What a sign-in came to.
 #[derive(Debug, Clone, PartialEq, Eq)]

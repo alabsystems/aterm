@@ -4,6 +4,14 @@
 use super::*;
 use aterm_spec::interp::State as ModelState;
 
+/// `bytes` at `path` as only its owner may write it, whatever the umask: an import refuses a
+/// file others can write, which a umask of 002 (Ubuntu's) gives a plain write.
+fn private_file(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelState {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(&root.path().join("m1"));
@@ -11,7 +19,7 @@ pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelStat
     let source_text = source.to_str().unwrap();
     let import = root.path().join("import");
     std::fs::create_dir(&import).unwrap();
-    std::fs::write(import.join("example"), b"original").unwrap();
+    private_file(&import.join("example"), b"original");
     let (context, pending) = prepare(&paths, source_text, Some(&import), Some("m1")).unwrap();
     let initial = pending.envelope.clone();
     let config = pending.config().unwrap();
@@ -258,7 +266,7 @@ fn failed_local_materialization_resumes_without_republishing() {
     let source = root.path().join("first.vault");
     let import = root.path().join("import");
     std::fs::create_dir(&import).unwrap();
-    std::fs::write(import.join("example"), b"original").unwrap();
+    private_file(&import.join("example"), b"original");
     let blocked = paths.home.join(".secrets/example");
     std::fs::create_dir_all(&blocked).unwrap();
     let made = create(&paths, source.to_str().unwrap(), Some(&import), Some("m1")).unwrap();
@@ -371,7 +379,7 @@ fn unfinished_creation_refuses_a_join_and_completed_resume_does_no_outbox_io() {
     let source = root.path().join("first.vault");
     let (context, pending) = prepare(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
     let plain = root.path().join("plain");
-    std::fs::write(&plain, b"[everyone]\ntoken = value\n").unwrap();
+    private_file(&plain, b"[everyone]\ntoken=value\n");
     let options = JoinOptions {
         source: plain.to_str().unwrap().into(),
         host: Some("m1".into()),
@@ -379,10 +387,15 @@ fn unfinished_creation_refuses_a_join_and_completed_resume_does_no_outbox_io() {
         wait: Duration::ZERO,
         confirm: &|_| false,
         say: &|_| {},
-        password: &|| None,
+        password: crate::client::JoinPassword::Given(None),
+        fetched: None,
         requested: &|| {},
     };
-    assert!(join(&paths, &options).is_err());
+    let refused = join(&paths, &options).unwrap_err();
+    assert!(
+        refused.to_string().contains("unfinished vault creation"),
+        "{refused}"
+    );
     assert!(config(&paths).unwrap().is_none());
     finish(&paths, context, pending).unwrap();
     std::fs::remove_dir_all(paths.dir.join("creation-outbox")).unwrap();

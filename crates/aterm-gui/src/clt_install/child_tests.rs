@@ -11,6 +11,35 @@ use crate::{App, Wake, WindowId};
 
 struct ChildWakes(WakePost);
 
+#[test]
+fn clt_child_recovery_refusal_prints_error_as_data_and_exits() {
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let sentinel = directory.path().join("must-not-exist");
+    let reason = format!(
+        "can't save '$(/usr/bin/touch {})' ` /usr/bin/touch {} `\n",
+        sentinel.display(),
+        sentinel.display()
+    );
+    let error = std::io::Error::other(reason.clone());
+    let line = super::recovery_refusal_line(&error);
+    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    command.args(["-c", &line]);
+    let output =
+        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "Installer not started: could not save its recovery state.\n{}\n",
+            reason.replace(char::is_control, " ")
+        )
+    );
+    assert!(
+        !sentinel.exists(),
+        "an error message executes no shell substitution"
+    );
+}
+
 impl WakeTarget for ChildWakes {
     fn wake_post(&self) -> WakePost {
         Arc::clone(&self.0)

@@ -61,19 +61,16 @@ pub enum Kind {
 }
 
 /// What [`Track`] knows of one DECSC slot: it was written with origin mode
-/// on, a DECSTBM or DECSLRM has come since, and the left/right margins have
-/// moved since (`decrc_of_a_wrap_after_the_margins_moved`) or may have left
-/// the wrap it saved off a line end ([`Track::wrap_off_a_line_end`]).
+/// on, and a DECSTBM or DECSLRM has come since.
 #[derive(Clone, Copy, Debug, Default)]
 struct OriginSlot {
     origin: bool,
     region_moved: bool,
-    margins_moved: bool,
 }
 
 impl OriginSlot {
     fn blocks_restore(self) -> bool {
-        (self.origin && self.region_moved) || self.margins_moved
+        self.origin && self.region_moved
     }
 }
 
@@ -139,13 +136,6 @@ struct Track {
     alt_slot: OriginSlot,
     /// DECLRMM is on, so `CSI s` sets margins rather than saving the cursor.
     lrmm: bool,
-    /// A DECSLRM has come under DECLRMM since it was last reset, so the margins
-    /// may be narrower than the screen.
-    narrowed: bool,
-    /// A DECLRMM reset of narrowed margins has come, which can leave a wrap
-    /// pending on the old right margin, mid-line: a slot saved since may hold
-    /// one (`decrc_of_a_wrap_a_declrmm_reset_left_mid_line`).
-    wrap_off_a_line_end: bool,
 }
 
 impl Track {
@@ -197,7 +187,6 @@ impl Track {
     fn save(&mut self) {
         let slot = OriginSlot {
             origin: self.origin,
-            margins_moved: self.wrap_off_a_line_end,
             ..OriginSlot::default()
         };
         if self.in_alt {
@@ -245,26 +234,11 @@ impl Track {
                 }
             }
             Kind::Origin { set } => self.origin = set,
-            Kind::Region => {
+            Kind::Region | Kind::Margins => {
                 self.main_slot.region_moved = true;
                 self.alt_slot.region_moved = true;
             }
-            Kind::Margins => {
-                self.narrowed = true;
-                for slot in [&mut self.main_slot, &mut self.alt_slot] {
-                    slot.region_moved = true;
-                    slot.margins_moved = true;
-                }
-            }
-            Kind::Lrmm { set } => {
-                self.lrmm = set;
-                if !set {
-                    self.wrap_off_a_line_end |= self.narrowed;
-                    self.narrowed = false;
-                    self.main_slot.margins_moved = true;
-                    self.alt_slot.margins_moved = true;
-                }
-            }
+            Kind::Lrmm { set } => self.lrmm = set,
             Kind::Plain => {}
         }
     }

@@ -1393,47 +1393,39 @@ fn the_file_read_is_the_one_claude_code_picks() {
     let subscribed = Some(aterm_phase::LoginMethod::Subscription);
     std::fs::write(&plain, subscription).expect("plain subscription");
     std::fs::remove_file(&legacy).expect("remove legacy");
-    assert_eq!(
-        login_method(&env, &home, false),
-        subscribed,
-        "plain control"
-    );
+    assert_eq!(login_method(&env, &home), subscribed, "plain control");
     std::fs::write(&legacy, console).expect("effective Console profile");
     assert_eq!(
-        login_method(&env, &home, false),
+        login_method(&env, &home),
         None,
         "a stale plain subscription is not the effective login"
     );
     std::fs::write(&plain, console).expect("plain Console profile");
     std::fs::write(&legacy, subscription).expect("effective subscription");
     assert_eq!(
-        login_method(&env, &home, false),
+        login_method(&env, &home),
         subscribed,
         "the effective subscription is used"
     );
     std::fs::write(&legacy, "not JSON").expect("unreadable effective profile");
-    assert_eq!(login_method(&env, &home, false), None);
+    assert_eq!(login_method(&env, &home), None);
     std::fs::write(&plain, subscription).expect("plain subscription again");
     std::fs::write(&legacy, "").expect("empty legacy beside plain");
-    assert_eq!(login_method(&env, &home, false), subscribed);
+    assert_eq!(login_method(&env, &home), subscribed);
     let mut unknown = env.clone();
     unknown.push("CLAUDE_CONFIG_DIR=".to_string());
     assert_eq!(
-        login_method(&unknown, &home, false),
+        login_method(&unknown, &home),
         None,
         "without the records directory its legacy profile cannot be ruled out"
     );
     unknown[1] = "CLAUDE_CONFIG_DIR=relative".to_string();
-    assert_eq!(login_method(&unknown, &home, false), None);
+    assert_eq!(login_method(&unknown, &home), None);
     let mut credential = env.clone();
     credential.push("ANTHROPIC_API_KEY=invented-test-key".to_string());
-    assert_eq!(login_method(&credential, &home, true), None);
-    assert_eq!(login_method(&[], &home, true), None);
-    assert_eq!(
-        login_method(&env, &home, true),
-        subscribed,
-        "renewable control"
-    );
+    assert_eq!(login_method(&credential, &home), None);
+    assert_eq!(login_method(&[], &home), None);
+    assert_eq!(login_method(&env, &home), subscribed, "credential control");
 }
 
 #[test]

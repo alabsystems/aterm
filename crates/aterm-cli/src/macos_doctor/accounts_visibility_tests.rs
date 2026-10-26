@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
-enum Preflight {
+pub(super) enum Preflight {
     Unknown,
     SignedOut,
 }
@@ -21,13 +21,21 @@ enum Current {
     Unknown,
 }
 
-struct Account {
-    signed_in: AtomicBool,
-    unreadable: bool,
-    signouts: AtomicUsize,
+pub(super) struct Account {
+    pub(super) signed_in: AtomicBool,
+    pub(super) unreadable: bool,
+    pub(super) signouts: AtomicUsize,
 }
 
-fn system(preflight: Option<Preflight>, account: &Arc<Account>) -> Fake {
+pub(super) fn system(preflight: Option<Preflight>, account: &Arc<Account>) -> Fake {
+    system_after_signout(preflight, account, || {})
+}
+
+pub(super) fn system_after_signout(
+    preflight: Option<Preflight>,
+    account: &Arc<Account>,
+    after_signout: impl Fn() + Send + Sync + 'static,
+) -> Fake {
     let mut sys = Fake::root();
     sys.euid = 501;
     sys.stat_of(
@@ -55,7 +63,7 @@ fn system(preflight: Option<Preflight>, account: &Arc<Account>) -> Fake {
             "/usr/bin/uname" => "arm64\n",
             "/usr/bin/sw_vers" => "27.0\n",
             "/usr/bin/defaults" => {
-                assert_eq!(args, ["export", "com.apple.imservice.ids.iMessage", "-"]);
+                assert!(matches!(args.as_slice(), ["export", "com.apple.imservice.ids.iMessage" | "com.apple.imservice.ids.FaceTime", "-"]));
                 if matches!(preflight, Some(Preflight::Unknown))
                     || (preflight.is_none() && account.unreadable)
                 {
@@ -68,9 +76,10 @@ fn system(preflight: Option<Preflight>, account: &Arc<Account>) -> Fake {
                 }
             }
             "/usr/bin/osascript" if args.first() == Some(&"-e") => {
-                assert_eq!(args[3], "Messages");
+                assert!(["Messages", "FaceTime"].contains(&args[3]));
                 account.signouts.fetch_add(1, Ordering::SeqCst);
                 account.signed_in.store(false, Ordering::SeqCst);
+                after_signout();
                 "sign-out-requested"
             }
             "/usr/bin/osascript" if args.get(4) == Some(&"--") => {

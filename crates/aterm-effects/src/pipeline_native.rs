@@ -461,7 +461,9 @@ impl EffectsPipeline {
                 self.cursor.scroll_bands(&current, first_seq, count);
                 if let Some(mut row) = self.flying_sky_row {
                     let mut next = Some(row);
-                    for i in 0..u64::from(count) {
+                    let count_u64 = u64::from(count);
+                    let mut i = 0;
+                    while i < count_u64 {
                         let m = current.band(first_seq + i);
                         match crate::cursor_glow::band_row(row, m.top, m.bottom, m.delta) {
                             Some(r) => row = r,
@@ -471,6 +473,7 @@ impl EffectsPipeline {
                             }
                         }
                         next = Some(row);
+                        i += 1;
                     }
                     self.flying_sky_row = next;
                 }
@@ -1401,7 +1404,8 @@ pub(super) fn step_cursor_family(
     let now = step.input.now;
     let live = step.input.live_viewport;
     cursor.begin(live, step.animate);
-    for _ in 0..step.pending_keys {
+    let mut k = 0;
+    while k < step.pending_keys {
         cursor.cadence.on_keystroke(now);
         cursor
             .momentum
@@ -1409,6 +1413,7 @@ pub(super) fn step_cursor_family(
         if live {
             cursor.glow.note_typed_cells(now, 1);
         }
+        k += 1;
     }
     if live && step.pending_keys > 0 {
         cursor.trail.note_typed_batch(now, step.pending_keys);

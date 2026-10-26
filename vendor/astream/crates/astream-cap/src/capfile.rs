@@ -393,7 +393,7 @@ fn at_path(path: &Path, e: std::io::Error) -> std::io::Error {
 }
 
 /// A refusal of `path`: `kind`, and a message that starts with the path.
-fn refused(path: &Path, kind: std::io::ErrorKind, why: std::fmt::Arguments<'_>) -> std::io::Error {
+fn refused(path: &Path, kind: std::io::ErrorKind, why: &str) -> std::io::Error {
     std::io::Error::new(kind, format!("{}{why}", path.display()))
 }
 
@@ -409,7 +409,7 @@ fn file_refusal(path: &Path, why: astream_sys::NotPrivate) -> std::io::Error {
         NotPrivate::Mode(mode) => refused(
             path,
             PermissionDenied,
-            format_args!(
+            &format!(
                 " is mode {mode:04o}: a secret file must be readable by its owner alone \
                  (0600 or tighter); run `chmod 600 {shown}` and treat its contents as exposed"
             ),
@@ -417,7 +417,7 @@ fn file_refusal(path: &Path, why: astream_sys::NotPrivate) -> std::io::Error {
         NotPrivate::Acl => refused(
             path,
             PermissionDenied,
-            format_args!(
+            &format!(
                 " {why}: a secret file must be readable by its owner alone; run `chmod -N \
                  {shown}` and treat its contents as exposed"
             ),
@@ -425,12 +425,12 @@ fn file_refusal(path: &Path, why: astream_sys::NotPrivate) -> std::io::Error {
         NotPrivate::Owner(_) => refused(
             path,
             PermissionDenied,
-            format_args!(" {why}: a secret file is its reader's own"),
+            &format!(" {why}: a secret file is its reader's own"),
         ),
         NotPrivate::Kind(_) => refused(
             path,
             InvalidInput,
-            format_args!(" {why}: a secret file is a regular file"),
+            &format!(" {why}: a secret file is a regular file"),
         ),
     }
 }
@@ -445,7 +445,7 @@ fn dir_refusal(path: &Path, dir: &Path, why: astream_sys::NotPrivate) -> std::io
         NotPrivate::Mode(mode) => refused(
             path,
             PermissionDenied,
-            format_args!(
+            &format!(
                 ": its directory {dir} is mode {mode:04o}: a secret's directory must be its \
                  owner's alone (0700), so that nobody else can replace the secret or give it \
                  a second name; run `chmod 700 {dir}`"
@@ -454,7 +454,7 @@ fn dir_refusal(path: &Path, dir: &Path, why: astream_sys::NotPrivate) -> std::io
         NotPrivate::Acl => refused(
             path,
             PermissionDenied,
-            format_args!(
+            &format!(
                 ": its directory {dir} {why}: a secret's directory must be its owner's alone, \
                  so that nobody else can replace the secret or give it a second name; run \
                  `chmod -N {dir}`"
@@ -463,12 +463,12 @@ fn dir_refusal(path: &Path, dir: &Path, why: astream_sys::NotPrivate) -> std::io
         NotPrivate::Owner(_) => refused(
             path,
             PermissionDenied,
-            format_args!(": its directory {dir} {why}: a secret's directory is its reader's own"),
+            &format!(": its directory {dir} {why}: a secret's directory is its reader's own"),
         ),
         NotPrivate::Kind(_) => refused(
             path,
             InvalidInput,
-            format_args!(": its directory {dir} {why}, not a directory"),
+            &format!(": its directory {dir} {why}, not a directory"),
         ),
     }
 }
@@ -506,9 +506,7 @@ fn open_private_as(
             return Err(refused(
                 path,
                 std::io::ErrorKind::PermissionDenied,
-                format_args!(
-                    " is a symlink: a secret in a private directory is read through no link"
-                ),
+                " is a symlink: a secret in a private directory is read through no link",
             ));
         }
         Err(e) => return Err(at_path(path, e)),
@@ -545,7 +543,7 @@ pub fn check_private(path: impl AsRef<Path>) -> std::io::Result<()> {
 /// and the bytes read before it are zeroed.
 fn read_judged(path: &Path, mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    read_secret_into(&mut file, &mut bytes).map_err(|e| at_path(path, e))?;
+    read_secret_file_into(&mut file, &mut bytes).map_err(|e| at_path(path, e))?;
     Ok(bytes)
 }
 
@@ -639,7 +637,7 @@ pub fn read_secret_in(dir: impl AsRef<Path>, name: &str) -> std::io::Result<Vec<
         return Err(refused(
             &path,
             std::io::ErrorKind::InvalidInput,
-            format_args!(": a secret's name in its directory is one path component"),
+            ": a secret's name in its directory is one path component",
         ));
     }
     secret_in(dir, name.as_ref(), &path, DirMode::AsItStands)
@@ -690,7 +688,7 @@ fn dir_and_name(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr)> {
         return Err(refused(
             path,
             std::io::ErrorKind::InvalidInput,
-            format_args!(": a secret's path names no file"),
+            ": a secret's path names no file",
         ));
     };
     let dir = match path.parent() {
@@ -726,7 +724,7 @@ fn secret_in(
             return Err(refused(
                 path,
                 std::io::ErrorKind::PermissionDenied,
-                format_args!(
+                &format!(
                     ": its directory {} is a symlink: a secret's directory is read through \
                      no link",
                     dir.display()
@@ -759,7 +757,7 @@ fn secret_in(
             return Err(refused(
                 path,
                 std::io::ErrorKind::PermissionDenied,
-                format_args!(
+                &format!(
                     " has {links} links: a secret in a private directory has exactly one (a \
                      second name for it may sit where others can read it)"
                 ),
@@ -771,17 +769,62 @@ fn secret_in(
     at_least_min(path, read_judged(path, file)?)
 }
 
+/// Keep the accumulated bytes available to wipe if a file read fails partway through.
+fn read_secret_file_into(file: &mut std::fs::File, secret: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut buf = [0u8; 512];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => {
+                buf.fill(0);
+                std::hint::black_box(&mut buf);
+                return Ok(());
+            }
+            Ok(n) => {
+                if let Some(slice) = buf.get(..n) {
+                    secret.extend_from_slice(slice);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                buf.fill(0);
+                std::hint::black_box(&mut buf);
+                secret.fill(0);
+                std::hint::black_box(&mut *secret);
+                return Err(error);
+            }
+        }
+    }
+}
+
 /// Keep the accumulated bytes available to wipe if a reader fails partway through.
+#[cfg(test)]
 pub(crate) fn read_secret_into(
     reader: &mut impl Read,
     secret: &mut Vec<u8>,
 ) -> std::io::Result<()> {
-    if let Err(error) = reader.read_to_end(secret) {
-        secret.fill(0);
-        std::hint::black_box(&mut *secret);
-        return Err(error);
+    let mut buf = [0u8; 512];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                buf.fill(0);
+                std::hint::black_box(&mut buf);
+                return Ok(());
+            }
+            Ok(n) => {
+                if let Some(slice) = buf.get(..n) {
+                    secret.extend_from_slice(slice);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                buf.fill(0);
+                std::hint::black_box(&mut buf);
+                secret.fill(0);
+                std::hint::black_box(&mut *secret);
+                return Err(error);
+            }
+        }
     }
-    Ok(())
 }
 
 const fn nibble(b: u8) -> Option<u8> {

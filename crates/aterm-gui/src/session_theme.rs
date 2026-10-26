@@ -313,6 +313,7 @@ impl App {
     /// Take a session into the pool and bring it up to the theme it draws ([`Self::install_session_colors`]): every production insertion goes through here, so a carried theme is on the engine before its reader runs.
     pub(crate) fn pool_insert(&mut self, session: crate::Session) -> u64 {
         let sid = self.pool.insert(session);
+        self.recover_developer_tools_install(sid);
         self.install_session_colors(sid);
         sid
     }

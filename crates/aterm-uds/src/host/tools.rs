@@ -835,7 +835,8 @@ pub const TOOLS: &[Tool] = &[
         &[],
         "the browser lane tests the web modules in Chromium itself, and the wasm smoke, glue and \
          perf lanes and aterm-verify's glue tests run their drivers in it; pinned by version and \
-         sha256 in aterm-verify's browser module (rows 17, 23)",
+         sha256 in `aterm_uds::host::chrome`, which the harness's headless sign-ins fetch by too \
+         (rows 17, 23)",
     ),
     workspace(
         "firefox",

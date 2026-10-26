@@ -12,8 +12,9 @@ description = "aterm — the coding-agent primer installer: the marked, self-gat
 # Deliberately dependency-free but for how a write is finished: the installer is
 # pure string transforms over std::fs, and it runs on a detached thread inside
 # every GUI process, so the whole thing stays auditable in one small crate with
-# nothing to drag in. aterm-durable is std plus astream-sys (zero dependencies,
-# Apple only): the barrier each atomic write and backup takes before its rename.
+# nothing to drag in. aterm-durable is std plus astream-sys (zero dependencies;
+# on Apple, the barrier itself): the barrier each atomic write and backup takes
+# before its rename.
 [dependencies]
 aterm-durable = { workspace = true }
 

@@ -45,6 +45,28 @@ pub enum Refusal {
     Capacity,
 }
 
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "sync_island.rs"]
+mod sync_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::sync_clamp_parent_count;
+#[cfg(clean_islands)]
+pub use sync_island::sync_clamp_parent_count;
+
+contract_fn! {
+    /// Kernel-certified check that `retained` sits strictly below `capacity`
+    /// (`retained < capacity`), backed by `sync_within_capacity_isl` (`clean-kernel-defeq`)
+    /// and the Clean-origin [`sync_clamp_parent_count`] (`min(len, cap)`).
+    #[must_use]
+    pub const fn sync_within_capacity(retained: u64, capacity: u64) -> bool
+    clauses [ensures result == (retained < capacity)]
+    {
+        retained < capacity
+    }
+}
+
 contract_fn! {
     /// Whether `next` densely follows `previous`, without wrapping at `u64::MAX`.
     pub const fn sequence_follows(previous: u64, next: u64) -> bool
@@ -62,10 +84,17 @@ contract_fn! {
 }
 
 impl Header {
+    /// Parent count clamped to [`MAX_PARENTS`] via Clean-origin [`sync_clamp_parent_count`].
+    #[must_use]
+    pub fn clamped_parent_count(&self) -> usize {
+        sync_clamp_parent_count(self.parents.len() as u64, MAX_PARENTS as u64) as usize
+    }
+
     fn shaped(&self) -> bool {
         self.sequence > 0
             && (self.sequence == 1) == self.previous.is_none()
             && self.parents.len() <= MAX_PARENTS
+            && self.clamped_parent_count() == self.parents.len()
             && !self.parents.contains(&self.id)
             && self.parents.windows(2).all(|p| p[0] < p[1])
             && self
@@ -75,8 +104,11 @@ impl Header {
 
     // Only shaped headers reach this helper: a predecessor then has sequence >= 2.
     fn claims(&self) -> impl Iterator<Item = (u64, Digest)> + '_ {
-        std::iter::once((self.sequence, self.id))
-            .chain(self.previous.map(|id| (self.sequence - 1, id)))
+        std::iter::once((self.sequence, self.id)).chain(
+            self.previous
+                .zip(self.sequence.checked_sub(1))
+                .map(|(id, seq)| (seq, id)),
+        )
     }
 }
 
@@ -160,7 +192,7 @@ impl Index {
                 Err(Refusal::DigestCollision)
             };
         }
-        if self.records.len() >= self.capacity {
+        if !sync_within_capacity(self.records.len() as u64, self.capacity as u64) {
             return Err(Refusal::Capacity);
         }
         self.records.insert(header.id, header);

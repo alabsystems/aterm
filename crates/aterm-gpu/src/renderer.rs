@@ -2217,7 +2217,7 @@ pub(crate) enum DrawPipe {
 
 impl DrawPipe {
     /// The table row this pipe draws through.
-    #[cfg(any(target_os = "macos", gl_arm))]
+    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     #[inline]
     pub(crate) const fn row(self) -> Pipeline {
         match self {
@@ -2252,7 +2252,7 @@ pub(crate) enum DrawAtlas {
 }
 
 /// How many [`DrawAtlas`] slots exist.
-#[cfg(any(target_os = "macos", gl_arm))]
+#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
 pub(crate) const DRAW_ATLAS_COUNT: usize = DrawAtlas::Fx as usize + 1;
 
 /// Every per-frame instance stream, in draw order.
@@ -2890,6 +2890,10 @@ pub(crate) enum FrameRes<'a> {
     Metal(&'a MetalFrameRig),
     #[cfg(gl_arm)]
     Gl(&'a GlFrameRig<'a>),
+    /// The D3D11 arm's resolution set (Windows). Constructed by the D3D11
+    /// differential until the flip wires the arm in.
+    #[cfg(d3d11_arm)]
+    D3d11(&'a D3dFrameRig<'a>),
 }
 
 impl FrameRes<'_> {
@@ -2911,6 +2915,11 @@ impl FrameRes<'_> {
                 tex: rig.offscreen,
                 srgb,
             },
+            #[cfg(d3d11_arm)]
+            Self::D3d11(rig) => crate::device_layer::FrameView::D3d11 {
+                tex: rig.offscreen,
+                srgb,
+            },
         }
     }
 
@@ -2926,12 +2935,17 @@ impl FrameRes<'_> {
                 buf: rig.uniform,
                 binding: rig.uniform_binding,
             },
+            #[cfg(d3d11_arm)]
+            Self::D3d11(rig) => crate::device_layer::FrameUniforms::D3d11 {
+                buf: rig.uniform,
+                binding: rig.uniform_binding,
+            },
         }
     }
 
     #[inline]
     fn pipeline(&self, pipe: DrawPipe, fetch: bool) -> crate::device_layer::FramePipeline<'_> {
-        #[cfg(any(wgpu_arm, gl_arm))]
+        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm))]
         let split_only = || {
             assert!(
                 !fetch,
@@ -2967,12 +2981,17 @@ impl FrameRes<'_> {
                 split_only();
                 rig.pipeline(pipe)
             }
+            #[cfg(d3d11_arm)]
+            Self::D3d11(rig) => {
+                split_only();
+                rig.pipeline(pipe)
+            }
         }
     }
 
     #[inline]
     fn atlas(&self, atlas: DrawAtlas, pipe: DrawPipe) -> crate::device_layer::FrameAtlas<'_> {
-        #[cfg(not(any(target_os = "macos", gl_arm)))]
+        #[cfg(not(any(target_os = "macos", gl_arm, d3d11_arm)))]
         let _ = pipe;
         match self {
             #[cfg(wgpu_arm)]
@@ -2996,6 +3015,8 @@ impl FrameRes<'_> {
             Self::Metal(rig) => rig.atlas(atlas, pipe),
             #[cfg(gl_arm)]
             Self::Gl(rig) => rig.atlas(atlas, pipe),
+            #[cfg(d3d11_arm)]
+            Self::D3d11(rig) => rig.atlas(atlas, pipe),
         }
     }
 
@@ -3015,6 +3036,8 @@ impl FrameRes<'_> {
             Self::Metal(rig) => rig.stream(id),
             #[cfg(gl_arm)]
             Self::Gl(rig) => rig.stream(id),
+            #[cfg(d3d11_arm)]
+            Self::D3d11(rig) => rig.stream(id),
         }
     }
 }
@@ -3045,7 +3068,7 @@ pub(crate) struct GlFxBind<'a> {
     pub(crate) sampler: &'a crate::gl::resources::GlSampler,
 }
 
-#[cfg(any(target_os = "macos", gl_arm))]
+#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
 #[inline]
 fn fx_bind_slots(pipe: DrawPipe) -> ([u32; 2], u32) {
     let binds = &pipe.row().spec().binds;
@@ -3105,6 +3128,87 @@ impl GlFrameRig<'_> {
         crate::device_layer::FrameStream::Gl(
             self.streams[id as usize]
                 .unwrap_or_else(|| panic!("gl frame rig: no stream buffer for {id:?}")),
+        )
+    }
+}
+
+/// The D3D11 arm's resolution set, the twin of [`GlFrameRig`].
+#[cfg(d3d11_arm)]
+pub(crate) struct D3dFrameRig<'a> {
+    pub(crate) offscreen: &'a crate::d3d11::resources::D3dTexture,
+    /// Pipelines by [`Pipeline`] row discriminant; `None` == the plan never
+    /// draws that row (resolving it is a rig-construction bug, panics by name).
+    pub(crate) pipelines:
+        [Option<&'a crate::d3d11::pipelines::D3dPipeline>; pipeline_table::PIPELINE_COUNT],
+    /// The `cell.hlsl` `Uniforms` buffer (`b0`).
+    pub(crate) uniform: &'a crate::d3d11::resources::D3dBuffer,
+    /// `BindSpec::vertex_uniform` of the drawn rows (one per frame).
+    pub(crate) uniform_binding: u32,
+    /// Instance streams by [`StreamId`] discriminant.
+    pub(crate) streams: [Option<&'a crate::d3d11::resources::D3dBuffer>; STREAM_COUNT],
+    /// Atlas texture + sampler by [`DrawAtlas`] discriminant.
+    pub(crate) atlases: [Option<(
+        &'a crate::d3d11::resources::D3dTexture,
+        &'a crate::d3d11::resources::D3dSampler,
+    )>; DRAW_ATLAS_COUNT],
+    /// The fx bind: the Index8 and RGBA atlases, this frame's palette texture
+    /// and the nearest sampler, when the frame draws fx.
+    pub(crate) fx: Option<D3dFxBind<'a>>,
+}
+
+/// The D3D11 rig's [`DrawAtlas::Fx`] resources.
+#[cfg(d3d11_arm)]
+#[derive(Clone, Copy)]
+pub(crate) struct D3dFxBind<'a> {
+    pub(crate) r8: &'a crate::d3d11::resources::D3dTexture,
+    pub(crate) rgba: &'a crate::d3d11::resources::D3dTexture,
+    pub(crate) palette: &'a crate::d3d11::resources::D3dTexture,
+    pub(crate) sampler: &'a crate::d3d11::resources::D3dSampler,
+}
+
+#[cfg(d3d11_arm)]
+impl D3dFrameRig<'_> {
+    #[inline]
+    fn pipeline(&self, pipe: DrawPipe) -> crate::device_layer::FramePipeline<'_> {
+        let row = pipe.row();
+        crate::device_layer::FramePipeline::D3d11(self.pipelines[row as usize].unwrap_or_else(
+            || panic!("d3d11 frame rig: no pipeline for row {row:?} (pipe {pipe:?})"),
+        ))
+    }
+
+    /// The row's `BindSpec` names the slot (`t<n>` with `s<n>`).
+    #[inline]
+    fn atlas(&self, atlas: DrawAtlas, pipe: DrawPipe) -> crate::device_layer::FrameAtlas<'_> {
+        if atlas == DrawAtlas::Fx {
+            let fx = self
+                .fx
+                .unwrap_or_else(|| panic!("d3d11 frame rig: no fx bind (pipe {pipe:?})"));
+            let ([u0, u1], u2) = fx_bind_slots(pipe);
+            return crate::device_layer::FrameAtlas::D3d11Fx {
+                r8: fx.r8,
+                rgba: fx.rgba,
+                palette: fx.palette,
+                sampler: fx.sampler,
+                units: [u0, u1, u2],
+            };
+        }
+        let unit = *pipe
+            .row()
+            .spec()
+            .binds
+            .fragment_textures
+            .first()
+            .unwrap_or_else(|| panic!("row {:?} samples no fragment texture", pipe.row()));
+        let (tex, sampler) = self.atlases[atlas as usize]
+            .unwrap_or_else(|| panic!("d3d11 frame rig: no atlas for {atlas:?} (pipe {pipe:?})"));
+        crate::device_layer::FrameAtlas::D3d11 { tex, sampler, unit }
+    }
+
+    #[inline]
+    fn stream(&self, id: StreamId) -> crate::device_layer::FrameStream<'_> {
+        crate::device_layer::FrameStream::D3d11(
+            self.streams[id as usize]
+                .unwrap_or_else(|| panic!("d3d11 frame rig: no stream buffer for {id:?}")),
         )
     }
 }
@@ -4701,16 +4805,20 @@ pub struct GpuSurface {
         expect(dead_code, reason = "read by the window HDR paths; a canvas has none")
     )]
     supports_f16: bool,
-    #[cfg(wgpu_arm)]
+    #[cfg(any(wgpu_arm, d3d11_arm))]
     last_hdr_probe: Option<aterm_time::Instant>,
     post_mult: bool,
-    #[cfg(wgpu_arm)]
+    #[cfg(any(wgpu_arm, d3d11_arm))]
     pre_mult: bool,
     copyable: bool,
     #[cfg(target_os = "macos")]
     metal: Option<crate::metal::present::MetalWindowSurface>,
     #[cfg(all(gl_arm, not(wgpu_arm)))]
     gl: Option<crate::gl::WindowSurface>,
+    /// The D3D11 arm's swap chain on the window (the shipped Windows build;
+    /// COM and window handles, keeping `GpuSurface` on the attaching thread).
+    #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+    d3d11: Option<d3d11_window::D3dWindow>,
 }
 
 fn next_surface_acquire_id() -> u64 {
@@ -4840,11 +4948,11 @@ impl GpuSurface {
     }
 }
 
-#[cfg(wgpu_arm)]
+#[cfg(any(wgpu_arm, d3d11_arm))]
 const HDR_COLOR_SPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[must_use]
-#[cfg(wgpu_arm)]
+#[cfg(any(wgpu_arm, d3d11_arm))]
 #[inline]
 fn hdr_color_space_probe_due(last: Option<aterm_time::Instant>, now: aterm_time::Instant) -> bool {
     match last {
@@ -5138,7 +5246,7 @@ const fn deco_sprite_index(g: aterm_render::DecoGlyph) -> usize {
 struct DecoAtlas {
     #[cfg(wgpu_arm)]
     bind: wgpu::BindGroup,
-    #[cfg(any(target_os = "macos", gl_arm))]
+    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     data: Vec<u8>,
     cw: usize,
     ch: usize,
@@ -5151,6 +5259,10 @@ struct SpriteTex {
     metal_atlas: std::sync::OnceLock<ArmAtlas>,
     #[cfg(gl_arm)]
     gl_atlas: std::sync::Mutex<Option<Arc<crate::gl::resources::GlTexture>>>,
+    /// The D3D11 arm's upload of these texels, made when a frame samples them
+    /// (re-made when the arm's device changes).
+    #[cfg(d3d11_arm)]
+    d3d11_atlas: std::sync::Mutex<Option<Arc<crate::d3d11::resources::D3dTexture>>>,
     #[cfg(wgpu_arm)]
     bind: wgpu::BindGroup,
     w: u32,
@@ -5308,6 +5420,30 @@ pub struct WindowGpu {
     gl_shift_scratch: Option<crate::gl::resources::GlTexture>,
     #[cfg(gl_arm)]
     gl_tray_card: Option<gl_arm::GlTrayCard>,
+    // The D3D11 arm's twins (`d3d11_arm.rs`): the armed frame's offscreen
+    // (`last_frame_arm_d3d11`), its band-shift scratch and the tray card.
+    #[cfg(d3d11_arm)]
+    d3d11_offscreen: Option<d3d11_arm::D3dOffscreen>,
+    #[cfg(d3d11_arm)]
+    d3d11_shift_scratch: Option<crate::d3d11::resources::D3dTexture>,
+    #[cfg(d3d11_arm)]
+    d3d11_tray_card: Option<d3d11_arm::D3dTrayCard>,
+    // The D3D11 arm's present residency (`d3d11_present.rs`), the GL arm's
+    // twins below: the present copy, the half-resolution bloom target, the
+    // shimmer scratch, the apron strip (with the apron generation it holds)
+    // and the headless virtual destination.
+    #[cfg(d3d11_arm)]
+    d3d11_present_off: Option<crate::d3d11::resources::D3dTexture>,
+    #[cfg(d3d11_arm)]
+    d3d11_bloom_half: Option<crate::d3d11::resources::D3dTexture>,
+    #[cfg(d3d11_arm)]
+    d3d11_shimmer_scratch: Option<crate::d3d11::resources::D3dTexture>,
+    #[cfg(d3d11_arm)]
+    d3d11_apron_tex: Option<crate::d3d11::resources::D3dTexture>,
+    #[cfg(d3d11_arm)]
+    d3d11_apron_gen: u64,
+    #[cfg(d3d11_arm)]
+    d3d11_virtual_off: Option<crate::d3d11::resources::D3dTexture>,
     #[cfg(gl_arm)]
     gl_present_off: Option<crate::gl::resources::GlTexture>,
     #[cfg(gl_arm)]
@@ -5602,7 +5738,7 @@ impl WindowGpu {
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
-    #[cfg(wgpu_arm)]
+    #[cfg(any(wgpu_arm, d3d11_arm))]
     fn apply_hdr_reconfigure_plan(&mut self, plan: crate::format_plan::HdrReconfigurePlan) {
         if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
             self.capture_color_space = crate::video_tap::CaptureColorSpace::Srgb;
@@ -5619,7 +5755,7 @@ impl WindowGpu {
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", wgpu_arm, d3d11_arm, test))]
     fn apply_hdr_surface_upgrade(&mut self) {
         self.capture_color_space = crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb;
         self.sdr_white_scale = 1.0;
@@ -5700,6 +5836,11 @@ impl WindowGpu {
     pub fn virtual_snapshot_bytes(&self) -> Option<usize> {
         #[cfg(gl_arm)]
         if let Some(tex) = self.gl_virtual_off.as_ref() {
+            return usize::try_from(u64::from(tex.width) * u64::from(tex.height) * 4).ok();
+        }
+        // The D3D11 arm likewise (`GpuRenderer::d3d11_virtual_snapshot`).
+        #[cfg(d3d11_arm)]
+        if let Some(tex) = self.d3d11_virtual_off.as_ref() {
             return usize::try_from(u64::from(tex.width) * u64::from(tex.height) * 4).ok();
         }
         self.tapped_virtual_bytes()
@@ -5789,6 +5930,13 @@ pub(crate) struct ImagePlane {
     gl_epoch: u64,
     #[cfg(gl_arm)]
     gl_atlas: Option<gl_arm::GlArmAtlas>,
+    /// The D3D11 arm's twins of `gl_texels`/`gl_epoch`/`gl_atlas`.
+    #[cfg(d3d11_arm)]
+    d3d11_texels: Option<Vec<u8>>,
+    #[cfg(d3d11_arm)]
+    d3d11_epoch: u64,
+    #[cfg(d3d11_arm)]
+    d3d11_atlas: Option<d3d11_arm::D3dArmAtlas>,
 }
 
 /// GPU terminal renderer.
@@ -5897,9 +6045,9 @@ pub struct GpuRenderer {
     metal_pending_band_shift: Option<BandShift>,
     #[cfg(target_os = "macos")]
     metal_inject_loss_after: Option<u64>,
-    #[cfg(any(target_os = "macos", gl_arm))]
+    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     image_plane_epoch: u64,
-    #[cfg(any(target_os = "macos", gl_arm))]
+    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     atlas_epoch: u64,
     #[cfg(gl_arm)]
     gl_armed: bool,
@@ -5913,6 +6061,22 @@ pub struct GpuRenderer {
     last_frame_arm_gl: bool,
     #[cfg(gl_arm)]
     gl_inject_loss_after: Option<u64>,
+    // The D3D11 arm (Windows, `d3d11_arm.rs`): armed by `arm_d3d11` until the
+    // flip, its lazily minted residency, why a mint failed, whether the last
+    // frame drew on it, and the injected-loss drill
+    // (`ATERM_D3D11_INJECT_LOSS=<n>`: after the n-th successful D3D11 present
+    // the device's next frame answers as a removed device, so the latch,
+    // `device_lost` and the frontend's CPU fallback run end to end).
+    #[cfg(d3d11_arm)]
+    d3d11_armed: bool,
+    #[cfg(d3d11_arm)]
+    d3d11_arm: Option<d3d11_arm::D3dArmLive>,
+    #[cfg(d3d11_arm)]
+    d3d11_mint_error: Option<String>,
+    #[cfg(d3d11_arm)]
+    last_frame_arm_d3d11: bool,
+    #[cfg(d3d11_arm)]
+    d3d11_inject_loss_after: Option<u64>,
     inst: Instances,
     fx: fx_gpu::FxGpu,
     #[cfg(wgpu_arm)]
@@ -6000,6 +6164,9 @@ pub(crate) struct PresentPrev {
     on_metal: bool,
     #[cfg(gl_arm)]
     on_gl: bool,
+    /// The D3D11 arm's twin of `on_metal`.
+    #[cfg(d3d11_arm)]
+    on_d3d11: bool,
 }
 
 enum RepaintScope<'a> {
@@ -7536,10 +7703,25 @@ impl GpuRenderer {
             last_frame_arm_metal: false,
             #[cfg(target_os = "macos")]
             metal_pending_band_shift: None,
-            #[cfg(any(target_os = "macos", gl_arm))]
+            #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
             image_plane_epoch: 0,
-            #[cfg(any(target_os = "macos", gl_arm))]
+            #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
             atlas_epoch: 0,
+            // Windows draws, presents and reads back on the D3D11 arm (GW.5's
+            // flip); the oracle build's suites disarm it to read wgpu.
+            #[cfg(d3d11_arm)]
+            d3d11_armed: true,
+            #[cfg(d3d11_arm)]
+            d3d11_arm: None,
+            #[cfg(d3d11_arm)]
+            d3d11_mint_error: None,
+            #[cfg(d3d11_arm)]
+            last_frame_arm_d3d11: false,
+            // A development seam (`dev_seam!`), never read by a shipped binary.
+            #[cfg(d3d11_arm)]
+            d3d11_inject_loss_after: aterm_types::dev_seam!("ATERM_D3D11_INJECT_LOSS")
+                .and_then(|v| v.to_str()?.parse::<u64>().ok())
+                .filter(|n| *n > 0),
             #[cfg(gl_arm)]
             gl_armed: true,
             #[cfg(gl_arm)]
@@ -7865,12 +8047,18 @@ impl GpuRenderer {
 
     /// Set a real bold face (`FaceId::BoldPrimary`) so SGR bold is not synthetic.
     pub fn set_bold_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.set_bold_face(bytes, 0)
+        self.set_bold_face(bytes, 0, None)
     }
 
-    /// [`Self::set_bold_font_bytes`] for face `index` of `bytes`.
-    pub fn set_bold_face(&mut self, bytes: &[u8], index: u32) -> Result<(), String> {
-        self.raster_changed(|cpu| cpu.set_bold_face(bytes, index))
+    /// [`Self::set_bold_font_bytes`] for face `index` of `bytes`, drawn at `named` where
+    /// its font name chose an instance ([`aterm_render::FaceRef::instance`]).
+    pub fn set_bold_face(
+        &mut self,
+        bytes: &[u8],
+        index: u32,
+        named: Option<aterm_render::NamedInstance>,
+    ) -> Result<(), String> {
+        self.raster_changed(|cpu| cpu.set_named_bold_face(bytes, index, named))
     }
 
     /// Set a symbol fallback face (config `symbol_font`) from font bytes and invalidate the atlas.
@@ -7880,12 +8068,19 @@ impl GpuRenderer {
 
     /// Set a real styled face and invalidate the atlas.
     pub fn set_styled_font_bytes(&mut self, slot: usize, bytes: &[u8]) -> Result<(), String> {
-        self.set_styled_face(slot, bytes, 0)
+        self.set_styled_face(slot, bytes, 0, None)
     }
 
-    /// [`Self::set_styled_font_bytes`] for face `index` of `bytes`.
-    pub fn set_styled_face(&mut self, slot: usize, bytes: &[u8], index: u32) -> Result<(), String> {
-        self.raster_changed(|cpu| cpu.set_styled_face(slot, bytes, index))
+    /// [`Self::set_styled_font_bytes`] for face `index` of `bytes`, drawn at `named` where
+    /// its font name chose an instance ([`aterm_render::FaceRef::instance`]).
+    pub fn set_styled_face(
+        &mut self,
+        slot: usize,
+        bytes: &[u8],
+        index: u32,
+        named: Option<aterm_render::NamedInstance>,
+    ) -> Result<(), String> {
+        self.raster_changed(|cpu| cpu.set_named_styled_face(slot, bytes, index, named))
     }
 
     /// Enable/disable synthetic bold/italic (`font_synthetic_style`).
@@ -8165,6 +8360,10 @@ impl GpuRenderer {
         if self.gl_armed {
             return fx_gpu::RampArm::Gl;
         }
+        #[cfg(d3d11_arm)]
+        if self.d3d11_armed {
+            return fx_gpu::RampArm::D3d11;
+        }
         #[cfg(wgpu_arm)]
         return fx_gpu::RampArm::Wgpu(&self.ctx.backend);
         #[cfg(not(wgpu_arm))]
@@ -8199,6 +8398,10 @@ impl GpuRenderer {
         }
         #[cfg(gl_arm)]
         if let Some(live) = self.gl_arm.as_mut() {
+            live.drop_fx_residency();
+        }
+        #[cfg(d3d11_arm)]
+        if let Some(live) = self.d3d11_arm.as_mut() {
             live.drop_fx_residency();
         }
     }
@@ -8537,6 +8740,16 @@ impl GpuRenderer {
         {
             return true;
         }
+        // The D3D11 arm's latch: a call answered with a removal code (or the
+        // injected-loss drill).
+        #[cfg(d3d11_arm)]
+        if self
+            .d3d11_arm
+            .as_ref()
+            .is_some_and(|live| live.dev.shared().lost())
+        {
+            return true;
+        }
         self.ctx.device_lost()
     }
 
@@ -8558,6 +8771,14 @@ impl GpuRenderer {
                     .unwrap_or("EGL_CONTEXT_LOST (the GL context was lost)")
                     .to_owned(),
             );
+        }
+        #[cfg(d3d11_arm)]
+        if let Some(live) = self
+            .d3d11_arm
+            .as_ref()
+            .filter(|live| live.dev.shared().lost())
+        {
+            return Some(live.dev.shared().loss_reason());
         }
         self.ctx.device_loss_reason()
     }
@@ -8689,6 +8910,11 @@ impl GpuRenderer {
         #[cfg(gl_arm)]
         {
             self.ctx.gl_max_texture_dim
+        }
+        // Every feature level the D3D11 arm takes (11_0 and up) holds this.
+        #[cfg(d3d11_arm)]
+        {
+            aterm_win32::d3d11::D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         }
     }
 
@@ -8900,7 +9126,7 @@ impl GpuRenderer {
             ch,
             curl_band,
             atlas_w,
-            #[cfg(any(target_os = "macos", gl_arm))]
+            #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
             data,
         });
     }
@@ -8978,7 +9204,7 @@ impl GpuRenderer {
         let cap_h = self.ctx.device_layer().max_texture_dim();
         #[cfg(not(wgpu_arm))]
         let cap_h = self.first_party_max_texture_dim();
-        #[cfg(any(target_os = "macos", gl_arm))]
+        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         {
             self.atlas_epoch += 1;
         }
@@ -9161,6 +9387,14 @@ impl GpuRenderer {
         } else {
             (None, 0)
         };
+        // The D3D11 arm's twin.
+        #[cfg(d3d11_arm)]
+        let (d3d11_texels, d3d11_epoch) = if self.d3d11_armed {
+            self.image_plane_epoch += 1;
+            (Some(data), self.image_plane_epoch)
+        } else {
+            (None, 0)
+        };
         win.image_plane = Some(ImagePlane {
             #[cfg(target_os = "macos")]
             metal_atlas: None,
@@ -9180,6 +9414,12 @@ impl GpuRenderer {
             gl_epoch,
             #[cfg(gl_arm)]
             gl_atlas: None,
+            #[cfg(d3d11_arm)]
+            d3d11_texels,
+            #[cfg(d3d11_arm)]
+            d3d11_epoch,
+            #[cfg(d3d11_arm)]
+            d3d11_atlas: None,
         });
         order.clear();
         self.image_order_scratch = order;
@@ -9353,6 +9593,21 @@ impl GpuRenderer {
             win.video = Some(tap);
             return Ok(());
         }
+        // The D3D11 arm records its window's buffer 0 as presented, in the
+        // chain's format (an EDR chain's f16 included).
+        #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+        if self.d3d11_armed && surf.d3d11.is_some() {
+            let tap = crate::video_tap::VideoTap::new_gl(
+                surf.neutral.width,
+                surf.neutral.height,
+                surf.neutral.format,
+                win.capture_color_space,
+                win.sdr_white_scale(),
+                opts,
+            )?;
+            win.video = Some(tap);
+            return Ok(());
+        }
         #[cfg(not(wgpu_arm))]
         {
             Err("video: the wgpu tap ring is not in this build".to_string())
@@ -9398,9 +9653,28 @@ impl GpuRenderer {
             win.video = Some(tap);
             return Ok(());
         }
+        // The D3D11 arm likewise (Windows; its headless presents draw there).
+        #[cfg(d3d11_arm)]
+        if self.d3d11_armed && self.d3d11_arm_ready() {
+            let tap = crate::video_tap::VideoTap::new_gl(
+                w,
+                h,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                crate::video_tap::CaptureColorSpace::Srgb,
+                1.0,
+                opts,
+            )?;
+            win.virtual_presented_input_epoch = 0;
+            win.video = Some(tap);
+            return Ok(());
+        }
         #[cfg(all(not(wgpu_arm), gl_arm))]
         {
             Err(format!("video: {}", self.gl_start_error()))
+        }
+        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        {
+            Err(format!("video: {}", self.d3d11_start_error()))
         }
         #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
@@ -9446,11 +9720,12 @@ impl GpuRenderer {
             if tap.ring_is_metal() {
                 tap.metal_after_present(t_us);
             }
-            #[cfg(gl_arm)]
+            // A host-readback ring (the GL or D3D11 arm's).
+            #[cfg(any(gl_arm, d3d11_arm))]
             let on_gl = tap.ring_is_gl();
-            #[cfg(all(not(gl_arm), wgpu_arm))]
+            #[cfg(all(not(any(gl_arm, d3d11_arm)), wgpu_arm))]
             let on_gl = false;
-            #[cfg(gl_arm)]
+            #[cfg(any(gl_arm, d3d11_arm))]
             if on_gl {
                 tap.gl_after_present(t_us);
             }
@@ -9468,7 +9743,7 @@ impl GpuRenderer {
             if t.ring_is_metal() {
                 return t.metal_finish();
             }
-            #[cfg(gl_arm)]
+            #[cfg(any(gl_arm, d3d11_arm))]
             if t.ring_is_gl() {
                 return t.gl_finish();
             }
@@ -9534,6 +9809,18 @@ impl GpuRenderer {
             )?);
             return Ok(());
         }
+        // The D3D11 arm's one-shot over its window's buffer 0.
+        #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+        if self.d3d11_armed && surface.d3d11.is_some() {
+            win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new_gl(
+                surface.neutral.width,
+                surface.neutral.height,
+                surface.neutral.format,
+                win.capture_color_space,
+                win.sdr_white_scale(),
+            )?);
+            return Ok(());
+        }
         #[cfg(not(wgpu_arm))]
         {
             Err("snapshot: the wgpu tap ring is not in this build".to_string())
@@ -9568,7 +9855,7 @@ impl GpuRenderer {
         if tap.tap_is_metal() {
             return tap.metal_after_present(t_us);
         }
-        #[cfg(gl_arm)]
+        #[cfg(any(gl_arm, d3d11_arm))]
         if tap.tap_is_gl() {
             return tap.gl_after_present(t_us);
         }
@@ -9590,7 +9877,7 @@ impl GpuRenderer {
         if tap.tap_is_metal() {
             return tap.metal_finish();
         }
-        #[cfg(gl_arm)]
+        #[cfg(any(gl_arm, d3d11_arm))]
         if tap.tap_is_gl() {
             return tap.gl_finish();
         }
@@ -9634,6 +9921,11 @@ impl GpuRenderer {
         if self.gl_armed {
             return self.gl_virtual_snapshot(win, t_us);
         }
+        // The D3D11 arm's likewise (the immediate context's readback waits).
+        #[cfg(d3d11_arm)]
+        if self.d3d11_armed {
+            return self.d3d11_virtual_snapshot(win, t_us);
+        }
         #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
             let target = win.metal_virtual_off.as_ref().ok_or_else(|| {
@@ -9672,6 +9964,10 @@ impl GpuRenderer {
         #[cfg(all(not(wgpu_arm), gl_arm))]
         {
             Err(format!("presented snapshot: {}", self.gl_start_error()))
+        }
+        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        {
+            Err(format!("presented snapshot: {}", self.d3d11_start_error()))
         }
         #[cfg(wgpu_arm)]
         {
@@ -9722,6 +10018,21 @@ impl GpuRenderer {
             .checked_frame_size(input.rows, input.cols)
             .expect("renderable framebuffer");
         let (texture, width, height) = self.render_input_target(win, input, tray);
+        #[cfg(d3d11_arm)]
+        if self.last_frame_arm_d3d11 {
+            return self
+                .d3d11_read_back_offscreen(win, width, height)
+                .unwrap_or_else(|e| {
+                    crate::stderr_line!(
+                        "aterm-gpu: d3d11 readback failed ({e}); returning blank frame"
+                    );
+                    Frame {
+                        width: width as usize,
+                        height: height as usize,
+                        pixels: vec![0; (width as usize) * (height as usize)],
+                    }
+                });
+        }
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
             return self
@@ -9781,6 +10092,10 @@ impl GpuRenderer {
     ) -> Result<Frame, String> {
         self.cpu.checked_frame_size(input.rows, input.cols)?;
         let (texture, width, height) = self.render_input_target(win, input, tray);
+        #[cfg(d3d11_arm)]
+        if self.last_frame_arm_d3d11 {
+            return self.d3d11_read_back_offscreen(win, width, height);
+        }
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
             return self.gl_read_back_offscreen(win, width, height);
@@ -9820,6 +10135,38 @@ impl GpuRenderer {
             pass += 1;
         }
         let (w, h) = dims;
+        // An armed D3D11 frame: the same order as the other arms (bloom,
+        // shimmer, the glide, the tray card with its scrim), each degrading by
+        // name, then the frame is read off `win.d3d11_offscreen`.
+        #[cfg(d3d11_arm)]
+        if self.last_frame_arm_d3d11 {
+            if self.enable_bloom
+                && fx_gpu::bloom_source_live(input)
+                && let Err(e) = self.d3d11_composite_bloom_in_place(win, input)
+            {
+                d3d11_arm::d3d11_arm_note(&format!(
+                    "armed readback: in-place bloom failed ({e}); frame has no halo"
+                ));
+            }
+            if self.shimmer_live(input)
+                && let Err(e) = self.d3d11_shimmer_in_place(win, input)
+            {
+                d3d11_arm::d3d11_arm_note(&format!(
+                    "armed readback: in-place shimmer failed ({e}); frame has no refraction"
+                ));
+            }
+            if input.scroll_frac_px != 0 {
+                self.d3d11_shift_offscreen_band(win, input);
+            }
+            if let Some(t) = tray
+                && let Err(e) = self.d3d11_tray_into_offscreen(win, t)
+            {
+                d3d11_arm::d3d11_arm_note(&format!(
+                    "armed readback: tray bake failed ({e}); frame has no settings card"
+                ));
+            }
+            return (None, w, h);
+        }
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
             if self.enable_bloom
@@ -12011,11 +12358,29 @@ impl GpuRenderer {
 
     fn shift_offscreen_rows(&mut self, win: &mut WindowGpu, delta_rows: i32, rows: usize) {
         #[cfg(gl_arm)]
-        let on_gl = self.last_frame_arm_gl;
-        #[cfg(all(not(gl_arm), wgpu_arm))]
-        let on_gl = false;
+        let on_first_party = self.last_frame_arm_gl;
+        // The D3D11 arm's resident frame likewise (`present_prev.on_d3d11`);
+        // the immediate context runs the copies before the encode's Load.
+        #[cfg(d3d11_arm)]
+        let on_first_party = self.last_frame_arm_d3d11;
+        #[cfg(all(not(any(gl_arm, d3d11_arm)), wgpu_arm))]
+        let on_first_party = false;
+        #[cfg(d3d11_arm)]
+        if on_first_party && let Some(h) = win.d3d11_offscreen.as_ref().map(|o| o.h as usize) {
+            let cell_h = self.cell_size().1;
+            let grid_top = self.cpu.grid_top();
+            let y0 = grid_top.min(h);
+            let y1 = grid_top.saturating_add(rows.saturating_mul(cell_h)).min(h);
+            self.d3d11_shift_offscreen_band_px(
+                win,
+                y0,
+                y1,
+                i64::from(delta_rows) * cell_h as i64,
+                None,
+            );
+        }
         #[cfg(gl_arm)]
-        if on_gl && let Some(h) = win.gl_offscreen.as_ref().map(|o| o.h as usize) {
+        if on_first_party && let Some(h) = win.gl_offscreen.as_ref().map(|o| o.h as usize) {
             let cell_h = self.cell_size().1;
             let grid_top = self.cpu.grid_top();
             let y0 = grid_top.min(h);
@@ -12046,7 +12411,7 @@ impl GpuRenderer {
             }
         }
         #[cfg(wgpu_arm)]
-        if !on_gl {
+        if !on_first_party {
             let Some(h) = win.offscreen.as_ref().map(|o| o.h as usize) else {
                 return;
             };
@@ -12122,6 +12487,10 @@ impl GpuRenderer {
             crate::device_layer::SubmittedFrame::Gl(_) => {
                 unreachable!("the production scroll shift constructs the Wgpu arm only")
             }
+            #[cfg(d3d11_arm)]
+            crate::device_layer::SubmittedFrame::D3d11(_) => {
+                unreachable!("the production scroll shift constructs the Wgpu arm only")
+            }
         }
     }
 
@@ -12160,6 +12529,12 @@ impl GpuRenderer {
         {
             self.gl_create_window_surface(target, width, height, None)
         }
+        // The shipped Windows build: the D3D11 arm's flip-model swap chain, on
+        // the window or on a DirectComposition visual.
+        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        {
+            self.d3d11_create_window_surface(target, width, height)
+        }
         #[cfg(wgpu_arm)]
         {
             #[cfg(gl_arm)]
@@ -12168,6 +12543,14 @@ impl GpuRenderer {
                     "a window attached on wgpu (the oracle build); GL disarmed for this renderer",
                 );
                 self.gl_armed = false;
+            }
+            // So does Windows' (`--features wgpu-oracle`).
+            #[cfg(d3d11_arm)]
+            if self.d3d11_armed {
+                d3d11_arm::d3d11_arm_note(
+                    "a window attached on wgpu (the oracle build); D3D11 disarmed for this renderer",
+                );
+                self.d3d11_armed = false;
             }
             let surf = self.create_window_surface_wgpu(target, width, height)?;
             #[cfg(target_os = "macos")]
@@ -12739,6 +13122,13 @@ impl GpuRenderer {
             debug_assert!(!surf.supports_f16, "a GL surface offers no f16 format");
             surf.supports_f16 && surf.is_hdr()
         }
+        // Windows follows HDR at the present's probe (`d3d11_window`), as the
+        // wgpu arm did; there is no screen to re-read here.
+        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        {
+            let _ = (win, surf, target);
+            false
+        }
         #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
             self.upgrade_surface_on_screen(win, surf, || {
@@ -13069,6 +13459,20 @@ impl GpuRenderer {
         #[cfg(target_os = "macos")]
         if self.metal_armed {
             return self.metal_present_input_with_crop(
+                win,
+                surf,
+                input,
+                invert,
+                overlay,
+                tray,
+                source_crop,
+                effects_transport_shift_y,
+            );
+        }
+        // The D3D11 arm's window present (the shipped Windows build).
+        #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+        if self.d3d11_armed {
+            return self.d3d11_present_input_with_crop(
                 win,
                 surf,
                 input,
@@ -13810,6 +14214,28 @@ impl GpuRenderer {
                 }
             };
         }
+        // The D3D11 arm's headless present: into its resident virtual target.
+        #[cfg(d3d11_arm)]
+        if self.d3d11_armed && self.d3d11_arm_ready() {
+            return match self.d3d11_present_virtual_with_crop(
+                win,
+                input,
+                invert,
+                overlay,
+                tray,
+                source_crop,
+                effects_transport_shift_y,
+                destination,
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    d3d11_arm::d3d11_arm_note(&format!(
+                        "armed virtual present refused ({e}); dropping this present"
+                    ));
+                    false
+                }
+            };
+        }
         #[cfg(not(wgpu_arm))]
         {
             first_party_note(
@@ -14280,7 +14706,26 @@ impl GpuRenderer {
                 false
             }
         };
-        #[cfg(not(any(target_os = "macos", gl_arm)))]
+        // The D3D11 arm's twin (Windows).
+        #[cfg(d3d11_arm)]
+        let offscreen_holds_prev = if self.d3d11_armed {
+            win.present_prev.as_ref().is_some_and(|p| p.on_d3d11)
+                && self.d3d11_arm.as_ref().is_some_and(|live| {
+                    matches!(&win.d3d11_offscreen,
+                        Some(o) if o.w == w && o.h == h && o.tex.on(&live.dev))
+                })
+        } else {
+            #[cfg(wgpu_arm)]
+            {
+                win.present_prev.as_ref().is_none_or(|p| !p.on_d3d11)
+                    && matches!(&win.offscreen, Some(o) if o.w == w && o.h == h)
+            }
+            #[cfg(not(wgpu_arm))]
+            {
+                false
+            }
+        };
+        #[cfg(not(any(target_os = "macos", gl_arm, d3d11_arm)))]
         let offscreen_holds_prev = matches!(&win.offscreen, Some(o) if o.w == w && o.h == h);
 
         let mut dirty = std::mem::take(&mut self.dirty_scratch);
@@ -14356,6 +14801,18 @@ impl GpuRenderer {
         } else {
             dims
         };
+        // The D3D11 twin.
+        #[cfg(d3d11_arm)]
+        let dims = if self.d3d11_armed && !self.last_frame_arm_d3d11 && was_dirty {
+            d3d11_arm::d3d11_arm_note(
+                "armed present: mid-frame degrade under a Dirty scope; re-encoded FULL for \
+                 coherence",
+            );
+            self.full_repaints += 1;
+            self.encode_frame(win, input, &RepaintScope::Full)
+        } else {
+            dims
+        };
         let dims = if was_dirty && self.overshoot_surprise {
             self.full_repaints += 1;
             self.encode_frame(win, input, &RepaintScope::Full)
@@ -14375,6 +14832,8 @@ impl GpuRenderer {
             on_metal: self.last_frame_arm_metal,
             #[cfg(gl_arm)]
             on_gl: self.last_frame_arm_gl,
+            #[cfg(d3d11_arm)]
+            on_d3d11: self.last_frame_arm_d3d11,
         });
         dims
     }
@@ -15118,6 +15577,23 @@ impl GpuRenderer {
                 }
             });
         }
+        // The D3D11 arm (see `d3d11_present_readback`).
+        #[cfg(d3d11_arm)]
+        if self.last_frame_arm_d3d11 {
+            return self
+                .d3d11_present_readback(win, input, (w, h))
+                .unwrap_or_else(|e| {
+                    crate::stderr_line!(
+                        "aterm-gpu: armed D3D11 present readback failed ({e}); returning blank \
+                         frame"
+                    );
+                    Frame {
+                        width: w as usize,
+                        height: h as usize,
+                        pixels: vec![0; (w as usize) * (h as usize)],
+                    }
+                });
+        }
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
             return self
@@ -15605,7 +16081,7 @@ impl GpuRenderer {
 
     /// Test helper for the HDR clamp laws.
     #[doc(hidden)]
-    #[cfg(wgpu_arm)]
+    #[cfg(any(wgpu_arm, d3d11_arm))]
     pub fn present_hdr_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -15615,10 +16091,37 @@ impl GpuRenderer {
         self.present_hdr_sized_for_test(win, input, boost_pass, 0, 0)
     }
 
-    /// Test helper.
+    /// Test helper; an armed D3D11 renderer runs its real present into an f16 destination
+    /// (`d3d11_present_hdr_for_test`).
     #[doc(hidden)]
-    #[cfg(wgpu_arm)]
+    #[cfg(any(wgpu_arm, d3d11_arm))]
     pub fn present_hdr_sized_for_test(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        boost_pass: bool,
+        extra_w: u32,
+        extra_h: u32,
+    ) -> (Vec<f32>, u32, u32) {
+        #[cfg(d3d11_arm)]
+        if self.d3d11_armed && self.d3d11_arm_ready() {
+            return self
+                .d3d11_present_hdr_for_test(win, input, boost_pass, (extra_w, extra_h))
+                .unwrap_or_else(|e| panic!("the D3D11 EDR present: {e}"));
+        }
+        #[cfg(not(wgpu_arm))]
+        {
+            panic!("the EDR present seam: {}", self.d3d11_start_error())
+        }
+        #[cfg(wgpu_arm)]
+        {
+            self.wgpu_present_hdr_for_test(win, input, boost_pass, extra_w, extra_h)
+        }
+    }
+
+    /// The wgpu arm's EDR present for [`Self::present_hdr_sized_for_test`].
+    #[cfg(wgpu_arm)]
+    fn wgpu_present_hdr_for_test(
         &mut self,
         win: &mut WindowGpu,
         input: &RenderInput,
@@ -16326,6 +16829,8 @@ impl GpuRenderer {
             metal_atlas: std::sync::OnceLock::new(),
             #[cfg(gl_arm)]
             gl_atlas: std::sync::Mutex::new(None),
+            #[cfg(d3d11_arm)]
+            d3d11_atlas: std::sync::Mutex::new(None),
             #[cfg(wgpu_arm)]
             bind,
             w: src.width,
@@ -16438,6 +16943,10 @@ impl GpuRenderer {
         #[cfg(gl_arm)]
         {
             self.last_frame_arm_gl = false;
+        }
+        #[cfg(d3d11_arm)]
+        {
+            self.last_frame_arm_d3d11 = false;
         }
         self.cpu.evict_caches_if_large();
         let (rows, cols) = (input.rows, input.cols);
@@ -16690,6 +17199,9 @@ impl GpuRenderer {
         };
         #[cfg(gl_arm)]
         let gl_armed = self.gl_arm_ready();
+        // The D3D11 arm likewise (Windows).
+        #[cfg(d3d11_arm)]
+        let d3d11_armed = self.d3d11_arm_ready();
         #[cfg(not(wgpu_arm))]
         let fx_ok = true;
         #[cfg(wgpu_arm)]
@@ -16698,7 +17210,9 @@ impl GpuRenderer {
             let first_party = armed;
             #[cfg(gl_arm)]
             let first_party = gl_armed;
-            #[cfg(not(any(target_os = "macos", gl_arm)))]
+            #[cfg(d3d11_arm)]
+            let first_party = d3d11_armed;
+            #[cfg(not(any(target_os = "macos", gl_arm, d3d11_arm)))]
             let first_party = false;
             first_party
                 || input.fx_layers.is_empty()
@@ -18125,6 +18639,63 @@ impl GpuRenderer {
                 )),
             }
         }
+        // The D3D11 tail (Windows, `d3d11_arm.rs`): the same instance bytes,
+        // plan and rig law on the D3D11 arm. A failure takes one named note and
+        // falls through to the wgpu tail.
+        #[cfg(d3d11_arm)]
+        if d3d11_armed {
+            let build_ns = elapsed_ns(build_started);
+            let live = self.d3d11_arm.as_mut().expect("d3d11_arm_ready minted it");
+            let tail = d3d11_arm::encode_tail(
+                live,
+                win,
+                &mut self.frame_plan,
+                d3d11_arm::D3dTailIn {
+                    inst: &self.inst,
+                    mono: mono_res,
+                    color: color_res,
+                    atlas_epoch: self.atlas_epoch,
+                    deco: self.deco_atlas.as_ref(),
+                    scope,
+                    dirty_band,
+                    grid_top,
+                    ch,
+                    rows,
+                    dims: (w, h),
+                    clear: theme_color_alpha(frame_bg, f64::from(bg_opacity)),
+                    text_blend,
+                    cursor_opaque,
+                    ablation: self.ablation,
+                    under_opaque: fx_gpu::under_draws_opaque(input),
+                    fx: &self.fx,
+                },
+            );
+            match tail {
+                Ok(out) => {
+                    self.fx.atlas_bytes = out.fx_atlas_bytes;
+                    self.last_frame_passes = out.passes as u32;
+                    self.last_frame_load = out.load0;
+                    self.last_frame_scissor = out.scissor;
+                    self.record_frame_instance_totals(
+                        out.passes as u32,
+                        build_ns,
+                        out.stage_ns,
+                        out.unorm,
+                        out.fx_staged,
+                    );
+                    self.last_frame_arm_d3d11 = true;
+                    return (w, h);
+                }
+                Err(e) => d3d11_arm::d3d11_arm_note(&format!(
+                    "armed frame failed ({e}); {}",
+                    if cfg!(wgpu_arm) {
+                        "this frame draws on wgpu"
+                    } else {
+                        "this frame is lost"
+                    }
+                )),
+            }
+        }
         #[cfg(target_os = "macos")]
         if armed {
             'armed: {
@@ -18745,6 +19316,10 @@ impl GpuRenderer {
                 crate::device_layer::SubmittedFrame::Gl(_) => {
                     unreachable!("the production encode constructs the Wgpu arm only")
                 }
+                #[cfg(d3d11_arm)]
+                crate::device_layer::SubmittedFrame::D3d11(_) => {
+                    unreachable!("the production encode constructs the Wgpu arm only")
+                }
             }
             self.last_frame_passes = passes as u32;
             self.frame_plan = plan;
@@ -18803,9 +19378,9 @@ fn clip_textured_quad_x(
     true
 }
 
-#[cfg(wgpu_arm)]
+#[cfg(any(wgpu_arm, d3d11_arm))]
 #[inline]
-fn f16_bits_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
     let exp = (bits >> 10) & 0x1f;
     let man = u32::from(bits & 0x3ff);
@@ -21722,6 +22297,8 @@ mod tests {
         gpu.disarm_metal_for_test();
         #[cfg(gl_arm)]
         gpu.disarm_gl_for_oracle();
+        #[cfg(d3d11_arm)]
+        gpu.disarm_d3d11_for_oracle();
         let (rows, cols) = (6usize, 12usize);
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
@@ -23334,6 +23911,8 @@ mod fx_wgsl_tests {
             gpu.disarm_metal_for_test();
             #[cfg(gl_arm)]
             gpu.disarm_gl_for_oracle();
+            #[cfg(d3d11_arm)]
+            gpu.disarm_d3d11_for_oracle();
             let device = gpu.ctx.device.clone();
             if let Some(src) = shader {
                 gpu.effects.shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -23617,9 +24196,49 @@ mod gl_arm;
 #[path = "gl_present.rs"]
 mod gl_present;
 
+// The D3D11 arm's renderer side: its residency and encode tail
+// (docs/AUDIT-third-party-2026-10-15.md GW.5).
+#[cfg(d3d11_arm)]
+#[path = "d3d11_arm.rs"]
+mod d3d11_arm;
+#[cfg(d3d11_arm)]
+#[path = "d3d11_present.rs"]
+mod d3d11_present;
+#[cfg(all(d3d11_arm, not(wgpu_arm)))]
+#[path = "d3d11_window.rs"]
+mod d3d11_window;
+// The shipped Windows build's window presents on real windows, against the
+// arm's own headless present (the desktop session only).
+#[cfg(all(test, d3d11_arm, not(wgpu_arm)))]
+#[path = "d3d11_window_tests.rs"]
+mod d3d11_window_tests;
+
+// The frames the arm differentials and the WARP record draw.
+#[cfg(all(test, any(all(gl_arm, wgpu_arm), windows)))]
+#[path = "replay_fixtures_tests.rs"]
+mod replay_fixtures;
+
 #[cfg(all(gl_arm, wgpu_arm, test))]
 #[path = "gl_replay_tests.rs"]
 mod gl_replay_tests;
+
+// The Windows renderer's frames on WARP against the digests wgpu-dx12 drew
+// before the D3D11 flip (docs/AUDIT-third-party-2026-10-15.md GW.5).
+#[cfg(all(test, windows))]
+#[path = "warp_record_tests.rs"]
+mod warp_record_tests;
+
+// The D3D11 arm's armed frames against wgpu-dx12's on the same adapter
+// (GW.5's live differential, while both arms are in the Windows build).
+#[cfg(all(test, d3d11_arm, wgpu_arm))]
+#[path = "d3d11_replay_tests.rs"]
+mod d3d11_replay_tests;
+
+// The D3D11 arm's removal latch where a frame writes resident state before
+// it draws, in both Windows builds.
+#[cfg(all(test, d3d11_arm))]
+#[path = "d3d11_removal_tests.rs"]
+mod d3d11_removal_tests;
 
 #[path = "fx_gpu.rs"]
 pub(crate) mod fx_gpu;

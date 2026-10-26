@@ -358,7 +358,7 @@ fn a_short_spelled_session_cwd_is_opened_only_on_a_local_volume() {
         SessionCwd::Unresolved(share.clone())
     );
     let long_share = Path::new(r"\\nas.invalid\share\Project\x");
-    let walked = resolve_local_reading(long_share, &two_drives());
+    let walked = resolve_local_reading(long_share, &two_drives(), false);
     assert!(matches!(walked, Ok(None)), "{walked:?}");
 }
 

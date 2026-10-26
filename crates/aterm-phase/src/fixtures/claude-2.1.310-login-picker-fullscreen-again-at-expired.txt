@@ -1,0 +1,51 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path on its default route (no `CLAUDE_CONFIG_DIR`, no `ANTHROPIC_BASE_URL` and no proxy: the lab's scratch HOME, `CLAUDE_SECURESTORAGE_CONFIG_DIR` a scratch login dir whose `.credentials.json` is a dead stored login, no `apiKeyHelper` and no OAuth token, every connection but loopback denied by the lab's jail, crates/aterm-lab), which drew its fullscreen renderer of its own accord (no `CLAUDE_CODE_NO_FLICKER`) · the /login method picker on the fullscreen renderer, a /login typed again (`aterm ctl send` and Enter in the composer, as a person types it) after aterm's harness backed out of its own with the picker's Esc: `⎿  Login interrupted` under `❯ /login` right above the panel, the `⏺ Login expired · Please run /login` error row above them, the focus where it opens (no method picked), 2.1.310
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.WM9D/proj
+
+
+❯ Write one sentence about harbours, then stop.
+
+⏺ Login expired · Please run /login
+
+✻ Cogitated for 0s · done 2:27 PM
+
+❯ /login
+  ⎿  Login interrupted
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Login
+
+   Claude Code can be used with your Claude subscription or billed based on API usage through your Console account.
+
+   Select login method:
+
+   ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise
+     2. Anthropic Console account · API usage billing
+     3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex AI
+
+   Esc to cancel

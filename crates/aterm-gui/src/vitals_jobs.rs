@@ -1235,6 +1235,7 @@ pub(crate) mod tests {
             shell_pid: 900 + u32::try_from(key).expect("small"),
             label: label.into(),
             program: String::new(),
+            tab_id: None,
         };
         let raw = TtyMode {
             canonical: false,
@@ -1602,6 +1603,7 @@ pub(crate) mod tests {
             shell_pid: me,
             label: "Tab 1".into(),
             program: String::new(),
+            tab_id: None,
         }];
         let mut pass = JobsPass::new();
         let first = pass
@@ -1655,6 +1657,7 @@ pub(crate) mod tests {
             shell_pid: me,
             label: "Tab 1".into(),
             program: String::new(),
+            tab_id: None,
         }];
         let mut pass = JobsPass::new();
         let first = pass

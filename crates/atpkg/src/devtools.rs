@@ -1038,23 +1038,30 @@ pub fn note_declined(version: &str) {
     DEVELOPER_TOOLS.note_declined(version);
 }
 
-/// Wait for the switch: read the list every two seconds until it reads `on` for `subject`, it
-/// cannot be read whole, or `limit` passes.
+/// How often [`await_switch`] reads the list: one TCC.db read is a few tens of milliseconds,
+/// and the person who flipped the switch is waiting for the next line.
+pub const AWAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Wait for the switch: read the list every [`AWAIT_POLL`] until it reads `on` for `subject`,
+/// it cannot be read whole, `ended` says the person stopped waiting (Enter, in `aterm
+/// doctor`), or `limit` passes.
 pub fn await_switch(
     subject: &str,
     limit: std::time::Duration,
     read: impl Fn(&str) -> DevToolList,
+    ended: impl Fn() -> bool,
 ) -> DevToolList {
     let until = std::time::Instant::now() + limit;
     loop {
         let list = read(subject);
         if list.listing == DevToolListing::On
             || list.label != DevToolListLabel::Read
+            || ended()
             || std::time::Instant::now() >= until
         {
             return list;
         }
-        std::thread::sleep(std::time::Duration::from_secs(2).min(limit));
+        std::thread::sleep(AWAIT_POLL.min(limit));
     }
 }
 
@@ -1809,19 +1816,48 @@ mod tests {
     #[test]
     fn the_wait_ends_at_the_switch_or_at_an_unreadable_list() {
         let reads = std::cell::Cell::new(0);
-        let got = await_switch("x", std::time::Duration::from_secs(60), |_| {
-            reads.set(reads.get() + 1);
-            read(DevToolListing::On, 1)
-        });
+        let got = await_switch(
+            "x",
+            std::time::Duration::from_secs(60),
+            |_| {
+                reads.set(reads.get() + 1);
+                read(DevToolListing::On, 1)
+            },
+            || false,
+        );
         assert_eq!((got.listing, reads.get()), (DevToolListing::On, 1));
-        let got = await_switch("x", std::time::Duration::from_secs(60), |_| {
-            DevToolList::refused(DevToolListLabel::NoFullDiskAccess)
-        });
+        let got = await_switch(
+            "x",
+            std::time::Duration::from_secs(60),
+            |_| DevToolList::refused(DevToolListLabel::NoFullDiskAccess),
+            || false,
+        );
         assert_eq!(got.label, DevToolListLabel::NoFullDiskAccess);
-        let got = await_switch("x", std::time::Duration::ZERO, |_| {
-            read(DevToolListing::Absent, 0)
-        });
+        let got = await_switch(
+            "x",
+            std::time::Duration::ZERO,
+            |_| read(DevToolListing::Absent, 0),
+            || false,
+        );
         assert_eq!(got.listing, DevToolListing::Absent);
+    }
+
+    /// THE PERSON ENDS THE WAIT: once `ended` reads true (Enter at `aterm doctor`'s terminal)
+    /// the wait returns the reading it took, the switch still off. The one-minute limit is the
+    /// hang detector: a wait that ignored `ended` would read the list until it ran out.
+    #[test]
+    fn the_wait_ends_when_the_person_stops_it() {
+        let reads = std::cell::Cell::new(0);
+        let got = await_switch(
+            "x",
+            aterm_spec::wait::MUST_HAPPEN,
+            |_| {
+                reads.set(reads.get() + 1);
+                read(DevToolListing::Off, 2)
+            },
+            || reads.get() >= 2,
+        );
+        assert_eq!((got.listing, reads.get()), (DevToolListing::Off, 2));
     }
 
     /// `[privacy] observer = false` stops `aterm doctor`'s reads as it stops the window's; only

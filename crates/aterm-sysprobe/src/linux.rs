@@ -1322,6 +1322,7 @@ impl Root {
                 ppid: stat.ppid,
                 exec: Some(stat.exec()),
                 cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
+                child_cpu_ns: None,
                 footprint,
                 disk_read: None,
                 disk_written: None,
@@ -1330,6 +1331,7 @@ impl Root {
                 uid: owner(&entry),
                 state: RunState::from_linux(stat.state),
                 session_leader: Some(stat.session == pid),
+                sid: stat.session,
                 has_tty: Some(stat.tty_nr != 0),
                 runnable_ns: None,
                 peak_footprint: None,
@@ -1339,6 +1341,7 @@ impl Root {
                 birth_ms: start.zip(clock).and_then(|(start, (boot, wall))| {
                     crate::procs::birth_of_boot_start(start, boot, wall)
                 }),
+                reaps_unwaited: None,
             });
         }
         Some(Sweep { procs, truncated })

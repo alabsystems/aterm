@@ -80,6 +80,31 @@ pub struct Row {
     pub status: String,
     /// Action or failure detail, without account identifiers.
     pub detail: String,
+    /// The wall time that produced the row, in milliseconds (the `--json` row's `elapsed_ms`):
+    /// a shared engine item's own ([`aterm_converge::ItemReport::elapsed_ms`]), else the act
+    /// or stage it reports ([`RowClock`]). `None` until one of them times it.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// A pass's clock for the rows it adds to a report: each [`RowClock::lap`] gives every row its
+/// producer did not time the milliseconds since the lap before, so a row carries the time of
+/// the act or step that produced it. A step that keeps its own clock ([`append_workstation`],
+/// [`refresh`]) is followed by a lap that only restarts the caller's.
+pub(crate) struct RowClock(std::time::Instant);
+
+impl RowClock {
+    pub(crate) fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    /// Time `rows` that have no time yet, and restart.
+    pub(crate) fn lap(&mut self, rows: &mut [Row]) {
+        let took = aterm_converge::millis(self.0.elapsed());
+        for row in rows.iter_mut().filter(|row| row.elapsed_ms.is_none()) {
+            row.elapsed_ms = Some(took);
+        }
+        self.0 = std::time::Instant::now();
+    }
 }
 
 /// The machine-readable and human-readable result of a profile pass.
@@ -144,6 +169,7 @@ impl PassPage {
                 name: setting.name().into(),
                 status: "error".into(),
                 detail: reason.into(),
+                elapsed_ms: None,
             }),
             None => {}
         }
@@ -179,9 +205,13 @@ impl Report {
             .rows
             .iter()
             .map(|r| {
-                json!({
+                let mut row = json!({
                     "name": r.name, "status": r.status, "detail": r.detail,
-                })
+                });
+                if let (Some(ms), Some(fields)) = (r.elapsed_ms, row.as_object_mut()) {
+                    fields.insert("elapsed_ms".into(), json!(ms));
+                }
+                row
             })
             .collect();
         aterm_json::to_string(&json!({
@@ -220,6 +250,97 @@ pub fn full_disk_access() -> Option<bool> {
         FdaState::Denied => Some(false),
         FdaState::Unknown => None,
     }
+}
+
+/// `aterm init`'s share of this Mac's setup records (INIT-8): `profile.lock`, waited for behind
+/// a pass another setup runs, and for a pass of the whole profile the plan and completion
+/// `aterm doctor --apply` records ([`run_mutation`]), so the first launch neither runs nor
+/// offers what init did. Under a private state root (a lab instance) there is nothing to share.
+pub struct InitRecords;
+
+impl aterm_machines::init::Records for InitRecords {
+    fn hold(
+        &self,
+        whole: bool,
+        wait: &dyn Fn(&str),
+    ) -> Result<Box<dyn aterm_machines::init::Held>, String> {
+        if aterm_types::dirs::runs_under_private_state_root() {
+            return Ok(Box::new(aterm_machines::init::NoRecords));
+        }
+        ensure_person_scope()?;
+        Ok(Box::new(init_hold_at(&state_root()?, whole, wait)?))
+    }
+}
+
+/// What `aterm init` hears while another setup holds the records ([`init_hold_at`]).
+pub const INIT_WAITS: &str = "waiting for the current setup pass\u{2026}";
+
+/// How often `aterm init` asks again for the records another setup holds.
+const INIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`InitRecords::hold`] at `root`: the profile lock, asked for again every [`INIT_POLL`]
+/// while another setup's pass holds it (`wait` hears [`INIT_WAITS`] once), then, for a pass of
+/// the whole profile (`whole`), the explicit plan `aterm doctor --apply` saves.
+fn init_hold_at(root: &Path, whole: bool, wait: &dyn Fn(&str)) -> Result<InitHold, String> {
+    let mut said = false;
+    let lock = loop {
+        if let Some(lock) = HeldLock::try_take(root)? {
+            break lock;
+        }
+        if !std::mem::replace(&mut said, true) {
+            wait(INIT_WAITS);
+        }
+        std::thread::sleep(INIT_POLL);
+    };
+    let run = if whole {
+        Some(initial::save_explicit_workstation_plan(root)?)
+    } else {
+        None
+    };
+    Ok(InitHold {
+        _lock: lock,
+        root: root.to_path_buf(),
+        run,
+    })
+}
+
+/// `aterm init`'s hold on the records ([`init_hold_at`]), let go when dropped.
+struct InitHold {
+    _lock: HeldLock,
+    root: PathBuf,
+    /// The explicit plan of a pass of the whole profile.
+    run: Option<initial::ExplicitRun>,
+}
+
+impl aterm_machines::init::Held for InitHold {
+    fn withheld(&self, ids: &[String]) -> Result<(), String> {
+        if self.run.is_none() {
+            return Ok(());
+        }
+        // Only a whole profile admits automatic follow-up work. Merge its debt
+        // before the Desktop lane runs, without spending retries or Restore state.
+        record_withheld(&self.root, ids, &[], &[], ("", 0))
+    }
+
+    fn verified(self: Box<Self>) -> Result<(), String> {
+        let Some(run) = self.run else {
+            return Ok(());
+        };
+        initial::record_applied(&self.root, Selection::all().workstation())?;
+        initial::complete_explicit_workstation_plan(&self.root, run)
+    }
+}
+
+/// aterm's macOS grants as `aterm init`'s Permissions phase reads them, without a prompt
+/// ([`aterm_machines::init::Grants`]).
+#[must_use]
+pub fn init_grants(
+    sign_out: bool,
+) -> Vec<(
+    aterm_types::macos_setup::Access,
+    aterm_machines::init::Grant,
+)> {
+    initial::init_grants(sign_out)
 }
 
 /// Check, apply, or restore the macOS workstation profile for the actual user.
@@ -556,6 +677,7 @@ fn apply_part_with(
                             name: "Mac settings".into(),
                             status: "ok".into(),
                             detail: "nothing left to set in the groups turned to Set up".into(),
+                            elapsed_ms: Some(0),
                         }],
                         manual_steps: Vec::new(),
                         backup: root.join("original-preferences.json"),
@@ -623,8 +745,11 @@ fn apply_part_with(
             &consent,
             &json!({ "profile": PROFILE, "state": "requested" }),
         )?;
+        let asked = std::time::Instant::now();
         match aterm_machines::init_accounts::request_accessibility(sys) {
-            Err(detail) => request_failure = Some(detail),
+            Err(detail) => {
+                request_failure = Some((detail, aterm_converge::millis(asked.elapsed())));
+            }
             Ok(true) => {}
             Ok(false) => {
                 let deadline = std::time::Instant::now() + aterm_types::macos_setup::DIALOG_WAIT;
@@ -639,7 +764,7 @@ fn apply_part_with(
     host.select(selected);
     let mut report = automatic_pass(host, root, build, now)?;
     if report.needs_attention()
-        && let Some(detail) = request_failure
+        && let Some((detail, took)) = request_failure
     {
         as_is(
             &mut report,
@@ -647,6 +772,7 @@ fn apply_part_with(
                 name: "Native account permission request".into(),
                 status: "blocked".into(),
                 detail,
+                elapsed_ms: Some(took),
             },
         );
     }
@@ -1614,6 +1740,7 @@ impl Host for NativeHost {
                                 (None, None) => None,
                             })
                             .unwrap_or_else(|| "workstation item completed".into()),
+                        elapsed_ms: row.elapsed_ms,
                     };
                     (setting, row)
                 })
@@ -1667,6 +1794,7 @@ impl Host for NativeHost {
                             name: "Original scroll direction".into(),
                             status: "restored".into(),
                             detail: "saved and active scroll direction restored".into(),
+                            elapsed_ms: None,
                         },
                         put_back: Some((Setting::NaturalScrolling, PutBack::Back)),
                     },
@@ -1676,6 +1804,7 @@ impl Host for NativeHost {
                             name: "Original scroll direction".into(),
                             status: "error".into(),
                             detail,
+                            elapsed_ms: None,
                         },
                         put_back: Some((Setting::NaturalScrolling, PutBack::AtLogin)),
                     },
@@ -1686,6 +1815,7 @@ impl Host for NativeHost {
                         name: Setting::NaturalScrolling.name().into(),
                         status: LOGIN.into(),
                         detail: "Log out and back in to use the restored scroll direction.".into(),
+                        elapsed_ms: None,
                     },
                     put_back: Some((Setting::NaturalScrolling, PutBack::AtLogin)),
                 });
@@ -1702,6 +1832,7 @@ impl Host for NativeHost {
                     name: Setting::CapsLock.name().into(),
                     status: LOGIN.into(),
                     detail: "Log out and back in to use the restored keyboard settings.".into(),
+                    elapsed_ms: None,
                 },
                 put_back: Some((Setting::CapsLock, PutBack::AtLogin)),
             });
@@ -1718,6 +1849,7 @@ impl Host for NativeHost {
                     name: Setting::TrackpadScrolling.name().into(),
                     status: LOGIN.into(),
                     detail: "Log out and back in to use the restored trackpad settings.".into(),
+                    elapsed_ms: None,
                 },
                 put_back: Some((Setting::TrackpadScrolling, PutBack::AtLogin)),
             });
@@ -1737,6 +1869,7 @@ fn journal_refused(refused: &[String]) -> Row {
             "the change journal refused these records; the changes went ahead anyway: {}",
             refused.join("; ")
         ),
+        elapsed_ms: None,
     }
 }
 
@@ -1803,6 +1936,47 @@ fn save_backup(path: &Path, keys: &[Saved]) -> Result<(), String> {
         })
         .collect();
     write_json(path, &json!({ "profile": PROFILE, "keys": rows }))
+}
+
+/// Originals a Restore still owes, including those waiting for a queued setup choice. A pass
+/// that already set a row again retired its old put-back and needs no original for it.
+fn required_restore_originals(root: &Path) -> Result<Vec<Target>, String> {
+    Ok(restore_waiting(root)?
+        .into_iter()
+        .filter(|target| initial::restore_owed(root, row_of(target)) != initial::RestoreOwed::LetGo)
+        .collect())
+}
+
+fn backup_unread(why: String) -> String {
+    if why.starts_with(BACKUP_UNREAD) {
+        why
+    } else {
+        format!("{BACKUP_UNREAD}: {why}")
+    }
+}
+
+/// Validate the complete pending set before any preference is captured or changed. An absent
+/// backup is valid only when no retained put-back needs an original from it.
+fn load_backup_preserving_restore(path: &Path, required: &[Target]) -> Result<Vec<Saved>, String> {
+    let saved = load_backup(path).map_err(|why| {
+        if required.is_empty() {
+            why
+        } else {
+            backup_unread(why)
+        }
+    })?;
+    for target in required {
+        if !saved
+            .iter()
+            .any(|saved| saved.target == *target && unknown_original(saved).is_none())
+        {
+            return Err(backup_unread(format!(
+                "the original for {} is missing or unknown",
+                target.describe()
+            )));
+        }
+    }
+    Ok(saved)
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -1903,6 +2077,7 @@ fn append_workstation(
         WorkstationGroup::All => "Workstation settings",
         WorkstationGroup::Withheld => "Settings waiting for Full Disk Access",
     };
+    let mut clock = RowClock::start();
     match host.workstation(group, apply) {
         Ok(rows) if rows.is_empty() => as_step(
             report,
@@ -1910,6 +2085,7 @@ fn append_workstation(
                 name: name.into(),
                 status: "unverified".into(),
                 detail: "setup returned no settings to verify".into(),
+                elapsed_ms: None,
             },
             covers,
         ),
@@ -1939,10 +2115,12 @@ fn append_workstation(
                 name: name.into(),
                 status: "unverified".into(),
                 detail,
+                elapsed_ms: None,
             },
             covers,
         ),
     }
+    clock.lap(&mut report.rows);
 }
 
 /// `report`'s rows for System State's page ([`Report::page`]), begun where none were.
@@ -1984,6 +2162,7 @@ fn step_page(row: &Row, subjects: impl IntoIterator<Item = Subject>) -> PassPage
                 name: subject.name().into(),
                 status: row.status.clone(),
                 detail: String::new(),
+                elapsed_ms: None,
             })
             .collect(),
     }
@@ -2035,6 +2214,7 @@ fn execute_pass(
     if action == Action::Restore {
         return restore(host, root, report).map(Pass::from);
     }
+    let mut clock = RowClock::start();
     if host.selection().is_empty() {
         if action == Action::Apply {
             initial::record_applied(root, host.selection())?;
@@ -2045,8 +2225,10 @@ fn execute_pass(
                 name: "Selected Mac settings".into(),
                 status: "ok".into(),
                 detail: "no settings selected; macOS was left unchanged".into(),
+                elapsed_ms: None,
             },
         );
+        clock.lap(&mut report.rows);
         return Ok(report.into());
     }
     // The sign-outs are their own stage: a pass of every preference is the full profile's, with
@@ -2068,6 +2250,7 @@ fn execute_pass(
                 status: "drift".into(),
                 detail: "a previous pass still needs activation; run aterm doctor --apply to retry"
                     .into(),
+                elapsed_ms: None,
             });
         }
         if let Some(why) = left.first().and_then(|target| withheld(host, target)) {
@@ -2081,8 +2264,10 @@ fn execute_pass(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+                elapsed_ms: None,
             });
         }
+        clock.lap(&mut report.rows);
         append_workstation(host, WorkstationGroup::All, false, &mut report);
         return Ok(report.into());
     }
@@ -2122,7 +2307,9 @@ fn apply_preferences(
     previous_activation: Vec<Target>,
     turn: (&str, u64),
 ) -> Result<(Vec<String>, Vec<String>), String> {
-    let mut saved = load_backup(&report.backup)?;
+    let mut clock = RowClock::start();
+    let required = required_restore_originals(root)?;
+    let mut saved = load_backup_preserving_restore(&report.backup, &required)?;
     let before = if group.selected(host.selection()).is_empty() {
         Vec::new()
     } else {
@@ -2143,6 +2330,7 @@ fn apply_preferences(
         initial::record_pending(root)?;
     }
     append_workstation(host, group, true, report);
+    clock.lap(&mut report.rows);
     let attempts = host.attempts();
     let settled = host.settled();
     let held = host.held();
@@ -2230,6 +2418,7 @@ fn apply_preferences(
                 name: "Preference rollback".into(),
                 status: "restored".into(),
                 detail: rolled_back(&restored),
+                elapsed_ms: None,
             });
         }
         if !left.is_empty() {
@@ -2237,6 +2426,7 @@ fn apply_preferences(
                 name: "Preference rollback".into(),
                 status: "blocked".into(),
                 detail: format!("left as this pass made it: {}", left.join("; ")),
+                elapsed_ms: None,
             });
         }
         if !refused.is_empty() {
@@ -2248,11 +2438,14 @@ fn apply_preferences(
                 name: "Preference rollback".into(),
                 status: "error".into(),
                 detail: errors.join("; "),
+                elapsed_ms: None,
             });
         }
     }
+    clock.lap(&mut report.rows);
     let relaunched = report.rows.len();
     let unread = refresh(host, &reload.iter().collect::<Vec<_>>(), report);
+    clock.lap(&mut report.rows);
     journal |= report.rows[relaunched..]
         .iter()
         .any(|row| row.name == JOURNAL_ROW);
@@ -2278,8 +2471,10 @@ fn apply_preferences(
             name: "Preference rollback".into(),
             status: "error".into(),
             detail: format!("{NOT_RETAINED}: {}", lost.join(", ")),
+            elapsed_ms: None,
         });
     }
+    clock.lap(&mut report.rows);
     if !rollback.is_empty() {
         for (target, _) in &put_back {
             rolled.push((row_of(target), put_back_as(target, &lost, &unread)));
@@ -2317,10 +2512,12 @@ fn apply_preferences(
                 name: "Settings waiting for Full Disk Access".into(),
                 status: "error".into(),
                 detail,
+                elapsed_ms: None,
             },
             aterm_machines::init_preferences::withheld_settings(group.selected(host.selection())),
         );
     }
+    clock.lap(&mut report.rows);
     Ok((unverified, settled))
 }
 
@@ -2358,6 +2555,13 @@ struct Withheld {
 }
 
 fn load_withheld(root: &Path) -> Result<Withheld, String> {
+    load_withheld_reading_revision(root, || initial::revision_at(root))
+}
+
+fn load_withheld_reading_revision(
+    root: &Path,
+    revision: impl FnOnce() -> Result<u64, String>,
+) -> Result<Withheld, String> {
     let path = root.join(WITHHELD_RECORD);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -2377,7 +2581,9 @@ fn load_withheld(root: &Path) -> Result<Withheld, String> {
         .map(|item| item.as_str().map(str::to_owned).ok_or_else(bad))
         .collect::<Result<_, _>>()?;
     let mut failed = current_tries(load_tries(&record["failed"], &bad)?, true);
-    if record["revision"].as_u64() != initial::revision_at(root).ok() {
+    // Only a known different run resets its retry budget. An unreadable current run
+    // must not make a spent attempt available again.
+    if record["revision"].as_u64() != Some(revision()?) {
         failed.clear();
     }
     Ok(Withheld {
@@ -2387,11 +2593,20 @@ fn load_withheld(root: &Path) -> Result<Withheld, String> {
 }
 
 fn save_withheld(root: &Path, record: &Withheld) -> Result<(), String> {
+    save_withheld_reading_revision(root, record, || initial::revision_at(root))
+}
+
+fn save_withheld_reading_revision(
+    root: &Path,
+    record: &Withheld,
+    revision: impl FnOnce() -> Result<u64, String>,
+) -> Result<(), String> {
     if !record.items.is_empty() {
+        let revision = revision()?;
         return write_json(
             &root.join(WITHHELD_RECORD),
             &json!({
-                "profile": PROFILE, "revision": initial::revision_at(root).ok(),
+                "profile": PROFILE, "revision": revision,
                 "items": record.items, "failed": tries_json(&record.failed),
             }),
         );
@@ -2501,7 +2716,17 @@ fn follow_up_setup_at(
     build: &str,
     now: std::time::SystemTime,
 ) -> Result<Option<Report>, String> {
-    let record = load_withheld(root)?;
+    follow_up_setup_reading_revision(root, host, build, now, || initial::revision_at(root))
+}
+
+fn follow_up_setup_reading_revision(
+    root: &Path,
+    host: &mut dyn Host,
+    build: &str,
+    now: std::time::SystemTime,
+    revision: impl FnOnce() -> Result<u64, String>,
+) -> Result<Option<Report>, String> {
+    let record = load_withheld_reading_revision(root, revision)?;
     if record.items.is_empty() || initial::stopped(root)? {
         return Ok(None);
     }
@@ -2555,11 +2780,26 @@ fn follow_up_setup_at(
 pub fn finish_withheld_preferences<S>(
     reserve: impl FnMut() -> S,
 ) -> Result<Option<Report>, String> {
+    let (observed, slot) = finish_withheld_preferences_observed(reserve);
+    drop(slot);
+    observed.result
+}
+
+/// [`finish_withheld_preferences`], binding its success or failure to the setup records while
+/// holding their profile lock. The returned reservation stays with the result until its caller
+/// publishes it; the profile lock has already gone. With no operation it returns no reservation.
+pub fn finish_withheld_preferences_observed<S>(
+    reserve: impl FnMut() -> S,
+) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
     if aterm_types::dirs::runs_under_private_state_root() {
-        return Ok(None);
+        return (InitialSetupObserved::new(Ok(None), None), None);
     }
-    follow_up_finished_waiting(
-        &state_root()?,
+    let root = match state_root() {
+        Ok(root) => root,
+        Err(why) => return (InitialSetupObserved::new(Err(why), None), None),
+    };
+    follow_up_finished_waiting_observed(
+        &root,
         reserve,
         || {
             ensure_person_scope()?;
@@ -2591,7 +2831,7 @@ const FOLLOW_UP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// How often the follow-up looks at the profile lock while another holds it.
 const FOLLOW_UP_LOCK_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// [`follow_up_finished_waiting`]'s wait in a live process: a [`FOLLOW_UP_LOCK_POLL`] at a
+/// [`follow_up_finished_waiting_observed`]'s wait in a live process: a [`FOLLOW_UP_LOCK_POLL`] at a
 /// time, `false` once [`FOLLOW_UP_LOCK_WAIT`] has passed.
 fn follow_up_lock_wait() -> impl FnMut() -> bool {
     let deadline = std::time::Instant::now() + FOLLOW_UP_LOCK_WAIT;
@@ -2610,44 +2850,67 @@ fn follow_up_lock_wait() -> impl FnMut() -> bool {
 /// whether to look again) until the lock is free, then takes both again. So a grant recorded while
 /// a pass elsewhere holds the lock, just after that pass's own follow-up point, is still followed
 /// up in this launch once the pass ends. What the holder followed up meanwhile is owed no more.
+#[cfg(test)]
 fn follow_up_finished_waiting<S, H: Host>(
+    root: &Path,
+    reserve: impl FnMut() -> S,
+    host: impl FnOnce() -> Result<H, String>,
+    build: &str,
+    now: std::time::SystemTime,
+    wait: impl FnMut() -> bool,
+) -> Result<Option<Report>, String> {
+    let (observed, slot) =
+        follow_up_finished_waiting_observed(root, reserve, host, build, now, wait);
+    drop(slot);
+    observed.result
+}
+
+fn follow_up_finished_waiting_observed<S, H: Host>(
     root: &Path,
     mut reserve: impl FnMut() -> S,
     host: impl FnOnce() -> Result<H, String>,
     build: &str,
     now: std::time::SystemTime,
     mut wait: impl FnMut() -> bool,
-) -> Result<Option<Report>, String> {
-    if !follow_up_owed(root)? {
-        return Ok(None);
-    }
-    let mut host = host()?;
-    if host.full_disk_access() != Some(true) {
-        return Ok(None);
-    }
-    loop {
-        let slot = reserve();
-        if let Some(lock) = HeldLock::try_take(root)? {
-            let report = if follow_up_owed(root)? {
-                follow_up_at(root, &mut host, build, now)
-            } else {
-                Ok(None)
-            };
-            // The lock goes before the slot, so the page's next operation finds it free.
-            drop(lock);
-            drop(slot);
-            return report;
+) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
+    let (mut observation, mut reserved) = (None, None);
+    let result = (|| {
+        if !follow_up_owed(root)? {
+            return Ok(None);
         }
-        drop(slot);
+        let mut host = host()?;
+        if host.full_disk_access() != Some(true) {
+            return Ok(None);
+        }
         loop {
-            if !wait() {
-                return Ok(None);
+            let slot = reserve();
+            if let Some(lock) = HeldLock::try_take(root)? {
+                let report = follow_up_owed(root).and_then(|owed| {
+                    if owed {
+                        follow_up_at(root, &mut host, build, now)
+                    } else {
+                        Ok(None)
+                    }
+                });
+                observation = initial::observation_at(root).ok();
+                // The caller publishes while retaining the slot, after releasing the profile
+                // lock, so no newer operation's report can be replaced by this one.
+                drop(lock);
+                reserved = Some(slot);
+                return report;
             }
-            if !HeldLock::profile_active(root)? {
-                break;
+            drop(slot);
+            loop {
+                if !wait() {
+                    return Ok(None);
+                }
+                if !HeldLock::profile_active(root)? {
+                    break;
+                }
             }
         }
-    }
+    })();
+    (InitialSetupObserved::new(result, observation), reserved)
 }
 
 fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
@@ -2787,9 +3050,14 @@ fn same_original(a: &PValue, b: &PValue) -> bool {
 }
 
 fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Report, String> {
+    let mut clock = RowClock::start();
+    // The stopping intent below resets the Restore baseline. Keep which earlier originals
+    // were still owed before it, while saving that intent even when preflight then fails.
+    let required = required_restore_originals(root);
     initial::save_restore(root)?;
+    let required = required?;
+    let saved = load_backup_preserving_restore(&report.backup, &required).map_err(backup_unread)?;
     save_withheld(root, &Withheld::default())?;
-    let saved = load_backup(&report.backup).map_err(|why| format!("{BACKUP_UNREAD}: {why}"))?;
     // What this Restore cannot put back until aterm has Full Disk Access, which a follow-up
     // then puts back by itself ([`finish_waiting_restore`]).
     let waiting: Vec<Target> = saved
@@ -2825,6 +3093,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
             name: "Original preferences".into(),
             status: "ok".into(),
             detail: "no changed preferences were backed up".into(),
+            elapsed_ms: None,
         });
     }
     // Each key's System State row, and how it came out, for the page (`RestoreRows`).
@@ -2832,6 +3101,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     let mut refused = Vec::new();
     let mut put_back = Vec::new();
     for item in saved.iter().rev() {
+        clock.lap(&mut report.rows);
         let why = unknown_original(item)
             .map(|why| (why, PutBack::Unknown))
             .or_else(|| {
@@ -2843,6 +3113,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
                 name: item.target.describe(),
                 status: "blocked".into(),
                 detail: why,
+                elapsed_ms: None,
             });
             continue;
         }
@@ -2855,6 +3126,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
                     name: item.target.describe(),
                     status: "restored".into(),
                     detail: "original value restored".into(),
+                    elapsed_ms: None,
                 });
             }
             Err((_, detail)) => {
@@ -2863,6 +3135,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
                     name: item.target.describe(),
                     status: "error".into(),
                     detail,
+                    elapsed_ms: None,
                 });
             }
         }
@@ -2871,8 +3144,10 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     if journal {
         report.rows.push(journal_refused(&refused));
     }
+    clock.lap(&mut report.rows);
     let relaunched = report.rows.len();
     let unread = refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report);
+    clock.lap(&mut report.rows);
     if unread.is_empty() {
         settle_pending_refresh(host, root)?;
     }
@@ -2918,6 +3193,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     save_restore_waiting(root, &waiting)?;
     // The groups Restore put back are left as is from now on (design §3.4).
     initial::leave_restored_as_is(root)?;
+    clock.lap(&mut report.rows);
     let mut outcome = RestoreOutcome::of(outcomes);
     outcome.journal_refused = journal;
     report.restore = Some(RestoreRows { outcome });
@@ -3012,7 +3288,13 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
         return Ok(None);
     }
     let backup = root.join("original-preferences.json");
-    let saved = load_backup(&backup)?;
+    let required = required_restore_originals(root)?;
+    let saved = if required.is_empty() {
+        Vec::new()
+    } else {
+        load_backup_preserving_restore(&backup, &required)?
+    };
+    let activation = pending_refresh(root)?;
     let mut report = Report {
         action: Action::Restore,
         rows: Vec::new(),
@@ -3023,7 +3305,9 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
     };
     let (mut still, mut put_back, mut outcomes, mut refused) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut clock = RowClock::start();
     for target in &waiting {
+        clock.lap(&mut report.rows);
         match initial::restore_owed(root, row_of(target)) {
             initial::RestoreOwed::Wait => {
                 still.push(target.clone());
@@ -3049,6 +3333,7 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
                     name: target.describe(),
                     status: "restored".into(),
                     detail: "original value restored".into(),
+                    elapsed_ms: None,
                 });
             }
             Err((_, detail)) => {
@@ -3057,6 +3342,7 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
                     name: target.describe(),
                     status: "error".into(),
                     detail,
+                    elapsed_ms: None,
                 });
             }
         }
@@ -3064,6 +3350,7 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
     if !refused.is_empty() {
         report.rows.push(journal_refused(&refused));
     }
+    clock.lap(&mut report.rows);
     let relaunched = report.rows.len();
     let unread = refresh(
         host,
@@ -3091,6 +3378,27 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
             row.detail = NOT_RETAINED.into();
         }
         outcomes.push((row_of(target), put_back_as(target, &lost, &unread)));
+    }
+    // This follow-up may also fulfil activation left by an earlier Restore. Only
+    // retire targets it actually put back and whose readers all relaunched; other
+    // activation remains owed. Publish this first so an I/O refusal leaves the
+    // waiting Restore available for recovery.
+    let remaining: Vec<Target> = activation
+        .iter()
+        .filter(|target| {
+            !put_back.iter().any(|(restored, _)| restored == *target)
+                || aterm_machines::init_activation::readers(&target.domain)
+                    .iter()
+                    .any(|process| unread.contains(process))
+        })
+        .cloned()
+        .collect();
+    if remaining != activation {
+        if remaining.is_empty() {
+            clear_pending_refresh(root)?;
+        } else {
+            save_pending_refresh(root, &remaining)?;
+        }
     }
     save_restore_waiting(root, &still)?;
     if outcomes.is_empty() && !journal {
@@ -3162,6 +3470,7 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> Vec
         .collect();
     let mut unread = Vec::new();
     let mut refused = Vec::new();
+    let mut clock = RowClock::start();
     for process in aterm_machines::init_activation::RELAUNCHED {
         let reads: Vec<&Target> = targets
             .iter()
@@ -3186,18 +3495,21 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> Vec
                 name: format!("Reload {process}"),
                 status: "error".into(),
                 detail,
+                elapsed_ms: None,
             });
         }
+        clock.lap(&mut report.rows);
     }
     if targets
         .iter()
         .any(|t| t.host || t.domain.contains("Trackpad") || t.domain.contains("trackpad"))
     {
-        report.rows.push(Row { name: "Keyboard and trackpad activation".into(), status: "ok".into(), detail: "native preferences saved; log out and back in if an already connected device still uses its previous setting".into() });
+        report.rows.push(Row { name: "Keyboard and trackpad activation".into(), status: "ok".into(), detail: "native preferences saved; log out and back in if an already connected device still uses its previous setting".into(), elapsed_ms: None });
     }
     if !refused.is_empty() {
         report.rows.push(journal_refused(&refused));
     }
+    clock.lap(&mut report.rows);
     unread
 }
 
@@ -3205,6 +3517,9 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> Vec
 mod tests {
     use super::*;
     use aterm_machines::port::Ran;
+
+    mod restore_activation_tests;
+    mod withheld_revision_tests;
 
     /// Fake doctor host backed by in-memory [`wanted`] keys.
     #[derive(Default)]
@@ -3668,7 +3983,7 @@ mod tests {
             fn full_disk_access(&self) -> Option<bool> {
                 self.full_disk_access
             }
-            fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+            fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
                 Ok(Box::new(super::InertJournal(std::sync::Arc::clone(
                     &self.lines,
                 ))))
@@ -4015,6 +4330,56 @@ mod tests {
             "{}",
             report.to_text()
         );
+    }
+
+    /// EVERY PROFILE ROW CARRIES ITS TIME in `--json`: a shared item's, a relaunch's, a
+    /// restore's and a note's, on Apply, Check, a relaunch that fails and Restore. A row its
+    /// producer timed keeps that time; a lap gives the rest the time since the last one.
+    /// Presence only, never a budget.
+    #[test]
+    fn every_profile_row_carries_its_time_in_the_json() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        let mut host = Fake::default();
+        let applied = execute(&mut host, root.path(), Action::Apply).expect("apply");
+        save_pending_refresh(root.path(), &[wanted()[0].0.clone()]).expect("owed activation");
+        let checked = execute(&mut host, root.path(), Action::Check).expect("check");
+        assert!(
+            checked
+                .rows
+                .iter()
+                .any(|row| row.name == "Preference activation"),
+            "{}",
+            checked.to_text()
+        );
+        host.fail_restart_once = true;
+        let restored = execute(&mut host, root.path(), Action::Restore).expect("restore");
+        assert!(
+            restored.rows.iter().any(|row| row.name == "Reload Dock")
+                && restored.rows.iter().any(|row| row.status == "restored"),
+            "{}",
+            restored.to_text()
+        );
+        for report in [applied, checked, restored] {
+            let json: Value = aterm_json::from_str(&report.to_json()).unwrap();
+            let rows = json["settings"].as_array().unwrap();
+            assert!(!rows.is_empty(), "{json}");
+            assert!(
+                rows.iter().all(|row| row["elapsed_ms"].as_u64().is_some()),
+                "{json}"
+            );
+        }
+
+        let row = |elapsed_ms| Row {
+            name: "row".into(),
+            status: "ok".into(),
+            detail: String::new(),
+            elapsed_ms,
+        };
+        let mut rows = vec![row(Some(7)), row(None)];
+        RowClock::start().lap(&mut rows);
+        assert_eq!(rows[0].elapsed_ms, Some(7), "its producer's time stays");
+        assert!(rows[1].elapsed_ms.is_some());
     }
 
     #[test]
@@ -6225,6 +6590,7 @@ mod tests {
                             name: item,
                             status: status.into(),
                             detail,
+                            elapsed_ms: None,
                         },
                     ));
                 }
@@ -6279,6 +6645,7 @@ mod tests {
                         name: item,
                         status: status.into(),
                         detail,
+                        elapsed_ms: None,
                     },
                 ));
             }
@@ -7478,6 +7845,127 @@ mod tests {
         (root, host)
     }
 
+    #[test]
+    fn init_withheld_widgets_are_applied_once_after_full_disk_access() {
+        use aterm_machines::init::Held as _;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let mut host = Fake {
+            selected: Some(widgets),
+            notification_center: true,
+            full_disk_access: Some(false),
+            values: BTreeMap::from([(nc_widgets(), populated())]),
+            ..Fake::default()
+        };
+        let hold = init_hold_at(root.path(), true, &|_| panic!("uncontended hold")).unwrap();
+        hold.withheld(&[WIDGETS.into()]).unwrap();
+        Box::new(hold).verified().unwrap();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(
+            follow_up_at(root.path(), &mut host, BUILD, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.writes.is_empty());
+        assert!(host.values[&nc_widgets()].same(&populated()));
+        host.full_disk_access = Some(true);
+        let report = follow_up_at(root.path(), &mut host, BUILD, now)
+            .unwrap()
+            .expect("the whole init retained its withheld Notification Center item");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(host.values[&nc_widgets()].same(&cleared()));
+        assert_eq!(host.writes, [nc_widgets()]);
+        assert_eq!(
+            host.relaunches("NotificationCenter")
+                + host
+                    .restarts
+                    .iter()
+                    .filter(|name| *name == "NotificationCenter")
+                    .count(),
+            1
+        );
+        assert!(load_withheld(root.path()).unwrap().items.is_empty());
+        let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+        assert!(
+            follow_up_at(root.path(), &mut host, BUILD, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            (host.writes.len(), host.restarts.len(), host.lines.len()),
+            effects
+        );
+    }
+
+    #[test]
+    fn init_withheld_record_failure_leaves_the_admission_unverified() {
+        use aterm_machines::init::Held as _;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let hold = init_hold_at(root.path(), true, &|_| panic!("uncontended hold")).unwrap();
+        let before = initial::observation_at(root.path()).unwrap();
+        std::fs::create_dir(root.path().join(WITHHELD_RECORD)).unwrap();
+        let result = hold.withheld(&[WIDGETS.into()]);
+        assert_eq!(initial::observation_at(root.path()).unwrap(), before);
+        assert!(
+            result.is_err(),
+            "the desktop lane cannot start without recording its withheld item"
+        );
+        drop(hold);
+        assert!(!first_run_complete(root.path()).unwrap());
+    }
+
+    #[test]
+    fn init_withheld_partial_pass_preserves_existing_debt_and_restore() {
+        use aterm_machines::init::Held as _;
+
+        for older_debt in [false, true] {
+            let (root, mut host) = deferred_widgets_restore();
+            let old = Withheld {
+                items: vec![WIDGETS.into()],
+                failed: vec![Failed {
+                    item: WIDGETS.into(),
+                    build: BUILD.into(),
+                    tries: 1,
+                    at: 1,
+                }],
+            };
+            if older_debt {
+                save_withheld(root.path(), &old).unwrap();
+            }
+            let withheld = std::fs::read(root.path().join(WITHHELD_RECORD)).ok();
+            let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+            let before = initial::observation_at(root.path()).unwrap();
+            let hold = init_hold_at(root.path(), false, &|_| panic!("uncontended hold")).unwrap();
+            hold.withheld(&[WIDGETS.into()]).unwrap();
+            Box::new(hold).verified().unwrap();
+            assert_eq!(
+                std::fs::read(root.path().join(WITHHELD_RECORD)).ok(),
+                withheld
+            );
+            assert_eq!(
+                std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+                waiting
+            );
+            assert_eq!(initial::observation_at(root.path()).unwrap(), before);
+            host.full_disk_access = Some(true);
+            let writes = host.writes.len();
+            let report = follow_up_at(root.path(), &mut host, BUILD, std::time::SystemTime::now())
+                .unwrap()
+                .expect("the earlier Restore remains owed");
+            assert_eq!(
+                report.restore.unwrap().outcome.rows,
+                [(Some(Setting::Widgets), PutBack::Back)]
+            );
+            assert!(host.values[&nc_widgets()].same(&populated()));
+            assert_eq!(host.writes.len(), writes + 1);
+            assert!(restore_waiting(root.path()).unwrap().is_empty());
+        }
+    }
+
     /// A Restore that could not put Notification Center's widget list back for want of Full
     /// Disk Access puts it back by itself once aterm has the grant (design §3.4), with no
     /// press: nothing before the grant, once after it, its reader relaunched, and a calm
@@ -7530,6 +8018,446 @@ mod tests {
                 .is_none()
         );
         assert_eq!(host.writes.len(), writes, "once");
+    }
+
+    fn missing_backup_keeps_restore_waiting(explicit: bool) {
+        let (root, mut host) = deferred_widgets_restore();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let backup = root.path().join("original-preferences.json");
+        let held_backup = root.path().join("original-preferences.saved");
+        let originals = std::fs::read(&backup).unwrap();
+        let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+        std::fs::rename(&backup, &held_backup).unwrap();
+        host.full_disk_access = Some(true);
+        let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+        let now = std::time::SystemTime::now();
+        let result = if explicit {
+            run_mutation(&mut host, root.path(), Action::Restore).map(|_| ())
+        } else {
+            follow_up_at(root.path(), &mut host, BUILD, now).map(|_| ())
+        };
+        assert_eq!(
+            (host.writes.len(), host.restarts.len(), host.lines.len()),
+            effects,
+            "unavailable originals permit no preference write, relaunch or journal entry"
+        );
+        assert!(host.values[&nc_widgets()].same(&cleared()));
+        assert!(
+            result.is_err(),
+            "an owed original cannot be treated as absent"
+        );
+        assert_eq!(restore_waiting(root.path()).unwrap(), [nc_widgets()]);
+        assert_eq!(
+            std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+            waiting,
+            "the missing backup must leave the original put-back owed"
+        );
+        assert_eq!(std::fs::read(&held_backup).unwrap(), originals);
+        assert!(!backup.exists());
+
+        std::fs::rename(&held_backup, &backup).unwrap();
+        let restored = follow_up_at(root.path(), &mut host, BUILD, now)
+            .unwrap()
+            .expect("repairing the backup permits the original put-back");
+        assert_eq!(
+            restored.restore.unwrap().outcome.rows,
+            [(Some(Setting::Widgets), PutBack::Back)]
+        );
+        assert!(host.values[&nc_widgets()].same(&populated()));
+        assert_eq!(host.writes.len(), effects.0 + 1);
+        assert_eq!(host.restarts.len(), effects.1 + 1);
+        assert!(restore_waiting(root.path()).unwrap().is_empty());
+        assert_eq!(std::fs::read(&backup).unwrap(), originals);
+        let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+        assert!(
+            follow_up_at(root.path(), &mut host, BUILD, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            (host.writes.len(), host.restarts.len(), host.lines.len()),
+            effects,
+            "the repaired put-back runs once"
+        );
+    }
+
+    #[test]
+    fn restore_backup_debt_missing_backup_keeps_the_follow_up_owed() {
+        missing_backup_keeps_restore_waiting(false);
+    }
+
+    #[test]
+    fn restore_backup_debt_missing_backup_keeps_a_repeated_restore_owed() {
+        missing_backup_keeps_restore_waiting(true);
+    }
+
+    #[test]
+    fn restore_backup_debt_no_backup_and_no_prior_changes_is_valid() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let unowned = Target::new("com.apple.dock", "orientation");
+        let mut host = Fake {
+            full_disk_access: Some(true),
+            values: BTreeMap::from([(unowned.clone(), PValue::Str("left".into()))]),
+            ..Fake::default()
+        };
+        let report = run_mutation(&mut host, root.path(), Action::Restore).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(!report.backup.exists());
+        assert!(host.writes.is_empty());
+        assert!(host.restarts.is_empty());
+        assert!(host.lines.is_empty());
+        assert_eq!(host.values.len(), 1);
+        assert_eq!(host.values[&unowned], PValue::Str("left".into()));
+        assert!(restore_waiting(root.path()).unwrap().is_empty());
+        assert!(
+            follow_up_at(root.path(), &mut host, BUILD, std::time::SystemTime::now())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn init_admission_preserves_pending_original(missing: bool) {
+        let (root, _host) = deferred_widgets_restore();
+        let backup = root.path().join("original-preferences.json");
+        let originals = std::fs::read(&backup).unwrap();
+        let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+        if missing {
+            std::fs::rename(&backup, root.path().join("original-preferences.saved")).unwrap();
+        } else {
+            let mut saved = load_backup(&backup).unwrap();
+            saved.retain(|saved| saved.target != nc_widgets());
+            assert!(!saved.is_empty(), "the other valid originals remain");
+            save_backup(&backup, &saved).unwrap();
+        }
+        let damaged = std::fs::read(&backup).ok();
+        let before = initial::observation_at(root.path()).unwrap();
+        let admitted = init_hold_at(root.path(), true, &|line| {
+            panic!("no other pass holds these records: {line}")
+        });
+        let refused = admitted.is_err();
+        drop(admitted);
+        assert!(
+            refused,
+            "init must validate its pending original before admission"
+        );
+        assert_eq!(initial::observation_at(root.path()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+            waiting
+        );
+        assert_eq!(std::fs::read(&backup).ok(), damaged);
+        assert_eq!(
+            initial::restore_owed(root.path(), Some(Setting::Widgets)),
+            initial::RestoreOwed::PutBack
+        );
+        assert!(
+            HeldLock::try_take(root.path()).unwrap().is_some(),
+            "refusal releases the profile lock"
+        );
+
+        std::fs::write(&backup, &originals).unwrap();
+        let held = init_hold_at(root.path(), true, &|line| panic!("{line}"))
+            .expect("repairing the original permits the real init admission");
+        assert_ne!(initial::observation_at(root.path()).unwrap(), before);
+        assert_eq!(std::fs::read(&backup).unwrap(), originals);
+        drop(held);
+    }
+
+    #[test]
+    fn init_admission_missing_original_preserves_restore_debt() {
+        init_admission_preserves_pending_original(true);
+    }
+
+    #[test]
+    fn init_admission_incomplete_original_preserves_restore_debt() {
+        init_admission_preserves_pending_original(false);
+    }
+
+    #[test]
+    fn init_admission_fresh_and_partial_passes_need_no_pending_original() {
+        let fresh = aterm_tempfile::tempdir().unwrap();
+        let held = init_hold_at(fresh.path(), true, &|line| panic!("{line}"))
+            .expect("a fresh profile has no original it still owes");
+        assert!(!fresh.path().join("original-preferences.json").exists());
+        drop(held);
+
+        let (root, _host) = deferred_widgets_restore();
+        std::fs::rename(
+            root.path().join("original-preferences.json"),
+            root.path().join("original-preferences.saved"),
+        )
+        .unwrap();
+        let before = initial::observation_at(root.path()).unwrap();
+        let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+        let held = init_hold_at(root.path(), false, &|line| panic!("{line}"))
+            .expect("a partial pass does not replace the Restore admission");
+        assert_eq!(initial::observation_at(root.path()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+            waiting
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn restore_backup_debt_incomplete_originals_refuse_before_any_put_back() {
+        for unknown in [false, true] {
+            for explicit in [false, true] {
+                let (root, mut host) = deferred_widgets_restore();
+                let _lock = HeldLock::take(root.path()).unwrap();
+                let backup = root.path().join("original-preferences.json");
+                let mut saved = load_backup(&backup).unwrap();
+                let mut owed =
+                    saved.remove(saved.iter().position(|s| s.target == nc_widgets()).unwrap());
+                if unknown {
+                    owed.value = None;
+                    owed.granted = false;
+                    saved.insert(0, owed);
+                }
+                // This valid original would be put back first by a reverse walk. Validate
+                // the missing or unknown owed original before even that independent write.
+                let valid = saved.last().unwrap();
+                assert_ne!(valid.target, nc_widgets());
+                host.values.insert(valid.target.clone(), PValue::Bool(true));
+                save_backup(&backup, &saved).unwrap();
+                let damaged = std::fs::read(&backup).unwrap();
+                let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+                let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+                let values = host.values.clone();
+                host.full_disk_access = Some(true);
+                let result = if explicit {
+                    run_mutation(&mut host, root.path(), Action::Restore).map(|_| ())
+                } else {
+                    follow_up_at(root.path(), &mut host, BUILD, std::time::SystemTime::now())
+                        .map(|_| ())
+                };
+                assert!(result.is_err(), "unknown={unknown}, explicit={explicit}");
+                assert_eq!(
+                    (host.writes.len(), host.restarts.len(), host.lines.len()),
+                    effects
+                );
+                assert_eq!(host.values, values);
+                assert_eq!(std::fs::read(&backup).unwrap(), damaged);
+                assert_eq!(
+                    std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+                    waiting
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_backup_debt_apply_cannot_recapture_a_changed_value_as_the_original() {
+        let (root, mut host) = deferred_widgets_restore();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let backup = root.path().join("original-preferences.json");
+        let held_backup = root.path().join("original-preferences.saved");
+        let originals = std::fs::read(&backup).unwrap();
+        let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+        std::fs::rename(&backup, &held_backup).unwrap();
+        host.full_disk_access = Some(true);
+        let external = PValue::Dict(vec![
+            ("vers".into(), PValue::Int(1)),
+            (
+                "instances".into(),
+                PValue::Array(vec![PValue::Data(vec![99])]),
+            ),
+        ]);
+        host.values.insert(nc_widgets(), external.clone());
+        let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+        let captures = host.preference_passes;
+        let before = initial::observation_at(root.path()).unwrap();
+        assert!(run_mutation(&mut host, root.path(), Action::Apply).is_err());
+        assert_eq!(initial::observation_at(root.path()).unwrap(), before);
+        assert_eq!(
+            host.preference_passes, captures,
+            "validate before capturing replacements"
+        );
+        assert_eq!(
+            (host.writes.len(), host.restarts.len(), host.lines.len()),
+            effects
+        );
+        assert_eq!(host.values[&nc_widgets()], external);
+        assert!(
+            !backup.exists(),
+            "Apply must not invent a replacement original"
+        );
+        assert_eq!(std::fs::read(&held_backup).unwrap(), originals);
+        assert_eq!(
+            std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+            waiting
+        );
+
+        std::fs::rename(&held_backup, &backup).unwrap();
+        let applied = run_mutation(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!applied.needs_attention(), "{}", applied.to_text());
+        assert_eq!(std::fs::read(&backup).unwrap(), originals);
+        let restored = run_mutation(&mut host, root.path(), Action::Restore).unwrap();
+        assert!(!restored.needs_attention(), "{}", restored.to_text());
+        assert!(host.values[&nc_widgets()].same(&populated()));
+    }
+
+    #[test]
+    fn restore_backup_debt_a_queued_choice_still_needs_its_original() {
+        let (root, mut host) = deferred_widgets_restore();
+        let choice = InitialSetupAdmissionStopTest::restart(root.path()).unwrap();
+        assert!(choice.choose_group(&[Setting::Widgets]).unwrap().is_some());
+        let _lock = HeldLock::take(root.path()).unwrap();
+        assert_eq!(
+            initial::restore_owed(root.path(), Some(Setting::Widgets)),
+            initial::RestoreOwed::Wait
+        );
+        let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+        std::fs::rename(
+            root.path().join("original-preferences.json"),
+            root.path().join("original-preferences.saved"),
+        )
+        .unwrap();
+        host.full_disk_access = Some(true);
+        let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+        assert!(follow_up_at(root.path(), &mut host, BUILD, std::time::SystemTime::now()).is_err());
+        assert_eq!(
+            (host.writes.len(), host.restarts.len(), host.lines.len()),
+            effects
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+            waiting
+        );
+    }
+
+    #[test]
+    fn restore_backup_debt_a_completed_new_choice_retires_the_old_original() {
+        for explicit in [false, true] {
+            let (root, mut host) = deferred_widgets_restore();
+            let _lock = HeldLock::take(root.path()).unwrap();
+            host.full_disk_access = Some(true);
+            let applied = run_mutation(&mut host, root.path(), Action::Apply).unwrap();
+            assert!(!applied.needs_attention(), "{}", applied.to_text());
+            assert_eq!(
+                initial::restore_owed(root.path(), Some(Setting::Widgets)),
+                initial::RestoreOwed::LetGo
+            );
+            assert_eq!(restore_waiting(root.path()).unwrap(), [nc_widgets()]);
+            std::fs::rename(
+                root.path().join("original-preferences.json"),
+                root.path().join("original-preferences.saved"),
+            )
+            .unwrap();
+            let effects = (host.writes.len(), host.restarts.len(), host.lines.len());
+            if explicit {
+                let restored = run_mutation(&mut host, root.path(), Action::Restore).unwrap();
+                assert!(!restored.needs_attention(), "{}", restored.to_text());
+            } else {
+                assert!(
+                    follow_up_at(root.path(), &mut host, BUILD, std::time::SystemTime::now())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                (host.writes.len(), host.restarts.len(), host.lines.len()),
+                effects
+            );
+            assert!(restore_waiting(root.path()).unwrap().is_empty());
+            assert!(host.values[&nc_widgets()].same(&cleared()));
+        }
+    }
+
+    #[test]
+    fn restore_backup_debt_observes_the_result_before_releasing_its_reservation() {
+        use std::cell::Cell;
+
+        struct Slot<'a> {
+            root: &'a Path,
+            held: &'a Cell<bool>,
+        }
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                let _lock =
+                    HeldLock::take(self.root).expect("the profile lock goes before the slot");
+                initial::save_explicit_workstation_plan(self.root).unwrap();
+                self.held.set(false);
+            }
+        }
+
+        for missing in [false, true] {
+            let (root, mut host) = deferred_widgets_restore();
+            host.full_disk_access = Some(true);
+            let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+            if missing {
+                std::fs::rename(
+                    root.path().join("original-preferences.json"),
+                    root.path().join("original-preferences.saved"),
+                )
+                .unwrap();
+            }
+            let held = Cell::new(false);
+            let (observed, slot) = follow_up_finished_waiting_observed(
+                root.path(),
+                || {
+                    held.set(true);
+                    Slot {
+                        root: root.path(),
+                        held: &held,
+                    }
+                },
+                || Ok(host),
+                BUILD,
+                std::time::SystemTime::now(),
+                || false,
+            );
+            assert!(slot.is_some() && held.get());
+            assert!(HeldLock::try_take(root.path()).unwrap().is_some());
+            assert_eq!(
+                observed.observation,
+                Some(initial::observation_at(root.path()).unwrap())
+            );
+            if missing {
+                assert!(
+                    observed
+                        .result
+                        .as_ref()
+                        .unwrap_err()
+                        .starts_with(BACKUP_UNREAD)
+                );
+                assert_eq!(
+                    std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+                    waiting
+                );
+            } else {
+                assert_eq!(
+                    observed
+                        .result
+                        .unwrap()
+                        .unwrap()
+                        .restore
+                        .unwrap()
+                        .outcome
+                        .rows,
+                    [(Some(Setting::Widgets), PutBack::Back)]
+                );
+                assert!(restore_waiting(root.path()).unwrap().is_empty());
+            }
+            let binding = observed.observation.unwrap();
+            if missing {
+                // The slot's later explicit admission must meet the same
+                // original-preservation preflight as the operation it follows.
+                std::fs::rename(
+                    root.path().join("original-preferences.saved"),
+                    root.path().join("original-preferences.json"),
+                )
+                .unwrap();
+            }
+            drop(slot);
+            assert!(!held.get());
+            assert_ne!(
+                initial::observation_at(root.path()).unwrap(),
+                binding,
+                "a later choice cannot become this result's binding"
+            );
+        }
     }
 
     fn a_waiting_restore_survives_a_replacement_that_never_wrote(interrupted: bool) {

@@ -1420,10 +1420,12 @@ impl Meteors {
                 dir,
             } => self.on_move(from, to, licence, dir, at, ctx),
             Event::Focus(false) => {
-                for m in &mut self.live {
-                    if m.retired_at.is_none() {
-                        m.retired_at = Some(at);
+                let mut i = 0;
+                while i < self.live.len() {
+                    if self.live[i].retired_at.is_none() {
+                        self.live[i].retired_at = Some(at);
                     }
+                    i += 1;
                 }
                 None
             }
@@ -1473,7 +1475,10 @@ impl Meteors {
         };
         let (live, landings, sown) = (&mut self.live, &mut self.landings, &mut self.sown);
 
-        for m in live.iter_mut() {
+        let mut mi = 0;
+        while mi < live.len() {
+            let m = &mut live[mi];
+            mi += 1;
             if let Some(f) = Flight::of(m, ctx) {
                 draw_train(&mut verts, m, &f, ctx, frame, (square, clean, warm), train);
                 // A dark peel (a Return's or the program's, which rings no
@@ -1514,11 +1519,14 @@ impl Meteors {
             }
         }
         let halo_cap = frame.halos.len() + SPARK_HALO_CAP;
-        for l in landings.iter() {
+        let mut li = 0;
+        while li < landings.len() {
+            let l = &landings[li];
             draw_burst(l, ctx, frame);
             draw_flash(l, ctx, frame);
             draw_pin(l, ctx, frame);
             draw_sparks(l, ctx, frame, halo_cap);
+            li += 1;
         }
 
         self.verts = verts;
@@ -1558,18 +1566,24 @@ impl Meteors {
         if self.landings.is_empty() && self.sown.is_empty() {
             return;
         }
-        for l in &mut self.landings {
+        let mut li = 0;
+        while li < self.landings.len() {
+            let l = &mut self.landings[li];
             if l.sky.is_none() {
                 l.sky = Some(SkyMask::probe(l.x, l.y, dust.probe(), ctx.geom));
             }
+            li += 1;
         }
-        for sow in self.sown.drain(..) {
-            match sow {
+        let mut si = 0;
+        while si < self.sown.len() {
+            match self.sown[si] {
                 Sow::Shed { at, spec } => dust.sow_shed(at, spec, ctx),
                 Sow::Fan { at, spec } => dust.sow_fan(at, spec, ctx),
                 Sow::MiniFan { at, at_px, seed } => dust.sow_mini_fan(at, at_px, seed, ctx),
             }
+            si += 1;
         }
+        self.sown.clear();
     }
 
     /// Meteors not on the 60 ms retire (`trail status` `meteors=`).
@@ -1602,7 +1616,10 @@ impl Meteors {
         if self.reduced {
             return false;
         }
-        for m in &self.live {
+        let live = self.live.as_slice();
+        let mut i = 0;
+        while i < live.len() {
+            let m = &live[i];
             let active = match m.retired_at {
                 Some(_) => now < m.end(),
                 None => now < m.arrival() + ROOT_SUCK_DUR,
@@ -1610,11 +1627,15 @@ impl Meteors {
             if active {
                 return true;
             }
+            i += 1;
         }
-        for l in &self.landings {
-            if now < l.moving_until() {
+        let landings = self.landings.as_slice();
+        let mut j = 0;
+        while j < landings.len() {
+            if now < landings[j].moving_until() {
                 return true;
             }
+            j += 1;
         }
         false
     }
@@ -1624,7 +1645,10 @@ impl Meteors {
         if self.reduced {
             return false;
         }
-        for m in &self.live {
+        let live = self.live.as_slice();
+        let mut i = 0;
+        while i < live.len() {
+            let m = &live[i];
             let active = match m.retired_at {
                 Some(_) => now < m.end(),
                 None => now < m.arrival() + PIN_DUR,
@@ -1632,11 +1656,15 @@ impl Meteors {
             if active {
                 return true;
             }
+            i += 1;
         }
-        for l in &self.landings {
-            if now < l.pin.at + PIN_DUR {
+        let landings = self.landings.as_slice();
+        let mut j = 0;
+        while j < landings.len() {
+            if now < landings[j].pin.at + PIN_DUR {
                 return true;
             }
+            j += 1;
         }
         false
     }
@@ -1655,7 +1683,10 @@ impl Meteors {
             cad.tail(0.0);
             return cad.take();
         }
-        for m in &self.live {
+        let live = self.live.as_slice();
+        let mut i = 0;
+        while i < live.len() {
+            let m = &live[i];
             if self.reduced {
                 let fade_from = m.end() - REDUCED_MOTION_FADE_DUR;
                 if m.retired_at.is_none() && now < fade_from {
@@ -1665,8 +1696,12 @@ impl Meteors {
                 }
             }
             cad.tail_at(m.end());
+            i += 1;
         }
-        for l in &self.landings {
+        let landings = self.landings.as_slice();
+        let mut j = 0;
+        while j < landings.len() {
+            let l = &landings[j];
             if self.reduced {
                 let fade_from = l.static_end() - REDUCED_MOTION_FADE_DUR;
                 if now < fade_from {
@@ -1678,6 +1713,7 @@ impl Meteors {
             } else {
                 cad.tail_at(l.end());
             }
+            j += 1;
         }
         cad.take()
     }
@@ -1785,7 +1821,7 @@ impl Meteors {
         if drow == 0 {
             let n = dcol.unsigned_abs();
             if n < u32::from(JUMP_MIN_CELLS) {
-                if (u32::from(MINI_FAN_MIN_CELLS)..=u32::from(MINI_FAN_MAX_CELLS)).contains(&n) {
+                if n >= u32::from(MINI_FAN_MIN_CELLS) && n <= u32::from(MINI_FAN_MAX_CELLS) {
                     self.ord = self.ord.wrapping_add(1);
                     self.sown.push(Sow::MiniFan {
                         at,
@@ -1843,7 +1879,11 @@ impl Meteors {
         let mut chained: Option<usize> = None;
         let chain_reach = CHAIN_CELLS * cw;
         let chain_reach_sq = chain_reach * chain_reach;
-        for (i, old) in self.live.iter_mut().enumerate() {
+        let mut i = 0;
+        while i < self.live.len() {
+            let old = &mut self.live[i];
+            let cur_i = i;
+            i += 1;
             if old.retired_at.is_some()
                 || old.chained
                 || old.landed
@@ -1865,16 +1905,19 @@ impl Meteors {
                     old.t_flight = at.saturating_duration_since(old.t0);
                 }
                 old.chained = true;
-                chained = Some(i);
+                chained = Some(cur_i);
                 break;
             }
         }
 
         let corridor = CORRIDOR_CH * ch;
-        let same_row =
-            |old: &Meteor| m.y0 == m.y1 && old.y0 == old.y1 && m.y0 == old.y0 && at < old.arrival();
-        for (i, old) in self.live.iter_mut().enumerate() {
-            if Some(i) == chained || old.retired_at.is_some() {
+        let m_flat = m.y0 == m.y1;
+        let mut i = 0;
+        while i < self.live.len() {
+            let old = &mut self.live[i];
+            let cur_i = i;
+            i += 1;
+            if Some(cur_i) == chained || old.retired_at.is_some() {
                 continue;
             }
             let near = seg_gap(
@@ -1883,20 +1926,24 @@ impl Meteors {
                 (old.x0, old.y0),
                 (old.x1, old.y1),
             ) <= corridor;
-            if near || same_row(old) {
+            let same_row = m_flat && old.y0 == old.y1 && m.y0 == old.y0 && at < old.arrival();
+            if near || same_row {
                 old.retired_at = Some(at);
             }
         }
 
         if self.live.len() >= METEOR_POOL {
             let mut victim: Option<(usize, Instant)> = None;
-            for (i, x) in self.live.iter().enumerate() {
+            let mut i = 0;
+            while i < self.live.len() {
+                let x = &self.live[i];
                 if x.retired_at.is_some() {
                     let end = x.end();
                     if !matches!(victim, Some((_, best)) if end >= best) {
                         victim = Some((i, end));
                     }
                 }
+                i += 1;
             }
             self.live.remove(match victim {
                 Some((i, _)) => i,
@@ -1909,7 +1956,9 @@ impl Meteors {
         while unretired > FLIGHT_MAX_LIVE {
             let mut fallback = None;
             let mut landed = None;
-            for (i, x) in self.live.iter().enumerate() {
+            let mut i = 0;
+            while i < self.live.len() {
+                let x = &self.live[i];
                 if x.retired_at.is_none() {
                     if fallback.is_none() {
                         fallback = Some(i);
@@ -1919,6 +1968,7 @@ impl Meteors {
                         break;
                     }
                 }
+                i += 1;
             }
             let Some(i) = (match landed {
                 Some(i) => Some(i),
@@ -2282,34 +2332,39 @@ impl<'a> Behind<'a> {
         if !self.on || self.keep.rows().is_empty() || from >= quads.len() {
             return;
         }
-        let scale = |q: &mut GlowQuad, k: f32| {
+        #[inline]
+        const fn scale_quad(q: &mut GlowQuad, k: f32) {
             let a = (k * 255.0).round().clamp(0.0, 255.0) as u8;
             q.color = premul_rgb(q.color, a);
             q.color2 = premul_rgb(q.color2, a);
-            q.alpha = (f32::from(q.alpha) * k).round() as u8;
-            q.alpha2 = (f32::from(q.alpha2) * k).round() as u8;
-        };
+            q.alpha = (q.alpha as f32 * k).round() as u8;
+            q.alpha2 = (q.alpha2 as f32 * k).round() as u8;
+        }
         let n0 = quads.len();
         let mut any_zero = false;
-        for i in from..n0 {
+        let mut i = from;
+        while i < n0 {
             let q = quads[i];
+            let cur_i = i;
+            i += 1;
             let (x0, y0) = (i32::from(q.x), i32::from(q.y));
             let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
             let Some((z0, z1)) = self.zone((x0, x1), (y0, y1)) else {
                 continue;
             };
             let cx = 0.5 * (x0 + x1) as f32;
-            for y in z0..z1 {
+            let mut y = z0;
+            while y < z1 {
                 let k = self.at(cx, y as f32 + 0.5);
-                if k * 255.0 < 1.0 {
-                    continue;
+                if k * 255.0 >= 1.0 {
+                    let mut piece = q;
+                    (piece.y, piece.h) = (y as u16, 1);
+                    if k < 1.0 {
+                        scale_quad(&mut piece, k);
+                    }
+                    quads.push(piece);
                 }
-                let mut piece = q;
-                (piece.y, piece.h) = (y as u16, 1);
-                if k < 1.0 {
-                    scale(&mut piece, k);
-                }
-                quads.push(piece);
+                y += 1;
             }
             if z1 < y1 {
                 let mut below = q;
@@ -2317,21 +2372,23 @@ impl<'a> Behind<'a> {
                 quads.push(below);
             }
             if z0 > y0 {
-                quads[i].h = (z0 - y0) as u16;
+                quads[cur_i].h = (z0 - y0) as u16;
             } else {
-                quads[i].w = 0;
+                quads[cur_i].w = 0;
                 any_zero = true;
             }
         }
         if any_zero {
             let mut kept = from;
-            for i in from..quads.len() {
+            let mut i = from;
+            while i < quads.len() {
                 if quads[i].w > 0 {
                     if kept != i {
                         quads[kept] = quads[i];
                     }
                     kept += 1;
                 }
+                i += 1;
             }
             quads.truncate(kept);
         }
@@ -2346,12 +2403,21 @@ impl<'a> Behind<'a> {
     /// lays, laid into `quads` as that piece: it draws nothing, and every
     /// count of the stream counts it as the legacy one does.
     fn cut_ramps(self, (quads, ramps): (&mut Vec<GlowQuad>, &mut GlowRamps), from: RampMark) {
+        #[inline]
+        const fn scale_end(e: GlowEnd, cov: u8, s: f32) -> GlowEnd {
+            glow_end(
+                premul_rgb(end_color(e), cov),
+                (end_alpha(e) as f32 * s).round() as u8,
+            )
+        }
         if !self.on || self.keep.rows().is_empty() {
             return;
         }
         let k0 = from.items();
-        for i in k0..ramps.items.len() {
+        let mut i = k0;
+        while i < ramps.items.len() {
             let r = ramps.items[i];
+            i += 1;
             debug_assert_eq!(r.joined, 0, "a train lays rows, no run: {r:?}");
             let (x0, y0) = (i32::from(r.x), i32::from(r.y));
             let (x1, y1) = (x0 + i32::from(r.w), y0 + i32::from(r.h));
@@ -2359,9 +2425,11 @@ impl<'a> Behind<'a> {
                 continue;
             }
             let cx = 0.5 * (x0 + x1) as f32;
-            for row in 0..r.h {
+            let mut row = 0;
+            while row < r.h {
                 let y = y0 + i32::from(row);
                 let k = r.ink as usize + 2 * usize::from(row);
+                row += 1;
                 let (a, b) = (ramps.ends[k], ramps.ends[k + 1]);
                 if a | b == 0 || self.zone((x0, x1), (y, y + 1)).is_none() {
                     continue;
@@ -2371,13 +2439,7 @@ impl<'a> Behind<'a> {
                     (0, 0)
                 } else if s < 1.0 {
                     let cov = (s * 255.0).round().clamp(0.0, 255.0) as u8;
-                    let scale = |e: GlowEnd| {
-                        glow_end(
-                            premul_rgb(end_color(e), cov),
-                            (f32::from(end_alpha(e)) * s).round() as u8,
-                        )
-                    };
-                    (scale(a), scale(b))
+                    (scale_end(a, cov, s), scale_end(b, cov, s))
                 } else {
                     continue;
                 };
@@ -2408,25 +2470,29 @@ impl<'a> Behind<'a> {
         }
         let n0 = halos.len();
         let mut any_zero = false;
-        for i in from..n0 {
+        let mut i = from;
+        while i < n0 {
             let h = halos[i];
+            let cur_i = i;
+            i += 1;
             let (x0, y0) = (i32::from(h.x), i32::from(h.y));
             let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
             let Some((z0, z1)) = self.zone((x0, x1), (y0, y1)) else {
                 continue;
             };
             let cx = f32::from(h.cx);
-            for y in z0..z1 {
+            let mut y = z0;
+            while y < z1 {
                 let k = self.at(cx, y as f32 + 0.5);
-                if k * 255.0 < 1.0 {
-                    continue;
+                if k * 255.0 >= 1.0 {
+                    let mut piece = h;
+                    (piece.y, piece.h) = (y as u16, 1);
+                    if k < 1.0 {
+                        piece.color = premul_rgb(h.color, (k * 255.0).round() as u8);
+                    }
+                    halos.push(piece);
                 }
-                let mut piece = h;
-                (piece.y, piece.h) = (y as u16, 1);
-                if k < 1.0 {
-                    piece.color = premul_rgb(h.color, (k * 255.0).round() as u8);
-                }
-                halos.push(piece);
+                y += 1;
             }
             if z1 < y1 {
                 let mut below = h;
@@ -2434,21 +2500,23 @@ impl<'a> Behind<'a> {
                 halos.push(below);
             }
             if z0 > y0 {
-                halos[i].h = (z0 - y0) as u16;
+                halos[cur_i].h = (z0 - y0) as u16;
             } else {
-                halos[i].w = 0;
+                halos[cur_i].w = 0;
                 any_zero = true;
             }
         }
         if any_zero {
             let mut kept = from;
-            for i in from..halos.len() {
+            let mut i = from;
+            while i < halos.len() {
                 if halos[i].w > 0 {
                     if kept != i {
                         halos[kept] = halos[i];
                     }
                     kept += 1;
                 }
+                i += 1;
             }
             halos.truncate(kept);
         }
@@ -2754,12 +2822,19 @@ fn build_stations(
     let ease_tail = (END_EASE_TAIL_CELLS * cw).min(END_EASE_SPAN_SHARE * span);
     let inv_ease_head = 1.0 / ease_head.max(1e-3);
     let inv_ease_tail = 1.0 / ease_tail.max(1e-3);
-    let ends = |s: f32| {
+    #[inline]
+    const fn station_ends(
+        s: f32,
+        square: bool,
+        span: f32,
+        inv_ease_head: f32,
+        inv_ease_tail: f32,
+    ) -> f32 {
         if square {
             return 1.0;
         }
         smoothstep01(s * inv_ease_head) * smoothstep01((span - s) * inv_ease_tail)
-    };
+    }
     // A dark train too short to reach full light between its eased ends
     // (a Return's first frames) is drawn at full light in its middle: dimmed
     // whole it reads as a grey and brown smudge.
@@ -2767,8 +2842,16 @@ fn build_stations(
         1.0
     } else {
         let mut peak = 1e-3_f32;
-        for i in 0..=32 {
-            peak = peak.max(ends((span * i as f32) * (1.0 / 32.0)));
+        let mut i = 0;
+        while i <= 32 {
+            peak = peak.max(station_ends(
+                (span * i as f32) * (1.0 / 32.0),
+                square,
+                span,
+                inv_ease_head,
+                inv_ease_tail,
+            ));
+            i += 1;
         }
         peak
     };
@@ -2830,7 +2913,7 @@ fn build_stations(
                 }
             }
         };
-        let end_ease = ends(s);
+        let end_ease = station_ends(s, square, span, inv_ease_head, inv_ease_tail);
         if end_ease <= 0.0 {
             continue;
         }
@@ -3090,7 +3173,9 @@ fn draw_head(
             out
         };
         let (ss, cs) = crate::supernova::sin_cos_f32(spin);
-        for (i, &(si, ci)) in COMA_PETAL_UNIT.iter().enumerate() {
+        let mut i = 0;
+        while i < COMA_PETALS {
+            let (si, ci) = COMA_PETAL_UNIT[i];
             let ca = cs * ci - ss * si;
             let sa = ss * ci + cs * si;
             let (px, py) = (cx + orbit_x * ca, cy + orbit_y * sa);
@@ -3108,6 +3193,7 @@ fn draw_head(
                 petal_y,
                 premul_rgb(rgb, coma_alpha),
             );
+            i += 1;
         }
     }
     let (nx, ny) = (nx * core_k, ny * core_k);
@@ -3195,8 +3281,11 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     );
     let arm_premul = premul_rgb(arms_rgb, cov as u8);
     if reach > 0 {
-        for (x, y, w, h) in arms {
+        let mut ai = 0;
+        while ai < 4 {
+            let (x, y, w, h) = arms[ai];
             push_fx_rect(frame.out, ctx.geom, x, y, w, h, arm_premul);
+            ai += 1;
         }
     }
     push_fx_rect(
@@ -3240,19 +3329,22 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     let y0 = (l.y - geom.ch as f32 * 0.5).round() as i32;
     let colour_scale = colour_share * intensity;
     let white_scale = white_share * intensity;
-    for k in -FLASH_CELLS..=FLASH_CELLS {
-        let blank = matches!(l.sky, Some(s) if s.flash_blank(k));
+    let mut k = -FLASH_CELLS;
+    while k <= FLASH_CELLS {
+        let cur_k = k;
+        k += 1;
+        let blank = matches!(l.sky, Some(s) if s.flash_blank(cur_k));
         let cap = if blank {
             FLASH_FULL_COV
         } else {
             TRANSIENT_STAR_COV_CEIL
         };
-        let x = x0 + k * cw;
+        let x = x0 + cur_k * cw;
         let colour_cov = cap * colour_scale;
         if light {
             let ink = (colour_cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
             if ink > 0 {
-                let stop = spectrum_snap(l.field(k as f32));
+                let stop = spectrum_snap(l.field(cur_k as f32));
                 push_ink_rect(
                     frame.out,
                     geom,
@@ -3276,7 +3368,7 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
             );
         }
         if colour_cov >= 1.0 {
-            let stop = spectrum_snap(l.field(k as f32));
+            let stop = spectrum_snap(l.field(cur_k as f32));
             push_fx_rect(
                 frame.out,
                 geom,
@@ -3358,13 +3450,12 @@ fn burst_lance(
     let light_ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
     let mut s0 = root;
     let mut done = 0.0_f32;
-    for (k, &thick_ch) in sec_thick_px.iter().enumerate() {
+    let mut k = 0;
+    while k < 3 {
+        let thick_ch = sec_thick_px[k];
         done += BURST_SEC_SHARE[k];
-        let s1 = if k + 1 == sec_thick_px.len() {
-            tip
-        } else {
-            root + span * done
-        };
+        k += 1;
+        let s1 = if k == 3 { tip } else { root + span * done };
         if s1 - s0 < 0.5 {
             s0 = s1;
             continue;
@@ -3392,7 +3483,8 @@ fn burst_lance(
         } else {
             frame.beams.clear();
             let ds = s1 - s0;
-            for j in 0..BURST_SEC_STATIONS {
+            let mut j = 0;
+            while j < BURST_SEC_STATIONS {
                 let f = j as f32 * inv_stations;
                 let s = s0 + ds * f;
                 let t = (s - root) * inv_span;
@@ -3403,6 +3495,7 @@ fn burst_lance(
                     color: landing_ink_at(l, px, inv_cw, page, memo),
                     cov: (cov * (1.0 - BURST_TIP_FADE * t)).clamp(0.0, 255.0) as u8,
                 });
+                j += 1;
             }
             frame.lay_beam(clip, thick, step);
         }
@@ -3440,14 +3533,17 @@ fn burst_jet(
     let inv_cw = 1.0 / cw;
     let inv_span = 1.0 / span;
     let mut s0 = root;
-    for k in 0..2 {
+    let mut k = 0;
+    while k < 2 {
         let s1 = sec_end[k];
+        let cur_k = k;
+        k += 1;
         let seg = s1 - s0;
         if seg < 1.0 {
             s0 = s1;
             continue;
         }
-        let thick = (JET_SEC_THICK_CH[k] * ch).max(1.0);
+        let thick = (JET_SEC_THICK_CH[cur_k] * ch).max(1.0);
         let stations = ((seg * inv_cw) * JET_STATIONS_PER_CELL as f32)
             .ceil()
             .max(1.0) as usize
@@ -3458,8 +3554,10 @@ fn burst_jet(
         let h = (thick.round() as i32).max(1);
         let (half_w, half_h) = (w / 2, h / 2);
         frame.beams.clear();
-        for j in 0..stations {
+        let mut j = 0;
+        while j < stations {
             let share = j as f32 * inv_denom;
+            j += 1;
             let d = s0 + seg * share;
             let dx = dir.0 * d;
             let cell = (dx * inv_cw).round() as i32;
@@ -3538,11 +3636,13 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     ];
     let half_root_thick = sec_thick[0] * 0.5;
     let core_step = burst_step(ch, BURST_STEP_CH_SHARE, BURST_STEP_PX);
-    for slot in 0..n {
+    let mut slot = 0;
+    while slot < n {
         if frame.out_ramps.laid(frame.out.len()) >= cap {
             break;
         }
         let i = usize::from(b.order[slot]);
+        slot += 1;
         let dir = b.dir[i];
         let tip =
             (core_full * b.len[i] * grow).min(burst_rise_limit(dir.1, rise_px, half_root_thick));
@@ -3570,8 +3670,11 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     if jet_root <= root {
         return;
     }
-    for (k, &len_share) in JET_LEN_SHARE.iter().enumerate() {
-        for si in 0..2 {
+    let mut k = 0;
+    while k < JET_LEN_SHARE.len() {
+        let len_share = JET_LEN_SHARE[k];
+        let mut si = 0;
+        while si < 2 {
             if frame.out_ramps.laid(frame.out.len()) >= cap {
                 return;
             }
@@ -3589,7 +3692,9 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 light,
                 &mut light_ink_memo,
             );
+            si += 1;
         }
+        k += 1;
     }
 }
 
@@ -3673,8 +3778,12 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
     let gravity_dy = 0.5 * g * age * age;
     let light = !ctx.cfg.dark_theme;
     let mut light_stops = [None; SPECTRUM_STOPS];
-    for spark in l.spark.iter().take(usize::from(l.sparks)) {
-        let Some(((dx, dy), alpha)) = spark_at_with_gravity(*spark, age, gravity_dy) else {
+    let limit = usize::from(l.sparks).min(l.spark.len());
+    let mut si = 0;
+    while si < limit {
+        let spark = l.spark[si];
+        si += 1;
+        let Some(((dx, dy), alpha)) = spark_at_with_gravity(spark, age, gravity_dy) else {
             continue;
         };
         let cov = TRANSIENT_STAR_COV_CEIL * alpha * intensity;
@@ -3739,12 +3848,15 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
     let t_ms = (m.t_flight.as_secs_f32() * 1000.0).max(1.0);
     let speed = head_speed(f.l, t_ms, f.u);
     let v_head = (f.unit.0 * speed, f.unit.1 * speed);
-    for i in 0..n {
-        let bit = 1_u8 << i;
+    let mut i = 0;
+    while i < n {
+        let cur_i = i;
+        i += 1;
+        let bit = 1_u8 << cur_i;
         if m.shed & bit != 0 {
             continue;
         }
-        let share = SHED_S_MIN + (SHED_S_MAX - SHED_S_MIN) * unit01(m.seed, 0x5ED0 ^ i as u32);
+        let share = SHED_S_MIN + (SHED_S_MAX - SHED_S_MIN) * unit01(m.seed, 0x5ED0 ^ cur_i as u32);
         if passed < share {
             continue;
         }
@@ -3760,7 +3872,7 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
                 at_px,
                 v_head,
                 tint_t: m.arc((f.l - s) * inv_cw),
-                seed: mix32(m.seed ^ (i as u32).wrapping_mul(0x9E37_79B9)),
+                seed: mix32(m.seed ^ (cur_i as u32).wrapping_mul(0x9E37_79B9)),
                 n: 1,
             },
         });
@@ -3810,14 +3922,19 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> La
     };
     let seed = mix32(m.seed ^ 0xFA5E);
     let mut spark = [Spark::EMPTY; SPARK_N_MAX];
-    for (k, sp) in spark.iter_mut().enumerate().take(sparks) {
-        *sp = mint_spark(seed, k, ch);
+    let mut k = 0;
+    while k < sparks {
+        spark[k] = mint_spark(seed, k, ch);
+        k += 1;
     }
     if let Some(room) = spark_room(m, ctx, hand_floor) {
-        for sp in spark.iter_mut().take(sparks) {
+        let mut k = 0;
+        while k < sparks {
+            let sp = &mut spark[k];
             if sp.vx < 0.0 && -sp.vx * sp.life > room {
                 sp.vx = -sp.vx;
             }
+            k += 1;
         }
     }
 

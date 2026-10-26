@@ -256,6 +256,7 @@ pub fn admin_cached(paths: &Paths) -> crate::Result<Admin> {
         seed: opened.seed,
         commons_seed: opened.commons_seed,
         commons_bound: opened.commons_bound,
+        custody: opened.custody,
         seq: envelope.seq,
         handoff,
         opened_pairs: envelope.handoff.len(),

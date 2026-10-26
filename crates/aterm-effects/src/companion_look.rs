@@ -206,28 +206,37 @@ impl KittyTenure {
             self.arrival = PetArrival::Quiet;
             return;
         };
-        for s in &mut self.roster {
-            if let Some(h) = s.as_ref()
+        let mut i = 0;
+        while i < HOMECOMING_SLOTS {
+            if let Some(h) = self.roster[i].as_ref()
                 && h.greeted
                 && h.id != id.id
                 && now.saturating_duration_since(h.at) >= HOMECOMING
             {
-                *s = None;
+                self.roster[i] = None;
             }
+            i += 1;
         }
         let mut hit = None;
-        for entry in &mut self.roster {
-            if let Some(h) = entry
+        let mut i = 0;
+        while i < HOMECOMING_SLOTS {
+            if let Some(h) = &self.roster[i]
                 && h.id == id.id
             {
-                hit = Some(h);
+                hit = Some(i);
                 break;
             }
+            i += 1;
         }
         match hit {
-            Some(h) => {
-                h.at = now;
-                self.arrival = if h.greeted {
+            Some(idx) => {
+                let greeted = if let Some(h) = &mut self.roster[idx] {
+                    h.at = now;
+                    h.greeted
+                } else {
+                    false
+                };
+                self.arrival = if greeted {
                     PetArrival::Quiet
                 } else {
                     self.floor(now)
@@ -265,13 +274,15 @@ impl KittyTenure {
     #[inline]
     pub fn commit_hello(&mut self, now: Instant) {
         if let Some(id) = self.worn.as_ref() {
-            for entry in &mut self.roster {
-                if let Some(h) = entry
+            let mut i = 0;
+            while i < HOMECOMING_SLOTS {
+                if let Some(h) = &mut self.roster[i]
                     && h.id == id.id
                 {
                     h.greeted = true;
                     break;
                 }
+                i += 1;
             }
         }
         self.last_hello = Some(now);
@@ -291,8 +302,9 @@ impl KittyTenure {
 fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now: Instant) -> bool {
     let mut slot = None;
     let mut oldest_at = None;
-    for (i, entry) in roster.iter().enumerate() {
-        let Some(h) = entry else {
+    let mut i = 0;
+    while i < HOMECOMING_SLOTS {
+        let Some(h) = &roster[i] else {
             slot = Some(i);
             break;
         };
@@ -304,6 +316,7 @@ fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now
             oldest_at = Some(h.at);
             slot = Some(i);
         }
+        i += 1;
     }
     match slot {
         Some(i) => {

@@ -2057,7 +2057,7 @@ mod tests {
                 .unwrap();
             assert_eq!(off, seq - 1);
         }
-        broker.retain_before(1).expect("the cut");
+        broker.retain_before_carrying_state(1).expect("the cut");
         let fired = base.join("fired");
         let mut c = cfg(&dir);
         c.broker = sock.to_string_lossy().into_owned();

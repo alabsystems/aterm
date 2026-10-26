@@ -107,18 +107,20 @@ pub fn disarm_for_oracle(g: &mut aterm_gpu::GpuRenderer) {
     g.disarm_metal_for_oracle();
     #[cfg(target_os = "linux")]
     g.disarm_gl_for_oracle();
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    g.disarm_d3d11_for_oracle();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let _ = g;
 }
 
 /// The arms a parity test runs on, each a fresh [`backends`] pair at
-/// `px`/`theme`: the native arm (Metal on macOS, GL on Linux) and, in the
-/// oracle build on macOS or Linux, the wgpu oracle.
+/// `px`/`theme`: the native arm (Metal on macOS, GL on Linux, D3D11 on Windows) and, in the
+/// oracle build, the wgpu oracle.
 pub fn arms(px: f32, theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = backends(px, theme);
     #[allow(unused_mut, reason = "the oracle build adds an arm")]
     let mut out = vec![("native", cpu, gpu)];
-    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux", windows)))]
     {
         let (cpu, mut gpu) = backends(px, theme);
         disarm_for_oracle(&mut gpu);
@@ -128,7 +130,7 @@ pub fn arms(px: f32, theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::Gp
 }
 
 /// That `gpu`'s last frame drew on the arm `arm` names (the oracle is
-/// neither Metal nor GL).
+/// neither Metal, GL nor D3D11).
 #[track_caller]
 pub fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
     #[cfg(target_os = "macos")]
@@ -143,7 +145,13 @@ pub fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
         arm == "native",
         "{arm}: the frame's arm"
     );
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    assert_eq!(
+        gpu.last_frame_on_d3d11(),
+        arm == "native",
+        "{arm}: the frame's arm"
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let _ = (arm, gpu);
 }
 

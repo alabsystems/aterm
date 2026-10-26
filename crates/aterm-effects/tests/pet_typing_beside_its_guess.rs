@@ -102,6 +102,10 @@ struct Knobs {
     /// beside the chips, as `rule_walled` sent it until the escort passed
     /// under the chrome over its line.
     line_walled: bool,
+    /// The host's chrome (the chips, the harness's lockup and switch) reserved only from
+    /// this many ms into the take: aterm paints it once it has told the session is Claude
+    /// Code's, a beat after the composer's first frame.
+    chrome_from_ms: u64,
 }
 
 impl Knobs {
@@ -113,6 +117,7 @@ impl Knobs {
         brand: false,
         rule_walled: false,
         line_walled: false,
+        chrome_from_ms: 0,
     };
 }
 
@@ -273,15 +278,16 @@ impl Host {
         let rules = self.rules(input);
         let rule = rules.map(|(_, bottom)| bottom);
         let cols = f32::from(self.cols);
+        let chrome = now >= self.knobs.chrome_from_ms;
         let mut chips: Vec<PetRect> = rule
-            .filter(|_| self.knobs.chips)
+            .filter(|_| self.knobs.chips && chrome)
             .map(|row| {
                 let w = f32::from(CHIPS_COLS);
                 PetRect::new(row as f32, cols - 1.0 - w, 1.0, w)
             })
             .into_iter()
             .collect();
-        if let Some((top, _)) = rules.filter(|_| self.knobs.brand) {
+        if let Some((top, _)) = rules.filter(|_| self.knobs.brand && chrome) {
             let (mark, switch) = (f32::from(BRAND_MARK_COLS), f32::from(BRAND_SWITCH_COLS));
             chips.push(PetRect::new(top as f32, 2.0, 1.0, mark));
             chips.push(PetRect::new(top as f32, cols - 2.0 - switch, 1.0, switch));
@@ -915,9 +921,9 @@ fn the_pet_rides_the_composer_down_when_its_chips_come_onto_it() {
                  composer's rule moved {moved} rows"
             );
         }
-        if *rows == 22 {
-            assert!(m.rides.is_empty(), "{label}: rides {:?}", m.rides);
-        } else {
+        // At 22 rows the wrap's growth never reaches the cat; a ride there is the seat under
+        // the footer going down with the composer, judged with the rest above.
+        if *rows != 22 {
             assert!(
                 !m.rides.is_empty(),
                 "{label}: the wrap grows the composer under the resting cat: rides {:?}",
@@ -1757,19 +1763,20 @@ fn a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles() {
 /// then took the cat to the newest inked row, the spinner's, two rows under a
 /// caret that never went there, and its eviction off the launch card's words
 /// ran it along them. Each flight of the session's first seconds lands where
-/// the caret was as it left or as it came down. Judged plain and with the
-/// chips: the harness's chrome rests the cat beside the composer, not on its
-/// caret's row.
+/// the caret was as it left or as it came down, plain and with the chips. (With
+/// the harness the host holds the composer's upper rule whole and no stand is
+/// under it; that session's one trip, to where the cat rests, is
+/// `the_sessions_first_trip_is_its_only_one`'s.)
 ///
 /// NEGATIVE CONTROL (as run on main before the fix): at 120 Hz the
 /// flight at 1.57 s to row 14 with the caret on row 12; with the echo 150 ms
 /// late, the hop at 0.39 s along row 0 with the caret on rows 6 and 12.
 #[test]
 fn the_first_screens_send_the_cat_only_where_the_caret_was() {
-    for (label, echo, harness, flights, _) in generating_flights() {
-        if harness {
-            continue;
-        }
+    for (label, echo, _, flights, _) in generating_flights()
+        .into_iter()
+        .filter(|(_, _, harness, ..)| !harness)
+    {
         for (at, from, landed, to) in flights.iter().filter(|(at, ..)| *at <= 2_500 + echo) {
             assert!(
                 [from.0, to.0]
@@ -1788,27 +1795,28 @@ fn the_first_screens_send_the_cat_only_where_the_caret_was() {
 /// A FLIGHT COMES DOWN WHERE THE CARET WENT. Claude Code moves its prompt down
 /// the screen as its first screens and a submitted prompt lay the transcript
 /// out, a move every few hundred milliseconds, no key behind any of them. A
-/// flight in the air when the prompt moves rows goes on to its new row (the
-/// session's first bound, to row 10 as the prompt went to row 12; the submit's
-/// hop off the words, along row 13 as the prompt went to row 18): each flight
-/// of the session's first 13 s lands on the caret's row as it comes down, at
-/// 120 and 60 Hz, plain and with the chips, the echo as recorded. (With the
-/// echo 150 ms late the first bound is too far along when the prompt moves to
-/// reach its new row inside the speed cap, and hops after it; the harness's
-/// chrome rests the cat beside the composer, not on its caret's row.)
+/// flight in the air when the prompt moves rows goes on to its new row, drawn
+/// out if it must be to stay inside the animal's speed (the session's first
+/// bound, to row 10 as the prompt went to row 12, the echo as recorded or
+/// 150 ms late); a cat on the ground the prompt moves under rides down with
+/// the rows round it. Each flight of the session's first 13 s lands on the
+/// caret's row as it comes down, at 120 and 60 Hz, the echo as recorded and
+/// 150 ms late, plain and with the chips. (With the harness no stand is under
+/// the composer's upper rule the host holds whole; that session's one trip is
+/// `the_sessions_first_trip_is_its_only_one`'s.)
 ///
-/// NEGATIVE CONTROL (as run before the fix): the first bound came down on row
-/// 10 with the caret on row 12, and the submit's eviction on row 13 with the
-/// caret on row 18, in every one of these hosts.
+/// NEGATIVE CONTROL (as run on main before the re-timing, b81b2c2ff0 +
+/// merges): with the echo 150 ms late the first bound came down on row 10
+/// with the caret on row 12.
 #[test]
 fn a_flight_comes_down_on_the_row_the_caret_went_to() {
-    for (label, echo, harness, flights, _) in generating_flights() {
-        if harness || echo > 0 {
-            continue;
-        }
+    for (label, _, _, flights, _) in generating_flights()
+        .into_iter()
+        .filter(|(_, _, harness, ..)| !harness)
+    {
         let early: Vec<_> = flights.iter().filter(|(at, ..)| *at <= 13_000).collect();
         assert!(
-            early.len() >= 3,
+            early.len() >= 2,
             "{label}: fixture: the first screens and the submit fly ({early:?})"
         );
         for (at, _, landed, to) in early {
@@ -1823,16 +1831,16 @@ fn a_flight_comes_down_on_the_row_the_caret_went_to() {
 }
 
 /// A MID-LINE INSERT WRAPS IN ONE FLIGHT AT MOST. The owner's long insert types
-/// into the first line of Claude Code's two-line composer, the rest of the line
-/// pushed on ahead of the caret to the wall; the cat runs on the line under it,
-/// where its stand went. As the caret comes to the margin the pushed word wraps
-/// down, the caret's row clears, and its stand came back up: the cat hopped onto
-/// the caret's row a second before the wrap and bounded back down at it. It
-/// waits on the next line now: it is there when the caret wraps onto it, and
-/// any flight near the wrap lands on that line, one at most, at 120 and 60 Hz,
-/// echo as recorded and 150 ms late, with and without the host's chrome. (Where
-/// the head law keeps the cat's stand on that line at the wall, as it does
-/// under this composer's lettered first line, the wrap needs no flight.)
+/// into the last line of Claude Code's composer, the rest of the line pushed on
+/// ahead of the caret to the wall, the lines above it lettered to the margin.
+/// The cat follows the writing from a seat its head stays clear on: the
+/// composer's footer under the bottom rule, or the line under the caret's. As
+/// the caret comes to the margin the pushed word wraps down and the caret's row
+/// clears; brought up onto it a second before the wrap, the cat hopped there and
+/// bounded back down at the wrap. It waits where it is now: on the line the
+/// caret wraps onto or on a seat under it, and any flight near the wrap lands
+/// there too, one at most, never on the row the caret left, at 120 and 60 Hz,
+/// echo as recorded and 150 ms late, with and without the host's chrome.
 ///
 /// NEGATIVE CONTROL (as run on main before the fix): 2 flights within 1.5 s of
 /// the wrap in every host, the first a hop up onto row 56 at col 139 with the
@@ -1873,9 +1881,9 @@ fn a_mid_line_insert_wraps_in_one_flight() {
         let (at, line, cat_row) = wraps[0];
         let line = f32::from(line);
         assert!(
-            (cat_row - line).abs() < 0.5,
-            "{label}: the cat waits on the line the caret wraps onto (row {line}), at row \
-             {cat_row}"
+            cat_row > line - 0.5,
+            "{label}: the cat waits on the line the caret wraps onto (row {line}) or under it, \
+             at row {cat_row}"
         );
         let near: Vec<_> = flights
             .iter()
@@ -1883,12 +1891,780 @@ fn a_mid_line_insert_wraps_in_one_flight() {
             .map(|(ms, from, landed, to)| (*ms, *from, (landed.col.round(), landed.row), *to))
             .collect();
         assert!(
-            near.len() <= 1
-                && near
-                    .iter()
-                    .all(|(.., (_, row), _)| (*row - line).abs() < 0.5),
+            near.len() <= 1 && near.iter().all(|(.., (_, row), _)| *row > line - 0.5),
             "{label}: flights within 1.5 s of the wrap at {at} ms onto row {line}, one at most \
-             and onto that row (ms, caret, landing at (col, row), caret): {near:?}"
+             and onto that row or under it (ms, caret, landing at (col, row), caret): {near:?}"
+        );
+    }
+}
+/// The frames of `shots` between `from` and `to` ms with the cat on glass: how far the
+/// cat is from the caret's cell, `(ms, cells)`, rows counted as two columns, measured to
+/// the body's nearest edge (`art_cols` wide).
+fn distances_from_the_caret(shots: &[Shot], from: u64, to: u64) -> Vec<(u64, f32)> {
+    let width = aterm_effects::kitty_pet::art_cols(CW, CH);
+    shots
+        .iter()
+        .filter(|s| (from..=to).contains(&s.ms) && s.frame.alpha > 0)
+        .map(|s| {
+            let cc = f32::from(s.caret.1);
+            let dc = if cc < s.frame.col {
+                s.frame.col - cc
+            } else {
+                (cc - s.frame.col - width).max(0.0)
+            };
+            let dr = s.frame.row - f32::from(s.caret.0);
+            (s.ms, dc.hypot(2.0 * dr))
+        })
+        .collect()
+}
+
+/// THE WRITING IS FOLLOWED, NOT WATCHED FROM THE FAR MARGIN. The owner's long
+/// insert types for ten seconds into the middle of the last line of Claude
+/// Code's composer, every line above lettered to within a few cells of the
+/// margin, the rest of the caret's line pushed on ahead of it. The stand beside
+/// the caret is on those letters; the head law (a cat's head never on a letter) took the cat
+/// along the row to the only spot whose row above held no letter, the far
+/// margin, 80 to 125 cells from the writing for the whole of it. It sits on the
+/// composer's footer under the caret now (its head over the bottom rule, no
+/// letter under it), or beside the chips that cover the footer's end, and goes
+/// with the writing. It sets out once the arrow keys have left the caret at
+/// the insert's point half a second (`HEAD_SEAT_SETTLE`: a caret walked to and
+/// fro by words is watched from where the cat stands), and its two bounds
+/// across the composer have come down by the insert's first second: from then
+/// on never more than 30 cells from the caret (rows counted as two) while the
+/// insert is typed, at 120 and 60 Hz, the echo as recorded and 150 ms late,
+/// plain, with the chips and with the harness.
+///
+/// NEGATIVE CONTROL (as run on main before the fix): 123 cells at most and 79
+/// at the median in every host, every frame further than 30.
+#[test]
+fn a_long_insert_is_followed_from_near_the_writing() {
+    let runs: Vec<(u64, u64, &str, Knobs)> = [(8, 0), (16, 0), (8, 150), (16, 150)]
+        .into_iter()
+        .flat_map(|(frame_ms, echo_ms)| {
+            [
+                ("plain", Knobs::SHIPPED),
+                (
+                    "chips",
+                    Knobs {
+                        chips: true,
+                        ..Knobs::SHIPPED
+                    },
+                ),
+                (
+                    "harness",
+                    Knobs {
+                        chips: true,
+                        brand: true,
+                        ..Knobs::SHIPPED
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(move |(host, k)| {
+                (
+                    frame_ms,
+                    echo_ms,
+                    host,
+                    Knobs {
+                        frame_ms,
+                        echo_ms,
+                        ..k
+                    },
+                )
+            })
+        })
+        .collect();
+    let seen = crate::common::par_map(&runs, |&(frame_ms, echo_ms, host, knobs)| {
+        let far = distances_from_the_caret(replayed(3, knobs), 13_200 + echo_ms, 22_300 + echo_ms)
+            .into_iter()
+            .filter(|&(_, d)| d > 30.0)
+            .collect::<Vec<_>>();
+        (
+            format!("{frame_ms} ms a frame, echo +{echo_ms} ms, {host}"),
+            far,
+        )
+    });
+    for (label, far) in seen {
+        assert!(
+            far.is_empty(),
+            "{label}: {} frames of the insert with the cat over 30 cells from the caret (ms, \
+             cells): {:?}",
+            far.len(),
+            &far[..far.len().min(6)]
+        );
+    }
+}
+
+/// The long insert's events with each multi-byte printable input split into one key a
+/// millisecond, as the app notes each key it sends (the owner's dictation types its chunks
+/// as keys).
+fn long_insert_by_keys() -> Vec<(u64, Rec)> {
+    let mut out = Vec::new();
+    for (ms, ev) in recording(TAKES[3].src, 1_000_000) {
+        match ev {
+            Rec::In(b) if b.as_slice() == b"\x1b[99;5u" => {
+                out.push((ms, Rec::In(b)));
+                break;
+            }
+            Rec::In(b) if b.len() > 1 && b.iter().all(|c| (0x20..0x7f).contains(c)) => {
+                for (i, c) in b.iter().enumerate() {
+                    out.push((ms + i as u64 / 8, Rec::In(vec![*c])));
+                }
+            }
+            ev => out.push((ms, ev)),
+        }
+    }
+    out
+}
+
+/// THE ARROW KEYS WALK THE CARET, NOT THE CAT TO THE FAR MARGIN. After the
+/// long insert's dictation the cat stands beside the line's end; the arrow
+/// keys then walk the caret back into the line, letter by letter, to the
+/// insert's point. While the caret is on the move the head law's slide along
+/// the row stays within reach of the caret (`HEAD_SEAT_REACH`), and the seat
+/// under the box waits for the caret to rest: no landing past column 100 from
+/// the dictation's end to the first key of the insert, and two flights at
+/// most, at 120 and 60 Hz, plain and with the harness, the dictation typed as
+/// keys.
+///
+/// NEGATIVE CONTROL (as run before the fix): the cat flew from the line's end
+/// to column 137 as the arrows walked the caret, and crossed back in two
+/// bounds once they stopped.
+#[test]
+fn the_arrow_keys_walk_the_caret_not_the_cat_to_the_far_margin() {
+    for (frame_ms, brand) in [(8u64, false), (16, false), (8, true), (16, true)] {
+        let knobs = Knobs {
+            frame_ms,
+            chips: brand,
+            brand,
+            ..Knobs::SHIPPED
+        };
+        let h = Host::replay_events(&TAKES[3], knobs, long_insert_by_keys());
+        let walk: Vec<_> = flights_of(&h.shots)
+            .into_iter()
+            .filter(|(at, ..)| (7_500..12_180).contains(at))
+            .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
+            .collect();
+        assert!(
+            walk.len() <= 2 && walk.iter().all(|(_, _, (col, _), _)| *col <= 100.0),
+            "{frame_ms} ms a frame, harness {brand}: flights from the dictation's end to the \
+             insert (ms, caret, landing at (col, row), caret): {walk:?}"
+        );
+    }
+}
+
+/// THE COMPOSER'S RULE CARRIES THE CAT IT GROWS UNDER. With the harness the
+/// cat waits on top of the composer's upper rule (the host's line) as the
+/// owner's dictation types the long insert's lines; the composer grows a row
+/// up under it with each, and where the rows round the cat rose with the rule
+/// the host carries the cat up with them (`line_ride`). Hopped off as chrome
+/// come over it instead, it was a hop for every row. The dictation's rows carry
+/// the cat on at least four presents, at 120 and 60 Hz.
+///
+/// NEGATIVE CONTROL (as run before the fix): no present carried; nine hops.
+#[test]
+fn the_composers_rule_carries_the_cat_it_grows_under() {
+    for frame_ms in [8u64, 16] {
+        let knobs = Knobs {
+            frame_ms,
+            chips: true,
+            brand: true,
+            ..Knobs::SHIPPED
+        };
+        let h = Host::replay_events(&TAKES[3], knobs, long_insert_by_keys());
+        let carried = h
+            .shots
+            .iter()
+            .filter(|s| (2_300..7_700).contains(&s.ms) && s.reason == "content-ride")
+            .count();
+        assert!(
+            carried >= 4,
+            "{frame_ms} ms a frame: the dictation's growing composer carried the cat on \
+             {carried} presents"
+        );
+    }
+}
+
+/// THE SESSION'S FIRST TRIP IS ITS ONLY ONE. A cat asleep at the top-left wakes
+/// as Claude Code's first screens lay out the session and its first turn pushes
+/// the composer down the screen. It goes once, and that trip ends where it then
+/// rests, by the prompt: plain, on the composer's line, where the first key will
+/// be typed (a prompt that moves on while the cat is in the air takes the landing
+/// with it; a prompt pushed down under the resting cat carries it down). With the
+/// harness, whose upper rule the host holds whole (aterm-effects SPECS
+/// `host-line-head-law`: no stand under it), the console seats a resting cat on
+/// the clean ground nearest the caret's stand (here under the composer's footer:
+/// the first turn's spinner is over the rule), and a seat taken for the first
+/// composer goes with the caret when the turn pushes it down: the landing goes on
+/// to the new seat, and the cat rests within four rows of the caret's.
+/// Judged on the first 10 s at 120 and 60 Hz, with the echo from as recorded to
+/// 300 ms late, plain and with the harness: one flight at most, landing where the
+/// cat is at 3 s; plain, on the caret's row; with the harness, by the composer.
+///
+/// NEGATIVE CONTROL (as run before the fix, a seat kept anywhere in reach): with
+/// the harness and the echo 10 ms late or more the cat rested at row 3.85 under
+/// the launch card, eight rows from the caret's row 12, until the first turn's end
+/// at 11.7 s sent it down.
+#[test]
+fn the_sessions_first_trip_is_its_only_one() {
+    let mut runs: Vec<(String, Knobs)> = Vec::new();
+    for frame_ms in [8u64, 16] {
+        for echo_ms in [0u64, 10, 20, 40, 80, 120, 150, 200, 300] {
+            for (host, k) in [
+                ("plain", Knobs::SHIPPED),
+                (
+                    "harness",
+                    Knobs {
+                        chips: true,
+                        brand: true,
+                        ..Knobs::SHIPPED
+                    },
+                ),
+            ] {
+                runs.push((
+                    format!("{frame_ms} ms a frame, echo +{echo_ms} ms, {host}"),
+                    Knobs {
+                        frame_ms,
+                        echo_ms,
+                        ..k
+                    },
+                ));
+            }
+        }
+    }
+    let seen = crate::common::par_map(&runs, |(label, knobs)| {
+        let h = Host::replay(&TAKES[0], *knobs);
+        let flights: Vec<_> = flights_of(&h.shots)
+            .into_iter()
+            .filter(|(at, ..)| *at < 10_000)
+            .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
+            .collect();
+        let at3 = h
+            .shots
+            .iter()
+            .find(|s| s.ms >= 3_000 + knobs.echo_ms)
+            .map(|s| (s.frame.col, s.frame.row, s.caret));
+        (label.clone(), knobs.brand, flights, at3)
+    });
+    for (label, harness, flights, at3) in seen {
+        assert!(
+            flights.len() <= 1,
+            "{label}: the session's first trips (ms, caret, landing at (col, row), caret): \
+             {flights:?}"
+        );
+        let (col, row, caret) = at3.expect("frames at 3 s");
+        if harness {
+            for (at, _, (_, landed), _) in &flights {
+                assert!(
+                    (row - landed).abs() < 0.5,
+                    "{label}: the flight at {at} ms came down on row {landed}, and at 3 s the \
+                     cat rests at ({col:.1}, {row})"
+                );
+            }
+            assert!(
+                (row - f32::from(caret.0)).abs() <= 4.0,
+                "{label}: at 3 s the cat rests at ({col:.1}, {row}), the caret at {caret:?}: \
+                 not by the composer"
+            );
+        } else {
+            assert!(
+                (row - f32::from(caret.0)).abs() < 0.5,
+                "{label}: at 3 s the cat rests at ({col:.1}, {row}), the caret at {caret:?}"
+            );
+        }
+    }
+}
+
+/// THE SEAT UNDER THE FOOTER RIDES THE COMPOSER DOWN. With the harness the cat
+/// rests on the clean ground under Claude Code's footer. As the session's first
+/// turn ends, its last line pushes the composer down a row, the footer's words
+/// changing as it goes (` · esc to interrupt` gone), so no row round the cat moved
+/// whole: the console's seat goes down the row with the composer, and the cat
+/// rides with it in the frame the composer moves. Hopped after its seat, it
+/// bounded a row down. At 120 and 60 Hz, the echo as recorded and 150 ms late: a
+/// ride as the turn ends (11.2 s to 11.5 s, shifted by the echo) and no flight.
+///
+/// NEGATIVE CONTROL (as run before the fix): a hop at 11.33 s from row 15.85 to
+/// row 16.85, no ride; with the echo 150 ms late the cat was not by the composer.
+#[test]
+fn the_seat_under_the_footer_rides_the_composer_down() {
+    for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+        let knobs = Knobs {
+            frame_ms,
+            echo_ms,
+            chips: true,
+            brand: true,
+            ..Knobs::SHIPPED
+        };
+        let shots = replayed(0, knobs);
+        let span = (11_200 + echo_ms)..(11_500 + echo_ms);
+        let rode = shots
+            .iter()
+            .filter(|s| span.contains(&s.ms) && s.reason == "content-ride")
+            .map(|s| (s.ms, s.frame.row))
+            .collect::<Vec<_>>();
+        let flew = flights_of(shots)
+            .into_iter()
+            .filter(|(at, ..)| span.contains(at))
+            .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
+            .collect::<Vec<_>>();
+        assert!(
+            !rode.is_empty() && flew.is_empty(),
+            "{frame_ms} ms a frame, echo +{echo_ms} ms: rides (ms, row) {rode:?}, flights \
+             (ms, caret, landing, caret) {flew:?}"
+        );
+    }
+}
+
+/// NO BOUND ON THE SPOT. A gather re-reads its target every tick; one whose target
+/// came back within a short walk along its own row (`BOUND_SPAN_MIN`) while it
+/// gathered stands up and walks there. Launched, it hopped a cell or two: the
+/// long insert's cat bounded from column 54.3 to 53.1 as the arrow keys walked
+/// the caret back into the line (the head law's seat at the far margin for a
+/// moment had latched a big jump), and from 140.0 to 138.1 at the far margin. No
+/// flight in any take lands within three cells of where it left on its own row,
+/// at 120 and 60 Hz, the echo as recorded and 150 ms late, plain, with the chips
+/// and with the harness, and the long insert's dictation typed as keys.
+///
+/// NEGATIVE CONTROL (as run before the fix): six such hops in the long insert.
+#[test]
+fn no_flight_is_a_hop_on_the_spot() {
+    let hosts = [
+        Knobs::SHIPPED,
+        Knobs {
+            chips: true,
+            ..Knobs::SHIPPED
+        },
+        Knobs {
+            chips: true,
+            brand: true,
+            ..Knobs::SHIPPED
+        },
+    ];
+    let mut runs: Vec<(usize, Knobs, bool)> = Vec::new();
+    for take in 0..TAKES.len() {
+        for host in hosts {
+            for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+                let knobs = Knobs {
+                    frame_ms,
+                    echo_ms,
+                    ..host
+                };
+                runs.push((take, knobs, false));
+                if take == 3 && echo_ms == 0 {
+                    runs.push((take, knobs, true));
+                }
+            }
+        }
+    }
+    let seen = crate::common::par_map(&runs, |&(take, knobs, keys)| {
+        let typed;
+        let shots: &[Shot] = if keys {
+            typed = Host::replay_events(&TAKES[take], knobs, long_insert_by_keys()).shots;
+            &typed
+        } else {
+            replayed(take, knobs)
+        };
+        let hops = shots
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| {
+                w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap
+            })
+            .filter_map(|(i, w)| {
+                let from = (w[0].frame.col, w[0].frame.row);
+                let landed = shots[i + 1..]
+                    .iter()
+                    .find(|s| s.frame.action != PetAction::Leap)?;
+                let to = (landed.frame.col, landed.frame.row);
+                ((to.1 - from.1).abs() < 0.5 && (to.0 - from.0).abs() < 3.0)
+                    .then_some((w[1].ms, from, to))
+            })
+            .collect::<Vec<_>>();
+        (
+            format!(
+                "{} at {} ms, echo +{} ms, chips {}, harness {}, keys {keys}",
+                TAKES[take].name, knobs.frame_ms, knobs.echo_ms, knobs.chips, knobs.brand
+            ),
+            hops,
+        )
+    });
+    for (label, hops) in seen {
+        assert!(
+            hops.is_empty(),
+            "{label}: flights landing within three cells of where they left (ms, from, to): \
+             {hops:?}"
+        );
+    }
+}
+
+/// A late-chrome run ([`late_chrome_runs`]): its label, its flights, and the presents
+/// `(ms, console reason)` on which the host moved the body off chrome or hid it there (the
+/// console's `cursor-home` and `protected-home-*`).
+type LateChromeRun = (String, Vec<Flown>, Vec<(u64, &'static str)>);
+
+/// The session's first 10 s with the harness's chrome laid at each of `froms` ms into the take,
+/// at 120 and 60 Hz with the echo late by each of `echoes`.
+fn late_chrome_runs(froms: &[u64], echoes: &[u64]) -> Vec<LateChromeRun> {
+    let mut runs: Vec<(String, Knobs)> = Vec::new();
+    for frame_ms in [8u64, 16] {
+        for &echo_ms in echoes {
+            for &chrome_from_ms in froms {
+                runs.push((
+                    format!(
+                        "{frame_ms} ms a frame, echo +{echo_ms} ms, chrome at {chrome_from_ms} ms"
+                    ),
+                    Knobs {
+                        frame_ms,
+                        echo_ms,
+                        chips: true,
+                        brand: true,
+                        chrome_from_ms,
+                        ..Knobs::SHIPPED
+                    },
+                ));
+            }
+        }
+    }
+    crate::common::par_map(&runs, |(label, knobs)| {
+        let h = Host::replay(&TAKES[0], *knobs);
+        let early: Vec<Shot> = h.shots.iter().filter(|s| s.ms < 10_000).copied().collect();
+        let moved = early
+            .iter()
+            .filter(|s| s.reason == "cursor-home" || s.reason.starts_with("protected-home"))
+            .map(|s| (s.ms, s.reason))
+            .collect();
+        (label.clone(), flights_of(&early), moved)
+    })
+}
+
+/// CHROME LAID UNDER THE FIRST BOUND TAKES ITS LANDING. aterm lays the harness's lockup and
+/// switch over Claude Code's composer rule, and its chips, a beat after the composer's first
+/// frame, once it has told the session is Claude Code's: in a window, while the session's
+/// first bound is in the air. The bound comes down clear of the chrome, beside the
+/// composer's line, in the one flight; the host never has to move it off the chrome.
+/// Judged with the chrome laid 500 and 600 ms into the take, at 120 and 60 Hz, with the echo
+/// 10 and 150 ms late.
+///
+/// NEGATIVE CONTROL (as run before the fix): with the echo 10 ms late the bound came down
+/// beside the prompt under the lockup, the host moved it to the footer in one present, and it
+/// leapt to the line: two flights.
+#[test]
+fn chrome_laid_under_the_first_bound_takes_its_landing() {
+    for (label, flights, moved) in late_chrome_runs(&[500, 600], &[10, 150]) {
+        assert!(
+            flights.len() <= 1 && moved.is_empty(),
+            "{label}: flights (ms, caret, landing, caret) {flights:?}; the body moved off \
+             chrome (ms, reason) {moved:?}"
+        );
+    }
+}
+
+/// CHROME LAID OVER THE RESTING CAT IS HOPPED OFF. The harness's chrome laid only once the
+/// cat has come down beside the prompt covers its head: it hops off to its seat beside the
+/// composer's line, as off ink. The host moving it off the chrome in one present is a jump
+/// on the spot. Judged with the chrome laid 1 s and 1.2 s into the take, at 120 and 60 Hz,
+/// with the echo as recorded, 10 and 150 ms late.
+///
+/// NEGATIVE CONTROL (as run before the fix): the host moved the body off the chrome
+/// (`cursor-home`) as it landed or sat, and the cat leapt from where it was put.
+#[test]
+fn chrome_laid_over_the_resting_cat_is_hopped_off() {
+    for (label, flights, moved) in late_chrome_runs(&[1_000, 1_200], &[0, 10, 150]) {
+        assert!(
+            moved.is_empty() && flights.len() <= 2,
+            "{label}: the body moved off chrome (ms, reason) {moved:?}; flights {flights:?}"
+        );
+    }
+}
+
+/// A host that pastes `text` into the composer at 3.36 s and submits it
+/// `submit_after` ms later; the transcript takes the prompt and the cleared
+/// composer goes down under it. The keys are noted as the app notes them: the
+/// paste as a paste, the Enter as a submit.
+fn pasted_and_submitted(submit_after: u64, frame_ms: u64) -> Host {
+    let text = "please read the design notes in docs and tell me what the footer should do \
+                when the composer wraps past the right edge of the window";
+    let window = Take {
+        name: "paste",
+        src: "",
+        rows: 40,
+        cols: 120,
+    };
+    let composer = |draft: &str, top: usize| -> Vec<u8> {
+        const COLS: usize = 120;
+        let rule = "\u{2500}".repeat(COLS);
+        let footer = "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)";
+        let chars: Vec<char> = draft.chars().collect();
+        let lines: Vec<String> = if chars.is_empty() {
+            vec![String::new()]
+        } else {
+            chars.chunks(COLS - 2).map(|c| c.iter().collect()).collect()
+        };
+        let mut out = String::from("\x1b[?2026h");
+        for row in top..top + 8 {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+        }
+        out.push_str(&format!("\x1b[{top};1H{rule}"));
+        for (i, line) in lines.iter().enumerate() {
+            let lead = if i == 0 { "\u{276f} " } else { "  " };
+            out.push_str(&format!("\x1b[{};1H{lead}{line}", top + 1 + i));
+        }
+        let last = lines.len() - 1;
+        let caret_col = 2 + lines[last].chars().count();
+        let lower = top + lines.len();
+        out.push_str(&format!(
+            "\x1b[{};1H{rule}\x1b[{};1H{footer}\x1b[{};{}H\x1b[?2026l",
+            lower + 1,
+            lower + 2,
+            top + 1 + last,
+            caret_col + 1
+        ));
+        out.into_bytes()
+    };
+    let mut ev: Vec<(u64, Rec, Option<PetInputKind>)> = Vec::new();
+    let mut screen = String::from("\x1b[2J\x1b[H\x1b[?25l");
+    screen.push_str(
+        "\x1b[1;1H \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{258c}   Claude Code v2.1.305",
+    );
+    screen.push_str("\x1b[2;1H\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b}\u{2598}  Opus 5.5 \u{b7} API Usage Billing");
+    screen.push_str("\x1b[3;1H  \u{2598}\u{2598} \u{259d}\u{259d}    /private/tmp/lab/proj");
+    ev.push((0, Rec::Out(screen.into_bytes()), None));
+    ev.push((10, Rec::Out(composer("", 5)), None));
+    let mut t = 1_000;
+    for (n, ch) in "hi ".char_indices() {
+        ev.push((
+            t,
+            Rec::In(ch.to_string().into_bytes()),
+            Some(PetInputKind::Text),
+        ));
+        ev.push((t + 15, Rec::Out(composer(&"hi "[..=n], 5)), None));
+        t += 120;
+    }
+    t += 2_000;
+    let draft = format!("hi {text}");
+    ev.push((t, Rec::In(Vec::new()), Some(PetInputKind::Paste)));
+    ev.push((t + 20, Rec::Out(composer(&draft, 5)), None));
+    t += submit_after;
+    ev.push((t, Rec::In(b"\r".to_vec()), Some(PetInputKind::Submit)));
+    let mut sub = String::from("\x1b[?2026h");
+    sub.push_str(&format!("\x1b[6;1H\x1b[2K> hi {}", &text[..100]));
+    sub.push_str(&format!("\x1b[7;1H\x1b[2K  {}", &text[100..]));
+    sub.push_str("\x1b[9;1H\x1b[2K\u{25cf} Reading the notes\u{2026}");
+    sub.push_str("\x1b[?2026l");
+    ev.push((t + 30, Rec::Out(sub.into_bytes()), None));
+    ev.push((t + 60, Rec::Out(composer("", 11)), None));
+    ev.push((t + 3_000, Rec::Out(Vec::new()), None));
+    let mut h = Host::new(
+        &window,
+        Knobs {
+            frame_ms,
+            ..Knobs::SHIPPED
+        },
+    );
+    for (ms, rec, kind) in ev {
+        h.run_to(ms);
+        if let Some(k) = kind
+            && k != PetInputKind::Text
+        {
+            h.owner.note_console_input(h.now, k);
+        }
+        match rec {
+            Rec::In(b) => {
+                if kind == Some(PetInputKind::Text) {
+                    h.key(&b);
+                }
+            }
+            Rec::Out(b) => h.feed(&b),
+        }
+    }
+    let end = h.ms() + 1_000;
+    h.run_to(end);
+    h
+}
+
+/// A PASTE SUBMITTED AT ONCE IS ONE TRIP. A program that pastes a prompt into
+/// Claude Code's composer and presses Enter within half a second (the harness,
+/// an agent's driver) moves the caret three times: to the end of the pasted
+/// text, then, with the submit's repaint, onto the transcript and down to the
+/// cleared composer under it. The cat leapt at the paste's jump, came down on a
+/// row the submit had left and leapt again. The paste hands the caret to the
+/// program until it settles (`PASTE_SETTLE`): one flight, onto the caret's
+/// row, with the Enter 120 to 450 ms after the paste, at 120 and 60 Hz.
+///
+/// NEGATIVE CONTROL (as run on main before the fix): 2 flights in every case,
+/// the first landing on row 6 or 8 with the caret on row 11 below 450 ms.
+#[test]
+fn a_paste_submitted_at_once_is_one_trip() {
+    let runs: Vec<(u64, u64)> = [120u64, 200, 300, 450]
+        .into_iter()
+        .flat_map(|after| [(after, 8u64), (after, 16)])
+        .collect();
+    let seen = crate::common::par_map(&runs, |&(after, frame_ms)| {
+        let h = pasted_and_submitted(after, frame_ms);
+        let flights: Vec<_> = flights_of(&h.shots)
+            .into_iter()
+            .filter(|(at, ..)| *at >= 3_300)
+            .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
+            .collect();
+        (after, frame_ms, flights)
+    });
+    for (after, frame_ms, flights) in seen {
+        let label = format!("Enter {after} ms after the paste, {frame_ms} ms a frame");
+        assert_eq!(
+            flights.len(),
+            1,
+            "{label}: flights (ms, caret, landing at (col, row), caret): {flights:?}"
+        );
+        let (_, _, (_, row), caret) = flights[0];
+        assert!(
+            (row - f32::from(caret.0)).abs() < 0.5,
+            "{label}: came down on row {row} with the caret on row {}",
+            caret.0
+        );
+    }
+}
+
+/// A PASTE SUBMITTED LATER COMES DOWN ON THE ROW THE PROMPT WENT TO. Enter
+/// pressed 800 ms after the paste comes while the cat is coming down to the
+/// pasted text's end: the cleared composer's prompt lies behind it, under the
+/// transcript. The bound never turns back in the air; it takes the prompt's row
+/// and keeps its column, and goes along the row to the caret from there. Kept on
+/// the row the submit's repaint had left, it came down there and leapt again.
+/// At 120 and 60 Hz: every landing on the caret's row.
+///
+/// NEGATIVE CONTROL (as run before the fix): the first landing on row 8, the
+/// caret on row 11.
+#[test]
+fn a_paste_submitted_later_comes_down_on_the_row_the_prompt_went_to() {
+    for frame_ms in [8u64, 16] {
+        let h = pasted_and_submitted(800, frame_ms);
+        for (at, from, landed, to) in flights_of(&h.shots)
+            .into_iter()
+            .filter(|(at, ..)| *at >= 3_300)
+        {
+            assert!(
+                (landed.row - f32::from(to.0)).abs() < 0.5,
+                "{frame_ms} ms a frame: the flight at {at} ms (caret {from:?}) came down on row \
+                 {} with the caret on row {}",
+                landed.row,
+                to.0
+            );
+        }
+    }
+}
+
+/// The first key the take's recording sends, in ms.
+fn first_key_ms(take: &Take) -> u64 {
+    recording(take.src, 1_000_000)
+        .into_iter()
+        .find_map(|(ms, ev)| match ev {
+            Rec::In(b) if b.len() == 1 && (0x20..0x7f).contains(&b[0]) => Some(ms),
+            _ => None,
+        })
+        .expect("the take types")
+}
+
+/// THE FIRST KEY COSTS NO FLIGHT UNDER THE HARNESS. The harness's top rule,
+/// which the host holds whole, keeps every stand from under it: the escort's
+/// stand goes on top of it (aterm-effects SPECS `host-line-head-law`). The cat
+/// rested above the composer and flew down to the line each time typing began;
+/// it waits now where typing finds it, and a first key that comes while the
+/// cat is still in the air takes its landing to the escort's stand: no flight
+/// leaves from the first key until the writing has gone 1.5 s, in the composer
+/// and wrap-end takes and in the bracketed composer, at 120 and 60 Hz, echo as
+/// recorded and 150 ms late.
+///
+/// NEGATIVE CONTROL (as run on main before the fix): one flight 0 to 10 ms
+/// after the first key in every host, from row 34.85 or 8.85 down to the
+/// caret's row.
+#[test]
+fn the_first_key_costs_no_flight_under_the_harness() {
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let runs: Vec<(usize, u64, u64)> = [1usize, 2]
+        .into_iter()
+        .flat_map(|take| {
+            [(8u64, 0u64), (16, 0), (8, 150), (16, 150)]
+                .into_iter()
+                .map(move |(f, e)| (take, f, e))
+        })
+        .collect();
+    let mut seen = crate::common::par_map(&runs, |&(take, frame_ms, echo_ms)| {
+        let knobs = Knobs {
+            frame_ms,
+            echo_ms,
+            ..harness
+        };
+        let key = first_key_ms(&TAKES[take]);
+        let flights: Vec<_> = flights_of(replayed(take, knobs))
+            .into_iter()
+            .filter(|(at, ..)| (key..=key + 1_500).contains(at))
+            .map(|(at, ..)| at)
+            .collect();
+        (
+            format!("{} at {frame_ms} ms, echo +{echo_ms} ms", TAKES[take].name),
+            key,
+            flights,
+        )
+    });
+    let h = Host::replay_events(
+        &Take {
+            name: "bracketed",
+            src: "",
+            rows: 40,
+            cols: 120,
+        },
+        harness,
+        bracketed_composer_take(),
+    );
+    seen.push((
+        "bracketed at 8 ms".to_string(),
+        1_000,
+        flights_of(&h.shots)
+            .into_iter()
+            .filter(|(at, ..)| (1_000..=2_500).contains(at))
+            .map(|(at, ..)| at)
+            .collect(),
+    ));
+    for (label, key, flights) in seen {
+        assert!(
+            flights.is_empty(),
+            "{label}: flights leaving after the first key at {key} ms: {flights:?}"
+        );
+    }
+}
+
+/// A JUMP A PROGRAM TAKES STRAIGHT BACK IS NO TRIP. Between turns a program
+/// types a prompt into Claude Code's composer and submits it at once (`go
+/// slowly`, 340 ms later): the caret runs nine cells along the row and comes
+/// back. The cat pounced at the first jump and turned round in the air for the
+/// second. The coil waits out a lone jump along the row (`LONE_SETTLE`) and,
+/// the caret back where the cat stands, leaves nowhere: no flight from 39.3 s
+/// to 40.6 s, at 120 and 60 Hz, echo as recorded and 150 ms late, plain and
+/// with the chips. With the harness the cat rests on clean ground on top of
+/// the composer's upper rule, past the transcript's last line, and the
+/// program's prompt calls it to the caret's column: one flight at most, to
+/// where the caret came back to.
+///
+/// NEGATIVE CONTROL (as run on main before the fix): one flight in every host,
+/// out toward column 12 and turned back mid-air to column 3.
+#[test]
+fn a_jump_a_program_takes_straight_back_is_no_trip() {
+    for (label, echo, harness, flights, _) in generating_flights() {
+        let out_and_back: Vec<_> = flights
+            .iter()
+            .filter(|(at, ..)| (39_300 + echo..=40_600 + echo).contains(at))
+            .map(|(at, from, landed, to)| (*at, *from, (landed.col.round(), landed.row), *to))
+            .collect();
+        assert!(
+            out_and_back.len() <= usize::from(harness)
+                && out_and_back.iter().all(|(_, _, _, to)| to.1 < 9),
+            "{label}: flights (ms, caret, landing at (col, row), caret): {out_and_back:?}"
         );
     }
 }

@@ -829,6 +829,7 @@ impl GpuRenderer {
             if let Some(tap) = win.video.as_mut() {
                 tap.gl_enqueue_frame(
                     (dw, dh),
+                    crate::device_layer::TexelFormat::Rgba8Unorm,
                     &pixels,
                     capture_color_space,
                     capture_sdr_white_scale,
@@ -837,6 +838,7 @@ impl GpuRenderer {
             if let Some(tap) = win.presented_snapshot.as_mut() {
                 tap.gl_enqueue_frame(
                     (dw, dh),
+                    crate::device_layer::TexelFormat::Rgba8Unorm,
                     &pixels,
                     capture_color_space,
                     capture_sdr_white_scale,

@@ -3816,7 +3816,10 @@ fn dispatch_hold_verb(
             aterm_containment::mode_or_containment(),
             "hold names its session as the argument: a selector is refused",
         );
-        return "ERR denied\n".to_string();
+        return format!(
+            "ERR usage: hold names its session as its argument, never a selector: {}",
+            crate::fabric::hold_usage(issuer).trim_start_matches("ERR usage: ")
+        );
     }
     #[cfg(unix)]
     if issuer == HoldIssuer::Owner
@@ -6146,9 +6149,9 @@ fn drive_admission(
 }
 
 #[cfg(any(unix, test))]
-const DRIVE_CLOSE_REFUSED: &str = "a drive closes only a worker it spawned since this aterm \
-                                   started (an update or a restart forgets which; the person \
-                                   here closes it)";
+const DRIVE_CLOSE_REFUSED: &str = "a drive closes only a worker it spawned since the driven \
+                                   Mac's aterm started (an update or a restart forgets which; \
+                                   the person at the driven Mac closes it)";
 
 #[cfg(any(unix, test))]
 fn drive_gate(
@@ -6156,9 +6159,12 @@ fn drive_gate(
     hosts: &dyn Fn(&SessionId) -> bool,
     spawned: &dyn Fn(&SessionId) -> bool,
 ) -> Result<DriveLine, String> {
-    const SID: &str = "a drive names a session this Mac hosts by its sid (@s-…)";
-    const HOLD_SID: &str = "a drive's hold names a session this Mac hosts by its bare sid, with \
-                            no @: hold s-… on|off [reason=<pct>]";
+    const SID: &str = "a drive names a session the driven Mac hosts by its sid (`survey --host` \
+                       lists them)";
+    const HOLD_SID: &str = "a drive's hold names a session the driven Mac hosts by its bare sid, \
+                            with no @: hold s-… on|off [reason=<pct>]";
+    const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
+                                 selector: hold s-… on|off [reason=<pct>]";
     let request = Request::parse(line.to_owned());
     if request.frame().is_some() || request.post_frame().is_some() {
         return Err("a drive serves no frame but a worker's task".to_owned());
@@ -6197,7 +6203,8 @@ fn drive_gate(
                                 [reason=<pct>]"
                         .to_owned());
                 }
-                let sid = hosted(sid).ok_or_else(|| HOLD_SID.to_owned())?;
+                let sid = hosted(sid)
+                    .ok_or_else(|| if sid.starts_with('@') { HOLD_SID } else { SID }.to_owned())?;
                 Ok(DriveLine::Act {
                     line: line.to_owned(),
                     write: Some(DriveAct {
@@ -6237,6 +6244,7 @@ fn drive_gate(
                 verb.chars().take(32).collect::<String>()
             )),
         },
+        Some(_) if verb == "hold" => Err(HOLD_SELECTOR.to_owned()),
         Some(Selector::Sid(sid)) => {
             let Some(sid) = hosted(sid.as_str()) else {
                 return Err(SID.to_owned());
@@ -6280,12 +6288,17 @@ fn drive_spawn(
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
 ) -> Result<String, String> {
-    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|codex|agy|muse|grok> \
-                         [model=<m>] [cwd=<absolute>] [from=<sid>] [raise=false] len=<n>";
-    let tokens = control_media::split_quoted_tokens(rest).ok_or(USAGE)?;
+    let usage = || {
+        format!(
+            "a drive spawns only a worker: spawn agent=<{}> [model=<m>] [cwd=<absolute>] \
+             [from=<sid>] [raise=false] - < task",
+            aterm_agent::harness::worker::started_words()
+        )
+    };
+    let tokens = control_media::split_quoted_tokens(rest).ok_or_else(usage)?;
     let (mut agent, mut framed, mut raise) = (false, false, false);
     for token in &tokens {
-        let (key, value) = token.split_once('=').ok_or(USAGE)?;
+        let (key, value) = token.split_once('=').ok_or_else(usage)?;
         match key {
             "agent"
                 if aterm_agent::harness::worker::WORKERS
@@ -6306,17 +6319,17 @@ fn drive_spawn(
             "cwd" => return Err("a drive's spawn names an absolute cwd=".to_owned()),
             "from" if hosts(&SessionId::new(value)) => {
                 return Err(
-                    "a drive's from= is its own session, never one of this Mac's".to_owned(),
+                    "a drive's from= is its own session, never one of the driven Mac's".to_owned(),
                 );
             }
             "from" => {}
             "raise" if value == "false" => raise = true,
             "raise" => return Err("a drive's worker opens raise=false".to_owned()),
-            _ => return Err(USAGE.to_owned()),
+            _ => return Err(usage()),
         }
     }
     if !(agent && framed) {
-        return Err(USAGE.to_owned());
+        return Err(usage());
     }
     Ok(if raise {
         line.to_owned()

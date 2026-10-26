@@ -3096,6 +3096,37 @@ fn the_vault_opens_by_itself_only_when_it_waits_for_input_here() {
 }
 
 #[test]
+fn a_join_password_an_admin_refused_opens_the_fields_again() {
+    let mut app = SystemStateApp::new(Plan::default());
+    let with = |now: &str, note: Option<&str>| {
+        let mut status = status_of("set-up");
+        status
+            .observed
+            .retain(|o| o.subject != Subject::Setting(Setting::Secrets));
+        status.observed.push(observed_with_note(
+            Subject::Setting(Setting::Secrets),
+            Standing::NeedsYou,
+            Some(now),
+            note,
+        ));
+        status
+    };
+    let waiting = with(
+        "Awaiting code",
+        Some("On an admin Mac: aterm secrets approve ABCD-EFGH, or retype the join password"),
+    );
+    app.publish(waiting.clone());
+    act(&mut app, "system-state/row/secrets/disclose");
+    act(&mut app, "system-state/row/secrets/disclose");
+    assert!(!app.vault_shown(), "the person closed the fields");
+    // CONTROL: the same reading again leaves them as the person set them.
+    app.publish(waiting);
+    assert!(!app.vault_shown());
+    app.publish(with("Wrong password", None));
+    assert!(app.vault_shown(), "a refused password opens them again");
+}
+
+#[test]
 fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
     for scenario in [
         "checking",
@@ -4516,7 +4547,7 @@ fn page_states() -> Vec<(String, SetupStatus, bool)> {
                 secrets,
                 Standing::NeedsYou,
                 Some("Awaiting code"),
-                Some("Approve on an admin Mac: 7QK2-M9WD-4HTX-PL3B, or retype the join password"),
+                Some("On an admin Mac: aterm secrets approve 7QK2-M9WD-4HTX-PL3B, or retype the join password"),
             ),
         ),
         false,
@@ -5147,6 +5178,7 @@ fn the_setups_facts_for_later_are_digest_entries() {
     for entry in [
         setup_not_started_entry("initial-setup.json: Permission denied"),
         setup_set_aside_entry("initial-setup.json.unreadable"),
+        setup_unfinished_entry(),
     ] {
         assert_eq!(entry.family(), aterm_messages::exceptions::Family::Setup);
         assert!(entry.message().is_ok(), "{:?}", entry.message().err());
@@ -6650,6 +6682,66 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
         app.take_action(),
         Some(SystemStateAction::InstallDeveloperTools { by_person: true })
     ));
+}
+
+/// A restored installer tab owns its unfinished work without claiming a password prompt or
+/// offering a second installer. A confirmed live installer remains a calm wait; once that
+/// work is gone and the tools are still missing, the row offers a retry.
+#[test]
+fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered() {
+    let repositories = Subject::Setting(Setting::Repositories);
+    let mut status = status_of("clt-recovered");
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status.clone());
+    let view = SystemStateViewState::default();
+    let row = app.reviewed_row(repositories);
+    assert_eq!(app.headline().text, TOOLS_RECOVERED_HEADLINE);
+    assert_eq!(row.standing, Some(Standing::NeedsYou));
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert_eq!(row.note.as_deref(), Some(TOOLS_RECOVERED_NOTE));
+    assert!(!row.install_tools);
+    assert!(
+        compile(&app, &view, 999.0, 1400.0)
+            .semantic(&UiKey::new(INSTALL_TOOLS))
+            .is_none()
+    );
+    assert!(app.needs_attention());
+    assert_eq!(
+        crate::system_state_access::menu_line(&status, false).and_then(|line| line.note),
+        Some(TOOLS_RECOVERED_HEADLINE.to_owned())
+    );
+    app.by_person = true;
+    act(&mut app, INSTALL_TOOLS);
+    assert!(
+        app.take_action().is_none(),
+        "a saved Install action is obsolete"
+    );
+
+    // The live process probe can confirm installation after recovery without requiring a
+    // person, even though the persisted receipt alone did not say the command started.
+    status.developer_tools = Some(ToolsInstall::Installing);
+    app.publish(status.clone());
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.standing, Some(Standing::Waiting));
+    assert_eq!(row.note.as_deref(), Some(INSTALLING_TOOLS_NOTE));
+    assert!(!row.install_tools);
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+
+    status.developer_tools = None;
+    app.publish(status);
+    assert!(app.reviewed_row(repositories).install_tools);
+    assert!(
+        compile(&app, &view, 999.0, 1400.0)
+            .semantic(&UiKey::new(INSTALL_TOOLS))
+            .is_some()
+    );
+    act(&mut app, INSTALL_TOOLS);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::InstallDeveloperTools { by_person: true })
+    ));
+    assert!(app.take_action().is_none(), "one explicit retry");
 }
 
 /// A step the run could not finish keeps its reason on its row (§3.6), in the words its step

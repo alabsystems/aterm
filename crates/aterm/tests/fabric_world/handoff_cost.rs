@@ -12,6 +12,34 @@ const SESSIONS: usize = 8;
 /// The topic every session opts into.
 const TOPIC: &str = "s6.cost";
 
+/// Whether `line`, one that counts or times durable flushes, is of the flushes aterm ships:
+/// it carries no [`aterm_durable::PLAIN_DURABLE_FLUSHES`]. Every instance whose lines are
+/// MEASURED here is relaunched by [`World::relaunch_gui_shipping_flushes`]; a world's first
+/// instance keeps this test binary's mark, and [`its_first_start_is_marked`] shows on it that
+/// this check can fail.
+fn ships(line: &str) -> bool {
+    !line.contains(aterm_durable::PLAIN_DURABLE_FLUSHES)
+}
+
+/// CONTROL for [`ships`]: the world's first instance keeps this test binary's mark, so on
+/// Apple targets every start line it printed names its plain `fsync(2)`s. Read before any
+/// relaunch, while the log holds only its lines.
+fn its_first_start_is_marked(w: &World) {
+    let began = said(w, 0, "aterm-link: the run record says a bridge runs");
+    assert!(
+        !began.is_empty(),
+        "the first instance's start says what it flushed"
+    );
+    for line in &began {
+        assert_eq!(
+            ships(line),
+            !cfg!(target_vendor = "apple"),
+            "CONTROL: under this test binary's mark, a start line names its plain fsync(2)s \
+             on Apple targets: {line}"
+        );
+    }
+}
+
 /// The lines of aterm's log past byte `from` that start with `prefix`.
 fn said(w: &World, from: usize, prefix: &str) -> Vec<String> {
     let log = std::fs::read_to_string(&w.gui_log).unwrap_or_default();
@@ -107,9 +135,10 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
     eprintln!("MEASURED handoff, the old bridge: {stopped:?} {handed:?}");
     assert!(stopped.is_empty(), "a handoff is not the run's end");
     assert_eq!(handed.len(), 1, "it says so once");
+    its_first_start_is_marked(&w);
 
     let successor = log_len(&w);
-    let gui = w.gui.insert(World::relaunch_gui(&w));
+    let gui = w.gui.insert(World::relaunch_gui_shipping_flushes(&w));
     w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
     w.wait_ready();
     let began = said(
@@ -132,6 +161,7 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
         "over the open run it inherits, in full: {}",
         began[0]
     );
+    assert!(ships(&began[0]), "timed as it ships: {}", began[0]);
 
     let before = log_len(&w);
     quit(&mut w);
@@ -143,9 +173,14 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
         "aterm-link: mirror: the floor of the node's total",
     );
     eprintln!("MEASURED handoff, the successor's first floor raise: {floor:?}");
+    assert!(
+        floor.iter().all(|l| ships(l)),
+        "timed as it ships: {floor:?}"
+    );
     let [line] = stopped.as_slice() else {
         panic!("one stop line, not {stopped:?}");
     };
+    assert!(ships(line), "timed as it ships: {line}");
     let files = number(line, "state files");
     assert!(
         files >= 2 * SESSIONS as u64,
@@ -156,4 +191,61 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
         (files + number(line, "directories flushed") + 1, 1),
         "a barrier a file, a directory and the record's bytes, then one full flush: {line}"
     );
+}
+
+/// **A START OVER AN EARLIER BOOT'S CLEAN STOP IS ORDERED BY TWO BARRIERS**
+/// (B07, `StateDir::begin_run`): the first start of a boot after a quit in the
+/// boot before. The barrier orders a start over any earlier boot's record, an
+/// open one (a crash or a power cut in the boot before) as well as a clean
+/// one, and never over a record of this boot. A test cannot reboot, so the
+/// clean stop's record is rewritten to name another boot before the relaunch;
+/// `inc`'s lease still names this boot, so what the start's line times is the
+/// fence alone.
+#[test]
+fn a_start_over_an_earlier_boots_clean_stop_is_ordered_by_two_barriers() {
+    let mut w = World::boot("b07-reboot", &[]);
+    w.wait_ready();
+    let before = log_len(&w);
+    quit(&mut w);
+    let stopped = said(&w, before, "aterm-link: the run stopped cleanly:");
+    assert_eq!(
+        stopped.len(),
+        1,
+        "a quit stops the run cleanly: {stopped:?}"
+    );
+    its_first_start_is_marked(&w);
+    let run = w.state.join("run");
+    let record = std::fs::read_to_string(&run).expect("the clean stop's record");
+    let boot = record
+        .trim()
+        .strip_prefix("clean boot=")
+        .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("a clean record naming a boot: {record:?}"));
+    let earlier: String = boot
+        .chars()
+        .enumerate()
+        .map(|(i, c)| match (i, c) {
+            (0, '0') => '1',
+            (0, _) => '0',
+            (_, c) => c,
+        })
+        .collect();
+    std::fs::write(&run, format!("clean boot={earlier}\n")).expect("an earlier boot's record");
+
+    let start = log_len(&w);
+    let gui = w.gui.insert(World::relaunch_gui_shipping_flushes(&w));
+    w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
+    w.wait_ready();
+    let began = said(&w, start, "aterm-link: the run record says a bridge runs");
+    eprintln!("MEASURED a start over an earlier boot's clean stop: {began:?}");
+    let [line] = began.as_slice() else {
+        panic!("one start line, not {began:?}");
+    };
+    assert_eq!(
+        (number(line, "barriers"), number(line, "full flushes")),
+        (2, 0),
+        "over an earlier boot's record, by the barrier: {line}"
+    );
+    assert!(ships(line), "timed as it ships: {line}");
+    quit(&mut w);
 }

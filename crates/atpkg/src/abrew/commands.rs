@@ -549,7 +549,7 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
                     let mut row = aterm_json::Map::new();
                     row.insert(
                         "full_name".to_string(),
-                        aterm_json::Value::String(prefix.full_name(&inst)),
+                        aterm_json::Value::String(prefix.specified_name(&inst)),
                     );
                     row.insert(
                         "pkg_version".to_string(),
@@ -2364,18 +2364,44 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
             Err(e) => return failed(&format!("abrew: {e}")),
         }
     } else {
+        // Brew prints names alone unless --verbose (which --quiet
+        // overrides); verbose groups every outdated keg version
+        // and marks pins with their pinned version.
+        let verbose = has_flag(rest, "--verbose", "-v") && !has_flag(rest, "--quiet", "-q");
         for (rows, casks) in collected.iter().zip([false, true]) {
+            let kind = if casks { Kind::Cask } else { Kind::Formula };
             for (name, have, latest) in rows {
-                let pin = if !casks && prefix.is_pinned(name) {
-                    " [pinned]"
-                } else {
-                    ""
+                let inst = prefix.installed_one(kind, name);
+                // Brew prints the specified name: the full name
+                // with an official tap prefix stripped.
+                let shown = match &inst {
+                    Some(i) if !casks => prefix.specified_name(i),
+                    _ => name.clone(),
                 };
-                if has_flag(rest, "--verbose", "-v") || !has_flag(rest, "--quiet", "-q") {
-                    println!("{name} ({have}) < {latest}{pin}");
-                } else {
-                    println!("{name}");
+                if !verbose {
+                    println!("{shown}");
+                    continue;
                 }
+                let versions = match &inst {
+                    Some(i) => i
+                        .versions
+                        .iter()
+                        .filter(|v| version_cmp(v, latest) == Ordering::Less)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    None => have.clone(),
+                };
+                let versions = if versions.is_empty() {
+                    have.clone()
+                } else {
+                    versions
+                };
+                let pin = match prefix.pinned_version(name) {
+                    Some(p) => format!(" [pinned at {p}]"),
+                    _ => String::new(),
+                };
+                println!("{shown} ({versions}) < {latest}{pin}");
             }
         }
     }
@@ -2384,6 +2410,53 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Brew's `Formatter.version_changes` in redirected output:
+/// name and version columns padded to their widest entry, a
+/// two-space separator (one space for a single change), and the
+/// download size in parentheses when known.
+fn version_change_lines(rows: &[(String, String, String, Option<String>)]) -> Vec<String> {
+    let name_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let sep = if rows.len() == 1 { " " } else { "  " };
+    let old_width = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+    let versions: Vec<String> = rows
+        .iter()
+        .map(|r| format!("{:old_width$} -> {}", r.1, r.2))
+        .collect();
+    let versions_width = versions.iter().map(|v| v.len()).max().unwrap_or(0);
+    rows.iter()
+        .zip(versions)
+        .map(|(r, versions)| {
+            let mut parts = vec![
+                format!("{:name_width$}", r.0),
+                format!("{versions:versions_width$}"),
+            ];
+            if let Some(size) = &r.3 {
+                parts.push(format!("({size})"));
+            }
+            parts.join(sep).trim_end().to_string()
+        })
+        .collect()
+}
+
+/// A formula's bottle download size for a dry-run table, by HEAD
+/// request. Best effort, like brew's optional bottle size.
+fn upgrade_bottle_size(prefix: &Prefix, api: &Api, name: &str) -> Option<String> {
+    let f = api
+        .formula(name)
+        .ok()
+        .or_else(|| tap::lookup(prefix, name))?;
+    let bottle = f.bottle_for(&super::machine::Machine::this().bottle_tags())?;
+    let mut headers: Vec<String> = Vec::new();
+    if let Some(repo) = super::api::ghcr_repo_of(&bottle.url) {
+        headers.push(format!(
+            "Authorization: Bearer {}",
+            super::api::ghcr_token(&repo).ok()?
+        ));
+    }
+    let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+    fetch::head_size(&bottle.url, &refs).map(disk_usage_readable)
 }
 
 pub(super) fn cmd_upgrade(
@@ -2432,18 +2505,65 @@ pub(super) fn cmd_upgrade(
             Err(error) => return failed(&error),
         };
         if rows.is_empty() {
-            println!("abrew: everything is up to date");
+            // Brew says nothing when there is nothing to do.
+            return ExitCode::SUCCESS;
+        }
+        let (pinned, rows): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|(name, _, _)| prefix.is_pinned(name));
+        if opts.dry_run {
+            if !rows.is_empty() {
+                println!(
+                    "==> Would upgrade {} outdated {}",
+                    rows.len(),
+                    if rows.len() == 1 {
+                        "package"
+                    } else {
+                        "packages"
+                    }
+                );
+                let changes: Vec<_> = rows
+                    .iter()
+                    .map(|(name, have, latest)| {
+                        (
+                            name.clone(),
+                            have.clone(),
+                            latest.clone(),
+                            upgrade_bottle_size(prefix, api, name),
+                        )
+                    })
+                    .collect();
+                for line in version_change_lines(&changes) {
+                    println!("{line}");
+                }
+            }
+            if !pinned.is_empty() {
+                println!(
+                    "==> {} Pinned {}",
+                    pinned.len(),
+                    if pinned.len() == 1 {
+                        "formula"
+                    } else {
+                        "formulae"
+                    }
+                );
+                let changes: Vec<_> = pinned
+                    .iter()
+                    .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
+                    .collect();
+                for line in version_change_lines(&changes) {
+                    println!("{line}");
+                }
+            }
             return ExitCode::SUCCESS;
         }
         let mut failures = 0;
+        let mut upgraded: Vec<(String, String, String, Option<String>)> = Vec::new();
         for (name, have, latest) in rows {
-            if prefix.is_pinned(&name) {
-                eprintln!("==> {name} ({have}) is pinned; skipping");
-                continue;
-            }
             println!("==> Upgrading {name} {have} -> {latest}");
             match install::install(api, prefix, &name, &opts) {
                 Ok(now) if now != have => {
+                    upgraded.push((name.clone(), have, now, None));
                     if !opts.dry_run
                         && let Err(error) =
                             auto_cleanup_old_versions(prefix, api, false, &[name.as_str()])
@@ -2461,6 +2581,40 @@ pub(super) fn cmd_upgrade(
                     eprintln!("abrew: {error}");
                     failures += 1;
                 }
+            }
+        }
+        // Brew's final summary appears once at least two packages
+        // were upgraded.
+        if upgraded.len() >= 2 {
+            println!(
+                "==> Upgraded {} outdated {}",
+                upgraded.len(),
+                if upgraded.len() == 1 {
+                    "package"
+                } else {
+                    "packages"
+                }
+            );
+            for line in version_change_lines(&upgraded) {
+                println!("{line}");
+            }
+        }
+        if !pinned.is_empty() {
+            println!(
+                "==> {} Pinned {}",
+                pinned.len(),
+                if pinned.len() == 1 {
+                    "formula"
+                } else {
+                    "formulae"
+                }
+            );
+            let changes: Vec<_> = pinned
+                .iter()
+                .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
+                .collect();
+            for line in version_change_lines(&changes) {
+                println!("{line}");
             }
         }
         return if failures == 0 {
@@ -2481,6 +2635,7 @@ fn upgrade_formula_names(
 ) -> ExitCode {
     let mut failures = 0;
     let mut landed = false;
+    let mut changes: Vec<(String, String, String, Option<String>)> = Vec::new();
     for name in names {
         let short = Formula::short_name(name);
         let Some(before) = prefix.installed_one(Kind::Formula, short) else {
@@ -2508,10 +2663,45 @@ fn upgrade_formula_names(
             }
             continue;
         }
+        if opts.dry_run {
+            // Brew's dry run resolves and reports; it installs
+            // nothing and prints no per-formula install output.
+            let latest = api
+                .formula(name)
+                .ok()
+                .or_else(|| tap::lookup(prefix, name))
+                .map(|f| install::keg_version(&f));
+            match latest {
+                Some(latest) if version_cmp(&before.version, &latest) == Ordering::Less => {
+                    changes.push((
+                        short.to_string(),
+                        before.version.clone(),
+                        latest,
+                        upgrade_bottle_size(prefix, api, name),
+                    ));
+                }
+                Some(_) => {
+                    eprintln!("Warning: {short} {} already installed", before.version);
+                }
+                None => {
+                    eprintln!("abrew: {short}: no such formula");
+                    failures += 1;
+                }
+            }
+            continue;
+        }
         let result = install::install(api, prefix, name, opts);
         landed |= super::native_attempt_may_have_progress(&result);
         match result {
             Ok(installed_now) => {
+                if installed_now != before.version {
+                    changes.push((
+                        short.to_string(),
+                        before.version.clone(),
+                        installed_now.clone(),
+                        None,
+                    ));
+                }
                 if !opts.dry_run
                     && installed_now != before.version
                     && let Err(error) = auto_cleanup_old_versions(prefix, api, false, &[name])
@@ -2535,6 +2725,27 @@ fn upgrade_formula_names(
                     return from_install(prefix, args, Err(error));
                 }
             }
+        }
+    }
+    // Brew's final summary: always for a dry run, otherwise once
+    // at least two packages were upgraded.
+    if !changes.is_empty() && (opts.dry_run || changes.len() >= 2) {
+        println!(
+            "==> {} {} requested outdated {}",
+            if opts.dry_run {
+                "Would upgrade"
+            } else {
+                "Upgraded"
+            },
+            changes.len(),
+            if changes.len() == 1 {
+                "package"
+            } else {
+                "packages"
+            }
+        );
+        for line in version_change_lines(&changes) {
+            println!("{line}");
         }
     }
     if failures == 0 {
@@ -2575,7 +2786,6 @@ fn cmd_upgrade_casks(
     };
     if rows.is_empty() {
         if failures == 0 {
-            println!("abrew: everything is up to date");
             return ExitCode::SUCCESS;
         }
         return ExitCode::FAILURE;
@@ -2904,9 +3114,12 @@ fn cleanup_old_versions(
 ) -> Result<(usize, u64), String> {
     let mut removed = 0;
     let mut freed = 0u64;
+    let protected = no_cleanup_names();
     for kind in [Kind::Formula, Kind::Cask] {
         for i in prefix.installed(kind) {
-            let _ = api;
+            if kind == Kind::Formula && no_cleanup_formula(api, &i.name, &protected) {
+                continue;
+            }
             let active = prefix
                 .opt(&i.name)
                 .read_link()
@@ -3065,6 +3278,12 @@ const fn unpin_outcome(pinned: bool, installed: bool, definitively_unknown: bool
 }
 
 pub(super) fn cmd_unpin(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    if operands(rest).is_empty() {
+        eprintln!(
+            "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
+        );
+        return ExitCode::from(1);
+    }
     let mut failures = 0;
     for name in operands(rest) {
         let short = Formula::short_name(&name);
@@ -3115,9 +3334,22 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
             return failed(&format!("abrew: no formula or cask named \"{short}\""));
         }
     }
+    let protected = no_cleanup_names();
+    let mut refused = false;
     let scope: Vec<&str> = named
         .iter()
         .map(|s| super::api::canonical_cask_token(Formula::short_name(s)))
+        .filter(|short| {
+            if no_cleanup_formula(api, short, &protected) {
+                eprintln!(
+                    "Error: Refusing to clean {short} because it is listed in HOMEBREW_NO_CLEANUP_FORMULAE!"
+                );
+                refused = true;
+                false
+            } else {
+                true
+            }
+        })
         .collect();
     let mut freed = match cleanup_old_versions(prefix, api, dry, &scope) {
         Ok((_, bytes)) => bytes,
@@ -3142,7 +3374,11 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
             );
         }
     }
-    ExitCode::SUCCESS
+    if refused {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 const MAX_REQUEST_RECEIPT_BYTES: usize = 64 * 1024;
@@ -3178,11 +3414,35 @@ pub(super) fn requested(
     Ok(any)
 }
 
+/// `HOMEBREW_NO_CLEANUP_FORMULAE` entries (comma-separated short
+/// names): formulae cleanup and autoremove must never take.
+fn no_cleanup_names() -> Vec<String> {
+    std::env::var("HOMEBREW_NO_CLEANUP_FORMULAE")
+        .unwrap_or_default()
+        .split(',')
+        .map(|n| Formula::short_name(n.trim()).to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Whether a formula is protected by that list, by name or alias
+/// (brew's Cleanup.skip_clean_formula?).
+fn no_cleanup_formula(api: &Api, name: &str, protected: &[String]) -> bool {
+    if protected.iter().any(|p| p == name) {
+        return true;
+    }
+    api.formula(name)
+        .is_ok_and(|f| f.aliases.iter().any(|a| protected.contains(a)))
+}
+
 fn autoremove_targets(
     prefix: &Prefix,
     read: impl FnMut(&str) -> Result<Formula, String>,
 ) -> Result<Vec<String>, String> {
     let installed = prefix.installed_checked(Kind::Formula)?;
+    // HOMEBREW_NO_CLEANUP_FORMULAE names formulae (and thereby
+    // their dependencies) autoremove must never take.
+    let protected = no_cleanup_names();
     let mut roots = Vec::new();
     let mut pinned = std::collections::BTreeSet::new();
     for i in &installed {
@@ -3190,7 +3450,7 @@ fn autoremove_targets(
         if pin {
             pinned.insert(i.name.clone());
         }
-        if requested(prefix, i)? || pin {
+        if requested(prefix, i)? || pin || protected.contains(&i.name) {
             roots.push(i.name.clone());
         }
     }
@@ -3246,16 +3506,47 @@ pub(super) fn cmd_autoremove(prefix: &Prefix, api: &Api, rest: &[String]) -> Exi
         Err(e) => return failed(&e),
     };
     if targets.is_empty() {
-        println!("Nothing to autoremove.");
+        // Brew says nothing when nothing is removable.
+        return ExitCode::SUCCESS;
+    }
+    let mut names: Vec<String> = targets
+        .iter()
+        .map(|n| {
+            prefix
+                .installed_one(Kind::Formula, n)
+                .map(|i| prefix.specified_name(&i))
+                .unwrap_or_else(|| n.clone())
+        })
+        .collect();
+    names.sort();
+    println!(
+        "==> {} {} unneeded {}:",
+        if dry {
+            "Would autoremove"
+        } else {
+            "Autoremoving"
+        },
+        names.len(),
+        if names.len() == 1 {
+            "formula"
+        } else {
+            "formulae"
+        }
+    );
+    for name in &names {
+        println!("{name}");
+    }
+    if dry {
+        return ExitCode::SUCCESS;
     }
     for name in targets {
-        if dry {
-            println!("Would autoremove {name}");
-        } else {
-            if let Err(e) = install::uninstall(api, prefix, &name, false, true, false) {
-                return from_install(prefix, &[], Err(e));
-            }
-            println!("Autoremoving {name}");
+        if let Some(inst) = prefix.installed_one(Kind::Formula, &name) {
+            let targets_v = install::uninstall_versions(prefix, &inst, false);
+            let keg = prefix.keg(&name, &targets_v[0]);
+            println!("Uninstalling {}... ({})", keg.display(), keg_abv(&keg));
+        }
+        if let Err(e) = install::uninstall(api, prefix, &name, false, false, false) {
+            return from_install(prefix, &[], Err(e));
         }
     }
     ExitCode::SUCCESS
@@ -3716,7 +4007,7 @@ pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
                 continue;
             }
             let shown = if full_name {
-                prefix.full_name(&i)
+                prefix.specified_name(&i)
             } else {
                 i.name.clone()
             };
@@ -3752,6 +4043,17 @@ fn lookup_error(
 enum FetchJob {
     Cask(super::formula::Cask),
     Formula(Formula, Vec<Formula>),
+}
+
+/// The tap a fetch heading names: a tap formula's own tap, else
+/// homebrew/core.
+fn fetch_tap(f: &Formula) -> String {
+    let parts: Vec<&str> = f.full_name.split('/').collect();
+    if parts.len() == 3 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        "homebrew/core".to_string()
+    }
 }
 
 pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[String]) -> ExitCode {
@@ -3811,9 +4113,48 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
             }
         }
     }
+    // Brew's output: a "Fetching:" bucket line when more than one
+    // download runs, a per-package heading on stdout, and a ✔︎ line
+    // on stderr per completed download. (Brew also fetches a bottle
+    // manifest per formula; abrew verifies against the API record
+    // and has no manifest to claim.)
+    let with_deps = has_flag(rest, "--deps", "");
+    let mut bucket: Vec<String> = Vec::new();
+    for job in &jobs {
+        match job {
+            FetchJob::Cask(c) => bucket.push(c.token.clone()),
+            FetchJob::Formula(f, deps) => {
+                bucket.push(f.name.clone());
+                bucket.extend(deps.iter().map(|d| d.name.clone()));
+            }
+        }
+    }
+    {
+        let mut deduped: Vec<String> = Vec::new();
+        for name in bucket {
+            if !deduped.contains(&name) {
+                deduped.push(name);
+            }
+        }
+        bucket = deduped;
+    }
+    if bucket.len() > 1 {
+        println!("Fetching: {}", bucket.join(", "));
+    }
+    let fetched_bottle = |f: &Formula| {
+        eprintln!("✔︎ Bottle {} ({})", f.name, install::keg_version(f));
+    };
     for job in &jobs {
         match job {
             FetchJob::Cask(c) => {
+                println!("==> Fetching {} from homebrew/cask", c.token);
+                if let Some(plan) = cask::git_raw_plan(c) {
+                    match cask::fetch_git_raw(prefix, c, &plan) {
+                        Ok(_) => eprintln!("✔︎ Cask {} ({})", c.token, c.version),
+                        Err(e) => return from_install(prefix, args, Err(e)),
+                    }
+                    continue;
+                }
                 let dest = prefix.cache().join(cask::download_name(c));
                 let expected = c.sha256.as_deref().unwrap_or("no_check");
                 let reusable = c.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
@@ -3823,16 +4164,21 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                 if let Err(e) = fetch::verify_sha256(&dest, expected) {
                     return failed(&e);
                 }
-                println!("Downloaded to {}", dest.display());
+                eprintln!("✔︎ Cask {} ({})", c.token, c.version);
             }
             FetchJob::Formula(f, deps) => {
+                if !with_deps {
+                    println!("==> Fetching {} from {}", f.name, fetch_tap(f));
+                }
                 for dep in deps {
-                    if let Err(e) = install::fetch_only(prefix, dep) {
-                        return from_install(prefix, args, Err(e));
+                    match install::fetch_only(prefix, dep) {
+                        Ok(_) => fetched_bottle(dep),
+                        Err(e) => return from_install(prefix, args, Err(e)),
                     }
                 }
-                if let Err(e) = install::fetch_only(prefix, f) {
-                    return from_install(prefix, args, Err(e));
+                match install::fetch_only(prefix, f) {
+                    Ok(_) => fetched_bottle(f),
+                    Err(e) => return from_install(prefix, args, Err(e)),
                 }
             }
         }
@@ -3931,6 +4277,33 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             .installed_one(Kind::Formula, Formula::short_name(name))
             .is_some()
     };
+    // Brew warns whenever the answer is not the actual runtime
+    // dependencies: a named formula is not installed, or a mode
+    // flag widened/narrowed the set. Reasons in brew's order —
+    // the last matching one wins.
+    if !super::no_env_hints() {
+        let mut reason: Option<&str> = None;
+        if !names.is_empty() && !names.iter().all(|n| is_installed(n)) {
+            reason = Some(if installed_only {
+                "not all the named formulae were installed"
+            } else {
+                "`--installed` was not passed"
+            });
+        }
+        if direct {
+            reason = Some("--direct was passed");
+        }
+        if tree {
+            reason = Some("--tree was passed");
+        }
+        if let Some(reason) = reason {
+            eprintln!(
+                "Warning: `brew deps` is not the actual runtime dependencies because {reason}!"
+            );
+            eprintln!("This means dependencies may differ from a formula's declared dependencies.");
+            eprintln!("Hide these hints with `HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).");
+        }
+    }
     if installed_only && names.is_empty() {
         for i in prefix.installed(Kind::Formula) {
             if let Ok(f) = api.formula(&i.name) {
@@ -3943,6 +4316,7 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                         direct,
                         |line| println!("{line}"),
                     );
+                    println!();
                 } else {
                     let deps = flat_dependencies(&f, direct, |n| api.formula(n).ok());
                     let shown: Vec<&str> = deps
@@ -3979,6 +4353,7 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                 direct,
                 |line| println!("{line}"),
             );
+            println!();
         }
         return ExitCode::SUCCESS;
     }
@@ -4126,36 +4501,90 @@ pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
         .iter()
         .map(|n| Formula::short_name(n).to_string())
         .collect();
-    for name in &scope {
-        if prefix.installed_one(Kind::Formula, name).is_none() {
-            return failed(&format!("abrew: {name} is not installed"));
-        }
-    }
     let hidden: Vec<String> = rest
         .iter()
         .filter_map(|arg| arg.strip_prefix("--hide="))
         .flat_map(|v| v.split(','))
         .map(|part| Formula::short_name(part.trim()).to_string())
         .collect();
-    let mut any = false;
-    for i in prefix.installed(Kind::Formula) {
-        if !scope.is_empty() && !scope.contains(&i.name) {
-            continue;
+    let is_hidden = |name: &str| hidden.iter().any(|h| h == name);
+    // Brew resolves named formulae and casks whether or not they
+    // are installed; bare means every installed package. A line
+    // per package lists its missing recursive dependencies,
+    // space-joined, prefixed with the package name only when
+    // more than one package is in scope.
+    let mut formulae: Vec<Formula> = Vec::new();
+    let mut casks: Vec<super::formula::Cask> = Vec::new();
+    if scope.is_empty() {
+        for i in prefix.installed(Kind::Formula) {
+            match api.formula(&i.name).or_else(|_| {
+                tap::lookup(prefix, &i.name).ok_or_else(|| format!("abrew: no formula {}", i.name))
+            }) {
+                Ok(f) => formulae.push(f),
+                Err(error) => return failed(&error),
+            }
         }
-        let f = match api.formula(&i.name) {
-            Ok(f) => f,
-            Err(error) => return failed(&error),
-        };
-        for d in &f.dependencies {
-            let short = Formula::short_name(d);
-            if hidden.iter().any(|h| h == short) {
+        for i in prefix.installed(Kind::Cask) {
+            match api.cask(&i.name) {
+                Ok(c) => casks.push(c),
+                Err(error) => return failed(&error),
+            }
+        }
+    } else {
+        for name in &scope {
+            if !has_flag(rest, "--cask", "")
+                && let Ok(f) = api.formula(name).or_else(|_| {
+                    tap::lookup(prefix, name).ok_or_else(|| format!("abrew: no formula {name}"))
+                })
+            {
+                formulae.push(f);
                 continue;
             }
-            if prefix.installed_one(Kind::Formula, short).is_none() {
-                println!("{}: missing {}", i.name, short);
-                any = true;
+            match api.cask(name) {
+                Ok(c) if !has_flag(rest, "--formula", "") => casks.push(c),
+                _ => {
+                    return failed(&format!(
+                        "abrew: no available formula or cask named \"{name}\""
+                    ));
+                }
             }
         }
+    }
+    let show_name = formulae.len() + casks.len() > 1;
+    let mut any = false;
+    let mut report = |name: &str, missing: Vec<String>| {
+        if missing.is_empty() {
+            return;
+        }
+        any = true;
+        if show_name {
+            println!("{name}: {}", missing.join(" "));
+        } else {
+            println!("{}", missing.join(" "));
+        }
+    };
+    for f in &formulae {
+        let missing: Vec<String> = flat_dependencies(f, false, |n| api.formula(n).ok())
+            .into_iter()
+            .map(|d| Formula::short_name(&d).to_string())
+            .filter(|d| !is_hidden(d) && prefix.installed_one(Kind::Formula, d).is_none())
+            .collect();
+        report(&f.name, missing);
+    }
+    for c in &casks {
+        let mut missing: Vec<String> = Vec::new();
+        for d in &c.depends_formula {
+            let short = Formula::short_name(d);
+            if !is_hidden(short) && prefix.installed_one(Kind::Formula, short).is_none() {
+                missing.push(short.to_string());
+            }
+        }
+        for d in &c.depends_cask {
+            if !is_hidden(d) && prefix.installed_one(Kind::Cask, d).is_none() {
+                missing.push(d.clone());
+            }
+        }
+        report(&c.token, missing);
     }
     if any {
         ExitCode::from(1)
@@ -4279,54 +4708,7 @@ fn is_macho(head: &[u8]) -> bool {
     ) && !crate::macho::is_java_class(head)
 }
 
-fn linkage_problem(
-    dylib: &str,
-    file_dir: &std::path::Path,
-    lib_dirs: &[std::path::PathBuf],
-    exists: &impl Fn(&std::path::Path) -> bool,
-) -> Option<String> {
-    if dylib.contains("@@HOMEBREW")
-        || dylib.starts_with("/opt/homebrew/")
-        || dylib.starts_with("/usr/local/Cellar/")
-        || dylib.starts_with("/home/linuxbrew/")
-    {
-        return Some(format!("unrelocated reference {dylib}"));
-    }
-    if dylib.starts_with("/usr/lib/") || dylib.starts_with("/System/") {
-        return None;
-    }
-    if let Some(rest) = dylib.strip_prefix("@rpath/") {
-        if lib_dirs.iter().any(|d| exists(&d.join(rest))) {
-            return None;
-        }
-        return Some(format!("unresolved @rpath reference {dylib}"));
-    }
-    for token in ["@loader_path/", "@executable_path/"] {
-        if let Some(rest) = dylib.strip_prefix(token) {
-            if exists(&file_dir.join(rest)) {
-                return None;
-            }
-            return Some(format!("missing reference {dylib}"));
-        }
-    }
-    if dylib.starts_with('/') {
-        if exists(std::path::Path::new(dylib)) {
-            return None;
-        }
-        return Some(format!("missing reference {dylib}"));
-    }
-    None
-}
-
-/// The install name and the dylibs the Mach-O at `path` loads, each once
-/// in load-command order: what `otool -L` lists, read in house
-/// ([`crate::macho::load_names_at`]) rather than through `otool`, whose
-/// `/usr/bin` shim raises Apple's install dialog on a Mac without the
-/// developer tools.
-///
-/// # Errors
-/// The file cannot be read or its load commands are malformed: a problem
-/// to report, never an empty list.
+#[cfg(test)]
 fn linked_dylibs(path: &std::path::Path) -> Result<Vec<String>, String> {
     let names = crate::macho::load_names_at(path)
         .map_err(|error| format!("inspection failed: {error}"))?
@@ -4340,89 +4722,420 @@ fn linked_dylibs(path: &std::path::Path) -> Result<Vec<String>, String> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn linked_library_exists(path: &std::path::Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
-pub(super) fn cmd_linkage(prefix: &Prefix, rest: &[String]) -> ExitCode {
-    let names = operands(rest);
-    if names.is_empty() {
-        return usage("linkage needs a formula name");
-    }
-    let mut kegs = Vec::new();
-    for name in &names {
-        let short = Formula::short_name(name);
-        let Some(inst) = prefix.installed_one(Kind::Formula, short) else {
-            return failed(&format!("abrew: {short} is not installed"));
+/// One keg's linkage classification, brew's LinkageChecker
+/// buckets (the macOS set; unwanted-system is Linux-only there
+/// and `:no_linkage` tags are not in the API record, so those
+/// sections never print).
+#[derive(Default)]
+struct LinkageReport {
+    system: Vec<String>,
+    brewed: std::collections::BTreeMap<String, Vec<String>>,
+    variable: Vec<String>,
+    broken_dylibs: Vec<String>,
+    broken_deps: std::collections::BTreeMap<String, Vec<String>>,
+    executable_path: Vec<String>,
+    files_missing_rpaths: Vec<String>,
+    reverse: std::collections::BTreeMap<String, Vec<String>>,
+    indirect: Vec<String>,
+    undeclared: Vec<String>,
+    unnecessary: Vec<String>,
+    conflicts: Vec<String>,
+}
+
+fn macho_is_executable(bytes: &[u8]) -> bool {
+    fn filetype(bytes: &[u8]) -> Option<u32> {
+        let be = match bytes.get(..4)? {
+            [0xFE, 0xED, 0xFA, 0xCF] | [0xFE, 0xED, 0xFA, 0xCE] => true,
+            [0xCF, 0xFA, 0xED, 0xFE] | [0xCE, 0xFA, 0xED, 0xFE] => false,
+            [0xCA, 0xFE, 0xBA, 0xBE] => {
+                let off = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?) as usize;
+                return filetype(bytes.get(off..)?);
+            }
+            _ => return None,
         };
-        kegs.push((short.to_string(), inst));
+        let raw: [u8; 4] = bytes.get(12..16)?.try_into().ok()?;
+        Some(if be {
+            u32::from_be_bytes(raw)
+        } else {
+            u32::from_le_bytes(raw)
+        })
     }
-    let mut any_problems = false;
-    for (short, inst) in &kegs {
-        let short = short.as_str();
-        let keg = prefix.keg(short, &inst.version);
-        if !cfg!(target_os = "macos") {
-            println!("{short}: linkage inspection reads Mach-O load commands: macOS only");
-            continue;
+    filetype(bytes) == Some(2) // MH_EXECUTE
+}
+
+/// The dependency a prefix dylib path belongs to
+/// (`<prefix>/opt/<name>/…` or `<prefix>/Cellar/<name>/…`).
+fn dylib_dep(prefix: &Prefix, dylib: &str) -> Option<String> {
+    let rest = dylib.strip_prefix(&format!("{}/", prefix.root.display()))?;
+    let mut parts = rest.split('/');
+    match (parts.next(), parts.next()) {
+        (Some("opt" | "Cellar"), Some(name)) if !name.is_empty() => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+/// Lexical path normalization (brew's Pathname#cleanpath).
+fn cleanpath(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
         }
-        let lib_dirs = [keg.join("lib"), prefix.root.join("lib")];
-        let exists = linked_library_exists;
-        let mut checked = 0usize;
-        let mut problems = 0usize;
-        fn walk(
-            dir: &std::path::Path,
-            lib_dirs: &[std::path::PathBuf],
-            exists: &impl Fn(&std::path::Path) -> bool,
-            checked: &mut usize,
-            problems: &mut usize,
-        ) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
+    }
+    out
+}
+
+/// Brew's variable resolution for one load name: @loader_path
+/// always expands to the file's directory, @executable_path
+/// only for executables, and @rpath tries each (already
+/// loader/executable-resolved) run path in order, first
+/// existing target wins. Unresolved names stay raw.
+fn resolve_load_name(
+    name: &str,
+    file_dir: &std::path::Path,
+    executable: bool,
+    rpaths: &[String],
+) -> String {
+    if let Some(rest) = name.strip_prefix("@loader_path") {
+        return cleanpath(&file_dir.join(format!(".{rest}")))
+            .to_string_lossy()
+            .into_owned();
+    }
+    if executable && let Some(rest) = name.strip_prefix("@executable_path") {
+        return cleanpath(&file_dir.join(format!(".{rest}")))
+            .to_string_lossy()
+            .into_owned();
+    }
+    if let Some(rest) = name.strip_prefix("@rpath") {
+        for rpath in rpaths {
+            let target = format!("{}{rest}", rpath.trim_end_matches('/'));
+            if std::path::Path::new(&target).exists() {
+                return target;
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn scan_linkage(prefix: &Prefix, keg: &std::path::Path) -> LinkageReport {
+    let mut report = LinkageReport::default();
+    let mut seen_dylibs: Vec<String> = Vec::new();
+    let push_unique = |list: &mut Vec<String>, item: &str| {
+        if !list.iter().any(|x| x == item) {
+            list.push(item.to_string());
+        }
+    };
+    fn walk(
+        dir: &std::path::Path,
+        prefix: &Prefix,
+        keg: &std::path::Path,
+        report: &mut LinkageReport,
+        seen_dylibs: &mut Vec<String>,
+    ) {
+        let push_unique = |list: &mut Vec<String>, item: &str| {
+            if !list.iter().any(|x| x == item) {
+                list.push(item.to_string());
+            }
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                walk(&p, prefix, keg, report, seen_dylibs);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
             };
-            for e in entries.flatten() {
-                let Ok(ft) = e.file_type() else { continue };
-                let p = e.path();
-                if ft.is_dir() {
-                    walk(&p, lib_dirs, exists, checked, problems);
-                    continue;
-                }
-                if !ft.is_file() {
-                    continue;
-                }
-                let mut head = [0u8; 8];
-                let is_bin = std::fs::File::open(&p)
-                    .and_then(|mut f| {
-                        use std::io::Read as _;
-                        f.read_exact(&mut head)
-                    })
-                    .is_ok()
-                    && is_macho(&head);
-                if !is_bin {
-                    continue;
-                }
-                let rows = match linked_dylibs(&p) {
-                    Ok(rows) => rows,
-                    Err(problem) => {
-                        println!("{}: {problem}", p.display());
-                        *problems += 1;
-                        continue;
+            if !is_macho(&bytes) {
+                continue;
+            }
+            let Ok(names) = crate::macho::load_names(&bytes) else {
+                continue;
+            };
+            let names = names.once();
+            let executable = macho_is_executable(&bytes);
+            let file_dir = p.parent().unwrap_or(dir);
+            let rpaths: Vec<String> = names
+                .rpaths
+                .iter()
+                .map(|r| resolve_load_name(r, file_dir, executable, &[]))
+                .collect();
+            let loads: Vec<String> = names
+                .loads
+                .iter()
+                .map(|n| resolve_load_name(n, file_dir, executable, &rpaths))
+                .collect();
+            let mut has_rpath_lib = false;
+            for dylib in &loads {
+                report.reverse.entry(dylib.clone()).or_default().push(
+                    p.strip_prefix(keg)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if !has_rpath_lib && dylib.starts_with("@rpath/") {
+                    has_rpath_lib = true;
+                    if names.rpaths.is_empty() {
+                        push_unique(&mut report.files_missing_rpaths, &p.to_string_lossy());
                     }
-                };
-                *checked += 1;
-                let file_dir = p.parent().unwrap_or(dir);
-                for dylib in rows {
-                    if let Some(problem) = linkage_problem(&dylib, file_dir, lib_dirs, exists) {
-                        println!("{}: {problem}", p.display());
-                        *problems += 1;
+                }
+                if seen_dylibs.contains(dylib) {
+                    continue;
+                }
+                seen_dylibs.push(dylib.clone());
+                if dylib.starts_with("@rpath") {
+                    push_unique(&mut report.variable, dylib);
+                    continue;
+                }
+                if dylib.starts_with("@executable_path") && !executable {
+                    push_unique(&mut report.executable_path, dylib);
+                    continue;
+                }
+                if !dylib.starts_with('/') {
+                    // Brew's Keg.for raises NotAKeg here (@loader_path
+                    // and friends land in System libraries).
+                    push_unique(&mut report.system, dylib);
+                    continue;
+                }
+                let exists = std::path::Path::new(dylib.as_str()).exists();
+                match dylib_dep(prefix, dylib) {
+                    Some(dep) if exists => {
+                        let shown = prefix
+                            .installed_one(Kind::Formula, &dep)
+                            .map(|i| prefix.specified_name(&i))
+                            .unwrap_or_else(|| dep.clone());
+                        push_unique(report.brewed.entry(shown).or_default(), dylib);
                     }
+                    Some(dep) => {
+                        push_unique(report.broken_deps.entry(dep).or_default(), dylib);
+                    }
+                    None if dylib.starts_with("/usr/lib/") || dylib.starts_with("/System/") => {
+                        push_unique(&mut report.system, dylib);
+                    }
+                    None if exists => push_unique(&mut report.system, dylib),
+                    None => push_unique(&mut report.broken_dylibs, dylib),
                 }
             }
         }
-        walk(&keg, &lib_dirs, &exists, &mut checked, &mut problems);
-        println!("{short}: {checked} Mach-O files checked, {problems} problem(s)");
-        any_problems |= problems > 0;
     }
-    if any_problems {
+    let _ = push_unique;
+    walk(keg, prefix, keg, &mut report, &mut seen_dylibs);
+    report.system.sort();
+    report.variable.sort();
+    report.broken_dylibs.sort();
+    report.executable_path.sort();
+    report.files_missing_rpaths.sort();
+    for v in report.brewed.values_mut() {
+        v.sort();
+    }
+    for v in report.broken_deps.values_mut() {
+        v.sort();
+    }
+    for v in report.reverse.values_mut() {
+        v.sort();
+    }
+    report
+}
+
+/// Declared/indirect/undeclared analysis against the formula
+/// record, brew's check_formula_deps (minus `:no_linkage`, which
+/// the API record does not carry).
+fn analyse_linkage_deps(prefix: &Prefix, api: &Api, f: &Formula, report: &mut LinkageReport) {
+    let short = |n: &str| Formula::short_name(n).to_string();
+    let declared: Vec<String> = f.dependencies.iter().map(|d| short(d)).collect();
+    let recursive: Vec<String> = flat_dependencies(f, false, |n| api.formula(n).ok())
+        .iter()
+        .map(|d| short(d))
+        .collect();
+    let brewed_names: Vec<String> = report
+        .brewed
+        .keys()
+        .map(|k| short(k))
+        .filter(|n| *n != f.name)
+        .collect();
+    for full in report.brewed.keys() {
+        let name = short(full);
+        if name == f.name {
+            continue;
+        }
+        if recursive.contains(&name) {
+            if !declared.contains(&name) {
+                report.indirect.push(full.clone());
+            }
+        } else {
+            report.undeclared.push(full.clone());
+        }
+    }
+    let broken: Vec<String> = report.broken_deps.keys().cloned().collect();
+    for d in &declared {
+        let has_bin = prefix
+            .installed_one(Kind::Formula, d)
+            .is_some_and(|i| prefix.keg(d, &i.version).join("bin").is_dir());
+        if !has_bin && !brewed_names.contains(d) && !broken.contains(d) {
+            report.unnecessary.push(
+                prefix
+                    .installed_one(Kind::Formula, d)
+                    .map(|i| prefix.specified_name(&i))
+                    .unwrap_or_else(|| d.clone()),
+            );
+        }
+    }
+    let mut by_stem: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for full in report.brewed.keys() {
+        let name = short(full);
+        let stem = name.split('@').next().unwrap_or(&name).to_string();
+        let entry = by_stem.entry(stem).or_default();
+        if !entry.contains(&name) {
+            entry.push(name);
+        }
+    }
+    for variants in by_stem.values() {
+        if variants.len() >= 2 {
+            report.conflicts.extend(variants.iter().cloned());
+        }
+    }
+    report.indirect.sort();
+    report.undeclared.sort();
+    report.unnecessary.sort();
+    report.conflicts.sort();
+}
+
+fn print_linkage_items(label: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    println!("{label}:");
+    for item in items {
+        println!("  {item}");
+    }
+}
+
+fn print_linkage_brewed(label: &str, map: &std::collections::BTreeMap<String, Vec<String>>) {
+    if map.is_empty() {
+        return;
+    }
+    println!("{label}:");
+    for (dep, items) in map {
+        for item in items {
+            println!("  {item} ({dep})");
+        }
+    }
+}
+
+pub(super) fn cmd_linkage(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    if !cfg!(target_os = "macos") {
+        println!("linkage inspection reads Mach-O load commands: macOS only");
+        return ExitCode::SUCCESS;
+    }
+    let test = has_flag(rest, "--test", "");
+    let strict = has_flag(rest, "--strict", "");
+    let reverse = has_flag(rest, "--reverse", "");
+    let names = operands(rest);
+    let mut kegs: Vec<(String, super::prefix::Installed)> = Vec::new();
+    if names.is_empty() {
+        for inst in prefix.installed(Kind::Formula) {
+            kegs.push((inst.name.clone(), inst));
+        }
+    } else {
+        for name in &names {
+            let short = Formula::short_name(name);
+            let Some(inst) = prefix.installed_one(Kind::Formula, short) else {
+                return failed(&format!("abrew: {short} is not installed"));
+            };
+            kegs.push((short.to_string(), inst));
+        }
+    }
+    let mut failed_any = false;
+    for (short, inst) in &kegs {
+        if kegs.len() > 1 {
+            println!("==> Checking {short} linkage");
+        }
+        let keg = prefix.keg(short, &inst.version);
+        let mut report = scan_linkage(prefix, &keg);
+        if let Ok(f) = api
+            .formula(short)
+            .or_else(|_| tap::lookup(prefix, short).ok_or_else(|| "no record".to_string()))
+        {
+            analyse_linkage_deps(prefix, api, &f, &mut report);
+        }
+        if reverse {
+            let total = report.reverse.len();
+            for (i, (dylib, files)) in report.reverse.iter().enumerate() {
+                println!("{dylib}");
+                for f in files {
+                    println!("  {f}");
+                }
+                if i + 1 < total {
+                    println!();
+                }
+            }
+            continue;
+        }
+        if test {
+            print_linkage_items("Missing libraries", &report.broken_dylibs);
+            // Broken dependencies print as the deps' dylib paths.
+            let broken_flat: Vec<String> = report.broken_deps.values().flatten().cloned().collect();
+            print_linkage_items("Broken dependencies", &broken_flat);
+            print_linkage_items("Conflicting libraries", &report.conflicts);
+            print_linkage_items("Indirect dependencies with linkage", &report.indirect);
+            if strict {
+                print_linkage_items("Undeclared dependencies with linkage", &report.undeclared);
+                print_linkage_items("Files with missing rpath", &report.files_missing_rpaths);
+                print_linkage_items(
+                    "@executable_path references in libraries",
+                    &report.executable_path,
+                );
+            }
+            let mut issues = !report.broken_dylibs.is_empty()
+                || !report.broken_deps.is_empty()
+                || !report.conflicts.is_empty()
+                || !report.indirect.is_empty();
+            if strict {
+                issues |= !report.undeclared.is_empty()
+                    || !report.files_missing_rpaths.is_empty()
+                    || !report.executable_path.is_empty();
+            }
+            failed_any |= issues;
+        } else {
+            print_linkage_items("System libraries", &report.system);
+            print_linkage_brewed("Homebrew libraries", &report.brewed);
+            print_linkage_items("Indirect dependencies with linkage", &report.indirect);
+            print_linkage_items("@rpath-referenced libraries", &report.variable);
+            print_linkage_items("Missing libraries", &report.broken_dylibs);
+            let broken_flat: Vec<String> = report.broken_deps.values().flatten().cloned().collect();
+            print_linkage_items("Broken dependencies", &broken_flat);
+            print_linkage_items("Undeclared dependencies with linkage", &report.undeclared);
+            print_linkage_items("Dependencies with no linkage", &report.unnecessary);
+            print_linkage_items("Files with missing rpath", &report.files_missing_rpaths);
+            print_linkage_items(
+                "@executable_path references in libraries",
+                &report.executable_path,
+            );
+        }
+    }
+    if failed_any {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -5239,52 +5952,21 @@ mod tests {
     }
 
     #[test]
-    fn linkage_classifier_judges_each_reference_kind() {
-        let dir = std::path::Path::new("/keg/bin");
-        let libs = [std::path::PathBuf::from("/keg/lib")];
-        let present = |p: &std::path::Path| {
-            p == std::path::Path::new("/keg/lib/libfoo.dylib")
-                || p == std::path::Path::new("/keg/bin/libnear.dylib")
-                || p == std::path::Path::new("/elsewhere/libok.dylib")
-        };
-        assert_eq!(
-            linkage_problem("/usr/lib/libSystem.B.dylib", dir, &libs, &present),
-            None
-        );
-        assert_eq!(
-            linkage_problem("@rpath/libfoo.dylib", dir, &libs, &present),
-            None
-        );
-        assert_eq!(
-            linkage_problem("@loader_path/libnear.dylib", dir, &libs, &present),
-            None
-        );
-        assert_eq!(
-            linkage_problem("/elsewhere/libok.dylib", dir, &libs, &present),
-            None
-        );
-        assert!(
-            linkage_problem("/opt/homebrew/lib/libx.dylib", dir, &libs, &present)
-                .is_some_and(|p| p.contains("unrelocated"))
-        );
-        assert!(
-            linkage_problem("@@HOMEBREW_PREFIX@@/lib/libx.dylib", dir, &libs, &present)
-                .is_some_and(|p| p.contains("unrelocated"))
-        );
-        assert!(
-            linkage_problem("@rpath/libgone.dylib", dir, &libs, &present)
-                .is_some_and(|p| p.contains("unresolved"))
-        );
-        assert!(
-            linkage_problem("/nope/libgone.dylib", dir, &libs, &present)
-                .is_some_and(|p| p.contains("missing"))
-        );
+    fn macho_magic_and_executable_filetype() {
         assert!(is_macho(&[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 0x01]));
         assert!(!is_macho(b"#!/bin/sh"));
         assert!(
             !is_macho(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 52]),
             "a Java class file"
         );
+        // Thin LE 64-bit header: magic, cputype, cpusubtype, filetype.
+        let mut exe = vec![0xcdu8; 0];
+        exe.extend_from_slice(&[
+            0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 0x01, 0, 0, 0, 0, 2, 0, 0, 0,
+        ]);
+        assert!(macho_is_executable(&exe));
+        exe[12] = 6; // MH_DYLIB
+        assert!(!macho_is_executable(&exe));
 
         use crate::macho::fixtures::{
             ID_DYLIB, LOAD_DYLIB, archive, dylib_command, dylib_command32, fat, thin, thin32,
@@ -5366,25 +6048,6 @@ mod tests {
             symlink("absent.dylib", &dangling).unwrap();
             assert!(linked_library_exists(&alias));
             assert!(!linked_library_exists(&dangling));
-            let owned_libs = [scratch.path().to_path_buf()];
-            assert_eq!(
-                linkage_problem(
-                    "@rpath/libalias.dylib",
-                    scratch.path(),
-                    &owned_libs,
-                    &linked_library_exists
-                ),
-                None
-            );
-            assert!(
-                linkage_problem(
-                    "@rpath/libgone.dylib",
-                    scratch.path(),
-                    &owned_libs,
-                    &linked_library_exists
-                )
-                .is_some()
-            );
         }
     }
 
@@ -5676,7 +6339,7 @@ mod tests {
         assert_eq!(runtime.len(), 1);
         assert_eq!(
             runtime[0].get("full_name").unwrap(),
-            &aterm_json::json!("homebrew/core/dep")
+            &aterm_json::json!("dep")
         );
         assert_eq!(
             runtime[0].get("declared_directly").unwrap(),
@@ -5708,6 +6371,37 @@ mod tests {
         assert_eq!(disk_usage_readable(1_000_000), "1MB");
         assert_eq!(disk_usage_readable(1_050_000), "1.1MB");
         assert_eq!(disk_usage_readable(2_500_000_000), "2.5GB");
+    }
+
+    #[test]
+    fn version_change_lines_align_like_brew() {
+        let row = |n: &str, o: &str, v: &str, s: Option<&str>| {
+            (n.into(), o.into(), v.into(), s.map(str::to_owned))
+        };
+        // Oracle sample (brew upgrade --dry-run, redirected).
+        let lines = version_change_lines(&[
+            row("brotli", "1.2.0", "1.2.1", Some("791.9KB")),
+            row(
+                "ca-certificates",
+                "2026-09-25_1",
+                "2026-10-20",
+                Some("109.6KB"),
+            ),
+            row("gh", "2.102.0", "2.103.0", None),
+        ]);
+        assert_eq!(
+            lines,
+            [
+                "brotli           1.2.0        -> 1.2.1       (791.9KB)",
+                "ca-certificates  2026-09-25_1 -> 2026-10-20  (109.6KB)",
+                "gh               2.102.0      -> 2.103.0",
+            ]
+        );
+        // A single change joins with one space.
+        assert_eq!(
+            version_change_lines(&[row("xz", "5.8.3", "5.8.4", None)]),
+            ["xz 5.8.3 -> 5.8.4"]
+        );
     }
 
     #[test]

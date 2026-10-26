@@ -3218,7 +3218,10 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
         | EDIT_CURSOR_GLOW_SDR_BOOST => {
             "Bloom, shimmer, and HDR fall back quietly when the display cannot show them."
         }
-        EDIT_FONT_WEIGHT => "Only variable fonts use Variable font weight; other fonts ignore it.",
+        EDIT_FONT_WEIGHT => {
+            "Only variable fonts use Variable font weight; other fonts, and a font named at \
+             one weight (SF Mono Light), ignore it."
+        }
         EDIT_WINDOW_PADDING_TOP => "The top cannot be more than Sides and bottom.",
         EDIT_CONFIRM_MULTILINE_PASTE => {
             "Asks before pasting text with a line break into a program that does not use \

@@ -210,8 +210,7 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
         std::thread::Builder::new()
             .name(exit_moment_thread(pid))
             .spawn(move || {
-                use std::os::fd::AsRawFd as _;
-                if wait_readable(target.as_raw_fd(), cancelled.as_raw_fd()) {
+                if wait_readable(&target, &cancelled) {
                     let _ = into.set(stamp());
                 }
             })
@@ -324,50 +323,13 @@ fn exit_readable(_pid: u32) -> Option<ExitReadable> {
 /// Block until `target` or `cancel` is readable: `true` when the target is
 /// (the exit came), `false` when only the cancel pipe is or `poll` fails.
 #[cfg(unix)]
-#[cfg_attr(trust_verify, trust::skip)]
-fn wait_readable(target: i32, cancel: i32) -> bool {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    #[cfg(target_os = "linux")]
-    type Nfds = core::ffi::c_ulong;
-    #[cfg(not(target_os = "linux"))]
-    type Nfds = core::ffi::c_uint;
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
-    }
-    const POLLIN: i16 = 0x1;
-    loop {
-        let mut fds = [
-            PollFd {
-                fd: target,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: cancel,
-                events: POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: two initialized pollfds that outlive the call.
-        let ready = unsafe { poll(fds.as_mut_ptr(), 2, -1) };
-        if ready < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return false;
-        }
-        if fds[0].revents != 0 {
-            return true;
-        }
-        if fds[1].revents != 0 {
-            return false;
-        }
-    }
+fn wait_readable(target: &ExitReadable, cancel: &std::io::PipeReader) -> bool {
+    use std::os::fd::AsFd as _;
+    #[cfg(target_vendor = "apple")]
+    let target = target.kq.as_fd();
+    #[cfg(not(target_vendor = "apple"))]
+    let target = target.as_fd();
+    crate::ready::either(target, cancel.as_fd()).is_ok_and(|ready| ready.first)
 }
 
 #[cfg(all(test, unix))]

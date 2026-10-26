@@ -63,3 +63,4 @@ pub use steps::{step_prefix_advance, step_within_bounds};
 pub use subject::{
     filter_depth_contains, segment_depth_advance, Filter, FilterError, Subject, SubjectError,
 };
+pub use sync::{sync_clamp_parent_count, sync_within_capacity};

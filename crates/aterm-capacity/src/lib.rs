@@ -15,6 +15,8 @@
 //! holder. That is admission, not a retry. It refuses at once only a need that can never fit
 //! here: all the memory that can ever be available or more (physical memory less what is
 //! wired, [`Reading::reachable`]), or more disk than the volume holds above its floor.
+//! Timing-sensitive work waits for the load within its [`Patience`]: past its reservation age
+//! it holds back claimed work that asks after it, and at its bound it starts whatever the load.
 //!
 //! A claim's memory reservation is its declared peak less what its holder's process tree
 //! already uses, so memory in use is not counted twice: a process is counted toward its
@@ -29,6 +31,7 @@
 #![warn(missing_docs)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub mod admit;
 pub mod floor;
@@ -38,8 +41,8 @@ pub mod reading;
 pub mod room;
 
 pub use admit::{
-    CREDIT_MAX, Claim, Error, Holder, Pace, Polled, Relief, Short, Shortfall, Waiter, admit,
-    admit_relieved, admit_until, admit_with, gib, never, span,
+    CREDIT_MAX, Claim, Error, Holder, Pace, Polled, QuietStart, Relief, Short, Shortfall, Waiter,
+    admit, admit_relieved, admit_until, admit_with, gib, never, span,
 };
 pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
 pub use ledger::{Held, Ledger, Record};
@@ -90,12 +93,14 @@ pub struct Need {
     pub mem: u64,
     /// Memory that must stay available beside its peak for it to be admitted (a VM's host margin): asked of the room, never reserved, so needs admitted side by side share one margin.
     pub margin: u64,
-    /// The cores it would use; it is granted as many as are idle, at least one, never more ([`Claim::cores`]). `0`: none asked.
+    /// The cores it would use; it is granted its share of them, at least one, never more, and never waits for them ([`Claim::cores`]). `0`: none asked.
     pub cores: u32,
     /// The disk it will write, on the volume holding [`Self::path`].
     pub disk: u64,
     /// Admit it only while the 1-minute load is at or below this, and no other quiet claim is held or waits ahead.
     pub quiet: Option<f64>,
+    /// How long a quiet claim waits for the load ([`Patience`]); unset, it waits until the load falls.
+    pub patience: Option<Patience>,
     /// Where its disk need lands (the working directory when unset). In a [`Record`], the mount of that volume.
     pub path: Option<PathBuf>,
     /// The checkout it runs for, where that is not its working directory's (a tool that confines its working directory to `/`); unset, the working directory's enclosing checkout. A [`Record`] keeps it as its `checkout`, never here.
@@ -156,11 +161,20 @@ impl Need {
         self
     }
 
+    /// Wait for the load within `patience` ([`Patience`]), for a [`Self::quiet`] claim.
+    #[must_use]
+    pub const fn patience(mut self, patience: Patience) -> Need {
+        self.patience = Some(patience);
+        self
+    }
+
     /// Timing-sensitive work, `what`: a [`Need::quiet`] claim whose bound is [`quiet_bound`] of
-    /// this machine's cores.
+    /// this machine's cores, waiting for it within [`QUIET_PATIENCE`].
     #[must_use]
     pub fn timing(what: impl Into<String>) -> Need {
-        Need::new(what).quiet(quiet_bound(cores()))
+        Need::new(what)
+            .quiet(quiet_bound(cores()))
+            .patience(QUIET_PATIENCE)
     }
 
     /// The checkout it runs for, `dir`, which its record and every wait line name in place of the working directory's ([`Self::checkout`]).
@@ -184,6 +198,37 @@ pub const QUIET_LOAD_PER_CORE: f64 = 2.0;
 pub fn quiet_bound(cores: u32) -> f64 {
     QUIET_LOAD_PER_CORE * f64::from(cores.max(1))
 }
+
+/// How long a quiet claim waits for the load once nothing but the load holds it back (no other
+/// quiet claim is held or waits ahead of it: it is next). Its patience counts from then, so a
+/// claim that queued behind another timed run still gets all of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Patience {
+    /// Next for this long, it reserves the machine: claimed work that asked after it (memory,
+    /// cores or disk, outside its own process tree and ancestry) waits, naming it, so no new
+    /// grant or admission adds load while it waits.
+    pub reserve: Duration,
+    /// Next for this long, it starts whatever the load: its bound. Its tool's report says the load
+    /// it started under.
+    pub start: Duration,
+    /// Its reservation lasts this long into the work once it starts, at most, so what it held back
+    /// does not start in a burst beside the work's first minutes; it ends sooner when the claim
+    /// does. A reservation therefore lasts at most `start - reserve + hold`.
+    pub hold: Duration,
+}
+
+/// The patience of timing-sensitive work ([`Need::timing`]), from 13 hours of this 14-core M4
+/// Pro's 1-minute load (`docs/measured/quiet-bound-2026-10-25.md`), above the quiet bound half
+/// the time: 26 of its 58 spells above the bound ended within 2 minutes, so it reserves after
+/// 2; 65% of moments above the bound reached a quiet machine within 10 minutes, and one still
+/// waiting at 10 had a median 11 minutes more to go, so it starts by 10; its reservation holds
+/// 15 minutes into the work, past the longest measuring stage QUIET-ADMIT ran under load
+/// (771 s).
+pub const QUIET_PATIENCE: Patience = Patience {
+    reserve: Duration::from_secs(120),
+    start: Duration::from_secs(600),
+    hold: Duration::from_secs(900),
+};
 
 /// How a caller admits its work: `--admit wait` (the default) or `--admit now`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

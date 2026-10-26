@@ -227,17 +227,6 @@ impl std::ops::DerefMut for BoltPts {
     }
 }
 
-impl<'a> IntoIterator for &'a mut BoltPts {
-    type Item = &'a mut (f32, f32);
-    type IntoIter = std::slice::IterMut<'a, (f32, f32)>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        let len = usize::from(self.len);
-        self.buf[..len].iter_mut()
-    }
-}
-
 impl PartialEq for BoltPts {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -752,10 +741,16 @@ impl FrameFingerprint {
             Some(h) => h,
             None => FNV64_OFFSET,
         };
-        for q in quads {
-            for w in q.damage_words() {
-                hash = fnv_mix_u64(hash, w);
+        let mut qi = 0;
+        while qi < quads.len() {
+            let quad_words = quads[qi].damage_words();
+            let words = quad_words.as_slice();
+            let mut wi = 0;
+            while wi < words.len() {
+                hash = fnv_mix_u64(hash, words[wi]);
+                wi += 1;
             }
+            qi += 1;
         }
         self.0 = Some(hash);
     }
@@ -772,13 +767,25 @@ impl FrameFingerprint {
             Some(h) => h,
             None => FNV64_OFFSET,
         };
-        for r in &ramps.items {
-            for word in r.damage_words() {
-                hash = fnv_mix_u64(hash, word);
+        let items = ramps.items.as_slice();
+        let ends = ramps.ends.as_slice();
+        let mut ri = 0;
+        while ri < items.len() {
+            let r = &items[ri];
+            let words = r.damage_words();
+            let mut wi = 0;
+            while wi < words.len() {
+                hash = fnv_mix_u64(hash, words[wi]);
+                wi += 1;
             }
-            for e in r.kept_ends(&ramps.ends).as_chunks::<2>().0 {
-                hash = fnv_mix_u64(hash, u64::from(e[0]) | u64::from(e[1]) << 32);
+            let chunks = r.kept_ends(ends).as_chunks::<2>().0;
+            let mut ci = 0;
+            while ci < chunks.len() {
+                let e = &chunks[ci];
+                hash = fnv_mix_u64(hash, (e[0] as u64) | ((e[1] as u64) << 32));
+                ci += 1;
             }
+            ri += 1;
         }
         self.0 = Some(hash);
     }
@@ -1308,11 +1315,6 @@ impl CursorGlow {
     /// Returns the deadline for the next visible change, or `None` when idle.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
-        const POOF_FALLBACK_GRACE_DUR: Duration = Duration::from_nanos(
-            (CursorGlow::POOF_FALLBACK_GRACE as f64 * 1_000_000_000.0).round() as u64,
-        );
-        const TORN_REST_DUR: Duration =
-            Duration::from_nanos((CursorGlow::TORN_REST_S as f64 * 1_000_000_000.0).round() as u64);
         let v1_due = if self.needs_frame_cadence() {
             Some(now + frame_interval)
         } else if let Some(t) = self.poof_hint_pending() {
@@ -1590,7 +1592,8 @@ impl CursorGlow {
             if let Some(sample) = sample {
                 let mut exact = true;
                 let mut replaced = false;
-                for col in 0..p.origin {
+                let mut col = 0;
+                while col < p.origin {
                     let old = rk::witness::unit_at(&self.park_source_cells, col);
                     let current = rk::witness::unit_at(&sample.cols, col);
                     if old != current {
@@ -1600,6 +1603,7 @@ impl CursorGlow {
                             break;
                         }
                     }
+                    col += 1;
                 }
                 self.park_source_confirmed = exact;
                 if replaced {
@@ -1614,6 +1618,16 @@ impl CursorGlow {
         self.v2.set_engaged(v2_active);
         if !self.v2.engaged() {
             self.v2_stop = None;
+        }
+        #[inline]
+        const fn visible_at(
+            cur: Option<(u16, u16)>,
+            now: Instant,
+        ) -> Option<((u16, u16), Instant)> {
+            match cur {
+                Some(c) => Some((c, now)),
+                None => None,
+            }
         }
         if !valid_canvas {
             if cfg.enabled {
@@ -1631,7 +1645,7 @@ impl CursorGlow {
             }
             self.dark_settled = !self.sound_live;
             self.last = cur;
-            self.last_visible = cur.map(|c| (c, now));
+            self.last_visible = visible_at(cur, now);
             self.hide_bridge_shown = None;
             return 0;
         }
@@ -1649,7 +1663,7 @@ impl CursorGlow {
                 self.clear_thermals();
             }
             self.last = cur;
-            self.last_visible = cur.map(|c| (c, now));
+            self.last_visible = visible_at(cur, now);
             self.hide_bridge_shown = None;
             self.store_key_timbre(cfg);
             self.settle_key_seam(cfg, cfg.intensity > 0.0);
@@ -2133,15 +2147,22 @@ impl CursorGlow {
                 self.v2.tick(now, geom, &v2_cfg, &mut frame);
             }
             self.v2_caret = frame.caret;
-            for &(from, to) in self.v2.ribbon().rail_spans() {
+            let rail_spans = self.v2.ribbon().rail_spans();
+            let mut ri = 0;
+            while ri < rail_spans.len() {
+                let (from, to) = rail_spans[ri];
                 self.ink_ledger.note_rail_laid(from, to);
+                ri += 1;
             }
             self.read_fresh_run_origin(now);
-            for cue in self.v2_cues.drain(..) {
+            let mut ci = 0;
+            while ci < self.v2_cues.len() {
                 if self.sound_cues.len() < Self::MAX_SOUND_CUES {
-                    self.sound_cues.push(cue);
+                    self.sound_cues.push(self.v2_cues[ci]);
                 }
+                ci += 1;
             }
+            self.v2_cues.clear();
             let owns_light = match cur {
                 Some((r, c)) => self.v2.field_at(r, c).is_some(),
                 None => false,

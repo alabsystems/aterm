@@ -29,6 +29,7 @@ pub const MIN_RUN_KEYS: u32 = 16;
 const LOW: f32 = 0.14;
 const REVIVE_GATE: f32 = 0.35;
 const FADE_IN: f32 = 0.35;
+const FADE_IN_DUR: Duration = Duration::from_millis(350);
 const FADE_OUT: f32 = 0.75;
 const FADE_OUT_DUR: Duration = Duration::from_millis(750);
 
@@ -53,7 +54,7 @@ const CELEBRATE_HOLD_DUR: Duration = dur_from_secs_f32(CELEBRATE_HOLD);
 
 const OOPS_HOLD: f32 = 0.60;
 const OOPS_HOLD_DUR: Duration = dur_from_secs_f32(OOPS_HOLD);
-const OOPS_REARM: f32 = 0.30;
+const OOPS_REARM_DUR: Duration = Duration::from_millis(300);
 const OOPS_RECOIL: f32 = 0.12;
 const OOPS_SQUASH: f32 = 0.07;
 const OOPS_ATTACK: f32 = 0.07;
@@ -61,7 +62,7 @@ const OOPS_SETTLE: f32 = 0.18;
 
 const WINCE_HOLD: f32 = 0.52;
 const WINCE_HOLD_DUR: Duration = dur_from_secs_f32(WINCE_HOLD);
-const WINCE_CHAIN_WINDOW: f32 = 0.85;
+const WINCE_CHAIN_WINDOW_DUR: Duration = Duration::from_millis(850);
 const WINCE_ATTACK: f32 = 0.045;
 const WINCE_SETTLE: f32 = 0.16;
 const WINCE_RECOIL: f32 = 0.16;
@@ -83,7 +84,7 @@ const WINCE_TUMBLE_OMEGA: [f32; MAX_WINCE_CHAIN as usize] = {
 
 const DELIGHT_HOLD: f32 = 0.62;
 const DELIGHT_HOLD_DUR: Duration = dur_from_secs_f32(DELIGHT_HOLD);
-const DELIGHT_CHAIN_WINDOW: f32 = 0.9;
+const DELIGHT_CHAIN_WINDOW_DUR: Duration = Duration::from_millis(900);
 const DELIGHT_ATTACK: f32 = 0.05;
 const DELIGHT_SETTLE: f32 = 0.2;
 const DELIGHT_STRETCH: f32 = 0.14;
@@ -463,7 +464,7 @@ pub struct CursorCat {
     /// The current oops burst's kick instant, the recoil envelope's attack
     /// clock.
     oops_at: Option<Instant>,
-    /// The last delete of the current burst: the [`OOPS_REARM`] gap decides
+    /// The last delete of the current burst: the [`OOPS_REARM_DUR`] gap decides
     /// between extending this burst and re-kicking a new one.
     oops_last: Option<Instant>,
     /// First sample of the current curse-wince kick.
@@ -734,7 +735,7 @@ impl CursorCat {
 
     /// Fire (or sustain) the delete oops on a live companion: every delete extends the hold
     /// to [`OOPS_HOLD`] past it; the flinch and recoil kick only on a burst's first delete
-    /// ([`OOPS_REARM`]).
+    /// ([`OOPS_REARM_DUR`]).
     #[inline]
     fn note_oops(&mut self, now: Instant) {
         if !self.is_active() {
@@ -743,7 +744,7 @@ impl CursorCat {
         let same_burst = if self.reaction == CatReaction::Startled
             && let Some(t) = self.oops_last
         {
-            now.saturating_duration_since(t).as_secs_f32() < OOPS_REARM
+            now.saturating_duration_since(t) < OOPS_REARM_DUR
         } else {
             false
         };
@@ -763,7 +764,7 @@ impl CursorCat {
             return false;
         }
         let chained = match self.wince_last {
-            Some(last) => now.saturating_duration_since(last).as_secs_f32() < WINCE_CHAIN_WINDOW,
+            Some(last) => now.saturating_duration_since(last) < WINCE_CHAIN_WINDOW_DUR,
             None => false,
         };
         self.wince_chain = if chained {
@@ -826,7 +827,7 @@ impl CursorCat {
             return false;
         }
         let chained = match self.delight_last {
-            Some(last) => now.saturating_duration_since(last).as_secs_f32() < DELIGHT_CHAIN_WINDOW,
+            Some(last) => now.saturating_duration_since(last) < DELIGHT_CHAIN_WINDOW_DUR,
             None => false,
         };
         self.delight_chain = if chained {
@@ -1394,7 +1395,7 @@ impl CursorCat {
                     if grounded {
                         self.exit = CatExit::Plain;
                         self.state = State::FadeOut(self.low_crossing_at(now));
-                    } else if now.saturating_duration_since(t0).as_secs_f32() >= FADE_IN {
+                    } else if now.saturating_duration_since(t0) >= FADE_IN_DUR {
                         self.state = State::Shown;
                     }
                 }
@@ -1703,7 +1704,9 @@ pub fn emit_exit_fx(
                 }
                 const ROWS: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
                 let pink = premul_rgb(EXIT_HEART_PINK, cov);
-                for (ry, &(x0, x1)) in ROWS.iter().enumerate() {
+                let mut ry = 0;
+                while ry < ROWS.len() {
+                    let (x0, x1) = ROWS[ry];
                     push_fx_rect(
                         out,
                         geom,
@@ -1713,6 +1716,7 @@ pub fn emit_exit_fx(
                         u,
                         pink,
                     );
+                    ry += 1;
                 }
                 push_fx_rect(out, geom, hx + 4 * u, hy, 2 * u, u, pink);
             } else {
@@ -1852,7 +1856,8 @@ pub fn resample_nearest_into(
     let mut sy = 0usize;
     let mut y_acc = 0usize;
     let mut prev_sy = usize::MAX;
-    for ty in 0..th {
+    let mut ty = 0usize;
+    while ty < th {
         let cur_sy = sy;
         sy += y_step;
         y_acc += y_rem;
@@ -1861,6 +1866,7 @@ pub fn resample_nearest_into(
             sy += 1;
         }
         let row_d = ty * row_bytes;
+        ty += 1;
         if cur_sy == prev_sy {
             let prev_row_d = row_d - row_bytes;
             out.copy_within(prev_row_d..prev_row_d + row_bytes, row_d);
@@ -1876,8 +1882,10 @@ pub fn resample_nearest_into(
         let dst_row = out[row_d..row_d + row_bytes].as_chunks_mut::<4>().0;
         let mut sx = 0usize;
         let mut x_acc = 0usize;
-        for dst_px in dst_row {
-            *dst_px = src_row[sx];
+        let mut tx = 0usize;
+        while tx < dst_row.len() {
+            dst_row[tx] = src_row[sx];
+            tx += 1;
             sx += x_step;
             x_acc += x_rem;
             if x_acc >= tw {

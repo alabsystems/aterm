@@ -201,12 +201,14 @@ impl CursorGlow {
         geom: Geom,
     ) {
         let cc_plus_1 = cc.saturating_add(1);
-        let snuffed = |row: u16, col: u16| row != cr || (back_leap && col > cc_plus_1);
-        for s in &mut self.sparks {
-            if snuffed(s.row, s.col) {
+        let mut si = 0;
+        while si < self.sparks.len() {
+            let s = &mut self.sparks[si];
+            if s.row != cr || (back_leap && s.col > cc_plus_1) {
                 let age = now.saturating_duration_since(s.born).as_secs_f32();
                 s.life = s.life.min(age + Self::FLAME_SNUFF_S);
             }
+            si += 1;
         }
         self.snuff_sparks_off_line(cr, back_leap, now, geom, Self::SPARK_SNUFF_S);
     }
@@ -225,11 +227,14 @@ impl CursorGlow {
         }
         let (oy, inv_ch) = (f32::from(geom.origin_y), 1.0 / (geom.ch as f32));
         let cr_i32 = i32::from(cr);
-        for p in &mut self.particles {
+        let mut pi = 0;
+        while pi < self.particles.len() {
+            let p = &mut self.particles[pi];
             if back_leap || ((p.y0 - oy) * inv_ch).floor() as i32 != cr_i32 {
                 let age = now.saturating_duration_since(p.born).as_secs_f32();
                 p.life = p.life.min(age + within_s);
             }
+            pi += 1;
         }
     }
 
@@ -283,7 +288,7 @@ impl CursorGlow {
             while mi > 0 {
                 mi -= 1;
                 let m = &self.fire_meteors[mi];
-                if now.saturating_duration_since(m.born).as_secs_f32() <= Self::METEOR_RETARGET_S
+                if now.saturating_duration_since(m.born) <= METEOR_RETARGET_DUR
                     && (m.x1 - o_x).abs() < cwf * 0.6
                     && (m.y1 - o_y).abs() < chf * 0.6
                 {
@@ -326,12 +331,17 @@ impl CursorGlow {
             };
             self.path_scratch.clear();
             if shape_wrap {
-                let pane_col1 = pane_col0.saturating_add(pane_cols);
-                for c in (pc as i32)..(pane_col1 as i32) {
+                let pane_col1 = pane_col0.saturating_add(pane_cols) as i32;
+                let mut c = pc as i32;
+                while c < pane_col1 {
                     self.path_scratch.push((pr as i32, c));
+                    c += 1;
                 }
-                for c in (pane_col0 as i32)..(cc as i32) {
+                let mut c = pane_col0 as i32;
+                let cc_i32 = cc as i32;
+                while c < cc_i32 {
                     self.path_scratch.push((cr as i32, c));
+                    c += 1;
                 }
             } else if re_anchor {
                 self.path_scratch.push((cr as i32, cc as i32));
@@ -379,37 +389,38 @@ impl CursorGlow {
                     hue_advances = self.path_scratch.len() as f32;
                 }
                 let inv_n = 1.0 / (self.path_scratch.len() as f32);
-                for i in 0..self.path_scratch.len() {
+                let mut i = 0;
+                while i < self.path_scratch.len() {
                     let (r, c) = self.path_scratch[i];
-                    if r < 0 || c < 0 || r as usize >= geom.rows || c as usize >= geom.cols {
-                        continue;
-                    }
-                    let pos = if typing_run {
-                        1.0
-                    } else {
-                        (i as f32 + 1.0) * inv_n
-                    };
-                    let born_cov = match cfg.style {
-                        GlowStyle::Laser => ((205.0 + 50.0 * pos) * boost).min(255.0) as u8,
-                        GlowStyle::Beam => ((165.0 + 70.0 * pos) * boost).min(240.0) as u8,
-                        GlowStyle::Phaser => ((92.0 + 34.0 * pos) * boost).min(150.0) as u8,
-                        GlowStyle::Fire => ((20.0 + 78.0 * pos) * boost).min(122.0) as u8,
-                        _ => ((40.0 + 175.0 * pos) * boost).min(255.0) as u8,
-                    };
-                    self.sparks.push(Spark {
-                        row: r as u16,
-                        col: c as u16,
-                        born_cov,
-                        pos,
-                        life: spark_life,
-                        typing,
-                        hue: if typing_run {
-                            (self.hue + hue_step * i as f32 + 0.5).fract()
+                    if r >= 0 && c >= 0 && (r as usize) < geom.rows && (c as usize) < geom.cols {
+                        let pos = if typing_run {
+                            1.0
                         } else {
-                            (self.hue + pos * 0.5).fract()
-                        },
-                        born: now,
-                    });
+                            (i as f32 + 1.0) * inv_n
+                        };
+                        let born_cov = match cfg.style {
+                            GlowStyle::Laser => ((205.0 + 50.0 * pos) * boost).min(255.0) as u8,
+                            GlowStyle::Beam => ((165.0 + 70.0 * pos) * boost).min(240.0) as u8,
+                            GlowStyle::Phaser => ((92.0 + 34.0 * pos) * boost).min(150.0) as u8,
+                            GlowStyle::Fire => ((20.0 + 78.0 * pos) * boost).min(122.0) as u8,
+                            _ => ((40.0 + 175.0 * pos) * boost).min(255.0) as u8,
+                        };
+                        self.sparks.push(Spark {
+                            row: r as u16,
+                            col: c as u16,
+                            born_cov,
+                            pos,
+                            life: spark_life,
+                            typing,
+                            hue: if typing_run {
+                                (self.hue + hue_step * i as f32 + 0.5).fract()
+                            } else {
+                                (self.hue + pos * 0.5).fract()
+                            },
+                            born: now,
+                        });
+                    }
+                    i += 1;
                 }
                 if self.sparks.len() > cap {
                     let drop = self.sparks.len() - cap;
@@ -419,7 +430,12 @@ impl CursorGlow {
                     && typing
                     && gap <= Self::PHASER_CHAIN_GAP_MAX
                 {
-                    for s in self.sparks.iter_mut().rev().take(8) {
+                    let len = self.sparks.len();
+                    let stop = len.saturating_sub(8);
+                    let mut si = len;
+                    while si > stop {
+                        si -= 1;
+                        let s = &mut self.sparks[si];
                         if s.typing && s.row == cr && s.col != cc && cc.abs_diff(s.col) <= 3 {
                             let age = now.saturating_duration_since(s.born).as_secs_f32();
                             s.life = s.life.max(age + spark_life);
@@ -448,7 +464,7 @@ impl CursorGlow {
         let last = self.bolt_onsets[(self.bolt_onset_next + n - 1) % n];
         if crackle
             && let Some(t) = last
-            && now.saturating_duration_since(t).as_secs_f32() < Self::CRACKLE_REFRACTORY_S
+            && now.saturating_duration_since(t) < CRACKLE_REFRACTORY_DUR
         {
             return false;
         }
@@ -493,7 +509,12 @@ impl CursorGlow {
                 let (rr, rc) = {
                     let mut cells = [(0u16, 0u16); Self::CRACKLE_TRAIL_CELLS];
                     let mut n = 0usize;
-                    for s in self.sparks.iter().rev().take(Self::CRACKLE_TRAIL_CELLS) {
+                    let spark_len = self.sparks.len();
+                    let stop = spark_len.saturating_sub(Self::CRACKLE_TRAIL_CELLS);
+                    let mut si = spark_len;
+                    while si > stop {
+                        si -= 1;
+                        let s = &self.sparks[si];
                         if s.typing && now.saturating_duration_since(s.born).as_secs_f32() < s.life
                         {
                             cells[n] = (s.row, s.col);
@@ -652,7 +673,9 @@ impl CursorGlow {
                     None
                 }
             };
-            for _ in 0..burst {
+            let mut bi = 0;
+            while bi < burst {
+                bi += 1;
                 let r0 = self.frand();
                 let r1 = self.frand();
                 let r2 = self.frand();
@@ -927,10 +950,14 @@ impl CursorGlow {
         pts.push(from);
         pts.push(to);
         let mut amp = (len * 0.16).clamp(cell * 0.35, cell * 2.6);
-        for _ in 0..rounds {
+        let mut round = 0;
+        while round < rounds {
+            round += 1;
             next.len = 0;
-            for w in pts.windows(2) {
-                let (a, b) = (w[0], w[1]);
+            let pts_slice = pts.as_slice();
+            let mut wi = 0;
+            while wi + 1 < pts_slice.len() {
+                let (a, b) = (pts_slice[wi], pts_slice[wi + 1]);
                 let (sx, sy) = (b.0 - a.0, b.1 - a.1);
                 let inv_sl = 1.0 / crate::color_math::hypot_f32(sx, sy).max(1e-3);
                 let kick_sl = (self.frand() - 0.5) * 2.0 * amp * inv_sl;
@@ -939,14 +966,17 @@ impl CursorGlow {
                     (a.0 + b.0) * 0.5 - sy * kick_sl,
                     (a.1 + b.1) * 0.5 + sx * kick_sl,
                 ));
+                wi += 1;
             }
-            next.push(*pts.last().expect("bolt polyline is never empty"));
+            next.push(pts_slice[pts_slice.len() - 1]);
             std::mem::swap(&mut pts, &mut next);
             amp *= 0.5;
         }
         if big {
             let forks = 2 + (self.frand() * 3.0) as usize;
-            for _ in 0..forks {
+            let mut fi = 0;
+            while fi < forks {
+                fi += 1;
                 let i = (1 + (self.frand() * (pts.len() as f32 - 2.0)) as usize).min(pts.len() - 2);
                 let root = pts[i];
                 let prevp = pts[i - 1];
@@ -1005,7 +1035,9 @@ impl CursorGlow {
         let dist_cells = len / geom.cw.max(1) as f32;
         let (ux, uy) = (dx * inv_len, dy * inv_len);
         let burst = ((6.0 + dist_cells) as usize).min(24);
-        for _ in 0..burst {
+        let mut bi = 0;
+        while bi < burst {
+            bi += 1;
             if self.particles.len() >= Self::MAX_PARTICLES {
                 break;
             }
@@ -1038,12 +1070,12 @@ impl CursorGlow {
         // Expire a stale hint: it keeps the animation timer armed
         // (`is_active`), so an unconsumed one must self-disarm.
         if let Some(t) = self.kill_hint
-            && now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH
+            && now.saturating_duration_since(t) > KILL_HINT_FRESH_DUR
         {
             self.kill_hint = None;
         }
         if let Some(t) = self.bs_poof_hint
-            && now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH
+            && now.saturating_duration_since(t) > KILL_HINT_FRESH_DUR
         {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
@@ -1054,7 +1086,7 @@ impl CursorGlow {
         }
         let fresh_kill = true;
         let gap_ok = match self.last_poof {
-            Some(t) => now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_MIN_GAP,
+            Some(t) => now.saturating_duration_since(t) >= POOF_MIN_GAP_DUR,
             None => true,
         };
         let bs_only = self.kill_hint.is_none();
@@ -1066,8 +1098,6 @@ impl CursorGlow {
             PoofVoice::Swoosh
         };
         let mut poofed = false;
-        const POOF_PROBE_STALE_DUR: Duration =
-            Duration::from_secs(CursorGlow::POOF_PROBE_STALE as u64);
         if fresh_kill
             && gap_ok
             && let (Some(prev), Some(cur)) = (self.row_prev_meta, self.row_cur_meta)
@@ -1098,11 +1128,14 @@ impl CursorGlow {
                 let c1 = (prev_fill - s_span).max(c0 as usize + 1) as u16;
                 let mut survivor_holds_ink = s_span > 0;
                 if !survivor_holds_ink {
-                    for &ch in &cur_slice[..(c0 as usize).min(cur_slice.len())] {
-                        if ch != ' ' {
+                    let prefix_end = (c0 as usize).min(cur_slice.len());
+                    let mut ci = 0;
+                    while ci < prefix_end {
+                        if cur_slice[ci] != ' ' {
                             survivor_holds_ink = true;
                             break;
                         }
+                        ci += 1;
                     }
                 }
                 if survivor_holds_ink {
@@ -1137,9 +1170,7 @@ impl CursorGlow {
             && (!bs_only || erasure_proven || bs_erased)
             && (erase_on_glass
                 || match poof_hint_at {
-                    Some(t) => {
-                        now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
-                    }
+                    Some(t) => now.saturating_duration_since(t) >= POOF_FALLBACK_GRACE_DUR,
                     None => false,
                 })
             && let Some(cur) = self.row_cur_meta
@@ -1235,7 +1266,8 @@ impl CursorGlow {
                 let drops = (3 + (n as usize) / 8).min(5);
                 let inv_drops = 1.0 / (drops as f32);
                 let gy = if comet { 0.25 * cell } else { 3.0 * cell };
-                for k in 0..drops {
+                let mut k = 0;
+                while k < drops {
                     if self.particles.len() >= Self::MAX_PARTICLES {
                         break;
                     }
@@ -1259,6 +1291,7 @@ impl CursorGlow {
                         cov_scale: 1.0,
                         born: now,
                     });
+                    k += 1;
                 }
             }
             GlowStyle::Fire => {
@@ -1304,7 +1337,8 @@ impl CursorGlow {
         let heft_y = 0.6 + 0.9 * heft;
         let gy = 0.9 * cell;
         let life_scale = 0.85 + 0.45 * heft;
-        for k in 0..stars {
+        let mut k = 0;
+        while k < stars {
             if self.particles.len() >= Self::MAX_PARTICLES {
                 break;
             }
@@ -1325,6 +1359,7 @@ impl CursorGlow {
                 cov_scale: ERASE_ROUND_SCALE,
                 born: now,
             });
+            k += 1;
         }
         if self.particles.len() < Self::MAX_PARTICLES {
             let r0 = self.frand();
@@ -1361,7 +1396,8 @@ impl CursorGlow {
         let puffs = ((1.0 + crate::color_math::sqrt_f32(f32::from(n)) * 1.4) as usize).clamp(1, 8);
         let inv_puffs = 1.0 / (puffs as f32);
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
-        for k in 0..puffs {
+        let mut k = 0;
+        while k < puffs {
             if self.vapor.len() >= Self::MAX_VAPOR {
                 break;
             }
@@ -1378,6 +1414,7 @@ impl CursorGlow {
                 kind: VaporKind::Poof,
                 born: now,
             });
+            k += 1;
         }
     }
 
@@ -1391,7 +1428,8 @@ impl CursorGlow {
         cw: f32,
         now: Instant,
     ) {
-        for k in 0..puffs {
+        let mut k = 0;
+        while k < puffs {
             if self.vapor.len() >= Self::MAX_VAPOR {
                 break;
             }
@@ -1412,6 +1450,7 @@ impl CursorGlow {
                 kind: VaporKind::Steam,
                 born: now,
             });
+            k += 1;
         }
     }
 }

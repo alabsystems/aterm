@@ -6556,6 +6556,7 @@ impl App {
         }
         if let Some(chrome) = prepared_chrome {
             crate::tray_raster::set_prepared_chrome_fonts(chrome);
+            self.redraw_native_leaves_for_landed_fonts();
         } else {
             self.sync_chrome_fonts();
         }
@@ -6604,6 +6605,10 @@ impl App {
             ),
         };
         crate::tray_raster::set_chrome_fonts(primary, bold, semantic);
+        // A native page drawn before these faces is stale under its stamp
+        // ([`crate::tray_raster::chrome_coverage_epoch`]): the first present draws before
+        // they are installed.
+        self.redraw_native_leaves_for_landed_fonts();
     }
 
     /// Route one renderer knob change to exactly one renderer call (pinned by the config round-trip test).
@@ -6821,7 +6826,15 @@ impl App {
 
     /// Toggle borderless full screen on the current monitor (View ▸ Enter Full Screen).
     pub(crate) fn toggle_fullscreen(&self) -> Result<(), &'static str> {
-        let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) else {
+        let Some(wid) = self.frontmost_window else {
+            return Err("no window is on screen to full-screen");
+        };
+        self.toggle_fullscreen_in(wid)
+    }
+
+    /// Toggle borderless full screen for the window that received the command.
+    pub(crate) fn toggle_fullscreen_in(&self, wid: WindowId) -> Result<(), &'static str> {
+        let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) else {
             return Err("no window is on screen to full-screen");
         };
         let next = match w.fullscreen() {

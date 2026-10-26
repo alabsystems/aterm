@@ -14,16 +14,26 @@ pub const SHELL: &str = "base.shell.starts";
 /// The stale copies of aterm (macOS): the one `asked` item.
 pub const COPIES: &str = "base.pkg.copies";
 
-/// The Developer Tools row, whose fix-mode gather hands the owner to the pane.
+/// The Developer Tools row, whose fix-mode gather leaves the owner's hand-over to its pane
+/// for after the report.
 pub const DEVTOOLS: &str = "base.privacy.devtools";
 
 /// Whether a run narrowed to `only` reads the Developer Tools row.
 #[must_use]
 pub fn hands_over(only: &[String]) -> bool {
+    reads(only, "devtools:")
+}
+
+/// Whether a run narrowed to `only` reads the row labelled `label`: every row when no word
+/// narrows it, the shell's always, and otherwise each row a word names.
+#[must_use]
+pub fn reads(only: &[String], label: &str) -> bool {
     only.is_empty()
-        || only
-            .iter()
-            .any(|token| aterm_converge::selects(token, DEVTOOLS, "privacy", Some(Layer::Base)))
+        || label == "shell:"
+        || named(label).is_some_and(|(id, family, _)| {
+            only.iter()
+                .any(|token| aterm_converge::selects(token, id, family, Some(Layer::Base)))
+        })
 }
 
 /// Whether the `--only` word `token` names one of doctor's own rows on any platform.
@@ -198,12 +208,29 @@ pub fn args(rest: &[String]) -> Result<Args, String> {
     Ok(parsed)
 }
 
+/// Why `action` may not run for whoever is at this process ([`aterm_machines::console`]):
+/// `--apply` and `--restore` change the person's own Mac, so only a person at its console runs
+/// them, never an SSH session, an agent or a run without a terminal; `--check` changes nothing.
+/// `presence` is read only for an action that changes the Mac.
+#[cfg(target_os = "macos")]
+fn needs_person(
+    action: Settings,
+    presence: impl FnOnce() -> aterm_machines::console::Presence,
+) -> Option<String> {
+    (action != Settings::Check)
+        .then(|| presence().needs_person())
+        .flatten()
+}
+
 /// A settings action's report and exit ([`Settings`]).
 #[must_use]
 pub fn settings(action: Settings, json: bool) -> (String, u8) {
     #[cfg(target_os = "macos")]
     {
         use super::macos_doctor::{self, Action};
+        if let Some(why) = needs_person(action, aterm_machines::console::here) {
+            return settings_refused(json, &why);
+        }
         let action = match action {
             Settings::Check => Action::Check,
             Settings::Apply => Action::Apply,
@@ -262,11 +289,18 @@ pub struct Section {
     pub fact: String,
 }
 
-/// What `aterm doctor` read of this machine: its rows, and the stale-copy item.
+/// What `aterm doctor` read of this machine: its rows, the stale-copy item, and the Developer
+/// Tools hand-over due after the report.
 pub struct Gathered {
     lines: Vec<DoctorRow>,
     copies: Option<Copies>,
+    hand_over: Option<atpkg::devtools::Facts>,
 }
+
+/// The Developer Tools hand-over a fix-mode gather left due ([`gather`]): aterm is not granted
+/// and a person is at this terminal. [`answer`] makes it after the report.
+#[derive(Debug)]
+pub struct HandOver(atpkg::devtools::Facts);
 
 impl Gathered {
     /// The facts already read, as the pure report's tests build them.
@@ -275,6 +309,7 @@ impl Gathered {
         Self {
             lines,
             copies: None,
+            hand_over: None,
         }
     }
 
@@ -297,7 +332,14 @@ impl Gathered {
                 })
                 .collect(),
             copies: None,
+            hand_over: None,
         }
+    }
+
+    /// The Developer Tools hand-over due after the report, when the gather left one.
+    #[must_use]
+    pub fn hand_over(&self) -> Option<HandOver> {
+        self.hand_over.clone().map(HandOver)
     }
 
     /// The rows as items, in report order: each fact, and the stale copies after the privacy rows.
@@ -348,13 +390,28 @@ impl Gathered {
     }
 }
 
-/// Read this machine's facts for `aterm doctor`; with `fix`, the Developer Tools hand-over first.
+/// Read this machine's facts for `aterm doctor`, only the rows `only` names (the shell's
+/// always: [`reads`]), each probe on a thread of its own, the stale copies' look among them;
+/// it waits on no person. With `fix`, the Developer Tools hand-over is left due for after the
+/// report ([`Gathered::hand_over`]).
 #[must_use]
-pub fn gather(fix: bool) -> Gathered {
-    Gathered {
-        lines: super::doctor_facts_rows(fix),
-        copies: cfg!(target_os = "macos").then(|| Copies::new(atpkg::copies::prune)),
-    }
+pub fn gather(fix: bool, only: &[String]) -> Gathered {
+    let reads = |label: &str| reads(only, label);
+    std::thread::scope(|scope| {
+        let copies = (cfg!(target_os = "macos") && reads("copies:"))
+            .then(|| scope.spawn(|| atpkg::copies::prune(true)));
+        let (lines, hand_over) = super::doctor_facts_rows(fix, &reads);
+        Gathered {
+            lines,
+            copies: copies.map(|look| {
+                let look = look
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                Copies::new(atpkg::copies::prune, Some(look))
+            }),
+            hand_over,
+        }
+    })
 }
 
 /// The rows and the `health:` line, with its exit code; only tests call it, and
@@ -453,18 +510,69 @@ fn report_lines(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) 
     lines
 }
 
-/// Print `aterm doctor`'s answer as the diagnostics print theirs.
+/// Print `aterm doctor`'s answer, spelled for the shell that reads it, then make the
+/// Developer Tools hand-over the gather left due ([`HandOver`]). A report (`stdout`: the text,
+/// the JSON, a settings action's) goes to stdout whatever its code, which carries the verdict
+/// (`aterm doctor && aterm`), so `aterm doctor | less` and a captured stdout read it; only a
+/// refusal goes to stderr. The hand-over follows the report and never holds it back; its
+/// lines go to stderr.
 #[must_use]
-pub fn answer(text: &str, code: u8, stdout: bool) -> std::process::ExitCode {
-    if code == 0 || stdout {
-        return aterm_uds::stdout::answer_exit(
-            "aterm doctor",
-            &super::cli_text::for_stdout(text),
-            code,
-        );
+pub fn answer(
+    text: &str,
+    code: u8,
+    stdout: bool,
+    hand_over: Option<HandOver>,
+) -> std::process::ExitCode {
+    let status = answer_over(
+        text,
+        code,
+        stdout,
+        hand_over.as_ref().map(|HandOver(facts)| facts),
+        &Ends {
+            stdout: &|text| aterm_uds::stdout::answer(&super::cli_text::for_stdout(text)),
+            stderr: &|text| eprint!("{}", super::cli_text::for_stderr(text)),
+            hand_over: &super::devtools_hand_over_live,
+        },
+    );
+    std::process::ExitCode::from(status)
+}
+
+/// Where [`answer`] writes and what it runs after: injected, so a test reads both streams and
+/// scripts the hand-over.
+pub(crate) struct Ends<'a> {
+    /// Write the report whole to stdout ([`aterm_uds::stdout::answer`]).
+    pub(crate) stdout: &'a dyn Fn(&str) -> std::io::Result<()>,
+    /// Write to stderr.
+    pub(crate) stderr: &'a dyn Fn(&str),
+    /// The hand-over ([`super::devtools_hand_over_live`]).
+    pub(crate) hand_over: &'a dyn Fn(&atpkg::devtools::Facts),
+}
+
+/// [`answer`] over `ends`: the text, then the hand-over; the exit status, which is `code`
+/// unless the report could not be written ([`aterm_uds::stdout::answer_status`]: 1, and its
+/// line on stderr).
+pub(crate) fn answer_over(
+    text: &str,
+    code: u8,
+    stdout: bool,
+    hand_over: Option<&atpkg::devtools::Facts>,
+    ends: &Ends<'_>,
+) -> u8 {
+    let status = if stdout {
+        aterm_uds::stdout::answer_status("aterm doctor", (ends.stdout)(text), code).unwrap_or_else(
+            |line| {
+                (ends.stderr)(&format!("{line}\n"));
+                1
+            },
+        )
+    } else {
+        (ends.stderr)(text);
+        code
+    };
+    if let Some(facts) = hand_over {
+        (ends.hand_over)(facts);
     }
-    eprint!("{}", super::cli_text::for_stderr(text));
-    std::process::ExitCode::from(code)
+    status
 }
 
 const fn mark_of(row: &ItemReport) -> Mark {
@@ -547,14 +655,18 @@ impl Item for Fact<'_> {
 
 struct Copies {
     prune: fn(bool) -> atpkg::copies::Pruned,
+    /// The look [`gather`] took beside the other facts, which the first probe takes instead of
+    /// looking again.
+    early: Mutex<Option<atpkg::copies::Pruned>>,
     looked: Mutex<Option<atpkg::copies::Pruned>>,
     did: Mutex<Option<atpkg::copies::Pruned>>,
 }
 
 impl Copies {
-    fn new(prune: fn(bool) -> atpkg::copies::Pruned) -> Self {
+    fn new(prune: fn(bool) -> atpkg::copies::Pruned, early: Option<atpkg::copies::Pruned>) -> Self {
         Self {
             prune,
+            early: Mutex::new(early),
             looked: Mutex::new(None),
             did: Mutex::new(None),
         }
@@ -601,7 +713,13 @@ impl Item for CopiesItem<'_> {
 
     fn probe(&self) -> Probe {
         use atpkg::copies::Pruned;
-        let look = (self.0.prune)(true);
+        let early = self
+            .0
+            .early
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let look = early.unwrap_or_else(|| (self.0.prune)(true));
         let said = atpkg::copies::row(&look);
         let probe = match &look {
             Pruned::NotLooked(_) | Pruned::Incomplete { .. } => Probe::Unusable { why: said.text },
@@ -655,6 +773,33 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(ToString::to_string).collect()
+    }
+
+    /// `--apply` and `--restore` run only for a person at this Mac's console, refused in the
+    /// presence's one line otherwise; `--check` runs for anyone and reads nobody's presence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_person_at_the_console_applies_or_restores_the_settings() {
+        use aterm_machines::console::Presence;
+        for action in [Settings::Apply, Settings::Restore] {
+            assert_eq!(needs_person(action, || Presence::AtConsole), None);
+            for away in [
+                Presence::Remote,
+                Presence::NoTerminal,
+                Presence::AgentTab,
+                Presence::OtherLogin,
+                Presence::NoConsole,
+            ] {
+                let why = needs_person(action, || away).expect("refused");
+                assert_eq!(Some(why), away.needs_person());
+            }
+        }
+        assert_eq!(
+            needs_person(Settings::Check, || unreachable!(
+                "a check reads no presence"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -758,7 +903,8 @@ mod tests {
         }
         let gathered = Gathered {
             lines: Vec::new(),
-            copies: Some(Copies::new(prune)),
+            copies: Some(Copies::new(prune, None)),
+            hand_over: None,
         };
         let items = gathered.items();
         let planned = aterm_converge::run_scoped(
@@ -819,11 +965,39 @@ mod tests {
         ] {
             let gathered = Gathered {
                 lines: Vec::new(),
-                copies: Some(Copies::new(probe)),
+                copies: Some(Copies::new(probe, None)),
+                hand_over: None,
             };
             let rows = gathered.plan();
             assert_eq!(rows[0].outcome, expected);
             assert_eq!(Readiness::of(&rows, &[]).all_green, expected == Outcome::Ok);
         }
+    }
+
+    /// THE COPIES' LOOK IS TAKEN ONCE, BESIDE THE OTHER FACTS: the probe takes the look the
+    /// gather made on its own thread and looks no second time; a later probe looks afresh.
+    /// NEGATIVE CONTROL: with no early look the probe looks itself.
+    #[test]
+    fn the_copies_probe_takes_the_look_the_gather_made() {
+        use atpkg::copies::Pruned;
+        static LOOKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn look(_: bool) -> Pruned {
+            LOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Pruned::NotLooked("looked again".to_owned())
+        }
+        let early = Pruned::Found {
+            offered: Vec::new(),
+            kept: Vec::new(),
+            complete: true,
+        };
+        let gathered = Gathered {
+            lines: Vec::new(),
+            copies: Some(Copies::new(look, Some(early))),
+            hand_over: None,
+        };
+        assert_eq!(gathered.plan()[0].outcome, Outcome::Ok, "the early look");
+        assert_eq!(LOOKS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(gathered.plan()[0].outcome, Outcome::Unknown, "a fresh look");
+        assert_eq!(LOOKS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

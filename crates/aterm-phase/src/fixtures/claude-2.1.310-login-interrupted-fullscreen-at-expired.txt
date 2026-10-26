@@ -1,0 +1,51 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path on its default route (no `CLAUDE_CONFIG_DIR`, no `ANTHROPIC_BASE_URL` and no proxy: the lab's scratch HOME, `CLAUDE_SECURESTORAGE_CONFIG_DIR` a scratch login dir whose `.credentials.json` is a dead stored login, no `apiKeyHelper` and no OAuth token, every connection but loopback denied by the lab's jail, crates/aterm-lab), which drew its fullscreen renderer of its own accord (no `CLAUDE_CODE_NO_FLICKER`) · Esc out of the fullscreen renderer's /login picker (aterm's harness typed /login at the `⏺ Login expired · Please run /login` error row; no method picked): `⎿  Login interrupted` under `❯ /login`, the composer back, 2.1.310
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.cL9J/proj
+
+
+❯ Write one sentence about harbours, then stop.
+
+⏺ Login expired · Please run /login
+
+✻ Worked for 0s · done 1:48 PM
+
+❯ /login
+  ⎿  Login interrupted
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                            ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

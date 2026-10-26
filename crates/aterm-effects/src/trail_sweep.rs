@@ -37,9 +37,11 @@ pub fn line_cells_tail(
         };
         let r = origin.0;
         let mut c = i64::from(origin.1) + step_c * start;
-        for _ in start..available {
+        let mut idx = start;
+        while idx < available {
             out.push((r, c as i32));
             c += step_c;
+            idx += 1;
         }
         return;
     }
@@ -51,9 +53,11 @@ pub fn line_cells_tail(
         };
         let mut r = i64::from(origin.0) + sr * start;
         let c = origin.1;
-        for _ in start..available {
+        let mut idx = start;
+        while idx < available {
             out.push((r as i32, c));
             r += sr;
+            idx += 1;
         }
         return;
     }
@@ -76,7 +80,8 @@ pub fn line_cells_tail(
         let mut r = i64::from(origin.0) + sr * ((num0 / major128) as i64);
         let mut rem = (num0 % major128) as i64;
         let mut c = i64::from(origin.1) + sc * start;
-        for _ in start..available {
+        let mut idx = start;
+        while idx < available {
             out.push((r as i32, c as i32));
             c += sc;
             rem += dr;
@@ -84,13 +89,15 @@ pub fn line_cells_tail(
                 rem -= major;
                 r += sr;
             }
+            idx += 1;
         }
     } else {
         let num0 = start128 * i128::from(dc) + bias;
         let mut r = i64::from(origin.0) + sr * start;
         let mut c = i64::from(origin.1) + sc * ((num0 / major128) as i64);
         let mut rem = (num0 % major128) as i64;
-        for _ in start..available {
+        let mut idx = start;
+        while idx < available {
             out.push((r as i32, c as i32));
             r += sr;
             rem += dc;
@@ -98,6 +105,7 @@ pub fn line_cells_tail(
                 rem -= major;
                 c += sc;
             }
+            idx += 1;
         }
     }
 }

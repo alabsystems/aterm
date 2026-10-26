@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 use super::fixtures::{
-    Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, exited_skewed_1510,
-    finished_1032, idle_skewed_1510, lane_off_1032, liar_1032, reaped_1510, spotlight_1032,
-    spotlight_late_1032, tab, tab2_build_1048, wrapped_1218,
+    Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, claude_reaped_1032,
+    exited_skewed_1510, exited_unseen_1510, finished_1032, idle_skewed_1510, lane_off_1032,
+    liar_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab2_build_1048,
+    wrapped_1218,
 };
 use super::*;
 use crate::model::{MemRates, MemSample, MemView, Pressure, Thermal, Throttle, Vitals};
@@ -1002,7 +1003,8 @@ fn a_tabs_role_is_by_its_share_its_rank_and_the_floor() {
 /// tab 2's build, none for a tab with no work, `unavailable(truncated)` on
 /// a cut sweep (never none), and `unavailable(not_sampled)` where aterm's
 /// finished work could make the tab the cause: 0.20 live is minor, 3.20 with
-/// the 3.00 no live process holds is main.
+/// the 3.00 no member's reaped time holds is main; where claude reaped them,
+/// the tab's 3.20 is main.
 #[test]
 fn the_you_role_needs_a_whole_sweep_and_its_bound() {
     let you = |scene: &Scene, tab: u64| account(WhySubject::Cpu, Some(tab), &snap(scene));
@@ -1074,6 +1076,13 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
     );
     assert!(f.cannot.contains(&("finished_tab_work", "not_sampled")));
     assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
+    let r = you(&claude_reaped_1032(), 1);
+    assert_eq!(
+        (r.you.role, r.you.figure, r.you.unattributed_mc),
+        (Role::Main, Some(3200), None),
+        "the compilers claude reaped count in its tab"
+    );
+    assert!(!r.cannot.contains(&("finished_tab_work", "not_sampled")));
     let mut build = tab2_build_1048();
     build.busy_mc += 1000;
     for c in build.coalitions.iter_mut().filter(|c| c.id == 1342) {
@@ -1086,6 +1095,32 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
         (Role::Main, Some(6000), Some(1000))
     );
     assert!(!g.cannot.contains(&("finished_tab_work", "not_sampled")));
+}
+
+/// A tab the reap credit marked short of its work, over a window with no unattributed work, may
+/// hold any of the rest of aterm's side: where that much would make it the main user, its role
+/// is unread, never `minor`. NEGATIVE CONTROL: unmarked, the same figures read `minor`.
+#[test]
+fn a_short_tabs_role_is_bounded_by_the_rest_of_aterms_side() {
+    let you = |short: bool| {
+        let mut s = snap(&spotlight_1032());
+        let mut f = (**s.why.as_ref().expect("a window")).clone();
+        let split = &mut f.split;
+        split.tabs = vec![(1, 200)];
+        split.global_mc = 3300;
+        (split.aterm_mc, split.delegated_mc, split.others_mc) = (2400, 0, 500);
+        (
+            split.services_mc,
+            split.unaccounted_mc,
+            split.unattributed_mc,
+        ) = (400, 0, 0);
+        split.short_tabs = if short { vec![1] } else { Vec::new() };
+        s.why = Some(std::sync::Arc::new(f));
+        let a = account(WhySubject::Cpu, Some(1), &s);
+        (a.you.role, a.you.unattributed_mc)
+    };
+    assert_eq!(you(true), (Role::Unavailable("not_sampled"), Some(0)));
+    assert_eq!(you(false), (Role::Minor, None), "NEGATIVE CONTROL");
 }
 
 /// An idle tab beside aterm's coalition and its live work 0.30 mc apart
@@ -1158,9 +1193,12 @@ fn the_parts_rounding_never_reads_as_unattributed_work() {
 /// member whose coalition went unread (the sweep found fewer than the
 /// counters hold), with a member whose CPU was not read at both ends (a
 /// root `sudo` in tab 1 at 500 mc), or with one whose user went unread at
-/// the window's end (tab 1's `claude` at 300 mc) keeps what no tab's figure
-/// holds as work, and the role `not_sampled`; so does a `git` that exited
-/// after 3 mc (`exited_skewed_1510`).
+/// the window's end (tab 1's `claude` at 300 mc: its last second) keeps what
+/// no tab's figure holds as work, and the role `not_sampled` where that work
+/// could change it; so does a `git` that exited after 3 mc
+/// (`exited_skewed_1510`), whose 3 mc the shell's reaped time puts in its tab,
+/// with the skew unattributed, and a task of 3 mc no member reaped
+/// (`exited_unseen_1510`), which stays unattributed with it.
 #[test]
 fn the_counters_skew_never_reads_as_finished_work() {
     let read = |scene: &Scene, tweak: fn(&mut Sample)| {
@@ -1274,20 +1312,46 @@ fn the_counters_skew_never_reads_as_finished_work() {
         }
     });
     assert_eq!(
-        (split.skew_mc, split.unattributed_mc),
-        (0, 301),
-        "a member whose user went unread at the window's end"
+        (split.skew_mc, split.unattributed_mc, split.tabs.as_slice()),
+        (0, 61, &[(1, 240)][..]),
+        "a member whose user went unread at the window's end: its work to the reading before \
+         counts in its tab (the window's 4 s of 5), its last second does not"
     );
     assert_eq!(
         (a.you.role, a.you.unattributed_mc),
-        (Role::Unavailable("not_sampled"), Some(301))
+        (Role::Minor, Some(61)),
+        "with its last second the tab is still minor, so its role is read"
     );
 
     let (split, a) = read(&exited_skewed_1510(), |_| {});
     assert_eq!(
-        (split.aterm_mc, split.skew_mc, split.unattributed_mc),
-        (204, 0, 4),
-        "the git's 15 ms and the counters' 3.26 ms, with a member reaped"
+        (
+            split.aterm_mc,
+            split.tabs.as_slice(),
+            split.skew_mc,
+            split.unattributed_mc
+        ),
+        (204, &[(1, 3)][..], 0, 1),
+        "the git's 15 ms count in its tab, its last second by the shell's reaped time; the \
+         counters' 3.26 ms, with a member reaped, are unattributed"
+    );
+    assert_eq!(
+        (a.you.role, a.you.figure, a.you.unattributed_mc),
+        (Role::Minor, Some(3), Some(1)),
+        "a 1 mc bound leaves the tab minor"
+    );
+    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
+
+    let (split, a) = read(&exited_unseen_1510(), |_| {});
+    assert_eq!(
+        (
+            split.aterm_mc,
+            split.tabs.as_slice(),
+            split.skew_mc,
+            split.unattributed_mc
+        ),
+        (204, &[(1, 0)][..], 0, 4),
+        "a task's 15 ms no member reaped and the counters' 3.26 ms, with a member reaped"
     );
     assert_eq!(
         (a.you.role, a.you.figure, a.you.unattributed_mc),

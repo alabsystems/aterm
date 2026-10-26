@@ -276,6 +276,85 @@ fn a_successor_paces_by_the_lines_typed_at_a_break_alone() {
     );
 }
 
+/// THE WAKE DOOR'S ROWS READ BACK BY THEIR EPISODE: a successor seeds a wake's intent
+/// (`kind=wake`), its `typed` and `skipped` outcomes and an answer told by its await as the
+/// wake's own episode; it paces by the line typed at a break, and seeds the door's books from it
+/// (`rules::would_rows_in`), never from a skip. NEGATIVE CONTROL: the hold's typed row beside
+/// them reads as the hold's.
+#[test]
+fn a_successor_reads_the_wake_doors_rows_by_their_episode() {
+    use super::super::wakes_seen::wake_episode;
+    let episode = wake_episode(1_000, 1);
+    let key = EpisodeKey {
+        kind: FactKind::Wake,
+        id: episode,
+    };
+    let rule = FactKind::Wake.rule();
+    let intent = wake_intent_reason(1, episode, 60_000);
+    assert!(
+        intent.starts_with(&format!("kind=wake episode={episode:016x} ord=1 ")),
+        "{intent}"
+    );
+    let typed = wake_outcome_reason(1, episode, 60_000, Told::Typed);
+    let skipped = wake_outcome_reason(1, episode, 60_000, Told::Skipped("unmet"));
+    assert!(skipped.ends_with(" door=break why=unmet"), "{skipped}");
+    let nudged = outcome_reason(RuleId::WaitNudge, 0xab, 1_800_000, false, Told::Typed);
+    let body = [
+        row(SID, 1, INTENT_RULE, Outcome::Waiting, &intent),
+        row(SID, 2, rule, Outcome::Skipped, &skipped),
+        row(SID, 3, INTENT_RULE, Outcome::Waiting, &intent),
+        row(SID, 4, rule, Outcome::Typed, &typed),
+        row(
+            SID,
+            5,
+            rule,
+            Outcome::Waiting,
+            &wake_heard_reason(1, episode),
+        ),
+        row(SID, 6, FactKind::Hold.rule(), Outcome::Typed, &nudged),
+    ]
+    .join("\n");
+    let seeded: Vec<_> = seed_rows_in(&body, Some(SID))
+        .into_iter()
+        .filter(|(k, _, _)| *k == key)
+        .map(|(_, at, outcome)| (at, outcome))
+        .collect();
+    assert_eq!(
+        seeded,
+        [
+            (1, SeedOutcome::Intent),
+            (2, SeedOutcome::Skipped),
+            (3, SeedOutcome::Intent),
+            (4, SeedOutcome::Typed),
+            (5, SeedOutcome::Answered),
+        ]
+    );
+    assert_eq!(
+        break_lines_in(&body, Some(SID)),
+        [(4, FactKind::Wake), (6, FactKind::Hold)]
+    );
+    let pointed = typed.replace(" door=break", " door=point");
+    assert_ne!(pointed, typed);
+    let rode = format!("{body}\n{}", row(SID, 7, rule, Outcome::Typed, &pointed));
+    assert_eq!(
+        break_lines_in(&rode, Some(SID)),
+        [(4, FactKind::Wake), (6, FactKind::Hold)],
+        "a wake's line that rode a point's act is no break line"
+    );
+    let booked: Vec<(RuleId, i64, Option<u64>)> =
+        super::super::rules::would_rows_in(&body, Some(SID))
+            .into_iter()
+            .map(|row| (row.rule, row.row_ms, row.episode))
+            .collect();
+    assert_eq!(
+        booked,
+        [
+            (RuleId::Wake, 4, Some(episode)),
+            (RuleId::WaitNudge, 6, Some(0xab))
+        ]
+    );
+}
+
 #[test]
 fn every_pace_answer_reads_back_by_its_word() {
     let answers = [

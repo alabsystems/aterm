@@ -90,23 +90,10 @@ pub(crate) fn usage_credits() -> bool {
 
 /// [`USAGE_TAP`]: `[harness] usage_tap` is on and the harness supervises Claude Code
 /// ([`SupervisorConfig::usage_tap_on`]). It decides whether the relaunch lines aterm types are
-/// offered the usage tap ([`usage_tap_armed`]) and what the Claude Code footer says of a weekly
-/// figure it has not got (`claude_footer`, `profile::WeeklyGap`).
+/// offered the usage tap ([`window_drive_opts_with_tap`]) and what the Claude Code footer says
+/// of a weekly figure it has not got (`claude_footer`, `profile::WeeklyGap`).
 pub(crate) fn usage_tap_on() -> bool {
     USAGE_TAP.load(Ordering::SeqCst)
-}
-
-/// The usage tap armed for the relaunch lines the background lane ([`live_acts`]) types under
-/// harness state `state`, from [`USAGE_TAP`], [`tap::stable_exe`] and the roster beside the
-/// active `aterm.toml` ([`tap::Armed::arm`], which `aterm harness upgrade` arms by too).
-pub(crate) fn usage_tap_armed(state: &Path) -> Option<tap::Armed> {
-    tap::Armed::arm(
-        usage_tap_on(),
-        tap::stable_exe,
-        accounts::default_roster_path().as_deref(),
-        &accounts::Store::at(state),
-        aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()),
-    )
 }
 
 /// Whether `cfg` supervises this instance's agent sessions.
@@ -167,7 +154,8 @@ pub(crate) struct Switches {
     usage_notes: AtomicBool,
     /// `[harness] logins`, `false` where the policy supervises nothing here or Claude Code is switched off (as for [`Self::accounts`]).
     logins: AtomicBool,
-    /// News of the accounts, counted ([`HostHandle::note_accounts`]: the store's wake marker was replaced).
+    /// News of the accounts, counted ([`HostHandle::note_accounts`]: the store's wake marker was
+    /// replaced; [`activation_loop`]: the roster's file reads otherwise than at its last look).
     accounts_news: AtomicU64,
     /// The hash of the [`AccountsSaid`] the window was last told ([`accounts_tell`]).
     accounts_said: AtomicU64,
@@ -1723,6 +1711,19 @@ type TaskFactFn = dyn Fn(
 type WakesFn = dyn Fn(&str) -> aterm_agent::supervise::occupancy::WakesSeen + Send + Sync;
 /// Session `sid`'s loop told a wake of its book, by ordinal and episode, through a door ([`Acts::wake_told`]).
 type WakeToldFn = dyn Fn(&str, u16, u64, aterm_agent::supervise::occupancy::WakeDoor) + Send + Sync;
+/// Session `sid`'s loop claims a wake of its book, by ordinal and episode, for a door's line, with the refusal its worker judged ([`Acts::wake_claim`]).
+type WakeClaimFn = dyn Fn(
+        &str,
+        u16,
+        u64,
+        aterm_agent::supervise::occupancy::WakeDoor,
+        Option<aterm_agent::supervise::occupancy::PaceRefusal>,
+    ) -> aterm_agent::supervise::occupancy::WakeClaim
+    + Send
+    + Sync;
+/// Session `sid`'s loop gives back the claim one of its doors holds on a wake, by ordinal, episode and door ([`Acts::wake_release`]).
+type WakeReleaseFn =
+    dyn Fn(&str, u16, u64, aterm_agent::supervise::occupancy::WakeDoor) + Send + Sync;
 /// Session `sid`'s worker went ([`Acts::wakes_left`]).
 type WakesLeftFn = dyn Fn(&str) + Send + Sync;
 type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
@@ -2218,8 +2219,12 @@ pub(crate) struct Acts {
     pub(crate) task_fact: Arc<TaskFactFn>,
     /// The session's book of wakes the worker's loop reads ([`WorkerIdle::wakes`], live [`crate::occupancy_wakes::seen_for`]): from that read on the session is hosted, and an answer written waits for the loop to tell it heard.
     pub(crate) wakes: Arc<WakesFn>,
-    /// A wake the worker's loop told ([`WorkerIdle::wake_told`], live [`crate::occupancy_wakes::told_for`]): an answer heard.
+    /// A wake the worker's loop told ([`WorkerIdle::wake_told`], live [`crate::occupancy_wakes::told_for`]): an answer heard, or a claimed line written.
     pub(crate) wake_told: Arc<WakeToldFn>,
+    /// The worker's loop claims a wake for its line ([`WorkerIdle::wake_claim`], live [`crate::occupancy_wakes::claim_for`]).
+    pub(crate) wake_claim: Arc<WakeClaimFn>,
+    /// The worker's loop gives back a claim its line did not use ([`WorkerIdle::wake_release`], live [`crate::occupancy_wakes::release_for`]).
+    pub(crate) wake_release: Arc<WakeReleaseFn>,
     /// The worker went: no loop is left to tell its session's answers heard ([`WorkerIdle`]'s drop, live [`crate::occupancy_wakes::left`]).
     pub(crate) wakes_left: Arc<WakesLeftFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
@@ -3414,22 +3419,40 @@ impl IdleHost for WorkerIdle {
         rule: aterm_agent::supervise::occupancy::RuleId,
         hold_since_ms: i64,
     ) -> aterm_agent::supervise::occupancy::PaceGrant {
-        use aterm_agent::supervise::occupancy::{PaceGrant, PaceRefusal};
-        let refused = if !self.on() {
-            Some(PaceRefusal::Off)
-        } else if self.beside() {
-            Some(PaceRefusal::Beside)
-        } else if self.owns_turn_end() {
-            Some(PaceRefusal::Owns)
-        } else if host_carries_relaunch(self.agent) && with_kept_of(&self.kept, |k| k.carry_asked) {
-            Some(PaceRefusal::CarryOwed)
-        } else {
-            None
-        };
-        match refused {
+        use aterm_agent::supervise::occupancy::PaceGrant;
+        match self.pace_refusal() {
             Some(why) => PaceGrant::Refused(why),
             None => (self.hooks.acts.occupancy_pace)(&self.sid, rule, hold_since_ms),
         }
+    }
+
+    /// The claim on wake `ord` of `episode` for `door`'s line ([`Acts::wake_claim`]), refused
+    /// (`refused:off`) unless the owner's mode in force here is `prompt`
+    /// ([`crate::occupancy_host::prompt_now`]): the GUI's own gate beside the loop's grant (the
+    /// slice-2 plan's W1). The book judges it under its lock with the refusal this worker judges
+    /// for every fact line ([`Self::occupancy_pace`]'s).
+    fn wake_claim(
+        &self,
+        ord: u16,
+        episode: u64,
+        door: aterm_agent::supervise::occupancy::WakeDoor,
+    ) -> aterm_agent::supervise::occupancy::WakeClaim {
+        use aterm_agent::supervise::occupancy::{PaceRefusal, WakeClaim};
+        if !crate::occupancy_host::prompt_now() {
+            return WakeClaim::Refused(PaceRefusal::Off);
+        }
+        (self.hooks.acts.wake_claim)(&self.sid, ord, episode, door, self.pace_refusal())
+    }
+
+    /// The loop gives back `door`'s claim on wake `ord` of `episode` ([`Acts::wake_release`]): the
+    /// book honours it only where that door holds the claim.
+    fn wake_release(
+        &self,
+        ord: u16,
+        episode: u64,
+        door: aterm_agent::supervise::occupancy::WakeDoor,
+    ) {
+        (self.hooks.acts.wake_release)(&self.sid, ord, episode, door);
     }
 
     /// The task door's fact word on this session's record ([`Acts::task_fact`]), refused
@@ -3451,7 +3474,8 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.wakes)(&self.sid)
     }
 
-    /// The loop told wake `ord` of `episode` through `door` ([`Acts::wake_told`]): an answer heard.
+    /// The loop told wake `ord` of `episode` through `door` ([`Acts::wake_told`]): an answer heard,
+    /// or the line its claim let go written.
     fn wake_told(&self, ord: u16, episode: u64, door: aterm_agent::supervise::occupancy::WakeDoor) {
         (self.hooks.acts.wake_told)(&self.sid, ord, episode, door);
     }
@@ -4356,7 +4380,11 @@ impl IdleHost for WorkerIdle {
             .is_some_and(|(roster, look, _)| renewable_own(&roster, &look).is_none())
     }
 
-    /// The method the session's login already is ([`IdleHost::login_method`]).
+    /// The method the session's login already is ([`IdleHost::login_method`]), for a login no
+    /// roster row renews. A renewable login's picker is the loop's to back out of
+    /// (`PickerGate::Roster`), never to pick in, so its method is `None`: a row named between
+    /// the picker's gate and this read leaves the picker unpicked rather than opens its browser
+    /// sign-in.
     fn login_method(&self) -> Option<aterm_phase::LoginMethod> {
         if !accounts_for(self.agent) {
             return None;
@@ -4369,8 +4397,10 @@ impl IdleHost for WorkerIdle {
             return None;
         }
         let seat = (self.hooks.acts.account_seat)()?;
-        let renewable = self.renewable_look().is_some();
-        aterm_agent::harness::profile::login_method(&env, &seat.home, renewable)
+        if self.renewable_look().is_some() {
+            return None;
+        }
+        aterm_agent::harness::profile::login_method(&env, &seat.home)
     }
 
     /// Another tab's sign-in of this session's login ([`IdleHost::login_shared`]), asked at its lost login.
@@ -5088,6 +5118,24 @@ impl WorkerIdle {
     /// The worker still acts: not stopped, and its agent still admitted ([`Switches::on_for`]).
     fn on(&self) -> bool {
         !self.stop.load(Ordering::SeqCst) && self.switches.on_for(self.agent)
+    }
+
+    /// Why this worker refuses every fact line of its session (slice 1's refusals, a wake's
+    /// claim's too): off, beside a self-supervising agent, the wind-down owning its turn ends, or
+    /// a relaunch's carry-on owed; `None` where it takes them.
+    fn pace_refusal(&self) -> Option<aterm_agent::supervise::occupancy::PaceRefusal> {
+        use aterm_agent::supervise::occupancy::PaceRefusal;
+        if !self.on() {
+            Some(PaceRefusal::Off)
+        } else if self.beside() {
+            Some(PaceRefusal::Beside)
+        } else if self.owns_turn_end() {
+            Some(PaceRefusal::Owns)
+        } else if host_carries_relaunch(self.agent) && with_kept_of(&self.kept, |k| k.carry_asked) {
+            Some(PaceRefusal::CarryOwed)
+        } else {
+            None
+        }
     }
 
     /// Whether the session's agent is one this host relaunches in place.
@@ -5964,7 +6012,9 @@ impl WorkerIdle {
         }
     }
 
-    /// A claim's transaction that failed after it was saved (the state written, its ledger row or wake marker not).
+    /// Ends this worker's claim if a failed transaction still left it readable as open. Under the sync
+    /// commit a pre-admission refusal saves nothing and an interrupted publication fences reads until
+    /// recovery, so this is a belt for any path that saved the claim without its outcome.
     fn reset_unclaim(&self, seat: &AccountSeat, look: &AccountLook, label: &str, until: i64) {
         let open = accounts::Store::at(&seat.state)
             .load(seat.now)
@@ -14029,6 +14079,24 @@ pub(crate) fn window_drive_opts(
     state: std::path::PathBuf,
     sock: Option<String>,
 ) -> upgrade_drive::Opts {
+    window_drive_opts_with_tap(home, state, sock, false)
+}
+
+/// Capture the model-evidence policy and optional tap from one recovered roster.
+/// Only the acting lane enables the tap; views and recorded requests leave it off.
+fn window_drive_opts_with_tap(
+    home: std::path::PathBuf,
+    state: std::path::PathBuf,
+    sock: Option<String>,
+    tap_on: bool,
+) -> upgrade_drive::Opts {
+    let accounts = tap::LaunchPolicy::read(
+        tap_on,
+        tap::stable_exe,
+        accounts::default_roster_path().as_deref(),
+        &accounts::Store::at(&state),
+        aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()),
+    );
     upgrade_drive::Opts {
         home,
         state,
@@ -14041,9 +14109,9 @@ pub(crate) fn window_drive_opts(
         background: false,
         aterm_state: aterm_types::dirs::state_dir(),
         ask: upgrade_ask(),
-        several_logins: several_logins(),
+        several_logins: accounts.several_logins,
         usage_credits: usage_credits(),
-        usage_tap: None,
+        usage_tap: accounts.usage_tap,
         instances: upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
         land: false,
@@ -14085,14 +14153,13 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let [w1, w2, w3, w4, w5, w6, w7, w8, w9, w10] = std::array::from_fn(|_| Arc::clone(&row));
     let opts = move |sid: &str, grace: u32| {
         place.clone().map(|(home, state)| upgrade_drive::Opts {
-            usage_tap: usage_tap_armed(&state),
             only_sid: Some(sid.to_string()),
             human_grace_s: grace,
             agents_off: AGENTS_OFF
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
-            ..window_drive_opts(home, state, Some(sock.clone()))
+            ..window_drive_opts_with_tap(home, state, Some(sock.clone()), usage_tap_on())
         })
     };
     let opts = Arc::new(opts);
@@ -14163,6 +14230,8 @@ fn live_acts(store: Store, sock: String) -> Acts {
         task_fact: Arc::new(move |sid, word| task_fact_live(&fact_store, sid, word)),
         wakes: Arc::new(crate::occupancy_wakes::seen_for),
         wake_told: Arc::new(crate::occupancy_wakes::told_for),
+        wake_claim: Arc::new(crate::occupancy_wakes::claim_for),
+        wake_release: Arc::new(crate::occupancy_wakes::release_for),
         wakes_left: Arc::new(crate::occupancy_wakes::left),
         resume: Arc::new(move |sid, grace, carry| {
             let Some(o) = o7(sid, grace) else {
@@ -14353,13 +14422,12 @@ fn live_acts(store: Store, sock: String) -> Acts {
             };
             let r = match why {
                 Restart::Account { .. } => {
-                    let roster = accounts::default_roster_path()
-                        .and_then(|path| accounts::Roster::load(&path).ok())
-                        .unwrap_or_default();
                     let roster = match (harness_state(), aterm_time::unix_secs()) {
-                        (Some(state), Some(now)) => match accounts::Store::at(&state)
-                            .bound(&roster, i64::try_from(now).unwrap_or(i64::MAX))
-                        {
+                        (Some(state), Some(now)) => match read_account_roster(
+                            accounts::default_roster_path().as_deref(),
+                            &accounts::Store::at(&state),
+                            i64::try_from(now).unwrap_or(i64::MAX),
+                        ) {
                             Ok(roster) => roster,
                             Err(_) => return "wait:account-state".to_string(),
                         },
@@ -14479,7 +14547,13 @@ fn account_wall_live(
     };
     let roster = accounts::default_roster_path();
     walled_between_upkeeps(&|step| upkeep.make(step), || {
-        account_wall_at((home, &state, roster.as_deref()), sid, agent, settled, now)
+        account_wall_at(
+            (home, &accounts::Store::at(&state), roster.as_deref()),
+            sid,
+            agent,
+            settled,
+            now,
+        )
     })
 }
 
@@ -14491,22 +14565,18 @@ fn walled_between_upkeeps<T>(upkeep: &dyn Fn(UpkeepStep), wall: impl FnOnce() ->
     read
 }
 
-/// [`account_wall_live`] over the places it is given (`(home, harness state root, roster file)`,
+/// [`account_wall_live`] over the places it is given (`(home, account store, roster file)`,
 /// the roster `None` where no config path is known) and the caller's clock.
 fn account_wall_at(
-    (home, state, roster): (&Path, &Path, Option<&Path>),
+    (home, store, roster): (&Path, &accounts::Store, Option<&Path>),
     sid: &str,
     agent: &WalledAgent<'_>,
     settled: &dyn Fn() -> bool,
     now: i64,
 ) -> (&'static str, Option<String>) {
-    let roster = match roster.map(accounts::Roster::load) {
-        None => accounts::Roster::default(),
-        Some(Ok(roster)) => match accounts::Store::at(state).bound(&roster, now) {
-            Ok(roster) => roster,
-            Err(_) => return ("roster-refused", None),
-        },
-        Some(Err(_)) => return ("roster-refused", None),
+    let roster = match read_account_roster(roster, store, now) {
+        Ok(roster) => roster,
+        Err(why) => return (why.recording_word(), None),
     };
     let roster = match roster {
         roster if roster.rows.is_empty() && agent.own => accounts::Roster::own(),
@@ -14523,7 +14593,7 @@ fn account_wall_at(
         wall: upgrade_drive::named_standing_wall(home, agent.snap),
         started: process_started(&agent.snap.start),
     };
-    account_wall_of(&accounts::Store::at(state), &roster, sid, &read, now)
+    account_wall_of(store, &roster, sid, &read, now)
 }
 
 /// The unix second a process started, from its kernel start as the snapshot keeps it ([`Snapshot::start`]: `ps -o lstart=` in UTC).
@@ -14986,13 +15056,12 @@ fn usage_roster(
     (own, listed): (bool, bool),
     now: i64,
 ) -> Result<accounts::Roster, &'static str> {
-    match path.map(accounts::Roster::load) {
-        Some(Err(_)) => Err("roster-refused"),
-        Some(Ok(roster)) if !roster.rows.is_empty() => {
+    match read_account_roster(path, store, now).map_err(RosterUnread::recording_word)? {
+        roster if !roster.rows.is_empty() => {
             if !listed {
                 return Err("off");
             }
-            store.bound(&roster, now).map_err(|_| "roster-refused")
+            Ok(roster)
         }
         _ if own => Ok(accounts::Roster::own()),
         _ => Err("not-listed"),
@@ -15321,15 +15390,56 @@ fn account_roster_or_own(seat: &AccountSeat) -> Option<accounts::Roster> {
 
 /// One bounded read of `seat`'s roster file.
 fn roster_read(seat: &AccountSeat) -> Result<accounts::Roster, RosterUnread> {
-    let Some(path) = seat.roster.as_deref() else {
-        return Err(RosterUnread::Nothing);
-    };
-    match accounts::Roster::load(path) {
+    let store = accounts::Store::at(&seat.state).bounded_by(seat.ladder);
+    match read_account_roster(seat.roster.as_deref(), &store, seat.now) {
         Ok(roster) if roster.rows.is_empty() => Err(RosterUnread::Nothing),
-        Ok(roster) => accounts::Store::at(&seat.state)
-            .bound(&roster, seat.now)
-            .map_err(|_| RosterUnread::LoginsUnread),
-        Err(_) => Err(RosterUnread::Refused),
+        Ok(roster) => Ok(roster),
+        Err(why) => Err(why),
+    }
+}
+
+/// Every GUI account reader recovers admitted records before inspecting roster shape.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountGuiRead",
+        action = "AnotherReader",
+        reason = "Fixture selection chooses the restart, wall, usage, or normal UI consumer"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountGuiRead",
+        action = "AnotherShape",
+        reason = "Fixture selection chooses an absent, empty, or populated roster"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountGuiRead",
+        action = "AnotherFault",
+        reason = "Fixture selection installs complete, pending, locked, conflicting, or damaged records"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountGuiRead",
+        action = "Read",
+        project = "harness_host::tests::account_read_tests::read_transition"
+    )
+)]
+fn read_account_roster(
+    path: Option<&Path>,
+    store: &accounts::Store,
+    now: i64,
+) -> Result<accounts::Roster, RosterUnread> {
+    match store.read_roster(path, now) {
+        Ok(roster) => Ok(roster),
+        Err(accounts::RosterReadError::Roster(_)) => Err(RosterUnread::Refused),
+        Err(accounts::RosterReadError::Records(_)) => Err(RosterUnread::LoginsUnread),
     }
 }
 
@@ -15342,6 +15452,16 @@ enum RosterUnread {
     Refused,
     /// [`AccountsSaid::LoginsUnread`].
     LoginsUnread,
+}
+
+impl RosterUnread {
+    fn recording_word(self) -> &'static str {
+        match self {
+            Self::Nothing => "not-listed",
+            Self::Refused => "roster-refused",
+            Self::LoginsUnread => "account-state-refused",
+        }
+    }
 }
 
 impl From<RosterUnread> for AccountsSaid {
@@ -15840,23 +15960,6 @@ fn account_signed_out(
             .is_some_and(|a| a.auth == accounts::Auth::SignedOut)
     })
 }
-
-/// [`upgrade_drive::Opts::several_logins`] for this window's sweeps.
-pub(crate) fn several_logins() -> bool {
-    static READ_AT: AtomicU64 = AtomicU64::new(0);
-    static SEVERAL: AtomicBool = AtomicBool::new(false);
-    let now = crate::upgrade_host::now_s().max(1);
-    let at = READ_AT.load(Ordering::SeqCst);
-    if at != 0 && now >= at && now - at < SEVERAL_LOGINS_EVERY_S {
-        return SEVERAL.load(Ordering::SeqCst);
-    }
-    let several = accounts::several_listed(accounts::default_roster_path().as_deref());
-    SEVERAL.store(several, Ordering::SeqCst);
-    READ_AT.store(now, Ordering::SeqCst);
-    several
-}
-
-const SEVERAL_LOGINS_EVERY_S: u64 = 10;
 
 /// The production [`Acts::memory`].
 pub(crate) fn agent_memory(pid: u32) -> Option<AgentMemory> {
@@ -17175,11 +17278,24 @@ impl DiskPrivate {
 /// Whether, and why ([`DiskPrivate`]), this process is not the owner's disk watch.
 fn disk_private(home: &Path) -> Option<DiskPrivate> {
     disk_private_with(
-        aterm_types::dirs::runs_under_private_state_root(),
+        disk_private_root(
+            aterm_types::dirs::runs_under_private_state_root(),
+            crate::headless_seam_admits(
+                aterm_types::dev_seam!(aterm_agent::harness::disk::WATCH_SEAM).is_some(),
+            ),
+        ),
         atpkg::platform::account_home().as_deref(),
         home,
         &aterm_agent::harness::disk::target::dev_of,
     )
+}
+
+/// Whether the private state root (`private`) keeps this process from the owner's disk watch
+/// ([`DiskPrivate::StateRoot`]): it does unless the watch's development seam was admitted
+/// (`watch_seam`, [`aterm_agent::harness::disk::WATCH_SEAM`], only under a private state root
+/// and a scratch home), which leaves the home's own rules to judge it.
+const fn disk_private_root(private: bool, watch_seam: bool) -> bool {
+    private && !watch_seam
 }
 
 /// [`disk_private`] over its facts.
@@ -18026,10 +18142,44 @@ fn live_view(
 
 const WAKE_FALLBACK: Duration = Duration::from_secs(60);
 
+/// What the roster's file held at a look of the activation thread ([`activation_loop`]): the hash
+/// of its bounded read (`accounts::roster_text`: its text, no file, or one print for a file that
+/// does not read, a FIFO, a device or one too large among them), or `None` where the host's seat
+/// names no roster path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RosterPrint(Option<u64>);
+
+impl RosterPrint {
+    /// The roster file of the host's account seat ([`Acts::account_seat`]) as it reads now, or
+    /// `None` while the host reads no roster: muted, or with the accounts, the logins and the
+    /// usage notes all off ([`accounts_look`]'s own condition), when nothing is opened at all.
+    fn of(host: &HostHandle) -> Option<Self> {
+        use std::hash::{Hash as _, Hasher as _};
+        let switches = &host.shared.switches;
+        if switches.mute() || !(switches.accounts_live() || switches.notes()) {
+            return None;
+        }
+        let read = (host.hooks.acts.account_seat)()
+            .and_then(|seat| seat.roster)
+            .map(|path| accounts::roster_text(&path).ok());
+        Some(Self(read.map(|read| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            read.hash(&mut hasher);
+            hasher.finish()
+        })))
+    }
+}
+
 /// The activation thread's loop over `wait` until the host shuts down. `wait` is the parked
 /// [`ActivationWake::wait`]: `true` for a newer build, `false` for the fallback or a pulled
-/// trigger.
+/// trigger. A roster file that reads otherwise after a wait than at the last look that read it
+/// (a row named, changed or dropped there: by hand or by `aterm harness accounts add`) is
+/// news of the accounts ([`Switches::accounts_news`]), which no store transaction wakes the
+/// host for: a session's loop then decides again what it holds, as the dialog of its own
+/// `/login` over a login a row now names, which it backs out of. While the host reads no roster
+/// ([`RosterPrint::of`]) the file is not opened, and the last look that read it stands.
 fn activation_loop(host: &HostHandle, mut wait: impl FnMut() -> bool) {
+    let mut roster = RosterPrint::of(host);
     accounts_look(
         &host.shared.switches,
         &host.hooks,
@@ -18048,6 +18198,16 @@ fn activation_loop(host: &HostHandle, mut wait: impl FnMut() -> bool) {
                  looks at its next idle point"
             );
             host.note_activation();
+        }
+        if let Some(read) = RosterPrint::of(host) {
+            if roster.is_some_and(|was| was != read) {
+                aterm_log::info!("harness: the accounts' roster changed: news of the accounts");
+                host.shared
+                    .switches
+                    .accounts_news
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            roster = Some(read);
         }
         accounts_look(
             &host.shared.switches,
@@ -18771,6 +18931,10 @@ impl Acts {
             task_fact: Arc::new(|_, _| aterm_agent::supervise::occupancy::NoteOutcome::NoTask),
             wakes: Arc::new(|_| aterm_agent::supervise::occupancy::WakesSeen::default()),
             wake_told: Arc::new(|_, _, _, _| {}),
+            wake_claim: Arc::new(|_, _, _, _, _| {
+                aterm_agent::supervise::occupancy::WakeClaim::Gone
+            }),
+            wake_release: Arc::new(|_, _, _, _| {}),
             wakes_left: Arc::new(|_| {}),
             snapshot: Arc::new(|_| None),
             point_read: INERT_POINT_READ,

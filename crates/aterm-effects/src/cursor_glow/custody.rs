@@ -6,6 +6,7 @@
 use super::*;
 
 /// Whether a one-shot hint stamped at `hint` is still inside its `window` (seconds) at `now`.
+#[cfg(test)]
 #[inline]
 pub(crate) fn hint_fresh(hint: Option<Instant>, now: Instant, window: f32) -> bool {
     matches!(hint, Some(t) if now.saturating_duration_since(t).as_secs_f32() <= window)
@@ -15,23 +16,6 @@ pub(crate) fn hint_fresh(hint: Option<Instant>, now: Instant, window: f32) -> bo
 #[inline]
 pub(crate) fn hint_fresh_dur(hint: Option<Instant>, now: Instant, window: Duration) -> bool {
     matches!(hint, Some(t) if now.saturating_duration_since(t) <= window)
-}
-
-/// Spend a one-shot hint: take it only while fresh ([`hint_fresh`]).
-#[inline]
-pub(crate) fn take_hint_fresh(
-    hint: &mut Option<Instant>,
-    now: Instant,
-    window: f32,
-) -> Option<Instant> {
-    if let Some(t) = *hint
-        && now.saturating_duration_since(t).as_secs_f32() <= window
-    {
-        *hint = None;
-        Some(t)
-    } else {
-        None
-    }
 }
 
 /// Spend a one-shot hint: take it only while fresh ([`hint_fresh_dur`]).
@@ -122,6 +106,21 @@ pub(super) const POOF_PROBE_STALE_DUR: Duration =
     Duration::from_secs(CursorGlow::POOF_PROBE_STALE as u64);
 pub(super) const BLINK_HINT_FRESH_DUR: Duration =
     Duration::from_nanos((CursorGlow::BLINK_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+pub(super) const REFLOW_HINT_FRESH_DUR: Duration =
+    Duration::from_millis((CursorGlow::REFLOW_HINT_FRESH * 1_000.0).round() as u64);
+pub(super) const KILL_HINT_FRESH_DUR: Duration =
+    Duration::from_millis((CursorGlow::KILL_HINT_FRESH * 1_000.0).round() as u64);
+pub(super) const TORN_REST_DUR: Duration =
+    Duration::from_millis((CursorGlow::TORN_REST_S * 1_000.0).round() as u64);
+pub(super) const POOF_FALLBACK_GRACE_DUR: Duration =
+    Duration::from_millis((CursorGlow::POOF_FALLBACK_GRACE * 1_000.0).round() as u64);
+pub(super) const POOF_MIN_GAP_DUR: Duration =
+    Duration::from_millis((CursorGlow::POOF_MIN_GAP * 1_000.0).round() as u64);
+pub(super) const METEOR_RETARGET_DUR: Duration =
+    Duration::from_millis((CursorGlow::METEOR_RETARGET_S * 1_000.0).round() as u64);
+pub(super) const CRACKLE_REFRACTORY_DUR: Duration =
+    Duration::from_millis((CursorGlow::CRACKLE_REFRACTORY_S * 1_000.0).round() as u64);
+const QUENCH_KEEP_DUR: Duration = Duration::from_millis(30);
 
 /// Capacity of [`CursorGlow::anchor_rows`].
 pub(super) const ANCHOR_ROWS: usize = 16;
@@ -225,8 +224,9 @@ impl TypedStamps {
         let mut kept = Self::EMPTY;
         let mut later = Self::EMPTY;
         let (mut nk, mut nl) = (0, 0);
-        for slot in &self.slots {
-            let Some(t) = *slot else {
+        let mut i = 0;
+        while i < TYPED_STAMP_DEPTH {
+            let Some(t) = self.slots[i] else {
                 break;
             };
             if t <= at {
@@ -236,6 +236,7 @@ impl TypedStamps {
                 later.slots[nl] = Some(t);
                 nl += 1;
             }
+            i += 1;
         }
         *self = kept;
         later
@@ -309,13 +310,15 @@ impl TypedStamps {
     /// Whether any banked stamp is still within `window` of `now`.
     #[inline]
     pub(crate) fn any_fresh(&self, now: Instant, window: Duration) -> bool {
-        for slot in &self.slots {
-            let Some(t) = *slot else {
+        let mut i = 0;
+        while i < TYPED_STAMP_DEPTH {
+            let Some(t) = self.slots[i] else {
                 break;
             };
             if now.saturating_duration_since(t) <= window {
                 return true;
             }
+            i += 1;
         }
         false
     }
@@ -329,11 +332,13 @@ impl TypedStamps {
     /// The oldest still-fresh stamp, left in place.
     #[inline]
     pub(crate) fn peek_fresh(&self, now: Instant, window: Duration) -> Option<Instant> {
-        for slot in &self.slots {
-            let t = (*slot)?;
+        let mut i = 0;
+        while i < TYPED_STAMP_DEPTH {
+            let t = self.slots[i]?;
             if now.saturating_duration_since(t) <= window {
                 return Some(t);
             }
+            i += 1;
         }
         None
     }
@@ -436,33 +441,18 @@ impl PressCredits {
             && (self.admit_held || !self.held(at))
     }
 
-    /// The live presses: unpaid, younger than [`IN_FLIGHT_PATIENCE_S`].
-    #[inline]
-    pub(super) fn within(
-        &self,
-        now: Instant,
-    ) -> impl Iterator<Item = (Instant, u8, Option<char>)> + '_ {
-        let mut mask = self.occupied;
-        std::iter::from_fn(move || {
-            while mask != 0 {
-                let i = mask.trailing_zeros() as usize;
-                mask &= mask - 1;
-                if let Some((t, c, g)) = self.slots[i]
-                    && self.payable(t, c, now)
-                {
-                    return Some((t, c, g));
-                }
-            }
-            None
-        })
-    }
-
     /// Unpaid cells of the live presses whose instant `keep` admits.
     #[inline]
     pub(super) fn cells_where(&self, now: Instant, keep: impl Fn(Instant) -> bool) -> usize {
         let mut total = 0usize;
-        for (t, c, _) in self.within(now) {
-            if keep(t) {
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && self.payable(t, c, now)
+                && keep(t)
+            {
                 total += usize::from(c);
             }
         }
@@ -472,31 +462,70 @@ impl PressCredits {
     /// Unpaid cells of every live press.
     #[inline]
     pub(super) fn cells_within(&self, now: Instant) -> usize {
-        self.cells_where(now, |_| true)
+        let mut total = 0usize;
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && self.payable(t, c, now)
+            {
+                total += usize::from(c);
+            }
+        }
+        total
     }
 
     /// Unpaid presses — the same pool counted in keys.
     #[inline]
     pub(super) fn presses_within(&self, now: Instant) -> usize {
-        self.within(now).count()
+        let mut count = 0usize;
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && self.payable(t, c, now)
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Whether any unpaid press is live at `now`.
     #[inline]
     pub(super) fn any_within(&self, now: Instant) -> bool {
-        self.within(now).next().is_some()
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && self.payable(t, c, now)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The oldest unpaid press, or `None`.
     #[inline]
     pub(super) fn oldest_unpaid(&self, now: Instant) -> Option<Instant> {
         let (mut free, mut held) = (None::<Instant>, None::<Instant>);
-        for (t, _, _) in self.within(now) {
-            let slot = if self.held(t) { &mut held } else { &mut free };
-            *slot = Some(match *slot {
-                Some(prev) => prev.min(t),
-                None => t,
-            });
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && self.payable(t, c, now)
+            {
+                let slot = if self.held(t) { &mut held } else { &mut free };
+                *slot = Some(match *slot {
+                    Some(prev) => prev.min(t),
+                    None => t,
+                });
+            }
         }
         match free {
             Some(t) => Some(t),
@@ -508,11 +537,18 @@ impl PressCredits {
     #[inline]
     pub(super) fn newest_unpaid(&self, now: Instant) -> Option<Instant> {
         let mut newest = None::<Instant>;
-        for (t, _, _) in self.within(now) {
-            newest = Some(match newest {
-                Some(prev) => prev.max(t),
-                None => t,
-            });
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && self.payable(t, c, now)
+            {
+                newest = Some(match newest {
+                    Some(prev) => prev.max(t),
+                    None => t,
+                });
+            }
         }
         newest
     }
@@ -520,8 +556,15 @@ impl PressCredits {
     /// Whether an unpaid press stamped exactly `glyph` within `freshness_s`.
     #[inline]
     pub(super) fn fresh_glyph(&self, now: Instant, freshness: Duration, glyph: char) -> bool {
-        for (at, _, g) in self.within(now) {
-            if g == Some(glyph) && now.saturating_duration_since(at) <= freshness {
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((at, c, g)) = self.slots[i]
+                && g == Some(glyph)
+                && self.payable(at, c, now)
+                && now.saturating_duration_since(at) <= freshness
+            {
                 return true;
             }
         }
@@ -543,7 +586,7 @@ impl PressCredits {
                 && self.payable(at, credits, now)
                 && now.saturating_duration_since(at) <= freshness
             {
-                return glyph.map(|glyph| (i, glyph));
+                return Some((i, glyph?));
             }
         }
         None
@@ -552,11 +595,18 @@ impl PressCredits {
     /// Whether `printed` is foreign to every press in flight.
     pub(super) fn foreign_to_live(&self, now: Instant, printed: char) -> Option<bool> {
         let mut any = false;
-        for (_, _, glyph) in self.within(now) {
-            match glyph {
-                None => return None,
-                Some(g) if g == printed => return Some(false),
-                Some(_) => any = true,
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, glyph)) = self.slots[i]
+                && self.payable(t, c, now)
+            {
+                match glyph {
+                    None => return None,
+                    Some(g) if g == printed => return Some(false),
+                    Some(_) => any = true,
+                }
             }
         }
         if any { Some(true) } else { None }
@@ -604,10 +654,13 @@ impl PressCredits {
             live[n] = Some((i, at, credits, glyph));
             n += 1;
         }
-        for start in 0..n {
+        let mut start = 0;
+        while start < n {
             if start + glyphs.len() <= n {
                 let mut exact = true;
-                for (offset, &expected) in glyphs.iter().enumerate() {
+                let mut offset = 0;
+                while offset < glyphs.len() {
+                    let expected = glyphs[offset];
                     if !matches!(
                         live[start + offset],
                         Some((_, _, 1, Some(g))) if g == expected
@@ -615,11 +668,13 @@ impl PressCredits {
                         exact = false;
                         break;
                     }
+                    offset += 1;
                 }
                 if exact {
                     let (_, last_at, _, _) = live[start + glyphs.len() - 1]?;
                     if now.saturating_duration_since(last_at) <= tail_window {
-                        return live[start].map(|(slot, _, _, _)| slot);
+                        let (slot, _, _, _) = live[start]?;
+                        return Some(slot);
                     }
                 }
             }
@@ -630,6 +685,7 @@ impl PressCredits {
             {
                 return None;
             }
+            start += 1;
         }
         None
     }
@@ -695,7 +751,10 @@ impl PressCredits {
             return 0;
         }
         let mut drained = 0;
-        for held in [false, true] {
+        let mut pass = 0;
+        while pass < 2 {
+            let held = pass != 0;
+            pass += 1;
             let mut mask = self.occupied.rotate_right(self.head as u32);
             while mask != 0 {
                 if cells == 0 {
@@ -709,7 +768,7 @@ impl PressCredits {
                 };
                 if self.held(t) != held || !self.payable(t, c, now) {
                     continue;
-                }
+                };
                 let take = usize::from(c).min(cells);
                 cells -= take;
                 if usize::from(c) == take {
@@ -862,7 +921,8 @@ impl PressCredits {
                 best = Some((i, t));
             }
         }
-        best.map(|(i, _)| i)
+        let (i, _) = best?;
+        Some(i)
     }
 
     /// Retire the newest press (the key a Backspace erases), whole.
@@ -1676,11 +1736,15 @@ impl CursorGlow {
                 row: Some(hop.row),
                 ..armed
             };
-            for entry in self.anchor_rows.iter_mut().flatten() {
-                if entry.row == hop.row {
+            let mut ai = 0;
+            while ai < ANCHOR_ROWS {
+                if let Some(entry) = self.anchor_rows[ai].as_mut()
+                    && entry.row == hop.row
+                {
                     entry.tainted = false;
                     break;
                 }
+                ai += 1;
             }
             self.lay_insert(hop.row, hop.col0, hop.row, hop.col1, ins, at);
         }
@@ -1719,20 +1783,18 @@ impl CursorGlow {
     /// The insert's row at `now`, read once as [`InsertLicence::row`].
     #[inline]
     pub(super) fn insert_row(&self, now: Instant) -> Option<u16> {
-        let established = self.last_anchor_sweep.map(|(row, _)| row);
         if let Some((row, _)) = self.last
-            && !matches!(established, Some(er) if er != row)
+            && !matches!(self.last_anchor_sweep, Some((er, _)) if er != row)
         {
             return Some(row);
         }
-        match self.last_licensed_row {
-            Some((row, at))
-                if now.saturating_duration_since(at) <= rk::ribbon::CHAIN_GAP_MAX_DUR =>
-            {
-                Some(row)
-            }
-            _ => established,
+        if let Some((row, at)) = self.last_licensed_row
+            && now.saturating_duration_since(at) <= rk::ribbon::CHAIN_GAP_MAX_DUR
+        {
+            return Some(row);
         }
+        let (row, _) = self.last_anchor_sweep?;
+        Some(row)
     }
 
     /// Remember a refused same-row forward hop `col0 → col1` on `row` for one in-flight delivery.
@@ -1857,7 +1919,7 @@ impl CursorGlow {
         now: Instant,
     ) -> bool {
         if hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
-            || hint_fresh(self.reflow_hint, now, Self::REFLOW_HINT_FRESH)
+            || hint_fresh_dur(self.reflow_hint, now, REFLOW_HINT_FRESH_DUR)
             || (hint_fresh_dur(self.user_gesture_hint, now, USER_GESTURE_HINT_FRESH_DUR)
                 && self.user_gesture_hint != Some(ins.at))
         {
@@ -1873,8 +1935,8 @@ impl CursorGlow {
     #[inline]
     pub(super) fn erase_key_fresh(&self, now: Instant) -> bool {
         hint_fresh_dur(self.quench_hint, now, QUENCH_HINT_FRESH_DUR)
-            || hint_fresh(self.kill_hint, now, Self::KILL_HINT_FRESH)
-            || hint_fresh(self.bs_poof_hint, now, Self::KILL_HINT_FRESH)
+            || hint_fresh_dur(self.kill_hint, now, KILL_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.bs_poof_hint, now, KILL_HINT_FRESH_DUR)
             || hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
     }
 
@@ -1934,8 +1996,10 @@ impl CursorGlow {
             let presses = self
                 .type_press_ring
                 .spend_counting(now, surplus.min(credits));
-            for _ in 0..presses {
+            let mut i = 0;
+            while i < presses {
                 let _ = self.type_hint.take_fresh(now, TYPE_HINT_FRESH_DUR);
+                i += 1;
             }
         }
         if !ins.known && self.type_press_ring.cells_where(now, |t| t <= ins.at) > 0 {
@@ -2260,15 +2324,29 @@ impl CursorGlow {
         {
             return None;
         }
-        let blank = |row: &[char], col: usize| !matches!(row.get(col), Some(&g) if g != ' ');
+        #[inline]
+        const fn blank(row: &[char], col: usize) -> bool {
+            if col < row.len() {
+                row[col] == ' '
+            } else {
+                true
+            }
+        }
+        #[inline]
+        const fn at(row: &[char], col: usize) -> char {
+            if col < row.len() { row[col] } else { ' ' }
+        }
         let origin = usize::from(pc);
         if blank(&self.row_above_cur, origin) {
             return None;
         }
-        for col in pane_col0..usize::from(cc) {
+        let mut col = pane_col0;
+        let cc_usize = usize::from(cc);
+        while col < cc_usize {
             if !blank(&self.row_cur, col) {
                 return None;
             }
+            col += 1;
         }
         let glyph = self.row_above_cur[origin];
         if !blank(&self.row_prev, origin)
@@ -2279,20 +2357,22 @@ impl CursorGlow {
         {
             return None;
         }
-        let at = |row: &[char], col: usize| match row.get(col) {
-            Some(&c) => c,
-            None => ' ',
-        };
-        for col in pane_col0..origin {
+        let mut col = pane_col0;
+        while col < origin {
             if at(&self.row_prev, col) != at(&self.row_above_cur, col) {
                 return None;
             }
+            col += 1;
         }
         let mut word_col0 = origin;
         while word_col0 > pane_col0 && !blank(&self.row_above_cur, word_col0 - 1) {
             word_col0 -= 1;
         }
-        u16::try_from(word_col0).ok()
+        if word_col0 <= u16::MAX as usize {
+            Some(word_col0 as u16)
+        } else {
+            None
+        }
     }
 
     /// Whether the forward echo from a soft-wrapped caret's landing carried the wrap key's word.
@@ -2492,11 +2572,16 @@ impl CursorGlow {
     /// Disarm dangling typed and backspace hints when a key with its own move semantics arrives.
     #[inline]
     pub fn clear_typed(&mut self, now: Instant) {
+        #[inline]
+        const fn unparked(last: Option<(u16, u16)>) -> Option<UnownedCaret> {
+            match last {
+                Some((row, _)) => Some(UnownedCaret { row, parked: false }),
+                None => None,
+            }
+        }
         self.clear_typed_keeping_hand(now);
         self.hand_row = None;
-        self.unowned_caret = self
-            .last
-            .map(|(row, _)| UnownedCaret { row, parked: false });
+        self.unowned_caret = unparked(self.last);
     }
 
     /// A licensed echo of the hand's own input landed on `row`.
@@ -2528,7 +2613,7 @@ impl CursorGlow {
         self.reflow_hint = None;
         self.newline_hint = None;
         if let Some(t) = self.quench_hint
-            && now.saturating_duration_since(t).as_secs_f32() > 0.03
+            && now.saturating_duration_since(t) > QUENCH_KEEP_DUR
         {
             self.quench_hint = None;
         }
@@ -2543,22 +2628,23 @@ impl CursorGlow {
 
     /// Revoke the classifier cohort armed by the input dispatch at `at`, licence terms included.
     pub fn revoke_input_hints_at(&mut self, at: Instant) {
-        let clear = |slot: &mut Option<Instant>| {
+        #[inline]
+        fn clear(slot: &mut Option<Instant>, at: Instant) {
             if *slot == Some(at) {
                 *slot = None;
             }
-        };
+        }
         self.type_hint.revoke_at(at);
-        clear(&mut self.quench_hint);
-        clear(&mut self.nav_hint);
-        clear(&mut self.return_hint);
-        clear(&mut self.user_gesture_hint);
-        clear(&mut self.newline_hint);
-        clear(&mut self.reflow_hint);
-        clear(&mut self.kill_hint);
+        clear(&mut self.quench_hint, at);
+        clear(&mut self.nav_hint, at);
+        clear(&mut self.return_hint, at);
+        clear(&mut self.user_gesture_hint, at);
+        clear(&mut self.newline_hint, at);
+        clear(&mut self.reflow_hint, at);
+        clear(&mut self.kill_hint, at);
         self.insert.revoke_arm_at(at);
         let revoke_bs = self.bs_poof_hint == Some(at);
-        clear(&mut self.bs_poof_hint);
+        clear(&mut self.bs_poof_hint, at);
         if revoke_bs {
             self.bs_baseline = None;
         }

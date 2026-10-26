@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use aterm_agent::supervise::occupancy::fault::{self as agent_fault, Fault as AgentFault};
 use aterm_agent::supervise::occupancy::wake_atoms::{ContainmentWord, Probed};
@@ -400,6 +400,8 @@ struct Rig {
     tree: Tree,
     kernel: bool,
     sys: Mutex<Option<SysRead>>,
+    /// How many machine snapshots were pulled ([`Env::sys`]).
+    sys_reads: AtomicUsize,
     at_ns: AtomicU64,
     pace: Mutex<Pace>,
     said: Mutex<BTreeMap<String, Said>>,
@@ -419,6 +421,7 @@ impl Rig {
             tree: Tree::machine(),
             kernel: false,
             sys: Mutex::new(None),
+            sys_reads: AtomicUsize::new(0),
             at_ns: AtomicU64::new(1),
             pace: Mutex::new(Pace::default()),
             said: Mutex::new(BTreeMap::new()),
@@ -498,6 +501,7 @@ impl Env for Rig {
     }
 
     fn sys(&self, _fresh: Option<Duration>) -> Option<SysRead> {
+        self.sys_reads.fetch_add(1, Ordering::SeqCst);
         self.sys.lock().unwrap().clone()
     }
 
@@ -506,6 +510,13 @@ impl Env for Rig {
             .lock()
             .unwrap()
             .reserve(sid, age_ms, usable, now_ms)
+    }
+
+    fn wake_pace(&self, sid: &str, slot: bool, age_ms: i64, usable: u16, now_ms: i64) -> PaceGrant {
+        self.pace
+            .lock()
+            .unwrap()
+            .ask_wake(sid, slot, age_ms, usable, now_ms)
     }
 
     fn said(&self, sid: &str) -> Option<Said> {
@@ -2071,6 +2082,9 @@ fn a_ready_wake_with_its_need_met_reads_the_session_ready() {
     assert!(host.seen_for(&rig, A).wakes[0].need_met);
     assert!(!host.met(B), "another session's book is its own");
 }
+
+#[path = "occupancy_wake_claim_tests.rs"]
+mod claim_tests;
 
 #[cfg(target_os = "macos")]
 #[path = "occupancy_wake_files_tests.rs"]

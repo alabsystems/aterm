@@ -110,19 +110,23 @@ impl App {
 
     /// Open the command palette scoped to its Theme section.
     pub(crate) fn open_theme_palette(&mut self) {
-        if self
-            .front()
-            .and_then(|ws| ws.palette())
-            .is_some_and(PaletteState::is_themes_only)
-        {
-            return;
-        }
-        if self.front().and_then(|ws| ws.palette()).is_some() {
-            self.palette_exit();
-        }
         let Some(wid) = self.frontmost_window else {
             return;
         };
+        self.open_theme_palette_in(wid);
+    }
+
+    /// Open the named window's command palette scoped to its Theme section.
+    pub(crate) fn open_theme_palette_in(&mut self, wid: crate::WindowId) {
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        if window.palette().is_some_and(PaletteState::is_themes_only) {
+            return;
+        }
+        if window.palette().is_some() {
+            self.palette_exit_in(wid);
+        }
         let state = self.palette_snapshot(wid).themes_only();
         self.palette_open_state(wid, state);
     }
@@ -613,7 +617,8 @@ impl App {
                 self.palette_pointer_motion(wid, x, y);
             }
         }
-        self.overlay_a11y_update();
+        #[cfg(a11y_tree)]
+        self.push_a11y_tree(wid);
     }
 
     /// Open the command palette scoped to recovery actions for a blocked native close.
@@ -698,10 +703,21 @@ impl App {
 
     /// Toggle the command palette on the front window.
     pub(crate) fn toggle_palette(&mut self) {
-        if self.front().is_some_and(|ws| ws.palette().is_some()) {
-            self.palette_exit();
+        if let Some(wid) = self.frontmost_window {
+            self.toggle_palette_in(wid);
+        }
+    }
+
+    /// Toggle the command palette on the named window.
+    pub(crate) fn toggle_palette_in(&mut self, wid: crate::WindowId) {
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        if window.palette().is_some() {
+            self.palette_exit_in(wid);
         } else {
-            self.palette_enter();
+            let state = self.palette_snapshot(wid);
+            self.palette_open_state(wid, state);
         }
     }
 
@@ -1063,6 +1079,271 @@ mod tests {
                 repeat,
             ),
         );
+    }
+
+    #[test]
+    fn configured_palette_openers_keep_their_key_window() {
+        use crate::keybinding::Action;
+        use crate::native_app::{AppEvent, AppKind, TextInputEvent};
+        use aterm_window::event::ElementState::{Pressed, Released};
+        use aterm_window::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+
+        let mut failures = Vec::new();
+        for native_source in [false, true] {
+            for action in [Action::OpenPalette, Action::ChooseTheme] {
+                for background_palette in [false, true] {
+                    let scratch = aterm_tempfile::TempDir::new().unwrap();
+                    let path = scratch.path().join("palette-owner.txt");
+                    let bytes = "owner needle λ\n";
+                    std::fs::write(&path, bytes).unwrap();
+                    let mut app = themed_app("theme = \"Dracula\"\n");
+                    let a = WindowId(0);
+                    let source_editor = if native_source {
+                        app.open_document_tab_in_window(
+                            a,
+                            AppKind::Editor,
+                            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+                        )
+                        .unwrap();
+                        app.dispatch_native_event(
+                            a,
+                            AppEvent::TextInput(TextInputEvent::Commit("draft ".into())),
+                        )
+                        .unwrap();
+                        let (instance, view) = app.active_native_view(a).unwrap();
+                        let document = app.native_runtime.document_id(instance).unwrap();
+                        Some((
+                            view,
+                            document,
+                            editor_buffer(&app, view).clone(),
+                            app.document_store.snapshot(document).unwrap(),
+                        ))
+                    } else {
+                        None
+                    };
+                    let sid = app.next_session_id;
+                    let b = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+                    if background_palette {
+                        open_palette_in(&mut app, b, "gruv");
+                        highlight_in(&mut app, b, "Gruvbox Light");
+                        app.sync_palette_theme_preview();
+                        assert_eq!(
+                            app.theme_preview.as_ref().unwrap().hold,
+                            PreviewHold::Palette { window: b }
+                        );
+                    }
+                    app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+                        &[(
+                            "f4".to_string(),
+                            if action == Action::OpenPalette {
+                                "open_palette"
+                            } else {
+                                "choose_theme"
+                            }
+                            .to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ));
+                    let palette_state = |app: &App, wid| {
+                        app.windows[&wid]
+                            .palette()
+                            .map(|palette| (palette.controls_lines(), palette.input_lifetime()))
+                    };
+                    let terminal_state = |app: &App, session| {
+                        let pooled = app.pool.get(session).unwrap();
+                        let term = crate::term_lock(&pooled.term);
+                        (
+                            term.visible_content(),
+                            term.content_seq(),
+                            term.grid().display_offset(),
+                            term.text_selection().clone(),
+                            pooled.ctx.sink.input_epoch(),
+                        )
+                    };
+                    let b_before = palette_state(&app, b);
+                    let preview = app.theme_preview.clone();
+                    let colors = app.theme;
+                    let config = durable(&app);
+                    let terminals = [terminal_state(&app, 0), terminal_state(&app, sid)];
+                    let source_content = app.windows[&a].front_content;
+                    let background_content = app.windows[&b].front_content;
+                    let mut opened = None;
+                    for (stage, from, state, repeat) in [
+                        ("press", a, Pressed, false),
+                        ("repeat", b, Pressed, true),
+                        ("release", b, Released, false),
+                    ] {
+                        physical_palette_event(
+                            &mut app,
+                            from,
+                            KeyCode::F4,
+                            Key::Named(NamedKey::F4),
+                            state,
+                            repeat,
+                        );
+                        let context = format!(
+                            "{action:?} native={native_source} background_palette={background_palette} {stage}"
+                        );
+                        let target = app.windows[&a].palette();
+                        if !target.is_some_and(|palette| {
+                            palette.is_themes_only() == (action == Action::ChooseTheme)
+                                && (action == Action::ChooseTheme || !native_source || palette.rows().iter().any(|row| {
+                                    matches!(&row.action, PaletteTarget::Native(target) if target.window == a)
+                                }))
+                        }) {
+                            failures.push(format!("{context}: source palette did not open with its own scope"));
+                        }
+                        let source_after = palette_state(&app, a);
+                        if let Some((controls, lifetime)) = &opened {
+                            if !source_after.as_ref().is_some_and(|(now, token)| {
+                                now == controls && std::sync::Arc::ptr_eq(lifetime, token)
+                            }) {
+                                failures.push(format!("{context}: repeat/release replaced or changed the source palette"));
+                            }
+                        } else if stage == "press" {
+                            opened = source_after;
+                        }
+                        let b_after = palette_state(&app, b);
+                        let same_background = match (&b_before, &b_after) {
+                            (None, None) => true,
+                            (Some((controls, lifetime)), Some((now, token))) => {
+                                controls == now && std::sync::Arc::ptr_eq(lifetime, token)
+                            }
+                            _ => false,
+                        };
+                        if !same_background || app.theme_preview != preview || app.theme != colors {
+                            failures.push(format!(
+                                "{context}: changed the other window's palette/query/preview"
+                            ));
+                        }
+                        let physical = PhysicalKey::Code(KeyCode::F4);
+                        let owned = if state == Released {
+                            !app.physical_press_owners.contains_key(&physical)
+                                && !app.windows[&a].consumed_press_keys.contains(&physical)
+                        } else {
+                            matches!(app.physical_press_owners.get(&physical), Some(crate::PhysicalPressOwner::Consumed { window }) if *window == a)
+                                && app.windows[&a].consumed_press_keys.contains(&physical)
+                        };
+                        assert!(owned, "{context}: command press/repeat/release custody");
+                        assert_eq!(app.frontmost_window, Some(b), "{context}");
+                        assert_eq!(
+                            (app.windows[&a].front_content, app.windows[&b].front_content),
+                            (source_content, background_content),
+                            "{context}"
+                        );
+                        assert_eq!(
+                            [terminal_state(&app, 0), terminal_state(&app, sid)],
+                            terminals,
+                            "{context}"
+                        );
+                        assert_eq!(
+                            durable(&app),
+                            config,
+                            "{context}: opening does not save a theme"
+                        );
+                        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "{context}");
+                        if let Some((view, document, buffer, snapshot)) = &source_editor {
+                            assert_eq!(editor_buffer(&app, *view), buffer, "{context}");
+                            let after = app.document_store.snapshot(*document).unwrap();
+                            assert_eq!(
+                                (after.seq, after.text),
+                                (snapshot.seq, snapshot.text.clone()),
+                                "{context}"
+                            );
+                            assert_eq!(
+                                app.document_store.dirty(*document),
+                                Some(true),
+                                "{context}"
+                            );
+                        }
+                    }
+                    assert!(app.structural_invariants_ok());
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn palette_action_lifecycle_keeps_the_target_window() {
+        use crate::keybinding::Action;
+
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let a = WindowId(0);
+        open_palette_in(&mut app, a, "save");
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+        open_palette_in(&mut app, b, "gruv");
+        highlight_in(&mut app, b, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        let b_before = app.windows[&b].palette().unwrap().controls_lines();
+        let b_lifetime = app.windows[&b].palette().unwrap().input_lifetime();
+        let preview = app.theme_preview.clone();
+        let theme = app.theme;
+        let config = durable(&app);
+        let mut failures = Vec::new();
+
+        for (stage, action) in [
+            ("close source", Action::OpenPalette),
+            ("open source themes", Action::ChooseTheme),
+            ("retain source themes", Action::ChooseTheme),
+            ("close source themes", Action::OpenPalette),
+        ] {
+            if stage == "open source themes" {
+                open_palette_in(&mut app, a, "find");
+            }
+            let previous = app.windows[&a]
+                .palette()
+                .map(|palette| (palette.controls_lines(), palette.input_lifetime()));
+            app.dispatch_action(a, action);
+            let source = app.windows[&a].palette();
+            let source_ok = if action == Action::OpenPalette {
+                source.is_none()
+            } else {
+                source.is_some_and(|palette| palette.is_themes_only())
+            };
+            if !source_ok {
+                failures.push(format!("{stage}: acted on the wrong palette"));
+            }
+            if stage == "retain source themes"
+                && !source.is_some_and(|palette| {
+                    previous.as_ref().is_some_and(|(controls, token)| {
+                        palette.controls_lines() == *controls
+                            && std::sync::Arc::ptr_eq(token, &palette.input_lifetime())
+                    })
+                })
+            {
+                failures.push("reopening source themes changed its filter/lifetime".into());
+            }
+            if !app.windows[&b].palette().is_some_and(|palette| {
+                palette.controls_lines() == b_before
+                    && std::sync::Arc::ptr_eq(&b_lifetime, &palette.input_lifetime())
+            }) || app.theme_preview != preview
+                || app.theme != theme
+            {
+                failures.push(format!(
+                    "{stage}: reset or closed the other window's draft/preview"
+                ));
+            }
+            assert_eq!(app.frontmost_window, Some(b));
+            assert_eq!(durable(&app), config);
+        }
+
+        app.palette_exit_in(a);
+        app.palette_exit_in(b);
+        assert!(app.theme_preview.is_none());
+        app.toggle_palette();
+        assert!(app.windows[&a].palette().is_none());
+        assert!(app.windows[&b].palette().is_some());
+        app.toggle_palette();
+        assert!(app.windows[&b].palette().is_none());
+        app.open_theme_palette();
+        assert!(app.windows[&a].palette().is_none());
+        assert!(app.windows[&b].palette().unwrap().is_themes_only());
+        assert_eq!(app.frontmost_window, Some(b));
+        assert_eq!(durable(&app), config);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

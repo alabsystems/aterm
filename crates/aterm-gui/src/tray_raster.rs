@@ -157,6 +157,9 @@ struct SemanticPrewarmWorker {
     results: std::sync::mpsc::Receiver<SemanticPrewarmResult>,
 }
 
+/// The event loop's wake for a chrome font that finished loading off the event loop: a
+/// semantic renderer the prewarm worker built, or a face the coverage warm parsed
+/// ([`chrome_coverage_epoch`]).
 static SEMANTIC_READY_WAKE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 /// Install [`SEMANTIC_READY_WAKE`]; the first install wins.
@@ -1330,9 +1333,51 @@ fn reload_chrome_fonts_locked(
         let _ = crate::qos::spawn_lane_thread(
             "aterm-chrome-coverage-warm",
             crate::qos::Role::Background,
-            warm,
+            move || {
+                land_chrome_coverage(warm, || {
+                    if let Some(wake) = SEMANTIC_READY_WAKE.get() {
+                        wake();
+                    }
+                })
+            },
         );
     }
+}
+
+/// Run the coverage `warm`, and `wake` the event loop when it parsed a face: what a native
+/// view drew before that face could ink was drawn with holes where it would draw, and the
+/// view draws again ([`chrome_coverage_epoch`]).
+fn land_chrome_coverage(warm: impl FnOnce() -> usize, wake: impl FnOnce()) -> usize {
+    let landed = warm();
+    if landed > 0 {
+        wake();
+    }
+    landed
+}
+
+/// WHICH FACES CHROME TEXT CAN INK A GLYPH FROM NOW: the UI faces, their parsed East Asian
+/// faces and the terminal chain's parsed faces ([`ChromeFonts::face_for`]). Chrome text
+/// draws only parsed faces, so a native view's raster is stamped with this
+/// (`App::native_ui_compile_stamp_for`): one drawn before a face it needed had parsed (a
+/// first open's Japanese, parsed by the coverage warm or a terminal's fallback) is drawn
+/// again once it has, not left blank until something else redraws.
+pub(crate) fn chrome_coverage_epoch() -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut fonts = lock_fonts();
+    fonts.sync_coverage();
+    let mut epoch = std::collections::hash_map::DefaultHasher::new();
+    fonts
+        .ui_cjk
+        .as_ref()
+        .map_or(0, |store| store.parsed_count())
+        .hash(&mut epoch);
+    for face in &fonts.coverage {
+        Arc::as_ptr(&face.font).hash(&mut epoch);
+    }
+    fonts.ui_regular.as_ref().map(Arc::as_ptr).hash(&mut epoch);
+    fonts.ui_semibold.as_ref().map(Arc::as_ptr).hash(&mut epoch);
+    epoch.finish()
 }
 
 fn chrome_coverage_warm(fonts: &ChromeFonts) -> Option<impl FnOnce() -> usize + Send + 'static> {
@@ -1574,6 +1619,13 @@ pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
     install_dormant_chrome_fonts_for_test(seed);
     prepare_ui_fonts_for_direct_view_test();
     Some(live)
+}
+
+/// Parse what the startup warm parses in `live`'s chain on this test thread, as the warm
+/// thread does; how many faces landed.
+#[cfg(test)]
+pub(crate) fn warm_chrome_coverage_for_test(live: &Renderer) -> usize {
+    warm_chrome_coverage(Some(&live.fallback_coverage()), None)
 }
 
 /// Whether this test thread's chrome cascade draws `ch` from a face it holds parsed (the terminal
@@ -6541,6 +6593,44 @@ mod tests {
             0,
             "a second warm parses nothing"
         );
+        clear_ui_fonts_for_test();
+    }
+
+    /// A face the coverage warm parses changes what chrome text can ink, the epoch a native
+    /// view's raster is stamped with, and wakes the event loop to draw it again; a warm that
+    /// parses nothing changes and wakes nothing. Before, the warm's faces landed silently,
+    /// so a first open's Japanese stayed blank until something else redrew.
+    #[test]
+    fn a_face_the_warm_parses_restamps_and_wakes_the_native_views() {
+        let Some(live) = install_unparsed_cjk_chain_for_test() else {
+            aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
+        };
+        let before = chrome_coverage_epoch();
+        assert_eq!(
+            chrome_coverage_epoch(),
+            before,
+            "stable while nothing lands"
+        );
+        let wakes = std::cell::Cell::new(0);
+        let coverage = live.fallback_coverage();
+        let landed = land_chrome_coverage(
+            || warm_chrome_coverage(Some(&coverage), None),
+            || wakes.set(wakes.get() + 1),
+        );
+        assert!(landed >= 1, "CONTROL: the warm parsed the CJK face");
+        assert_eq!(wakes.get(), 1, "the landing wakes the event loop");
+        assert_ne!(
+            chrome_coverage_epoch(),
+            before,
+            "the native views are stale"
+        );
+        let after = chrome_coverage_epoch();
+        let landed = land_chrome_coverage(
+            || warm_chrome_coverage(Some(&coverage), None),
+            || wakes.set(wakes.get() + 1),
+        );
+        assert_eq!((landed, wakes.get()), (0, 1), "nothing new, no wake");
+        assert_eq!(chrome_coverage_epoch(), after);
         clear_ui_fonts_for_test();
     }
 

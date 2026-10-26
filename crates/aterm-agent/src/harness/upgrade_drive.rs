@@ -362,6 +362,7 @@ pub struct Opts {
     pub background: bool,
     pub aterm_state: Option<PathBuf>,
     pub ask: bool,
+    /// Exclude model and billing file evidence for a multi-account or unreadable pool.
     pub several_logins: bool,
     pub usage_credits: bool,
     pub usage_tap: Option<super::tap::Armed>,

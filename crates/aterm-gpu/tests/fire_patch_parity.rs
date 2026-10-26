@@ -183,7 +183,7 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
     over_ink_fire_parity("over_ink_fire_byte_exact_over_dark_and_light_frames", false);
 }
 
-#[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+#[cfg(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm))]
 #[test]
 fn over_ink_fire_byte_exact_cpu_vs_wgpu_oracle() {
     over_ink_fire_parity("over_ink_fire_byte_exact_cpu_vs_wgpu_oracle", true);
@@ -193,11 +193,11 @@ fn over_ink_fire_parity(test: &str, oracle: bool) {
     let exact = ByteExact::default();
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
         let (mut cpu, mut gpu) = backends(18.0, theme);
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm))]
         if oracle {
             crate::common::disarm_for_oracle(&mut gpu);
         }
-        #[cfg(not(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)))]
+        #[cfg(not(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm)))]
         let _ = oracle;
         let mut win = aterm_gpu::WindowGpu::new();
         let (rows, cols) = (10usize, 40usize);

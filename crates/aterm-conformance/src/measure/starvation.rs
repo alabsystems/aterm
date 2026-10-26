@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The instrument's account of its own run: whether the take is evidence about paint.
+//! The instrument's account of its own run: whether the take is evidence about the subject (its
+//! paint, or a latency row's bound).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,7 +114,7 @@ pub enum Starved {
     Unknown,
 }
 
-/// Whether a take may be used as evidence about paint.
+/// Whether a take may be used as evidence about the subject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Evidence {
     Sound,
@@ -175,7 +176,7 @@ impl std::fmt::Display for Starvation {
                 write!(
                     f,
                     "the driver was descheduled for {late_max_us}us (>= {threshold_us}us): not \
-                     evidence about paint"
+                     evidence about the subject"
                 )?;
                 match qos {
                     Some(q) if q.clamped() => write!(
@@ -194,11 +195,12 @@ impl std::fmt::Display for Starvation {
             } => write!(
                 f,
                 "the capture cadence blew out: hole {hole_us}us is more than twice the nominal \
-                 {nominal_us}us: not evidence about paint"
+                 {nominal_us}us: not evidence about the subject"
             ),
             Self::BudgetPressure { wall_us, budget_us } => write!(
                 f,
-                "the take used {wall_us}us of its {budget_us}us budget: not evidence about paint"
+                "the take used {wall_us}us of its {budget_us}us budget: not evidence about the \
+                 subject"
             ),
             Self::KeptCadence {
                 late_max_us,
@@ -270,6 +272,19 @@ pub const fn paint_verdict(shape: ShapeVerdict, evidence: Evidence) -> Dispositi
         (ShapeVerdict::Pass, Evidence::Sound) => Disposition::Pass,
         (ShapeVerdict::Pass, Evidence::Unproved) => Disposition::Unproved,
         (ShapeVerdict::Fail, _) => Disposition::Fail,
+    }
+}
+
+/// Compose a latency row's verdict with the take's standing, the other way round from
+/// [`paint_verdict`]: stalls only add latency, so a bound met on a starved take is met, but a
+/// bound missed while the machine held the driver off its core for as long as the bound is no
+/// evidence the subject is slow, since one such stall in a step is enough to miss it.
+#[must_use]
+pub const fn latency_verdict(bound: ShapeVerdict, starved: Starved) -> Disposition {
+    match (bound, starved) {
+        (ShapeVerdict::Pass, _) => Disposition::Pass,
+        (ShapeVerdict::Fail, Starved::Yes) => Disposition::Unproved,
+        (ShapeVerdict::Fail, Starved::No | Starved::Unknown) => Disposition::Fail,
     }
 }
 

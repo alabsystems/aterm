@@ -3907,7 +3907,11 @@ pub fn lay_repo_at(
     std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
+/// Seed each of `dirs` (and its `/private`-less spelling) as a folder Claude Code trusts, in the
+/// lab's scratch `.claude.json`.
+/// # Errors
+/// The scratch `.claude.json` could not be written (a COULD NOT RUN).
+pub(crate) fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
     let p = run.w.join("home/.claude/.claude.json");
     let text = crate::util::scratch_text(&p);
     let mut cj = J::parse(&text).unwrap_or_else(|_| J::obj([]));

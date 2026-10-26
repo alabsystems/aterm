@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod complete_input;
+mod console_session;
 mod create_new;
 mod github_api;
 pub(crate) mod github_rest;
@@ -699,8 +700,36 @@ pub trait System: Sync {
     }
 
     /// Open the converge journal for the account this system acts as.
-    fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+    fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
         Err("this system keeps no converge journal".into())
+    }
+
+    /// Whether this process came in over a remote login: OpenSSH's `SSH_CONNECTION` or
+    /// `SSH_TTY` is set ([`crate::console`]). The default: no.
+    fn remote_login(&self) -> bool {
+        false
+    }
+
+    /// Whether this process's audit session reaches the window server and was not
+    /// established over the network (`SessionGetInfo`'s `sessionHasGraphicAccess` without
+    /// `sessionIsRemote`); `None` when it cannot be read. The default: `None`, so a backend
+    /// that reads no session never counts as the console's.
+    fn graphic_session(&self) -> Option<bool> {
+        None
+    }
+
+    /// Whether a person can answer at this process: standard input is a terminal and its
+    /// controlling terminal (`/dev/tty`, where [`System::ask`] reads) opens. Claude Code's
+    /// Bash tool has neither. The default: no.
+    fn terminal(&self) -> bool {
+        false
+    }
+
+    /// The coding agent among this process's ancestors, by aterm's one name table
+    /// (`aterm_agent_names::agent_of`, what `status program=` names an agent by): its product
+    /// name. The default: none.
+    fn agent_ancestor(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -932,6 +961,30 @@ impl Default for Live {
     }
 }
 
+/// The terminal, owned by one question or one attached program at a time ([`Live`]'s
+/// [`System::ask`] and [`System::run_tty`]): `aterm init`'s lanes print rows while another lane
+/// asks or runs a program at the terminal, and [`terminal_free`] holds those rows back until it
+/// is done, so no row lands inside a prompt or a program's output.
+static TERMINAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Own the terminal for `work` ([`TERMINAL`]).
+pub(crate) fn owning_terminal<T>(work: impl FnOnce() -> T) -> T {
+    let _owned = TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    work()
+}
+
+/// The terminal while no question or attached program owns it ([`TERMINAL`]), for one write;
+/// `None` while one does.
+pub(crate) fn terminal_free() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match TERMINAL.try_lock() {
+        Ok(free) => Some(free),
+        Err(std::sync::TryLockError::Poisoned(free)) => Some(free.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 impl System for Live {
     fn github_api(
         &self,
@@ -1078,13 +1131,15 @@ impl System for Live {
         if let Some(dir) = &cmd.cwd {
             child.current_dir(dir);
         }
-        let status = child
-            .args(&args)
-            .stdin(aterm_uds::spawnfd::Stdio::inherit())
-            .stdout(aterm_uds::spawnfd::Stdio::inherit())
-            .stderr(aterm_uds::spawnfd::Stdio::inherit())
-            .status()
-            .map_err(|e| RunFailed::Spawn(e.to_string()))?;
+        let status = owning_terminal(|| {
+            child
+                .args(&args)
+                .stdin(aterm_uds::spawnfd::Stdio::inherit())
+                .stdout(aterm_uds::spawnfd::Stdio::inherit())
+                .stderr(aterm_uds::spawnfd::Stdio::inherit())
+                .status()
+        })
+        .map_err(|e| RunFailed::Spawn(e.to_string()))?;
         Ok(status.code())
     }
 
@@ -1123,7 +1178,7 @@ impl System for Live {
     }
 
     fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
-        secret::ask_tty(prompt, secret)
+        owning_terminal(|| secret::ask_tty(prompt, secret))
     }
 
     fn has_tty(&self) -> bool {
@@ -1476,13 +1531,29 @@ impl System for Live {
         crate::agent::platform::ioreg_value(&ran.out(), "IOPlatformUUID")
     }
 
-    fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+    fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
         aterm_types::dirs::account_state_dir()
             .map(|root| {
                 Box::new(aterm_converge::FileJournal::under(&root))
-                    as Box<dyn aterm_converge::Journal>
+                    as Box<dyn aterm_converge::Journal + Send>
             })
             .ok_or_else(|| "this account has no state directory to journal changes in".into())
+    }
+
+    fn remote_login(&self) -> bool {
+        console_session::remote_login()
+    }
+
+    fn graphic_session(&self) -> Option<bool> {
+        console_session::graphic_session()
+    }
+
+    fn terminal(&self) -> bool {
+        console_session::terminal()
+    }
+
+    fn agent_ancestor(&self) -> Option<&'static str> {
+        console_session::agent_ancestor()
     }
 }
 
@@ -1659,6 +1730,14 @@ mod fake {
         /// What [`System::awake_ms`] answers ([`Fake::awake_at`]): `None`, no awake clock,
         /// unless a test sets it.
         awake: Mutex<Option<u64>>,
+        /// What [`System::remote_login`] answers ([`Fake::root`]: no).
+        pub remote_login: bool,
+        /// What [`System::graphic_session`] answers ([`Fake::root`]: the console's).
+        pub graphic_session: Option<bool>,
+        /// What [`System::terminal`] answers ([`Fake::root`]: a person at it).
+        pub terminal: bool,
+        /// What [`System::agent_ancestor`] answers ([`Fake::root`]: none).
+        pub agent: Option<&'static str>,
     }
 
     #[derive(Clone)]
@@ -1852,11 +1931,14 @@ mod fake {
         pub const JOURNAL: &'static str =
             "/var/root/Library/Application Support/aterm/converge/journal.ndjson";
 
-        /// A fake running as root at a fixed time.
+        /// A fake running as root at a fixed time, in a local graphic session at a terminal
+        /// ([`crate::console::presence`] reads a person there once the console is its uid's).
         #[must_use]
         pub fn root() -> Self {
             Self {
                 now: 1_800_000_000,
+                graphic_session: Some(true),
+                terminal: true,
                 ..Self::default()
             }
         }
@@ -2710,7 +2792,7 @@ mod fake {
             self.now
         }
 
-        fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+        fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
             Ok(Box::new(Journaled(self)))
         }
 
@@ -2861,6 +2943,22 @@ mod fake {
 
         fn ignore_hangups(&self) {
             self.calls.lock().unwrap().push("ignore hangups".into());
+        }
+
+        fn remote_login(&self) -> bool {
+            self.remote_login
+        }
+
+        fn graphic_session(&self) -> Option<bool> {
+            self.graphic_session
+        }
+
+        fn terminal(&self) -> bool {
+            self.terminal
+        }
+
+        fn agent_ancestor(&self) -> Option<&'static str> {
+            self.agent
         }
     }
 

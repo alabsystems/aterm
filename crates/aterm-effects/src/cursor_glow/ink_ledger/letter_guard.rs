@@ -243,20 +243,27 @@ fn ramp_row(
         Err(_) => 1.0,
     };
     let reach = WORD_GAP_COLS + 1;
-    for col in (lo - reach).max(0)..=hi + reach {
+    let mut col = (lo - reach).max(0);
+    let col_end = hi + reach;
+    while col <= col_end {
         if skip == Some(col) {
+            col += 1;
             continue;
         }
         let own = share_of(col);
         let mut eased = own;
         if col >= lo && col <= hi {
-            for &(c, s) in cuts {
+            let mut ci = 0;
+            while ci < cuts.len() {
+                let (c, s) = cuts[ci];
                 eased = eased.min(s + RAMP_SLOPE * (c - col).abs() as f32);
+                ci += 1;
             }
         }
         if !climb && !lettered(col) {
             let mut left = None;
-            for d in 1..=reach {
+            let mut d = 1;
+            while d <= reach {
                 let c = col - d;
                 if c < 0 {
                     break;
@@ -265,15 +272,18 @@ fn ramp_row(
                     left = Some(c);
                     break;
                 }
+                d += 1;
             }
             if let Some(a) = left {
                 let max_b = (col + reach).min(a + 1 + WORD_GAP_COLS);
                 let mut right = None;
-                for c in col + 1..=max_b {
+                let mut c = col + 1;
+                while c <= max_b {
                     if lettered(c) {
                         right = Some(c);
                         break;
                     }
+                    c += 1;
                 }
                 if let Some(b) = right {
                     let (sa, sb) = (share_of(a), share_of(b));
@@ -287,6 +297,7 @@ fn ramp_row(
         if eased < own {
             cut(col, eased);
         }
+        col += 1;
     }
 }
 
@@ -325,16 +336,20 @@ fn lay_run(
 ) {
     let n = knots.len() - 1;
     let rows = ends.len() / (2 * n);
-    for s in 0..n {
+    let mut s = 0;
+    while s < n {
         let row = |i: usize| (ends[2 * (i * n + s)], ends[2 * (i * n + s) + 1]);
         let mut first_opt = None;
-        for i in 0..rows {
+        let mut i = 0;
+        while i < rows {
             if row(i) != (0, 0) {
                 first_opt = Some(i);
                 break;
             }
+            i += 1;
         }
         let Some(first) = first_opt else {
+            s += 1;
             continue;
         };
         let mut last = first;
@@ -368,12 +383,15 @@ fn lay_run(
             ink: out.ends.len() as u32,
         };
         out.items.push(laid);
-        for i in first..=last {
+        let mut i = first;
+        while i <= last {
             if !laid.continues((i - first) as u16) {
                 let (a, b) = row(i);
                 out.ends.extend([a, b]);
             }
+            i += 1;
         }
+        s += 1;
     }
 }
 
@@ -397,11 +415,13 @@ fn row_lights(
     let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
     ramps.in_order(quads.len(), |at| match at {
         Laid::Quads(r) => {
-            for k in r {
+            let mut k = r.start;
+            while k < r.end {
                 let q = &quads[k];
                 if lit(q) && meets_y(q.y, q.h) {
                     push(sq, k, q.x, q.w, 0);
                 }
+                k += 1;
             }
         }
         Laid::Ramp(k) => {
@@ -476,7 +496,10 @@ impl LetterGuard {
     ) -> u32 {
         let halos = streams.halos;
         let lights = &self.by_px[self.px_at[k] as usize..self.px_at[k + 1] as usize];
-        for &(stream, i) in lights {
+        let mut li = 0;
+        while li < lights.len() {
+            let (stream, i) = lights[li];
+            li += 1;
             let i = i as usize;
             match stream {
                 Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
@@ -517,9 +540,27 @@ impl LetterGuard {
     /// then a share's composite is the ground or ink plus that share of it,
     /// saturating, as `add_sat` composes. Returns whether it is additive.
     fn prepare(&mut self, j: Judge, streams: Streams<'_>, has_over: bool) -> bool {
+        #[inline]
+        const fn unpack_rgb(c: u32) -> [u16; 3] {
+            [
+                ((c >> 16) & 0xff) as u16,
+                ((c >> 8) & 0xff) as u16,
+                (c & 0xff) as u16,
+            ]
+        }
+        #[inline]
+        const fn add_rgb(acc: &mut [u16; 3], rgb: [u16; 3]) {
+            acc[0] = acc[0].saturating_add(rgb[0]);
+            acc[1] = acc[1].saturating_add(rgb[1]);
+            acc[2] = acc[2].saturating_add(rgb[2]);
+        }
         let halos = streams.halos;
+        let cell_slice = self.cell.as_slice();
         let mut additive = true;
-        for &(stream, i) in &self.cell {
+        let mut ci = 0;
+        while ci < cell_slice.len() {
+            let (stream, i) = cell_slice[ci];
+            ci += 1;
             let ok = match stream {
                 Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
                     let q = streams.quad(stream, i as usize);
@@ -545,19 +586,10 @@ impl LetterGuard {
             lo.clear();
             lo.resize(w * h, [0; 3]);
         }
-        let unpack_rgb = |c: u32| {
-            [
-                ((c >> 16) & 0xff) as u16,
-                ((c >> 8) & 0xff) as u16,
-                (c & 0xff) as u16,
-            ]
-        };
-        let add_rgb = |acc: &mut [u16; 3], rgb: [u16; 3]| {
-            acc[0] = acc[0].saturating_add(rgb[0]);
-            acc[1] = acc[1].saturating_add(rgb[1]);
-            acc[2] = acc[2].saturating_add(rgb[2]);
-        };
-        for &(stream, i) in &self.cell {
+        let mut ci = 0;
+        while ci < cell_slice.len() {
+            let (stream, i) = cell_slice[ci];
+            ci += 1;
             let i = i as usize;
             let (bx0, by0, bw, bh) = match stream {
                 Stream::HaloAdd | Stream::HaloOver => {
@@ -588,23 +620,32 @@ impl LetterGuard {
                         if c != 0 {
                             let rgb = unpack_rgb(c);
                             let (rx0, rx1) = ((x0 - j.x0) as usize, (x1 - j.x0) as usize);
-                            for y in y0..y1 {
+                            let mut y = y0;
+                            while y < y1 {
                                 let row_off = (y - j.y0) as usize * w;
-                                for cell in &mut dst[row_off + rx0..row_off + rx1] {
-                                    add_rgb(cell, rgb);
+                                let row_slice = &mut dst[row_off + rx0..row_off + rx1];
+                                let mut ri = 0;
+                                while ri < row_slice.len() {
+                                    add_rgb(&mut row_slice[ri], rgb);
+                                    ri += 1;
                                 }
+                                y += 1;
                             }
                         }
                     } else {
-                        for x in x0..x1 {
+                        let mut x = x0;
+                        while x < x1 {
                             let c = quad_at(q, x, 1.0).0;
                             if c != 0 {
                                 let rgb = unpack_rgb(c);
                                 let col_off = (x - j.x0) as usize;
-                                for y in y0..y1 {
+                                let mut y = y0;
+                                while y < y1 {
                                     add_rgb(&mut dst[(y - j.y0) as usize * w + col_off], rgb);
+                                    y += 1;
                                 }
                             }
+                            x += 1;
                         }
                     }
                 }
@@ -618,24 +659,28 @@ impl LetterGuard {
                     let rx2 = (i32::from(h.rx) * i32::from(h.rx)).max(1);
                     let cx = i32::from(h.cx);
                     let cy = i32::from(h.cy);
-                    for y in y0..y1 {
+                    let mut y = y0;
+                    while y < y1 {
                         let ny = aterm_render::halo_row_ny(y - cy, ry2);
-                        if ny >= 256 {
-                            continue;
-                        }
-                        let span = ((((256 - ny) * rx2) >> 8) as u32).isqrt() as i32 + 1;
-                        let hx0 = x0.max(cx - span);
-                        let hx1 = x1.min(cx + span + 1);
-                        let row_off = (y - j.y0) as usize * w;
-                        for x in hx0..hx1 {
-                            let wt = aterm_render::halo_weight(x - cx, ny, rx2).clamp(0, 255) as u8;
-                            if wt != 0 {
-                                add_rgb(
-                                    &mut lo[row_off + (x - j.x0) as usize],
-                                    unpack_rgb(aterm_render::premul_rgb(color, wt)),
-                                );
+                        if ny < 256 {
+                            let span = ((((256 - ny) * rx2) >> 8) as u32).isqrt() as i32 + 1;
+                            let hx0 = x0.max(cx - span);
+                            let hx1 = x1.min(cx + span + 1);
+                            let row_off = (y - j.y0) as usize * w;
+                            let mut x = hx0;
+                            while x < hx1 {
+                                let wt =
+                                    aterm_render::halo_weight(x - cx, ny, rx2).clamp(0, 255) as u8;
+                                if wt != 0 {
+                                    add_rgb(
+                                        &mut lo[row_off + (x - j.x0) as usize],
+                                        unpack_rgb(aterm_render::premul_rgb(color, wt)),
+                                    );
+                                }
+                                x += 1;
                             }
                         }
+                        y += 1;
                     }
                 }
             }
@@ -650,9 +695,15 @@ impl LetterGuard {
     /// [`Self::composite`] visits exactly a pixel's own lights, in the order
     /// it would meet them in `cell`.
     fn index_pixels(&mut self, j: Judge, streams: Streams<'_>) {
+        #[inline]
+        fn span(at: u16, len: u16, o: i32, n: i32) -> (usize, usize) {
+            let lo = (i32::from(at) - o).clamp(0, n) as usize;
+            let hi = (i32::from(at) + i32::from(len) - o).clamp(0, n) as usize;
+            (lo, hi)
+        }
         let halos = streams.halos;
         let (w, h) = ((j.x1 - j.x0).max(0), (j.y1 - j.y0).max(0));
-        let cover = |&(stream, i): &(Stream, u32)| {
+        let cover = |(stream, i): (Stream, u32)| {
             let i = i as usize;
             let (x, y, qw, qh) = match stream {
                 Stream::HaloAdd | Stream::HaloOver => {
@@ -663,26 +714,31 @@ impl LetterGuard {
                     (q.x, q.y, q.w, q.h)
                 }
             };
-            let span = |at: u16, len: u16, o: i32, n: i32| {
-                let lo = (i32::from(at) - o).clamp(0, n);
-                let hi = (i32::from(at) + i32::from(len) - o).clamp(0, n);
-                lo as usize..hi as usize
-            };
             (span(x, qw, j.x0, w), span(y, qh, j.y0, h))
         };
         let (w, n) = (w as usize, (w * h) as usize);
         self.px_at.clear();
         self.px_at.resize(n + 1, 0);
-        for light in &self.cell {
-            let (xs, ys) = cover(light);
-            for y in ys {
-                for n in &mut self.px_at[y * w + xs.start + 1..y * w + xs.end + 1] {
-                    *n += 1;
+        let cell_slice = self.cell.as_slice();
+        let mut ci = 0;
+        while ci < cell_slice.len() {
+            let ((x0, x1), (y0, y1)) = cover(cell_slice[ci]);
+            ci += 1;
+            let mut y = y0;
+            while y < y1 {
+                let row_slice = &mut self.px_at[y * w + x0 + 1..y * w + x1 + 1];
+                let mut ri = 0;
+                while ri < row_slice.len() {
+                    row_slice[ri] += 1;
+                    ri += 1;
                 }
+                y += 1;
             }
         }
-        for k in 0..n {
+        let mut k = 0;
+        while k < n {
             self.px_at[k + 1] += self.px_at[k];
+            k += 1;
         }
         self.by_px.clear();
         self.by_px
@@ -690,13 +746,22 @@ impl LetterGuard {
         let mut next = std::mem::take(&mut self.px_fill);
         next.clear();
         next.extend_from_slice(&self.px_at[..n]);
-        for &light in &self.cell {
-            let (xs, ys) = cover(&light);
-            for y in ys {
-                for at in &mut next[y * w + xs.start..y * w + xs.end] {
-                    self.by_px[*at as usize] = light;
-                    *at += 1;
+        let mut ci = 0;
+        while ci < cell_slice.len() {
+            let light = cell_slice[ci];
+            ci += 1;
+            let ((x0, x1), (y0, y1)) = cover(light);
+            let mut y = y0;
+            while y < y1 {
+                let row_slice = &mut next[y * w + x0..y * w + x1];
+                let mut ri = 0;
+                while ri < row_slice.len() {
+                    let at = row_slice[ri];
+                    self.by_px[at as usize] = light;
+                    row_slice[ri] = at + 1;
+                    ri += 1;
                 }
+                y += 1;
             }
         }
         self.px_fill = next;
@@ -715,6 +780,20 @@ impl LetterGuard {
         streams: Streams<'_>,
         (additive, has_over): (bool, bool),
     ) -> bool {
+        #[inline]
+        const fn lift_rgb(c: u32, a: [u16; 3], s: f32) -> u32 {
+            #[inline]
+            const fn ch(c: u32, sh: u32, ak: u16, s: f32) -> u32 {
+                let l = (ak as f32 * s) as u32;
+                let v = ((c >> sh) & 0xff) + l;
+                if v < 255 { v } else { 255 }
+            }
+            (ch(c, 16, a[0], s) << 16) | (ch(c, 8, a[1], s) << 8) | ch(c, 0, a[2], s)
+        }
+        #[inline]
+        const fn ratio(a: f32, b: f32) -> f32 {
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
         let r = RING as usize;
         if w <= 2 * r || h <= 2 * r {
@@ -726,22 +805,16 @@ impl LetterGuard {
         lum.resize(w * h, 0.0);
         ring_lo.resize(w * h, 0.0);
         ring_hi.resize(w * h, 0.0);
-        let lift = |c: u32, a: [u16; 3]| {
-            let ch = |sh: u32, k: usize| {
-                let l = f32::from(a[k]) * s;
-                (((c >> sh) & 0xff) + l as u32).min(255)
-            };
-            (ch(16, 0) << 16) | (ch(8, 1) << 8) | ch(0, 2)
-        };
-        let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
         let mut holds = true;
         let mut last_g: Option<(u32, f32)> = None;
         let mut last_g_lift: Option<([u16; 3], f32)> = None;
         let mut last_ink: Option<(u32, f32)> = None;
         let mut last_ink_lift: Option<([u16; 3], f32)> = None;
-        'rows: for gy in 0..h {
+        let mut gy = 0;
+        'rows: while gy < h {
             let row = gy * w;
-            for x in 0..w {
+            let mut x = 0;
+            while x < w {
                 let k = row + x;
                 let lg = if additive {
                     let a = self.lift_under[k];
@@ -762,7 +835,7 @@ impl LetterGuard {
                     {
                         prev_lum
                     } else {
-                        let g = lift(j.ground, ab);
+                        let g = lift_rgb(j.ground, ab, s);
                         let l = if g == j.ground {
                             j.l_ground
                         } else {
@@ -797,22 +870,32 @@ impl LetterGuard {
                     }
                 };
                 lum[k] = lg;
+                x += 1;
             }
-            for x in r..w - r {
+            let mut x = r;
+            let x_end = w - r;
+            while x < x_end {
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                for &l in &lum[row + x - r..=row + x + r] {
+                let slice = &lum[row + x - r..=row + x + r];
+                let mut si = 0;
+                while si < slice.len() {
+                    let l = slice[si];
                     lo = lo.min(l);
                     hi = hi.max(l);
+                    si += 1;
                 }
                 ring_lo[row + x] = lo;
                 ring_hi[row + x] = hi;
+                x += 1;
             }
             let Some(y) = gy.checked_sub(2 * r) else {
+                gy += 1;
                 continue;
             };
             let y = y + r;
             let irow = y * w;
-            for x in r..w - r {
+            let mut x = r;
+            while x < x_end {
                 let k = irow + x;
                 let li = if !has_over {
                     j.l_ink
@@ -825,7 +908,7 @@ impl LetterGuard {
                     {
                         prev_lum
                     } else {
-                        let ink = lift(j.ink, b);
+                        let ink = lift_rgb(j.ink, b, s);
                         let l = if ink == j.ink {
                             j.l_ink
                         } else {
@@ -860,15 +943,21 @@ impl LetterGuard {
                     }
                 };
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                for yy in y - r..=y + r {
-                    lo = lo.min(ring_lo[yy * w + x]);
-                    hi = hi.max(ring_hi[yy * w + x]);
+                let mut yy = y - r;
+                let yy_end = y + r;
+                while yy <= yy_end {
+                    let idx = yy * w + x;
+                    lo = lo.min(ring_lo[idx]);
+                    hi = hi.max(ring_hi[idx]);
+                    yy += 1;
                 }
                 if ratio(li, lo) < bar || ratio(li, hi) < bar {
                     holds = false;
                     break 'rows;
                 }
+                x += 1;
             }
+            gy += 1;
         }
         self.lum = lum;
         self.ring_lo = ring_lo;
@@ -880,11 +969,14 @@ impl LetterGuard {
     /// ([`letter_bar`]; `1.0` when the whole light does).
     fn share(&mut self, j: Judge, bar: f32, streams: Streams<'_>) -> f32 {
         let mut has_over = false;
-        for &(stream, _) in &self.cell {
-            if !stream.on_ground() {
+        let cell_slice = self.cell.as_slice();
+        let mut ci = 0;
+        while ci < cell_slice.len() {
+            if !cell_slice[ci].0.on_ground() {
                 has_over = true;
                 break;
             }
+            ci += 1;
         }
         let additive = self.prepare(j, streams, has_over);
         if !additive {
@@ -895,13 +987,15 @@ impl LetterGuard {
             return 1.0;
         }
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        for _ in 0..STEPS {
+        let mut step = 0;
+        while step < STEPS {
             let mid = 0.5 * (lo + hi);
             if self.holds(j, mid, bar, streams, flags) {
                 lo = mid;
             } else {
                 hi = mid;
             }
+            step += 1;
         }
         lo
     }
@@ -910,14 +1004,25 @@ impl LetterGuard {
     /// the ring box, per channel, over the ink (`over`) and the ground
     /// (`all`); `None` when a source-over light reaches it (no bound).
     fn bound(&self, j: Judge, streams: Streams<'_>) -> Option<([u32; 3], [u32; 3])> {
-        let halos = streams.halos;
-        let (mut on_ink, mut all) = ([0u32; 3], [0u32; 3]);
-        let add = |acc: &mut [u32; 3], c: u32| {
+        #[inline]
+        const fn add(acc: &mut [u32; 3], c: u32) {
             acc[0] += (c >> 16) & 0xff;
             acc[1] += (c >> 8) & 0xff;
             acc[2] += c & 0xff;
-        };
-        for &(stream, i) in &self.cell {
+        }
+        #[inline]
+        const fn max_ch(a: u32, b: u32, sh: u32) -> u32 {
+            let ca = (a >> sh) & 0xff;
+            let cb = (b >> sh) & 0xff;
+            if ca > cb { ca } else { cb }
+        }
+        let halos = streams.halos;
+        let (mut on_ink, mut all) = ([0u32; 3], [0u32; 3]);
+        let cell_slice = self.cell.as_slice();
+        let mut ci = 0;
+        while ci < cell_slice.len() {
+            let (stream, i) = cell_slice[ci];
+            ci += 1;
             let i = i as usize;
             let c = match stream {
                 Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
@@ -926,8 +1031,7 @@ impl LetterGuard {
                         return None;
                     }
                     let (a, b) = (q.color, q.color2);
-                    let ch = |sh: u32| ((a >> sh) & 0xff).max((b >> sh) & 0xff);
-                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+                    (max_ch(a, b, 16) << 16) | (max_ch(a, b, 8) << 8) | max_ch(a, b, 0)
                 }
                 Stream::HaloAdd => {
                     let h = &halos[i];
@@ -1087,12 +1191,12 @@ impl InkLedger {
         pieces.clear();
         let mut cut = false;
         let mut next = 0;
-        for (i, &q) in quads.iter().enumerate() {
+        let mut i = 0;
+        while i < quads.len() {
+            let q = quads[i];
             if RAMPS {
-                while let Some(r) = ramps.get_mut(next)
-                    && r.at as usize <= i
-                {
-                    r.at = pieces.len() as u32;
+                while next < ramps.len() && ramps[next].at as usize <= i {
+                    ramps[next].at = pieces.len() as u32;
                     next += 1;
                 }
             }
@@ -1112,16 +1216,20 @@ impl InkLedger {
                 || !self.knots((x0, y0, x1, y1))
             {
                 pieces.push(q);
+                i += 1;
                 continue;
             }
             cut = true;
             let inv_w = 1.0 / f32::from(q.w);
-            let at = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
-            let (r0, g0, b0) = (at(q.color, 16), at(q.color, 8), at(q.color, 0));
+            #[inline]
+            const fn at_ch(c: u32, sh: u32) -> f32 {
+                ((c >> sh) & 0xff) as f32
+            }
+            let (r0, g0, b0) = (at_ch(q.color, 16), at_ch(q.color, 8), at_ch(q.color, 0));
             let (dr, dg, db) = (
-                at(q.color2, 16) - r0,
-                at(q.color2, 8) - g0,
-                at(q.color2, 0) - b0,
+                at_ch(q.color2, 16) - r0,
+                at_ch(q.color2, 8) - g0,
+                at_ch(q.color2, 0) - b0,
             );
             let a0 = f32::from(q.alpha);
             let da = f32::from(q.alpha2) - a0;
@@ -1134,12 +1242,12 @@ impl InkLedger {
             let end = |x: i32, m: f32| {
                 let t = (x - x0) as f32 * inv_w;
                 let fit = |v: f32| {
-                    (if m < 1.0 && !round_cuts {
+                    let u = if m < 1.0 && !round_cuts {
                         v.trunc()
                     } else {
                         v.round()
-                    } as u32)
-                        .min(255)
+                    } as u32;
+                    if u < 255 { u } else { 255 }
                 };
                 let ch = |c0: f32, dc: f32| fit((c0 + dc * t) * m);
                 let a = a0 + da * t;
@@ -1151,14 +1259,16 @@ impl InkLedger {
             let ny = self.knots_y.len() - 1;
             let nx = self.knots_x.len() - 1;
             let x0_knot = self.knots_x[0];
-            for yi in 0..ny {
+            let mut yi = 0;
+            while yi < ny {
                 let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
                 let ym = 0.5 * (ya + yb) as f32;
                 let ya_u = ya as u16;
                 let h_u = (yb - ya) as u16;
                 let mut xa = x0_knot;
                 let mut ca = end(xa, self.mask_at_with(xa as f32, ym, feather));
-                for xi in 0..nx {
+                let mut xi = 0;
+                while xi < nx {
                     let xb = self.knots_x[xi + 1];
                     let cb = end(xb, self.mask_at_with(xb as f32, ym, feather));
                     if ca.0 | cb.0 != 0 || ca.1 | cb.1 != 0 {
@@ -1176,12 +1286,16 @@ impl InkLedger {
                     }
                     xa = xb;
                     ca = cb;
+                    xi += 1;
                 }
+                yi += 1;
             }
+            i += 1;
         }
         if RAMPS {
-            for r in &mut ramps[next..] {
-                r.at = pieces.len() as u32;
+            while next < ramps.len() {
+                ramps[next].at = pieces.len() as u32;
+                next += 1;
             }
         }
         if cut {
@@ -1245,7 +1359,8 @@ impl InkLedger {
         let mut out = std::mem::take(&mut self.ramp_pieces);
         out.clear();
         let mut cut = false;
-        for k in 0..ramps.items.len() {
+        let mut k = 0;
+        while k < ramps.items.len() {
             let r = ramps.items[k];
             let (x0, y0) = (i32::from(r.x), i32::from(r.y));
             let (x1, y1) = (x0 + i32::from(r.w), y0 + i32::from(r.h));
@@ -1253,27 +1368,27 @@ impl InkLedger {
                 span += 1;
             }
             let rail = span < spans.len() && spans[span].0 as usize <= k;
-            // A rail's light (a row, or a run's rows) the cut may reach.
-            let reached = |this: &Self, (ya, yb): (i32, i32)| {
-                !rail || this.meets_dim_box((x0, ya, x1, yb), feather.0)
-            };
-            let keep = |out: &mut GlowRamps, r: &GlowRamp| {
+            #[inline]
+            fn keep(out: &mut GlowRamps, ends: &[u32], r: &GlowRamp) {
                 out.items.push(GlowRamp {
                     ink: out.ends.len() as u32,
                     ..*r
                 });
-                out.ends.extend_from_slice(r.kept_ends(&ramps.ends));
-            };
+                out.ends.extend_from_slice(r.kept_ends(ends));
+            }
             if r.w == 0 || x1 <= bx0 || x0 >= bx1 || y1 <= by0 || y0 >= by1 {
                 // Whole: laid again only once the stream is rebuilt.
                 if cut {
-                    keep(&mut out, &r);
+                    keep(&mut out, &ramps.ends, &r);
                 }
+                k += 1;
                 continue;
             }
             if !cut {
-                for before in &ramps.items[..k] {
-                    keep(&mut out, before);
+                let mut bi = 0;
+                while bi < k {
+                    keep(&mut out, &ramps.ends, &ramps.items[bi]);
+                    bi += 1;
                 }
             }
             cut = true;
@@ -1293,14 +1408,15 @@ impl InkLedger {
             let mut held_knotted = false;
             // The gathered rows' one light, if they hold one (`lay_run`).
             let mut run_held = None;
-            for y in y0..y1 {
+            let mut y = y0;
+            while y < y1 {
                 let (a, b) = r.row_ends(&ramps.ends, (y - y0) as u16);
                 let in_held = r.joined > 0 && y >= held.0 && y < held.1;
                 if in_held && y == held.0 {
                     held_knotted = a | b != 0
                         && held.0 < by1
                         && held.1 > by0
-                        && reached(self, held)
+                        && (!rail || self.meets_dim_box((x0, held.0, x1, held.1), feather.0))
                         && self.knots((x0, held.0, x1, held.1));
                 }
                 let knotted = if in_held {
@@ -1309,14 +1425,14 @@ impl InkLedger {
                     a | b != 0
                         && y >= by0
                         && y < by1
-                        && reached(self, (y, y + 1))
+                        && (!rail || self.meets_dim_box((x0, y, x1, y + 1), feather.0))
                         && self.knots((x0, y, x1, y + 1))
                 };
                 // The held rows' light from `y`: the whole run uncut, or the
                 // knot interval `y` begins.
                 let interval = if in_held && knotted {
-                    let k = self.knots_y.partition_point(|&k| k <= y);
-                    Some((self.knots_y[k - 1], self.knots_y[k]))
+                    let kp = self.knots_y.partition_point(|&ky| ky <= y);
+                    Some((self.knots_y[kp - 1], self.knots_y[kp]))
                 } else {
                     None
                 };
@@ -1360,8 +1476,9 @@ impl InkLedger {
                     if run_knots.len() == 2 {
                         run_ends.extend([a, b]);
                     } else {
-                        run_ends.extend(std::iter::repeat_n(0, 2 * (run_knots.len() - 1)));
+                        run_ends.resize(run_ends.len() + 2 * (run_knots.len() - 1), 0);
                     }
+                    y += 1;
                     continue;
                 }
                 if interval.is_some() && opens.is_none() {
@@ -1369,27 +1486,31 @@ impl InkLedger {
                     // ends, its pieces cut at the same `ym`.
                     let n = run_ends.len();
                     run_ends.extend_from_within(n - 2 * (run_knots.len() - 1)..n);
+                    y += 1;
                     continue;
                 }
-                let at = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+                #[inline]
+                const fn at_ch(c: u32, sh: u32) -> f32 {
+                    ((c >> sh) & 0xff) as f32
+                }
                 // A cut piece truncated as `guard_mask_quads` truncates it.
                 let end = |x: i32, m: f32| {
                     let t = (x - x0) as f32 * inv_w;
                     let fit = |v: f32| {
-                        (if m < 1.0 && !round_cuts {
+                        let u = if m < 1.0 && !round_cuts {
                             v.trunc()
                         } else {
                             v.round()
-                        } as u32)
-                            .min(255)
+                        } as u32;
+                        if u < 255 { u } else { 255 }
                     };
-                    let ch = |sh: u32| fit((at(a, sh) + (at(b, sh) - at(a, sh)) * t) * m);
-                    let al = fit((at(a, 24) + (at(b, 24) - at(a, 24)) * t) * m) as u8;
+                    let ch = |sh: u32| fit((at_ch(a, sh) + (at_ch(b, sh) - at_ch(a, sh)) * t) * m);
+                    let al = fit((at_ch(a, 24) + (at_ch(b, 24) - at_ch(a, 24)) * t) * m) as u8;
                     glow_end((ch(16) << 16) | (ch(8) << 8) | ch(0), al)
                 };
                 let ym = if in_held {
-                    let k = self.knots_y.partition_point(|&k| k <= y);
-                    0.5 * (self.knots_y[k - 1] + self.knots_y[k]) as f32
+                    let kp = self.knots_y.partition_point(|&ky| ky <= y);
+                    0.5 * (self.knots_y[kp - 1] + self.knots_y[kp]) as f32
                 } else {
                     0.5 * (2 * y + 1) as f32
                 };
@@ -1397,17 +1518,22 @@ impl InkLedger {
                     run_knots[0],
                     self.mask_at_with(run_knots[0] as f32, ym, feather),
                 );
-                for &xb in &run_knots[1..] {
+                let mut xi = 1;
+                while xi < run_knots.len() {
+                    let xb = run_knots[xi];
                     let cb = end(xb, self.mask_at_with(xb as f32, ym, feather));
                     // A piece of no light is never laid: a dark row (two
                     // zero ends already).
                     run_ends.extend([ca, cb]);
                     ca = cb;
+                    xi += 1;
                 }
+                y += 1;
             }
             lay_run(&mut out, &r, run_y, &run_knots, &run_ends, run_held);
             self.run_ends = run_ends;
             self.run_knots = run_knots;
+            k += 1;
         }
         if cut {
             out.lit = out.count_lit();
@@ -1430,7 +1556,9 @@ impl InkLedger {
         let mut pieces = std::mem::take(&mut self.halo_pieces);
         pieces.clear();
         let mut cut = false;
-        for &h in halos.iter() {
+        let mut hi = 0;
+        while hi < halos.len() {
+            let h = halos[hi];
             let (x0, y0) = (i32::from(h.x), i32::from(h.y));
             let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
             if h.w == 0
@@ -1442,17 +1570,20 @@ impl InkLedger {
                 || !self.knots((x0, y0, x1, y1))
             {
                 pieces.push(h);
+                hi += 1;
                 continue;
             }
             cut = true;
             let ny = self.knots_y.len() - 1;
             let nx = self.knots_x.len() - 1;
-            for yi in 0..ny {
+            let mut yi = 0;
+            while yi < ny {
                 let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
                 let ym = 0.5 * (ya + yb) as f32;
                 let ya_u = ya as u16;
                 let h_u = (yb - ya) as u16;
-                for xi in 0..nx {
+                let mut xi = 0;
+                while xi < nx {
                     let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
                     let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
                     let color = match h.mode {
@@ -1462,10 +1593,14 @@ impl InkLedger {
                                 (h.color & 0x00FF_FFFF) | (u32::from(cap) << 24)
                             }
                             Some(_) => h.color,
-                            None => continue,
+                            None => {
+                                xi += 1;
+                                continue;
+                            }
                         },
                     };
                     if h.mode == HaloMode::Add && color == 0 {
+                        xi += 1;
                         continue;
                     }
                     pieces.push(RainHalo {
@@ -1476,8 +1611,11 @@ impl InkLedger {
                         color,
                         ..h
                     });
+                    xi += 1;
                 }
+                yi += 1;
             }
+            hi += 1;
         }
         if cut {
             std::mem::swap(halos, &mut pieces);
@@ -1560,29 +1698,49 @@ impl CursorGlow {
         let over_q = over.as_slice();
         // Each stream's lit extent down the page, its ramps' boxes counted:
         // a text row none of its lights reach skips that stream.
-        let y_bounds = |qs: &[GlowQuad], ramps: &GlowRamps| {
+        #[inline]
+        const fn y_bounds(qs: &[GlowQuad], ramps: &GlowRamps) -> (i32, i32) {
             let (mut y0, mut y1) = (i32::MAX, i32::MIN);
-            for q in qs {
+            let mut i = 0;
+            while i < qs.len() {
+                let q = &qs[i];
                 if lit(q) {
-                    let qy = i32::from(q.y);
-                    y0 = y0.min(qy);
-                    y1 = y1.max(qy + i32::from(q.h));
+                    let qy = q.y as i32;
+                    let qy1 = qy + q.h as i32;
+                    if qy < y0 {
+                        y0 = qy;
+                    }
+                    if qy1 > y1 {
+                        y1 = qy1;
+                    }
                 }
+                i += 1;
             }
-            for r in &ramps.items {
+            let items = ramps.items.as_slice();
+            let mut j = 0;
+            while j < items.len() {
+                let r = &items[j];
                 if r.w > 0 && r.h > 0 {
-                    let ry = i32::from(r.y);
-                    y0 = y0.min(ry);
-                    y1 = y1.max(ry + i32::from(r.h));
+                    let ry = r.y as i32;
+                    let ry1 = ry + r.h as i32;
+                    if ry < y0 {
+                        y0 = ry;
+                    }
+                    if ry1 > y1 {
+                        y1 = ry1;
+                    }
                 }
+                j += 1;
             }
             (y0, y1)
-        };
+        }
         let (u_y0, u_y1) = y_bounds(under, &self.under_ramps);
         let (o_y0, o_y1) = y_bounds(over_q, &self.out_ramps);
         let (mut ha_y0, mut ha_y1) = (i32::MAX, i32::MIN);
         let (mut ho_y0, mut ho_y1) = (i32::MAX, i32::MIN);
-        for h in halos {
+        let mut hi = 0;
+        while hi < halos.len() {
+            let h = &halos[hi];
             if h.w > 0 && h.h > 0 && h.color & 0x00FF_FFFF != 0 {
                 let hy0 = i32::from(h.y);
                 let hy1 = hy0 + i32::from(h.h);
@@ -1594,6 +1752,7 @@ impl CursorGlow {
                     ho_y1 = ho_y1.max(hy1);
                 }
             }
+            hi += 1;
         }
         let all_y0 = u_y0.min(o_y0).min(ha_y0).min(ho_y0);
         let all_y1 = u_y1.max(o_y1).max(ha_y1).max(ho_y1);
@@ -1605,14 +1764,25 @@ impl CursorGlow {
         let mut print = 0u64;
         let mut solid = None;
         let lum = crate::color_math::relative_luminance;
-        let lum_ratio = |la: f32, lb: f32| (la.max(lb) + 0.05) / (la.min(lb) + 0.05);
-        for (i, span) in text.rows.iter().enumerate() {
-            let Some((first, end)) = *span else {
+        #[inline]
+        const fn lum_ratio(la: f32, lb: f32) -> f32 {
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+        #[inline]
+        const fn meets_y(y: u16, h: u16, ry0: i32, ry1: i32) -> bool {
+            let y0 = y as i32;
+            y0 < ry1 && y0 + h as i32 > ry0
+        }
+        let mut i = 0;
+        while i < text.rows.len() {
+            let Some((first, end)) = text.rows[i] else {
+                i += 1;
                 continue;
             };
             let row = text.lo + i as i32;
             let (ry0, ry1) = (oy + row * ch - RING, oy + (row + 1) * ch + RING);
             if ry1 <= all_y0 || ry0 >= all_y1 {
+                i += 1;
                 continue;
             }
             guard.row.clear();
@@ -1632,16 +1802,18 @@ impl CursorGlow {
                     rows: rows as u32,
                 });
             };
-            let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
             // Each stream's quads, then where it has ramps its quads and
             // ramps in draw order ([`row_lights`]); a stream of quads alone
             // reads as the guard read it before ramps.
             if ry1 > u_y0 && ry0 < u_y1 {
                 if self.under_ramps.is_empty() {
-                    for (k, q) in under.iter().enumerate() {
-                        if lit(q) && meets_y(q.y, q.h) {
+                    let mut k = 0;
+                    while k < under.len() {
+                        let q = &under[k];
+                        if lit(q) && meets_y(q.y, q.h, ry0, ry1) {
                             push_row(Stream::Under, k, q.x, q.w, 0);
                         }
+                        k += 1;
                     }
                 } else {
                     row_lights(
@@ -1655,10 +1827,13 @@ impl CursorGlow {
             }
             if ry1 > o_y0 && ry0 < o_y1 {
                 if self.out_ramps.is_empty() {
-                    for (k, q) in over_q.iter().enumerate() {
-                        if lit(q) && meets_y(q.y, q.h) {
+                    let mut k = 0;
+                    while k < over_q.len() {
+                        let q = &over_q[k];
+                        if lit(q) && meets_y(q.y, q.h, ry0, ry1) {
                             push_row(Stream::Over, k, q.x, q.w, 0);
                         }
+                        k += 1;
                     }
                 } else {
                     row_lights(
@@ -1671,30 +1846,37 @@ impl CursorGlow {
                 }
             }
             if ry1 > ha_y0 && ry0 < ha_y1 {
-                for (k, h) in halos.iter().enumerate() {
+                let mut k = 0;
+                while k < halos.len() {
+                    let h = &halos[k];
                     if h.mode == HaloMode::Add
                         && h.w > 0
                         && h.h > 0
                         && h.color & 0x00FF_FFFF != 0
-                        && meets_y(h.y, h.h)
+                        && meets_y(h.y, h.h, ry0, ry1)
                     {
                         push_row(Stream::HaloAdd, k, h.x, h.w, 0);
                     }
+                    k += 1;
                 }
             }
             if ry1 > ho_y0 && ry0 < ho_y1 {
-                for (k, h) in halos.iter().enumerate() {
+                let mut k = 0;
+                while k < halos.len() {
+                    let h = &halos[k];
                     if h.mode == HaloMode::Over
                         && h.w > 0
                         && h.h > 0
                         && h.color & 0x00FF_FFFF != 0
-                        && meets_y(h.y, h.h)
+                        && meets_y(h.y, h.h, ry0, ry1)
                     {
                         push_row(Stream::HaloOver, k, h.x, h.w, 0);
                     }
+                    k += 1;
                 }
             }
             if guard.row.is_empty() {
+                i += 1;
                 continue;
             }
             let skip = match caret {
@@ -1703,43 +1885,53 @@ impl CursorGlow {
             };
             let row_from = ledger.dims.len();
             guard.cuts.clear();
-            for col in first..end {
+            let mut col = first;
+            while col < end {
                 let (cx0, cx1) = (ox + col * cw - RING, ox + (col + 1) * cw + RING);
                 if max_x <= cx0 {
                     break;
                 }
                 if min_x >= cx1 || skip == Some(col) {
+                    col += 1;
                     continue;
                 }
                 let Some((Some(ink), ground)) = text.pair(row, col) else {
+                    col += 1;
                     continue;
                 };
                 let (ink, ground) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
                 guard.cell.clear();
-                for &light in &guard.row {
+                let mut li = 0;
+                while li < guard.row.len() {
+                    let light = guard.row[li];
                     if light.x0 < cx1 && light.x1 > cx0 {
                         if light.rows == 0 {
                             guard.cell.push((light.stream, light.idx));
                         } else {
-                            for k in light.idx..light.idx + light.rows {
+                            let mut k = light.idx;
+                            let k_end = light.idx + light.rows;
+                            while k < k_end {
                                 guard.cell.push((light.stream, k));
+                                k += 1;
                             }
                         }
                     }
+                    li += 1;
                 }
                 if guard.cell.is_empty() {
+                    col += 1;
                     continue;
                 }
                 let (ink, l_ink, l_ground, bar) = match solid {
                     Some((pair, cached)) if pair == (ink, ground) => cached,
                     _ => {
                         let s = solid_ink(ink, ground);
-                        let li = lum(s);
-                        let lg = lum(ground);
+                        let l_i = lum(s);
+                        let l_g = lum(ground);
                         // The bare page's reading: every light at share 0 composes
                         // to the ground and the ink themselves.
-                        let b = letter_bar(lum_ratio(li, lg), no_room);
-                        let cached = (s, li, lg, b);
+                        let b = letter_bar(lum_ratio(l_i, l_g), no_room);
+                        let cached = (s, l_i, l_g, b);
                         solid = Some(((ink, ground), cached));
                         cached
                     }
@@ -1766,10 +1958,11 @@ impl CursorGlow {
                         let lg = lum(lifted(ground, all));
                         lg < l_ink && lum_ratio(l_ink, lg) >= bar
                     } else {
-                        let li = lum(lifted(ink, on_ink));
-                        li < l_ground && lum_ratio(li, l_ground) >= bar
+                        let l_i = lum(lifted(ink, on_ink));
+                        l_i < l_ground && lum_ratio(l_i, l_ground) >= bar
                     };
                     if clear {
+                        col += 1;
                         continue;
                     }
                 }
@@ -1788,12 +1981,14 @@ impl CursorGlow {
                         ((row as u64) << 48) ^ ((col as u64) << 32) ^ u64::from(share.to_bits()),
                     );
                 }
+                col += 1;
             }
             #[cfg(any(test, debug_assertions))]
             let comb = guard.comb;
             #[cfg(not(any(test, debug_assertions)))]
             let comb = false;
             if comb || guard.cuts.is_empty() {
+                i += 1;
                 continue;
             }
             #[cfg(any(test, debug_assertions))]
@@ -1804,7 +1999,7 @@ impl CursorGlow {
             let lettered = |col: i32| matches!(text.pair(row, col), Some((Some(_), _)));
             ramp_row(&cuts, skip, climb, lettered, |col, share| {
                 match cuts.binary_search_by_key(&col, |c| c.0) {
-                    Ok(i) => ledger.dims[row_from + i].share = share,
+                    Ok(idx) => ledger.dims[row_from + idx].share = share,
                     Err(_) => ledger.dims.push(Dim {
                         x0: (ox + col * cw - RING) as f32,
                         y0: ry0 as f32,
@@ -1819,6 +2014,7 @@ impl CursorGlow {
                 );
             });
             guard.cuts = cuts;
+            i += 1;
         }
         guard.ramp_rows = ramp_rows;
         if !ledger.dims.is_empty() {
@@ -1895,8 +2091,11 @@ impl CursorGlow {
                     (ox, oy),
                     &mut bands,
                 );
-                for b in &mut bands {
+                let mut bi = 0;
+                while bi < bands.len() {
+                    let b = &mut bands[bi];
                     (b.0, b.1) = ((b.0 - pad).max(bx0), (b.1 + pad).min(bx1));
+                    bi += 1;
                 }
             }
             _ => bands.push((bx0, bx1, by0, by1)),
@@ -1926,7 +2125,8 @@ impl CursorGlow {
                 let coat = solid;
                 let mut prev_g = coat;
                 let mut found = u8::MAX;
-                for a in 1..=u8::MAX {
+                let mut a = 1u8;
+                loop {
                     let g = aterm_render::over_premul(coat, premul_rgb(ground, a), a) & 0x00FF_FFFF;
                     if g != prev_g {
                         prev_g = g;
@@ -1935,6 +2135,10 @@ impl CursorGlow {
                             break;
                         }
                     }
+                    if a == u8::MAX {
+                        break;
+                    }
+                    a += 1;
                 }
                 Some(found)
             };
@@ -2001,17 +2205,19 @@ impl CursorGlow {
                         (y0, y1): (i32, i32),
                         (a0, a1): (u8, u8),
                         (k0, k1): (i32, i32)| {
-                for &(cx0, cx1, cy0, cy1) in &bands {
+                let mut bi = 0;
+                while bi < bands.len() {
+                    let (cx0, cx1, cy0, cy1) = bands[bi];
                     let (c0, c1) = (x0.max(cx0).max(k0), x1.min(cx1).min(k1));
                     let (t0, t1) = (y0.max(cy0), y1.min(cy1));
                     if c1 <= c0 || t1 <= t0 {
+                        bi += 1;
                         continue;
                     }
-                    let at = |x: i32| -> u8 {
-                        let (a0, a1) = (i32::from(a0), i32::from(a1));
-                        (a0 + (a1 - a0) * (x - x0) / (x1 - x0).max(1)).clamp(0, 255) as u8
-                    };
-                    let (s, e) = (at(c0), at(c1));
+                    let dx = (x1 - x0).max(1);
+                    let (ia0, da) = (i32::from(a0), i32::from(a1) - i32::from(a0));
+                    let s = (ia0 + da * (c0 - x0) / dx).clamp(0, 255) as u8;
+                    let e = (ia0 + da * (c1 - x0) / dx).clamp(0, 255) as u8;
                     crate::effect_util::push_fx_ramp(
                         under,
                         geom,
@@ -2022,6 +2228,7 @@ impl CursorGlow {
                         (premul_rgb(page, s), s),
                         (premul_rgb(page, e), e),
                     );
+                    bi += 1;
                 }
             };
             let lay = |under: &mut Vec<GlowQuad>, ys: (i32, i32), a: u8, clip: (i32, i32)| {
@@ -2034,7 +2241,9 @@ impl CursorGlow {
             // where the silhouette leaves the row bare, it lays nothing.
             let edge_span = |y: i32| {
                 let mut span: Option<(i32, i32)> = None;
-                for b in &bands {
+                let mut bi = 0;
+                while bi < bands.len() {
+                    let b = bands[bi];
                     if b.2 <= y && y < b.3 {
                         let (a0, b0) = (b.0.max(l0), b.1.min(r1));
                         if b0 > a0 {
@@ -2044,6 +2253,7 @@ impl CursorGlow {
                             });
                         }
                     }
+                    bi += 1;
                 }
                 span
             };
@@ -2061,7 +2271,10 @@ impl CursorGlow {
                 d
             };
             let feathers = [(edges.0, y0, 1, -1, y0 - 1), (edges.1, y1 - 1, -1, 1, y1)];
-            for (open, edge, inward, outward, first) in feathers {
+            let mut fi = 0;
+            while fi < feathers.len() {
+                let (open, edge, inward, outward, first) = feathers[fi];
+                fi += 1;
                 if !open {
                     continue;
                 }
@@ -2070,14 +2283,15 @@ impl CursorGlow {
                 };
                 let r = if deep { rise } else { depth(edge, inward) };
                 let inv_r1 = 1.0 / (r + 1) as f32;
-                for k in 1..=r {
+                let mut k = 1;
+                while k <= r {
                     let u = (r + 1 - k) as f32 * inv_r1;
                     let ak = (f32::from(a) * u * u * (3.0 - 2.0 * u)).round() as u8;
                     let y = first + outward * (k - 1);
-                    if ak == 0 || y < by0 || y >= by1 {
-                        continue;
+                    if ak != 0 && y >= by0 && y < by1 {
+                        lay(under, (y, y + 1), ak, clip);
                     }
-                    lay(under, (y, y + 1), ak, clip);
+                    k += 1;
                 }
             }
             print = aterm_hash::fnv_mix_u64(
@@ -2085,17 +2299,21 @@ impl CursorGlow {
                 ((l0 as u64) << 48) ^ ((y0 as u64) << 32) ^ ((r1 as u64) << 16) ^ u64::from(a),
             );
         };
-        for (i, span) in text.rows.iter().enumerate() {
-            let Some((first, end)) = *span else {
+        let mut i = 0;
+        while i < text.rows.len() {
+            let Some((first, end)) = text.rows[i] else {
+                i += 1;
                 continue;
             };
             if ox + end * cw <= bx0 || ox + first * cw >= bx1 {
+                i += 1;
                 continue;
             }
             let row = text.lo + i as i32;
             let (top, bottom) = (oy + row * ch, oy + (row + 1) * ch);
             let (y0, y1) = (top.max(by0), bottom.min(by1));
             if y1 <= y0 {
+                i += 1;
                 continue;
             }
             let lettered = |j: Option<usize>| {
@@ -2117,7 +2335,8 @@ impl CursorGlow {
             };
             // `(first column, page, opacity)` of the open run.
             let mut run: Option<(i32, u32, u8)> = None;
-            for col in first..=end {
+            let mut col = first;
+            while col <= end {
                 let at = if col < end
                     && caret_col != Some(col)
                     && ox + (col + 1) * cw > bx0
@@ -2151,7 +2370,9 @@ impl CursorGlow {
                         run = next;
                     }
                 }
+                col += 1;
             }
+            i += 1;
         }
         self.icon_scratch = bands;
         // The veil lies on the pet's coat, beneath every light: laid over
@@ -2170,8 +2391,10 @@ impl CursorGlow {
             under.rotate_right(laid);
             // The stream's ramps keep their places among the quads they
             // were drawn before, the veil beneath them all.
-            for r in &mut ramps.items {
-                r.at += laid as u32;
+            let mut ri = 0;
+            while ri < ramps.items.len() {
+                ramps.items[ri].at += laid as u32;
+                ri += 1;
             }
         }
         print

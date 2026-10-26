@@ -14,6 +14,7 @@ pub mod askpass;
 pub mod baseline;
 pub(crate) mod checkout;
 pub mod cli;
+pub mod console;
 pub mod controller;
 pub mod engine;
 pub mod envelope;

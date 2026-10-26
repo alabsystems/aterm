@@ -73,6 +73,7 @@ pub const FLOW_FREEZE_S: f32 = 0.25;
 
 const FLOW_FREEZE_DUR: Duration = dur_from_secs_f32(FLOW_FREEZE_S);
 const VERDICT_WINDOW_DUR: Duration = dur_from_secs_f32(VERDICT_WINDOW_S);
+const MEND_WINDOW_DUR: Duration = dur_from_secs_f32(MEND_WINDOW_S);
 
 /// Minimum birth-price rise over the previous key required for [`Spine::surge`].
 pub const SURGE_MIN_RISE: f32 = 0.15;
@@ -246,7 +247,7 @@ impl Spine {
         self.run = 0;
         let here = self.birth_disp();
         let (disp, count) = match self.mark {
-            Some(m) if now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S => {
+            Some(m) if now.saturating_duration_since(m.at) <= MEND_WINDOW_DUR => {
                 (m.disp.max(here), m.count.saturating_add(1))
             }
             _ => (here, 1),
@@ -438,7 +439,7 @@ impl Spine {
     pub fn mend(&self, now: Instant) -> Option<EraseMark> {
         if let Some(m) = self.mark
             && m.count <= MEND_MAX_DELETES
-            && now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S
+            && now.saturating_duration_since(m.at) <= MEND_WINDOW_DUR
         {
             Some(m)
         } else {

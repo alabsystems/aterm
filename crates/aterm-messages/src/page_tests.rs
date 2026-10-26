@@ -250,6 +250,7 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
             label: "Packages",
             still_actionable: true,
             declines: false,
+            by_name: false,
         }],
         "a navigation is always live"
     );
@@ -1435,6 +1436,7 @@ fn any_word_survives_the_page_lines() {
             label: "Open\tlog\n",
             still_actionable: true,
             declines: false,
+            by_name: false,
         }],
         ..entry_at(9, NOW - 60_000)
     };
@@ -1751,6 +1753,7 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
             label,
             still_actionable,
             declines,
+            by_name: false,
         }
     };
     assert_eq!(
@@ -1817,6 +1820,35 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
 }
 
 #[test]
+fn an_action_pressed_only_by_name_is_never_the_primary() {
+    use crate::page::primary_index;
+    let approve = Intent::ApproveJoin {
+        recipient: "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq".into(),
+    };
+    assert!(approve.never_default());
+    assert!(
+        !approve.is_consequential(),
+        "no primary ink on the band either"
+    );
+    assert_eq!(Intent::decode(&approve.encode()), Some(approve.clone()));
+    let act = |index: u8, label: &'static str, by_name: bool| MessageActionView {
+        index,
+        label,
+        still_actionable: true,
+        declines: false,
+        by_name,
+    };
+    // First, alone, or first of two: never the primary.
+    assert_eq!(primary_index(&[act(0, approve.label(), true)]), None);
+    assert_eq!(
+        primary_index(&[act(0, approve.label(), true), act(1, "System State", false)]),
+        Some(1)
+    );
+    // CONTROL: the same action not pressed by name is.
+    assert_eq!(primary_index(&[act(0, approve.label(), false)]), Some(0));
+}
+
+#[test]
 fn the_action_lines_carry_the_primary_after_every_older_key() {
     let act = |index: u8, label: &'static str, still_actionable: bool, declines: bool| {
         MessageActionView {
@@ -1824,6 +1856,7 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
             label,
             still_actionable,
             declines,
+            by_name: false,
         }
     };
     let entries = vec![
@@ -1893,6 +1926,7 @@ fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index(
         label,
         still_actionable,
         declines: false,
+        by_name: false,
     };
     let page = MessagesState {
         revision: 1,

@@ -1,0 +1,16 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, no `apiKeyHelper` and no OAuth token but a scratch `.credentials.json` and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a turn over a dead stored login (the scratch `.credentials.json` is `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,…}}`, the refresh token Claude Code blanks once it is refused; no request reaches the stub): `⏺ Login expired · Please run /login` in column 0 (an error row, no `⎿` gutter), the composer back, the footer's own `Not logged in · Run /login`, 2.1.310
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+
+⏺ Login expired · Please run /login
+
+✻ Churned for 0s · done 12:56 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                              Not logged in · Run /login

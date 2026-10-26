@@ -799,3 +799,38 @@ fn history_cache_crash_leftovers_preserve_full_capacity_and_allow_exact_overwrit
     std::fs::write(dir.path().join("unknown"), []).unwrap();
     assert!(history_capacity(dir.path(), &first, 2).is_err());
 }
+
+#[test]
+fn control_state_is_a_claim_a_pin_or_history_and_never_a_device_key_alone() {
+    let (_root, paths) = fixture();
+    assert!(!retains_control(&paths).unwrap(), "nothing");
+    std::fs::create_dir_all(paths.dir.join("commons")).unwrap();
+    std::fs::write(paths.dir.join("commons/device.age"), b"").unwrap();
+    std::fs::write(paths.dir.join("commons/device.claim"), b"").unwrap();
+    assert!(!retains_control(&paths).unwrap(), "a device key alone");
+    for kept in [
+        "commons.claim",
+        "commons/default.pin",
+        "commons/control",
+        "commons/history",
+        "commons/tables",
+    ] {
+        let path = paths.dir.join(kept);
+        if kept.contains('.') {
+            std::fs::write(&path, b"").unwrap();
+        } else {
+            std::fs::create_dir(&path).unwrap();
+        }
+        assert!(retains_control(&paths).unwrap(), "{kept}");
+        if kept.contains('.') {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::remove_dir(&path).unwrap();
+        }
+        assert!(!retains_control(&paths).unwrap(), "{kept} removed");
+    }
+    // A `commons` that is a symlink, even to nothing, is not read through as empty.
+    std::fs::rename(paths.dir.join("commons"), paths.dir.join("moved")).unwrap();
+    symlink(paths.dir.join("gone"), paths.dir.join("commons")).unwrap();
+    assert!(retains_control(&paths).unwrap(), "a dangling commons link");
+}

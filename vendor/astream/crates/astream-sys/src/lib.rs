@@ -85,7 +85,8 @@
 //! pointer leaves those modules: every call returns `io::Result` or an owned value.
 //! `astream-broker` stays `forbid(unsafe_code)` and reaches the OS through this
 //! crate's safe functions (and reads a barrier's refusal through
-//! [`barrier_refused`], plain errno numbers that need no `unsafe`).
+//! [`barrier_refused`], and a directory flush's through [`dir_flush_unavailable`]:
+//! plain errno numbers that need no `unsafe`).
 //!
 //! ## Who else calls it
 //!
@@ -99,9 +100,12 @@
 //! targets every ordered write it makes, to a file or a directory, is finished with
 //! [`barrier_sync`], [`barrier_refused`] telling a volume that takes no barrier from
 //! a failed flush; elsewhere aterm-durable's ordered write is a full flush of its
-//! own, not this crate's. aterm reaches `fcntl`, `sysctlbyname` and `poll` (the last
-//! through astream-broker's client, whose `Closer` it bounds both ways on every
-//! dial), and never installs the `SIGHUP` handler. Its private files are held to
+//! own, not this crate's. aterm-durable's `Flush::dir_best_effort` and aterm-link's
+//! tolerated state-dir flushes go on without a directory's flush exactly where
+//! [`dir_flush_unavailable`] says so, the broker's own rule, and return any other
+//! failure. aterm reaches `fcntl`, `sysctlbyname` and `poll` (the last through
+//! astream-broker's client, whose `Closer` it bounds both ways on every dial), and
+//! never installs the `SIGHUP` handler. Its private files are held to
 //! the owner rule: aterm-uds's `private_file` judges each file it reads with
 //! [`owner_private`] and each private directory with [`owner_private_dir`], and
 //! aterm-link reads the fabric's mint secret through capfile's `read_secret_in`.
@@ -426,6 +430,50 @@ pub fn barrier_refused(err: &io::Error) -> bool {
     #[cfg(not(target_vendor = "apple"))]
     {
         let _ = err;
+        false
+    }
+}
+
+/// Whether `err`, from opening a directory or from a full flush of its handle
+/// ([`full_sync`]), says the directory's entries simply cannot be flushed here, rather
+/// than that a flush failed:
+///
+/// - a filesystem that refuses to flush a directory handle: `Unsupported` or
+///   `InvalidInput`, and on Apple the errnos a volume answers a flush `fcntl` it cannot
+///   take with ([`is_apple_barrier_refused_errno`]: `F_FULLFSYNC` is refused as
+///   `F_BARRIERFSYNC` is). Darwin's `ENOTSUP` is 45 and its `EOPNOTSUPP` 102, and std
+///   reads only the second as `Unsupported`, so the kind alone misses the usual refusal;
+/// - a directory this process may write but not OPEN (`PermissionDenied`): a
+///   write-only `0300` directory, where opening a file inside it is allowed;
+/// - a directory that is gone by the time it is opened (`NotFound`).
+///
+/// The file's own bytes are flushed on their own handle; there is nothing more a writer
+/// can do about the entry, and failing here would refuse a write that landed. Any other
+/// error (`EIO`, `ENOSPC`, ...) is a failed flush: the entry may not survive a power loss,
+/// and the caller handles it as a failed `fsync`.
+///
+/// This is the classification only. Each caller decides what an unavailable flush means
+/// for it: astream-broker's `sync_parent_dir` goes on without the entry's flush, and a
+/// writer whose promise rests on that flush refuses instead.
+#[must_use]
+pub fn dir_flush_unavailable(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::Unsupported
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::NotFound
+    ) {
+        return true;
+    }
+    // Plain errno numbers, not FFI, as in `barrier_refused`.
+    #[cfg(target_vendor = "apple")]
+    {
+        err.raw_os_error()
+            .is_some_and(is_apple_barrier_refused_errno)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
         false
     }
 }
@@ -859,6 +907,63 @@ mod tests {
             assert!(!barrier_refused(e), "{e}");
         }
         assert!(!barrier_refused(&io::Error::other("not an errno")));
+    }
+
+    /// A directory that cannot be flushed or opened is unavailable, on every platform by
+    /// its kind and on Apple by Darwin's own refusal errnos too (`ENOTSUP` is 45 there,
+    /// which std leaves uncategorized); a real I/O failure never is.
+    #[test]
+    fn a_refused_or_unopenable_directory_flush_is_unavailable_and_eio_is_not() {
+        for kind in [
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+        ] {
+            assert!(dir_flush_unavailable(&io::Error::from(kind)), "{kind:?}");
+        }
+        // EACCES, ENOENT, EINVAL by number.
+        for errno in [13, 2, 22] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert!(dir_flush_unavailable(&e), "{e}");
+        }
+        // Darwin's ENOTSUP, ENODEV and ENOTTY: refusals on Apple only (elsewhere the
+        // numbers name other errors).
+        for errno in [45, 19, 25] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                dir_flush_unavailable(&e),
+                cfg!(target_vendor = "apple"),
+                "{e}"
+            );
+        }
+        // EIO and ENOSPC are failed flushes everywhere.
+        for errno in [5, 28] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert!(!dir_flush_unavailable(&e), "{e}");
+        }
+        assert!(!dir_flush_unavailable(&io::Error::other("not an errno")));
+    }
+
+    /// On Apple a descriptor that is no file on a volume refuses the full flush with an
+    /// errno std leaves uncategorized, and the predicate still reads it as a refusal.
+    /// NEGATIVE CONTROL for the errno half: the error's kind alone would not.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apples_refusal_of_a_full_flush_reads_as_unavailable() {
+        let null = File::open("/dev/null").unwrap();
+        let refused = null.sync_all().expect_err("/dev/null takes no F_FULLFSYNC");
+        assert!(dir_flush_unavailable(&refused), "{refused:?}");
+        assert!(
+            !matches!(
+                refused.kind(),
+                io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::NotFound
+            ),
+            "CONTROL: the kind alone names this refusal ({refused:?}); the errno half is untested"
+        );
     }
 
     #[test]

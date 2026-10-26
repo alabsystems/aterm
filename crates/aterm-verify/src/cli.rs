@@ -246,6 +246,8 @@ pub fn usage() -> String {
         line.push(' ');
     }
     checks.push_str(line.trim_end());
+    let reserve = aterm_capacity::span(aterm_capacity::QUIET_PATIENCE.reserve);
+    let start = aterm_capacity::span(aterm_capacity::QUIET_PATIENCE.start);
     format!(
         "targo --unverified verify [CHECK|SET ...] [OPTIONS]
 
@@ -293,7 +295,9 @@ Options:
       --admit <wait|now>  wait for room for the disk the run will write, and
                           for a quiet machine before the first timed stage,
                           held through the last (default wait, saying why
-                          once a minute); now starts at once, saying what
+                          once a minute; next in line, it holds back claimed
+                          work after {reserve} and starts whatever the load
+                          after {start}); now starts at once, saying what
                           it lacks, and a starved take is refused; the
                           Linux lane's lab is given it too
       --test-threads <n>  RUST_TEST_THREADS for every test binary

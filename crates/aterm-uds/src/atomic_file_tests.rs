@@ -102,6 +102,45 @@ fn a_write_is_whole_or_nothing_and_never_through_a_link() {
     );
 }
 
+/// The directory's flush after the rename: `EIO` there is returned (the bytes are in place, but
+/// their entry may not survive a power loss), and the volume's `ENOTSUP` (Darwin's 45, Linux's 95)
+/// is accepted. Either way the rename has landed, and the flush is asked of the file's own
+/// directory.
+#[test]
+fn a_failed_directory_flush_is_returned_and_a_refused_one_is_not() {
+    let scratch = Scratch::new("dirflush");
+    let path = scratch.0.join("key");
+    let enotsup = if cfg!(target_vendor = "apple") {
+        45
+    } else {
+        95
+    };
+    for (errno, fails) in [(libc::EIO, true), (enotsup, false)] {
+        let mut asked = None;
+        let wrote = write_flushing_dir(
+            &path,
+            format!("errno {errno}\n").as_bytes(),
+            0o600,
+            || Ok(()),
+            |dir| {
+                asked = Some(dir.to_path_buf());
+                Err(io::Error::from_raw_os_error(errno))
+            },
+        );
+        assert_eq!(
+            wrote.map_err(|e| e.raw_os_error()),
+            if fails { Err(Some(errno)) } else { Ok(()) },
+            "errno {errno}"
+        );
+        assert_eq!(asked.as_deref(), Some(scratch.0.as_path()), "errno {errno}");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            format!("errno {errno}\n").as_bytes(),
+            "errno {errno}: the rename landed"
+        );
+    }
+}
+
 #[test]
 fn aterm_toml_is_written_through_its_link_and_never_over_a_change() {
     let scratch = Scratch::new("config");
@@ -180,6 +219,66 @@ fn aterm_toml_is_written_through_its_link_and_never_over_a_change() {
         .expect("replace");
     assert_eq!(bak, None, "no .bak for a file nobody made");
     assert_eq!(mode_of(&fresh), 0o600, "a new file is private");
+}
+
+/// An edit whose directory flush fails after the rename is in effect, and its error says so:
+/// it carries [`EditLanded`] (the target, its `.bak`, the flush's own error) under the flush's
+/// kind, never a bare error a caller would read as "nothing changed". A directory the volume
+/// cannot flush (`ENOTSUP`: Darwin's 45, Linux's 95) is no error at all.
+#[test]
+fn an_edit_whose_directory_flush_fails_is_reported_as_in_effect() {
+    let scratch = Scratch::new("editflush");
+    let config = scratch.0.join("aterm.toml");
+    std::fs::write(&config, "theme = \"Nord\"\n").expect("seed");
+    let bak_path = scratch.0.join("aterm.toml.bak");
+    let enotsup = if cfg!(target_vendor = "apple") {
+        45
+    } else {
+        95
+    };
+
+    let file = ConfigFile::open(&config).expect("open");
+    let edit = file.lock().expect("lock");
+    let landed = edit
+        .replace_flushing_dir("theme = \"Dracula\"\n", |dir| {
+            assert_eq!(dir, scratch.0.as_path(), "the target's own directory");
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .expect_err("a failed flush is reported");
+    assert_eq!(
+        landed.kind(),
+        io::Error::from_raw_os_error(libc::EIO).kind(),
+        "the flush's kind is kept"
+    );
+    let landed = landed
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<EditLanded>())
+        .unwrap_or_else(|| panic!("the error says the edit is in effect: {landed:?}"));
+    assert_eq!(landed.target, config);
+    assert_eq!(landed.bak.as_deref(), Some(bak_path.as_path()));
+    assert_eq!(landed.flush.raw_os_error(), Some(libc::EIO));
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read"),
+        "theme = \"Dracula\"\n",
+        "the edit is in effect"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bak_path).expect("bak"),
+        "theme = \"Nord\"\n"
+    );
+
+    let file = ConfigFile::open(&config).expect("open");
+    let edit = file.lock().expect("lock");
+    let bak = edit
+        .replace_flushing_dir("theme = \"Gruvbox\"\n", |_| {
+            Err(io::Error::from_raw_os_error(enotsup))
+        })
+        .expect("a directory the volume cannot flush is accepted");
+    assert_eq!(bak.as_deref(), Some(bak_path.as_path()));
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read"),
+        "theme = \"Gruvbox\"\n"
+    );
 }
 
 #[test]

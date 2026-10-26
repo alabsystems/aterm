@@ -119,15 +119,20 @@ impl RainLayers {
         withdraw(layers, &self.ids);
         self.ids.clear();
         self.next.clear();
-        for v in &mut self.by_row {
-            v.clear();
+        let mut bi = 0;
+        while bi < self.by_row.len() {
+            self.by_row[bi].clear();
+            bi += 1;
         }
-        for c in cells {
+        let mut ci = 0;
+        while ci < cells.len() {
+            let c = cells[ci];
             let r = usize::from(c.row);
             if self.by_row.len() <= r {
                 self.by_row.resize_with(r + 1, Vec::new);
             }
-            self.by_row[r].push(*c);
+            self.by_row[r].push(c);
+            ci += 1;
         }
         let mut at = layers.len();
         let mut li = 0;
@@ -142,11 +147,15 @@ impl RainLayers {
         }
         let version = tiles.version();
         let mut held = std::mem::take(&mut self.held);
-        for (r, row_cells) in self.by_row.iter().enumerate() {
+        let mut r = 0;
+        while r < self.by_row.len() {
+            let row_cells = &self.by_row[r];
+            let cur_r = r;
+            r += 1;
             if row_cells.is_empty() {
                 continue;
             }
-            let row = r as u16;
+            let row = cur_r as u16;
             let mut found = None;
             let mut hi = 0;
             while hi < held.len() {
@@ -225,7 +234,10 @@ pub const fn is_rain_row(layer: &FxLayer) -> bool {
 fn row_content(cells: &[RainCell], tiles: &RainBaker) -> FxContent {
     let mut palette: Vec<FxInk> = Vec::new();
     let mut items = Vec::with_capacity(cells.len());
-    for c in cells {
+    let mut ci = 0;
+    while ci < cells.len() {
+        let c = &cells[ci];
+        ci += 1;
         if c.alpha == 0 || c.w == 0 || c.h == 0 {
             continue;
         }

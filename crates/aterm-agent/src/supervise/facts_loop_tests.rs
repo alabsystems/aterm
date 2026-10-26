@@ -459,6 +459,40 @@ fn the_stuck_line_waits_out_the_pace_of_a_nudge_the_door_typed() {
     assert_eq!(ran.facts("break"), ["paced", "typed"]);
 }
 
+/// A wake's line the door typed at a break paces the stuck line as any break line does
+/// ([`crate::supervise::occupancy::rules::SESSION_PACE_MS`]): a hung call due at that break and
+/// at the next, two minutes on, waits out the pace. NEGATIVE CONTROL: past the pace, at 21
+/// minutes, it is typed.
+#[test]
+fn the_stuck_line_waits_out_the_pace_of_a_wake_line_the_door_typed() {
+    let at = |m: i64, step| (m * 60, step);
+    let host = Arc::new(DoorHost::default());
+    *host.facts.lock().expect("facts") = Some(vec![hung(BORN)]);
+    *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
+    let run = Run {
+        host,
+        ..Run::new(
+            "facts-after-wake",
+            keyed(Occupancy::Prompt, true),
+            &[at(0, Step::Break), at(2, Step::Break), at(21, Step::Break)],
+        )
+    };
+    let ran = run.run(&[BORN], &mut |s, host, i| {
+        if i == 1 {
+            took(s);
+            *host.facts.lock().expect("facts") = Some(vec![hung(BORN)]);
+        }
+    });
+    assert!(
+        ran.sent[0].len() == 1 && ran.sent[0][0].ends_with(&format!("(rule {WAKE})")),
+        "the wake's line: {:#?}",
+        ran.sent
+    );
+    assert!(ran.sent[1].is_empty(), "{:#?}", ran.ran.noted);
+    assert_eq!(ran.sent[2], [stuck(BORN)], "CONTROL: {:#?}", ran.ran.noted);
+    assert_eq!(ran.facts("break"), ["paced", "typed"]);
+}
+
 #[test]
 fn with_the_key_off_a_break_is_mains_exactly() {
     let run = |tag: &str, occupancy, key: bool, reading: bool| {
@@ -800,4 +834,40 @@ fn a_planted_word_reaches_no_write_at_either_door() {
             .collect();
         assert!(informed.iter().all(|c| !c.contains(PLANT)), "{informed:#?}");
     }
+}
+
+/// §2.1 AT A BREAK WITH NO HOST STEP, RANKS 2 AND 4: a wake's line and a hung call's fact due at
+/// one break, the wake's line is the break's one line and the stuck fact is not asked for there.
+/// NEGATIVE CONTROL: the book empty, the stuck fact goes at that break.
+#[test]
+fn a_due_wake_goes_before_the_stuck_fact_at_a_break() {
+    let run = |wakes: WakesSeen| {
+        let host = Arc::new(DoorHost::default());
+        *host.facts.lock().expect("facts") = Some(vec![hung(BORN)]);
+        *host.wakes.lock().expect("wakes") = wakes;
+        Run {
+            host,
+            ..Run::new(
+                "facts-wake-rank",
+                keyed(Occupancy::Prompt, true),
+                &[(0, Step::Break)],
+            )
+        }
+        .run(&[BORN], &mut |_, _, _| {})
+    };
+    let ranked = run(book(&[job_wake(1, WakeState::Ready)]));
+    assert_eq!(ranked.sent[0].len(), 1, "one line: {:#?}", ranked.sent);
+    assert!(
+        ranked.sent[0][0].ends_with(&format!("(rule {WAKE})")),
+        "{:#?}",
+        ranked.sent
+    );
+    assert_eq!(ranked.facts("break"), Vec::<String>::new());
+    let alone = run(WakesSeen::default());
+    assert_eq!(
+        alone.sent[0],
+        [stuck(BORN)],
+        "CONTROL: {:#?}",
+        alone.ran.noted
+    );
 }

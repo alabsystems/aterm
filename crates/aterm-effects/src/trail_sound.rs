@@ -1483,8 +1483,8 @@ impl TrailSynth {
 
     /// Push one gesture.
     #[inline]
-    pub fn push(&mut self, ev: SoundEvent) {
-        self.push_meta(ev, EventMeta::default());
+    pub const fn push(&mut self, ev: SoundEvent) {
+        self.push_meta(ev, EventMeta::EMPTY);
     }
 
     /// Test-only: account a pause the render clock did not see (§10.1, §16 row 7).
@@ -1524,7 +1524,7 @@ impl TrailSynth {
     }
 
     /// [`Self::push`] with the v2 side-car (§16 rows 6-8).
-    pub fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
+    pub const fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
         // TOML accepts NaN/Inf, and one non-finite scalar would poison the
         // persistent voice and bed state. Reject before any mutation and clamp
         // finite inputs into range. Every scalar `SoundEvent` carries must
@@ -1550,7 +1550,7 @@ impl TrailSynth {
         self.block_lead_s = 0.0;
     }
 
-    fn push_meta_latched(&mut self, ev: SoundEvent, meta: EventMeta) {
+    const fn push_meta_latched(&mut self, ev: SoundEvent, meta: EventMeta) {
         let ev = SoundEvent {
             pan: ev.pan.clamp(-1.0, 1.0),
             heat: ev.heat.clamp(0.0, 1.0),
@@ -1624,8 +1624,8 @@ impl TrailSynth {
                 | SoundGesture::Celebration(_)
                 | SoundGesture::Output(_)
         );
-        let erase = ev.kind == SoundGesture::Trail(SoundKind::Backspace);
-        let shift = ev.kind == SoundGesture::Trail(SoundKind::Shift);
+        let erase = matches!(ev.kind, SoundGesture::Trail(SoundKind::Backspace));
+        let shift = matches!(ev.kind, SoundGesture::Trail(SoundKind::Shift));
         let admit = if erase {
             self.since_erase >= ERASE_MIN_GAP
         } else if shift {
@@ -1983,7 +1983,7 @@ impl TrailSynth {
         Some(idx)
     }
 
-    fn design_trail(&mut self, ev: SoundEvent, kind: SoundKind, duck: f32, pause: f32) {
+    const fn design_trail(&mut self, ev: SoundEvent, kind: SoundKind, duck: f32, pause: f32) {
         let g = ev.gain * duck * (0.55 + 0.45 * ev.heat);
         let kg = match kind {
             SoundKind::Typed => TYPED_KIND_GAIN,
@@ -2005,16 +2005,12 @@ impl TrailSynth {
         let g = g * kg * shift_gain(&ev, kind);
         let col_off = (ev.pan).round() as i32;
         let shape = gesture_shape(kind);
-        let ghosting = kind == SoundKind::Typed && !self.song_accent;
+        let ghosting = matches!(kind, SoundKind::Typed) && !self.song_accent;
         let deg = self.walk
             + col_off
-            + i32::from(self.song_key)
+            + (self.song_key as i32)
             + shape.offset
-            + if ghosting {
-                i32::from(self.song_ghost)
-            } else {
-                0
-            }
+            + if ghosting { self.song_ghost as i32 } else { 0 }
             + shift_lift(&ev, kind);
 
         if matches!(kind, SoundKind::Glide { .. } | SoundKind::Sweep { .. }) {
@@ -2022,31 +2018,31 @@ impl TrailSynth {
             return;
         }
 
-        if kind == SoundKind::Land {
+        if matches!(kind, SoundKind::Land) {
             self.design_land(&ev, g);
             return;
         }
 
-        if kind == SoundKind::Backspace {
+        if matches!(kind, SoundKind::Backspace) {
             self.design_erase_poof(&ev, g);
             return;
         }
 
-        if kind == SoundKind::KillWord {
+        if matches!(kind, SoundKind::KillWord) {
             self.design_word_poof(&ev, g);
             return;
         }
 
-        if kind == SoundKind::Space {
+        if matches!(kind, SoundKind::Space) {
             self.design_space(&ev, g, pause);
             return;
         }
-        if kind == SoundKind::Shift {
+        if matches!(kind, SoundKind::Shift) {
             self.design_shift(&ev, deg, g);
             return;
         }
 
-        if kind == SoundKind::Kill {
+        if matches!(kind, SoundKind::Kill) {
             let (hi, lo) = kill_swoosh_band(ev.voice, ev.style);
             let v = Voice {
                 dur: 0.28,
@@ -2058,13 +2054,13 @@ impl TrailSynth {
                 n_glide: 0.10,
                 n_q: 1.2,
                 lp_cut: 2400.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             self.spawn(v, g * 2.6, ev.pan);
             return;
         }
 
-        if kind == SoundKind::Poof {
+        if matches!(kind, SoundKind::Poof) {
             self.design_poof(&ev, g);
             return;
         }
@@ -2078,9 +2074,10 @@ impl TrailSynth {
         self.shift_octave = 1.0;
     }
 
-    fn design_cursor(&mut self, ev: &SoundEvent, shape: GestureShape, deg: i32, g: f32) {
+    const fn design_cursor(&mut self, ev: &SoundEvent, shape: GestureShape, deg: i32, g: f32) {
         let anchor = palette_for(ev.voice, ev.style).anchor_hz();
-        for i in 0..shape.notes {
+        let mut i = 0;
+        while i < shape.notes {
             let f = self.melody_hz(anchor, deg + shape.step * i as i32);
             let (f0, f1) = gesture_bend(f, shape.dir);
             let v = Voice {
@@ -2094,19 +2091,19 @@ impl TrailSynth {
                         f0,
                         f1,
                         glide: GESTURE_BEND_TAU,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.12,
                         f0: f0 * 0.5,
                         f1: f1 * 0.5,
                         glide: GESTURE_BEND_TAU,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 2200.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             let level = if shape.notes == 1 {
                 0.5
@@ -2114,11 +2111,13 @@ impl TrailSynth {
                 0.45 * (1.0 - 0.15 * i as f32)
             };
             self.spawn(v, g * level, ev.pan);
+            i += 1;
         }
     }
 
-    fn design_land(&mut self, ev: &SoundEvent, g: f32) {
-        for i in 0..LAND_STARS {
+    const fn design_land(&mut self, ev: &SoundEvent, g: f32) {
+        let mut i = 0;
+        while i < LAND_STARS {
             let deg = self.walk + LAND_STAR_DEGREE_STEP * i as i32;
             let f = self.melody_hz(LAND_ANCHOR_HZ, deg);
             let v = Voice {
@@ -2134,28 +2133,29 @@ impl TrailSynth {
                         fm_ratio: 2.01,
                         fm_i0: 0.42,
                         fm_tau: 0.03,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.2,
                         f0: f * 0.5,
                         f1: f * 0.5,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.1,
                         f0: f * 2.0,
                         f1: f * 2.0,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                 ],
                 tw_rate: 11.0,
                 tw_depth: 0.35,
                 lp_cut: 4200.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             let pan = ev.pan + 0.22 * if i & 1 == 0 { -1.0 } else { 1.0 };
             self.spawn(v, g * (0.5 - 0.12 * i as f32), pan);
+            i += 1;
         }
         let low = self.melody_hz(LAND_ANCHOR_HZ * 0.25, self.walk);
         let body = Voice {
@@ -2167,10 +2167,10 @@ impl TrailSynth {
                     lvl: 0.7,
                     f0: low,
                     f1: low,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             n_lvl: 0.2,
             n_f0: 2600.0,
@@ -2178,14 +2178,14 @@ impl TrailSynth {
             n_glide: 0.05,
             n_q: 0.8,
             lp_cut: 2000.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn(body, g * 0.3, ev.pan);
     }
 
-    fn design_space(&mut self, ev: &SoundEvent, g: f32, pause: f32) {
-        let anchor = palette_for(ev.voice, ev.style).anchor_hz();
-        let breath = |lvl: f32| Voice {
+    #[inline]
+    const fn space_breath(lvl: f32) -> Voice {
+        Voice {
             dur: 0.11,
             attack: 0.008,
             decay: 0.055,
@@ -2195,11 +2195,15 @@ impl TrailSynth {
             n_glide: 0.08,
             n_q: 0.7,
             lp_cut: 1400.0,
-            ..Voice::default()
-        };
+            ..Voice::DEFAULT
+        }
+    }
+
+    const fn design_space(&mut self, ev: &SoundEvent, g: f32, pause: f32) {
+        let anchor = palette_for(ev.voice, ev.style).anchor_hz();
         if !self.space_head {
             self.spawn_seeded(
-                breath(0.05),
+                Self::space_breath(0.05),
                 g * SPACE_VOICE_LEVEL * SPACE_RUN_BREATH_LEVEL,
                 ev.pan,
                 0.0,
@@ -2210,13 +2214,15 @@ impl TrailSynth {
                 let deg = self.space_run_deg;
                 let root = self.melody_hz(anchor, deg);
                 let mut f = self.space_run_root_hz;
-                for n in (1..=i32::from(self.space_run_len)).rev() {
+                let mut n = self.space_run_len as i32;
+                while n >= 1 {
                     let step =
                         self.space_run_root_hz * (self.melody_hz(anchor, deg + n) / root).max(1.0);
                     if step < SPACE_STEP_HI_HZ {
                         f = step;
                         break;
                     }
+                    n -= 1;
                 }
                 let step = Voice {
                     dur: SPACE_STEP_DUR_S,
@@ -2230,15 +2236,15 @@ impl TrailSynth {
                             fm_ratio: 3.01,
                             fm_i0: SPACE_STEP_GLINT,
                             fm_tau: 0.018,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
                         Partial {
                             lvl: SPACE_STEP_OCTAVE_LEVEL,
                             f0: f * 2.0,
                             f1: f * 2.0,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
-                        Partial::default(),
+                        Partial::DEFAULT,
                     ],
                     n_lvl: 0.4,
                     n_f0: 4200.0,
@@ -2246,7 +2252,7 @@ impl TrailSynth {
                     n_glide: 0.005,
                     n_q: 0.7,
                     lp_cut: 5200.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 self.spawn_seeded(
                     step,
@@ -2259,11 +2265,14 @@ impl TrailSynth {
             return;
         }
         self.since_space_step = 0.0;
-        for v in &mut self.voices {
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &mut self.voices[i];
             if v.on && v.bass && v.damp <= 0.0 {
                 v.damp = SPACE_DAMP_S;
                 v.damp0 = SPACE_DAMP_S;
             }
+            i += 1;
         }
         let rested = pause > PHRASE_PAUSE_S;
         let (attack, decay, dur, oct_lvl, fifth_lvl) = if rested {
@@ -2284,8 +2293,7 @@ impl TrailSynth {
             )
         };
         let f = self.space_root_hz(anchor, self.bass_step);
-        self.space_run_deg =
-            i32::from(SONG_BASS[usize::from(self.bass_step)]) + i32::from(self.song_key);
+        self.space_run_deg = (SONG_BASS[self.bass_step as usize] as i32) + (self.song_key as i32);
         self.space_run_root_hz = f;
         self.bass_step = (self.bass_step + 1) % SONG_BASS.len() as u8;
         let v = Voice {
@@ -2301,19 +2309,19 @@ impl TrailSynth {
                     fm_ratio: 3.01,
                     fm_i0: SPACE_BELL_GLINT,
                     fm_tau: 0.022,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: oct_lvl,
                     f0: f * 2.0,
                     f1: f * 2.0,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: fifth_lvl.max(SPACE_BELL_TINK),
                     f0: f * 4.0,
                     f1: f * 4.0,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
             ],
             n_lvl: 0.5,
@@ -2322,7 +2330,7 @@ impl TrailSynth {
             n_glide: 0.005,
             n_q: 0.7,
             lp_cut: 5200.0,
-            ..breath(0.05)
+            ..Self::space_breath(0.05)
         };
         self.spawn(v, g * SPACE_VOICE_LEVEL, 0.0);
         let tw = twinkle_hz(f);
@@ -2336,15 +2344,15 @@ impl TrailSynth {
                         lvl: SPACE_TWINKLE,
                         f0: tw,
                         f1: tw,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: SPACE_TWINKLE_TWIN,
                         f0: tw + f * SPACE_TWINKLE_DETUNE,
                         f1: tw + f * SPACE_TWINKLE_DETUNE,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
+                    Partial::DEFAULT,
                 ],
                 n_lvl: 0.5,
                 n_f0: 6400.0,
@@ -2354,7 +2362,7 @@ impl TrailSynth {
                 tw_rate: SPACE_TWINKLE_RATE,
                 tw_depth: SPACE_TWINKLE_DEPTH,
                 lp_cut: 8000.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             },
             g * SPACE_VOICE_LEVEL * SPACE_AIR_LEVEL,
             0.0,
@@ -2363,12 +2371,12 @@ impl TrailSynth {
         );
     }
 
-    fn design_shift(&mut self, ev: &SoundEvent, deg: i32, g: f32) {
+    const fn design_shift(&mut self, ev: &SoundEvent, deg: i32, g: f32) {
         let anchor = palette_for(ev.voice, ev.style).anchor_hz();
-        let deg = deg + SHIFT_ROTATION[usize::from(self.shift_step)];
+        let deg = deg + SHIFT_ROTATION[self.shift_step as usize];
         self.shift_step = (self.shift_step + 1) % SHIFT_ROTATION.len() as u8;
         let f = ting_octave(self.melody_hz(anchor, deg));
-        let ghost_next = SONG_PULSE[usize::from(self.song_pulse)] != SONG_ACCENT;
+        let ghost_next = SONG_PULSE[self.song_pulse as usize] != SONG_ACCENT;
         let g = if ghost_next { g * SONG_GHOST_LEVEL } else { g };
         let v = Voice {
             dur: SHIFT_TING_DUR_S,
@@ -2382,15 +2390,15 @@ impl TrailSynth {
                     fm_ratio: 3.01,
                     fm_i0: SHIFT_TING_GLINT,
                     fm_tau: SHIFT_TING_GLINT_TAU_S,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: SHIFT_TING_OCTAVE_LEVEL,
                     f0: f * 2.0,
                     f1: f * 2.0,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             n_lvl: 0.35,
             n_f0: 4200.0,
@@ -2398,12 +2406,12 @@ impl TrailSynth {
             n_glide: 0.005,
             n_q: 0.7,
             lp_cut: 9000.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn(v, g * SHIFT_TING_VOICE_LEVEL, ev.pan);
     }
 
-    fn design_erase_poof(&mut self, ev: &SoundEvent, g: f32) {
+    const fn design_erase_poof(&mut self, ev: &SoundEvent, g: f32) {
         let body = Voice {
             dur: POOF_BODY_DUR_S,
             attack: POOF_BODY_ATTACK_S,
@@ -2414,7 +2422,7 @@ impl TrailSynth {
             n_glide: 0.0,
             n_q: POOF_BODY_Q,
             lp_cut: POOF_LP_CUT_HZ,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn_seeded(body, g * POOF_VOICE_GAIN, ev.pan, 0.0, [0.0; 3]);
         let air = Voice {
@@ -2428,7 +2436,7 @@ impl TrailSynth {
             n_glide: POOF_AIR_SETTLE_GLIDE_S,
             n_q: POOF_AIR_Q,
             lp_cut: POOF_LP_CUT_HZ,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn_seeded(
             air,
@@ -2452,7 +2460,7 @@ impl TrailSynth {
                 tw_rate: ERASE_SHIMMER_TW_RATE,
                 tw_depth: ERASE_SHIMMER_TW_DEPTH,
                 lp_cut: ERASE_SHIMMER_LP_HZ,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             self.spawn_seeded(glitter, g * ERASE_SHIMMER_GAIN, ev.pan, 0.0, [0.0; 3]);
         }
@@ -2471,7 +2479,7 @@ impl TrailSynth {
         }
     }
 
-    fn design_word_poof(&mut self, ev: &SoundEvent, g: f32) {
+    const fn design_word_poof(&mut self, ev: &SoundEvent, g: f32) {
         let body = Voice {
             dur: WORD_POOF_BODY_DUR_S,
             attack: WORD_POOF_BODY_ATTACK_S,
@@ -2482,7 +2490,7 @@ impl TrailSynth {
             n_glide: 0.0,
             n_q: WORD_POOF_BODY_Q,
             lp_cut: POOF_LP_CUT_HZ,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn_seeded(
             body,
@@ -2502,7 +2510,7 @@ impl TrailSynth {
             n_glide: WORD_POOF_AIR_GLIDE_S,
             n_q: WORD_POOF_AIR_Q,
             lp_cut: POOF_LP_CUT_HZ,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn_seeded(
             air,
@@ -2513,7 +2521,7 @@ impl TrailSynth {
         );
     }
 
-    fn design_poof(&mut self, ev: &SoundEvent, g: f32) {
+    const fn design_poof(&mut self, ev: &SoundEvent, g: f32) {
         let v = Voice {
             dur: POOF_CLOUD_DUR_S,
             attack: POOF_CLOUD_ATTACK_S,
@@ -2524,12 +2532,12 @@ impl TrailSynth {
             n_glide: POOF_CLOUD_GLIDE_S,
             n_q: POOF_AIR_Q,
             lp_cut: POOF_LP_CUT_HZ,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn_seeded(v, g * POOF_CLOUD_GAIN, ev.pan, 0.0, [0.0; 3]);
     }
 
-    fn design_output_pip(&mut self, ev: &SoundEvent, gesture: OutputGesture, duck: f32) {
+    const fn design_output_pip(&mut self, ev: &SoundEvent, gesture: OutputGesture, duck: f32) {
         let (kind_gain, octave) = match gesture {
             OutputGesture::Shimmer => (OUTPUT_PIP_KIND_GAIN, 0.25),
             OutputGesture::Settle => (OUTPUT_SETTLE_KIND_GAIN, 0.0),
@@ -2547,24 +2555,24 @@ impl TrailSynth {
                     lvl: 0.5,
                     f0: f,
                     f1: f,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: octave,
                     f0: f * 2.0,
                     f1: f * 2.0,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             n_lvl: 0.0,
             lp_cut: 2200.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn_seeded(v, g, ev.pan, 0.0, [0.0; 3]);
     }
 
-    fn design_bonk(&mut self, ev: SoundEvent, duck: f32) {
+    const fn design_bonk(&mut self, ev: SoundEvent, duck: f32) {
         let g = ev.gain * duck * (0.55 + 0.45 * ev.heat) * BONK_KIND_GAIN;
         let root = penta(palette_for(ev.voice, ev.style).anchor_hz(), self.walk);
         let m2 = root * BONK_MINOR_SECOND;
@@ -2579,20 +2587,20 @@ impl TrailSynth {
                     f0: m2 * 1.35,
                     f1: m2,
                     glide: 0.02,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.5,
                     f0: tt * 1.35,
                     f1: tt,
                     glide: 0.02,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             lp_cut: 2600.0,
             duck_exempt: true,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn(clash, g * 0.306, ev.pan);
         let thump = Voice {
@@ -2605,10 +2613,10 @@ impl TrailSynth {
                     f0: 150.0,
                     f1: 92.0,
                     glide: 0.045,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             n_lvl: 0.18,
             n_f0: 700.0,
@@ -2617,7 +2625,7 @@ impl TrailSynth {
             n_q: 0.9,
             lp_cut: 900.0,
             duck_exempt: true,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn(thump, g * 0.258, ev.pan * 0.6);
         self.duck = 1.0;
@@ -2629,35 +2637,40 @@ impl TrailSynth {
         self.v2_key_pending = false;
     }
 
-    fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
+    const fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
         // Same-sig bars skip this, and it draws no rng.
         if matches!(self.last_riff_sig, Some(old) if old != sig) {
-            for v in &mut self.voices {
+            let mut i = 0;
+            while i < self.voices.len() {
+                let v = &mut self.voices[i];
                 if v.on && v.celebration && v.damp <= 0.0 {
                     v.damp = CELEBRATION_DAMP_S;
                     v.damp0 = CELEBRATION_DAMP_S;
                 }
+                i += 1;
             }
         }
         self.last_riff_sig = Some(sig);
         const _: () = assert!(CELEBRATION_PHRASE_BARS.is_power_of_two());
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
-        let idx = usize::from(bar) & (CELEBRATION_PHRASE_BARS - 1);
+        let idx = (bar as usize) & (CELEBRATION_PHRASE_BARS - 1);
         let phrase = &celebration_bar_degrees(sig, idx);
         let bass_bar = &CELEBRATION_BASS[idx];
         let shift = celebration_root(sig) + celebration_mode(sig);
         const INV_CELEBRATION_BUILD_BARS: f32 = 1.0 / CELEBRATION_BUILD_BARS;
-        let build = (f32::from(bar) * INV_CELEBRATION_BUILD_BARS).min(1.0);
+        let build = ((bar as f32) * INV_CELEBRATION_BUILD_BARS).min(1.0);
         let lift = CELEBRATION_BAR_LIFT[idx];
         let clap = bar >= CELEBRATION_CLAP_BAR;
         let turnaround = idx == CELEBRATION_PHRASE_BARS - 1;
         let sustain_limit = if turnaround { 6 } else { phrase.len() };
         let lp_cut = 2800.0 + 1400.0 * build;
         let shimmer = 0.10 + 0.12 * build;
-        for i in 0..phrase.len() {
+        let mut i = 0;
+        while i < phrase.len() {
             let deg = phrase[i];
             // Distinct branch.
             if deg == REST {
+                i += 1;
                 continue;
             }
             let span = celebration_span(phrase, i, sustain_limit);
@@ -2668,10 +2681,10 @@ impl TrailSynth {
                     lvl: 0.42 * build,
                     f0: b,
                     f1: b,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 }
             } else {
-                Partial::default()
+                Partial::DEFAULT
             };
             let (n_lvl, n_f0, n_f1, n_glide, n_q) = if clap && (i == 2 || i == 6) {
                 (0.10, 2600.0, 1200.0, 0.02, 1.4)
@@ -2692,13 +2705,14 @@ impl TrailSynth {
                 lp_cut,
                 duck_exempt: true,
                 celebration: true,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             self.spawn(
                 v,
                 g * CELEBRATION_GROOVE[i] * lift,
                 celebration_sway(ev.pan, deg),
             );
+            i += 1;
         }
         if turnaround {
             let mut k = 0;
@@ -2710,11 +2724,11 @@ impl TrailSynth {
                     dur: CELEBRATION_EIGHTH,
                     attack: 0.003,
                     decay: 0.055,
-                    p: celebration_lead(hz, shimmer, Partial::default()),
+                    p: celebration_lead(hz, shimmer, Partial::DEFAULT),
                     lp_cut,
                     duck_exempt: true,
                     celebration: true,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 self.spawn(
                     v,
@@ -2728,7 +2742,7 @@ impl TrailSynth {
         self.sing_hold = CELEBRATION_BAR_SECONDS + 0.1;
     }
 
-    fn design_celebration_outro(&mut self, ev: SoundEvent, sig: u32) {
+    const fn design_celebration_outro(&mut self, ev: SoundEvent, sig: u32) {
         self.last_riff_sig = Some(sig);
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
         let shift = celebration_root(sig) + celebration_mode(sig);
@@ -2738,7 +2752,7 @@ impl TrailSynth {
             lvl: 0.42,
             f0: sub,
             f1: sub,
-            ..Partial::default()
+            ..Partial::DEFAULT
         };
         let lead = Voice {
             dur: CELEBRATION_OUTRO_S,
@@ -2748,7 +2762,7 @@ impl TrailSynth {
             lp_cut: 4200.0,
             duck_exempt: true,
             celebration: true,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.spawn(lead, g * CELEBRATION_GROOVE[0], celebration_sway(ev.pan, 0));
         let (mut bell, trim) = rainbow_kitty_v2::cad_bell_voice(0.0);
@@ -2760,14 +2774,14 @@ impl TrailSynth {
     }
 
     /// Render interleaved stereo into `out` (length must be even).
-    pub fn render(&mut self, out: &mut [f32]) {
+    pub const fn render(&mut self, out: &mut [f32]) {
         debug_assert!(out.len().is_multiple_of(CHANNELS));
         let frames = out.len() / CHANNELS;
         if frames == 0 {
             return;
         }
         let dt_block = frames as f32 * self.inv_sr;
-        self.clock_s += f64::from(dt_block);
+        self.clock_s += dt_block as f64;
         self.since_event += dt_block;
         self.since_voice += dt_block;
         self.since_erase += dt_block;
@@ -2782,7 +2796,11 @@ impl TrailSynth {
         }
 
         if self.is_quiet() {
-            out.fill(0.0);
+            let mut i = 0;
+            while i < out.len() {
+                out[i] = 0.0;
+                i += 1;
+            }
             self.bed.level = 0.0;
             self.bed.energy = 0.0;
             self.duck = 0.0;
@@ -2826,20 +2844,23 @@ impl TrailSynth {
         };
         let mut active_voices = [0u8; MAX_VOICES];
         let mut active_len = 0usize;
-        for i in 0..self.voices.len() {
+        let mut i = 0;
+        while i < self.voices.len() {
             if self.voices[i].on {
                 active_voices[active_len] = i as u8;
                 active_len += 1;
             }
+            i += 1;
         }
-        for f in 0..frames {
+        let mut f = 0;
+        while f < frames {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             let (mut xl, mut xr) = (0.0f32, 0.0f32);
 
             let mut read_idx = 0;
             let mut write_idx = 0;
             while read_idx < active_len {
-                let vi = usize::from(active_voices[read_idx]);
+                let vi = active_voices[read_idx] as usize;
                 read_idx += 1;
                 let v = &mut self.voices[vi];
                 v.t += dt;
@@ -3033,6 +3054,7 @@ impl TrailSynth {
             };
             out[f * 2] = soft_clip(yl);
             out[f * 2 + 1] = soft_clip(yr);
+            f += 1;
         }
         if self.duck < 1e-4 {
             self.duck = 0.0;
@@ -3066,7 +3088,7 @@ impl TrailSynth {
         self.bed.gain += (gain - self.bed.gain) * 0.3;
     }
 
-    fn tick_bed(&mut self, dt: f32) {
+    const fn tick_bed(&mut self, dt: f32) {
         let b = &mut self.bed;
         if b.energy > 0.0 {
             let inv_tau_e = if b.energy < 0.02 { -5.0 } else { -1.0 / 0.7 };
@@ -3111,14 +3133,14 @@ impl TrailSynth {
 
     #[cfg(test)]
     #[inline]
-    pub(super) fn bed_sample(&mut self, dt: f32) -> (f32, f32) {
+    pub(super) const fn bed_sample(&mut self, dt: f32) -> (f32, f32) {
         let palette = palette_for(self.bed_voice, self.bed_style);
         let lvl = self.bed.level * self.bed.gain;
         self.bed_sample_with(palette, dt, lvl)
     }
 
     #[inline]
-    fn bed_sample_with(&mut self, palette: &dyn Palette, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample_with(&mut self, palette: PaletteKind, dt: f32, lvl: f32) -> (f32, f32) {
         self.bed.lfo1 = (self.bed.lfo1 + 0.23 * dt).fract();
         self.bed.lfo2 = (self.bed.lfo2 + 0.71 * dt).fract();
 
@@ -3127,68 +3149,126 @@ impl TrailSynth {
     }
 }
 
-trait Palette {
-    fn design(
-        &self,
+#[derive(Clone, Copy)]
+enum PaletteKind {
+    Lumen,
+    Phaser,
+    RainbowKittyV2,
+    Sparkle,
+    Fire,
+    Laser,
+    Beam,
+    Water,
+    Comet,
+    Mech,
+    Typewriter,
+    Marimba,
+    Felt,
+}
+
+impl PaletteKind {
+    #[inline]
+    const fn design(
+        self,
         s: &mut TrailSynth,
         ev: &SoundEvent,
         kind: SoundKind,
         g: f32,
         deg: i32,
         col_off: i32,
-    );
-
-    #[inline]
-    fn bed_grain(&self, s: &mut TrailSynth, _level: f32, _gain: f32) {
-        s.bed.timer = 0.25;
+    ) {
+        match self {
+            Self::Lumen => LumenPalette::design(s, ev, kind, g, deg),
+            Self::Phaser => PhaserPalette::design(s, ev, kind, g, col_off),
+            Self::RainbowKittyV2 => {}
+            Self::Sparkle => SparklePalette::design(s, ev, kind, g, deg),
+            Self::Fire => FirePalette::design(s, ev, kind, g),
+            Self::Laser => LaserPalette::design(s, ev, kind, g, deg),
+            Self::Beam => BeamPalette::design(s, ev, kind, g, deg),
+            Self::Water => WaterPalette::design(s, ev, kind, g, deg),
+            Self::Comet => CometPalette::design(s, ev, kind, g, deg),
+            Self::Mech => MechPalette::design(s, ev, kind, g),
+            Self::Typewriter => TypewriterPalette::design(s, ev, kind, g),
+            Self::Marimba => MarimbaPalette::design(s, ev, kind, g, deg),
+            Self::Felt => FeltPalette::design(s, ev, kind, g, deg),
+        }
     }
 
     #[inline]
-    fn bed_sample(&self, _s: &mut TrailSynth, _dt: f32, _lvl: f32) -> (f32, f32) {
-        (0.0, 0.0)
+    const fn bed_grain(self, s: &mut TrailSynth, level: f32, gain: f32) {
+        match self {
+            Self::Phaser => PhaserPalette::bed_grain(s, level, gain),
+            Self::Sparkle => SparklePalette::bed_grain(s, level, gain),
+            Self::Fire => FirePalette::bed_grain(s, level, gain),
+            Self::Laser => LaserPalette::bed_grain(s, level, gain),
+            Self::Water => WaterPalette::bed_grain(s, level, gain),
+            Self::Comet => CometPalette::bed_grain(s, level, gain),
+            _ => s.bed.timer = 0.25,
+        }
     }
 
     #[inline]
-    fn anchor_hz(&self) -> f32 {
-        CURSOR_ANCHOR_HZ
+    const fn bed_sample(self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+        match self {
+            Self::Lumen => LumenPalette::bed_sample(s, dt, lvl),
+            Self::Phaser => PhaserPalette::bed_sample(s, dt, lvl),
+            Self::RainbowKittyV2 => RainbowKittyV2Palette::bed_sample(s, dt, lvl),
+            Self::Sparkle => SparklePalette::bed_sample(s, dt, lvl),
+            Self::Fire => FirePalette::bed_sample(s, dt, lvl),
+            Self::Laser => LaserPalette::bed_sample(s, dt, lvl),
+            Self::Beam => BeamPalette::bed_sample(s, dt, lvl),
+            Self::Water => WaterPalette::bed_sample(s, dt, lvl),
+            Self::Comet => CometPalette::bed_sample(s, dt, lvl),
+            Self::Marimba => MarimbaPalette::bed_sample(s, dt, lvl),
+            Self::Felt => FeltPalette::bed_sample(s, dt, lvl),
+            Self::Mech | Self::Typewriter => (0.0, 0.0),
+        }
+    }
+
+    #[inline]
+    const fn anchor_hz(self) -> f32 {
+        match self {
+            Self::Phaser => 392.0,
+            Self::RainbowKittyV2 => RainbowKittyV2Palette::anchor_hz(),
+            Self::Sparkle => 523.25,
+            Self::Laser => 880.0,
+            Self::Beam => 330.0,
+            Self::Water => 430.0,
+            Self::Comet => 220.0,
+            Self::Marimba => MarimbaPalette::BASE_HZ,
+            Self::Felt => FeltPalette::BASE_HZ,
+            Self::Lumen | Self::Fire | Self::Mech | Self::Typewriter => CURSOR_ANCHOR_HZ,
+        }
     }
 }
 
 #[inline]
-const fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
+const fn palette_for(voice: SoundVoice, style: GlowStyle) -> PaletteKind {
     match voice {
-        SoundVoice::Mech => &MechPalette,
-        SoundVoice::Typewriter => &TypewriterPalette,
-        SoundVoice::Marimba => &MarimbaPalette,
-        SoundVoice::Felt => &FeltPalette,
-        SoundVoice::RainbowKittyV2 => &RainbowKittyV2Palette,
+        SoundVoice::Mech => PaletteKind::Mech,
+        SoundVoice::Typewriter => PaletteKind::Typewriter,
+        SoundVoice::Marimba => PaletteKind::Marimba,
+        SoundVoice::Felt => PaletteKind::Felt,
+        SoundVoice::RainbowKittyV2 => PaletteKind::RainbowKittyV2,
         SoundVoice::Of(s) => palette_for(SoundVoice::Style, s),
         SoundVoice::Style => match style {
-            GlowStyle::Lumen => &LumenPalette,
-            GlowStyle::Phaser | GlowStyle::Classic => &PhaserPalette,
-            GlowStyle::RainbowKitty => &RainbowKittyV2Palette,
-            GlowStyle::Sparkle => &SparklePalette,
-            GlowStyle::Fire => &FirePalette,
-            GlowStyle::Laser => &LaserPalette,
-            GlowStyle::Beam => &BeamPalette,
-            GlowStyle::Water => &WaterPalette,
-            GlowStyle::Comet => &CometPalette,
+            GlowStyle::Lumen => PaletteKind::Lumen,
+            GlowStyle::Phaser | GlowStyle::Classic => PaletteKind::Phaser,
+            GlowStyle::RainbowKitty => PaletteKind::RainbowKittyV2,
+            GlowStyle::Sparkle => PaletteKind::Sparkle,
+            GlowStyle::Fire => PaletteKind::Fire,
+            GlowStyle::Laser => PaletteKind::Laser,
+            GlowStyle::Beam => PaletteKind::Beam,
+            GlowStyle::Water => PaletteKind::Water,
+            GlowStyle::Comet => PaletteKind::Comet,
         },
     }
 }
 
 struct LumenPalette;
 
-impl Palette for LumenPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+impl LumenPalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let f = s.melody_hz(330.0, deg);
         let (f0, f1v) = (f * 0.97, f);
         let v = Voice {
@@ -3201,21 +3281,21 @@ impl Palette for LumenPalette {
                     f0,
                     f1: f1v,
                     glide: 0.05,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.22,
                     f0: f0 * 1.004,
                     f1: f1v * 1.004,
                     glide: 0.05,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.16,
                     f0: f0 * 0.5,
                     f1: f1v * 0.5,
                     glide: 0.05,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
             ],
             n_lvl: 0.02,
@@ -3224,10 +3304,10 @@ impl Palette for LumenPalette {
             n_glide: 0.0,
             n_q: 0.6,
             lp_cut: 2000.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(v, g * 0.42, ev.pan);
-        if kind == SoundKind::Jump {
+        if matches!(kind, SoundKind::Jump) {
             let f2 = f * 1.5;
             let v2 = Voice {
                 delay: 0.055,
@@ -3240,24 +3320,24 @@ impl Palette for LumenPalette {
                         f0: f2 * 0.97,
                         f1: f2,
                         glide: 0.05,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.2,
                         f0: f2 * 1.004,
                         f1: f2 * 1.004,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 2200.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v2, g * 0.3, ev.pan);
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 165.0 * dt).fract();
@@ -3270,16 +3350,8 @@ impl Palette for LumenPalette {
 
 struct PhaserPalette;
 
-impl Palette for PhaserPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        _deg: i32,
-        col_off: i32,
-    ) {
+impl PhaserPalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, col_off: i32) {
         let hue_deg = (ev.hue * 5.0) as i32;
         let d = hue_deg + col_off + gesture_shape(kind).offset + shift_lift(ev, kind);
         let f = s.melody_hz(392.0, d);
@@ -3287,26 +3359,30 @@ impl Palette for PhaserPalette {
         let v = Voice {
             dur: 0.18,
             attack: 0.004,
-            decay: if kind == SoundKind::Jump { 0.09 } else { 0.075 },
+            decay: if matches!(kind, SoundKind::Jump) {
+                0.09
+            } else {
+                0.075
+            },
             p: [
                 Partial {
                     lvl: 0.75,
                     f0,
                     f1: f1v,
                     glide: 0.022,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.12,
                     f0: f * 2.0,
                     f1: f1v * 2.0,
                     glide: 0.022,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             lp_cut: 1900.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(v, g * 0.4, ev.pan);
         let t = Voice {
@@ -3319,10 +3395,10 @@ impl Palette for PhaserPalette {
             n_glide: 0.01,
             n_q: 1.1,
             lp_cut: 1200.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(t, g * 0.25, ev.pan);
-        if kind == SoundKind::Jump {
+        if matches!(kind, SoundKind::Jump) {
             let f2 = s.melody_hz(392.0, d + 3);
             let v2 = Voice {
                 delay: 0.07,
@@ -3335,7 +3411,7 @@ impl Palette for PhaserPalette {
                         f0: f2 * 1.09,
                         f1: f2,
                         glide: 0.022,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.1,
@@ -3344,18 +3420,18 @@ impl Palette for PhaserPalette {
                         fm_ratio: 3.01,
                         fm_i0: 0.4,
                         fm_tau: 0.05,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 2100.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v2, g * 0.34, ev.pan * 0.5);
         }
     }
 
-    fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+    const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 5.0) as i32;
         let f = s.melody_hz(392.0, grain_deg);
         let v = Voice {
@@ -3368,20 +3444,20 @@ impl Palette for PhaserPalette {
                     f0: f * 1.06,
                     f1: f,
                     glide: 0.03,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             lp_cut: 1700.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = s.rnd_in(-0.5, 0.5);
         s.spawn(v, gain * level * 0.05, pan);
         s.bed.timer = s.rnd_in(0.45, 1.2) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 196.0 * dt).fract();
@@ -3391,10 +3467,6 @@ impl Palette for PhaserPalette {
         b.lp1 += k * (sm - b.lp1);
         (b.lp1 * lvl * 0.05, 0.0)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        392.0
-    }
 }
 
 const KEY_BELL_BEND_SHARE: f32 = 0.33;
@@ -3402,18 +3474,15 @@ const KEY_BELL_BEND_TAU: f32 = 0.004;
 
 struct SparklePalette;
 
-impl Palette for SparklePalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
-        let n = if kind == SoundKind::Jump { 3 } else { 2 };
-        for i in 0..n {
+impl SparklePalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
+        let n = if matches!(kind, SoundKind::Jump) {
+            3
+        } else {
+            2
+        };
+        let mut i = 0;
+        while i < n {
             let d = deg + i * 2 + (s.rnd() * 2.0) as i32;
             let f = s.melody_hz(523.25, d);
             let delay = i as f32 * s.rnd_in(0.022, 0.05);
@@ -3430,32 +3499,33 @@ impl Palette for SparklePalette {
                         fm_ratio: 3.01,
                         fm_i0: 0.6,
                         fm_tau: 0.04,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.15,
                         f0: f * 0.5,
                         f1: f * 0.5,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.08,
                         f0: f * 2.01,
                         f1: f * 2.01,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                 ],
                 tw_rate: s.rnd_in(7.0, 11.0),
                 tw_depth: 0.4,
                 lp_cut: 2800.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             let pan = ev.pan + s.rnd_in(-0.4, 0.4);
             s.spawn(v, g * 0.28 / (1.0 + i as f32 * 0.4), pan);
+            i += 1;
         }
     }
 
-    fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+    const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 8.0) as i32;
         let f = s.melody_hz(523.25, grain_deg);
         let v = Voice {
@@ -3470,22 +3540,22 @@ impl Palette for SparklePalette {
                     fm_ratio: 3.01,
                     fm_i0: 0.5,
                     fm_tau: 0.04,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             tw_rate: 9.0,
             tw_depth: 0.4,
             lp_cut: 2800.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = s.rnd_in(-0.8, 0.8);
         s.spawn(v, gain * level * 0.08, pan);
         s.bed.timer = s.rnd_in(0.15, 0.5) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u2 = s.bed.lfo_u2();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 261.6 * dt).fract();
@@ -3494,28 +3564,16 @@ impl Palette for SparklePalette {
         let sm = sin01(b.ph1) + sin01(b.ph2) + (0.08 + 0.15 * u2) * sin01(b.ph3);
         (sm * lvl * 0.022, sm * lvl * 0.006)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        523.25
-    }
 }
 
 struct FirePalette;
 
-impl Palette for FirePalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        _deg: i32,
-        _col_off: i32,
-    ) {
+impl FirePalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32) {
         // Crackle: every key is an impulsive few-ms high-Q snap over a woody
         // ember knock; impulsiveness separates fire from water. Jump is the
         // flame leaping: a dark low whoomph plus a scatter of spark snaps.
-        if kind == SoundKind::Jump {
+        if matches!(kind, SoundKind::Jump) {
             let v = Voice {
                 dur: 0.25,
                 attack: 0.012,
@@ -3526,10 +3584,11 @@ impl Palette for FirePalette {
                 n_glide: 0.06,
                 n_q: 1.1,
                 lp_cut: 900.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v, g * 0.5, ev.pan);
-            for i in 0..4 {
+            let mut i = 0;
+            while i < 4 {
                 let centre = s.rnd_in(2000.0, 5000.0);
                 let v = Voice {
                     delay: 0.02 + i as f32 * 0.05 + s.rnd_in(0.0, 0.03),
@@ -3542,11 +3601,12 @@ impl Palette for FirePalette {
                     n_glide: 0.008,
                     n_q: s.rnd_in(3.5, 6.0),
                     lp_cut: 5200.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 let pan = ev.pan + s.rnd_in(-0.5, 0.5);
                 let sg = g * s.rnd_in(0.16, 0.3);
                 s.spawn(v, sg, pan);
+                i += 1;
             }
         } else {
             let centre = s.rnd_in(2000.0, 4800.0);
@@ -3560,7 +3620,7 @@ impl Palette for FirePalette {
                 n_glide: 0.008,
                 n_q: s.rnd_in(3.5, 6.0),
                 lp_cut: 5200.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v, g * 0.42, ev.pan);
             if s.rnd() < 0.35 {
@@ -3576,7 +3636,7 @@ impl Palette for FirePalette {
                     n_glide: 0.008,
                     n_q: s.rnd_in(3.5, 6.0),
                     lp_cut: 5200.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 let pan = ev.pan + s.rnd_in(-0.3, 0.3);
                 s.spawn(v2, g * 0.22, pan);
@@ -3592,19 +3652,19 @@ impl Palette for FirePalette {
                         f0: fe * 1.3,
                         f1: fe,
                         glide: 0.03,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 450.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v3, g * (0.1 + 0.28 * ev.heat), ev.pan * 0.5);
         }
     }
 
-    fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+    const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let low = s.rnd() < 0.12;
         let (centre, q, decay, lvl) = if low {
             (s.rnd_in(240.0, 480.0), 2.0, 0.02, 0.2)
@@ -3626,14 +3686,14 @@ impl Palette for FirePalette {
             n_glide: 0.008,
             n_q: q,
             lp_cut: 5200.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = s.rnd_in(-0.6, 0.6);
         s.spawn(v, gain * level * lvl, pan);
         s.bed.timer = s.rnd_in(0.03, 0.18) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
         let k = (380.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
@@ -3647,24 +3707,19 @@ impl Palette for FirePalette {
 
 struct LaserPalette;
 
-impl Palette for LaserPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+impl LaserPalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let lift = shift_lift(ev, kind);
-        let f_hi = s.melody_hz(880.0, (deg - lift).min(5) + lift);
+        let base_deg = deg - lift;
+        let clamped_deg = if base_deg < 5 { base_deg } else { 5 };
+        let f_hi = s.melody_hz(880.0, clamped_deg + lift);
         let f_lo = f_hi * 0.25;
-        let dur = if kind == SoundKind::Jump { 0.2 } else { 0.11 };
+        let is_jump = matches!(kind, SoundKind::Jump);
+        let dur = if is_jump { 0.2 } else { 0.11 };
         let v = Voice {
             dur,
             attack: 0.001,
-            decay: if kind == SoundKind::Jump { 0.08 } else { 0.045 },
+            decay: if is_jump { 0.08 } else { 0.045 },
             p: [
                 Partial {
                     lvl: 0.7,
@@ -3674,16 +3729,16 @@ impl Palette for LaserPalette {
                     fm_ratio: 7.03,
                     fm_i0: 1.2,
                     fm_tau: 0.012,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.15,
                     f0: f_hi * 2.0,
                     f1: f_lo * 2.0,
                     glide: 0.024,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             n_lvl: 0.08,
             n_f0: 3200.0,
@@ -3691,7 +3746,7 @@ impl Palette for LaserPalette {
             n_glide: 0.02,
             n_q: 1.0,
             lp_cut: 3800.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(v, g * 0.4, ev.pan);
         let cf = s.rnd_in(3200.0, 5200.0);
@@ -3705,10 +3760,10 @@ impl Palette for LaserPalette {
             n_glide: 0.006,
             n_q: 4.5,
             lp_cut: 6000.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(crack, g * 0.2, ev.pan);
-        if kind == SoundKind::Jump {
+        if is_jump {
             let v2 = Voice {
                 dur: 0.14,
                 attack: 0.003,
@@ -3719,13 +3774,13 @@ impl Palette for LaserPalette {
                         f0: 140.0,
                         f1: 90.0,
                         glide: 0.05,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 400.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v2, g * 0.3, ev.pan * 0.4);
             let roll = Voice {
@@ -3739,7 +3794,7 @@ impl Palette for LaserPalette {
                 n_glide: 0.25,
                 n_q: 0.75,
                 lp_cut: 500.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(roll, g * 0.45, ev.pan * 0.3);
             let echo = Voice {
@@ -3753,13 +3808,13 @@ impl Palette for LaserPalette {
                 n_glide: 0.22,
                 n_q: 0.75,
                 lp_cut: 380.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(echo, g * 0.22, -ev.pan * 0.5);
         }
     }
 
-    fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+    const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         // The storm keeps grumbling: mostly distant rolls, now and then the
         // faint tick of a far-off strike.
         if s.rnd() < 0.25 {
@@ -3774,7 +3829,7 @@ impl Palette for LaserPalette {
                 n_glide: 0.006,
                 n_q: 5.0,
                 lp_cut: 6000.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             let pan = s.rnd_in(-0.8, 0.8);
             s.spawn(tick, gain * level * 0.05, pan);
@@ -3789,7 +3844,7 @@ impl Palette for LaserPalette {
                 n_glide: 0.3,
                 n_q: 0.8,
                 lp_cut: 420.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             let pan = s.rnd_in(-0.7, 0.7);
             s.spawn(roll, gain * level * 0.18, pan);
@@ -3797,7 +3852,7 @@ impl Palette for LaserPalette {
         s.bed.timer = s.rnd_in(0.5, 1.4) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
         let k = (140.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
@@ -3807,24 +3862,12 @@ impl Palette for LaserPalette {
         let swell = (1.0 + 40.0 * b.lp2).clamp(0.25, 2.2);
         (b.lp1 * lvl * 0.5 * swell, 0.0)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        880.0
-    }
 }
 
 struct BeamPalette;
 
-impl Palette for BeamPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+impl BeamPalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let lift = shift_lift(ev, kind);
         let f = s.melody_hz(330.0, ((deg - lift) / 2) * 2 + lift);
         let thud = Voice {
@@ -3837,7 +3880,7 @@ impl Palette for BeamPalette {
             n_glide: 0.01,
             n_q: 1.0,
             lp_cut: 1100.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(thud, g * 0.22, ev.pan);
         let (b0, b1) = (f * 1.06, f);
@@ -3851,22 +3894,22 @@ impl Palette for BeamPalette {
                     f0: b0,
                     f1: b1,
                     glide: 0.02,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.12,
                     f0: b0 * 2.0,
                     f1: b1 * 2.0,
                     glide: 0.02,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             lp_cut: 1600.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(blip, g * 0.3, ev.pan);
-        if kind == SoundKind::Jump {
+        if matches!(kind, SoundKind::Jump) {
             let v2 = Voice {
                 delay: 0.05,
                 dur: 0.3,
@@ -3878,13 +3921,13 @@ impl Palette for BeamPalette {
                         f0: f,
                         f1: f * 1.5,
                         glide: 0.09,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 1800.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(v2, g * 0.24, ev.pan);
             let surge = Voice {
@@ -3898,13 +3941,13 @@ impl Palette for BeamPalette {
                 n_glide: 0.2,
                 n_q: 0.8,
                 lp_cut: 380.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(surge, g * 0.26, ev.pan * 0.3);
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
@@ -3916,24 +3959,12 @@ impl Palette for BeamPalette {
         let breathe = 0.75 + 0.25 * u1;
         (b.lp2 * lvl * 0.5 * breathe, b.lp1 * lvl * 0.03)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        330.0
-    }
 }
 
 struct WaterPalette;
 
-impl Palette for WaterPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+impl WaterPalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let f = s.melody_hz(430.0, deg);
         let (a, b) = (f * 0.85, f * 1.25);
         let tap = Voice {
@@ -3946,7 +3977,7 @@ impl Palette for WaterPalette {
             n_glide: 0.008,
             n_q: 1.0,
             lp_cut: 1600.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(tap, g * 0.16, ev.pan);
         let v = Voice {
@@ -3959,22 +3990,22 @@ impl Palette for WaterPalette {
                     f0: a,
                     f1: b,
                     glide: 0.045,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.12,
                     f0: a * 0.5,
                     f1: b * 0.5,
                     glide: 0.045,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
+                Partial::DEFAULT,
             ],
             lp_cut: 1800.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(v, g * 0.42, ev.pan);
-        if kind == SoundKind::Jump {
+        if matches!(kind, SoundKind::Jump) {
             let vs = Voice {
                 dur: 0.22,
                 attack: 0.008,
@@ -3985,10 +4016,11 @@ impl Palette for WaterPalette {
                 n_glide: 0.07,
                 n_q: 0.8,
                 lp_cut: 2200.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(vs, g * 0.32, ev.pan);
-            for i in 0..3 {
+            let mut i = 0;
+            while i < 3 {
                 let fd = s.melody_hz(430.0, deg + 2 + i);
                 let vd = Voice {
                     delay: s.rnd_in(0.05, 0.16),
@@ -4001,17 +4033,18 @@ impl Palette for WaterPalette {
                             f0: fd * 0.9,
                             f1: fd * 1.3,
                             glide: 0.03,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
-                        Partial::default(),
-                        Partial::default(),
+                        Partial::DEFAULT,
+                        Partial::DEFAULT,
                     ],
                     lp_cut: 2200.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 let pan = ev.pan + s.rnd_in(-0.5, 0.5);
                 let gd = g * s.rnd_in(0.12, 0.22);
                 s.spawn(vd, gd, pan);
+                i += 1;
             }
         } else if s.rnd() < 0.18 {
             let vb = Voice {
@@ -4025,19 +4058,19 @@ impl Palette for WaterPalette {
                         f0: f * 0.7,
                         f1: f * 1.6,
                         glide: 0.03,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 2400.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(vb, g * 0.18, ev.pan);
         }
     }
 
-    fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+    const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 6.0) as i32;
         let f = s.melody_hz(430.0, grain_deg);
         let v = Voice {
@@ -4050,20 +4083,20 @@ impl Palette for WaterPalette {
                     f0: f * 2.0,
                     f1: f,
                     glide: 0.025,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             lp_cut: 2200.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = s.rnd_in(-0.7, 0.7);
         s.spawn(v, gain * level * 0.09, pan);
         s.bed.timer = s.rnd_in(0.25, 0.9) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let u1 = s.bed.lfo_u1();
         let u2 = s.bed.lfo_u2();
@@ -4075,24 +4108,12 @@ impl Palette for WaterPalette {
         let und = 0.55 + 0.3 * u1 + 0.15 * u2;
         (b.lp2 * lvl * 0.5 * und, b.lp1 * lvl * 0.06)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        430.0
-    }
 }
 
 struct CometPalette;
 
-impl Palette for CometPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+impl CometPalette {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let f = s.melody_hz(220.0, deg);
         let (f0, f1v) = (f * 1.04, f * 0.97);
         let v = Voice {
@@ -4105,21 +4126,21 @@ impl Palette for CometPalette {
                     f0,
                     f1: f1v,
                     glide: 0.16,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.32,
                     f0: f0 * 1.006,
                     f1: f1v * 1.006,
                     glide: 0.16,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.07,
                     f0: f0 * 3.0,
                     f1: f1v * 3.0,
                     glide: 0.16,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
             ],
             n_lvl: 0.025,
@@ -4128,10 +4149,10 @@ impl Palette for CometPalette {
             n_glide: 0.0,
             n_q: 0.7,
             lp_cut: 1600.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(v, g * 0.34, ev.pan);
-        if kind == SoundKind::Typed && s.rnd() < 0.14 {
+        if matches!(kind, SoundKind::Typed) && s.rnd() < 0.14 {
             let hi = s.rnd_in(1400.0, 2200.0);
             let delay = s.rnd_in(0.03, 0.1);
             let star = Voice {
@@ -4145,19 +4166,19 @@ impl Palette for CometPalette {
                         f0: hi,
                         f1: hi * 0.35,
                         glide: 0.07,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 tw_rate: 9.0,
                 tw_depth: 0.4,
                 lp_cut: 3200.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(star, g * 0.16, -ev.pan * 0.6);
         }
-        if kind == SoundKind::Jump {
+        if matches!(kind, SoundKind::Jump) {
             let swoosh = Voice {
                 dur: 0.45,
                 attack: 0.03,
@@ -4168,10 +4189,10 @@ impl Palette for CometPalette {
                         f0: f * 2.0,
                         f1: f * 0.9,
                         glide: 0.12,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 n_lvl: 0.5,
                 n_f0: 1200.0,
@@ -4179,10 +4200,11 @@ impl Palette for CometPalette {
                 n_glide: 0.12,
                 n_q: 1.4,
                 lp_cut: 2400.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(swoosh, g * 0.4, ev.pan);
-            for i in 0..3 {
+            let mut i = 0;
+            while i < 3 {
                 let glint_deg = (s.rnd() * 5.0) as i32;
                 let fg = s.melody_hz(1046.5, glint_deg);
                 let delay = 0.08 + i as f32 * 0.07 + s.rnd_in(0.0, 0.03);
@@ -4200,23 +4222,24 @@ impl Palette for CometPalette {
                             fm_ratio: 3.01,
                             fm_i0: 1.2,
                             fm_tau: 0.03,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
-                        Partial::default(),
-                        Partial::default(),
+                        Partial::DEFAULT,
+                        Partial::DEFAULT,
                     ],
                     tw_rate: 8.0,
                     tw_depth: 0.35,
                     lp_cut: 5200.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 let pan = ev.pan + s.rnd_in(-0.5, 0.5);
                 s.spawn(glint, g * 0.12, pan);
+                i += 1;
             }
         }
     }
 
-    fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+    const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 5.0) as i32;
         let f = s.melody_hz(660.0, grain_deg);
         let v = Voice {
@@ -4229,20 +4252,20 @@ impl Palette for CometPalette {
                     f0: f * 1.01,
                     f1: f * 0.99,
                     glide: 0.3,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             lp_cut: 2600.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = s.rnd_in(-0.8, 0.8);
         s.spawn(v, gain * level * 0.06, pan);
         s.bed.timer = s.rnd_in(0.6, 1.6) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 110.0 * dt).fract();
@@ -4251,16 +4274,12 @@ impl Palette for CometPalette {
         let sm = 0.5 * sin01(b.ph1) + 0.5 * sin01(b.ph2) + (0.08 + 0.12 * u1) * sin01(b.ph3);
         (sm * lvl * 0.055, sm * lvl * 0.014)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        220.0
-    }
 }
 
 struct MechPalette;
 
 impl MechPalette {
-    fn key(s: &mut TrailSynth, pan: f32, g: f32, body: f32, bright: f32, click_only: bool) {
+    const fn key(s: &mut TrailSynth, pan: f32, g: f32, body: f32, bright: f32, click_only: bool) {
         let click = Voice {
             dur: 0.035,
             attack: 0.001,
@@ -4271,7 +4290,7 @@ impl MechPalette {
             n_glide: 0.012,
             n_q: 0.8,
             lp_cut: 3600.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(click, g * if click_only { 0.4 } else { 0.34 }, pan);
         if click_only {
@@ -4287,10 +4306,10 @@ impl MechPalette {
                     f0: body,
                     f1: body * 0.55,
                     glide: 0.03,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             n_lvl: 0.12,
             n_f0: 620.0,
@@ -4298,22 +4317,12 @@ impl MechPalette {
             n_glide: 0.045,
             n_q: 0.9,
             lp_cut: 1000.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(thock, g * 0.5, pan * 0.7);
     }
-}
 
-impl Palette for MechPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        _deg: i32,
-        _col_off: i32,
-    ) {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32) {
         match kind {
             SoundKind::Typed => {
                 let body = s.rnd_in(150.0, 174.0);
@@ -4335,10 +4344,10 @@ impl Palette for MechPalette {
                             f0: s.rnd_in(104.0, 118.0),
                             f1: 62.0,
                             glide: 0.045,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
-                        Partial::default(),
-                        Partial::default(),
+                        Partial::DEFAULT,
+                        Partial::DEFAULT,
                     ],
                     n_lvl: 0.22,
                     n_f0: 520.0,
@@ -4346,10 +4355,11 @@ impl Palette for MechPalette {
                     n_glide: 0.05,
                     n_q: 0.9,
                     lp_cut: 850.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 s.spawn(clunk, g * 0.6, ev.pan * 0.6);
-                for i in 0..2 {
+                let mut i = 0;
+                while i < 2 {
                     let tick = Voice {
                         delay: 0.05 + i as f32 * 0.055 + s.rnd_in(0.0, 0.015),
                         dur: 0.035,
@@ -4361,9 +4371,10 @@ impl Palette for MechPalette {
                         n_glide: 0.012,
                         n_q: 0.8,
                         lp_cut: 3200.0,
-                        ..Voice::default()
+                        ..Voice::DEFAULT
                     };
                     s.spawn(tick, g * 0.22, -ev.pan * 0.4);
+                    i += 1;
                 }
             }
             _ => {}
@@ -4374,7 +4385,7 @@ impl Palette for MechPalette {
 struct TypewriterPalette;
 
 impl TypewriterPalette {
-    fn strike(s: &mut TrailSynth, pan: f32, g: f32, bright: f32, ring: f32, body: f32) {
+    const fn strike(s: &mut TrailSynth, pan: f32, g: f32, bright: f32, ring: f32, body: f32) {
         let clack = Voice {
             dur: 0.04,
             attack: 0.0008,
@@ -4385,7 +4396,7 @@ impl TypewriterPalette {
             n_glide: 0.008,
             n_q: 0.6,
             lp_cut: 5200.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(clack, g * 1.6, pan);
         if ring > 0.0 {
@@ -4398,18 +4409,18 @@ impl TypewriterPalette {
                         lvl: 0.5,
                         f0: 3150.0 * ring,
                         f1: 3150.0 * ring,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
                     Partial {
                         lvl: 0.3,
                         f0: 4720.0 * ring,
                         f1: 4720.0 * ring,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 6000.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(ring_v, g * 0.35, pan);
         }
@@ -4424,10 +4435,10 @@ impl TypewriterPalette {
                         f0: body,
                         f1: body * 0.55,
                         glide: 0.025,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 n_lvl: 0.15,
                 n_f0: 900.0,
@@ -4435,23 +4446,13 @@ impl TypewriterPalette {
                 n_glide: 0.03,
                 n_q: 0.9,
                 lp_cut: 1400.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(thud, g * 0.22, pan * 0.7);
         }
     }
-}
 
-impl Palette for TypewriterPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        _deg: i32,
-        _col_off: i32,
-    ) {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32) {
         match kind {
             SoundKind::Typed => {
                 let bright = s.rnd_in(0.9, 1.1);
@@ -4475,15 +4476,15 @@ impl Palette for TypewriterPalette {
                             fm_ratio: 2.71,
                             fm_i0: 0.9,
                             fm_tau: 0.05,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
                         Partial {
                             lvl: 0.12,
                             f0: 4.0 * 2093.0,
                             f1: 4.0 * 2093.0,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
-                        Partial::default(),
+                        Partial::DEFAULT,
                     ],
                     n_lvl: 0.5,
                     n_f0: 6000.0,
@@ -4491,7 +4492,7 @@ impl Palette for TypewriterPalette {
                     n_glide: 0.004,
                     n_q: 0.7,
                     lp_cut: 7000.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 s.spawn(ding, g * 0.56, (ev.pan * 0.3 + 0.35).clamp(-1.0, 1.0));
                 let zip = Voice {
@@ -4505,7 +4506,7 @@ impl Palette for TypewriterPalette {
                     n_glide: 0.09,
                     n_q: 1.1,
                     lp_cut: 3600.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 s.spawn(zip, g * 0.48, -0.35);
                 let clunk = Voice {
@@ -4519,10 +4520,10 @@ impl Palette for TypewriterPalette {
                             f0: 130.0,
                             f1: 70.0,
                             glide: 0.03,
-                            ..Partial::default()
+                            ..Partial::DEFAULT
                         },
-                        Partial::default(),
-                        Partial::default(),
+                        Partial::DEFAULT,
+                        Partial::DEFAULT,
                     ],
                     n_lvl: 0.2,
                     n_f0: 700.0,
@@ -4530,7 +4531,7 @@ impl Palette for TypewriterPalette {
                     n_glide: 0.03,
                     n_q: 0.9,
                     lp_cut: 900.0,
-                    ..Voice::default()
+                    ..Voice::DEFAULT
                 };
                 s.spawn(clunk, g * 0.61, -0.5);
             }
@@ -4544,7 +4545,15 @@ struct MarimbaPalette;
 impl MarimbaPalette {
     const BASE_HZ: f32 = 261.63;
 
-    fn bar(s: &mut TrailSynth, deg: i32, delay: f32, decay: f32, glint: bool, g: f32, pan: f32) {
+    const fn bar(
+        s: &mut TrailSynth,
+        deg: i32,
+        delay: f32,
+        decay: f32,
+        glint: bool,
+        g: f32,
+        pan: f32,
+    ) {
         let f = s.melody_hz(Self::BASE_HZ, deg);
         let (b0, b1) = gesture_bend(f, 1);
         let f0 = b1 + (b0 - b1) * KEY_BELL_BEND_SHARE;
@@ -4559,10 +4568,10 @@ impl MarimbaPalette {
                     f0,
                     f1: f,
                     glide: KEY_BELL_BEND_TAU,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             n_lvl: 0.35,
             n_f0: 700.0,
@@ -4570,7 +4579,7 @@ impl MarimbaPalette {
             n_glide: 0.008,
             n_q: 0.5,
             lp_cut: 3000.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(bar, g * 0.42, pan);
         if glint {
@@ -4584,29 +4593,19 @@ impl MarimbaPalette {
                         lvl: 0.5,
                         f0: f * 4.0,
                         f1: f * 4.0,
-                        ..Partial::default()
+                        ..Partial::DEFAULT
                     },
-                    Partial::default(),
-                    Partial::default(),
+                    Partial::DEFAULT,
+                    Partial::DEFAULT,
                 ],
                 lp_cut: 6000.0,
-                ..Voice::default()
+                ..Voice::DEFAULT
             };
             s.spawn(glint_v, g * 0.12, pan);
         }
     }
-}
 
-impl Palette for MarimbaPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         match kind {
             SoundKind::Typed => {
                 Self::bar(s, deg, 0.0, 0.13, true, g, ev.pan);
@@ -4623,7 +4622,7 @@ impl Palette for MarimbaPalette {
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 130.8 * dt).fract();
@@ -4633,10 +4632,6 @@ impl Palette for MarimbaPalette {
         b.lp1 += k * (sm - b.lp1);
         (b.lp1 * lvl * 0.018, 0.0)
     }
-
-    fn anchor_hz(&self) -> f32 {
-        Self::BASE_HZ
-    }
 }
 
 struct FeltPalette;
@@ -4644,7 +4639,15 @@ struct FeltPalette;
 impl FeltPalette {
     const BASE_HZ: f32 = 196.0;
 
-    fn note(s: &mut TrailSynth, deg: i32, delay: f32, decay: f32, thud: f32, g: f32, pan: f32) {
+    const fn note(
+        s: &mut TrailSynth,
+        deg: i32,
+        delay: f32,
+        decay: f32,
+        thud: f32,
+        g: f32,
+        pan: f32,
+    ) {
         let f = s.melody_hz(Self::BASE_HZ, deg);
         let (b0, b1) = gesture_bend(f, 1);
         let f0 = b1 + (b0 - b1) * KEY_BELL_BEND_SHARE;
@@ -4662,19 +4665,19 @@ impl FeltPalette {
                     fm_ratio: 1.0,
                     fm_i0: 0.35,
                     fm_tau: 0.02,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.22,
                     f0: f * 2.0,
                     f1: f * 2.0,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
                 Partial {
                     lvl: 0.10,
                     f0: f * 3.0,
                     f1: f * 3.0,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
             ],
             n_lvl: 0.3 * thud,
@@ -4683,22 +4686,12 @@ impl FeltPalette {
             n_glide: 0.012,
             n_q: 0.5,
             lp_cut: 1300.0,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         s.spawn(v, g * 0.5, pan);
     }
-}
 
-impl Palette for FeltPalette {
-    fn design(
-        &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
-        kind: SoundKind,
-        g: f32,
-        deg: i32,
-        _col_off: i32,
-    ) {
+    const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         match kind {
             SoundKind::Typed => {
                 Self::note(s, deg, 0.0, 0.19, 1.0, g, ev.pan);
@@ -4715,7 +4708,7 @@ impl Palette for FeltPalette {
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+    const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 98.0 * dt).fract();
         b.ph2 = (b.ph2 + 98.3 * dt).fract();
@@ -4723,10 +4716,6 @@ impl Palette for FeltPalette {
         let k = (400.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (sm - b.lp1);
         (b.lp1 * lvl * 0.02, 0.0)
-    }
-
-    fn anchor_hz(&self) -> f32 {
-        Self::BASE_HZ
     }
 }
 

@@ -22,10 +22,12 @@ fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32
         start: Some(1),
         ppid,
         cpu_ns: cpu_ms.map(|ms| ms * 1_000_000),
+        child_cpu_ns: None,
         footprint: Some(mib << 20),
         name: name.into(),
         uid: Some(uid),
         pgid: pid,
+        sid: 0,
         state: ProcState::Run,
         disk_written: cpu_ms.map(|ms| ms * 1000),
         runnable_ns: cpu_ms.map(|ms| ms * 1_200_000),
@@ -34,6 +36,7 @@ fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32
         coalition: None,
         version: None,
         birth_ms: None,
+        reaps_unwaited: None,
     }
 }
 
@@ -110,6 +113,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             shell_pid: 200,
             label: "Tab 1".into(),
             program: "cargo".into(),
+            tab_id: Some(7),
         }],
         self_uid: Some(501),
         thermal: Some(Thermal {

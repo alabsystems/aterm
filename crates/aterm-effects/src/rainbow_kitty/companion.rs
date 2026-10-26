@@ -290,7 +290,7 @@ where
     if ahead.probe == Probe::Blind {
         let shift_behind = ahead.covers_caret && cols > 0 && {
             let (b_first, b_last) = cell_span(behind_x, w, cw, cols);
-            !(b_first..=b_last).contains(&caret_col)
+            caret_col < b_first || caret_col > b_last
         };
         let x = if shift_behind { behind_x } else { rest.x };
         return seat(query, x, rest.y, caret_row, caret_left, 0, false);
@@ -368,12 +368,14 @@ where
         };
     }
     let (first, last) = cell_span(x, w, cw, cols);
-    let covers_caret = row == caret.0 && (first..=last).contains(&caret.1);
+    let covers_caret = row == caret.0 && caret.1 >= first && caret.1 <= last;
     let mut inked = false;
     let mut blank = 0_u32;
     let mut unknown = 0_u32;
-    for c in first..=last {
+    let mut c = first;
+    while c <= last {
         if (row, c) == caret {
+            c += 1;
             continue;
         }
         match ink(row, c) {
@@ -388,6 +390,7 @@ where
             inked = true;
             break;
         }
+        c += 1;
     }
     let probe = if inked {
         Probe::Inked

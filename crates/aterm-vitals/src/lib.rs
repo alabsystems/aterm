@@ -34,7 +34,7 @@ pub use model::{
     Writer,
 };
 pub use peaks::{DailyMax, PeakRow, Peaks, PlanDay, PlanWeek};
-pub use ring::{Bucket, BucketRing, Cell};
+pub use ring::{Bucket, BucketRing, Cell, Reading, SlotGrid};
 pub use strain::Strain;
 pub use trend::{History, Motion, Trend, TrendView};
 pub use writes::{ProgramHour, WriteHour};

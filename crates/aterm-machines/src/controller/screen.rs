@@ -1091,6 +1091,7 @@ mod tests {
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         }
     }
 

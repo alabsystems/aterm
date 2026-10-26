@@ -1740,34 +1740,32 @@ fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
 /// re-uses a sequence number the broker has already seen — the record is deduped
 /// away silently, which is exactly the loss `--seq-file` exists to prevent.
 ///
-/// A filesystem that will not let this process fsync a directory HANDLE (Unsupported
-/// / InvalidInput), or a directory it may write but not open, is not a reason to
-/// refuse the publish — that is the same judgement `store::sync_parent_dir` makes.
-/// Any other error IS reported: a directory that fails its own fsync has not made
-/// the rename durable, and the caller must not publish under a number that may not
-/// have been recorded.
+/// A directory whose entries cannot be flushed here (`astream_sys::dir_flush_unavailable`:
+/// a filesystem that will not flush a directory HANDLE, or a directory this process may
+/// write but not open) is not a reason to refuse the publish — the judgement
+/// `store::sync_parent_dir` makes too. Any other error IS reported: a directory that
+/// fails its own fsync has not made the rename durable, and the caller must not publish
+/// under a number that may not have been recorded.
 fn sync_parent_dir(path: &str) -> io::Result<()> {
+    sync_parent_dir_by(path, |dir| {
+        astream_sys::full_sync(&std::fs::File::open(dir)?)
+    })
+}
+
+/// [`sync_parent_dir`] with the directory's open and full flush (`flush`) handed in, so a
+/// test can make them fail; what that outcome means for the publish is decided here either
+/// way.
+fn sync_parent_dir_by(
+    path: &str,
+    flush: impl FnOnce(&std::path::Path) -> io::Result<()>,
+) -> io::Result<()> {
     let dir = match std::path::Path::new(path).parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
-    let res = match std::fs::File::open(&dir) {
-        Ok(d) => astream_sys::full_sync(&d),
-        Err(e) => Err(e),
-    };
-    match res {
+    match flush(&dir) {
         Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::Unsupported
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::NotFound
-            ) =>
-        {
-            Ok(())
-        }
+        Err(e) if astream_sys::dir_flush_unavailable(&e) => Ok(()),
         Err(e) => Err(io::Error::new(
             e.kind(),
             format!("--seq-file {path}: fsync of {}: {e}", dir.display()),
@@ -2848,7 +2846,7 @@ fn read_retain_file(path: &str) -> Result<astream_broker::Retention, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_seq_file, decode_hex, print_records};
+    use super::{advance_seq_file, decode_hex, print_records, sync_parent_dir_by};
 
     /// Removes a test's scratch directory when dropped, so the test leaves nothing
     /// behind whether it passes or panics.
@@ -3043,6 +3041,46 @@ mod tests {
         std::fs::remove_file(format!("{path}.lock")).unwrap();
         assert_eq!(advance_seq_file(path).unwrap(), 1);
         assert_eq!(advance_seq_file(path).unwrap(), 2);
+    }
+
+    /// `--seq-file`'s directory flush after the rename goes on exactly where
+    /// `astream_sys::dir_flush_unavailable` says the entry cannot be flushed: the volume's
+    /// `ENOTSUP` (Darwin's 45, which std leaves uncategorized, so a list of kinds alone
+    /// refused the publish there; Linux's 95) is tolerated, and `EIO` refuses the publish,
+    /// its kind kept. Either way the flush is asked of the directory that names the file,
+    /// `.` for a bare name. Unix errno numbers (Windows's 5 is `ERROR_ACCESS_DENIED`).
+    #[test]
+    #[cfg(unix)]
+    fn the_seq_files_directory_flush_tolerates_enotsup_and_refuses_on_eio() {
+        let enotsup = if cfg!(target_vendor = "apple") {
+            45
+        } else {
+            95
+        };
+        let eio = 5;
+        for (path, dir) in [("/seqs/p.seq", "/seqs"), ("p.seq", ".")] {
+            for (errno, tolerated) in [(enotsup, true), (eio, false)] {
+                let mut asked = None;
+                let flushed = sync_parent_dir_by(path, |d| {
+                    asked = Some(d.to_path_buf());
+                    Err(std::io::Error::from_raw_os_error(errno))
+                });
+                assert_eq!(
+                    flushed.map_err(|e| e.kind()),
+                    if tolerated {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::from_raw_os_error(eio).kind())
+                    },
+                    "{path} errno {errno}"
+                );
+                assert_eq!(
+                    asked.as_deref(),
+                    Some(std::path::Path::new(dir)),
+                    "{path} errno {errno}"
+                );
+            }
+        }
     }
 
     /// The wildcard-read header cannot be SPOOFED by a subject. `Subject::new`

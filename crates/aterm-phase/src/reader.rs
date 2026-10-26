@@ -13,6 +13,8 @@ use crate::prompt::{CancelEffect, PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
 use crate::wall::{Wall, memory_wall, wall};
 use crate::{agy, grok, kimi, muse};
+pub use aterm_agent_names::{AGENT_RUNTIMES, may_host_agent};
+use aterm_agent_names::{Agent, agent_of, program_word};
 
 /// Program identified for a terminal screen. Every variant is in [`Program::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,18 +89,41 @@ impl Program {
         }
     }
 
-    /// Display name used on harness surfaces.
+    /// Display name used on harness surfaces: the agent's, by the name table
+    /// ([`Agent::product`]).
     #[inline]
     #[must_use]
     pub const fn product(self) -> &'static str {
+        match self.agent() {
+            Some(agent) => agent.product(),
+            None => "the program",
+        }
+    }
+
+    /// The agent this program is in the name table, `None` for [`Program::Generic`].
+    #[inline]
+    #[must_use]
+    pub const fn agent(self) -> Option<Agent> {
         match self {
-            Program::Claude => "Claude Code",
-            Program::Codex => "Codex",
-            Program::Agy => "Antigravity CLI",
-            Program::Muse => "Muse Code",
-            Program::Grok => "Grok Build",
-            Program::Kimi => "Kimi Code",
-            Program::Generic => "the program",
+            Program::Claude => Some(Agent::Claude),
+            Program::Codex => Some(Agent::Codex),
+            Program::Agy => Some(Agent::Agy),
+            Program::Muse => Some(Agent::Muse),
+            Program::Grok => Some(Agent::Grok),
+            Program::Kimi => Some(Agent::Kimi),
+            Program::Generic => None,
+        }
+    }
+
+    /// The program `agent` is.
+    const fn of(agent: Agent) -> Program {
+        match agent {
+            Agent::Claude => Program::Claude,
+            Agent::Codex => Program::Codex,
+            Agent::Agy => Program::Agy,
+            Agent::Muse => Program::Muse,
+            Agent::Grok => Program::Grok,
+            Agent::Kimi => Program::Kimi,
         }
     }
 
@@ -1052,51 +1077,11 @@ fn zone_walk(rows: &[String], n: usize) -> (usize, usize) {
 /// How many blank rows in a row make a gap rather than a separator ([`live_zone_start`]).
 pub const BLANK_GAP: usize = 4;
 
-/// Map a program command string or shell-wrapped command to its [`Program`], if known.
+/// Map a program command string or shell-wrapped command to its [`Program`], if known: the
+/// agent the name table ([`agent_of`]) names.
 #[must_use]
 pub fn program_of(program: &str) -> Option<Program> {
-    let word = program_word(program);
-    let is = |name: &str| word.eq_ignore_ascii_case(name);
-    if is("claude") || is("claude-code") {
-        Some(Program::Claude)
-    } else if is("codex") || is("codex-old") {
-        Some(Program::Codex)
-    } else if is("agy") {
-        Some(Program::Agy)
-    } else if is("muse") || is_muse_build(word) {
-        Some(Program::Muse)
-    } else if is("grok") || is("grok-alab") {
-        // grok-alab, the Grok Build harness, leads the session's foreground group and runs the
-        // vendor's grok as its child on the same terminal: the screen is Grok's
-        // (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 5).
-        Some(Program::Grok)
-    } else if is("kimi") || is("kimi-code") {
-        Some(Program::Kimi)
-    } else {
-        None
-    }
-}
-
-/// `muse-bin-1.4.10-R6427.1`: the build Meta's installer's launcher execs
-/// (`muse-bin-` and a version that opens on a digit), case aside.
-fn is_muse_build(word: &str) -> bool {
-    word.get(..9)
-        .is_some_and(|p| p.eq_ignore_ascii_case("muse-bin-"))
-        && word[9..].starts_with(|c: char| c.is_ascii_digit())
-}
-
-/// The script runtimes an agent runs under without renaming itself (an npm or bun install of
-/// Claude Code starts as `node` or `bun`): a program so
-/// named may be identified as an agent by its screen ([`identify`]).
-pub const AGENT_RUNTIMES: &[&str] = &["node", "bun", "deno"];
-
-/// Whether `program` is one of the [`AGENT_RUNTIMES`], which may host an agent.
-#[must_use]
-pub fn may_host_agent(program: &str) -> bool {
-    let word = program_word(program);
-    AGENT_RUNTIMES
-        .iter()
-        .any(|runtime| word.eq_ignore_ascii_case(runtime))
+    agent_of(program).map(Program::of)
 }
 
 /// Whether `rows` could be the shell's alone, before a program drew: every row blank, or the
@@ -1109,13 +1094,6 @@ pub fn shell_alone(rows: &[String]) -> bool {
     };
     let last = rows.iter().rposition(drawn).unwrap_or(first);
     rows[first..=last].iter().all(drawn)
-}
-
-/// Borrowed basename of `program`'s first word with any leading login-shell `-` stripped.
-fn program_word(program: &str) -> &str {
-    let head = program.split_whitespace().next().unwrap_or(program);
-    let base = head.rsplit('/').next().unwrap_or(head);
-    base.trim_start_matches('-')
 }
 
 #[cfg(test)]
@@ -1279,54 +1257,11 @@ mod tests {
         ])
     }
 
-    /// A program word matches without case, from a path and past a login shell's `-`, and is
-    /// borrowed, never rebuilt: the GUI asks it of every pane on every frame.
+    /// A shell's or a viewer's name reads as no agent's, without case, from a path and past a
+    /// login shell's `-` (the name table's own reading, aterm-agent-names), and a runtime's leaves
+    /// the screen to say: the frame here is Claude Code's.
     #[test]
-    fn program_words_match_without_case_from_a_path_and_a_login_dash() {
-        for (program, want) in [
-            ("codex", Some(Program::Codex)),
-            ("CODEX", Some(Program::Codex)),
-            ("/usr/local/bin/Claude --resume", Some(Program::Claude)),
-            ("-Claude-Code", Some(Program::Claude)),
-            ("Agy", Some(Program::Agy)),
-            ("MUSE x", Some(Program::Muse)),
-            (
-                "/Users//x/.local/bin/muse-bin-1.4.10-R6427.1",
-                Some(Program::Muse),
-            ),
-            ("muse-bin-", None),
-            ("muse-bin-latest", None),
-            ("muse-binary", None),
-            ("codexx", None),
-            ("codex-old", Some(Program::Codex)),
-            (
-                "/opt/pkg/store/codex-old/1000000000163000000/bin/codex-old resume",
-                Some(Program::Codex),
-            ),
-            ("CODEX-OLD", Some(Program::Codex)),
-            ("codex-older", None),
-            ("xcodex-old", None),
-            ("codex-", None),
-            ("grok", Some(Program::Grok)),
-            ("grok-alab", Some(Program::Grok)),
-            (
-                "/opt/pkg/bin/grok-alab run -- --resume x",
-                Some(Program::Grok),
-            ),
-            ("Grok-Alab", Some(Program::Grok)),
-            ("grok-alabs", None),
-            ("grok-", None),
-            ("kimi-alab", None),
-            ("claude-codes", None),
-            ("node", None),
-            ("", None),
-        ] {
-            assert_eq!(program_of(program), want, "{program:?}");
-        }
-        assert!(may_host_agent("Node"));
-        assert!(may_host_agent("/opt/homebrew/bin/BUN run x"));
-        assert!(!may_host_agent("nodes"));
-        assert!(!may_host_agent("codex"));
+    fn a_shell_or_viewer_is_no_agent_and_a_runtime_is_read_by_its_screen() {
         let rows = composer("");
         assert_eq!(identify(Some("-ZSH"), &rows).program(), Program::Generic);
         assert_eq!(

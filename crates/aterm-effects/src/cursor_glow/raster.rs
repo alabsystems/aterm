@@ -870,7 +870,8 @@ pub(crate) fn push_soft_veil(
     };
     let layer_cap = LAYER_CAP[usize::from(cap)];
     let color = (ink & 0x00FF_FFFF) | (layer_cap << 24);
-    for k in 0..SOFT_VEIL_LAYERS {
+    let mut k = 0;
+    while k < SOFT_VEIL_LAYERS {
         let shrink = 1.0 - k as f32 * (1.0 / SOFT_VEIL_LAYERS as f32);
         push_halo_rows(
             halos,
@@ -880,6 +881,7 @@ pub(crate) fn push_soft_veil(
             color,
             HaloMode::Over,
         );
+        k += 1;
     }
 }
 
@@ -997,38 +999,64 @@ pub(super) fn push_paper_bead(
     if alpha < 4 || r < 0.75 {
         return;
     }
-    let mut disc = |rr: f32, rgb: u32| {
+    #[inline]
+    fn lay_px(
+        out: &mut Vec<GlowQuad>,
+        geom: Geom,
+        (x, y, w): (i32, i32, i32),
+        rgb: u32,
+        alpha: u8,
+        f: f32,
+        rows: f32,
+    ) {
+        let a = (f32::from(alpha) * (f * rows).clamp(0.0, 1.0)) as u8;
+        if a > 0 && w > 0 {
+            push_fx_quad(out, geom, x, y, w, 1, premul_rgb(rgb, a), a);
+        }
+    }
+    #[inline]
+    fn disc(
+        out: &mut Vec<GlowQuad>,
+        geom: Geom,
+        (cx, cy): (f32, f32),
+        rr: f32,
+        rgb: u32,
+        alpha: u8,
+    ) {
         let rr2 = rr * rr;
         let (y0, y1) = ((cy - rr).floor() as i32, (cy + rr).ceil() as i32);
-        for y in y0..y1 {
+        let mut y = y0;
+        while y < y1 {
             let dy = y as f32 + 0.5 - cy;
             let rest = rr2 - dy * dy;
-            if rest <= 0.0 {
-                continue;
-            }
-            let half = crate::color_math::sqrt_f32(rest);
-            let rows = (rr - dy.abs() + 0.5).clamp(0.0, 1.0);
-            let (xl, xr) = (cx - half, cx + half);
-            let mut lay = |x: i32, w: i32, f: f32| {
-                let a = (f32::from(alpha) * (f * rows).clamp(0.0, 1.0)) as u8;
-                if a > 0 && w > 0 {
-                    push_fx_quad(out, geom, x, y, w, 1, premul_rgb(rgb, a), a);
+            if rest > 0.0 {
+                let half = crate::color_math::sqrt_f32(rest);
+                let rows = (rr - dy.abs() + 0.5).clamp(0.0, 1.0);
+                let (xl, xr) = (cx - half, cx + half);
+                let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
+                if pl == pr {
+                    lay_px(out, geom, (pl, y, 1), rgb, alpha, xr - xl, rows);
+                } else {
+                    lay_px(
+                        out,
+                        geom,
+                        (pl, y, 1),
+                        rgb,
+                        alpha,
+                        (pl + 1) as f32 - xl,
+                        rows,
+                    );
+                    if pr > pl + 1 {
+                        lay_px(out, geom, (pl + 1, y, pr - pl - 1), rgb, alpha, 1.0, rows);
+                    }
+                    lay_px(out, geom, (pr, y, 1), rgb, alpha, xr - pr as f32, rows);
                 }
-            };
-            let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
-            if pl == pr {
-                lay(pl, 1, xr - xl);
-                continue;
             }
-            lay(pl, 1, (pl + 1) as f32 - xl);
-            if pr > pl + 1 {
-                lay(pl + 1, pr - pl - 1, 1.0);
-            }
-            lay(pr, 1, xr - pr as f32);
+            y += 1;
         }
-    };
-    disc(r, rim);
-    disc(r * 0.6, core);
+    }
+    disc(out, geom, (cx, cy), r, rim, alpha);
+    disc(out, geom, (cx, cy), r * 0.6, core, alpha);
 }
 
 /// The crescent's shadow disc offset as a share of the moon's radius from its centre.
@@ -1167,31 +1195,48 @@ pub(super) fn push_crescent(
         cy + CRESCENT_SHADOW_OFFSET.1 * r,
     );
     let sr = CRESCENT_SHADOW_R * r;
-    let at = |a: u8| match ink {
-        CrescentInk::Add => (premul_rgb(rgb, a), 0),
-        CrescentInk::Over => (premul_rgb(rgb, a), a),
-        CrescentInk::Page(page) => page_matched(rgb, a, page),
-    };
-    let (full_premul, full_alpha) = at(cov);
-    let mut span = |y: i32, xl: f32, xr: f32| {
+    #[inline]
+    const fn crescent_at(rgb: u32, a: u8, ink: CrescentInk) -> (u32, u8) {
+        match ink {
+            CrescentInk::Add => (premul_rgb(rgb, a), 0),
+            CrescentInk::Over => (premul_rgb(rgb, a), a),
+            CrescentInk::Page(page) => page_matched(rgb, a, page),
+        }
+    }
+    #[inline]
+    fn lay_px(
+        out: &mut Vec<GlowQuad>,
+        geom: Geom,
+        (x, y, w): (i32, i32, i32),
+        (rgb, cov, ink): (u32, u8, CrescentInk),
+        f: f32,
+    ) {
+        let a = (f32::from(cov) * f.clamp(0.0, 1.0)) as u8;
+        if a > 0 {
+            let (premul, alpha) = crescent_at(rgb, a, ink);
+            if premul != 0 || alpha != 0 {
+                push_fx_quad(out, geom, x, y, w, 1, premul, alpha);
+            }
+        }
+    }
+    #[inline]
+    fn push_span(
+        out: &mut Vec<GlowQuad>,
+        geom: Geom,
+        y: i32,
+        (xl, xr): (f32, f32),
+        (rgb, cov, ink): (u32, u8, CrescentInk),
+        (full_premul, full_alpha): (u32, u8),
+    ) {
         if xr - xl < 0.05 {
             return;
         }
-        let lay = |out: &mut Vec<GlowQuad>, x: i32, w: i32, f: f32| {
-            let a = (f32::from(cov) * f.clamp(0.0, 1.0)) as u8;
-            if a > 0 {
-                let (premul, alpha) = at(a);
-                if premul != 0 || alpha != 0 {
-                    push_fx_quad(out, geom, x, y, w, 1, premul, alpha);
-                }
-            }
-        };
         let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
         if pl == pr {
-            lay(out, pl, 1, xr - xl);
+            lay_px(out, geom, (pl, y, 1), (rgb, cov, ink), xr - xl);
             return;
         }
-        lay(out, pl, 1, (pl + 1) as f32 - xl);
+        lay_px(out, geom, (pl, y, 1), (rgb, cov, ink), (pl + 1) as f32 - xl);
         if pr > pl + 1 {
             push_fx_quad(
                 out,
@@ -1204,27 +1249,29 @@ pub(super) fn push_crescent(
                 full_alpha,
             );
         }
-        lay(out, pr, 1, xr - pr as f32);
-    };
+        lay_px(out, geom, (pr, y, 1), (rgb, cov, ink), xr - pr as f32);
+    }
+    let full = crescent_at(rgb, cov, ink);
     let (r2, sr2) = (r * r, sr * sr);
     let (y0, y1) = ((cy - r).floor() as i32, (cy + r).ceil() as i32);
-    for y in y0..y1 {
+    let mut y = y0;
+    while y < y1 {
         let yc = y as f32 + 0.5;
         let dy = yc - cy;
-        if dy.abs() >= r {
-            continue;
+        if dy.abs() < r {
+            let half = crate::color_math::sqrt_f32(r2 - dy * dy);
+            let (xl, xr) = (cx - half, cx + half);
+            let ds = yc - sy;
+            if ds.abs() >= sr {
+                push_span(out, geom, y, (xl, xr), (rgb, cov, ink), full);
+            } else {
+                let shalf = crate::color_math::sqrt_f32(sr2 - ds * ds);
+                let (sl, sr_x) = (sx - shalf, sx + shalf);
+                push_span(out, geom, y, (xl, xr.min(sl)), (rgb, cov, ink), full);
+                push_span(out, geom, y, (xl.max(sr_x), xr), (rgb, cov, ink), full);
+            }
         }
-        let half = crate::color_math::sqrt_f32(r2 - dy * dy);
-        let (xl, xr) = (cx - half, cx + half);
-        let ds = yc - sy;
-        if ds.abs() >= sr {
-            span(y, xl, xr);
-            continue;
-        }
-        let shalf = crate::color_math::sqrt_f32(sr2 - ds * ds);
-        let (sl, sr_x) = (sx - shalf, sx + shalf);
-        span(y, xl, xr.min(sl));
-        span(y, xl.max(sr_x), xr);
+        y += 1;
     }
 }
 
@@ -1356,7 +1403,10 @@ pub(crate) fn push_ripple_ring(
         let (o, i) = (outer as i32, inner as i32);
         if o > i {
             let mid = 0.5 * (o + i) as f32;
-            for (x, xm) in [(cxi - o, cx - mid), (cxi + i, cx + mid)] {
+            let pairs = [(cxi - o, cx - mid), (cxi + i, cx + mid)];
+            let mut pi = 0;
+            while pi < 2 {
+                let (x, xm) = pairs[pi];
                 let fade = fade_y * crate::effect_util::fx_fade_x(geom, xm);
                 if fade > 0.0 {
                     push_rect(
@@ -1369,6 +1419,7 @@ pub(crate) fn push_ripple_ring(
                         crate::effect_util::scale_premul(premul, fade),
                     );
                 }
+                pi += 1;
             }
         }
         dy += h;

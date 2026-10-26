@@ -292,49 +292,84 @@ pub(crate) fn push_ink_ring(
     let row_top = oy + ((cy - oy) * (1.0 / chf)).floor() * chf;
     let y0 = (cy - r).max(row_top).floor() as i32;
     let y1 = (cy + r).min(row_top + chf).ceil() as i32;
-    let span = |under: &mut Vec<GlowQuad>, y: i32, a: f32, b: f32, alpha: f32| {
+    #[inline]
+    fn put_ring_px(
+        under: &mut Vec<GlowQuad>,
+        geom: Geom,
+        (x, y, w): (i32, i32, i32),
+        ink: u32,
+        alpha: f32,
+        share: f32,
+        budget: usize,
+    ) {
+        let al = (alpha * share).round().clamp(0.0, 255.0) as u8;
+        if al > 0 && under.len() < budget {
+            let pm = premul_rgb(ink, al);
+            crate::effect_util::push_fx_ramp(under, geom, x, y, w, 1, (pm, al), (pm, al));
+        }
+    }
+    #[inline]
+    fn put_ring_span(
+        under: &mut Vec<GlowQuad>,
+        geom: Geom,
+        y: i32,
+        (a, b): (f32, f32),
+        ink: u32,
+        alpha: f32,
+        budget: usize,
+    ) {
         if b <= a || alpha < 1.0 {
             return;
         }
-        let mut put = |x: i32, w: i32, share: f32| {
-            let al = (alpha * share).round().clamp(0.0, 255.0) as u8;
-            if al > 0 && under.len() < budget {
-                let pm = premul_rgb(ink, al);
-                crate::effect_util::push_fx_ramp(under, geom, x, y, w, 1, (pm, al), (pm, al));
-            }
-        };
         let (ia, ib) = (a.ceil() as i32, b.floor() as i32);
         if ib < ia {
-            put(a.floor() as i32, 1, b - a);
+            put_ring_px(
+                under,
+                geom,
+                (a.floor() as i32, y, 1),
+                ink,
+                alpha,
+                b - a,
+                budget,
+            );
             return;
         }
         if ia as f32 > a {
-            put(ia - 1, 1, ia as f32 - a);
+            put_ring_px(
+                under,
+                geom,
+                (ia - 1, y, 1),
+                ink,
+                alpha,
+                ia as f32 - a,
+                budget,
+            );
         }
         if ib > ia {
-            put(ia, ib - ia, 1.0);
+            put_ring_px(under, geom, (ia, y, ib - ia), ink, alpha, 1.0, budget);
         }
         if b > ib as f32 {
-            put(ib, 1, b - ib as f32);
+            put_ring_px(under, geom, (ib, y, 1), ink, alpha, b - ib as f32, budget);
         }
-    };
+    }
     let ri = (r - rim_w).max(0.0);
     let (r2, ri2) = (r * r, ri * ri);
-    for y in y0..y1 {
+    let mut y = y0;
+    while y < y1 {
         let dy = (y as f32 + 0.5 - cy).abs();
-        if dy >= r {
-            continue;
+        if dy < r {
+            let dy2 = dy * dy;
+            let outer = crate::color_math::sqrt_f32(r2 - dy2);
+            let inner = if dy < ri {
+                crate::color_math::sqrt_f32(ri2 - dy2)
+            } else {
+                0.0
+            };
+            put_ring_span(under, geom, y, (cx - outer, cx - inner), ink, rim, budget);
+            put_ring_span(under, geom, y, (cx - inner, cx + inner), ink, fill, budget);
+            put_ring_span(under, geom, y, (cx + inner, cx + outer), ink, rim, budget);
         }
-        let dy2 = dy * dy;
-        let outer = crate::color_math::sqrt_f32(r2 - dy2);
-        let inner = if dy < ri {
-            crate::color_math::sqrt_f32(ri2 - dy2)
-        } else {
-            0.0
-        };
-        span(under, y, cx - outer, cx - inner, rim);
-        span(under, y, cx - inner, cx + inner, fill);
-        span(under, y, cx + inner, cx + outer, rim);
+        y += 1;
     }
 }
 
@@ -448,7 +483,9 @@ fn soft_ellipse(
 /// Re-ink quads rasterized in WHITE (so each channel is the coverage that lit it) as source-over ink at that coverage, capped at `cap`: the light-ground form of any additive beam, its own anti-aliasing intact.
 #[inline]
 pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&GlowQuad) -> u32) {
-    for q in quads {
+    let mut i = 0;
+    while i < quads.len() {
+        let q = &mut quads[i];
         let a = ((q.color & 0xff) as u8).min(cap);
         let a2 = ((q.color2 & 0xff) as u8).min(cap);
         if a == 0 && a2 == 0 {
@@ -456,6 +493,7 @@ pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&Glow
             q.color2 = 0;
             q.alpha = 0;
             q.alpha2 = 0;
+            i += 1;
             continue;
         }
         let ink = ink_at(q);
@@ -465,6 +503,7 @@ pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&Glow
         q.color2 = if a == a2 { c1 } else { premul_rgb(ink, a2) };
         q.alpha = a;
         q.alpha2 = a2;
+        i += 1;
     }
 }
 

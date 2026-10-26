@@ -1348,8 +1348,8 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
 /// `aterm harness upgrade` alike: on when the switch is and there is an aterm to name, with
 /// the lone login the store binds to a one-row roster, else every login a roster of several
 /// names as the store binds it, each login a renewal moved a row away from too (the logins
-/// the footer's `row_left` promises a restart for), and none where the clock was not read or
-/// the store's logins cannot be; off otherwise.
+/// the footer's `row_left` promises a restart for); off where the clock or required account
+/// records cannot be read.
 #[test]
 fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
     let abs = |path: &str| {
@@ -1396,12 +1396,8 @@ fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
     );
     assert_eq!(
         arm(true, Some(exe.clone()), None),
-        Some(Armed {
-            exe: exe.clone(),
-            lone_login: None,
-            listed: Vec::new(),
-        }),
-        "no clock read: no login"
+        None,
+        "no clock read: no tap"
     );
     let work = abs("/s/work");
     let work = work.as_str();
@@ -1456,8 +1452,8 @@ fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
     std::fs::write(&logins_file, "{ torn").expect("torn");
     assert_eq!(
         arm(true, Some(exe.clone()), Some(now)).map(|a| (a.lone_login, a.listed)),
-        Some((None, Vec::new())),
-        "logins.json unread: no login, as the host's attribution and the footer's gate refuse \
+        None,
+        "logins.json unread: no tap, as the host's attribution and the footer's gate refuse \
          that roster too"
     );
     std::fs::write(&logins_file, kept).expect("restored");

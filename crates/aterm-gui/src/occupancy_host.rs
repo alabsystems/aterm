@@ -589,14 +589,8 @@ pub(crate) const ASK_KEEP_MS: i64 = aterm_agent::supervise::occupancy::reading::
 pub(crate) enum Pool {
     /// A fact rule's line ([`MACHINE_LINES_PER_HOUR`]).
     Facts,
-    /// A declared wake's typed line ([`WAKE_LINES_PER_HOUR`]).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the wake door's claim asks it; only the tests do yet"
-        )
-    )]
+    /// A declared wake's typed line ([`WAKE_LINES_PER_HOUR`]), asked by its claim
+    /// ([`Pace::ask_wake`]).
     Wake,
 }
 
@@ -774,6 +768,39 @@ impl Pace {
             own.line = Some(ask.pool);
         }
         PaceGrant::Granted
+    }
+
+    /// A table whose last hour drew `facts` fact lines and `wakes` typed wake lines at `at_ms`,
+    /// no slot reserved: the pace a test of another module's door starts from.
+    #[cfg(test)]
+    pub(crate) fn drawn_for_test(facts: usize, wakes: usize, at_ms: i64) -> Self {
+        Self {
+            lines: vec![at_ms; facts],
+            wake_lines: vec![at_ms; wakes],
+            ..Self::default()
+        }
+    }
+
+    /// THE WAKE LINES' PACE for session `sid`'s claimed wake ([`crate::occupancy_wakes`]'s claim):
+    /// [`Self::ask`] on the wake pool ([`Pool::Wake`]), aged from `age_ms` (its open hold's
+    /// start, else its wake's ready since), a slot reserved where its need names slots (`slot`)
+    /// with `usable` slots its fresh read proves at `now_ms`. It never draws the facts pool.
+    pub(crate) fn ask_wake(
+        &mut self,
+        sid: &str,
+        slot: bool,
+        age_ms: i64,
+        usable: u16,
+        now_ms: i64,
+    ) -> PaceGrant {
+        let ask = Ask {
+            sid,
+            slot,
+            hold_since_ms: age_ms,
+            usable,
+            pool: Pool::Wake,
+        };
+        self.ask(&ask, now_ms)
     }
 
     /// Reserve a free build slot for session `sid`, aged from `age_ms` (its open hold's start,
@@ -1283,6 +1310,23 @@ pub(crate) fn reserve_for_await(sid: &str, age_ms: i64, usable: u16, now_ms: i64
         .get_or_insert_with(Judged::default)
         .pace
         .reserve(sid, age_ms, usable, now_ms)
+}
+
+/// The wake lines' pace on the board's table for session `sid`'s claimed wake
+/// ([`Pace::ask_wake`]).
+pub(crate) fn pace_for_wake(
+    sid: &str,
+    slot: bool,
+    age_ms: i64,
+    usable: u16,
+    now_ms: i64,
+) -> PaceGrant {
+    BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(Judged::default)
+        .pace
+        .ask_wake(sid, slot, age_ms, usable, now_ms)
 }
 
 /// Every session whose loop told this window a word ([`Judged::told_sids`]).

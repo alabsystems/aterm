@@ -14,6 +14,12 @@ use crate::supervise::run::CtlReply;
 #[path = "cli_label_retention_tests.rs"]
 mod label_retention;
 
+#[path = "cli_report_read_tests.rs"]
+mod report_read;
+
+#[path = "cli_upgrade_policy_tests.rs"]
+mod upgrade_policy;
+
 fn tmp_dir(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-harness-cli-{tag}-"))
@@ -826,6 +832,30 @@ fn usage_names_the_account_its_claude_code_runs_under() {
 
     std::fs::write(&roster, &two).expect("write");
     assert_eq!(shown(&env, &main), "main", "the roster is back");
+    let store = env.accounts_store();
+    let renewed = tmp.path().join("renewed").to_str().unwrap().to_owned();
+    let renew = |login: &str| {
+        store.transact_logins(env.now, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state, logins, "work-2", None, login, None, env.now,
+            ))
+        })
+    };
+    renew(work).unwrap();
+    let witness = store.state_witness_file();
+    let retained = witness.with_extension("retained");
+    std::fs::rename(&witness, &retained).unwrap();
+    std::fs::create_dir(&witness).unwrap();
+    assert!(renew(&renewed).is_err());
+    assert!(store.load(env.now).is_err());
+    std::fs::rename(&witness, witness.with_extension("obstruction")).unwrap();
+    std::fs::rename(&retained, &witness).unwrap();
+    let on_renewed = FakeClaude::with(&[home, (accounts::LOGIN_ENV, &renewed)]);
+    assert_eq!(
+        shown(&env, &on_renewed),
+        "work-2",
+        "recovery precedes binding"
+    );
     env.claude_pid = None;
     assert_eq!(shown(&env, &unread), "account", "no CLAUDE_PID");
     env.claude_pid = Some(FakeClaude::PID);
@@ -2909,6 +2939,26 @@ fn a_ledger_tail_keeps_only_the_newest_rows() {
         READ_MAX_ROWS
     );
     assert!(tail_lines(&path, 0).expect("read").is_empty());
+    assert!(
+        tail_lines(tmp.path(), 1).is_err(),
+        "a directory read error terminates"
+    );
+    assert!(tail_lines(tmp.path(), 0).is_err());
+    #[cfg(unix)]
+    {
+        let linked = tmp.path().join("linked.jsonl");
+        std::os::unix::fs::symlink(&path, &linked).unwrap();
+        assert!(tail_lines(&linked, 1).is_err());
+        let dangling = tmp.path().join("dangling.jsonl");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &dangling).unwrap();
+        assert!(tail_lines(&dangling, 1).is_err());
+    }
+    let invalid = tmp.path().join("invalid.jsonl");
+    std::fs::write(&invalid, b"first\n\xff\nlast\n").unwrap();
+    assert!(
+        tail_lines(&invalid, 3).is_err(),
+        "unreadable history is not silently omitted"
+    );
 }
 
 #[test]
@@ -5927,6 +5977,99 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
 }
 
 #[test]
+fn accounts_stats_recovers_before_choosing_its_label_and_state() {
+    let tmp = tmp_dir("stats-recovery");
+    let old = tmp.path().join("old");
+    let new = tmp.path().join("new");
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(new.join(".claude.json"), stats_profile()).unwrap();
+    let env = stats_env(&tmp, new.clone(), new.join(".claude.json"));
+    std::fs::write(
+        env.accounts_roster().unwrap(),
+        accounts::append_row("", "work", Class::Dedicated, old.to_str()).unwrap(),
+    )
+    .unwrap();
+    let store = env.accounts_store();
+    let renew = |dir: &Path| {
+        store.transact_logins(env.now, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "work",
+                None,
+                dir.to_str().unwrap(),
+                None,
+                env.now,
+            ))
+        })
+    };
+    renew(&old).unwrap();
+    let witness = store.state_witness_file();
+    let retained = witness.with_extension("retained");
+    std::fs::rename(&witness, &retained).unwrap();
+    std::fs::create_dir(&witness).unwrap();
+    assert!(renew(&new).is_err());
+    assert!(store.load(env.now).is_err(), "publication was admitted");
+    std::fs::rename(&witness, witness.with_extension("obstruction")).unwrap();
+    std::fs::rename(&retained, &witness).unwrap();
+
+    let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+    let doc: Value = aterm_json::from_str(out.trim()).unwrap();
+    assert_eq!(doc["accounts"][0]["label"], Value::from("work"), "{out}");
+    assert!(!out.contains("state-unread"), "{out}");
+    assert_eq!(store.load_logins(env.now).unwrap().0.generation_clock, 2);
+}
+
+#[test]
+fn accounts_stats_refuses_all_account_metadata_when_any_record_is_unreadable() {
+    for damaged in ["state", "logins", "roster", "receipt"] {
+        let tmp = tmp_dir("stats-refused");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".claude.json"), stats_profile()).unwrap();
+        let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+        let store = env.accounts_store();
+        store
+            .transact_logins(env.now, &mut None, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state, logins, "known", None, "/known", None, env.now,
+                ))
+            })
+            .unwrap();
+        let path = match damaged {
+            "state" => store.state_file(),
+            "logins" => store.logins_file(),
+            "roster" => env.accounts_roster().unwrap(),
+            "receipt" => store.dir.join("sync-commit.json"),
+            _ => unreachable!(),
+        };
+        std::fs::write(&path, "{").unwrap();
+        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+        let doc: Value = aterm_json::from_str(out.trim()).unwrap();
+        assert!(
+            doc["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|missing| missing["what"] == Value::from("state")
+                    && missing["reason"] == Value::from("state-unread")),
+            "{damaged}: {out}"
+        );
+        assert!(
+            doc["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|missing| missing["what"] == Value::from("used_by")
+                    && missing["reason"] == Value::from("state-unread")),
+            "{damaged}: {out}"
+        );
+        assert_eq!(doc["accounts"][0]["plan"]["word"], Value::from("max"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+    }
+}
+
+#[test]
 fn accounts_stats_names_a_home_it_could_not_resolve() {
     let tmp = tmp_dir("stats-no-home");
     let mut env = env_at(&tmp);
@@ -6489,7 +6632,7 @@ fn a_window_the_tap_never_records_says_so() {
     let refused = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
                    [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"/logins/x\"\n";
     std::fs::write(&roster, refused).expect("roster");
-    assert_eq!(reason(&env), Value::from("tap-not-this-home"), "refused");
+    assert_eq!(reason(&env), Value::from("state-unread"), "refused");
     let work = tmp.path().join("logins").join("work");
     std::fs::create_dir_all(&work).expect("work");
     std::fs::write(work.join(".claude.json"), stats_profile()).expect("its login");
@@ -7540,5 +7683,7 @@ fn signin_parses_for_grok_alone_and_wait_belongs_to_it() {
     ] {
         assert!(parse(&words(line)).is_err(), "{line} should be refused");
     }
-    assert!(help_page(HelpPage::Signin).contains("NEEDS YOU: approve Grok Build sign-in"));
+    let signin = help_page(HelpPage::Signin);
+    assert!(signin.contains("Grok Build signs in by itself from now on"));
+    assert!(signin.contains("aterm approves its page itself first, in a headless browser"));
 }

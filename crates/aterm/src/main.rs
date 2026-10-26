@@ -282,11 +282,19 @@ pub(crate) fn main() -> ExitCode {
             #[cfg(not(target_os = "macos"))]
             aterm_cli::Verb::Machines => machines_unavailable(),
             #[cfg(target_os = "macos")]
-            aterm_cli::Verb::Init => aterm_machines::init::main_entry(
-                forwarded,
-                &doctor::init_base,
-                &aterm_cli::macos_doctor::full_disk_access,
-            ),
+            aterm_cli::Verb::Init => {
+                // The run's phase totals go to aterm.log, never to this terminal.
+                aterm_gui::install_session_log();
+                aterm_machines::init::main_entry(
+                    forwarded,
+                    &aterm_machines::init::Host {
+                        base: &doctor::init_base,
+                        full_disk_access: &aterm_cli::macos_doctor::full_disk_access,
+                        records: &aterm_cli::macos_doctor::InitRecords,
+                        grants: aterm_cli::macos_doctor::init_grants,
+                    },
+                )
+            }
             #[cfg(not(target_os = "macos"))]
             aterm_cli::Verb::Init => {
                 eprintln!("aterm init: local macOS setup is available on macOS only");
@@ -492,8 +500,11 @@ pub(crate) fn main() -> ExitCode {
     }
 
     let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+    // The day's host settings are this Mac's: a remote shell (ssh) changes none of them and
+    // leaves the day's slot to a session at its console.
     if cfg!(target_os = "macos")
         && session_lane_is_interactive()
+        && !session_away_from_console()
         && let Some(layout) = layout.as_ref()
         && atpkg::machine::launch_apply_due(layout, now).runs(log_launch_apply_stood_aside)
     {
@@ -692,6 +703,20 @@ fn session_lane_is_interactive() -> bool {
     stdin_is_terminal()
 }
 
+/// Whether this terminal session runs outside the console owner's own graphic session: an ssh
+/// login, a session without the window server, or another login at this Mac's screen
+/// (`aterm_machines::console::remote`).
+#[cfg(target_os = "macos")]
+fn session_away_from_console() -> bool {
+    aterm_machines::console::remote_here()
+}
+
+/// Off macOS no host settings are applied at launch.
+#[cfg(not(target_os = "macos"))]
+fn session_away_from_console() -> bool {
+    true
+}
+
 fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
     use aterm_update_core::pkg_check;
     pkg_check::full_pass_owed(&atpkg::status::pass_stamps(layout, now_unix), now_unix).is_some()
@@ -875,8 +900,14 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
     let first_run = {
         let restoring_window = std::env::var_os(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some();
         let setup_args = first_run_window_args(args, restoring_window);
-        first_run_window_eligible(setup_args, doctor_startup_env())
-            .then_some(apply_first_run_doctor as fn() -> bool)
+        // An update successor resumes an admitted run but never shows a review: the person
+        // may be away while the update relaunched this window ([`Review::Withheld`]).
+        let start: fn() -> bool = if restoring_window {
+            apply_successor_first_run
+        } else {
+            apply_first_run_doctor
+        };
+        first_run_window_eligible(setup_args, doctor_startup_env()).then_some(start)
     };
     #[cfg(not(target_os = "macos"))]
     let first_run = {
@@ -907,15 +938,18 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
 }
 
 /// What keeps a launch from first-run setup, which belongs to a window started by the person at
-/// this Mac: a private state root (a laboratory's) or CI, a scope outside the person's, or ssh.
+/// this Mac: a private state root (a laboratory's) or CI, a scope outside the person's, or a
+/// remote session.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Default)]
 struct DoctorStartupEnv {
     isolated: bool,
     outside_person_scope: bool,
-    /// Started from an ssh login: the person is at another machine, so setup waits for a window
-    /// started at this Mac.
-    ssh: bool,
+    /// Started outside the console owner's own graphic session: from an ssh login, in a session
+    /// without the window server, or with another login (or nobody) at this Mac's screen
+    /// (`aterm_machines::console::remote`). The person is not at this Mac, so setup waits for a
+    /// window started at it.
+    remote: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -923,21 +957,24 @@ fn doctor_startup_env() -> DoctorStartupEnv {
     doctor_startup_env_from(
         |key| std::env::var_os(key),
         aterm_cli::macos_doctor::lasting_scope_refusal(),
+        aterm_machines::console::remote_here,
     )
 }
 
-/// [`doctor_startup_env`] from the environment variable reader `var` and the process's lasting
-/// scope refusal (`aterm_cli::macos_doctor::lasting_scope_refusal`), which a test feeds from
-/// scratch account paths.
+/// [`doctor_startup_env`] from the environment variable reader `var`, the process's lasting
+/// scope refusal (`aterm_cli::macos_doctor::lasting_scope_refusal`) and its console session
+/// reading (`aterm_machines::console::remote_here`, asked only when no ssh marker answers),
+/// which a test feeds from scratch account paths and a fixed answer.
 #[cfg(target_os = "macos")]
 fn doctor_startup_env_from(
     var: impl Fn(&str) -> Option<OsString>,
     lasting_scope_refusal: Option<String>,
+    away_from_console: impl FnOnce() -> bool,
 ) -> DoctorStartupEnv {
     DoctorStartupEnv {
         isolated: var("ATERM_STATE_HOME").is_some() || var("CI").is_some(),
         outside_person_scope: lasting_scope_refusal.is_some(),
-        ssh: var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some(),
+        remote: var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some() || away_from_console(),
     }
 }
 
@@ -945,7 +982,7 @@ fn doctor_startup_env_from(
 /// opened it, or from its update predecessor.
 #[cfg(any(target_os = "macos", test))]
 fn first_run_window_eligible(args: &[OsString], env: DoctorStartupEnv) -> bool {
-    if env.isolated || env.outside_person_scope || env.ssh {
+    if env.isolated || env.outside_person_scope || env.remote {
         return false;
     }
     let args = strip_mode_flags(args);
@@ -966,13 +1003,24 @@ fn first_run_window_args(args: &[OsString], restoring_window: bool) -> &[OsStrin
 
 #[cfg(target_os = "macos")]
 fn apply_first_run_doctor() -> bool {
+    start_first_run(Review::Offered)
+}
+
+/// An update successor's first-run setup ([`Review::Withheld`]).
+#[cfg(target_os = "macos")]
+fn apply_successor_first_run() -> bool {
+    start_first_run(Review::Withheld)
+}
+
+#[cfg(target_os = "macos")]
+fn start_first_run(review: Review) -> bool {
     match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
-        .spawn(|| {
+        .spawn(move || {
             // A plan aterm chose by itself on an earlier launch widens only through a review of
             // its own, which the watch offers as soon as the startup is done ([`AlabWatch`]):
             // nothing is widened unreviewed (System State design §3.5).
-            run_startup_setup(None);
+            run_startup_setup_with(None, review);
         }) {
         Ok(_) => true,
         Err(why) => {
@@ -1003,12 +1051,30 @@ struct Widened {
 /// watch widened, so a Stop pressed since its look, or asked for the plan it widened, stops the
 /// run it admitted.
 #[cfg(target_os = "macos")]
-fn run_startup_setup(mut widened: Option<Widened>) {
+fn run_startup_setup(widened: Option<Widened>) {
+    run_startup_setup_with(widened, Review::Offered);
+}
+
+/// Whether a startup may show its plan on System State for review ([`SetupStartup::may_offer`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Review {
+    /// A launch the person started, or a startup a person's press began: the plan is offered.
+    Offered,
+    /// An update successor's: nobody may be at this Mac while the update relaunched the window,
+    /// so a setup never reviewed waits for the person, who opens System State from a note
+    /// (`aterm_gui::note_setup_unfinished`); a plan already admitted still resumes.
+    Withheld,
+}
+
+/// [`run_startup_setup`] for a startup whose review is `review`.
+#[cfg(target_os = "macos")]
+fn run_startup_setup_with(mut widened: Option<Widened>, review: Review) {
     let running = StartupRunning::enter();
     run_repaired_startups(|reserved| {
         let mut password = None;
         let (prepared, mut sent, recovered) =
-            prepare_first_run_doctor(reserved, |initial, look, on_begin| {
+            prepare_first_run_doctor(reserved, review, |initial, look, on_begin| {
                 let mut answer = aterm_gui::await_initial_setup_answer_while(
                     initial,
                     || {
@@ -1714,6 +1780,7 @@ fn startup_offer_withdrawn(finished: impl FnOnce() -> bool) -> bool {
 #[cfg(target_os = "macos")]
 fn prepare_first_run_doctor(
     reserved: Option<StartupSent>,
+    review: Review,
     offer: impl FnMut(
         aterm_types::macos_setup::Plan,
         StartupLook,
@@ -1722,6 +1789,7 @@ fn prepare_first_run_doctor(
 ) -> (PreparedSetup<StartupClaim>, StartupSent, bool) {
     let mut host = LiveSetupStartup {
         offer,
+        review,
         receipt: None,
         authorization: None,
         last_failure: None,
@@ -2036,6 +2104,12 @@ trait SetupStartup {
         false
     }
     fn admission(&mut self) -> Result<Option<SetupAdmission>, String>;
+    /// Whether this startup may show a plan nobody admitted yet for review: an update
+    /// successor's may not ([`Review::Withheld`]), and leaves a note instead. Asked before the
+    /// plan is read, so a withheld review reads and probes nothing for it.
+    fn may_offer(&mut self) -> bool {
+        true
+    }
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String>;
     fn offer(
         &mut self,
@@ -2083,6 +2157,8 @@ trait SetupStartup {
 struct LiveSetupStartup<F> {
     /// Shows the plan on System State and waits for the page's answer.
     offer: F,
+    /// Whether this startup may show it ([`Review`]).
+    review: Review,
     receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
     authorization: Option<aterm_cli::macos_doctor::InitialSetupAuthorization>,
     last_failure: Option<String>,
@@ -2302,11 +2378,21 @@ impl<
         Ok(plan)
     }
 
+    fn may_offer(&mut self) -> bool {
+        if self.review == Review::Withheld {
+            aterm_gui::note_setup_unfinished();
+            return false;
+        }
+        true
+    }
+
     fn offer(
         &mut self,
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision {
         startup_went_on();
+        // The page shows the review itself: the note an update successor left goes.
+        aterm_gui::clear_setup_unfinished();
         let widen_to = self
             .offered
             .as_ref()
@@ -2444,6 +2530,7 @@ mod startup_answer_tests {
                 vault_typed,
                 ..aterm_gui::WorkstationSetupDecision::Begin(plan).into()
             },
+            review: Review::Offered,
             receipt: None,
             authorization: None,
             last_failure: None,
@@ -2525,6 +2612,7 @@ mod startup_answer_tests {
                 widened: true,
                 ..aterm_gui::WorkstationSetupDecision::Begin(answer.clone()).into()
             },
+            review: Review::Offered,
             receipt: None,
             authorization: None,
             last_failure: None,
@@ -2726,6 +2814,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
         Resume(u64),
         Finished,
         Superseded,
+        Withheld,
     }
     loop {
         let claim = match retry_bound_setup_read(host, H::claim)? {
@@ -2757,6 +2846,9 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
                     BeforeOffer::Resume(admission.revision)
                 });
             }
+            if !host.may_offer() {
+                return Ok(BeforeOffer::Withheld);
+            }
             host.initial().map(BeforeOffer::Initial)
         })();
         if host.stopped() {
@@ -2768,7 +2860,9 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
                 return Ok(PreparedSetup::Authorized { claim, revision });
             }
             Ok(BeforeOffer::Finished) => return Ok(PreparedSetup::Finished),
-            Ok(BeforeOffer::Superseded) => return Ok(PreparedSetup::Unavailable),
+            Ok(BeforeOffer::Superseded | BeforeOffer::Withheld) => {
+                return Ok(PreparedSetup::Unavailable);
+            }
             Err(why) => {
                 drop(claim);
                 if matches!(
@@ -3030,20 +3124,45 @@ fn while_vault_sync_kept_with(
 /// at a later launch once it is due.
 #[cfg(target_os = "macos")]
 fn finish_withheld_preferences() {
-    let report =
-        finish_withheld_preferences_with(aterm_cli::macos_doctor::finish_withheld_preferences);
+    report_withheld_preferences(
+        finish_withheld_preferences_with(
+            aterm_cli::macos_doctor::finish_withheld_preferences_observed,
+        ),
+        |report, observation| {
+            remember_initial_setup_rows(report, None, observation);
+            aterm_gui::publish_initial_setup_status(initial_setup_status());
+        },
+        restore_initial_setup_error,
+    );
+}
+
+/// Keep the follow-up's setup slot until its result has been published: a later choice cannot
+/// publish a newer result only to have this one replace it. The observation came from under
+/// the profile lock, so an external choice since then filters this result out.
+#[cfg(target_os = "macos")]
+fn report_withheld_preferences<S>(
+    finished: (
+        aterm_cli::macos_doctor::InitialSetupObserved<Option<aterm_cli::macos_doctor::Report>>,
+        Option<S>,
+    ),
+    restored: impl FnOnce(
+        &aterm_cli::macos_doctor::Report,
+        Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+    ),
+    failed: impl FnOnce(String, Option<aterm_cli::macos_doctor::InitialSetupObservation>),
+) {
+    let (report, _reservation) = finished;
     // A Restore it finished says so on the page in place of what that Restore left waiting.
-    if let Ok(Some(report)) = &report
-        && report.restore.is_some()
-    {
-        remember_initial_setup_rows(
-            report,
-            None,
-            aterm_cli::macos_doctor::initial_setup_observation().ok(),
-        );
-        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    match &report.result {
+        Ok(Some(restored_report)) if restored_report.restore.is_some() => {
+            restored(restored_report, report.observation);
+        }
+        Err(why) if why.starts_with(aterm_cli::macos_doctor::BACKUP_UNREAD) => {
+            failed(why.clone(), report.observation);
+        }
+        _ => {}
     }
-    match report {
+    match report.result {
         Ok(Some(report)) if report.needs_attention() => aterm_log::warn!(
             "setup follow-up with Full Disk Access: {}",
             report.to_text()
@@ -6277,6 +6396,8 @@ fn register_admitted_run(
     widened_from: Option<u64>,
 ) -> bool {
     start_stop_worker();
+    // A run admitted: setup is no longer waiting for its review.
+    aterm_gui::clear_setup_unfinished();
     SETUP_WIDENED.store(
         if widened_from.is_some() { revision } else { 0 },
         std::sync::atomic::Ordering::Release,
@@ -8167,6 +8288,9 @@ fn start_startup_again() -> bool {
 
 #[cfg(all(test, target_os = "macos"))]
 mod initial_setup_result_tests {
+    #[path = "withheld_restore_result_tests.rs"]
+    mod withheld_restore_result_tests;
+
     #[path = "startup_retry_wake_tests.rs"]
     mod startup_retry_wake_tests;
 
@@ -8672,16 +8796,19 @@ mod initial_setup_result_tests {
                     name: KEY.into(),
                     status: "restored".into(),
                     detail: "original value restored".into(),
+                    elapsed_ms: None,
                 },
                 Row {
                     name: "Caps Lock key".into(),
                     status: LOGIN.into(),
                     detail: "log out and back in to load the saved mappings".into(),
+                    elapsed_ms: None,
                 },
                 Row {
                     name: "Reload Dock".into(),
                     status: "error".into(),
                     detail: "Dock did not come back".into(),
+                    elapsed_ms: None,
                 },
             ],
             manual_steps: Vec::new(),
@@ -8739,6 +8866,7 @@ mod initial_setup_result_tests {
             name: name.into(),
             status: status.into(),
             detail: detail.into(),
+            elapsed_ms: None,
         };
         let report = Report {
             action: Action::Check,
@@ -8797,6 +8925,7 @@ mod initial_setup_result_tests {
             name: name.into(),
             status: status.into(),
             detail: detail.into(),
+            elapsed_ms: None,
         };
         let repositories = row("GitHub repositories", "ok", "all 3 cloned");
         let report = Report {
@@ -8856,6 +8985,7 @@ mod initial_setup_result_tests {
                     name: "Widgets".into(),
                     status: "blocked".into(),
                     detail: WHY.into(),
+                    elapsed_ms: None,
                 }],
                 manual_steps: Vec::new(),
                 backup: root.path().join("original-preferences.json"),
@@ -13734,9 +13864,10 @@ mod tests {
                 outside_person_scope: true,
                 ..DoctorStartupEnv::default()
             },
-            // A window started over ssh leaves setup to one started at this Mac.
+            // A window started over ssh, or outside the console's graphic session, leaves
+            // setup to one started at this Mac.
             DoctorStartupEnv {
-                ssh: true,
+                remote: true,
                 ..DoctorStartupEnv::default()
             },
         ] {

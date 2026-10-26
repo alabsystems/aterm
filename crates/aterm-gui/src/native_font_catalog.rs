@@ -56,8 +56,9 @@ pub(crate) struct FontRefusal {
 pub(crate) enum FontRefusalReason {
     /// No resolver found the name.
     NotFound,
-    /// The name names a face that does not draw the row's style (`Menlo Italic` in the Bold row).
-    WrongStyle,
+    /// The name names a face that does not draw the row's style (`Menlo Italic` in the Bold
+    /// row): the style it draws there, which the row says.
+    WrongStyle(aterm_render::DrawnStyle),
 }
 
 pub(crate) struct PreparedFonts {
@@ -441,17 +442,24 @@ pub(crate) fn prepare(request: Request) -> Completion {
         let Some(index) = index else { continue };
         let themed = from_theme(style_keys[slot]).is_some();
         match admitted(index) {
-            Some(asset) => match renderer.set_styled_face(slot, &asset.bytes, asset.index) {
+            Some(asset) => match renderer.set_named_styled_face(
+                slot,
+                &asset.bytes,
+                asset.index,
+                asset.instance.clone(),
+            ) {
                 Ok(()) => {
                     // A name that resolved to a face of another style draws
-                    // that face; the row says so rather than "Changed".
-                    if !aterm_render::FaceTarget::for_slot(slot)
-                        .suits_face_in(&asset.bytes, asset.index)
+                    // that face; the row says which style rather than "Changed".
+                    let target = aterm_render::FaceTarget::for_slot(slot);
+                    if let Some(drawn) = target
+                        .drawn_style_in(&asset.bytes, asset.index, asset.instance.as_ref())
+                        .filter(|drawn| !target.suits_style(*drawn))
                     {
                         font_refusals.push(FontRefusal {
                             key: style_keys[slot],
                             family: names[index].0.clone(),
-                            reason: FontRefusalReason::WrongStyle,
+                            reason: FontRefusalReason::WrongStyle(drawn),
                             from_theme: from_theme(style_keys[slot]),
                         });
                     }
@@ -810,7 +818,10 @@ mod tests {
             [FontRefusal {
                 key: crate::prefs::EDIT_FONT_FAMILY_ITALIC,
                 family: bold.to_string_lossy().into_owned(),
-                reason: FontRefusalReason::WrongStyle,
+                reason: FontRefusalReason::WrongStyle(aterm_render::DrawnStyle {
+                    bold: true,
+                    slanted: false,
+                }),
                 from_theme: None,
             }],
             "a bold face in the italic row is named"

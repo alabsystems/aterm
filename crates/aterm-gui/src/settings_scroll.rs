@@ -185,7 +185,7 @@ pub(super) struct ScrollPlan {
     room: f32,
     overhang: f32,
     given: f32,
-    held_start: Option<(usize, bool)>,
+    held_start: Option<HeldStart>,
     gap: f32,
     seated: Option<Seat>,
     segments: Shared<(UiKey, UiKey)>,
@@ -243,6 +243,18 @@ struct CardCaption {
 pub(super) enum ScrollRun {
     Card(usize),
     Group { group: usize, rows: Range<usize> },
+}
+
+/// How the last screen drawn at stop `top` sat, held while nothing scrolls the list
+/// ([`ScrollPlan::held_seat`]): a stop that grows or shrinks in place (a Timer opened under the
+/// pointer) re-decides neither, so it moves nothing on the screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct HeldStart {
+    top: usize,
+    /// Whether it let its run's caption go ([`ScrollPlan::starts_bare`]).
+    bare: bool,
+    /// How far it was nudged so the next card peeks ([`ScrollPlan::peek_seat`]).
+    peek: f32,
 }
 
 /// What one screen of a list draws ([`ScrollPlan::screen`]).
@@ -1397,17 +1409,34 @@ impl ScrollPlan {
             return None;
         }
         let shows = reach - (self.card_top(start, next) - screen.offset);
-        let padding = match self.groups[first] {
+        Some((PEEK_MIN - shows, self.peek_padding(first)))
+    }
+
+    /// How far a screen that starts at stop `first` may be nudged for the next card's peek: the
+    /// stop's blank above its ink (its run's caption's, where it heads one).
+    fn peek_padding(&self, first: usize) -> f32 {
+        match self.groups[first] {
             Some(group) => self.captions[group]
                 .map_or(self.ink_top[first], |(top, _)| top.min(self.lead_of(first))),
             None => self.ink_top[first],
-        };
-        Some((PEEK_MIN - shows, padding))
+        }
     }
 
     fn peek_seat(&self, screen: Screen) -> Screen {
         if screen.view.start == 0 || screen.offset > 0.01 || screen.bare {
             return screen;
+        }
+        // The last screen at this stop, unscrolled, took this nudge (or none) for the stops
+        // as they stood then: a stop grown in place keeps it, rather than shifting the screen
+        // to give the next card back its peek under the pointer.
+        if let Some(held) = self.held_start
+            && held.top == screen.view.start
+        {
+            return if held.peek > 0.01 && held.peek <= self.peek_padding(held.top) + 0.01 {
+                self.nudged(screen, held.peek, false)
+            } else {
+                screen
+            };
         }
         let Some((lacks, padding)) = self.peek_need(&screen) else {
             return screen;
@@ -1431,10 +1460,10 @@ impl ScrollPlan {
         let Some(group) = self.groups.get(top).copied().flatten() else {
             return false;
         };
-        if let Some((at, bare)) = self.held_start
-            && at == top
+        if let Some(held) = self.held_start
+            && held.top == top
         {
-            return bare;
+            return held.bare;
         }
         let lead = self.leads[group];
         let room = self.room + self.given;
@@ -1442,6 +1471,21 @@ impl ScrollPlan {
             && lead > 0.01
             && !self.shows_at(lead, top, room)
             && self.shows_at(0.0, top, room)
+    }
+
+    /// How the screen that starts at stop `top` sits ([`HeldStart`]).
+    fn held_seat(&self, top: usize) -> HeldStart {
+        let bare = self.starts_bare(top);
+        let screen = self.stop_screen(top);
+        HeldStart {
+            top,
+            bare,
+            peek: if bare || screen.bare || screen.view.start != top {
+                0.0
+            } else {
+                screen.offset
+            },
+        }
     }
 
     fn seat_drop(&self, top: usize) -> f32 {
@@ -2247,7 +2291,7 @@ impl SettingsViewState {
                     && record.top == top
                     && (record.plan.room - plan.room).abs() < 0.5
             })
-            .map(|record| (top, record.plan.starts_bare(record.top)));
+            .map(|record| record.plan.held_seat(record.top));
         plan.held_start = held_start;
         let first_screen = self
             .scroll_record
@@ -2803,8 +2847,13 @@ impl SettingsViewState {
         true
     }
 
-    /// Bring `key` into view at the next render when the page's list holds it off screen.
+    /// Bring `key` into view at the next render when the page's list, or the rail, holds it off
+    /// screen.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey) -> bool {
+        if key.as_str().starts_with("settings/nav/") {
+            *self.navigation_reveal.borrow_mut() = Some(key.clone());
+            return true;
+        }
         let listed = self
             .scroll_plan()
             .is_some_and(|plan| plan.stop_of(key).is_some())
@@ -4594,12 +4643,27 @@ pub(super) fn holds_open_disclosure(node: &UiNode) -> bool {
     open || node.children.iter().any(holds_open_disclosure)
 }
 
+/// Whether a row part can be listed a child at a time: a column of children (a segmented
+/// control's wrapped lines among them), or a group that holds one such column alone (a stacked
+/// row's name over its lines, its controls' line holding one control), so a part taller than its
+/// screen is listed a line at a time rather than cut under the list's edge with its last lines
+/// never shown (a seven-line name at 2× in a 152pt window showed one; Dark, the third line of a
+/// wrapped Auto/Light/Dark, none).
 fn splittable(node: &UiNode) -> bool {
     matches!(node.content, UiContent::Group(_))
-        && node.layout.flow == Flow::Column
         && node.layout.offset == 0.0
-        && !node.segmented
-        && !node.children.is_empty()
+        && match (node.layout.flow, node.children.as_slice()) {
+            (Flow::Column, children) => !children.is_empty(),
+            (Flow::Overlay | Flow::Row, [only]) => !node.segmented && splittable(only),
+            _ => false,
+        }
+}
+
+/// Whether `node` stays whole wherever a screen holds it, split only where it is taller than the
+/// most a part may take: a group around one column (a name over its lines), a segmented
+/// control's lines (one control the keyboard enters once while it is whole).
+fn whole_while_it_fits(node: &UiNode) -> bool {
+    node.segmented || node.layout.flow != Flow::Column
 }
 
 fn column_heights(node: &UiNode, height: f32) -> Vec<f32> {
@@ -4635,6 +4699,11 @@ pub(super) fn row_parts(
     most: f32,
     gap: f32,
 ) -> Vec<(UiNode, f32)> {
+    let limit = if whole_while_it_fits(&node) {
+        most.max(limit)
+    } else {
+        limit
+    };
     if height <= limit + 0.01 || !splittable(&node) {
         return vec![(node, height)];
     }
@@ -4653,6 +4722,36 @@ pub(super) fn row_parts(
             row_parts((child, height), inner, inner_most, gap)
         })
         .collect();
+    // A group around one column wraps each part of it as it wraps the column: its child's parts
+    // are already as full as the room holds, and side by side or overlaid they would not stack.
+    if template.layout.flow != Flow::Column {
+        let count = pieces.len();
+        return pieces
+            .into_iter()
+            .enumerate()
+            .map(|(index, (piece, height))| {
+                let mut part = template.clone();
+                let padding = Insets {
+                    top: if index == 0 { padding.top } else { 0.0 },
+                    bottom: if index + 1 == count {
+                        padding.bottom
+                    } else {
+                        0.0
+                    },
+                    ..padding
+                };
+                let height = height + padding.top + padding.bottom;
+                if index > 0 {
+                    part.key = UiKey::new(format!("{}/part-{index}", template.key.as_str()));
+                    part.content = UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group));
+                }
+                part.layout.padding = padding;
+                part.layout.height = Length::Fixed(height);
+                part.children = vec![piece];
+                (part, height)
+            })
+            .collect();
+    }
     let mut parts: Vec<Vec<(UiNode, f32)>> = vec![Vec::new()];
     let mut used = 0.0_f32;
     for (piece, height) in pieces {
@@ -4933,8 +5032,8 @@ pub(super) fn list_page_peeking(
     overhang: Overhang,
 ) -> UiNode {
     let mut items = items;
-    if let Some((name, height)) = state.take_list_head() {
-        items.insert(0, ListItem::Card(Box::new(name), height));
+    for (at, (node, height)) in state.take_list_head().into_iter().enumerate() {
+        items.insert(at, ListItem::Card(Box::new(node), height));
     }
     let items = fit_rows(&items, room, ListFoot::Peek);
     let seated = SeatedList::new(state, &items, room, gap, overhang);

@@ -403,6 +403,7 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
                     name,
                     status,
                     detail,
+                    elapsed_ms: None,
                 })
                 .collect()
         },
@@ -549,6 +550,7 @@ pub(super) fn page(root: &Path, rows: &[Row]) -> super::PassPage {
             name: aterm_types::macos_setup::SECRETS_VAULT_ROW.into(),
             status: row.status.clone(),
             detail: detail.into(),
+            elapsed_ms: None,
         };
         let said = page
             .rows
@@ -608,6 +610,7 @@ mod tests {
             name: "Secrets vault".into(),
             status: "blocked".into(),
             detail: detail.into(),
+            elapsed_ms: None,
         }]
     }
 
@@ -658,6 +661,7 @@ mod tests {
             name: "Secrets vault".into(),
             status: "ok".into(),
             detail: "in vault alab (seq 7)".into(),
+            elapsed_ms: None,
         }];
         record(root, 3, &pace("n", 1_302), true, &mut done).unwrap();
         assert_eq!(done[0].detail, "in vault alab (seq 7)");
@@ -753,6 +757,7 @@ mod tests {
                 name: "Secrets vault".into(),
                 status: "error".into(),
                 detail: "joining the vault: which nothing pins".into(),
+                elapsed_ms: None,
             }]
         };
         let mut rows = failed();
@@ -805,6 +810,7 @@ mod tests {
                 name: "Secrets vault".into(),
                 status: "error".into(),
                 detail: "injected change failure".into(),
+                elapsed_ms: None,
             }]
         };
         let unknown = pace("unchanged source and interface", 1_000);

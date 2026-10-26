@@ -1,0 +1,19 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the stub's custom mode `{"status": 403, "json": {"type": "error", "error": {"type": "permission_error", "message": "OAuth authentication is currently not allowed for this organization."}}}` on a turn under the fake OAuth token, after `/clear`: `⏺ Your organization has disabled Claude subscription access for Claude Code · …` in column 0, wrapped, the composer back, 2.1.310
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ /clear
+
+❯ hi
+
+⏺ Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to
+  enable access
+
+✻ Brewed for 0s · done 12:45 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

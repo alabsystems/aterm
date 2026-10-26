@@ -75,6 +75,6 @@ reason = "the wasm cells do not compile winit; the backend held pin-project and 
 # allow it, so it shares the graph's hashbrown 0.16.1 and no cell gains a package. A
 # plain resolve picks 2.14.x and brings hashbrown 0.17.1 back (+1 package / +25,236
 # lines and a duplicate name in every cell that compiles indexmap); the forge-budget
-# ratchet turns that RED. indexmap leaves the graph with wgpu (win, win-arm, wasm-gpu:
-# GW.5, WP.8). The ledger holds no [[fork]]: vendor/ holds only the first-party
-# astream submodule.
+# ratchet turns that RED. indexmap leaves the graph with wgpu: wasm-gpu at WP.8, win
+# and win-arm at GW.5; the lock keeps it for the wgpu oracles until GW.6. The ledger
+# holds no [[fork]]: vendor/ holds only the first-party astream submodule.

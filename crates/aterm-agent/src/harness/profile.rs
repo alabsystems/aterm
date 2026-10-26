@@ -702,20 +702,13 @@ pub fn custom_oauth(raw: Option<&std::ffi::OsStr>) -> bool {
     raw.is_some_and(|url| !url.is_empty())
 }
 
-/// The method a Claude Code process's login is: a subscription for a stored login that is
-/// renewable or on a known plan, else `None`.
+/// The method a Claude Code process's login is: a subscription for a stored login on a known
+/// plan, else `None`.
 #[must_use]
-pub fn login_method(
-    env: &[String],
-    user_home: &Path,
-    renewable: bool,
-) -> Option<aterm_phase::LoginMethod> {
+pub fn login_method(env: &[String], user_home: &Path) -> Option<aterm_phase::LoginMethod> {
     let who = super::accounts::ProcessLogin::of_exec_env(env)?;
     if !who.stored_login {
         return None;
-    }
-    if renewable {
-        return Some(aterm_phase::LoginMethod::Subscription);
     }
     let path = effective_of(env, user_home)?;
     let plan = read(&path).ok()?.plan.word?;

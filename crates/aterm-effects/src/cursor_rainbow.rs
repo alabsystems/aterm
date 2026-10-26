@@ -373,7 +373,9 @@ impl CursorRainbow {
         };
         let mut at = origin;
         let mut wake = None;
-        for _ in 0..steps {
+        let mut step_idx = 0;
+        while step_idx < steps {
+            step_idx += 1;
             at += frame_interval;
             let ahead = at.saturating_duration_since(origin).as_secs_f32();
             let paint = match (probe_in.paint_prev, probe_in.cfg.paint) {
@@ -560,12 +562,14 @@ impl CursorRainbow {
 
         if cfg.blinking {
             let mut rung_reached = 0u8;
-            for &step in &MOMENTUM_FLARE_STEPS {
-                if paint >= step {
+            let mut si = 0;
+            while si < MOMENTUM_FLARE_STEPS.len() {
+                if paint >= MOMENTUM_FLARE_STEPS[si] {
                     rung_reached += 1;
                 } else {
                     break;
                 }
+                si += 1;
             }
             if rung_reached > self.flare_rung {
                 self.flare_rung = rung_reached;
@@ -726,13 +730,15 @@ impl CursorRainbow {
                 _ => None,
             };
             const INV_HALO_SPAN: f32 = 1.0 / (HALO_LAYERS - 1) as f32;
-            for layer in 0..HALO_LAYERS {
+            let mut layer = 0;
+            while layer < HALO_LAYERS {
                 let t = layer as f32 * INV_HALO_SPAN;
                 let gx = (t * radius_x) as i32 + 1;
                 let gy = (t * radius_y) as i32 + 1;
                 let falloff = (1.0 - t) * (1.0 - t);
                 let cov = (HALO_BASE_COV * falloff * halo_energy).min(OVER_INK_COV_CAP) as u8;
                 if cov == 0 {
+                    layer += 1;
                     continue;
                 }
                 let ring_arc = if layer == 0 {
@@ -770,6 +776,7 @@ impl CursorRainbow {
                     ch + 2 * gy,
                     ring_light,
                 );
+                layer += 1;
             }
             let key = RimMemoKey {
                 cur: (cr, cc),
@@ -846,7 +853,8 @@ impl CursorRainbow {
             let dot_cov = (TWINKLE_DOT_COV * pop * pop * cfg.intensity).min(OVER_INK_COV_CAP) as u8;
             if dot_cov > 0 {
                 let s = (ch / 8).max(2);
-                for k in 0..2u32 {
+                let mut k = 0u32;
+                while k < 2 {
                     let h = self
                         .twinkle_seq
                         .wrapping_mul(0x9E37_79B9)
@@ -860,6 +868,7 @@ impl CursorRainbow {
                     };
                     let hue = shade(spectrum_at(sweep, 0.13 + k as f32 * 0.29), 0.85, 1.0);
                     push_ring_rect(out, geom, cx + dx, cy + dy, s, s, premul_rgb(hue, dot_cov));
+                    k += 1;
                 }
             }
         }
@@ -981,7 +990,10 @@ impl CursorRainbow {
             return (None, None);
         }
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        for q in quads.iter() {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &quads[qi];
+            qi += 1;
             x0 = x0.min(u32::from(q.x));
             y0 = y0.min(u32::from(q.y));
             x1 = x1.max(u32::from(q.x) + u32::from(q.w));
@@ -999,14 +1011,19 @@ impl CursorRainbow {
         scratch.clear();
         scratch.resize(w * h, 0);
         let mut ring_pixels = [0u32; HALO_LAYERS as usize];
-        for (i, &(start, _, _, _)) in rings.iter().enumerate() {
+        let mut i = 0;
+        while i < rings.len() {
+            let start = rings[i].0;
             let end = if i + 1 < rings.len() {
                 rings[i + 1].0
             } else {
                 quads.len()
             };
             let bit = 1u32 << (i * 8);
-            for q in &quads[start..end] {
+            let mut q_idx = start;
+            while q_idx < end {
+                let q = &quads[q_idx];
+                q_idx += 1;
                 if q.alpha != 0 {
                     continue;
                 }
@@ -1014,19 +1031,28 @@ impl CursorRainbow {
                 let qw = usize::from(q.w);
                 ring_pixels[i] += u32::from(q.w) * u32::from(q.h);
                 let mut row_start = (u32::from(q.y) - y0) as usize * w + x_off;
-                for _ in 0..q.h {
-                    for px in &mut scratch[row_start..row_start + qw] {
-                        *px += bit;
+                let mut row_idx = 0;
+                while row_idx < q.h {
+                    let row_end = row_start + qw;
+                    let mut p_idx = row_start;
+                    while p_idx < row_end {
+                        scratch[p_idx] += bit;
+                        p_idx += 1;
                     }
                     row_start += w;
+                    row_idx += 1;
                 }
             }
+            i += 1;
         }
         let mut buckets = [(0u32, 0u32); 32];
         let mut n_buckets = 0usize;
         let mut buckets_complete = true;
         let mut last_bucket: (u32, usize) = (0, 0);
-        for &mask in &scratch {
+        let mut si = 0;
+        while si < scratch.len() {
+            let mask = scratch[si];
+            si += 1;
             if mask == 0 {
                 continue;
             }
@@ -1066,17 +1092,25 @@ impl CursorRainbow {
             };
             const FIELD_PEAK: f32 = crate::color_math::relative_luminance(FIELD) * 255.0;
             let mut peak = FIELD_PEAK;
-            for &(mask, _) in &buckets[..n_buckets] {
+            let mut bi = 0;
+            while bi < n_buckets {
+                let mask = buckets[bi].0;
+                bi += 1;
                 let mut px = FIELD;
                 let mut m = mask;
-                for &c in &cols[..rings_len] {
+                let mut ri = 0;
+                while ri < rings_len {
                     if m == 0 {
                         break;
                     }
+                    let c = cols[ri];
+                    ri += 1;
                     let hits = m & 0xff;
                     m >>= 8;
-                    for _ in 0..hits {
+                    let mut hi = 0;
+                    while hi < hits {
                         px = crate::spectrum::compose_on_glass(px, c, 0);
+                        hi += 1;
                     }
                 }
                 if px != FIELD {
@@ -1087,21 +1121,31 @@ impl CursorRainbow {
         };
         let pile_light = |cols: &[u32; HALO_LAYERS as usize]| -> f32 {
             let mut aurora = 0.0f32;
-            for (i, &px_count) in ring_pixels[..rings_len].iter().enumerate() {
-                aurora += px_count as f32 * crate::color_math::relative_luminance(cols[i]);
+            let mut i = 0;
+            while i < rings_len {
+                aurora += ring_pixels[i] as f32 * crate::color_math::relative_luminance(cols[i]);
+                i += 1;
             }
             let mut sum = 0.0f32;
-            for &(mask, count) in &buckets[..n_buckets] {
+            let mut bi = 0;
+            while bi < n_buckets {
+                let (mask, count) = buckets[bi];
+                bi += 1;
                 let mut px = page;
                 let mut m = mask;
-                for &c in &cols[..rings_len] {
+                let mut ri = 0;
+                while ri < rings_len {
                     if m == 0 {
                         break;
                     }
+                    let c = cols[ri];
+                    ri += 1;
                     let hits = m & 0xff;
                     m >>= 8;
-                    for _ in 0..hits {
+                    let mut hi = 0;
+                    while hi < hits {
                         px = crate::spectrum::compose_on_glass(px, c, 0);
+                        hi += 1;
                     }
                 }
                 if px != page {
@@ -1113,9 +1157,12 @@ impl CursorRainbow {
         };
         let mut grey_rings = [0u32; HALO_LAYERS as usize];
         let mut init_cols = [0u32; HALO_LAYERS as usize];
-        for (i, &(_, cov, _, light)) in rings.iter().enumerate() {
+        let mut i = 0;
+        while i < rings_len {
+            let (_, cov, _, light) = rings[i];
             grey_rings[i] = premul_rgb(RIM_LIGHT_GREY, cov);
             init_cols[i] = light;
+            i += 1;
         }
         let target = pile_light(&grey_rings);
         let have = pile_light(&init_cols);
@@ -1126,8 +1173,11 @@ impl CursorRainbow {
         }
         let solve = |scale: f32| -> [u32; HALO_LAYERS as usize] {
             let mut c = [0u32; HALO_LAYERS as usize];
-            for (i, &(_, cov, arc, _)) in rings.iter().enumerate() {
+            let mut i = 0;
+            while i < rings_len {
+                let (_, cov, arc, _) = rings[i];
                 c[i] = ring_light_on_page(arc, cov, page, scale);
+                i += 1;
             }
             c
         };
@@ -1139,7 +1189,9 @@ impl CursorRainbow {
             hi = 1.0;
             (None, Some((init_cols, have)))
         };
-        for _ in 1..8 {
+        let mut iter = 1;
+        while iter < 8 {
+            iter += 1;
             let mid = 0.5 * (lo + hi);
             let c = solve(mid);
             if matches!(lo_solved, Some((lc, _)) if lc == c) {
@@ -1200,7 +1252,10 @@ impl CursorRainbow {
             return 0.0;
         }
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        for q in quads {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &quads[qi];
+            qi += 1;
             x0 = x0.min(u32::from(q.x));
             y0 = y0.min(u32::from(q.y));
             x1 = x1.max(u32::from(q.x) + u32::from(q.w));
@@ -1221,20 +1276,32 @@ impl CursorRainbow {
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
         scratch.resize(w * h, FIELD);
-        for q in quads {
+        let mut qi = 0;
+        while qi < quads.len() {
+            let q = &quads[qi];
+            qi += 1;
             let x_off = (u32::from(q.x) - x0) as usize;
             let qw = usize::from(q.w);
             let mut row_start = (u32::from(q.y) - y0) as usize * w + x_off;
-            for _ in 0..q.h {
-                for px in &mut scratch[row_start..row_start + qw] {
-                    *px = crate::spectrum::compose_on_glass(*px, q.color, q.alpha);
+            let mut row_idx = 0;
+            while row_idx < q.h {
+                let row_end = row_start + qw;
+                let mut p_idx = row_start;
+                while p_idx < row_end {
+                    scratch[p_idx] =
+                        crate::spectrum::compose_on_glass(scratch[p_idx], q.color, q.alpha);
+                    p_idx += 1;
                 }
                 row_start += w;
+                row_idx += 1;
             }
         }
         let mut last_px = FIELD;
         let mut peak = FIELD_PEAK;
-        for &px in &scratch {
+        let mut si = 0;
+        while si < scratch.len() {
+            let px = scratch[si];
+            si += 1;
             if px != FIELD && px != last_px {
                 last_px = px;
                 peak = peak.max(crate::color_math::relative_luminance(px) * 255.0);

@@ -5,6 +5,38 @@
 
 use super::*;
 
+/// How far from `centre` the farthest and the nearest pixel `quads` light stand: a ring's rim
+/// lies between its inner and outer radius.
+fn rim_reach(quads: &[GlowQuad], (cx, cy): (f32, f32)) -> Option<(f32, f32)> {
+    let mut reach: Option<(f32, f32)> = None;
+    for q in quads.iter().filter(|q| q.color != 0) {
+        for y in q.y..q.y + q.h {
+            for x in q.x..q.x + q.w {
+                let d = (f32::from(x) + 0.5 - cx).hypot(f32::from(y) + 0.5 - cy);
+                reach = Some(reach.map_or((d, d), |(near, far)| (near.min(d), far.max(d))));
+            }
+        }
+    }
+    reach
+}
+
+/// A ring's radius and rim at `ms` of a 300 ms life on `g`, as [`CursorGlow::emit_ring_rim`]
+/// lays it for a hop (`scale` 1).
+fn rim_at(g: Geom, ms: u64, life_s: f32, scale: f32) -> (f32, f32) {
+    let t = (ms as f32 / 1000.0 / life_s).clamp(0.0, 1.0);
+    (
+        (0.7 + t) * g.ch as f32 * classic_ring_radius_factor(scale),
+        (g.ch as f32 / 8.0).max(2.0),
+    )
+}
+
+/// Whether `quads` lie on the ring about `centre` ([`rim_at`]), within two pixels' slack (the
+/// rim is laid in whole pixels from a centre cut to one).
+fn on_the_rim(quads: &[GlowQuad], centre: (f32, f32), (radius, rim): (f32, f32)) -> bool {
+    rim_reach(quads, centre)
+        .is_some_and(|(near, far)| near >= radius - rim - 2.0 && far <= radius + 2.0)
+}
+
 #[test]
 fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     let g = geom();
@@ -58,7 +90,7 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
 }
 
 #[test]
-fn every_style_lands_a_veil_ring_on_light() {
+fn every_style_lands_a_veil_and_a_rim_on_light() {
     let g = geom();
     let born = Instant::now();
     let ring = Ring {
@@ -102,7 +134,17 @@ fn every_style_lands_a_veil_ring_on_light() {
             );
             continue;
         }
-        assert!(out.is_empty(), "{style:?}: no additive ring quads on light");
+        assert!(
+            !out.is_empty()
+                && out
+                    .iter()
+                    .all(|q| q.alpha > 0 && f32::from(q.alpha) <= LIGHT_INK_ALPHA_CAP),
+            "{style:?}: the light ring's rim is source-over ink under the over-text ceiling"
+        );
+        assert!(
+            on_the_rim(&out, (100.0, 40.0), rim_at(g, 60, 0.30, 1.0)),
+            "{style:?}: the light ring's rim is round about its landing"
+        );
         assert!(
             !halos.is_empty() && halos.iter().all(|h| h.mode == HaloMode::Over),
             "{style:?}: the light ring is a source-over veil"
@@ -177,7 +219,7 @@ fn classic_landing_ring_expands_wider_with_the_jump() {
 }
 
 #[test]
-fn the_dark_landing_ring_is_a_soft_bloom_in_its_row() {
+fn the_dark_landing_ring_is_a_round_rim_over_a_soft_bloom_in_its_row() {
     let g = geom();
     let born = Instant::now();
     let c = cfg(GlowStyle::Phaser, true);
@@ -217,9 +259,13 @@ fn the_dark_landing_ring_is_a_soft_bloom_in_its_row() {
             &mut out,
             &mut halos,
         );
-        assert!(out.is_empty(), "no quad in the ring at {ms}ms: {out:?}");
+        assert!(
+            on_the_rim(&out, (100.0, 40.0), rim_at(g, ms, 0.30, 1.0)),
+            "the ring's rim is round about its landing at {ms}ms: {:?}",
+            rim_reach(&out, (100.0, 40.0))
+        );
         assert!(!halos.is_empty(), "the ring blooms at {ms}ms");
-        let (across, down) = lines(&out, &halos, 100, 40);
+        let (across, down) = lines(&[], &halos, 100, 40);
         let peak = *across.iter().max().unwrap_or(&0);
         assert!(peak > 0, "the bloom is lit at {ms}ms");
         assert!(
@@ -668,9 +714,23 @@ fn a_paper_landing_veil_stays_in_the_caret_row_at_the_text_bar() {
                         &mut out,
                         &mut halos,
                     );
+                    // The rim is round about the caret's cell, past its row as a ring
+                    // is; the veil under it stays in the row.
+                    if style.reads_knob(TrailKnob::Ring, KnobContext::widest(false)) {
+                        assert!(
+                            on_the_rim(
+                                &out,
+                                g.cell_center(caret.0, caret.1),
+                                rim_at(g, ms, 0.40, 1.6)
+                            ),
+                            "{style:?} on {bg:06x}, {ms} ms: the rim is round about the caret: {:?}",
+                            rim_reach(&out, g.cell_center(caret.0, caret.1))
+                        );
+                    } else {
+                        assert!(out.is_empty(), "{style:?}: no rim without a Ring knob");
+                    }
                     let mut glass = Glass::new(g, bg);
                     glass.add_halos(&halos);
-                    glass.add_quads(&out);
                     for y in 0..i32::from(g.win_h) {
                         for x in 0..i32::from(g.win_w) {
                             let p = glass.at(y, x);
@@ -859,9 +919,19 @@ fn a_dark_landing_veil_stays_in_the_caret_row_in_its_hue() {
                         &mut out,
                         &mut halos,
                     );
+                    // The rim is round about the caret's cell, past its row as a ring
+                    // is; the veil under it stays in the row.
+                    assert!(
+                        on_the_rim(
+                            &out,
+                            g.cell_center(caret.0, caret.1),
+                            rim_at(g, ms, 0.40, 1.6)
+                        ),
+                        "{style:?} on {bg:06x}, {ms} ms: the rim is round about the caret: {:?}",
+                        rim_reach(&out, g.cell_center(caret.0, caret.1))
+                    );
                     let mut glass = Glass::new(g, bg);
                     glass.add_halos(&halos);
-                    glass.add_quads(&out);
                     for y in 0..i32::from(g.win_h) {
                         for x in 0..i32::from(g.win_w) {
                             let p = glass.at(y, x) & 0x00FF_FFFF;

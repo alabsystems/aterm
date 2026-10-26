@@ -121,59 +121,72 @@ pub fn recipient_retirement_model() -> Model {
 
 /// Vault removal follows retained Commons retirement; retries never mint an
 /// extra epoch and a failed publication cannot restore a retired device.
+/// `controlled` is Commons control: a control entry the published document or
+/// the edit names, or Commons state the admin's Mac keeps. The custody marker
+/// alone is not control, so a vault without control removes vault-only.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn retirement_publication_model() -> Model {
     aterm_spec::ty_model! {
         DbRetirementPublication {
             const Buggy = 0;
-            var scenario = 0; var bound = 0; var retired = 0; var published = 0; var same = 1;
+            var scenario = 0; var controlled = 0; var retired = 0; var published = 0; var same = 1;
             action Revoke when (scenario == 0) {
-                scenario = 1; bound = 1; retired = if Buggy == 1 {0} else {1}; published = if Buggy == 10 {0} else {1}; same = 0;
+                scenario = 1; controlled = 1; retired = if Buggy == 1 {0} else {1}; published = if Buggy == 10 {0} else {1}; same = 0;
             }
             action PublishFailure when (scenario == 0) {
-                scenario = 2; bound = 1; retired = if Buggy == 2 {0} else {1}; published = 0; same = 0;
+                scenario = 2; controlled = 1; retired = if Buggy == 2 {0} else {1}; published = 0; same = 0;
             }
             action Retry when (scenario == 0) {
-                scenario = 3; bound = 1; retired = 1; published = 1; same = if Buggy == 3 {0} else {1};
+                scenario = 3; controlled = 1; retired = 1; published = 1; same = if Buggy == 3 {0} else {1};
             }
             action NoBinding when (scenario == 0) {
-                scenario = 4; bound = 1; retired = if Buggy == 4 {0} else {1}; published = 1; same = 0;
+                scenario = 4; controlled = 1; retired = if Buggy == 4 {0} else {1}; published = 1; same = 0;
             }
             action Legacy when (scenario == 0) {
-                scenario = 5; bound = 0; retired = if Buggy == 5 {1} else {0}; published = 1; same = 1;
+                scenario = 5; controlled = 0; retired = if Buggy == 5 {1} else {0}; published = 1; same = 1;
             }
             action SelfRemoval when (scenario == 0) {
-                scenario = 6; bound = 1; retired = if Buggy == 6 {1} else {0}; published = 0; same = 1;
+                scenario = 6; controlled = 1; retired = if Buggy == 6 {1} else {0}; published = 0; same = 1;
             }
             action Admin when (scenario == 0) {
-                scenario = 7; bound = 1; retired = if Buggy == 7 {1} else {0}; published = 0; same = 1;
+                scenario = 7; controlled = 1; retired = if Buggy == 7 {1} else {0}; published = 0; same = 1;
             }
             action Fork when (scenario == 0) {
-                scenario = 8; bound = 1; retired = if Buggy == 8 {1} else {0}; published = 0; same = 1;
+                scenario = 8; controlled = 1; retired = if Buggy == 8 {1} else {0}; published = 0; same = 1;
             }
             action MissingIdentity when (scenario == 0) {
-                scenario = 9; bound = 1; retired = if Buggy == 9 {1} else {0}; published = 0; same = 1;
+                scenario = 9; controlled = 1; retired = if Buggy == 9 {1} else {0}; published = 0; same = 1;
             }
             action RepairRemoved when (scenario == 0) {
-                scenario = 10; bound = 1; retired = if Buggy == 11 {0} else {1}; published = 1; same = 0;
+                scenario = 10; controlled = 1; retired = if Buggy == 11 {0} else {1}; published = 1; same = 0;
             }
             action BatchRemoved when (scenario == 0) {
-                scenario = 11; bound = 1; retired = if Buggy == 12 {0} else {1}; published = 1; same = 0;
+                scenario = 11; controlled = 1; retired = if Buggy == 12 {0} else {1}; published = 1; same = 0;
             }
             action UnknownBatch when (scenario == 0) {
-                scenario = 12; bound = 1; retired = if Buggy == 13 {1} else {0}; published = 0; same = 1;
+                scenario = 12; controlled = 1; retired = if Buggy == 13 {1} else {0}; published = 0; same = 1;
             }
             action GenericRemoval when (scenario == 0) {
-                scenario = 13; bound = 1; retired = 0; published = if Buggy == 14 {1} else {0}; same = 1;
+                scenario = 13; controlled = 1; retired = 0; published = if Buggy == 14 {1} else {0}; same = 1;
             }
-            invariant RetireBeforeRemoval: bound == 0 || published == 0 || retired == 1;
+            action Unfounded when (scenario == 0) {
+                scenario = 14; controlled = 0; retired = 0; published = if Buggy == 15 {0} else {1}; same = 1;
+            }
+            action RetainedRoot when (scenario == 0) {
+                scenario = 15; controlled = 1; retired = 0; published = if Buggy == 16 {1} else {0}; same = 1;
+            }
+            action UnfoundedEdit when (scenario == 0) {
+                scenario = 16; controlled = 0; retired = 0; published = if Buggy == 17 {0} else {1}; same = 1;
+            }
+            invariant RetireBeforeRemoval: controlled == 0 || published == 0 || retired == 1;
             invariant FailedPublicationRetains: 2 > scenario || scenario > 2 || retired == 1;
             invariant RetryKeepsEpoch: 3 > scenario || scenario > 3 || same == 1;
-            invariant NoInventedRetirement: bound == 1 || retired == 0;
+            invariant NoInventedRetirement: controlled == 1 || retired == 0;
             invariant PreflightProtects: 6 > scenario || scenario > 9 || (retired == 0 && published == 0 && same == 1);
-            invariant UnknownBatchInert: 12 > scenario || (retired == 0 && published == 0 && same == 1);
-            invariant Progress: scenario == 0 || scenario == 2 || scenario > 5 || published == 1;
+            invariant UnknownBatchInert: 12 > scenario || scenario > 13 || (retired == 0 && published == 0 && same == 1);
+            invariant RetainedControlRefuses: 15 > scenario || scenario > 15 || (retired == 0 && published == 0 && same == 1);
+            invariant Progress: scenario == 0 || scenario == 2 || (scenario > 5 && 14 > scenario) || scenario == 15 || published == 1;
         }
     }
 }

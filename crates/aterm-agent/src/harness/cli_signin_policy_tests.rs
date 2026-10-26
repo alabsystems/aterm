@@ -360,3 +360,374 @@ fn vendor_policy_is_rechecked_before_queued_authentication_starts() {
         }
     }
 }
+
+struct ObservationHost<'a> {
+    base: PolicyHost<'a>,
+    operation: i64,
+    fault: i64,
+    obstruction: RefCell<Option<(PathBuf, Option<PathBuf>)>>,
+}
+
+impl ObservationHost<'_> {
+    fn obstruct(&self) {
+        let store = &self.base.world.store;
+        let path = match self.fault {
+            1 => return,
+            2 => store.ledger_path(),
+            3 => store.state_witness_file(),
+            4 => store.logins_witness_file(),
+            5 => store.wake_path(),
+            _ => unreachable!(),
+        };
+        let retained = path.exists().then(|| {
+            let retained = path.with_extension("retained");
+            std::fs::rename(&path, &retained).unwrap();
+            retained
+        });
+        std::fs::create_dir(&path).unwrap();
+        *self.obstruction.borrow_mut() = Some((path, retained));
+    }
+
+    fn repair(&self) {
+        if let Some((path, retained)) = self.obstruction.borrow_mut().take() {
+            std::fs::rename(&path, path.with_extension("obstruction")).unwrap();
+            if let Some(retained) = retained {
+                std::fs::rename(retained, path).unwrap();
+            }
+        }
+    }
+}
+
+impl AccountsHost for ObservationHost<'_> {
+    fn stdin_is_terminal(&self) -> bool {
+        true
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        unreachable!()
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        unreachable!()
+    }
+    fn now(&self) -> i64 {
+        NOW
+    }
+    fn vendor_sign_in(&self, req: &Request<'_>) -> Drove {
+        self.base.authenticate(req);
+        self.obstruct();
+        Drove {
+            host: None,
+            outcome: match self.operation {
+                1 => Outcome::SignedIn {
+                    email: Some("wrong@example.test".into()),
+                    page: false,
+                },
+                2 => Outcome::NeedsSignIn("fixture".into()),
+                3 => Outcome::NeedsYou("fixture".into()),
+                5 => Outcome::Hung,
+                6 | 7 => Outcome::SignedIn {
+                    email: None,
+                    page: false,
+                },
+                _ => unreachable!(),
+            },
+        }
+    }
+    fn codex_account(&self, _: &Path) -> Option<String> {
+        (self.operation == 6).then(|| "wrong@example.test".into())
+    }
+}
+
+fn observation_host(world: &World, operation: i64, fault: i64) -> ObservationHost<'_> {
+    ObservationHost {
+        base: PolicyHost::new(world, 1, 0),
+        operation,
+        fault,
+        obstruction: RefCell::new(None),
+    }
+}
+
+fn run_observation(world: &World, host: &ObservationHost<'_>) -> bool {
+    let logins = world.store.load_logins(NOW).unwrap().0;
+    let rows = accounts::bound(&world.raw, &logins);
+    if host.operation == 4 {
+        host.obstruct();
+        return accounts_observe_signin(
+            &world.store,
+            &world.path,
+            NOW,
+            &mut Vec::new(),
+            |_, _, _| {
+                Ok(vec![
+                    accounts::Event::new(NOW, accounts::Kind::SignIn, "main")
+                        .because("fixture window closed session-kept"),
+                ])
+            },
+        )
+        .is_ok();
+    }
+    let result = renew_one_for(
+        world.cli,
+        NOW,
+        host,
+        &world.store,
+        (rows.row("main").unwrap(), &world.path, &logins),
+        world.raw.rows[0].dir.as_deref(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    matches!(result, Renewal::WrongAccount | Renewal::NeedsPerson)
+}
+
+#[test]
+fn failed_login_observations_never_publish_without_their_history() {
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for operation in 1..=3 {
+            let world = World::new(cli);
+            let before = world.records();
+            let host = observation_host(&world, operation, 2);
+            assert!(!run_observation(&world, &host));
+            host.repair();
+            assert_eq!(world.records(), before, "{cli:?}, operation {operation}");
+        }
+    }
+}
+
+fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
+    let world = World::new(cli);
+    let before = world.records();
+    let state_before = world.store.load(NOW).unwrap().0;
+    let mut expected = world.store.load_logins(NOW).unwrap().0;
+    let roster_before = std::fs::read(&world.path).unwrap();
+    let old_login = Path::new(expected.get("main").unwrap().dir.as_ref().unwrap())
+        .join(cli.connector().stores[0]);
+    std::fs::create_dir_all(old_login.parent().unwrap()).unwrap();
+    std::fs::write(&old_login, b"existing private credential").unwrap();
+    let kind = match operation {
+        1 => {
+            accounts::note_wrong_account(&mut expected, "main", NOW);
+            accounts::Kind::WrongAccount
+        }
+        2 | 3 | 5 => {
+            accounts::note_sign_in_task(
+                &mut expected,
+                "main",
+                if operation == 2 {
+                    accounts::SignInAction::Browser
+                } else {
+                    accounts::SignInAction::Login
+                },
+                NOW,
+            );
+            accounts::Kind::SignIn
+        }
+        4 => accounts::Kind::SignIn,
+        _ => unreachable!(),
+    };
+    let host = observation_host(&world, operation, fault);
+    let accepted = run_observation(&world, &host);
+    let pending = matches!(fault, 3 | 4);
+    let readable = world.store.load(NOW).is_ok() && world.store.load_logins(NOW).is_ok();
+    let mut guarded = readable != pending;
+    if operation != 4 && matches!(fault, 2..=4) {
+        assert!(
+            host.base.staging.borrow().as_ref().unwrap().is_dir(),
+            "an unacknowledged observation retains its staged login"
+        );
+    }
+    host.repair();
+    if fault == 2 {
+        guarded &= world.records() == before;
+        let retry = observation_host(&world, operation, 1);
+        assert!(run_observation(&world, &retry));
+    } else if pending {
+        assert!(world.store.recover_sync_within(&[], &world.path).unwrap());
+    }
+    let logins = world.store.load_logins(NOW).unwrap().0;
+    let state = world.store.load(NOW).unwrap().0;
+    let coherent = logins == expected
+        && state == state_before
+        && world
+            .store
+            .tail(100)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == kind && event.t == NOW && event.account == "main")
+            .count()
+            == 1;
+    let after = world.records();
+    let receipt = std::fs::read(world.store.dir.join("sync-commit.json")).unwrap();
+    let once = !world.store.recover_sync_within(&[], &world.path).unwrap()
+        && world.records() == after
+        && std::fs::read(world.store.dir.join("sync-commit.json")).unwrap() == receipt
+        && host.base.called.get() == (operation != 4);
+    let preserved = std::fs::read(&world.path).unwrap() == roster_before
+        && std::fs::read(old_login).unwrap() == b"existing private credential"
+        && logins.generation_clock == expected.generation_clock;
+    let quiet = after[3] == before[3];
+    [accepted, guarded, coherent, once, preserved, quiet]
+}
+
+pub(crate) fn observation_commit_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherProvider" => {
+            next.insert("provider", state["provider"] + 1);
+        }
+        "AnotherOperation" => {
+            next.insert("operation", state["operation"] + 1);
+        }
+        "AnotherFault" => {
+            next.insert("fault", state["fault"] + 1);
+        }
+        "Observe" => {
+            let observed = observation_case(
+                provider(state["provider"]),
+                state["operation"],
+                state["fault"],
+            );
+            next.insert("phase", 1);
+            for (key, value) in [
+                "accepted",
+                "guarded",
+                "coherent",
+                "once",
+                "preserved",
+                "quiet",
+            ]
+            .into_iter()
+            .zip(observed)
+            {
+                next.insert(key, i64::from(value));
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn signin_observations_conform_to_durable_publication() {
+    let model = aterm_models_harness::account_signin_observation_commit_model();
+    assert_eq!(model.mutant_dials(), (1..=7).collect::<Vec<_>>());
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = observation_commit_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let mut admitted = model.init_state();
+    admitted.insert("phase", 1);
+    admitted.insert("fault", 3);
+    admitted.insert("guarded", 0);
+    assert!(!model.check_invariant("RefusalOrPendingFence", &admitted));
+}
+
+#[test]
+fn secondary_codex_identity_observations_recover_without_another_login() {
+    for operation in [6, 7] {
+        let world = World::new(Cli::Codex);
+        let host = observation_host(&world, operation, 4);
+        assert!(!run_observation(&world, &host));
+        assert!(world.store.load_logins(NOW).is_err());
+        assert!(host.base.staging.borrow().as_ref().unwrap().exists());
+        host.repair();
+        assert!(world.store.recover_sync_within(&[], &world.path).unwrap());
+        let kind = if operation == 6 {
+            accounts::Kind::WrongAccount
+        } else {
+            accounts::Kind::SignIn
+        };
+        assert_eq!(
+            world
+                .store
+                .tail(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == kind && event.t == NOW)
+                .count(),
+            1
+        );
+        assert!(host.base.called.get());
+        assert!(!world.store.recover_sync_within(&[], &world.path).unwrap());
+        assert!(host.base.staging.borrow().as_ref().unwrap().is_dir());
+    }
+}
+
+#[test]
+fn signin_observation_policy_uses_the_admitted_roster_image() {
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let world = World::new(cli);
+        let row = world.raw.rows[0].clone();
+        let original = std::fs::read(&world.path).unwrap();
+        let before = world.records();
+        let receipt_path = world.store.dir.join("sync-commit.json");
+        let receipt_before = std::fs::read(&receipt_path).unwrap();
+        world.change(2);
+        let changed = std::fs::read(&world.path).unwrap();
+        let record = |raw: &Roster| {
+            signin_policy_matches(&row, raw, row.dir.as_deref())?;
+            Ok(vec![accounts::Event::new(
+                NOW,
+                accounts::Kind::SignIn,
+                "main",
+            )])
+        };
+        // A second read would see the original policy, but this transaction read the edit.
+        assert!(
+            accounts_observe_signin(
+                &world.store,
+                &world.path,
+                NOW,
+                &mut Vec::new(),
+                |raw, _, _| {
+                    std::fs::write(&world.path, &original).unwrap();
+                    record(raw)
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(world.records(), before);
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_before);
+        // A conflicting edit after that read fences the admitted record and is preserved.
+        assert!(
+            accounts_observe_signin(
+                &world.store,
+                &world.path,
+                NOW,
+                &mut Vec::new(),
+                |raw, _, _| {
+                    std::fs::write(&world.path, &changed).unwrap();
+                    record(raw)
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&world.path).unwrap(), changed);
+        assert!(world.store.load(NOW).is_err());
+        std::fs::write(&world.path, original).unwrap();
+        assert!(world.store.recover_sync_within(&[], &world.path).unwrap());
+        assert_eq!(
+            world
+                .store
+                .tail(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == accounts::Kind::SignIn)
+                .count(),
+            1
+        );
+    }
+}

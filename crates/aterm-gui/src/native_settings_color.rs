@@ -994,8 +994,7 @@ pub(super) fn tab_color_page(
         SettingsRoute::TabColor.label(),
         route_subtitle(SettingsRoute::TabColor),
     );
-    let room =
-        (settings_list_body_height(state, width, viewport) - used).max(scaled_control_height());
+    let room = page_list_room(state, width, viewport, used);
     let steady_room = (settings_steady_body_height(state, width, viewport) - used)
         .min(room)
         .max(scaled_control_height());

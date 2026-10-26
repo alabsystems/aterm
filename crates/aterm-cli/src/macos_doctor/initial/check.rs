@@ -5,8 +5,9 @@
 
 use super::{
     Action, InitialHost, InitialSetupObserved, LiveInitial, NativeHost, PassPage, Path, Plan,
-    Report, Row, Selection, Stage, access_revision_at, accounts, ensure_person_scope, execute,
-    item_rows, observe_read_only, preferences, readiness_row, rows_ready, state_root, step_page,
+    Report, Row, RowClock, Selection, Stage, access_revision_at, accounts, ensure_person_scope,
+    execute, item_rows, observe_read_only, preferences, readiness_row, rows_ready, state_root,
+    step_page,
 };
 use aterm_secrets::client::{self, Membership, Paths, Status};
 use aterm_secrets::service::{self, Job, State};
@@ -183,6 +184,7 @@ pub(super) fn vault_rows(
             name: Stage::Secrets.name().into(),
             status: "drift".into(),
             detail: "vault source or signer differs; Set up now to enroll".into(),
+            elapsed_ms: None,
         }]);
     };
     let membership_ready = matches!(status.membership, Membership::In { .. } | Membership::Plain);
@@ -230,7 +232,10 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
     };
     let mut page = PassPage::default();
     let mut vault_ready = !Stage::Secrets.selected(plan);
+    // Each stage's rows its producer did not time carry the stage's time.
+    let mut clock = RowClock::start();
     for stage in Stage::ALL {
+        clock.lap(&mut report.rows);
         if !stage.selected(plan) {
             continue;
         }
@@ -275,6 +280,7 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
                     detail: result
                         .err()
                         .unwrap_or_else(|| "the selected check returned no observations".into()),
+                    elapsed_ms: None,
                 };
                 page.merge(step_page(&row, stage.page_rows(&stage.subjects_in(plan))));
                 report.rows.push(row);
@@ -286,8 +292,10 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
             name: "System State".into(),
             status: "ok".into(),
             detail: "no settings selected; no checks ran".into(),
+            elapsed_ms: None,
         });
     }
+    clock.lap(&mut report.rows);
     report.page = Some(page);
     report
 }
@@ -428,6 +436,22 @@ mod tests {
         let report = check_with(&mut host, root.path(), &Plan::from(Selection::none()));
         assert!(host.calls.is_empty());
         assert!(!report.needs_attention());
+    }
+
+    /// EVERY ROW OF A CHECK CARRIES ITS TIME: each stage's readings, and the note when nothing
+    /// is selected (presence only, never a budget).
+    #[test]
+    fn every_check_row_carries_its_time() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for plan in [Plan::default(), Plan::from(Selection::none())] {
+            let report = check_with(&mut Fake::default(), root.path(), &plan);
+            assert!(!report.rows.is_empty());
+            assert!(
+                report.rows.iter().all(|row| row.elapsed_ms.is_some()),
+                "{}",
+                report.to_text()
+            );
+        }
     }
 
     /// A stage whose check fails as a whole is said on the page under the rows it covers, with

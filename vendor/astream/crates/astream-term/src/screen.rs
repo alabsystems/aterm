@@ -153,17 +153,11 @@ use crate::record::Record;
 /// hasher that consumes it without buffering.
 pub(crate) trait ByteSink {
     fn extend_from_slice(&mut self, bytes: &[u8]);
-    fn push(&mut self, byte: u8) {
-        self.extend_from_slice(&[byte]);
-    }
 }
 
 impl ByteSink for Vec<u8> {
     fn extend_from_slice(&mut self, bytes: &[u8]) {
         Vec::extend_from_slice(self, bytes);
-    }
-    fn push(&mut self, byte: u8) {
-        Vec::push(self, byte);
     }
 }
 
@@ -413,6 +407,39 @@ impl Folder {
         }
     }
 
+    /// A fresh folder with normalized [`ScreenOp`] recording enabled, so each
+    /// [`Folder::apply`] appends the emitted ops for incremental draining via
+    /// [`Folder::take_ops`].
+    pub fn new_recording(cols: u16, rows: u16) -> Folder {
+        let mut f = Self::new(cols, rows);
+        f.parser.recording = true;
+        f
+    }
+
+    /// Enable or disable incremental [`ScreenOp`] recording on this folder.
+    pub fn set_recording(&mut self, recording: bool) {
+        self.parser.recording = recording;
+    }
+
+    /// Drain the [`ScreenOp`]s recorded since the last call (empty unless
+    /// recording is enabled via [`Folder::new_recording`] or [`Folder::set_recording`]).
+    pub fn take_ops(&mut self) -> Vec<ScreenOp> {
+        std::mem::take(&mut self.parser.ops)
+    }
+
+    /// Discard any partial mid-record VT escape, OSC/DCS string, or multibyte
+    /// UTF-8 sequence in the parser while keeping the painted [`Screen`] and
+    /// any already-recorded [`ScreenOp`]s intact.
+    ///
+    /// Call this across a stream discontinuity (such as a broker retention
+    /// `Gap`) where intermediate `Out` chunks were dropped: without resetting,
+    /// an unterminated pre-gap OSC/DCS (`State::Str`) would swallow post-gap
+    /// printable bytes, and a partial CSI/UTF-8 prefix would splice onto the
+    /// first post-gap byte.
+    pub fn reset_escape(&mut self) {
+        self.parser.reset_escape();
+    }
+
     /// Advance by one record. `In`/`Exit` do not paint (only echoed `Out` does).
     pub fn apply(&mut self, record: &Record) {
         match record {
@@ -631,7 +658,7 @@ impl Screen {
                 saved.pen.bg,
                 saved.pen.attrs,
             )),
-            None => out.push(0),
+            None => out.extend_from_slice(&[0]),
         }
         match self.alt_saved_cursor {
             Some(saved) => out.extend_from_slice(&encode_saved_cursor_bytes(
@@ -641,17 +668,17 @@ impl Screen {
                 saved.pen.bg,
                 saved.pen.attrs,
             )),
-            None => out.push(0),
+            None => out.extend_from_slice(&[0]),
         }
         match &self.inactive {
             Some(cells) => {
-                out.push(1);
+                out.extend_from_slice(&[1]);
                 out.extend_from_slice(&encode_u32_le_bytes(cells.len() as u32));
                 for cell in cells {
                     out.extend_from_slice(&encode_cell_bytes(cell));
                 }
             }
-            None => out.push(0),
+            None => out.extend_from_slice(&[0]),
         }
         out.extend_from_slice(&encode_scroll_region_bytes(
             self.scroll_top,
@@ -686,7 +713,7 @@ impl Screen {
         let margins = encode_scroll_region_bytes(self.left, self.right);
         let full_width = encode_scroll_region_bytes(0, self.cols.saturating_sub(1));
         if modes != MODES_AT_RESET || charsets != [0; 3] || margins != full_width {
-            out.push(1);
+            out.extend_from_slice(&[1]);
             out.extend_from_slice(&modes);
             out.extend_from_slice(&charsets);
             out.extend_from_slice(&margins);
@@ -2042,6 +2069,15 @@ impl Parser {
         }
     }
 
+    fn reset_escape(&mut self) {
+        self.state = State::Ground;
+        self.params.clear();
+        self.marker = 0;
+        self.csi_ignore = false;
+        self.esc_inter = 0;
+        self.esc_inter_more = false;
+    }
+
     /// Record one top-level op (no-op unless recording). Internal mutator
     /// cascades (deferred-wrap line-feed, line-feed scroll) are deliberately NOT
     /// recorded — they reproduce deterministically when the op is re-applied.
@@ -2569,11 +2605,11 @@ pub fn emit_ops(cols: u16, rows: u16, records: &[Record]) -> Vec<ScreenOp> {
     folder.parser.ops
 }
 
-/// Re-apply a screen-op stream to a fresh screen, re-driving the **same** private
-/// mutators from typed ops — an independent dispatch path that bypasses only the
-/// VT state machine. Reproduces the fold's screen byte-for-byte.
-pub fn apply_ops(cols: u16, rows: u16, ops: &[ScreenOp]) -> Screen {
-    let mut screen = Screen::new(cols, rows);
+/// Re-apply a screen-op slice onto an existing [`Screen`], re-driving the
+/// **same** private mutators from typed ops — an independent dispatch path that
+/// bypasses only the VT state machine. Enables incremental cross-machine
+/// viewers that decode [`ScreenOp`] batches off the bus record-by-record.
+pub fn apply_ops_to(screen: &mut Screen, ops: &[ScreenOp]) {
     for op in ops {
         match op {
             ScreenOp::Print(ch) => screen.put(*ch),
@@ -2616,6 +2652,14 @@ pub fn apply_ops(cols: u16, rows: u16, ops: &[ScreenOp]) -> Screen {
             ScreenOp::Resize(c, r) => screen.resize(*c, *r),
         }
     }
+}
+
+/// Re-apply a screen-op stream to a fresh screen, re-driving the **same** private
+/// mutators from typed ops — an independent dispatch path that bypasses only the
+/// VT state machine. Reproduces the fold's screen byte-for-byte.
+pub fn apply_ops(cols: u16, rows: u16, ops: &[ScreenOp]) -> Screen {
+    let mut screen = Screen::new(cols, rows);
+    apply_ops_to(&mut screen, ops);
     screen
 }
 

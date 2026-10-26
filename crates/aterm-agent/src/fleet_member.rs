@@ -591,14 +591,11 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
         Err(Unwritten::Lock(why)) => return Err(unwritten_config(places, &why)),
     };
     let config_line = ungranted.unwrap_or(line);
-    // A rotate replaced the key an aterm here serves: a member that joins next meets the new one.
-    let served = if opts.rotate {
-        FleetSecret::new(&code.secret)
-            .map(|secret| serves_new_key(places, &secret))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // A new key, a rotate's or a new fleet's (an aterm here may serve a fleet a leave just ended):
+    // a member that joins next meets it.
+    let served = FleetSecret::new(&code.secret)
+        .map(|secret| serves_new_key(places, &secret))
+        .unwrap_or_default();
     let mut out = format!(
         "aterm fleet init: this machine ({}, node {}) is the fleet's issuer{}\n",
         aterm_codec::tty::one_line(&code.host, 80),
@@ -1013,7 +1010,11 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         Ok(registered) => registered,
         Err(why) => {
             say(&out);
-            return Err(failed(not_recorded(&issuer_at, &why, minted)));
+            return Err(failed(not_recorded(
+                &issuer_at,
+                &why,
+                (&places.state, minted),
+            )));
         }
     };
     // Read before the key's write, as a leave reads it: holding another fleet's key, this machine
@@ -1070,7 +1071,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
                     bound: node,
                     proved: issuer_key.map(|_| joined.issuer.node.clone()),
                 },
-                minted,
+                (&places.state, minted),
             )));
         }
         // Only a join of the fleet held here leaves the issuer it named.
@@ -1255,11 +1256,9 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
             places.state.join(NODE_KEY_FILE).display(),
         ),
     );
-    // A join that replaced the key an aterm here serves: a reader that comes next meets the new
-    // one.
-    if replaced.is_some() {
-        out.push_str(&serves_new_key(places, &secret));
-    }
+    // The key a join wrote, where an aterm here may still serve another (one it replaced, or one a
+    // leave just removed): a reader that comes next meets the new one.
+    out.push_str(&serves_new_key(places, &secret));
     if allow == FleetScope::Facts.word() {
         out.push_str(
             "  allow      facts: the fleet reads programs, agent states, roles, task records and \
@@ -1432,6 +1431,10 @@ enum Advice {
     Busy,
     /// The issuer proved itself and gave no answer to the registration.
     Unanswered,
+    /// The registration names the issuer's own node: this machine carries its node files.
+    IssuersNode,
+    /// The issuer left or rotated its fleet while it served the join.
+    MovedOn,
     /// The issuer answered and did not record this machine, for the reason it gave.
     Answered,
     /// Anything else, before any proof: the host and port the code names, and an aterm there.
@@ -1445,6 +1448,8 @@ impl JoinFailed {
             Self::Registration(words) if words.contains(NO_ISSUER) => Advice::NoIssuer,
             Self::Registration(words) if words.contains(member::BEFORE_KEYS) => Advice::BeforeKeys,
             Self::Registration(words) if words.contains(member::REBIND) => Advice::NodeBound,
+            Self::Registration(words) if words.contains(member::OWN_NODE) => Advice::IssuersNode,
+            Self::Registration(words) if words.contains(member::MOVED_ON) => Advice::MovedOn,
             Self::OtherKey(_) | Self::Unproved(_) => Advice::IssuerKey,
             Self::OtherIssuer { proved: None, .. } => Advice::BoundUnproved,
             Self::OtherIssuer { .. } => Advice::BoundIssuer,
@@ -1464,7 +1469,7 @@ impl JoinFailed {
     }
 }
 
-fn not_recorded(issuer_at: &str, why: &JoinFailed, minted: bool) -> String {
+fn not_recorded(issuer_at: &str, why: &JoinFailed, (state, minted): (&Path, bool)) -> String {
     let nothing = if minted {
         format!(
             "Nothing of the fleet was written here; this machine's node key ({NODE_FILE}, \
@@ -1589,6 +1594,20 @@ fn not_recorded(issuer_at: &str, why: &JoinFailed, minted: bool) -> String {
              or this machine's socket failed (as said). If the registration reached it, it may \
              have recorded this machine: `aterm fleet join` again with the same code finishes \
              either way."
+        ),
+        Advice::IssuersNode => format!(
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} This \
+             machine carries the issuer's node ({}, {}): no member joins under its issuer's node, \
+             and nothing on the issuer changes that. Remove those two files here, and a join \
+             mints this machine a node of its own; then join again.",
+            state.join(NODE_FILE).display(),
+            state.join(NODE_KEY_FILE).display()
+        ),
+        Advice::MovedOn => format!(
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} If it \
+             rotated (`aterm fleet init --rotate`), copy the code it issues now (the file its \
+             `aterm fleet init` names); if it left (`aterm fleet leave`), it issues none until \
+             `aterm fleet init` runs there again: copy the code that writes. Then join with it."
         ),
         Advice::Answered => format!(
             "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} The \
@@ -2250,8 +2269,8 @@ fn own_listener(
     ))
 }
 
-/// How long a verb that replaced the key waits for an aterm running here to serve the new one:
-/// its listener reads the key every [`aterm_net::fleet::KEY_READ_EVERY`], and a second more.
+/// How long a verb that wrote the key waits for an aterm running here to serve it: its listener
+/// reads the key every [`aterm_net::fleet::KEY_READ_EVERY`], and a second more.
 const SERVES_NEW_KEY: Duration =
     aterm_net::fleet::KEY_READ_EVERY.saturating_add(Duration::from_secs(1));
 
@@ -2261,10 +2280,11 @@ const PROBE_MIN: Duration = Duration::from_millis(500);
 
 const PROBE_MAX: Duration = Duration::from_secs(1);
 
-/// Once a verb replaced the key an aterm running here serves with `secret`, wait, at most
-/// [`SERVES_NEW_KEY`], while its `[fleet] listen` place answers under another secret, so a
-/// reader or a join that comes next meets the new key; the line saying so where it still does.
-/// Nothing is waited for where nothing answers there under another secret.
+/// Once a verb wrote `secret` as the key an aterm running here serves, wait, at most
+/// [`SERVES_NEW_KEY`], while its `[fleet] listen` place answers under another secret, or nothing
+/// listens there and an aterm runs here ([`aterm_runs_here`]) to bind it, so a reader or a join
+/// that comes next meets the new key; the line saying so where it still does. Nothing is waited
+/// for where anything else answers there, or nothing does and no aterm runs here.
 fn serves_new_key(places: &Places, secret: &FleetSecret) -> String {
     let table = ConfigFile::open(&places.config)
         .map_err(failed)
@@ -2273,25 +2293,61 @@ fn serves_new_key(places: &Places, secret: &FleetSecret) -> String {
         return String::new();
     };
     let end = Instant::now() + SERVES_NEW_KEY;
+    let mut runs = None;
     loop {
         let left = end.saturating_duration_since(Instant::now());
-        let Some(Err(Unreached::Handshake(at, FleetError::ListenerWrongSecret))) = own_listener(
+        let unserved = match own_listener(
             &table,
             (secret, Some(&me)),
             left.clamp(PROBE_MIN, PROBE_MAX),
-        ) else {
-            return String::new();
+        ) {
+            Some(Err(Unreached::Handshake(at, FleetError::ListenerWrongSecret))) => format!(
+                "{at} still answers under another secret {} s after the new key was written: an \
+                 aterm here that has not read it (`aterm ctl status` here reads fleet=listening, \
+                 or refused:<why>), or another fleet's listener holding that port \
+                 (fleet=retrying then)",
+                SERVES_NEW_KEY.as_secs()
+            ),
+            Some(Err(Unreached::Connect(at, e)))
+                if e.kind() == io::ErrorKind::ConnectionRefused
+                    && *runs.get_or_insert_with(aterm_runs_here) =>
+            {
+                format!(
+                    "nothing listens on {at} {} s after the new key was written, though an aterm \
+                     runs here: `aterm ctl status` here reads why (fleet=refused:<why>, or off \
+                     where that aterm reads another aterm.toml)",
+                    SERVES_NEW_KEY.as_secs()
+                )
+            }
+            _ => return String::new(),
         };
         if Instant::now() >= end {
-            return format!(
-                "  listener   {at} still answers under another secret {} s after the new key was \
-                 written: an aterm here that has not read it (`aterm ctl status` here reads \
-                 fleet=listening, or refused:<why>), or another fleet's listener holding that \
-                 port (fleet=retrying then)\n",
-                SERVES_NEW_KEY.as_secs()
-            );
+            return format!("  listener   {unserved}\n");
         }
         std::thread::sleep(PROBE_MIN.min(end.saturating_duration_since(Instant::now())));
+    }
+}
+
+/// A test's answer to whether an aterm runs here ([`aterm_runs_here`]); with none, no aterm does.
+#[cfg(test)]
+type AtermHere = Box<dyn FnMut() -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    static ATERM_HERE: std::cell::RefCell<Option<AtermHere>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether an aterm runs here, to serve `[fleet] listen` once it reads it: its control socket
+/// answers ([`aterm_ctl::front_door_instance`]).
+fn aterm_runs_here() -> bool {
+    #[cfg(test)]
+    {
+        ATERM_HERE.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook()))
+    }
+    #[cfg(not(test))]
+    {
+        aterm_ctl::front_door_instance().is_some()
     }
 }
 
@@ -3682,7 +3738,12 @@ fn drive_again(why: &Unreached) -> bool {
     match why {
         Unreached::Handshake(_, aterm_net::fleet::FleetError::AddressBusy) => true,
         _ if why.hung_up() => true,
-        Unreached::Connect(_, e) => e.kind() == io::ErrorKind::ConnectionRefused,
+        Unreached::Connect(_, e) => matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+        ),
         _ => false,
     }
 }

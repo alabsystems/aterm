@@ -119,11 +119,12 @@ impl TerminalFacts {
             None
         };
         let cmd_seq = term.completed_command_seq();
-        let cmd_done = match term.last_completed_command() {
-            Some(m) => m
-                .exit_code
-                .map(|code| (cmd_seq, code, m.exec_duration_ms())),
-            None => None,
+        let cmd_done = if let Some(m) = term.last_completed_command()
+            && let Some(code) = m.exit_code
+        {
+            Some((cmd_seq, code, m.exec_duration_ms()))
+        } else {
+            None
         };
         Self {
             session,

@@ -17,19 +17,19 @@ autotests = false
 # DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
 # reads (the `ATERM_GPU_*` adapter/power/present seams, the pass-economy
 # ablation `ATERM_GPU_ABLATE_UNORM` with its programmatic twin
-# `GpuRenderer::set_unorm_ablation`, and the `ATERM_METAL_INJECT_LOSS` and
-# `ATERM_GL_INJECT_LOSS` drills). A debug build
+# `GpuRenderer::set_unorm_ablation`, and the `ATERM_METAL_INJECT_LOSS`,
+# `ATERM_GL_INJECT_LOSS` and `ATERM_D3D11_INJECT_LOSS` drills). A debug build
 # compiles them anyway; the release cutter never enables it (aterm-gui's
 # `dev-seams` forwards here).
 dev-seams = []
-# The wgpu ORACLE arm, off in every build but its own lane. On macOS and Linux
-# wgpu is optional and this is its only activator, named on the command line and
-# never by a manifest: `targo --unverified test -p aterm-gpu --features
-# wgpu-oracle` compiles both arms (Metal or GL beside wgpu) and runs the
+# The wgpu ORACLE arm, off in every build but its own lane. On macOS, Linux and
+# Windows wgpu is optional and this is its only activator, named on the command
+# line and never by a manifest: `targo --unverified test -p aterm-gpu --features
+# wgpu-oracle` compiles both arms (Metal, GL or D3D11 beside wgpu) and runs the
 # differential suites (the release's gpu-oracle stage). No dev-dependency turns
 # it on, so `-p` and `--workspace` builds compile one aterm-gpu, and none of
-# wgpu/naga on macOS or Linux. A no-op elsewhere, where wgpu is required. Code
-# gates on `cfg(wgpu_arm)` (build.rs).
+# wgpu/naga on macOS, Linux or Windows. A no-op on the BSDs, where wgpu is
+# required. Code gates on `cfg(wgpu_arm)` (build.rs).
 wgpu-oracle = ["dep:wgpu"]
 # Aos M5a shared-buffer inference (docs/DESIGN-aos-hosted-execution-2026-10-21.md
 # §12): `aterm_gpu::compute`, finite int32-exact/v1 jobs on macOS, compared bit
@@ -115,13 +115,16 @@ wgpu = { version = "29", optional = true, default-features = false, features = [
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 aterm-wasm-abi = { workspace = true }
 
-# Windows: DX12, the only backend wired for the HDR/scRGB present.
-# `as_hal::<Dx12>` hands back wgpu-hal's `IDXGISwapChain3`, which this crate
-# takes over as an aterm-win32 `Com` (one pointer, whatever `windows` version
-# wgpu-hal resolved) and tags scRGB with `SetColorSpace1` through aterm-win32's
-# DXGI vtables (WB.2 of docs/AUDIT-third-party-2026-10-15.md).
+# Windows renders on the first-party Direct3D 11 arm (`src/d3d11`,
+# docs/AUDIT-third-party-2026-10-15.md GW.5 + WB.4) through aterm-win32's COM
+# slices: no wgpu, naga or `windows` crate in the shipped graph. wgpu's DX12
+# backend compiles here only as the oracle (`wgpu-oracle`): the differential
+# suites and the WARP record's wgpu hold (`oracle/warp-frames.tsv`). Its
+# `as_hal::<Dx12>` swap chain is taken over as an aterm-win32 `Com` and tagged
+# scRGB through aterm-win32's DXGI vtables (WB.2), as the D3D11 arm tags its
+# own.
 [target.'cfg(windows)'.dependencies]
-wgpu = { version = "29", default-features = false, features = ["dx12", "wgsl"] }
+wgpu = { version = "29", optional = true, default-features = false, features = ["dx12", "wgsl"] }
 aterm-win32 = { workspace = true }
 
 [dev-dependencies]
@@ -140,6 +143,10 @@ aterm-models-misc = { workspace = true }
 aterm-models-render = { workspace = true }
 # `nova_parity` feeds the clockless supernova emitters into RenderInput directly.
 aterm-effects = { workspace = true }
+
+# The WARP record (`warp_record_tests`) holds each frame by its SHA-256.
+[target.'cfg(windows)'.dev-dependencies]
+aterm-digest = { workspace = true }
 
 # The GL arm's windowed X11 test (`gl::glx`) runs its work in a child, this test
 # binary run again, with its output in a scratch directory: Xlib's error and IO

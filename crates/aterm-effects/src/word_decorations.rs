@@ -1617,15 +1617,32 @@ impl WordDecorations {
             && let Some(start) = ep.nova_start
         {
             let mut remapped = 0usize;
-            for reservation in &mut self.ignitions {
+            let mut i = 0;
+            while i < self.ignitions.len() {
+                let reservation = &mut self.ignitions[i];
                 if reservation.owner == old_ident && reservation.start == start {
                     reservation.owner = new_ident;
                     remapped += 1;
                 }
+                i += 1;
             }
             debug_assert!(remapped <= 1, "one limiter slot per episode");
         }
         self.insert_persist_bounded(new_ident, ep, PersistAdmission::Observed)
+    }
+
+    #[inline]
+    fn oldest_persist(&self) -> Option<(u64, Instant)> {
+        let mut oldest: Option<(u64, Instant)> = None;
+        for (&key, resident) in &self.persist {
+            if match oldest {
+                Some((best_key, best_seen)) => (resident.last_seen, key) < (best_seen, best_key),
+                None => true,
+            } {
+                oldest = Some((key, resident.last_seen));
+            }
+        }
+        oldest
     }
 
     fn insert_persist_bounded(
@@ -1645,18 +1662,7 @@ impl WordDecorations {
         }
 
         while self.persist.len() > PERSIST_CAP {
-            let mut oldest: Option<(u64, Instant)> = None;
-            for (&key, resident) in &self.persist {
-                if match oldest {
-                    Some((best_key, best_seen)) => {
-                        (resident.last_seen, key) < (best_seen, best_key)
-                    }
-                    None => true,
-                } {
-                    oldest = Some((key, resident.last_seen));
-                }
-            }
-            let Some((oldest_key, _)) = oldest else {
+            let Some((oldest_key, _)) = self.oldest_persist() else {
                 break;
             };
             if let Some(evicted) = self.persist.remove(&oldest_key) {
@@ -1664,17 +1670,7 @@ impl WordDecorations {
             }
         }
         if self.persist.len() == PERSIST_CAP {
-            let mut oldest: Option<(u64, Instant)> = None;
-            for (&key, resident) in &self.persist {
-                if match oldest {
-                    Some((best_key, best_seen)) => {
-                        (resident.last_seen, key) < (best_seen, best_key)
-                    }
-                    None => true,
-                } {
-                    oldest = Some((key, resident.last_seen));
-                }
-            }
+            let oldest = self.oldest_persist();
             if !matches!(
                 oldest,
                 Some((oldest_ident, oldest_seen))
@@ -1964,11 +1960,15 @@ impl WordDecorations {
                 *s += d;
             }
         }
-        for occ in &mut self.occ {
-            occ.appeared += d;
+        let mut oi = 0;
+        while oi < self.occ.len() {
+            self.occ[oi].appeared += d;
+            oi += 1;
         }
-        for reservation in &mut self.ignitions {
-            reservation.start += d;
+        let mut ii = 0;
+        while ii < self.ignitions.len() {
+            self.ignitions[ii].start += d;
+            ii += 1;
         }
         if let Some(a) = &mut self.active_until {
             *a += d;
@@ -2526,13 +2526,18 @@ impl WordDecorations {
             };
             let mut tile = self.cat_baker.get_v4(&key);
             if tile.is_none() {
-                for eyes in [EyesFrame::Open, EyesFrame::Happy, EyesFrame::Blink] {
+                const FALLBACK_EYES: [EyesFrame; 3] =
+                    [EyesFrame::Open, EyesFrame::Happy, EyesFrame::Blink];
+                let mut ei = 0;
+                while ei < FALLBACK_EYES.len() {
+                    let eyes = FALLBACK_EYES[ei];
                     if eyes != key.eyes {
                         tile = self.cat_baker.peek_v4(&BakeKeyV4 { eyes, ..key });
                         if tile.is_some() {
                             break;
                         }
                     }
+                    ei += 1;
                 }
             }
             let Some(tile) = tile else {
@@ -2591,10 +2596,13 @@ impl WordDecorations {
             let alpha_scale = f32::from(alpha) * INV_255 * sing;
             let cw_f = f32::from(geom.cell_w);
             let ch_f = f32::from(geom.cell_h);
-            for note in &notes {
-                let Some(note) = note else {
+            let mut ni = 0;
+            while ni < notes.len() {
+                let Some(note) = &notes[ni] else {
+                    ni += 1;
                     continue;
                 };
+                ni += 1;
                 let a = (f32::from(note.alpha) * alpha_scale) as u8;
                 if a == 0 {
                     continue;
@@ -2755,7 +2763,13 @@ impl WordDecorations {
             let cell_dims = (geom.cell_w, geom.cell_h);
             let grid_dims = (geom.cols, geom.rows);
             let mut side = 0u16;
-            for m in pet.motes.iter().flatten() {
+            let mut mi = 0;
+            while mi < pet.motes.len() {
+                let Some(m) = &pet.motes[mi] else {
+                    mi += 1;
+                    continue;
+                };
+                mi += 1;
                 let alpha = (f32::from(m.alpha) * pet_alpha_scale) as u8;
                 if alpha == 0 {
                     continue;
@@ -2811,32 +2825,42 @@ impl WordDecorations {
         let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
             [const { None }; crate::kitty_pet::PET_DEPARTURES_MAX];
         let mut depart_len = 0usize;
-        for d in pet.departures.into_iter().flatten() {
-            if d.own_glass {
-                continue;
-            }
-            if let Some(sp) = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h)) {
+        let mut di = 0;
+        while di < pet.departures.len() {
+            if let Some(d) = pet.departures[di]
+                && !d.own_glass
+                && let Some(sp) = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h))
+            {
                 depart_sprites[depart_len] = Some(sp);
                 depart_len += 1;
             }
+            di += 1;
         }
         let mut fp = FNV64_OFFSET;
         if let Some(s) = &sprite {
             fp = fold_free(fp, s);
         }
-        for m in mote_sprites[..mote_len].iter().flatten() {
-            fp = fold_free(fp, m);
+        let mut mi = 0;
+        while mi < mote_len {
+            if let Some(m) = &mote_sprites[mi] {
+                fp = fold_free(fp, m);
+            }
+            mi += 1;
         }
-        for slot in &mut depart_sprites[..depart_len] {
-            if let Some(g) = slot.take() {
+        let mut di = 0;
+        while di < depart_len {
+            if let Some(g) = depart_sprites[di].take() {
                 fp = fold_free(fp, &g);
                 free.push(g);
             }
+            di += 1;
         }
-        for slot in &mut mote_sprites[..mote_len] {
-            if let Some(m) = slot.take() {
+        let mut mi = 0;
+        while mi < mote_len {
+            if let Some(m) = mote_sprites[mi].take() {
                 free.push(m);
             }
+            mi += 1;
         }
         if let Some(s) = sprite {
             free.push(s);
@@ -2870,7 +2894,9 @@ impl WordDecorations {
             false
         }
         let mut free_idx = None;
-        for (i, slot) in self.pet_depart_tiles.iter_mut().enumerate() {
+        let mut i = 0;
+        while i < self.pet_depart_tiles.len() {
+            let slot = &mut self.pet_depart_tiles[i];
             match slot.as_ref() {
                 Some((held, held_art, held_host)) if *held == id => {
                     if *held_host != host || !Arc::ptr_eq(held_art, art) {
@@ -2886,6 +2912,7 @@ impl WordDecorations {
                 }
                 _ => {}
             }
+            i += 1;
         }
         if let Some(i) = free_idx {
             self.pet_depart_tiles[i] = Some((id, Arc::clone(art), host));
@@ -2932,13 +2959,15 @@ impl WordDecorations {
             }
             None => {
                 let mut held_art = None;
-                for slot in &self.pet_depart_tiles {
-                    if let Some((id, art, _)) = slot
+                let mut i = 0;
+                while i < self.pet_depart_tiles.len() {
+                    if let Some((id, art, _)) = &self.pet_depart_tiles[i]
                         && *id == d.id
                     {
                         held_art = Some(Arc::clone(art));
                         break;
                     }
+                    i += 1;
                 }
                 held_art?
             }
@@ -3159,26 +3188,33 @@ impl WordDecorations {
         let mut poly_buf = [aterm_scene::PathCmd::Close; 11];
         let mut fill_poly = |tile: &mut aterm_scene::Tile, pts: &[(f32, f32)], alpha: f32| {
             debug_assert!(pts.len() < poly_buf.len());
-            for (i, &(u, v)) in pts.iter().enumerate() {
+            let mut i = 0;
+            while i < pts.len() {
+                let (u, v) = pts[i];
                 let (x, y) = rp(u, v);
                 poly_buf[i] = if i == 0 {
                     aterm_scene::PathCmd::Move(x, y)
                 } else {
                     aterm_scene::PathCmd::Line(x, y)
                 };
+                i += 1;
             }
             poly_buf[pts.len()] = aterm_scene::PathCmd::Close;
             aterm_scene::fill_path(tile, &[&poly_buf[..=pts.len()]], white, alpha, fit);
         };
         match kind {
             crate::kitty_pet::PetMoteKind::Dust => {
-                for &(u, v, r, a) in &[
-                    (0.42f32, 0.52f32, 0.26f32, 0.50f32),
+                const DUST_DISCS: [(f32, f32, f32, f32); 3] = [
+                    (0.42, 0.52, 0.26, 0.50),
                     (0.68, 0.44, 0.16, 0.42),
                     (0.30, 0.34, 0.12, 0.36),
-                ] {
+                ];
+                let mut i = 0;
+                while i < DUST_DISCS.len() {
+                    let (u, v, r, a) = DUST_DISCS[i];
                     let (x, y) = rp(u, v);
                     tile.disc(x * s, y * s, (r * s).max(1.0), white, a);
+                    i += 1;
                 }
             }
             crate::kitty_pet::PetMoteKind::Zee | crate::kitty_pet::PetMoteKind::ZeePop => {
@@ -3215,9 +3251,13 @@ impl WordDecorations {
             }
             crate::kitty_pet::PetMoteKind::Heart => {
                 fill_poly(tile, &[(0.18, 0.46), (0.82, 0.46), (0.50, 0.86)], 0.85);
-                for &(u, v) in &[(0.34f32, 0.38f32), (0.66, 0.38)] {
+                const HEART_LOBES: [(f32, f32); 2] = [(0.34, 0.38), (0.66, 0.38)];
+                let mut i = 0;
+                while i < HEART_LOBES.len() {
+                    let (u, v) = HEART_LOBES[i];
                     let (x, y) = rp(u, v);
                     tile.disc(x * s, y * s, (0.19 * s).max(1.2), white, 0.85);
+                    i += 1;
                 }
             }
         }
@@ -3555,8 +3595,8 @@ impl WordDecorations {
         let mut row_cells = std::mem::take(&mut self.scan_cells);
         let mut start_row = 0usize;
         'pass: loop {
-            let pass_start = start_row;
-            for r in pass_start..rows {
+            let mut r = start_row;
+            while r < rows {
                 term.render_row_into(r, &mut row_cells);
                 let dec_line = if let Ok(vr) = u16::try_from(r)
                     && let Some(row) = term.grid().row(vr)
@@ -3601,6 +3641,7 @@ impl WordDecorations {
                     }
                     break;
                 }
+                r += 1;
             }
             break;
         }
@@ -3699,8 +3740,11 @@ impl WordDecorations {
             Some((geom, default_bg)) => (Some(cells), Some(geom), Some(default_bg)),
             None => (None, None, None),
         };
+        let pass_end = rows.min(cells.len());
         'pass: loop {
-            for (r, row_slice) in cells.iter().enumerate().take(rows).skip(start_row) {
+            let mut r = start_row;
+            while r < pass_end {
+                let row_slice = &cells[r];
                 let dec_line = matches!(
                     line_sizes.get(r),
                     Some(ls) if *ls != aterm_core::grid::LineSize::SingleWidth
@@ -3743,6 +3787,7 @@ impl WordDecorations {
                     }
                     break;
                 }
+                r += 1;
             }
             break;
         }
@@ -3823,7 +3868,9 @@ impl WordDecorations {
         }
         let mut budget = MAX_OCCURRENCES;
         let mut cutoff = 0usize;
-        for r in (0..rows).rev() {
+        let mut r = rows;
+        while r > 0 {
+            r -= 1;
             load_row(r, row_cells);
             let need_text = cutoff == 0;
             if need_text {
@@ -3832,13 +3879,16 @@ impl WordDecorations {
             let mut ink_first = u16::MAX;
             let mut ink_end = 0u16;
             let mut occupied = false;
-            for (c, cell) in row_cells.iter().enumerate() {
+            let mut c = 0;
+            while c < row_cells.len() {
+                let cell = &row_cells[c];
                 let col = c as u16;
                 if cell.wide {
                     if ink_end == col {
                         ink_first = ink_first.min(col);
                         ink_end = col.saturating_add(1);
                     }
+                    c += 1;
                     continue;
                 }
                 if cell.ch != ' '
@@ -3851,10 +3901,13 @@ impl WordDecorations {
                     if !occupied {
                         occupied = true;
                         if need_text {
-                            for prev in &row_cells[..c] {
+                            let mut pc = 0;
+                            while pc < c {
+                                let prev = &row_cells[pc];
                                 if !prev.wide {
                                     self.scan_text.push(prev.ch);
                                 }
+                                pc += 1;
                             }
                         }
                     }
@@ -3864,6 +3917,7 @@ impl WordDecorations {
                 if need_text && occupied {
                     self.scan_text.push(cell.ch);
                 }
+                c += 1;
             }
             self.pet_ink_spans[r] = if ink_end > ink_first {
                 (ink_first, ink_end)
@@ -3930,13 +3984,16 @@ impl WordDecorations {
         let mut ink_first = u16::MAX;
         let mut ink_end = 0u16;
         let mut occupied = false;
-        for (c, cell) in row_cells.iter().enumerate() {
+        let mut c = 0;
+        while c < row_cells.len() {
+            let cell = &row_cells[c];
             let col = c as u16;
             if cell.wide {
                 if ink_end == col {
                     ink_first = ink_first.min(col);
                     ink_end = col.saturating_add(1);
                 }
+                c += 1;
                 continue;
             }
             if cell.ch != ' '
@@ -3948,11 +4005,14 @@ impl WordDecorations {
             {
                 if !occupied {
                     occupied = true;
-                    for (prev_c, prev) in row_cells[..c].iter().enumerate() {
+                    let mut prev_c = 0;
+                    while prev_c < c {
+                        let prev = &row_cells[prev_c];
                         if !prev.wide {
                             self.scan_text.push(prev.ch);
                             self.scan_colmap.push(prev_c as u16);
                         }
+                        prev_c += 1;
                     }
                 }
                 ink_first = ink_first.min(col);
@@ -3962,6 +4022,7 @@ impl WordDecorations {
                 self.scan_text.push(cell.ch);
                 self.scan_colmap.push(col);
             }
+            c += 1;
         }
         if self.pet_ink_spans.len() <= r {
             self.pet_ink_spans.resize(r + 1, (0, 0));
@@ -4011,7 +4072,10 @@ impl WordDecorations {
             Some(ttl) => ttl,
             None => GRACE_TTL,
         };
-        for &m in matches {
+        let mut mi = 0;
+        while mi < matches.len() {
+            let m = matches[mi];
+            mi += 1;
             let start_col = self.scan_colmap.get(m.start).copied().unwrap_or_default();
             let end_lead = match self.scan_colmap.get(m.end.saturating_sub(1)) {
                 Some(&c) => c,
@@ -4148,9 +4212,14 @@ impl WordDecorations {
             if capture_ink {
                 ink_base = self.ink_base_fg.len();
             }
-            for c in start_col..=end_col {
+            let mut c = start_col;
+            while c <= end_col {
                 let cell = &row_cells[c as usize];
                 if cell.wide {
+                    if c == u16::MAX {
+                        break;
+                    }
+                    c += 1;
                     continue;
                 }
                 if !have_bg {
@@ -4173,6 +4242,10 @@ impl WordDecorations {
                     self.ink_cols.push(c);
                     ink_cells += 1;
                 }
+                if c == u16::MAX {
+                    break;
+                }
+                c += 1;
             }
             out.push(Occurrence {
                 row: r as u16,
@@ -4261,7 +4334,10 @@ impl WordDecorations {
         }
 
         if let Some(surface) = cat_surface {
-            for occ in &mut out {
+            let mut oi = 0;
+            while oi < out.len() {
+                let occ = &mut out[oi];
+                oi += 1;
                 if occ.spec.graphic.is_none() {
                     occ.cat_text_clear = true;
                     occ.cat_peek_down = false;
@@ -4283,11 +4359,14 @@ impl WordDecorations {
 
         self.occ = out;
         if let Some(cell) = cursor {
-            for occ in &self.occ {
+            let mut oi = 0;
+            while oi < self.occ.len() {
+                let occ = &self.occ[oi];
                 if caret_on_span(cell, occ.row, occ.start_col, occ.end_col) {
                     self.caret_word = Some((occ.ident, cell));
                     break;
                 }
+                oi += 1;
             }
             self.last_caret = Some(cell);
         }
@@ -4312,9 +4391,12 @@ impl WordDecorations {
         let pending = std::mem::take(&mut self.pending);
         let mut typed_here = [false; MAX_OCCURRENCES];
         if typed_witness {
-            for (k, p) in pending.iter().enumerate().take(MAX_OCCURRENCES) {
-                let occ = &out[usize::from(p.occ_idx)];
+            let limit = pending.len().min(MAX_OCCURRENCES);
+            let mut k = 0;
+            while k < limit {
+                let occ = &out[usize::from(pending[k].occ_idx)];
                 typed_here[k] = self.typed_edit_reached(occ.row, occ.start_col, occ.end_col);
+                k += 1;
             }
         }
         let mut done = [false; MAX_OCCURRENCES];
@@ -4337,25 +4419,31 @@ impl WordDecorations {
         if unseen_len > 0 && decisions.len() < ALIGN_DECISION_CELLS {
             decisions.resize(ALIGN_DECISION_CELLS, 0);
         }
-        for i in 0..pending.len() {
+        let mut i = 0;
+        while i < pending.len() {
             if done[i] {
+                i += 1;
                 continue;
             }
             let form_id = out[usize::from(pending[i].occ_idx)].form_id;
             let mut group_len = 0usize;
-            for (k, p) in pending.iter().enumerate().skip(i) {
-                if !done[k] && out[usize::from(p.occ_idx)].form_id == form_id {
+            let mut k = i;
+            while k < pending.len() {
+                if !done[k] && out[usize::from(pending[k].occ_idx)].form_id == form_id {
                     done[k] = true;
                     group[group_len] = k;
                     group_len += 1;
                 }
+                k += 1;
             }
             let group = &group[..group_len];
             self.align_old.clear();
             if unseen_len > 0 {
                 let lo = unseen[..unseen_len].partition_point(|&(f, _)| f < form_id);
                 let hi = unseen[lo..unseen_len].partition_point(|&(f, _)| f == form_id) + lo;
-                for &(_, k) in &unseen[lo..hi] {
+                let mut ui = lo;
+                while ui < hi {
+                    let k = unseen[ui].1;
                     // Order does not matter; `align_old` is sorted below by
                     // `(last_row, last_col, key)`.
                     if let std::collections::hash_map::Entry::Occupied(entry) =
@@ -4365,6 +4453,7 @@ impl WordDecorations {
                     {
                         self.align_old.push((k, entry.remove()));
                     }
+                    ui += 1;
                 }
                 self.align_old
                     .sort_unstable_by_key(|(k, ep)| (ep.last_row, ep.last_col, *k));
@@ -4375,12 +4464,14 @@ impl WordDecorations {
                 prev_scores[..=group_len].fill(AlignScore::default());
                 decisions[1..=group_len].fill(2);
                 let same_width = self.have_scanned && self.cols == cols;
-                for oi in 1..=self.align_old.len() {
+                let mut oi = 1;
+                while oi <= self.align_old.len() {
                     let row_base = oi * (MAX_OCCURRENCES + 1);
                     curr_scores[0] = prev_scores[0];
                     decisions[row_base] = 1;
                     let ep = &self.align_old[oi - 1].1;
-                    for gj in 1..=group_len {
+                    let mut gj = 1;
+                    while gj <= group_len {
                         let mut best = prev_scores[gj];
                         let mut decision = 1u8;
                         if curr_scores[gj - 1].better_than(best) {
@@ -4402,8 +4493,10 @@ impl WordDecorations {
                         }
                         curr_scores[gj] = best;
                         decisions[row_base + gj] = decision;
+                        gj += 1;
                     }
                     std::mem::swap(&mut prev_scores, &mut curr_scores);
+                    oi += 1;
                 }
                 let mut oi = self.align_old.len();
                 let mut gj = group_len;
@@ -4420,24 +4513,30 @@ impl WordDecorations {
                     }
                 }
                 matched[..self.align_old.len()].fill(false);
-                for &oi in &winner[..group_len] {
-                    if let Some(oi) = oi {
+                let mut wi = 0;
+                while wi < group_len {
+                    if let Some(oi) = winner[wi] {
                         matched[oi] = true;
                     }
+                    wi += 1;
                 }
             }
             let group_class = out[usize::from(pending[group[0]].occ_idx)].class;
             let mut has_tainted_old = false;
-            for (_, ep) in &self.align_old {
-                if ep.continuity_tainted {
+            let mut ai = 0;
+            while ai < self.align_old.len() {
+                if self.align_old[ai].1.continuity_tainted {
                     has_tainted_old = true;
                     break;
                 }
+                ai += 1;
             }
             let mut group_has_live_caret_completion = false;
             let mut typed_keys = [0u64; MAX_OCCURRENCES];
             let mut typed_keys_len = 0usize;
-            for &k in group {
+            let mut gi = 0;
+            while gi < group.len() {
+                let k = group[gi];
                 if typed_here[k] {
                     if pending[k].live_caret_completion {
                         group_has_live_caret_completion = true;
@@ -4448,10 +4547,13 @@ impl WordDecorations {
                         typed_keys_len += 1;
                     }
                 }
+                gi += 1;
             }
             let group_has_at_live_cursor = typed_keys_len > 0;
 
-            for (j, &k) in group.iter().enumerate() {
+            let mut j = 0;
+            while j < group.len() {
+                let k = group[j];
                 let occ = &mut out[usize::from(pending[k].occ_idx)];
                 if let Some(oi) = winner[j] {
                     matched[oi] = true;
@@ -4527,12 +4629,16 @@ impl WordDecorations {
                     }
                     self.insert_persist_bounded(occ.ident, ep, PersistAdmission::Observed);
                 }
+                j += 1;
             }
-            for (oi, is_matched) in matched[..self.align_old.len()].iter().copied().enumerate() {
-                if is_matched {
+            let mut oi = 0;
+            while oi < self.align_old.len() {
+                if matched[oi] {
+                    oi += 1;
                     continue;
                 }
                 let (old_ident, ep) = self.align_old[oi];
+                oi += 1;
                 if ep.continuity_tainted
                     && ((group_class == Class::Feline && group_has_at_live_cursor)
                         || (group_class == Class::Profanity && group_has_live_caret_completion))
@@ -4549,6 +4655,7 @@ impl WordDecorations {
                 }
                 self.insert_persist_bounded(old_ident, ep, PersistAdmission::Grace);
             }
+            i += 1;
         }
         self.pending = pending;
         self.align_decisions = decisions;
@@ -4608,22 +4715,27 @@ impl WordDecorations {
             (Some(_), None) => {}
             (_, Some(cell)) => {
                 let mut live = None;
-                for occ in &self.occ {
+                let mut oi = 0;
+                while oi < self.occ.len() {
+                    let occ = &self.occ[oi];
                     if caret_on_span(cell, occ.row, occ.start_col, occ.end_col) {
                         live = Some(occ.ident);
                         break;
                     }
+                    oi += 1;
                 }
                 if live.is_none()
                     && let Some((id, at)) = self.caret_word
                     && at.0 == cell.0
                     && at.1 <= cell.1
                 {
-                    for occ in &self.occ {
-                        if occ.ident == id {
+                    let mut oi = 0;
+                    while oi < self.occ.len() {
+                        if self.occ[oi].ident == id {
                             live = Some(id);
                             break;
                         }
+                        oi += 1;
                     }
                 }
                 if live.is_some() {
@@ -4671,7 +4783,10 @@ impl WordDecorations {
             arm_until(&mut active_until, until);
         }
         if prepass.has_bonk {
-            for occ in &self.occ {
+            let mut oi = 0;
+            while oi < self.occ.len() {
+                let occ = &self.occ[oi];
+                oi += 1;
                 if occ.class != Class::Profanity || occ.inert {
                     continue;
                 }
@@ -4707,7 +4822,11 @@ impl WordDecorations {
         let mut cats = 0usize;
         let mut animals = 0usize;
 
-        for (oi, occ) in self.occ.iter().enumerate() {
+        let mut oi = 0;
+        while oi < self.occ.len() {
+            let occ = &self.occ[oi];
+            let cur_oi = oi;
+            oi += 1;
             let ep = if !occ.inert && (occ.spec.graphic.is_some() || occ.spec.burst.is_some()) {
                 self.persist.get(&occ.ident)
             } else {
@@ -4723,7 +4842,7 @@ impl WordDecorations {
                     })
                 ) {
                 ink_fx(
-                    oi,
+                    cur_oi,
                     occ,
                     cfg,
                     now,
@@ -4873,7 +4992,7 @@ impl WordDecorations {
                 BurstKind::Nova => {
                     emit_nova_axis(
                         occ,
-                        oi,
+                        cur_oi,
                         cfg,
                         geom,
                         now,
@@ -4890,7 +5009,7 @@ impl WordDecorations {
                 BurstKind::SuperNova => {
                     emit_super_axis(
                         occ,
-                        oi,
+                        cur_oi,
                         cfg,
                         geom,
                         now,
@@ -4957,7 +5076,8 @@ impl WordDecorations {
                         let frame_rot = self.frame.rotate_left(17);
                         let frame_term = self.frame.wrapping_mul(0x9E37_79B1);
                         let glyphs_len = cfg.glyphs.len().max(1);
-                        for k in 0..density {
+                        let mut k = 0;
+                        while k < density {
                             if out.len() >= MAX_DECORATIONS {
                                 break;
                             }
@@ -4984,6 +5104,7 @@ impl WordDecorations {
                             };
                             fp = fold_deco(fp, &d) ^ frame_term;
                             out.push(d);
+                            k += 1;
                         }
                     } else {
                         let t = elapsed.as_millis() as u64;
@@ -5023,12 +5144,16 @@ impl WordDecorations {
         if let Some((t, cx, cy)) = nuke_pending {
             let grid_w = i32::from(geom.cols) * i32::from(geom.cell_w);
             let base_y = cy + i32::from(geom.cell_h) / 2;
-            for (slot, part, core) in [
-                (0usize, crate::nuke::NukePart::Skirt, false),
+            const NUKE_PARTS: [(usize, crate::nuke::NukePart, bool); 4] = [
+                (0, crate::nuke::NukePart::Skirt, false),
                 (1, crate::nuke::NukePart::Stem, false),
                 (2, crate::nuke::NukePart::Cap, false),
                 (2, crate::nuke::NukePart::Cap, true),
-            ] {
+            ];
+            let mut ni = 0;
+            while ni < NUKE_PARTS.len() {
+                let (slot, part, core) = NUKE_PARTS[ni];
+                ni += 1;
                 let d = if core {
                     crate::nuke::nuke_core_draw(t)
                 } else {
@@ -5072,10 +5197,12 @@ impl WordDecorations {
                 });
             }
         }
-        for s in &self.sightings {
-            if let Some(ep) = self.persist.get_mut(&s.ident) {
+        let mut si = 0;
+        while si < self.sightings.len() {
+            if let Some(ep) = self.persist.get_mut(&self.sightings[si].ident) {
                 ep.logged = true;
             }
+            si += 1;
         }
         if !free.is_empty() {
             fp = fnv_mix_u64(fp, self.cat_baker.version());
@@ -5105,7 +5232,10 @@ impl WordDecorations {
         let mut flags = PrepassFlags::default();
         let mut cat_slots = 0usize;
         let mut animal_slots = 0usize;
-        for occ in &self.occ {
+        let mut oi = 0;
+        while oi < self.occ.len() {
+            let occ = &self.occ[oi];
+            oi += 1;
             if occ.inert {
                 continue;
             }
@@ -5124,7 +5254,10 @@ impl WordDecorations {
                 }
             }
         }
-        for occ in &self.occ {
+        let mut oi = 0;
+        while oi < self.occ.len() {
+            let occ = &self.occ[oi];
+            oi += 1;
             if occ.inert {
                 continue;
             }
@@ -5136,9 +5269,15 @@ impl WordDecorations {
                 continue;
             }
             if !ep.nova_done {
-                match occ.spec.burst.map(|b| b.kind) {
-                    Some(BurstKind::SuperNova) if ep.burst_roll => flags.has_super = true,
-                    Some(BurstKind::Nova) if ep.burst_roll || ep.nova_start.is_some() => {
+                match occ.spec.burst {
+                    Some(BurstSpec {
+                        kind: BurstKind::SuperNova,
+                        ..
+                    }) if ep.burst_roll => flags.has_super = true,
+                    Some(BurstSpec {
+                        kind: BurstKind::Nova,
+                        ..
+                    }) if ep.burst_roll || ep.nova_start.is_some() => {
                         flags.has_nova = true;
                     }
                     _ => {}
@@ -5248,17 +5387,21 @@ impl WordDecorations {
                     }
                 }
             }
-            match occ.spec.burst.map(|b| b.kind) {
-                Some(BurstKind::Sparkle | BurstKind::Starburst)
-                    if !cfg.reduced_motion && ep.burst_roll =>
-                {
+            match occ.spec.burst {
+                Some(BurstSpec {
+                    kind: BurstKind::Sparkle | BurstKind::Starburst,
+                    ..
+                }) if !cfg.reduced_motion && ep.burst_roll => {
                     ep.burst_started = true;
                     let t = now.saturating_duration_since(ep.appeared).as_millis() as u64;
                     if t >= cfg.anim_ms + RESIDUAL_FADE_MS {
                         ep.burst_done = true;
                     }
                 }
-                Some(BurstKind::Glow) if !cfg.reduced_motion && ep.burst_roll => {
+                Some(BurstSpec {
+                    kind: BurstKind::Glow,
+                    ..
+                }) if !cfg.reduced_motion && ep.burst_roll => {
                     ep.burst_started = true;
                     let t = now.saturating_duration_since(ep.appeared).as_millis() as u64;
                     if t >= GLOW_BURST_MS {
@@ -5389,14 +5532,19 @@ impl WordDecorations {
         let ch = i32::from(geom.cell_h);
         let grid_h = i32::from(geom.rows) * ch;
         let r_max = supernova::r_max_for(ch, grid_h);
-        for (i, occ) in self.occ.iter().enumerate() {
+        let mut i = 0;
+        while i < self.occ.len() {
+            let occ = &self.occ[i];
             if !matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::SuperNova) {
+                i += 1;
                 continue;
             }
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
+                i += 1;
                 continue;
             };
             if !ep.burst_roll || ep.nova_done || ep.inert() {
+                i += 1;
                 continue;
             }
             let (cx, cy) = burst_center(occ, geom);
@@ -5406,6 +5554,7 @@ impl WordDecorations {
                 if busy
                     || matches!(sel, Some(sv) if sv.span_selected(occ.row, occ.start_col, occ.end_col))
                 {
+                    i += 1;
                     continue;
                 }
                 if !grant_burst(
@@ -5420,13 +5569,18 @@ impl WordDecorations {
                     &mut self.burst_hint,
                     &mut self.curse_cues,
                 ) {
+                    i += 1;
                     continue;
                 }
             }
-            let Some(start) = ep.nova_start else { continue };
+            let Some(start) = ep.nova_start else {
+                i += 1;
+                continue;
+            };
             let win = super_window_of(ep.burst_tier);
             if now >= start + win {
                 ep.nova_done = true;
+                i += 1;
                 continue;
             }
             busy = true;
@@ -5434,6 +5588,7 @@ impl WordDecorations {
             arm_until(&mut until, end);
             arm_until(&mut self.super_until, end);
             if now < start {
+                i += 1;
                 continue;
             }
             if self.supers.len() < supernova::MAX_ACTIVE_SUPERNOVAE {
@@ -5444,6 +5599,7 @@ impl WordDecorations {
                     r_max,
                 });
             }
+            i += 1;
         }
         until
     }
@@ -5466,16 +5622,21 @@ impl WordDecorations {
         let mut until: Option<Instant> = None;
         let scope = self.scan_scope();
         let ch_f = i32::from(geom.cell_h).max(1) as f32;
-        for (i, occ) in self.occ.iter().enumerate() {
+        let mut i = 0;
+        while i < self.occ.len() {
+            let occ = &self.occ[i];
             // v3 §6 dispatch: the classic nova is the `BurstKind::Nova` arm
             // (profanity `style = "nova"` and custom specs alike).
             if !matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::Nova) {
+                i += 1;
                 continue;
             }
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
+                i += 1;
                 continue;
             };
             if ep.nova_done {
+                i += 1;
                 continue;
             }
             let (cx, cy) = burst_center(occ, geom);
@@ -5484,16 +5645,19 @@ impl WordDecorations {
                 // `chance_pct`: a rolled-off burst never ignites (episodes with
                 // a pre-granted `nova_start` are past the roll).
                 if !ep.burst_roll {
+                    i += 1;
                     continue;
                 }
                 if matches!(sel, Some(sv) if sv.span_selected(occ.row, occ.start_col, occ.end_col))
                 {
+                    i += 1;
                     continue;
                 }
                 if super_busy {
                     if let Some(wake) = super_wake {
                         arm_until(&mut until, wake);
                     }
+                    i += 1;
                     continue;
                 }
                 if !grant_burst(
@@ -5508,22 +5672,29 @@ impl WordDecorations {
                     &mut self.burst_hint,
                     &mut self.curse_cues,
                 ) {
+                    i += 1;
                     continue;
                 }
             }
-            let Some(start) = ep.nova_start else { continue };
+            let Some(start) = ep.nova_start else {
+                i += 1;
+                continue;
+            };
             let d = Duration::from_millis(u64::from(nova_duration_ms(occ.genome.gkey)));
             if now >= start + d {
                 ep.nova_done = true;
+                i += 1;
                 continue;
             }
             let end = start + d;
             arm_until(&mut until, end);
             if now < start {
+                i += 1;
                 continue;
             }
             if self.novas.len() >= nova::MAX_ACTIVE_NOVAS {
                 ep.nova_done = true;
+                i += 1;
                 continue;
             }
             self.novas.push(NovaLive {
@@ -5538,20 +5709,29 @@ impl WordDecorations {
                     None
                 },
             });
+            i += 1;
         }
-        for (ni, nv) in self.novas.iter().enumerate() {
+        let mut ni = 0;
+        while ni < self.novas.len() {
+            let nv = self.novas[ni];
             self.dist_scratch.clear();
-            for (i, occ) in self.occ.iter().enumerate() {
-                if i == usize::from(nv.idx) || occ.ink_cells == 0 {
-                    continue;
+            let mut i = 0;
+            while i < self.occ.len() {
+                let occ = &self.occ[i];
+                if i != usize::from(nv.idx) && occ.ink_cells != 0 {
+                    self.dist_scratch
+                        .push((span_dist2(occ, nv.center_px, geom), i as u16));
                 }
-                self.dist_scratch
-                    .push((span_dist2(occ, nv.center_px, geom), i as u16));
+                i += 1;
             }
             self.dist_scratch.sort_unstable();
-            for &(_, i) in self.dist_scratch.iter().take(nova::MAX_COUPLING_WORDS) {
-                self.coupling.push((i, ni as u8));
+            let take_n = self.dist_scratch.len().min(nova::MAX_COUPLING_WORDS);
+            let mut di = 0;
+            while di < take_n {
+                self.coupling.push((self.dist_scratch[di].1, ni as u8));
+                di += 1;
             }
+            ni += 1;
         }
         until
     }
@@ -5659,13 +5839,15 @@ fn grant_ignition(
     // episodes). The safety bound is the rolling-window count below, over
     // every scope.
     let mut pane_count = 0usize;
-    for r in igns.iter() {
-        if r.pane == pane {
+    let mut ri = 0;
+    while ri < igns.len() {
+        if igns[ri].pane == pane {
             pane_count += 1;
             if pane_count >= MAX_IGNITION_RESERVATIONS {
                 return None;
             }
         }
+        ri += 1;
     }
     let overlap_dist2 = overlap_dist * overlap_dist;
     let check_overlap = overlap_dist > 0.0;
@@ -5674,9 +5856,12 @@ fn grant_ignition(
         let mut count = 0usize;
         let mut overlap = false;
         let mut next_free: Option<Instant> = None;
-        for reservation in igns.iter() {
+        let mut ri = 0;
+        while ri < igns.len() {
+            let reservation = &igns[ri];
             let (t, c) = (reservation.start, reservation.center);
             if t > slot || t + IGNITION_WINDOW <= slot {
+                ri += 1;
                 continue;
             }
             count += 1;
@@ -5689,6 +5874,7 @@ fn grant_ignition(
                 Some(f) => f.min(free),
                 None => free,
             });
+            ri += 1;
         }
         let cap = if overlap { 1 } else { 2 };
         if count < cap {
@@ -5724,11 +5910,14 @@ fn emit_nova_axis(
     active_until: &mut Option<Instant>,
 ) {
     let mut found_nv = None;
-    for n in novas {
+    let mut ni = 0;
+    while ni < novas.len() {
+        let n = novas[ni];
         if usize::from(n.idx) == oi {
-            found_nv = Some(*n);
+            found_nv = Some(n);
             break;
         }
+        ni += 1;
     }
     if let Some(nv) = found_nv {
         let t = now.saturating_duration_since(nv.start).as_millis() as u64;
@@ -5744,18 +5933,22 @@ fn emit_nova_axis(
         {
             let cw = i32::from(geom.cell_w).max(1);
             let mut w = n0;
-            for r in n0..nova.len() {
+            let mut r = n0;
+            while r < nova.len() {
                 let q = nova[r];
                 let ccol = ((i32::from(q.x) + i32::from(q.w) / 2) / cw).max(0) as u16;
                 if !sv.cell_selected(q.row, ccol) {
                     nova[w] = q;
                     w += 1;
                 }
+                r += 1;
             }
             nova.truncate(w);
         }
-        for q in &nova[n0..] {
-            *fp = fold_glow(*fp, q);
+        let mut qi = n0;
+        while qi < nova.len() {
+            *fp = fold_glow(*fp, &nova[qi]);
+            qi += 1;
         }
         let d0 = out.len();
         nova::emit_debris(t, &env, out, MAX_DECORATIONS);
@@ -5763,8 +5956,10 @@ fn emit_nova_axis(
             let cap = nova::MAX_RING_ARC_CELLS.min(MAX_DECORATIONS.saturating_sub(out.len()));
             nova::emit_ring_arc(t, &env, out, cap);
         }
-        for d in &out[d0..] {
-            *fp = fold_deco(*fp, d);
+        let mut di = d0;
+        while di < out.len() {
+            *fp = fold_deco(*fp, &out[di]);
+            di += 1;
         }
     } else {
         let done = match ep {
@@ -5856,11 +6051,14 @@ fn emit_super_axis(
         return;
     }
     let mut found_sv = None;
-    for s in supers {
+    let mut si = 0;
+    while si < supers.len() {
+        let s = supers[si];
         if usize::from(s.idx) == oi {
-            found_sv = Some(*s);
+            found_sv = Some(s);
             break;
         }
+        si += 1;
     }
     if let Some(sv) = found_sv {
         let t = now.saturating_duration_since(sv.start).as_millis() as u64;
@@ -5902,8 +6100,10 @@ fn emit_super_axis(
         {
             split_super_selection(nova, n0, geom, &sv_sel);
         }
-        for q in &nova[n0..] {
-            *fp = fold_glow(*fp, q);
+        let mut qi = n0;
+        while qi < nova.len() {
+            *fp = fold_glow(*fp, &nova[qi]);
+            qi += 1;
         }
         let d0 = out.len();
         supernova::emit_super_decos(t, &env, out, MAX_DECORATIONS);
@@ -5911,17 +6111,21 @@ fn emit_super_axis(
             && sv_sel.sel.has_selection()
         {
             let mut w = d0;
-            for r in d0..out.len() {
+            let mut r = d0;
+            while r < out.len() {
                 let dq = out[r];
                 if !(matches!(dq.blend, DecoBlend::Over) && sv_sel.cell_selected(dq.row, dq.col)) {
                     out[w] = dq;
                     w += 1;
                 }
+                r += 1;
             }
             out.truncate(w);
         }
-        for d in &out[d0..] {
-            *fp = fold_deco(*fp, d);
+        let mut di = d0;
+        while di < out.len() {
+            *fp = fold_deco(*fp, &out[di]);
+            di += 1;
         }
     } else if !cfg.reduced_motion
         && let Some(ep) = ep
@@ -5962,13 +6166,15 @@ fn split_super_selection(quads: &mut Vec<GlowQuad>, n0: usize, geom: EffectGeom,
         let c0 = (i32::from(q.x) / cw).clamp(0, cols - 1);
         let c1 = ((i32::from(q.x) + i32::from(q.w) - 1) / cw).clamp(0, cols - 1);
         let (mut s0, mut s1) = (None, None);
-        for c in c0..=c1 {
+        let mut c = c0;
+        while c <= c1 {
             if sv.cell_selected(q.row, c as u16) {
                 if s0.is_none() {
                     s0 = Some(c);
                 }
                 s1 = Some(c);
             }
+            c += 1;
         }
         let (Some(s0), Some(s1)) = (s0, s1) else {
             i += 1;
@@ -6079,8 +6285,11 @@ fn ink_fx(
     ep: Option<&Episode>,
 ) -> InkFx {
     let mut fx = INK_FX_NONE;
-    for s in supers {
+    let mut si = 0;
+    while si < supers.len() {
+        let s = &supers[si];
         if usize::from(s.idx) != oi {
+            si += 1;
             continue;
         }
         let t = now.saturating_duration_since(s.start).as_millis() as u64;
@@ -6132,8 +6341,11 @@ fn ink_fx(
             }
         }
     }
-    for &(ci, ni) in coupling {
+    let mut cpi = 0;
+    while cpi < coupling.len() {
+        let (ci, ni) = coupling[cpi];
         if usize::from(ci) != oi {
+            cpi += 1;
             continue;
         }
         let nv = &novas[usize::from(ni)];
@@ -6170,6 +6382,7 @@ fn ink_fx(
             }
             break;
         }
+        cpi += 1;
     }
     fx
 }
@@ -6866,19 +7079,26 @@ const PAPER_GLOW_KEEP: f32 = 0.9;
 
 #[inline]
 const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
-    let lum_fg = relative_luminance(fg);
+    let table = crate::color_math::relative_luminance_table();
+    let lum_fg = crate::color_math::relative_luminance_with(table, fg);
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
     }
     let num = lum_bg + 0.05;
     let floor = PAPER_GLOW_KEEP * num / (lum_fg + 0.05);
     #[inline]
-    const fn reads_rgb(rgb: u32, lum_bg: f32, num: f32, floor: f32) -> bool {
-        let lum = relative_luminance(rgb).min(lum_bg);
+    const fn reads_rgb(
+        table: &crate::color_math::RelativeLuminanceTable,
+        rgb: u32,
+        lum_bg: f32,
+        num: f32,
+        floor: f32,
+    ) -> bool {
+        let lum = crate::color_math::relative_luminance_with(table, rgb).min(lum_bg);
         num / (lum + 0.05) >= floor
     }
     let mut hi_rgb = mix_rgb(fg, lit, amp);
-    if reads_rgb(hi_rgb, lum_bg, num, floor) {
+    if reads_rgb(table, hi_rgb, lum_bg, num, floor) {
         return 1.0;
     }
     let mut lo_rgb = fg & 0x00FF_FFFF;
@@ -6887,7 +7107,8 @@ const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
     while step < 12 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(fg, lit, mid);
-        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(mid_rgb, lum_bg, num, floor)) {
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(table, mid_rgb, lum_bg, num, floor))
+        {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -6964,7 +7185,10 @@ fn emit_ink(
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
             let mut memo: Option<([u8; 3], [u8; 3])> = None;
-            for (&col, &fg_rgb) in cols.iter().zip(fgs) {
+            let mut i = 0;
+            while i < cols.len() {
+                let col = cols[i];
+                let fg_rgb = fgs[i];
                 let color = match memo {
                     Some((k, v)) if k == fg_rgb => v,
                     _ => {
@@ -6987,6 +7211,7 @@ fn emit_ink(
                 *fp = fold_ink(*fp, cell);
                 *fp ^= frame_term;
                 ink.push(cell);
+                i += 1;
             }
             return;
         }
@@ -7066,7 +7291,10 @@ fn emit_ink(
     let has_strength = strength > 0.0;
     let dim = fx.dim;
     let has_dim = dim < 1.0;
-    for (&col, &fg_rgb) in cols.iter().zip(fgs) {
+    let mut i = 0;
+    while i < cols.len() {
+        let col = cols[i];
+        let fg_rgb = fgs[i];
         let mut color = if has_strength {
             let u = f32::from(col.saturating_sub(start_col)) * inv_span;
             let base = mix_rgb(c0, c1, u);
@@ -7097,6 +7325,7 @@ fn emit_ink(
             *fp ^= frame_term;
         }
         ink.push(cell);
+        i += 1;
     }
     if animating {
         let until = if ink_loop {
@@ -7110,14 +7339,20 @@ fn emit_ink(
 
 const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum_bg: f32) -> f32 {
     #[inline]
-    const fn contrast(c: u32, lum_bg: f32, lum_bg_plus: f32) -> f32 {
-        let la = relative_luminance(c);
+    const fn contrast(
+        table: &crate::color_math::RelativeLuminanceTable,
+        c: u32,
+        lum_bg: f32,
+        lum_bg_plus: f32,
+    ) -> f32 {
+        let la = crate::color_math::relative_luminance_with(table, c);
         if la >= lum_bg {
             (la + 0.05) / lum_bg_plus
         } else {
             lum_bg_plus / (la + 0.05)
         }
     }
+    let table = crate::color_math::relative_luminance_table();
     let lum_bg_plus = lum_bg + 0.05;
     let mut strength = ink_strength.clamp(0.0, 1.0);
     let step = strength * 0.125;
@@ -7125,6 +7360,7 @@ const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum
         let mut idx = 0;
         while idx < samples.len() {
             if contrast(
+                table,
                 mix_rgb(fg_first, samples[idx], strength),
                 lum_bg,
                 lum_bg_plus,
@@ -7211,7 +7447,10 @@ fn emit_rainbow_ink(
     let has_lift = fx.lift > 0.0;
     let dim = fx.dim;
     let has_dim = dim < 1.0;
-    for (i, (&col, &fg_rgb)) in cols.iter().zip(fgs).enumerate() {
+    let mut i = 0;
+    while i < cols_len {
+        let col = cols[i];
+        let fg_rgb = fgs[i];
         let mut color = if has_strength {
             let target = if span_used == 0.0 || i == 0 {
                 guard_hues[0]
@@ -7242,6 +7481,7 @@ fn emit_rainbow_ink(
             *fp ^= frame_term;
         }
         ink.push(cell);
+        i += 1;
     }
     if animating {
         let until = occ.appeared + Duration::from_millis(drift);
@@ -7285,7 +7525,8 @@ fn emit_rainbow_sparkles(
     let width_f = f32::from(width);
     let env_intensity = cfg.intensity * envelope;
     let hue_drift = 45.0 * p;
-    for i in 0..count {
+    let mut i = 0;
+    while i < count {
         let u = i as f32 * inv_denom;
         let phase = p_tau + i as f32 * 2.094 + seed_phase;
         let (sin_p, cos_p) = crate::supernova::sin_cos_f32(phase);
@@ -7306,6 +7547,7 @@ fn emit_rainbow_sparkles(
         };
         *fp = fold_deco(*fp, &d);
         out.push(d);
+        i += 1;
     }
     *fp ^= frame.wrapping_mul(0xD1B5_4A32_D192_ED03);
     let until = occ.appeared + Duration::from_millis(RAINBOW_SPARKLE_MS);
@@ -7917,9 +8159,10 @@ fn fold_free(mut h: u64, s: &FreeSprite) -> u64 {
     let id = s.art.id();
     h = fnv_mix_u64(h, id as u64);
     h = fnv_mix_u64(h, (id >> 64) as u64);
-    for e in [s.clip.x0, s.clip.y0, s.clip.x1, s.clip.y1] {
-        h = fnv_mix_u64(h, (e as u32) as u64);
-    }
+    h = fnv_mix_u64(h, (s.clip.x0 as u32) as u64);
+    h = fnv_mix_u64(h, (s.clip.y0 as u32) as u64);
+    h = fnv_mix_u64(h, (s.clip.x1 as u32) as u64);
+    h = fnv_mix_u64(h, (s.clip.y1 as u32) as u64);
     h = fnv_mix_u64(h, s.tint as u64);
     h = fnv_mix_u64(h, s.alpha as u64);
     h = fnv_mix_u64(h, s.flip_x as u64);

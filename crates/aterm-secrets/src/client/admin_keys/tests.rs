@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use super::legacy::publish_legacy;
 use super::*;
 use crate::{
     age,
-    client::{self, Admin, Paths},
+    client::{self, Paths},
     commons::{
         binding::{Pending, Request},
         bootstrap::{Bootstrap, Descriptor, Device},
         journal::Journal,
         roster::{Grant, Role},
     },
-    envelope::Unsigned,
     text::Audience,
     transport,
 };
@@ -23,46 +23,6 @@ fn audience() -> Audience {
 
 fn second_identity() -> age::Identity {
     age::Identity::from_secret_bytes([37; 32])
-}
-
-fn legacy_plaintext(admin: &Admin) -> SecretBytes {
-    let seed = Zeroizing::new(crate::b64::encode_padded(&admin.seed));
-    let mut bytes = format!("{LEGACY_MAGIC}\nsigner-seed: {}\n\n", seed.as_str()).into_bytes();
-    bytes.extend_from_slice(admin.doc.render().as_slice());
-    SecretBytes::new(bytes)
-}
-
-/// Emulate an old admin's complete signed publication, including loss of the
-/// independent Commons field. This is deliberately unavailable in production.
-fn publish_legacy(paths: &Paths, admin: &Admin) {
-    let bytes = client::seal(
-        &admin.config.name,
-        admin.seq() + 1,
-        &admin.seed,
-        &admin.commons_seed,
-        admin.commons_bound,
-        &admin.doc,
-        &admin.handoff,
-    )
-    .unwrap();
-    let parsed = envelope::parse(&bytes).unwrap();
-    let mut lockers = parsed.lockers.clone();
-    let recipients = client::recipients_of(&admin.doc.admins(), &admin.doc).unwrap();
-    lockers[0].armored =
-        age::armor(&age::encrypt(&recipients, legacy_plaintext(admin).as_slice()).unwrap());
-    let bytes = envelope::sign(
-        &Unsigned {
-            name: parsed.name.clone(),
-            seq: parsed.seq,
-            time: parsed.time,
-            handoff: parsed.handoff.clone(),
-            lockers,
-        },
-        &admin.seed,
-    )
-    .unwrap();
-    transport::publish(&admin.config.source, &bytes).unwrap();
-    client::sync(paths, None).unwrap();
 }
 
 struct Lab {
@@ -422,6 +382,170 @@ fn malformed_custody_never_becomes_a_legacy_fallback() {
         bytes.extend_from_slice(doc.render().as_slice());
         assert!(parse_admin(&SecretBytes::new(bytes)).is_err());
     }
+}
+
+#[test]
+fn custody_records_its_format_and_a_later_format_names_itself() {
+    let doc = Document::new_vault(
+        "m1",
+        &age::Identity::from_secret_bytes([31; 32])
+            .recipient()
+            .to_bech32(),
+    );
+    let with = |header: &str| {
+        let mut bytes = format!("{header}\n\n").into_bytes();
+        bytes.extend_from_slice(doc.render().as_slice());
+        SecretBytes::new(bytes)
+    };
+    let signer = crate::b64::encode_padded(&[17; 32]);
+    let legacy = parse_admin(&with(&format!("{LEGACY_MAGIC}\nsigner-seed: {signer}"))).unwrap();
+    assert_eq!(legacy.custody, LEGACY_MAGIC);
+    let current =
+        admin_plaintext_with_admissions(&[17; 32], &[19; 32], false, &doc, &Ledger::default());
+    assert_eq!(parse_admin(&current).unwrap().custody, MAGIC);
+
+    let written: u32 = MAGIC
+        .strip_prefix("alab-vault-admin/")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let later = format!("alab-vault-admin/{}", written + 1);
+    let refused = parse_admin(&with(&format!("{later}\nsigner-seed: {signer}")))
+        .err()
+        .expect("a later format is refused")
+        .to_string();
+    assert!(
+        refused.contains(&format!(
+            "{later} is newer than this aterm reads ({MAGIC} at most)"
+        )),
+        "{refused}"
+    );
+    for magic in [
+        "alab-vault-admin/0",
+        "alab-vault-admin/x",
+        "alab-vault-admin/1234567",
+        "vault/9",
+        "",
+    ] {
+        let refused = parse_admin(&with(&format!("{magic}\nsigner-seed: {signer}")))
+            .err()
+            .expect("an unknown format is refused")
+            .to_string();
+        assert_eq!(
+            refused, "admin locker: unsupported custody version",
+            "{magic}"
+        );
+    }
+}
+
+#[test]
+fn a_publish_that_rewrites_a_legacy_locker_asks_the_running_approver_first() {
+    use client::locker_skew::{PLAYED, Running};
+    let play = |running: Option<Running>| {
+        PLAYED.with(|played| *played.borrow_mut() = running.map(|running| vec![running]));
+    };
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("m1"));
+    let source = root.path().join("test.vault");
+    client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    publish_legacy(&paths, &client::admin_open(&paths).unwrap());
+    let admin = client::admin_open(&paths).unwrap();
+    assert_eq!(admin.custody, LEGACY_MAGIC);
+    let mut doc = admin.doc.clone();
+    doc.add_machine("m2", &second_identity().recipient().to_bech32())
+        .unwrap();
+    let old = Running {
+        pid: Some(8000),
+        program: "/opt/old/aterm".into(),
+        version: Ok((0, 1, 0)),
+    };
+
+    play(Some(old.clone()));
+    let refused = client::admin_publish(&paths, &admin, &doc)
+        .expect_err("an older approver refuses the rewrite")
+        .to_string();
+    assert!(
+        refused.contains(&format!("from {LEGACY_MAGIC} to {MAGIC}")),
+        "{refused}"
+    );
+    assert!(refused.contains("(/opt/old/aterm secrets …)"), "{refused}");
+    let after = client::admin_open(&paths).unwrap();
+    assert_eq!(after.seq(), admin.seq(), "nothing was published");
+    assert_eq!(after.custody, LEGACY_MAGIC);
+
+    // A revoke's publish, checked before its retirement, does not ask again.
+    client::admin_publish_checked(&paths, &admin, &doc).unwrap();
+    assert_eq!(client::admin_open(&paths).unwrap().custody, MAGIC);
+    publish_legacy(&paths, &client::admin_open(&paths).unwrap());
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&audience(), "again", b"x").unwrap();
+
+    // CONTROL: with no approver running here, the same publish rewrites the locker.
+    play(None);
+    client::admin_publish(&paths, &admin, &doc).unwrap();
+    let rewritten = client::admin_open(&paths).unwrap();
+    assert_eq!(rewritten.custody, MAGIC);
+
+    // A publish that keeps the locker's format asks nothing of the approver.
+    play(Some(old));
+    let mut doc = rewritten.doc.clone();
+    doc.set_entry(&audience(), "note", b"kept").unwrap();
+    client::admin_publish(&paths, &rewritten, &doc).unwrap();
+    play(None);
+}
+
+#[test]
+fn a_revoke_that_would_strand_the_approver_refuses_before_it_publishes_anything() {
+    use client::locker_skew::{PLAYED, Running};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("m1"));
+    let source = root.path().join("test.vault");
+    client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.add_machine("m2", &second_identity().recipient().to_bech32())
+        .unwrap();
+    client::admin_publish(&paths, &admin, &doc).unwrap();
+    publish_legacy(&paths, &client::admin_open(&paths).unwrap());
+    let admin = client::admin_open(&paths).unwrap();
+    assert_eq!(admin.custody, LEGACY_MAGIC);
+
+    PLAYED.with(|played| {
+        *played.borrow_mut() = Some(vec![Running {
+            pid: Some(8000),
+            program: "/opt/old/aterm".into(),
+            version: Ok((0, 1, 0)),
+        }]);
+    });
+    let refused = match client::admin_revoke(&paths, &admin, "m2", false) {
+        Ok(_) => panic!("an older approver refuses the revoke"),
+        Err(error) => error.to_string(),
+    };
+    assert!(refused.starts_with("refusing to publish:"), "{refused}");
+    assert_eq!(
+        client::admin_open(&paths).unwrap().seq(),
+        admin.seq(),
+        "nothing was published"
+    );
+    // CONTROL: with no approver here, the same revoke publishes. A version-1 vault (bound,
+    // with no Commons control) removes the member from the vault alone, and stays bound.
+    PLAYED.with(|played| *played.borrow_mut() = None);
+    let done = match client::admin_revoke(&paths, &admin, "m2", false) {
+        Ok(done) => done,
+        Err(error) => panic!("a vault without Commons control revokes: {error}"),
+    };
+    assert!(done.retirement.is_none());
+    let after = client::admin_open(&paths).unwrap();
+    assert_eq!(after.custody, MAGIC);
+    assert!(after.commons_bound);
+    assert!(
+        !after
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.name == "m2")
+    );
 }
 
 #[test]

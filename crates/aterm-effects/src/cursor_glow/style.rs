@@ -297,9 +297,16 @@ impl GlowStyle {
     /// `METEOR_SLOPE`; and on a dark ground Length also grows Sparkle's bed under a jump, up to
     /// `SPARKLE_LEAP_WEDGE_GROWTH` times the default length.
     #[must_use]
-    pub fn jump_reach(self, rows: u16, cols: u16, aspect: f32, ctx: KnobContext) -> Option<f32> {
-        let (dr, dc) = (f32::from(rows), f32::from(cols));
-        let leap = rows > 0 || i32::from(cols) >= CursorGlow::METEOR_MIN_COLS;
+    #[inline]
+    pub const fn jump_reach(
+        self,
+        rows: u16,
+        cols: u16,
+        aspect: f32,
+        ctx: KnobContext,
+    ) -> Option<f32> {
+        let (dr, dc) = (rows as f32, cols as f32);
+        let leap = rows > 0 || (cols as i32) >= CursorGlow::METEOR_MIN_COLS;
         let path = match self {
             GlowStyle::Classic | GlowStyle::Comet => dr.max(dc),
             _ => dr.max(dc) - 1.0,

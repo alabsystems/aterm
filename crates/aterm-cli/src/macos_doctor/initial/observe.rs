@@ -175,6 +175,10 @@ enum VaultRead {
         code: Option<String>,
         with_password: bool,
     },
+    /// Asked to join with a join password an admin Mac refused
+    /// (`client::password_refused`): only the password typed again lets it in, so the row's
+    /// fields open for it.
+    Refused,
     /// Asked to join, and the person turned sync off since
     /// ([`aterm_secrets::service::subscriber_off_path`]), so the subscriber that finishes an
     /// approved join does not run. It reads Sync off in place, as [`Self::TurnedOff`] does.
@@ -297,6 +301,7 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
     ) {
         (_, Membership::Unconfigured) => VaultRead::Unconfigured,
         (None, _) => VaultRead::OtherVault,
+        (Some(_), Membership::Pending) if client::password_refused(&paths) => VaultRead::Refused,
         (Some(_), Membership::Pending) if sync_turned_off(&paths.home) => VaultRead::PendingOff {
             code: status.machine.as_ref().map(|(_, code)| code.to_string()),
         },
@@ -383,6 +388,14 @@ const APPROVAL: &str = "Waits for an admin Mac to approve this Mac";
 /// nothing, and Join with it retyped under the row's disclosure sends a new proof.
 const RETYPE: &str = "or retype the join password";
 
+/// What a pending join's approval code is written into on an admin Mac: the command that
+/// approves exactly that Mac (`aterm secrets approve <code>`).
+const APPROVE: &str = "On an admin Mac: aterm secrets approve";
+
+/// The value of a join an admin Mac refused for its join password: its fields open to take it
+/// again (no note, so `vault_shown` opens them).
+const WRONG_PASSWORD: &str = "Wrong password";
+
 /// The Secrets vault row in §3.3's words: Not joined, Awaiting code, Other vault, Out of sync,
 /// Not syncing, Not set up, In sync, or Sync off (the person's choice, so in place). A stopped or
 /// uninstalled subscriber differs, with a note only on a managed row. `here` is the last ALab
@@ -431,9 +444,9 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
             person,
             "Awaiting code",
             Some(if *with_password {
-                format!("Approve on an admin Mac: {code}, {RETYPE}")
+                format!("{APPROVE} {code}, {RETYPE}")
             } else {
-                format!("Approve on an admin Mac: {code}")
+                format!("{APPROVE} {code}")
             }),
         ),
         VaultRead::Pending {
@@ -448,6 +461,7 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
                 APPROVAL.to_owned()
             }),
         ),
+        VaultRead::Refused => (person, WRONG_PASSWORD, None),
         VaultRead::Unconfigured if managed && here.is_some() => {
             (Standing::Waiting, "Not joined", here.map(str::to_owned))
         }
@@ -680,6 +694,7 @@ mod tests {
             explain: None,
             stood_aside: None,
             essential: false,
+            elapsed_ms: None,
         };
         let saved = item(Effect::Login, "Caps Lock→Left Control");
         let live = item(Effect::Now, "Caps Lock acts as Control");
@@ -751,8 +766,21 @@ mod tests {
             (
                 Standing::NeedsYou,
                 "Awaiting code".into(),
-                Some("Approve on an admin Mac: abcd-efgh".into())
+                Some("On an admin Mac: aterm secrets approve abcd-efgh".into())
             )
+        );
+        assert_eq!(
+            words(pending(Some("abcd-efgh"), true), None).2.as_deref(),
+            Some("On an admin Mac: aterm secrets approve abcd-efgh, or retype the join password")
+        );
+        // A refused password needs the person: no note, so the row's fields open for it.
+        assert_eq!(
+            words(VaultRead::Refused, None),
+            (Standing::NeedsYou, WRONG_PASSWORD.into(), None)
+        );
+        assert_eq!(
+            vault_observation(&VaultRead::Refused, false, None).standing,
+            Standing::Differs
         );
         // What the probe heard is a note, and only the words it can stand behind:
         // nothing answering is not proof there is no vault.
@@ -795,6 +823,7 @@ mod tests {
             VaultRead::TurnedOff,
             VaultRead::PendingOff { code: None },
             VaultRead::Fleeting,
+            VaultRead::Refused,
         ] {
             let now = vault_observation(&read, true, None).now.unwrap();
             assert!(now.chars().count() <= 14, "{now}");
@@ -851,6 +880,7 @@ mod tests {
             },
             VaultRead::Fleeting,
             VaultRead::Revoked,
+            VaultRead::Refused,
         ] {
             for managed in [true, false] {
                 for here in [None, scope::VaultHere::Absent.note()] {
@@ -1020,7 +1050,12 @@ mod tests {
                 continue;
             };
             assert_eq!(note.contains(RETYPE), with_password, "{note}");
-            assert!(!note.contains("aterm secrets"), "{note}");
+            // The one command a note names is the one an admin Mac runs for this Mac's code.
+            assert_eq!(
+                note.contains("aterm secrets"),
+                note.starts_with(APPROVE),
+                "{note}"
+            );
         }
         let code = VaultRead::Pending {
             code: Some("abcd-efgh".into()),
@@ -1028,7 +1063,7 @@ mod tests {
         };
         assert_eq!(
             vault_observation(&code, true, None).note.as_deref(),
-            Some("Approve on an admin Mac: abcd-efgh, or retype the join password")
+            Some("On an admin Mac: aterm secrets approve abcd-efgh, or retype the join password")
         );
     }
 }

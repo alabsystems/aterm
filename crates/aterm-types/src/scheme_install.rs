@@ -230,10 +230,12 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Write `bytes` to `dest` through a temporary file in the same folder.
+/// Write `bytes` to `dest` through a temporary file in the same folder, durably flushed, then
+/// flush the folder's entry best-effort ([`aterm_durable::Flush::dir_best_effort`]).
 ///
 /// # Errors
-/// [`InstallError::Exists`] if `dest` exists without `replace`, or [`InstallError::Failed`].
+/// [`InstallError::Exists`] if `dest` exists without `replace`, or [`InstallError::Failed`]: a
+/// failed write leaves `dest` as it was, and a failed flush of the folder leaves the theme in place.
 pub fn write_atomically(
     dir: &Path,
     dest: &Path,
@@ -266,12 +268,28 @@ pub fn write_atomically(
     drop(file);
     written.map_err(|e| failed(&tmp, e))?;
     if replace {
-        again_while_refused(|| std::fs::rename(&tmp, dest)).map_err(|e| failed(dest, e))
+        again_while_refused(|| std::fs::rename(&tmp, dest)).map_err(|e| failed(dest, e))?;
     } else {
         // Only an exclusive operation can publish without replacement: a
         // theme may appear after any check that the name is free.
-        publish_new(&tmp, dest, |from, to| std::fs::hard_link(from, to))
+        publish_new(&tmp, dest, |from, to| std::fs::hard_link(from, to))?;
     }
+    // The theme is in place; its folder's entry is flushed best-effort, a folder that cannot
+    // be flushed here accepted and any other failure reported.
+    let folder = match dest.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder,
+        _ => Path::new("."),
+    };
+    let _flushed_or_unavailable = aterm_durable::Flush::Durable
+        .dir_best_effort(folder)
+        .map_err(|e| {
+            InstallError::Failed(format!(
+                "{} was written, but flushing {} failed, so it may not survive a power loss: {e}",
+                dest.display(),
+                folder.display()
+            ))
+        })?;
+    Ok(())
 }
 
 /// How many times [`again_while_refused`] tries the replace again.

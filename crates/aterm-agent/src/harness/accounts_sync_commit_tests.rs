@@ -34,8 +34,9 @@ impl Bed {
         let events = note_auth(&mut state, "new", Auth::SignedOut, NOW);
         advance_renewal_generations(&before, &mut logins, &events).unwrap();
         let plan = Plan {
+            local_logins: false,
             wake: None,
-            roster_path: absolute(&path).unwrap().to_str().unwrap().into(),
+            roster_path: Some(absolute(&path).unwrap().to_str().unwrap().into()),
             roster_mode: None,
             state: Image {
                 before: read(&store.state_file(), MAX_STATE_BYTES).unwrap(),
@@ -240,14 +241,19 @@ fn sync_commit_rejects_changed_target_corruption_and_read_epoch() {
 #[test]
 fn sync_commit_rejects_linked_receipt_and_preserves_target() {
     let bed = Bed::new();
+    let receipt = bed.store.dir.join(RECEIPT);
+    let retained = bed.root.path().join("retained-receipt");
+    std::fs::rename(&receipt, &retained).unwrap();
+    let before = std::fs::read(&retained).unwrap();
     let target = bed.root.path().join("target");
-    std::fs::write(&target, "keep").unwrap();
+    std::fs::write(&target, &before).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&target, bed.store.dir.join(RECEIPT)).unwrap();
     #[cfg(not(unix))]
     std::fs::create_dir(bed.store.dir.join(RECEIPT)).unwrap();
     assert!(bed.store.load(NOW).is_err());
-    assert_eq!(std::fs::read_to_string(target).unwrap(), "keep");
+    assert_eq!(std::fs::read(target).unwrap(), before);
+    assert_eq!(std::fs::read(retained).unwrap(), before);
 }
 
 #[test]

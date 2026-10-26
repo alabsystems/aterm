@@ -1,0 +1,29 @@
+# claude-code 2.1.310 · MEASURED 2026-10-25, `aterm ctl text` of a private headless aterm (144x50, aterm 0.139.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the stub's custom mode `{"status": 401, "json": {"type": "error", "error": {"type": "authentication_error", "message": "Invalid bearer token"}}}` on a turn under the fake OAuth token, after the `Not logged in` and `OAuth token revoked` walls: `⏺ Please run /login · API Error: 401 Invalid bearer token` in column 0 (an error row, no `⎿` gutter), the composer back, 2.1.310
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Churned for 1s · done 12:43 PM
+
+❯ /login
+  ⎿  Login interrupted
+
+❯ are you there
+  ⎿  OAuth token revoked · Please run /login
+
+✻ Baked for 1s · done 12:44 PM
+
+❯ try again
+
+⏺ Please run /login · API Error: 401 Invalid bearer token
+
+✻ Sautéed for 1s · done 12:44 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
