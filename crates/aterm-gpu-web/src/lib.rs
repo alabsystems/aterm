@@ -173,6 +173,14 @@ struct GpuState {
     renderer: GpuRenderer,
     surface: GpuSurface,
     win: WindowGpu,
+    /// The browser lane's crown: its wall-clock ease reset before each
+    /// present, so every run meets the same budget (`set_bloom_for_lane`).
+    #[cfg(all(target_arch = "wasm32", debug_assertions))]
+    lane_crown: bool,
+    /// The browser lane's fx art, drawn beside the glow in every frame
+    /// (`set_fx_art_for_lane`); empty for none.
+    #[cfg(all(target_arch = "wasm32", debug_assertions))]
+    lane_art: Vec<aterm_core::render::FxLayer>,
 }
 
 /// Convert the GPU crate's typed swapchain failure into the string error
@@ -1198,6 +1206,10 @@ impl AtermGpuTerminal {
             renderer,
             surface,
             win: WindowGpu::new(),
+            #[cfg(all(target_arch = "wasm32", debug_assertions))]
+            lane_crown: false,
+            #[cfg(all(target_arch = "wasm32", debug_assertions))]
+            lane_art: Vec::new(),
         });
         self.last_frame_key = None;
         self.last_render_gated = false;
@@ -1217,6 +1229,16 @@ impl AtermGpuTerminal {
         self.build_frame();
         self.record_presented_frame(key);
         let gpu = self.gpu.as_mut().ok_or("render() before init()")?;
+        #[cfg(all(target_arch = "wasm32", debug_assertions))]
+        if gpu.lane_crown {
+            gpu.renderer.reset_glow_ease_for_test(&mut gpu.win);
+        }
+        #[cfg(all(target_arch = "wasm32", debug_assertions))]
+        if !gpu.lane_art.is_empty() {
+            let layers = &mut self.frame_scratch.fx_layers;
+            layers.retain(|l| !gpu.lane_art.iter().any(|a| a.id == l.id));
+            layers.extend(gpu.lane_art.iter().cloned());
+        }
         let presented = webgl_present_result(gpu.renderer.present_input(
             &mut gpu.win,
             &mut gpu.surface,
@@ -1277,6 +1299,182 @@ impl AtermGpuTerminal {
     /// Copy of the last [`render_offscreen`](Self::render_offscreen) RGBA8 framebuffer (`width*height*4` bytes), ready for `ctx.putImageData(new ImageData(rgba, width, height), 0, 0)` or a pixel diff.
     pub fn rgba(&self) -> Vec<u8> {
         self.rgba.clone()
+    }
+}
+
+/// The SDR crown's strength in the browser lane: `cursor_glow_sdr_boost`'s
+/// default.
+#[cfg(all(target_arch = "wasm32", debug_assertions))]
+const LANE_CROWN: f32 = 0.25;
+
+/// The browser lane's fx art (`set_fx_art_for_lane`) over the glow scene's
+/// prompt row and the row below it, window pixels from `origin` in cells of
+/// `(cw, ch)`: exact rects at Under, Glow and Over, which share the fx
+/// streams the glow ramps ride, and a linear sprite at Over, a stream of its
+/// own (the pet's and the word icons' sprites are linear layers).
+#[cfg(all(target_arch = "wasm32", debug_assertions))]
+fn lane_art(origin: (usize, usize), (cw, ch): (usize, usize)) -> Vec<aterm_core::render::FxLayer> {
+    use aterm_core::render::{
+        FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, FxSprite,
+        FxTexels, PxRect,
+    };
+    use std::sync::Arc;
+    let px = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
+    let at = |k: usize| {
+        (
+            px(origin.0 + (2 + 5 * k) * cw),
+            px(origin.1 + (k % 2) * ch + 3),
+        )
+    };
+    let (w, h) = (
+        u16::try_from(4 * cw).unwrap_or(u16::MAX),
+        u16::try_from(ch / 2).unwrap_or(u16::MAX),
+    );
+    let layer = |id: u64, slot: FxSlot, blend: FxBlend, items: Vec<FxItem>, ink: FxInk| {
+        FxLayer::new(
+            0x4c41_4e45_0000 + id,
+            Arc::new(FxContent::new(items, vec![ink; 2])),
+            slot,
+            FxSpace::Window,
+            blend,
+        )
+    };
+    let rects = |from: usize| {
+        (from..from + 3)
+            .map(|k| {
+                let (x, y) = at(k);
+                FxItem::Rect(FxRect { x, y, w, h, ink: 0 })
+            })
+            .collect()
+    };
+    let texels: Vec<u8> = (0..16u8)
+        .flat_map(|k| {
+            [
+                0x30 + 9 * k,
+                0xC0 - 7 * k,
+                0x60,
+                [0, 0x50, 0xB0, 0xFF][usize::from(k % 4)],
+            ]
+        })
+        .collect();
+    let Some(sprite) = FxArt::new(4, 4, FxTexels::Rgba8Straight, texels) else {
+        return Vec::new();
+    };
+    let sprite = Arc::new(sprite);
+    let sprites = (2..5)
+        .map(|k| {
+            let (x, y) = at(k);
+            FxItem::Sprite(FxSprite {
+                x,
+                y,
+                dw: w,
+                dh: h,
+                flip_x: k % 2 == 1,
+                art: Arc::clone(&sprite),
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })
+        })
+        .collect();
+    vec![
+        layer(
+            0,
+            FxSlot::Under,
+            FxBlend::Exact,
+            rects(0),
+            FxInk::over(0x0030_80C0, 0xA0),
+        ),
+        layer(
+            1,
+            FxSlot::Glow,
+            FxBlend::Exact,
+            rects(1),
+            FxInk::add(0x0040_2010),
+        ),
+        layer(
+            2,
+            FxSlot::Over,
+            FxBlend::Exact,
+            rects(2),
+            FxInk::over(0x00C0_4080, 0x60),
+        ),
+        layer(
+            3,
+            FxSlot::Over,
+            FxBlend::Linear,
+            sprites,
+            FxInk::over(0x00FF_FFFF, 0xFF),
+        ),
+    ]
+}
+
+/// The browser lane's glow scene (`verify browser`, `crates/aterm-verify/
+/// browser/lane.mjs`): a dev build's seams that route the cursor glow's
+/// beam runs, so its ramps are held to the quads they stand for through
+/// `cell.glsl` and `hdr_glow.glsl` on WebGL2.
+#[cfg(all(target_arch = "wasm32", debug_assertions))]
+#[export]
+impl AtermGpuTerminal {
+    /// Lay every beam run as a ramp drawn in the fx stream (`ramps`), or every
+    /// row as the quad it stands for (the oracle). Call after `init`.
+    pub fn set_glow_ramps_for_lane(&mut self, ramps: bool) -> Result<(), String> {
+        let gpu = self
+            .gpu
+            .as_mut()
+            .ok_or("set_glow_ramps_for_lane() before init()")?;
+        let (cost, route) = if ramps {
+            (aterm_render::RampCost::ALWAYS, aterm_gpu::RampsFx::Always)
+        } else {
+            (aterm_render::RampCost::NEVER, aterm_gpu::RampsFx::Never)
+        };
+        gpu.renderer.set_ramps_fx_for_test(Some(route));
+        self.effects.cursor_mut().glow.set_ramp_cost(cost);
+        Ok(())
+    }
+
+    /// Turn the cursor glow's bloom and its SDR crown (at
+    /// `cursor_glow_sdr_boost`'s default, its ease reset before each present)
+    /// on or off. Call after `init`.
+    pub fn set_bloom_for_lane(&mut self, on: bool) -> Result<(), String> {
+        let gpu = self
+            .gpu
+            .as_mut()
+            .ok_or("set_bloom_for_lane() before init()")?;
+        gpu.renderer.set_bloom(on);
+        gpu.renderer
+            .set_sdr_glow_boost(if on { LANE_CROWN } else { 0.0 });
+        gpu.lane_crown = on;
+        Ok(())
+    }
+
+    /// Draw the fx art of [`lane_art`] beside the glow in every frame
+    /// (`on`), or none: the fx stream a frame opens for its own art, the
+    /// one its ramps ride beside it. Call after `init`.
+    pub fn set_fx_art_for_lane(&mut self, on: bool) -> Result<(), String> {
+        let origin = (self.cpu.pad(), self.cpu.grid_top());
+        let cell = self.cpu.cell_size();
+        let gpu = self
+            .gpu
+            .as_mut()
+            .ok_or("set_fx_art_for_lane() before init()")?;
+        gpu.lane_art = if on {
+            lane_art(origin, cell)
+        } else {
+            Vec::new()
+        };
+        Ok(())
+    }
+
+    /// The last frame's glow ramps and the lit rows they carry, over both
+    /// glow streams, then the additive stream's ramps (the ones the bloom
+    /// and the crown read as their item list): `[ramps, lit rows, additive]`.
+    pub fn glow_ramps_for_lane(&self) -> Vec<u32> {
+        let add = &self.frame_scratch.cursor_glow_add_ramps;
+        let streams = [&self.frame_scratch.glow_under_ramps, add];
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let ramps = count(streams.iter().map(|s| s.items.len()).sum());
+        let lit = count(streams.iter().map(|s| s.lit).sum());
+        vec![ramps, lit, count(add.items.len())]
     }
 }
 
@@ -2437,7 +2635,10 @@ mod tests {
                 "frame {i} after an unwitnessed leap put {band_lit} lit pixels in the \
                  band — cold program movement must not splash the chrome"
             );
-            last_quads = t.frame_scratch.cursor_glow_add.len();
+            last_quads = t
+                .frame_scratch
+                .cursor_glow_add_ramps
+                .laid(t.frame_scratch.cursor_glow_add.len());
             if last_quads == 0 {
                 drained_at = Some(i);
                 break;

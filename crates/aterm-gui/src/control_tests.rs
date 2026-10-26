@@ -4511,7 +4511,7 @@ fn sessionless_front_key_is_owner_bare_only_and_terminal_routing_is_unchanged() 
 }
 
 #[test]
-fn the_window_form_of_resize_survives_a_native_front_and_the_cell_form_does_not_move() {
+fn both_forms_of_resize_survive_a_native_front() {
     let route = sessionless_front_window_resize(
         "resize",
         "px 420 820",
@@ -4540,16 +4540,30 @@ fn the_window_form_of_resize_survives_a_native_front_and_the_cell_form_does_not_
         .is_none(),
         "a terminal front retains the established session resize path",
     );
-    assert!(
+    assert_eq!(
         sessionless_front_window_resize(
             "resize",
             "24 80",
             None,
             false,
             NativeControlPrincipal::Owner
-        )
-        .is_none(),
-        "the CELL form resizes the engine and the PTY, so it stays session-class",
+        ),
+        Some(Ok(InputEvent::Resize {
+            rows: 24,
+            cols: 80,
+            echo_to_window: true,
+        })),
+        "the CELL form re-grids the front window, whatever tab is in front",
+    );
+    assert_eq!(
+        sessionless_front_window_resize(
+            "resize",
+            "24 80",
+            None,
+            false,
+            NativeControlPrincipal::Edge
+        ),
+        Some(Err("ERR denied\n".to_string())),
     );
     assert!(
         sessionless_front_window_resize(
@@ -4572,6 +4586,13 @@ fn the_window_form_of_resize_survives_a_native_front_and_the_cell_form_does_not_
         ),
         Some(Err("ERR denied\n".to_string())),
     );
+    assert!(
+        control_input::input_reply_to_str(Ok(InputOutcome::NotApplied(
+            "resize px: no window to resize"
+        )))
+        .starts_with("ERR "),
+        "a resize that reached no window says so, never OK",
+    );
     for rest in ["px 420", "px wide tall"] {
         let answer = sessionless_front_window_resize(
             "resize",
@@ -4581,7 +4602,11 @@ fn the_window_form_of_resize_survives_a_native_front_and_the_cell_form_does_not_
             NativeControlPrincipal::Owner,
         );
         assert!(matches!(answer, Some(Err(_))), "{rest:?}: {answer:?}");
-        assert_eq!(answer, control_input::parse_resize_px(rest), "{rest:?}");
+        assert_eq!(
+            answer,
+            Some(control_input::parse_window_resize(rest)),
+            "{rest:?}"
+        );
     }
 }
 
@@ -15703,6 +15728,18 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     let launch =
         |prompt| crate::task_launch::type_launch_line(&store, &h.sid, h.nonce, prompt, "worker");
     let observed = observe();
+    assert!(
+        launch(observed).is_err_and(|why| why.contains("no task record")),
+        "a session with no task record is no worker to launch"
+    );
+    assert!(drain_pipe(&rx).is_empty());
+    let mark = |state, why| {
+        let mut mark = crate::task_record::TaskMark::new(state);
+        mark.why = why;
+        crate::task_record::mark_session_task(&h.ctx, h.local_id, &mark).expect("unfenced");
+    };
+    mark(crate::task_record::TaskState::Working, None);
+    let observed = observe();
     assert_eq!(launch(observed), Ok("written whole"));
     assert_eq!(
         drain_pipe(&rx),
@@ -15753,6 +15790,23 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     assert!(launch(observed).is_err());
     assert!(drain_pipe(&rx).is_empty());
     h.ctx.update_parked.resume_for_test();
+
+    // A TASK THAT MOVED ON GETS NO LINE: once its record says the worker never started (a
+    // deadline's stall, a lead's mark), a line typed now would start a worker its lead has
+    // been told is not there, beside any it spawned again.
+    mark(crate::task_record::TaskState::Stalled, Some("startup"));
+    let observed = observe();
+    let refused = launch(observed).expect_err("a stalled task");
+    assert!(refused.contains("stalled why=startup"), "{refused}");
+    assert!(drain_pipe(&rx).is_empty());
+    mark(crate::task_record::TaskState::Working, None);
+    let observed = observe();
+    assert_eq!(
+        launch(observed),
+        Ok("written whole"),
+        "CONTROL: working again"
+    );
+    assert_eq!(drain_pipe(&rx), b"worker\r");
 
     assert!(
         crate::task_launch::type_launch_line(
@@ -19640,6 +19694,19 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
                  (agent=agy)"
             )),
             "{line}: the retired Gemini CLI is refused by name"
+        );
+    }
+    for line in [
+        format!("hold @{W} on"),
+        "hold s-00000000000000cc off".to_owned(),
+    ] {
+        assert_eq!(
+            gate(&line).err().as_deref(),
+            Some(
+                "a drive's hold names a session this Mac hosts by its bare sid, with no @: hold \
+                 s-… on|off [reason=<pct>]"
+            ),
+            "{line}: the form a hold takes"
         );
     }
     let long = format!("{:?}", gate(&format!("@{W} turn timeout=22001 hi")));

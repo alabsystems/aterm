@@ -14,21 +14,22 @@ pub(super) fn run(
     vault: Option<&Plan>,
     mode: Mode,
 ) -> Result<Vec<Row>, String> {
-    run_reading(sys, ctx, vault, mode).map(|(rows, _)| rows)
+    run_reading(sys, ctx, vault, mode).map(|(rows, _, _)| rows)
 }
 
-/// [`run`], and whether its rows stopped for want of Apple's Command Line Tools
-/// ([`want_developer_tools`]).
+/// [`run`], whether its rows stopped for want of Apple's Command Line Tools
+/// ([`want_developer_tools`]), and the reason a part that failed gives ([`failure_note`]).
 pub(super) fn run_reading(
     sys: &dyn System,
     ctx: &Ctx,
     vault: Option<&Plan>,
     mode: Mode,
-) -> Result<(Vec<Row>, bool), String> {
+) -> Result<(Vec<Row>, bool, Option<&'static str>), String> {
     Ok(match items(sys, ctx, vault, mode)? {
         Some(rows) => {
             let wanted = want_developer_tools(&rows);
-            (item_rows(rows), wanted)
+            let failure = failure_note(&rows);
+            (item_rows(rows), wanted, failure)
         }
         None => (
             vec![readiness_row(
@@ -37,8 +38,16 @@ pub(super) fn run_reading(
                 "the selected secrets vault changed or is still syncing; repository inputs wait for a complete version".into(),
             )],
             false,
+            None,
         ),
     })
+}
+
+/// Why the repositories' item `rows` failed, where the step that stopped decided it: the
+/// reading their item took, in System State's words (`GitHub can't be reached`), never the
+/// engine's English, which `aterm doctor` and the log keep (System State design §3.6).
+pub(super) fn failure_note(rows: &[aterm_machines::model::ItemReport]) -> Option<&'static str> {
+    aterm_machines::init_observe::failure_note(&rows.iter().collect::<Vec<_>>())
 }
 
 /// Whether the repositories' item `rows` stopped for want of Apple's Command Line Tools: the

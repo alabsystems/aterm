@@ -807,10 +807,109 @@ impl CursorGlow {
         self.under_out.as_slice()
     }
 
+    /// The ramps laid among this frame's under-ink quads ([`Self::under_quads`]).
+    #[inline]
+    pub const fn under_ramps(&self) -> &GlowRamps {
+        &self.under_ramps
+    }
+
+    /// The ramps laid among the last tick's `out` quads.
+    #[inline]
+    pub const fn out_ramps(&self) -> &GlowRamps {
+        &self.out_ramps
+    }
+
     /// Mutable under-ink quad sink for caret body effects.
     #[inline]
     pub(crate) const fn under_sink(&mut self) -> &mut Vec<GlowQuad> {
         &mut self.under_out
+    }
+
+    /// `quads` and `ramps` as a beam's sink: its runs laid as ramps where
+    /// they pay, under a test's cost where one is set ([`Self::rows_cost`]).
+    #[inline]
+    pub(crate) fn ramp_sink<'a>(
+        &self,
+        quads: &'a mut Vec<GlowQuad>,
+        ramps: &'a mut GlowRamps,
+    ) -> RampSink<'a> {
+        rows_sink(quads, ramps, self.rows_cost())
+    }
+
+    /// A test's cost for the beams' runs in place of the measured one
+    /// ([`Self::set_glow_ramps`], [`Self::set_ramp_cost`]).
+    #[inline]
+    pub(crate) const fn rows_cost(&self) -> Option<RampCost> {
+        #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+        {
+            self.rows_cost
+        }
+        #[cfg(not(any(test, debug_assertions, feature = "dev-seams")))]
+        {
+            None
+        }
+    }
+
+    /// A test's oracle: lay every ramp row as the quad it stands for
+    /// (`on: false`), the stream every ramp reader must draw alike; `on`
+    /// lays the runs that pay under the measured cost.
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    #[inline]
+    pub const fn set_glow_ramps(&mut self, on: bool) {
+        self.rows_cost = if on { None } else { Some(RampCost::NEVER) };
+    }
+
+    /// A test's cost for the beams' runs ([`RampCost::ALWAYS`]: every run a
+    /// ramp, however short), so a law reaches every producer's ramps.
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    #[inline]
+    pub const fn set_ramp_cost(&mut self, cost: RampCost) {
+        self.rows_cost = Some(cost);
+    }
+
+    /// At a tick's end, the streams folded into their quads where a test
+    /// reads them so ([`Self::fold_glow_ramps`]).
+    #[inline]
+    pub(super) fn fold_for_tests(&mut self, out: &mut Vec<GlowQuad>) {
+        #[cfg(any(test, debug_assertions))]
+        if self.fold_rows.unwrap_or(cfg!(test)) {
+            self.out_ramps.flatten_into(out);
+            self.under_ramps.flatten_into(&mut self.under_out);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = out;
+    }
+
+    /// A test's read of the streams as quads: the ramps laid as the shipped
+    /// path lays them, then folded at the tick's end into the quads they
+    /// stand for, so [`Self::under_quads`] and the tick's `out` hold the
+    /// whole streams. This crate's own unit tests read them so unless they
+    /// say otherwise; every other build lays them unfolded.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn fold_glow_ramps(&mut self, on: bool) {
+        self.fold_rows = Some(on);
+    }
+
+    /// A test's read of this frame's whole under-ink stream:
+    /// [`Self::under_quads`] with every lit ramp row the quad it stands for,
+    /// in draw order, however the tick laid it.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn under_laid(&self) -> Vec<GlowQuad> {
+        let mut all = Vec::new();
+        self.under_ramps.expand_into(&self.under_out, &mut all);
+        all
+    }
+
+    /// A test's read of the last tick's whole `out` stream: `out` with every
+    /// lit row of [`Self::out_ramps`] the quad it stands for, in draw order.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn out_laid(&self, out: &[GlowQuad]) -> Vec<GlowQuad> {
+        let mut all = Vec::new();
+        self.out_ramps.expand_into(out, &mut all);
+        all
     }
 
     /// This frame's per-pixel fire patches.
@@ -909,6 +1008,24 @@ impl CursorGlow {
     #[inline]
     pub const fn swap_under_quads(&mut self, dst: &mut Vec<GlowQuad>) {
         std::mem::swap(dst, &mut self.under_out);
+    }
+
+    /// Swap this frame's under-ink ramps into `dst` (see [`Self::under_ramps`]).
+    #[inline]
+    pub const fn swap_under_ramps(&mut self, dst: &mut GlowRamps) {
+        std::mem::swap(dst, &mut self.under_ramps);
+    }
+
+    /// Swap the last tick's `out` ramps into `dst` (see [`Self::out_ramps`]).
+    #[inline]
+    pub const fn swap_out_ramps(&mut self, dst: &mut GlowRamps) {
+        std::mem::swap(dst, &mut self.out_ramps);
+    }
+
+    /// Drop the last tick's `out` ramps, with the quads they lie among.
+    #[inline]
+    pub fn clear_out_ramps(&mut self) {
+        self.out_ramps.clear();
     }
 
     /// Swap this frame's per-pixel fire patches into `dst` (see [`Self::patches`]).
@@ -1146,5 +1263,40 @@ impl<'a> TextView<'a> {
     #[inline]
     pub(crate) const fn over_text(&self, row: i32, col: i32) -> bool {
         !self.knows_row(row) || self.covers_cell(row, col)
+    }
+}
+
+/// `quads` and `ramps` as a beam's sink ([`CursorGlow::ramp_sink`]), every
+/// row laid as its quad where `as_quads` (a test's oracle).
+#[cfg(test)]
+#[inline]
+pub(crate) fn glow_sink<'a>(
+    quads: &'a mut Vec<GlowQuad>,
+    ramps: &'a mut GlowRamps,
+    as_quads: bool,
+) -> RampSink<'a> {
+    rows_sink(
+        quads,
+        ramps,
+        if as_quads {
+            Some(RampCost::NEVER)
+        } else {
+            None
+        },
+    )
+}
+
+/// `quads` and `ramps` as a beam's sink, its runs laid as ramps where they
+/// pay under a test's `cost` where one is set, else the measured one.
+#[inline]
+pub(crate) fn rows_sink<'a>(
+    quads: &'a mut Vec<GlowQuad>,
+    ramps: &'a mut GlowRamps,
+    cost: Option<RampCost>,
+) -> RampSink<'a> {
+    let sink = RampSink::new(quads, ramps);
+    match cost {
+        Some(cost) => sink.costed(cost),
+        None => sink,
     }
 }

@@ -24,7 +24,7 @@ use super::store::Store;
 
 /// The usage text.
 pub const USAGE: &str = "\
-aterm ai — this machine's AI CLIs (claude, codex, agy, muse): health, sign-in, cross-AI reviews.
+aterm ai — this machine's AI CLIs (claude, codex, agy, muse, grok): health, sign-in, cross-AI reviews.
 
   aterm ai [status] [--json]    one row per CLI and a health line, read-only (exit 0)
   aterm ai doctor [--read-only] [--json] [--on <host>[:/abs/aterm],\u{2026} | --fleet]
@@ -355,11 +355,22 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     let _ = writeln!(out, "\nhealth: {}", h.line(next));
 }
 
-fn default_reviewers<'s>(s: &'s Settings, asker: &str) -> Vec<&'s str> {
+/// Whether a review asks `id` unless named: wanted here, and its row not off ([`State::Off`]: no
+/// build for this platform, excluded, uninstalled on purpose, or an opt-in program nobody
+/// installed), which a review would only skip.
+fn asked_by_default(s: &Settings, rows: &[Row], id: &str) -> bool {
+    s.wants(id)
+        && rows
+            .iter()
+            .find(|r| r.connector.id == id)
+            .is_none_or(|r| r.state != State::Off)
+}
+
+fn default_reviewers<'s>(s: &'s Settings, rows: &[Row], asker: &str) -> Vec<&'s str> {
     s.reviewers
         .0
         .iter()
-        .filter(|c| s.wants(c.id) && c.id != asker)
+        .filter(|c| asked_by_default(s, rows, c.id) && c.id != asker)
         .map(|c| c.id)
         .collect()
 }
@@ -385,7 +396,7 @@ fn reviews_line(look: &Look) -> String {
         return format!("off (reviews = false, set in {})", s.reviews.1.word());
     }
     let asker = look.asker.agent().map_or(s.preferred.0.id, |(id, _)| id);
-    let who = default_reviewers(s, asker);
+    let who = default_reviewers(s, &look.rows, asker);
     let (level, why) = review_level(s, look.asker)
         .map(|(level, why)| (level.word().to_string(), why))
         .unwrap_or_else(|why| ("unknown".to_string(), why.to_string()));
@@ -498,7 +509,7 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
     reviews.insert(
         "asks".to_string(),
         Value::Array(
-            default_reviewers(s, asker)
+            default_reviewers(s, &look.rows, asker)
                 .into_iter()
                 .map(Value::from)
                 .collect(),
@@ -607,6 +618,7 @@ fn sign_in_one(
         store,
         now: &now,
         ask: &ask_line,
+        no_desk: Some(Path::new(crate::harness::login_drive::SANDBOX_EXEC)),
     };
     login::sign_in(&host, facts, row, out)
 }
@@ -1055,17 +1067,15 @@ fn login_verb(
 }
 
 /// The CLIs with an accounts pool of their own that are no connection of `aterm ai`'s: `aterm
-/// ai login <id>` runs their pool's sign-in alone ([`pool_login_verb`]).
-const POOL_ONLY: &[crate::harness::accounts::Cli] = &[
-    crate::harness::accounts::Cli::Grok,
-    crate::harness::accounts::Cli::Kimi,
-];
+/// ai login <id>` runs their pool's sign-in alone ([`pool_login_verb`]). Grok Build is a
+/// connection ([`connector::ROWS`]), so its login is the connections' ([`login::sign_in`]).
+const POOL_ONLY: &[crate::harness::accounts::Cli] = &[crate::harness::accounts::Cli::Kimi];
 
 fn pool_only(id: &str) -> Option<crate::harness::accounts::Cli> {
     POOL_ONLY.iter().copied().find(|cli| cli.id() == id)
 }
 
-/// `aterm ai login grok|kimi`: the pool's `aterm harness accounts renew <label> --cli <id>`
+/// `aterm ai login kimi`: the pool's `aterm harness accounts renew <label> --cli <id>`
 /// where this machine keeps its roster (`accounts-<id>.toml`); with none, it says how to add a
 /// row and runs nothing.
 fn pool_login_verb(
@@ -1131,6 +1141,7 @@ fn pool_login_verb(
                 store: &store,
                 now: &now,
                 ask: &ask_line,
+                no_desk: Some(Path::new(crate::harness::login_drive::SANDBOX_EXEC)),
             };
             login::pool_sign_in(&host, login::PoolCli { id }, &pool)
         }
@@ -1323,7 +1334,7 @@ fn review_verb(
             .0
             .iter()
             .copied()
-            .filter(|c| s.wants(c.id))
+            .filter(|c| asked_by_default(s, &l.rows, c.id))
             .collect(),
     };
     let permission = match a.permissions {

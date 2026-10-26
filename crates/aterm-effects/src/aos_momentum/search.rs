@@ -310,8 +310,8 @@ impl FileProposer {
     /// The candidates, in line order.
     #[inline]
     #[must_use]
-    pub fn candidates(&self) -> &[Vec<u8>] {
-        &self.candidates
+    pub const fn candidates(&self) -> &[Vec<u8>] {
+        self.candidates.as_slice()
     }
 }
 

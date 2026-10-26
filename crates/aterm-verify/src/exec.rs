@@ -877,7 +877,7 @@ pub mod group {
             self.group
                 .ok_or_else(|| std::io::Error::other("the group leader is no longer held unreaped"))
         }
-        pub(super) fn holds(&self, pid: u32) -> bool {
+        pub(crate) fn holds(&self, pid: u32) -> bool {
             self.group == Some(pid)
         }
         pub fn kill(&self) -> std::io::Result<()> {
@@ -901,7 +901,7 @@ pub mod group {
             self.group = None;
             Ok(())
         }
-        pub(super) fn exited(
+        pub(crate) fn exited(
             &mut self,
             child: &mut std::process::Child,
             block: bool,
@@ -942,7 +942,7 @@ pub mod group {
 
         /// Reap `child`, running `sweep` once after the leader exits and before it is reaped (macOS
         /// and Linux only).
-        pub(super) fn reap_stage_sweeping(
+        pub(crate) fn reap_stage_sweeping(
             &mut self,
             child: &mut std::process::Child,
             block: bool,

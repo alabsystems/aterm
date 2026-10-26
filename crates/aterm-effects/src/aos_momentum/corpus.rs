@@ -320,7 +320,10 @@ pub fn scenario(seed: u64) -> Result<Scenario, ScenarioFault> {
         }
         Stratum::Plain | Stratum::CaretAtKeys | Stratum::ConfigAtKeys => {}
     }
-    let last = inputs.last().map_or(0, |&(at, _)| at);
+    let last = match inputs.last() {
+        Some(&(at, _)) => at,
+        None => 0,
+    };
     Scenario::new(f, start, inputs, last + END_AFTER_NS)
 }
 
@@ -401,8 +404,8 @@ impl Item {
     /// Its stable id.
     #[inline]
     #[must_use]
-    pub fn id(&self) -> &str {
-        &self.id
+    pub const fn id(&self) -> &str {
+        self.id.as_str()
     }
 
     /// Its kind.
@@ -537,8 +540,8 @@ impl Corpus {
     /// Every item, train first.
     #[inline]
     #[must_use]
-    pub fn items(&self) -> &[Item] {
-        &self.items
+    pub const fn items(&self) -> &[Item] {
+        self.items.as_slice()
     }
 
     /// The items of `split`, in order.

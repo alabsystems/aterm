@@ -272,19 +272,26 @@ const TWIN_MIN_MS: u32 = TWIN_MIN.as_millis() as u32;
 pub(super) const FOLLOW_DRS: [i16; 4] = [-1, 1, -2, 2];
 
 #[inline]
+const fn row_sample_at<'a>(rows: &[RowSample<'a>], row: u16) -> Option<RowSample<'a>> {
+    let mut j = 0;
+    while j < rows.len() {
+        if rows[j].row == row {
+            return Some(rows[j]);
+        }
+        j += 1;
+    }
+    None
+}
+
+#[inline]
 const fn neighbours_of<'a>(rows: &[RowSample<'a>], row: u16) -> [Option<&'a [char]>; 4] {
     let mut out = [None; 4];
     let mut k = 0;
     while k < FOLLOW_DRS.len() {
-        if let Some(r) = row.checked_add_signed(FOLLOW_DRS[k]) {
-            let mut j = 0;
-            while j < rows.len() {
-                if rows[j].row == r {
-                    out[k] = Some(rows[j].cols);
-                    break;
-                }
-                j += 1;
-            }
+        if let Some(r) = row.checked_add_signed(FOLLOW_DRS[k])
+            && let Some(s) = row_sample_at(rows, r)
+        {
+            out[k] = Some(s.cols);
         }
         k += 1;
     }
@@ -568,16 +575,22 @@ impl Witness {
         let mut score = FollowScore::default();
         out.clear();
         self.follow_runs.clear();
-        let short_owner = short_park.and_then(|(from, to)| {
-            if from.0 != to.0 || !(1..=2).contains(&from.1.saturating_sub(to.1)) {
-                return None;
+        let short_owner = if let Some((from, to)) = short_park
+            && from.0 == to.0
+            && (1..=2).contains(&from.1.saturating_sub(to.1))
+            && let Some(last_col) = from.1.checked_sub(1)
+        {
+            let mut owner = None;
+            for cell in cells {
+                if !cell.leaving() && cell.row == from.0 && cell.col == last_col {
+                    owner = Some((from.0, cell.cohort));
+                    break;
+                }
             }
-            let last_col = from.1.checked_sub(1)?;
-            cells
-                .iter()
-                .find(|cell| !cell.leaving() && cell.row == from.0 && cell.col == last_col)
-                .map(|cell| (from.0, cell.cohort))
-        });
+            owner
+        } else {
+            None
+        };
         let mut sample_row: Option<(u16, bool)> = None;
         for cell in cells {
             if !cell.leaving() {
@@ -588,7 +601,7 @@ impl Witness {
                 let sampled = match sample_row {
                     Some((r, ok)) if r == cell.row => ok,
                     _ => {
-                        let ok = rows.iter().any(|s| s.row == cell.row);
+                        let ok = row_sample_at(rows, cell.row).is_some();
                         sample_row = Some((cell.row, ok));
                         ok
                     }
@@ -654,7 +667,10 @@ impl Witness {
             }
         }
         let glyph = glyph?;
-        let sole = rode_to.map_or(SoleArrival::Refused, |to| SoleArrival::Hand { glyph, to });
+        let sole = match rode_to {
+            Some(to) => SoleArrival::Hand { glyph, to },
+            None => SoleArrival::Refused,
+        };
         self.judge_follow(cells, rows, (hand.0, cohort), true, sole)
             .0
     }
@@ -667,7 +683,7 @@ impl Witness {
         typed_only: bool,
         sole: SoleArrival,
     ) -> (Option<FollowRun>, usize) {
-        let Some(own) = rows.iter().find(|s| s.row == row) else {
+        let Some(own) = row_sample_at(rows, row) else {
             return (None, 0);
         };
         let carry = self.scroll_carry();
@@ -735,7 +751,7 @@ impl Witness {
             let Some(target) = row.checked_add_signed(dr) else {
                 continue;
             };
-            let Some(there) = rows.iter().find(|s| s.row == target) else {
+            let Some(there) = row_sample_at(rows, target) else {
                 continue;
             };
             let v = Self::follow_verdict(&self.follow_armed, there.cols, k, relaid);
@@ -768,18 +784,20 @@ impl Witness {
                 arrivals & bit == 0 && unit_at(there.cols, col) == unit
             };
             let is_cell = |col: u16| {
-                cells.iter().any(|c| {
-                    (!c.leaving() || k >= RETURN_K)
+                for c in cells {
+                    if (!c.leaving() || k >= RETURN_K)
                         && c.row == row
                         && c.cohort == cohort
                         && c.col == col
-                })
+                    {
+                        return true;
+                    }
+                }
+                false
             };
-            let armed_at = |col: u16| {
-                self.follow_armed
-                    .binary_search_by_key(&col, |a| a.0)
-                    .ok()
-                    .map(|i| self.follow_armed[i])
+            let armed_at = |col: u16| match self.follow_armed.binary_search_by_key(&col, |a| a.0) {
+                Ok(i) => Some(self.follow_armed[i]),
+                Err(_) => None,
             };
             let mut beyond_hi = false;
             let mut idx_hi = self.follow_armed.len();
@@ -964,7 +982,7 @@ impl Witness {
             let own = match sample_row {
                 Some((r, s)) if r == cell.row => s,
                 _ => {
-                    let s = rows.iter().find(|s| s.row == cell.row).copied();
+                    let s = row_sample_at(rows, cell.row);
                     sample_row = Some((cell.row, s));
                     s
                 }
@@ -987,7 +1005,7 @@ impl Witness {
         self.follow_runs.dedup();
         for k in 0..self.follow_runs.len() {
             let (row, cohort) = self.follow_runs[k];
-            let Some(own) = rows.iter().find(|s| s.row == row).copied() else {
+            let Some(own) = row_sample_at(rows, row) else {
                 continue;
             };
             self.shift_cells.clear();
@@ -1005,7 +1023,10 @@ impl Witness {
                                 >= super::ribbon::RETRACT_FADE_S
                         );
                     if !dark_release {
-                        leaving_max = Some(leaving_max.map_or(cell.col, |m| m.max(cell.col)));
+                        leaving_max = Some(match leaving_max {
+                            Some(m) => m.max(cell.col),
+                            None => cell.col,
+                        });
                     }
                     continue;
                 }
@@ -1025,7 +1046,10 @@ impl Witness {
             }
             self.shift_cells.sort_unstable_by_key(|c| c.0);
             self.shift_cells.dedup_by_key(|c| c.0);
-            let caret_col = caret.filter(|c| c.0 == row).map(|c| c.1);
+            let caret_col = match caret {
+                Some((r, col)) if r == row => Some(col),
+                _ => None,
+            };
             if let Some((lo, hi, dc)) = find_shift(&self.shift_cells, own.cols, caret_col)
                 && !matches!(leaving_max, Some(m) if m >= lo)
             {
@@ -1169,10 +1193,10 @@ impl Witness {
             return;
         }
         self.scroll_carry = self.scroll_carry.saturating_add(rows);
-        self.awaiting = self
-            .awaiting
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, cohort)| (row - rows, cohort));
+        self.awaiting = match self.awaiting {
+            Some((row, cohort)) if row >= rows => Some((row - rows, cohort)),
+            _ => None,
+        };
         let first_new = bottom.saturating_sub(rows);
         let last_walk = self.last_walk;
         self.seen.retain_mut(|s| {
@@ -1181,10 +1205,11 @@ impl Witness {
             }
             s.row -= rows;
             if bottom > 0 && s.row.saturating_add(2) >= first_new {
-                let pend_ms = last_walk.map_or(0, |t| {
-                    u32::try_from(t.saturating_duration_since(s.born).as_millis())
-                        .unwrap_or(u32::MAX)
-                });
+                let pend_ms = match last_walk {
+                    Some(t) => u32::try_from(t.saturating_duration_since(s.born).as_millis())
+                        .unwrap_or(u32::MAX),
+                    None => 0,
+                };
                 for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
                     if let Some(r) = s.row.checked_add_signed(dr)
                         && r >= first_new
@@ -1212,9 +1237,13 @@ impl Witness {
             return;
         }
         self.scroll_carry = 0;
-        self.awaiting = self
-            .awaiting
-            .and_then(|(row, cohort)| band_row(row, top, bottom, delta).map(|row| (row, cohort)));
+        self.awaiting = if let Some((row, cohort)) = self.awaiting
+            && let Some(row) = band_row(row, top, bottom, delta)
+        {
+            Some((row, cohort))
+        } else {
+            None
+        };
         self.seen
             .retain_mut(|s| match band_row(s.row, top, bottom, delta) {
                 Some(row) => {
@@ -1354,7 +1383,7 @@ impl Witness {
             let row_sample = match sample_row {
                 Some((r, s)) if r == cell.row => s,
                 _ => {
-                    let s = rows.iter().find(|s| s.row == cell.row).copied();
+                    let s = row_sample_at(rows, cell.row);
                     sample_row = Some((cell.row, s));
                     s
                 }
@@ -1559,7 +1588,7 @@ impl Witness {
                         match sample_row {
                             Some((r, s)) if r == cell.row => s,
                             _ => {
-                                let s = rows.iter().find(|s| s.row == cell.row).copied();
+                                let s = row_sample_at(rows, cell.row);
                                 sample_row = Some((cell.row, s));
                                 s
                             }
@@ -1686,13 +1715,18 @@ impl Witness {
         let mut lo = u16::MAX;
         let mut hi = 0u16;
         for cell in cells {
-            if (cell.row, cell.cohort) != run
-                || !retire.contains(&(cell.row, cell.col, cell.born))
-                || self
-                    .landed
-                    .iter()
-                    .any(|l| (l.0, l.1, l.2) == (cell.row, cell.col, cell.born))
+            if (cell.row, cell.cohort) != run || !retire.contains(&(cell.row, cell.col, cell.born))
             {
+                continue;
+            }
+            let mut in_landed = false;
+            for l in &self.landed {
+                if (l.0, l.1, l.2) == (cell.row, cell.col, cell.born) {
+                    in_landed = true;
+                    break;
+                }
+            }
+            if in_landed {
                 continue;
             }
             lo = lo.min(cell.col);
@@ -1726,7 +1760,7 @@ impl Witness {
                     let blind = (cell.row > 0 && withheld.contains(&(cell.row - 1)))
                         || (cell.row < u16::MAX && withheld.contains(&(cell.row + 1)));
                     let s = if blind {
-                        rows.iter().find(|s| s.row == cell.row).copied()
+                        row_sample_at(rows, cell.row)
                     } else {
                         None
                     };
@@ -1873,12 +1907,15 @@ impl Witness {
                 .retain(|id| id.0 != row || !self.run_ids.contains(id));
             self.retired_runs.retain(|r| *r != run);
             self.released_runs.retain(|r| *r != run);
-            let sample = rows.iter().find(|s| s.row == row);
+            let sample = row_sample_at(rows, row);
             let nb = neighbours_of(rows, row);
             for j in 0..self.run_ids.len() {
                 let (r, c, born) = self.run_ids[j];
                 if let Some(i) = self.find(r, c, born) {
-                    self.seen[i].unit = sample.map_or(Unit::BLANK, |s| unit_at(s.cols, c));
+                    self.seen[i].unit = match sample {
+                        Some(s) => unit_at(s.cols, c),
+                        None => Unit::BLANK,
+                    };
                     self.seen[i].live = true;
                     self.seen[i].forget_evidence();
                     self.seen[i].observe(&nb, true, now);
@@ -2002,15 +2039,25 @@ impl Witness {
     ) {
         out.clear();
         self.restore_runs.clear();
-        if !self.seen.iter().any(|s| s.restorable) {
+        let mut has_restorable = false;
+        for s in &self.seen {
+            if s.restorable {
+                has_restorable = true;
+                break;
+            }
+        }
+        if !has_restorable {
             return;
         }
         for cell in cells {
-            if self
-                .restore_runs
-                .iter()
-                .any(|r| r.cohort == cell.cohort && r.stamp == cell.released_at)
-            {
+            let mut in_restore = false;
+            for r in &self.restore_runs {
+                if r.cohort == cell.cohort && r.stamp == cell.released_at {
+                    in_restore = true;
+                    break;
+                }
+            }
+            if in_restore {
                 continue;
             }
             if !matches!(
@@ -2037,25 +2084,25 @@ impl Witness {
             else {
                 continue;
             };
-            let seen = self
-                .find(cell.row, cell.col, cell.born)
-                .map(|j| self.seen[j]);
+            let seen_idx = self.find(cell.row, cell.col, cell.born);
             let sample = match sample_row {
                 Some((r, s)) if r == cell.row => s,
                 _ => {
-                    let s = rows.iter().find(|r| r.row == cell.row).copied();
+                    let s = row_sample_at(rows, cell.row);
                     sample_row = Some((cell.row, s));
                     s
                 }
             };
             let run = &mut self.restore_runs[i];
-            match (seen, sample) {
-                (Some(seen), Some(sample)) if run.stamp.is_some() => {
+            match (seen_idx, sample) {
+                (Some(j), Some(sample)) if run.stamp.is_some() => {
+                    let seen = self.seen[j];
                     let now = unit_at(sample.cols, cell.col);
                     run.exact &= seen.restorable && run.row == cell.row;
                     run.returned_ink |= seen.released && !seen.unit.is_blank() && seen.unit == now;
                 }
-                (Some(seen), Some(sample)) => {
+                (Some(j), Some(sample)) => {
+                    let seen = self.seen[j];
                     run.exact &= if seen.restorable {
                         let standing = seen.unit == unit_at(sample.cols, cell.col);
                         (!cell.leaving() || cell.released_at.is_some())

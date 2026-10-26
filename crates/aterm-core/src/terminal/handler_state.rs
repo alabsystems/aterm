@@ -10,6 +10,16 @@ use super::{CursorStyle, SavedCursorState};
 use crate::vt_level::VtLevel;
 use aterm_types::CharacterSetState;
 
+/// Whether `col` of `row` is a line's end, where a printed glyph arms the
+/// deferred wrap: the row's last column, or the right margin under DECSLRM.
+/// DECRC puts a saved wrap back only there, so a wrap DECSC saved on the right
+/// margin survives the round trip while a resize that moved the edge leaves
+/// none pending mid-line.
+pub(super) fn at_a_line_end(grid: &crate::grid::Grid, row: u16, col: u16) -> bool {
+    let max_col = grid.effective_cols_for_row(row).saturating_sub(1);
+    col >= max_col || col == grid.horizontal_margins().right
+}
+
 impl CursorStateHandler<'_> {
     /// Save cursor state (DECSC) for the current screen.
     #[cfg_attr(
@@ -70,8 +80,8 @@ impl CursorStateHandler<'_> {
             };
             self.grid.set_cursor_following_content(row, col);
             if state.pending_wrap {
-                let max_col = self.grid.effective_cols_for_row(row).saturating_sub(1);
-                self.grid.set_pending_wrap(col >= max_col);
+                self.grid
+                    .set_pending_wrap(at_a_line_end(self.grid, row, col));
             }
             self.style.update_cached_colors();
             self.grid.set_cursor_template(
@@ -117,11 +127,9 @@ impl CursorStateHandler<'_> {
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
             }
-            b'G' => {
-                let col = params.first().copied().unwrap_or(1).saturating_sub(1);
-                self.grid.set_cursor(self.grid.cursor_row(), col);
-            }
-            b'`' => {
+            b'G' | b'`' => {
+                // CHA and HPA are both xterm's `CASE_HPA`: under DECOM and DECLRMM
+                // the column counts from the left margin and stops at the right.
                 let col = params.first().copied().unwrap_or(1).saturating_sub(1);
                 let actual_col = if self.modes.origin_mode && self.modes.left_right_margin_mode {
                     let margins = self.grid.horizontal_margins();
@@ -563,6 +571,32 @@ mod erase_pending_wrap_tests {
             'Z',
             "the restored wrap takes the next glyph"
         );
+    }
+
+    /// CHA counts from the left margin under DECOM and DECLRMM and stops at the
+    /// right one, as HPA does (xterm parses both to `CASE_HPA`).
+    #[test]
+    fn cha_counts_from_the_left_margin_under_decom_like_hpa() {
+        for final_byte in ["G", "`"] {
+            let mut term = Terminal::new(3, 20);
+            // Margins at columns 5..=10 (1-based), origin mode on: home is (0,4).
+            term.process(b"\x1b[?69h\x1b[5;10s\x1b[?6h");
+            term.process(format!("\x1b[3{final_byte}").as_bytes());
+            assert_eq!(
+                cursor(&term),
+                (0, 6),
+                "CSI 3 {final_byte}: the margin's third column"
+            );
+            term.process(format!("\x1b[99{final_byte}").as_bytes());
+            assert_eq!(
+                cursor(&term),
+                (0, 9),
+                "CSI 99 {final_byte}: stopped at the right margin"
+            );
+            // Without origin mode both are absolute.
+            term.process(format!("\x1b[?6l\x1b[3{final_byte}").as_bytes());
+            assert_eq!(cursor(&term), (0, 2), "CSI 3 {final_byte} without DECOM");
+        }
     }
 
     #[test]

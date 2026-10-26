@@ -39,6 +39,7 @@ use aterm_types::macos_setup::{
 };
 
 use crate::status_item::SystemStateLine;
+use crate::system_state::ToolsWait;
 use crate::{App, SetupStatus, devtools_helper};
 
 /// How long the Local Network alert counts as up after the trigger. macOS reports neither the
@@ -370,7 +371,12 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
             .map(|observation| observation.subject)
     };
     let fda = Subject::Access(Access::FullDiskAccess);
-    let mut needs: Vec<Subject> = managed_with(Standing::NeedsYou).collect();
+    let repositories = Subject::Setting(Setting::Repositories);
+    let tools = status.repositories_tools_wait();
+    // Apple's Command Line Tools installing is a wait that ends by itself (§3.3): no line.
+    let mut needs: Vec<Subject> = managed_with(Standing::NeedsYou)
+        .filter(|subject| *subject != repositories || tools != Some(ToolsWait::Installing))
+        .collect();
     if fda_regressed && !needs.contains(&fda) {
         needs.push(fda);
     }
@@ -428,7 +434,16 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
             .and_then(|observation| observation.note.clone())
             .filter(|note| !note.trim().is_empty())
     };
-    let note = note_of(Setting::Secrets).or_else(|| note_of(Setting::Repositories));
+    // Their tab asking for the password says where the person is needed, as the headline does.
+    let note = note_of(Setting::Secrets).or_else(|| {
+        note_of(Setting::Repositories).map(|note| {
+            if tools == Some(ToolsWait::Password) {
+                crate::system_state::TOOLS_PASSWORD_HEADLINE.to_owned()
+            } else {
+                note
+            }
+        })
+    });
     Some(SystemStateLine { label, note })
 }
 

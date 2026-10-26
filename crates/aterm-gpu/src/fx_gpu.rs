@@ -5,7 +5,7 @@
 
 use super::*;
 use aterm_core::render::{FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxTexels};
-use aterm_render::{FxFrame, FxSlice, FxSliceSink, FxSlicer, GlowQuad};
+use aterm_render::{FxFrame, FxSlice, FxSliceSink, FxSlicer, GlowQuad, GlowRamps};
 
 /// One band slice of one fx item, as the vertex stage reads it ([`pipeline_table::FX_LAYOUT`]).
 #[repr(C)]
@@ -105,6 +105,212 @@ impl FxStream {
 pub(crate) const fn palette_word(ink: FxInk) -> u32 {
     let c = ink.color;
     ((c >> 16) & 0xff) | (((c >> 8) & 0xff) << 8) | ((c & 0xff) << 16) | ((ink.alpha as u32) << 24)
+}
+
+/// A glow end ([`aterm_render::GlowEnd`]) as its frame-palette word.
+#[inline]
+const fn end_word(end: u32) -> u32 {
+    palette_word(FxInk::over(
+        aterm_render::end_color(end),
+        aterm_render::end_alpha(end),
+    ))
+}
+
+/// Lay a window-space glow stream as fx instances, in its draw order: each
+/// quad a Rect of its two ends, each ramp ([`GlowRamps`]) one Ramps item of
+/// its rows' ends, so `fs_fx` draws every row by law F exactly as the quad
+/// it stands for (a dark row's zero ends draw nothing). A ramp's run keeps
+/// its ends once ([`aterm_render::GlowRamp::end_row`]), its first row and
+/// length in `src.y`/`src.z` for `fx_ramp_row` to fold its rows onto them.
+/// Rows tagged past `rows` or not `row_active` are skipped, as the glow
+/// stream skips them.
+pub(crate) fn glow_stream_into(
+    (quads, ramps): (&[GlowQuad], &GlowRamps),
+    rows: usize,
+    row_active: impl Fn(usize) -> bool,
+    palette: &mut Vec<u32>,
+    out: &mut Vec<FxInstance>,
+) {
+    let live = |row: u16| usize::from(row) < rows && row_active(usize::from(row));
+    let rect = |x: u16, y: u16, w: u16, h: u16, pal: u32, kind: u32| FxInstance {
+        rect: [x, y, w, h],
+        origin: [x as i16, y as i16],
+        dst: [0, 0],
+        src: [w, 0, 0, 0],
+        pal,
+        flags: kind,
+    };
+    use aterm_render::glow_ramps::Lights;
+    aterm_render::glow_ramps::each_laid(quads, ramps, |laid| match laid {
+        Lights::Quads(run) => {
+            for q in run.iter().filter(|q| live(q.row)) {
+                let pal = palette.len() as u32;
+                palette.push(palette_word(FxInk::over(q.color, q.alpha)));
+                palette.push(palette_word(FxInk::over(q.color2, q.alpha2)));
+                out.push(rect(q.x, q.y, q.w, q.h, pal, FX_KIND_RECT));
+            }
+        }
+        Lights::Ramp(r) => {
+            if live(r.row) {
+                let pal = palette.len() as u32;
+                let ink = r.ink as usize;
+                palette.extend(
+                    ramps.ends[ink..ink + r.end_count()]
+                        .iter()
+                        .map(|&e| end_word(e)),
+                );
+                out.push(FxInstance {
+                    src: [r.w, r.join, r.joined, 0],
+                    ..rect(r.x, r.y, r.w, r.h, pal, FX_KIND_RAMPS)
+                });
+            }
+        }
+    });
+}
+
+/// Whether a glow stream's quads may draw as glow instances ahead of its
+/// ramps: every light from its first ramp on adds (both ends at alpha 0), and
+/// saturating adds of light commute, so drawing the quads first and the ramps
+/// after them in their order stores the bytes the stream's own order does
+/// (the quads before the first ramp come first in both).
+pub(crate) fn ramps_commute(quads: &[GlowQuad], ramps: &GlowRamps) -> bool {
+    let from = ramps
+        .items
+        .first()
+        .map_or(quads.len(), |r| (r.at as usize).min(quads.len()));
+    quads[from..].iter().all(|q| q.alpha == 0 && q.alpha2 == 0)
+        && ramps.ends.iter().all(|&e| aterm_render::end_alpha(e) == 0)
+}
+
+/// What a frame's ramps cost the GPU side drawn in an fx stream rather than
+/// as the glow instances their lit rows stand for, in the picoseconds of
+/// frame time each adds (a saving is negative) over build, stage, encode and
+/// the GPU, as one arm measured them: opening the fx stream on a frame that
+/// draws none, each lit row in an fx stream so opened, and each lit row in
+/// an fx stream the frame opens anyway for its own art. A ramp itself costs
+/// the routes alike (measured −2.8 ± 6.9 ns), so the rule counts lit rows
+/// only (`docs/measured/card-engine-b5-2026-10-24.md`, rounds 2 and 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FxRampCost {
+    /// Opening the fx stream: its draws, its palette's upload and binding.
+    pub(crate) open: i64,
+    /// One lit row in an fx stream the ramps open, against its glow instance.
+    pub(crate) light: i64,
+    /// One lit row in an fx stream that also draws the frame's art, against
+    /// its glow instance.
+    pub(crate) art: i64,
+}
+
+impl FxRampCost {
+    /// Whether ramps carrying `lit` lit rows cost the frame less in the fx
+    /// stream than as their glow instances, on a frame whose fx stream draws
+    /// art anyway (`art`) or none.
+    #[inline]
+    pub(crate) const fn pays(&self, art: bool, lit: u64) -> bool {
+        // A frame's lit rows are budgeted in the thousands, far from overflow.
+        let lit = if lit > i32::MAX as u64 {
+            i32::MAX as i64
+        } else {
+            lit as i64
+        };
+        let cost = if art {
+            lit * self.art
+        } else {
+            self.open + lit * self.light
+        };
+        cost < 0
+    }
+}
+
+/// The arm a frame draws on, as the ramps' route costs were measured
+/// ([`ramp_cost`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RampArm<'a> {
+    /// The native Metal arm.
+    #[cfg_attr(
+        not(any(test, target_os = "macos")),
+        expect(dead_code, reason = "only a macOS build arms Metal")
+    )]
+    Metal,
+    /// The wgpu arm on the named backend (`GpuContext::backend`).
+    #[cfg_attr(
+        not(any(test, wgpu_arm)),
+        expect(dead_code, reason = "only a build with the wgpu arm draws on it")
+    )]
+    Wgpu(&'a str),
+    /// The GL arm (Linux and WebGL2).
+    #[cfg_attr(
+        not(any(test, gl_arm)),
+        expect(dead_code, reason = "only a build with the GL arm draws on it")
+    )]
+    Gl,
+    /// No GPU arm armed.
+    #[cfg_attr(
+        all(wgpu_arm, not(test)),
+        expect(dead_code, reason = "a build with the wgpu arm always has it")
+    )]
+    Unarmed,
+}
+
+/// The Metal arm's measured costs ([`FxRampCost`]), on the Mac16,8 (M4 Pro)
+/// the lane measured (`docs/measured/card-engine-b5-2026-10-24/`): opening
+/// the fx stream 8.75 ± 1.5 µs, each lit row 5.7 ± 0.2 ns less in it than as
+/// a glow instance (6 ns, as round 2's measured tree held it), so ramps open
+/// it from 1,459 lit rows a frame; in an fx stream the frame draws art in
+/// anyway, each lit row costs the GPU's median frame 0.78 ± 0.12 ns more than
+/// its glow instance (pet 1.07, icons 0.30), so no count of them pays.
+pub(crate) const METAL_RAMP_COST: FxRampCost = FxRampCost {
+    open: 8_749_000,
+    light: -6_000,
+    art: 780,
+};
+
+/// The wgpu arm's measured costs on its Metal backend ([`FxRampCost`]), the
+/// macOS oracle, on the same Mac16,8: each lit row 11.9 ± 1.1 ns less in an
+/// fx stream the ramps open than as a glow instance and 13.8 ± 1.2 ns less
+/// beside art; opening the stream fitted at −11.8 ± 8.6 µs, which the runs
+/// cannot tell from nothing and which is held at nothing, so ramps ride it
+/// from one lit row.
+pub(crate) const WGPU_METAL_RAMP_COST: FxRampCost = FxRampCost {
+    open: 0,
+    light: -11_850,
+    art: -13_760,
+};
+
+/// The measured costs of the arm a frame draws on ([`FxRampCost`]), or
+/// `None` where no cost was measured: there the frame draws every ramp as the
+/// glow instances its lit rows stand for, the GPU work a stream with no ramp
+/// draws, so no unmeasured arm can lose to it.
+#[must_use]
+#[inline]
+pub(crate) const fn ramp_cost(arm: RampArm<'_>) -> Option<FxRampCost> {
+    match arm {
+        RampArm::Metal => Some(METAL_RAMP_COST),
+        RampArm::Wgpu(backend) if matches!(backend.as_bytes(), b"Metal") => {
+            Some(WGPU_METAL_RAMP_COST)
+        }
+        RampArm::Wgpu(_) | RampArm::Gl | RampArm::Unarmed => None,
+    }
+}
+
+/// Whether a frame's glow ramps draw in its fx stream, under the measured
+/// costs of the arm it draws on (`cost`, [`ramp_cost`]): where their lit rows,
+/// both streams' together, cost less there than as glow instances, in an fx
+/// stream the frame draws its art in anyway (`fx_open`) or one they open.
+/// Otherwise, and on an arm with no measured cost, each lit row draws as the
+/// glow instance it stands for, and the frame opens no fx stream and uploads
+/// no palette for them.
+#[inline]
+pub(crate) fn ramps_open_fx(
+    fx_open: bool,
+    streams: [&GlowRamps; 2],
+    cost: Option<FxRampCost>,
+) -> bool {
+    let Some(cost) = cost else {
+        return false;
+    };
+    let lit: u64 = streams.iter().map(|s| s.lit as u64).sum();
+    lit > 0 && cost.pays(fx_open, lit)
 }
 
 /// Palette entries per row of the GL arm's palette texture (`cell.glsl` fetches entry `j`
@@ -773,7 +979,32 @@ impl FxGpu {
             return None;
         }
         self.bloom_src.clear();
-        self.bloom_src.extend_from_slice(&input.cursor_glow_add);
+        input
+            .cursor_glow_add_ramps
+            .expand_into(&input.cursor_glow_add, &mut self.bloom_src);
+        aterm_render::fx_bloom_quads(
+            f,
+            &input.fx_layers,
+            &input.fx_occluders,
+            &mut self.slicer,
+            &mut self.bloom_cols,
+            &mut self.bloom_src,
+        );
+        Some(&self.bloom_src)
+    }
+
+    /// This frame's `bloom` layers' quads alone, the lights an item list
+    /// carries after its stream's ([`aterm_render::bloom::items_into`]), or
+    /// `None` when no layer blooms.
+    pub(crate) fn bloom_layers<'s>(
+        &'s mut self,
+        f: &FxFrame,
+        input: &RenderInput,
+    ) -> Option<&'s [GlowQuad]> {
+        if !input.fx_layers.iter().any(|l| l.bloom) {
+            return None;
+        }
+        self.bloom_src.clear();
         aterm_render::fx_bloom_quads(
             f,
             &input.fx_layers,
@@ -791,7 +1022,9 @@ impl FxGpu {
 #[inline]
 pub(crate) fn bloom_source_live(input: &RenderInput) -> bool {
     !input.bloom_gate.held()
-        && (!input.cursor_glow_add.is_empty() || input.fx_layers.iter().any(|l| l.bloom))
+        && (!input.cursor_glow_add.is_empty()
+            || !input.cursor_glow_add_ramps.is_empty()
+            || input.fx_layers.iter().any(|l| l.bloom))
 }
 
 /// Whether the present's crown (the HDR or SDR aurora boost over the bloom source) has
@@ -802,6 +1035,11 @@ pub(crate) fn crown_glow_present(input: &RenderInput) -> bool {
         .cursor_glow_add
         .iter()
         .any(|q| (q.row as usize) < input.rows)
+        || input
+            .cursor_glow_add_ramps
+            .items
+            .iter()
+            .any(|r| (r.row as usize) < input.rows)
         || input.fx_layers.iter().any(|l| l.bloom)
 }
 
@@ -809,13 +1047,16 @@ pub(crate) fn crown_glow_present(input: &RenderInput) -> bool {
 /// ([`FxContent::draws_opaque`]): such light stores the same byte through
 /// the sRGB view as the Unorm `over` law does (an alpha-255 `over` is a
 /// store), so route (1) of the pass economy may draw it in the base pass.
+/// A frame whose `glow_under` carries ramps draws that stream in the Under
+/// stream ([`glow_stream_into`]), light that is not opaque.
 #[inline]
 pub(crate) fn under_draws_opaque(input: &RenderInput) -> bool {
-    input
-        .fx_layers
-        .iter()
-        .filter(|l| FxStream::of(l.slot, l.blend) == Some(FxStream::Under))
-        .all(|l| l.content.draws_opaque())
+    input.glow_under_ramps.is_empty()
+        && input
+            .fx_layers
+            .iter()
+            .filter(|l| FxStream::of(l.slot, l.blend) == Some(FxStream::Under))
+            .all(|l| l.content.draws_opaque())
 }
 
 /// The item a [`FxBuild`] is slicing.
@@ -1751,6 +1992,78 @@ mod tests {
                 1,
                 "{why}: unchanged valid frame still draws"
             );
+        }
+    }
+
+    /// A frame's ramps open its fx stream on the Metal arm only where the
+    /// glow instances their lit rows spare, both streams' together, pay for
+    /// opening it; in an fx stream the frame draws its art in anyway they
+    /// ride only where a lit row costs less there than its glow instance,
+    /// which on Metal none does; on the wgpu oracle's Metal backend they ride
+    /// from one lit row; a frame with no lit ramp row opens nothing; and an
+    /// arm no cost was measured on never opens it.
+    #[test]
+    fn ramps_open_the_fx_stream_only_where_their_lit_rows_pay() {
+        let lit = |lit: usize| GlowRamps {
+            lit,
+            ..GlowRamps::default()
+        };
+        let cost = ramp_cost(RampArm::Metal).expect("Metal's costs were measured");
+        assert_eq!(cost, METAL_RAMP_COST);
+        let even = usize::try_from(cost.open / -cost.light).expect("small");
+        let (half, rest) = (even / 2, even - even / 2);
+        for (under, add) in [(0, 0), (even, 0), (0, even), (half, rest)] {
+            let streams = [&lit(under), &lit(add)];
+            assert!(
+                !ramps_open_fx(false, streams, Some(cost)),
+                "{under} + {add}"
+            );
+        }
+        for (under, add) in [(even + 1, 0), (0, even + 1), (half + 1, rest)] {
+            let streams = [&lit(under), &lit(add)];
+            assert!(ramps_open_fx(false, streams, Some(cost)), "{under} + {add}");
+        }
+        // Beside art, a lit row costs Metal more in fx than as its glow
+        // instance, however many there are; an arm where it costs less
+        // rides from one lit row.
+        assert!(cost.art > 0, "{cost:?}");
+        let cheaper = FxRampCost { art: -1, ..cost };
+        for n in [1, even, 10 * even] {
+            let streams = [&lit(n / 2), &lit(n - n / 2)];
+            assert!(!ramps_open_fx(true, streams, Some(cost)), "{n} beside art");
+            assert!(
+                ramps_open_fx(true, streams, Some(cheaper)),
+                "{n} beside art"
+            );
+        }
+        assert!(!ramps_open_fx(true, [&lit(0), &lit(0)], Some(cheaper)));
+        // The wgpu oracle's Metal backend was measured too: there a lit row
+        // costs less in fx than as its glow instance, beside art or not, so
+        // ramps ride it from one lit row.
+        let oracle = ramp_cost(RampArm::Wgpu("Metal")).expect("the oracle's costs were measured");
+        assert_eq!(oracle, WGPU_METAL_RAMP_COST);
+        for art in [false, true] {
+            assert!(!ramps_open_fx(art, [&lit(0), &lit(0)], Some(oracle)));
+            for (under, add) in [(1, 0), (0, 1), (even, even)] {
+                let streams = [&lit(under), &lit(add)];
+                assert!(ramps_open_fx(art, streams, Some(oracle)), "{under} + {add}");
+            }
+        }
+        for arm in [
+            RampArm::Gl,
+            RampArm::Unarmed,
+            RampArm::Wgpu("Dx12"),
+            RampArm::Wgpu("Vulkan"),
+            RampArm::Wgpu("Gl"),
+            RampArm::Wgpu("metal"),
+        ] {
+            assert_eq!(ramp_cost(arm), None, "{arm:?}: no cost was measured");
+            for n in [1, even + 1, 10 * even] {
+                for art in [false, true] {
+                    let streams = [&lit(n), &lit(n)];
+                    assert!(!ramps_open_fx(art, streams, ramp_cost(arm)), "{arm:?}");
+                }
+            }
         }
     }
 }

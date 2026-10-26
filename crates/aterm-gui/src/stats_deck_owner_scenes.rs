@@ -606,11 +606,25 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
             chars(of(Owner::HotHard)) * 10 > calm * more,
             "{form:?}: hot-hard says {how} what light says: {ladder:?}"
         );
+        // What a strip of this form at this width draws: its columns and the one the glide
+        // slides out, 10 s each (a bucket each) in both forms here; Folded's strip spans 80 s,
+        // Full's ten minutes (§11 of the live edge's design).
+        let strip = match form {
+            DeckForm::Full => crate::stats_plan::plan_full(OWNER_W, &m).strip,
+            DeckForm::Folded => crate::stats_plan::plan_folded(OWNER_W, &m).blocks[0].strip,
+        };
+        assert_eq!(strip.period_s, 10, "{form:?}: a column is a bucket");
+        let drawn = strip.cols as usize + 1;
+        assert_eq!(
+            drawn,
+            if form == DeckForm::Full { SPAN + 1 } else { 9 },
+            "{form:?}"
+        );
         for (o, runs) in &said {
             // The legend shows a mark only while a strip draws it.
             let over_drawn = owner_scene(*o).resources[..3]
                 .iter()
-                .any(|v| v.ring.iter().rev().take(SPAN + 1).any(|c| c.over));
+                .any(|v| v.ring.iter().rev().take(drawn).any(|c| c.over));
             assert_eq!(
                 runs.iter().any(|r| r == "over max"),
                 over_drawn,

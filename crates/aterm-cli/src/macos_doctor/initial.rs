@@ -3545,6 +3545,13 @@ fn parse_decision_reviewed(bytes: &[u8]) -> Result<DecisionRecord, String> {
         (Decision::Stopped(Stop::Cancelled), Some(reviewed)) => {
             Some(parse_plan_record(reviewed)?.0)
         }
+        // A Cancel of the review a Restore brought forward ([`save_cancelled_restore`]): the
+        // Restore's record, held by it.
+        (Decision::Stopped(Stop::Restored), Some(reviewed))
+            if restored.is_some_and(|restored| restored.held) =>
+        {
+            Some(parse_plan_record(reviewed)?.0)
+        }
         _ => None,
     };
     Ok((decision, restored, reviewed))
@@ -3566,6 +3573,28 @@ pub(super) fn save_cancelled_decision(root: &Path, reviewed: &Plan) -> Result<()
             "reviewed": plan_record(reviewed, false),
         })),
     )
+}
+
+/// A person's Cancel of the review that offered what a Restore brought forward (System State
+/// design §3.3, §3.4): the Restore's record held ([`Restored::held`]), naming the plan the
+/// review showed (`reviewed`), in one write. It reads and behaves as any other Cancel
+/// ([`save_cancelled_decision`], [`Records::cancelled`]): every group at Leave as is, aterm's own
+/// permissions held, nothing runs and no launch offers the review again, and Set up now applies
+/// the plan it names. The held record keeps what the Restore put back: nothing automatic sets
+/// those groups again, and a put-back still waiting for Full Disk Access is still put back. An
+/// older aterm reads past `reviewed` (`format` 1) and keeps the held Restore as it was.
+fn save_cancelled_restore(root: &Path, restored: Restored, reviewed: &Plan) -> Result<(), String> {
+    validate_plan(reviewed)?;
+    let mut record = Restored {
+        held: true,
+        ..restored
+    }
+    .record(RestoredState::Restored);
+    record
+        .as_object_mut()
+        .ok_or("the Restore's record is not an object")?
+        .insert("reviewed".into(), plan_record(reviewed, false));
+    write_json(&root.join("first-run.json"), &record)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3937,6 +3966,13 @@ trait InitialHost {
     /// the pass then asks the window to install them ([`SetupHooks::developer_tools`]).
     fn repositories_want_developer_tools(&mut self) -> bool {
         false
+    }
+    /// The reason the failed part of the Repositories stage, as [`Self::repositories`] last ran
+    /// it, gives where the step that stopped decided one
+    /// ([`aterm_machines::init_observe::failure_note`]): System State's row says it in place of
+    /// the stage's own line.
+    fn repositories_failure(&mut self) -> Option<&'static str> {
+        None
     }
     /// The Messages and FaceTime sign-outs, with the Accessibility they need.
     /// `on_screen` is whether System State is the visible view of a focused window
@@ -4858,6 +4894,9 @@ struct LiveInitial<R> {
     /// Whether the last Repositories stage stopped for want of the Command Line Tools
     /// ([`InitialHost::repositories_want_developer_tools`]).
     developer_tools_wanted: bool,
+    /// The reason the last Repositories stage's failed part gives
+    /// ([`InitialHost::repositories_failure`]).
+    repositories_failure: Option<&'static str>,
 }
 
 impl LiveInitial<secrets_retry::Live> {
@@ -4865,6 +4904,7 @@ impl LiveInitial<secrets_retry::Live> {
         Self {
             reads: secrets_retry::Live,
             developer_tools_wanted: false,
+            repositories_failure: None,
         }
     }
 }
@@ -5027,18 +5067,24 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         let sys = aterm_machines::port::Live::new();
         self.developer_tools_wanted = false;
-        let (rows, wanted) = repositories::run_reading(
+        self.repositories_failure = None;
+        let (rows, wanted, failure) = repositories::run_reading(
             &sys,
             &self.context()?,
             vault,
             aterm_machines::model::Mode::Apply,
         )?;
         self.developer_tools_wanted = wanted;
+        self.repositories_failure = failure;
         Ok(rows)
     }
 
     fn repositories_want_developer_tools(&mut self) -> bool {
         self.developer_tools_wanted
+    }
+
+    fn repositories_failure(&mut self) -> Option<&'static str> {
+        self.repositories_failure
     }
 
     fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
@@ -5361,6 +5407,12 @@ fn execute_pass(
             }
         };
         if stage == Stage::Repositories {
+            // A failed part's reason, where its step decided one, is the row's words on the page.
+            if let Some(reason) = host.repositories_failure()
+                && let Some(page) = page.as_mut()
+            {
+                page.failed_because(Setting::Repositories, reason);
+            }
             let wanted = host.repositories_want_developer_tools();
             // A stage that no longer waits on the tools withdraws at once, so a pass that fails
             // after it leaves no want standing; an ask waits for the pass's end.
@@ -5654,6 +5706,8 @@ mod tests {
         /// Whether the last native Repositories stage stopped for want of the Command Line
         /// Tools, read as the live host reads it ([`repositories::want_developer_tools`]).
         developer_tools_wanted: bool,
+        /// The reason its failed part gave ([`repositories::failure_note`]).
+        repositories_failure: Option<&'static str>,
         /// What each Workstation stage was given to set ([`Progress::only`]).
         only: Vec<Option<Selection>>,
     }
@@ -5808,6 +5862,7 @@ mod tests {
                     aterm_machines::model::Mode::Apply,
                 )?;
                 self.developer_tools_wanted = repositories::want_developer_tools(&rows);
+                self.repositories_failure = repositories::failure_note(&rows);
                 return Ok(item_rows(rows));
             }
             self.stage(Stage::Repositories)
@@ -5815,6 +5870,10 @@ mod tests {
 
         fn repositories_want_developer_tools(&mut self) -> bool {
             self.developer_tools_wanted
+        }
+
+        fn repositories_failure(&mut self) -> Option<&'static str> {
+            self.repositories_failure
         }
 
         fn withheld(&mut self, _root: &Path) -> Result<Option<Report>, String> {
@@ -7117,6 +7176,87 @@ mod tests {
                 .unwrap()
                 .cancelled
         );
+    }
+
+    /// A person's Cancel of the review that offered what a Restore brought forward reads and
+    /// behaves as any other Cancel (design §3.3): every group at Leave as is, aterm's own
+    /// permissions held, the page's Cancel line, no launch offering it again, and Set up now
+    /// applying the plan the review showed. The Restore's record stays, held: nothing automatic
+    /// sets again the groups it put back, and Set up now, which shows none of them, leaves them
+    /// restored. An older aterm reads past the plan the record names, and still holds.
+    #[test]
+    fn a_cancelled_review_of_a_restore_brought_forward_holds_as_any_cancel() {
+        let cancelled = || {
+            let root = aterm_tempfile::tempdir().unwrap();
+            older_restored_setup(root.path(), Some(Selection::all().workstation()));
+            bring_forward_restored_at(root.path())
+                .unwrap()
+                .expect("brought forward");
+            let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            let reviewed = startup.offer_reading(root.path(), || Ok(None)).unwrap();
+            assert!(reviewed.selection.contains(Setting::Permissions));
+            assert!(preferences(reviewed.selection).is_empty());
+            let cancel = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                startup.cancel_at(root, &reviewed)
+            });
+            assert_eq!(cancel.result, Ok(true));
+            (root, reviewed)
+        };
+        let (root, reviewed) = cancelled();
+        let restored = Records::read(root.path()).unwrap().restored.unwrap();
+        assert!(restored.held, "the Restore's record stays, held");
+        assert_eq!(restored.left, preferences(Selection::all()));
+        let page = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(page.cancelled, "the page's Cancel line, beside Set up now");
+        assert!(page.finished && !page.permissions_allowed && !page.provisional);
+        assert!(page.plan.selection.is_empty(), "every group at Leave as is");
+        assert_eq!(launch_startup(root.path()), None, "nothing offers it again");
+        assert_eq!(bring_forward_restored_at(root.path()).unwrap(), None);
+        let record: Value =
+            aterm_json::from_slice(&std::fs::read(root.path().join("first-run.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            (&record["state"], &record["held"], &record["format"]),
+            (&json!("restored"), &json!(true), &json!(FORMAT)),
+            "a held Restore, as an older aterm reads it"
+        );
+
+        // Set up now, as System State sends it: the plan the review showed.
+        observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            InitialSetupRestart::default()
+                .changing(Some(Selection::none()))
+                .persist_with(
+                    root,
+                    &Plan::from(Selection::none()),
+                    false,
+                    || Ok(None),
+                    save_progress,
+                    observe_restart,
+                )
+        })
+        .result
+        .unwrap()
+        .expect("admitted");
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(reviewed.clone()));
+        let page = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(!page.cancelled && page.permissions_allowed);
+        let records = Records::read(root.path()).unwrap();
+        assert_eq!(
+            records.restored.map(|restored| restored.left),
+            Some(preferences(Selection::all())),
+            "the groups the Restore put back stay put back"
+        );
+
+        // An older aterm reads past `reviewed`: the held Restore it knew, offering nothing.
+        let (root, _) = cancelled();
+        let path = root.path().join("first-run.json");
+        let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("reviewed");
+        write_json(&path, &record).unwrap();
+        let page = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(!page.cancelled && !page.permissions_allowed);
+        assert!(page.plan.selection.is_empty());
+        assert_eq!(launch_startup(root.path()), None);
     }
 
     /// An older aterm's setup gets aterm's own permissions at the next launch unless a person
@@ -12464,6 +12604,7 @@ mod tests {
         let mut host = LiveInitial {
             reads: reads(true),
             developer_tools_wanted: false,
+            repositories_failure: None,
         };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));
@@ -13037,6 +13178,50 @@ mod tests {
         let shown =
             snapshot_in_vault(root.path(), Err("source.toml: no name".into()), None).unwrap();
         assert_eq!(shown.plan, selected(&[Setting::Permissions]));
+    }
+
+    /// A Repositories step that failed says on the page the reason its step decided
+    /// (`init_observe::failure_note`), under the page's row, in place of the words a change
+    /// that did not take carries or the stage's own line, which the log keeps.
+    #[test]
+    fn a_failed_repositories_step_says_the_reason_it_decided() {
+        const REASON: &str = "GitHub can't be reached";
+        let failed = aterm_types::macos_setup::Unfinished::Failed;
+        let said = |page: &PassPage| {
+            page.rows
+                .iter()
+                .map(|row| (row.name.clone(), row.status.clone(), row.detail.clone()))
+                .collect::<Vec<_>>()
+        };
+        let reason = vec![(
+            Setting::Repositories.name().to_owned(),
+            "error".to_owned(),
+            REASON.to_owned(),
+        )];
+        let item = Row {
+            name: "GitHub repositories from synced development credentials".into(),
+            status: "error".into(),
+            detail: "GET /user: connection refused".into(),
+        };
+        let mut page = items_page(Stage::Repositories, &[item]).unwrap();
+        assert_eq!(page.outcome.unfinished, [(Setting::Repositories, failed)]);
+        page.failed_because(Setting::Repositories, REASON);
+        assert!(page.outcome.unfinished.is_empty());
+        assert_eq!(said(&page), reason);
+
+        let stage = Row {
+            name: Stage::Repositories.name().into(),
+            status: "error".into(),
+            detail: "the stage's own line".into(),
+        };
+        let mut page = items_page(Stage::Repositories, &[stage]).unwrap();
+        assert_eq!(page.rows[0].detail, "", "no words of the stage's own");
+        page.failed_because(Setting::Repositories, REASON);
+        assert_eq!(said(&page), reason);
+
+        let mut calm = PassPage::default();
+        calm.failed_because(Setting::Repositories, REASON);
+        assert!(calm.rows.is_empty() && calm.outcome.unfinished.is_empty());
     }
 
     /// The same Mac's first-launch offer goes ahead, so aterm's own permissions, which need no

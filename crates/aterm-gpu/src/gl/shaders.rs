@@ -372,9 +372,10 @@ mod tests {
                     spec.fs
                 );
             }
-            assert!(
-                v_samplers.is_empty(),
-                "{row}: `{}` samples {v_samplers:?}",
+            let v_units: BTreeSet<u32> = b.vertex_items.into_iter().collect();
+            assert_eq!(
+                v_samplers, v_units,
+                "{row}: `{}` samples {v_samplers:?}; the row binds {v_units:?} to its vertex stage",
                 spec.vs
             );
             let f_points: BTreeSet<u32> = b.fragment_buffers.iter().copied().collect();

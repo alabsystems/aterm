@@ -114,6 +114,16 @@ const fn reports_its_boxes(program: aterm_phase::Program) -> bool {
     }
 }
 
+/// Whether `program`'s sign-in wall folds into the machine's one sign-in
+/// (`aterm harness signin --cli <id>`, [`crate::needs::GrokSignin`]): Grok Build's alone.
+const fn signs_in_once_per_machine(program: aterm_phase::Program) -> bool {
+    use aterm_phase::Program as P;
+    match program {
+        P::Grok => true,
+        P::Claude | P::Codex | P::Agy | P::Muse | P::Kimi | P::Generic => false,
+    }
+}
+
 fn need_unix_now() -> i64 {
     #[cfg(test)]
     if let Some(now) = NEED_UNIX_CLOCK_FOR_TEST.with(std::cell::Cell::get) {
@@ -308,15 +318,9 @@ impl App {
                     let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                     crate::harness_host::agent_of(timeline.agent())
                 };
-                if program.is_some_and(|agent| {
-                    host.admits(agent)
-                        && (*kind != aterm_phase::WallKind::Auth
-                            || aterm_agent::supervise::policy::login::carried(agent))
-                }) {
-                    host.wall_answer(*kind, reset.is_some())
-                } else {
-                    presence::WallAnswer::Nobody
-                }
+                program.map_or(presence::WallAnswer::Nobody, |agent| {
+                    host.wall_answer(agent, *kind, reset.is_some())
+                })
             }
             (Some(presence::AgentPhase::Wall { kind, reset, .. }), _)
                 if claimant_in_front
@@ -384,7 +388,8 @@ impl App {
             }
             (
                 attention,
-                meta.live_supervisor(now_us).map(str::to_string),
+                meta.live_claim(now_us)
+                    .map(|claim| (claim.holder.clone(), claim.speaks_for_boxes_and_walls())),
                 meta.supervisor_proven(now_us),
             )
         };
@@ -427,6 +432,10 @@ impl App {
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             let admit = (crate::harness_host::agent_of(a), a.program_pgid);
             let told = tl.harness_needs();
+            // The walled program's group leader, whose start says whether a login predates it.
+            let grok_walled = (a.word == "wall:auth"
+                && crate::harness_host::identified_agent(a).is_some_and(signs_in_once_per_machine))
+            .then_some(a.program_pgid);
             (
                 agent,
                 program_blocked,
@@ -435,9 +444,12 @@ impl App {
                 task,
                 resume,
                 a.age_ms(),
-                told,
+                (told, grok_walled),
             )
         };
+        let (told, grok_walled) = told;
+        // Read only for a Grok session on a sign-in wall: a record read and a file stat.
+        let grok_signin = grok_walled.map(grok_signin_now);
         let host_supervises =
             crate::harness_host::admitted_as(ctx, admit.0, admit.1).is_some_and(hosted);
         let holds = ctx.fabric.holds();
@@ -474,9 +486,12 @@ impl App {
             .filter(|a| a.word.starts_with("wall:"))
             .and_then(|a| a.detail.as_deref())
             .and_then(|reset| presence::place_reset(reset, printed));
+        // A scoped claim stands aterm down for exactly the duties it names (§8.1 item 4): one that
+        // does not speak for boxes and walls (grok-alab's `relaunch,upgrade`) leaves its boxes,
+        // walls and codex's own reports raised for the person.
         let other_supervisor = supervisor
-            .as_deref()
-            .is_some_and(|holder| holder != crate::harness_host::holder());
+            .as_ref()
+            .is_some_and(|(holder, speaks)| *speaks && *holder != crate::harness_host::holder());
         crate::needs::NeedFacts {
             stall,
             task,
@@ -494,6 +509,7 @@ impl App {
             reset_unix,
             now_unix,
             told,
+            grok_signin,
         }
     }
 
@@ -1975,6 +1991,37 @@ fn opened_at(started_ms: u64) -> Option<std::time::Instant> {
     now.checked_sub(std::time::Duration::from_millis(ago))
 }
 
+/// Where this machine's one Grok Build sign-in stands for a Grok session on its sign-in wall
+/// whose program group leader is `pgid` ([`crate::needs::GrokSignin`]): a sign-in runs (its
+/// leader's record under the harness state), else a login the walled grok may not have read
+/// (written after it started) says restart it, else signed out. A login written before that grok
+/// started was read and refused by it: it is marked refused
+/// ([`aterm_agent::harness::grok_signin::mark_refused`]), so the next launch is signed in through
+/// the one sandboxed sign-in instead of a grok that opens its own page.
+fn grok_signin_now(pgid: i32) -> crate::needs::GrokSignin {
+    use aterm_agent::harness::grok_signin::{self, WallLogin};
+    if crate::harness_host::harness_state().is_some_and(|state| grok_signin::running(&state)) {
+        return crate::needs::GrokSignin::Running;
+    }
+    let home = aterm_types::dirs::home_dir();
+    let started = (pgid > 0)
+        .then(|| aterm_uds::process::read_process_birth(pgid))
+        .flatten()
+        .map(|b| {
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(b.seconds)
+                + std::time::Duration::from_micros(b.microseconds)
+        });
+    match grok_signin::wall_login(&|name| std::env::var_os(name), home.as_deref(), started) {
+        WallLogin::SignedIn(_) => crate::needs::GrokSignin::SignedIn,
+        WallLogin::Refused(file) => {
+            let _ = grok_signin::mark_refused(&file);
+            crate::needs::GrokSignin::Idle
+        }
+        WallLogin::SignedOut => crate::needs::GrokSignin::Idle,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3382,6 +3429,163 @@ mod tests {
             if let Some(host) = app.harness.take() {
                 host.shutdown_and_join();
             }
+        });
+    }
+
+    /// A WALL THE LOOP TYPES NOTHING INTO IS NOBODY'S: under this host's own claim, Claude Code's
+    /// usage wall is the harness's to resume, and a wall of a program no act of the loop reaches
+    /// ([`aterm_phase::Program::supervisable`]) is nobody's, so its need is a person's rather
+    /// than a `waiting:` nothing ends. Codex is one: the host types nothing into it (its worker
+    /// watches beside codex-alab and never takes the claim), so the same standing wall, once a
+    /// Codex leads the tab under the host's claim, reads nobody's where it once read the
+    /// harness's; that screen-level step is the one the host's per-agent gate decides. Grok
+    /// Build's weekly limit reads nobody's on the screen too, but there two filters ahead of the
+    /// host decide it whatever the host says (its reading is no evidence, so the presence shows
+    /// no wall, and [`crate::harness_host::agent_of`] drops a program with no
+    /// `[harness.<agent>]` table), so for it the host's own answer is asked directly: it is what
+    /// stays honest once either filter moves.
+    #[test]
+    fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
+        crate::fabric::with_link_reset(|| {
+            let (mut app, _wid, sid, ctx) = app_with_stub();
+            app.harness = Some(crate::harness_host::HostHandle::for_supervised_test(
+                Vec::new(),
+                Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+            ));
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                &crate::harness_host::holder(),
+                None,
+                None,
+                crate::metrics::now_us(),
+            )
+            .unwrap();
+            let mut seq = 0;
+            let mut wall = |app: &mut App, program: &str, screen: &str| {
+                seq += 1;
+                {
+                    let mut timeline = ctx.timeline.lock().unwrap();
+                    timeline.note_foreground_group(42);
+                    timeline.set_program(42, Some(program.into()));
+                }
+                let step = app.session_status.agent_observe(
+                    sid,
+                    crate::control::ScreenGen { epoch: 0, seq },
+                    Some(aterm_phase::prompt::fixtures::screen(screen)),
+                    crate::presence::Cursor::Unknown,
+                    Some(program.into()),
+                    42,
+                    false,
+                    Instant::now(),
+                );
+                let (word, detail, subject, reader) = step.publish.expect("the wall was read");
+                ctx.timeline.lock().unwrap().publish_agent(
+                    word,
+                    detail,
+                    subject,
+                    reader,
+                    crate::session_timeline::AgentStamp {
+                        generation: crate::control::ScreenGen { epoch: 0, seq },
+                        fp: seq,
+                    },
+                );
+                let facts = app.presence_facts(sid).unwrap();
+                let kind = match facts.agent.as_ref().map(|a| &a.phase) {
+                    Some(presence::AgentPhase::Wall { kind, .. }) => Some(*kind),
+                    _ => None,
+                };
+                (kind, facts.wall_answer)
+            };
+            assert_eq!(
+                wall(
+                    &mut app,
+                    "claude",
+                    aterm_phase::prompt::fixtures::SESSION_LIMIT_THEN_LOCAL_COMMANDS_MEASURED,
+                ),
+                (
+                    Some(aterm_phase::WallKind::UsageSession),
+                    presence::WallAnswer::Harness
+                ),
+                "Claude Code's usage wall under the host's claim resumes"
+            );
+            {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(43);
+                timeline.set_program(43, Some("codex".into()));
+            }
+            let facts = app.presence_facts(sid).unwrap();
+            assert!(
+                matches!(
+                    facts.agent.as_ref().map(|a| &a.phase),
+                    Some(presence::AgentPhase::Wall {
+                        kind: aterm_phase::WallKind::UsageSession,
+                        ..
+                    })
+                ),
+                "precondition: the wall still stands"
+            );
+            assert_eq!(
+                facts.wall_answer,
+                presence::WallAnswer::Nobody,
+                "a wall while a Codex leads the tab under the host's claim is nobody's"
+            );
+            let (_, grok) = wall(
+                &mut app,
+                "grok",
+                aterm_phase::grok::fixtures::WALL_WEEKLY_LIMIT,
+            );
+            assert_eq!(
+                grok,
+                presence::WallAnswer::Nobody,
+                "Grok Build's weekly limit under the host's claim is nobody's"
+            );
+            let host = app.harness.take().expect("the host");
+            for kind in [
+                aterm_phase::WallKind::UsageSession,
+                aterm_phase::WallKind::UsageWeekly,
+                aterm_phase::WallKind::Spend,
+                aterm_phase::WallKind::Overloaded,
+                aterm_phase::WallKind::Auth,
+            ] {
+                for agent in [
+                    aterm_phase::Program::Grok,
+                    aterm_phase::Program::Kimi,
+                    aterm_phase::Program::Codex,
+                ] {
+                    assert_eq!(
+                        host.wall_answer(agent, kind, true),
+                        presence::WallAnswer::Nobody,
+                        "{agent:?} {kind:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                host.wall_answer(
+                    aterm_phase::Program::Claude,
+                    aterm_phase::WallKind::UsageWeekly,
+                    true
+                ),
+                presence::WallAnswer::Harness
+            );
+            assert_eq!(
+                host.wall_answer(
+                    aterm_phase::Program::Claude,
+                    aterm_phase::WallKind::Auth,
+                    false
+                ),
+                presence::WallAnswer::Harness,
+                "Claude Code's lost login is carried"
+            );
+            assert_eq!(
+                host.wall_answer(
+                    aterm_phase::Program::Agy,
+                    aterm_phase::WallKind::Auth,
+                    false
+                ),
+                presence::WallAnswer::Nobody,
+                "agy's lost login is not"
+            );
+            host.shutdown_and_join();
         });
     }
 

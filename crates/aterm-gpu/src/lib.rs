@@ -59,6 +59,10 @@ pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};
 #[doc(hidden)]
 pub use metal::warm::{first_frame_bench_main, first_frame_bench_warm};
 mod renderer;
+/// A test's route for a frame's glow ramps.
+#[doc(hidden)]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+pub use renderer::RampsFx;
 /// Native window target for swapchain attachment.
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderer::WindowTarget;

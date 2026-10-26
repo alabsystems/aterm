@@ -867,9 +867,9 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
 /// (`connector_tests::every_grok_auth_word_is_one_of_the_builds_login_ended_texts`). The agent
 /// proxy's status `Not authenticated.` says no login is stored too, but its two words are no
 /// phrase: the build's own log lines end on them (`announcements refresh skipped: not
-/// authenticated`), and so does much other prose. Nothing reads these words yet: no running path
-/// asks a pool's [`Walls::ended_in`], and Grok Build's row is not in [`ROWS`], so no review runs
-/// it.
+/// authenticated`), and so does much other prose. A review's failed run reads these words
+/// ([`super::review::verdict_of`]: Grok Build's row is in [`ROWS`]); no running path asks a
+/// pool's [`Walls::ended_in`] yet.
 ///
 /// None is bare `token expired`, `re-authenticate`, ``run `grok login` `` or `sign in again`, which
 /// the build also prints where no login of the row's ended: a passing failure (``Authentication
@@ -1320,10 +1320,13 @@ pub const KIMI: Connector = Connector {
     accounts: Some(&KIMI_ACCOUNTS),
 };
 
-/// All connector rows; [`connections`] yields them in `VENDORS` order. [`GROK`] and [`KIMI`]
-/// join once atpkg's `VENDORS` serves their programs: until then they are not connections,
-/// and only their account pools ([`Cli`]) read them.
-pub const ROWS: &[&Connector] = &[&CLAUDE, &CODEX, &AGY, &MUSE];
+/// All connector rows; [`connections`] yields them in `VENDORS` order. Each is a program atpkg's
+/// `VENDORS` serves; [`GROK`] is one outside its default set, so a machine that never asked for
+/// it reads it as off ([`super::facts::Kept::OptIn`]), not as an install it owes. [`KIMI`] is
+/// served too and is not a connection yet: until its review and sign-in are tested here as Grok
+/// Build's are (`connector_tests`, `review_tests`, `login_tests`), only its account pool
+/// ([`Cli`]) reads it.
+pub const ROWS: &[&Connector] = &[&CLAUDE, &CODEX, &AGY, &MUSE, &GROK];
 
 /// Connector IDs in [`ROWS`] order.
 pub const IDS: [&str; ROWS.len()] = {

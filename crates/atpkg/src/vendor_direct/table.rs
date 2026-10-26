@@ -113,6 +113,89 @@ pub struct AccountState {
     pub under_home: &'static [&'static str],
 }
 
+/// A program that opens its vendor's sign-in page in the desk's browser on every signed-out
+/// launch (Grok Build: through LaunchServices, whatever its `PATH`): under aterm its twin signs
+/// the machine in once through `aterm harness signin --cli <cli> --wait` before an interactive
+/// launch, and runs the program only once that exits 0 ([`crate::platform`]'s sign-in block).
+/// Signed in is read the way the program reads it, from its environment and files alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigninGate {
+    /// The word `aterm harness signin --cli` takes.
+    pub cli: &'static str,
+    /// Variables whose non-empty value signs a launch in ahead of any login file.
+    pub credential_env: &'static [&'static str],
+    /// The variable naming the login file the program then reads in place of its home's.
+    pub login_file_env: &'static str,
+    /// The variable naming the program's home.
+    pub home_env: &'static str,
+    /// The home under `$HOME` where [`Self::home_env`] is unset.
+    pub home_default: &'static str,
+    /// The login file in the home.
+    pub login_file: &'static str,
+    /// Options that answer and exit, or run one prompt and exit: a launch carrying one before
+    /// a literal `--` is never gated.
+    pub one_shot: &'static [&'static str],
+    /// The subcommands that start neither the program's interactive screen nor a sign-in of
+    /// its own (a local read or edit, help, version, and its own `login`/`logout`, which a
+    /// person types to sign in or out): a launch whose first word is one is never gated, nor is
+    /// one of [`VendorSpec::self_update_verbs`]. Every other subcommand is gated, an unknown one
+    /// too (fail closed: [`VendorSpec::yolo_skip`] names subcommands that take no permission
+    /// flag, among them ones that open the interactive screen, such as Grok Build's
+    /// `dashboard`).
+    pub local: &'static [&'static str],
+}
+
+/// Grok Build's sign-in gate: `GROK_AUTH`/`XAI_API_KEY`, else `GROK_AUTH_PATH`'s file, else
+/// `${GROK_HOME:-~/.grok}/auth.json` (aterm's `harness::grok_signin::signed_in`, the same
+/// order); its one-shot options are 1.0.70's `--help` and `--version` spellings and the
+/// one-prompt options of its `PagerArgs` (`crate::yolo::word_options`). Its local subcommands
+/// are those 1.0.70's `--help` describes as a local read or edit (`doctor` "without starting
+/// Grok", the `~/.grok` disk use, the configuration, a transcript export, persisted usage, MCP
+/// and memory configuration, leader processes, worktrees, a trace export that falls back to a
+/// local file without credentials), help, version, and its own `login` and `logout`. Gated:
+/// `dashboard` (the interactive screen, "Sign in to open the dashboard"), `sessions` (it
+/// restores one), `agent`, `models`, `plugin`, `setup`, `share`, `wrap`, the workers and hosts,
+/// and any word not named here.
+pub const GROK_SIGNIN_GATE: SigninGate = SigninGate {
+    cli: "grok",
+    credential_env: &["GROK_AUTH", "XAI_API_KEY"],
+    login_file_env: "GROK_AUTH_PATH",
+    home_env: "GROK_HOME",
+    home_default: ".grok",
+    login_file: "auth.json",
+    one_shot: &[
+        "-h",
+        "--help",
+        "-v",
+        "-V",
+        "--version",
+        "-p",
+        "--single",
+        "--print",
+        "--prompt-file",
+        "--prompt-json",
+    ],
+    local: &[
+        "login",
+        "logout",
+        "help",
+        "version",
+        "v",
+        "completions",
+        "doctor",
+        "du",
+        "disk-usage",
+        "inspect",
+        "export",
+        "usage",
+        "mcp",
+        "memory",
+        "leader",
+        "worktree",
+        "trace",
+    ],
+};
+
 /// One vendor-direct program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VendorSpec {
@@ -164,6 +247,8 @@ pub struct VendorSpec {
     pub legacy_ceiling: u64,
     /// Whether the default set installs it on every machine it serves; a row without it is installed only when a person asks (`aterm pkg install <program>`) and kept current once installed.
     pub default_set: bool,
+    /// Its twin's sign-in gate under aterm, for a program that opens a browser on every signed-out launch ([`SigninGate`]).
+    pub signin_gate: Option<SigninGate>,
 }
 
 impl VendorSpec {
@@ -330,6 +415,7 @@ const OPENAI_CODEX: VendorSpec = VendorSpec {
     floor: floor(0, 156, 1),
     legacy_ceiling: LEGACY_CEILING,
     default_set: true,
+    signin_gate: None,
 };
 
 /// The agent programs, each fetched from its own vendor.
@@ -418,6 +504,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
         default_set: true,
+        signin_gate: None,
     },
     OPENAI_CODEX,
     VendorSpec {
@@ -463,6 +550,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: floor(1, 3, 6),
         legacy_ceiling: NEVER_INDEX_PINNED,
         default_set: true,
+        signin_gate: None,
     },
     VendorSpec {
         program: "muse",
@@ -543,6 +631,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,
         default_set: true,
+        signin_gate: None,
     },
     VendorSpec {
         program: "codex-old",
@@ -660,6 +749,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: floor(1, 0, 67),
         legacy_ceiling: NEVER_INDEX_PINNED,
         default_set: false,
+        signin_gate: Some(GROK_SIGNIN_GATE),
     },
     VendorSpec {
         program: "kimi",
@@ -732,6 +822,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: floor(2, 3, 1),
         legacy_ceiling: NEVER_INDEX_PINNED,
         default_set: false,
+        signin_gate: None,
     },
 ];
 

@@ -1226,13 +1226,34 @@ static WIDEN_REVIEW_ANSWERED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a watch of aterm's provisional plan has work in this launch
-/// ([`aterm_cli::macos_doctor::provisional_setup_widens`], [`WIDEN_REVIEW_ANSWERED`]).
+/// ([`aterm_cli::macos_doctor::provisional_setup_widens`], [`WIDEN_REVIEW_ANSWERED`],
+/// [`widens_here_with`]).
 #[cfg(target_os = "macos")]
 fn provisional_setup_widens_here() -> Result<bool, String> {
-    if WIDEN_REVIEW_ANSWERED.load(std::sync::atomic::Ordering::Acquire) {
+    widens_here_with(
+        WIDEN_REVIEW_ANSWERED.load(std::sync::atomic::Ordering::Acquire),
+        aterm_cli::macos_doctor::provisional_setup_widens,
+        aterm_cli::macos_doctor::initial_setup_revision,
+    )
+}
+
+/// Whether a watch of aterm's provisional plan has work in this launch: no review of the
+/// widen was `answered` in it, the records still widen the plan in force (`widens`), and no
+/// Stop was asked in it for the run in force (`revision`, [`setup_stop_requested`]). A person
+/// who pressed Stop gets no more automatic setup in this launch, so no review offers to widen
+/// the run they stopped, even one the Stop came too late for (it finished, and its records keep
+/// no Stop). The next launch may offer it, as may a later run in this one (Set up now, a
+/// choice), which the Stop did not stop.
+#[cfg(target_os = "macos")]
+fn widens_here_with(
+    answered: bool,
+    widens: impl FnOnce() -> Result<bool, String>,
+    revision: impl FnOnce() -> Result<u64, String>,
+) -> Result<bool, String> {
+    if answered || !widens()? {
         return Ok(false);
     }
-    aterm_cli::macos_doctor::provisional_setup_widens()
+    Ok(!setup_stop_requested(revision()?))
 }
 
 /// A person's Cancel of the review of the groups the ALab signal adds: the plan in force becomes
@@ -1262,8 +1283,13 @@ struct LiveAlabWatch {
     /// The plan the last look widens, or widened.
     widened: Widened,
     /// The page's receipt for the review this watch's upgrade answers: accepted once the
-    /// upgrade is saved, so the page takes the widened plan as the one in force.
+    /// upgrade is saved, so the page takes the widened plan as the one in force; kept only
+    /// while the upgrade is pending, and refused otherwise ([`look_settling_with`]).
     receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
+    /// The number the review's Apply took as the latest plan change
+    /// ([`SETUP_APPLY_GENERATION`]): a later choice overtakes it while it waits for another
+    /// setup, as it overtakes a choice waiting. Zero before a review applied.
+    generation: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -1274,6 +1300,7 @@ impl LiveAlabWatch {
             upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade::default(),
             widened: Widened::default(),
             receipt: None,
+            generation: 0,
         }
     }
 }
@@ -1289,6 +1316,13 @@ impl AlabWatch for LiveAlabWatch {
     }
 
     fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration) {
+        // A held upgrade whose write failed is a review's Apply still owed: it is tried again
+        // after the retry wait, never after the longer wait between looks for the signal.
+        let limit = if self.upgrade.pending() {
+            limit.min(SETUP_RETRY_WAIT)
+        } else {
+            limit
+        };
         std::thread::sleep(gap);
         SETUP_WAKES.back_off(&mut self.wakes_seen, limit.saturating_sub(gap));
     }
@@ -1298,16 +1332,20 @@ impl AlabWatch for LiveAlabWatch {
         if self.upgrade.pending() {
             return Ok(WidenReview::Applied);
         }
+        // Read again at the moment of the look: a Stop pressed while the watch waited holds it.
+        if !provisional_setup_widens_here()? {
+            return Ok(WidenReview::NotYet);
+        }
         let Some((in_force, widened)) = aterm_cli::macos_doctor::provisional_setup_widened()?
         else {
             return Ok(WidenReview::NotYet);
         };
         // Offered in System State's tab without taking the person's (design §6); withdrawn once
-        // the plan is no longer aterm's to widen (a choice made meanwhile).
+        // the plan is no longer aterm's to widen (a choice made meanwhile), or a Stop holds it.
         let mut answer = aterm_gui::await_widen_answer_while(
             widened.clone(),
             in_force,
-            || !aterm_cli::macos_doctor::provisional_setup_widens().unwrap_or(true),
+            || !provisional_setup_widens_here().unwrap_or(true),
             || {},
         );
         let password = answer.password.take();
@@ -1319,6 +1357,14 @@ impl AlabWatch for LiveAlabWatch {
         match answer.decision {
             WorkstationSetupDecision::Begin(plan) if !answer.chosen && plan == widened => {
                 self.receipt = receipt;
+                // The latest plan change from now: a later choice overtakes it.
+                let generation =
+                    SETUP_APPLY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                self.generation = generation;
+                // Shown waiting the moment its write finds another setup holding the records
+                // (design §3.3), never a run going.
+                self.upgrade
+                    .noting_wait(move || queue_setup_press(generation));
                 Ok(WidenReview::Applied)
             }
             // A press on the review is the person's choice, which runs as their choices do.
@@ -1339,11 +1385,23 @@ impl AlabWatch for LiveAlabWatch {
     }
 
     fn look(&mut self) -> Result<Option<u64>, String> {
-        let looked = look_setup_upgrade_with(&mut self.widened, &mut self.upgrade);
-        if matches!(looked, Ok(Some(_)))
-            && let Some(receipt) = self.receipt.take()
-        {
-            receipt.accept();
+        let generation = self.generation;
+        let (looked, receipt) = look_settling_with(
+            &mut self.widened,
+            &mut self.upgrade,
+            self.receipt.take(),
+            |widened| {
+                queue_setup_press(generation);
+                wait_while_queued(|| {
+                    setup_choice_overtaken(generation)
+                        || stop_covers(widened.sent)
+                        || setup_stop_requested(widened.from)
+                })
+            },
+        );
+        self.receipt = receipt;
+        if generation != 0 {
+            unqueue_setup_press(generation);
         }
         looked
     }
@@ -1353,6 +1411,57 @@ impl AlabWatch for LiveAlabWatch {
         wake_setup();
         run_startup_setup(Some(std::mem::take(&mut self.widened)));
     }
+}
+
+/// One look of a watch whose widen review applied (`receipt`, the page's for that Apply), which
+/// settles that Apply by every way the look ends but one: accepted once the widened plan is
+/// saved (`Ok(Some)`); kept while the upgrade is still pending, whose next look finishes or
+/// retires it; and otherwise refused, so the page shows the plan in force again, its controls
+/// live and the permission gate released (System State design §3.5). The receipt that comes
+/// back is the one kept.
+///
+/// An upgrade that finds another setup holding the records past its wait
+/// ([`aterm_cli::macos_doctor::SETUP_BUSY`]) waits on, as a choice does (§3.3): `queue` shows it
+/// waiting, waits a moment and says whether to ask again, `false` once a Stop covers it or a
+/// later choice overtook it. An attempt that published nothing is then let go.
+#[cfg(target_os = "macos")]
+fn look_settling_with(
+    widened: &mut Widened,
+    upgrade: &mut impl WatchUpgrade,
+    receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
+    mut queue: impl FnMut(&Widened) -> bool,
+) -> (
+    Result<Option<u64>, String>,
+    Option<aterm_gui::InitialSetupApplyReceipt>,
+) {
+    let looked = loop {
+        let looked = look_setup_upgrade_with(widened, upgrade);
+        let held_elsewhere = upgrade.pending()
+            && matches!(&looked, Err(why) if why == aterm_cli::macos_doctor::SETUP_BUSY);
+        if !held_elsewhere {
+            break looked;
+        }
+        if queue(widened) {
+            continue;
+        }
+        // Let go (a Stop, a later choice): an attempt that published nothing goes with it.
+        if widened.under_way.is_none() {
+            upgrade.forget();
+            break Ok(None);
+        }
+        break looked;
+    };
+    let receipt = match (&looked, receipt) {
+        (Ok(Some(_)), Some(receipt)) => {
+            receipt.accept();
+            None
+        }
+        (Ok(Some(_)), None) => None,
+        (_, receipt) if upgrade.pending() => receipt,
+        // Dropped: refused.
+        (_, _) => None,
+    };
+    (looked, receipt)
 }
 
 /// The actual admission port of one look; the test arm uses the same scratch record writers.
@@ -8114,6 +8223,276 @@ mod initial_setup_result_tests {
 
     fn snapshot(root: &Path) -> InitialSetupSnapshot {
         initial_setup_snapshot_at(root, Plan::default()).unwrap()
+    }
+
+    /// A Stop pressed in this launch for the run in force holds every widen review in it, even
+    /// one the Stop came too late for (it came during the run's last stage, which finished, so
+    /// the records keep no Stop and still widen): a person who pressed Stop gets no more
+    /// automatic setup this launch (design §3.5). A later run, which the Stop did not stop,
+    /// may be widened.
+    #[test]
+    fn a_stop_in_this_launch_offers_no_widen_review_of_the_run_it_stopped() {
+        let _globals = globals();
+        reset_worker_state();
+        assert_eq!(
+            widens_here_with(false, || Ok(true), || Ok(7)),
+            Ok(true),
+            "control: no Stop"
+        );
+        // What `stop_setup_run(7)` leaves in memory; the durable request it saves is spent.
+        *SETUP_STOP.lock().unwrap() = Some(7);
+        let held = widens_here_with(false, || Ok(true), || Ok(7));
+        let later = widens_here_with(false, || Ok(true), || Ok(8));
+        let answered = widens_here_with(true, || panic!("not read"), || panic!("not read"));
+        reset_worker_state();
+        assert_eq!(held, Ok(false), "no review of the run the person stopped");
+        assert_eq!(later, Ok(true), "a later run is not the one stopped");
+        assert_eq!(answered, Ok(false));
+    }
+
+    /// A stand-in for the watch's upgrade: each persist answers as scripted, with whether the
+    /// attempt is still held after it.
+    struct ScriptedUpgrade {
+        pending: bool,
+        answers: VecDeque<(
+            Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String>,
+            bool,
+        )>,
+        persisted: u32,
+        forgot: u32,
+    }
+
+    impl ScriptedUpgrade {
+        fn new(
+            answers: impl IntoIterator<
+                Item = (
+                    Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String>,
+                    bool,
+                ),
+            >,
+        ) -> Self {
+            Self {
+                pending: false,
+                answers: answers.into_iter().collect(),
+                persisted: 0,
+                forgot: 0,
+            }
+        }
+    }
+
+    impl WatchUpgrade for ScriptedUpgrade {
+        fn pending(&self) -> bool {
+            self.pending
+        }
+        fn widens_from(&self) -> Option<u64> {
+            self.pending.then_some(7)
+        }
+        fn revision(&self) -> Result<u64, String> {
+            Ok(7)
+        }
+        fn persist(&mut self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String> {
+            self.persisted += 1;
+            let (answer, pending) = self.answers.pop_front().expect("a scripted answer");
+            self.pending = pending;
+            answer
+        }
+        fn published(&self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String> {
+            Ok(None)
+        }
+        fn forget(&mut self) {
+            self.forgot += 1;
+            self.pending = false;
+        }
+    }
+
+    const WIDENED: aterm_cli::macos_doctor::SetupUpgrade =
+        aterm_cli::macos_doctor::SetupUpgrade { from: 7, to: 8 };
+
+    /// One look of a watch whose widen review applied, with the page's receipt for that Apply:
+    /// the look's answer and the receipt it kept. The watch keeps `widened` from look to look.
+    fn look_once(
+        widened: &mut Widened,
+        upgrade: &mut ScriptedUpgrade,
+        receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
+        queue: impl FnMut(&Widened) -> bool,
+    ) -> (
+        Result<Option<u64>, String>,
+        Option<aterm_gui::InitialSetupApplyReceipt>,
+    ) {
+        look_settling_with(widened, upgrade, receipt, queue)
+    }
+
+    /// Every look of a widen review's Apply settles it but one whose upgrade is still pending:
+    /// accepted once the widened plan is saved, refused when the look ends with nothing
+    /// written (a Stop retired it, the records changed, a write failed for good), so the page
+    /// never shows a run that nothing runs and no later offer is refused for it.
+    #[test]
+    fn every_look_of_a_widen_apply_accepts_keeps_or_refuses_its_receipt() {
+        let _globals = globals();
+        reset_worker_state();
+        let no_wait = |_: &Widened| -> bool { panic!("nothing waits for another setup") };
+        let heard = |answer: &std::sync::mpsc::Receiver<bool>| answer.try_recv().ok();
+
+        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+        let mut upgrade = ScriptedUpgrade::new([(Ok(Some(WIDENED)), false)]);
+        let (looked, kept) = look_once(
+            &mut Widened::default(),
+            &mut upgrade,
+            Some(receipt),
+            no_wait,
+        );
+        assert_eq!(
+            (looked, kept.is_none(), heard(&answer)),
+            (Ok(Some(8)), true, Some(true))
+        );
+
+        for (why, answer_now) in [
+            ("nothing changed", (Ok(None), false)),
+            (
+                "a write that failed for good",
+                (Err("disk".to_string()), false),
+            ),
+        ] {
+            let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+            let mut upgrade = ScriptedUpgrade::new([answer_now]);
+            let (_, kept) = look_once(
+                &mut Widened::default(),
+                &mut upgrade,
+                Some(receipt),
+                no_wait,
+            );
+            assert!(kept.is_none(), "{why}");
+            assert_eq!(
+                heard(&answer),
+                Some(false),
+                "{why}: refused, the page shows the plan in force"
+            );
+        }
+
+        // A write that failed, its attempt held: the next look finishes it.
+        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+        let mut upgrade =
+            ScriptedUpgrade::new([(Err("disk".to_string()), true), (Ok(Some(WIDENED)), false)]);
+        let mut widened = Widened::default();
+        let (looked, kept) = look_once(&mut widened, &mut upgrade, Some(receipt), no_wait);
+        assert_eq!(looked, Err("disk".to_string()));
+        assert!(
+            kept.is_some() && heard(&answer).is_none(),
+            "kept while pending"
+        );
+        let (looked, kept) = look_once(&mut widened, &mut upgrade, kept, no_wait);
+        assert_eq!(
+            (looked, kept.is_none(), heard(&answer)),
+            (Ok(Some(8)), true, Some(true))
+        );
+
+        // This launch's Stop of the run the widen would replace (one spent on a finished run
+        // included): the look retires the upgrade unwritten, and the Apply is refused.
+        *SETUP_STOP.lock().unwrap() = Some(7);
+        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+        let mut upgrade = ScriptedUpgrade::new([(Ok(Some(WIDENED)), false)]);
+        let (looked, kept) = look_once(
+            &mut Widened::default(),
+            &mut upgrade,
+            Some(receipt),
+            no_wait,
+        );
+        reset_worker_state();
+        assert_eq!(looked, Ok(None));
+        assert_eq!(upgrade.persisted, 0, "nothing reached the records");
+        assert!(kept.is_none());
+        assert_eq!(
+            heard(&answer),
+            Some(false),
+            "refused, never left unanswered"
+        );
+    }
+
+    /// The upgrade finds another setup holding the records past its wait: it waits on, shown
+    /// waiting, as a choice does, and is admitted once that setup lets go; one a Stop or a later
+    /// choice lets go meanwhile is retired unwritten and its Apply refused.
+    #[test]
+    fn a_widen_apply_another_setup_holds_waits_until_admitted_or_let_go() {
+        let _globals = globals();
+        reset_worker_state();
+        let busy = || (Err(aterm_cli::macos_doctor::SETUP_BUSY.to_string()), true);
+        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+        let mut upgrade = ScriptedUpgrade::new([busy(), busy(), (Ok(Some(WIDENED)), false)]);
+        let mut waits = 0;
+        let (looked, kept) =
+            look_once(&mut Widened::default(), &mut upgrade, Some(receipt), |_| {
+                waits += 1;
+                true
+            });
+        assert_eq!((looked, waits), (Ok(Some(8)), 2));
+        assert!(kept.is_none());
+        assert_eq!(answer.try_recv(), Ok(true));
+
+        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+        let mut upgrade = ScriptedUpgrade::new([busy()]);
+        let (looked, kept) =
+            look_once(&mut Widened::default(), &mut upgrade, Some(receipt), |_| {
+                false
+            });
+        reset_worker_state();
+        assert_eq!(looked, Ok(None));
+        assert_eq!(
+            (upgrade.forgot, upgrade.pending),
+            (1, false),
+            "retired unwritten"
+        );
+        assert!(kept.is_none());
+        assert_eq!(answer.try_recv(), Ok(false));
+    }
+
+    /// The person cancels the review that offered what a Restore brought forward: the status
+    /// the page reads says so as for any Cancel, its Cancel line beside Set up now, every group
+    /// at Leave as is, aterm's own permissions held; Set up now then applies the plan the review
+    /// showed (design §3.3).
+    #[test]
+    fn a_cancelled_review_of_a_restore_brought_forward_reads_as_any_cancel() {
+        use aterm_cli::macos_doctor::InitialSetupAdmissionStopTest;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let restored = InitialSetupAdmissionStopTest::restored_before_run(root.path()).unwrap();
+        assert!(
+            restored.bring_forward().unwrap().is_some(),
+            "brought forward"
+        );
+        let mut review = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
+        let reviewed = review.plan();
+        assert!(review.cancel().unwrap(), "the Cancel is recorded");
+        let status = initial_setup_status_with(
+            Ok(review.snapshot().unwrap()),
+            false,
+            &InitialSetupRows::default(),
+        );
+        assert!(
+            status.cancelled,
+            "the page's Cancel line, beside Set up now"
+        );
+        assert!(status.finished && !status.provisional);
+        assert!(
+            status.plan.unwrap().selection.is_empty(),
+            "every group at Leave as is"
+        );
+        assert!(
+            !status.permissions.unwrap().allowed,
+            "aterm's permission steps held"
+        );
+
+        assert!(
+            review.set_up_now().unwrap().is_some(),
+            "Set up now is admitted"
+        );
+        assert_eq!(review.saved_plan().unwrap(), Some(reviewed.clone()));
+        let status = initial_setup_status_with(
+            Ok(review.snapshot().unwrap()),
+            false,
+            &InitialSetupRows::default(),
+        );
+        assert!(!status.cancelled);
+        assert_eq!(status.plan, Some(reviewed));
+        assert!(status.permissions.unwrap().allowed);
     }
 
     #[test]

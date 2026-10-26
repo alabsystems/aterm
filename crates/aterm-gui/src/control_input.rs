@@ -299,6 +299,7 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
         "key" => parse_key(rest),
         "ctrl" => parse_ctrl(rest),
         "paste" => Some(paste_event(rest)),
+        "focus" => parse_focus(rest).map(InputEvent::Focus),
         _ => None,
     }
 }
@@ -935,6 +936,7 @@ pub(super) fn input_reply_to_str(r: Result<InputOutcome, String>) -> String {
         Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
         Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
         Ok(InputOutcome::QueueFull) => INPUT_QUEUE_FULL.to_string(),
+        Ok(InputOutcome::NotApplied(why)) => format!("ERR {why}\n"),
         Err(e) => e,
     }
 }
@@ -1655,34 +1657,44 @@ const POINTER_MOVE_USAGE: &str =
 
 const MAX_CHROME_ROWS: u16 = 16;
 
-/// `pointer [move <r> <c>|click|wheel dy=<n>|leave|status|mods <list>]` -> drive the front window's pointer on a cell or chrome row and reply with its position.
+/// `pointer [move <r> <c>|click|wheel dy=<n>|leave|status|mods <list>]` -> drive the front window's pointer and report its position or acknowledge dispatch when readback is unavailable.
 pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let action = match parse_pointer(rest) {
         Ok(action) => action,
         Err(usage) => return usage,
     };
+    match super::control_media::call_main(proxy, |reply| Wake::PointerCmd { action, reply }) {
+        Ok(reply) => pointer_reply_line(reply),
+        Err(error) => format!("ERR pointer command failed: {error}\n"),
+    }
+}
+
+fn pointer_reply_line(reply: crate::app_mouse::PointerReply) -> String {
     use crate::app_mouse::PointerAt;
     let px_field =
         |px: Option<(i32, i32)>| px.map_or_else(String::new, |(x, y)| format!(" px={x},{y}"));
-    match super::control_media::call_main(proxy, |reply| Wake::PointerCmd { action, reply }) {
-        Ok(Ok(PointerAt::Grid {
+    match reply {
+        Ok(PointerAt::Grid {
             cell: (row, col),
             px,
-        })) => format!("OK at={row},{col}{}\n", px_field(px)),
-        Ok(Ok(PointerAt::Native {
+        }) => format!("OK at={row},{col}{}\n", px_field(px)),
+        Ok(PointerAt::Native {
             view,
             x,
             y,
             key,
             px,
-        })) => format!(
+        }) => format!(
             "OK at=native view={view} x={x:.1} y={y:.1} key={}{}\n",
             key.as_deref().unwrap_or("-"),
             px_field(px)
         ),
-        Ok(Ok(PointerAt::Absent)) => "OK at=-\n".to_string(),
-        Ok(Err(why)) => format!("ERR {why}\n"),
-        Err(error) => format!("ERR pointer command failed: {error}\n"),
+        Ok(PointerAt::Absent) => "OK at=-\n".to_string(),
+        Ok(PointerAt::Dispatched { readback_error }) => format!(
+            "OK dispatched=1 readback=unavailable detail={}\n",
+            super::pct_encode(&readback_error)
+        ),
+        Err(why) => format!("ERR {why}\n"),
     }
 }
 
@@ -1709,32 +1721,24 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // the platform's `Resized`, as an edge drag does. The cell form applies the grid first
     // and echoes the pixel size after, so the live-resize throttle sees no reflow; the px
     // form is what drives the throttle. Several back to back reproduce a drag's pressure.
+    match parse_window_resize(rest) {
+        Ok(event) => input_reply_to_str(post_input_reply(proxy, vec![event])),
+        Err(usage) => usage,
+    }
+}
+
+/// Parse either form of `resize` into the event that resizes the front window: `resize px <w> <h>`
+/// ([`parse_resize_px`]), else `resize <r> <c>` ([`parse_resize`]) with the window echoed to match.
+pub(crate) fn parse_window_resize(rest: &str) -> Result<InputEvent, String> {
     if let Some(event) = parse_resize_px(rest) {
-        return match event {
-            Err(usage) => usage,
-            Ok(event) => match post_input_reply(proxy, vec![event]) {
-                Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
-                Ok(_) => "OK\n".to_string(),
-                Err(e) => e,
-            },
-        };
+        return event;
     }
-    let (r, c) = match parse_resize(rest) {
-        Ok(rc) => rc,
-        Err(e) => return e,
-    };
-    match post_input_reply(
-        proxy,
-        vec![InputEvent::Resize {
-            rows: r,
-            cols: c,
-            echo_to_window: true,
-        }],
-    ) {
-        Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
-        Ok(_) => "OK\n".to_string(),
-        Err(e) => e,
-    }
+    let (rows, cols) = parse_resize(rest)?;
+    Ok(InputEvent::Resize {
+        rows,
+        cols,
+        echo_to_window: true,
+    })
 }
 
 /// Parse `resize px <w> <h>` (the window form) into its event, or `None` for the cell form ([`parse_resize`]).
@@ -1913,6 +1917,12 @@ mod tests {
             control_fence(input_of("paste"), "paste", "hello", false),
             Some(true)
         );
+        for body in ["in", "out"] {
+            assert_eq!(
+                control_fence(input_of("focus"), "focus", body, false),
+                Some(true)
+            );
+        }
         assert_eq!(
             control_fence(input_of("key"), "key", "a", true),
             Some(false)
@@ -2634,7 +2644,7 @@ mod tests {
 
     #[test]
     fn pointer_move_refuses_a_cell_it_cannot_address() {
-        use crate::app_mouse::PointerAction;
+        use crate::app_mouse::{PointerAction, PointerAt};
         assert_eq!(
             parse_pointer("move 3 9"),
             Ok(PointerAction::Move { row: 3, col: 9 })
@@ -2714,6 +2724,59 @@ mod tests {
         );
         assert_eq!(parse_pointer("click"), Ok(PointerAction::Click));
         assert!(parse_pointer("click right").is_err());
+        for (reply, expected) in [
+            (
+                Ok(PointerAt::Grid {
+                    cell: (3, 9),
+                    px: Some((100, 120)),
+                }),
+                "OK at=3,9 px=100,120\n",
+            ),
+            (
+                Ok(PointerAt::Grid {
+                    cell: (-1, 5),
+                    px: None,
+                }),
+                "OK at=-1,5\n",
+            ),
+            (
+                Ok(PointerAt::Native {
+                    view: 2,
+                    x: 120.5,
+                    y: 64.0,
+                    key: Some("editor/buffer".to_string()),
+                    px: Some((241, 128)),
+                }),
+                "OK at=native view=2 x=120.5 y=64.0 key=editor/buffer px=241,128\n",
+            ),
+            (
+                Ok(PointerAt::Native {
+                    view: 2,
+                    x: 0.0,
+                    y: 1.0,
+                    key: None,
+                    px: None,
+                }),
+                "OK at=native view=2 x=0.0 y=1.0 key=-\n",
+            ),
+            (Ok(PointerAt::Absent), "OK at=-\n"),
+            (Err("refused".to_string()), "ERR refused\n"),
+        ] {
+            assert_eq!(pointer_reply_line(reply), expected);
+        }
+        let detail = "frame\n\t100% λ";
+        let line = pointer_reply_line(Ok(PointerAt::Dispatched {
+            readback_error: detail.to_string(),
+        }));
+        assert_eq!(
+            line,
+            "OK dispatched=1 readback=unavailable detail=frame%0A%09100%25%20%CE%BB\n"
+        );
+        let encoded = line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("detail="))
+            .unwrap();
+        assert_eq!(aterm_control::wire::pct_decode(encoded), detail);
     }
 
     #[test]

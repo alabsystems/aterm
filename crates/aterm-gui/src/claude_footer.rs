@@ -72,6 +72,8 @@ struct TopWrite {
     leaf_index: usize,
     ground: RenderCell,
     glass: std::ops::Range<usize>,
+    /// A `─` rule ([`TopLine::Rule`]): the host's line, held for the resident pet whole.
+    rule: bool,
 }
 
 /// The top-effort key's target on a top rule.
@@ -4785,6 +4787,7 @@ impl App {
                 leaf_index,
                 ground,
                 glass: composed.glass.clone(),
+                rule: line == TopLine::Rule,
             });
         }
     }
@@ -5743,11 +5746,22 @@ impl App {
             }
             let rows = claude_footer_undo.written();
             for r in rows {
-                if !lists
-                    .agy_edits
+                let at = (r.frame_row, r.col_off);
+                if lists.agy_edits.iter().any(|e| (e.frame_row, e.col) == at) {
+                    continue;
+                }
+                if lists
+                    .tops
                     .iter()
-                    .any(|e| e.frame_row == r.frame_row && e.col == r.col_off)
+                    .any(|t| t.rule && (t.frame_row, t.col) == at)
                 {
+                    // The top rule aterm repaints with its lockup and switch is the host's
+                    // line, held whole, strokes and all: a resident pet under it is drawn
+                    // under the line, its head behind the strokes, where the person cannot
+                    // see it (aterm-effects `PetBrain::over_the_hosts_line`). Codex's slab
+                    // pad is blank glass, held only at its marks.
+                    pet_chrome.note(r.frame_row, r.col_off, 1, r.painted.len());
+                } else {
                     pet_chrome.note_painted(r.frame_row, r.col_off, &r.painted);
                 }
             }

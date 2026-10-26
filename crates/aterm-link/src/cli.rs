@@ -392,8 +392,9 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
   <socket>             the Unix socket the bridges' `--broker` names (keep it in a 0700
                        dir: nothing checks)
   [log]                the durable record log (default `<socket>.log`)
-  --secret-file <path> the mint secret (32+ raw bytes, 0600, in a 0700 dir) that
-                       `aterm link mint` and `aterm fabric mint-for` mint under. Without
+  --secret-file <path> the mint secret (32+ raw bytes, 0600, in a 0700 dir of yours,
+                       held to `aterm link mint --help`'s rule) that `aterm link mint`
+                       and `aterm fabric mint-for` mint under. Without
                        the flag a `mint.secret` beside <socket> is used; with neither, the
                        broker is unguarded and checks no capability
   --durability <tier>  what an ack promises; default `ordered` with --secret-file, else
@@ -1007,7 +1008,9 @@ usage: aterm link mint <grant> --secret-file <path>
 
   <grant>              e.g. `rw,p=<node>:/f/<fleet>/pub/<node>/>` or `ro:/f/<fleet>/pub/>`
   --secret-file <path> the mint key, used byte for byte: 32+ raw bytes, 0600, in a 0700
-                       dir of yours (a looser mode, a symlink or fewer bytes is refused)
+                       dir of yours (a looser mode, an access-list allow entry or a
+                       symlink on the file or its dir, a second link to the file, or
+                       fewer bytes is refused; a deny entry passes)
 
 Prints one `<grant> <tag-hex>` line: append it to the file `serve --cap-file` reads.
 ";

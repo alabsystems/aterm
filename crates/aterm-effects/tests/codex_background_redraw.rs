@@ -24,7 +24,7 @@ impl Host {
     fn new() -> Self {
         let mut h = Self {
             term: Terminal::new(24, 80),
-            glow: CursorGlow::default(),
+            glow: crate::common::quads_glow(),
             now: Instant::now(),
             blink: 0,
             buf: Vec::new(),

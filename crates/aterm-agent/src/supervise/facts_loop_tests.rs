@@ -233,6 +233,7 @@ impl<'a> Run<'a> {
                 calls: self.host.calls(),
                 ledger,
                 land: false,
+                in_flight: false,
                 said: self.host.said.lock().expect("said").clone(),
             },
             sent,

@@ -658,6 +658,12 @@ impl Bridge {
         self.mirror.as_deref().map(|m| m.pin.total)
     }
 
+    /// TEST-ONLY: what the last attach read of the broker's retention ([`Bridge::broker_retains`]) — the simulation's count of the mirror's retained and unretained paths (`crate::sim::world`).
+    #[cfg(test)]
+    pub(crate) fn broker_retention_read(&self) -> Option<bool> {
+        self.broker_retains
+    }
+
     /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, `None` for nothing.
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {

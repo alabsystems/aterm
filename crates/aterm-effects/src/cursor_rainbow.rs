@@ -392,11 +392,19 @@ impl CursorRainbow {
                 break;
             };
             let cfg = RainbowConfig {
-                paint: probe_in.cfg.paint.map(|_| paint),
-                flare_at: probe_in.cfg.flare_at.filter(|&t| {
-                    at.saturating_duration_since(t).as_secs_f32()
+                paint: if probe_in.cfg.paint.is_some() {
+                    Some(paint)
+                } else {
+                    None
+                },
+                flare_at: if let Some(t) = probe_in.cfg.flare_at
+                    && at.saturating_duration_since(t).as_secs_f32()
                         < crate::rainbow_kitty::timing::SPRING_SNAP_RESPONSE_S
-                }),
+                {
+                    Some(t)
+                } else {
+                    None
+                },
                 ..probe_in.cfg
             };
             out.clear();

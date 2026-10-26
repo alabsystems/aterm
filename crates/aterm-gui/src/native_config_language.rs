@@ -1520,7 +1520,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "AI CLIs",
         ConfigSchemaKind::Table,
         &[
-            "ai", "cli", "claude", "codex", "agy", "muse", "review", "login",
+            "ai", "cli", "claude", "codex", "agy", "muse", "grok", "review", "login",
         ],
         false,
     ),
@@ -1571,6 +1571,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Muse Code on this machine",
         ConfigSchemaKind::Table,
         &["ai", "muse", "meta"],
+        false,
+    ),
+    manual(
+        "ai.grok",
+        "Grok Build on this machine",
+        ConfigSchemaKind::Table,
+        &["ai", "grok", "grok build", "xai"],
         false,
     ),
     manual(
@@ -5580,7 +5587,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit and types /usage to sample it; \"off\" moves no session · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), and no session of theirs is moved in this build"
         }
         "harness.logins" => {
-            " · a login listed with an email is signed in again by aterm itself when it ends or comes due, and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due login of another CLI's roster in the background where a headless browser is installed and the row names an email (not Grok Build's on macOS, whose sign-in opens a browser of its own), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs)"
+            " · a login listed with an email is signed in again by aterm itself when it ends or comes due, and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due login of another CLI's roster in the background where a headless browser is installed and the row names an email (on macOS, Grok Build's and Codex's sign-in runs in a sandbox that keeps it from opening a browser on the desk, and not at all where that sandbox is missing), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs)"
         }
         "harness.hosts" => {
             " · read by aterm harness accounts renew --due alone · each is host or host:/abs/path/to/aterm"

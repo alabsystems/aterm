@@ -10,6 +10,53 @@ use super::*;
 const OWNER: &str = "owner@example.com";
 const WORK: &str = "w2@example.com";
 
+#[test]
+fn a_running_renewal_blocks_readoption_of_its_removed_label() {
+    let (_tmp, env) = renew_env("renew-readoption");
+    let path = env.accounts_roster().unwrap();
+    let row = accounts::Row {
+        label: "main".into(),
+        email: Some(OWNER.into()),
+        ..accounts::Row::default()
+    };
+    std::fs::write(
+        &path,
+        accounts::append_rows_for(Cli::Claude, "", &[row]).unwrap(),
+    )
+    .unwrap();
+    let changed_env = env.clone();
+    let changed_path = path.clone();
+    let mut host = RenewHost::new();
+    host.during_flow = Some(Box::new(move || {
+        // Model an external edit while the managed provider flow is pending.
+        std::fs::write(&changed_path, "").unwrap();
+        let (code, out, err) = acc_quiet(
+            AccountsCmd::AdoptDefault {
+                label: "main".into(),
+                email: Some(OWNER.into()),
+                identity_email: None,
+                browser: None,
+            },
+            &changed_env,
+        );
+        assert_eq!(code, exit(1), "{out}{err}");
+        assert!(err.contains(accounts::SIGNIN_HELD), "{err}");
+        assert_eq!(std::fs::read_to_string(&changed_path).unwrap(), "");
+    }));
+    let (code, _, err) = acc(renew(&["main"], false, None), &env, &host);
+    assert_eq!(code, exit(1), "{err}");
+    assert_eq!(host.flows.borrow().len(), 1);
+    assert!(err.contains("changed"), "{err}");
+    assert!(
+        env.accounts_store()
+            .load_logins(env.now)
+            .unwrap()
+            .0
+            .labels
+            .is_empty()
+    );
+}
+
 fn roster_text(work_dir: &str) -> String {
     let dir = |d: &str| aterm_toml::Value::from(d).to_string();
     format!(
@@ -790,7 +837,7 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
 }
 
 #[test]
-fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
+fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
     cached_profile_only(&env);
     let store = env.accounts_store();
@@ -802,6 +849,19 @@ fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     let host = RenewHost::new();
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
+    assert!(host.flows.borrow().is_empty());
+    assert!(host.checked.borrow().is_empty());
+    assert!(logins_of(&env).get("main").is_none());
+    assert!(!store.load(env.now).unwrap().0.accounts.contains_key("main"));
+    assert!(!store.logins_dir().join("main+1").exists());
+    assert!(store.ledger_path().is_dir());
+    std::fs::rename(
+        store.ledger_path(),
+        store.dir.join("retained-ledger-obstruction"),
+    )
+    .unwrap();
+    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
     assert!(matches!(
         &host.flows.borrow()[0].2,
@@ -810,10 +870,14 @@ fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     assert_eq!(host.checked.borrow().len(), 1);
 
     let logins = logins_of(&env);
-    let bound = logins.get("main").expect("binding was already published");
+    let bound = logins
+        .get("main")
+        .expect("binding published after admission");
     let home = Path::new(bound.dir.as_deref().expect("a bound home"));
     assert_eq!(home, store.logins_dir().join("main+1"));
-    let (state, _) = store.load(env.now).expect("state was already published");
+    let (state, _) = store
+        .load(env.now)
+        .expect("state published after admission");
     assert_eq!(state.account("main").auth, Auth::Ok);
     assert!(
         home.is_dir(),

@@ -443,7 +443,33 @@ mod tests {
         assert!(e.to_string().contains("chmod 600"), "{e}");
         once(p, &e);
         mode(&path, 0o600);
+        let missing = dir.join("missing.secret");
+        let m = missing.to_str().expect("utf8");
+        let e = read_mint_secret(m).expect_err("absent, in a directory open to others");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        once(m, &e);
         mode(&dir, 0o700);
+
+        // The directory's other clauses name no command; only its access list and
+        // its mode do. A symlink to the root, and a file where a directory belongs.
+        let via = scratch.path().join("via");
+        std::os::unix::fs::symlink(&dir, &via).expect("symlink");
+        let v = via.join("mint.secret");
+        let v = v.to_str().expect("utf8");
+        let file_dir = path.join("mint.secret");
+        let f = file_dir.to_str().expect("utf8");
+        for (at, kind) in [
+            (v, io::ErrorKind::PermissionDenied),
+            (f, io::ErrorKind::InvalidInput),
+        ] {
+            let e = read_mint_secret(at).expect_err("no private directory");
+            assert_eq!(e.kind(), kind, "{e}");
+            assert!(!e.to_string().contains("chmod"), "{e}");
+            once(at, &e);
+        }
+        let e = read_mint_secret("/").expect_err("names no file");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        once("/", &e);
 
         let linked = dir.join("linked.secret");
         std::os::unix::fs::symlink(&path, &linked).expect("symlink");
@@ -477,6 +503,51 @@ mod tests {
             bare.to_string(),
             "a non-OS error is kept as said"
         );
+    }
+
+    /// ON MACOS ONLY AN ACCESS-LIST ALLOW ENTRY REFUSES A MINT SECRET, as `aterm link mint
+    /// --help` says: a 0700 directory and its 0600 secret that each carry a deny entry
+    /// read byte for byte (a macOS home folder carries `everyone deny delete`; these deny
+    /// what leaves a failed run's scratch removable). An `everyone allow read` entry on
+    /// the directory is refused, naming `chmod -N <dir>`; once `chmod -N` strips both
+    /// lists the secret reads again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mint_secret_is_refused_for_an_access_list_allow_entry_not_a_deny_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let dir = scratch.path().join("root");
+        std::fs::create_dir(&dir).expect("root");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let path = dir.join("mint.secret");
+        let bytes = [0x5a; 32];
+        std::fs::write(&path, bytes).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let acl = |args: &[&str], at: &std::path::Path| {
+            let ran = aterm_uds::spawnfd::command("/bin/chmod")
+                .args(args)
+                .arg(at)
+                .status()
+                .expect("run chmod");
+            assert!(ran.success(), "chmod {args:?} {}", at.display());
+        };
+        let p = path.to_str().expect("utf8");
+        acl(&["+a", "everyone deny add_subdirectory"], &dir);
+        acl(&["+a", "everyone deny write,append"], &path);
+        assert_eq!(read_mint_secret(p).expect("a deny entry passes"), bytes);
+
+        acl(&["+a", "everyone allow read"], &dir);
+        let e = read_mint_secret(p).expect_err("an allow entry on the directory");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(
+            e.to_string()
+                .contains(&format!("`chmod -N {}`", dir.display())),
+            "{e}"
+        );
+
+        acl(&["-N"], &dir);
+        acl(&["-N"], &path);
+        assert_eq!(read_mint_secret(p).expect("no access list"), bytes);
     }
 
     /// Set in the child [`a_bare_secret_name_is_read_here_and_named_as_given`] runs.

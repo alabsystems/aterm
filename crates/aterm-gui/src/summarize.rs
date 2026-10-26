@@ -149,6 +149,7 @@ impl StartBlock {
             Self::Worker(WorkerBlock::Unsupervised(switch)) => {
                 format!("(the window harness would not carry it \u{2014} {switch})")
             }
+            Self::Worker(WorkerBlock::Unseen(why)) => format!("({why})"),
             Self::Worker(WorkerBlock::NoIntegration) => {
                 "(needs shell integration \u{2014} off with -e or --no-shell-integration)"
                     .to_string()

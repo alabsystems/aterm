@@ -38,7 +38,19 @@ fn body(
     cur: (u16, u16),
 ) -> Vec<GlowQuad> {
     let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
-    glow.emit_comet(at, c, g, Some(cur), &mut out, &mut halos, &mut under);
+    glow.emit_comet(
+        at,
+        c,
+        g,
+        Some(cur),
+        &mut crate::cursor_glow::glow_sink(&mut out, &mut aterm_render::GlowRamps::default(), true),
+        &mut halos,
+        &mut crate::cursor_glow::glow_sink(
+            &mut under,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+    );
     under
 }
 
@@ -383,7 +395,19 @@ fn light_grains_keep_off_the_block_caret() {
                 born: t,
             });
             let (mut q, mut h, mut u) = (Vec::new(), Vec::new(), Vec::new());
-            glow.emit_particles(t, &c, g, &mut q, &mut h, &mut u);
+            glow.emit_particles(
+                t,
+                &c,
+                g,
+                &mut q,
+                &mut h,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut u,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
             !q.is_empty() || !h.is_empty() || !u.is_empty()
         };
         assert!(
@@ -436,7 +460,18 @@ fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
         glow.note_synthetic_move(t0);
         glow.tick(Some((landing, 2)), t0, &c, g, &mut out);
         let mut bolts = Vec::new();
-        glow.emit_bolts(t0, &c, g, &mut bolts, &mut Vec::new(), &mut Vec::new());
+        glow.emit_bolts(
+            t0,
+            &c,
+            g,
+            &mut crate::cursor_glow::glow_sink(
+                &mut bolts,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         bolts
     };
     assert!(

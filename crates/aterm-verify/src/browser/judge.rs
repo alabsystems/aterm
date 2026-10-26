@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Browser lane verdicts: GPU frames and offscreen readback against CPU frames, worker frames
-//! against the GPU page's, and a synchronous `init`.
+//! against the GPU page's, a synchronous `init`, and the glow scene's ramps against the quads
+//! they stand for.
 
 use aterm_json::Value;
 
@@ -54,6 +55,85 @@ pub(crate) struct Answer {
     pub init: Option<Init>,
     /// Where the GPU page drew; the CPU page says nothing.
     pub drawn: Option<Where>,
+    /// The GPU page's glow scene runs (`spec.glow`); empty where none ran.
+    pub glow: Vec<GlowRun>,
+}
+
+/// One run of the GPU page's glow scene: a glow style, a page theme, bloom
+/// on or off, and the glow's beam runs laid as ramps or as the quads they
+/// stand for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GlowRun {
+    pub style: String,
+    pub page: String,
+    pub bloom: bool,
+    pub ramps: bool,
+    /// Each presented frame's digest.
+    pub digests: Vec<String>,
+    /// Each frame's glow ramps, the lit rows they carry, and the additive
+    /// stream's ramps (the bloom's and the crown's item list).
+    pub laid: Vec<[u64; 3]>,
+    /// The last frame, whole.
+    pub last: Frame,
+}
+
+fn parse_glow(v: &Value) -> Result<Vec<GlowRun>, String> {
+    let Some(runs) = v.get("glow") else {
+        return Ok(Vec::new());
+    };
+    let runs = runs.as_array().ok_or("the page's `glow` is not an array")?;
+    runs.iter()
+        .enumerate()
+        .map(|(i, run)| {
+            let field = |k: &str| {
+                run.get(k)
+                    .ok_or_else(|| format!("glow run {i} has no `{k}`"))
+            };
+            let flag = |k: &str| {
+                field(k)?
+                    .as_bool()
+                    .ok_or_else(|| format!("glow run {i}'s `{k}` is not a bool"))
+            };
+            let list = |k: &str| {
+                field(k)?
+                    .as_array()
+                    .ok_or_else(|| format!("glow run {i}'s `{k}` is not an array"))
+            };
+            let digests = list("digests")?
+                .iter()
+                .map(|d| d.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("glow run {i} has a digest that is not a string"))?;
+            let laid = list("laid")?
+                .iter()
+                .map(|l| match l.as_array()?.as_slice() {
+                    [ramps, lit, add] => Some([ramps.as_u64()?, lit.as_u64()?, add.as_u64()?]),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    format!("glow run {i} has a `laid` entry that is not [ramps, lit, additive]")
+                })?;
+            let last = parse_frames(std::slice::from_ref(field("last")?), "glow frame")?
+                .pop()
+                .ok_or_else(|| format!("glow run {i} has no last frame"))?;
+            Ok(GlowRun {
+                style: field("style")?
+                    .as_str()
+                    .ok_or_else(|| format!("glow run {i}'s `style` is not a string"))?
+                    .to_string(),
+                page: field("page")?
+                    .as_str()
+                    .ok_or_else(|| format!("glow run {i}'s `page` is not a string"))?
+                    .to_string(),
+                bloom: flag("bloom")?,
+                ramps: flag("ramps")?,
+                digests,
+                laid,
+                last,
+            })
+        })
+        .collect()
 }
 
 fn parse_where(v: &Value) -> Result<Option<Where>, String> {
@@ -135,6 +215,7 @@ pub(crate) fn parse(v: &Value) -> Result<Answer, String> {
         timings: v.get("timings").cloned().unwrap_or(Value::Null),
         init: parse_init(v)?,
         drawn: parse_where(v)?,
+        glow: parse_glow(v)?,
     })
 }
 
@@ -412,6 +493,162 @@ fn moved(a: &Frame, b: &Frame) -> String {
     }
 }
 
+/// Judge the GPU page's glow scene: in each of `styles` on each of `pages`
+/// with bloom on and off, the run laying ramps must lay some and present
+/// every one of its `frames` byte-identical to the run laying quads, which
+/// lays none. Its controls: the glow must change the frame (the last frame
+/// is not the prompt's), bloom must change it on some page (bloom on is not
+/// bloom off; a light page dims the bloom by design, so one page may not),
+/// and some run with bloom on must lay ramps in the additive stream, the
+/// ones the bloom and its crown read as their item list. Each `art` page
+/// (beside the plain page it names) draws fx art of its own in every frame,
+/// so there the ramps ride the fx stream the art opens; its control: the
+/// art must change the quads run's last frame from the plain page's.
+pub(crate) fn glow(
+    gpu: &Answer,
+    styles: &[&str],
+    pages: &[&str],
+    art: &[(&str, &str)],
+    frames: usize,
+) -> Verdict {
+    let mut v = Verdict::default();
+    let mut bloomed = Vec::new();
+    let mut read = Vec::new();
+    let run = |style: &str, page: &str, bloom: bool, ramps: bool| {
+        gpu.glow
+            .iter()
+            .find(|r| r.style == style && r.page == page && r.bloom == bloom && r.ramps == ramps)
+    };
+    for (style, page) in styles
+        .iter()
+        .flat_map(|s| pages.iter().map(move |p| (*s, *p)))
+    {
+        let mut lasts = Vec::new();
+        for bloom in [true, false] {
+            let what = format!(
+                "glow [{style}, {page} page, bloom {}]",
+                if bloom { "on" } else { "off" }
+            );
+            let (r, q) = (
+                run(style, page, bloom, true),
+                run(style, page, bloom, false),
+            );
+            let (Some(r), Some(q)) = (r, q) else {
+                v.failures
+                    .push(format!("{what}: the page sent no ramps and quads runs"));
+                continue;
+            };
+            let before = v.failures.len();
+            for (who, x) in [("ramps", r), ("quads", q)] {
+                if x.digests.len() != frames || x.laid.len() != frames {
+                    v.failures.push(format!(
+                        "{what}: the {who} run answered {} frames ({} laid counts), the lane typed {frames}",
+                        x.digests.len(),
+                        x.laid.len()
+                    ));
+                }
+            }
+            let ramp_frames = r.laid.iter().filter(|[_, lit, _]| *lit > 0).count();
+            let (most, lit) = r
+                .laid
+                .iter()
+                .fold((0, 0), |(m, l), &[n, k, _]| (m.max(n), l.max(k)));
+            let added = r.laid.iter().filter(|[_, _, add]| *add > 0).count();
+            if ramp_frames == 0 {
+                v.failures.push(format!(
+                    "{what}: the ramps run laid no lit ramp: it does not reach the route it holds"
+                ));
+            }
+            if q.laid.iter().any(|[n, _, _]| *n > 0) {
+                v.failures
+                    .push(format!("{what}: the quads run laid ramps: it is no oracle"));
+            }
+            let differ: Vec<String> = r
+                .digests
+                .iter()
+                .zip(&q.digests)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(k, _)| k.to_string())
+                .collect();
+            if !differ.is_empty() {
+                v.failures.push(format!(
+                    "{what}: the ramps differ from the quads on frames {}",
+                    differ.join(", ")
+                ));
+            }
+            if r.last != q.last {
+                v.failures.push(format!(
+                    "{what}: the last frame's ramps differ from its quads ({})",
+                    moved(&q.last, &r.last)
+                ));
+            }
+            if r.digests.first() == r.digests.last() {
+                v.failures.push(format!(
+                    "NEGATIVE CONTROL: {what}: the last frame is the prompt's: the glow drew nothing"
+                ));
+            }
+            if v.failures.len() == before {
+                v.lines.push(format!(
+                    "{what}: {frames} frames byte-identical to the quads, ramps laid on {ramp_frames} \
+                     (up to {most} ramps, {lit} lit rows; additive ramps on {added})"
+                ));
+            }
+            if bloom && added > 0 {
+                read.push(format!("{style} on the {page} page ({added} frames)"));
+            }
+            lasts.push(&r.last);
+        }
+        if let [on, off] = lasts[..]
+            && on != off
+        {
+            bloomed.push(format!("{style} on the {page} page"));
+        }
+    }
+    for (style, &(with, without)) in styles.iter().flat_map(|s| art.iter().map(move |a| (*s, a))) {
+        for bloom in [true, false] {
+            let (Some(a), Some(b)) = (
+                run(style, with, bloom, false),
+                run(style, without, bloom, false),
+            ) else {
+                continue;
+            };
+            if a.last == b.last {
+                v.failures.push(format!(
+                    "NEGATIVE CONTROL: glow [{style}, {with} page, bloom {}]: the last frame is \
+                     the {without} page's: the art drew nothing",
+                    if bloom { "on" } else { "off" }
+                ));
+            }
+        }
+    }
+    if read.is_empty() {
+        v.failures.push(
+            "NEGATIVE CONTROL: glow: no run with bloom on laid ramps in the additive stream, so \
+             no item list was read by the bloom or its crown"
+                .to_string(),
+        );
+    } else {
+        v.lines.push(format!(
+            "glow: the bloom and its crown read the additive stream's ramps in {}",
+            read.join(", ")
+        ));
+    }
+    if bloomed.is_empty() {
+        v.failures.push(
+            "NEGATIVE CONTROL: glow: bloom on drew the frame bloom off drew on every page, so \
+             no ramp was held through the bloom"
+                .to_string(),
+        );
+    } else {
+        v.lines.push(format!(
+            "glow: bloom changed the last frame in {}",
+            bloomed.join(", ")
+        ));
+    }
+    v
+}
+
 fn judge_readback(cpu: &Answer, gpu: &Answer, v: &mut Verdict) {
     let Some(rb) = gpu.readback.as_ref() else {
         v.failures
@@ -513,6 +750,7 @@ mod tests {
             readback: Some(frame(2)),
             frames,
             diff: Vec::new(),
+            glow: Vec::new(),
             timings: Value::Null,
             init: Some(Init {
                 ready_on_return: true,
@@ -525,6 +763,114 @@ mod tests {
 
     fn run() -> Vec<Frame> {
         (0..3).map(frame).collect()
+    }
+
+    /// The glow style of [`glowing`]'s runs.
+    const STYLE: &str = "rainbow kitty";
+
+    /// A glow scene answer: in [`STYLE`] on each page, bloom on and off, a
+    /// ramps run laying a ramp on every frame after the prompt (one of them
+    /// additive) and a quads run laying none, every frame the same; a page
+    /// named `… art` draws art its plain page does not.
+    fn glowing(pages: &[&str]) -> Answer {
+        let mut a = answer(Vec::new());
+        for &page in pages {
+            for bloom in [true, false] {
+                for ramps in [true, false] {
+                    let laid = (0..3u64)
+                        .map(|k| {
+                            if ramps && k > 0 {
+                                [2, 4 * k, 1]
+                            } else {
+                                [0, 0, 0]
+                            }
+                        })
+                        .collect();
+                    let mut last = frame(2);
+                    last.rgba[6] = u8::from(bloom);
+                    last.rgba[10] ^= if page.ends_with(" art") { 0x40 } else { 0 };
+                    a.glow.push(GlowRun {
+                        style: STYLE.to_string(),
+                        page: page.to_string(),
+                        bloom,
+                        ramps,
+                        digests: ["prompt", "one", "two"].map(str::to_string).to_vec(),
+                        laid,
+                        last,
+                    });
+                }
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn glow_ramps_byte_identical_to_their_quads_pass() {
+        let pages = ["dark", "light", "dark art"];
+        let art = [("dark art", "dark")];
+        let v = glow(&glowing(&pages), &[STYLE], &pages, &art, 3);
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+        assert_eq!(v.lines.len(), 8, "{:?}", v.lines);
+        // A page whose bloom draws nothing passes while another blooms.
+        let mut a = glowing(&["dark", "light"]);
+        for r in a.glow.iter_mut().filter(|r| r.page == "light") {
+            r.last.rgba[6] = 0;
+        }
+        let v = glow(&a, &[STYLE], &["dark", "light"], &[], 3);
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+    }
+
+    #[test]
+    fn glow_ramps_that_differ_from_their_quads_fail_and_each_control_bites() {
+        let pages = ["dark", "dark art"];
+        let fails = |a: &Answer, says: &str| {
+            let v = glow(a, &[STYLE], &pages, &[("dark art", "dark")], 3);
+            assert!(
+                v.failures.iter().any(|f| f.contains(says)),
+                "{says}: {:?}",
+                v.failures
+            );
+        };
+        let mut a = glowing(&pages);
+        a.glow[0].digests[1] = "moved".to_string();
+        fails(&a, "differ from the quads on frames 1");
+        let mut a = glowing(&pages);
+        a.glow[0].last.rgba[0] ^= 1;
+        fails(&a, "the last frame's ramps differ from its quads");
+        let mut a = glowing(&pages);
+        a.glow[0].laid = vec![[0, 0, 0]; 3];
+        fails(&a, "laid no lit ramp");
+        let mut a = glowing(&pages);
+        a.glow[1].laid[2] = [1, 3, 0];
+        fails(&a, "it is no oracle");
+        let mut a = glowing(&pages);
+        for r in a.glow.iter_mut().filter(|r| r.bloom) {
+            for l in &mut r.laid {
+                l[2] = 0;
+            }
+        }
+        fails(&a, "no item list was read by the bloom or its crown");
+        let mut a = glowing(&pages);
+        a.glow[0].style = "comet".to_string();
+        fails(&a, "sent no ramps and quads runs");
+        let mut a = glowing(&pages);
+        for r in &mut a.glow {
+            r.digests[2] = "prompt".to_string();
+        }
+        fails(&a, "the glow drew nothing");
+        let mut a = glowing(&pages);
+        for r in &mut a.glow {
+            r.last.rgba[6] = 0;
+        }
+        fails(&a, "bloom on drew the frame bloom off drew on every page");
+        let mut a = glowing(&pages);
+        a.glow.retain(|r| r.bloom);
+        fails(&a, "sent no ramps and quads runs");
+        let mut a = glowing(&pages);
+        for r in a.glow.iter_mut().filter(|r| r.page == "dark art") {
+            r.last.rgba[10] ^= 0x40;
+        }
+        fails(&a, "the art drew nothing");
     }
 
     #[test]

@@ -2067,6 +2067,13 @@ pub(super) fn status_line(c: &mut Client, sid: &str) -> Option<String> {
 /// What [`step`] answers for a tab whose agent supervises itself under a proven self-claim ([`self_claimed_by_status`]).
 pub const SKIP_SELF_CLAIMED: &str = "skip:self-claimed";
 
+/// Whether `status` says a proven claim stands (`supervisor_proven=1`): codex-alab's v2
+/// self-claim, or a rostered harness's contract v3 scoped claim. `status` carries no scope, so a
+/// scoped claim stands this lane down whatever its scope (`docs/DESIGN-harness-repos-2026-10-24.md`
+/// §11 D29, 2026-10-25 amendment): two actors never move one tab, and the only rostered row
+/// (grok-alab) always claims `upgrade` for a program this lane has no upgrade for. A row whose
+/// scope may leave `upgrade` to aterm, for a program this lane upgrades, puts the scope on
+/// `status` first.
 #[must_use]
 pub(super) fn self_claimed_by_status(line: &str) -> bool {
     crate::is_ok_reply(line) && line.split_whitespace().any(|t| t == "supervisor_proven=1")

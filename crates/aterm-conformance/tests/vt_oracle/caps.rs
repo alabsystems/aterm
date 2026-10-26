@@ -41,6 +41,8 @@ pub struct Caps {
     pub newline_mode: bool,
     /// G0/G1 designation of ASCII and DEC Special Graphics (`ESC ( 0`, `ESC ) 0`), SO/SI, and DECSC.
     pub charsets: bool,
+    /// DECLRMM (`?69`) and DECSLRM (`CSI Pl ; Pr s`) left/right margins.
+    pub lr_margins: bool,
 }
 
 fn line(cols: u16, rows: u16, bytes: &[u8], row: u16) -> String {
@@ -71,6 +73,7 @@ impl Caps {
                 && line(4, 2, b"a\x1b[T", 1) == "a",
             newline_mode: line(4, 2, b"\x1b[20hab\nc", 1) == "c",
             charsets: line(4, 1, b"\x1b(0q", 0) == "\u{2500}",
+            lr_margins: line(4, 1, b"\x1b[?69h\x1b[1;2sabc", 0) == "c",
         }
     }
 }

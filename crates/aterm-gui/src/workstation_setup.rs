@@ -328,8 +328,17 @@ impl Request {
         request
     }
 
+    /// A dev scenario's review of the groups the ALab signal adds to `in_force`
+    /// ([`OfferKind::Widen`]), whose answer nobody awaits, as [`Self::unanswered`]'s.
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    pub(crate) fn unanswered_widen(widened: Plan, in_force: Plan) -> Self {
+        let mut request = Self::unanswered(widened);
+        request.kind = OfferKind::Widen { in_force };
+        request
+    }
+
     /// Leave `plan` for the review as the worker's look does ([`widen_once`]).
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
     pub(crate) fn send_widened(&self, plan: Plan) {
         *self.widened.lock().unwrap_or_else(PoisonError::into_inner) = Some(plan);
     }
@@ -448,6 +457,11 @@ pub(crate) struct Host {
     pub(crate) developer_tools: crate::clt_install::Install,
     /// Its dedicated terminal's child owns the prompt slot until exit or final detachment.
     pub(crate) developer_tools_session: Option<crate::clt_install::Terminal>,
+    /// Whether the tab opened on this Mac before: aterm opens it by itself once per Mac.
+    pub(crate) developer_tools_mark: crate::clt_install::Mark,
+    /// Whether Apple's installer runs now ([`crate::clt_install::installing_now`]); none in a
+    /// headless instance or a test, which never look at this Mac's installer.
+    pub(crate) developer_tools_probe: Option<fn() -> bool>,
 }
 
 impl Host {
@@ -475,6 +489,9 @@ impl Host {
             proxy_registered: false,
             developer_tools: crate::clt_install::Install::default(),
             developer_tools_session: None,
+            developer_tools_mark: crate::clt_install::Mark::for_launch(),
+            developer_tools_probe: (!headless && !cfg!(test))
+                .then_some(crate::clt_install::installing_now as fn() -> bool),
         }
     }
 

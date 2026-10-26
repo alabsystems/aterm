@@ -1701,7 +1701,7 @@ fn a_registration_tells_an_issuers_refusal_from_no_answer() {
             register_by(&mut reached, &reg, Instant::now() + HANG).expect_err("nothing recorded");
         match (said, refused) {
             (Some(_), Unregistered::Answered(why)) => {
-                assert_eq!(why, "the issuer refused: the book is full");
+                assert_eq!(why, "the book is full");
             }
             (None, Unregistered::Unanswered(why)) => {
                 assert!(why.starts_with("the issuer did not answer"), "{why}");
@@ -1862,7 +1862,12 @@ fn a_join_answers_with_the_member_as_the_book_records_it() {
         ..reg
     };
     let (outcome, answer) = serve(&itself);
-    assert!(outcome.is_err() && answer.starts_with("ERR "), "{answer}");
+    assert!(
+        outcome.is_err()
+            && answer.starts_with("ERR the registration names the issuer's own node")
+            && !answer.contains("this machine"),
+        "{answer}"
+    );
     assert_eq!(read_peers(state.dir()).unwrap().len(), 1);
 }
 

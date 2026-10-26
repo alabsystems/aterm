@@ -257,7 +257,7 @@ pub(crate) struct Host {
     /// time, or the review of the groups the ALab signal adds) opens its tab behind the person's
     /// and waits there, never taking the tab they are in (design §6).
     review_shown: bool,
-    /// The launch review's last view closed before the worker's Closed answer/status caught up.
+    /// The launch review closed or was cancelled before the worker's status caught up.
     /// Its unadmitted rows stay calm until durable status says the review has given way.
     closed_launch_review: bool,
     /// A System State view was visible at the last tick: showing it again
@@ -380,11 +380,13 @@ impl App {
 
     /// The first launch's review is up and unanswered: its headline is the page's one signal
     /// meanwhile, so neither the menu line nor the tab's diamond says anything (§3.3, §3.6).
+    /// The review of the groups the ALab signal adds stills neither: its tab never takes focus,
+    /// and the plan in force, which it leaves as is, goes on saying what it needs (§3.5).
     pub(crate) fn system_state_review_pending(&self) -> bool {
         self.system_state_host
             .pending
             .as_ref()
-            .is_some_and(Request::pending)
+            .is_some_and(|request| matches!(request.kind(), OfferKind::Launch) && request.pending())
     }
 
     /// Queued setup and Restore still belong to this worker; a live installer also
@@ -595,6 +597,11 @@ impl App {
         }
         if self.closed_launch_is_unanswered(&status) {
             status.unanswered = true;
+        }
+        // The page and the menu line read where the Command Line Tools install stands, which
+        // the window alone knows (its tab, Apple's installer); a scenario keeps its own.
+        if !self.system_state_host.showing_fixture() && status.repositories_tools_wait().is_some() {
+            status.developer_tools = self.developer_tools_install_step();
         }
         self.system_state_host.latest_status = status.clone();
         let (status, step) = self.project_system_state_status(status);
@@ -896,7 +903,23 @@ impl App {
             return;
         }
         self.system_state_host.fixture_review = None;
-        self.attach_system_state_offer(Request::unanswered(Plan::default()));
+        let mut permissions = Selection::none();
+        permissions.set(aterm_types::macos_setup::Setting::Permissions, true);
+        let permissions = Plan::from(permissions);
+        match review {
+            crate::system_state::FixtureReview::Counting
+            | crate::system_state::FixtureReview::Stopped => {
+                self.attach_system_state_offer(Request::unanswered(Plan::default()));
+            }
+            // The worker's look widens the review it offered once it hears the signal.
+            crate::system_state::FixtureReview::Widened => {
+                let request = Request::unanswered(permissions);
+                request.send_widened(Plan::default());
+                self.attach_system_state_offer(request);
+            }
+            crate::system_state::FixtureReview::Widen => self
+                .attach_system_state_offer(Request::unanswered_widen(Plan::default(), permissions)),
+        }
         if review == crate::system_state::FixtureReview::Stopped {
             self.native_runtime.system_state_gesture(true);
         }
@@ -1249,8 +1272,12 @@ impl App {
             SystemStateAction::CancelReview => {
                 let _ = self.take_system_state_press();
                 let mut widen = false;
+                let mut launch = false;
                 if let Some(request) = self.system_state_host.pending.take() {
                     widen = matches!(request.kind(), OfferKind::Widen { .. });
+                    // The model already answered Cancel, so its retained request no longer
+                    // reads pending. Keep the launch's calm projection across final close.
+                    launch = matches!(request.kind(), OfferKind::Launch);
                     request.finish(WorkstationSetupDecision::Cancelled);
                 }
                 self.begin_system_state_action(false, false);
@@ -1260,7 +1287,11 @@ impl App {
                     self.recheck_initial_setup_permissions();
                 }
                 self.finish_system_state_action(true, "Setup");
-                self.refresh_system_state_tab_indicators();
+                if launch {
+                    self.note_launch_review_closed();
+                } else {
+                    self.refresh_system_state_tab_indicators();
+                }
             }
             // Stop changes no plan or status generation. It withdraws future
             // automatic gestures locally even when the durable run already
@@ -1293,6 +1324,16 @@ impl App {
                 }
                 if !handlers.is_some_and(|handlers| (handlers.sync_on)()) {
                     aterm_log::info!("system state: Turn On Sync did not start");
+                }
+            }
+            SystemStateAction::InstallDeveloperTools { by_person } => {
+                let press = self.take_system_state_press();
+                if !by_person || press != crate::workstation_setup::PagePress::Person {
+                    aterm_log::info!("system state: Install… refused: not a person's press");
+                    return;
+                }
+                if !self.press_developer_tools_install() {
+                    aterm_log::info!("system state: Install… opened no Command Line Tools tab");
                 }
             }
             SystemStateAction::Apply(mut answer, admission) => {

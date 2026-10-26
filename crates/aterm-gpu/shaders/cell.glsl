@@ -108,7 +108,7 @@ void fs_bg() {
 // refuses to translate it for any GLES target, so wgpu's GL backend cannot
 // build this row at all); every vertex has w == 1, so the default smooth
 // interpolation computes the same value.
-#if defined(ATERM_VS_vs_glow)
+#if defined(ATERM_VS_vs_glow) || defined(ATERM_VS_vs_glow_items)
 flat ATERM_VARYING vec2 v_span;
 flat ATERM_VARYING uvec4 v_c0;
 flat ATERM_VARYING uvec4 v_c1;
@@ -148,6 +148,86 @@ void fs_glow() {
     uint w = max(uint(v_span.y), 1u);
     uvec4 c = glow_lerp4(v_c0, v_c1, glow_column(v_lx, v_span.y), w);
     o_frag = vec4(c) / vec4(255.0);
+}
+#endif
+
+// ---------------------------------------------------------------- GLOW ITEMS
+// The bloom's lights as an item list (aterm_render::bloom::BloomItems, whose
+// `light` is this reader's twin; shaders/cell.metal's GLOW ITEMS spells out the
+// layout), read by instance id, the WGSL `glow_item` op for op. GLSL ES 3.00
+// has no storage buffer, so the list is an RGBA8 texture 1024 words wide (word
+// j at (j % 1024, j / 1024), its bytes little-endian, recovered with roundEven)
+// at the vertex stage's unit 0 (BindSpec::GLOW_ITEMS).
+#if defined(ATERM_VERTEX) && defined(ATERM_VS_vs_glow_items)
+uint glow_item_word(uint j) {
+    uvec4 b = uvec4(roundEven(texelFetch(aterm_t0, ivec2(int(j % 1024u), int(j / 1024u)), 0)
+                              * 255.0));
+    return b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+}
+
+// An end as bytes (r, g, b, a), its colour times num / den, rounded.
+uvec4 glow_item_end(uint e, uint num, uint den) {
+    uvec3 c = ((uvec3(e >> 16u, e >> 8u, e) & uvec3(255u)) * num + uvec3(den / 2u)) / uvec3(den);
+    return uvec4(c, e >> 24u);
+}
+
+void glow_item(uint i, bool widen, out uvec4 rect, out uvec4 c0, out uvec4 c1) {
+    uint lo = 0u;
+    uint hi = glow_item_word(0u) - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (glow_item_word(4u + mid) <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uint s = i - glow_item_word(4u + lo);
+    uint r = glow_item_word(1u) + 4u * lo;
+    uint xy = glow_item_word(r);
+    uint jj = glow_item_word(r + 2u);
+    uint join = jj & 0xFFFFu;
+    uint joined = jj >> 16u;
+    uint e = glow_item_word(2u) + glow_item_word(r + 3u) + 2u * s;
+    uint e0 = glow_item_word(e);
+    uint e1 = glow_item_word(e + 1u);
+    uint qw = glow_item_word(r + 1u) & 0xFFFFu;
+    uint qh = s == join ? joined + 1u : 1u;
+    uint num = 1u;
+    uint den = 1u;
+    if (widen) {
+        if (qw > 0u && qw < 2u) {
+            num = num * qw;
+            den = den * 2u;
+            qw = 2u;
+        }
+        if (qh < 2u) {
+            num = num * qh;
+            den = den * 2u;
+            qh = 2u;
+        }
+    }
+    rect = (e0 | e1) == 0u
+        ? uvec4(0u)
+        : uvec4(xy & 0xFFFFu, (xy >> 16u) + s + (s > join ? joined : 0u), qw, qh);
+    c0 = glow_item_end(e0, num, den);
+    c1 = glow_item_end(e1, num, den);
+}
+
+// vs_glow over the item list, widened: the bloom extract's lights.
+void vs_glow_items() {
+    uvec4 r;
+    uvec4 c0;
+    uvec4 c1;
+    glow_item(uint(gl_InstanceID), true, r, c0, c1);
+    vec4 rect = vec4(r);
+    vec2 k = corner(uint(gl_VertexID));
+    vec2 px = rect.xy + k * rect.zw;
+    gl_Position = vec4(to_ndc(px), 0.0, 1.0);
+    v_span = rect.xz;
+    v_lx = k.x * rect.z;
+    v_c0 = c0;
+    v_c1 = c1;
 }
 #endif
 
@@ -578,6 +658,13 @@ ivec2 fx_texel(uvec2 l) {
     }
     return ivec2(v_src.xy + t);
 }
+
+// A Ramps item's palette row for its row y: the rows src.y + 1 ..= src.y +
+// src.z repeat row src.y's ends (a run, one light as tall as its rows), which
+// the palette holds once.
+uint fx_ramp_row(uint y, uvec4 src) {
+    return y - min(y - min(y, src.y), src.z);
+}
 #endif
 
 // The Exact law: (c, a) / 255 raw into src + dst*(1 - a) on the Unorm view.
@@ -602,8 +689,8 @@ void fs_fx() {
             c = fx_byte4(texelFetch(aterm_t1, t, 0));
         }
     } else {
-        // Rect (row 0) and Ramps (row l.y).
-        uint j = v_pal + 2u * (kind == 1u ? l.y : 0u);
+        // Rect (row 0) and Ramps (row l.y's palette row).
+        uint j = v_pal + 2u * (kind == 1u ? fx_ramp_row(l.y, v_src) : 0u);
         c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(v_src.x, 1u));
     }
     o_frag = vec4(c) / vec4(255.0);
@@ -631,7 +718,7 @@ void fs_fx_store() {
             c = fx_byte4(texelFetch(aterm_t1, t, 0));
         }
     } else {
-        uint j = v_pal + 2u * (kind == 1u ? l.y : 0u);
+        uint j = v_pal + 2u * (kind == 1u ? fx_ramp_row(l.y, v_src) : 0u);
         c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(v_src.x, 1u));
     }
     o_frag = vec4(s2l(vec3(c.rgb) / vec3(255.0)), 1.0);

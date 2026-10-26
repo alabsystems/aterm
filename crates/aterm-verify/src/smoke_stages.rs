@@ -4,15 +4,14 @@
 //! The GUI typing-pacing smoke: the `measure` check's live window.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::Ctx;
-use crate::exec::{Cmd, capture_reply};
+use crate::exec::{Cmd, StageGroupEnd, capture_reply};
 use crate::ladder::Report;
 use crate::smoke::{
-    is_socket_or_symlink, metric_ms_whole, metric_u64, retire_smoke_child, smoke_log_tail,
-    socket_listening,
+    SmokeChild, is_socket_or_symlink, metric_ms_whole, metric_u64, smoke_log_tail, socket_listening,
 };
 
 fn ok_reply(reply: &str) -> bool {
@@ -96,6 +95,8 @@ const ACQUIRE_P99_CEILING_MS: u64 = 50;
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
 /// The socket-listen budget.
 pub const SOCKET_POLLS: usize = 600;
+/// The stage the instance's process group is recorded and swept under in the run's record.
+const GROUP_LABEL: &str = "gui smoke";
 /// The pause between two looks of the smoke's waits.
 pub const POLL_GAP: Duration = Duration::from_millis(100);
 
@@ -104,7 +105,7 @@ struct Sandbox {
     rundir: PathBuf,
     cfgdir: PathBuf,
     gui_log: PathBuf,
-    child: Option<Child>,
+    child: Option<SmokeChild>,
 }
 
 impl Sandbox {
@@ -142,9 +143,15 @@ impl Sandbox {
         self.rundir.join("aterm/aterm.sock")
     }
 
-    fn teardown(&mut self, r: &mut Report) {
-        if let Some(mut child) = self.child.take() {
-            let (ok, _) = retire_smoke_child(&mut child);
+    /// End the instance with its group ([`SmokeChild::retire`]); `groups` sweeps and records the
+    /// group before its leader is reaped.
+    fn teardown(&mut self, r: &mut Report, groups: Option<&dyn StageGroupEnd>) {
+        if let Some(child) = self.child.take() {
+            let ok = child.retire(|pgid| {
+                if let Some(groups) = groups {
+                    groups.group_ended(pgid, GROUP_LABEL);
+                }
+            });
             if !ok {
                 r.fail("smoke: child cleanup/reap failed");
             }
@@ -201,7 +208,13 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
         .stdout(log)
         .stderr(log2);
     cmd.arg("--control-sock").arg(sb.sock());
-    match cmd.spawn() {
+    let groups = ctx.exec_env().stage_groups;
+    let made = |pgid| {
+        if let Some(groups) = groups {
+            groups.group_made(pgid, GROUP_LABEL);
+        }
+    };
+    match SmokeChild::spawn(&mut cmd, made) {
         Ok(c) => sb.child = Some(c),
         Err(e) => {
             r.cannot_run(format!("{tag}: cannot launch aterm-gui ({e})"));
@@ -262,9 +275,7 @@ fn wait_to_listen(
 }
 
 fn child_exited(sb: &mut Sandbox) -> bool {
-    sb.child
-        .as_mut()
-        .is_none_or(|c| matches!(c.try_wait(), Ok(Some(_)) | Err(_)))
+    sb.child.as_mut().is_none_or(SmokeChild::exited)
 }
 
 fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
@@ -300,7 +311,7 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
         aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
         settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
     }
-    sb.teardown(r);
+    sb.teardown(r, ctx.exec_env().stage_groups);
 }
 
 /// The server's answer in what the bundle's `aterm-ctl` printed: a refusal goes to stderr
@@ -332,7 +343,7 @@ fn aos_release_step(
     subject: &crate::stages::Subject,
 ) {
     let tag = "gui smoke: release aos";
-    let Some(pid) = sb.child.as_ref().map(Child::id) else {
+    let Some(pid) = sb.child.as_ref().map(SmokeChild::id) else {
         r.cannot_run(format!("{tag}: no child to drive"));
         return;
     };
@@ -395,7 +406,7 @@ pub fn aos_release_verdict(attach: &str, detach: &str, bundle: &str) -> Result<S
 }
 
 fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
-    let Some(pid) = sb.child.as_ref().map(Child::id) else {
+    let Some(pid) = sb.child.as_ref().map(SmokeChild::id) else {
         r.cannot_run("gui smoke: no child to measure");
         return;
     };
@@ -471,7 +482,7 @@ fn settings_hardware_key_step(
     subject: &crate::stages::Subject,
 ) {
     let tag = "gui smoke: settings key path";
-    let Some(pid) = sb.child.as_ref().map(Child::id) else {
+    let Some(pid) = sb.child.as_ref().map(SmokeChild::id) else {
         r.cannot_run(format!("{tag}: no child to drive"));
         return;
     };
@@ -1059,7 +1070,7 @@ mod tests {
         );
 
         let mut r = Report::new("t");
-        sb.teardown(&mut r);
+        sb.teardown(&mut r, None);
         assert!(!sb.tmp.exists(), "the sandbox removes itself");
         assert_eq!(r.outcomes().count(), 0, "a clean teardown says nothing");
     }
@@ -1089,12 +1100,14 @@ mod tests {
     fn a_teardown_that_loses_its_child_is_a_failure() {
         let mut sb = Sandbox::with_config("atl", "").expect("sandbox");
         sb.child = Some(
-            Command::new("/bin/sh")
-                .args(["-c", "exit 7"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn"),
+            SmokeChild::spawn(
+                Command::new("/bin/sh")
+                    .args(["-c", "exit 7"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                |_| {},
+            )
+            .expect("spawn"),
         );
         let pid = sb.child.as_ref().expect("child").id();
         assert!(
@@ -1102,7 +1115,7 @@ mod tests {
             "`exit 7` never exited within a minute"
         );
         let mut r = Report::new("t");
-        sb.teardown(&mut r);
+        sb.teardown(&mut r, None);
         assert_eq!(
             r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
             [crate::Outcome::Fail(crate::Severity::GateFailed)]

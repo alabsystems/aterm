@@ -852,6 +852,109 @@ pub(crate) fn take_person_stamps(
         .collect()
 }
 
+/// THE KEEP SEAM's folder, `ATERM_DEBUG_SEAMLESS_KEEP` (read through [`aterm_types::dev_seam!`], so `None` in a shipped binary, which keeps nothing): an absolute folder into which an outgoing process copies every file its handoff writes, before its successor can read one ([`keep_attempt`]). `lab seamless`'s privacy leg sweeps the copies, since the successor consumes the originals.
+#[cfg(unix)]
+fn keep_seam_root() -> Option<&'static std::path::Path> {
+    static ROOT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| keep_root_of(aterm_types::dev_seam!("ATERM_DEBUG_SEAMLESS_KEEP")))
+        .as_deref()
+}
+
+/// The keep seam's folder from its value: an absolute path, or none.
+#[cfg(unix)]
+pub(crate) fn keep_root_of(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from(value?);
+    root.is_absolute().then_some(root)
+}
+
+/// Copy the attempt `nonce`'s handoff files into the keep seam's folder when the seam is armed ([`keep_attempt_in`]); a failure is logged and never costs the handoff.
+#[cfg(unix)]
+pub(crate) fn keep_attempt(nonce: &str) {
+    let Some(root) = keep_seam_root() else {
+        return;
+    };
+    let Some(dir) = crate::control_auth::socket_dir() else {
+        return;
+    };
+    match keep_attempt_in(root, &dir, std::process::id(), nonce) {
+        Ok(copied) => {
+            aterm_log::info!("update apply: the keep seam copied {copied} handoff file(s)");
+        }
+        Err(error) => aterm_log::warn!("update apply: the keep seam copied no more: {error}"),
+    }
+}
+
+/// The most bytes the keep seam copies of one file: the aggregate grid cap.
+#[cfg(unix)]
+const KEEP_FILE_MAX: u64 = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
+
+/// The most bytes a keep folder's `index` may hold.
+#[cfg(unix)]
+const KEEP_INDEX_MAX: u64 = 1024 * 1024;
+
+/// Copy every file of process `pid`'s attempt `nonce` in `dir` (`seamless-<pid>-<nonce>.…`) that `<root>/<pid>-<nonce>/` does not list yet into it, each copy 0600 in that 0700 folder, and list it in the folder's `index`: `file <mode> <len> <name>`, the mode the original's own, read without following a link; a name that is no regular file, or is past [`KEEP_FILE_MAX`], is listed `skip <name>` and not read. The index's first row is `dir <mode> <dir>`. Returns how many files it copied.
+#[cfg(unix)]
+pub(crate) fn keep_attempt_in(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    pid: u32,
+    nonce: &str,
+) -> std::io::Result<usize> {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    aterm_uds::private_file::ensure_private_dir(root)?;
+    let kept = root.join(format!("{pid}-{nonce}"));
+    aterm_uds::private_file::create_private_dir(&kept)?;
+    let mut index = read_regular_capped(&kept.join("index"), KEEP_INDEX_MAX)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    if index.is_empty() {
+        let mode = std::fs::symlink_metadata(dir)?.permissions().mode() & 0o7777;
+        let _ = writeln!(index, "dir {mode:o} {}", dir.display());
+    }
+    let listed: std::collections::BTreeSet<String> = index
+        .lines()
+        .filter_map(|row| match row.split_once(' ')? {
+            ("file", rest) => rest.splitn(3, ' ').nth(2),
+            ("skip", name) => Some(name),
+            _ => None,
+        })
+        .map(str::to_string)
+        .collect();
+    let prefix = format!("seamless-{pid}-{nonce}.");
+    let mut names: Vec<String> = std::fs::read_dir(dir)?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix) && !listed.contains(name))
+        .collect();
+    names.sort();
+    let mut copied = 0;
+    for name in names {
+        let path = dir.join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let bytes = if meta.file_type().is_file() {
+            read_regular_capped(&path, KEEP_FILE_MAX)
+        } else {
+            None
+        };
+        match bytes {
+            Some(bytes) => {
+                aterm_uds::private_file::write_private(&kept, &name, &bytes)?;
+                let mode = meta.permissions().mode() & 0o7777;
+                let _ = writeln!(index, "file {mode:o} {} {name}", bytes.len());
+                copied += 1;
+            }
+            None => {
+                let _ = writeln!(index, "skip {name}");
+            }
+        }
+    }
+    aterm_uds::private_file::write_private(&kept, "index", index.as_bytes())?;
+    Ok(copied)
+}
+
 /// Read a regular file without following a symlink, without blocking on whatever else sits at the path, and without allocating past its protocol cap.
 pub(crate) fn take_regular_capped(
     path: &std::path::Path,
@@ -5756,6 +5859,10 @@ pub(crate) mod tests;
 #[cfg(all(test, unix))]
 #[path = "seamless_carry_tests.rs"]
 mod carry_tests;
+
+#[cfg(all(test, unix))]
+#[path = "seamless_keep_tests.rs"]
+mod keep_tests;
 
 #[cfg(test)]
 #[path = "seamless_ladder_tests.rs"]

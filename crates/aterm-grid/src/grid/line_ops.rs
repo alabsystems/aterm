@@ -92,17 +92,18 @@ impl Grid {
             self.insert_chars(count);
             return;
         }
-        self.storage.clear_pending_wrap();
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
+        // Outside the margins ICH changes nothing, the pending wrap included: xterm's
+        // `InsertChar` returns before its `ResetWrap`.
         let in_margins = cursor_col >= margins.left && cursor_col <= margins.right;
-        let right_bound = if in_margins {
-            margins.right.saturating_add(1).min(effective_cols)
-        } else {
-            effective_cols
-        };
+        if !in_margins {
+            return;
+        }
+        self.storage.clear_pending_wrap();
+        let right_bound = margins.right.saturating_add(1).min(effective_cols);
         let fill = self.storage.cursor_template;
         let bounded = self.shift_is_bounded(right_bound, in_margins);
         if cursor_col < right_bound {
@@ -135,17 +136,18 @@ impl Grid {
             self.delete_chars(count);
             return;
         }
-        self.storage.clear_pending_wrap();
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
+        // Outside the margins DCH changes nothing, the pending wrap included: xterm's
+        // `DeleteChar` returns before its `ResetWrap`.
         let in_margins = cursor_col >= margins.left && cursor_col <= margins.right;
-        let right_bound = if in_margins {
-            margins.right.saturating_add(1).min(effective_cols)
-        } else {
-            effective_cols
-        };
+        if !in_margins {
+            return;
+        }
+        self.storage.clear_pending_wrap();
+        let right_bound = margins.right.saturating_add(1).min(effective_cols);
         let fill = self.storage.cursor_template;
         let bounded = self.shift_is_bounded(right_bound, in_margins);
         if cursor_col < right_bound {

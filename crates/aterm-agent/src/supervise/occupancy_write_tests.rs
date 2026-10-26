@@ -50,6 +50,13 @@ struct DoorHost {
     clear_note: Mutex<Option<NoteOutcome>>,
     /// The host's persistent task slot across loop instances: edits alone move its revision.
     record: Mutex<(Option<FactWord>, u64)>,
+    /// The fact the host owes at a background break ([`IdleHost::fact_owed`]), and the step it
+    /// answers there ([`IdleHost::at_background_fact`]); `None`, none owed.
+    fact: Mutex<Option<HostStep>>,
+    /// The points the loop offered the host's fact at, in order.
+    fact_points: Mutex<Vec<IdlePoint>>,
+    /// Each lasting withhold the loop told ([`IdleHost::lasting_hold`]), in order.
+    lasting: Mutex<Vec<Option<crate::supervise::Lasting>>>,
     /// The session's book of wakes as the loop reads it ([`IdleHost::wakes`]).
     wakes: Mutex<WakesSeen>,
     /// How many times the loop read the book.
@@ -85,6 +92,17 @@ impl IdleHost for DoorHost {
         let line = self.notice.lock().expect("notice").take()?;
         self.called("at_background".to_string());
         Some((line, HostTurn::Notice))
+    }
+    fn fact_owed(&self) -> bool {
+        self.fact.lock().expect("fact").is_some()
+    }
+    fn at_background_fact(&self, point: IdlePoint) -> Option<HostStep> {
+        self.called("at_background_fact".to_string());
+        self.fact_points.lock().expect("fact_points").push(point);
+        self.fact.lock().expect("fact").take()
+    }
+    fn lasting_hold(&self, hold: Option<crate::supervise::Lasting>) {
+        self.lasting.lock().expect("lasting").push(hold);
     }
     fn taskless(&self) -> bool {
         self.taskless.load(Ordering::SeqCst)
@@ -321,6 +339,9 @@ struct Ran {
     /// Whether the land act a loop before this one typed is still owed its answer
     /// (`land_act_seeded`), as the run left it.
     land: bool,
+    /// Whether an act of the policy's is in flight (`act_in_flight`: typed, its answer still
+    /// awaited), as the run left it.
+    in_flight: bool,
     /// What the door told the host, in order.
     said: Vec<OccupancySaid>,
 }
@@ -404,7 +425,7 @@ impl<'a> Script<'a> {
             ledger: path.clone(),
             seen: Vec::new(),
         };
-        let (noted, land) = {
+        let (noted, land, in_flight) = {
             let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
             clock.stand_mono();
             clock.set_at_ms(start_ms);
@@ -453,7 +474,11 @@ impl<'a> Script<'a> {
                     .expect("the break's step");
             }
             s.hold_left(Some(&self.policy), &heard);
-            (heard.noted.clone(), s.turn_end.land_act_seeded())
+            (
+                heard.noted.clone(),
+                s.turn_end.land_act_seeded(),
+                s.turn_end.act_in_flight(),
+            )
         };
         let requests = logged.seen;
         let rows = fact_rows(&path);
@@ -466,6 +491,7 @@ impl<'a> Script<'a> {
             calls: self.host.calls(),
             ledger,
             land,
+            in_flight,
             said: self.host.said.lock().expect("said").clone(),
         }
     }
@@ -3887,3 +3913,277 @@ fn a_successor_books_no_second_would_row_for_a_carried_wake() {
 
 #[path = "facts_loop_tests.rs"]
 mod facts_loop;
+
+/// The ask to free space's line (`disk-free@v1`, a fact of the host's own) as its host answers a
+/// break it is offered at: typed.
+fn disk_free_typed() -> HostStep {
+    HostStep {
+        line: "disk-free@v1 step=typed".to_string(),
+        moved: true,
+        typed: Some(HostTurn::Fact),
+        repeat: false,
+    }
+}
+
+/// A session whose turn ended with its own background shell still running (a manager awaiting
+/// its workers) reads busy for hours and comes to no idle point. The host's own fact owed it, the
+/// ask to free space's line, is offered at such a break once it settles, through the same act and
+/// the guards an idle point's fact is: before, only the upgrade's notice was, and the line waited
+/// out its delivery window and was handed on undelivered, and as the only seat the episode parked
+/// for six hours with nothing asked.
+#[test]
+fn a_fact_owed_at_a_settled_background_break_is_offered_there() {
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    let ran = Script {
+        host: Arc::clone(&host),
+        ..Script::new("background-fact", Occupancy::Off, &[0, 60])
+    }
+    .run(&mut nothing);
+    assert_eq!(
+        ran.calls
+            .iter()
+            .filter(|c| *c == "at_background_fact")
+            .count(),
+        1,
+        "{:?}",
+        ran.calls
+    );
+    assert!(
+        ran.noted
+            .iter()
+            .any(|n| n.ends_with("background disk-free@v1 step=typed")),
+        "{:#?}",
+        ran.noted
+    );
+    assert_eq!(
+        *host.fact_points.lock().expect("fact_points"),
+        [IdlePoint::default()],
+        "nothing holds it: nobody's hand, nobody else's session"
+    );
+    assert!(
+        host.fact.lock().expect("fact").is_none(),
+        "typed, so owed no more"
+    );
+}
+
+/// The host's fact at a background break is offered under an idle point's guards: a draft
+/// standing in the composer holds it unoffered, and still owed; the person's own exchange is
+/// passed as whose the session is, so the host gives the line up rather than keep it owed.
+#[test]
+fn a_fact_at_a_background_break_keeps_an_idle_points_guards() {
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    let ran = Script {
+        host: Arc::clone(&host),
+        drawn: &|_| drafted_break(),
+        set: &|m| m.cursor_col = Some(20),
+        ..Script::new("background-fact-draft", Occupancy::Off, &[0, 60])
+    }
+    .run(&mut nothing);
+    assert!(
+        !ran.calls.iter().any(|c| c == "at_background_fact"),
+        "{:?}",
+        ran.calls
+    );
+    assert!(
+        ran.noted
+            .iter()
+            .any(|n| n.ends_with("background fact held: draft")),
+        "{:#?}",
+        ran.noted
+    );
+    assert!(host.fact.lock().expect("fact").is_some(), "still owed");
+
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    let _ = Script {
+        host: Arc::clone(&host),
+        ..Script::new("background-fact-exchange", Occupancy::Off, &[0, 60])
+    }
+    .run(&mut |s, i| {
+        if i == 0 && !s.turn_end.left_to_person() {
+            let mut reading = s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
+            reading.left_record = true;
+            s.turn_end.observe(&reading, s.fx.mono());
+        }
+    });
+    assert_eq!(
+        *host.fact_points.lock().expect("fact_points"),
+        [IdlePoint {
+            done_under_land: false,
+            held: Some(Guard::Exchange),
+            theirs: Some(Guard::Exchange),
+        }],
+    );
+}
+
+/// A background break that is no shell or monitor the turn left (the agent waits on its dynamic
+/// workflows to finish) is not where the fact goes: the agent picks up its own turn when they
+/// finish, and the line would land in that turn.
+#[test]
+fn no_fact_is_offered_where_the_agent_waits_on_its_own_workflows() {
+    fn workflows() -> Vec<String> {
+        let mut r = rows(&[
+            "⏺ Both workflows are running; I will pick up when they finish.",
+            "",
+            "✻ Waiting for 2 dynamic workflows to finish",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ auto mode on · 2 workflows · ← for agents"));
+        r
+    }
+    assert!(aterm_phase::phase::background_wait(&workflows()).is_some());
+    assert!(!aterm_phase::turn_over_background(&workflows()));
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    let ran = Script {
+        host: Arc::clone(&host),
+        drawn: &|_| workflows(),
+        ..Script::new("background-fact-workflows", Occupancy::Off, &[0, 60])
+    }
+    .run(&mut nothing);
+    assert!(
+        !ran.calls.iter().any(|c| c == "at_background_fact"),
+        "{:?}",
+        ran.calls
+    );
+    assert!(host.fact.lock().expect("fact").is_some(), "still owed");
+}
+
+/// The credits hold at a background break is a lasting withhold of the loop's: it is told to the
+/// host, with when it lifts, once, so the window's seat rule (`disk-free@v1`) holds the session
+/// out of its seats meanwhile.
+#[test]
+fn the_credits_hold_at_a_background_break_is_told_once() {
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    let _ = Script {
+        host: Arc::clone(&host),
+        drawn: &|_| {
+            let mut r = break_screen();
+            let mode = r.last_mut().expect("the mode row");
+            *mode = aterm_phase::prompt::fixtures::right_aligned(mode, "Now using usage credits");
+            r
+        },
+        ..Script::new("background-credits", Occupancy::Off, &[0, 60, 120])
+    }
+    .run(&mut nothing);
+    let lasting = host.lasting.lock().expect("lasting").clone();
+    assert!(
+        matches!(
+            lasting.as_slice(),
+            [Some(crate::supervise::Lasting::Credits { .. })]
+        ),
+        "{lasting:?}"
+    );
+}
+
+/// The host's fact at a background break is judged on a `status` read made there, as an idle
+/// point's step reads `status` first and every line at a break is judged on one: a person who
+/// typed seconds ago (their own message to a manager, answered at once, its turn ending with its
+/// background await of its workers still running) is inside their grace, and the fact is offered
+/// held by it, so the host keeps its line owed. Before, the break judged the person by the loop's
+/// last read, made at an idle point long before, and the line went into the person's exchange.
+#[test]
+fn a_fact_at_a_background_break_reads_the_persons_grace_there() {
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    let ran = Script {
+        host: Arc::clone(&host),
+        set: &|m| m.human_ms = Some(5_000),
+        ..Script::new("background-fact-person", Occupancy::Off, &[0, 60])
+    }
+    .run(&mut nothing);
+    assert!(
+        ran.requests().iter().any(|r| r == "status"),
+        "{:?}",
+        ran.requests()
+    );
+    assert_eq!(
+        host.fact_points.lock().expect("fact_points").first(),
+        Some(&IdlePoint {
+            done_under_land: false,
+            held: Some(Guard::Person),
+            theirs: None,
+        }),
+        "the person's grace, read at the break"
+    );
+}
+
+/// A halt or another driver's hand the loop's last `status` read saw, and lifted since, holds the
+/// host's fact at a background break no longer: the read made there is the session's word on
+/// them. Before, the halt the last idle point's read saw held the line at every break of a session
+/// that came to no idle point again, and it was handed on undelivered.
+#[test]
+fn a_halt_or_a_hand_lifted_since_the_last_read_holds_no_fact_at_a_background_break() {
+    for tag in ["halted", "driver"] {
+        let host = Arc::new(DoorHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        *host.fact.lock().expect("fact") = Some(disk_free_typed());
+        let ran = Script {
+            host: Arc::clone(&host),
+            ..Script::new(tag, Occupancy::Off, &[0, 60])
+        }
+        .run(&mut |s, i| match (i, tag) {
+            (0, "halted") => s.halted = true,
+            (0, _) => s.driver = true,
+            _ => {}
+        });
+        assert_eq!(
+            *host.fact_points.lock().expect("fact_points"),
+            [IdlePoint::default()],
+            "{tag}: {:#?}",
+            ran.noted
+        );
+        assert!(host.fact.lock().expect("fact").is_none(), "{tag}: typed");
+    }
+}
+
+/// The host's fact typed at a background break is kept in a record of its own, as the occupancy
+/// door's line there is: an act the agent took and whose answer is still awaited (a continuation,
+/// a land check) keeps its record, so the turn that ends next is judged as that act's answer, and
+/// the land episode stays owed its answer. Before, the line was recorded as the host's turn, which
+/// took the awaited act's place: a manager's `Nothing left:` was read as the line's answer, never
+/// a done report, and the harness typed another land check.
+#[test]
+fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
+    let host = Arc::new(DoorHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    let ran = Script {
+        host: Arc::clone(&host),
+        ..Script::new("background-fact-awaited", Occupancy::Off, &[0])
+    }
+    .run(&mut |s, i| {
+        if i == 0 {
+            let now = s.fx.mono();
+            s.turn_end.seed_land(2, true, false, false);
+            s.turn_end.seed_land_owed(RULE_LAND);
+            s.turn_end.seed_land_act(1, 1, Duration::ZERO, now);
+            assert!(s.turn_end.seed_awaited(
+                crate::supervise::policy::turn_end::RULE_CONTINUE,
+                Duration::ZERO,
+                crate::supervise::policy::turn_end::FirstRead::Unknown,
+                false,
+                false,
+                now,
+            ));
+            s.turn_end.took();
+        }
+    });
+    assert!(
+        ran.noted
+            .iter()
+            .any(|n| n.ends_with("background disk-free@v1 step=typed")),
+        "{:#?}",
+        ran.noted
+    );
+    assert!(ran.in_flight, "the continuation is still owed its answer");
+    assert!(ran.land, "the land act is still owed its answer");
+}

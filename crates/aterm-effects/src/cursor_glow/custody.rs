@@ -24,7 +24,14 @@ pub(crate) fn take_hint_fresh(
     now: Instant,
     window: f32,
 ) -> Option<Instant> {
-    hint.take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= window)
+    if let Some(t) = *hint
+        && now.saturating_duration_since(t).as_secs_f32() <= window
+    {
+        *hint = None;
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Spend a one-shot hint: take it only while fresh ([`hint_fresh_dur`]).
@@ -34,7 +41,14 @@ pub(crate) fn take_hint_fresh_dur(
     now: Instant,
     window: Duration,
 ) -> Option<Instant> {
-    hint.take_if(|t| now.saturating_duration_since(*t) <= window)
+    if let Some(t) = *hint
+        && now.saturating_duration_since(t) <= window
+    {
+        *hint = None;
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Cap of the exact content witness for the last adjacent typed echo run.
@@ -151,10 +165,15 @@ impl HandRow {
     /// Carried across a scroll or band move.
     #[inline]
     pub(super) fn carried(self, map: &impl Fn(u16) -> Option<u16>, at_caret: bool) -> Option<Self> {
-        let caret_row = self.caret_row.or(at_caret.then_some(self.row));
-        match map(self.row) {
-            Some(row) => Some(Self { row, caret_row }),
-            None => caret_row.map(Self::at),
+        let caret_row = match self.caret_row {
+            Some(cr) => Some(cr),
+            None if at_caret => Some(self.row),
+            None => None,
+        };
+        match (map(self.row), caret_row) {
+            (Some(row), caret_row) => Some(Self { row, caret_row }),
+            (None, Some(cr)) => Some(Self::at(cr)),
+            (None, None) => None,
         }
     }
 
@@ -388,6 +407,15 @@ impl PressCredits {
         self.head = (self.head + 1) & STAMP_RING_MASK;
     }
 
+    /// The press instant at `slot`, if occupied.
+    #[inline]
+    pub(super) const fn slot_at(&self, slot: usize) -> Option<Instant> {
+        match self.slots[slot] {
+            Some((at, _, _)) => Some(at),
+            None => None,
+        }
+    }
+
     /// Hold every press banked through `at` ([`Self::held_through`]).
     #[inline]
     pub(super) fn hold_through(&mut self, at: Instant) {
@@ -432,10 +460,13 @@ impl PressCredits {
     /// Unpaid cells of the live presses whose instant `keep` admits.
     #[inline]
     pub(super) fn cells_where(&self, now: Instant, keep: impl Fn(Instant) -> bool) -> usize {
-        self.within(now)
-            .filter(|(t, _, _)| keep(*t))
-            .map(|(_, c, _)| usize::from(c))
-            .sum()
+        let mut total = 0usize;
+        for (t, c, _) in self.within(now) {
+            if keep(t) {
+                total += usize::from(c);
+            }
+        }
+        total
     }
 
     /// Unpaid cells of every live press.
@@ -467,20 +498,34 @@ impl PressCredits {
                 None => t,
             });
         }
-        free.or(held)
+        match free {
+            Some(t) => Some(t),
+            None => held,
+        }
     }
 
     /// The last press still funding a foreign-row park.
     #[inline]
     pub(super) fn newest_unpaid(&self, now: Instant) -> Option<Instant> {
-        self.within(now).map(|(t, _, _)| t).max()
+        let mut newest = None::<Instant>;
+        for (t, _, _) in self.within(now) {
+            newest = Some(match newest {
+                Some(prev) => prev.max(t),
+                None => t,
+            });
+        }
+        newest
     }
 
     /// Whether an unpaid press stamped exactly `glyph` within `freshness_s`.
     #[inline]
     pub(super) fn fresh_glyph(&self, now: Instant, freshness: Duration, glyph: char) -> bool {
-        self.within(now)
-            .any(|(at, _, g)| g == Some(glyph) && now.saturating_duration_since(at) <= freshness)
+        for (at, _, g) in self.within(now) {
+            if g == Some(glyph) && now.saturating_duration_since(at) <= freshness {
+                return true;
+            }
+        }
+        false
     }
 
     /// The oldest fresh press's exact glyph, in ring order.
@@ -514,7 +559,7 @@ impl PressCredits {
                 Some(_) => any = true,
             }
         }
-        any.then_some(true)
+        if any { Some(true) } else { None }
     }
 
     /// The chronological unpaid one-cell keys must spell this whole small observed run.
@@ -615,10 +660,16 @@ impl PressCredits {
             if at <= after || credits != 1 || glyph != Some(glyphs[n]) {
                 return None;
             }
-            first.get_or_insert(i);
+            if first.is_none() {
+                first = Some(i);
+            }
             n += 1;
         }
-        first.filter(|_| n == glyphs.len() && n > 0)
+        if n == glyphs.len() && n > 0 {
+            first
+        } else {
+            None
+        }
     }
 
     /// A later exact content echo proves earlier same-stream keys already appeared.
@@ -744,7 +795,7 @@ impl PressCredits {
             keys[n] = Some((at, glyph));
             n += 1;
         }
-        (n > 0).then_some((keys, n))
+        if n > 0 { Some((keys, n)) } else { None }
     }
 
     /// Take every press banked after `at` out of the ring at its own index.
@@ -1150,9 +1201,12 @@ impl InsertSeam {
         self.tally.delivered += 1;
         self.undo.last_cells = self.tally.last_cells;
         self.tally.last_cells = cells;
-        let prior = self
-            .armed
-            .filter(|prev| at.saturating_duration_since(prev.at) <= INSERT_HINT_FRESH_DUR);
+        let prior = match self.armed {
+            Some(prev) if at.saturating_duration_since(prev.at) <= INSERT_HINT_FRESH_DUR => {
+                Some(prev)
+            }
+            _ => None,
+        };
         let armed = match prior {
             Some(prev) if prev.breaks || breaks => InsertLicence {
                 at,
@@ -1160,7 +1214,10 @@ impl InsertSeam {
                 cells: CursorGlow::INSERT_GESTURE_CELLS,
                 known: false,
                 breaks: false,
-                row: row.or(prev.row),
+                row: match row {
+                    Some(r) => Some(r),
+                    None => prev.row,
+                },
             },
             Some(prev) => InsertLicence {
                 at,
@@ -1172,7 +1229,10 @@ impl InsertSeam {
                 },
                 known: prev.known && known,
                 breaks: false,
-                row: row.or(prev.row),
+                row: match row {
+                    Some(r) => Some(r),
+                    None => prev.row,
+                },
             },
             None => InsertLicence {
                 at,
@@ -1206,7 +1266,11 @@ impl InsertSeam {
         } else {
             INSERT_GESTURE_HINT_FRESH_DUR
         };
-        (now.saturating_duration_since(i.at) <= window).then_some(i)
+        if now.saturating_duration_since(i.at) <= window {
+            Some(i)
+        } else {
+            None
+        }
     }
 
     /// Drop the licence and the credit it accumulated.
@@ -1254,10 +1318,14 @@ impl InsertSeam {
         dispatched_at: Option<Instant>,
     ) -> Option<PendingHop> {
         let hop = self.pending_hop.take()?;
-        (at.saturating_duration_since(hop.at) <= INSERT_RETRO_FRESH_DUR
+        if at.saturating_duration_since(hop.at) <= INSERT_RETRO_FRESH_DUR
             && !matches!(dispatched_at, Some(dispatched) if hop.at < dispatched)
-            && Self::retro_hop_is_the_inserts(hop, armed.cells, armed.known, armed.row))
-        .then_some(hop)
+            && Self::retro_hop_is_the_inserts(hop, armed.cells, armed.known, armed.row)
+        {
+            Some(hop)
+        } else {
+            None
+        }
     }
 
     /// Whether a refused hop is the insert now delivered.
@@ -1369,12 +1437,17 @@ impl CursorGlow {
             Some(i) => self.type_press_ring.slots[i],
             None => None,
         };
-        match cells {
-            Some(cells) => self
-                .type_press_ring
-                .retire_newest_cells(u8::try_from(cells).unwrap_or(u8::MAX)),
-            None => self.type_press_ring.retire_newest(),
-        }
+        let erased_cells = match cells {
+            Some(cells) => {
+                self.type_press_ring
+                    .retire_newest_cells(cells.min(u8::MAX as u16) as u8);
+                cells
+            }
+            None => {
+                self.type_press_ring.retire_newest();
+                1
+            }
+        };
         let retired = match (newest, newest_press) {
             (Some(i), Some((_, _, glyph))) if self.type_press_ring.slots[i].is_none() => glyph,
             _ => None,
@@ -1402,7 +1475,7 @@ impl CursorGlow {
             at: now,
             retired: owed.0,
             retired_n: owed.1,
-            owed: owed.2.saturating_add(cells.unwrap_or(1)),
+            owed: owed.2.saturating_add(erased_cells),
         });
         self.bs_poof_hint = Some(now);
         self.bs_baseline = self.row_fill_at_key();
@@ -1489,7 +1562,7 @@ impl CursorGlow {
             cells,
             shifted,
             class,
-            (cells == 1).then_some(glyph),
+            if cells == 1 { Some(glyph) } else { None },
         );
     }
 
@@ -1711,7 +1784,11 @@ impl CursorGlow {
         }
         let ins = self.insert.fresh(now)?;
         let hop = usize::from(cc - pc);
-        (hop <= self.insert_reach(ins, now)).then_some(ins)
+        if hop <= self.insert_reach(ins, now) {
+            Some(ins)
+        } else {
+            None
+        }
     }
 
     /// Row identity for the insert.
@@ -1734,8 +1811,11 @@ impl CursorGlow {
     ) -> Option<InsertLicence> {
         let ins = self.insert_echo(pr, pc, cr, cc, now, cfg)?;
         let hop = usize::from(cc - pc);
-        (Self::insert_row_identity(cr, hop, ins) && !self.fresher_class_owns_hop(hop, ins, now))
-            .then_some(ins)
+        if Self::insert_row_identity(cr, hop, ins) && !self.fresher_class_owns_hop(hop, ins, now) {
+            Some(ins)
+        } else {
+            None
+        }
     }
 
     /// The line insert's echo across its break ([`InsertWidth::Line`]).
@@ -1751,18 +1831,22 @@ impl CursorGlow {
         {
             return None;
         }
-        let ins = self
-            .insert
-            .fresh(now)
-            .filter(|ins| ins.known && ins.breaks && ins.row == Some(pr))?;
-        let end = pc
-            .checked_add(ins.cells)
-            .filter(|&end| usize::from(end) < geom.cols)?;
+        let ins = self.insert.fresh(now)?;
+        if !ins.known || !ins.breaks || ins.row != Some(pr) {
+            return None;
+        }
+        let end = pc.checked_add(ins.cells)?;
+        if usize::from(end) >= geom.cols {
+            return None;
+        }
         let ahead = self
             .type_press_ring
             .cells_where(now, |key_at| key_at <= ins.dispatched_at);
-        (ahead == 0 && !self.fresher_class_owns_hop(usize::from(ins.cells), ins, now))
-            .then_some((ins, end))
+        if ahead == 0 && !self.fresher_class_owns_hop(usize::from(ins.cells), ins, now) {
+            Some((ins, end))
+        } else {
+            None
+        }
     }
 
     /// Whether a fresher press class owns this same-row forward hop.
@@ -2178,10 +2262,13 @@ impl CursorGlow {
         }
         let blank = |row: &[char], col: usize| !matches!(row.get(col), Some(&g) if g != ' ');
         let origin = usize::from(pc);
-        if !(pane_col0..usize::from(cc)).all(|col| blank(&self.row_cur, col))
-            || blank(&self.row_above_cur, origin)
-        {
+        if blank(&self.row_above_cur, origin) {
             return None;
+        }
+        for col in pane_col0..usize::from(cc) {
+            if !blank(&self.row_cur, col) {
+                return None;
+            }
         }
         let glyph = self.row_above_cur[origin];
         if !blank(&self.row_prev, origin)
@@ -2192,15 +2279,19 @@ impl CursorGlow {
         {
             return None;
         }
-        let at = |row: &[char], col: usize| row.get(col).copied().unwrap_or(' ');
-        if (pane_col0..origin).any(|col| at(&self.row_prev, col) != at(&self.row_above_cur, col)) {
-            return None;
+        let at = |row: &[char], col: usize| match row.get(col) {
+            Some(&c) => c,
+            None => ' ',
+        };
+        for col in pane_col0..origin {
+            if at(&self.row_prev, col) != at(&self.row_above_cur, col) {
+                return None;
+            }
         }
-        let word_col0 = (pane_col0..origin)
-            .rev()
-            .take_while(|&col| !blank(&self.row_above_cur, col))
-            .last()
-            .unwrap_or(origin);
+        let mut word_col0 = origin;
+        while word_col0 > pane_col0 && !blank(&self.row_above_cur, word_col0 - 1) {
+            word_col0 -= 1;
+        }
         u16::try_from(word_col0).ok()
     }
 
@@ -2351,15 +2442,19 @@ impl CursorGlow {
         geom: Geom,
     ) -> Option<usize> {
         let (pane_cols, pc_local, cc_local, pane_contains_move) = self.pane_local(pc, cc, geom);
-        (cr == pr.saturating_add(1)
+        if cr == pr.saturating_add(1)
             && pane_contains_move
             && (1..=3).contains(&cc_local)
             && pc_local.saturating_add(4) >= pane_cols
-            && (!self.ctx_alt || self.blink_fresh(now)))
-        .then_some(
-            self.fold_origin_tail(pr, pc_local, pane_cols)
-                .saturating_add(cc_local),
-        )
+            && (!self.ctx_alt || self.blink_fresh(now))
+        {
+            Some(
+                self.fold_origin_tail(pr, pc_local, pane_cols)
+                    .saturating_add(cc_local),
+            )
+        } else {
+            None
+        }
     }
 
     /// Host key hint: one kill keypress (Ctrl-K/U/W, Alt-D, word-delete Backspace, forward Delete).
@@ -2383,7 +2478,7 @@ impl CursorGlow {
         if moves_cursor {
             self.nav_hint = Some(now);
         }
-        self.kill_retreat_pending = moves_cursor.then_some(now);
+        self.kill_retreat_pending = if moves_cursor { Some(now) } else { None };
         self.kill_hint_word = false;
     }
 

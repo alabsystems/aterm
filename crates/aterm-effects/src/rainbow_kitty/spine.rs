@@ -436,10 +436,14 @@ impl Spine {
     #[inline]
     #[must_use]
     pub fn mend(&self, now: Instant) -> Option<EraseMark> {
-        self.mark.filter(|m| {
-            m.count <= MEND_MAX_DELETES
-                && now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S
-        })
+        if let Some(m) = self.mark
+            && m.count <= MEND_MAX_DELETES
+            && now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S
+        {
+            Some(m)
+        } else {
+            None
+        }
     }
 
     /// The flow state: the run, its high-water mark and the open ramp ([`Flow`]).

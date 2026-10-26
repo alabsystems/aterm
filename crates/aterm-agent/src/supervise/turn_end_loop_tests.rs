@@ -5758,6 +5758,10 @@ struct CarriedHost {
     launched: Option<i64>,
     offered: std::sync::atomic::AtomicUsize,
     backgrounds: std::sync::atomic::AtomicUsize,
+    /// Each busy read's tap ([`IdleHost::busy_tap`]).
+    busy_taps: std::sync::atomic::AtomicUsize,
+    /// Each lasting withhold told ([`IdleHost::lasting_hold`]), in order.
+    lasting: std::sync::Mutex<Vec<Option<crate::supervise::Lasting>>>,
 }
 
 impl IdleHost for CarriedHost {
@@ -5782,6 +5786,57 @@ impl IdleHost for CarriedHost {
     fn launched_at(&self) -> Option<i64> {
         self.launched
     }
+    fn busy_tap(&self) {
+        self.busy_taps.fetch_add(1, Ordering::SeqCst);
+    }
+    fn lasting_hold(&self, hold: Option<crate::supervise::Lasting>) {
+        self.lasting.lock().unwrap().push(hold);
+    }
+}
+
+/// A turn whose transcript says it ended waiting on the agent's own background work, carried as a
+/// break of that work, that ended at an API error (a manager awaiting its workers through an
+/// overloaded API) stands at a wall: it reads busy, and is no work past the wall. Its wall's
+/// lasting withhold is told once and stands across every read of it. Before, each read told it
+/// and the same read's busy tap took it down again (on the host's board and in the loop's
+/// record), so the window's seat rule (`disk-free@v1`) nearly always found the board bare, seated
+/// the session and elected it at breaks its line could not go: handed on undelivered, and as the
+/// only seat the episode parked.
+#[test]
+fn a_wall_at_a_carried_break_of_the_agents_own_background_work_stands_across_its_reads() {
+    let walled = waiting_on(&[
+        "⏺ Monitor event: \"lander\"",
+        "",
+        "⏺ Still in its crates-tests lane. I restarted the watch.",
+        "  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again \
+         in a moment. If it persists, check https://status.claude.com.",
+        "",
+    ]);
+    let host = Arc::new(CarriedHost {
+        tail: Some(transcript_closed(1)),
+        launched: Some(transcript_at("20:00:00")),
+        ..CarriedHost::default()
+    });
+    let mut m = Mock::new(vec![busy_screen(), walled]);
+    m.vanish_after = Some(5);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_background_settle(Duration::ZERO));
+    let why = format!("{lines:#?}");
+    assert!(
+        host.backgrounds.load(Ordering::SeqCst) == 0 && host.busy_taps.load(Ordering::SeqCst) >= 3,
+        "read again and again as a busy break the wall withholds: {why}"
+    );
+    let lasting = host.lasting.lock().unwrap().clone();
+    assert_eq!(
+        lasting,
+        [Some(crate::supervise::Lasting::Wall {
+            wire: aterm_phase::WallKind::Overloaded.wire(),
+        })],
+        "told once, never told over while the break stands at it: {why}"
+    );
 }
 
 #[test]

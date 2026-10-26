@@ -88,9 +88,17 @@ fn lines(
             or_unknown(r.load5, |l| format!("{l:.2}"))
         ),
         format!(
-            "memory   {} available of {}",
+            "memory   {} available of {}{}",
             or_unknown(r.available, gib),
-            or_unknown(r.physical, gib)
+            or_unknown(r.physical, gib),
+            match (r.wired, r.reachable()) {
+                (Some(w), Some(reach)) => format!(
+                    ", never more than {} ({} is wired): a claim of that or more is refused unless --admit now starts it anyway",
+                    gib(reach),
+                    gib(w)
+                ),
+                _ => String::new(),
+            }
         ),
         format!(
             "swap     {} used of {}",
@@ -205,6 +213,8 @@ fn json_of(
     o.insert("idle_cores".to_owned(), Value::from(r.idle_cores()));
     o.insert("available".to_owned(), Value::from(r.available));
     o.insert("physical".to_owned(), Value::from(r.physical));
+    o.insert("wired".to_owned(), Value::from(r.wired));
+    o.insert("reachable".to_owned(), Value::from(r.reachable()));
     o.insert("swap_used".to_owned(), Value::from(r.swap_used));
     o.insert("swap_total".to_owned(), Value::from(r.swap_total));
     o.insert(

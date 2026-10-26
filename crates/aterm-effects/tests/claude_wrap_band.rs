@@ -183,7 +183,7 @@ struct Host {
 impl Host {
     fn new() -> Self {
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         glow.note_pane_rows(0, ROWS);
         Self {

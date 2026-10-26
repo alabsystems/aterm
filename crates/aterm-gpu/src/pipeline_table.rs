@@ -683,6 +683,10 @@ pub(crate) struct BindSpec {
     pub(crate) fragment_buffers: &'static [u32],
     /// Optional fragment storage buffer slot for the fx palette.
     pub(crate) fragment_palette: Option<u32>,
+    /// The texture unit the vertex stage reads the bloom's item list from on
+    /// GL (`aterm_render::bloom::BloomItems`; Metal reads it at the instance
+    /// stream's slot).
+    pub(crate) vertex_items: Option<u32>,
 }
 
 #[cfg(any(target_os = "macos", gl_arm))]
@@ -695,6 +699,7 @@ impl BindSpec {
         fragment_samplers: &[],
         fragment_buffers: &[],
         fragment_palette: None,
+        vertex_items: None,
     };
     /// The atlas-sampling cell rows (colour glyph, deco pair, sprites):
     /// [`Self::CELL_FLAT`] plus the atlas at fragment texture/sampler 0.
@@ -704,6 +709,7 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[],
         fragment_palette: None,
+        vertex_items: None,
     };
     /// `fs_glyph`: [`Self::CELL_ATLAS`] plus `Uniforms` re-bound at fragment
     /// `[[buffer(0)]]` (it reads `text_blend`).
@@ -713,6 +719,7 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[0],
         fragment_palette: None,
+        vertex_items: None,
     };
     /// The `[[vertex_id]]` post passes (bloom, shimmer, blit): no vertex
     /// uniform; the frame at fragment texture/sampler 0 and the pass uniform at
@@ -723,6 +730,7 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[2],
         fragment_palette: None,
+        vertex_items: None,
     };
     /// The crown pair: `HdrU` at vertex `[[buffer(0)]]` and fragment
     /// `[[buffer(0)]]`; no texture (the crown is procedural light).
@@ -732,6 +740,7 @@ impl BindSpec {
         fragment_samplers: &[],
         fragment_buffers: &[0],
         fragment_palette: None,
+        vertex_items: None,
     };
     /// The fx rows: `Uniforms` at vertex `[[buffer(0)]]`; the R8 (Index8) and
     /// RGBA8 atlases at fragment textures 0 and 1, read by integer texel
@@ -743,6 +752,19 @@ impl BindSpec {
         fragment_samplers: &[],
         fragment_buffers: &[],
         fragment_palette: Some(2),
+        vertex_items: None,
+    };
+    /// The bloom extract over its item list: [`Self::CELL_FLAT`], the list at
+    /// vertex texture unit 0 on GL.
+    const GLOW_ITEMS: Self = Self {
+        vertex_items: Some(0),
+        ..Self::CELL_FLAT
+    };
+    /// The crown over the bloom's item list: [`Self::CROWN`], the list at
+    /// vertex texture unit 0 on GL.
+    const CROWN_ITEMS: Self = Self {
+        vertex_items: Some(0),
+        ..Self::CROWN
     };
     /// The tray: placement uniform at vertex `[[buffer(2)]]`, card texture and
     /// linear sampler at fragment 0.
@@ -752,6 +774,7 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[],
         fragment_palette: None,
+        vertex_items: None,
     };
 }
 
@@ -1162,10 +1185,52 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::FX,
     },
+    PipelineSpec {
+        label: "aterm-gpu glow items pipeline",
+        library: ShaderLibrary::Cell,
+        vs: "vs_glow_items",
+        fs: "fs_glow",
+        target: TargetRole::OffscreenUnorm,
+        blend: Some(Blend::GLOW_OVER),
+        write_mask: WriteMask::Color,
+        vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::GLOW_ITEMS,
+    },
+    PipelineSpec {
+        label: "aterm-gpu hdr-glow items pipeline",
+        library: ShaderLibrary::HdrGlow,
+        vs: "vs_hdr_glow_items",
+        fs: "fs_hdr_glow",
+        target: TargetRole::Edr,
+        blend: Some(Blend::ADDITIVE),
+        write_mask: WriteMask::Color,
+        vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::CROWN_ITEMS,
+    },
+    PipelineSpec {
+        label: "aterm-gpu sdr-glow items pipeline",
+        library: ShaderLibrary::HdrGlow,
+        vs: "vs_hdr_glow_items",
+        fs: "fs_sdr_glow",
+        target: TargetRole::Present,
+        blend: Some(Blend::SCREEN),
+        write_mask: WriteMask::Color,
+        vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::CROWN_ITEMS,
+    },
 ];
 
 /// Total number of entries in [`PIPELINES`].
-pub(crate) const PIPELINE_COUNT: usize = 21;
+pub(crate) const PIPELINE_COUNT: usize = 24;
 
 /// Identifier and index into [`PIPELINES`] for each render pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1217,6 +1282,17 @@ pub(crate) enum Pipeline {
     FxLinear = 19,
     /// Exact fx layers whose every drawn pixel is opaque, stored on the sRGB view.
     FxStore = 20,
+    /// [`Self::GlowAdd`] over the bloom's item list: the extract of a stream
+    /// with ramps (`aterm_render::bloom::BloomItems`).
+    GlowItems = 21,
+    /// [`Self::HdrGlow`] over the bloom's item list.
+    #[cfg_attr(
+        all(gl_arm, not(wgpu_arm), not(test)),
+        expect(dead_code, reason = "no f16 destination exists on GL")
+    )]
+    HdrGlowItems = 22,
+    /// [`Self::SdrGlow`] over the bloom's item list.
+    SdrGlowItems = 23,
 }
 
 /// All [`Pipeline`] variants in row order.
@@ -1243,6 +1319,9 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Fx,
     Pipeline::FxLinear,
     Pipeline::FxStore,
+    Pipeline::GlowItems,
+    Pipeline::HdrGlowItems,
+    Pipeline::SdrGlowItems,
 ];
 
 impl Pipeline {
@@ -1278,6 +1357,9 @@ impl Pipeline {
             Self::Fx => "fx",
             Self::FxLinear => "fx_linear",
             Self::FxStore => "fx_store",
+            Self::GlowItems => "glow_items",
+            Self::HdrGlowItems => "hdr_glow_items",
+            Self::SdrGlowItems => "sdr_glow_items",
         }
     }
 }

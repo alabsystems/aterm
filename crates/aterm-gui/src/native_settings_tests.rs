@@ -40580,7 +40580,10 @@ fn the_last_screen_draws_no_band_over_its_rows() {
         let mut faults = Vec::new();
         let (mut filled, mut activity) = (0, 0);
         for route in SettingsRoute::ALL {
-            for &(width, height) in &sizes {
+            for (&(width, height), status) in sizes
+                .iter()
+                .flat_map(|size| [(size, None), (size, Some("Cursor blink turned off"))])
+            {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = setup();
                 assert!(runtime.replace_settings_packages(packages_state_with_activity(20), 2));
@@ -40589,6 +40592,7 @@ fn the_last_screen_draws_no_band_over_its_rows() {
                         unreachable!();
                     };
                     state.navigate(route);
+                    state.feedback = status.map(str::to_string);
                 }
                 let _ = compile_settings_view(&runtime, instance, view, &cx);
                 let limit = settings_state(&runtime, view)
@@ -40605,13 +40609,47 @@ fn the_last_screen_draws_no_band_over_its_rows() {
                     state.page_reveal = None;
                 }
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                let context = format!("{scale}x {route:?} {width}x{height}");
+                let context = format!(
+                    "{scale}x {route:?} {width}x{height}{}",
+                    if status.is_some() {
+                        " under a status"
+                    } else {
+                        ""
+                    }
+                );
                 let Some(plan) = settings_state(&runtime, view).scroll_plan() else {
                     continue;
                 };
                 let screen = plan.screen(plan.limit());
                 if screen.drawn.start < screen.view.start {
                     filled += 1;
+                    // The stop that fills the top draws some of itself: words whole, a control,
+                    // a picture; its card's empty foot alone is a band of blank.
+                    let filler: Vec<&UiKey> = plan.identities(screen.drawn.start).collect();
+                    let draws = compiled.paint.iter().any(|node| {
+                        filler.contains(&&node.key)
+                            && node.clip.height > 0.5
+                            && match &node.content {
+                                UiContent::Group(_) => false,
+                                // Words are drawn where their line, centred in its box, shows
+                                // whole.
+                                UiContent::Text(spec) => {
+                                    let (px, _) =
+                                        crate::native_ui::text_paint_metrics(spec.role, spec.style);
+                                    let line = (px * 1.25).min(node.rect.height);
+                                    let at = node.rect.y + (node.rect.height - line) / 2.0;
+                                    node.clip.y <= at + 0.5 && node.clip.bottom() >= at + line - 0.5
+                                }
+                                UiContent::RichText(_) => node.clip == node.rect,
+                                _ => true,
+                            }
+                    });
+                    if !draws {
+                        faults.push(format!(
+                            "{context}: stop {} fills the top and draws nothing of itself",
+                            screen.drawn.start
+                        ));
+                    }
                 }
                 match screen.caption {
                     Some(caption) if !caption.kept => {

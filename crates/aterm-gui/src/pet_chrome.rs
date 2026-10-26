@@ -58,7 +58,7 @@ impl PetChrome {
         }
     }
 
-    /// A splice painted `cells` from frame cell `(row, col)`: the runs of them that carry the host's words and marks, as [`PetChrome::note`] notes a write.
+    /// A splice painted `cells` from frame cell `(row, col)`: the runs of them that carry the host's words and marks, as [`PetChrome::note`] notes a write. A rule's strokes between them are the program's (Claude Code's lower rule around the footer's chips and facts); the top rule the footer repaints with its lockup and switch is the host's line and is noted whole with [`PetChrome::note`] instead.
     pub(crate) fn note_painted(&mut self, row: usize, col: usize, cells: &[RenderCell]) {
         let mut run: Option<usize> = None;
         for (i, cell) in cells.iter().enumerate() {

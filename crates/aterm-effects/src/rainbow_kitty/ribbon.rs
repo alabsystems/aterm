@@ -7,8 +7,8 @@ use std::mem;
 use aterm_time::Instant;
 
 use aterm_render::{
-    BeamClip, BeamVertex, GlowBlend, GlowQuad, RibbonVertex, comet_beam, over_premul, premul_rgb,
-    ribbon_beam,
+    BeamClip, BeamRows, BeamVertex, GlowBlend, RampMark, RampSink, RibbonVertex, over_premul,
+    premul_rgb, ribbon_beam_into,
 };
 
 use crate::color_math::{hsv2rgb, oklab, relative_luminance, rgb2hsv};
@@ -209,6 +209,17 @@ pub const fn reads_as_ink(rgb: u32) -> bool {
 const BODY_FRAME_TOP: f32 = 251.0;
 
 use crate::cursor_glow::{BODY_CONTRAST_BAR, BODY_CONTRAST_GUARD};
+
+/// A place in a stream laid through a [`RampSink`]: its quads' length and
+/// its ramps' mark ([`BeamRows::mark`]).
+pub type StreamMark = (usize, RampMark);
+
+/// Whether the stream laid up to `to` still stands within the stream at
+/// `at`: a rail span past it was cut away with what it drew.
+#[inline]
+const fn rail_within(to: StreamMark, at: StreamMark) -> bool {
+    to.0 <= at.0 && to.1.items() <= at.1.items()
+}
 
 const BED_LUMA_MIN: f32 = 0.020;
 
@@ -440,19 +451,20 @@ pub const RUN_TAIL_EASE: f32 = 0.10;
 #[inline]
 #[must_use]
 pub fn live_since(cohorts: &[Cohort], cell: &Cell) -> Instant {
-    cohorts
-        .iter()
-        .find(|c| c.id == cell.cohort)
-        .map_or(cell.born, |c| cell.born.max(c.alive_at))
+    for c in cohorts {
+        if c.id == cell.cohort {
+            return cell.born.max(c.alive_at);
+        }
+    }
+    cell.born
 }
 
 #[inline]
-fn freshest<'a>(cohorts: impl Iterator<Item = &'a Cohort>) -> Option<&'a Cohort> {
-    cohorts.max_by(|a, b| {
-        a.alive_at
-            .cmp(&b.alive_at)
-            .then_with(|| a.walk_d(a.col1).total_cmp(&b.walk_d(b.col1)))
-    })
+fn is_fresher_or_equal(a: &Cohort, b: &Cohort) -> bool {
+    a.alive_at
+        .cmp(&b.alive_at)
+        .then_with(|| a.walk_d(a.col1).total_cmp(&b.walk_d(b.col1)))
+        .is_ge()
 }
 
 /// Which layer a cell is on.
@@ -541,7 +553,10 @@ impl Cohort {
     #[inline]
     fn revoke_releases(&mut self, at: Instant) {
         self.release_clock = None;
-        self.parts_revoked_at = Some(self.parts_revoked_at.map_or(at, |t| t.max(at)));
+        self.parts_revoked_at = Some(match self.parts_revoked_at {
+            Some(t) => t.max(at),
+            None => at,
+        });
     }
 
     #[inline]
@@ -631,7 +646,10 @@ impl Cohort {
     #[inline]
     #[must_use]
     pub fn clock(&self) -> Instant {
-        self.flow.map_or(self.alive_at, |f| self.alive_at.max(f))
+        match self.flow {
+            Some(f) => self.alive_at.max(f),
+            None => self.alive_at,
+        }
     }
 
     /// Seconds of idle at `now` on [`Cohort::clock`].
@@ -922,10 +940,14 @@ impl FieldIndex {
         if matches!(self.lanes.last(), Some(l) if l.row == row) {
             return self.lanes.last_mut().expect("just checked");
         }
-        if let Some(i) = self.lanes.iter().position(|l| l.row == row) {
-            let last = self.lanes.len() - 1;
-            self.lanes.swap(i, last);
-            return &mut self.lanes[last];
+        let mut i = 0;
+        while i < self.lanes.len() {
+            if self.lanes[i].row == row {
+                let last = self.lanes.len() - 1;
+                self.lanes.swap(i, last);
+                return &mut self.lanes[last];
+            }
+            i += 1;
         }
         let mut lane = self.spare.pop().unwrap_or(FieldLane::EMPTY);
         lane.row = row;
@@ -1952,7 +1974,10 @@ fn for_each_feathered(
     (end_reach, end_px): (f32, f32),
     mut each: impl FnMut(Option<usize>, LaidSegment),
 ) {
-    let tail = segs.first().map_or(0.0, |s| s.x);
+    let tail = match segs.first() {
+        Some(s) => s.x,
+        None => 0.0,
+    };
     let feather_active = feather.width > 0.0;
     let end_active = end_reach > 0.0 && end_px > 0.0 && (tail - feather.head_x).abs() >= 1.0;
     let laid = |s: &Segment| LaidSegment {
@@ -1972,52 +1997,46 @@ fn for_each_feathered(
     let mut prev: Option<LaidSegment> = None;
     for (i, seg) in segs.iter().enumerate().rev() {
         let here = laid(seg);
-        let feathered = |p: &LaidSegment| {
-            feather_active
+        if let Some(p) = prev {
+            let feathered = feather_active
                 && (p.x - feather.head_x)
                     .abs()
                     .min((here.x - feather.head_x).abs())
-                    < feather.width
-        };
-        let at_end = |p: &LaidSegment| {
-            end_active && (p.x - tail).abs().min((here.x - tail).abs()) < end_reach
-        };
-        let fine = prev.map(|p| {
-            if feathered(&p) {
+                    < feather.width;
+            let at_end = end_active && (p.x - tail).abs().min((here.x - tail).abs()) < end_reach;
+            let px = if feathered {
                 FEATHER_FINE_PX
-            } else if at_end(&p) {
+            } else if at_end {
                 end_px
             } else {
                 0.0
-            }
-        });
-        if let Some(p) = prev
-            && let Some(px) = fine.filter(|&px| px > 0.0)
-        {
-            let n = ((here.x - p.x).abs() / px).floor() as usize;
-            if n > 1 {
-                let inv_nf = 1.0 / (n as f32);
-                let (dx, d_spine, d_up, d_dn, dt, d_cov) = (
-                    here.x - p.x,
-                    here.spine - p.spine,
-                    here.up - p.up,
-                    here.dn - p.dn,
-                    here.t - p.t,
-                    here.cov - p.cov,
-                );
-                for k in 1..n {
-                    let u = k as f32 * inv_nf;
-                    each(
-                        None,
-                        LaidSegment {
-                            x: p.x + dx * u,
-                            spine: p.spine + d_spine * u,
-                            up: p.up + d_up * u,
-                            dn: p.dn + d_dn * u,
-                            t: p.t + dt * u,
-                            cov: p.cov + d_cov * u,
-                        },
+            };
+            if px > 0.0 {
+                let n = ((here.x - p.x).abs() / px).floor() as usize;
+                if n > 1 {
+                    let inv_nf = 1.0 / (n as f32);
+                    let (dx, d_spine, d_up, d_dn, dt, d_cov) = (
+                        here.x - p.x,
+                        here.spine - p.spine,
+                        here.up - p.up,
+                        here.dn - p.dn,
+                        here.t - p.t,
+                        here.cov - p.cov,
                     );
+                    for k in 1..n {
+                        let u = k as f32 * inv_nf;
+                        each(
+                            None,
+                            LaidSegment {
+                                x: p.x + dx * u,
+                                spine: p.spine + d_spine * u,
+                                up: p.up + d_up * u,
+                                dn: p.dn + d_dn * u,
+                                t: p.t + dt * u,
+                                cov: p.cov + d_cov * u,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2127,7 +2146,7 @@ pub struct Ribbon {
     ink_quads: usize,
     /// The frame's rails laid clear of their row's ring, as `[from, to)`
     /// spans of the under stream ([`Self::rail_spans`]).
-    rail_spans: Vec<(usize, usize)>,
+    rail_spans: Vec<(StreamMark, StreamMark)>,
     ember_at: Option<Instant>,
     rearm: Option<(Instant, f32)>,
     translated_at: Option<Instant>,
@@ -2437,6 +2456,40 @@ impl Ribbon {
         self.cohorts.as_slice()
     }
 
+    #[inline]
+    #[must_use]
+    const fn cohort_index(&self, id: u32) -> Option<usize> {
+        let cohorts = self.cohorts.as_slice();
+        let mut i = 0;
+        while i < cohorts.len() {
+            if cohorts[i].id == id {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    #[inline]
+    #[must_use]
+    const fn cohort_by_id(&self, id: u32) -> Option<&Cohort> {
+        let cohorts = self.cohorts.as_slice();
+        let mut i = 0;
+        while i < cohorts.len() {
+            if cohorts[i].id == id {
+                return Some(&cohorts[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    #[inline]
+    fn cohort_by_id_mut(&mut self, id: u32) -> Option<&mut Cohort> {
+        let idx = self.cohort_index(id)?;
+        Some(&mut self.cohorts[idx])
+    }
+
     /// The instant `cell`'s expiry is measured from — see [`live_since`].
     #[must_use]
     #[cfg(test)]
@@ -2559,10 +2612,11 @@ impl Ribbon {
     }
 
     /// The frame's rails laid clear of their row's ring, as `[from, to)`
-    /// spans of the under stream ([`crate::cursor_glow::InkLedger::note_rail`]).
+    /// spans of the under stream, its quads' and its ramps'
+    /// ([`crate::cursor_glow::InkLedger::note_rail_laid`]).
     #[inline]
     #[must_use]
-    pub const fn rail_spans(&self) -> &[(usize, usize)] {
+    pub const fn rail_spans(&self) -> &[(StreamMark, StreamMark)] {
         self.rail_spans.as_slice()
     }
 
@@ -2666,7 +2720,7 @@ impl Ribbon {
                 }
                 let same_row = to.0 == from.0;
                 if licence == Licence::Return || (!same_row && licence == Licence::Nav) {
-                    self.arm_fresh_line(at, (!same_row).then_some(from.0));
+                    self.arm_fresh_line(at, if same_row { None } else { Some(from.0) });
                     if licence == Licence::Return
                         && let Some(gate) = &mut self.fresh_line
                     {
@@ -2681,8 +2735,9 @@ impl Ribbon {
                             self.leave_row(from, to, at, licence);
                         }
                     } else if to.1 < from.1 {
-                        if let Some(lift) =
-                            self.lift.filter(|l| l.origin == from && l.landing == to)
+                        if let Some(lift) = self.lift
+                            && lift.origin == from
+                            && lift.landing == to
                         {
                             self.lift_word(lift, at);
                         } else if self.pending_erase > 0 {
@@ -2728,8 +2783,10 @@ impl Ribbon {
                         let program = licence == Licence::Pty;
                         let toward = if program {
                             Some((None, from.1, false))
+                        } else if same_row {
+                            Some((Some(to.0), to.1, to.1 < from.1))
                         } else {
-                            same_row.then_some((Some(to.0), to.1, to.1 < from.1))
+                            None
                         };
                         if to.0 > from.0 && licence == Licence::Return {
                             self.print_row(from.0, at);
@@ -2861,10 +2918,18 @@ impl Ribbon {
 
     #[inline]
     fn curtain_hand(&self) -> Option<(u16, u16)> {
-        let newest = |wake_ok: bool| {
-            freshest(self.cohorts.iter().filter(|c| wake_ok || !c.wake)).map(|c| (c.row, c.col1))
-        };
-        newest(false).or_else(|| newest(true))
+        let mut best_non_wake: Option<&Cohort> = None;
+        let mut best_any: Option<&Cohort> = None;
+        for c in &self.cohorts {
+            if !c.wake && !matches!(best_non_wake, Some(prev) if !is_fresher_or_equal(c, prev)) {
+                best_non_wake = Some(c);
+            }
+            if !matches!(best_any, Some(prev) if !is_fresher_or_equal(c, prev)) {
+                best_any = Some(c);
+            }
+        }
+        let c = best_non_wake.or(best_any)?;
+        Some((c.row, c.col1))
     }
 
     /// Whether a curtain is falling.
@@ -2895,18 +2960,20 @@ impl Ribbon {
 
     #[inline]
     fn note_key(&mut self, at: Instant) {
-        let gap_ms = self
-            .last_key_at
-            .map(|t| (at.saturating_duration_since(t).as_secs_f32() * 1000.0).round());
-        let first = gap_ms.is_none();
-        let rest = match gap_ms {
-            Some(g) => g >= self.rest_s() * 1000.0,
-            None => true,
+        let (first, rest, gap) = match self.last_key_at {
+            Some(t) => {
+                let g = (at.saturating_duration_since(t).as_secs_f32() * 1000.0).round();
+                (
+                    false,
+                    g >= self.rest_s() * 1000.0,
+                    g.clamp(0.0, f32::from(u16::MAX) * 64.0) as u32,
+                )
+            }
+            None => (true, true, 0),
         };
         if rest || self.phrase_open.is_none() {
             self.open_phrase();
         }
-        let gap = gap_ms.map_or(0, |g| g.clamp(0.0, f32::from(u16::MAX) * 64.0) as u32);
         let ioi = if self.ioi_ms > 0.0 {
             self.ioi_ms
         } else {
@@ -3003,10 +3070,13 @@ impl Ribbon {
             let held = match cached_coh {
                 Some((id, h)) if id == cell.cohort => h,
                 _ => {
-                    let h = cohorts
-                        .iter()
-                        .enumerate()
-                        .any(|(i, c)| c.id == cell.cohort && held_by(i, c));
+                    let mut h = false;
+                    for (i, c) in cohorts.iter().enumerate() {
+                        if c.id == cell.cohort && held_by(i, c) {
+                            h = true;
+                            break;
+                        }
+                    }
                     cached_coh = Some((cell.cohort, h));
                     h
                 }
@@ -3102,9 +3172,12 @@ impl Ribbon {
 
     #[inline]
     fn owned(&self, row: u16, col: u16, at: Instant) -> bool {
-        self.cells
-            .iter()
-            .any(|c| c.row == row && c.col == col && self.alive_at(c, at))
+        for c in &self.cells {
+            if c.row == row && c.col == col && self.alive_at(c, at) {
+                return true;
+            }
+        }
+        false
     }
 
     /// A key whose echo has not landed is held, not laid.
@@ -3130,10 +3203,13 @@ impl Ribbon {
     fn sweep(&mut self, row: u16, col0: u16, col1: u16, at: Instant, ctx: &Ctx<'_>) {
         let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
         for col in col0..col1.min(cols) {
-            let own = self
-                .cells
-                .iter()
-                .any(|c| c.row == row && c.col == col && c.born >= at && self.alive_at(c, at));
+            let mut own = false;
+            for c in &self.cells {
+                if c.row == row && c.col == col && c.born >= at && self.alive_at(c, at) {
+                    own = true;
+                    break;
+                }
+            }
             if !own {
                 self.lay_cell(row, col, at, ctx, true);
             }
@@ -3155,9 +3231,10 @@ impl Ribbon {
             return;
         }
         let cols = i32::try_from(ctx.geom.cols).unwrap_or(i32::MAX);
-        let (pane_col0, pane_cols) = self
-            .pane
-            .map_or((0, cols), |(c0, w)| (i32::from(c0), i32::from(w).max(1)));
+        let (pane_col0, pane_cols) = match self.pane {
+            Some((c0, w)) => (i32::from(c0), i32::from(w).max(1)),
+            None => (0, cols),
+        };
         let pane_col1 = pane_col0.saturating_add(pane_cols).min(cols);
         let (row, col_end) = ctx.caret;
         for back in (1..=i32::from(n)).rev() {
@@ -3191,7 +3268,13 @@ impl Ribbon {
         let base = (full * LIFE_DURATION_GAIN).clamp(LIFE_BASE_MIN, LIFE_BASE_MAX);
         let d = Self::birth_price(ctx);
         let life = base * (1.0 + LIFE_SPINE_LINEAR * d + LIFE_SPINE_SQUARE * d * d);
-        let life = if let Some(newest) = self.cohorts.iter().map(|c| c.alive_at).max() {
+        let mut newest: Option<Instant> = None;
+        for c in &self.cohorts {
+            if !matches!(newest, Some(m) if c.alive_at <= m) {
+                newest = Some(c.alive_at);
+            }
+        }
+        let life = if let Some(newest) = newest {
             let gap = at.saturating_duration_since(newest).as_secs_f32();
             if gap <= CHAIN_GAP_MAX {
                 life.max((CHAIN_KEYS * gap + CHAIN_MARGIN).min(CHAIN_LIFE_MAX))
@@ -3300,11 +3383,10 @@ impl Ribbon {
     }
 
     fn leave_row(&mut self, from: (u16, u16), to: (u16, u16), at: Instant, licence: Licence) {
-        let soft_wrap = self
-            .soft_wrap
-            .filter(|sw| sw.origin == from && sw.landing == to);
         self.carry = None;
-        if let Some(sw) = soft_wrap
+        if let Some(sw) = self.soft_wrap
+            && sw.origin == from
+            && sw.landing == to
             && Self::folded_down(from, to, licence)
         {
             self.arm_seam(to.0, at);
@@ -3317,13 +3399,19 @@ impl Ribbon {
             self.carry = Some((sw, at));
             return;
         }
-        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
-        let rewrap = self
-            .rewrap_start
-            .filter(|rewrap| rewrap.from == from && rewrap.to == to);
-        let w = rewrap
-            .and_then(|rewrap| rewrap.width)
-            .unwrap_or_else(|| self.moved_word_len(from, at));
+        let pane_col0 = match self.pane {
+            Some((c0, _)) => c0,
+            None => 0,
+        };
+        let w = if let Some(rewrap) = self.rewrap_start
+            && rewrap.from == from
+            && rewrap.to == to
+            && let Some(width) = rewrap.width
+        {
+            width
+        } else {
+            self.moved_word_len(from, at)
+        };
         let held_after = self.space_held_after_the_wrap(from);
         let re_wrapped = licence == Licence::Typed && to.1 > pane_col0.saturating_add(1);
         let origin = if re_wrapped {
@@ -3462,34 +3550,39 @@ impl Ribbon {
     fn re_anchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
         let n = from.1 - to.1;
         let rewrap = self.take_rewrap_start(from, to);
-        let w = rewrap
-            .and_then(|rewrap| rewrap.width)
-            .unwrap_or_else(|| self.moved_word_len(from, at));
+        let w = match rewrap {
+            Some(RewrapStart {
+                width: Some(width), ..
+            }) => width,
+            _ => self.moved_word_len(from, at),
+        };
         let held_after = self.space_held_after_the_wrap(from);
         let origin = self.relay_origin(from, w);
-        let start = rewrap.map(|rewrap| rewrap.start);
         self.split_off = None;
         self.retract_suffix(to.0, to.1, n, at, RETRACT_DUR_S);
         self.reseat_spaces(held_after, to);
-        if let Some(space) = rewrap.and_then(|rewrap| rewrap.space) {
+        if let Some(RewrapStart {
+            space: Some(space), ..
+        }) = rewrap
+        {
             self.note_space((to.0, space));
         }
         self.arrived = None;
-        let hand_floor = self
-            .hand_floor_on(to.0)
-            .map(|floor| start.map_or(floor, |s| floor.min(s)));
-        let relays_off_the_hand_s_ink =
-            matches!(hand_floor, Some(floor) if to.1.saturating_sub(1).saturating_sub(w) < floor);
-        if relays_off_the_hand_s_ink {
-            return;
+        if let Some(raw_floor) = self.hand_floor_on(to.0) {
+            let floor = match rewrap {
+                Some(r) => raw_floor.min(r.start),
+                None => raw_floor,
+            };
+            if to.1.saturating_sub(1).saturating_sub(w) < floor {
+                return;
+            }
         }
-        if let (Some(start), Some(glyph)) = (start, to.1.checked_sub(1))
-            && start <= glyph.saturating_sub(w)
-            && start < glyph
-            && !matches!(hand_floor, Some(floor) if start < floor)
+        if let (Some(r), Some(glyph)) = (rewrap, to.1.checked_sub(1))
+            && r.start <= glyph.saturating_sub(w)
+            && r.start < glyph
         {
             self.relocate = None;
-            self.relay_word(to.0, start, to.1, at, origin);
+            self.relay_word(to.0, r.start, to.1, at, origin);
             return;
         }
         self.begin_relocate(to, w, at, origin);
@@ -3621,13 +3714,13 @@ impl Ribbon {
         self.prev_space = None;
         self.arrived = None;
         self.relocate = None;
-        let Some(lit0) = (col0..end)
-            .rev()
-            .take_while(|&col| self.owned(row, col, at))
-            .last()
-        else {
+        let mut lit0 = end;
+        while lit0 > col0 && self.owned(row, lit0 - 1, at) {
+            lit0 -= 1;
+        }
+        if lit0 == end {
             return;
-        };
+        }
         let lit = end - lit0;
         let t0 = self.relay_origin((row, end), lit);
         self.retract_span(row, lit0, lit, at, RETRACT_FADE_S);
@@ -3660,13 +3753,13 @@ impl Ribbon {
         {
             return;
         }
-        let Some(lit0) = (sw.word_col0..src_end)
-            .rev()
-            .take_while(|&col| self.owned(src_row, col, at))
-            .last()
-        else {
+        let mut lit0 = src_end;
+        while lit0 > sw.word_col0 && self.owned(src_row, lit0 - 1, at) {
+            lit0 -= 1;
+        }
+        if lit0 == src_end {
             return;
-        };
+        }
         let lit = src_end - lit0;
         let t0 = self.relay_origin((src_row, src_end), lit);
         self.retract_span(src_row, lit0, lit, at, RETRACT_FADE_S);
@@ -3681,38 +3774,46 @@ impl Ribbon {
             Some((row, s)) if row == from.0 && s < from.1 => Some(s + 1),
             _ => None,
         };
-        let arrived = self
-            .arrived
-            .filter(|&(row, col)| row == from.0 && col <= from.1)
-            .map(|(row, col)| {
-                (0..col)
-                    .rev()
-                    .take_while(|&c| self.typed_live(row, c, at))
-                    .last()
-                    .unwrap_or(col)
-            });
-        after_space.max(arrived).map_or(0, |start| from.1 - start)
+        let arrived = match self.arrived {
+            Some((row, mut col)) if row == from.0 && col <= from.1 => {
+                while col > 0 && self.typed_live(row, col - 1, at) {
+                    col -= 1;
+                }
+                Some(col)
+            }
+            _ => None,
+        };
+        match after_space.max(arrived) {
+            Some(start) => from.1 - start,
+            None => 0,
+        }
     }
 
     #[inline]
     fn typed_live(&self, row: u16, col: u16, at: Instant) -> bool {
-        self.cells
-            .iter()
-            .any(|c| c.row == row && c.col == col && c.typing && self.alive_at(c, at))
+        for c in &self.cells {
+            if c.row == row && c.col == col && c.typing && self.alive_at(c, at) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Resident typed suffix immediately before `from`, for a content proof whose preceding Space was program text rather than a typed event.
     #[inline]
     pub(crate) fn typed_suffix_len(&self, from: (u16, u16), at: Instant) -> u16 {
-        (0..from.1)
-            .rev()
-            .take_while(|&col| self.typed_live(from.0, col, at))
-            .last()
-            .map_or(0, |start| from.1 - start)
+        let mut col = from.1;
+        while col > 0 && self.typed_live(from.0, col - 1, at) {
+            col -= 1;
+        }
+        from.1 - col
     }
 
     fn begin_relocate(&mut self, to: (u16, u16), w: u16, at: Instant, walk: Option<WalkPos>) {
-        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
+        let pane_col0 = match self.pane {
+            Some((c0, _)) => c0,
+            None => 0,
+        };
         let (row, landing) = to;
         let Some(glyph) = landing.checked_sub(1) else {
             return;
@@ -3740,7 +3841,10 @@ impl Ribbon {
             self.relocate = None;
             return;
         }
-        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
+        let pane_col0 = match self.pane {
+            Some((c0, _)) => c0,
+            None => 0,
+        };
         let Some(glyph) = from_col.checked_sub(1) else {
             return;
         };
@@ -3760,7 +3864,10 @@ impl Ribbon {
             if self.owned(row, col, at) {
                 continue;
             }
-            let own = minted.and_then(|id| self.cohorts.iter().position(|c| c.id == id));
+            let own = match minted {
+                Some(id) => self.cohort_index(id),
+                None => None,
+            };
             let idx = match (walk, own) {
                 (_, Some(i)) => i,
                 (Some(walk), None) if first => {
@@ -3775,14 +3882,20 @@ impl Ribbon {
             let (life_s, cov0, birth_disp, edge_cells) = match cached_like {
                 Some((id, pricing)) if id == cohort.id => pricing,
                 _ => {
-                    let pricing = self
-                        .cells
-                        .iter()
-                        .filter(|c| c.row == row && c.cohort == cohort.id && c.typing)
-                        .max_by(|a, b| a.born.cmp(&b.born))
-                        .map_or((SWOOSH_LIFE_S, BODY_COLD_SHARE, 0.0, HOT_EDGE_CELLS), |c| {
-                            (c.life_s, c.cov0, c.birth_disp, c.edge_cells)
-                        });
+                    let mut best: Option<&Cell> = None;
+                    for c in &self.cells {
+                        if c.row == row
+                            && c.cohort == cohort.id
+                            && c.typing
+                            && !matches!(best, Some(prev) if c.born < prev.born)
+                        {
+                            best = Some(c);
+                        }
+                    }
+                    let pricing = match best {
+                        Some(c) => (c.life_s, c.cov0, c.birth_disp, c.edge_cells),
+                        None => (SWOOSH_LIFE_S, BODY_COLD_SHARE, 0.0, HOT_EDGE_CELLS),
+                    };
                     cached_like = Some((cohort.id, pricing));
                     pricing
                 }
@@ -3814,10 +3927,16 @@ impl Ribbon {
         if lo == hi {
             return false;
         }
-        let owner = |cells: &[Cell], col: u16| {
-            cells
-                .iter()
-                .rposition(|c| c.row == row && c.col == col && !c.leaving())
+        let owner = |cells: &[Cell], col: u16| -> Option<usize> {
+            let mut i = cells.len();
+            while i > 0 {
+                i -= 1;
+                let c = &cells[i];
+                if c.row == row && c.col == col && !c.leaving() {
+                    return Some(i);
+                }
+            }
+            None
         };
         let reduced = ctx.cfg.reduced_motion;
         let mut last_coh: Option<(u32, Instant)> = None;
@@ -3832,7 +3951,7 @@ impl Ribbon {
             let alive_at = match last_coh {
                 Some((id, alive_at)) if id == cell.cohort => alive_at,
                 _ => {
-                    let Some(coh) = self.cohorts.iter().find(|k| k.id == cell.cohort) else {
+                    let Some(coh) = self.cohort_by_id(cell.cohort) else {
                         return false;
                     };
                     if coh.leaving_at(at) {
@@ -3863,7 +3982,7 @@ impl Ribbon {
             if last_held == Some(id) {
                 continue;
             }
-            if let Some(coh) = self.cohorts.iter_mut().find(|k| k.id == id) {
+            if let Some(coh) = self.cohort_by_id_mut(id) {
                 coh.alive_at = coh.alive_at.max(at);
                 coh.phase = Phase::Laying;
                 coh.retract_col = None;
@@ -3941,17 +4060,22 @@ impl Ribbon {
         let birth_disp = Self::birth_price(ctx);
         let cov0 = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
         let reviving = matches!(self.revive, Some(rv) if rv.covers(row, col));
-        let gate = self
-            .fresh_line
-            .filter(|gate| !reviving && gate.takes(row, at));
+        let gate = match self.fresh_line {
+            Some(gate) if !reviving && gate.takes(row, at) => Some(gate),
+            _ => None,
+        };
         let idx = self.join_cohort(row, col, at, gate.is_some());
         if let Some(gate) = gate {
             let joined = self.cohorts[idx];
-            let re_laid = joined.born < gate.since
-                && self
-                    .cells
-                    .iter()
-                    .any(|c| c.row == row && c.col == col && c.cohort == joined.id);
+            let mut re_laid = false;
+            if joined.born < gate.since {
+                for c in &self.cells {
+                    if c.row == row && c.col == col && c.cohort == joined.id {
+                        re_laid = true;
+                        break;
+                    }
+                }
+            }
             if !re_laid {
                 self.fresh_line = None;
             }
@@ -3995,9 +4119,10 @@ impl Ribbon {
 
     fn seat_fold_successor(&mut self, idx: usize, col: u16, ctx: &Ctx<'_>) {
         let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
-        let (pane_col0, pane_col1) = self
-            .pane
-            .map_or((0, cols), |(c0, w)| (c0, c0.saturating_add(w.max(1))));
+        let (pane_col0, pane_col1) = match self.pane {
+            Some((c0, w)) => (c0, c0.saturating_add(w.max(1))),
+            None => (0, cols),
+        };
         if col.saturating_add(1) != pane_col1 {
             return;
         }
@@ -4031,19 +4156,23 @@ impl Ribbon {
 
     fn place(&mut self, idx: usize, mut cell: Cell, at: Instant, hand_row: u16) {
         let (row, col, typing) = (cell.row, cell.col, cell.typing);
-        if (self.cohorts[idx].col0..self.cohorts[idx].col1).contains(&col)
-            && let Some(slot) = self
-                .cells
-                .iter()
-                .position(|c| c.row == row && c.col == col && c.cohort == cell.cohort)
-        {
-            let old = self.cells.remove(slot);
-            self.custody_replaced(idx, old.released_at, 1);
-            let alive = self.alive_at(&old, at);
-            if alive && old.typing == typing {
-                cell.attack_at = old.attack_at.min(cell.attack_at);
-                cell.cov0 = cell.cov0.max(old.cov0);
-                cell.life_s = cell.life_s.max(old.life_s);
+        if (self.cohorts[idx].col0..self.cohorts[idx].col1).contains(&col) {
+            let mut slot = None;
+            for (i, c) in self.cells.iter().enumerate() {
+                if c.row == row && c.col == col && c.cohort == cell.cohort {
+                    slot = Some(i);
+                    break;
+                }
+            }
+            if let Some(slot) = slot {
+                let old = self.cells.remove(slot);
+                self.custody_replaced(idx, old.released_at, 1);
+                let alive = self.alive_at(&old, at);
+                if alive && old.typing == typing {
+                    cell.attack_at = old.attack_at.min(cell.attack_at);
+                    cell.cov0 = cell.cov0.max(old.cov0);
+                    cell.life_s = cell.life_s.max(old.life_s);
+                }
             }
         }
         self.cells.push(cell);
@@ -4094,14 +4223,26 @@ impl Ribbon {
         let birth_disp = clamp01(ctx.birth_disp);
         let cov0_new = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
         let (anchor_col, walk) = self.wake_origin(row, to, at);
-        let minted = takeover.then(|| self.own_wake_cohort(row, to, from, anchor_col, walk, at));
-        let reach = (WAKE_MAX_CELLS..=span)
-            .rev()
-            .find(|&k| {
+        let minted = if takeover {
+            Some(self.own_wake_cohort(row, to, from, anchor_col, walk, at))
+        } else {
+            None
+        };
+        let mut reach = 0;
+        if span >= WAKE_MAX_CELLS {
+            let mut k = span;
+            loop {
                 let col = if leftward { to + k } else { to - k };
-                self.corridor_keeps_glass_light(ctx, row, col, at)
-            })
-            .unwrap_or(0);
+                if self.corridor_keeps_glass_light(ctx, row, col, at) {
+                    reach = k;
+                    break;
+                }
+                if k == WAKE_MAX_CELLS {
+                    break;
+                }
+                k -= 1;
+            }
+        }
 
         for k in (0..=span).rev() {
             let col = if leftward { to + k } else { to - k };
@@ -4112,12 +4253,14 @@ impl Ribbon {
                 ))
                 .unwrap_or(at);
             let (over, base_cov, base_leaving) = self.corridor_column(ctx, row, col, at);
-            let over_live = over.filter(|&i| {
+            let over_live = if let Some(i) = over {
                 let c = self.cells[i];
                 !c.leaving() && self.env_of(ctx, &c) > 0.0
-            });
+            } else {
+                false
+            };
             let base_live = base_cov > 0.0 && !base_leaving;
-            if !takeover && (base_live || over_live.is_some()) {
+            if !takeover && (base_live || over_live) {
                 continue;
             }
             let (born, attack_at, cov0, rearm, adopted) = match over {
@@ -4179,7 +4322,10 @@ impl Ribbon {
             };
             self.place(idx, cell, at, row);
         }
-        minted.map(|idx| self.cohorts[idx].id)
+        match minted {
+            Some(idx) => Some(self.cohorts[idx].id),
+            None => None,
+        }
     }
 
     #[inline]
@@ -4212,18 +4358,21 @@ impl Ribbon {
                 _ => {}
             }
         }
-        let (base_cov, base_leaving) = base.map_or((0.0, false), |c| {
-            let env = if c.leaving() {
-                0.0
-            } else {
-                self.env_of(ctx, c)
-            };
-            let leaving = match self.cohorts.iter().find(|k| k.id == c.cohort) {
-                Some(k) => k.leaving_at(at),
-                None => true,
-            };
-            (c.cov0 * env, leaving)
-        });
+        let (base_cov, base_leaving) = match base {
+            Some(c) => {
+                let env = if c.leaving() {
+                    0.0
+                } else {
+                    self.env_of(ctx, c)
+                };
+                let leaving = match self.cohort_by_id(c.cohort) {
+                    Some(k) => k.leaving_at(at),
+                    None => true,
+                };
+                (c.cov0 * env, leaving)
+            }
+            None => (0.0, false),
+        };
         (over, base_cov, base_leaving)
     }
 
@@ -4248,32 +4397,47 @@ impl Ribbon {
         at: Instant,
     ) -> usize {
         let (lo, hi) = (to.min(from), to.max(from));
-        let live = self.cohorts.iter().enumerate().find(|(_, c)| {
-            c.row == row
+        for i in 0..self.cohorts.len() {
+            let c = &self.cohorts[i];
+            if c.row == row
                 && c.wake
                 && !c.abandoned
                 && c.col0 <= hi
                 && lo < c.col1
                 && at.saturating_duration_since(c.alive_at).as_secs_f32() <= WAKE_LIFE_S
-        });
-        if let Some((i, _)) = live {
-            let coh = &mut self.cohorts[i];
-            coh.alive_at = at;
-            coh.phase = Phase::Laying;
-            coh.retract_col = None;
-            return i;
+            {
+                let coh = &mut self.cohorts[i];
+                coh.alive_at = at;
+                coh.phase = Phase::Laying;
+                coh.retract_col = None;
+                return i;
+            }
         }
         self.mint_cohort(row, to, anchor_col, walk, at, true)
     }
 
     #[inline]
     fn wake_origin(&self, row: u16, landing: u16, at: Instant) -> (u16, WalkPos) {
-        let fresh = |c: &&Cohort| at.saturating_duration_since(c.alive_at) <= CHAIN_GAP_MAX_DUR;
-        if let Some(c) = freshest(self.cohorts.iter().filter(fresh).filter(|c| c.row == row)) {
+        let mut best_on_row: Option<&Cohort> = None;
+        let mut best_any: Option<&Cohort> = None;
+        for c in &self.cohorts {
+            if at.saturating_duration_since(c.alive_at) > CHAIN_GAP_MAX_DUR {
+                continue;
+            }
+            if c.row == row && !matches!(best_on_row, Some(prev) if !is_fresher_or_equal(c, prev)) {
+                best_on_row = Some(c);
+            }
+            if !matches!(best_any, Some(prev) if !is_fresher_or_equal(c, prev)) {
+                best_any = Some(c);
+            }
+        }
+        if let Some(c) = best_on_row {
             return (c.anchor_col, c.origin_walk());
         }
-        let walk = freshest(self.cohorts.iter().filter(fresh))
-            .map_or(WalkPos::COLD, |c| c.walk_at(c.col1));
+        let walk = match best_any {
+            Some(c) => c.walk_at(c.col1),
+            None => WalkPos::COLD,
+        };
         (landing, walk.restarted())
     }
 
@@ -4286,15 +4450,16 @@ impl Ribbon {
         walk: WalkPos,
         at: Instant,
     ) -> usize {
-        if let Some(i) = self.cohorts.iter().position(|c| {
-            c.row == row
+        for (i, c) in self.cohorts.iter().enumerate() {
+            if c.row == row
                 && c.wake
                 && !c.abandoned
                 && col + 1 >= c.col0
                 && col <= c.col1
                 && at.saturating_duration_since(c.alive_at) <= CHAIN_GAP_MAX_DUR
-        }) {
-            return i;
+            {
+                return i;
+            }
         }
         self.mint_cohort(row, col, anchor_col, walk, at, true)
     }
@@ -4370,24 +4535,34 @@ impl Ribbon {
             coh.printed = None;
             return i;
         }
-        if let Some(rv) = self.revive.filter(|rv| rv.covers(row, col)) {
+        if let Some(rv) = self.revive
+            && rv.covers(row, col)
+        {
             return self.mint_cohort(row, col, rv.origin.anchor_col, rv.origin.walk(), at, false);
         }
         let fresh = |t: Instant| at.saturating_duration_since(t) <= CHAIN_GAP_MAX_DUR;
-        let continued = freshest(self.cohorts.iter().filter(|c| fresh(c.alive_at)));
-        let walk = continued
-            .map(|c| {
-                if c.row == row && !new_line && self.stands(c) {
-                    c.walk_at(col)
-                } else {
-                    c.walk_at(c.col1)
-                }
-            })
-            .or_else(|| {
-                // A finished swoosh's walk continues too, inside the chain window (`retire` drops the cohort with its cells).
-                self.last_walk.filter(|w| fresh(w.alive_at)).map(|w| w.end)
-            })
-            .unwrap_or(WalkPos::COLD);
+        let mut continued: Option<&Cohort> = None;
+        for c in &self.cohorts {
+            if fresh(c.alive_at)
+                && !matches!(continued, Some(prev) if !is_fresher_or_equal(c, prev))
+            {
+                continued = Some(c);
+            }
+        }
+        let walk = if let Some(c) = continued {
+            if c.row == row && !new_line && self.stands(c) {
+                c.walk_at(col)
+            } else {
+                c.walk_at(c.col1)
+            }
+        } else if let Some(w) = self.last_walk
+            && fresh(w.alive_at)
+        {
+            // A finished swoosh's walk continues too, inside the chain window (`retire` drops the cohort with its cells).
+            w.end
+        } else {
+            WalkPos::COLD
+        };
         let walk = if new_line { walk.restarted() } else { walk };
         self.mint_cohort(row, col, col, walk, at, false)
     }
@@ -4440,8 +4615,9 @@ impl Ribbon {
         let fresh = |t: Instant| at.saturating_duration_since(t) <= CHAIN_GAP_MAX_DUR;
         let joined = self.cohorts[idx];
         let band_id = if joined.wake {
-            let Some(j) = self.cohorts.iter().position(|c| {
-                c.id != joined.id
+            let mut found = None;
+            for (j, c) in self.cohorts.iter().enumerate() {
+                if c.id != joined.id
                     && c.row == row
                     && !c.wake
                     && !c.abandoned
@@ -4450,44 +4626,64 @@ impl Ribbon {
                     && fresh(c.alive_at)
                     && c.col1 >= joined.col0
                     && joined.col1 >= c.col0
-            }) else {
+                {
+                    found = Some(j);
+                    break;
+                }
+            }
+            let Some(j) = found else {
                 return idx;
             };
             self.cohorts[j].id
         } else {
             joined.id
         };
-        while let Some(w) = self.cohorts.iter().position(|c| {
-            c.wake
-                && c.id != band_id
-                && c.row == row
-                && !c.abandoned
-                && fresh(c.alive_at)
-                && col.saturating_add(1) >= c.col0
-                && col <= c.col1
-        }) {
+        loop {
+            let mut wake_idx = None;
+            for (w, c) in self.cohorts.iter().enumerate() {
+                if c.wake
+                    && c.id != band_id
+                    && c.row == row
+                    && !c.abandoned
+                    && fresh(c.alive_at)
+                    && col.saturating_add(1) >= c.col0
+                    && col <= c.col1
+                {
+                    wake_idx = Some(w);
+                    break;
+                }
+            }
+            let Some(w) = wake_idx else {
+                break;
+            };
             let wake = self.cohorts[w];
-            let Some(b) = self.cohorts.iter().position(|c| c.id == band_id) else {
+            let Some(b) = self.cohort_index(band_id) else {
                 break;
             };
             let band = self.cohorts[b];
-            let like = self
-                .cells
-                .iter()
-                .filter(|c| c.row == band.row && c.cohort == band.id && c.typing)
-                .max_by(|a, b| a.born.cmp(&b.born))
-                .copied();
+            let mut like: Option<Cell> = None;
+            for c in &self.cells {
+                if c.row == band.row
+                    && c.cohort == band.id
+                    && c.typing
+                    && !matches!(like, Some(prev) if c.born < prev.born)
+                {
+                    like = Some(*c);
+                }
+            }
             let mut ci = 0usize;
             while ci < self.cells.len() {
                 let c = self.cells[ci];
-                if c.cohort == band.id
-                    && c.row == row
-                    && (wake.col0..wake.col1).contains(&c.col)
-                    && self
-                        .cells
-                        .iter()
-                        .any(|w| w.cohort == wake.id && w.col == c.col)
-                {
+                let mut wake_has_col = false;
+                if c.cohort == band.id && c.row == row && (wake.col0..wake.col1).contains(&c.col) {
+                    for wc in &self.cells {
+                        if wc.cohort == wake.id && wc.col == c.col {
+                            wake_has_col = true;
+                            break;
+                        }
+                    }
+                }
+                if wake_has_col {
                     let gone = self.cells.remove(ci);
                     self.custody_replaced(b, gone.released_at, 1);
                 } else {
@@ -4513,9 +4709,7 @@ impl Ribbon {
             self.cohorts.remove(w);
         }
         self.prune_release_parts();
-        self.cohorts
-            .iter()
-            .position(|c| c.id == band_id)
+        self.cohort_index(band_id)
             .unwrap_or(idx.min(self.cohorts.len().saturating_sub(1)))
     }
 
@@ -4536,15 +4730,12 @@ impl Ribbon {
     fn retract_suffix(&mut self, row: u16, col: u16, min_cells: u16, at: Instant, span_s: f32) {
         let followed = &self.followed_now;
         let arrived = |c: &Cell| followed.contains(&(c.row, c.col, c.born));
-        let far = self
-            .cells
-            .iter()
-            .filter(|c| c.row == row && c.col >= col && !c.leaving() && !arrived(c))
-            .map(|c| c.col)
-            .max();
-        let last = far
-            .unwrap_or(col)
-            .max(col.saturating_add(min_cells.saturating_sub(1)));
+        let mut last = col.saturating_add(min_cells.saturating_sub(1));
+        for c in &self.cells {
+            if c.row == row && c.col > last && !c.leaving() && !arrived(c) {
+                last = c.col;
+            }
+        }
         let mut right_latest: Option<Instant> = None;
         for cell in &mut self.cells {
             if cell.row != row
@@ -4561,13 +4752,20 @@ impl Ribbon {
                     prev
                 };
                 if at.saturating_duration_since(capped).as_secs_f32() < RETRACT_FADE_S {
-                    right_latest = Some(right_latest.map_or(capped, |m| m.max(capped)));
+                    right_latest = Some(match right_latest {
+                        Some(m) => m.max(capped),
+                        None => capped,
+                    });
                 }
             }
         }
-        let base_at = right_latest
-            .and_then(|t| t.checked_add(std::time::Duration::from_millis(16)))
-            .map_or(at, |t| at.max(t));
+        let base_at = if let Some(t) = right_latest
+            && let Some(t) = t.checked_add(std::time::Duration::from_millis(16))
+        {
+            at.max(t)
+        } else {
+            at
+        };
         let n = f32::from(last - col + 1);
         let step = span_s / n;
         for cell in &mut self.cells {
@@ -4580,9 +4778,13 @@ impl Ribbon {
                 continue;
             }
             let rank = f32::from(last - cell.col);
-            cell.retract_at = at
-                .checked_add(std::time::Duration::from_secs_f32(rank * step))
-                .map(|t| t.max(base_at));
+            let mut retract_at = at.checked_add(std::time::Duration::from_secs_f32(rank * step));
+            if let Some(t) = &mut retract_at
+                && *t < base_at
+            {
+                *t = base_at;
+            }
+            cell.retract_at = retract_at;
         }
     }
 
@@ -4629,16 +4831,22 @@ impl Ribbon {
             }
             if cell.leaving() {
                 // Replaced content cannot restore a prior partial release, even when its visual retract has already finished.
-                if cell.released_at.take().is_some()
-                    && let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort)
-                {
-                    coh.revoke_releases(at);
+                if cell.released_at.take().is_some() {
+                    for coh in &mut self.cohorts {
+                        if coh.id == cell.cohort {
+                            coh.revoke_releases(at);
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
             cell.retire_at = Some(at);
-            if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort) {
-                coh.revoke_releases(at);
+            for coh in &mut self.cohorts {
+                if coh.id == cell.cohort {
+                    coh.revoke_releases(at);
+                    break;
+                }
             }
             n += 1;
         }
@@ -4694,7 +4902,7 @@ impl Ribbon {
                         stamped += 1;
                     }
                 }
-                if stamped > 0 && self.cohorts.iter().any(|coh| coh.id == id) {
+                if stamped > 0 && self.cohort_by_id(id).is_some() {
                     self.hold_part(ReleasePart {
                         cohort: id,
                         stamp: at,
@@ -4704,7 +4912,7 @@ impl Ribbon {
                 continue;
             }
             n += live_count;
-            let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == id) else {
+            let Some(coh) = self.cohort_by_id_mut(id) else {
                 continue;
             };
             if !coh.abandoned {
@@ -4738,7 +4946,7 @@ impl Ribbon {
         if cell.retire_at.is_some() {
             return false;
         }
-        let Some(cohort) = self.cohorts.iter().find(|cohort| cohort.id == cell.cohort) else {
+        let Some(cohort) = self.cohort_by_id(cell.cohort) else {
             return false;
         };
         let alive = now
@@ -4769,7 +4977,11 @@ impl Ribbon {
                 resident += 1;
             }
         }
-        (resident == self.release_parts[index].cells).then_some(index)
+        if resident == self.release_parts[index].cells {
+            Some(index)
+        } else {
+            None
+        }
     }
 
     /// Lift the releases whose text the witness found back.
@@ -4780,7 +4992,7 @@ impl Ribbon {
     ) {
         accepted.clear();
         for &(id, stamp) in candidates {
-            let Some(k) = self.cohorts.iter().position(|c| c.id == id) else {
+            let Some(k) = self.cohort_index(id) else {
                 continue;
             };
             let Some(stamp) = stamp else {
@@ -4862,15 +5074,26 @@ impl Ribbon {
             let cohort_live = match cached_cohort {
                 Some((id, live)) if id == part.cohort => live,
                 _ => {
-                    let live = cohorts.iter().any(|cohort| cohort.id == part.cohort);
+                    let mut live = false;
+                    for cohort in cohorts {
+                        if cohort.id == part.cohort {
+                            live = true;
+                            break;
+                        }
+                    }
                     cached_cohort = Some((part.cohort, live));
                     live
                 }
             };
-            cohort_live
-                && cells
-                    .iter()
-                    .any(|cell| cell.cohort == part.cohort && cell.released_at == Some(part.stamp))
+            if !cohort_live {
+                return false;
+            }
+            for cell in cells {
+                if cell.cohort == part.cohort && cell.released_at == Some(part.stamp) {
+                    return true;
+                }
+            }
+            false
         });
     }
 
@@ -4879,33 +5102,38 @@ impl Ribbon {
         if from == into {
             return;
         }
-        if !self.cohorts.iter().any(|cohort| cohort.id == into) {
+        if self.cohort_by_id(into).is_none() {
             return;
         }
-        let Some(revoked) = self
-            .cohorts
-            .iter()
-            .find(|c| c.id == from)
-            .map(|c| c.parts_revoked_at)
-        else {
+        let Some(from_coh) = self.cohort_by_id(from) else {
             return;
         };
-        while let Some(at) = self
-            .release_parts
-            .iter()
-            .position(|part| part.cohort == from)
-        {
+        let revoked = from_coh.parts_revoked_at;
+        loop {
+            let mut found = None;
+            for (at, part) in self.release_parts.iter().enumerate() {
+                if part.cohort == from {
+                    found = Some(at);
+                    break;
+                }
+            }
+            let Some(at) = found else {
+                break;
+            };
             let part = self.release_parts.remove(at);
             self.hold_part(ReleasePart {
                 cohort: into,
                 ..part
             });
         }
-        let Some(target) = self.cohorts.iter_mut().find(|c| c.id == into) else {
+        let Some(target) = self.cohort_by_id_mut(into) else {
             return;
         };
         if let Some(t) = revoked {
-            target.parts_revoked_at = Some(target.parts_revoked_at.map_or(t, |u| u.max(t)));
+            target.parts_revoked_at = Some(match target.parts_revoked_at {
+                Some(u) => u.max(t),
+                None => t,
+            });
         }
     }
 
@@ -4918,20 +5146,21 @@ impl Ribbon {
                 part.cohort < from
                     || (part.cohort == from && matches!(after, Some(stamp) if part.stamp <= stamp))
             });
-            let Some(part) = self
-                .release_parts
-                .get(at)
-                .copied()
-                .filter(|part| part.cohort == from)
-            else {
+            let Some(&part) = self.release_parts.get(at) else {
                 break;
             };
+            if part.cohort != from {
+                break;
+            }
             after = Some(part.stamp);
-            if self
-                .cells
-                .iter()
-                .any(|cell| cell.cohort == into && cell.released_at == Some(part.stamp))
-            {
+            let mut has_cell = false;
+            for cell in &self.cells {
+                if cell.cohort == into && cell.released_at == Some(part.stamp) {
+                    has_cell = true;
+                    break;
+                }
+            }
+            if has_cell {
                 self.hold_part(ReleasePart {
                     cohort: into,
                     ..part
@@ -4963,14 +5192,18 @@ impl Ribbon {
             let a = self.cohorts[i];
             let hot =
                 |c: &Cohort| !c.wake && !c.abandoned && c.retract_col.is_none() && c.flow.is_none();
-            if !hot(&a) {
+            if !hot(&a) || !self.stands(&a) {
                 i += 1;
                 continue;
             }
-            let next = self.cohorts.iter().position(|b| {
-                b.id != a.id && b.row == a.row && b.col0 == a.col1 && hot(b) && self.stands(b)
-            });
-            let Some(j) = next.filter(|_| self.stands(&a)) else {
+            let mut found_j = None;
+            for (idx_b, b) in self.cohorts.iter().enumerate() {
+                if b.id != a.id && b.row == a.row && b.col0 == a.col1 && hot(b) && self.stands(b) {
+                    found_j = Some(idx_b);
+                    break;
+                }
+            }
+            let Some(j) = found_j else {
                 i += 1;
                 continue;
             };
@@ -4980,10 +5213,22 @@ impl Ribbon {
             let mut idx = 0;
             while idx < self.cells.len() {
                 let c = self.cells[idx];
-                let shadowed = c.cohort == into_id
-                    && self.cells.iter().any(|d| {
-                        d.cohort == from_id && d.row == c.row && d.col == c.col && d.born >= c.born
-                    });
+                let shadowed = if c.cohort == into_id {
+                    let mut sh = false;
+                    for d in &self.cells {
+                        if d.cohort == from_id
+                            && d.row == c.row
+                            && d.col == c.col
+                            && d.born >= c.born
+                        {
+                            sh = true;
+                            break;
+                        }
+                    }
+                    sh
+                } else {
+                    false
+                };
                 if shadowed {
                     let gone = self.cells.remove(idx);
                     self.custody_replaced(into, gone.released_at, 1);
@@ -5071,7 +5316,10 @@ impl Ribbon {
             return;
         }
         let now = ctx.now;
-        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
+        let pane_col0 = match self.pane {
+            Some((c0, _)) => c0,
+            None => 0,
+        };
         let mut reach = [(0u16, 0u16, 0u32); REACH_STAGE];
         let mut n_reach = 0usize;
         for i in 0..self.cohorts.len() {
@@ -5119,7 +5367,14 @@ impl Ribbon {
             }
         }
         for &(row, col, cohort) in &reach[..n_reach] {
-            if self.cells.iter().any(|c| c.row == row && c.col == col) {
+            let mut occupied = false;
+            for c in &self.cells {
+                if c.row == row && c.col == col {
+                    occupied = true;
+                    break;
+                }
+            }
+            if occupied {
                 continue;
             }
             self.lay_reach_cell(row, col, cohort);
@@ -5127,15 +5382,19 @@ impl Ribbon {
     }
 
     fn lay_reach_cell(&mut self, row: u16, col: u16, cohort: u32) {
-        let Some(coh) = self.cohorts.iter().find(|c| c.id == cohort).copied() else {
+        let Some(&coh) = self.cohort_by_id(cohort) else {
             return;
         };
-        let Some(&tail) = self
-            .cells
-            .iter()
-            .filter(|c| c.row == row && c.cohort == cohort)
-            .min_by_key(|c| c.col)
-        else {
+        let mut tail: Option<Cell> = None;
+        for c in &self.cells {
+            if c.row == row
+                && c.cohort == cohort
+                && !matches!(tail, Some(prev) if c.col >= prev.col)
+            {
+                tail = Some(*c);
+            }
+        }
+        let Some(tail) = tail else {
             return;
         };
         self.cells.push(Cell {
@@ -5156,7 +5415,7 @@ impl Ribbon {
             rearm: tail.rearm,
             released_at: None,
         });
-        if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cohort) {
+        if let Some(coh) = self.cohort_by_id_mut(cohort) {
             coh.col0 = coh.col0.min(col);
         }
     }
@@ -5195,7 +5454,14 @@ impl Ribbon {
             let (coh, phase_live) = match cached_coh {
                 Some((c, live)) if c.id == cell.cohort => (c, live),
                 _ => {
-                    let Some(c) = cohorts.iter().find(|c| c.id == cell.cohort) else {
+                    let mut found = None;
+                    for c in cohorts {
+                        if c.id == cell.cohort {
+                            found = Some(c);
+                            break;
+                        }
+                    }
+                    let Some(c) = found else {
                         return false;
                     };
                     let live = c.phase_at(c.idle_s(now)).is_some();
@@ -5230,7 +5496,14 @@ impl Ribbon {
         let mut gone_freshest: Option<Cohort> = None;
         self.cohorts.retain_mut(|coh| {
             let resident = if coh.flow.is_none() {
-                cells.iter().any(|cell| cell.cohort == coh.id)
+                let mut res = false;
+                for cell in cells {
+                    if cell.cohort == coh.id {
+                        res = true;
+                        break;
+                    }
+                }
+                res
             } else {
                 let mut resident = false;
                 let mut lo = u16::MAX;
@@ -5260,11 +5533,7 @@ impl Ribbon {
             };
             if !resident {
                 let fresher = match gone_freshest {
-                    Some(a) => coh
-                        .alive_at
-                        .cmp(&a.alive_at)
-                        .then_with(|| coh.walk_d(coh.col1).total_cmp(&a.walk_d(a.col1)))
-                        .is_ge(),
+                    Some(a) => is_fresher_or_equal(coh, &a),
                     None => true,
                 };
                 if fresher {
@@ -5288,18 +5557,23 @@ impl Ribbon {
         self.runs.clear();
         if let Some((row, col)) = self.attach
             && ctx.caret != (row, col)
-            && !self
-                .cells
-                .iter()
-                .any(|c| c.row == row && c.col == col && !c.leaving())
         {
-            for c in &mut self.cells {
-                if c.row == row
-                    && c.col == col
-                    && let Some(at) = c.retract_at
-                    && at < ctx.now
-                {
-                    c.retract_at = Some(ctx.now);
+            let mut active_at_attach = false;
+            for c in &self.cells {
+                if c.row == row && c.col == col && !c.leaving() {
+                    active_at_attach = true;
+                    break;
+                }
+            }
+            if !active_at_attach {
+                for c in &mut self.cells {
+                    if c.row == row
+                        && c.col == col
+                        && let Some(at) = c.retract_at
+                        && at < ctx.now
+                    {
+                        c.retract_at = Some(ctx.now);
+                    }
                 }
             }
         }
@@ -5399,32 +5673,43 @@ impl Ribbon {
                 _ => {
                     let end = s + sorted[s..].partition_point(|e| e.0 == row);
                     let row_cells = &sorted[s..end];
-                    let last = row_cells.last().map_or(sorted[s].1, |e| e.1);
+                    let last = match row_cells.last() {
+                        Some(e) => e.1,
+                        None => sorted[s].1,
+                    };
                     let floor = f32::from(ctx.geom.origin_y) + (f32::from(row) + 1.0) * chf;
                     let held = if floor >= pane_bot {
                         Some(true)
+                    } else if let Some(p) = below {
+                        Self::inked_below(p, ctx, row, sorted[s].1, last)
                     } else {
-                        below.and_then(|p| Self::inked_below(p, ctx, row, sorted[s].1, last))
+                        None
                     };
-                    let held = held.map(|h| {
-                        if !h {
-                            return false;
-                        }
-                        let mut seen_coh = None;
-                        let flowing = row_cells
-                            .iter()
-                            .filter_map(|e| cohort_of(&self.cells, *e))
-                            .any(|id| {
+                    let held = match held {
+                        Some(true) => {
+                            let mut seen_coh = None;
+                            let mut flowing = false;
+                            for e in row_cells {
+                                let Some(id) = cohort_of(&self.cells, *e) else {
+                                    continue;
+                                };
                                 if seen_coh == Some(id) {
-                                    return false;
+                                    continue;
                                 }
                                 seen_coh = Some(id);
-                                self.cohorts.iter().any(|c| {
-                                    c.id == id && c.flow.is_some() && c.phase.is_retracting()
-                                })
-                            });
-                        !flowing
-                    });
+                                if let Some(c) = self.cohort_by_id(id)
+                                    && c.flow.is_some()
+                                    && c.phase.is_retracting()
+                                {
+                                    flowing = true;
+                                    break;
+                                }
+                            }
+                            Some(!flowing)
+                        }
+                        Some(false) => Some(false),
+                        None => None,
+                    };
                     let previous = self.previous_hold(row, row_cells);
                     let hold = self.ease_hold(ctx, row, held, previous);
                     held_row = Some((row, hold));
@@ -5443,14 +5728,20 @@ impl Ribbon {
             let nb = |i: Option<usize>, col: Option<u16>| -> Option<Cell> {
                 let (i, col) = (i?, col?);
                 let e = sorted.get(i)?;
-                (e.0 == row && e.1 == col).then(|| self.cells.get(e.2 as usize).copied())?
+                if e.0 == row && e.1 == col {
+                    self.cells.get(e.2 as usize).copied()
+                } else {
+                    None
+                }
             };
             let abuts_left = nb(s.checked_sub(1), sorted[s].1.checked_sub(1)).is_some();
-            let seam = if abuts_left {
-                self.runs
-                    .last()
-                    .filter(|r| r.row == row && r.col1.checked_add(1) == Some(sorted[s].1))
-                    .and_then(|r| self.plan.get(r.hi.checked_sub(1)?).copied())
+            let seam = if abuts_left
+                && let Some(r) = self.runs.last()
+                && r.row == row
+                && r.col1.checked_add(1) == Some(sorted[s].1)
+                && let Some(idx) = r.hi.checked_sub(1)
+            {
+                self.plan.get(idx).copied()
             } else {
                 None
             };
@@ -5467,7 +5758,7 @@ impl Ribbon {
     /// source alongside the copy's carried shape. A no-move, no-birth frame
     /// reads its row directly, and a move scans each contiguous cohort once.
     fn previous_hold(&self, row: u16, row_cells: &[(u16, u16, u32)]) -> Option<(f32, Instant)> {
-        let original = self.holds.iter().find(|h| h.0 == row).map(|h| (h.1, h.2));
+        let original = self.row_hold(row);
         if self.carried_holds.is_empty() {
             return original;
         }
@@ -5479,16 +5770,32 @@ impl Ribbon {
             };
             if seen == Some(cell.cohort) {
                 continue;
-            }
+            };
             seen = Some(cell.cohort);
-            let previous = self
-                .carried_holds
-                .iter()
-                .find(|h| h.0 == cell.cohort)
-                .map_or(original, |h| h.1);
+            let mut found = None;
+            for &(id, held) in &self.carried_holds {
+                if id == cell.cohort {
+                    found = Some(held);
+                    break;
+                }
+            }
+            let previous = found.unwrap_or(original);
             strongest = Self::strongest_hold(strongest, previous);
         }
         strongest
+    }
+
+    #[inline]
+    const fn row_hold(&self, row: u16) -> Option<(f32, Instant)> {
+        let holds = self.holds.as_slice();
+        let mut j = 0;
+        while j < holds.len() {
+            if holds[j].0 == row {
+                return Some((holds[j].1, holds[j].2));
+            }
+            j += 1;
+        }
+        None
     }
 
     #[inline]
@@ -5517,23 +5824,17 @@ impl Ribbon {
             }
             i += 1;
         }
-        let holds = self.holds.as_slice();
-        let mut j = 0;
-        while j < holds.len() {
-            if holds[j].0 == row {
-                return Some((holds[j].1, holds[j].2));
-            }
-            j += 1;
-        }
-        None
+        self.row_hold(row)
     }
 
     fn stage_hold(&mut self, cohort: u32, previous: Option<(f32, Instant)>) {
-        if let Some(carried) = self.carried_holds.iter_mut().find(|h| h.0 == cohort) {
-            carried.1 = previous;
-        } else {
-            self.carried_holds.push((cohort, previous));
+        for (id, held) in &mut self.carried_holds {
+            if *id == cohort {
+                *held = previous;
+                return;
+            }
         }
+        self.carried_holds.push((cohort, previous));
     }
 
     /// Adopting old visual cells keeps their shape while any old cells left
@@ -5574,10 +5875,11 @@ impl Ribbon {
         let steps = self.hold_steps;
         #[cfg(not(test))]
         let steps = false;
-        let level = match (held.map(|h| f32::from(u8::from(h))), last) {
+        let level = match (held, last) {
             (None, Some((level, _))) => level,
             (None, None) => 0.0,
-            (Some(target), Some((level, at))) if !steps && !ctx.cfg.reduced_motion => {
+            (Some(h), Some((level, at))) if !steps && !ctx.cfg.reduced_motion => {
+                let target = if h { 1.0 } else { 0.0 };
                 let dt = ctx.now.saturating_duration_since(at).as_secs_f32();
                 if target > level {
                     (level + dt * (1.0 / HOLD_EASE_S)).min(target)
@@ -5585,7 +5887,13 @@ impl Ribbon {
                     (level - dt * (1.0 / HOLD_RELEASE_S)).max(target)
                 }
             }
-            (Some(target), _) => target,
+            (Some(h), _) => {
+                if h {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
         };
         self.holds_next.push((row, level, ctx.now));
         level
@@ -5767,7 +6075,7 @@ impl Ribbon {
 
     #[inline]
     fn env_of(&self, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
-        self.env_with(ctx, cell, self.cohorts.iter().find(|c| c.id == cell.cohort))
+        self.env_with(ctx, cell, self.cohort_by_id(cell.cohort))
     }
 
     #[inline]
@@ -5777,13 +6085,22 @@ impl Ribbon {
             return 0.0;
         }
         let reduced = ctx.cfg.reduced_motion;
-        let attack_now = cell.retire_at.map_or(now, |at| now.min(at));
+        let attack_now = match cell.retire_at {
+            Some(at) => now.min(at),
+            None => now,
+        };
         let age = attack_now
             .saturating_duration_since(cell.attack_at)
             .as_secs_f32();
-        let spent_to = coh.and_then(|c| c.flow).map_or(now, |f| now.min(f));
+        let spent_to = match coh {
+            Some(Cohort { flow: Some(f), .. }) => now.min(*f),
+            _ => now,
+        };
         let spent = spent_to
-            .saturating_duration_since(coh.map_or(cell.born, |c| cell.born.max(c.alive_at)))
+            .saturating_duration_since(match coh {
+                Some(c) => cell.born.max(c.alive_at),
+                None => cell.born,
+            })
             .as_secs_f32();
         let u = (spent / cell.life_s.max(1e-3)).clamp(0.0, 1.0);
         let attack = match cell.rearm {
@@ -5820,13 +6137,19 @@ impl Ribbon {
             env *= if reduced {
                 reduced_fade(CURTAIN_S - r)
             } else {
-                let rank = coh.map_or(1.0, |c| c.drain_rank(cell.col));
+                let rank = match coh {
+                    Some(c) => c.drain_rank(cell.col),
+                    None => 1.0,
+                };
                 let t0 = CURTAIN_STAGGER_S * (1.0 - rank);
                 spend(clamp01((r - t0) * (1.0 / CURTAIN_SPEND_S)))
             };
         }
-        if let Some(at) = coh.and_then(|c| c.printed) {
-            let r = now.saturating_duration_since(at).as_secs_f32();
+        if let Some(Cohort {
+            printed: Some(at), ..
+        }) = coh
+        {
+            let r = now.saturating_duration_since(*at).as_secs_f32();
             env *= 1.0 - (1.0 - RETURN_PRINTED_SHARE) * smoothstep01(r * (1.0 / RETURN_DIM_S));
         }
         if let Some(coh) = coh
@@ -5925,18 +6248,25 @@ impl Ribbon {
         if let Some(at) = self.curtain {
             let u =
                 clamp01(ctx.now.saturating_duration_since(at).as_secs_f32() * (1.0 / CURTAIN_S));
-            let Some(col) = coh.and_then(|c| c.retract_col) else {
+            let Some(Cohort {
+                retract_col: Some(col),
+                ..
+            }) = coh
+            else {
                 return RetractX::Identity;
             };
-            let caret_x = f32::from(ctx.geom.origin_x) + f32::from(col) * ctx.geom.cw as f32;
+            let caret_x = f32::from(ctx.geom.origin_x) + f32::from(*col) * ctx.geom.cw as f32;
             return RetractX::SuckIn {
                 caret_x,
                 keep: 1.0 - suck_in(u),
             };
         }
-        let Some(coh) = coh.filter(|c| c.phase.is_retracting()) else {
+        let Some(coh) = coh else {
             return RetractX::Identity;
         };
+        if !coh.phase.is_retracting() {
+            return RetractX::Identity;
+        }
         let idle = coh.idle_s(ctx.now);
         if coh.flow.is_some() {
             let Some(edge) = coh.retract_col else {
@@ -5957,8 +6287,12 @@ impl Ribbon {
                 }
             };
         }
-        let Some(col) = coh.retract_col.or_else(|| self.caret.map(|(_, col)| col)) else {
-            return RetractX::Identity;
+        let col = match coh.retract_col {
+            Some(col) => col,
+            None => match self.caret {
+                Some((_, col)) => col,
+                None => return RetractX::Identity,
+            },
         };
         let u = clamp01((idle - coh.retract_start()) / (coh.retract_span() + RETRACT_FADE_S));
         let caret_x = f32::from(ctx.geom.origin_x) + f32::from(col) * ctx.geom.cw as f32;
@@ -6023,10 +6357,12 @@ impl Ribbon {
     ) {
         let row = run[0].0;
         let (col0, col1) = (run[0].1, run[run.len() - 1].1);
-        let Some(cohort) = self.cells.get(run[0].2 as usize).map(|c| c.cohort) else {
+        let Some(first_cell) = self.cells.get(run[0].2 as usize) else {
             return;
         };
-        let coh = self.cohorts.iter().find(|c| c.id == cohort);
+        let cohort = first_cell.cohort;
+        let coh = self.cohort_by_id(cohort).copied();
+        let coh = coh.as_ref();
         let slabs = self.slabs_per_cell();
         let (head_col, at_caret, wet, stream_dir) = self.head_col(ctx, run, coh);
         let mut born_max: Option<Instant> = None;
@@ -6043,13 +6379,17 @@ impl Ribbon {
         let cell_at = |col: u16| -> Option<&Cell> {
             let i = usize::from(col.checked_sub(col0)?);
             let e = run.get(i)?;
-            (e.1 == col).then(|| self.cells.get(e.2 as usize))?
+            if e.1 == col {
+                self.cells.get(e.2 as usize)
+            } else {
+                None
+            }
         };
         let cw = ctx.geom.cw as f32;
-        let pane_end = self.pane.map_or(
-            u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX),
-            |(c0, w)| c0.saturating_add(w),
-        );
+        let pane_end = match self.pane {
+            Some((c0, w)) => c0.saturating_add(w),
+            None => u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX),
+        };
         let caret_cell = head_col.wrapping_add(1);
         let under_caret_leaving = match cell_at(caret_cell) {
             Some(c) => c.leaving(),
@@ -6065,20 +6405,19 @@ impl Ribbon {
             && ctx.caret.1 == caret_cell
             && ctx.caret.1 < pane_end
             && caret_free;
-        let attack = attach
-            .then(|| cell_at(head_col).copied())
-            .flatten()
-            .map(|head| {
-                let probe = Cell {
-                    attack_at: head.born,
-                    ..head
-                };
-                let age = ctx.now.saturating_duration_since(head.born).as_secs_f32();
-                (
-                    BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age),
-                    probe,
-                )
-            });
+        let attack = if attach && let Some(&head) = cell_at(head_col) {
+            let probe = Cell {
+                attack_at: head.born,
+                ..head
+            };
+            let age = ctx.now.saturating_duration_since(head.born).as_secs_f32();
+            Some((
+                BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age),
+                probe,
+            ))
+        } else {
+            None
+        };
         if attack.is_some() {
             self.attach = Some((row, caret_cell));
         }
@@ -6090,25 +6429,33 @@ impl Ribbon {
         let ox = f32::from(ctx.geom.origin_x);
         let inv_slabs = 1.0 / (slabs as f32);
         let retract = self.retract_x(ctx, coh);
-        let flow_settle = if ctx.cfg.reduced_motion {
-            (0.0, 0.0)
+        let flow_settle = if !ctx.cfg.reduced_motion
+            && let Some(c) = coh
+            && c.flow.is_some()
+            && c.phase.is_retracting()
+        {
+            let idle = c.idle_s(ctx.now);
+            (
+                c.flow_progress(idle),
+                smoothstep01((idle - (FLOW_TOTAL_S - FLOW_TAIL_S)) * (1.0 / FLOW_TAIL_S)),
+            )
         } else {
-            coh.filter(|c| c.flow.is_some() && c.phase.is_retracting())
-                .map_or((0.0, 0.0), |c| {
-                    let idle = c.idle_s(ctx.now);
-                    (
-                        c.flow_progress(idle),
-                        smoothstep01((idle - (FLOW_TOTAL_S - FLOW_TAIL_S)) * (1.0 / FLOW_TAIL_S)),
-                    )
-                })
+            (0.0, 0.0)
         };
         let rs = self.run_sample(ctx, row, coh, hold, flow_settle);
         for boundary in u32::from(col0)..=u32::from(col1) + 1 {
-            let left = boundary
-                .checked_sub(1)
-                .and_then(|c| u16::try_from(c).ok())
-                .and_then(cell_at);
-            let right = u16::try_from(boundary).ok().and_then(cell_at);
+            let left = if let Some(c) = boundary.checked_sub(1)
+                && let Ok(c) = u16::try_from(c)
+            {
+                cell_at(c)
+            } else {
+                None
+            };
+            let right = if let Ok(c) = u16::try_from(boundary) {
+                cell_at(c)
+            } else {
+                None
+            };
             let (a, b) = match (left, right) {
                 (Some(a), Some(b)) => (a, b),
                 (Some(a), None) => (a, a),
@@ -6120,20 +6467,27 @@ impl Ribbon {
             };
             let sp = |c: &Cell| f32::from(head_col.abs_diff(c.col)) * inv_span;
             debug_assert_eq!(left_sample.is_some(), left.is_some());
-            let sa = left_sample.unwrap_or_else(|| self.sample_with(ctx, a, coh, sp(a), &rs));
+            let sa = match left_sample {
+                Some(sa) => sa,
+                None => self.sample_with(ctx, a, coh, sp(a), &rs),
+            };
             let sb = if a.col == b.col {
                 sa
             } else {
                 self.sample_with(ctx, b, coh, sp(b), &rs)
             };
-            left_sample = right.map(|_| sb);
+            left_sample = if right.is_some() { Some(sb) } else { None };
             let mid = |u: f32, v: f32| (u + v) * 0.5;
-            let mut la = left.map_or(0.0, |_| {
+            let mut la = if left.is_some() {
                 sa.3 * self.wipe_of(ctx, a, if caret_side_right { 0.0 } else { 1.0 })
-            });
-            let mut lb = right.map_or(0.0, |_| {
+            } else {
+                0.0
+            };
+            let mut lb = if right.is_some() {
                 sb.3 * self.wipe_of(ctx, b, if caret_side_right { 1.0 } else { 0.0 })
-            });
+            } else {
+                0.0
+            };
             let mut shape = (
                 mid(sa.0, sb.0),
                 mid(sa.1, sb.1),
@@ -6149,13 +6503,17 @@ impl Ribbon {
             if right.is_none()
                 && let Some(nb) = right_nb.as_ref()
             {
-                let nb_coh = self.cohorts.iter().find(|c| c.id == nb.cohort);
+                let nb_coh = self.cohort_by_id(nb.cohort);
                 lb = self.cov_of(ctx, nb, nb_coh) * self.wipe_of(ctx, nb, 1.0);
             }
             let natural = la.max(lb * RUN_TAIL_EASE);
-            let floored = left
-                .and_then(|l| self.attach_floor_at(ctx, row, l, 1.0))
-                .map(|floor| natural.max(floor));
+            let floored = if let Some(l) = left
+                && let Some(floor) = self.attach_floor_at(ctx, row, l, 1.0)
+            {
+                Some(natural.max(floor))
+            } else {
+                None
+            };
             let cov = floored.unwrap_or(natural);
             let here = (shape.0, shape.1, shape.2, shape.3, cov);
             if let Some((uniform, probe)) = attack
@@ -6266,7 +6624,11 @@ impl Ribbon {
     #[inline]
     fn attach_floor_at(&self, ctx: &Ctx<'_>, row: u16, cell: &Cell, dist: f32) -> Option<f32> {
         let af = self.attach_floor?;
-        (af.row == row && af.col == cell.col && cell.leaving()).then(|| af.level(self, ctx, dist))
+        if af.row == row && af.col == cell.col && cell.leaving() {
+            Some(af.level(self, ctx, dist))
+        } else {
+            None
+        }
     }
 
     /// Draw the body into `frame.under` and the hot edge into `frame.out`.
@@ -6276,7 +6638,7 @@ impl Ribbon {
         if self.plan.is_empty() || self.runs.is_empty() {
             return;
         }
-        let ink_from = frame.under.len();
+        let ink_from = (frame.under.len(), frame.under_ramps.mark());
         let prof = Self::body_profile(ctx.cfg);
         let shoulder = prof.shoulder;
         #[cfg(test)]
@@ -6292,28 +6654,33 @@ impl Ribbon {
             light_role(ctx.cfg).alpha_cap()
         };
         let clip = ctx.geom.beam_clip();
-        let budget = frame.under.len() + RIBBON_QUAD_BUDGET;
+        let budget = frame.under_ramps.laid(frame.under.len()) + RIBBON_QUAD_BUDGET;
         let core_up = prof.core_up_ch * chf;
         let lift_span = LEAD_CH * chf;
         let mut verts = mem::take(&mut self.verts);
         let runs = mem::take(&mut self.runs);
         let stride = ctx.geom.cw.max(1).div_ceil(self.slabs_per_cell());
-        let focused_multi_run_row = runs
-            .iter()
-            .find(|run| run.at_caret)
-            .map(|run| run.row)
-            .filter(|&row| {
-                let mut count = 0usize;
-                for r in &runs {
-                    if r.row == row {
-                        count += 1;
-                        if count > 1 {
-                            return true;
-                        }
+        let mut caret_row = None;
+        for run in &runs {
+            if run.at_caret {
+                caret_row = Some(run.row);
+                break;
+            }
+        }
+        let focused_multi_run_row = if let Some(row) = caret_row {
+            let mut count = 0usize;
+            for r in &runs {
+                if r.row == row {
+                    count += 1;
+                    if count > 1 {
+                        break;
                     }
                 }
-                false
-            });
+            }
+            if count > 1 { Some(row) } else { None }
+        } else {
+            None
+        };
         let pane_bot = self.pane_bot(ctx, chf);
         let dn_floor = DN_FLOOR_CH * chf;
         let rail_reach_max = RAIL_REACH_MAX_CH * chf;
@@ -6348,7 +6715,14 @@ impl Ribbon {
                 * (ctx.geom.cw as f32 / fine as f32 - self.slabs_per_cell() as f32);
             let mut tail_rows = 0usize;
             for (i, run) in runs.iter().enumerate() {
-                if !runs[..i].iter().any(|r| r.row == run.row) {
+                let mut seen_row = false;
+                for r in &runs[..i] {
+                    if r.row == run.row {
+                        seen_row = true;
+                        break;
+                    }
+                }
+                if !seen_row {
                     tail_rows += 1;
                 }
             }
@@ -6358,11 +6732,11 @@ impl Ribbon {
                 < RIBBON_QUAD_BUDGET as f32 * RUN_END_ROOM_SHARE
         };
         {
-            let mut paint = |out: &mut Vec<GlowQuad>, run: &Run, rail_layer: bool| -> bool {
+            let mut paint = |out: &mut RampSink<'_>, run: &Run, rail_layer: bool| -> bool {
                 // A span past the stream's end was cut away with what it
                 // drew (the body-first repaint): it is spent.
-                let at = out.len();
-                rail_spans.retain(|&(_, to)| to <= at);
+                let at = out.mark();
+                rail_spans.retain(|&(_, to)| rail_within(to, at));
                 let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
                 if rail_layer && (!rail || run.hold >= 1.0 || row_bottom >= pane_bot) {
                     return true;
@@ -6459,10 +6833,10 @@ impl Ribbon {
                         });
                     });
                 }
-                let start = out.len();
+                let start = out.mark();
                 let shoulder = if rail_layer { 1.0 } else { shoulder };
                 let mut complete =
-                    ribbon_beam(out, clip, &verts, shoulder, stride, budget, GlowBlend::Over);
+                    ribbon_beam_into(out, clip, &verts, shoulder, stride, budget, GlowBlend::Over);
                 let head = verts.len().saturating_sub(1 + head_rev);
                 if !complete && head + 1 < verts.len() {
                     out.truncate(start);
@@ -6471,44 +6845,63 @@ impl Ribbon {
                         out, clip, &mut verts, head, shoulder, stride, budget,
                     );
                 }
-                if rail_layer && rail_clear && out.len() > start {
-                    rail_spans.push((start, out.len()));
+                let end = out.mark();
+                if rail_layer && rail_clear && (end.0 > start.0 || end.1.items() > start.1.items())
+                {
+                    rail_spans.push((start, end));
                 }
                 complete
             };
             let mut retry_body_first = false;
             let mut prior_rail_drawn = false;
+            let mut sink = frame.under_sink();
+            let under = &mut sink;
             for (i, run) in runs.iter().enumerate() {
-                if !paint(frame.under, run, false) {
+                if !paint(under, run, false) {
                     retry_body_first = prior_rail_drawn && focused_multi_run_row == Some(run.row);
                     break;
                 }
-                let rail_from = frame.under.len();
-                if !paint(frame.under, run, true) {
+                let rail_from = under.laid();
+                if !paint(under, run, true) {
                     retry_body_first = if let Some(row) = focused_multi_run_row {
-                        runs[i + 1..].iter().any(|later| later.row == row)
+                        let mut later_on_row = false;
+                        for later in &runs[i + 1..] {
+                            if later.row == row {
+                                later_on_row = true;
+                                break;
+                            }
+                        }
+                        later_on_row
                     } else {
                         false
                     };
                     break;
                 }
-                prior_rail_drawn |= frame.under.len() > rail_from;
+                prior_rail_drawn |= under.laid() > rail_from;
             }
             if retry_body_first {
                 let row = focused_multi_run_row.expect("retry requires a multi-run focused row");
-                frame.under.truncate(ink_from);
-                let bodies_complete = runs
-                    .iter()
-                    .filter(|run| run.row == row)
-                    .all(|run| paint(frame.under, run, false));
+                under.truncate(ink_from);
+                let mut bodies_complete = true;
+                for run in &runs {
+                    if run.row == row && !paint(under, run, false) {
+                        bodies_complete = false;
+                        break;
+                    }
+                }
                 if bodies_complete {
-                    let rails_complete = runs
-                        .iter()
-                        .filter(|run| run.row == row)
-                        .all(|run| paint(frame.under, run, true));
+                    let mut rails_complete = true;
+                    for run in &runs {
+                        if run.row == row && !paint(under, run, true) {
+                            rails_complete = false;
+                            break;
+                        }
+                    }
                     if rails_complete {
-                        for run in runs.iter().filter(|run| run.row != row) {
-                            if !paint(frame.under, run, false) || !paint(frame.under, run, true) {
+                        for run in &runs {
+                            if run.row != row
+                                && (!paint(under, run, false) || !paint(under, run, true))
+                            {
                                 break;
                             }
                         }
@@ -6516,28 +6909,41 @@ impl Ribbon {
                 }
             }
         }
-        rail_spans.retain(|&(_, to)| to <= frame.under.len());
+        let at = (frame.under.len(), frame.under_ramps.mark());
+        rail_spans.retain(|&(_, to)| rail_within(to, at));
         self.rail_spans = rail_spans;
         self.runs = runs;
         self.verts = verts;
         self.emit_hot_edge(ctx, frame);
         let bg = ctx.cfg.theme_bg;
+        let ramps = &*frame.under_ramps;
         let mut last_ink: Option<(u32, u8, bool)> = None;
-        let mut ink_quads = 0usize;
-        for q in &frame.under[ink_from..] {
-            let res = match last_ink {
-                Some((prev_c, prev_a, res)) if prev_c == q.color && prev_a == q.alpha => res,
-                _ => {
-                    let res = reads_as_ink(over_premul(bg, q.color, q.alpha));
-                    last_ink = Some((q.color, q.alpha, res));
-                    res
-                }
-            };
-            if res {
-                ink_quads += 1;
+        let mut ink = |q: &aterm_render::GlowQuad| {
+            if let Some((prev_c, prev_a, res)) = last_ink
+                && prev_c == q.color
+                && prev_a == q.alpha
+            {
+                return res;
+            }
+            let res = reads_as_ink(over_premul(bg, q.color, q.alpha));
+            last_ink = Some((q.color, q.alpha, res));
+            res
+        };
+        let mut quads = 0usize;
+        for q in &frame.under[ink_from.0..] {
+            if ink(q) {
+                quads += 1;
             }
         }
-        self.ink_quads = ink_quads;
+        let mut rows = 0usize;
+        for r in ramps.since(ink_from.1) {
+            for q in r.quads(&ramps.ends) {
+                if ink(&q) {
+                    rows += 1;
+                }
+            }
+        }
+        self.ink_quads = quads + rows;
     }
 
     /// The reach `up` of a body boundary at window x `x` standing on
@@ -6598,7 +7004,7 @@ impl Ribbon {
     }
 
     fn repaint_capped_run_from_head(
-        out: &mut Vec<GlowQuad>,
+        out: &mut RampSink<'_>,
         clip: BeamClip,
         verts: &mut [RibbonVertex],
         head: usize,
@@ -6608,7 +7014,7 @@ impl Ribbon {
     ) -> bool {
         debug_assert!(head < verts.len());
         verts[..=head].reverse();
-        let left_complete = ribbon_beam(
+        let left_complete = ribbon_beam_into(
             out,
             clip,
             &verts[..=head],
@@ -6619,7 +7025,7 @@ impl Ribbon {
         );
         verts[..=head].reverse();
         left_complete
-            && ribbon_beam(
+            && ribbon_beam_into(
                 out,
                 clip,
                 &verts[head..],
@@ -6690,21 +7096,30 @@ impl Ribbon {
             .edge_cells
             .clamp(HOT_EDGE_CELLS, HOT_EDGE_CELLS_MAX);
         let cw = ctx.geom.cw as f32;
-        let seam = self
-            .seam
-            .filter(|s| s.row == run.row && run.at_caret && dir < 0.0)
-            .and_then(|s| {
-                let floor_x =
-                    f32::from(ctx.geom.origin_x) + f32::from(self.hand_floor_on(run.row)?) * cw;
-                let lvl = SEAM_LEVEL
-                    * spend(clamp01(
-                        ctx.now.saturating_duration_since(s.at).as_secs_f32()
-                            * (1.0 / FLOW_TOTAL_S),
-                    ));
-                (lvl > 0.0).then_some((floor_x, lvl))
-            });
+        let seam = if let Some(s) = self.seam
+            && s.row == run.row
+            && run.at_caret
+            && dir < 0.0
+            && let Some(floor_col) = self.hand_floor_on(run.row)
+        {
+            let floor_x = f32::from(ctx.geom.origin_x) + f32::from(floor_col) * cw;
+            let lvl = SEAM_LEVEL
+                * spend(clamp01(
+                    ctx.now.saturating_duration_since(s.at).as_secs_f32() * (1.0 / FLOW_TOTAL_S),
+                ));
+            if lvl > 0.0 {
+                Some((floor_x, lvl))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let reach = cells * cw;
-        let seam_lvl = seam.map_or(0.0, |(_, l)| l);
+        let seam_lvl = match seam {
+            Some((_, l)) => l,
+            None => 0.0,
+        };
         let intensity = clamp01(ctx.cfg.intensity);
         let gain_intensity = gain * intensity;
         let feather = self.head_feather(ctx, run);
@@ -6735,11 +7150,10 @@ impl Ribbon {
             if !(0.0..=reach).contains(&behind) && !in_seam {
                 continue;
             }
-            let a_rel = (1.0 - behind * inv_reach).max(0.0).powi(2).max(if in_seam {
-                seam_lvl
-            } else {
-                0.0
-            });
+            let a_rel = {
+                let t = (1.0 - behind * inv_reach).max(0.0);
+                (t * t).max(if in_seam { seam_lvl } else { 0.0 })
+            };
             let cov = (HOT_EDGE_COV_MAX * a_rel * gain_intensity * feather.at(seg.x))
                 .clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
@@ -6759,14 +7173,7 @@ impl Ribbon {
             frame.beams.clear();
             return;
         }
-        comet_beam(
-            frame.out,
-            ctx.geom.beam_clip(),
-            frame.beams,
-            HOT_EDGE_THICKNESS,
-            1,
-            0.0,
-        );
+        frame.lay_beam(ctx.geom.beam_clip(), HOT_EDGE_THICKNESS, 1);
         frame.beams.clear();
     }
 
@@ -6814,24 +7221,30 @@ impl Ribbon {
         if self.cells.is_empty() {
             return 0.0;
         }
-        if let Some(t) = self.caret.and_then(|(row, col)| self.field_at(row, col)) {
+        if let Some((row, col)) = self.caret
+            && let Some(t) = self.field_at(row, col)
+        {
             return t;
         }
-        let caret_row = self.caret.map(|(row, _)| row);
         let mut best_on_row: Option<(Instant, f32)> = None;
         let mut best_any: Option<(Instant, f32)> = None;
         for c in &self.cells {
             if !c.typing || c.leaving() {
                 continue;
             }
-            if caret_row == Some(c.row) && !matches!(best_on_row, Some((b, _)) if c.born < b) {
+            if matches!(self.caret, Some((row, _)) if row == c.row)
+                && !matches!(best_on_row, Some((b, _)) if c.born < b)
+            {
                 best_on_row = Some((c.born, c.t));
             }
             if !matches!(best_any, Some((b, _)) if c.born < b) {
                 best_any = Some((c.born, c.t));
             }
         }
-        best_on_row.or(best_any).map_or(0.0, |(_, t)| t)
+        match (best_on_row, best_any) {
+            (Some((_, t)), _) | (None, Some((_, t))) => t,
+            (None, None) => 0.0,
+        }
     }
 
     /// The source RGB a companion cursor inherits to meet the laid ribbon with no palette seam (seam point 5).
@@ -6942,19 +7355,31 @@ impl Ribbon {
         const TWIN_TRANSLATED_WINDOW_DUR: std::time::Duration =
             super::witness::TWIN_MIN.saturating_add(std::time::Duration::from_millis(16));
         let ramping = |at: Instant| now.saturating_duration_since(at).as_secs_f32() < EDGE_IN_S;
-        (!self.reduced && self.curtain.is_some() && !self.cells.is_empty())
+        if (!self.reduced && self.curtain.is_some() && !self.cells.is_empty())
             || (!self.reduced && self.seam.is_some() && !self.cells.is_empty())
             || matches!(self.rearm, Some((at, _)) if ramping(at))
             || matches!(
                 self.translated_at,
                 Some(at) if now.saturating_duration_since(at) < TWIN_TRANSLATED_WINDOW_DUR
             )
-            || self.cells.iter().rev().any(|c| ramping(c.attack_at))
-            || (!self.reduced
-                && self
-                    .cohorts
-                    .iter()
-                    .any(|c| c.phase_at(c.idle_s(now)) == Some(Phase::Retracting)))
+        {
+            return true;
+        }
+        let mut i = self.cells.len();
+        while i > 0 {
+            i -= 1;
+            if ramping(self.cells[i].attack_at) {
+                return true;
+            }
+        }
+        if !self.reduced {
+            for c in &self.cohorts {
+                if c.phase_at(c.idle_s(now)) == Some(Phase::Retracting) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Seconds until the mark's settle under a falling spine moves a pixel.
@@ -7003,11 +7428,14 @@ impl Ribbon {
         const CURTAIN_DUR: std::time::Duration =
             std::time::Duration::from_nanos((CURTAIN_S as f64 * 1_000_000_000.0).round() as u64);
         let reduced_fade_s = REDUCED_MOTION_FADE_MS / 1000.0;
-        let ember_left = self.ember_at.map(|at| FOCUS_EMBER_S - since(at));
-        let ember_u = self
-            .ember_at
-            .map(|at| clamp01(since(at) * (1.0 / FOCUS_EMBER_S)));
-        let ember_spend = ember_u.map(spend);
+        let (ember_left, ember_u, ember_spend) = match self.ember_at {
+            Some(at) => {
+                let s = since(at);
+                let u = clamp01(s * (1.0 / FOCUS_EMBER_S));
+                (Some(FOCUS_EMBER_S - s), Some(u), Some(spend(u)))
+            }
+            None => (None, None, None),
+        };
         let mut cached_coh: Option<(u32, Option<&Cohort>)> = None;
         for cell in &self.cells {
             if cad.at_tail_floor() {
@@ -7016,12 +7444,15 @@ impl Ribbon {
             let coh = match cached_coh {
                 Some((id, c)) if id == cell.cohort => c,
                 _ => {
-                    let c = self.cohorts.iter().find(|c| c.id == cell.cohort);
+                    let c = self.cohort_by_id(cell.cohort);
                     cached_coh = Some((cell.cohort, c));
                     c
                 }
             };
-            let age = since(coh.map_or(cell.born, |c| cell.born.max(c.alive_at)));
+            let age = since(match coh {
+                Some(c) => cell.born.max(c.alive_at),
+                None => cell.born,
+            });
             let life = cell.life_s.max(1e-3);
             let flowing = matches!(coh, Some(c) if c.flow.is_some());
             if !flowing {
@@ -7033,42 +7464,52 @@ impl Ribbon {
                 continue;
             }
             if self.reduced {
-                let ends = [
-                    (!flowing).then_some(cell.life_s - age),
-                    cell.retract_at.map(|at| RETRACT_FADE_S - since(at)),
-                    cell.retire_at.map(|at| RETIRE_MELT_S - since(at)),
-                    ember_left,
-                    coh.map(|c| c.swoosh_total() - c.idle_s(now)),
-                ];
-                let mut k = 0;
-                while k < ends.len() {
-                    if let Some(left) = ends[k] {
-                        cad.tail((left - reduced_fade_s).max(0.0));
-                    }
-                    k += 1;
+                if !flowing {
+                    cad.tail((cell.life_s - age - reduced_fade_s).max(0.0));
+                }
+                if let Some(at) = cell.retract_at {
+                    cad.tail((RETRACT_FADE_S - since(at) - reduced_fade_s).max(0.0));
+                }
+                if let Some(at) = cell.retire_at {
+                    cad.tail((RETIRE_MELT_S - since(at) - reduced_fade_s).max(0.0));
+                }
+                if let Some(left) = ember_left {
+                    cad.tail((left - reduced_fade_s).max(0.0));
+                }
+                if let Some(c) = coh {
+                    cad.tail((c.swoosh_total() - c.idle_s(now) - reduced_fade_s).max(0.0));
                 }
                 continue;
             }
             let base = UNDER_COV_CAP * cell.cov0;
             let u = clamp01(age / life);
             let melt = expiry_melt(u);
-            let retract_u = cell
-                .retract_at
-                .map(|at| clamp01(since(at) * (1.0 / RETRACT_FADE_S)));
-            let swoosh_u = coh.and_then(|c| {
-                let idle = c.idle_s(now);
-                if c.phase_at(idle) != Some(Phase::Fading) {
-                    return None;
+            let (retract_u, f_r) = match cell.retract_at {
+                Some(at) => {
+                    let ur = clamp01(since(at) * (1.0 / RETRACT_FADE_S));
+                    (Some(ur), spend(ur))
                 }
-                let t0 = c.retract_start() + c.retract_span() * (1.0 - c.drain_rank(cell.col));
-                Some(clamp01((idle - t0) * (1.0 / RETRACT_FADE_S)))
-            });
-            let retire_u = cell
-                .retire_at
-                .map(|at| clamp01(since(at) * (1.0 / RETIRE_MELT_S)));
-            let f_r = retract_u.map_or(1.0, spend);
-            let f_s = swoosh_u.map_or(1.0, spend);
-            let f_m = retire_u.map_or(1.0, spend);
+                None => (None, 1.0),
+            };
+            let (swoosh_u, f_s) = if let Some(c) = coh {
+                let idle = c.idle_s(now);
+                if c.phase_at(idle) == Some(Phase::Fading) {
+                    let t0 = c.retract_start() + c.retract_span() * (1.0 - c.drain_rank(cell.col));
+                    let us = clamp01((idle - t0) * (1.0 / RETRACT_FADE_S));
+                    (Some(us), spend(us))
+                } else {
+                    (None, 1.0)
+                }
+            } else {
+                (None, 1.0)
+            };
+            let (retire_u, f_m) = match cell.retire_at {
+                Some(at) => {
+                    let um = clamp01(since(at) * (1.0 / RETIRE_MELT_S));
+                    (Some(um), spend(um))
+                }
+                None => (None, 1.0),
+            };
             let carried = base * melt * f_r * f_s * f_m;
             let (ember_floor, f_e) = match ember_spend {
                 Some(s) => {
@@ -7158,13 +7599,12 @@ impl Ribbon {
         if dc == 0 || lo > hi {
             return 0;
         }
-        let Some(ci) = self
-            .cohorts
-            .iter()
-            .position(|c| c.id == cohort && c.row == row)
-        else {
+        let Some(ci) = self.cohort_index(cohort) else {
             return 0;
         };
+        if self.cohorts[ci].row != row {
+            return 0;
+        }
         let carry_partial = self.partial_custody_follows(ci, lo, hi, true);
         let mut i = 0usize;
         while i < self.cells.len() {
@@ -7176,9 +7616,14 @@ impl Ribbon {
                 && let Some(src) = c.col.checked_add_signed(-dc)
                 && (lo..=hi).contains(&src)
             {
-                self.cells
-                    .iter()
-                    .any(|d| d.row == row && d.cohort == cohort && !d.leaving() && d.col == src)
+                let mut has_src = false;
+                for d in &self.cells {
+                    if d.row == row && d.cohort == cohort && !d.leaving() && d.col == src {
+                        has_src = true;
+                        break;
+                    }
+                }
+                has_src
             } else {
                 false
             };
@@ -7269,13 +7714,12 @@ impl Ribbon {
             hi,
             dr,
         } = run;
-        let Some(ci) = self
-            .cohorts
-            .iter()
-            .position(|c| c.id == cohort && c.row == row)
-        else {
+        let Some(ci) = self.cohort_index(cohort) else {
             return 0;
         };
+        if self.cohorts[ci].row != row {
+            return 0;
+        }
         let Some(new_row) = row.checked_add_signed(dr) else {
             return 0;
         };
@@ -7293,11 +7737,10 @@ impl Ribbon {
         let mut all = 0usize;
         let (mut c0, mut c1) = (u16::MAX, 0u16);
         let (mut k0, mut k1) = (u16::MAX, 0u16);
-        for c in self
-            .cells
-            .iter()
-            .filter(|c| c.row == row && c.cohort == cohort)
-        {
+        for c in &self.cells {
+            if c.row != row || c.cohort != cohort {
+                continue;
+            }
             all += 1;
             if carried(c) {
                 n += 1;
@@ -7323,7 +7766,9 @@ impl Ribbon {
             copy.col0 = c0;
             copy.col1 = c1;
             if copy.flow.is_some() && c0 < c1 {
-                copy.retract_col = copy.retract_col.map(|e| e.clamp(c0, c1 - 1));
+                if let Some(e) = &mut copy.retract_col {
+                    *e = (*e).clamp(c0, c1 - 1);
+                }
                 copy.flow_drift = copy
                     .flow_drift
                     .min(FLOW_DRIFT_MAX_SHARE * f32::from(c1 - c0));
@@ -7354,7 +7799,7 @@ impl Ribbon {
         if id != cohort {
             self.split_release(cohort, id);
         }
-        if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == id) {
+        if let Some(coh) = self.cohort_by_id_mut(id) {
             if away {
                 Self::flow_cohort(coh, at);
             } else if coh.flow.take().is_some() {
@@ -7400,52 +7845,62 @@ impl Ribbon {
             true
         });
         let cells = &self.cells;
-        self.cohorts
-            .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
+        self.cohorts.retain(|coh| {
+            for c in cells {
+                if c.cohort == coh.id {
+                    return true;
+                }
+            }
+            false
+        });
+        let cohorts = &self.cohorts;
         let mut last_coh: Option<(u32, bool)> = None;
         self.cells.retain(|c| match last_coh {
             Some((id, keep)) if id == c.cohort => keep,
             _ => {
-                let keep = self.cohorts.iter().any(|coh| coh.id == c.cohort);
+                let mut keep = false;
+                for coh in cohorts {
+                    if coh.id == c.cohort {
+                        keep = true;
+                        break;
+                    }
+                }
                 last_coh = Some((c.cohort, keep));
                 keep
             }
         });
         self.prune_release_parts();
-        self.caret = self.caret.map(|(row, col)| (row.saturating_sub(rows), col));
-        self.pen = self
-            .pen
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
-        self.arrived = self
-            .arrived
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
-        self.hand_floor = self
-            .hand_floor
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
-        self.last_space = self
-            .last_space
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
-        self.prev_space = self
-            .prev_space
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
-        self.attach = self
-            .attach
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
+        if let Some((row, _)) = &mut self.caret {
+            *row = row.saturating_sub(rows);
+        }
+        #[inline]
+        const fn scroll_pt(pt: Option<(u16, u16)>, rows: u16) -> Option<(u16, u16)> {
+            match pt {
+                Some((row, col)) if row >= rows => Some((row - rows, col)),
+                _ => None,
+            }
+        }
+        self.pen = scroll_pt(self.pen, rows);
+        self.arrived = scroll_pt(self.arrived, rows);
+        self.hand_floor = scroll_pt(self.hand_floor, rows);
+        self.last_space = scroll_pt(self.last_space, rows);
+        self.prev_space = scroll_pt(self.prev_space, rows);
+        self.attach = scroll_pt(self.attach, rows);
         self.attach_floor = None;
-        self.seam = self.seam.filter(|s| s.row >= rows).map(|s| Seam {
-            row: s.row - rows,
-            ..s
-        });
-        self.relocate = self.relocate.filter(|r| r.row >= rows).map(|r| Relocate {
-            row: r.row - rows,
-            ..r
-        });
+        self.seam = match self.seam {
+            Some(s) if s.row >= rows => Some(Seam {
+                row: s.row - rows,
+                ..s
+            }),
+            _ => None,
+        };
+        self.relocate = match self.relocate {
+            Some(r) if r.row >= rows => Some(Relocate {
+                row: r.row - rows,
+                ..r
+            }),
+            _ => None,
+        };
         self.carry = None;
         if let Some(proof) = &mut self.short_reanchor {
             proof.from.0 = proof.from.0.saturating_sub(rows);
@@ -7456,7 +7911,10 @@ impl Ribbon {
             proof.to.0 = proof.to.0.saturating_sub(rows);
         }
         if let Some(gate) = &mut self.fresh_line {
-            gate.left_row = gate.left_row.and_then(|row| row.checked_sub(rows));
+            gate.left_row = match gate.left_row {
+                Some(row) => row.checked_sub(rows),
+                None => None,
+            };
         }
         self.holds.retain_mut(|h| match h.0.checked_sub(rows) {
             Some(row) => {
@@ -7497,46 +7955,70 @@ impl Ribbon {
                 None => false,
             });
         let cells = &self.cells;
-        self.cohorts
-            .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
+        self.cohorts.retain(|coh| {
+            for c in cells {
+                if c.cohort == coh.id {
+                    return true;
+                }
+            }
+            false
+        });
+        let cohorts = &self.cohorts;
         let mut last_coh: Option<(u32, bool)> = None;
         self.cells.retain(|c| match last_coh {
             Some((id, keep)) if id == c.cohort => keep,
             _ => {
-                let keep = self.cohorts.iter().any(|coh| coh.id == c.cohort);
+                let mut keep = false;
+                for coh in cohorts {
+                    if coh.id == c.cohort {
+                        keep = true;
+                        break;
+                    }
+                }
                 last_coh = Some((c.cohort, keep));
                 keep
             }
         });
         self.prune_release_parts();
-        self.caret = self
-            .caret
-            .map(|(row, col)| (band_pos(row, top, bottom, delta), col));
-        self.pen = self
-            .pen
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
-        self.arrived = self
-            .arrived
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
-        self.hand_floor = self
-            .hand_floor
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
-        self.last_space = self
-            .last_space
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
-        self.prev_space = self
-            .prev_space
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
-        self.attach = self
-            .attach
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+        if let Some((row, _)) = &mut self.caret {
+            *row = band_pos(*row, top, bottom, delta);
+        }
+        #[inline]
+        const fn band_pt(
+            pt: Option<(u16, u16)>,
+            top: u16,
+            bottom: u16,
+            delta: i16,
+        ) -> Option<(u16, u16)> {
+            match pt {
+                Some((row, col)) => match band_row(row, top, bottom, delta) {
+                    Some(row) => Some((row, col)),
+                    None => None,
+                },
+                None => None,
+            }
+        }
+        self.pen = band_pt(self.pen, top, bottom, delta);
+        self.arrived = band_pt(self.arrived, top, bottom, delta);
+        self.hand_floor = band_pt(self.hand_floor, top, bottom, delta);
+        self.last_space = band_pt(self.last_space, top, bottom, delta);
+        self.prev_space = band_pt(self.prev_space, top, bottom, delta);
+        self.attach = band_pt(self.attach, top, bottom, delta);
         self.attach_floor = None;
-        self.seam = self
-            .seam
-            .and_then(|s| band_row(s.row, top, bottom, delta).map(|row| Seam { row, ..s }));
-        self.relocate = self
-            .relocate
-            .and_then(|r| band_row(r.row, top, bottom, delta).map(|row| Relocate { row, ..r }));
+        self.seam = if let Some(s) = self.seam
+            && let Some(row) = band_row(s.row, top, bottom, delta)
+        {
+            Some(Seam { row, ..s })
+        } else {
+            None
+        };
+        self.relocate = if let Some(r) = self.relocate
+            && let Some(row) = band_row(r.row, top, bottom, delta)
+        {
+            Some(Relocate { row, ..r })
+        } else {
+            None
+        };
         self.carry = None;
         if let Some(proof) = &mut self.short_reanchor {
             proof.from.0 = band_pos(proof.from.0, top, bottom, delta);
@@ -7547,9 +8029,10 @@ impl Ribbon {
             proof.to.0 = band_pos(proof.to.0, top, bottom, delta);
         }
         if let Some(gate) = &mut self.fresh_line {
-            gate.left_row = gate
-                .left_row
-                .and_then(|row| band_row(row, top, bottom, delta));
+            gate.left_row = match gate.left_row {
+                Some(row) => band_row(row, top, bottom, delta),
+                None => None,
+            };
         }
         self.holds
             .retain_mut(|h| match band_row(h.0, top, bottom, delta) {
@@ -7832,6 +8315,8 @@ mod tests {
     struct Sink {
         under: Vec<GlowQuad>,
         out: Vec<GlowQuad>,
+        under_ramps: aterm_render::GlowRamps,
+        out_ramps: aterm_render::GlowRamps,
         halos: Vec<RainHalo>,
         beams: Vec<BeamVertex>,
         cues: Vec<SoundCue>,
@@ -7846,12 +8331,15 @@ mod tests {
             Frame {
                 under: &mut self.under,
                 out: &mut self.out,
+                under_ramps: &mut self.under_ramps,
+                out_ramps: &mut self.out_ramps,
                 halos: &mut self.halos,
                 beams: &mut self.beams,
                 cues: &mut self.cues,
                 caret: CaretSeam::default(),
                 companion: None,
                 fp: 0,
+                rows_cost: Some(aterm_render::RampCost::NEVER),
             }
         }
     }

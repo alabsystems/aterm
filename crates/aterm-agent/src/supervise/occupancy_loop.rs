@@ -897,8 +897,12 @@ impl<C: Ctl> Session<'_, C> {
     /// read it (`Session::managed_at_write`), the composer's read (a composer the read cannot
     /// judge is a draft) and the host's `taskless`; `Err` with the guard that holds where a read
     /// itself says nothing (`Guard::Person` for the status, `Guard::Managed` for the record).
-    /// Every line at a break goes through it: the door's ([`Self::door_holds`]) and the stuck
-    /// fact's (`Session::stuck_break`, through `door::stuck_at_break`).
+    /// Every line at a break goes through it: the door's ([`Self::door_holds`]), the stuck
+    /// fact's (`Session::stuck_break`, through `door::stuck_at_break`) and the host's own fact's
+    /// (`Session::background_fact`). The halt and another driver's hand are the read's word
+    /// alone: what the loop's last `status` read saw of them, which a session at background
+    /// breaks for hours made long before, holds nothing past it, while a person's grace from
+    /// their last key still does.
     pub(super) fn write_guards(
         &mut self,
         screen: &Screen,
@@ -927,8 +931,8 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(Err(guard));
         }
         let mut guards = self.occupancy_guards(now, cfg, &screen.rows);
-        guards.person |= seen.person(cfg.human_grace_s);
-        guards.halted |= seen.halted;
+        guards.person = self.typed_within(now, cfg.human_grace_s) || seen.person(cfg.human_grace_s);
+        guards.halted = seen.halted;
         guards.draft |= seen.input_unread || self.door_draft(screen) != Some(false);
         guards.taskless |= host.taskless();
         if armed(Fault::DoorIgnoresPerson) {
@@ -1236,12 +1240,7 @@ impl<C: Ctl> Session<'_, C> {
         ]
         .into_iter()
         .find_map(|(holds, guard)| holds.then_some(guard));
-        let grace = Duration::from_secs(u64::from(cfg.human_grace_s));
-        let person = self.driver
-            || self
-                .person_at()
-                .and_then(|typed| typed.checked_add(grace))
-                .is_some_and(|until| until > now);
+        let person = self.driver || self.typed_within(now, cfg.human_grace_s);
         let (exchange, managed) = self.held_for_others();
         Guards {
             brake,
@@ -1259,6 +1258,15 @@ impl<C: Ctl> Session<'_, C> {
             reach_down: matches!(self.reach_seen, Some(Reach::Down { .. })),
             mode: cfg.autopilot_for(self.autopilot.word()),
         }
+    }
+
+    /// A person typed into the session within `grace_s` of `now`, by what the loop holds
+    /// (`Session::person_at`): their last key or draft the loop saw.
+    fn typed_within(&self, now: Instant, grace_s: u32) -> bool {
+        let grace = Duration::from_secs(u64::from(grace_s));
+        self.person_at()
+            .and_then(|typed| typed.checked_add(grace))
+            .is_some_and(|until| until > now)
     }
 
     /// The guards' `exchange` and `managed`: the task is done and the person's own exchange holds

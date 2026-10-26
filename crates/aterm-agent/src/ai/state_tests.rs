@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::ai::connector::{AGY, CLAUDE, CODEX, MUSE};
+use crate::ai::connector::{AGY, CLAUDE, CODEX, GROK, MUSE};
 use crate::ai::facts::{ClaudeAccounts, Managed};
 use crate::ai::store::{How, Record};
 
@@ -59,6 +59,29 @@ fn not_wanted_excluded_removed_and_unavailable_are_off_never_a_fault() {
         let row = assess(&f, true, NOW);
         assert_eq!((row.state, row.mark), (State::Off, Mark::Note), "{kept:?}");
     }
+}
+
+/// AN OPT-IN PROGRAM NOBODY ASKED FOR NEEDS NOBODY: Grok Build kept off as opt-in is an off
+/// note with no fix, never a sign-in or an install a person owes, and no review asks it.
+#[test]
+fn an_opt_in_program_not_installed_is_an_off_note_never_a_need() {
+    let mut f = facts(&GROK);
+    f.managed = None;
+    f.kept = Some(Kept::OptIn);
+    let row = assess(&f, true, NOW);
+    assert_eq!((row.state, row.mark), (State::Off, Mark::Note));
+    assert_eq!(row.fix, None);
+    assert!(!row.state.needs_person(row.wanted));
+    assert!(!row.state.usable());
+    assert!(row.fact.contains("aterm pkg install grok"), "{}", row.fact);
+    let mut installed = facts(&GROK);
+    installed.home_exists = false;
+    let row = assess(&installed, true, NOW);
+    assert_eq!(
+        (row.state, row.fix.as_deref()),
+        (State::SignedOut, Some("aterm ai login grok")),
+        "installed, it is read as any other"
+    );
 }
 
 #[test]

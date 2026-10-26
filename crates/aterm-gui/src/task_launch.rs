@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Worker launch (`spawn agent=<claude|codex|agy|muse>`) across harnesses.
+//! Worker launch (`spawn agent=<claude|codex|agy|muse|grok>`) across harnesses.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -474,13 +474,6 @@ fn run_worker_launch(work: &Launch) {
         );
         return;
     }
-    let prompt = match await_first_prompt(work) {
-        Ok(prompt) => prompt,
-        Err(why) => {
-            stall(work, why);
-            return;
-        }
-    };
     let Some(cli) = aterm_agent::harness::worker::worker_cli(work.agent) else {
         stall(work, "its agent has no worker line");
         return;
@@ -493,12 +486,34 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
+    let admitted = match admit_worker(
+        cli,
+        caller,
+        aterm_types::dirs::home_dir().as_deref(),
+        &|note| note_launch(&work.ctx, note),
+        &|| InstallingMark::of(&work.ctx),
+        &AtpkgStore,
+    ) {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            stall_why(work, refused_why(&refused), refused.why());
+            return;
+        }
+    };
+    let caller = admitted.starter();
+    let prompt = match await_first_prompt(work) {
+        Ok(prompt) => prompt,
+        Err(why) => {
+            stall(work, why);
+            return;
+        }
+    };
     let here = trusted_here(
         cli.trust_flag.is_some(),
         work.trusted_cwd.as_deref(),
         || shell_cwd(&work.store, &work.ctx),
     );
-    let rotated = agy_rotation(work, &caller);
+    let rotated = agy_rotation(work, caller);
     if let Some(pick) = &rotated {
         note_launch(&work.ctx, format!("agy quota: {}", pick.describe()));
         if pick.model().is_none() {
@@ -514,7 +529,7 @@ fn run_worker_launch(work: &Launch) {
         model,
         trusted_here: here,
     };
-    let line = aterm_agent::harness::worker::line(cli, work.dialect, &caller, &fresh);
+    let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
         Ok(line) => {
             let Some(proxy) = work.proxy.as_ref() else {
@@ -562,6 +577,169 @@ fn run_worker_launch(work: &Launch) {
             note_launch(&work.ctx, note);
         }
         Err(why) => stall(work, &format!("its launch line cannot be written: {why}")),
+    }
+}
+
+/// The store a worker's on-demand program is read from and installed into ([`admit_worker`]).
+pub(crate) trait ProgramStore {
+    /// Whether `program` has an installed build.
+    fn present(&self, program: &str) -> bool;
+    /// Why a person keeps `program` off this machine, where they do.
+    fn held(&self, program: &str) -> Option<String>;
+    /// Install `program` by atpkg's verified install.
+    ///
+    /// # Errors
+    ///
+    /// What the install said, where it did not finish cleanly.
+    fn install(&self, program: &str) -> Result<(), String>;
+}
+
+/// atpkg's own store, and its verified install run as `aterm pkg install <program>` runs it.
+pub(crate) struct AtpkgStore;
+
+impl ProgramStore for AtpkgStore {
+    fn present(&self, program: &str) -> bool {
+        atpkg::store::resolve_configured()
+            .is_some_and(|layout| atpkg::ops::active_builds(&layout).contains_key(program))
+    }
+
+    fn held(&self, program: &str) -> Option<String> {
+        if atpkg::config::load().exclude().iter().any(|e| e == program) {
+            return Some("`[packages] exclude` in aterm.toml names it".to_string());
+        }
+        atpkg::store::resolve_configured()
+            .is_some_and(|layout| layout.removed_programs().contains(program))
+            .then(|| format!("a person removed it (`aterm pkg install {program}` brings it back)"))
+    }
+
+    fn install(&self, program: &str) -> Result<(), String> {
+        let Some(atpkg) = crate::co_located_atpkg() else {
+            return Err("the package tool is not installed beside aterm".to_string());
+        };
+        if !atpkg::manager_enabled() {
+            return Err(
+                "the package manager is inert (no package root key is pinned in this build)"
+                    .to_string(),
+            );
+        }
+        let layout = atpkg::store::resolve_configured();
+        let mut cmd = crate::qos::atpkg_command(&atpkg);
+        cmd.args(crate::pass_lead(
+            aterm_types::dirs::runs_under_private_state_root(),
+        ));
+        let run = crate::run_atpkg_pass(
+            install_argv(program, layout.as_ref()),
+            cmd,
+            Some(&crate::spawn::atpkg_child_path()),
+            layout.as_ref(),
+            false,
+            &|_: crate::Wake| {},
+        )
+        .map_err(|e| format!("it could not run: {e}"))?;
+        if run.clean() {
+            return Ok(());
+        }
+        let why = run.why();
+        Err(if why.is_empty() {
+            format!("it exited {:?} and said nothing", run.code)
+        } else {
+            why
+        })
+    }
+}
+
+/// The argv of atpkg's verified install of `program` (after any pass lead): the verb
+/// `aterm pkg install <program>` runs, waiting its turn behind a running pass and writing its
+/// progress where every pass does.
+pub(crate) fn install_argv(
+    program: &str,
+    layout: Option<&atpkg::store::Layout>,
+) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = vec!["install".into(), program.into()];
+    argv.extend(crate::pass_wait_and_progress_args(layout));
+    argv
+}
+
+/// ADMIT A WORKER BEFORE ITS FIRST PROMPT IS AWAITED: its sign-in first, then its program
+/// ([`aterm_agent::harness::worker::admit`]). A signed-out CLI that would open a sign-in page by
+/// itself (Grok Build) is refused before anything is installed. A CLI the default set does not
+/// keep is installed by atpkg's verified install where it is absent, with each step told to the
+/// launch record by `note`. While the install runs, the session carries the mark `installing`
+/// makes ([`InstallingMark`]), so the startup deadline does not count the install as a start
+/// that never came.
+///
+/// # Errors
+///
+/// Why no worker can start ([`aterm_agent::harness::worker::Refused`]).
+pub(crate) fn admit_worker<M>(
+    cli: &aterm_agent::harness::worker::WorkerCli,
+    starter: aterm_agent::harness::worker::Starter,
+    user: Option<&Path>,
+    note: &dyn Fn(String),
+    installing: &dyn Fn() -> M,
+    store: &dyn ProgramStore,
+) -> Result<aterm_agent::harness::worker::Admitted, aterm_agent::harness::worker::Refused> {
+    use aterm_agent::harness::worker::{Readiness, admit};
+    let admitted = admit(
+        cli,
+        starter,
+        user,
+        |program| store.present(program),
+        |program| store.held(program),
+        |program| {
+            note(format!(
+                "installing {program} by atpkg's verified install: `spawn agent={}` named it, \
+                 which opts this machine in",
+                cli.word
+            ));
+            let _mark = installing();
+            store.install(program)
+        },
+    )?;
+    if admitted.readiness() == Readiness::Installed {
+        note(format!(
+            "installed {}; atpkg keeps it current from here",
+            cli.word
+        ));
+    }
+    Ok(admitted)
+}
+
+/// The task record's `why=` for a worker its launcher refused before its line
+/// ([`aterm_agent::harness::worker::Refused`]): `signin` for a signed-out CLI, which only a
+/// person can fix, and `install` for a program that is held back or failed to install.
+pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused) -> &'static str {
+    match refused {
+        aterm_agent::harness::worker::Refused::SignedOut(_) => crate::task_record::WHY_SIGNIN,
+        aterm_agent::harness::worker::Refused::Program(_) => crate::task_record::WHY_INSTALL,
+    }
+}
+
+/// A session's launcher is installing its worker's program: set on the session's timeline while
+/// it lives, and cleared when it drops, on an error or a panic too
+/// ([`crate::session_timeline::SessionTimeline::worker_installing`]). The startup deadline does
+/// not judge a worker while this stands. It lives only in this process, so a seamless update's
+/// successor, which has no launcher, judges the worker as usual.
+pub(crate) struct InstallingMark<'a>(&'a SessionCtx);
+
+impl<'a> InstallingMark<'a> {
+    /// Set the mark on `ctx`'s timeline.
+    pub(crate) fn of(ctx: &'a SessionCtx) -> Self {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_worker_installing(true);
+        Self(ctx)
+    }
+}
+
+impl Drop for InstallingMark<'_> {
+    fn drop(&mut self) {
+        self.0
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_worker_installing(false);
     }
 }
 
@@ -643,6 +821,9 @@ pub(crate) fn type_launch_line(
     let Some((term, ctx)) = target else {
         return Err("its live launch is gone".to_string());
     };
+    if let Some(why) = task_moved_on(&ctx) {
+        return Err(why);
+    }
     if ctx.update_parked.is_parked() {
         return Err("its session is parked for an update".to_string());
     }
@@ -673,6 +854,26 @@ pub(crate) fn type_launch_line(
         GuardedInput::Pressed(Delivery::PartialInDoubt { .. }) => Ok("written in part"),
         GuardedInput::Pressed(Delivery::BusyZero) => Err("its input sink is busy".to_string()),
         GuardedInput::Pressed(Delivery::Failed) => Err("its input write failed".to_string()),
+    }
+}
+
+/// Why a worker's line must not be typed because its task record is no longer `working`: a
+/// deadline stalled it (an install that outran the startup deadline in another process, say), a
+/// lead marked it, or it has no record at all. The lead has then been told the task did not
+/// start, and a line typed now would start a worker it does not know about, beside any it
+/// spawned again.
+pub(crate) fn task_moved_on(ctx: &SessionCtx) -> Option<String> {
+    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    match timeline.task() {
+        Some(task) if task.state == TaskState::Working => None,
+        Some(task) => Some(format!(
+            "its task is {}{} now, so its line was not typed",
+            task.state.as_str(),
+            task.why
+                .map(|why| format!(" why={why}"))
+                .unwrap_or_default()
+        )),
+        None => Some("its session has no task record, so its line was not typed".to_string()),
     }
 }
 
@@ -707,15 +908,25 @@ fn agy_rotation(
 }
 
 fn stall(work: &Launch, why: &str) {
+    stall_why(work, "shell", why);
+}
+
+/// [`stall`] with the task record's `why=` word `word`.
+fn stall_why(work: &Launch, word: &'static str, why: &str) {
     note_launch(&work.ctx, format!("never typed ({why})"));
-    stall_task(&work.ctx, work.local, why);
+    stall_task_why(&work.ctx, work.local, word, why);
 }
 
 /// [`stall`] of session `local` by its parts.
 pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, why: &str) {
+    stall_task_why(ctx, local, "shell", why);
+}
+
+/// [`stall_task`] with the task record's `why=` word `word`.
+pub(crate) fn stall_task_why(ctx: &SessionCtx, local: u64, word: &'static str, why: &str) {
     aterm_log::warn!("worker session {local}: {why}; its task is stalled and nothing was typed");
     let mut mark = TaskMark::new(TaskState::Stalled);
-    mark.why = Some("shell");
+    mark.why = Some(word);
     if crate::task_record::mark_session_task(ctx, local, &mark).is_err() {
         aterm_log::warn!(
             "worker session {local}: the stall was not marked (an update was committing)"

@@ -111,7 +111,23 @@ fn light_body_burst(
         }
         let (mut b_out, mut b_halos, mut b_under) = (Vec::new(), Vec::new(), Vec::new());
         let cur = Some((row, caret));
-        glow.emit_comet(at, &c, g, cur, &mut b_out, &mut b_halos, &mut b_under);
+        glow.emit_comet(
+            at,
+            &c,
+            g,
+            cur,
+            &mut crate::cursor_glow::glow_sink(
+                &mut b_out,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut b_halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut b_under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+        );
         glow.emit_crown(at, &c, g, cur, &mut b_halos, &mut b_under);
         *drew |= !b_under.is_empty();
         let typed = start..caret;

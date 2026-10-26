@@ -3320,6 +3320,11 @@ enum Wake {
         session: u64,
         reply: std::sync::mpsc::Sender<Result<(f32, std::time::Instant), String>>,
     },
+    /// A cross-session `resize` re-gridded `session` behind its pane: a window that lays it out
+    /// owes it its pane's grid again ([`App::owe_pane_regrid`]).
+    PaneRegridOwed {
+        session: u64,
+    },
     ReadSessionStatus {
         session: u64,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
@@ -4039,6 +4044,12 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
         .chain(input.glow_under.iter())
         .all(|quad| translated(quad.y).is_some())
         && input
+            .cursor_glow_add_ramps
+            .items
+            .iter()
+            .chain(&input.glow_under_ramps.items)
+            .all(|r| translated(r.y).is_some() && translated(r.y + r.h.max(1) - 1).is_some())
+        && input
             .glow_halo
             .iter()
             .all(|halo| translated(halo.y).is_some() && translated(halo.cy).is_some())
@@ -4058,6 +4069,14 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
         .chain(input.glow_under.iter_mut())
     {
         shift(&mut quad.y);
+    }
+    for ramp in input
+        .cursor_glow_add_ramps
+        .items
+        .iter_mut()
+        .chain(input.glow_under_ramps.items.iter_mut())
+    {
+        shift(&mut ramp.y);
     }
     for halo in &mut input.glow_halo {
         shift(&mut halo.y);
@@ -6388,6 +6407,8 @@ struct LeafRenderCache {
     staged_input: RenderInput,
     native: Option<NativeLeafRaster>,
     native_damage: Option<native_app::DamageRegion>,
+    /// Rises with every change to what this native leaf draws (`App::native_paint_serial`).
+    native_paint_serial: u64,
     /// The terminal id, engine fill and display offset of the fill this leaf's last frame
     /// showed, which the hover memo keys on (`HoverMemo::frame_of`). The swap of `input` and
     /// `staged_input` after the frame leaves it alone.
@@ -6401,6 +6422,7 @@ impl Default for LeafRenderCache {
             staged_input: RenderInput::empty(),
             native: None,
             native_damage: None,
+            native_paint_serial: 0,
             hover_key: (0, 0, 0),
         }
     }
@@ -6408,6 +6430,8 @@ impl Default for LeafRenderCache {
 
 struct NativeLeafRaster {
     stamp: app_native::NativeUiCompileStamp,
+    /// The leaf's paint serial when these pixels were painted (`App::native_paint_serial`).
+    paint_serial: u64,
     compiled: native_ui::CompiledUi,
     ime_caret: Option<native_ui::LogicalRect>,
     rgba: Vec<u8>,
@@ -6992,12 +7016,12 @@ struct WindowState {
     deck_still: std::cell::RefCell<crate::stats_deck::DeckStill>,
     /// The deck's live edge as its last layout drew it ([`crate::stats_live`]): its key, what
     /// the card's raster holds, the card's rects that move with it, and how fast its strips
-    /// glide (device px a second).
+    /// glide (device px a second) with that strip's column period (s).
     deck_live_drawn: std::cell::Cell<Option<u64>>,
     deck_live_card: std::cell::Cell<(u64, crate::stats_live::DeckLive)>,
     deck_live_rects:
         std::cell::RefCell<Vec<(crate::stats_live::LiveLayer, crate::stats_paint::Rect)>>,
-    deck_glide: std::cell::Cell<f64>,
+    deck_glide: std::cell::Cell<(f64, u32)>,
     stats_hits: std::cell::RefCell<Vec<crate::stats_paint::Hit>>,
     lens_card: Option<SettingsCard>,
     stats_lens: crate::stats_lens::LensSlot,
@@ -7602,8 +7626,10 @@ impl WindowState {
 
         self.input_scratch.cursor_trail.clear();
         self.input_scratch.cursor_glow_add.clear();
+        self.input_scratch.cursor_glow_add_ramps.clear();
         self.input_scratch.glow_halo.clear();
         self.input_scratch.glow_under.clear();
+        self.input_scratch.glow_under_ramps.clear();
         self.input_scratch.fire_patch.clear();
         self.input_scratch.char_fg.clear();
         self.input_scratch.fire_halo.clear();
@@ -8041,7 +8067,7 @@ impl WindowState {
             deck_live_drawn: std::cell::Cell::new(None),
             deck_live_card: std::cell::Cell::new((0, crate::stats_live::DeckLive::STILL)),
             deck_live_rects: std::cell::RefCell::new(Vec::new()),
-            deck_glide: std::cell::Cell::new(0.0),
+            deck_glide: std::cell::Cell::new((0.0, 0)),
             stats_hits: std::cell::RefCell::new(Vec::new()),
             lens_card: None,
             stats_lens: crate::stats_lens::LensSlot::default(),
@@ -9282,6 +9308,10 @@ struct App {
     launch_kitty: aterm_effects::kitty_registry::KittyLook,
     kitty_summon_seq: u64,
     pending_action_refusal: Option<String>,
+    /// Why this aterm is quitting with nobody at a window to answer (the process that started a
+    /// headless aterm is gone, a supervisor's signal), once such a quit began
+    /// ([`App::on_unattended_quit`]).
+    quit_unattended: Option<&'static str>,
     invoke_typist: Option<Arc<typed_by::Caller>>,
     os_appearance: aterm_types::Appearance,
     os_appearance_source: os_appearance::OsAppearanceSource,
@@ -14166,6 +14196,12 @@ impl App {
         }
         if self.ever_shared {
             self.resize_panes(wid);
+        } else if front_changed && self.windows.get(&wid).is_some_and(|ws| ws.panes_stale) {
+            // A tab brought to the front that a live drag left at an old grid, or whose session a
+            // cross-session `resize` re-gridded behind its pane, is laid out now rather than at
+            // the window's next frame: a headless window draws none, and a lab read the stale
+            // grid back.
+            self.resize_panes_scoped(wid, true);
         }
         self.sync_native_visibility();
         self.refresh_window_tabs(wid);
@@ -14628,6 +14664,7 @@ impl App {
             ),
             kitty_summon_seq: 0,
             pending_action_refusal: None,
+            quit_unattended: None,
             invoke_typist: None,
             os_appearance: aterm_types::Appearance::default(),
             os_appearance_source: os_appearance::OsAppearanceSource::Inert,
@@ -15614,7 +15651,7 @@ impl App {
             ws.rearm_present(false);
         }
         self.reconcile_licence(wid);
-        self.clear_move_license(wid);
+        self.clear_move_license_keeping_hand(wid);
         self.recompute_focus_reports();
         if focused && let Some(session) = self.focused_session_id(wid) {
             self.note_session_seen(wid, session);
@@ -18782,8 +18819,8 @@ impl App {
                 let _ = reply.send(moved);
             }
             Wake::PointerCmd { action, reply } => {
-                let at = self.with_gesture_source(true, |app| app.pointer_cmd(action));
-                let _ = reply.send(at.and_then(|cell| self.pointer_reply(cell)));
+                let at = self.with_gesture_source(true, |app| app.pointer_request(action));
+                let _ = reply.send(at);
                 self.escalate_pending_close(el);
                 self.escalate_caption_close(el);
             }
@@ -19471,8 +19508,11 @@ impl App {
                 reply,
             } => {
                 self.invoke_typist = typist;
-                let answer =
-                    self.invoke_attributed(by, |app| app.invoke_menu_action_by_name(el, &name));
+                let answer = if crate::control::control_media::person_invoke_act(&name) {
+                    self.with_gesture_source(false, |app| app.invoke_menu_action_by_name(el, &name))
+                } else {
+                    self.invoke_attributed(by, |app| app.invoke_menu_action_by_name(el, &name))
+                };
                 self.invoke_typist = None;
                 let _ = reply.send(answer);
             }
@@ -19506,6 +19546,7 @@ impl App {
             Wake::TypingMomentum { session, reply } => {
                 let _ = reply.send(self.typing_momentum_of(session));
             }
+            Wake::PaneRegridOwed { session } => self.owe_pane_regrid(session),
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
             }
@@ -26466,6 +26507,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         ),
         kitty_summon_seq: 0,
         pending_action_refusal: None,
+        quit_unattended: None,
         invoke_typist: None,
         os_appearance,
         os_appearance_source,

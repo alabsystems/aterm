@@ -211,9 +211,11 @@ fn retire_torn_cursor_fx_host(window: &mut WindowState) {
 
 fn suppress_torn_cursor_projection(input: &mut aterm_core::render::RenderInput) {
     input.cursor_glow_add.clear();
+    input.cursor_glow_add_ramps.clear();
     input.glow_halo.clear();
     input.fire_patch.clear();
     input.glow_under.clear();
+    input.glow_under_ramps.clear();
     input.char_fg.clear();
     input.fire_halo.clear();
     input.cursor_trail.clear();
@@ -898,6 +900,7 @@ fn retain_native_leaf_raster(
         .compiled
         .tray_with_chrome(chrome, terminal_theme, 13.0);
     let ime_caret = scene.compiled.ime_caret_rect();
+    let paint_serial = cache.native_paint_serial;
     let patched = match (cache.native.as_mut(), effective_damage) {
         (
             Some(raster),
@@ -938,6 +941,7 @@ fn retain_native_leaf_raster(
                     return false;
                 }
                 raster.stamp = scene.stamp;
+                raster.paint_serial = paint_serial;
                 raster.compiled = scene.compiled.clone();
                 raster.ime_caret = ime_caret;
                 raster.presented = false;
@@ -969,6 +973,7 @@ fn retain_native_leaf_raster(
         let pixels = u64::from(width) * u64::from(height);
         cache.native = Some(crate::NativeLeafRaster {
             stamp: scene.stamp,
+            paint_serial,
             compiled: scene.compiled,
             ime_caret,
             rgba,
@@ -3279,8 +3284,16 @@ pub(crate) fn scrub_overlay_row_band(
         .retain(|trail| !rows.contains(&trail.row));
     input.char_fg.retain(|cell| !tagged(cell.row));
     input.fire_halo.retain(|cell| !tagged(cell.row));
-    input.cursor_glow_add.retain(|quad| !tagged(quad.row));
-    input.glow_under.retain(|quad| !tagged(quad.row));
+    input.cursor_glow_add_ramps.retain_mut(
+        &mut input.cursor_glow_add,
+        |quad| !tagged(quad.row),
+        |ramp| !tagged(ramp.row),
+    );
+    input.glow_under_ramps.retain_mut(
+        &mut input.glow_under,
+        |quad| !tagged(quad.row),
+        |ramp| !tagged(ramp.row),
+    );
     input.fire_patch.retain(|quad| !tagged(quad.row));
     input.glow_halo.retain(|quad| !tagged(quad.row));
     input.ink.retain(|cell| !tagged(cell.row));
@@ -3365,12 +3378,16 @@ pub(crate) fn scrub_overlay_card(
         left < x1 && left + i64::from(w) > x0
     };
     let tag_in = |row: u16| rows.contains(&usize::from(row));
-    input
-        .cursor_glow_add
-        .retain(|q| !(tag_in(q.row) && meets_x(q.x, q.w, pad)));
-    input
-        .glow_under
-        .retain(|q| !(tag_in(q.row) && meets_x(q.x, q.w, pad)));
+    input.cursor_glow_add_ramps.retain_mut(
+        &mut input.cursor_glow_add,
+        |q| !(tag_in(q.row) && meets_x(q.x, q.w, pad)),
+        |r| !(tag_in(r.row) && meets_x(r.x, r.w, pad)),
+    );
+    input.glow_under_ramps.retain_mut(
+        &mut input.glow_under,
+        |q| !(tag_in(q.row) && meets_x(q.x, q.w, pad)),
+        |r| !(tag_in(r.row) && meets_x(r.x, r.w, pad)),
+    );
     input
         .fire_patch
         .retain(|q| !(tag_in(q.row) && meets_x(q.x, q.w, pad)));
@@ -4704,9 +4721,11 @@ fn settle_fx_prefetch(
 /// The effect-overlay half of [`fill_divider_grid`].
 pub(crate) fn clear_effect_overlays_for_compose(dst: &mut RenderInput) {
     dst.cursor_glow_add.clear();
+    dst.cursor_glow_add_ramps.clear();
     dst.glow_halo.clear();
     dst.fire_patch.clear();
     dst.glow_under.clear();
+    dst.glow_under_ramps.clear();
     dst.char_fg.clear();
     dst.fire_halo.clear();
     dst.cursor_trail.clear();
@@ -4796,9 +4815,11 @@ fn withdraw_fx_layers(
 
 struct FocusedComposedCursorEffects<'a> {
     glow_add: &'a [aterm_core::render::GlowQuad],
+    glow_add_ramps: &'a aterm_core::render::GlowRamps,
     glow_halo: &'a [aterm_core::render::RainHalo],
     fire_patch: &'a [aterm_core::render::FirePatch],
     glow_under: &'a [aterm_core::render::GlowQuad],
+    glow_under_ramps: &'a aterm_core::render::GlowRamps,
     char_fg: &'a [aterm_core::render::CharFg],
     fire_halo: &'a [aterm_core::render::FireHaloCell],
     trail: &'a [aterm_core::render::TrailCell],
@@ -4813,22 +4834,36 @@ struct FocusedComposedCursorEffects<'a> {
     pet_veil: &'a [aterm_core::render::GlowQuad],
 }
 
-/// Keep `quads` to the composed pane `clip` ([`project_focused_composed_cursor_effects`]).
-fn clip_glow_quads(quads: &mut Vec<aterm_core::render::GlowQuad>, clip: &ComposedCursorEffectClip) {
-    quads.retain_mut(|quad| {
-        let x0 = quad.x.max(clip.x0);
-        let y0 = quad.y.max(clip.y0);
-        let x1 = quad.x.saturating_add(quad.w).min(clip.x1);
-        let y1 = quad.y.saturating_add(quad.h).min(clip.y1);
-        if x1 > x0 && y1 > y0 {
-            (quad.x, quad.y, quad.w, quad.h) = (x0, y0, x1 - x0, y1 - y0);
-            true
-        } else {
-            false
-        }
-    });
+/// Keep a glow stream, `quads` and their `ramps`, to the composed pane
+/// `clip` ([`project_focused_composed_cursor_effects`]): each ramp narrowed
+/// as its rows' quads are ([`aterm_core::render::GlowRamp::clip_to`]), in its
+/// place among the quads kept.
+fn clip_glow_stream(
+    quads: &mut Vec<aterm_core::render::GlowQuad>,
+    ramps: &mut aterm_core::render::GlowRamps,
+    clip: &ComposedCursorEffectClip,
+) {
+    ramps.retain_mut(
+        quads,
+        |quad| {
+            let x0 = quad.x.max(clip.x0);
+            let y0 = quad.y.max(clip.y0);
+            let x1 = quad.x.saturating_add(quad.w).min(clip.x1);
+            let y1 = quad.y.saturating_add(quad.h).min(clip.y1);
+            if x1 > x0 && y1 > y0 {
+                (quad.x, quad.y, quad.w, quad.h) = (x0, y0, x1 - x0, y1 - y0);
+                true
+            } else {
+                false
+            }
+        },
+        |ramp| ramp.clip_to((clip.x0, clip.y0, clip.x1, clip.y1)),
+    );
 }
 
+/// Project the focused pane's cursor streams into `dst`, kept to `clip`, and set `dst.fx_clip`
+/// (the box the bloom and shimmer grow within) to the same pane, so a split or mixed frame never
+/// inherits the box another tab's frame left; a single-pane frame clears it afterwards.
 fn project_focused_composed_cursor_effects(
     dst: &mut RenderInput,
     effects: FocusedComposedCursorEffects<'_>,
@@ -4836,10 +4871,15 @@ fn project_focused_composed_cursor_effects(
     focus_cursor_override: Option<CursorStyle>,
     body_style_override: Option<CursorStyle>,
 ) {
+    dst.fx_clip = clip
+        .as_ref()
+        .map(|clip| (clip.x0, clip.y0, clip.x1, clip.y1));
     dst.cursor_glow_add.clear();
+    dst.cursor_glow_add_ramps.clear();
     dst.glow_halo.clear();
     dst.fire_patch.clear();
     dst.glow_under.clear();
+    dst.glow_under_ramps.clear();
     dst.char_fg.clear();
     dst.fire_halo.clear();
     dst.cursor_trail.clear();
@@ -4855,9 +4895,13 @@ fn project_focused_composed_cursor_effects(
     clip.fx.install(&mut dst.fx_layers, effects.fx_layers);
 
     dst.cursor_glow_add.extend_from_slice(effects.glow_add);
+    dst.cursor_glow_add_ramps
+        .append_from(effects.glow_add_ramps, 0);
     dst.glow_halo.extend_from_slice(effects.glow_halo);
     dst.fire_patch.extend_from_slice(effects.fire_patch);
     dst.glow_under.extend_from_slice(effects.glow_under);
+    dst.glow_under_ramps
+        .append_from(effects.glow_under_ramps, 0);
     dst.glow_under.extend_from_slice(effects.pet_veil);
     dst.char_fg.extend_from_slice(effects.char_fg);
     dst.fire_halo.extend_from_slice(effects.fire_halo);
@@ -4874,15 +4918,12 @@ fn project_focused_composed_cursor_effects(
         let y1 = y.saturating_add(h).min(clip.y1);
         (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
     };
-    dst.cursor_glow_add
-        .retain_mut(|quad| match clip_quad(quad.x, quad.y, quad.w, quad.h) {
-            Some((x, y, w, h)) => {
-                (quad.x, quad.y, quad.w, quad.h) = (x, y, w, h);
-                true
-            }
-            None => false,
-        });
-    clip_glow_quads(&mut dst.glow_under, &clip);
+    clip_glow_stream(
+        &mut dst.cursor_glow_add,
+        &mut dst.cursor_glow_add_ramps,
+        &clip,
+    );
+    clip_glow_stream(&mut dst.glow_under, &mut dst.glow_under_ramps, &clip);
     dst.glow_halo
         .retain_mut(|quad| match clip_quad(quad.x, quad.y, quad.w, quad.h) {
             Some((x, y, w, h)) => {
@@ -6825,6 +6866,34 @@ impl App {
         self.resize_panes_scoped(wid, self.resize_live_drag);
     }
 
+    /// Owe every window that lays out `session` a pass that gives it its pane's grid again (a
+    /// cross-session `resize` re-gridded it behind its pane): paid at the frame that draws its tab,
+    /// or when its tab comes to the front ([`Self::sync_window`]).
+    pub(crate) fn owe_pane_regrid(&mut self, session: u64) {
+        let App {
+            windows,
+            view_store,
+            ..
+        } = self;
+        for ws in windows.values_mut() {
+            let lays_out = ws.tab_set.tabs().iter().any(|tab| {
+                tab.root.any_leaf(&mut |view| {
+                    view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        == Some(session)
+                })
+            });
+            if lays_out {
+                ws.panes_stale = true;
+                if let Some(window) = ws.os_window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
     /// The body of [`Self::resize_panes`].
     #[track_caller]
     pub(crate) fn resize_panes_scoped(&mut self, wid: WindowId, active_only: bool) {
@@ -8092,10 +8161,12 @@ impl App {
             );
         }
         if let Some(ws) = self.windows.get(&id) {
+            let fx = ws.fx.cursor();
+            // Every lit ramp row counts as the quad it stands for.
             metrics::note_fx_composed(
-                ws.fx.cursor().glow_scratch.len(),
-                ws.fx.cursor().glow.under_quads().len(),
-                ws.fx.cursor().trail_scratch.len(),
+                fx.glow.out_ramps().laid(fx.glow_scratch.len()),
+                fx.glow.under_ramps().laid(fx.glow.under_quads().len()),
+                fx.trail_scratch.len(),
             );
         }
         Some(CursorFxTick {
@@ -8232,9 +8303,11 @@ impl App {
                 input_scratch,
                 FocusedComposedCursorEffects {
                     glow_add: glow_scratch,
+                    glow_add_ramps: cursor_glow.out_ramps(),
                     glow_halo: cursor_glow.halos(),
                     fire_patch: cursor_glow.patches(),
                     glow_under: cursor_glow.under_quads(),
+                    glow_under_ramps: cursor_glow.under_ramps(),
                     char_fg: cursor_glow.charred(),
                     fire_halo: cursor_glow.halo_cells(),
                     trail: trail_scratch,
@@ -8253,9 +8326,11 @@ impl App {
                 input_scratch,
                 FocusedComposedCursorEffects {
                     glow_add: &[],
+                    glow_add_ramps: &aterm_core::render::GlowRamps::default(),
                     glow_halo: &[],
                     fire_patch: &[],
                     glow_under: &[],
+                    glow_under_ramps: &aterm_core::render::GlowRamps::default(),
                     char_fg: &[],
                     fire_halo: &[],
                     trail: &[],
@@ -10374,7 +10449,8 @@ impl App {
                             if new_native_pixels {
                                 metrics::record_native_content_present(
                                     &mut state.present_metrics.pending_native_input,
-                                    raster.stamp,
+                                    leaf.view,
+                                    raster.paint_serial,
                                 );
                             }
                         }
@@ -10403,7 +10479,8 @@ impl App {
                         if new_native_pixels {
                             metrics::record_native_content_present(
                                 &mut state.present_metrics.pending_native_input,
-                                raster.stamp,
+                                view,
+                                raster.paint_serial,
                             );
                         }
                     }
@@ -13557,6 +13634,10 @@ impl App {
                 }
                 None => {}
             }
+            // A sole pane's bloom spreads into the padding, as the live single-pane frame's does.
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.input_scratch.fx_clip = None;
+            }
             return Some((
                 TerminalCaptureGrid {
                     composed: false,
@@ -15546,7 +15627,6 @@ impl App {
                 &ws.composed_retain.row_keep,
             );
         }
-        ws.input_scratch.fx_clip = pane_clip.map(|clip| (clip.x0, clip.y0, clip.x1, clip.y1));
         let sole_pane = panes.len() == 1;
         ws.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
         ws.input_scratch.cursor_color = aterm_core::render::COLOR_UNSET;
@@ -15735,9 +15815,11 @@ impl App {
             &mut ws.input_scratch,
             FocusedComposedCursorEffects {
                 glow_add: &cursor_fx.glow_scratch,
+                glow_add_ramps: cursor_fx.glow.out_ramps(),
                 glow_halo: cursor_fx.glow.halos(),
                 fire_patch: cursor_fx.glow.patches(),
                 glow_under: cursor_fx.glow.under_quads(),
+                glow_under_ramps: cursor_fx.glow.under_ramps(),
                 char_fg: cursor_fx.glow.charred(),
                 fire_halo: cursor_fx.glow.halo_cells(),
                 trail: &cursor_fx.trail_scratch,
@@ -15767,7 +15849,11 @@ impl App {
         // The pet's veil the word publish laid keeps to the focused pane as
         // the trail's streams do, and goes where they were withdrawn.
         match &pane_clip {
-            Some(clip) => clip_glow_quads(&mut ws.input_scratch.glow_under, clip),
+            Some(clip) => clip_glow_stream(
+                &mut ws.input_scratch.glow_under,
+                &mut ws.input_scratch.glow_under_ramps,
+                clip,
+            ),
             None => ws.input_scratch.glow_under.truncate(under_from),
         }
         if let Some((pr, pc)) = focus_pred_cursor {

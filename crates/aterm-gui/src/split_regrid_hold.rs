@@ -42,8 +42,9 @@ pub(crate) enum HoldVerdict {
 /// Why a resize pass is running, as far as the hold is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RelayCause {
-    /// A pane of the tab collapsed (`apply_close_outcome`): the one pass whose
-    /// grow back to the pre-split grid is the take-back.
+    /// A leaf left the tab ([`App::resize_panes_after_collapse`]: a pane's close, a
+    /// mixed leaf's close, a document leaf's close after its save): the one pass
+    /// whose grow back to the pre-split grid is the take-back.
     Collapse,
     /// Anything else: a drag, a re-grid, a zoom, a divider, a redraw's pass.
     Other,
@@ -130,6 +131,14 @@ impl SplitRegridHolds {
             h.until = h.until.checked_sub(by).unwrap_or(h.until);
         }
     }
+
+    /// Test seam: stretch every hold's quiet `by`, so a test's slow step cannot outlast it.
+    #[cfg(test)]
+    pub(crate) fn prolong(&mut self, by: Duration) {
+        for h in self.holds.values_mut() {
+            h.until = h.until.checked_add(by).unwrap_or(h.until);
+        }
+    }
 }
 
 impl App {
@@ -173,6 +182,14 @@ impl App {
                 self.split_regrid_holds.arm(session, grid, now);
             }
         }
+    }
+
+    /// Re-lays `wid` after a leaf left one of its tabs, so a pane growing back to its pre-split grid waits out the quiet.
+    #[track_caller]
+    pub(crate) fn resize_panes_after_collapse(&mut self, wid: WindowId) {
+        self.split_regrid_cause = RelayCause::Collapse;
+        self.resize_panes(wid);
+        self.split_regrid_cause = RelayCause::Other;
     }
 
     /// The one wake a withheld take-back owes (`None` when nothing is held).

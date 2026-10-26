@@ -72,6 +72,65 @@ vertex HdrVsOut vs_hdr_glow(uint vi [[vertex_id]],
     return o;
 }
 
+// The bloom's lights as an item list, unwidened: cell.metal's GLOW ITEMS reader
+// (aterm_render::bloom::BloomItems), so the crown reads a ramp whole as the
+// extract does.
+struct GlowItem {
+    uint4 rect;
+    uint4 c0;
+    uint4 c1;
+};
+
+static inline uint4 glow_item_end(uint e) {
+    return uint4((uint3(e >> 16u, e >> 8u, e) & 0xFFu), e >> 24u);
+}
+
+static inline GlowItem glow_item(device const uint* w, uint i) {
+    uint lo = 0u;
+    uint hi = w[0] - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (w[4u + mid] <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uint s = i - w[4u + lo];
+    uint r = w[1] + 4u * lo;
+    uint xy = w[r];
+    uint join = w[r + 2u] & 0xFFFFu;
+    uint joined = w[r + 2u] >> 16u;
+    uint e = w[2] + w[r + 3u] + 2u * s;
+    uint e0 = w[e];
+    uint e1 = w[e + 1u];
+    GlowItem it;
+    it.rect = (e0 | e1) == 0u
+        ? uint4(0u)
+        : uint4(xy & 0xFFFFu, (xy >> 16u) + s + (s > join ? joined : 0u), w[r + 1u] & 0xFFFFu,
+                s == join ? joined + 1u : 1u);
+    it.c0 = glow_item_end(e0);
+    it.c1 = glow_item_end(e1);
+    return it;
+}
+
+// vs_hdr_glow over the item list ([[buffer(30)]], read by instance id).
+vertex HdrVsOut vs_hdr_glow_items(uint vi [[vertex_id]],
+                                  uint ii [[instance_id]],
+                                  device const uint* items [[buffer(30)]],
+                                  constant HdrU& hu [[buffer(0)]]) {
+    GlowItem it = glow_item(items, ii);
+    float4 rect = float4(it.rect);
+    float2 k = hdr_corner(vi);
+    float2 px = rect.xy + k * rect.zw + hu.content_off;
+    HdrVsOut o;
+    o.pos = float4(2.0 * px.x / hu.screen.x - 1.0, 1.0 - 2.0 * px.y / hu.screen.y, 0.0, 1.0);
+    o.span = float2(rect.x + hu.content_off.x, rect.z);
+    o.c0 = it.c0;
+    o.c1 = it.c1;
+    return o;
+}
+
 // The white part of a premultiplied sRGB colour is its smallest channel (§L5): a
 // spectrum stop (`#FF0000`, `#FFFF00`, ...) has none however bright it is, while
 // `#FFFFFF` at coverage `k` is white up to `k`. No side channel or per-quad tag.

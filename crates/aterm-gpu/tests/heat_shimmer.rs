@@ -214,7 +214,7 @@ fn tap_swapchain(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, 
         .expect("standin tap");
     gpu.present_swapchain_standin_for_test(&mut win, input, false, None, None, (w, h));
     gpu.video_after_present(&mut win, 1);
-    let take = gpu.video_finish(&mut win).expect("swapchain take");
+    let take = gpu.video_finish(&mut win).expect("swapchain take").settle();
     assert_eq!(take.frames.len(), 1);
     take.frames[0].rgba.clone()
 }
@@ -226,7 +226,7 @@ fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h:
         .expect("virtual tap");
     assert!(gpu.present_virtual(&mut win, input, false, None, None));
     gpu.video_after_present(&mut win, 1);
-    let take = gpu.video_finish(&mut win).expect("virtual take");
+    let take = gpu.video_finish(&mut win).expect("virtual take").settle();
     assert_eq!(take.frames.len(), 1);
     take.frames[0].rgba.clone()
 }

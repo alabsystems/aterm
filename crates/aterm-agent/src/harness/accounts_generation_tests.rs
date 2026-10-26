@@ -112,7 +112,7 @@ pub(crate) fn generation_transition(
                     Ok(vec![Event::new(NOW, Kind::Renewed, "work")])
                 }),
                 11 => store.transact_logins(NOW, &mut None, |state, logins| {
-                    move_account(state, logins, "work", "moved");
+                    move_account(state, logins, "work", "moved")?;
                     let path = store.logins_dir().join("work");
                     Ok(note_renewed(
                         state,

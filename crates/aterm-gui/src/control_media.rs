@@ -2687,7 +2687,7 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
+pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|codex|agy|muse|grok> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
 
 /// Parsed `agent=<word>` worker specification for `spawn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3015,6 +3015,9 @@ pub(crate) fn cmd_tab_aimed(
 pub(crate) enum WorkerBlock {
     Unhosted,
     Unsupervised(&'static str),
+    /// Nothing would see the worker's task end
+    /// ([`aterm_agent::harness::worker::WorkerCli::end_unseen`]).
+    Unseen(String),
     NoIntegration,
     Shell(String),
     OldFish,
@@ -3029,6 +3032,7 @@ impl WorkerBlock {
                 "unsupervised: no window harness runs here (no control socket)".to_string()
             }
             Self::Unsupervised(switch) => format!("unsupervised: {switch}"),
+            Self::Unseen(why) => format!("spawn agent={word}: {why}"),
             Self::NoIntegration => format!(
                 "spawn agent={word}: shell integration is off, so no prompt is marked to type at"
             ),
@@ -3361,6 +3365,11 @@ impl crate::App {
         ) {
             return Err(WorkerBlock::Unsupervised(switch));
         }
+        if let Some(why) =
+            aterm_agent::harness::worker::worker_cli(agent).and_then(|cli| cli.end_unseen())
+        {
+            return Err(WorkerBlock::Unseen(why));
+        }
         if !self.session_factory.integrate {
             return Err(WorkerBlock::NoIntegration);
         }
@@ -3563,7 +3572,7 @@ impl crate::App {
         apply(self)
     }
 
-    /// Executes `invoke <action>` on the main thread with control-close attribution.
+    /// Executes `invoke <action>` with control-close attribution and a controller gesture.
     pub(crate) fn invoke_attributed(
         &mut self,
         by: crate::session_store::ExitActor,
@@ -3573,7 +3582,7 @@ impl crate::App {
             crate::session_store::ExitReason::CtlClose,
             by,
         );
-        invoke(self)
+        self.with_gesture_source(true, invoke)
     }
 }
 
@@ -3895,6 +3904,7 @@ mod spawn_parse_tests {
             aterm_phase::Program::Codex,
             aterm_phase::Program::Agy,
             aterm_phase::Program::Muse,
+            aterm_phase::Program::Grok,
         ] {
             assert_eq!(
                 agent_of(&format!(
@@ -3941,14 +3951,50 @@ mod spawn_parse_tests {
             "agent=gemini model=--yolo len=1",
             "agent=muse model=-x len=1",
             "agent=claude model=- len=1",
+            "agent=Grok len=1",
+            "agent=grok model=--always-approve len=1",
+            "agent=kimi len=1",
             "connected=controlled place=tab of=s-a len=3",
         ] {
             assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
         }
         assert!(super::SPAWN_USAGE.contains(
-            "agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
+            "agent=<claude|codex|agy|muse|grok> [model=<m>] [autopilot=<land|cruise>] \
              [from=<sid>] len=<n>"
         ));
+    }
+
+    /// `agent=grok` IS A WORKER WORD: `spawn agent=grok` parses to a Grok Build worker with its
+    /// model, Autopilot and starter, as every other row's word does (it was `ERR usage` while
+    /// `WORKERS` had no Grok row), and the usage line names it.
+    #[test]
+    fn agent_grok_parses_as_a_grok_build_worker() {
+        assert_eq!(
+            parse_spawn_args("agent=grok model=grok-code-fast-1 from=s-ab12 len=9"),
+            Ok(SpawnForm::Plain {
+                window: None,
+                raise: None,
+                cwd: None,
+                split: None,
+                theme: None,
+                agent: Some(AgentSpec::Worker {
+                    agent: aterm_phase::Program::Grok,
+                    model: Some("grok-code-fast-1".to_string()),
+                    autopilot: None,
+                    from: Some(aterm_session::SessionId::new("s-ab12")),
+                }),
+            })
+        );
+        assert_eq!(
+            crate::task_launch::worker_word(Some("grok")),
+            "grok",
+            "the frame's replies name grok, not the claude fallback"
+        );
+        assert!(
+            super::SPAWN_USAGE.contains("|grok>"),
+            "{}",
+            super::SPAWN_USAGE
+        );
     }
 
     /// A SPAWN NAMING THE RETIRED GEMINI CLI IS REFUSED BY NAME, with agy, which
@@ -4488,6 +4534,62 @@ mod worker_start_app_tests {
         ));
         let path = seed.write_for(&SessionId::new(sid)).expect("written");
         (seed, path)
+    }
+
+    /// A headless app that would start a worker of any supervised agent: the harness hosted and
+    /// on, shell integration on, zsh.
+    fn supervising_app() -> App {
+        let mut app = App::headless_for_test();
+        app.harness = Some(crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        ));
+        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+            crate::app_config::HarnessPolicy::read("[harness]\nenabled = true\nheadless = true\n"),
+        );
+        app.session_factory.integrate = true;
+        app.session_factory.shell_override = Some("/bin/zsh".to_string());
+        app
+    }
+
+    /// `spawn agent=grok` IS REFUSED, BEFORE ANY TAB OPENS, WHILE NO READER SEES GROK BUILD'S
+    /// TURN END: its task could never be marked done and `await task` would never wake, so the
+    /// reply says why (fail closed) instead of starting a worker nobody can see end. Muse Code,
+    /// whose turn end aterm reads, passes the same check in the same app (the control). The test
+    /// does not follow `Program::supervisable`: flipping it for Grok Build lifts this refusal, so
+    /// the flip turns this red and is made on purpose
+    /// (`docs/DESIGN-harness-repos-2026-10-24.md` D40).
+    #[test]
+    fn a_grok_worker_is_refused_while_its_turn_end_is_unseen() {
+        use super::{SpawnAim, WorkerBlock};
+        let app = supervising_app();
+        assert!(
+            app.worker_shell(aterm_phase::Program::Muse).is_ok(),
+            "PRECONDITION: this app starts a supervised agent's worker"
+        );
+        let block = app.worker_shell(aterm_phase::Program::Grok).expect_err(
+            "refused: lifting this is a deliberate change that reads Grok Build's turn end and \
+             keeps WorkerCli::signed_out on the sign-in gate (D40)",
+        );
+        assert!(
+            matches!(&block, WorkerBlock::Unseen(why) if why.contains("Grok Build")),
+            "{block:?}"
+        );
+        let refusal = block.refusal(aterm_phase::Program::Grok);
+        assert!(refusal.starts_with("spawn agent=grok: "), "{refusal}");
+        assert!(refusal.contains("await task"), "{refusal}");
+        let order = TaskOrder::of_frame(
+            Some(b"the task".to_vec()),
+            aterm_phase::Program::Grok,
+            None,
+            None,
+            None,
+        )
+        .expect("a well-formed order");
+        let Err(why) = app.resolve_spawn(SpawnAim::Front, Some(order)) else {
+            panic!("a Grok Build worker was planned");
+        };
+        assert_eq!(why, refusal);
     }
 
     fn sid_of(app: &App, local: u64) -> String {

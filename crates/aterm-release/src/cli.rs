@@ -214,12 +214,13 @@ USAGE
                            then it waits, naming the shortfall and each holder
                            once a minute (`aterm pkg capacity` lists the
                            claims), and --admit now starts it at once. A
-                           library whose claim is not below the RAM, which is
-                           never all available, is refused up front, and under
-                           --try-refused its check starts at once, holding its
-                           claim; the RAM / 8 ceiling model refuses only under a
-                           prover whose `trustc -Z help` lists the ceiling
-                           flag. --prover names
+                           library whose claim is not below what can ever be
+                           available (the RAM less what is wired, which
+                           `aterm pkg capacity` prints) is refused up front,
+                           and under --try-refused its check starts at once,
+                           holding its claim; the RAM / 8 ceiling model refuses
+                           only under a prover whose `trustc -Z help` lists the
+                           ceiling flag. --prover names
                            another toolchain's bin/ (an absolute path). A
                            whole-tree run on a clean checkout files the facts
                            `trust judge` reads. --update-ratchet raises the floors

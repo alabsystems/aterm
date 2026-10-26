@@ -3,13 +3,13 @@
 
 //! Spill-band rasterizer.
 
-use aterm_core::render::{FxBlend, FxInk, FxLayer, FxSlot, FxSpace, PxRect};
+use aterm_core::render::{FxBlend, FxInk, FxLayer, FxSlot, FxSpace, GlowEnd, GlowRamp, PxRect};
 
 use crate::fire_field;
 use crate::fx_raster::{self, FxCanvas, FxFrame, FxScratch, FxSlice, Knock};
 use crate::{
-    FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput, Renderer, add_sat, halo_row_ny,
-    halo_weight, over_rgb, premul_rgb,
+    FireMode, FirePatch, GlowQuad, GlowRamps, HaloMode, RainHalo, RenderInput, Renderer, add_sat,
+    halo_row_ny, halo_weight, over_rgb, premul_rgb,
 };
 
 /// The band geometry a spill buffer was laid out for. `pad_top` is explicit because
@@ -133,6 +133,56 @@ impl SpillGeom {
         s[0].w * s[0].h + s[1].w * s[1].h + s[2].w * s[2].h + s[3].w * s[3].h
     }
 
+    /// The rows of `ramp` whose lights reach the band, as `(top, rows)`: a
+    /// light reaches it where its rect does ([`Self::rect_touches_band`]), a
+    /// run whole where any of its rows does, and the span runs from the
+    /// first such lit row to the last; `None` where none does.
+    fn band_rows(&self, ramp: &GlowRamp, ends: &[GlowEnd]) -> Option<(u16, u16)> {
+        let (x, y, w) = (
+            usize::from(ramp.x),
+            usize::from(ramp.y),
+            usize::from(ramp.w),
+        );
+        let xe = (x + w).min(self.frame_w);
+        if x >= xe || y >= self.frame_h {
+            return None;
+        }
+        // Rows past the frame's foot reach nothing.
+        let mut end = usize::from(ramp.h).min(self.frame_h - y);
+        let mut top = 0;
+        if x >= self.pad && xe <= self.frame_w - self.pad {
+            // Inside the grid's columns: only the rows above its top and those
+            // at and below its foot (the rows between, inside the grid box,
+            // spill nothing and widen no dirty rect past theirs).
+            let above = self.grid_top().saturating_sub(y).min(end);
+            let foot = self.grid_bottom().saturating_sub(y);
+            match (above > 0, foot < end) {
+                (false, false) => return None,
+                (false, true) => top = foot,
+                (true, false) => end = above,
+                (true, true) => {}
+            }
+        }
+        let (mut top, mut end) = (top as u16, end as u16);
+        if ramp.joined > 0 {
+            let (j0, j1) = (ramp.join, ramp.join + ramp.joined + 1);
+            if j0 < end && top < j1 {
+                (top, end) = (top.min(j0), end.max(j1));
+            }
+        }
+        let dark = |r: u16| {
+            let (a, b) = ramp.row_ends(ends, r);
+            a | b == 0
+        };
+        while top < end && dark(top) {
+            top += 1;
+        }
+        while end > top && dark(end - 1) {
+            end -= 1;
+        }
+        (top < end).then_some((top, end - top))
+    }
+
     /// Whether a frame-space rect reaches the band: non-empty after the frame clip and
     /// not inside the grid box.
     #[inline]
@@ -241,12 +291,13 @@ pub struct SpillBand {
     fx_scratch: FxScratch,
 }
 
-/// One frame's band-clipped emissions, per window-absolute stream.
+/// One frame's band-clipped emissions, per window-absolute stream: a glow
+/// stream's quads with its ramps' rows that reach the band.
 #[derive(Default, PartialEq)]
 struct BandStreams {
-    glow_under: Vec<GlowQuad>,
+    glow_under: (Vec<GlowQuad>, GlowRamps),
     fire: Vec<FirePatch>,
-    glow: Vec<GlowQuad>,
+    glow: (Vec<GlowQuad>, GlowRamps),
     halo: Vec<RainHalo>,
     /// The fx layers whose extent reaches the band, in frame order. Compared
     /// by identity (the content `Arc`), and held, so a settled card costs a
@@ -260,9 +311,11 @@ struct BandStreams {
 impl BandStreams {
     #[inline]
     const fn is_empty(&self) -> bool {
-        self.glow_under.is_empty()
+        self.glow_under.0.is_empty()
+            && self.glow_under.1.is_empty()
             && self.fire.is_empty()
-            && self.glow.is_empty()
+            && self.glow.0.is_empty()
+            && self.glow.1.is_empty()
             && self.halo.is_empty()
             && self.fx.is_empty()
     }
@@ -302,6 +355,49 @@ fn clip_stream<T: Emission>(
             .filter(|q| q.row() < rows && keep(q) && geom.rect_touches_band(q.rect()))
             .copied(),
     );
+}
+
+/// [`clip_stream`] for a glow stream: its quads that reach the band and,
+/// of each ramp, the rows whose lights do ([`SpillGeom::band_rows`]), in
+/// draw order.
+fn clip_glow(
+    (dst, dst_ramps): &mut (Vec<GlowQuad>, GlowRamps),
+    (src, ramps): (&[GlowQuad], &GlowRamps),
+    rows: usize,
+    geom: SpillGeom,
+) {
+    dst.clear();
+    dst_ramps.clear();
+    use crate::glow_ramps::Lights;
+    crate::glow_ramps::each_laid(src, ramps, |laid| match laid {
+        Lights::Quads(run) => dst.extend(
+            run.iter()
+                .filter(|q| q.row() < rows && geom.rect_touches_band(q.rect()))
+                .copied(),
+        ),
+        Lights::Ramp(ramp) => {
+            if usize::from(ramp.row) < rows
+                && let Some(kept) = geom.band_rows(ramp, &ramps.ends)
+            {
+                dst_ramps.copy_rows(ramp, &ramps.ends, dst.len(), kept);
+            }
+        }
+    });
+}
+
+/// A band glow stream's lights' rects, its ramps' each the rows it keeps.
+fn glow_rects((quads, ramps): &(Vec<GlowQuad>, GlowRamps)) -> impl Iterator<Item = Rect> + '_ {
+    quads
+        .iter()
+        .map(Emission::rect)
+        .chain(ramps.items.iter().map(|r| {
+            (
+                usize::from(r.x),
+                usize::from(r.y),
+                usize::from(r.w),
+                usize::from(r.h),
+            )
+        }))
 }
 
 impl SpillBand {
@@ -366,9 +462,19 @@ impl SpillBand {
         let base_bg = renderer.frame_bg(input) & 0x00FF_FFFF;
 
         let (rows, cur) = (input.rows, &mut self.cur);
-        clip_stream(&mut cur.glow_under, &input.glow_under, rows, geom, |_| true);
+        clip_glow(
+            &mut cur.glow_under,
+            (&input.glow_under, &input.glow_under_ramps),
+            rows,
+            geom,
+        );
         clip_stream(&mut cur.fire, &input.fire_patch, rows, geom, |_| true);
-        clip_stream(&mut cur.glow, &input.cursor_glow_add, rows, geom, |_| true);
+        clip_glow(
+            &mut cur.glow,
+            (&input.cursor_glow_add, &input.cursor_glow_add_ramps),
+            rows,
+            geom,
+        );
         let include_veils = !self.veils_excluded;
         clip_stream(&mut cur.halo, &input.glow_halo, rows, geom, |q| {
             include_veils || q.mode == HaloMode::Add
@@ -458,14 +564,14 @@ impl SpillBand {
                 Some((bx, by, bxe, bye)) => (bx.min(x), by.min(y), bxe.max(xe), bye.max(ye)),
             });
         };
-        for q in self.prev.glow_under.iter().chain(&self.cur.glow_under) {
-            grow(q.rect());
+        for r in glow_rects(&self.prev.glow_under).chain(glow_rects(&self.cur.glow_under)) {
+            grow(r);
         }
         for q in self.prev.fire.iter().chain(&self.cur.fire) {
             grow(q.rect());
         }
-        for q in self.prev.glow.iter().chain(&self.cur.glow) {
-            grow(q.rect());
+        for r in glow_rects(&self.prev.glow).chain(glow_rects(&self.cur.glow)) {
+            grow(r);
         }
         for q in self.prev.halo.iter().chain(&self.cur.halo) {
             grow(q.rect());
@@ -540,11 +646,11 @@ impl SpillBand {
                     }
                 };
             fx(color, cover, (FxSlot::Under, FxBlend::Linear, Knock::Not));
-            replay_flat_add(color, cover, s, &cur.glow_under);
+            replay_glow(color, cover, s, &cur.glow_under);
             fx(color, cover, (FxSlot::Under, FxBlend::Exact, Knock::Any));
             replay_fire(color, cover, s, pad, &cur.fire);
             fx(color, cover, (FxSlot::Under, FxBlend::Linear, Knock::Only));
-            replay_flat_add(color, cover, s, &cur.glow);
+            replay_glow(color, cover, s, &cur.glow);
             fx(color, cover, (FxSlot::Glow, FxBlend::Exact, Knock::Any));
             replay_halo(color, cover, s, &cur.halo);
             fx(color, cover, (FxSlot::Over, FxBlend::Exact, Knock::Any));
@@ -640,7 +746,27 @@ fn clip_to_strip(s: StripRect, (x, y, w, h): Rect) -> Option<(usize, usize, usiz
     (x0 < xe && y0 < ye).then_some((x0, y0, xe, ye))
 }
 
-fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[GlowQuad]) {
+/// Replay a band glow stream in draw order: its quads, and each ramp's
+/// lit rows as the quads they stand for, read off its ends in place.
+fn replay_glow(
+    color: &mut [u32],
+    cover: &mut [u8],
+    s: StripRect,
+    (quads, ramps): &(Vec<GlowQuad>, GlowRamps),
+) {
+    use crate::glow_ramps::Lights;
+    crate::glow_ramps::each_laid(quads, ramps, |laid| match laid {
+        Lights::Quads(run) => replay_flat_add(color, cover, s, run.iter().copied()),
+        Lights::Ramp(ramp) => replay_flat_add(color, cover, s, ramp.quads(&ramps.ends)),
+    });
+}
+
+fn replay_flat_add(
+    color: &mut [u32],
+    cover: &mut [u8],
+    s: StripRect,
+    quads: impl Iterator<Item = GlowQuad>,
+) {
     for q in quads {
         let Some((x0, y0, xe, ye)) = clip_to_strip(s, q.rect()) else {
             continue;
@@ -1449,6 +1575,146 @@ mod tests {
             "origin move dirties the full band"
         );
         assert_band_parity(&mut r, &input, &spill, theme.bg & 0x00FF_FFFF);
+    }
+
+    /// A glow stream's ramps spill as the quads they stand for: of each, the
+    /// rows whose lights reach the band (by its columns, above the grid's top,
+    /// at and below its foot; a run whole where any of its rows does), drawn
+    /// in the stream's order, frame after frame, byte for byte, with the same
+    /// dirty rects and revisions. A ramp inside the grid box spills nothing.
+    #[test]
+    fn glow_ramps_spill_as_their_quads() {
+        let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
+        r.set_pad(10);
+        r.set_pad_top(3);
+        r.set_head(24);
+        let mut term = Terminal::new(6, 20);
+        let base = term.cell_frame(6, 20);
+        let (fw, fh) = r.frame_size(6, 20);
+        let (gt, gb) = (27u16, (fh - 17) as u16);
+        let fw16 = fw as u16;
+        let end = |c: u32, k: u16, a: u8| {
+            crate::glow_end(
+                premul_rgb(c.wrapping_add(u32::from(k) * 0x0003_0507), 0xC0),
+                a,
+            )
+        };
+        // The stream at `shift`: quads between ramps reaching the band by its
+        // left and right columns, across the grid's top (dark rows above its
+        // first lit one, its run across the top), at its foot, and one inside
+        // the grid box; the left one's over light drawn under a quad.
+        let stream = |shift: u16| {
+            let mut ramps = GlowRamps::default();
+            let quads = vec![
+                GlowQuad::gradient(0, 2, gt + 2, 30, 6, 0x0030_0810, 0x30, 0x0008_1030, 0x50),
+                GlowQuad::flat(1, 40, gt + 30, 12, 3, 0x0010_2030, 0),
+                GlowQuad::gradient(2, fw16 - 9, gt + 8, 8, 5, 0x0020_3010, 0, 0x0010_2030, 0),
+            ];
+            ramps.open(
+                0,
+                0,
+                (2, gt + 4, 30),
+                (end(0x0040_2010, 0, 0x80), end(0x0010_4020, 0, 0x40)),
+            );
+            for k in 1..12u16 {
+                let lit = if k == 7 {
+                    (0, 0)
+                } else {
+                    (end(0x0040_2010, k, 0x80), end(0x0010_4020, k, 0x40))
+                };
+                if k == 3 {
+                    assert!(ramps.extend_run(0, 4, lit));
+                } else if !(3..=6).contains(&k) {
+                    ramps.extend_last(0, lit);
+                }
+            }
+            let y = gt - 6 + shift;
+            ramps.open(1, 0, (40, y, 20), (0, 0));
+            ramps.extend_last(0, (0, 0));
+            for k in 2..4u16 {
+                ramps.extend_last(0, (end(0x0050_3020, k, 0), end(0x0020_3050, k, 0)));
+            }
+            assert!(ramps.extend_run(0, 5, (end(0x0060_6020, 0, 0), end(0x0020_6060, 0, 0))));
+            for k in 9..14u16 {
+                ramps.extend_last(0, (end(0x0050_3020, k, 0), end(0x0020_3050, k, 0)));
+            }
+            ramps.open(
+                2,
+                5,
+                (60, gb - 5, 16),
+                (end(0x0030_5070, 0, 0), end(0x0070_5030, 0, 0)),
+            );
+            for k in 1..9u16 {
+                ramps.extend_last(
+                    u16::from(k == 4),
+                    (end(0x0030_5070, k, 0), end(0x0070_5030, k, 0)),
+                );
+            }
+            ramps.open(2, 2, (50, gt + 20, 10), (end(0x0050_5050, 0, 0), 0));
+            for k in 1..6u16 {
+                ramps.extend_last(0, (end(0x0050_5050, k, 0), 0));
+            }
+            ramps.open(
+                3,
+                3,
+                (fw16 - 14, gt + 40, 12),
+                (end(0x0010_5030, 0, 0), end(0x0030_1050, 0, 0)),
+            );
+            for k in 1..7u16 {
+                ramps.extend_last(0, (end(0x0010_5030, k, 0), end(0x0030_1050, k, 0)));
+            }
+            ramps.lit = ramps.count_lit();
+            (quads, ramps)
+        };
+        // The ramp across the grid's top alone, after a clear frame, beside a
+        // light in the left column ending above its run's foot: the run's rows
+        // inside the grid box spill nothing, but its whole rect widens the
+        // dirty rect down the left column.
+        let alone = || {
+            let (_, all) = stream(0);
+            let mut ramps = GlowRamps::default();
+            ramps.copy_rows(&all.items[1], &all.ends, 0, (0, all.items[1].h));
+            (
+                vec![GlowQuad::flat(0, 2, gt + 1, 6, 1, 0x0030_2010, 0)],
+                ramps,
+            )
+        };
+        let (mut spill, mut legacy) = (SpillBand::new(), SpillBand::new());
+        let mut carried = 0;
+        for (frame, shift) in [Some(0), Some(3), Some(3), None, Some(99), None, Some(1)]
+            .into_iter()
+            .enumerate()
+        {
+            let (mut with, mut without) = (base.clone(), base.clone());
+            if let Some(shift) = shift {
+                let (quads, ramps) = if shift == 99 { alone() } else { stream(shift) };
+                ramps.expand_into(&quads, &mut without.cursor_glow_add);
+                ramps.expand_into(&quads, &mut without.glow_under);
+                (with.glow_under, with.glow_under_ramps) = (quads.clone(), ramps.clone());
+                (with.cursor_glow_add, with.cursor_glow_add_ramps) = (quads, ramps);
+            }
+            spill.update(&r, &with);
+            legacy.update(&r, &without);
+            carried = carried.max(spill.prev.glow.1.items.len());
+            assert_eq!(
+                spill.rects(),
+                legacy.rects(),
+                "frame {frame}: the dirty rects"
+            );
+            assert_eq!(spill.rev(), legacy.rev(), "frame {frame}: the revision");
+            assert!(
+                spill.rgba() == legacy.rgba(),
+                "frame {frame}: the band's bytes"
+            );
+        }
+        assert_eq!(
+            carried, 4,
+            "four ramps reach the band, the grid box's does not"
+        );
+        assert!(
+            legacy.rev() == 6 && spill.rgba().iter().any(|&b| b != 0),
+            "the band lit"
+        );
     }
 
     #[test]

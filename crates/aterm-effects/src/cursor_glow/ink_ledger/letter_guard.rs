@@ -37,6 +37,7 @@
 //! ramp only ever lowers a share, so every letter keeps its bar.
 
 use super::*;
+use aterm_render::{GlowEnd, GlowRamp, Laid, glow_end};
 
 /// The bar every letter a light lies on keeps (WCAG AA for text, with a
 /// hair of room for the judge's rounding).
@@ -69,17 +70,34 @@ const RAMP_SLOPE: f32 = 0.08;
 /// keeps the straight line between their shares ([`ramp_row`]).
 const WORD_GAP_COLS: i32 = 2;
 
-/// Which stream a light rides, in the renderer's draw order.
+/// Which stream a light rides, in the renderer's draw order. The four
+/// streams of quads come first, each its index in [`Streams::quads`], the
+/// two on the ground before the two over the ink.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum Stream {
     /// `glow_under`: on the ground, beneath the ink.
-    Under,
+    Under = 0,
+    /// A `glow_under` ramp's light within the row being read: a quad of
+    /// [`RampRows::under`].
+    UnderRow = 1,
     /// `cursor_glow_add`: over ground and ink.
-    Over,
+    Over = 2,
+    /// A `cursor_glow_add` ramp's light within the row: a quad of
+    /// [`RampRows::over`].
+    OverRow = 3,
     /// `glow_halo`, [`HaloMode::Add`] (drawn before every `Over` halo).
-    HaloAdd,
+    HaloAdd = 4,
     /// `glow_halo`, [`HaloMode::Over`].
-    HaloOver,
+    HaloOver = 5,
+}
+
+impl Stream {
+    /// Whether the light lies on the ground alone, beneath the ink.
+    #[inline]
+    const fn on_ground(self) -> bool {
+        (self as u8) <= Self::UnderRow as u8
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +106,36 @@ struct RowLight {
     idx: u32,
     x0: i32,
     x1: i32,
+    /// A ramp's lights within the row, `idx .. idx + rows` of its
+    /// [`RampRows`] stream (`0`: one light, `idx` itself).
+    rows: u32,
+}
+
+/// The lights a text row's ramps ([`GlowRamps`]) lay within its band, each
+/// the quad it stands for (a run one quad, read off the ramp's kept ends):
+/// the guard reads a ramp's rows exactly as the legacy stream's quads, from
+/// one row light a ramp ([`RowLight::rows`]).
+#[derive(Default)]
+pub(crate) struct RampRows {
+    under: Vec<GlowQuad>,
+    over: Vec<GlowQuad>,
+}
+
+/// The frame's lights a text row reads: the under-text quads, the over-text
+/// quads and the row's ramp lights of each, indexed by [`Stream`], and the
+/// halos.
+#[derive(Clone, Copy)]
+struct Streams<'a> {
+    quads: [&'a [GlowQuad]; 4],
+    halos: &'a [RainHalo],
+}
+
+impl<'a> Streams<'a> {
+    /// The quad an `Under`, `Over`, `UnderRow` or `OverRow` light names.
+    #[inline]
+    const fn quad(self, stream: Stream, i: usize) -> &'a GlowQuad {
+        &self.quads[stream as usize][i]
+    }
 }
 
 /// The guard's resident scratch ([`CursorGlow::guard_letters`]).
@@ -115,6 +163,8 @@ pub(crate) struct LetterGuard {
     lift_over: Vec<[u16; 3]>,
     /// The row being read's cuts, `(column, share)`, for its ramp.
     cuts: Vec<(i32, f32)>,
+    /// The row being read's ramp lights.
+    ramp_rows: RampRows,
     /// [`CursorGlow::holds_bloom`]'s last `(ink, ground)` and its answer.
     bloom_memo: Option<((u32, u32), bool)>,
     /// A test's negative control: the guard off.
@@ -146,6 +196,10 @@ impl LetterGuard {
         lift_under: Vec::new(),
         lift_over: Vec::new(),
         cuts: Vec::new(),
+        ramp_rows: RampRows {
+            under: Vec::new(),
+            over: Vec::new(),
+        },
         bloom_memo: None,
         #[cfg(any(test, debug_assertions))]
         off: false,
@@ -256,6 +310,118 @@ const fn scale_u8(v: u32, s: f32) -> u32 {
     if v > 255 { 255 } else { v }
 }
 
+/// Lay a run of `ramp`'s cut rows from `y` ([`InkLedger::guard_mask_ramps`]):
+/// one ramp a slice between `knots`, each row's ends `ends[row][slice]`,
+/// its dark rows at either end left off and a slice dark throughout none.
+/// `held` names the rows that are one light, `(first row, rows after it)`:
+/// each slice's ramp keeps them its run where they are lit.
+fn lay_run(
+    out: &mut GlowRamps,
+    ramp: &GlowRamp,
+    y: i32,
+    knots: &[i32],
+    ends: &[GlowEnd],
+    held: Option<(i32, u16)>,
+) {
+    let n = knots.len() - 1;
+    let rows = ends.len() / (2 * n);
+    for s in 0..n {
+        let row = |i: usize| (ends[2 * (i * n + s)], ends[2 * (i * n + s) + 1]);
+        let mut first_opt = None;
+        for i in 0..rows {
+            if row(i) != (0, 0) {
+                first_opt = Some(i);
+                break;
+            }
+        }
+        let Some(first) = first_opt else {
+            continue;
+        };
+        let mut last = first;
+        let mut i = rows;
+        while i > first {
+            i -= 1;
+            if row(i) != (0, 0) {
+                last = i;
+                break;
+            }
+        }
+        let (join, joined) = if let Some((hy, after)) = held
+            && let Ok(offset) = usize::try_from(hy - y)
+            && let Some(k) = offset.checked_sub(first)
+            && k + usize::from(after) <= last - first
+            && row(first + k) != (0, 0)
+        {
+            (k as u16, after)
+        } else {
+            (0, 0)
+        };
+        let laid = GlowRamp {
+            at: ramp.at,
+            row: ramp.row,
+            x: knots[s] as u16,
+            y: (y + first as i32) as u16,
+            w: (knots[s + 1] - knots[s]) as u16,
+            h: (last + 1 - first) as u16,
+            join,
+            joined,
+            ink: out.ends.len() as u32,
+        };
+        out.items.push(laid);
+        for i in first..=last {
+            if !laid.continues((i - first) as u16) {
+                let (a, b) = row(i);
+                out.ends.extend([a, b]);
+            }
+        }
+    }
+}
+
+/// Whether a quad lays light (a lit row light of the guard's).
+#[inline]
+const fn lit(q: &GlowQuad) -> bool {
+    q.w > 0 && q.h > 0 && (q.color | q.color2) & 0x00FF_FFFF != 0
+}
+
+/// A text row's lights of a stream with ramps, in its draw order: each lit
+/// quad meeting the band `ry0 .. ry1` a row light (`push(stream, index,
+/// x, w, 0)`), and each ramp meeting it one row light of its lights there,
+/// laid into `laid` (`push(row stream, first, x, w, lights)`).
+fn row_lights(
+    (quads, ramps): (&[GlowQuad], &GlowRamps),
+    (sq, sr): (Stream, Stream),
+    (ry0, ry1): (i32, i32),
+    laid: &mut Vec<GlowQuad>,
+    push: &mut impl FnMut(Stream, usize, u16, u16, usize),
+) {
+    let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
+    ramps.in_order(quads.len(), |at| match at {
+        Laid::Quads(r) => {
+            for k in r {
+                let q = &quads[k];
+                if lit(q) && meets_y(q.y, q.h) {
+                    push(sq, k, q.x, q.w, 0);
+                }
+            }
+        }
+        Laid::Ramp(k) => {
+            let r = &ramps.items[k];
+            if r.w == 0 || !meets_y(r.y, r.h) {
+                return;
+            }
+            let from = laid.len();
+            for q in r.quads_within(&ramps.ends, (ry0, ry1)) {
+                if lit(&q) {
+                    laid.push(q);
+                }
+            }
+            if laid.len() > from {
+                push(sr, from, r.x, r.w, laid.len() - from);
+            }
+        }
+    });
+}
+
 /// A quad's light at window column `x`, scaled to `s`: its premultiplied
 /// colour and opacity, as the renderer's gradient law reads them.
 #[inline]
@@ -297,7 +463,8 @@ const fn over_cap(color: u32, s: f32) -> Option<u8> {
 impl LetterGuard {
     /// Composite `px` (window pixel `(x, y)`, ring box pixel `k`) under the
     /// cell's lights at share `s`: the under-text lights when `ground`, then
-    /// the over-text quads and the halos.
+    /// the over-text quads and the halos. `streams` comes by reference: a
+    /// call a pixel copies no slices.
     #[inline]
     fn composite(
         &self,
@@ -305,23 +472,18 @@ impl LetterGuard {
         (x, y, k): (i32, i32, usize),
         ground: bool,
         s: f32,
-        streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
+        streams: &Streams<'_>,
     ) -> u32 {
-        let (under, over, halos) = streams;
+        let halos = streams.halos;
         let lights = &self.by_px[self.px_at[k] as usize..self.px_at[k + 1] as usize];
         for &(stream, i) in lights {
             let i = i as usize;
             match stream {
-                Stream::Under | Stream::Over => {
-                    if stream == Stream::Under && !ground {
+                Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
+                    if stream.on_ground() && !ground {
                         continue;
                     }
-                    let q = if stream == Stream::Under {
-                        &under[i]
-                    } else {
-                        &over[i]
-                    };
-                    let (c, a) = quad_at(q, x, s);
+                    let (c, a) = quad_at(streams.quad(stream, i), x, s);
                     px = aterm_render::over_premul(px, c, a);
                 }
                 Stream::HaloAdd => {
@@ -354,25 +516,25 @@ impl LetterGuard {
     /// light, when every light that reaches it adds (no source-over light):
     /// then a share's composite is the ground or ink plus that share of it,
     /// saturating, as `add_sat` composes. Returns whether it is additive.
-    fn prepare(
-        &mut self,
-        j: Judge,
-        (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
-        has_over: bool,
-    ) -> bool {
-        let mut ci = 0;
-        while ci < self.cell.len() {
-            let (stream, i) = self.cell[ci];
+    fn prepare(&mut self, j: Judge, streams: Streams<'_>, has_over: bool) -> bool {
+        let halos = streams.halos;
+        let mut additive = true;
+        for &(stream, i) in &self.cell {
             let ok = match stream {
-                Stream::Under => under[i as usize].alpha | under[i as usize].alpha2 == 0,
-                Stream::Over => over[i as usize].alpha | over[i as usize].alpha2 == 0,
+                Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
+                    let q = streams.quad(stream, i as usize);
+                    q.alpha | q.alpha2 == 0
+                }
                 Stream::HaloAdd => true,
                 Stream::HaloOver => false,
             };
             if !ok {
-                return false;
+                additive = false;
+                break;
             }
-            ci += 1;
+        }
+        if !additive {
+            return false;
         }
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
         let mut lu = std::mem::take(&mut self.lift_under);
@@ -398,10 +560,12 @@ impl LetterGuard {
         for &(stream, i) in &self.cell {
             let i = i as usize;
             let (bx0, by0, bw, bh) = match stream {
-                Stream::Under => (under[i].x, under[i].y, under[i].w, under[i].h),
-                Stream::Over => (over[i].x, over[i].y, over[i].w, over[i].h),
                 Stream::HaloAdd | Stream::HaloOver => {
                     (halos[i].x, halos[i].y, halos[i].w, halos[i].h)
+                }
+                _ => {
+                    let q = streams.quad(stream, i);
+                    (q.x, q.y, q.w, q.h)
                 }
             };
             let (x0, x1) = (
@@ -416,17 +580,9 @@ impl LetterGuard {
                 continue;
             }
             match stream {
-                Stream::Under | Stream::Over => {
-                    let q = if stream == Stream::Under {
-                        &under[i]
-                    } else {
-                        &over[i]
-                    };
-                    let dst = if stream == Stream::Under {
-                        &mut lu
-                    } else {
-                        &mut lo
-                    };
+                Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
+                    let q = streams.quad(stream, i);
+                    let dst = if stream.on_ground() { &mut lu } else { &mut lo };
                     if (q.color ^ q.color2) & 0x00FF_FFFF == 0 {
                         let c = q.color & 0x00FF_FFFF;
                         if c != 0 {
@@ -493,19 +649,18 @@ impl LetterGuard {
     /// [`Self::cell`] by the pixels each light covers, so
     /// [`Self::composite`] visits exactly a pixel's own lights, in the order
     /// it would meet them in `cell`.
-    fn index_pixels(
-        &mut self,
-        j: Judge,
-        (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
-    ) {
+    fn index_pixels(&mut self, j: Judge, streams: Streams<'_>) {
+        let halos = streams.halos;
         let (w, h) = ((j.x1 - j.x0).max(0), (j.y1 - j.y0).max(0));
         let cover = |&(stream, i): &(Stream, u32)| {
             let i = i as usize;
             let (x, y, qw, qh) = match stream {
-                Stream::Under => (under[i].x, under[i].y, under[i].w, under[i].h),
-                Stream::Over => (over[i].x, over[i].y, over[i].w, over[i].h),
                 Stream::HaloAdd | Stream::HaloOver => {
                     (halos[i].x, halos[i].y, halos[i].w, halos[i].h)
+                }
+                _ => {
+                    let q = streams.quad(stream, i);
+                    (q.x, q.y, q.w, q.h)
                 }
             };
             let span = |at: u16, len: u16, o: i32, n: i32| {
@@ -557,7 +712,7 @@ impl LetterGuard {
         j: Judge,
         s: f32,
         bar: f32,
-        streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
+        streams: Streams<'_>,
         (additive, has_over): (bool, bool),
     ) -> bool {
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
@@ -627,7 +782,7 @@ impl LetterGuard {
                     j.l_ground
                 } else {
                     let at = (j.x0 + x as i32, j.y0 + gy as i32, k);
-                    let g = self.composite(j.ground, at, true, s, streams);
+                    let g = self.composite(j.ground, at, true, s, &streams);
                     if g == j.ground {
                         j.l_ground
                     } else {
@@ -690,7 +845,7 @@ impl LetterGuard {
                     j.l_ink
                 } else {
                     let at = (j.x0 + x as i32, j.y0 + y as i32, k);
-                    let ink = self.composite(j.ink, at, false, s, streams);
+                    let ink = self.composite(j.ink, at, false, s, &streams);
                     if ink == j.ink {
                         j.l_ink
                     } else {
@@ -723,20 +878,13 @@ impl LetterGuard {
 
     /// The largest share of the cell's lights that keeps the letter's `bar`
     /// ([`letter_bar`]; `1.0` when the whole light does).
-    fn share(
-        &mut self,
-        j: Judge,
-        bar: f32,
-        streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
-    ) -> f32 {
+    fn share(&mut self, j: Judge, bar: f32, streams: Streams<'_>) -> f32 {
         let mut has_over = false;
-        let mut ci = 0;
-        while ci < self.cell.len() {
-            if self.cell[ci].0 != Stream::Under {
+        for &(stream, _) in &self.cell {
+            if !stream.on_ground() {
                 has_over = true;
                 break;
             }
-            ci += 1;
         }
         let additive = self.prepare(j, streams, has_over);
         if !additive {
@@ -761,11 +909,8 @@ impl LetterGuard {
     /// The upper bound of the light the cell's lights can add to a pixel of
     /// the ring box, per channel, over the ink (`over`) and the ground
     /// (`all`); `None` when a source-over light reaches it (no bound).
-    fn bound(
-        &self,
-        j: Judge,
-        (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
-    ) -> Option<([u32; 3], [u32; 3])> {
+    fn bound(&self, j: Judge, streams: Streams<'_>) -> Option<([u32; 3], [u32; 3])> {
+        let halos = streams.halos;
         let (mut on_ink, mut all) = ([0u32; 3], [0u32; 3]);
         let add = |acc: &mut [u32; 3], c: u32| {
             acc[0] += (c >> 16) & 0xff;
@@ -775,12 +920,8 @@ impl LetterGuard {
         for &(stream, i) in &self.cell {
             let i = i as usize;
             let c = match stream {
-                Stream::Under | Stream::Over => {
-                    let q = if stream == Stream::Under {
-                        &under[i]
-                    } else {
-                        &over[i]
-                    };
+                Stream::Under | Stream::Over | Stream::UnderRow | Stream::OverRow => {
+                    let q = streams.quad(stream, i);
                     if q.alpha != 0 || q.alpha2 != 0 {
                         return None;
                     }
@@ -797,7 +938,7 @@ impl LetterGuard {
                 }
                 Stream::HaloOver => return None,
             };
-            if stream != Stream::Under {
+            if !stream.on_ground() {
                 add(&mut on_ink, c);
             }
             add(&mut all, c);
@@ -897,11 +1038,35 @@ const fn solid_ink(ink: u32, ground: u32) -> u32 {
 
 impl InkLedger {
     /// Cut every quad of `quads` (additive or source-over) to the guard's
-    /// dims ([`Self::mask_at_with`]), easing back to the whole light off them.
-    /// With `rails` (the under stream), a quad of a rail laid clear of its
-    /// row's ring ([`Self::note_rail`]) is cut only where it meets a dimmed
-    /// cell's box.
-    fn guard_mask_quads(&mut self, quads: &mut Vec<GlowQuad>, rails: bool) {
+    /// dims ([`Self::mask_at_with`]), easing back to the whole light off them,
+    /// and the stream's `ramps` with them ([`Self::guard_mask_ramps`]). With
+    /// `rails` (the under stream), a light of a rail laid clear of its row's
+    /// ring ([`Self::note_rail`]) is cut only where it meets a dimmed cell's
+    /// box.
+    fn guard_mask_stream(&mut self, quads: &mut Vec<GlowQuad>, ramps: &mut GlowRamps, rails: bool) {
+        if ramps.is_empty() {
+            self.guard_mask_quads::<false>(quads, &mut [], rails);
+            if rails {
+                self.rail_ramps.clear();
+            }
+            return;
+        }
+        self.guard_mask_quads::<true>(quads, &mut ramps.items, rails);
+        self.guard_mask_ramps(ramps, rails);
+    }
+
+    /// Cut every quad of `quads` to the guard's dims ([`Self::guard_mask_stream`]),
+    /// each of `ramps` (in draw order, where `RAMPS`) drawn before the first
+    /// piece of the quad it was drawn before (after the last where it was
+    /// drawn after every quad). With `rails`, a quad of a rail laid clear of
+    /// its row's ring ([`Self::note_rail`]) is cut only where it meets a
+    /// dimmed cell's box.
+    fn guard_mask_quads<const RAMPS: bool>(
+        &mut self,
+        quads: &mut Vec<GlowQuad>,
+        ramps: &mut [GlowRamp],
+        rails: bool,
+    ) {
         let (bx0, by0, bx1, by1) = self.dims_bounds();
         let feather = self.feather();
         #[cfg(any(test, debug_assertions))]
@@ -921,7 +1086,16 @@ impl InkLedger {
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.clear();
         let mut cut = false;
+        let mut next = 0;
         for (i, &q) in quads.iter().enumerate() {
+            if RAMPS {
+                while let Some(r) = ramps.get_mut(next)
+                    && r.at as usize <= i
+                {
+                    r.at = pieces.len() as u32;
+                    next += 1;
+                }
+            }
             let (x0, y0) = (i32::from(q.x), i32::from(q.y));
             let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
             while span < spans.len() && spans[span].1 as usize <= i {
@@ -1005,6 +1179,11 @@ impl InkLedger {
                 }
             }
         }
+        if RAMPS {
+            for r in &mut ramps[next..] {
+                r.at = pieces.len() as u32;
+            }
+        }
         if cut {
             std::mem::swap(quads, &mut pieces);
         }
@@ -1032,6 +1211,215 @@ impl InkLedger {
             i += 1;
         }
         false
+    }
+
+    /// Cut every ramp of `ramps` to the guard's dims as
+    /// [`Self::guard_mask_quads`] cuts the quads its rows stand for, piece
+    /// for piece: a run of rows the same knots slice lays each slice
+    /// between them as one ramp, its rows the pieces' ends (a piece the cut
+    /// darkens whole a dark row). A row's pieces lie side by side, so the
+    /// slices of a ramp may be laid in any order. A ramp's run is the one
+    /// quad its rows stand for: its knots are the run's, each of its rows
+    /// takes the cut of the knot interval it lies in, and each interval's
+    /// pieces are one light apiece (a run of each slice's ramp), as the
+    /// quad's are. With `rails`, a ramp of a rail laid clear of its row's
+    /// ring ([`Self::note_rail_laid`]) has a row (a run, its one quad) cut
+    /// only where it meets a dimmed cell's box, as its quad would be.
+    fn guard_mask_ramps(&mut self, ramps: &mut GlowRamps, rails: bool) {
+        let (bx0, by0, bx1, by1) = self.dims_bounds();
+        let feather = self.feather();
+        #[cfg(any(test, debug_assertions))]
+        let round_cuts = self.round_cuts;
+        #[cfg(not(any(test, debug_assertions)))]
+        let round_cuts = false;
+        #[cfg(any(test, debug_assertions))]
+        let rails = rails && !self.rails_feathered;
+        let spans = if rails {
+            let mut spans = std::mem::take(&mut self.rail_ramps);
+            spans.sort_unstable();
+            spans
+        } else {
+            Vec::new()
+        };
+        let mut span = 0usize;
+        let mut out = std::mem::take(&mut self.ramp_pieces);
+        out.clear();
+        let mut cut = false;
+        for k in 0..ramps.items.len() {
+            let r = ramps.items[k];
+            let (x0, y0) = (i32::from(r.x), i32::from(r.y));
+            let (x1, y1) = (x0 + i32::from(r.w), y0 + i32::from(r.h));
+            while span < spans.len() && spans[span].1 as usize <= k {
+                span += 1;
+            }
+            let rail = span < spans.len() && spans[span].0 as usize <= k;
+            // A rail's light (a row, or a run's rows) the cut may reach.
+            let reached = |this: &Self, (ya, yb): (i32, i32)| {
+                !rail || this.meets_dim_box((x0, ya, x1, yb), feather.0)
+            };
+            let keep = |out: &mut GlowRamps, r: &GlowRamp| {
+                out.items.push(GlowRamp {
+                    ink: out.ends.len() as u32,
+                    ..*r
+                });
+                out.ends.extend_from_slice(r.kept_ends(&ramps.ends));
+            };
+            if r.w == 0 || x1 <= bx0 || x0 >= bx1 || y1 <= by0 || y0 >= by1 {
+                // Whole: laid again only once the stream is rebuilt.
+                if cut {
+                    keep(&mut out, &r);
+                }
+                continue;
+            }
+            if !cut {
+                for before in &ramps.items[..k] {
+                    keep(&mut out, before);
+                }
+            }
+            cut = true;
+            // The run of rows being gathered: its first row, its slices'
+            // knots, and each row's ends per slice, row-major.
+            let mut run_y = y0;
+            let mut run_ends = std::mem::take(&mut self.run_ends);
+            run_ends.clear();
+            let mut run_knots = std::mem::take(&mut self.run_knots);
+            run_knots.clear();
+            run_knots.extend([x0, x1]);
+            let inv_w = 1.0 / f32::from(r.w);
+            let held = (
+                y0 + i32::from(r.join),
+                y0 + i32::from(r.join) + i32::from(r.joined) + 1,
+            );
+            let mut held_knotted = false;
+            // The gathered rows' one light, if they hold one (`lay_run`).
+            let mut run_held = None;
+            for y in y0..y1 {
+                let (a, b) = r.row_ends(&ramps.ends, (y - y0) as u16);
+                let in_held = r.joined > 0 && y >= held.0 && y < held.1;
+                if in_held && y == held.0 {
+                    held_knotted = a | b != 0
+                        && held.0 < by1
+                        && held.1 > by0
+                        && reached(self, held)
+                        && self.knots((x0, held.0, x1, held.1));
+                }
+                let knotted = if in_held {
+                    held_knotted
+                } else {
+                    a | b != 0
+                        && y >= by0
+                        && y < by1
+                        && reached(self, (y, y + 1))
+                        && self.knots((x0, y, x1, y + 1))
+                };
+                // The held rows' light from `y`: the whole run uncut, or the
+                // knot interval `y` begins.
+                let interval = if in_held && knotted {
+                    let k = self.knots_y.partition_point(|&k| k <= y);
+                    Some((self.knots_y[k - 1], self.knots_y[k]))
+                } else {
+                    None
+                };
+                let opens = match interval {
+                    Some((ya, yb)) => {
+                        if y == ya {
+                            Some((ya, (yb - ya - 1) as u16))
+                        } else {
+                            None
+                        }
+                    }
+                    None => {
+                        if in_held && y == held.0 {
+                            Some((held.0, r.joined))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                let same = if knotted {
+                    self.knots_x == run_knots
+                } else {
+                    a | b == 0 || run_knots == [x0, x1]
+                };
+                if !same || (interval.is_some() && opens.is_some() && y > run_y) {
+                    lay_run(&mut out, &r, run_y, &run_knots, &run_ends, run_held);
+                    run_y = y;
+                    run_held = None;
+                    run_ends.clear();
+                    run_knots.clear();
+                    if knotted {
+                        run_knots.extend_from_slice(&self.knots_x);
+                    } else {
+                        run_knots.extend([x0, x1]);
+                    }
+                }
+                if opens.is_some() {
+                    run_held = opens;
+                }
+                if !knotted {
+                    if run_knots.len() == 2 {
+                        run_ends.extend([a, b]);
+                    } else {
+                        run_ends.extend(std::iter::repeat_n(0, 2 * (run_knots.len() - 1)));
+                    }
+                    continue;
+                }
+                if interval.is_some() && opens.is_none() {
+                    // A held row past its interval's first: the row above's
+                    // ends, its pieces cut at the same `ym`.
+                    let n = run_ends.len();
+                    run_ends.extend_from_within(n - 2 * (run_knots.len() - 1)..n);
+                    continue;
+                }
+                let at = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+                // A cut piece truncated as `guard_mask_quads` truncates it.
+                let end = |x: i32, m: f32| {
+                    let t = (x - x0) as f32 * inv_w;
+                    let fit = |v: f32| {
+                        (if m < 1.0 && !round_cuts {
+                            v.trunc()
+                        } else {
+                            v.round()
+                        } as u32)
+                            .min(255)
+                    };
+                    let ch = |sh: u32| fit((at(a, sh) + (at(b, sh) - at(a, sh)) * t) * m);
+                    let al = fit((at(a, 24) + (at(b, 24) - at(a, 24)) * t) * m) as u8;
+                    glow_end((ch(16) << 16) | (ch(8) << 8) | ch(0), al)
+                };
+                let ym = if in_held {
+                    let k = self.knots_y.partition_point(|&k| k <= y);
+                    0.5 * (self.knots_y[k - 1] + self.knots_y[k]) as f32
+                } else {
+                    0.5 * (2 * y + 1) as f32
+                };
+                let mut ca = end(
+                    run_knots[0],
+                    self.mask_at_with(run_knots[0] as f32, ym, feather),
+                );
+                for &xb in &run_knots[1..] {
+                    let cb = end(xb, self.mask_at_with(xb as f32, ym, feather));
+                    // A piece of no light is never laid: a dark row (two
+                    // zero ends already).
+                    run_ends.extend([ca, cb]);
+                    ca = cb;
+                }
+            }
+            lay_run(&mut out, &r, run_y, &run_knots, &run_ends, run_held);
+            self.run_ends = run_ends;
+            self.run_knots = run_knots;
+        }
+        if cut {
+            out.lit = out.count_lit();
+            std::mem::swap(ramps, &mut out);
+        }
+        out.clear();
+        self.ramp_pieces = out;
+        if rails {
+            // The ramps' indices moved with the cuts: the spans are spent.
+            self.rail_ramps = spans;
+            self.rail_ramps.clear();
+        }
     }
 
     /// Cut every halo of `halos` to the guard's dims: an additive halo's
@@ -1112,15 +1500,16 @@ impl CursorGlow {
     /// and 93% under the plain caret's typing glow; without the bloom every
     /// letter the gallery measured kept 97%. A page whose text clears the
     /// floor has the room and keeps its bloom.
-    pub(crate) fn holds_bloom(&mut self, ink: u32, ground: u32) -> bool {
+    pub(crate) const fn holds_bloom(&mut self, ink: u32, ground: u32) -> bool {
         let key = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
         if let Some((at, held)) = self.letter_guard.bloom_memo
-            && at == key
+            && at.0 == key.0
+            && at.1 == key.1
         {
             return held;
         }
-        let lum = crate::color_math::relative_luminance;
-        let (li, lg) = (lum(solid_ink(key.0, key.1)), lum(key.1));
+        let li = crate::color_math::relative_luminance(solid_ink(key.0, key.1));
+        let lg = crate::color_math::relative_luminance(key.1);
         let held = (li.max(lg) + 0.05) / (li.min(lg) + 0.05) < LETTER_FLOOR;
         self.letter_guard.bloom_memo = Some((key, held));
         held
@@ -1145,7 +1534,11 @@ impl CursorGlow {
         }
         if (matches!(style, GlowStyle::Classic) && !self.last_classic_mono)
             || self.frame_text.rows.is_empty()
-            || (over.is_empty() && self.under_out.is_empty() && self.halo_out.is_empty())
+            || (over.is_empty()
+                && self.under_out.is_empty()
+                && self.halo_out.is_empty()
+                && self.under_ramps.is_empty()
+                && self.out_ramps.is_empty())
         {
             return 0;
         }
@@ -1162,15 +1555,12 @@ impl CursorGlow {
         let ledger = &mut self.ink_ledger;
         ledger.grid = (ox as f32, oy as f32, cw as f32, ch as f32);
         ledger.dims.clear();
-        let caret = caret.map(|(r, c)| (i32::from(r), i32::from(c)));
         let text = &self.frame_text;
-        let streams = (
-            self.under_out.as_slice(),
-            over.as_slice(),
-            self.halo_out.as_slice(),
-        );
-        let lit = |q: &GlowQuad| q.w > 0 && q.h > 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
-        let quad_y_bounds = |qs: &[GlowQuad]| {
+        let (under, halos) = (self.under_out.as_slice(), self.halo_out.as_slice());
+        let over_q = over.as_slice();
+        // Each stream's lit extent down the page, its ramps' boxes counted:
+        // a text row none of its lights reach skips that stream.
+        let y_bounds = |qs: &[GlowQuad], ramps: &GlowRamps| {
             let (mut y0, mut y1) = (i32::MAX, i32::MIN);
             for q in qs {
                 if lit(q) {
@@ -1179,13 +1569,20 @@ impl CursorGlow {
                     y1 = y1.max(qy + i32::from(q.h));
                 }
             }
+            for r in &ramps.items {
+                if r.w > 0 && r.h > 0 {
+                    let ry = i32::from(r.y);
+                    y0 = y0.min(ry);
+                    y1 = y1.max(ry + i32::from(r.h));
+                }
+            }
             (y0, y1)
         };
-        let (u_y0, u_y1) = quad_y_bounds(streams.0);
-        let (o_y0, o_y1) = quad_y_bounds(streams.1);
+        let (u_y0, u_y1) = y_bounds(under, &self.under_ramps);
+        let (o_y0, o_y1) = y_bounds(over_q, &self.out_ramps);
         let (mut ha_y0, mut ha_y1) = (i32::MAX, i32::MIN);
         let (mut ho_y0, mut ho_y1) = (i32::MAX, i32::MIN);
-        for h in streams.2 {
+        for h in halos {
             if h.w > 0 && h.h > 0 && h.color & 0x00FF_FFFF != 0 {
                 let hy0 = i32::from(h.y);
                 let hy1 = hy0 + i32::from(h.h);
@@ -1201,8 +1598,10 @@ impl CursorGlow {
         let all_y0 = u_y0.min(o_y0).min(ha_y0).min(ho_y0);
         let all_y1 = u_y1.max(o_y1).max(ha_y1).max(ho_y1);
         if all_y0 >= all_y1 {
+            self.letter_guard = guard;
             return 0;
         }
+        let mut ramp_rows = std::mem::take(&mut guard.ramp_rows);
         let mut print = 0u64;
         let mut solid = None;
         let lum = crate::color_math::relative_luminance;
@@ -1217,8 +1616,10 @@ impl CursorGlow {
                 continue;
             }
             guard.row.clear();
+            ramp_rows.under.clear();
+            ramp_rows.over.clear();
             let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
-            let mut push_row = |stream: Stream, k: usize, x: u16, w: u16| {
+            let mut push_row = |stream: Stream, k: usize, x: u16, w: u16, rows: usize| {
                 let x0 = i32::from(x);
                 let x1 = x0 + i32::from(w);
                 min_x = min_x.min(x0);
@@ -1228,50 +1629,78 @@ impl CursorGlow {
                     idx: k as u32,
                     x0,
                     x1,
+                    rows: rows as u32,
                 });
             };
             let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
+            // Each stream's quads, then where it has ramps its quads and
+            // ramps in draw order ([`row_lights`]); a stream of quads alone
+            // reads as the guard read it before ramps.
             if ry1 > u_y0 && ry0 < u_y1 {
-                for (k, q) in streams.0.iter().enumerate() {
-                    if lit(q) && meets_y(q.y, q.h) {
-                        push_row(Stream::Under, k, q.x, q.w);
+                if self.under_ramps.is_empty() {
+                    for (k, q) in under.iter().enumerate() {
+                        if lit(q) && meets_y(q.y, q.h) {
+                            push_row(Stream::Under, k, q.x, q.w, 0);
+                        }
                     }
+                } else {
+                    row_lights(
+                        (under, &self.under_ramps),
+                        (Stream::Under, Stream::UnderRow),
+                        (ry0, ry1),
+                        &mut ramp_rows.under,
+                        &mut push_row,
+                    );
                 }
             }
             if ry1 > o_y0 && ry0 < o_y1 {
-                for (k, q) in streams.1.iter().enumerate() {
-                    if lit(q) && meets_y(q.y, q.h) {
-                        push_row(Stream::Over, k, q.x, q.w);
+                if self.out_ramps.is_empty() {
+                    for (k, q) in over_q.iter().enumerate() {
+                        if lit(q) && meets_y(q.y, q.h) {
+                            push_row(Stream::Over, k, q.x, q.w, 0);
+                        }
                     }
+                } else {
+                    row_lights(
+                        (over_q, &self.out_ramps),
+                        (Stream::Over, Stream::OverRow),
+                        (ry0, ry1),
+                        &mut ramp_rows.over,
+                        &mut push_row,
+                    );
                 }
             }
             if ry1 > ha_y0 && ry0 < ha_y1 {
-                for (k, h) in streams.2.iter().enumerate() {
+                for (k, h) in halos.iter().enumerate() {
                     if h.mode == HaloMode::Add
                         && h.w > 0
                         && h.h > 0
                         && h.color & 0x00FF_FFFF != 0
                         && meets_y(h.y, h.h)
                     {
-                        push_row(Stream::HaloAdd, k, h.x, h.w);
+                        push_row(Stream::HaloAdd, k, h.x, h.w, 0);
                     }
                 }
             }
             if ry1 > ho_y0 && ry0 < ho_y1 {
-                for (k, h) in streams.2.iter().enumerate() {
+                for (k, h) in halos.iter().enumerate() {
                     if h.mode == HaloMode::Over
                         && h.w > 0
                         && h.h > 0
                         && h.color & 0x00FF_FFFF != 0
                         && meets_y(h.y, h.h)
                     {
-                        push_row(Stream::HaloOver, k, h.x, h.w);
+                        push_row(Stream::HaloOver, k, h.x, h.w, 0);
                     }
                 }
             }
             if guard.row.is_empty() {
                 continue;
             }
+            let skip = match caret {
+                Some((r, c)) if i32::from(r) == row => Some(i32::from(c)),
+                _ => None,
+            };
             let row_from = ledger.dims.len();
             guard.cuts.clear();
             for col in first..end {
@@ -1279,7 +1708,7 @@ impl CursorGlow {
                 if max_x <= cx0 {
                     break;
                 }
-                if min_x >= cx1 || caret == Some((row, col)) {
+                if min_x >= cx1 || skip == Some(col) {
                     continue;
                 }
                 let Some((Some(ink), ground)) = text.pair(row, col) else {
@@ -1289,7 +1718,13 @@ impl CursorGlow {
                 guard.cell.clear();
                 for &light in &guard.row {
                     if light.x0 < cx1 && light.x1 > cx0 {
-                        guard.cell.push((light.stream, light.idx));
+                        if light.rows == 0 {
+                            guard.cell.push((light.stream, light.idx));
+                        } else {
+                            for k in light.idx..light.idx + light.rows {
+                                guard.cell.push((light.stream, k));
+                            }
+                        }
                     }
                 }
                 if guard.cell.is_empty() {
@@ -1318,6 +1753,10 @@ impl CursorGlow {
                     ground,
                     l_ink,
                     l_ground,
+                };
+                let streams = Streams {
+                    quads: [under, &ramp_rows.under, over_q, &ramp_rows.over],
+                    halos,
                 };
                 if let Some((on_ink, all)) = guard.bound(j, streams) {
                     // Light ink on a dark page reads worst against the
@@ -1357,10 +1796,6 @@ impl CursorGlow {
             if comb || guard.cuts.is_empty() {
                 continue;
             }
-            let skip = match caret {
-                Some((r, c)) if r == row => Some(c),
-                _ => None,
-            };
             #[cfg(any(test, debug_assertions))]
             let climb = guard.gaps_climb;
             #[cfg(not(any(test, debug_assertions)))]
@@ -1385,9 +1820,10 @@ impl CursorGlow {
             });
             guard.cuts = cuts;
         }
+        guard.ramp_rows = ramp_rows;
         if !ledger.dims.is_empty() {
-            ledger.guard_mask_quads(&mut self.under_out, true);
-            ledger.guard_mask_quads(over, false);
+            ledger.guard_mask_stream(&mut self.under_out, &mut self.under_ramps, true);
+            ledger.guard_mask_stream(over, &mut self.out_ramps, false);
             ledger.guard_mask_halos(&mut self.halo_out);
         }
         ledger.dims.clear();
@@ -1428,7 +1864,7 @@ impl CursorGlow {
     /// on any window cut the trail's light under the letters beside it.
     pub(crate) fn veil_letters_on_pet(
         &mut self,
-        out: &mut Vec<GlowQuad>,
+        (out, ramps): (&mut Vec<GlowQuad>, &mut GlowRamps),
         caret: Option<(u16, u16)>,
         geom: Geom,
         sprite: Option<&aterm_render::sprites::FreeSprite>,
@@ -1449,7 +1885,8 @@ impl CursorGlow {
         let (bx0, bx1, by0, by1) = (bx0 - pad, bx1 + pad, by0 - pad, by1 + pad);
         // The silhouette's rows, each its span padded; the padded box whole
         // without the body's sprite.
-        let mut bands = Vec::new();
+        let mut bands = std::mem::take(&mut self.icon_scratch);
+        bands.clear();
         match sprite {
             Some(s) if !self.pet_veil_boxed() => {
                 super::super::icon_shade::sprite_rows(
@@ -1686,14 +2123,14 @@ impl CursorGlow {
                     && ox + (col + 1) * cw > bx0
                     && ox + col * cw < bx1
                     && let Some((Some(ink), ground)) = text.pair(row, col)
+                    && let Some(b) = veil(ink & 0x00FF_FFFF, ground & 0x00FF_FFFF)
                 {
-                    let ground = ground & 0x00FF_FFFF;
-                    veil(ink & 0x00FF_FFFF, ground).map(|b| (ground, b))
+                    Some((col, ground & 0x00FF_FFFF, b))
                 } else {
                     None
                 };
                 match (run, at) {
-                    (Some((c0, page, a)), Some((g, b))) if g == page => {
+                    (Some((c0, page, a)), Some((_, g, b))) if g == page => {
                         run = Some((c0, page, a.max(b)));
                     }
                     (open, next) => {
@@ -1711,11 +2148,12 @@ impl CursorGlow {
                                 );
                             }
                         }
-                        run = next.map(|(g, b)| (col, g, b));
+                        run = next;
                     }
                 }
             }
         }
+        self.icon_scratch = bands;
         // The veil lies on the pet's coat, beneath every light: laid over
         // them, it cut a dim page's bed (its hue at the page's own
         // luminance) back to the page along the silhouette's rows, a hard
@@ -1730,6 +2168,11 @@ impl CursorGlow {
         if beneath {
             let laid = under.len() - from;
             under.rotate_right(laid);
+            // The stream's ramps keep their places among the quads they
+            // were drawn before, the veil beneath them all.
+            for r in &mut ramps.items {
+                r.at += laid as u32;
+            }
         }
         print
     }
@@ -1779,17 +2222,17 @@ impl CursorGlow {
     }
 
     /// The pet's page veil ([`Self::veil_letters_on_pet`]) at the body the
-    /// pet's tick drew this frame ([`Self::note_pet_body`]), appended to the
-    /// frame's published under stream `out`, kept to the silhouette of the
-    /// body's sprite among the frame's `sprites` (grid pixels; the one whose
-    /// box is the body's). The host calls it after the pet's tick, its
+    /// pet's tick drew this frame ([`Self::note_pet_body`]), laid in the
+    /// frame's published under stream `out` (its quads and their ramps),
+    /// kept to the silhouette of the body's sprite among the frame's
+    /// `sprites` (grid pixels; the one whose box is the body's). The host calls it after the pet's tick, its
     /// word pass and the trail's publish; the print of what it drew. What it
     /// drew is kept ([`Self::pet_veil`]) for the frames that project the
     /// trail's streams again before the next pet tick.
     #[inline]
     pub fn veil_pet_letters(
         &mut self,
-        out: &mut Vec<GlowQuad>,
+        (out, ramps): (&mut Vec<GlowQuad>, &mut GlowRamps),
         sprites: &[aterm_render::sprites::FreeSprite],
     ) -> u64 {
         let from = out.len();
@@ -1809,13 +2252,14 @@ impl CursorGlow {
                         si += 1;
                     }
                 }
-                self.veil_letters_on_pet(out, caret, geom, sprite)
+                self.veil_letters_on_pet((&mut *out, ramps), caret, geom, sprite)
             }
             None => 0,
         };
         self.pet_veil.clear();
-        self.pet_veil
-            .extend_from_slice(out.get(from..).unwrap_or_default());
+        if let Some(slice) = out.get(from..) {
+            self.pet_veil.extend_from_slice(slice);
+        }
         print
     }
 
@@ -2042,6 +2486,128 @@ mod tests {
         assert!(
             past >= 1.0,
             "control: climbing, the gap past the run keeps {past}, under its whole light"
+        );
+    }
+
+    /// Lane B5: the guard cuts a stream's ramps as it cuts the quads their
+    /// rows stand for, a rail laid clear of the ring included
+    /// ([`InkLedger::note_rail_laid`]): a rail's row, or its run's one
+    /// quad, is cut only where it meets a dimmed cell's box, and every cut
+    /// piece is truncated as the quad's is. A light across a dimmed row and
+    /// a rail below it, laid once as quads and once as ramps (every run a
+    /// ramp), are cut alike, light for light. Premise: the rail noted, its
+    /// quads keep light the feather would cut. Negative controls: the
+    /// rail's ramps not noted (its quads alone, [`InkLedger::note_rail`]),
+    /// or the ramps' cut pieces rounded, the ramps are cut otherwise.
+    #[test]
+    fn a_stream_s_ramps_are_cut_as_their_quads_rails_included() {
+        use aterm_render::{BeamRows, RampCost, RampSink};
+        // Cells 10 x 20 px; columns 4..7 of the row at y 40..60 dimmed.
+        let dimmed = || {
+            let mut ledger = InkLedger::EMPTY;
+            ledger.grid = (0.0, 0.0, 10.0, 20.0);
+            for (col, share) in [(4, 0.3), (5, 0.25), (6, 0.4)] {
+                ledger.dims.push(Dim {
+                    x0: col as f32 * 10.0,
+                    y0: 40.0,
+                    x1: (col + 1) as f32 * 10.0,
+                    y1: 60.0,
+                    share,
+                });
+            }
+            ledger
+        };
+        // A row's ends: additive, every third source-over.
+        fn ends(y: u16) -> ((u32, u8), (u32, u8)) {
+            let k = u32::from(y % 5 + 1);
+            if y.is_multiple_of(3) {
+                ((k * 0x000E_0804, 0x50), (k * 0x0004_080C, 0x48))
+            } else {
+                ((k * 0x0018_1008, 0), (k * 0x0006_0C14, 0))
+            }
+        }
+        // The light across the row (y 30..56), then the rail below it: rows
+        // 56..60 in the dimmed box, a run's tall light at 60..64 and rows
+        // to 70, in the feather's reach and past it. The rail's marks.
+        fn lay<S: BeamRows>(out: &mut S) -> (S::Mark, S::Mark) {
+            out.slab();
+            for y in 30..56 {
+                let (a, b) = ends(y);
+                out.row(i32::from(y / 20), y / 20, (30, y, 50), a, b);
+            }
+            let from = out.mark();
+            out.slab();
+            for y in 56..60 {
+                let (a, b) = ends(y);
+                out.row(3, 3, (30, y, 50), a, b);
+            }
+            out.rect(3, 3, (30, 60, 50, 4), (0x0020_1810, 0));
+            for y in 64..70 {
+                let (a, b) = ends(y);
+                out.row(3, 3, (30, y, 50), a, b);
+            }
+            (from, out.mark())
+        }
+        let lead = GlowQuad::flat(1, 0, 10, 4, 4, 0x0010_1010, 0);
+        let legacy = |rails: bool| {
+            let mut quads = vec![lead];
+            let (from, to) = lay(&mut quads);
+            let mut ledger = dimmed();
+            if rails {
+                ledger.note_rail(from, to);
+            }
+            ledger.guard_mask_stream(&mut quads, &mut GlowRamps::default(), true);
+            quads
+        };
+        let ramped = |(rails, rounded): (bool, bool)| {
+            let (mut quads, mut ramps) = (vec![lead], GlowRamps::default());
+            let (from, to) = {
+                let mut sink = RampSink::new(&mut quads, &mut ramps).costed(RampCost::ALWAYS);
+                lay(&mut sink)
+            };
+            assert!(
+                to.1.items() > from.1.items(),
+                "premise: the rail rides ramps"
+            );
+            let mut ledger = dimmed();
+            if rails {
+                ledger.note_rail_laid(from, to);
+            } else {
+                ledger.note_rail(from.0, to.0);
+            }
+            ledger.round_cuts = rounded;
+            ledger.guard_mask_stream(&mut quads, &mut ramps, true);
+            let mut got = Vec::new();
+            ramps.expand_into(&quads, &mut got);
+            (got, ramps.laid(quads.len()))
+        };
+        let key = |q: &GlowQuad| (q.y, q.x, q.w, q.h, q.color, q.alpha, q.color2, q.alpha2);
+        let sorted = |mut v: Vec<GlowQuad>| {
+            v.sort_by_key(key);
+            v
+        };
+        let want = legacy(true);
+        assert_ne!(
+            sorted(want.clone()),
+            sorted(legacy(false)),
+            "premise: the rail keeps light the feather would cut"
+        );
+        let (got, laid) = ramped((true, false));
+        assert_eq!(
+            sorted(got),
+            sorted(want.clone()),
+            "the ramps are cut as their quads"
+        );
+        assert_eq!(laid, want.len(), "the stream counts alike");
+        assert_ne!(
+            sorted(ramped((false, false)).0),
+            sorted(want.clone()),
+            "control: the rail's ramps not noted, they are cut as the rail's quads are"
+        );
+        assert_ne!(
+            sorted(ramped((true, true)).0),
+            sorted(want),
+            "control: rounded, the ramps' cut pieces are their quads' truncated"
         );
     }
 }

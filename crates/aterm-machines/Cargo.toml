@@ -46,6 +46,9 @@ aterm-toolchain = { workspace = true }
 aterm-converge = { workspace = true }
 # The native initial repository inventory uses agh's routed credential and HTTP doors.
 agh = { workspace = true }
+# The free space the window's disk watch keeps on a volume (`reading::Volume`), which a
+# repository clone leaves free.
+aterm-capacity = { workspace = true }
 # GitHub's REST pagination (`github_pages`), which init's repository inventory and the
 # controller's key listing share with the publishers' REST lane.
 aterm-update-core = { workspace = true }

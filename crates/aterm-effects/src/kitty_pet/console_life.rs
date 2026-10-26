@@ -34,6 +34,16 @@ pub(super) struct CheerStage {
 const HOME_REACH: f32 = 6.0;
 const RIDE_ROWS_MAX: usize = 3;
 const REST_REACH: f32 = 64.0;
+/// How far (columns) the head law slides a stand taken on top of the host's line past the letters
+/// over it ([`PetBrain::over_the_hosts_line`]): an escort's reach of the caret's column, the
+/// reach the typing replays hold the stand beside the caret to. A cat that already stands past
+/// the letters on that row keeps its place, however far the caret is.
+const LINE_SLIDE_REACH: f32 = 12.0;
+/// How far over its line a stand on top of the host's line keeps its soles: the body centred in
+/// the two rows over the line, as [`PetWorld::nearest_clear_perch`] fits every perch, which clears
+/// the line by more than [`CLEARANCE`].
+const LINE_PERCH_GAP: f32 = (2.0 - ART_ROWS) * 0.5;
+const _: () = assert!(LINE_PERCH_GAP > CLEARANCE);
 
 const SEAT_KEPT: f32 = 0.5;
 
@@ -115,7 +125,13 @@ impl VisibilityHold {
                 Some(clear)
             }
             None => {
-                let since = *self.blind_since.get_or_insert(now);
+                let since = match self.blind_since {
+                    Some(s) => s,
+                    None => {
+                        self.blind_since = Some(now);
+                        now
+                    }
+                };
                 if now.saturating_duration_since(since) >= VETO_BLIND_DUR {
                     Some(false)
                 } else {
@@ -126,7 +142,13 @@ impl VisibilityHold {
         match observed {
             Some(observed) if observed == self.shown => self.contrary_since = None,
             Some(_) => {
-                let since = *self.contrary_since.get_or_insert(now);
+                let since = match self.contrary_since {
+                    Some(s) => s,
+                    None => {
+                        self.contrary_since = Some(now);
+                        now
+                    }
+                };
                 if now.saturating_duration_since(since) >= VETO_DWELL_DUR {
                     self.shown = !self.shown;
                     self.contrary_since = None;
@@ -214,7 +236,13 @@ impl ZHold {
             self.under = true;
             self.clear_since = None;
         } else if self.under {
-            let since = *self.clear_since.get_or_insert(now);
+            let since = match self.clear_since {
+                Some(s) => s,
+                None => {
+                    self.clear_since = Some(now);
+                    now
+                }
+            };
             if now.saturating_duration_since(since) >= Z_DWELL_DUR {
                 *self = Self::EMPTY;
             }
@@ -242,18 +270,22 @@ enum MoteGate {
     Clearance,
 }
 
-/// Whether the console draws mote `m`: a box a tile's radius around its centre clears the ink by
-/// [`CLEARANCE`].
+/// Whether the console draws mote `m`: a box a tile's radius around the pixel its centre draws at
+/// ([`crate::kitty_pet::mote_box_px`]) clears the ink by [`CLEARANCE`]. Judged at that pixel, the
+/// verdict turns only where the mote's drawn box does, at one of its own edges
+/// ([`PetBrain::hidden_mote_offer`]).
 #[inline]
 const fn mote_clears(world: &PetWorld, m: &PetMoteSprite, (cell_w, cell_h): (u16, u16)) -> bool {
     let min_ch = (if cell_h > 6 { cell_h } else { 6 }) as f32;
-    let inv_cw = 1.0 / (if cell_w > 1 { cell_w } else { 1 }) as f32;
-    let inv_ch = 1.0 / (if cell_h > 1 { cell_h } else { 1 }) as f32;
+    let cw = (if cell_w > 1 { cell_w } else { 1 }) as f32;
+    let ch = (if cell_h > 1 { cell_h } else { 1 }) as f32;
+    let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
+    let (col, row) = ((m.col * cw).round() * inv_cw, (m.row * ch).round() * inv_ch);
     let radius = min_ch * m.scale + 1.0;
     let rw = radius * inv_cw;
     let rh = radius * inv_ch;
     world.clear(
-        PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
+        PetRect::new(row - rh, col - rw, 2.0 * rh, 2.0 * rw),
         CLEARANCE,
     )
 }
@@ -942,6 +974,65 @@ impl PetBrain {
         None
     }
 
+    /// THE HOST'S LINE CARRIES THE CAT UP. A body stood on top of the host's line
+    /// ([`Self::over_the_hosts_line`]) that the line came up onto (a composer at the foot of the
+    /// pane grown a row as its draft wraps, the rows over it scrolled up with it) rides up with
+    /// it: `Some(-k)` where the rows from over the body down to the one under its feet all moved
+    /// up `k` rows together and that one is still the host's line. A line that moved alone, or
+    /// rows that came up without one under the feet, carry nothing: the cat steps aside as before.
+    const fn line_ride(&self, world: &PetWorld, rect: PetRect) -> Option<f32> {
+        let (cur, prev) = (
+            self.console.row_sig.as_slice(),
+            self.console.row_sig_prev.as_slice(),
+        );
+        if prev.is_empty() || prev.len() != cur.len() || !rect.valid() {
+            return None;
+        }
+        let top_i = rect.row.floor() as i64 - 1;
+        let top = (if top_i > 0 { top_i } else { 0 }) as usize;
+        let ground_i = (rect.row + rect.rows).ceil() as i64;
+        let ground = (if ground_i > 1 { ground_i } else { 1 }) as usize;
+        if ground >= prev.len() {
+            return None;
+        }
+        let len = ground - top + 1;
+        let mut same = true;
+        let mut has_nonzero = false;
+        let mut i = 0;
+        while i < len {
+            let p = prev[top + i];
+            if p != cur[top + i] {
+                same = false;
+            }
+            if p != 0 {
+                has_nonzero = true;
+            }
+            i += 1;
+        }
+        if same || !has_nonzero {
+            return None;
+        }
+        let mut k = 1;
+        while k <= RIDE_ROWS_MAX {
+            if top >= k && matches!(world.host_line(ground - k), Some(true)) {
+                let mut matches = true;
+                let mut j = 0;
+                while j < len {
+                    if prev[top + j] != cur[top - k + j] {
+                        matches = false;
+                        break;
+                    }
+                    j += 1;
+                }
+                if matches {
+                    return Some(-(k as f32));
+                }
+            }
+            k += 1;
+        }
+        None
+    }
+
     /// Whether the console's last observation holds a command still running
     /// (shell integration's executing block).
     pub(super) const fn console_executing(&self) -> bool {
@@ -1399,7 +1490,10 @@ impl PetBrain {
         let settled_since = if self.console.moving {
             sense.now
         } else {
-            perched_since.unwrap_or(sense.now)
+            match perched_since {
+                Some(t) => t,
+                None => sense.now,
+            }
         };
         self.console.pose = None;
         self.console.still = false;
@@ -2477,7 +2571,10 @@ impl PetBrain {
                 (true, Some((px, py))) => Some((py, px)),
                 _ => None,
             };
-            if let Some((r, c)) = pointer_gaze.or(self.console.gaze) {
+            if let Some((r, c)) = match pointer_gaze {
+                Some(g) => Some(g),
+                None => self.console.gaze,
+            } {
                 self.facing_left = c < self.col + width * 0.5;
                 if matches!(
                     self.console.attention,
@@ -2594,7 +2691,7 @@ impl PetBrain {
     fn console_ground_passing(&self) -> bool {
         matches!(self.action, PetAction::Walk | PetAction::Run)
             || (self.escorted_within(SIT_AFTER + SIT_FOLD)
-                && matches!(self.last_caret, Some((cr, _)) if (self.row - f32::from(cr)).abs() < 1.5))
+                && matches!(self.last_caret, Some((cr, _)) if (self.row - cr as f32).abs() < 1.5))
     }
 
     #[inline]
@@ -2654,6 +2751,129 @@ impl PetBrain {
         }
         let world = self.console.world.as_ref()?;
         world.stamp()?;
+        if self.console_escorting()
+            && let Some(over) = self.over_the_hosts_line(world, desired, sense_dims, width)
+        {
+            return Some(
+                match self.console_station_on(world, over, sense_dims, width) {
+                    Some(s) => s,
+                    None => over,
+                },
+            );
+        }
+        self.console_station_on(world, desired, sense_dims, width)
+    }
+
+    /// THE HEAD LAW AT THE HOST'S LINE. A stand whose 1.7-row body reaches into a row the host
+    /// paints its chrome on ([`PetWorld::host_line`]: a harness's lockup and switch on a
+    /// composer's upper rule, which the host reserves whole, strokes and all) is drawn under that
+    /// line, its head behind the strokes and the host's words, so the person sees the line and
+    /// not the cat (2026-10-24, the owner: "the cursor kitty pet is drawn BELOW the top line and I
+    /// can't see it"). The line's reserved cells keep every seat's head out of it, so no stand
+    /// is taken under them; while the person types ([`Self::console_escorting`]) an escort's
+    /// stand whose head they would cover goes on top of the line instead, at the same column,
+    /// its feet on the row over it: the cat walks the top of the composer over the caret, whole,
+    /// and comes down to the caret's line where the line has room for its head (the draft's
+    /// second line). Its head keeps off the letters over that row as it does beside the caret
+    /// ([`Self::past_letters_above`]), so the letter veil never dims it there. Only where that
+    /// stand is clear behind text past the caret, none of the host's chrome over its head; with
+    /// none (a composer under the card, a rule on the pane's first rows) the ladder below seats
+    /// the cat clear of the line. At rest the ladder seats it too, on clean ground first. The
+    /// line coming up onto the stand carries the cat up with it ([`Self::line_ride`]).
+    ///
+    /// The stand is a perch over the line ([`LINE_PERCH_GAP`]): its soles clear the line by the
+    /// clearance every hold asks of a body (a repair's watch, a resident's seat). With its soles on
+    /// the line the stand passed and the hold did not, so the cat watching a deletion from there
+    /// stepped and sat by turns, a one-frame stride every few frames.
+    ///
+    /// Two limits keep that stand an escort's. Its slide past the letters stays within
+    /// [`LINE_SLIDE_REACH`] of the caret's column: past a longer transcript line the cat keeps the
+    /// caret's column, veiled over the letters as on the caret's own line when its slide finds no
+    /// room. Slid 29 columns off the caret past the transcript line over Claude Code's composer at
+    /// the first move of its turn end, the stand came to lie a hop from the cat, and the hop
+    /// launched at once, short of where the caret settled: two flights where the coil held through
+    /// the burst makes one. The reach does not call back a cat that already stands, on the ground
+    /// on that row, where the slide goes: resting past the letters, the first key would have flown
+    /// it back over them to the caret's column, to run out again as the caret came on. And the
+    /// stand is never taken in a rule ([`PetWorld::rule_line`]): over a reserved line that is the
+    /// composer's first (the rule above it the program's), the rule's strokes would cross the
+    /// cat, so the ladder seats it as it did.
+    const fn over_the_hosts_line(
+        &self,
+        world: &PetWorld,
+        desired: (f32, f32),
+        (rows, cols): (u16, u16),
+        width: f32,
+    ) -> Option<(f32, f32)> {
+        let body = Self::console_stand_rect(desired, rows, width);
+        let feet = PetWorld::feet_row_of(body).row;
+        let mut line = None;
+        let mut r = body.row.floor().max(0.0);
+        while r < feet {
+            if matches!(world.host_line(r as usize), Some(true)) {
+                line = Some(r);
+                break;
+            }
+            r += 1.0;
+        }
+        let Some(line) = line else {
+            return None;
+        };
+        // Only where the line's reserved cells are over the head: a host's line that leaves the
+        // head room (a chip at its far end) leaves the stand to the ladder.
+        let head = PetRect::new(body.row, body.col, feet - body.row, body.cols);
+        if !matches!(
+            world.under_text_clearance_past_caret(head, 0.0),
+            Some(false)
+        ) {
+            return None;
+        }
+        // Seated as every perch is, in the two rows over the line with the clearance all round
+        // ([`PetWorld::nearest_clear_perch`]): its soles a sliver over the line, so a body held
+        // there (a repair's watch, a resident's seat) is judged clear as the stand was.
+        let over = line - 1.0;
+        let row = over - LINE_PERCH_GAP;
+        let lifted = Self::console_stand_rect((desired.0, row), rows, width);
+        if lifted.row < CLEARANCE {
+            return None;
+        }
+        let mut r = lifted.row.floor().max(0.0);
+        while r < (lifted.row + lifted.rows).ceil() {
+            if !matches!(world.rule_line(r as usize), Some(false)) {
+                return None;
+            }
+            r += 1.0;
+        }
+        if !Self::console_may_stand(world, lifted, CLEARANCE, false) {
+            return None;
+        }
+        let stood = self.flight.is_none() && (self.row - row).abs() < 0.5;
+        let col = match self.past_letters_above(desired.0, over, cols, width) {
+            Some(col)
+                if (col - desired.0 <= LINE_SLIDE_REACH
+                    || (stood && (self.col - col).abs() <= ARRIVED))
+                    && Self::console_may_stand(
+                        world,
+                        Self::console_stand_rect((col, row), rows, width),
+                        CLEARANCE,
+                        false,
+                    ) =>
+            {
+                col
+            }
+            _ => desired.0,
+        };
+        Some((col, row))
+    }
+
+    /// [`Self::console_station`] for a stand the host's line leaves where it is.
+    fn console_station_on(
+        &self,
+        world: &PetWorld,
+        desired: (f32, f32),
+        sense_dims: (u16, u16),
+        width: f32,
+    ) -> Option<(f32, f32)> {
         let body = Self::console_stand_rect(desired, sense_dims.0, width);
         let from = self.rest_reach_from(world, sense_dims.0, width);
         let escorting = self.console_escorting();
@@ -2913,7 +3133,7 @@ impl PetBrain {
         }
         let body = Self::console_stand_rect(desired, rows, width);
         let escorting = self.console_escorting();
-        Self::stand_clearance(world, body, escorting) == Some(false)
+        matches!(Self::stand_clearance(world, body, escorting), Some(false))
             || matches!(
                 self.rest_reach_from(world, rows, width),
                 Some(from) if Self::console_walled(world, from, body, escorting)
@@ -2934,7 +3154,10 @@ impl PetBrain {
     }
 
     fn console_caret_home(&self, sense: PetSense, width: f32) -> Option<PetRect> {
-        let (r, c) = sense.caret.or(self.console.cursor_home)?;
+        let (r, c) = match sense.caret {
+            Some(rc) => rc,
+            None => self.console.cursor_home?,
+        };
         let want = if self.wall_side && f32::from(sense.cols) - width > 0.0 {
             (f32::from(c) - width - STATION_LEAD - self.standoff()).max(0.0)
         } else {
@@ -2948,9 +3171,10 @@ impl PetBrain {
             sense.rows,
             Some((r, c)),
         );
-        let stand = self
-            .console_station(stand, (sense.rows, sense.cols), width)
-            .unwrap_or(stand);
+        let stand = match self.console_station(stand, (sense.rows, sense.cols), width) {
+            Some(s) => s,
+            None => stand,
+        };
         Some(Self::console_stand_rect(stand, sense.rows, width))
     }
 
@@ -3072,6 +3296,20 @@ impl PetBrain {
             };
             if matches!(body_rect(&ridden, sense), Some(r) if world.under_text_clear(r, CLEARANCE))
             {
+                self.carry_console_body(frame, ridden, dy);
+                self.console.reason = "content-ride";
+                return;
+            }
+        } else if let Some(dy) = self.line_ride(world, rect) {
+            // Its feet on the line: judged as a stand, whose margin stops at its soles.
+            let ridden = PetFrame {
+                row: frame.row + dy,
+                ..*frame
+            };
+            if matches!(
+                body_rect(&ridden, sense),
+                Some(r) if Self::stand_clearance(world, r, false) == Some(true)
+            ) {
                 self.carry_console_body(frame, ridden, dy);
                 self.console.reason = "content-ride";
                 return;
@@ -3285,12 +3523,11 @@ impl PetBrain {
                 Some(v) => self.console.hold.update(sense.now, v),
                 None => self.console.hold.idle(sense.now),
             };
-            let verdict = verdict.flatten();
             if cover < 1.0 {
                 frame.alpha = cover_alpha(frame.alpha, cover);
                 frame.lane_alpha = cover_alpha(frame.lane_alpha, cover);
             }
-            if verdict == Some(false) {
+            if verdict == Some(Some(false)) {
                 if !self.console.reason.starts_with("protected-") {
                     self.console.reason = "protected-footprint";
                 }
@@ -3429,7 +3666,10 @@ impl PetBrain {
         if !self.console.presentable {
             return None;
         }
-        let floor = self.last_now.unwrap_or(now);
+        let floor = match self.last_now {
+            Some(t) => t,
+            None => now,
+        };
         let mut earliest: Option<Instant> = None;
         let mut offer = |cand: Option<Instant>| {
             if let Some(at) = cand
@@ -3499,15 +3739,22 @@ impl PetBrain {
     /// which the console then draws; a drawn mote the ink now covers; or a mote the brain drops
     /// (its life spent, or a z over ink), which frees its slot for the next.
     ///
-    /// A tick this skips draws the frame before it and keeps the brain's motes only because the
-    /// rest of the brain changes what it draws only at edges [`Self::next_change_secs`] offers,
-    /// which bound the walk (`horizon`): a glide ends under a whole pixel, a beat counts as its
-    /// offer does, and a still pose's hold offers its end. A skipped tick still changes how the
-    /// brain's `f32` clocks sum, so an edge can fall slightly apart from where a schedule that
-    /// woke for every step meets it; `a_dozing_pet_shows_the_frames_the_every_step_schedule_shows`
-    /// holds the two schedules' frames together.
-    pub(super) fn hidden_mote_offer(&self, horizon: Option<f32>) -> Option<f32> {
-        let limit = horizon.unwrap_or(f32::INFINITY);
+    /// A tick this skips would have drawn the frame before it, and kept the brain's motes, for two
+    /// reasons. The console judges a mote's clearance at the pixel it draws at ([`mote_clears`]),
+    /// in a look its slices hold, so the verdict turns only at the mote's own edges, which the
+    /// walk visits. And the rest of the brain changes what it draws only at the edges
+    /// [`Self::next_change_secs`] offers, which bound the walk (`horizon`), or on the frames it
+    /// asks for ([`Self::needs_frames`]), when the host takes no offer: a beat counts as its
+    /// offer does, a still pose's hold offers its end, a glide lands on its last step, and a
+    /// rhythm run asks for frames. A skipped tick still changes how the brain's `f32` clocks sum,
+    /// so an edge can fall a little apart from where a host that ticked at every step meets it;
+    /// `a_dozing_pet_draws_what_a_dense_host_draws` holds a host at these offers to one that also
+    /// ticks every 2⁻⁸ s.
+    pub(super) const fn hidden_mote_offer(&self, horizon: Option<f32>) -> Option<f32> {
+        let limit = match horizon {
+            Some(h) => h,
+            None => f32::INFINITY,
+        };
         let mut next = [None; PET_MOTES_MAX];
         let mut i = 0;
         while i < PET_MOTES_MAX {
@@ -3531,7 +3778,9 @@ impl PetBrain {
                 }
                 slot_idx += 1;
             }
-            let (slot, t) = soonest?;
+            let Some((slot, t)) = soonest else {
+                return None;
+            };
             if t >= limit {
                 return None;
             }
@@ -3548,12 +3797,15 @@ impl PetBrain {
 
     /// Whether a tick `t` seconds after the last would find the console's motes changed where no
     /// edge of their own says so: a hidden mote the brain drops, a hidden mote clear of the ink
-    /// again, or a drawn mote the ink now covers. The console judges a mote's clearance where it
-    /// is, not at the whole pixel it draws at, so that verdict can turn between the mote's own
-    /// edges, on whichever tick comes next.
-    fn console_motes_change_at(&self, t: f32) -> bool {
-        let clock = self.clock + f64::from(t);
-        let world = self.console.world.as_deref();
+    /// again, or a drawn mote the ink now covers. Judged at the pixel each mote draws at
+    /// ([`mote_clears`]), clearance turns only at a mote's own edges, so a walk of those edges
+    /// meets every turn.
+    const fn console_motes_change_at(&self, t: f32) -> bool {
+        let clock = self.clock + (t as f64);
+        let world = match &self.console.world {
+            Some(w) => Some(&**w),
+            None => None,
+        };
         let cells = (self.last_cell_w, self.last_cell_h);
         let mut i = 0;
         while i < PET_MOTES_MAX {
@@ -3563,7 +3815,7 @@ impl PetBrain {
                 let Some(sprite) = self.mote_sprite(&m, m.age(clock)) else {
                     return true;
                 };
-                if self.console.mote_gate == MoteGate::Clearance
+                if matches!(self.console.mote_gate, MoteGate::Clearance)
                     && matches!(world, Some(w) if mote_clears(w, &sprite, cells))
                         == self.console_hid_mote(i)
                 {
@@ -5150,6 +5402,19 @@ mod tests {
             )
         }
 
+        /// [`Self::new`] with the composer's upper rule held from the first frame, as aterm's
+        /// footer holds the top rule it repaints with its lockup and switch (the host's line).
+        /// Before the pet's window fix the caret's line here (row 13) was refused by rounding
+        /// alone, so the bare pane parked the cat under the footer as this one does.
+        fn hosted() -> Self {
+            let mut p = Self::new_warm(0);
+            p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+            for _ in 0..200 {
+                p.frame();
+            }
+            p
+        }
+
         fn with_transcript(transcript: &str, warm: usize) -> Self {
             Self::with_geom(transcript, warm, PaneGeom::WIDE)
         }
@@ -5256,7 +5521,7 @@ mod tests {
 
     #[test]
     fn a_landing_in_an_agents_pane_cheers_on_open_ground_with_its_notes_on_glass() {
-        let mut p = AgentPane::new();
+        let mut p = AgentPane::hosted();
         assert!(p.parks_within(10.0), "fixture: the cat parks");
         p.0.pet.note_room_landed();
         let mut frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
@@ -5677,9 +5942,8 @@ mod tests {
             "its three ♪/♥ on glass together"
         );
 
-        let mut p = AgentPane::new();
+        let mut p = AgentPane::hosted();
         assert!(p.parks_within(10.0), "fixture: the cat parks at home");
-        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
         p.0.pet.set_action(PetAction::Sleep);
         p.0.pet.note_room_landed();
         let frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
@@ -5695,7 +5959,7 @@ mod tests {
             "and frolics"
         );
 
-        let mut p = AgentPane::new();
+        let mut p = AgentPane::hosted();
         assert!(p.parks_within(10.0), "fixture: the cat parks at home");
         p.0.pet.set_action(PetAction::Sleep);
         p.frame();
@@ -6027,6 +6291,8 @@ mod tests {
     #[test]
     fn a_home_under_the_footer_cheers_on_the_ground_below_it() {
         let mut p = AgentPane::new_warm(0);
+        // The host's line held from the first frame ([`AgentPane::hosted`]).
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
         p.0.pet.col = 4.0;
         p.0.pet.row = 17.0;
         for _ in 0..200 {
@@ -6352,17 +6618,25 @@ mod tests {
         s.term.process(b"\x1b[s\x1b[6;32H|\x1b[u");
         for ch in "abcd".chars() {
             s.type_text(&ch.to_string());
-            for _ in 0..10 {
+            let mut was = s.pet.col;
+            for k in 0..10 {
                 let f = s.frame(0.02);
                 let cr = f32::from(s.term.cursor().row);
                 let cc = f32::from(s.term.cursor().col);
                 let on_caret_row = (f.row - cr).abs() < 0.5;
+                // A cat sitting a cell ahead sets off at the key ([`PetBrain::tick`]): the caret
+                // stands on its heel for the frames the run takes to clear it, never longer.
+                let setting_off = k < 3 && f.col > was;
                 assert!(
-                    !on_caret_row || f.col >= cc + 0.5 || f.col + art_cols(10, 20) <= cc + 0.1,
+                    !on_caret_row
+                        || setting_off
+                        || f.col >= cc + 0.5
+                        || f.col + art_cols(10, 20) <= cc + 0.1,
                     "cat at ({}, {}) must never park on caret ({cr}, {cc}) near box border",
                     f.col,
                     f.row
                 );
+                was = f.col;
             }
         }
     }
@@ -6841,10 +7115,12 @@ mod tests {
         s.pet
             .note_console_input(s.now - Duration::from_secs_f32(1.0), PetInputKind::Delete);
         let mut cols = Vec::new();
+        let mut last = None;
         for _ in 0..(3 * 60) {
             let f = s.frame();
             if f.alpha > 0 && f.action != PetAction::Leap {
                 cols.push(f.col);
+                last = Some(f);
             }
         }
         let (mut dir, mut anchor) = (0.0f32, cols[0]);
@@ -6864,9 +7140,17 @@ mod tests {
             turns.is_empty(),
             "the cat turned back on the composer's line: {turns:?} (from 9.00 to {end:.2})"
         );
+        // THE HEAD LAW AT THE HOST'S LINE (2026-10-24): the caret's stand under the mark is
+        // taken on top of the line instead, so the cat ends there, whole, clear of the mark;
+        // until then it ended on the line past the mark's end (col 18), its head under the rule.
+        let last = last.expect("the cat is drawn");
+        let covered = s.covered(&last);
         assert!(
-            end >= 18.0,
-            "fixture: it ends at its rest seat clear of the mark, at {end:.2}"
+            (last.row - (rule as f32 - 1.0 - LINE_PERCH_GAP)).abs() < 0.01 && covered.is_empty(),
+            "it ends on top of the composer's upper rule clear of the mark, at ({:.2}, {:.2}) \
+             covering {covered:?}",
+            last.col,
+            last.row
         );
     }
 
@@ -6938,13 +7222,20 @@ mod tests {
         }
     }
 
+    /// THE HEAD LAW AT THE HOST'S LINE (2026-10-24). With the harness off the host still
+    /// repaints the composer's upper rule with its switch's label, and holds that line whole:
+    /// the cat escorting the caret walks on top of it, key after key with no flight, and comes
+    /// down to the draft's second line at the wrap in one bound. Until then it walked the
+    /// composer's line under the rule's strokes and waited short of the label (b3ad799ce1),
+    /// drawn under the line where the person could not see it.
     #[test]
-    fn typed_up_to_a_label_on_the_rule_the_cat_waits_on_the_line() {
+    fn typed_up_to_a_label_on_the_rule_the_cat_walks_on_top_of_the_line() {
         let mut s = resting_above_the_composer();
         let draft = "the quick brown fox jumps over the lazy dog ".repeat(4);
         let chrome_off = |chrome: Vec<PetRect>| {
             let lower = chrome[2].row;
             vec![
+                PetRect::new(11.0, 0.0, 1.0, 120.0),
                 PetRect::new(11.0, 88.0, 1.0, 32.0),
                 PetRect::new(lower, 3.0, 1.0, 5.0),
                 PetRect::new(lower, 84.0, 1.0, 35.0),
@@ -6953,6 +7244,7 @@ mod tests {
         let mut hops = Hops::default();
         let mut on_line = None;
         let mut off_line = Vec::new();
+        let mut under = Vec::new();
         let mut wrap_leaps = None;
         for n in 1..=125usize {
             s.pet.note_console_input(s.now, PetInputKind::Text);
@@ -6965,8 +7257,14 @@ mod tests {
             for _ in 0..6 {
                 hops.frame(&mut s);
                 let (col, row) = hops.at.expect("a frame");
+                // On top of the rule: feet on row 10, or a seat held a hair above it
+                // ([`PetBrain::at_console_stand`]); never lower, where the body reaches into
+                // the rule's row.
+                if !hops.aloft && row > 10.01 && row < 12.5 {
+                    under.push((n, col, row));
+                }
                 if n < 119 && !hops.aloft {
-                    if (row - 12.0).abs() < 0.01 {
+                    if row > 9.5 && row <= 10.01 {
                         on_line = on_line.or(Some((n, hops.leaps)));
                     } else if on_line.is_some() {
                         off_line.push((n, col, row, s.pet.action));
@@ -6975,14 +7273,31 @@ mod tests {
             }
         }
         let (from_key, leaps_on) =
-            on_line.expect("fixture: the cat comes onto the composer's line");
+            on_line.expect("fixture: the cat comes on top of the composer's upper rule");
         let before_wrap = wrap_leaps.expect("the draft wraps") - leaps_on;
         let at_wrap = hops.leaps - wrap_leaps.unwrap_or(0);
+        for _ in 0..120 {
+            if !hops.aloft {
+                break;
+            }
+            hops.frame(&mut s);
+        }
+        let (col, row) = hops.at.expect("a frame");
         assert!(
             off_line.is_empty() && before_wrap == 0 && at_wrap == 1,
-            "on the line from key {from_key}: {before_wrap} flights before the wrap, {at_wrap} \
-             at it, frames off the line {:?}",
+            "on top of the line from key {from_key}: {before_wrap} flights before the wrap, \
+             {at_wrap} at it, frames off it {:?}",
             &off_line[..off_line.len().min(4)]
+        );
+        assert!(
+            under.is_empty(),
+            "{} ground frames on the composer's first line, under the rule (key, col, row): {:?}",
+            under.len(),
+            &under[..under.len().min(4)]
+        );
+        assert!(
+            (row - 13.0).abs() < 0.01 && col >= 2.0,
+            "the bound comes down to the draft's second line, at ({col:.2}, {row:.2})"
         );
     }
 
@@ -7811,6 +8126,243 @@ mod tests {
         assert_eq!((trip.from.1, trip.to.1), (8.0, 9.0));
     }
 
+    /// The composer of [`composer_with`] with its upper rule on `rule`: the rule, the draft's
+    /// lines under it, the lower rule, the mode line, the caret hidden at the draft's end.
+    fn composer_at(rule: usize, cols: usize, draft: &str) -> String {
+        let stroke = "\u{2500}".repeat(cols);
+        let chars: Vec<char> = draft.chars().collect();
+        let lines: Vec<String> = if chars.is_empty() {
+            vec![String::new()]
+        } else {
+            chars.chunks(cols - 2).map(|c| c.iter().collect()).collect()
+        };
+        let mut out = String::new();
+        for row in rule..rule + 9 {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+        }
+        out.push_str(&format!("\x1b[{};1H{stroke}", rule + 1));
+        for (i, line) in lines.iter().enumerate() {
+            let lead = if i == 0 { "\u{276F} " } else { "  " };
+            out.push_str(&format!("\x1b[{};1H{lead}{line}", rule + 2 + i));
+        }
+        let last = lines.len() - 1;
+        let caret_col = 2 + lines[last].chars().count();
+        let lower = rule + 1 + lines.len();
+        out.push_str(&format!(
+            "\x1b[{};1H{stroke}\x1b[{};1H  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)\x1b[{};{}H\x1b[?25l",
+            lower + 1,
+            lower + 2,
+            rule + 2 + last,
+            caret_col + 1
+        ));
+        out
+    }
+
+    /// The host's chrome over a composer whose upper rule is on `rule`, as `PetChrome` reserves
+    /// it with the harness on: the tool's lockup and the lit switch on the upper rule and the
+    /// rule's whole run they are repainted with, the chips on the lower rule `lower`, and the
+    /// card when `card`.
+    fn harness_chrome(cols: usize, rule: usize, lower: usize, card: bool) -> Vec<PetRect> {
+        let cols = cols as f32;
+        let mut chrome = vec![
+            PetRect::new(rule as f32, 2.0, 1.0, 11.0),
+            PetRect::new(rule as f32, cols - 21.0, 1.0, 19.0),
+            PetRect::new(rule as f32, 0.0, 1.0, cols),
+            PetRect::new(lower as f32, 3.0, 1.0, 5.0),
+            PetRect::new(lower as f32, cols - 36.0, 1.0, 35.0),
+        ];
+        if card {
+            chrome.push(PetRect::new(0.0, 0.0, 5.0, 87.0));
+        }
+        chrome
+    }
+
+    /// What typing `keys` letters into the composer on `rule` showed, six frames a key.
+    #[derive(Debug, Default)]
+    struct Typed {
+        /// Frames on glass with the body on the ground (no flight).
+        drawn: usize,
+        /// Frames the cat was off glass.
+        hidden: usize,
+        /// Ground frames whose body reached into the upper rule's row or covered the host's
+        /// chrome: (key, col, row, under_ink, body y0..y1 px).
+        under: Vec<(usize, f32, f32, bool, i32, i32)>,
+        /// Ground frames farther than [`TYPED_REACH`] columns from the caret: (key, caret col, col, row).
+        far: Vec<(usize, u16, f32, f32)>,
+    }
+
+    const TYPED_REACH: f32 = 12.0;
+
+    fn type_into(
+        s: &mut Console,
+        rule: usize,
+        keys: usize,
+        chrome: &dyn Fn(usize) -> Vec<PetRect>,
+    ) -> Typed {
+        let draft = "the quick brown fox jumps over the lazy dog ".repeat(3);
+        let cols = usize::from(s.cols);
+        let band = (rule as i32 * 20, rule as i32 * 20 + 20);
+        let mut t = Typed::default();
+        for n in 1..=keys {
+            s.pet.note_console_input(s.now, PetInputKind::Text);
+            let typed = &draft[..n];
+            let lines = typed.chars().count().div_ceil(cols - 2).max(1);
+            s.term.process(composer_at(rule, cols, typed).as_bytes());
+            s.chrome = chrome(rule + 1 + lines);
+            for _ in 0..6 {
+                let f = s.frame();
+                if f.alpha == 0 {
+                    t.hidden += 1;
+                    continue;
+                }
+                if f.action == PetAction::Leap {
+                    continue;
+                }
+                t.drawn += 1;
+                let (x0, x1, y0, y1) = f.body_px(10, 20, s.cols, s.rows).expect("on glass");
+                let covers = |r: &PetRect| {
+                    let (rx0, rx1) = ((r.col * 10.0) as i32, ((r.col + r.cols) * 10.0) as i32);
+                    let (ry0, ry1) = ((r.row * 20.0) as i32, ((r.row + r.rows) * 20.0) as i32);
+                    x0 < rx1 && x1 > rx0 && y0 < ry1 && y1 > ry0
+                };
+                if (y0 < band.1 && y1 > band.0) || s.chrome.iter().any(covers) {
+                    t.under.push((n, f.col, f.row, f.under_ink, y0, y1));
+                }
+                let caret = s.term.cursor().col;
+                if (f.col - f32::from(caret)).abs() > TYPED_REACH {
+                    t.far.push((n, caret, f.col, f.row));
+                }
+            }
+        }
+        t
+    }
+
+    /// THE HEAD LAW AT THE HOST'S LINE, TYPED THROUGH (2026-10-24, the owner: "the cursor kitty
+    /// pet is drawn BELOW the top line and I can't see it"). The resident pet escorting the caret
+    /// along a Claude Code composer whose upper rule the host holds whole (its lockup, its switch
+    /// and the rule's run it repaints them with, as `PetChrome` holds them) is never drawn with
+    /// its body in the rule's row or over the host's chrome, and never off glass: over a
+    /// transcript it walks on top of the rule; with the card right over the composer, where the
+    /// top of the rule has no room, it stays clear of the line where it is seen. Before the fix
+    /// the escort passed under the chrome over its line: 314 of its 334 ground frames over the
+    /// transcript, and 336 of 343 under the card, had its head in the rule's row.
+    #[test]
+    fn typing_into_a_hosted_composer_never_draws_the_cat_under_its_upper_rule() {
+        let pane = |rule: usize| {
+            let mut s = Console::agent(
+                16,
+                120,
+                &claude_screen(120, 5, &[]),
+                claude_chrome(120, 5, true),
+            );
+            s.ink = true;
+            s.rest(6.0);
+            if rule != 5 {
+                s.repaint(
+                    &format!(
+                        "{}{}",
+                        claude_screen(120, rule, &TURN),
+                        composer_at(rule, 120, "")
+                    ),
+                    harness_chrome(120, rule, rule + 2, true),
+                );
+                s.rest(8.0);
+            }
+            s
+        };
+        for (name, rule) in [("over a transcript", 11usize), ("under the card", 5)] {
+            let mut s = pane(rule);
+            let chrome = move |lower: usize| harness_chrome(120, rule, lower, true);
+            let t = type_into(&mut s, rule, 60, &chrome);
+            assert!(
+                t.drawn > 300 && t.hidden == 0,
+                "{name}: on glass for every key: {} frames drawn, {} hidden",
+                t.drawn,
+                t.hidden
+            );
+            assert!(
+                t.under.is_empty(),
+                "{name}: {} of {} ground frames under the composer's upper rule or the host's \
+                 chrome (key, col, row, under ink, body y0..y1 px): {:?}",
+                t.under.len(),
+                t.drawn,
+                &t.under[..t.under.len().min(6)]
+            );
+        }
+    }
+
+    /// THE STAND OVER THE HOST'S LINE ([`PetBrain::over_the_hosts_line`]) is one a hold keeps:
+    /// over a composer whose upper rule the host holds whole, the stand lifted off the caret's
+    /// line is a perch ([`LINE_PERCH_GAP`]), its body clear by the clearance all round
+    /// ([`PetBrain::console_may_stand`]), so a repair's watch or a resident's seat holds the
+    /// cat there; at the caret's column, over no letters. And no stand is taken in a rule
+    /// ([`PetWorld::rule_line`]): over a reserved line that is the composer's first, the upper
+    /// rule on the row over it, the stand is the ladder's. NEGATIVE CONTROLS (as run before
+    /// the fix): with the soles on the line (the stand on row 10, not 9.85) the hold judged
+    /// the stand blocked; with no rule check the stand went up into the rule's row.
+    #[test]
+    fn the_stand_over_the_hosts_line_is_a_perch_a_hold_keeps_and_never_in_a_rule() {
+        let width = art_cols(10, 20);
+        let mut s = Console::agent(
+            16,
+            120,
+            &format!(
+                "{}{}",
+                claude_screen(120, 11, &TURN),
+                composer_at(11, 120, "")
+            ),
+            harness_chrome(120, 11, 13, true),
+        );
+        for _ in 0..3 {
+            s.frame();
+        }
+        let world = s.pet.console.world.clone().expect("observed");
+        assert_eq!(
+            world.host_line(11),
+            Some(true),
+            "fixture: the upper rule is held"
+        );
+        let (col, row) = s
+            .pet
+            .over_the_hosts_line(&world, (40.0, 12.0), (16, 120), width)
+            .expect("over a transcript the stand goes on top of the line");
+        assert!(
+            (row - (10.0 - LINE_PERCH_GAP)).abs() < 1e-4 && (col - 40.0).abs() < 1e-4,
+            "a perch over the line at the caret's column, got ({col}, {row})"
+        );
+        let body = PetBrain::console_stand_rect((col, row), 16, width);
+        assert!(
+            PetBrain::console_may_stand(&world, body, CLEARANCE, false),
+            "a hold keeps the stand over the line ({col}, {row})"
+        );
+
+        // A draft two lines long whose first line the host holds whole, under the upper rule.
+        let draft = "the quick brown fox jumps over the lazy dog ".repeat(4);
+        s.repaint(
+            &format!(
+                "{}{}",
+                claude_screen(120, 11, &TURN),
+                composer_at(11, 120, &draft)
+            ),
+            vec![PetRect::new(12.0, 0.0, 1.0, 120.0)],
+        );
+        for _ in 0..3 {
+            s.frame();
+        }
+        let world = s.pet.console.world.clone().expect("observed");
+        assert_eq!(
+            (world.host_line(12), world.rule_line(11)),
+            (Some(true), Some(true)),
+            "fixture: the draft's first line is held, the upper rule over it"
+        );
+        assert_eq!(
+            s.pet
+                .over_the_hosts_line(&world, (60.0, 13.0), (16, 120), width),
+            None,
+            "no stand is taken in the composer's upper rule"
+        );
+    }
+
     /// How a host fills the scratch it hands the pet each frame.
     #[derive(Clone, Copy, Debug)]
     enum Host {
@@ -8259,6 +8811,8 @@ mod tests {
     const DOZE_GRID: (u16, u16) = (108, 35);
     /// How many entries of a [`drawn`] key the body takes.
     const DOZE_BODY_KEY: usize = 8;
+    /// How many entries of a [`drawn`] key each mote takes, its slot first.
+    const DOZE_MOTE_KEY: usize = 8;
 
     /// A shell's scrollback above a prompt near the top: each z rises into the ink, and the
     /// console hides it for its whole life.
@@ -8267,7 +8821,7 @@ mod tests {
 
     /// What the host draws of `f` (`WordDecorations::pet_cursor`) in `cell`-sized cells on a
     /// `grid`: the body's pose, look and pixel rect, then each mote it draws, in draw order, by
-    /// kind, pixel box, rotation bucket, alpha and tint. Empty while the lane is off.
+    /// slot, kind, pixel box, rotation bucket, alpha and tint. Empty while the lane is off.
     fn drawn(f: &PetFrame, (cell_w, cell_h): (u16, u16), (cols, rows): (u16, u16)) -> Vec<i64> {
         let mut key = Vec::new();
         if f.lane_alpha == 0 {
@@ -8283,7 +8837,10 @@ mod tests {
             key.extend([x0, x1, y0, y1].map(i64::from));
         }
         if f.alpha > 0 {
-            for m in f.motes.iter().flatten() {
+            for (slot, m) in f.motes.iter().enumerate() {
+                let Some(m) = m else {
+                    continue;
+                };
                 let alpha = (f32::from(m.alpha) * (f32::from(f.alpha) / 255.0)) as u8;
                 let Some((x, y, side)) =
                     mote_box_px((m.col, m.row), m.scale, (cell_w, cell_h), (cols, rows))
@@ -8296,6 +8853,7 @@ mod tests {
                 let turn = m.rot / core::f32::consts::TAU;
                 let bucket = ((turn - turn.floor()) * 12.0) as i64 % 12;
                 key.extend([
+                    slot as i64,
                     m.kind as i64,
                     i64::from(x),
                     i64::from(y),
@@ -8309,7 +8867,7 @@ mod tests {
         key
     }
 
-    /// A pet asleep beside a shell prompt in a console, ticked by hand.
+    /// A pet beside a shell prompt in a console, ticked by hand.
     struct Dozing {
         term: Terminal,
         pet: PetBrain,
@@ -8318,9 +8876,13 @@ mod tests {
         cell: (u16, u16),
         /// The console's columns and rows.
         grid: (u16, u16),
+        /// The console as the shell last left it, read once a write ([`Self::write`]).
+        seen: Option<(aterm_core::render::RenderInput, PetWorldFacts)>,
+        /// What the last tick drew ([`drawn`]).
+        last_key: Vec<i64>,
     }
 
-    /// One tick of [`Dozing::breathe`].
+    /// One tick of [`Dozing::run`].
     struct Doze {
         /// When it ran.
         at: Instant,
@@ -8339,12 +8901,46 @@ mod tests {
         covered: bool,
         /// How many motes the console hid.
         hidden: usize,
+        /// Whether a rhythm run's lead carried the pet ahead ([`PetBrain::carrying_run`]).
+        carrying: bool,
+        /// Whether the shell wrote one of [`Dozing::run`]'s edits on it.
+        edit: bool,
+        /// What the rest has done to the pet by the tick's end: its content, how far its gait
+        /// has slowed, and whether the gait has rested a full dwell ([`GAIT_DWELL`]).
+        rested: (f32, f32, bool),
+    }
+
+    /// When [`Dozing::run`] ticks the pet.
+    #[derive(Clone, Copy)]
+    enum Schedule {
+        /// At the brain's offers, and this often while it asks for frames.
+        Offered(Duration),
+        /// Every [`DENSE`], whatever the brain asks, and at its offers: the ticks every schedule
+        /// runs, with a tick at most [`DENSE`] after any moment between them.
+        Dense,
     }
 
     impl Dozing {
         /// [`Self::in_console`] in [`DOZE_CELL`] cells on a [`DOZE_GRID`].
         fn new(screen: &[u8], start: Instant, old_schedule: bool) -> Self {
             Self::in_console(screen, start, old_schedule, DOZE_CELL, DOZE_GRID)
+        }
+
+        /// The pet beside the caret `screen` leaves in a console of `cell`-sized cells on a `grid`,
+        /// before its first tick, at `start`.
+        fn unticked(screen: &[u8], start: Instant, cell: (u16, u16), grid: (u16, u16)) -> Self {
+            let (cols, rows) = grid;
+            let mut term = Terminal::new(rows, cols);
+            term.process(screen);
+            Self {
+                term,
+                pet: PetBrain::default(),
+                now: start,
+                cell,
+                grid,
+                seen: None,
+                last_key: Vec::new(),
+            }
         }
 
         /// The pet beside the caret `screen` leaves in a console of `cell`-sized cells on a `grid`,
@@ -8357,18 +8953,8 @@ mod tests {
             cell: (u16, u16),
             grid: (u16, u16),
         ) -> Self {
-            let (cols, rows) = grid;
-            let mut term = Terminal::new(rows, cols);
-            term.process(screen);
-            let mut pet = PetBrain::default();
-            pet.console.offer_hidden_motes = old_schedule;
-            let mut doze = Self {
-                term,
-                pet,
-                now: start,
-                cell,
-                grid,
-            };
+            let mut doze = Self::unticked(screen, start, cell, grid);
+            doze.pet.console.offer_hidden_motes = old_schedule;
             doze.tick();
             while !(doze.pet.action == PetAction::Sleep && doze.pet.quiet >= SLEEP_AFTER) {
                 doze.now += Duration::from_millis(16);
@@ -8382,15 +8968,41 @@ mod tests {
             doze
         }
 
+        /// [`Self::unticked`], awake: ticked at 60 Hz from `start` for `warm`.
+        fn awake(
+            screen: &[u8],
+            start: Instant,
+            cell: (u16, u16),
+            grid: (u16, u16),
+            warm: Duration,
+        ) -> Self {
+            let mut doze = Self::unticked(screen, start, cell, grid);
+            doze.tick();
+            while doze.now - start < warm {
+                doze.now += Duration::from_millis(16);
+                doze.tick();
+            }
+            doze
+        }
+
+        /// The shell writes `bytes`.
+        fn write(&mut self, bytes: &[u8]) {
+            self.term.process(bytes);
+            self.seen = None;
+        }
+
         fn tick(&mut self) -> PetFrame {
             let ((cell_w, cell_h), (cols, rows)) = (self.cell, self.grid);
-            let input = self.term.cell_frame(usize::from(rows), usize::from(cols));
-            let facts = PetWorldFacts::read(&self.term, 7);
-            self.pet
-                .observe_console(&input, &facts, PetPane::full(&input));
+            let (input, facts) = self.seen.get_or_insert_with(|| {
+                (
+                    self.term.cell_frame(usize::from(rows), usize::from(cols)),
+                    PetWorldFacts::read(&self.term, 7),
+                )
+            });
+            self.pet.observe_console(input, facts, PetPane::full(input));
             self.pet.set_console_presentable(true);
             let c = self.term.cursor();
-            self.pet.tick(PetSense {
+            let frame = self.pet.tick(PetSense {
                 caret_drawn: true,
                 now: self.now,
                 caret: Some((c.row, c.col)),
@@ -8402,42 +9014,55 @@ mod tests {
                 reduced_motion: false,
                 output_burst: false,
                 pointer: None,
-            })
+            });
+            self.last_key = drawn(&frame, self.cell, self.grid);
+            frame
         }
 
         /// Ticks the pet at its own offers, or at 60 Hz while it asks for frames, until its breath
         /// window has closed and deep sleep offers nothing.
         fn breathe(&mut self) -> Vec<Doze> {
-            self.breathe_through(&[])
+            self.run(&[], Schedule::Offered(Duration::from_millis(16)), None)
         }
 
-        /// [`Self::breathe`], while the shell writes each of `edits` (bytes, with how long after
-        /// the doze began).
-        ///
-        /// The first tick after a gap integrates at most 0.1 s of it (`PetBrain::tick`'s `dt`), so a
-        /// schedule that slept longer before an edit reacts to it a little further along. Each
-        /// edit is ticked under the old text a microsecond before, as a host ticking at every
-        /// step would have, so every schedule meets it from the same place.
-        fn breathe_through(&mut self, edits: &[(Duration, Vec<u8>)]) -> Vec<Doze> {
+        /// Ticks the pet on `schedule` from [`Self::now`], while the shell writes each of `edits`
+        /// (bytes, with how long after the start), each on a tick of its own; for `horizon`, or
+        /// without one, until deep sleep offers nothing.
+        fn run(
+            &mut self,
+            edits: &[(Duration, Vec<u8>)],
+            schedule: Schedule,
+            horizon: Option<Duration>,
+        ) -> Vec<Doze> {
+            assert!(
+                horizon.is_some() || matches!(schedule, Schedule::Offered(_)),
+                "a dense host runs to a horizon"
+            );
             let t0 = self.now;
             let mut edits = edits.iter().peekable();
             let mut out = Vec::new();
             loop {
-                let offered = !self.pet.needs_frames();
-                let next = if offered {
-                    self.pet.next_change_deadline(self.now)
-                } else {
-                    Some(self.now + Duration::from_millis(16))
+                let offered = matches!(schedule, Schedule::Offered(_)) && !self.pet.needs_frames();
+                let next = match schedule {
+                    Schedule::Dense if self.pet.needs_frames() => Some(self.now + DENSE),
+                    Schedule::Dense => Some(
+                        self.pet
+                            .next_change_deadline(self.now)
+                            .map_or(self.now + DENSE, |at| at.min(self.now + DENSE)),
+                    ),
+                    Schedule::Offered(_) if offered => self.pet.next_change_deadline(self.now),
+                    Schedule::Offered(train) => Some(self.now + train),
                 };
-                if let Some((after, bytes)) =
-                    edits.next_if(|(after, _)| next.is_none_or(|n| n >= t0 + *after))
-                {
-                    let at = (t0 + *after).max(self.now);
-                    self.now = (at - Duration::from_micros(1)).max(self.now);
+                let past = |at: Instant| horizon.is_some_and(|h| at >= t0 + h);
+                if let Some((after, bytes)) = edits.next_if(|(after, _)| {
+                    !past(t0 + *after) && next.is_none_or(|n| n >= t0 + *after)
+                }) {
+                    self.now = (t0 + *after).max(self.now);
+                    self.write(bytes);
                     self.step(false, &mut out);
-                    self.term.process(bytes);
-                    self.now = at;
-                    self.step(false, &mut out);
+                    if let Some(d) = out.last_mut() {
+                        d.edit = true;
+                    }
                     continue;
                 }
                 let Some(at) = next else {
@@ -8447,6 +9072,9 @@ mod tests {
                     );
                     return out;
                 };
+                if past(at) {
+                    return out;
+                }
                 self.now = at;
                 self.step(offered, &mut out);
                 assert!(
@@ -8461,14 +9089,14 @@ mod tests {
             let ids = |pet: &PetBrain| pet.motes.map(|m| m.map(|m| (m.seed, m.born.to_bits())));
             let (motes, before) = (self.pet.motes, ids(&self.pet));
             let hid = self.pet.console.hidden_motes;
-            let frame = self.tick();
+            self.tick();
             let after = ids(&self.pet);
             let hides = self.pet.console.hidden_motes;
             let kept = |i: usize| before[i].is_some() && before[i] == after[i];
             let earlier = self.pet.clock - ARM_MIN.as_secs_f64();
             out.push(Doze {
                 at: self.now,
-                key: drawn(&frame, self.cell, self.grid),
+                key: self.last_key.clone(),
                 offered,
                 motes_moved: before != after,
                 dropped_late: offered
@@ -8480,8 +9108,41 @@ mod tests {
                 revealed: (0..PET_MOTES_MAX).any(|i| kept(i) && hid[i] && !hides[i]),
                 covered: (0..PET_MOTES_MAX).any(|i| kept(i) && !hid[i] && hides[i]),
                 hidden: hides.iter().filter(|h| **h).count(),
+                carrying: self.pet.carrying_run(),
+                edit: false,
+                rested: (
+                    self.pet.content,
+                    self.pet.gait_pace,
+                    self.pet.gait_rest >= GAIT_DWELL,
+                ),
             });
         }
+
+        /// Where the pet rests: on the pixel its home draws at, or on the front seat it keeps on
+        /// purpose beside the caret (`seat_kept`, [`PECK_CLEAR`] past its station); else how far
+        /// from home's pixel, in pixels.
+        fn rest(&self) -> Result<Rest, f32> {
+            let p = &self.pet;
+            let cw = f32::from(self.cell.0);
+            if (p.col * cw).round() == (p.home * cw).round() {
+                return Ok(Rest::Home);
+            }
+            let width = art_cols(self.cell.0, self.cell.1);
+            let caret = f32::from(self.term.cursor().col);
+            let seat =
+                (caret + STATION_LEAD + PECK_CLEAR).min((f32::from(self.grid.0) - width).max(0.0));
+            if p.sit_front && p.facing_left && p.col == seat {
+                return Ok(Rest::FrontSeat);
+            }
+            Err((p.col - p.home) * cw)
+        }
+    }
+
+    /// Where [`Dozing::rest`] found the pet.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Rest {
+        Home,
+        FrontSeat,
     }
 
     /// The offered ticks of `run` that drew the frame before them and kept every mote.
@@ -8489,49 +9150,6 @@ mod tests {
         run.windows(2)
             .filter(|w| w[1].offered && w[1].key == w[0].key && !w[1].motes_moved)
             .count()
-    }
-
-    /// What `run` shows at `t`: the frame of the last tick at or before it.
-    fn shown_at(run: &[Doze], t: Instant) -> Option<&[i64]> {
-        let ran = run.partition_point(|d| d.at <= t);
-        ran.checked_sub(1).map(|i| run[i].key.as_slice())
-    }
-
-    /// The longest stretch `a` and `b` show different frames, and when it began. Each tick's
-    /// frame stays up until the run's next tick, its last one for good.
-    fn longest_disagreement(a: &[Doze], b: &[Doze]) -> (Duration, Option<Instant>) {
-        let mut ticks: Vec<Instant> = a.iter().chain(b).map(|d| d.at).collect();
-        ticks.sort_unstable();
-        ticks.dedup();
-        let (mut since, mut longest) = (None, (Duration::ZERO, None));
-        for t in ticks {
-            match (shown_at(a, t) != shown_at(b, t), since) {
-                (true, None) => since = Some(t),
-                (false, Some(from)) => {
-                    if t - from > longest.0 {
-                        longest = (t - from, Some(from));
-                    }
-                    since = None;
-                }
-                _ => {}
-            }
-        }
-        match since {
-            Some(from) => (Duration::MAX, Some(from)),
-            None => longest,
-        }
-    }
-
-    /// The longest two schedules of the sameness sweep may show different frames: the host's
-    /// shortest arm and an offer's overshoot ([`ARM_MIN`], [`OFFER_PAST`]), what a tick held back
-    /// by the arm's floor costs. The sweep arms its ticks exactly
-    /// ([`ConsoleLife::exact_arms`]); under the floor the two schedules part further, since a z
-    /// born on a tick the floor held back carries that into each step it takes, and a frame train
-    /// rounds it up to a whole frame, which is how the host arms and no edge the offer missed.
-    /// Armed exactly, they part only by how each one's offers round, well inside this; a missed
-    /// edge parts them until the next tick.
-    fn disagreement_slack() -> Duration {
-        ARM_MIN + Duration::from_secs_f32(OFFER_PAST)
     }
 
     #[test]
@@ -8580,7 +9198,7 @@ mod tests {
         }
     }
 
-    /// The cells the sameness sweep draws in, in pixels.
+    /// The cells the dense sweep draws in, in pixels.
     const DOZE_CELLS: [(u16, u16); 9] = [
         (15, 28),
         (8, 16),
@@ -8593,9 +9211,12 @@ mod tests {
         (11, 23),
     ];
 
-    /// A sameness sweep case: up to six words of up to six letters around a prompt, which a z
-    /// rises past, into or clear of; and, if `edit`, up to four edits mid-doze that write over,
-    /// blank out or scroll the page near it.
+    /// The dense sweep's console, in columns and rows.
+    const SWEEP_GRID: (u16, u16) = (100, 30);
+
+    /// A dense sweep case: up to six words of up to six letters around a prompt, which a z rises
+    /// past, into or clear of; and, if `edit`, up to four edits mid-doze that write over, blank
+    /// out or scroll the page near it.
     fn doze_case(rng: &mut Lcg, edit: bool) -> (String, Vec<(Duration, Vec<u8>)>) {
         let prow = rng.range(6, 20);
         let pcol = rng.range(5, 80);
@@ -8630,69 +9251,264 @@ mod tests {
         (screen, edits)
     }
 
-    /// Over a seeded sweep of prompts, words around them, cell sizes and edits mid-doze, a pet
-    /// ticked at its offers shows, at every moment of its doze, the frame shown by one that also
-    /// wakes for each step of the motes the console hides ([`ConsoleLife::offer_hidden_motes`]),
-    /// to within [`disagreement_slack`]: no tick the offer skips would have changed what the host
-    /// draws, of a mote or of the body.
-    #[test]
-    fn a_dozing_pet_shows_the_frames_the_every_step_schedule_shows() {
-        let start = Instant::now();
-        let mut rng = Lcg(0x5eed);
-        let (mut revealed, mut covered, mut skipped, mut rehomed) = (0, 0, 0, 0);
-        for case in 0..600 {
-            let cell = DOZE_CELLS[case % DOZE_CELLS.len()];
-            let (screen, edits) = doze_case(&mut rng, case % 2 == 1);
-            let layout = format!("case {case}, {cell:?} cells: {screen:?}, edits {edits:?}");
-            let mut runs = [true, false].map(|old_schedule| {
-                let mut doze =
-                    Dozing::in_console(screen.as_bytes(), start, old_schedule, cell, (100, 30));
-                doze.pet.console.exact_arms = true;
-                doze
-            });
-            let home = runs[0].pet.home;
-            let [old, new] = runs.each_mut().map(|doze| doze.breathe_through(&edits));
-            rehomed += usize::from(runs[0].pet.home != home);
-            revealed += old.iter().filter(|d| d.revealed).count();
-            covered += old.iter().filter(|d| d.covered).count();
-            for (schedule, run) in [("every-step", &old), ("offered", &new)] {
-                assert!(
-                    !run.iter().any(|d| d.dropped_late),
-                    "{layout}: the {schedule} schedule drops each mote as it ends"
-                );
+    /// A typing sweep case: [`doze_case`]'s page, and 1 to 14 keys echoed 40 to 260 ms apart from
+    /// 0.1 to 0.4 s in, a third of the time followed by a new prompt line up to 0.9 s after the last.
+    fn typing_case(rng: &mut Lcg) -> (String, Vec<(Duration, Vec<u8>)>) {
+        let (screen, _) = doze_case(rng, false);
+        let mut edits = Vec::new();
+        let mut t = rng.range(100, 400);
+        for _ in 0..rng.range(1, 14) {
+            edits.push((Duration::from_millis(t), b"a".to_vec()));
+            t += rng.range(40, 260);
+        }
+        if rng.range(0, 2) == 0 {
+            edits.push((
+                Duration::from_millis(t + rng.range(100, 900)),
+                b"\r\n$ ".to_vec(),
+            ));
+        }
+        (screen, edits)
+    }
+
+    /// 2⁻⁸ s, exact in `f32` and in [`Duration`]: a host ticking this often sums the brain's
+    /// `f32` clocks exactly.
+    const DENSE: Duration = Duration::from_nanos(3_906_250);
+
+    /// How far apart the dense sweep lets its two hosts draw the same change: two [`DENSE`]
+    /// ticks. Both tick at every offer, arming exactly ([`ConsoleLife::exact_arms`]), and on a
+    /// [`DENSE`] train while the brain asks for frames; the dense host also ticks between, at
+    /// most a [`DENSE`] after any moment. A change one host meets on such a tick and the other
+    /// at the offer after it, or a train one starts on such a tick, parts them by under a
+    /// [`DENSE`]; a change timed from one of those moments, by under two. A change neither the
+    /// train nor an offer names parts them until the offered host next ticks: tens of
+    /// milliseconds, or for good.
+    const DENSE_SLACK: Duration = Duration::from_nanos(2 * 3_906_250);
+
+    /// How far apart the dense sweep lets its two hosts' rest clocks run ([`Doze::rested`]) at an
+    /// edit, which both tick at its moment. They spend the same rest in different pieces, which
+    /// `f32` rounds apart by a few millionths over a run. A span of rest one of them skipped parts
+    /// them by what it rests: the gait pace it slows, and the content it tires, by more than this
+    /// for any span over 15 ms ([`CONTENT_DECAY`]).
+    const REST_SLACK: f32 = 1e-3;
+
+    /// What [`drawn`] key `key` holds of `view`: the body's entries, or mote slot `slot`'s.
+    fn view_of(key: &[i64], view: Option<usize>) -> &[i64] {
+        match view {
+            None => &key[..key.len().min(DOZE_BODY_KEY)],
+            Some(slot) => key
+                .get(DOZE_BODY_KEY..)
+                .unwrap_or_default()
+                .chunks(DOZE_MOTE_KEY)
+                .find(|m| m[0] == slot as i64)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Where `run`'s drawing of `view` changes, from `first`, the frame up before its first tick:
+    /// each change's time, and what it drew from then.
+    fn changes<'a>(
+        first: (Instant, &'a [i64]),
+        run: &'a [Doze],
+        view: Option<usize>,
+    ) -> Vec<(Instant, &'a [i64])> {
+        let mut out = vec![(first.0, view_of(first.1, view))];
+        for d in run {
+            let k = view_of(&d.key, view);
+            if out.last().is_none_or(|(_, last)| *last != k) {
+                out.push((d.at, k));
             }
-            skipped += old.len().saturating_sub(new.len());
+        }
+        out
+    }
+
+    /// What a run's [`changes`] draw at `t`.
+    fn drawn_at<'a>(c: &[(Instant, &'a [i64])], t: Instant) -> Option<&'a [i64]> {
+        let i = c.partition_point(|x| x.0 <= t);
+        i.checked_sub(1).map(|i| c[i].1)
+    }
+
+    /// The first of `a`'s [`changes`] whose frame `b` draws at no moment within `slack` of it.
+    /// Only a change to a frame `a` holds for `slack` or longer counts: a shorter one can fall
+    /// between two of `b`'s ticks.
+    fn unmatched<'a>(
+        a: &[(Instant, &'a [i64])],
+        b: &[(Instant, &[i64])],
+        slack: Duration,
+    ) -> Option<(Instant, &'a [i64])> {
+        let held = |i: usize| a.get(i + 1).is_none_or(|next| next.0 - a[i].0 >= slack);
+        let drawn_near = |(at, key): (Instant, &[i64])| {
+            let from = b.partition_point(|c| c.0 + slack <= at).saturating_sub(1);
+            b[from..]
+                .iter()
+                .enumerate()
+                .take_while(|(_, c)| c.0 <= at + slack)
+                .any(|(j, c)| {
+                    c.1 == key && b.get(from + j + 1).is_none_or(|end| end.0 + slack >= at)
+                })
+        };
+        (1..a.len())
+            .find(|&i| held(i) && !drawn_near(a[i]))
+            .map(|i| a[i])
+    }
+
+    /// What a dense sweep saw across its cases.
+    #[derive(Default)]
+    struct Sweep {
+        /// Ticks the console drew a mote it hid the tick before.
+        revealed: usize,
+        /// Ticks the console hid a mote it drew the tick before.
+        covered: usize,
+        /// Cases whose edits moved the pet's home.
+        rehomed: usize,
+        /// Cases in which a rhythm run's lead carried the pet ahead.
+        carried: usize,
+        /// Runs that ended on the pixel home draws at.
+        at_home: usize,
+        /// Runs that ended on the front seat ([`Rest::FrontSeat`]).
+        front_seat: usize,
+    }
+
+    /// A dense sweep case: the pet `make` builds, ticked for `horizon` by a host at its offers
+    /// (its frame train every [`DENSE`]) and by one that ticks every [`DENSE`] between them too
+    /// ([`Schedule::Dense`]), while the shell writes `edits`. The two draw the body, and each
+    /// mote, alike to within [`DENSE_SLACK`], and meet each edit as rested ([`REST_SLACK`]); the
+    /// offered host drops each mote on time; and each pet ends on the pixel its home draws at,
+    /// or on its front seat.
+    fn dense_case(
+        label: &str,
+        make: &dyn Fn() -> Dozing,
+        edits: &[(Duration, Vec<u8>)],
+        horizon: Duration,
+        sweep: &mut Sweep,
+    ) {
+        let mut hosts = [Schedule::Offered(DENSE), Schedule::Dense].map(|host| {
+            let mut doze = make();
+            doze.pet.console.exact_arms = true;
+            (host, doze)
+        });
+        let (t0, first, home) = (
+            hosts[0].1.now,
+            hosts[0].1.last_key.clone(),
+            hosts[0].1.pet.home,
+        );
+        let [offered, dense] = hosts
+            .each_mut()
+            .map(|(host, doze)| doze.run(edits, *host, Some(horizon)));
+        assert!(
+            !offered.iter().any(|d| d.dropped_late),
+            "{label}: the offered host drops each mote as it ends"
+        );
+        for view in [None].into_iter().chain((0..PET_MOTES_MAX).map(Some)) {
+            let what = view.map_or_else(|| "body".to_owned(), |slot| format!("mote {slot}"));
+            let runs = [
+                ("offered", changes((t0, &first), &offered, view)),
+                ("dense", changes((t0, &first), &dense, view)),
+            ];
+            for (one, other) in [(&runs[0], &runs[1]), (&runs[1], &runs[0])] {
+                if let Some((at, key)) = unmatched(&one.1, &other.1, DENSE_SLACK) {
+                    panic!(
+                        "{label}: {:?} in, the {} host draws {what} as {key:?}, which the {} host \
+                         does not within {DENSE_SLACK:?}: it draws {:?}",
+                        at - t0,
+                        one.0,
+                        other.0,
+                        drawn_at(&other.1, at),
+                    );
+                }
+            }
+        }
+        let rests = |run: &[Doze]| {
+            run.iter()
+                .filter(|d| d.edit)
+                .map(|d| (d.at, d.rested))
+                .collect::<Vec<_>>()
+        };
+        for ((at, a), (_, b)) in rests(&offered).into_iter().zip(rests(&dense)) {
             assert!(
-                new.len() <= old.len(),
-                "{layout}: no more ticks than the every-step schedule"
-            );
-            let (apart, from) = longest_disagreement(&old, &new);
-            assert!(
-                apart <= disagreement_slack(),
-                "{layout}: {} from {:?} into the doze, the offered schedule shows {:?} where the \
-                 every-step schedule shows {:?}",
-                if apart == Duration::MAX {
-                    "for good".to_owned()
-                } else {
-                    format!("for {apart:?}")
-                },
-                from.map(|t| t - old[0].at),
-                from.and_then(|t| shown_at(&new, t)),
-                from.and_then(|t| shown_at(&old, t)),
+                (a.0 - b.0).abs() <= REST_SLACK && (a.1 - b.1).abs() <= REST_SLACK && a.2 == b.2,
+                "{label}: {:?} in, at an edit, the offered host's pet has rested to {a:?} (content, \
+                 gait pace, gait dwelt), the dense host's to {b:?}",
+                at - t0,
             );
         }
+        for (host, (_, doze)) in ["offered", "dense"].into_iter().zip(&hosts) {
+            match doze.rest() {
+                Ok(Rest::Home) => sweep.at_home += 1,
+                Ok(Rest::FrontSeat) => sweep.front_seat += 1,
+                Err(px) => panic!(
+                    "{label}: the {host} host's pet rests {px} px from home's pixel, {:?}",
+                    doze.pet.action
+                ),
+            }
+        }
+        sweep.revealed += dense.iter().filter(|d| d.revealed).count();
+        sweep.covered += dense.iter().filter(|d| d.covered).count();
+        sweep.rehomed += usize::from(hosts[1].1.pet.home != home);
+        sweep.carried += usize::from(dense.iter().any(|d| d.carrying));
+    }
+
+    /// Over a seeded sweep of prompts with words around them, in nine cell sizes, half with edits
+    /// mid-doze, a dozing pet ticked at its offers draws, at every moment of its breath window,
+    /// what a host that ticks every [`DENSE`] between them draws ([`dense_case`]): no edge the
+    /// offers miss changes the body or a mote, the console's verdict on a hidden z among them.
+    #[test]
+    fn a_dozing_pet_draws_what_a_dense_host_draws() {
+        let start = Instant::now();
+        let mut rng = Lcg(0x5eed);
+        let mut sweep = Sweep::default();
+        for case in 0..90 {
+            let cell = DOZE_CELLS[case % DOZE_CELLS.len()];
+            let (screen, edits) = doze_case(&mut rng, case % 2 == 1);
+            let make = || Dozing::in_console(screen.as_bytes(), start, false, cell, SWEEP_GRID);
+            let label = format!("doze case {case}, {cell:?} cells: {screen:?}, edits {edits:?}");
+            dense_case(&label, &make, &edits, Duration::from_secs(12), &mut sweep);
+        }
         assert!(
-            revealed > 100,
-            "the sweep has hidden z's the console draws again: {revealed}"
+            sweep.revealed > 50 && sweep.covered > 100,
+            "the sweep reveals and covers z's: {} and {}",
+            sweep.revealed,
+            sweep.covered
+        );
+        assert!(sweep.rehomed > 0, "edits move the pet's home");
+        assert_eq!(sweep.at_home, 180, "every dozing pet rests home");
+    }
+
+    /// Over a seeded sweep of prompts, cell sizes and bursts of typing, a pet that walks beside
+    /// the keys, rides a rhythm run's lead ([`PetBrain::carrying_run`]) and is left to settle,
+    /// sit, loaf and sleep draws, ticked at its offers, what a host that ticks every [`DENSE`]
+    /// between them draws ([`dense_case`]), and rests on the pixel its home draws at, or on its
+    /// front seat.
+    #[test]
+    fn a_typing_pet_draws_what_a_dense_host_draws() {
+        let start = Instant::now();
+        let mut rng = Lcg(0xbeef);
+        let mut sweep = Sweep::default();
+        for case in 0..45 {
+            let cell = DOZE_CELLS[case % DOZE_CELLS.len()];
+            let (screen, edits) = typing_case(&mut rng);
+            let make = || {
+                Dozing::awake(
+                    screen.as_bytes(),
+                    start,
+                    cell,
+                    SWEEP_GRID,
+                    Duration::from_secs(2),
+                )
+            };
+            let label = format!("typing case {case}, {cell:?} cells: {screen:?}, edits {edits:?}");
+            dense_case(&label, &make, &edits, Duration::from_secs(30), &mut sweep);
+        }
+        assert!(
+            sweep.carried > 20 && sweep.rehomed > 30,
+            "runs carry the pet ahead, and edits move its home: {} and {}",
+            sweep.carried,
+            sweep.rehomed
         );
         assert!(
-            covered > 100,
-            "the sweep has drawn z's the console then hides: {covered}"
-        );
-        assert!(skipped > 10_000, "the sweep's offers skip ticks: {skipped}");
-        assert!(
-            rehomed > 25,
-            "the sweep's edits move the pet's home: {rehomed}"
+            sweep.front_seat > 10 && sweep.at_home > 40,
+            "pets rest on the front seat, and home: {} and {}",
+            sweep.front_seat,
+            sweep.at_home
         );
     }
 

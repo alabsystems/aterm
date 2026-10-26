@@ -112,9 +112,11 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
         &mut input,
         FocusedComposedCursorEffects {
             glow_add: &flat,
+            glow_add_ramps: &aterm_core::render::GlowRamps::default(),
             glow_halo: &halos,
             fire_patch: &patches,
             glow_under: &flat,
+            glow_under_ramps: &aterm_core::render::GlowRamps::default(),
             char_fg: &char_fg,
             fire_halo: &fire_halo,
             trail: &trail,
@@ -248,9 +250,11 @@ fn composed_status_owner_follows_the_fill_that_survives_host_projection() {
             input,
             FocusedComposedCursorEffects {
                 glow_add: &[],
+                glow_add_ramps: &aterm_core::render::GlowRamps::default(),
                 glow_halo: &[],
                 fire_patch: &[],
                 glow_under: &[],
+                glow_under_ramps: &aterm_core::render::GlowRamps::default(),
                 char_fg: &[],
                 fire_halo: &[],
                 trail: &[],

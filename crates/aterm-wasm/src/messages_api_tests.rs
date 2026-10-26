@@ -1180,16 +1180,19 @@ fn assert_translated(
             assert_eq!(y.row, x.row + rows, "{what}: an in-grid quad keeps its row");
         }
     };
-    assert_eq!(a.cursor_glow_add.len(), b.cursor_glow_add.len(), "glow");
-    for (x, y) in a.cursor_glow_add.iter().zip(&b.cursor_glow_add) {
+    // The glow streams read whole: every lit ramp row the quad it stands for.
+    let (a_add, b_add) = (a.glow_add_laid(), b.glow_add_laid());
+    assert_eq!(a_add.len(), b_add.len(), "glow");
+    for (x, y) in a_add.iter().zip(&b_add) {
         quad(x, y, "glow");
     }
-    note("glow", !a.cursor_glow_add.is_empty());
-    assert_eq!(a.glow_under.len(), b.glow_under.len(), "under");
-    for (x, y) in a.glow_under.iter().zip(&b.glow_under) {
+    note("glow", !a_add.is_empty());
+    let (a_under, b_under) = (a.glow_under_laid(), b.glow_under_laid());
+    assert_eq!(a_under.len(), b_under.len(), "under");
+    for (x, y) in a_under.iter().zip(&b_under) {
         quad(x, y, "under");
     }
-    note("under", !a.glow_under.is_empty());
+    note("under", !a_under.is_empty());
     assert_eq!(a.fire_patch.len(), b.fire_patch.len(), "fire");
     for (x, y) in a.fire_patch.iter().zip(&b.fire_patch) {
         let want = FirePatch {

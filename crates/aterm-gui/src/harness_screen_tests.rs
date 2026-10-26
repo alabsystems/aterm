@@ -3854,3 +3854,109 @@ fn the_open_page_follows_a_harness_need() {
     );
     assert_eq!(app.harness_state().sessions[0].need, None);
 }
+
+/// A scratch-home lab (an aterm that is not its account's own) is isolated: it reads no other
+/// aterm's socket and probes no network, where only a test build once was, so a lab listed the
+/// person's own aterm sessions and LAN Macs. Its page says why, and lists its own tabs whatever
+/// the sweep brought (a headless aterm once hid its own tab behind the siblings it read).
+#[test]
+fn an_aterm_that_is_not_its_accounts_own_reads_no_fleet() {
+    let why = "its HOME is not this account's home";
+    assert_eq!(FleetScope::decide(false, None), FleetScope::Account);
+    assert_eq!(
+        FleetScope::decide(false, Some(why)),
+        FleetScope::Isolated(why),
+        "a scratch HOME is isolated, not only a test build"
+    );
+    assert!(matches!(
+        FleetScope::decide(true, None),
+        FleetScope::Isolated(_)
+    ));
+
+    let mut app = App::headless_for_test();
+    let mut report = HarnessStatsReport::new(
+        HarnessStats::per_session(0),
+        HarnessStats::new(0),
+        0,
+        Some(0),
+        &|_| Some(0),
+    );
+    report.sibling_tabs = vec![TabSpreadsheetRow {
+        key: "sibling/1".to_string(),
+        instance: "aterm-99361".to_string(),
+        ..TabSpreadsheetRow::default()
+    }];
+    app.harness_screen.stats.report = Some(std::sync::Arc::new(report));
+    let state = app.tab_control_state(crate::autopilot::HarnessPosture::default());
+    assert!(
+        state.tabs.iter().any(|row| row.key.starts_with("local/")),
+        "a headless aterm lists its own tabs: {:?}",
+        state.tabs
+    );
+    assert_eq!(
+        state.computers[0].instances, 2,
+        "itself and the one it read"
+    );
+    assert_eq!(state.fleet, FleetScope::Isolated(TEST_BUILD_ISOLATION));
+
+    let isolated = TabControlState {
+        fleet: FleetScope::Isolated(why),
+        ..state.clone()
+    }
+    .projection(true, false);
+    let row = |projection: &TabControlProjection, label: &str| {
+        projection
+            .summary_rows
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, value)| value.clone())
+    };
+    assert!(
+        row(&isolated, "Fleet").is_some_and(|said| said.contains(why)),
+        "an isolated page says why it shows no fleet: {:?}",
+        isolated.summary_rows
+    );
+    let account = TabControlState {
+        fleet: FleetScope::Account,
+        ..state
+    }
+    .projection(true, false);
+    assert_eq!(
+        row(&account, "Fleet"),
+        None,
+        "CONTROL: an account's aterm reads it"
+    );
+}
+
+/// One probe that misses a host (a slow 120 ms connect on a loaded machine) keeps its last
+/// address, SSH banner and round trip, where the row once read "SSH banner unknown" for a sweep
+/// and reflowed the list; a host silent past the hold loses them.
+#[test]
+fn a_missed_probe_keeps_a_hosts_last_facts() {
+    let t0 = Instant::now();
+    let seen = (
+        Some("192.168.1.138".to_string()),
+        Some("SSH-2.0-OpenSSH_10.3".to_string()),
+        Some(4_000),
+    );
+    let mut held = HeldHostFacts::default();
+    assert_eq!(held.after_probe(seen.clone(), t0), (seen.clone(), true));
+    assert_eq!(
+        held.after_probe((None, None, None), t0 + std::time::Duration::from_secs(3)),
+        (seen.clone(), false),
+        "a miss shows the last facts, the round trip unsampled"
+    );
+    assert_eq!(
+        held.after_probe(
+            (Some("192.168.1.138".to_string()), None, Some(900)),
+            t0 + std::time::Duration::from_secs(6)
+        ),
+        (seen, false),
+        "a connect with no banner is no round trip sample"
+    );
+    assert_eq!(
+        held.after_probe((None, None, None), t0 + std::time::Duration::from_secs(33)),
+        ((Some("192.168.1.138".to_string()), None, None), false),
+        "past the hold what was not seen since is gone, the address seen at 6 s kept"
+    );
+}

@@ -169,6 +169,24 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     act fn at_background(&self) -> Option<(String, crate::supervise::policy::turn_end::HostTurn)> {
         None
     }
+    /// Whether the host owes a fact of its own (`HostTurn::Fact`: the `disk-free@v1` ask's line)
+    /// that it would type at a settled break of the agent's own background work, where the turn
+    /// is over and only a shell or a monitor it left runs on ([`Self::at_background_fact`]). Asked
+    /// before the loop reads anything more for that step, so a break with nothing owed costs one
+    /// question.
+    fn fact_owed(&self) -> bool {
+        false
+    }
+    /// The host's own fact ([`Self::fact_owed`]) at such a break, judged by the guards an idle
+    /// point's fact is ([`IdlePoint::held`], [`IdlePoint::theirs`]); the loop offers it only where
+    /// no draft stands in the composer and no hold is on the session, as the occupancy door's line
+    /// at such a break. A session whose turns end with its own background work still running (a
+    /// manager awaiting its workers) reads busy for hours and comes to no idle point, so a fact
+    /// offered only there would never go.
+    act fn at_background_fact(&self, point: IdlePoint) -> Option<HostStep> {
+        let _ = point;
+        None
+    }
     fn at_withheld_point(&self, wake: bool) -> Option<String> {
         let _ = wake;
         None
@@ -274,6 +292,17 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// disagree on when the wall is spent.
     fn limit_wall(&self, reset_unix: Option<i64>) {
         let _ = reset_unix;
+    }
+    /// What lasting withhold of the loop's holds the session at the turn break it last decided
+    /// (`None`: none now), told once per change ([`Lasting`]): the credits hold, with when it lifts,
+    /// or a wall that is no usage limit, by its kind. A host that publishes what holds a session
+    /// to others (the `disk-free@v1` seat rule's board) holds it out of what it offers while this
+    /// stands, rather than electing a session that could not take its line. A wall's hold is
+    /// told over (`None`) at the session's next live read as well, where it works past the wall;
+    /// a break of its own background work reads busy too ([`Self::busy_tap`]) and ends no wall, so
+    /// the host keeps what it was told until the loop tells it otherwise.
+    fn lasting_hold(&self, hold: Option<Lasting>) {
+        let _ = hold;
     }
     fn limit_until(&self) -> Option<u64> {
         None

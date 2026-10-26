@@ -51,6 +51,7 @@ fn row(c: &'static Connector, state: State) -> Row {
 
 struct Rig {
     vars: Vec<(String, String)>,
+    no_desk: Option<PathBuf>,
 }
 
 impl Rig {
@@ -66,7 +67,17 @@ impl Rig {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
         );
-        Rig { vars }
+        Rig {
+            vars,
+            no_desk: Some(PathBuf::from(crate::harness::login_drive::SANDBOX_EXEC)),
+        }
+    }
+
+    /// The same rig with `sandbox` as its no-desk sandbox ([`Host::no_desk`]).
+    #[cfg(target_os = "macos")]
+    fn sandbox(mut self, sandbox: Option<PathBuf>) -> Rig {
+        self.no_desk = sandbox;
+        self
     }
 
     fn sign_in(
@@ -94,6 +105,7 @@ impl Rig {
             store,
             now: &now,
             ask: &ask,
+            no_desk: self.no_desk.as_deref(),
         };
         sign_in(&host, f, r, &mut Vec::new())
     }
@@ -531,4 +543,210 @@ fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_i
     let calls = runner.calls();
     assert_eq!(calls.len(), 1);
     assert!(calls[0].terminal && calls[0].program == "kimi" && calls[0].args == ["login"]);
+}
+
+/// GROK BUILD'S SIGN-IN IS A PERSON'S, AT THIS TERMINAL OR THROUGH ITS POOL: under an agent's
+/// marker nothing runs; off as an opt-in nobody installed, it is refused with that fact; with no
+/// roster its own `grok login` runs on this terminal, with neither a carried login nor its home's
+/// override dropped; with a roster it is the pool's renewal of the next row (`aterm harness
+/// accounts renew <label> --cli grok`). Over SSH it is `grok login --device-auth`, kept off this
+/// machine's desk ([`sign_in_over_ssh_opens_no_browser_on_this_machines_desk`]). The connection
+/// is the one `aterm ai login grok` names ([`crate::ai::connector::connector`]).
+#[test]
+fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
+    let grok = crate::ai::connector::connector("grok").expect("Grok Build is a connection");
+    let b = machine(&["grok"]);
+    let store = Store::at(&b.state);
+    let shim = b.pkg.agents_dir().join("grok");
+    for marker in AGENT_MARKERS {
+        let runner = FakeRunner::quiet();
+        let done = Rig::new(&[(marker, "1")]).sign_in(
+            &runner,
+            &store,
+            &facts(grok, shim.clone()),
+            &row(grok, State::SignedOut),
+            &[],
+        );
+        assert!(matches!(done, Done::Refused(_)), "{marker}: {done:?}");
+        assert!(runner.calls().is_empty(), "{marker}: nothing ran");
+    }
+    let mut off = row(grok, State::Off);
+    off.fact = "not installed: an opt-in program".to_string();
+    let runner = FakeRunner::quiet();
+    let done = Rig::new(&[]).sign_in(&runner, &store, &facts(grok, shim.clone()), &off, &[]);
+    assert_eq!(
+        done,
+        Done::Refused("not installed: an opt-in program".to_string())
+    );
+    assert!(runner.calls().is_empty());
+    let runner = FakeRunner::quiet();
+    let done = Rig::new(&[
+        ("GROK_AUTH", "{\"token\":\"t\"}"),
+        ("XAI_API_KEY", "xai-test"),
+        ("GROK_HOME", "/home/me/.grok-own"),
+    ])
+    .sign_in(
+        &runner,
+        &store,
+        &facts(grok, shim.clone()),
+        &row(grok, State::SignedOut),
+        &[],
+    );
+    assert_eq!(done, Done::NotChecked);
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].terminal && calls[0].program == "grok",
+        "{:?}",
+        calls[0]
+    );
+    assert_eq!(calls[0].args, ["login"]);
+    assert!(
+        calls[0]
+            .env
+            .iter()
+            .all(|(k, _)| !["GROK_AUTH", "XAI_API_KEY", "CLAUDE_PID"].contains(&k.as_str())),
+        "{:?}",
+        calls[0].env
+    );
+    assert!(
+        calls[0]
+            .env
+            .iter()
+            .any(|(k, v)| k == "GROK_HOME" && v == "/home/me/.grok-own"),
+        "{:?}",
+        calls[0].env
+    );
+    assert!(
+        calls[0]
+            .env
+            .iter()
+            .any(|(k, v)| k == "PATH" && v == "/usr/bin:/bin"),
+        "at the desk, this process's PATH: {:?}",
+        calls[0].env
+    );
+    let mut pooled = facts(grok, shim);
+    pooled.pool = Some(crate::ai::facts::CliAccounts {
+        roster: PathBuf::from("/home/me/.config/aterm/accounts-grok.toml"),
+        refused: None,
+        next: Some("grok-two".to_string()),
+        ..crate::ai::facts::CliAccounts::default()
+    });
+    let runner = FakeRunner::quiet();
+    let done = Rig::new(&[]).sign_in(&runner, &store, &pooled, &row(grok, State::SignedOut), &[]);
+    assert_eq!(done, Done::SignedIn(None));
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].terminal && calls[0].program == "aterm",
+        "{:?}",
+        calls[0]
+    );
+    assert_eq!(
+        calls[0].args,
+        ["harness", "accounts", "renew", "grok-two", "--cli", "grok"]
+    );
+}
+
+/// The terminal call a signed-out `c` makes from `rig`, and what the sign-in came to.
+#[cfg(target_os = "macos")]
+fn one_terminal_call(
+    rig: &Rig,
+    c: &'static Connector,
+    b: &crate::ai::testing::Box3,
+    store: &Store,
+) -> (Done, Vec<crate::ai::testing::Call>) {
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(
+        &runner,
+        store,
+        &facts(c, b.pkg.agents_dir().join(c.id)),
+        &row(c, State::SignedOut),
+        &[],
+    );
+    (done, runner.calls())
+}
+
+/// OVER SSH A PERSON'S `aterm ai login` (and `aterm ai doctor`, and `doctor --on`/`--fleet`,
+/// which run it on each machine over `ssh -t`) OPENS NO BROWSER ON THIS MACHINE'S DESK, which
+/// nobody is at: Grok Build's `grok login --device-auth` and Codex's `codex login`, each of
+/// which opens the default browser through LaunchServices whatever its `PATH` (design §5 (g)),
+/// run under the no-desk sandbox with the opener-free `PATH`, the CLI printing its URL for the
+/// person to open where they are. Where the sandbox is missing or cannot apply, nothing runs
+/// and the refusal says why. CONTROL: at the desk each runs plainly with this process's `PATH`.
+#[cfg(target_os = "macos")]
+#[test]
+fn sign_in_over_ssh_opens_no_browser_on_this_machines_desk() {
+    use crate::harness::login_drive::{NO_DESK, SANDBOX_EXEC, sandbox_refusal};
+    assert_eq!(sandbox_refusal(Path::new(SANDBOX_EXEC)), None, "CONTROL");
+    let ssh = ("SSH_CONNECTION", "10.0.0.2 52000 10.0.0.3 22");
+    let grok = crate::ai::connector::connector("grok").expect("a connection");
+    for (c, words) in [
+        (grok, &["login", "--device-auth"][..]),
+        (&CODEX, &["login"][..]),
+    ] {
+        let b = machine(&[c.id]);
+        let store = Store::at(&b.state);
+        let shim = b.pkg.agents_dir().join(c.id);
+        let (done, calls) = one_terminal_call(&Rig::new(&[ssh]), c, &b, &store);
+        assert!(
+            matches!(done, Done::NotChecked | Done::SignedOut),
+            "{}: {done:?}",
+            c.id
+        );
+        let terminal: Vec<_> = calls.iter().filter(|call| call.terminal).collect();
+        assert_eq!(terminal.len(), 1, "{}: {calls:?}", c.id);
+        assert_eq!(terminal[0].program, "sandbox-exec", "{}", c.id);
+        let mut want = vec![
+            "-p".to_string(),
+            NO_DESK.to_string(),
+            shim.display().to_string(),
+        ];
+        want.extend(words.iter().map(|w| (*w).to_string()));
+        assert_eq!(terminal[0].args, want, "{}", c.id);
+        let path = terminal[0]
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| PathBuf::from(v))
+            .expect("a PATH");
+        assert!(
+            path.starts_with(store.dir()) && path != Path::new("/usr/bin:/bin"),
+            "{}: the opener-free PATH, not this process's: {path:?}",
+            c.id
+        );
+
+        let missing = b.dir.path().join("no-sandbox-exec");
+        for (sandbox, says) in [
+            (None, "is not here"),
+            (Some(missing), "is not here"),
+            (Some(PathBuf::from("/usr/bin/false")), "cannot run here"),
+        ] {
+            let (done, calls) =
+                one_terminal_call(&Rig::new(&[ssh]).sandbox(sandbox.clone()), c, &b, &store);
+            assert!(
+                matches!(done, Done::Refused(ref why)
+                    if why.starts_with("over SSH, ")
+                        && why.contains("would open this machine's default browser")
+                        && why.contains(says)),
+                "{} {sandbox:?}: {done:?}",
+                c.id
+            );
+            assert!(calls.is_empty(), "{} {sandbox:?}: nothing ran", c.id);
+        }
+
+        let (_, calls) = one_terminal_call(&Rig::new(&[]), c, &b, &store);
+        let terminal: Vec<_> = calls.iter().filter(|call| call.terminal).collect();
+        assert_eq!(terminal.len(), 1, "CONTROL {}: {calls:?}", c.id);
+        assert_eq!(terminal[0].program, c.id, "CONTROL: at the desk, plainly");
+        assert_eq!(terminal[0].args, ["login"], "CONTROL {}", c.id);
+        assert!(
+            terminal[0]
+                .env
+                .iter()
+                .any(|(k, v)| k == "PATH" && v == "/usr/bin:/bin"),
+            "CONTROL {}: this process's PATH",
+            c.id
+        );
+    }
 }

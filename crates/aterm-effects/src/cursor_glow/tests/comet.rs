@@ -51,7 +51,23 @@ fn comet_bridge_attaches_window_absolute() {
     let mut beam = Vec::new();
     let mut halos = Vec::new();
     let mut under = Vec::new();
-    glow.emit_comet(t, &c, g, Some((2, 14)), &mut beam, &mut halos, &mut under);
+    glow.emit_comet(
+        t,
+        &c,
+        g,
+        Some((2, 14)),
+        &mut crate::cursor_glow::glow_sink(
+            &mut beam,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        &mut halos,
+        &mut crate::cursor_glow::glow_sink(
+            &mut under,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+    );
     assert!(!beam.is_empty(), "a typing run draws a beam");
     let reach = beam
         .iter()

@@ -1,0 +1,336 @@
+00000000000000000000000001000014
+schema = 1
+next_turn_id = 4138
+outgoing_build = 1792968362
+roster_seq = 7
+fabric_attached = ["/home/dev/.local/bin/fabric-bridge", "serve", "--fleet"]
+fleet_told = ["9b86e63ee3259a25=ask"]
+mirror_dropped = ["s-a5603500bfa147566ac8 1:0:0:8"]
+mirror_served = true
+machine_names = ["devhost", "devhost-2.local"]
+
+[resources]
+boot = [123, 181, 114, 235, 230, 225, 77, 243, 150, 29, 137, 85, 170, 243, 154, 97]
+
+[[resources.jobs]]
+active = true
+ai = "codex"
+label = "handoff:fixture"
+members = [[99300, 70647938488014]]
+pid = 99300
+session = "s-00000000010000000000"
+start = 70647938488014
+
+[[sessions]]
+local_id = 0
+sid = "s-00000000010000000000"
+state = "alive"
+title = "zsh"
+user_title = "release"
+icon = "rocket"
+attention = "look at the failing test"
+autopilot = "cruise"
+land_at = 1792975562000
+control = "1008 f0eebff26160f499b56b7a0b6cadca5d1c3b3ddfdc9a915618fc1cb3aaaad4a2"
+topics = ["builds @12"]
+fg_holder = 40000
+history = "21848 774a146fb4915d82c1a470e15fa243a33f2a2a62d32e06e386bad32178004aeb 15"
+hold = "fleet maintenance"
+more_holds = ["local manual"]
+supervisor = "harness 30000"
+claim_known = true
+attention_owners = ["- look%20at%20the%20failing%20test", "harness kind=wait waiting%20on%20CI"]
+viewport_from_bottom = 12
+timeline_id = 65560
+task = "rev=2 state=working from=ctl since=1792971362000 result_bytes=0 attention=0"
+log_ids = "1792968790 4096 4096 4096"
+status_seen = "hold=local@1792971962"
+autopilot_end = "end=- worked=25000"
+log_seq = 65537
+wakes = "{\"next_ord\":3,\"wakes\":[{\"agent\":{\"birth_us\":1792971062000000,\"pid\":48200},\"answered_ms\":null,\"await_only\":true,\"by\":\"agent\",\"declared_ms\":1792971662000,\"due_by_ms\":1793058062000,\"label\":\"lunch\",\"need\":null,\"ord\":1,\"prio\":\"normal\",\"ready_since_ms\":null,\"state\":{\"state\":\"pending\"},\"unless\":[],\"when\":[{\"at_ms\":1792973462000,\"atom\":{\"time\":{\"in\":{\"ms\":1800000}}},\"held\":false}]},{\"agent\":{\"birth_us\":1792971062000000,\"pid\":48200},\"answered_ms\":null,\"await_only\":true,\"by\":\"agent\",\"declared_ms\":1792971662000,\"due_by_ms\":1793058062000,\"label\":\"build\",\"need\":\"sys slots>=1\",\"ord\":2,\"prio\":\"normal\",\"ready_since_ms\":null,\"state\":{\"state\":\"pending\"},\"unless\":[],\"when\":[{\"at_ms\":1792975262000,\"atom\":{\"time\":{\"in\":{\"ms\":3600000}}},\"held\":false}]}],\"pids\":[],\"due\":[]}"
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":256,\"cursor\":{\"cursor_row\":29,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":301,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s0.grid"
+
+[sessions.fabric]
+bus_log = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.0"
+last_msg_id = 4612
+last_post_id = 2
+last_receipt_id = 3
+uncarried = [1]
+receipts_uncarried = 1
+dropped = 1
+broadcasts_uncarried = 512
+broadcasts_refilled = 512
+marked = [10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365, 366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381, 382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429, 430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445, 446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461, 462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477, 478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493, 494, 495, 496, 497, 498, 499, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511, 512, 513, 514, 515, 516, 517, 518, 519, 520, 521, 522, 523, 524, 525, 526, 527, 528, 529, 530, 531, 532]
+
+[[sessions.fabric.posts]]
+id = 2
+to = "@s-peer"
+kind = "answer"
+re = 10
+dl = 600000
+via = "h-andrew"
+key = "build-42"
+body = "tagged v0.108.0"
+
+[[sessions.fabric.receipts]]
+rid = 2
+off = 10
+verdict = "handled"
+kind = "ask"
+from = "s-peer@n-lab"
+
+[[sessions.fabric.earlier_receipts]]
+rid = 1
+off = 10
+verdict = "handled"
+kind = "ask"
+from = "s-peer@n-lab"
+
+[sessions.fabric.given_up]
+from = 4
+to = 9
+records = 2
+
+[[sessions]]
+local_id = 1
+sid = "s-00000000010000010101"
+parent = "s-00000000010000000000"
+state = "alive"
+title = "zsh"
+control = "940 3dfa482799c438567308ab11380f1a9cccc46b985776a143b3e2695cd7fece38"
+fg_holder = 40001
+claim_known = true
+timeline_id = 65563
+journal_key = "48100:1"
+log_ids = "1792968791 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":11,\"cursor\":{\"cursor_row\":29,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":41,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s1.grid"
+
+[[sessions]]
+local_id = 2
+sid = "s-00000000010000020202"
+state = "alive"
+title = "claude"
+control = "4904 7880088871872d07e956f8f6f605529b950ae67ba0df9a62a1ec4b56c3cbf232"
+frozen_path = true
+fg_holder = 41002
+claim_known = true
+timeline_id = 65566
+log_ids = "1792968789 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":0,\"cursor\":{\"cursor_row\":29,\"cursor_col\":17,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":{\"cursor_row\":0,\"cursor_col\":8,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"saved_cursor_main\":{\"cursor_row\":0,\"cursor_col\":8,\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"origin_mode\":false,\"auto_wrap\":true,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"pending_wrap\":false,\"underline_color\":null},\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":true,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":true,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":1,\"main_saved_flags\":0,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":1},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":null,\"absolute_row_counter\":30,\"alt_absolute_row_counter\":30,\"title\":{},\"output_state\":{\"rep\":\"s\"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s2.grid"
+alt_grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s2.altgrid"
+
+[[sessions]]
+local_id = 3
+sid = "s-00000000010000030303"
+state = "alive"
+title = "zsh"
+control = "940 c006230bb269ea38143d6564c05d83bf7fe96e7d65786473a5116f633a3f97d2"
+fg_holder = 40003
+claim_known = true
+timeline_id = 65569
+log_ids = "1792968792 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":0,\"cursor\":{\"cursor_row\":6,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":30,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s3.grid"
+
+[[sessions]]
+local_id = 4
+sid = "s-00000000010000040404"
+state = "alive"
+title = "zsh"
+control = "940 b3e05da1c2b0d52cb848e5a8eb3889bb48daca38464f0e693a9cf2307204490a"
+fg_holder = 40004
+claim_known = true
+timeline_id = 65572
+log_ids = "1792968793 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":0,\"cursor\":{\"cursor_row\":6,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":30,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s4.grid"
+
+[[sessions]]
+local_id = 5
+sid = "s-00000000010000050505"
+state = "alive"
+title = "zsh"
+control = "940 03d60e9375109f0da32e32fa4cd494240d3ad405e7c8a29657fb26c9cc9ad4bc"
+fg_holder = 40005
+claim_known = true
+timeline_id = 65575
+log_ids = "1792968794 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":0,\"cursor\":{\"cursor_row\":6,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":30,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s5.grid"
+
+[[sessions]]
+local_id = 6
+sid = "s-00000000010000060606"
+state = "alive"
+title = "zsh"
+control = "940 0c7e24620fdef9661b816f05eaf38114b5343beea77d6800fe131ce47f6141eb"
+fg_holder = 40006
+claim_known = true
+timeline_id = 65578
+log_ids = "1792968795 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":0,\"cursor\":{\"cursor_row\":6,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":30,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s6.grid"
+
+[[sessions]]
+local_id = 7
+sid = "s-00000000010000070707"
+state = "alive"
+title = "zsh"
+attention = "Cannot bring the agent back (its conversation could not be resumed); run claude --resume 1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d in this tab"
+control = "940 6be855ec41c9c3db18dd6ba856b59823e1391beda620111146fe2bf29e4d9499"
+fg_holder = 40007
+claim_known = true
+timeline_id = 65581
+log_ids = "1792968796 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":30,\"cols\":100,\"history_lines\":0,\"cursor\":{\"cursor_row\":6,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":29,\"margin_left\":0,\"margin_right\":99,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":30,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-99300-00000000000000000000000001000014.s7.grid"
+
+[window]
+rows = 30
+cols = 201
+outer_x = 96
+outer_y = 48
+inner_px = [1407, 462]
+status_bar_rows = 3
+next_message_id = 8
+font_px_milli = 14000
+font_reset_px_milli = 12000
+font_size_milli = 14000
+font_reset_size_milli = 12000
+messages_captured_unix_ms = 1792968706835
+
+[[window.messages]]
+id = 2
+unix_ms = 1792968706834
+tag = "system"
+severity = "error"
+posted_severity = "warn"
+glyph = "✕"
+title = "Indexing stopped"
+hold = "default"
+on_glass = true
+
+[[window.messages]]
+id = 4
+unix_ms = 1792968706835
+tag = "script"
+severity = "info"
+glyph = "↻"
+title = "Building aterm"
+hold = "live:120"
+key = "wire.cargo"
+fill_permille = 420
+stats = "412/980 crates"
+on_glass = true
+wire = true
+
+[[window.messages]]
+id = 1
+unix_ms = 1792968706834
+tag = "build"
+severity = "warn"
+glyph = "⚠"
+title = "Disk almost full"
+detail = ["/home is 92% used"]
+hold = "default"
+on_glass = false
+wire = true
+repeats = 2
+
+[[window.messages]]
+id = 3
+unix_ms = 1792968706835
+tag = "update"
+severity = "warn"
+glyph = "⚠"
+title = "Couldn't download updates"
+detail = ["since Oct 25", "20 failed checks in a row since 2026-10-25T21:51:46Z: release manifests exist but cannot be downloaded."]
+actions = ["open-settings:/updates"]
+hold = "default"
+key = "update.health.download"
+on_glass = false
+
+[[window.messages]]
+id = 5
+unix_ms = 1792968706835
+tag = "crash"
+severity = "error"
+glyph = "✕"
+title = "aterm crashed last time"
+detail = ["a crash report was saved", "crash log at /home/dev/Library/Logs/aterm/crash-1760865242.log.seen", "thread 'main' panicked at crates/aterm-gui/src/app.rs:4100:9"]
+actions = ["open-path:/home/dev/Library/Logs/aterm/crash-1760865242.log.seen"]
+hold = "for:120"
+key = "crash.last"
+on_glass = false
+excerpt = false
+retrospective = true
+
+[[window.messages]]
+id = 6
+unix_ms = 1792968706835
+tag = "session"
+severity = "warn"
+glyph = "⚠"
+title = "Tab lost its shell integration"
+detail = ["in window 2, tab 2: no command blocks or exit codes there", "open a new tab to get it back", "it reads `status integration=degraded` — session s-00000000010000020202"]
+hold = "standing"
+key = "session.integration"
+on_glass = false
+excerpt = false
+finished = "Shell integration back"
+
+[[window.messages]]
+id = 7
+unix_ms = 1792968706835
+tag = "harness"
+severity = "warn"
+glyph = "⚠"
+title = "Claude's login expired in window 2, tab 2"
+short_title = "Login expired"
+detail = ["Finish the browser sign-in.", "Claude Code's login expired, so it cannot answer prompts.", "aterm typed /login in the tab and opened the sign-in in your browser.", "The session continues by itself once you are signed in."]
+actions = ["show-tab:2:2"]
+hold = "standing"
+key = "harness.resume-ask.s-00000000010000020202.si"
+on_glass = false
+finished = "Claude's login is back, window 2, tab 2"
+
+[[window.update_health_said]]
+kind = "update.health.download"
+title = "Couldn't download updates"
+line = "since Oct 25"
+body = "20 failed checks in a row since 2026-10-25T21:51:46Z: release manifests exist but cannot be downloaded."
+owed = true

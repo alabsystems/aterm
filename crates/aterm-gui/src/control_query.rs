@@ -2240,8 +2240,10 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         cursor_trail: _, // OMITTED: host-owned cursor-trail overlay cells (render bling), not engine cell content
         cursor_trail_color: _, // OMITTED: host-resolved cursor-trail tint, host-owned
         cursor_glow_add: _, // OMITTED: host-owned LUMEN aurora light quads, not engine cell content
+        cursor_glow_add_ramps: _, // OMITTED: its twin's ramps (the same lights, a slab a ramp), not engine cell content
         glow_halo: _, // OMITTED: host-owned GLOW-HALO radial cursor-effect light quads, not engine cell content
         glow_under: _, // OMITTED: host-owned EMBERFORGE under-glyph flame-body light quads, not engine cell content
+        glow_under_ramps: _, // OMITTED: its twin's ramps (the same lights, a slab a ramp), not engine cell content
         fire_patch: _, // OMITTED: host-owned EMBERFORGE per-pixel fire-field patches (render bling), not engine cell content
         cursor_glow_add_damage: _, // OMITTED: producer-side dirty-row revision for host-owned LUMEN quads, not engine cell content
         glow_halo_damage: _, // OMITTED: producer-side dirty-row revision for host-owned radial halos, not engine cell content

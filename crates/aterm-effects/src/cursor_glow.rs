@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 use aterm_render::{
-    BEAM_LAYERS, BeamClip, BeamScratch, BeamVertex, COMET_LAYERS, CharFg, CometSample,
-    FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, LASER_LAYERS, PHASER_LAYERS, RainHalo,
-    SPARKLE_LAYERS, comet_beam, comet_beam_over, layer_stack_lift, layered_beam_quads_with,
-    premul_rgb,
+    BEAM_LAYERS, BeamClip, BeamRows, BeamScratch, BeamVertex, COMET_LAYERS, CharFg, CometSample,
+    FireHaloCell, FireMode, FirePatch, GlowQuad, GlowRamps, HaloMode, LASER_LAYERS, PHASER_LAYERS,
+    RainHalo, RampCost, RampSink, SPARKLE_LAYERS, comet_beam, comet_beam_over, layer_stack_lift,
+    layered_beam_quads_with, premul_rgb,
 };
 
 use crate::rainbow_kitty::{self as rk, CaretSeam, CompanionImpulse};
@@ -52,8 +52,8 @@ mod status;
 mod style;
 mod thermal;
 pub(crate) use bed::{
-    AirLight, BedScratch, BedShape, air_lit, clip_quads_to, dark_bed_budget, dark_bed_ink,
-    lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink, split_air_runs,
+    AirLight, BedScratch, BedShape, air_lit, clip_quads_to, clip_stream_to, dark_bed_budget,
+    dark_bed_ink, lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink, split_air_runs,
 };
 pub use companion::*;
 pub use custody::*;
@@ -291,6 +291,10 @@ pub struct CursorGlow {
     halo_out: Vec<RainHalo>,
     patch_out: Vec<FirePatch>,
     under_out: Vec<GlowQuad>,
+    /// The ramps laid among [`Self::under_out`]'s quads ([`GlowRamps`]).
+    under_ramps: GlowRamps,
+    /// The ramps laid among the quads of [`Self::tick`]'s `out`.
+    out_ramps: GlowRamps,
     char_out: Vec<CharFg>,
     fire_halo_out: Vec<FireHaloCell>,
     engulf_scratch: Vec<(u16, u16, f32)>,
@@ -514,6 +518,14 @@ pub struct CursorGlow {
     /// A test's negative control: no page veil under the pet's letters.
     #[cfg(any(test, debug_assertions))]
     pet_veil_off: bool,
+    /// A test's cost for the beams' runs in place of the measured one
+    /// ([`Self::set_glow_ramps`], [`Self::set_ramp_cost`]).
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    rows_cost: Option<aterm_render::RampCost>,
+    /// A test's read: the ramps folded into the quads at the tick's end
+    /// ([`Self::fold_glow_ramps`]; unset, this crate's unit tests fold).
+    #[cfg(any(test, debug_assertions))]
+    fold_rows: Option<bool>,
     /// The caret and geometry the frame's step drew by, which the pet's veil,
     /// drawn after the pet's tick, lays its runs by ([`Self::veil_pet_letters`]).
     veil_frame: Option<(Option<(u16, u16)>, Geom)>,
@@ -551,9 +563,10 @@ pub struct CursorGlow {
     /// ([`Self::note_word_icon_sprites`]; empty: each icon is its box).
     word_icon_src: Vec<icon_shade::IconSrc>,
     /// The word icons' shade's working buffers: one icon's drawn rows in
-    /// window pixels, the cut quads and halos, and one light's pieces.
+    /// window pixels, the cut quads, ramps and halos, and one light's pieces.
     icon_scratch: Vec<(i32, i32, i32, i32)>,
     icon_quads: Vec<GlowQuad>,
+    icon_ramps: aterm_render::GlowRamps,
     icon_halos: Vec<RainHalo>,
     icon_patches: Vec<FirePatch>,
     icon_cut: Vec<(i32, i32, i32, i32)>,
@@ -711,6 +724,8 @@ impl FrameFingerprint {
     const FIRE_HALO: u64 = 0x6669_7265_6861_6c6f;
     const RAIN_HALO: u64 = 0x7261_696e_6861_6c6f;
     const FORGE_FILL: u64 = 0x666f_7267_655f_6669;
+    /// Marks a stream's ramps apart from its quads.
+    const RAMPS: u64 = 0x7261_6d70_0000_0000;
 
     #[inline]
     const fn write(&mut self, word: u64) {
@@ -740,6 +755,29 @@ impl FrameFingerprint {
         for q in quads {
             for w in q.damage_words() {
                 hash = fnv_mix_u64(hash, w);
+            }
+        }
+        self.0 = Some(hash);
+    }
+
+    /// A stream's ramps ([`GlowRamps`]): each one's band, box, run and
+    /// place ([`aterm_render::GlowRamp::damage_words`]), then the ends it keeps.
+    #[inline]
+    fn glow_ramps(&mut self, tag: u64, ramps: &GlowRamps) {
+        if ramps.is_empty() {
+            return;
+        }
+        self.begin_stream(tag ^ Self::RAMPS, ramps.items.len());
+        let mut hash = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
+        for r in &ramps.items {
+            for word in r.damage_words() {
+                hash = fnv_mix_u64(hash, word);
+            }
+            for e in r.kept_ends(&ramps.ends).as_chunks::<2>().0 {
+                hash = fnv_mix_u64(hash, u64::from(e[0]) | u64::from(e[1]) << 32);
             }
         }
         self.0 = Some(hash);
@@ -1128,6 +1166,14 @@ impl CursorGlow {
         }
     }
 
+    #[inline]
+    pub(crate) const fn print_anchor_seq(&self) -> Option<u64> {
+        match self.print_anchor {
+            Some((_, _, seq)) => Some(seq),
+            None => None,
+        }
+    }
+
     /// Which of the frame's colours ([`GlowConfig::color`], [`GlowConfig::accent`]) the user
     /// chose, so the lights that wear one draw it as itself ([`ColourPins`]).
     #[inline]
@@ -1220,7 +1266,8 @@ impl CursorGlow {
     fn poof_hint_pending(&self) -> Option<Instant> {
         match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         }
     }
 
@@ -1287,7 +1334,8 @@ impl CursorGlow {
         let v2_due = self.v2.next_change_deadline(now);
         let mut earliest = match (v1_due, v2_due) {
             (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         };
         if let Some(p) = self.held_park {
             let park_expiry = p.at + p.patience() + rk::ARM_MIN;
@@ -1366,6 +1414,8 @@ impl CursorGlow {
         self.halo_out.clear();
         self.patch_out.clear();
         self.under_out.clear();
+        self.under_ramps.clear();
+        self.out_ramps.clear();
         self.ink_ledger.clear_rails();
         self.char_out.clear();
         self.fire_halo_out.clear();
@@ -1470,7 +1520,7 @@ impl CursorGlow {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
     ) -> u64 {
-        let print_seq = self.print_anchor.map(|(_, _, seq)| seq);
+        let print_seq = self.print_anchor_seq();
         self.print_in_tick = print_seq.is_some() && print_seq != self.print_anchor_tick_seq;
         self.print_anchor_tick_seq = print_seq;
         self.last_ch = geom.ch.min(u16::MAX as usize) as u16;
@@ -1484,9 +1534,11 @@ impl CursorGlow {
             ));
         }
         out.clear();
+        self.out_ramps.clear();
         self.halo_out.clear();
         self.patch_out.clear();
         self.under_out.clear();
+        self.under_ramps.clear();
         self.char_out.clear();
         self.fire_halo_out.clear();
         self.ink_ledger.close();
@@ -1522,29 +1574,39 @@ impl CursorGlow {
         self.park_source_confirmed = false;
         let scroll_rows = std::mem::take(&mut self.scroll_rows);
         let scroll_frame = scroll_rows > 0;
-        if let Some(p) = self.held_park.filter(|p| p.cross_row)
-            && let Some(sample) = self.witness_rows[..self.witness_rows_n]
-                .iter()
-                .find(|s| s.row == p.row)
+        if let Some(p) = self.held_park
+            && p.cross_row
         {
-            let mut exact = true;
-            let mut replaced = false;
-            for col in 0..p.origin {
-                let old = rk::witness::unit_at(&self.park_source_cells, col);
-                let current = rk::witness::unit_at(&sample.cols, col);
-                if old != current {
-                    exact = false;
-                    replaced |= !current.is_blank();
-                    if replaced {
-                        break;
+            let n = self.witness_rows_n.min(self.witness_rows.len());
+            let mut sample = None;
+            let mut i = 0;
+            while i < n {
+                if self.witness_rows[i].row == p.row {
+                    sample = Some(&self.witness_rows[i]);
+                    break;
+                }
+                i += 1;
+            }
+            if let Some(sample) = sample {
+                let mut exact = true;
+                let mut replaced = false;
+                for col in 0..p.origin {
+                    let old = rk::witness::unit_at(&self.park_source_cells, col);
+                    let current = rk::witness::unit_at(&sample.cols, col);
+                    if old != current {
+                        exact = false;
+                        replaced |= !current.is_blank();
+                        if replaced {
+                            break;
+                        }
                     }
                 }
-            }
-            self.park_source_confirmed = exact;
-            if replaced {
-                self.flush_held_park();
-                self.type_hint.clear();
-                self.forget_typed_credits(now);
+                self.park_source_confirmed = exact;
+                if replaced {
+                    self.flush_held_park();
+                    self.type_hint.clear();
+                    self.forget_typed_credits(now);
+                }
             }
         }
         let witness_n = std::mem::take(&mut self.witness_rows_n);
@@ -1594,14 +1656,15 @@ impl CursorGlow {
             self.rotate_row_probe();
             self.begin_ink_ledger(cfg, geom, cur);
             let spans = self.probed_text_spans();
+            let cost = self.rows_cost();
             let fp = self.classic.tick(
                 cur,
                 now,
                 cfg,
                 geom,
-                out,
+                &mut rows_sink(out, &mut self.out_ramps, cost),
                 &mut self.halo_out,
-                &mut self.under_out,
+                &mut rows_sink(&mut self.under_out, &mut self.under_ramps, cost),
                 crate::classic_wake::WakeInk {
                     text: TextView::new(spans, Some(&self.frame_text)),
                     ledger: &mut self.ink_ledger,
@@ -1611,6 +1674,7 @@ impl CursorGlow {
                 self.spawns += 1;
                 self.log_licensed_as(now, from, to, AdmissionRecord::LICENCE_MOTION);
             }
+            self.fold_for_tests(out);
             return fp;
         }
         if self.classic.is_active() || self.classic.has_last() {
@@ -1737,7 +1801,12 @@ impl CursorGlow {
         let shown = self.cursor_anchor();
         let caret_carry = match (shown, cur) {
             (Some((pr, _)), Some((cr, _))) => {
-                i16::try_from(i32::from(cr) - i32::from(pr)).unwrap_or(0)
+                let diff = i32::from(cr) - i32::from(pr);
+                if diff >= i32::from(i16::MIN) && diff <= i32::from(i16::MAX) {
+                    diff as i16
+                } else {
+                    0
+                }
             }
             _ => 0,
         };
@@ -1790,25 +1859,34 @@ impl CursorGlow {
             && let Some(run) = self.recent_typed_run.as_mut()
             && run.row == pr
             && run.end() == cc
-            && (0..usize::from(run.len)).all(|i| {
-                self.row_cur
-                    .get(usize::from(run.col0) + i)
-                    .copied()
-                    .unwrap_or(' ')
-                    == run.glyphs[i]
-            })
         {
-            run.row = cr;
-            if let Some((_, Some((row, col)))) = &mut self.v2_stop
-                && (*row, *col) == (pr, pc)
-            {
-                *row = cr;
+            let col0 = usize::from(run.col0);
+            let len = usize::from(run.len);
+            let mut matched = true;
+            let mut i = 0;
+            while i < len {
+                let c = match self.row_cur.get(col0 + i) {
+                    Some(&ch) => ch,
+                    None => ' ',
+                };
+                if c != run.glyphs[i] {
+                    matched = false;
+                    break;
+                }
+                i += 1;
+            }
+            if matched {
+                run.row = cr;
+                if let Some((_, Some((row, col)))) = &mut self.v2_stop
+                    && (*row, *col) == (pr, pc)
+                {
+                    *row = cr;
+                }
             }
         }
         if cur.is_none()
-            && let Some(meta) = self
-                .row_prev_meta
-                .filter(|m| self.last == Some((m.row, m.caret)))
+            && let Some(meta) = self.row_prev_meta
+            && self.last == Some((meta.row, meta.caret))
         {
             self.row_shown.clone_from(&self.row_prev);
             self.row_shown_meta = Some(meta);
@@ -1821,7 +1899,7 @@ impl CursorGlow {
         self.carried_key_move = None;
         let cursor_move_observed =
             matches!((spawn_from, cur), (Some((pr, pc)), Some((cr, cc))) if pr != cr || pc != cc);
-        if cur.is_some() && cur != self.last_visible.map(|(cell, _)| cell) {
+        if cur.is_some() && !matches!((cur, self.last_visible), (Some(c), Some((v, _))) if c == v) {
             self.wrap_paid_row = None;
         }
         let content_echo = self.same_caret_typed_echo(cur, cursor_move_observed, now, cfg, geom);
@@ -1931,21 +2009,42 @@ impl CursorGlow {
         let mut halos = std::mem::take(&mut self.halo_out);
         let mut patches = std::mem::take(&mut self.patch_out);
         let mut under = std::mem::take(&mut self.under_out);
+        let mut under_ramps = std::mem::take(&mut self.under_ramps);
+        let mut out_ramps = std::mem::take(&mut self.out_ramps);
         let mut charred = std::mem::take(&mut self.char_out);
         let mut halo_cells = std::mem::take(&mut self.fire_halo_out);
         let mut engulf = std::mem::take(&mut self.engulf_scratch);
         let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
         let mut bolt_channel = std::mem::take(&mut self.bolt_channel);
-        let bolt_out = if cfg.dark_theme {
-            &mut *out
+        let mut bolt_out = if cfg.dark_theme {
+            self.ramp_sink(out, &mut out_ramps)
         } else {
-            &mut under
+            self.ramp_sink(&mut under, &mut under_ramps)
         };
-        self.emit_bolts(now, cfg, geom, bolt_out, &mut bolt_verts, &mut bolt_channel);
+        self.emit_bolts(
+            now,
+            cfg,
+            geom,
+            &mut bolt_out,
+            &mut bolt_verts,
+            &mut bolt_channel,
+        );
+        drop(bolt_out);
         self.bolt_channel = bolt_channel;
         self.begin_ink_ledger(cfg, geom, cur);
-        self.emit_comet(now, cfg, geom, cur, out, &mut halos, &mut under);
-        out.truncate(Self::MAX_QUADS);
+        let mut out_sink = self.ramp_sink(out, &mut out_ramps);
+        let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
+        self.emit_comet(
+            now,
+            cfg,
+            geom,
+            cur,
+            &mut out_sink,
+            &mut halos,
+            &mut under_sink,
+        );
+        out_sink.keep_laid(Self::MAX_QUADS);
+        drop((out_sink, under_sink));
         let mut ledger = std::mem::take(&mut self.ink_ledger);
         self.emit_flames(
             now,
@@ -1960,13 +2059,15 @@ impl CursorGlow {
         );
         self.ink_ledger = ledger;
         if cfg.dark_theme {
-            if out.len() < Self::MAX_QUADS {
-                self.emit_fire_meteors(now, cfg, geom, out);
+            if out_ramps.laid(out.len()) < Self::MAX_QUADS {
+                let mut out_sink = self.ramp_sink(out, &mut out_ramps);
+                self.emit_fire_meteors(now, cfg, geom, &mut out_sink);
             }
-        } else if under.len() < Self::MAX_QUADS {
-            self.emit_fire_meteors(now, cfg, geom, &mut under);
+        } else if under_ramps.laid(under.len()) < Self::MAX_QUADS {
+            let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
+            self.emit_fire_meteors(now, cfg, geom, &mut under_sink);
         }
-        if under.len() < Self::MAX_QUADS {
+        if under_ramps.laid(under.len()) < Self::MAX_QUADS {
             self.emit_water(now, cfg, geom, cur, &mut under);
         }
         if self.v2.engaged() {
@@ -1990,8 +2091,12 @@ impl CursorGlow {
             };
             if witness_n > 0 {
                 self.v2.carry_caret(caret_carry);
-                let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
-                let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
+                let pair = match self.held_park {
+                    Some(p) if !p.cross_row && p.fresh(now) => {
+                        Some(((p.row, p.origin), (p.landing_row, p.landing)))
+                    }
+                    _ => None,
+                };
                 let (_, proved) = self.v2.follow_rows_with_park(
                     witness_slice,
                     &asked[..asked_n],
@@ -2009,13 +2114,17 @@ impl CursorGlow {
             self.keep_out_boxes(cfg, geom, cur);
             let mut frame = rk::Frame {
                 under: &mut under,
+                under_ramps: &mut under_ramps,
                 out: &mut *out,
+                out_ramps: &mut out_ramps,
                 halos: &mut halos,
                 beams: &mut self.v2_beams,
                 cues: &mut self.v2_cues,
                 caret: CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
+                #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+                rows_cost: self.rows_cost,
             };
             if witness_n > 0 && !scroll_frame {
                 self.v2
@@ -2025,7 +2134,7 @@ impl CursorGlow {
             }
             self.v2_caret = frame.caret;
             for &(from, to) in self.v2.ribbon().rail_spans() {
-                self.ink_ledger.note_rail(from, to);
+                self.ink_ledger.note_rail_laid(from, to);
             }
             self.read_fresh_run_origin(now);
             for cue in self.v2_cues.drain(..) {
@@ -2047,11 +2156,11 @@ impl CursorGlow {
         } else {
             self.emit_crown(now, cfg, geom, cur, &mut halos, &mut under);
         }
-        if out.len() < Self::MAX_QUADS {
+        if out_ramps.laid(out.len()) < Self::MAX_QUADS {
             self.emit_forge_cursor(cfg, geom, cur, out, &mut halos);
         }
         let flying = !matches!(cfg.style, GlowStyle::Fire);
-        if out.len() < Self::MAX_QUADS {
+        if out_ramps.laid(out.len()) < Self::MAX_QUADS {
             let (q0, h0) = (out.len(), halos.len());
             if let Some(ring) = &mut self.ring
                 && let Some((r, c)) = cur
@@ -2069,9 +2178,13 @@ impl CursorGlow {
                     .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
             }
         }
-        if out.len() < Self::MAX_QUADS {
+        if out_ramps.laid(out.len()) < Self::MAX_QUADS {
             let (q0, h0) = (out.len(), halos.len());
-            self.emit_particles(now, cfg, geom, out, &mut halos, &mut under);
+            let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
+            // The room the stream's ramp lights leave its quads.
+            let cap = Self::MAX_QUADS.saturating_sub(out_ramps.lit);
+            self.emit_particles(now, cfg, geom, out, &mut halos, &mut under_sink, cap);
+            drop(under_sink);
             if flying {
                 self.ink_ledger
                     .admit_each_quad(&mut out[q0..], InkLedger::FLYING_FLOOR);
@@ -2088,22 +2201,26 @@ impl CursorGlow {
         self.halo_out = halos;
         self.patch_out = patches;
         self.under_out = under;
+        self.under_ramps = under_ramps;
         self.char_out = charred;
         self.fire_halo_out = halo_cells;
         self.engulf_scratch = engulf;
 
-        self.tick_fades(now, geom, out);
+        self.tick_fades(now, geom, (out, &mut out_ramps));
 
-        if out.len() > Self::MAX_QUADS {
-            out.truncate(Self::MAX_QUADS);
-        }
-        self.under_out.truncate(Self::MAX_QUADS);
+        out_ramps.truncate_laid(out, Self::MAX_QUADS);
+        self.under_ramps
+            .truncate_laid(&mut self.under_out, Self::MAX_QUADS);
 
         self.halo_out.truncate(Self::MAX_HALOS);
         let mut fp = FrameFingerprint::EMPTY;
         fp.glow_quads(FrameFingerprint::GLOW_OUT, out);
+        fp.glow_ramps(FrameFingerprint::GLOW_OUT, &out_ramps);
         fp.fire_patches(&self.patch_out);
         fp.glow_quads(FrameFingerprint::GLOW_UNDER, &self.under_out);
+        fp.glow_ramps(FrameFingerprint::GLOW_UNDER, &self.under_ramps);
+        self.out_ramps = out_ramps;
+        self.fold_for_tests(out);
         fp.chars(&self.char_out);
         fp.fire_halos(&self.fire_halo_out);
         fp.rain_halos(&self.halo_out);
@@ -2206,7 +2323,12 @@ impl CursorGlow {
         Self::RAMP_IN_FLOOR + (1.0 - Self::RAMP_IN_FLOOR) * eased
     }
 
-    fn tick_fades(&mut self, now: Instant, geom: Geom, out: &mut Vec<GlowQuad>) {
+    fn tick_fades(
+        &mut self,
+        now: Instant,
+        geom: Geom,
+        (out, out_ramps): (&mut Vec<GlowQuad>, &mut GlowRamps),
+    ) {
         if self.fading.is_empty() {
             return;
         }
@@ -2225,18 +2347,27 @@ impl CursorGlow {
             if c.intensity <= 0.0 {
                 return false;
             }
+            #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+            {
+                f.engine.rows_cost = self.rows_cost;
+            }
             f.engine.tick(f.anchor, now, &c, geom, &mut scratch);
             f.engine.sound_cues.clear();
             let contributed = !(scratch.is_empty()
+                && f.engine.out_ramps.is_empty()
                 && f.engine.halo_out.is_empty()
                 && f.engine.patch_out.is_empty()
                 && f.engine.under_out.is_empty()
+                && f.engine.under_ramps.is_empty()
                 && f.engine.char_out.is_empty()
                 && f.engine.fire_halo_out.is_empty());
             if contributed {
+                out_ramps.append_from(&f.engine.out_ramps, out.len());
                 out.extend_from_slice(&scratch);
                 self.halo_out.extend_from_slice(&f.engine.halo_out);
                 self.patch_out.extend_from_slice(&f.engine.patch_out);
+                self.under_ramps
+                    .append_from(&f.engine.under_ramps, self.under_out.len());
                 self.under_out.extend_from_slice(&f.engine.under_out);
                 self.char_out.extend_from_slice(&f.engine.char_out);
                 self.fire_halo_out

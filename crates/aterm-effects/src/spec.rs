@@ -228,9 +228,8 @@ impl SpecTable {
     #[inline]
     #[must_use]
     pub fn override_for(&self, form_hash: u64) -> Option<&WordEffectSpec> {
-        self.overrides
-            .get(&form_hash)
-            .and_then(|id| self.specs.get(usize::from(*id)))
+        let &id = self.overrides.get(&form_hash)?;
+        self.specs.get(usize::from(id))
     }
 
     fn intern_spec(&mut self, spec: WordEffectSpec) -> Option<SpecId> {
@@ -491,7 +490,15 @@ pub fn build_custom(entries: &[RawCustomEntry]) -> (SpecTable, String) {
             if w.is_empty() {
                 continue;
             }
-            if let Some(id) = *spec_id.get_or_insert_with(|| table.intern_spec(spec)) {
+            let id = match spec_id {
+                Some(id) => id,
+                None => {
+                    let id = table.intern_spec(spec);
+                    spec_id = Some(id);
+                    id
+                }
+            };
+            if let Some(id) = id {
                 table.insert_custom_with_id(w, id);
             }
             if is_no_space_surface(w) {
@@ -814,8 +821,10 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
             ));
         }
 
-        let spec_id = compile_toy_spec(toy, &context, &mut diagnostics)
-            .and_then(|spec| table.intern_spec(spec));
+        let spec_id = match compile_toy_spec(toy, &context, &mut diagnostics) {
+            Some(spec) => table.intern_spec(spec),
+            None => None,
+        };
         let mut spaced = Vec::new();
         let mut cjk = Vec::new();
         for (word_index, word) in toy.words.iter().take(MAX_WORDS_PER_TOY).enumerate() {
@@ -1119,7 +1128,11 @@ fn compile_toy_spec(
             "{context}: at least one of ink, burst, or graphic is required"
         ));
     }
-    (diagnostics.len() == before).then_some(spec)
+    if diagnostics.len() == before {
+        Some(spec)
+    } else {
+        None
+    }
 }
 
 fn compile_toy_ink(raw: &RawToyPackInk, context: &str, diagnostics: &mut Vec<String>) -> InkSpec {

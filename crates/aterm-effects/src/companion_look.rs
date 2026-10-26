@@ -79,7 +79,10 @@ impl ProgramClaim {
         let key = block.map(|b| (session, b.id, b.state, b.commandline.is_some()));
         if key != self.key {
             self.key = key;
-            self.identity = block.and_then(derive_identity);
+            self.identity = match block {
+                Some(b) => derive_identity(b),
+                None => None,
+            };
         }
         self.identity.as_ref()
     }
@@ -90,7 +93,8 @@ impl ProgramClaim {
 fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
     match block.state {
         BlockState::Executing => {
-            let basename = app_basename(block.commandline.as_deref().unwrap_or(""))?;
+            let cmd = block.commandline.as_deref()?;
+            let basename = app_basename(cmd)?;
             let id = canonical_app_id(&basename);
             if id == SHELL_APP_ID {
                 return None;

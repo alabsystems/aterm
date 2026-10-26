@@ -9,6 +9,8 @@ use crate::github_pages::Page;
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{Cmd, Scratch, Secret, System};
+use aterm_capacity::admit::gib;
+use aterm_capacity::reading::Volume;
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -120,9 +122,10 @@ impl Item for Repositories {
             }
             Ok(scan) => Probe::Change {
                 from: format!(
-                    "{} of {} repositories missing from ~; {} clean worktree(s) behind GitHub",
+                    "{} of {} repositories missing from ~{}; {} clean worktree(s) behind GitHub",
                     scan.missing.len(),
                     scan.all,
+                    unfit(sys, &self.user, &scan.missing),
                     scan.moving()
                 ),
                 to: "clone missing repositories with full history; fast-forward each clean \
@@ -137,7 +140,13 @@ impl Item for Repositories {
             return Err("GitHub authentication changed; no repositories cloned".into());
         };
         let scan = self.scan(sys, &token)?;
+        let home = Path::new(&self.user.home);
+        let mut left = Vec::new();
         for repo in scan.missing {
+            if let Some(name) = no_room(sys.volume(home).as_ref(), &repo) {
+                left.push(name);
+                continue;
+            }
             clone_one(sys, &self.user, &repo.owner, &repo)?;
         }
         let mut failed = Vec::new();
@@ -149,11 +158,26 @@ impl Item for Repositories {
                 failed.push(format!("~/{}: {}", repo.name, unread.why));
             }
         }
+        failed.extend(short_of_room(sys.volume(home).as_ref(), &left, INIT_AGAIN));
         if failed.is_empty() {
             Ok(())
         } else {
             Err(failed.join("; "))
         }
+    }
+}
+
+/// How many of `missing` the disk holding `user`'s home has no room for now ([`no_room`]), as
+/// the plan adds it; empty when every one fits or the volume cannot be read.
+fn unfit(sys: &dyn System, user: &User, missing: &[Repo]) -> String {
+    let volume = sys.volume(Path::new(&user.home));
+    match missing
+        .iter()
+        .filter(|repo| no_room(volume.as_ref(), repo).is_some())
+        .count()
+    {
+        0 => String::new(),
+        unfit => format!(", {unfit} of them with no room on the disk now"),
     }
 }
 
@@ -253,11 +277,71 @@ pub(super) fn git_installed(sys: &dyn System) -> bool {
     sys.stat(Path::new(GIT)).is_ok_and(|stat| !stat.dir)
 }
 
+/// The room a clone takes per byte of GitHub's `size`: 54 repositories GitHub sized at 10 GiB
+/// took 29 GiB cloned (2026-10-25), one of them 4.7 times its size.
+const CLONE_ROOM_PER_SIZE: u64 = 5;
+
+/// What a pass that left repositories for room ([`short_of_room`]) tells the person to do once
+/// there is room, as `aterm init` says it.
+pub(super) const INIT_AGAIN: &str = "run aterm init again";
+
+/// `repo` as a pass that leaves it uncloned names it, when its clone would take `volume` below
+/// the free space the window's disk watch keeps on it ([`Volume::floor`]); `None` when it fits,
+/// or when the volume could not be read. A size GitHub gives as `0` (an empty repository, or one
+/// it has not sized yet) counts as 1 KiB, so no clone runs on a volume already at its floor.
+pub(super) fn no_room(volume: Option<&Volume>, repo: &Repo) -> Option<String> {
+    let volume = volume?;
+    let need = repo
+        .size_kib
+        .max(1)
+        .saturating_mul(1024)
+        .saturating_mul(CLONE_ROOM_PER_SIZE);
+    if need <= volume.above_floor() {
+        return None;
+    }
+    Some(if need >= aterm_capacity::floor::GIB / 10 {
+        format!("~/{} (about {})", repo.name, gib(need))
+    } else {
+        format!("~/{}", repo.name)
+    })
+}
+
+/// What a pass that left `left` uncloned for room ([`no_room`]) says, with `volume`'s free space,
+/// the free space it keeps and `then`, what to do once there is room; `None` when it left none.
+pub(super) fn short_of_room(
+    volume: Option<&Volume>,
+    left: &[String],
+    then: &str,
+) -> Option<String> {
+    if left.is_empty() {
+        return None;
+    }
+    let disk = volume.map_or_else(String::new, |volume| {
+        format!(
+            "; {} has {} free and keeps {} free",
+            volume.mount.display(),
+            gib(volume.free),
+            gib(volume.floor)
+        )
+    });
+    let count = match left.len() {
+        1 => "1 repository".to_owned(),
+        n => format!("{n} repositories"),
+    };
+    Some(format!(
+        "{count} not cloned, for want of disk space: {}{disk}; free space, then {then}",
+        left.join(", ")
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Repo {
     pub(super) owner: String,
     pub(super) name: String,
     pub(super) default_branch: Option<String>,
+    /// GitHub's `size` for it in KiB (`0` where GitHub gives none, or has not sized it yet),
+    /// which [`no_room`] estimates its clone's room from.
+    pub(super) size_kib: u64,
 }
 
 impl Repo {
@@ -400,6 +484,7 @@ fn repo(value: &Value, expected_owner: Option<&str>) -> Result<Repo, String> {
         owner: owner.into(),
         name: name.into(),
         default_branch,
+        size_kib: value.get("size").and_then(Value::as_u64).unwrap_or(0),
     })
 }
 
@@ -1172,7 +1257,7 @@ mod tests {
                             }
                         }
                         "rev-list --count HEAD --not --remotes=origin" => Ran::ok("0\n"),
-                        "-c core.hooksPath=/dev/null fetch --quiet --no-recurse-submodules origin" =>
+                        "-c core.hooksPath=/dev/null -c maintenance.auto=false fetch --quiet --no-recurse-submodules origin" =>
                         {
                             state.1 = true;
                             Ran::ok("")
@@ -1184,7 +1269,7 @@ mod tests {
                         line if line == format!("rev-list --count {A}..{B}") => Ran::ok("1\n"),
                         line if line
                             == format!(
-                                "-c core.hooksPath=/dev/null -c submodule.recurse=false merge --ff-only --no-autostash --quiet {B}"
+                                "-c core.hooksPath=/dev/null -c maintenance.auto=false -c submodule.recurse=false merge --ff-only --no-autostash --quiet {B}"
                             ) =>
                         {
                             state.0 = B.to_owned();
@@ -1274,6 +1359,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    const GIB: u64 = aterm_capacity::floor::GIB;
+
+    /// A data volume of 100 GiB with `free` bytes free and a floor of 8 GiB.
+    fn volume(free: u64) -> aterm_capacity::reading::Volume {
+        aterm_capacity::reading::Volume {
+            mount: PathBuf::from("/System/Volumes/Data"),
+            total: 100 * GIB,
+            free,
+            floor: 8 * GIB,
+            room: 8 * GIB,
+        }
+    }
+
+    fn sized(name: &str, id: u64, size_kib: u64) -> Value {
+        let mut value = value(name, id, true);
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("size".into(), aterm_json::json!(size_kib));
+        value
+    }
+
+    /// A clone runs while five times GitHub's size for it leaves the disk watch's floor free, to
+    /// the byte; one that would not is named and left; an unread volume runs every clone.
+    #[test]
+    fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
+        let repo = |size_kib| Repo {
+            owner: "alice".into(),
+            name: "big".into(),
+            default_branch: Some("main".into()),
+            size_kib,
+        };
+        assert_eq!(no_room(None, &repo(u64::MAX)), None);
+        assert_eq!(short_of_room(None, &[], INIT_AGAIN), None);
+
+        // GitHub's 0 (empty, or not sized yet) still needs room above the floor.
+        assert_eq!(no_room(Some(&volume(8 * GIB + 5 * 1024)), &repo(0)), None);
+        assert_eq!(
+            no_room(Some(&volume(8 * GIB + 5 * 1024 - 1)), &repo(0)).as_deref(),
+            Some("~/big")
+        );
+        assert_eq!(
+            no_room(Some(&volume(3 * GIB)), &repo(0)).as_deref(),
+            Some("~/big")
+        );
+
+        let volume = volume(8 * GIB + 5 * 1000 * 1024);
+        assert_eq!(no_room(Some(&volume), &repo(1000)), None);
+        let left = [
+            no_room(Some(&volume), &repo(1001)).unwrap(),
+            no_room(Some(&volume), &repo(2 * 1024 * 1024)).unwrap(),
+        ];
+        assert_eq!(left, ["~/big", "~/big (about 10 GiB)"]);
+        assert_eq!(short_of_room(Some(&volume), &[], INIT_AGAIN), None);
+        assert_eq!(
+            short_of_room(Some(&volume), &left, "try again").unwrap(),
+            "2 repositories not cloned, for want of disk space: ~/big, ~/big (about 10 GiB); \
+             /System/Volumes/Data has 8 GiB free and keeps 8 GiB free; free space, then try again"
+        );
+    }
+
+    /// The plan says how many missing repositories the disk has no room for; a pass leaves
+    /// out each of them, still clones the next one that fits, and ends naming the one it left.
+    #[test]
+    fn a_repository_the_disk_has_no_room_for_is_left_and_the_rest_cloned() {
+        let (mut sys, who, config) = fixture();
+        sys.volume = Some(volume(12 * GIB));
+        let (_, _, clone_key) = script_clone(&sys, &who, false);
+        sys.on_github_api(
+            &who,
+            &format!("{BASE}&page=1"),
+            page(
+                vec![sized("huge", 1, 2 * 1024 * 1024), value("new", 2, true)],
+                None,
+            ),
+        );
+        let ctx = ctx(std::slice::from_ref(&who));
+        match item(&who, &config, Vec::new()).probe(&sys, &ctx) {
+            Probe::Change { from, .. } => assert_eq!(
+                from,
+                "2 of 2 repositories missing from ~, 1 of them with no room on the disk now; 0 \
+                 clean worktree(s) behind GitHub"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let why = item(&who, &config, Vec::new())
+            .apply(&sys, &ctx)
+            .unwrap_err();
+        assert_eq!(
+            why,
+            "1 repository not cloned, for want of disk space: ~/huge (about 10 GiB); \
+             /System/Volumes/Data has 12 GiB free and keeps 8 GiB free; free space, then run \
+             aterm init again"
+        );
+        let calls = sys.calls();
+        assert_eq!(calls.iter().filter(|call| **call == clone_key).count(), 1);
+        assert!(
+            calls.iter().all(|call| !call.contains("alice/huge")),
+            "{calls:?}"
+        );
     }
 
     #[test]
@@ -1387,7 +1574,7 @@ mod tests {
             )
             .unwrap();
             let ctx = ctx(std::slice::from_ref(&who));
-            let items = crate::init_github::items(&sys, &ctx).unwrap();
+            let items = crate::init_github::items(&sys, &ctx, None).unwrap();
             let repositories = items
                 .iter()
                 .find(|item| item.id().starts_with("init.github.repositories@"))
@@ -1512,6 +1699,7 @@ mod tests {
             owner: "alice".into(),
             name: "new".into(),
             default_branch: Some("main".into()),
+            size_kib: 0,
         };
         let url = "https://github.com/alice/new.git";
         sys.on(
@@ -1724,6 +1912,7 @@ mod tests {
                 owner: "alice".into(),
                 name: "new".into(),
                 default_branch: Some("main".into()),
+                size_kib: 0,
             };
             let url = "https://github.com/alice/new.git";
             sys.on(
@@ -1842,16 +2031,20 @@ mod tests {
         .unwrap();
         text(
             &sys,
-            &git(&who, Some(&path)).args([
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "fixture",
-            ]),
+            // A commit starts automatic maintenance too, whose fork would hold this drain's
+            // pipe past git's exit on a loaded machine.
+            &git(&who, Some(&path))
+                .args(crate::checkout::NO_SIDE_RUNS)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ]),
             "fixture commit",
         )
         .unwrap();
@@ -1878,6 +2071,7 @@ mod tests {
             owner: "alice".into(),
             name: "existing".into(),
             default_branch: Some("main".into()),
+            size_kib: 0,
         };
         verify_existing(&sys, &who, "alice", &repo, &path).unwrap();
         assert_eq!(
@@ -1908,6 +2102,7 @@ mod tests {
             owner: "alice".into(),
             name: "existing".into(),
             default_branch: Some("main".into()),
+            size_kib: 0,
         };
         verify_existing(&sys, &who, "alice", &repo, &path).unwrap();
         assert!(sys.calls().iter().all(|call| !call.contains("shallow")

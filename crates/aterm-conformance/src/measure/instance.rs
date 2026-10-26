@@ -332,8 +332,9 @@ impl Instance {
     /// [`Instance::launch`] with a window: AppKit's loop and its proxies, which `--headless`
     /// never runs. A window takes no lifeline (aterm refuses `--lifeline-fd` without
     /// `--headless`: a window is a person's to close), so it is this process's child in this
-    /// process's group, ended by its pid on drop and with the group when `verify`'s ceiling or an
-    /// interrupt ends the run.
+    /// process's group, ended on drop by its pid with the helpers it started
+    /// ([`end_with_helpers`]), and with the group when `verify`'s ceiling or an interrupt ends the
+    /// run.
     /// # Errors
     /// As [`Instance::launch`].
     pub fn launch_windowed(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
@@ -417,9 +418,60 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        end_with_helpers(&mut self.child);
     }
+}
+
+/// How long a helper an instance left has after its `SIGTERM` before its `SIGKILL`.
+const HELPER_GRACE: Duration = Duration::from_secs(2);
+
+/// Kill and reap `child`, an instance this process launched, then end the children it had in this
+/// process's group. Once launchd adopts them they outlive it: a window's consent sentinel
+/// (`log stream … --timeout 15m`) would run for a quarter of an hour, and the stage's group sweep
+/// names it. Each child is listed with its identity while the instance lives, and ended once the
+/// instance is reaped through [`aterm_uds::process::end_proven`], which re-reads the identity
+/// before each signal and signals only a process still in this group, so a pid reused meanwhile is
+/// never signalled. A child that set up a group of its own (a session's shell) is not this
+/// process's to end. One the instance starts between the listing and its kill is not listed; the
+/// stage's sweep names it.
+fn end_with_helpers(child: &mut spawnfd::Child) {
+    let helpers = children_of(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    for helper in helpers {
+        let _ = aterm_uds::process::end_proven(
+            helper,
+            HELPER_GRACE,
+            &mut aterm_uds::process::EndControlLive,
+            |id| in_this_group(id.pid),
+        );
+    }
+}
+
+/// `pid`'s children, each with its identity.
+#[cfg(target_vendor = "apple")]
+fn children_of(pid: u32) -> Vec<aterm_uds::process::Identity> {
+    i32::try_from(pid)
+        .ok()
+        .and_then(aterm_uds::process::child_pids)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(aterm_uds::process::read_identity)
+        .collect()
+}
+
+/// No child lister is wired here: the instance is ended alone.
+#[cfg(not(target_vendor = "apple"))]
+fn children_of(_pid: u32) -> Vec<aterm_uds::process::Identity> {
+    Vec::new()
+}
+
+/// Whether `pid` is in this process's group.
+fn in_this_group(pid: i32) -> bool {
+    // SAFETY: `getpgrp` takes no arguments and cannot fail.
+    let own = unsafe { libc::getpgrp() };
+    aterm_uds::process::read_lineage(pid)
+        .is_some_and(|lineage| i32::try_from(lineage.pgid).is_ok_and(|pgid| pgid == own))
 }
 
 /// One `ctl` request's answer.
@@ -739,6 +791,42 @@ mod tests {
             }
             Band::NoRoles => panic!("macOS has darwin roles"),
         }
+    }
+
+    /// A window's consent sentinel outlived the window in the bench's group. The stand-in's helper
+    /// is a subshell that never execs (so the identity listed is the one it keeps) blocked reading
+    /// a pipe this test holds: only the drop can end it.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn an_instance_ends_with_the_helper_it_started() {
+        use std::io::BufRead as _;
+        let mut child = spawnfd::command("/bin/sh")
+            .args([
+                "-c",
+                "exec 3<&0; (read held <&3) & echo $!; exec /bin/sleep 600 3<&-",
+            ])
+            .stdin(spawnfd::Stdio::piped())
+            .stdout(spawnfd::Stdio::piped())
+            .stderr(spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in instance");
+        let held = child.stdin.take().expect("the helper's held input");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("the helper's pid");
+        let helper: i32 = line.trim().parse().expect("a pid");
+        end_with_helpers(&mut child);
+        let presence = aterm_uds::process::process_presence(helper);
+        drop(held);
+        assert!(
+            matches!(
+                presence,
+                aterm_uds::process::ProcessPresence::Absent
+                    | aterm_uds::process::ProcessPresence::Exited
+            ),
+            "the helper (pid {helper}) outlived its instance: {presence:?}"
+        );
     }
 
     /// The bench takes aterm.app's band itself ([`Band::take_own`], the first thing

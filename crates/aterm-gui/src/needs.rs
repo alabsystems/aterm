@@ -58,6 +58,41 @@ pub(crate) struct AgentFact {
     pub(crate) subject: Option<String>,
 }
 
+/// Where this machine's one Grok Build sign-in stands (`aterm harness signin --cli grok`,
+/// [`aterm_agent::harness::grok_signin`]), read for a Grok session on a sign-in wall alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrokSignin {
+    /// A sign-in runs: its one need (code and page) stands on the session that leads it.
+    Running,
+    /// A login this session's grok may not have read (written after it started): only a restart
+    /// there reads it.
+    SignedIn,
+    /// Signed out, or the login was refused by this session's grok (written before it started),
+    /// and no sign-in runs.
+    Idle,
+}
+
+/// The one need every Grok session on a sign-in wall shares while this machine is signed out
+/// and no sign-in runs ([`machine_wide`]): its remedy is the sign-in that session's grok already
+/// runs, whose code is on its screen and whose page it already opened, never a second device
+/// flow with another code (the window starts no sign-in of its own).
+pub(crate) const GROK_SIGNIN_WHAT: &str =
+    "signed out of Grok Build: approve the sign-in on its screen";
+
+/// A Grok session's sign-in wall while this machine's sign-in runs.
+pub(crate) const GROK_SIGNIN_WAIT: &str = "signing Grok Build in for this machine";
+
+/// A Grok session's sign-in wall once this machine is signed in.
+pub(crate) const GROK_SIGNED_IN_WHAT: &str =
+    "Grok Build is signed in on this machine: restart grok here";
+
+/// Whether `need` is this machine's rather than its session's: every session it stands in
+/// shares it, so a surface listing the machine's needs lists it once.
+#[must_use]
+pub(crate) fn machine_wide(need: &Need) -> bool {
+    need.word == NeedWord::Login && need.what == GROK_SIGNIN_WHAT
+}
+
 /// The program's own report that it is blocked (OSC 7501 `blocked`, codex's claim), kept apart
 /// from [`AgentFact`]: a claim never moves the agent verdict ([`program_need`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +125,9 @@ pub(crate) struct NeedFacts {
     pub(crate) self_claimed: bool,
     /// A harness presses this session's boxes.
     pub(crate) supervised: bool,
-    /// Another holder's `meta set supervisor` claim is live.
+    /// Another holder's `meta set supervisor` claim is live and speaks for this session's boxes
+    /// and walls ([`crate::session_timeline::SupervisorClaim::speaks_for_boxes_and_walls`]): every
+    /// claim but a contract v3 scoped one whose scope does not name approvals, questions and walls.
     pub(crate) other_supervisor: bool,
     /// A supervisor's claim is live on the session.
     pub(crate) claim_live: bool,
@@ -108,6 +145,8 @@ pub(crate) struct NeedFacts {
     pub(crate) now_unix: i64,
     /// The worker's needs you sets as its loop told the window's host, whole.
     pub(crate) told: ToldNeeds,
+    /// This machine's Grok Build sign-in, for a Grok session on a sign-in wall alone.
+    pub(crate) grok_signin: Option<GrokSignin>,
 }
 
 impl NeedFacts {
@@ -448,7 +487,11 @@ pub(crate) fn wait_words(wait: &Waiting, unsupervised: bool) -> String {
         (WaitWord::Api, _) => "can't reach the API".to_string(),
         (WaitWord::Overloaded, _) => "retrying an overloaded service".to_string(),
         (WaitWord::MemoryRestart, _) => "memory restart queued for the next idle point".to_string(),
-        (WaitWord::Login, _) => "signing Claude back in".to_string(),
+        // A Grok sign-in wall's wait carries its words ([`GROK_SIGNIN_WAIT`]).
+        (WaitWord::Login, _) => wait
+            .entry
+            .as_ref()
+            .map_or_else(|| "signing Claude back in".to_string(), |e| e.text.clone()),
         (WaitWord::Limit, Some(wall)) if unsupervised => {
             format!("at the {}, unsupervised", wall_words(wall))
         }
@@ -602,12 +645,9 @@ fn task_need(facts: &NeedFacts) -> Option<Need> {
         .attention
         .iter()
         .find(|entry| aterm_agent::supervise::deadline_attention(&entry.text));
-    let what = match (deadline, task.why) {
-        (Some(entry), _) => entry.text.clone(),
-        (None, Some("held")) => "held at a screen aterm does not know".to_string(),
-        (None, Some("startup" | "shell")) => "never started".to_string(),
-        (None, Some(why)) => format!("stalled ({why})"),
-        (None, None) => "stalled".to_string(),
+    let what = match deadline {
+        Some(entry) => entry.text.clone(),
+        None => crate::task_record::stall_words(task.why),
     };
     Some(Need {
         word: NeedWord::Stalled,
@@ -656,6 +696,30 @@ fn wall_outcome(
                     need(NeedWord::Frozen, "frozen: not reading input".to_string())
                 }
             }),
+            None,
+            None,
+        ),
+        // Grok: the machine's one sign-in, never a page per session (`harness::grok_signin`).
+        "auth" if facts.grok_signin == Some(GrokSignin::Running) => (
+            None,
+            Some(Waiting {
+                word: WaitWord::Login,
+                wall: Some(kind),
+                reset: None,
+                entry: Some(WaitEntry {
+                    owner: aterm_agent::harness::grok_signin::NEED_OWNER.to_string(),
+                    text: GROK_SIGNIN_WAIT.to_string(),
+                }),
+            }),
+            None,
+        ),
+        "auth" if facts.grok_signin == Some(GrokSignin::Idle) => (
+            need(NeedWord::Login, GROK_SIGNIN_WHAT.to_string()),
+            None,
+            None,
+        ),
+        "auth" if facts.grok_signin == Some(GrokSignin::SignedIn) => (
+            need(NeedWord::Login, GROK_SIGNED_IN_WHAT.to_string()),
             None,
             None,
         ),

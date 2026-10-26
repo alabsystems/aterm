@@ -874,7 +874,7 @@ impl CandidateBundle {
 
     /// Bundle parts for declared/measured lab data and commit-witness publication.
     #[inline]
-    pub(super) fn parts_mut(&mut self) -> &mut UncheckedBundle {
+    pub(super) const fn parts_mut(&mut self) -> &mut UncheckedBundle {
         &mut self.0
     }
 
@@ -1116,11 +1116,13 @@ pub(super) const fn row_passes(r: &Row) -> bool {
 fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefusal> {
     let s = &b.selection;
     let st = &s.stats;
-    let counted = st
-        .oversized
-        .checked_add(st.duplicates)
-        .and_then(|n| n.checked_add(st.over_budget))
-        .and_then(|n| n.checked_add(st.distinct));
+    let counted = match (
+        st.oversized.checked_add(st.duplicates),
+        st.over_budget.checked_add(st.distinct),
+    ) {
+        (Some(a), Some(b)) => a.checked_add(b),
+        _ => None,
+    };
     let counts_ok = match s.mode {
         Mode::OnDemand => *st == SearchStats::ONE,
         Mode::Search | Mode::Distributed => {

@@ -1273,8 +1273,12 @@ fn decoration_has_no_node() {
     );
 }
 
+/// THE TOP RULE IS THE HOST'S LINE (2026-10-24): the run the footer repaints with the lockup
+/// and the switch is held for the resident pet whole, strokes and all, so no seat puts the cat's
+/// head under it, where it is drawn under the line and the person cannot see it; the lower
+/// rule's strokes around the footer's facts stay Claude Code's (a482f15b13).
 #[test]
-fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
+fn the_harness_top_rule_is_held_whole_and_the_lower_rules_strokes_are_the_programs() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     crate::session_timeline::claim_supervisor(
@@ -1292,42 +1296,83 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
         b.face == HarnessSwitch::On,
         "fixture: the harness carries the session: {b:?}"
     );
-    let row: Vec<char> = app.windows[&wid].input_scratch.cells[b.frame_row]
-        .iter()
-        .map(|c| c.ch)
-        .collect();
+    let chars = |frame_row: usize| -> Vec<char> {
+        app.windows[&wid].input_scratch.cells[frame_row]
+            .iter()
+            .map(|c| c.ch)
+            .collect()
+    };
     let held = app.windows[&wid].pet_chrome.held().to_vec();
-    let covered = |col: usize| {
-        let (r, c) = (b.term_row as f32 + 0.5, col as f32 + 0.5);
+    let covered = |term_row: usize, col: usize| {
+        let (r, c) = (term_row as f32 + 0.5, col as f32 + 0.5);
         held.iter().any(|rect| {
             rect.row <= r && r < rect.row + rect.rows && rect.col <= c && c < rect.col + rect.cols
         })
     };
-    let strokes: Vec<usize> = (0..row.len()).filter(|&c| row[c] == '\u{2500}').collect();
-    let marks: Vec<usize> = (0..row.len())
-        .filter(|&c| row[c] != '\u{2500}' && row[c] != ' ')
-        .collect();
+    let split = |row: &[char]| -> (Vec<usize>, Vec<usize>) {
+        (
+            (0..row.len()).filter(|&c| row[c] == '\u{2500}').collect(),
+            (0..row.len())
+                .filter(|&c| row[c] != '\u{2500}' && row[c] != ' ')
+                .collect(),
+        )
+    };
+    let row = chars(b.frame_row);
+    let (strokes, marks) = split(&row);
     assert!(
         strokes.len() > 60 && marks.len() >= 20 && marks.iter().any(|&c| c < 20),
         "fixture: the tinted rule, the lockup at its left, the switch: {:?}",
         row.iter().collect::<String>()
     );
-    let held_strokes: Vec<usize> = strokes.iter().copied().filter(|&c| covered(c)).collect();
+    let free_strokes: Vec<usize> = strokes
+        .iter()
+        .copied()
+        .filter(|&c| !covered(b.term_row, c))
+        .collect();
     assert!(
-        held_strokes.is_empty(),
-        "{} of the rule's {} strokes held as the host's chrome, from column {:?}",
-        held_strokes.len(),
+        free_strokes.is_empty(),
+        "the host's line is held whole: {} of the rule's {} strokes free, from column {:?}",
+        free_strokes.len(),
         strokes.len(),
-        held_strokes.first()
+        free_strokes.first()
     );
-    let free: Vec<usize> = marks.iter().copied().filter(|&c| !covered(c)).collect();
+    let free: Vec<usize> = marks
+        .iter()
+        .copied()
+        .filter(|&c| !covered(b.term_row, c))
+        .collect();
     assert!(
         free.is_empty(),
         "the mark's and the switch's cells are the host's: {free:?} free"
     );
     assert!(
-        (b.cols.start..b.cols.end).all(&covered),
+        (b.cols.start..b.cols.end).all(|c| covered(b.term_row, c)),
         "the switch's cells, spaces and all"
+    );
+    let lower = footer_row(&app, wid);
+    let lower_term = b.term_row + (lower - b.frame_row);
+    let low = chars(lower);
+    let (low_strokes, words) = split(&low);
+    assert!(
+        low_strokes.len() > 20 && !words.is_empty(),
+        "fixture: the lower rule with the footer's facts on it: {:?}",
+        low.iter().collect::<String>()
+    );
+    let held_low: Vec<usize> = low_strokes
+        .iter()
+        .copied()
+        .filter(|&c| covered(lower_term, c))
+        .collect();
+    assert!(
+        held_low.is_empty(),
+        "{} of the lower rule's {} strokes held as the host's, from column {:?}",
+        held_low.len(),
+        low_strokes.len(),
+        held_low.first()
+    );
+    assert!(
+        words.iter().all(|&c| covered(lower_term, c)),
+        "the footer's words on the lower rule are the host's"
     );
 }
 

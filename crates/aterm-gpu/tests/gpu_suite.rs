@@ -29,6 +29,7 @@ mod free_parity;
 mod free_sprite_gpu;
 mod fx_parity;
 mod glow_halo_parity;
+mod glow_ramps_parity;
 mod glow_under_parity;
 mod gpu_matches_cpu;
 #[cfg(wgpu_arm)]

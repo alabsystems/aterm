@@ -211,6 +211,52 @@ pub(crate) struct FleetAsk {
     pub(crate) local_vitals: bool,
 }
 
+/// WHAT OF THE FLEET THIS aterm MAY READ, decided once from what it is: an aterm of its account's
+/// own reads the account's other aterm instances and the computers on its network; any other (a
+/// private state folder, root, a home folder that is not its account's, a test build) is
+/// isolated, and Tab Control shows it alone, with this Mac's vitals, and says why
+/// ([`aterm_types::dirs::not_own_account`]). A scratch-home lab never dials the person's aterm
+/// sockets or probes their network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FleetScope {
+    /// Its user's own aterm.
+    Account,
+    /// Isolated, for the reason given (words that follow "not read here: ").
+    Isolated(&'static str),
+}
+
+impl Default for FleetScope {
+    fn default() -> Self {
+        Self::Isolated(TEST_BUILD_ISOLATION)
+    }
+}
+
+/// [`FleetScope::Isolated`]'s reason in a test build.
+const TEST_BUILD_ISOLATION: &str = "it is a test build's aterm";
+
+impl FleetScope {
+    /// This process's scope, decided on first use and kept.
+    pub(crate) fn of_this_process() -> Self {
+        static SCOPE: std::sync::OnceLock<FleetScope> = std::sync::OnceLock::new();
+        *SCOPE.get_or_init(|| {
+            Self::decide(
+                cfg!(test) || aterm_uds::test_binary::scratch_root().is_some(),
+                aterm_types::dirs::not_own_account(),
+            )
+        })
+    }
+
+    /// The scope of a test build (`test_build`) or of an aterm that is not its account's own for
+    /// the reason `not_own` gives ([`aterm_types::dirs::not_own_account`]).
+    pub(crate) const fn decide(test_build: bool, not_own: Option<&'static str>) -> Self {
+        match (test_build, not_own) {
+            (true, _) => Self::Isolated(TEST_BUILD_ISOLATION),
+            (false, Some(why)) => Self::Isolated(why),
+            (false, None) => Self::Account,
+        }
+    }
+}
+
 /// The ledgers' reading as the page has it: the last report, whether a reading is running, and why none could be taken.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HarnessStatsSlot {
@@ -467,6 +513,8 @@ pub(crate) struct TabSpreadsheetRow {
 pub(crate) struct TabControlState {
     pub(crate) computers: Vec<TabComputer>,
     pub(crate) tabs: Vec<TabSpreadsheetRow>,
+    /// What of the fleet this reading could look at.
+    pub(crate) fleet: FleetScope,
 }
 
 /// Pure projection rendered by Settings ▸ Harness ▸ Tab Control (`/tabs`).
@@ -504,11 +552,17 @@ impl TabControlState {
                         && (t.ai_status.starts_with("working") || t.ai_status.starts_with("busy"))
                 })
                 .count();
-            let mut rows = vec![
-                (
-                    "Computers".to_string(),
-                    format!("{total_computers} known \u{b7} {online_computers} online"),
-                ),
+            let mut rows = vec![(
+                "Computers".to_string(),
+                format!("{total_computers} known \u{b7} {online_computers} online"),
+            )];
+            if let FleetScope::Isolated(why) = self.fleet {
+                rows.push((
+                    "Fleet".to_string(),
+                    format!("other computers and aterm instances are not read here: {why}"),
+                ));
+            }
+            rows.extend([
                 (
                     "Sessions".to_string(),
                     format!(
@@ -538,7 +592,7 @@ impl TabControlState {
                         )
                     },
                 ),
-            ];
+            ]);
             if self.computers.iter().any(|c| !c.vitals.is_empty()) {
                 let kernel_or_ssh = self
                     .computers
@@ -556,16 +610,25 @@ impl TabControlState {
                     .map(|c| c.vitals.as_str())
                     .filter(|v| !v.is_empty())
                     .unwrap_or("sampling\u{2026}");
+                let isolated = matches!(self.fleet, FleetScope::Isolated(_));
                 rows.push((
                     "System Vitals".to_string(),
-                    format!(
-                        "this Mac: {local_v} \u{2014} fleet telemetry: {kernel_or_ssh} full kernel/SSH \u{b7} {lan_rtt} live LAN RTT"
-                    ),
+                    if isolated {
+                        format!("this Mac: {local_v}")
+                    } else {
+                        format!(
+                            "this Mac: {local_v} \u{2014} fleet telemetry: {kernel_or_ssh} full kernel/SSH \u{b7} {lan_rtt} live LAN RTT"
+                        )
+                    },
                 ));
                 rows.push((
                     "Live Monitor".to_string(),
-                    "Continuous (1s local kernel / 3s fleet sweep \u{b7} 30s mDNS cache)"
-                        .to_string(),
+                    if isolated {
+                        "Continuous (1s local kernel)"
+                    } else {
+                        "Continuous (1s local kernel / 3s fleet sweep \u{b7} 30s mDNS cache)"
+                    }
+                    .to_string(),
                 ));
             }
             rows
@@ -2342,24 +2405,13 @@ impl App {
                     )
                 },
             );
-        let hide_viewer_self_tab = self.headless
-            && !cfg!(test)
-            && aterm_uds::test_binary::scratch_root().is_none()
-            && !sibling_tabs.is_empty();
-        if hide_viewer_self_tab {
-            local_tabs.clear();
-        }
         let local_meta = remote_computers
             .iter()
             .position(|c| c.id == "__local_meta__")
             .map(|idx| remote_computers.remove(idx));
         let sibling_instances: std::collections::BTreeSet<&str> =
             sibling_tabs.iter().map(|t| t.instance.as_str()).collect();
-        let local_instances = if hide_viewer_self_tab {
-            sibling_instances.len().max(1)
-        } else {
-            1 + sibling_instances.len()
-        };
+        let local_instances = 1 + sibling_instances.len();
         let local_ai_clis = local_tabs
             .iter()
             .chain(sibling_tabs.iter())
@@ -2414,7 +2466,11 @@ impl App {
         let mut tabs = local_tabs;
         tabs.extend(sibling_tabs);
         tabs.extend(remote_tabs);
-        TabControlState { computers, tabs }
+        TabControlState {
+            computers,
+            tabs,
+            fleet: FleetScope::of_this_process(),
+        }
     }
 
     fn harness_sessions(&self, posture: HarnessPosture) -> Vec<HarnessSession> {
@@ -2947,47 +3003,18 @@ fn ai_product_for_name(name: &str) -> Option<&'static str> {
     }
 }
 
-fn real_account_home() -> Option<std::path::PathBuf> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        unsafe {
-            let mut pw: libc::passwd = std::mem::zeroed();
-            let mut buf = [0u8; 4096];
-            let mut out: *mut libc::passwd = std::ptr::null_mut();
-            let rc = libc::getpwuid_r(
-                libc::getuid(),
-                &mut pw,
-                buf.as_mut_ptr().cast::<libc::c_char>(),
-                buf.len(),
-                &mut out,
-            );
-            if rc == 0 && !out.is_null() && !pw.pw_dir.is_null() {
-                let bytes = std::ffi::CStr::from_ptr(pw.pw_dir).to_bytes();
-                if !bytes.is_empty() {
-                    return Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
-                }
-            }
-        }
-    }
-    aterm_types::dirs::home_dir()
-}
-
 fn shorten_home_dir(path: &str) -> String {
     let trimmed = path.trim();
-    for home in [real_account_home(), aterm_types::dirs::home_dir()]
-        .into_iter()
-        .flatten()
+    if let Some(home) = aterm_types::dirs::home_dir()
+        && let Some(h) = home.to_str().filter(|h| !h.is_empty())
     {
-        if let Some(h) = home.to_str().filter(|h| !h.is_empty()) {
-            if trimmed == h {
-                return "~".to_string();
-            }
-            if let Some(rest) = trimmed.strip_prefix(h)
-                && rest.starts_with('/')
-            {
-                return format!("~{rest}");
-            }
+        if trimmed == h {
+            return "~".to_string();
+        }
+        if let Some(rest) = trimmed.strip_prefix(h)
+            && rest.starts_with('/')
+        {
+            return format!("~{rest}");
         }
     }
     trimmed.to_string()
@@ -3133,26 +3160,15 @@ pub(crate) fn canonical_host_name_gui(
 
 fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    let mut candidates = Vec::new();
-    if let Some(cfg) = aterm_types::dirs::aterm_config_dir() {
-        candidates.push(cfg.join("machines/machines.toml"));
-    }
-    if !cfg!(test)
-        && aterm_uds::test_binary::scratch_root().is_none()
-        && let Some(home) = real_account_home()
+    if let Some(path) =
+        aterm_types::dirs::aterm_config_dir().map(|cfg| cfg.join("machines/machines.toml"))
+        && let Ok(content) = std::fs::read_to_string(&path)
+        && let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(&content)
+        && let Some(names) = val.get("names").and_then(|v| v.as_table())
     {
-        candidates.push(home.join(".config/aterm/machines/machines.toml"));
-        candidates.push(home.join("Library/Application Support/aterm/machines/machines.toml"));
-    }
-    for path in candidates {
-        if let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(&content)
-            && let Some(names) = val.get("names").and_then(|v| v.as_table())
-        {
-            for (k, v) in names {
-                if let Some(s) = v.as_str() {
-                    out.insert(k.clone(), s.to_string());
-                }
+        for (k, v) in names {
+            if let Some(s) = v.as_str() {
+                out.insert(k.clone(), s.to_string());
             }
         }
     }
@@ -3214,7 +3230,7 @@ fn collect_fleet_and_sibling_tabs(
     }
     #[cfg(test)]
     FLEET_SWEEPS.with(|sweeps| sweeps.set(sweeps.get() + 1));
-    if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
+    if FleetScope::of_this_process() != FleetScope::Account {
         return (Vec::new(), Vec::new(), Vec::new());
     }
     let sibling_tabs = collect_sibling_aterm_tabs();
@@ -3239,22 +3255,16 @@ fn sibling_socket_dirs() -> Vec<std::path::PathBuf> {
     if let Some(dir) = aterm_uds::control_socket_dir() {
         dirs.push(dir);
     }
-    if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
-        if let Some(host_dir) = std::env::var_os("ATERM_TAB_CONTROL_HOST_SOCK_DIR") {
-            let p = std::path::PathBuf::from(host_dir);
-            if !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-        if let Some(home) = real_account_home() {
-            for rel in [
-                ".local/state/aterm/run",
-                "Library/Application Support/aterm",
-            ] {
-                let candidate = home.join(rel);
-                if !dirs.contains(&candidate) {
-                    dirs.push(candidate);
-                }
+    // An aterm started with `$XDG_RUNTIME_DIR` set binds elsewhere than one started without it;
+    // both defaults under this account's home are read (only an account's own aterm sweeps).
+    if let Some(home) = aterm_types::dirs::home_dir() {
+        for rel in [
+            ".local/state/aterm/run",
+            "Library/Application Support/aterm",
+        ] {
+            let candidate = home.join(rel);
+            if !dirs.contains(&candidate) {
+                dirs.push(candidate);
             }
         }
     }
@@ -3722,9 +3732,7 @@ fn collect_remote_machines_tabs(local_vitals: bool) -> (Vec<TabComputer>, Vec<Ta
         });
     }
     #[cfg(target_os = "macos")]
-    if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
-        discover_bonjour_lan_computers(&mut computers, &custom_names, local_vitals);
-    }
+    discover_bonjour_lan_computers(&mut computers, &custom_names, local_vitals);
     #[cfg(not(target_os = "macos"))]
     let _ = local_vitals;
     (computers, tabs)
@@ -3773,6 +3781,17 @@ fn format_uptime_gui(secs: u64) -> String {
 }
 
 fn push_sparkline_sample(host_key: &str, sample_pct: u8) -> String {
+    sparkline(host_key, Some(sample_pct))
+}
+
+/// `host_key`'s sparkline as it stands, no sample added.
+#[cfg(target_os = "macos")]
+fn sparkline_now(host_key: &str) -> String {
+    sparkline(host_key, None)
+}
+
+/// `host_key`'s last ten samples as a sparkline, after adding `sample_pct` where one is given.
+fn sparkline(host_key: &str, sample_pct: Option<u8>) -> String {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Mutex, OnceLock};
     const BLOCKS: [char; 8] = [
@@ -3783,10 +3802,12 @@ fn push_sparkline_sample(host_key: &str, sample_pct: u8) -> String {
     let mutex = RINGS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
     let q = guard.entry(host_key.to_string()).or_default();
-    if q.len() >= 10 {
-        q.pop_front();
+    if let Some(sample_pct) = sample_pct {
+        if q.len() >= 10 {
+            q.pop_front();
+        }
+        q.push_back(sample_pct.min(100));
     }
-    q.push_back(sample_pct.min(100));
     q.iter()
         .map(|&v| {
             let idx = ((u16::from(v) * 7 + 50) / 100).min(7) as usize;
@@ -4229,11 +4250,78 @@ fn describe_gui_hardware(model_id: Option<&str>) -> String {
         .to_string()
 }
 
+/// How long a host's last address, SSH banner and round trip stand in for probes that miss: one
+/// slow or lost 120 ms probe on a loaded machine is not news, and a row that dropped them for one
+/// sweep reflowed the list under its reader.
+#[cfg(any(target_os = "macos", test))]
+const HOST_FACTS_HELD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What one probe of a host finds: its IPv4 address, its SSH banner and the round trip of the
+/// connect that read it ([`resolve_host_ipv4_banner_and_rtt`]).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) type HostFacts = (Option<String>, Option<String>, Option<u64>);
+
+/// One host's last good probe facts, each with when it was last seen.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeldHostFacts {
+    ipv4: Option<(String, Instant)>,
+    banner: Option<(String, Instant)>,
+    rtt_us: Option<(u64, Instant)>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl HeldHostFacts {
+    /// The facts to show after a probe at `now` found `probed` (address, banner, round trip): what
+    /// it found, else what was found within [`HOST_FACTS_HELD`], else nothing; and whether the round
+    /// trip is a fresh sample (a held one is shown, never sampled again).
+    pub(crate) fn after_probe(&mut self, probed: HostFacts, now: Instant) -> (HostFacts, bool) {
+        fn hold<T: Clone>(
+            slot: &mut Option<(T, Instant)>,
+            seen: Option<T>,
+            now: Instant,
+        ) -> Option<T> {
+            match seen {
+                Some(value) => {
+                    *slot = Some((value.clone(), now));
+                    Some(value)
+                }
+                None => {
+                    if slot
+                        .as_ref()
+                        .is_some_and(|(_, at)| now.saturating_duration_since(*at) > HOST_FACTS_HELD)
+                    {
+                        *slot = None;
+                    }
+                    slot.as_ref().map(|(value, _)| value.clone())
+                }
+            }
+        }
+        let (ipv4, banner, rtt_us) = probed;
+        let fresh_rtt = banner.is_some() && rtt_us.is_some();
+        let banner = hold(&mut self.banner, banner, now);
+        let rtt_us = hold(&mut self.rtt_us, rtt_us.filter(|_| fresh_rtt), now);
+        ((hold(&mut self.ipv4, ipv4, now), banner, rtt_us), fresh_rtt)
+    }
+}
+
+/// [`resolve_host_ipv4_banner_and_rtt`] through each host's [`HeldHostFacts`].
 #[cfg(target_os = "macos")]
-fn resolve_host_ipv4_banner_and_rtt(
-    hostname: &str,
-    port: u16,
-) -> (Option<String>, Option<String>, Option<u64>) {
+fn probe_host_facts(hostname: &str, port: u16) -> (HostFacts, bool) {
+    type ByHost = std::collections::BTreeMap<(String, u16), HeldHostFacts>;
+    static HELD: std::sync::OnceLock<std::sync::Mutex<ByHost>> = std::sync::OnceLock::new();
+    let probed = resolve_host_ipv4_banner_and_rtt(hostname, port);
+    let hosts = HELD.get_or_init(Default::default);
+    let mut held = hosts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.entry((hostname.to_string(), port))
+        .or_default()
+        .after_probe(probed, Instant::now())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_host_ipv4_banner_and_rtt(hostname: &str, port: u16) -> HostFacts {
     use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
         let v4s: Vec<std::net::Ipv4Addr> = addrs
@@ -4459,7 +4547,7 @@ fn discover_bonjour_lan_computers(
     let raw_local = raw_local_host_name_gui();
     let local_canonical = canonical_host_name_gui(&raw_local, custom_names);
     let local_dot = format!("{raw_local}.local");
-    let (local_ip, local_ssh, _) = resolve_host_ipv4_banner_and_rtt(&local_dot, 22);
+    let ((local_ip, local_ssh, _), _) = probe_host_facts(&local_dot, 22);
     let local_addr = match local_ip {
         Some(ip) => format!("{ip} \u{b7} {local_dot}"),
         None => local_dot.clone(),
@@ -4547,8 +4635,8 @@ fn discover_bonjour_lan_computers(
                     let canonical = canonical_host_name_gui(inst_name, custom_names);
                     let (dot_local, port, model_id, osxvers) =
                         resolved_ref.get(inst_name)?.clone();
-                    let (ipv4, ssh_banner, rtt_us) =
-                        resolve_host_ipv4_banner_and_rtt(&dot_local, port);
+                    let ((ipv4, ssh_banner, rtt_us), fresh_rtt) =
+                        probe_host_facts(&dot_local, port);
                     let addr_display = match ipv4 {
                         Some(ip) => format!("{ip} \u{b7} {dot_local}"),
                         None => dot_local.clone(),
@@ -4579,8 +4667,12 @@ fn discover_bonjour_lan_computers(
                         && let Some(us) = rtt_us
                     {
                         let rtt_pct = ((us / 500).min(100)) as u8;
-                        let rtt_spark =
-                            push_sparkline_sample(&format!("lan/{canonical}/rtt"), rtt_pct);
+                        let rtt_key = format!("lan/{canonical}/rtt");
+                        let rtt_spark = if fresh_rtt {
+                            push_sparkline_sample(&rtt_key, rtt_pct)
+                        } else {
+                            sparkline_now(&rtt_key)
+                        };
                         format!(
                             "LAN SSH RTT {:.1}ms {rtt_spark} \u{b7} system vitals unobserved (enroll in aterm machines for CPU/GPU/RAM/Disk)",
                             us as f64 / 1_000.0

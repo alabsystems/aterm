@@ -128,6 +128,26 @@ impl PassPage {
         self.outcome.merge(later.outcome);
         self.rows.extend(later.rows);
     }
+
+    /// Say that `setting`'s step failed for `reason`, the page's words its step decided
+    /// (`GitHub can't be reached`), in place of the words a change that did not take carries.
+    /// A page with no failure of `setting` is left as it is.
+    pub fn failed_because(&mut self, setting: Setting, reason: &str) {
+        let failed = (setting, Unfinished::Failed);
+        let unfinished = self.outcome.unfinished.contains(&failed);
+        self.outcome.unfinished.retain(|each| *each != failed);
+        match self.rows.iter_mut().find(|row| {
+            row.name == setting.name() && matches!(row.status.as_str(), "error" | "failed")
+        }) {
+            Some(row) => row.detail = reason.into(),
+            None if unfinished => self.rows.push(Row {
+                name: setting.name().into(),
+                status: "error".into(),
+                detail: reason.into(),
+            }),
+            None => {}
+        }
+    }
 }
 
 impl Report {

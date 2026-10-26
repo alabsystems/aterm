@@ -4,11 +4,10 @@
 //! Video capture core.
 
 use std::collections::VecDeque;
-use std::sync::LazyLock;
 #[cfg(any(wgpu_arm, not(target_arch = "wasm32")))]
 use std::sync::mpsc;
 
-use aterm_render::{linear_to_srgb, srgb8_to_linear};
+use aterm_render::capture_pixels::{self, mapped_geometry};
 
 /// The colour space the platform compositor uses for a window's presented texture.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -200,6 +199,79 @@ pub struct VideoTake {
     pub format: &'static str,
     /// True when a mid-capture resize forced an early finalize.
     pub resized_early_stop: bool,
+}
+
+/// A finished recording whose conversion lane may still owe it frames. [`Self::settle`] waits for
+/// them, on the lane that exports the take, never on the thread that finished the recording;
+/// dropping it abandons them, and the lane's workers end at their next answer.
+pub struct UnsettledTake {
+    take: VideoTake,
+    #[cfg(not(target_arch = "wasm32"))]
+    lane: Option<ConvertWorker>,
+    /// Bytes the recording's store held when it finished.
+    store_bytes: usize,
+}
+
+impl From<VideoTake> for UnsettledTake {
+    /// A take its conversion lane owes nothing.
+    fn from(take: VideoTake) -> Self {
+        let store_bytes = take.frames.iter().map(|frame| frame.rgba.len()).sum();
+        Self {
+            take,
+            #[cfg(not(target_arch = "wasm32"))]
+            lane: None,
+            store_bytes,
+        }
+    }
+}
+
+impl UnsettledTake {
+    /// The take, once every frame the conversion lane owes is adopted: in capture order and
+    /// under the byte budget the recording ran with, a lost conversion counted dropped.
+    #[must_use]
+    pub fn settle(self) -> VideoTake {
+        #[cfg(not(target_arch = "wasm32"))]
+        let Self {
+            mut take,
+            lane,
+            mut store_bytes,
+        } = self;
+        #[cfg(target_arch = "wasm32")]
+        let Self { take, .. } = self;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ConvertWorker {
+            job_tx,
+            result_rx,
+            mut pending,
+            handles,
+            ..
+        }) = lane
+        {
+            drop(job_tx);
+            while pending > 0 {
+                match result_rx.recv() {
+                    Ok(Some(frame)) => {
+                        take.evicted += ordered_capture_store_push(
+                            &mut take.frames,
+                            &mut store_bytes,
+                            take.budget_bytes,
+                            frame,
+                        );
+                    }
+                    Ok(None) => take.dropped += 1,
+                    Err(_) => {
+                        take.dropped += pending as u64;
+                        break;
+                    }
+                }
+                pending -= 1;
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+        take
+    }
 }
 
 /// Abstract lifecycle phase of one [`VideoTap`] staging slot.
@@ -480,9 +552,13 @@ const RING: usize = 4;
 /// Default RAM budget for the harvested store (bytes).
 pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
-/// Upper bound on conversions dispatched and not yet adopted, matching [`RING`].
+/// How many threads convert a recording's frames: one frame's decode can take longer than a
+/// present (an f16 HDR take at half size, about 50 ms a frame in a debug build), and the frames
+/// are independent, so a few convert side by side and the store takes them in capture order.
 #[cfg(not(target_arch = "wasm32"))]
-const CONVERT_BACKLOG: usize = RING;
+fn convert_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 4).clamp(1, 3))
+}
 
 /// One mapped slot's raw padded bytes and per-frame inputs for [`mapped_to_rgba8`].
 #[cfg(not(target_arch = "wasm32"))]
@@ -493,14 +569,18 @@ struct ConvertJob {
     capture_encoding: CaptureEncoding,
 }
 
-/// Off-thread conversion worker running [`mapped_to_rgba8`] per job until `finish` drops `job_tx`.
+/// Off-thread conversion lane: workers running [`mapped_to_rgba8`] per job until the take drops
+/// `job_tx` ([`UnsettledTake::settle`]).
 #[cfg(not(target_arch = "wasm32"))]
 struct ConvertWorker {
     job_tx: mpsc::Sender<ConvertJob>,
     result_rx: mpsc::Receiver<Option<CapturedFrame>>,
-    /// Jobs dispatched and not yet adopted; bounded by [`CONVERT_BACKLOG`].
+    /// Jobs dispatched and not yet adopted; bounded by `backlog`.
     pending: usize,
-    handle: std::thread::JoinHandle<()>,
+    /// The staging ring's depth and one more per worker past the first, so each worker has a
+    /// frame to take while the ring refills.
+    backlog: usize,
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// Spawn the conversion worker for one recording, or `None` when inline conversion must be used.
@@ -514,39 +594,57 @@ fn spawn_convert_worker(
 ) -> Option<ConvertWorker> {
     {
         let (job_tx, job_rx) = mpsc::channel::<ConvertJob>();
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
         let (result_tx, result_rx) = mpsc::channel::<Option<CapturedFrame>>();
-        let handle = std::thread::Builder::new()
-            .name("aterm-video-convert".to_string())
-            .spawn(move || {
-                while let Ok(job) = job_rx.recv() {
-                    let frame = mapped_to_rgba8(
-                        &job.raw,
-                        src_w,
-                        src_h,
-                        padded_row,
-                        format,
-                        job.capture_encoding,
-                        half_res,
-                    )
-                    .ok()
-                    .map(|(rgba, w, h)| CapturedFrame {
-                        seq: job.seq,
-                        t_us: job.t_us,
-                        w,
-                        h,
-                        rgba,
-                    });
-                    if result_tx.send(frame).is_err() {
-                        return;
+        let mut handles = Vec::new();
+        for _ in 0..convert_workers() {
+            let job_rx = std::sync::Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("aterm-video-convert".to_string())
+                .spawn(move || {
+                    loop {
+                        let job = job_rx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        let Ok(job) = job else {
+                            return;
+                        };
+                        let frame = mapped_to_rgba8(
+                            &job.raw,
+                            src_w,
+                            src_h,
+                            padded_row,
+                            format,
+                            job.capture_encoding,
+                            half_res,
+                        )
+                        .ok()
+                        .map(|(rgba, w, h)| CapturedFrame {
+                            seq: job.seq,
+                            t_us: job.t_us,
+                            w,
+                            h,
+                            rgba,
+                        });
+                        if result_tx.send(frame).is_err() {
+                            return;
+                        }
                     }
-                }
-            })
-            .ok()?;
+                });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(_) if handles.is_empty() => return None,
+                Err(_) => break,
+            }
+        }
         Some(ConvertWorker {
             job_tx,
             result_rx,
             pending: 0,
-            handle,
+            backlog: RING + handles.len() - 1,
+            handles,
         })
     }
 }
@@ -571,9 +669,8 @@ const fn padded_row_bytes(width: u32, bpp: u32) -> u64 {
 #[derive(Clone, Copy, Debug)]
 struct TexelDecode {
     bpp: usize,
-    f16: bool,
-    bgra: bool,
     encoding: CaptureEncoding,
+    pixels: capture_pixels::TexelDecode,
 }
 
 impl TexelDecode {
@@ -585,92 +682,26 @@ impl TexelDecode {
             .map_err(|_| "presented-frame bytes-per-pixel does not fit memory".to_string())?;
         Ok(Self {
             bpp,
-            f16: format == crate::device_layer::TexelFormat::Rgba16Float,
-            bgra: format == crate::device_layer::TexelFormat::Bgra8Unorm,
             encoding,
+            pixels: capture_pixels::TexelDecode {
+                bpp,
+                f16: format == crate::device_layer::TexelFormat::Rgba16Float,
+                bgra: format == crate::device_layer::TexelFormat::Bgra8Unorm,
+                display_p3: encoding.color_space == CaptureColorSpace::DisplayP3,
+                sdr_white_scale: encoding.sdr_white_scale,
+            },
         })
     }
 
     /// The texel at byte `base` of `data` as straight, non-linear sRGB RGBA8 channels.
     #[inline]
     fn fetch(&self, data: &[u8], base: usize) -> [u32; 4] {
-        if self.f16 {
-            let half = |channel: usize| {
-                u16::from_le_bytes([data[base + channel * 2], data[base + channel * 2 + 1]])
-            };
-            let linear = tone_map_scrgb_to_sdr(
-                [
-                    f16_to_f32(half(0)),
-                    f16_to_f32(half(1)),
-                    f16_to_f32(half(2)),
-                ],
-                self.encoding.sdr_white_scale,
-            );
-            let alpha = (f16_to_f32(half(3)).clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-            [
-                srgb8_from_linear(linear[0]),
-                srgb8_from_linear(linear[1]),
-                srgb8_from_linear(linear[2]),
-                alpha,
-            ]
-        } else {
-            let raw = if self.bgra {
-                [data[base + 2], data[base + 1], data[base], data[base + 3]]
-            } else {
-                [data[base], data[base + 1], data[base + 2], data[base + 3]]
-            };
-            if self.encoding.color_space == CaptureColorSpace::DisplayP3 {
-                let srgb = display_p3_to_srgb8([raw[0], raw[1], raw[2]]);
-                [
-                    u32::from(srgb[0]),
-                    u32::from(srgb[1]),
-                    u32::from(srgb[2]),
-                    u32::from(raw[3]),
-                ]
-            } else {
-                raw.map(u32::from)
-            }
-        }
+        self.pixels.fetch(data, base)
     }
 }
 
-/// Validated `(width, height)` for a mapped `src_w`×`src_h` buffer with `padded_row` stride.
-fn mapped_geometry(
-    data_len: usize,
-    src_w: u32,
-    src_h: u32,
-    padded_row: usize,
-    bpp: usize,
-) -> Result<(usize, usize), String> {
-    let sw = usize::try_from(src_w)
-        .map_err(|_| "presented-frame width does not fit memory".to_string())?;
-    let sh = usize::try_from(src_h)
-        .map_err(|_| "presented-frame height does not fit memory".to_string())?;
-    let row_bytes = sw
-        .checked_mul(bpp)
-        .ok_or_else(|| "presented-frame row size overflow".to_string())?;
-    if padded_row < row_bytes {
-        return Err(format!(
-            "presented-frame row stride {padded_row} is smaller than {row_bytes}"
-        ));
-    }
-    let required = if sh == 0 {
-        0
-    } else {
-        (sh - 1)
-            .checked_mul(padded_row)
-            .and_then(|n| n.checked_add(row_bytes))
-            .ok_or_else(|| "presented-frame buffer size overflow".to_string())?
-    };
-    if data_len < required {
-        return Err(format!(
-            "presented-frame buffer has {data_len} bytes, expected at least {required}"
-        ));
-    }
-    Ok((sw, sh))
-}
-
-/// Strip row padding, swizzle or decode the source format, and optionally box downsample 2×2.
+/// Strip row padding, swizzle or decode the source format, and optionally box downsample 2×2
+/// ([`capture_pixels::mapped_to_rgba8`]).
 fn mapped_to_rgba8(
     data: &[u8],
     src_w: u32,
@@ -681,59 +712,7 @@ fn mapped_to_rgba8(
     half_res: bool,
 ) -> Result<(Vec<u8>, u32, u32), String> {
     let texel = TexelDecode::new(format, capture_encoding)?;
-    let bpp = texel.bpp;
-    let (sw, sh) = mapped_geometry(data.len(), src_w, src_h, padded_row, bpp)?;
-
-    let (dw, dh) = if half_res {
-        (sw.div_ceil(2), sh.div_ceil(2))
-    } else {
-        (sw, sh)
-    };
-    let out_len = dw
-        .checked_mul(dh)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| "presented-frame output size overflow".to_string())?;
-    let mut rgba = vec![0u8; out_len];
-    let fetch = |x: usize, y: usize| texel.fetch(data, y * padded_row + x * bpp);
-
-    for dy in 0..dh {
-        for dx in 0..dw {
-            let pixel = if half_res {
-                let (x, y) = (dx * 2, dy * 2);
-                let (a, b, c, d) = (
-                    fetch(x, y),
-                    fetch((x + 1).min(sw - 1), y),
-                    fetch(x, (y + 1).min(sh - 1)),
-                    fetch((x + 1).min(sw - 1), (y + 1).min(sh - 1)),
-                );
-                let samples = [a, b, c, d];
-                let alpha_sum: u32 = samples.iter().map(|sample| sample[3]).sum();
-                let rgb = if alpha_sum == 0 {
-                    [0, 0, 0]
-                } else {
-                    std::array::from_fn(|channel| {
-                        let premul_linear: f32 = samples
-                            .iter()
-                            .map(|sample| {
-                                let linear = srgb8_to_linear(sample[channel] as u8);
-                                linear * sample[3] as f32
-                            })
-                            .sum();
-                        srgb8_from_linear(premul_linear / alpha_sum as f32)
-                    })
-                };
-                [rgb[0], rgb[1], rgb[2], (alpha_sum + 2) / 4]
-            } else {
-                fetch(dx, dy)
-            };
-            let out = (dy * dw + dx) * 4;
-            rgba[out] = pixel[0] as u8;
-            rgba[out + 1] = pixel[1] as u8;
-            rgba[out + 2] = pixel[2] as u8;
-            rgba[out + 3] = pixel[3] as u8;
-        }
-    }
-    Ok((rgba, dw as u32, dh as u32))
+    capture_pixels::mapped_to_rgba8(data, src_w, src_h, padded_row, texel.pixels, half_res)
 }
 
 /// The client-set controls for one recording (the `video` verb's knobs), passed as one value from `Wake::Video` through `video_begin` to `VideoTap`.
@@ -1150,7 +1129,7 @@ impl VideoTap {
             unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
         };
         if let Some(worker) = self.worker.as_mut() {
-            if worker.pending >= CONVERT_BACKLOG {
+            if worker.pending >= worker.backlog {
                 self.dropped += 1;
                 return None;
             }
@@ -1398,7 +1377,7 @@ impl VideoTap {
 
     /// Finalize a GL ring.
     #[cfg(gl_arm)]
-    pub(crate) fn gl_finish(mut self) -> VideoTake {
+    pub(crate) fn gl_finish(mut self) -> UnsettledTake {
         for s in &mut self.slots {
             if !matches!(s.state, SlotState::Free) {
                 let transition = video_slot_transition(s.state.phase(), VideoSlotEvent::Abort)
@@ -1407,7 +1386,6 @@ impl VideoTap {
                 s.state = SlotState::Free;
             }
         }
-        self.drain_convert_lane();
         self.into_take()
     }
 
@@ -1422,7 +1400,7 @@ impl VideoTap {
     ) -> Option<CapturedFrame> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(worker) = self.worker.as_mut() {
-            if worker.pending >= CONVERT_BACKLOG {
+            if worker.pending >= worker.backlog {
                 self.dropped += 1;
                 return None;
             }
@@ -1654,7 +1632,7 @@ impl VideoTap {
     ) -> Option<CapturedFrame> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(worker) = self.worker.as_mut() {
-            if worker.pending >= CONVERT_BACKLOG {
+            if worker.pending >= worker.backlog {
                 self.dropped += 1;
                 return None;
             }
@@ -1760,7 +1738,7 @@ impl VideoTap {
 
     /// Finalize a Metal ring.
     #[cfg(target_os = "macos")]
-    pub(crate) fn metal_finish(mut self) -> VideoTake {
+    pub(crate) fn metal_finish(mut self) -> UnsettledTake {
         self.metal_harvest_ready(true);
         for s in &mut self.slots {
             if !matches!(s.state, SlotState::Free) {
@@ -1773,13 +1751,12 @@ impl VideoTap {
                 }
             }
         }
-        self.drain_convert_lane();
         self.into_take()
     }
 
-    /// Finalize: blocking drain of in-flight maps and dispatched conversions (the recording is over), then hand out the store.
+    /// Finalize: blocking drain of in-flight maps (the recording is over), then hand out the store with the conversions still running ([`UnsettledTake::settle`]).
     #[cfg(wgpu_arm)]
-    pub(crate) fn finish(mut self, device: &wgpu::Device) -> VideoTake {
+    pub(crate) fn finish(mut self, device: &wgpu::Device) -> UnsettledTake {
         #[cfg(target_os = "macos")]
         self.metal_harvest_ready(true);
         let any_inflight = self
@@ -1801,45 +1778,21 @@ impl VideoTap {
                 }
             }
         }
-        self.drain_convert_lane();
         self.into_take()
     }
 
-    /// Drain the conversion lane by dropping the job sender and adopting every result.
-    fn drain_convert_lane(&mut self) {
+    /// The take assembly every finish arm shares: the conversions still running go with it
+    /// ([`UnsettledTake`]), so no finish waits on one.
+    fn into_take(mut self) -> UnsettledTake {
+        self.adopt_converted();
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ConvertWorker {
-            job_tx,
-            result_rx,
-            mut pending,
-            handle,
-        }) = self.worker.take()
-        {
-            drop(job_tx);
-            while pending > 0 {
-                match result_rx.recv() {
-                    Ok(Some(frame)) => self.push_frame(frame),
-                    Ok(None) => self.dropped += 1,
-                    Err(_) => {
-                        self.dropped += pending as u64;
-                        pending = 0;
-                        continue;
-                    }
-                }
-                pending -= 1;
-            }
-            let _ = handle.join();
-        }
-    }
-
-    /// The take assembly both finish arms share.
-    fn into_take(self) -> VideoTake {
+        let lane = self.worker.take();
         let (dw, dh) = if self.half_res {
             (self.src_w.div_ceil(2), self.src_h.div_ceil(2))
         } else {
             (self.src_w, self.src_h)
         };
-        VideoTake {
+        let take = VideoTake {
             frames: self.store,
             dropped: self.dropped,
             evicted: self.evicted,
@@ -1858,6 +1811,12 @@ impl VideoTap {
                     .map_or("unknown", |encoding| encoding.format_label(self.format))
             },
             resized_early_stop: self.resized_early_stop,
+        };
+        UnsettledTake {
+            take,
+            #[cfg(not(target_arch = "wasm32"))]
+            lane,
+            store_bytes: self.store_bytes,
         }
     }
 }
@@ -2895,106 +2854,10 @@ impl PresentedFrameTap {
     }
 }
 
-/// IEEE 754 half → f32, local so this module needs no renderer helper.
-const fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x3ff) as u32;
-    let f = match (exp, frac) {
-        (0, 0) => sign << 31,
-        (0, _) => {
-            let mut e = 127 - 15 + 1;
-            let mut m = frac;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            (sign << 31) | ((e as u32) << 23) | ((m & 0x3ff) << 13)
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-        (0x1f, _) => (sign << 31) | 0x7fc0_0000,
-        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
-    };
-    f32::from_bits(f)
-}
-
-/// The 8-bit sRGB encode of a linear channel: clamp to `[0, 1]`, apply the OETF, and round half up.
-fn srgb8_from_linear_powf(linear: f32) -> u32 {
-    (linear_to_srgb(linear.clamp(0.0, 1.0)) * 255.0 + 0.5) as u32
-}
-
-/// Entry `k - 1` is the least `f32` whose [`srgb8_from_linear_powf`] is at least `k`, for `k` in `1..=255`.
-static SRGB8_ENCODE_THRESHOLDS: LazyLock<[f32; 255]> = LazyLock::new(|| {
-    std::array::from_fn(|index| {
-        let byte = index as u32 + 1;
-        let (mut lo, mut hi) = (0.0_f32.to_bits(), 1.0_f32.to_bits());
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if srgb8_from_linear_powf(f32::from_bits(mid)) >= byte {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        f32::from_bits(hi)
-    })
-});
-
-/// [`srgb8_from_linear_powf`] read from [`SRGB8_ENCODE_THRESHOLDS`].
-#[inline]
-fn srgb8_from_linear(linear: f32) -> u32 {
-    srgb8_by_thresholds(&SRGB8_ENCODE_THRESHOLDS, linear)
-}
-
-/// Number of `thresholds` at or below `linear`, by an eight-step binary search of the sorted table.
-#[inline]
-fn srgb8_by_thresholds(thresholds: &[f32; 255], linear: f32) -> u32 {
-    let (mut below, mut step) = (0_usize, 128_usize);
-    while step > 0 {
-        below += step * usize::from(linear >= thresholds[below + step - 1]);
-        step /= 2;
-    }
-    below as u32
-}
-
-/// The CSS Color 4 Display-P3-to-linear-sRGB matrix, on linear channels.
-fn display_p3_linear_to_srgb_linear([r, g, b]: [f32; 3]) -> [f32; 3] {
-    [
-        1.224_940_2_f32.mul_add(r, -0.224_940_18 * g),
-        (-0.042_056_955_f32).mul_add(r, 1.042_057 * g),
-        (-0.019_637_555_f32).mul_add(r, (-0.078_636_05_f32).mul_add(g, 1.098_273_6 * b)),
-    ]
-}
-
-/// Convert 8-bit Display-P3 coordinates to sRGB via the Display-P3-to-linear-sRGB matrix.
-fn display_p3_to_srgb8(p3: [u8; 3]) -> [u8; 3] {
-    display_p3_linear_to_srgb_linear(p3.map(srgb8_to_linear))
-        .map(|channel| srgb8_from_linear(channel) as u8)
-}
-
-/// Tone-map scRGB/EDR to SDR-linear by removing `sdr_white_scale` and compressing over-white channels by peak.
-fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] {
-    let mut linear = scrgb.map(|channel| {
-        let bounded = if channel.is_nan() || channel <= 0.0 {
-            0.0
-        } else if channel.is_infinite() {
-            f32::MAX
-        } else {
-            channel
-        };
-        bounded / sdr_white_scale
-    });
-    let peak = linear[0].max(linear[1]).max(linear[2]);
-    if peak > 1.0 {
-        linear = linear.map(|channel| channel / peak);
-    }
-    linear
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_render::srgb_to_linear;
+    use aterm_render::capture_pixels::display_p3_to_srgb8;
 
     /// Device-free tap for the store and gate laws; `budget_bytes` is taken without the 16 MiB floor.
     fn test_tap(budget_bytes: usize, fps_cap: Option<u32>) -> VideoTap {
@@ -3028,6 +2891,59 @@ mod tests {
             #[cfg(not(target_arch = "wasm32"))]
             worker: None,
         }
+    }
+
+    /// Finishing a recording hands the conversions still running to its take: the finish
+    /// returns while one is held, where the UI thread once waited out the whole lane (about 5 s
+    /// at the end of a debug build's take), and [`VideoTake::settle`] adopts every frame in
+    /// capture order, a failed conversion counted dropped.
+    #[test]
+    #[cfg(any(target_os = "macos", gl_arm))]
+    fn finishing_a_take_never_waits_on_its_conversions() {
+        let (job_tx, job_rx) = mpsc::channel::<ConvertJob>();
+        let (result_tx, result_rx) = mpsc::channel::<Option<CapturedFrame>>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _jobs = job_rx;
+            let _ = gate_rx.recv();
+            for seq in [2_u64, 1, 3] {
+                let frame = (seq != 3).then(|| CapturedFrame {
+                    seq,
+                    t_us: seq,
+                    w: 1,
+                    h: 1,
+                    rgba: vec![0; 4],
+                });
+                if result_tx.send(frame).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut tap = test_tap(1 << 20, None);
+        tap.worker = Some(ConvertWorker {
+            job_tx,
+            result_rx,
+            pending: 3,
+            backlog: RING,
+            handles: vec![handle],
+        });
+        #[cfg(target_os = "macos")]
+        let finish = VideoTap::metal_finish;
+        #[cfg(all(not(target_os = "macos"), gl_arm))]
+        let finish = VideoTap::gl_finish;
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(finish(tap));
+        });
+        let unsettled = done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the finish returned while a conversion was still held");
+        assert!(unsettled.take.frames.is_empty(), "nothing converted yet");
+        gate_tx.send(()).expect("the worker waits on the gate");
+        let take = unsettled.settle();
+        let seqs: Vec<u64> = take.frames.iter().map(|frame| frame.seq).collect();
+        assert_eq!(seqs, [1, 2], "in capture order");
+        assert_eq!(take.dropped, 1, "the failed conversion");
     }
 
     fn padded_fixture(rows: &[&[u8]], stride: usize) -> Vec<u8> {
@@ -3123,10 +3039,11 @@ mod tests {
                 "{label}: the off-thread harvest must be byte-identical to inline"
             );
             drop(worker.job_tx);
-            worker
-                .handle
-                .join()
-                .expect("worker exits when the tap drops its sender");
+            for handle in worker.handles {
+                handle
+                    .join()
+                    .expect("each worker exits when the tap drops its sender");
+            }
         }
     }
 
@@ -3559,167 +3476,6 @@ mod tests {
 
         assert_eq!(display_p3_to_srgb8([0, 0, 0]), [0, 0, 0]);
         assert_eq!(display_p3_to_srgb8([255, 255, 255]), [255, 255, 255]);
-    }
-
-    /// The ulps on each side of a threshold that are walked one by one.
-    const THRESHOLD_WINDOW_ULPS: u32 = 4096;
-
-    /// Where `thresholds` departs from the encode's definition near its own entries, if it does.
-    fn threshold_table_error(thresholds: &[f32; 255]) -> Option<String> {
-        for (index, &threshold) in thresholds.iter().enumerate() {
-            let byte = index as u32 + 1;
-            let bits = threshold.to_bits();
-            let below = f32::from_bits(bits - 1);
-            if srgb8_from_linear_powf(below) != byte - 1
-                || srgb8_from_linear_powf(threshold) != byte
-            {
-                return Some(format!(
-                    "threshold {byte} at {threshold:e} is not the first f32 of its byte"
-                ));
-            }
-            let mut previous = 0;
-            for pattern in bits - THRESHOLD_WINDOW_ULPS..=bits + THRESHOLD_WINDOW_ULPS {
-                let linear = f32::from_bits(pattern);
-                let exact = srgb8_from_linear_powf(linear);
-                if exact < previous {
-                    return Some(format!("the encode decreases at {linear:e}"));
-                }
-                let read = srgb8_by_thresholds(thresholds, linear);
-                if read != exact {
-                    return Some(format!(
-                        "the table reads {read} at {linear:e}, the encode {exact}"
-                    ));
-                }
-                previous = exact;
-            }
-        }
-        None
-    }
-
-    /// `srgb8_from_linear_powf` before its floor, in both `f32` and `f64` over the same `f32` constants.
-    fn srgb8_unrounded(linear: f32) -> (f64, f64) {
-        let clamped = linear.clamp(0.0, 1.0);
-        let in_f32 = f64::from(linear_to_srgb(clamped) * 255.0 + 0.5);
-        let x = f64::from(clamped);
-        let encoded = if clamped <= 0.003_130_8 {
-            f64::from(12.92_f32) * x
-        } else {
-            f64::from(1.055_f32) * x.powf(f64::from(1.0_f32 / 2.4)) - f64::from(0.055_f32)
-        };
-        (in_f32, encoded * 255.0 + 0.5)
-    }
-
-    /// The table matches the definition for every `f32` across each threshold window.
-    #[test]
-    fn encode_thresholds_are_exact_and_locally_monotone() {
-        let thresholds = &*SRGB8_ENCODE_THRESHOLDS;
-        assert_eq!(threshold_table_error(thresholds), None);
-        assert!(
-            thresholds.windows(2).all(|pair| pair[0] < pair[1]),
-            "the thresholds ascend"
-        );
-        for (index, &threshold) in thresholds.iter().enumerate() {
-            let byte = f64::from(index as u32 + 1);
-            let bits = threshold.to_bits();
-            let edge = |pattern: u32| srgb8_unrounded(f32::from_bits(pattern)).1;
-            let margin = (byte - edge(bits - THRESHOLD_WINDOW_ULPS))
-                .min(edge(bits + THRESHOLD_WINDOW_ULPS) - byte);
-            let stray = (bits - THRESHOLD_WINDOW_ULPS..=bits + THRESHOLD_WINDOW_ULPS)
-                .map(|pattern| {
-                    let (in_f32, exact) = srgb8_unrounded(f32::from_bits(pattern));
-                    (in_f32 - exact).abs()
-                })
-                .fold(0.0, f64::max);
-            assert!(
-                margin > 16.0 * stray,
-                "byte {byte}: margin {margin:e} against an f32 stray of {stray:e}"
-            );
-        }
-        assert_eq!(
-            srgb8_from_linear(f32::NAN),
-            srgb8_from_linear_powf(f32::NAN)
-        );
-        for linear in [f32::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, 2.0, f32::INFINITY] {
-            assert_eq!(
-                srgb8_from_linear(linear),
-                srgb8_from_linear_powf(linear),
-                "{linear}"
-            );
-        }
-
-        let mut late = *thresholds;
-        late[127] = f32::from_bits(late[127].to_bits() + 1);
-        assert!(
-            threshold_table_error(&late).is_some(),
-            "negative control: an entry one ulp late is caught"
-        );
-        let mut early = *thresholds;
-        early[0] = f32::from_bits(early[0].to_bits() - 1);
-        assert!(
-            threshold_table_error(&early).is_some(),
-            "negative control: an entry one ulp early is caught"
-        );
-    }
-
-    /// The decode table holds `srgb_to_linear` bit for bit and every P3 triple encodes alike by table and `powf`.
-    #[test]
-    fn display_p3_lut_matches_powf_over_every_input() {
-        let decoded: [f32; 256] = std::array::from_fn(|byte| {
-            let by_powf = srgb_to_linear(byte as f32 / 255.0);
-            assert_eq!(
-                srgb8_to_linear(byte as u8).to_bits(),
-                by_powf.to_bits(),
-                "decode of {byte}"
-            );
-            by_powf
-        });
-        let decoded = &decoded;
-        std::thread::scope(|scope| {
-            for eighth in 0..8_u8 {
-                scope.spawn(move || {
-                    for r in eighth * 32..=eighth * 32 + 31 {
-                        for g in 0..=u8::MAX {
-                            for b in 0..=u8::MAX {
-                                let p3 = [r, g, b];
-                                let linear = display_p3_linear_to_srgb_linear(
-                                    p3.map(|channel| decoded[usize::from(channel)]),
-                                );
-                                let by_powf =
-                                    linear.map(|channel| srgb8_from_linear_powf(channel) as u8);
-                                assert_eq!(display_p3_to_srgb8(p3), by_powf, "{p3:?}");
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    }
-
-    #[test]
-    fn f16_lut_matches_powf() {
-        let agree = |linear: [f32; 3]| {
-            for channel in linear {
-                assert_eq!(
-                    srgb8_from_linear(channel),
-                    srgb8_from_linear_powf(channel),
-                    "{channel:e}"
-                );
-            }
-        };
-        for bits in 0..=u16::MAX {
-            agree(tone_map_scrgb_to_sdr([f16_to_f32(bits); 3], 1.0));
-        }
-        let mut state = 0x5eed_u64;
-        for _ in 0..1_000_000 {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut word = state;
-            word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            word ^= word >> 31;
-            let scrgb = [0, 16, 32].map(|shift| f16_to_f32((word >> shift) as u16));
-            let sdr_white_scale = 1.0 + f32::from((word >> 48) as u16) / 8192.0;
-            agree(tone_map_scrgb_to_sdr(scrgb, sdr_white_scale));
-        }
     }
 
     #[test]

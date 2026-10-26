@@ -868,20 +868,46 @@ fn each_reviewer_runs_at_the_level_in_its_own_flags() {
         (&AGY, Level::Plan, &["--mode", "plan"][..]),
         (&MUSE, Level::Yolo, &["--yolo"][..]),
         (&MUSE, Level::Plan, &["--disable-write"][..]),
+        (&GROK, Level::Yolo, &["--always-approve"][..]),
+        (
+            &GROK,
+            Level::Edits,
+            &["--permission-mode", "acceptEdits"][..],
+        ),
+        (&GROK, Level::Ask, &["--permission-mode", "dontAsk"][..]),
+        (&GROK, Level::Plan, &["--permission-mode", "plan"][..]),
     ] {
         let args = args_at(c, level);
         assert!(has(&args, want), "{} at {}: {args:?}", c.id, level.word());
     }
-    for c in [&CLAUDE, &CODEX, &AGY, &MUSE] {
+    for c in crate::ai::connector::ROWS.iter().copied() {
         let args = args_at(c, Level::Ask);
         assert!(
             !args
                 .iter()
-                .any(|a| a.contains("dangerously") || a == "--yolo"),
+                .any(|a| a.contains("dangerously") || a == "--yolo" || a == "--always-approve"),
             "{} at ask: {args:?}",
             c.id
         );
     }
+    let grok = args_at(
+        crate::ai::connector::connector("grok").expect("Grok Build is a connection a review asks"),
+        Level::Plan,
+    );
+    assert!(has(&grok, &["--output-format", "plain"]), "{grok:?}");
+    let file = grok
+        .iter()
+        .position(|a| a == "--prompt-file")
+        .expect("Grok Build reads its request from a file");
+    assert!(
+        grok.get(file + 1)
+            .is_some_and(|path| path.ends_with("request.txt")),
+        "the request file follows its flag: {grok:?}"
+    );
+    assert!(
+        !grok.iter().any(|a| a == "login" || a == "-p"),
+        "a review runs no sign-in and no prompt operand: {grok:?}"
+    );
     let muse = args_at(&MUSE, Level::Yolo);
     let yolo = muse.iter().position(|a| a == "--yolo").expect("--yolo");
     let exec = muse.iter().position(|a| a == "exec").expect("exec");

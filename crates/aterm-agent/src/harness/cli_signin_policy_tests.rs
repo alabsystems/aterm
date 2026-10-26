@@ -353,7 +353,7 @@ fn vendor_policy_is_rechecked_before_queued_authentication_starts() {
                 &mut Vec::new(),
                 &mut Vec::new(),
             );
-            assert_eq!(result, Renewal::Failed, "{cli:?}, case {case}");
+            assert_eq!(result, Renewal::Deferred, "{cli:?}, case {case}");
             assert!(!host.called.get());
             assert_eq!(world.records(), before);
             assert!(!world.store.logins_dir().join("main+1").exists());

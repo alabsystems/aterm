@@ -25,8 +25,11 @@ pub enum Triage {
 pub struct Want {
     /// Each row's text, trailing blanks trimmed; rows past the list are blank.
     pub rows: &'static [&'static str],
-    /// `(row, col)`, 0-based; `col == cols` while a wrap is pending.
+    /// `(row, col)`, 0-based; `col` is one past the cursor's column while a
+    /// wrap is pending (the [`Snap::cursor`] spelling).
     pub cursor: (u16, u16),
+    /// A wrap is pending.
+    pub wrap: bool,
     /// The alternate screen is up.
     pub alt: bool,
     /// Non-[`Ink::PLAIN`] cell rendition runs as `(row, first col, past last col, ink)`.
@@ -48,6 +51,9 @@ impl Want {
         }
         if snap.cursor != self.cursor {
             return Some(format!("cursor {:?}, not {:?}", snap.cursor, self.cursor));
+        }
+        if snap.wrap != self.wrap {
+            return Some(format!("wrap pending {}, not {}", snap.wrap, self.wrap));
         }
         if snap.alt_screen != self.alt {
             return Some(format!(
@@ -86,6 +92,7 @@ const fn text(rows: &'static [&'static str], cursor: (u16, u16)) -> Want {
     Want {
         rows,
         cursor,
+        wrap: false,
         alt: false,
         inks: &[],
     }
@@ -111,6 +118,38 @@ pub const EXCLUSIONS: &[Exclusion] = &[
               no DECSTBM has come since (generator.rs `OriginSlot`).",
     },
     Exclusion {
+        case: "decrc_of_a_wrap_after_the_margins_moved",
+        triage: Triage::ByDesign {
+            diverges: |c| c.lr_margins,
+        },
+        want: text(&["abcX"], (0, 4)),
+        why: "a DECRC of a wrap DECSC saved on a right margin that has moved \
+              since: xterm's CursorRestore puts the wrap flag back wherever the \
+              column lands (cursor.c `screen->do_wrap = sc->wrap_flag`, after \
+              the CursorSet), so the next glyph wraps from mid-line, where the \
+              fold puts it (row 1). aterm puts a saved wrap back only at a line \
+              end, the row's last column or the right margin (aterm-core \
+              handler_state.rs `at_a_line_end`), as after a resize moved the \
+              edge, so a DECRC never leaves a wrap pending mid-line. The \
+              generator restores no slot the margins moved past (generator.rs \
+              `OriginSlot::margins_moved`).",
+    },
+    Exclusion {
+        case: "decrc_of_a_wrap_a_declrmm_reset_left_mid_line",
+        triage: Triage::ByDesign {
+            diverges: |c| c.lr_margins,
+        },
+        want: text(&["abcX"], (0, 4)),
+        why: "a DECSC of a wrap left pending mid-line, on a right margin a \
+              DECLRMM reset moved aside, then a DECRC: xterm and the fold put \
+              the wrap back with the column (cursor.c `screen->do_wrap = \
+              sc->wrap_flag`), so the next glyph wraps to row 1. aterm restores \
+              a saved wrap only at a line end (aterm-core handler_state.rs \
+              `at_a_line_end`), so X overwrites the d. The generator restores \
+              no slot saved once a DECLRMM reset may have left such a wrap \
+              (generator.rs `Track::wrap_off_a_line_end`).",
+    },
+    Exclusion {
         case: "stray_1049l_with_a_saved_slot",
         triage: Triage::ByDesign { diverges: |_| true },
         want: text(&["", "", "", "        X"], (3, 9)),
@@ -132,6 +171,7 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         want: Want {
             rows: &["        X"],
             cursor: (0, 9),
+            wrap: false,
             alt: false,
             inks: &[(0, 8, 9, Ink::fg(1).bold())],
         },
@@ -169,6 +209,7 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         want: Want {
             rows: &[],
             cursor: (0, 0),
+            wrap: false,
             alt: true,
             inks: &[],
         },
@@ -192,6 +233,7 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         want: Want {
             rows: &[],
             cursor: (0, 0),
+            wrap: false,
             alt: true,
             inks: &[],
         },
@@ -214,6 +256,7 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         want: Want {
             rows: &["Z"],
             cursor: (0, 1),
+            wrap: false,
             alt: true,
             inks: &[],
         },

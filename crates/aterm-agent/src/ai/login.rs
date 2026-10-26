@@ -3,6 +3,7 @@
 
 //! Interactive vendor CLI sign-in flows.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -66,6 +67,11 @@ pub struct Host<'a> {
     pub now: &'a dyn Fn() -> i64,
     /// Asks the person a question on the terminal and answers the line typed.
     pub ask: &'a dyn Fn(&str) -> Option<String>,
+    /// The sandbox a CLI's own sign-in runs under over SSH where its
+    /// [`super::connector::SignIn::no_desk`] names this system
+    /// ([`crate::harness::login_drive::SANDBOX_EXEC`]); `None`, or one that cannot run here,
+    /// refuses that sign-in ([`crate::harness::login_drive::off_this_desk`]).
+    pub no_desk: Option<&'a Path>,
 }
 
 /// The environment a sign-in runs with.
@@ -255,7 +261,11 @@ pub fn pool_sign_in(h: &Host<'_>, c: PoolCli<'_>, pool: &super::facts::CliAccoun
     }
 }
 
-/// Signs `row`'s CLI in.
+/// Signs `row`'s CLI in: Claude Code through accounts v2, a CLI with a roster through its pool
+/// ([`pool_sign_in`]), else the CLI's own login on this terminal, kept off this machine's desk
+/// over SSH ([`crate::harness::login_drive::off_this_desk`]: a browser it opened there would be
+/// on a desk nobody is at, so on macOS Grok Build's and Codex's run under [`Host::no_desk`] and
+/// are refused where it cannot run).
 #[must_use]
 pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done {
     let c = f.connector;
@@ -307,12 +317,42 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
         (true, Some(r)) => *r,
         _ => *args,
     };
-    let env = sign_in_env(c, h.vars, h.var);
+    let kept = match crate::harness::login_drive::off_this_desk(
+        c.accounts.and_then(|a| a.signin.as_ref()),
+        c.product,
+        (
+            managed.path.clone(),
+            words.iter().copied().map(OsString::from).collect(),
+        ),
+        (under_ssh, h.no_desk),
+        h.store.dir(),
+        &|k| (h.var)(k).map(OsString::from),
+    ) {
+        Ok(kept) => kept,
+        Err(why) => return Done::Refused(why),
+    };
+    let (Some(program_args), Some(path)) = (
+        kept.args
+            .iter()
+            .map(|a| a.to_str().map(str::to_owned))
+            .collect::<Option<Vec<String>>>(),
+        kept.path.to_str(),
+    ) else {
+        return Done::Refused(format!(
+            "{}'s sign-in command or its PATH is not UTF-8 here",
+            c.product
+        ));
+    };
+    let mut env = sign_in_env(c, h.vars, h.var);
+    if kept.held.is_some() {
+        env.retain(|(k, _)| k != "PATH");
+        env.push(("PATH".to_string(), path.to_string()));
+    }
     let _ = writeln!(out, "{}: {tell}", c.product);
     let _ = out.flush();
     let exited = h
         .runner
-        .terminal(&managed.path, &as_args(words), &env, Some(run.path()));
+        .terminal(&kept.program, &program_args, &env, Some(run.path()));
     if let Err(why) = &exited {
         return Done::Failed(format!("{} could not be started: {why}", c.id));
     }

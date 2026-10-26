@@ -58,6 +58,8 @@ fn every_seed_holds_every_law() {
         total.exits += s.exits;
         total.log_records += s.log_records;
         total.mirrored += s.mirrored;
+        total.mirror_retained_passes += s.mirror_retained_passes;
+        total.mirror_unretained_passes += s.mirror_unretained_passes;
         total.set_aside += s.set_aside;
         total.set_aside_told += s.set_aside_told;
         total.pins_torn += s.pins_torn;
@@ -96,6 +98,14 @@ fn every_seed_holds_every_law() {
         ("sessions that left", total.exits),
         ("session-log records", total.log_records),
         ("`ms` the mirror put on the bus", total.mirrored),
+        (
+            "passes of a mirror over a broker that retains it",
+            total.mirror_retained_passes,
+        ),
+        (
+            "passes of a mirror over a broker that serves unretained",
+            total.mirror_unretained_passes,
+        ),
         ("torn state files set aside", total.set_aside),
         ("torn state files told to aterm", total.set_aside_told),
         ("power cuts that tore the mirror's pin", total.pins_torn),
@@ -800,27 +810,33 @@ const FOUND_QUITTING: &[FoundIn] = &[
     ),
 ];
 
+/// Every found seed, at the world it broke a law in.
+fn found() -> Vec<FoundIn> {
+    FOUND
+        .iter()
+        .map(|&(seed, steps, what)| (on_a_clean_disk as fn(u64) -> Opts, seed, steps, what))
+        .chain(
+            FOUND_ERRING
+                .iter()
+                .map(|&(seed, steps, what)| (Opts::seed as fn(u64) -> Opts, seed, steps, what)),
+        )
+        .chain(
+            FOUND_BOTH_WAYS
+                .iter()
+                .map(|&(seed, steps, what)| (both_ways as fn(u64) -> Opts, seed, steps, what)),
+        )
+        .chain(
+            FOUND_BOTH_WAYS_ERRING.iter().map(|&(seed, steps, what)| {
+                (both_ways_erring as fn(u64) -> Opts, seed, steps, what)
+            }),
+        )
+        .chain(FOUND_QUITTING.iter().copied())
+        .collect()
+}
+
 #[test]
 fn the_seeds_that_broke_a_law_hold_every_law() {
-    let found: Vec<FoundIn> =
-        FOUND
-            .iter()
-            .map(|&(seed, steps, what)| (on_a_clean_disk as fn(u64) -> Opts, seed, steps, what))
-            .chain(
-                FOUND_ERRING
-                    .iter()
-                    .map(|&(seed, steps, what)| (Opts::seed as fn(u64) -> Opts, seed, steps, what)),
-            )
-            .chain(
-                FOUND_BOTH_WAYS
-                    .iter()
-                    .map(|&(seed, steps, what)| (both_ways as fn(u64) -> Opts, seed, steps, what)),
-            )
-            .chain(FOUND_BOTH_WAYS_ERRING.iter().map(|&(seed, steps, what)| {
-                (both_ways_erring as fn(u64) -> Opts, seed, steps, what)
-            }))
-            .chain(FOUND_QUITTING.iter().copied())
-            .collect();
+    let found = found();
     let outs = aterm_spec::check::each(&found, |&(world, seed, steps, what)| {
         let mut o = world(seed);
         o.steps = steps;
@@ -837,6 +853,78 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
         failures.len(),
         found.len(),
         failures.join("\n")
+    );
+}
+
+/// THE RULES whose bugs the found seeds pin, where a [`Mutant`] switches the
+/// rule off: `(what the found rows name the bug, the rule off, the law it breaks)`.
+const FOUND_RULES: &[(&str, Mutant, &str)] = &[
+    (
+        "a pin judged before the reconcile a write error stopped",
+        Mutant::JudgePinBeforeRecovery,
+        "mirror",
+    ),
+    (
+        "a deduped replay moved the self-lane window down",
+        Mutant::RememberBelowTheWindow,
+        "forged-self",
+    ),
+    (
+        "a sweep a write error stopped, closed by the run record",
+        Mutant::BeginRunPastAFailedRecovery,
+        "liveness",
+    ),
+    (
+        "a record delivered while its in-flight entry stood",
+        Mutant::DeliverPastAStandingEntry,
+        "dup delivery",
+    ),
+];
+
+/// **NEGATIVE CONTROL: EACH BUG A FOUND SEED PINS IS REACHED AGAIN WITH ITS
+/// RULE OFF** ([`FOUND_RULES`]), by one of its seeds at the world and steps
+/// [`the_seeds_that_broke_a_law_hold_every_law`] replays it at. A change to a
+/// world moves its trajectories; one that moved every seed of a bug off it
+/// would leave that replay holding nothing for the bug.
+#[test]
+fn each_found_bug_is_reached_again_with_its_rule_off() {
+    let found = found();
+    let runs: Vec<(usize, FoundIn)> = FOUND_RULES
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &(what, _, _))| {
+            let rows: Vec<(usize, FoundIn)> = found
+                .iter()
+                .filter(|row| row.3 == what)
+                .map(|&row| (i, row))
+                .collect();
+            assert!(!rows.is_empty(), "a found rule names no found seed: {what}");
+            rows
+        })
+        .collect();
+    let reached = aterm_spec::check::each(&runs, |&(i, (world, seed, steps, _))| {
+        let (_, rule, law) = FOUND_RULES[i];
+        let mut o = world(seed).with(rule);
+        o.steps = steps;
+        (i, seed, breaks_law(&run(&o), law))
+    });
+    let missed: Vec<String> = FOUND_RULES
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| !reached.iter().any(|&(j, _, hit)| j == i && hit))
+        .map(|(i, (what, rule, law))| {
+            let seeds: Vec<u64> = reached
+                .iter()
+                .filter(|&&(j, _, _)| j == i)
+                .map(|&(_, seed, _)| seed)
+                .collect();
+            format!("{what}: {rule:?} breaks no `{law}` at seeds {seeds:?}")
+        })
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "no found seed reaches these bugs with their rule off:\n  {}",
+        missed.join("\n  ")
     );
 }
 

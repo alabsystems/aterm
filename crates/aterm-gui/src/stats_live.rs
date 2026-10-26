@@ -8,8 +8,9 @@
 //! they stop for [`STALE_PERIODS`] cadences the line and the dot turn grey and hollow and nothing
 //! moves, so a frozen deck never looks live. Between readings the strips glide left with the wall
 //! clock: the open column grows from the right end and the oldest slides out at the left, so time
-//! visibly flows right to left. And the header over the strip carries a time scale (the planner's
-//! [`crate::stats_plan::RulerTick`]s).
+//! visibly flows right to left (a Folded strip, the form a window draws unless Full is chosen,
+//! glides 1 pt a second: `stats_plan::FOLD_PITCH`). And the header over the strip carries a time
+//! scale (the planner's [`crate::stats_plan::RulerTick`]s).
 //!
 //! The glide and the beat are [`MotionEffect::DeckLive`]: they run only in a focused, unoccluded
 //! window whose motion policy animates (never under Reduce Motion or the load-shed latch), and
@@ -17,11 +18,12 @@
 //! presented alone (no lens or card folded over it). Without motion the columns stand in their
 //! slots and the marker stands still; its grey still comes, as information.
 //!
-//! Cost: the frames are scheduled at the glide's quantum ([`GLIDE_QUANTUM_PX`], at most
-//! [`GLIDE_STEP_MIN`] apart) and the beat's ([`BEAT_FRAME`] for [`BEAT`] after each reading), and
-//! such a frame re-rasters only the deck card's [`LiveLayer`] rects that changed
-//! (`App::splice_stats_deck`), never the whole card, from one layout that reads no words and
-//! plans no header line (`stats_deck::DeckStill`).
+//! Cost: every live frame falls on one grid, [`FRAME`] apart from the moment a reading lands,
+//! so a window presents at most four a second: the beat draws [`BEAT_FRAMES`] of them after each
+//! reading, and the glide moves on the grid's frames only when it has run a
+//! [`GLIDE_QUANTUM_PX`] and its open column has not ended. Such a frame re-rasters only the deck
+//! card's [`LiveLayer`] rects that changed (`App::splice_stats_deck`), never the whole card, from
+//! one layout that reads no words and plans no header line (`stats_deck::DeckStill`).
 
 use std::time::{Duration, Instant};
 
@@ -34,17 +36,22 @@ pub(crate) const STALE_PERIODS: u32 = 3;
 /// The least wait before the marker says the strips stopped, whatever the cadence.
 pub(crate) const STALE_FLOOR: Duration = Duration::from_secs(2);
 
-/// How long one beat rings after its reading lands.
-pub(crate) const BEAT: Duration = Duration::from_millis(840);
+/// The live edge's frame grid, laid from the moment each reading lands: every frame the edge
+/// asks for falls on it, so a window presents at most four live frames a second, whatever
+/// glides and beats (the cost bound of `docs/DESIGN-stats-deck-live-2026-10-24.md` §6).
+pub(crate) const FRAME: Duration = Duration::from_millis(250);
 
-/// The beat's frame period: about 17 frames a second, while it rings.
-pub(crate) const BEAT_FRAME: Duration = Duration::from_millis(60);
+/// The frames one beat draws after its reading lands; it rings for that many frames of the
+/// grid (750 ms).
+pub(crate) const BEAT_FRAMES: u32 = 3;
 
-/// The most the strips glide between two frames, device px.
-pub(crate) const GLIDE_QUANTUM_PX: f64 = 0.25;
+/// How far the strips glide between two frames, device px: a whole pixel, so every frame
+/// draws each cell edge sharp and each move is one crisp step left (a quarter pixel, as first
+/// built, smeared the edges and moved too little to be seen; §11 of the design).
+pub(crate) const GLIDE_QUANTUM_PX: f64 = 1.0;
 
-/// The glide's shortest frame period: at most eight frames a second.
-pub(crate) const GLIDE_STEP_MIN: Duration = Duration::from_millis(125);
+/// The glide's shortest frame period: one frame of the grid.
+pub(crate) const GLIDE_STEP_MIN: Duration = FRAME;
 
 /// The glide's longest frame period.
 pub(crate) const GLIDE_STEP_MAX: Duration = Duration::from_secs(2);
@@ -64,8 +71,8 @@ pub(crate) const BEAT_REACH: f64 = 4.0;
 /// The ring's opacity as the beat starts.
 const BEAT_ALPHA: f32 = 0.7;
 
-/// The line's opacity while live: quieter than the dot, which carries the beat.
-pub(crate) const LINE_ALPHA: u8 = 0x9C;
+/// A stalled marker's line is dashed: dashes and gaps this long, pt.
+pub(crate) const STALE_DASH: f64 = 1.5;
 
 /// What the deck's live edge shows in one frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,7 +80,7 @@ pub(crate) struct DeckLive {
     /// The frame's wall clock, unix ms (quantized to the glide's step), while the strips glide;
     /// `None` stands every column in its slot.
     pub(crate) glide_ms: Option<i64>,
-    /// How far through the newest reading's beat, `0..1` (quantized to [`BEAT_FRAME`]); `None`
+    /// How far through the newest reading's beat, `0..1` ([`beat_phase`] of its frame); `None`
     /// rings nothing.
     pub(crate) beat: Option<f32>,
     /// Whether readings keep coming: `false` draws the marker grey and hollow.
@@ -174,8 +181,15 @@ pub(crate) fn minute_columns(open_ms: i64, period_s: u32, n: usize) -> Vec<usize
 pub(crate) fn beat_ring(phase: f32) -> (f64, f32) {
     let t = phase.clamp(0.0, 1.0);
     let rest = 1.0 - t;
-    let widen = 1.0 - rest * rest * rest;
-    (BEAT_REACH * f64::from(widen), BEAT_ALPHA * rest * rest)
+    let widen = 1.0 - rest * rest;
+    (BEAT_REACH * f64::from(widen), BEAT_ALPHA * rest)
+}
+
+/// The phase the beat draws in frame `k` of its reading's grid (`k` from 0, the reading's own
+/// frame), or `None` once it has rung: frames sample the beat at `(k + 1) / (BEAT_FRAMES + 1)`,
+/// so each of its frames shows a ring, wider and fainter than the last.
+pub(crate) fn beat_phase(k: u32) -> Option<f32> {
+    (k < BEAT_FRAMES).then(|| (k + 1) as f32 / (BEAT_FRAMES + 1) as f32)
 }
 
 /// How long a reading speaks for: [`STALE_PERIODS`] of the slower of the cadence now and the one
@@ -208,6 +222,10 @@ pub(crate) struct LiveFacts {
     pub(crate) beat: bool,
     /// The glide's frame period ([`glide_step`]).
     pub(crate) step: Duration,
+    /// When the held snapshot's open column ends on the wall clock, unix ms: past it every
+    /// column stands in its slot until a reading opens the next ([`open_frac`] is 1), so the
+    /// glide holds there and asks no frame that would draw nothing new. `None`: no bound.
+    pub(crate) glide_end_ms: Option<i64>,
 }
 
 impl LiveFacts {
@@ -216,34 +234,40 @@ impl LiveFacts {
             .is_some_and(|at| now.saturating_duration_since(at) < self.stale_after)
     }
 
-    /// What the deck draws at `now` (`now_ms` on the wall clock).
+    /// The frame of the grid `now` falls in, counted from the reading's own (0), and how long
+    /// after that frame's moment `now` is.
+    fn frame_of(landed: Instant, now: Instant) -> (u32, Duration) {
+        let ran = now.saturating_duration_since(landed);
+        let k = ran.as_nanos() / FRAME.as_nanos();
+        let k = u32::try_from(k).unwrap_or(u32::MAX);
+        (k, ran.saturating_sub(FRAME.saturating_mul(k)))
+    }
+
+    /// What the deck draws at `now` (`now_ms` on the wall clock): the live edge as it stood at
+    /// the last frame of the grid, so it changes only on the grid.
     pub(crate) fn live(&self, now: Instant, now_ms: i64) -> DeckLive {
-        if !self.fresh(now) {
+        let Some(landed) = self.landed.filter(|_| self.fresh(now)) else {
             return DeckLive::STALE;
-        }
+        };
         if !self.motion {
             return DeckLive::STILL;
         }
+        let (k, into) = Self::frame_of(landed, now);
+        let frame_ms = now_ms - i64::try_from(into.as_millis()).unwrap_or(i64::MAX);
         let step = i64::try_from(self.step.as_millis())
             .unwrap_or(i64::MAX)
             .max(1);
-        let beat = self.landed.filter(|_| self.beat).and_then(|at| {
-            let ran = now.saturating_duration_since(at);
-            (ran < BEAT).then(|| {
-                let frames = ran.as_millis() / BEAT_FRAME.as_millis();
-                let at_frame = BEAT_FRAME.as_millis() * frames;
-                at_frame as f32 / BEAT.as_millis() as f32
-            })
-        });
+        let glide = frame_ms.div_euclid(step) * step;
         DeckLive {
-            glide_ms: Some(now_ms.div_euclid(step) * step),
-            beat,
+            glide_ms: Some(self.glide_end_ms.map_or(glide, |end| glide.min(end))),
+            beat: beat_phase(k).filter(|_| self.beat),
             fresh: true,
         }
     }
 
     /// The first moment after `now` at which [`Self::live`] changes, or `None` when it never
-    /// will without a new reading or a change of window.
+    /// will without a new reading or a change of window: the grey's moment, or the first frame
+    /// of the grid that draws something new.
     pub(crate) fn next_change(&self, now: Instant, now_ms: i64) -> Option<Instant> {
         let landed = self.landed?;
         let stale = landed + self.stale_after;
@@ -252,19 +276,19 @@ impl LiveFacts {
         }
         let mut next = stale;
         if self.motion {
-            let step = i64::try_from(self.step.as_millis())
-                .unwrap_or(i64::MAX)
-                .max(1);
-            let to_step = step - now_ms.rem_euclid(step);
-            next = next.min(now + Duration::from_millis(to_step.unsigned_abs()));
-            if self.beat {
-                let ran = now.saturating_duration_since(landed);
-                if ran < BEAT {
-                    let frames = ran.as_millis() / BEAT_FRAME.as_millis() + 1;
-                    let at = BEAT_FRAME
-                        .saturating_mul(u32::try_from(frames).unwrap_or(u32::MAX))
-                        .min(BEAT);
-                    next = next.min(landed + at);
+            let was = self.live(now, now_ms);
+            let (k, _) = Self::frame_of(landed, now);
+            // The grid up to the grey: at most stale_after / FRAME frames (12 at a 1 s cadence).
+            for j in (k.saturating_add(1)..).take(1 << 12) {
+                let at = landed + FRAME.saturating_mul(j);
+                if at >= next {
+                    break;
+                }
+                let ahead = i64::try_from(at.saturating_duration_since(now).as_millis())
+                    .unwrap_or(i64::MAX);
+                if self.live(at, now_ms.saturating_add(ahead)) != was {
+                    next = at;
+                    break;
                 }
             }
         }
@@ -304,12 +328,17 @@ impl crate::App {
             && ws.settings_card.is_none()
             && ws.badge_card.is_none();
         let beat = alone && self.serious_mode_policy().allows(SeriousEffect::DeckBeat);
+        let (px_per_s, glide_period_s) = ws.deck_glide.get();
+        let snap = self.vitals.snapshot.as_ref();
         Some(LiveFacts {
-            landed: self.vitals.snapshot.as_ref().and(self.vitals.landed_at),
+            landed: snap.and(self.vitals.landed_at),
             stale_after: stale_after(period, self.vitals.landed_period),
             motion,
             beat,
-            step: glide_step(ws.deck_glide.get()),
+            step: glide_step(px_per_s),
+            glide_end_ms: snap.filter(|_| glide_period_s > 0).map(|snap| {
+                open_start_ms(snap.at_unix_ms, glide_period_s) + i64::from(glide_period_s) * 1000
+            }),
         })
     }
 

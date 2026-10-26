@@ -127,7 +127,17 @@ impl SelView<'_> {
 
     #[inline]
     fn span_selected(&self, row: u16, c0: u16, c1: u16) -> bool {
-        (c0..=c1).any(|c| self.cell_selected(row, c))
+        let mut c = c0;
+        while c <= c1 {
+            if self.cell_selected(row, c) {
+                return true;
+            }
+            if c == u16::MAX {
+                break;
+            }
+            c += 1;
+        }
+        false
     }
 }
 
@@ -497,7 +507,11 @@ impl DecoConfig {
         ScanOptions {
             allow_bare_cat: self.allow_bare_cat,
             cjk_single_char: self.cjk_single_char,
-            ignore: (!self.ignore.is_empty()).then_some(&self.ignore),
+            ignore: if self.ignore.is_empty() {
+                None
+            } else {
+                Some(&self.ignore)
+            },
         }
     }
 }
@@ -1631,24 +1645,36 @@ impl WordDecorations {
         }
 
         while self.persist.len() > PERSIST_CAP {
-            let Some(oldest) = self
-                .persist
-                .iter()
-                .min_by_key(|&(key, resident)| (resident.last_seen, *key))
-                .map(|(key, _)| *key)
-            else {
+            let mut oldest: Option<(u64, Instant)> = None;
+            for (&key, resident) in &self.persist {
+                if match oldest {
+                    Some((best_key, best_seen)) => {
+                        (resident.last_seen, key) < (best_seen, best_key)
+                    }
+                    None => true,
+                } {
+                    oldest = Some((key, resident.last_seen));
+                }
+            }
+            let Some((oldest_key, _)) = oldest else {
                 break;
             };
-            if let Some(evicted) = self.persist.remove(&oldest) {
-                self.mark_persist_departure(oldest, &evicted);
+            if let Some(evicted) = self.persist.remove(&oldest_key) {
+                self.mark_persist_departure(oldest_key, &evicted);
             }
         }
         if self.persist.len() == PERSIST_CAP {
-            let oldest = self
-                .persist
-                .iter()
-                .min_by_key(|&(key, resident)| (resident.last_seen, *key))
-                .map(|(key, resident)| (*key, resident.last_seen));
+            let mut oldest: Option<(u64, Instant)> = None;
+            for (&key, resident) in &self.persist {
+                if match oldest {
+                    Some((best_key, best_seen)) => {
+                        (resident.last_seen, key) < (best_seen, best_key)
+                    }
+                    None => true,
+                } {
+                    oldest = Some((key, resident.last_seen));
+                }
+            }
             if !matches!(
                 oldest,
                 Some((oldest_ident, oldest_seen))
@@ -1699,10 +1725,11 @@ impl WordDecorations {
             Some(cur) if cur == key => return,
             Some(cur) => self.park_live_state(cur),
             None => {
-                let flash = self
-                    .trick_flash
-                    .found_in_a_pane()
-                    .then(|| std::mem::take(&mut self.trick_flash));
+                let flash = if self.trick_flash.found_in_a_pane() {
+                    Some(std::mem::take(&mut self.trick_flash))
+                } else {
+                    None
+                };
                 self.reset_bound();
                 if let Some(flash) = flash {
                     self.trick_flash = flash;
@@ -1893,7 +1920,16 @@ impl WordDecorations {
         self.dist_scratch.clear();
         self.supers.clear();
         self.super_until = None;
-        self.burst_hint = self.parked.values().filter_map(|p| p.burst_end_max).max();
+        let mut burst_hint: Option<Instant> = None;
+        for p in self.parked.values() {
+            if let Some(end) = p.burst_end_max {
+                burst_hint = Some(match burst_hint {
+                    Some(cur) if cur >= end => cur,
+                    _ => end,
+                });
+            }
+        }
+        self.burst_hint = burst_hint;
         self.combo_births.clear();
         self.trick_flash.clear();
     }
@@ -2150,7 +2186,10 @@ impl WordDecorations {
             self.kitty_cursor_placement.active = Some(KittyCursorActiveFold {
                 started: fold.started,
                 direction: fold.direction,
-                from: self.kitty_cursor_placement.last_target.unwrap_or(target),
+                from: match self.kitty_cursor_placement.last_target {
+                    Some(last) => last,
+                    None => target,
+                },
                 from_sprite: self.kitty_cursor_placement.last_sprite,
             });
         }
@@ -2359,7 +2398,10 @@ impl WordDecorations {
                 let from_x = (from_cx - i32::from(dest_w) / 2 + lead_px)
                     .clamp(0, grid_w - i32::from(dest_w));
                 let from_y = from.y + i32::from(from.h) / 2 - i32::from(dest_h) / 2;
-                let (start_x, start_y) = from_sprite.unwrap_or((from_x, from_y));
+                let (start_x, start_y) = match from_sprite {
+                    Some(pos) => pos,
+                    None => (from_x, from_y),
+                };
                 let end_x = match direction {
                     crate::kitty_cursor::CatFoldDirection::Forward => {
                         grid_w.saturating_add(clearance)
@@ -2706,13 +2748,14 @@ impl WordDecorations {
 
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [const { None }; crate::kitty_pet::PET_MOTES_MAX];
+        let mut mote_len = 0usize;
         if pet.alpha > 0 {
             const INV_255: f32 = 1.0 / 255.0;
             let pet_alpha_scale = f32::from(pet.alpha) * INV_255;
             let cell_dims = (geom.cell_w, geom.cell_h);
             let grid_dims = (geom.cols, geom.rows);
             let mut side = 0u16;
-            for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
+            for m in pet.motes.iter().flatten() {
                 let alpha = (f32::from(m.alpha) * pet_alpha_scale) as u8;
                 if alpha == 0 {
                     continue;
@@ -2750,7 +2793,7 @@ impl WordDecorations {
                     Some(rgb) => rgb,
                     None => Self::pet_mote_tint(m.kind, colors),
                 };
-                *slot = Some(FreeSprite {
+                mote_sprites[mote_len] = Some(FreeSprite {
                     x,
                     y,
                     w: dest,
@@ -2762,32 +2805,38 @@ impl WordDecorations {
                     flip_x: false,
                     z: FreeZ::OverText,
                 });
+                mote_len += 1;
             }
         }
         let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
             [const { None }; crate::kitty_pet::PET_DEPARTURES_MAX];
-        for (slot, d) in depart_sprites.iter_mut().zip(pet.departures) {
-            let Some(d) = d else {
-                continue;
-            };
+        let mut depart_len = 0usize;
+        for d in pet.departures.into_iter().flatten() {
             if d.own_glass {
                 continue;
             }
-            *slot = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h));
+            if let Some(sp) = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h)) {
+                depart_sprites[depart_len] = Some(sp);
+                depart_len += 1;
+            }
         }
         let mut fp = FNV64_OFFSET;
         if let Some(s) = &sprite {
             fp = fold_free(fp, s);
         }
-        for m in mote_sprites.iter().flatten() {
+        for m in mote_sprites[..mote_len].iter().flatten() {
             fp = fold_free(fp, m);
         }
-        for g in depart_sprites.into_iter().flatten() {
-            fp = fold_free(fp, &g);
-            free.push(g);
+        for slot in &mut depart_sprites[..depart_len] {
+            if let Some(g) = slot.take() {
+                fp = fold_free(fp, &g);
+                free.push(g);
+            }
         }
-        for m in mote_sprites.into_iter().flatten() {
-            free.push(m);
+        for slot in &mut mote_sprites[..mote_len] {
+            if let Some(m) = slot.take() {
+                free.push(m);
+            }
         }
         if let Some(s) = sprite {
             free.push(s);
@@ -2860,7 +2909,10 @@ impl WordDecorations {
             pose: d.pose,
             coat: d.coat,
             iris: d.iris,
-            colors: d.colors.unwrap_or(colors),
+            colors: match d.colors {
+                Some(c) => c,
+                None => colors,
+            },
             w: nat_w,
             h: nat_h,
         };
@@ -2957,7 +3009,10 @@ impl WordDecorations {
         if !crate::pane::crop_free_sprite(&mut sprite, pane) {
             return None;
         }
-        let d_colors = d.colors.unwrap_or(colors);
+        let d_colors = match d.colors {
+            Some(c) => c,
+            None => colors,
+        };
         let mut fp = FNV64_OFFSET;
         fp = fold_free(fp, &sprite);
         fp = fnv_mix_u64(fp, u64::from(d_colors.accent));
@@ -3952,14 +4007,16 @@ impl WordDecorations {
             );
         }
         let seq = self.rescan_seq;
-        let ttl = self.grace_override.unwrap_or(GRACE_TTL);
+        let ttl = match self.grace_override {
+            Some(ttl) => ttl,
+            None => GRACE_TTL,
+        };
         for &m in matches {
-            let start_col = self.scan_colmap.get(m.start).copied().unwrap_or(0);
-            let end_lead = self
-                .scan_colmap
-                .get(m.end.saturating_sub(1))
-                .copied()
-                .unwrap_or(start_col);
+            let start_col = self.scan_colmap.get(m.start).copied().unwrap_or_default();
+            let end_lead = match self.scan_colmap.get(m.end.saturating_sub(1)) {
+                Some(&c) => c,
+                None => start_col,
+            };
             let end_col = if matches!(row_cells.get(end_lead as usize + 1), Some(n) if n.wide) {
                 end_lead + 1
             } else {
@@ -4174,7 +4231,10 @@ impl WordDecorations {
             self.settle_until = None;
         }
 
-        let ttl = self.grace_override.unwrap_or(GRACE_TTL);
+        let ttl = match self.grace_override {
+            Some(ttl) => ttl,
+            None => GRACE_TTL,
+        };
         let marks = &mut self.done_marks;
         self.persist.retain(|ident, ep| {
             if now.saturating_duration_since(ep.last_seen) <= ttl {
@@ -4191,11 +4251,10 @@ impl WordDecorations {
         let rescan_seq = self.rescan_seq;
         for ep in self.persist.values_mut() {
             if ep.seen_seq != rescan_seq
-                && self
-                    .scan_row_occupied
-                    .get(usize::from(ep.last_row))
-                    .copied()
-                    .unwrap_or(false)
+                && matches!(
+                    self.scan_row_occupied.get(usize::from(ep.last_row)),
+                    Some(true)
+                )
             {
                 ep.continuity_tainted = true;
             }
@@ -4499,6 +4558,19 @@ impl WordDecorations {
         }
     }
 
+    #[inline]
+    const fn ink_sorted_unique(ink: &[InkCell]) -> bool {
+        let mut i = 1;
+        while i < ink.len() {
+            let (a, b) = (ink[i - 1], ink[i]);
+            if a.row > b.row || (a.row == b.row && a.col >= b.col) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
     /// Advance the animation one frame and emit into `out` (decorations), `ink` (fg overrides, sorted unique `(row, col)`: row-major emission, the trick flash merged in order), `free` (one [`FreeSprite`] per cat, over its baked art) and `nova` (§6 premultiplied row-band GlowQuads for `nova_add`).
     #[allow(
         clippy::too_many_arguments,
@@ -4575,8 +4647,7 @@ impl WordDecorations {
                 self.novas.clear();
                 self.coupling.clear();
                 debug_assert!(
-                    ink.windows(2)
-                        .all(|w| (w[0].row, w[0].col) < (w[1].row, w[1].col)),
+                    Self::ink_sorted_unique(ink),
                     "ink must be sorted by (row, col) with unique cells"
                 );
                 return fp;
@@ -4729,13 +4800,18 @@ impl WordDecorations {
                             break 'graphic;
                         };
                         let eligible = peek_eligible(occ, geom);
-                        let arm = peek.arm.unwrap_or(if !eligible {
-                            KittyShownAs::PawFallbackFloor
-                        } else if animals < MAX_ANIMALS {
-                            KittyShownAs::Cat
-                        } else {
-                            KittyShownAs::PawFallbackOverflow
-                        });
+                        let arm = match peek.arm {
+                            Some(a) => a,
+                            None => {
+                                if !eligible {
+                                    KittyShownAs::PawFallbackFloor
+                                } else if animals < MAX_ANIMALS {
+                                    KittyShownAs::Cat
+                                } else {
+                                    KittyShownAs::PawFallbackOverflow
+                                }
+                            }
+                        };
                         if arm == KittyShownAs::Cat {
                             animals += 1;
                             if eligible {
@@ -4889,11 +4965,10 @@ impl WordDecorations {
                                 ^ u64::from(k).wrapping_mul(0xA24B_AED4_963E_E407)
                                 ^ frame_rot);
                             let col = occ.start_col + (s % width) as u16;
-                            let glyph = cfg
-                                .glyphs
-                                .get((s >> 11) as usize % glyphs_len)
-                                .copied()
-                                .unwrap_or(DecoGlyph::Star4);
+                            let glyph = match cfg.glyphs.get((s >> 11) as usize % glyphs_len) {
+                                Some(&g) => g,
+                                None => DecoGlyph::Star4,
+                            };
                             let color = pick_color(cfg, s);
                             let env = twinkle(s, age_s);
                             let alpha = scale_u8(cfg.intensity * env);
@@ -5014,8 +5089,7 @@ impl WordDecorations {
             arm_until(&mut active_until, until);
         }
         debug_assert!(
-            ink.windows(2)
-                .all(|w| (w[0].row, w[0].col) < (w[1].row, w[1].col)),
+            Self::ink_sorted_unique(ink),
             "ink must be sorted by (row, col) with unique cells"
         );
         self.active_until = active_until;
@@ -6750,7 +6824,11 @@ fn emit_peek<'a>(
     };
     debug_assert_eq!(tile.art.w(), g.w, "the peek tile is the design box");
     push_cat_free(free, tile.art, i32::from(g.x), top, bottom, skip, pose, fp);
-    (free.len() > n_free).then_some((top, bottom))
+    if free.len() > n_free {
+        Some((top, bottom))
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -6939,7 +7017,10 @@ fn emit_ink(
         Colorway::TwoTone { c0, c1 } if occ.custom => Some((c0, c1)),
         _ => nudged_ink_pair(occ.class, occ.genome.gkey),
     };
-    let Some((c0, c1)) = fx.pair.or(spec_pair) else {
+    let Some((c0, c1)) = (match fx.pair {
+        Some(pair) => Some(pair),
+        None => spec_pair,
+    }) else {
         return;
     };
     let ink_loop = !ink_spec.sweep_once;

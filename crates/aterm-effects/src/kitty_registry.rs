@@ -59,7 +59,10 @@ pub fn app_basename(commandline: &str) -> Option<String> {
         if token.starts_with('-') || token.contains('=') {
             continue;
         }
-        let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        let base = match token.rfind(['/', '\\']) {
+            Some(i) => &token[i + 1..],
+            None => token,
+        };
         let base = if let Some(ext) = base.get(base.len().saturating_sub(4)..)
             && ext.eq_ignore_ascii_case(".exe")
         {

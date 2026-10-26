@@ -230,20 +230,23 @@ impl Grid {
 
     /// Advance the cursor to the next line for autowrap, with `line_feed()`'s scroll-region
     /// behaviour:
-    /// - at the region bottom: scroll the region up;
+    /// - at the region bottom: scroll the region up (only the rectangle between DECSLRM
+    ///   margins, and nothing from a cursor outside them);
     /// - above it: move down one row;
     /// - below it: move down unless at the screen bottom (xterm `xtermIndex`: below the region
     ///   is CursorDown clamped at `max_row`, never a display scroll).
     #[inline]
     pub(crate) fn advance_autowrap_line(&mut self) {
         self.storage.wrap_serial += 1;
+        // xterm `WrapLine`: the index reads the column the wrap was pending on (at the
+        // bottom margin it scrolls only from within the margins), then the cursor goes
+        // to the left margin wherever it came from.
         let margins = self.storage.horizontal_margins();
         let orig_col = self.storage.cursor.col;
-        let in_margins = !margins.is_full(self.storage.cols)
-            && orig_col >= margins.left
-            && orig_col <= margins.right;
+        let margined = !margins.is_full(self.storage.cols);
+        let in_margins = orig_col >= margins.left && orig_col <= margins.right;
 
-        self.storage.cursor.col = if in_margins { margins.left } else { 0 };
+        self.storage.cursor.col = if margined { margins.left } else { 0 };
 
         let bottom = self.storage.scroll_region.bottom;
         match self.storage.cursor.row.cmp(&bottom) {
@@ -251,9 +254,12 @@ impl Grid {
                 self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
                 self.mark_row_wrapped(self.storage.cursor.row);
             }
+            std::cmp::Ordering::Equal if margined && !in_margins => {
+                // At the bottom margin from outside the margins: no scroll, no move.
+            }
             std::cmp::Ordering::Equal => {
                 // Inside DECLRMM margins, scroll the rectangle so cells outside them stay.
-                if in_margins {
+                if margined {
                     self.scroll_region_up_margined(1, margins.left, margins.right);
                 } else {
                     self.scroll_region_up(1);
@@ -357,10 +363,8 @@ impl Grid {
 
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
-                if !margins.is_full(self.storage.cols)
-                    && cursor_col >= margins.left
-                    && cursor_col <= margins.right
-                {
+                // Not past the right margin (`last_print_col`).
+                if !margins.is_full(self.storage.cols) && cursor_col <= margins.right {
                     Some(margins.right.saturating_add(1))
                 } else {
                     None
@@ -447,10 +451,8 @@ impl Grid {
 
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
-                if !margins.is_full(self.storage.cols)
-                    && cursor_col >= margins.left
-                    && cursor_col <= margins.right
-                {
+                // Not past the right margin (`last_print_col`).
+                if !margins.is_full(self.storage.cols) && cursor_col <= margins.right {
                     Some(margins.right.saturating_add(1))
                 } else {
                     None
@@ -567,10 +569,8 @@ impl Grid {
 
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
-                if !margins.is_full(self.storage.cols)
-                    && cursor_col >= margins.left
-                    && cursor_col <= margins.right
-                {
+                // Not past the right margin (`last_print_col`).
+                if !margins.is_full(self.storage.cols) && cursor_col <= margins.right {
                     Some(margins.right.saturating_add(1))
                 } else {
                     None

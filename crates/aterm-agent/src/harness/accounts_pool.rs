@@ -64,20 +64,21 @@ impl Seat<'_> {
     /// `cli`'s roster with each row's login as `logins.json` binds it ([`accounts::bound`]): a
     /// row `accounts renew --cli` signed in to a staging home names that home, as `list`, `use`
     /// and the Account menu read it.
+    /// This observes policy and bindings without loading unrelated budget state. An
+    /// interrupted commit is still recovered as a whole before the observation.
     ///
     /// # Errors
     ///
-    /// Why the roster or the bindings do not read.
+    /// Why the roster or bindings cannot be read, the bounded account writer lock cannot be
+    /// taken, or an interrupted commit (including its budget image) cannot be recovered.
     pub fn bound_roster(&self, cli: Cli) -> Result<Roster, String> {
-        let roster = self.roster(cli)?;
-        if roster.rows.is_empty() {
-            return Ok(roster);
-        }
-        let (logins, _) = self
-            .store(cli)
-            .load_logins(self.now)
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(accounts::bound(&roster, &logins))
+        pool_read_using(
+            self,
+            cli,
+            || self.roster(cli),
+            std::convert::identity,
+            |store, held| policy_held(self, cli, store, held).map(|(roster, _)| roster),
+        )
     }
 
     /// `[harness] accounts =` in the `aterm.toml` beside the rosters: the one rotation switch of
@@ -169,6 +170,15 @@ struct PoolSnapshot {
     state: accounts::State,
 }
 
+impl PoolSnapshot {
+    fn require_policy(&self, raw: &Roster, logins: &accounts::Logins) -> Result<(), String> {
+        if *logins != self.logins || accounts::bound(raw, logins) != self.roster {
+            return Err("account policy or login changed before commit; nothing recorded".into());
+        }
+        Ok(())
+    }
+}
+
 /// Fingerprint the endpoint and the managed login generation, not the credentials. Tagged,
 /// length-delimited fields distinguish absent and empty values, even on non-UTF-8 homes.
 /// Serving a turn does not change this key; renewing even in the same directory does.
@@ -233,32 +243,93 @@ fn sample_context(
     accounts::SampleContext(aterm_codec::hex::encode_lower(&hash.finalize()))
 }
 
-fn snapshot_held(seat: &Seat<'_>, cli: Cli, store: &Store) -> Result<PoolSnapshot, String> {
+fn policy_held(
+    seat: &Seat<'_>,
+    cli: Cli,
+    store: &Store,
+    held: &accounts::Lock,
+) -> Result<(Roster, accounts::Logins), String> {
+    let path = seat.config_dir.join(cli.accounts().roster_file);
+    let (target, _) = super::cli::roster_target(&path)?;
+    store.recover_sync_held(held, &target)?;
     let raw = seat.roster(cli)?;
     let (logins, _) = store.load_logins(seat.now)?;
+    Ok((accounts::bound(&raw, &logins), logins))
+}
+
+fn snapshot_held(
+    seat: &Seat<'_>,
+    cli: Cli,
+    store: &Store,
+    held: &accounts::Lock,
+) -> Result<PoolSnapshot, String> {
+    let (roster, logins) = policy_held(seat, cli, store, held)?;
     let (state, _) = store.load(seat.now)?;
     Ok(PoolSnapshot {
-        roster: accounts::bound(&raw, &logins),
+        roster,
         logins,
         state,
     })
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolRecovery",
+        action = "Observe",
+        project = "aterm_agent::harness::accounts_pool::tests::recovery::recovery_transition"
+    )
+)]
 fn pool_snapshot(seat: &Seat<'_>, cli: Cli) -> Result<PoolSnapshot, String> {
-    let raw = seat.roster(cli)?;
-    if raw.rows.is_empty() {
-        return Ok(PoolSnapshot {
-            roster: raw,
+    pool_snapshot_using(seat, cli, || seat.roster(cli))
+}
+
+fn pool_snapshot_using(
+    seat: &Seat<'_>,
+    cli: Cli,
+    read_roster: impl FnOnce() -> Result<Roster, String>,
+) -> Result<PoolSnapshot, String> {
+    pool_read_using(
+        seat,
+        cli,
+        read_roster,
+        |roster| PoolSnapshot {
+            roster,
             logins: accounts::Logins::default(),
             state: accounts::State::default(),
-        });
-    }
+        },
+        |store, held| snapshot_held(seat, cli, store, held),
+    )
+}
+
+fn pool_read_using<T>(
+    seat: &Seat<'_>,
+    cli: Cli,
+    read_roster: impl FnOnce() -> Result<Roster, String>,
+    from_empty: impl FnOnce(Roster) -> T,
+    read_held: impl FnOnce(&Store, &accounts::Lock) -> Result<T, String>,
+) -> Result<T, String> {
     let store = seat.store(cli);
+    let path = seat.config_dir.join(cli.accounts().roster_file);
+    store.recover_sync_within(&accounts::LOCK_LADDER, &path)?;
+    // Even an empty roster may be an image of an interrupted pool creation. Keep this
+    // no-lock fast path only across one completed receipt; a healthy empty pool still
+    // needs no state directory, snapshot reads or usage polling.
+    let empty = store.sync_read_receipt().and_then(|receipt| {
+        let raw = read_roster()?;
+        store.check_sync_read_receipt(&receipt)?;
+        Ok(raw.rows.is_empty().then_some(raw))
+    });
+    // A concurrent commit can invalidate the bracket. Resolve it once under the
+    // writer lock; an invalid receipt still refuses there before any pool use.
+    if let Ok(Some(raw)) = empty {
+        return Ok(from_empty(raw));
+    }
     let _held = store
         .acquire_within(&accounts::LOCK_LADDER)
         .map_err(|why| why.to_string())?
         .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
-    snapshot_held(seat, cli, &store)
+    read_held(&store, &_held)
 }
 
 /// Reads the usage of each of `roster`'s rows of `cli` whose login is here (`enrolled`, or the
@@ -294,6 +365,14 @@ pub fn record_usage(
         machine = "AccountSampleContext",
         action = "Poll",
         project = "aterm_agent::harness::accounts_pool::tests::sample_context::context_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolCommit",
+        action = "Usage",
+        project = "aterm_agent::harness::accounts_pool::tests::commit::commit_transition"
     )
 )]
 fn poll_usage(
@@ -357,7 +436,7 @@ fn poll_usage(
         .acquire_within(&accounts::LOCK_LADDER)
         .map_err(|why| why.to_string())?
         .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
-    let current = snapshot_held(seat, cli, &store)?;
+    let current = snapshot_held(seat, cli, &store, &held)?;
     if current.roster != before.roster || current.logins != before.logins {
         return Err("account policy or login changed during usage read; nothing recorded".into());
     }
@@ -374,26 +453,30 @@ fn poll_usage(
         return Ok((current.state, Vec::new()));
     }
     let mut state_after = None;
-    let recorded = store.transact_logins_held(&held, seat.now, &mut None, |state, _| {
-        let mut events = Vec::new();
-        for (label, usage) in &readings {
-            let sample_events = accounts::note_sample(state, label, usage.sample.clone(), seat.now);
-            if !sample_events.is_empty()
-                && let Some(row) = current.roster.row(label)
-                && let Some(account) = state.accounts.get_mut(label)
-            {
-                account.sample_context = Some(sample_context(seat, cli, row, &current.logins));
+    let path = seat.config_dir.join(cli.accounts().roster_file);
+    let recorded =
+        store.transact_pool_logins_held(&held, &path, seat.now, &mut None, |raw, state, logins| {
+            current.require_policy(raw, logins)?;
+            let mut events = Vec::new();
+            for (label, usage) in &readings {
+                let sample_events =
+                    accounts::note_sample(state, label, usage.sample.clone(), seat.now);
+                if !sample_events.is_empty()
+                    && let Some(row) = current.roster.row(label)
+                    && let Some(account) = state.accounts.get_mut(label)
+                {
+                    account.sample_context = Some(sample_context(seat, cli, row, &current.logins));
+                }
+                events.extend(sample_events);
+                if let Some((window, until)) = usage.wall {
+                    events.extend(accounts::note_wall(
+                        state, label, window, until, seat.now, seat.now,
+                    ));
+                }
             }
-            events.extend(sample_events);
-            if let Some((window, until)) = usage.wall {
-                events.extend(accounts::note_wall(
-                    state, label, window, until, seat.now, seat.now,
-                ));
-            }
-        }
-        state_after = Some(state.clone());
-        Ok(events)
-    });
+            state_after = Some(state.clone());
+            Ok(events)
+        });
     recorded.map_err(|why| {
         format!(
             "{}: could not record fresh usage: {why}",
@@ -556,8 +639,9 @@ fn checked_launch_pin<'a>(
     Ok(Some(pinned))
 }
 
-/// Observe current admission after preparing an environment. This read-only check does not
-/// freeze credential contents, raw roster writers or the caller's later process spawn.
+/// Observe current admission after preparing an environment, completing any earlier admitted
+/// commit first. This records no new account decision and does not freeze credential contents,
+/// raw roster writers or the caller's later process spawn.
 fn finish_launch(
     seat: &Seat<'_>,
     cli: Cli,
@@ -571,7 +655,7 @@ fn finish_launch(
         .acquire_within(&accounts::LOCK_LADDER)
         .map_err(|why| why.to_string())?
         .ok_or(accounts::LOCK_HELD)?;
-    let current = snapshot_held(seat, cli, &store)?;
+    let current = snapshot_held(seat, cli, &store, &_held)?;
     if current.roster.row(&row.label) != Some(row)
         || !accounts::RenewalParent::capture(&before.logins, &row.label)
             .matches(&current.logins, &row.label)
@@ -629,6 +713,25 @@ fn finish_launch(
 )]
 #[doc(hidden)]
 pub fn account_pool_launch_policy_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolRecovery",
+        action = "AnotherProvider",
+        reason = "Select a native Codex, Grok or Kimi recovery fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolRecovery",
+        action = "AnotherCase",
+        reason = "Select a native interruption or conflict fixture."
+    )
+)]
+#[doc(hidden)]
+pub fn account_pool_recovery_environment() {}
 
 /// A running session of a pooled CLI, as [`session_move`] asks about it.
 #[derive(Debug, Clone)]
@@ -792,8 +895,16 @@ fn session_move_using(
     }
 }
 
-/// Validate a prepared line at one current policy observation before returning it. Roster
-/// writers do not share the lock; this does not freeze their files or a later process spawn.
+/// Validate a prepared line at one current policy observation, after completing any earlier
+/// admitted commit. This does not freeze external roster writers or a later process spawn.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolCommit",
+        action = "Rotate",
+        project = "aterm_agent::harness::accounts_pool::tests::commit::commit_transition"
+    )
+)]
 fn finish_move(
     seat: &Seat<'_>,
     session: &Session<'_>,
@@ -815,7 +926,7 @@ fn finish_move(
         .acquire_within(&accounts::LOCK_LADDER)
         .map_err(|why| why.to_string())?
         .ok_or(accounts::LOCK_HELD)?;
-    let current = snapshot_held(seat, session.cli, &store)?;
+    let current = snapshot_held(seat, session.cli, &store, &held)?;
     for label in [from, to.as_str()] {
         if before.roster.row(label) != current.roster.row(label)
             || !accounts::RenewalParent::capture(&before.logins, label)
@@ -845,22 +956,30 @@ fn finish_move(
         return Err("account advice changed while preparing a move".into());
     }
     if *rotates {
-        store.transact_logins_held(&held, seat.now, &mut None, |state, _| {
-            accounts::begin_rotation(
-                state,
-                &current.roster,
-                &enrolled,
-                current.state.active.as_deref(),
-                accounts::Mover {
-                    sid: session.sid,
-                    account: from,
-                },
-                to,
-                seat.now,
-            )
-            .map(|event| vec![event])
-            .map_err(|lost| format!("{lost:?}"))
-        })?;
+        let path = seat.config_dir.join(session.cli.accounts().roster_file);
+        store.transact_pool_logins_held(
+            &held,
+            &path,
+            seat.now,
+            &mut None,
+            |raw, state, logins| {
+                current.require_policy(raw, logins)?;
+                accounts::begin_rotation(
+                    state,
+                    &current.roster,
+                    &enrolled,
+                    current.state.active.as_deref(),
+                    accounts::Mover {
+                        sid: session.sid,
+                        account: from,
+                    },
+                    to,
+                    seat.now,
+                )
+                .map(|event| vec![event])
+                .map_err(|lost| format!("{lost:?}"))
+            },
+        )?;
     }
     Ok(())
 }
@@ -904,6 +1023,14 @@ pub fn account_pool_move_environment() {}
 /// current login into a historical one. Keep its usage, but only an unchanged current
 /// login can prove the canary. An unrecognised login supplies neither kind of evidence.
 /// Return the effective roster read under the lock for the following advice step.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolCommit",
+        action = "Observe",
+        project = "aterm_agent::harness::accounts_pool::tests::commit::commit_transition"
+    )
+)]
 fn record_session(
     seat: &Seat<'_>,
     session: &Session<'_>,
@@ -917,13 +1044,13 @@ fn record_session(
         who,
     };
     let mut recorded = None;
-    seat.store(session.cli).transact_logins_within(
+    seat.store(session.cli).transact_pool_logins_within(
         &accounts::LOCK_LADDER,
+        &path,
         seat.now,
         &mut None,
-        |state, logins| {
-            let raw = Roster::load_for(session.cli, &path)?;
-            let current = accounts::bound(&raw, logins);
+        |raw, state, logins| {
+            let current = accounts::bound(raw, logins);
             let me = who.me(&current);
             if !me.default_home || !me.stored_login || me.label() != Some(row.label.as_str()) {
                 return Err("session login changed; usage attribution is unknown".into());
@@ -960,6 +1087,25 @@ fn record_session(
     )?;
     recorded.ok_or_else(|| "session observation was not recorded".into())
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolCommit",
+        action = "AnotherOperation",
+        reason = "Select rotation or a provider-specific usage or session fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolCommit",
+        action = "AnotherFault",
+        reason = "Select success, a pre-admission refusal, or an interrupted admitted write."
+    )
+)]
+#[doc(hidden)]
+pub fn account_pool_commit_environment() {}
 
 #[cfg_attr(
     any(test, debug_assertions),

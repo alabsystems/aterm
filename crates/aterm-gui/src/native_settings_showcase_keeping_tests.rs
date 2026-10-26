@@ -4456,7 +4456,9 @@ fn work_walks() -> Vec<WorkWalk> {
             vec![
                 (None, [6, 0, 0, 0]),
                 (step(Warning), [1, 7, 0, 0]),
-                (step(Status), [1, 8, 6, 4]),
+                // Two more measures: the status docks beside the warning on the toolbar's row,
+                // its words scrolling there, where they grew the toolbar over the page.
+                (step(Status), [1, 10, 6, 4]),
                 (redraw, [1, 0, 4, 3]),
                 (redraw, [1, 0, 4, 3]),
                 (step(Status), [1, 7, 0, 0]),
@@ -4477,9 +4479,11 @@ fn work_walks() -> Vec<WorkWalk> {
         (
             nord(Keyboard::Row("Dracula")),
             at((244, 440), 2, true, true),
+            // Two more bars: the warning's bar sets its words on the lines half the window
+            // holds (it cut them to one), so the status's bar beside it shortens further.
             vec![
-                (None, [2, 5, 9, 7]),
-                (step(Window((243, 440))), [2, 5, 9, 7]),
+                (None, [2, 5, 9, 9]),
+                (step(Window((243, 440))), [2, 5, 9, 9]),
             ],
         ),
         (

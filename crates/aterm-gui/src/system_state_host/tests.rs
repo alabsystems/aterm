@@ -3631,7 +3631,10 @@ fn refused_actions_show_one_note_and_identical_reads_do_not_repaint() {
             })
             .count()
     };
-    assert_eq!(app.system_state_host.latest_status, completed);
+    // Cancel keeps an unadmitted launch calm until the worker's status catches up.
+    let mut after_cancel = completed.clone();
+    after_cancel.unanswered = true;
+    assert_eq!(app.system_state_host.latest_status, after_cancel);
     assert!(app.commit_glassless_native_frame(wid));
     assert_eq!(notes(&app), 1);
     let revision = app
@@ -4051,6 +4054,43 @@ mod closed_startup_review {
             state.needs_attention(),
             "a later admitted run keeps its actionable needs"
         );
+        assert!(app.system_state_menu_line().is_some());
+        assert_eq!(app.access_revision(), Some(9));
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn closed_review_reopen_after_cancel_stays_calm_until_a_later_admission() {
+        let (mut app, wid, old_instance, view, request, receive) = review();
+        let before_cancel = needs_disk_access(saved_plan(), 8, false);
+        fresh(&mut app, before_cancel.clone());
+        press(&mut app, wid, view, "system-state/cancel");
+        assert!(!request.pending());
+        assert!(app.system_state_host.pending.is_none());
+        app.close_active_native_tab(wid).unwrap();
+        assert!(app.native_runtime.app(old_instance).is_none());
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        assert_ne!(instance, old_instance);
+        // The worker has neither consumed Cancel nor published that it kept it.
+        calm_unanswered_page(&app, instance);
+        fresh(&mut app, before_cancel);
+        calm_unanswered_page(&app, instance);
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Cancelled
+        );
+        calls();
+        act(&mut app, view, "system-state/group/3/leave").unwrap();
+        assert_eq!(calls(), ["manual apply"]);
+        receipt().accept();
+        app.resolve_system_state_apply();
+        fresh(&mut app, needs_disk_access(changed_plan(), 9, true));
+        let Some(NativeApp::SystemState(state)) = app.native_runtime.app(instance) else {
+            panic!("the manual choice keeps its controller")
+        };
+        assert_eq!(state.headline().open, Some(Access::FullDiskAccess));
+        assert!(state.needs_attention());
         assert!(app.system_state_menu_line().is_some());
         assert_eq!(app.access_revision(), Some(9));
         assert!(app.structural_invariants_ok());
@@ -5016,4 +5056,100 @@ fn a_newer_aterms_setup_is_read_as_it_stands() {
         Observe::Started
     );
     assert_eq!(calls(), ["observe nothing set up true"]);
+}
+
+/// Install… on the GitHub repositories row is a person's press (design §3.3): a control
+/// client's press opens no Command Line Tools tab and spends its evidence, and the person's asks
+/// for the tab at once (here, with no event loop to spawn on, the ask is answered at once).
+#[test]
+fn only_a_persons_install_asks_for_the_command_line_tools_tab() {
+    use crate::clt_install::Install;
+    for client in [true, false] {
+        let mut app = App::headless_for_test();
+        let (wid, _, _) = page(&mut app);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.os_window_for_test = true;
+        window.focused = true;
+        assert!(app.commit_glassless_native_frame(wid));
+        assert!(app.system_state_frontmost_in(wid));
+        app.headless = false;
+        app.with_gesture_source(client, |app| {
+            app.interact_system_state(wid);
+            app.run_system_state_action_with_handlers(
+                SystemStateAction::InstallDeveloperTools { by_person: !client },
+                None,
+            );
+        });
+        app.headless = true;
+        let expected = if client {
+            Install::Unasked
+        } else {
+            Install::Opened
+        };
+        assert_eq!(
+            app.workstation_setup.developer_tools, expected,
+            "a client's press: {client}"
+        );
+    }
+}
+
+/// The review of the groups the ALab signal adds applies untouched after its 30 seconds
+/// (`chosen: false`), and the watch's look ends with nothing written (a Stop retired it, the
+/// records changed under it): the watch refuses that Apply, and the page goes back to the plan in
+/// force at once. No run shows, the permission gate is released, and the watch's next offer of
+/// the review is taken (design §3.5).
+#[test]
+fn a_widen_apply_the_watch_refuses_returns_the_page_to_the_plan_in_force() {
+    let policy = || SetupStatus {
+        plan: Some(Plan::default()),
+        permissions: Some(crate::InitialSetupPermissionPolicy {
+            revision: 6,
+            allowed: true,
+        }),
+        ..SetupStatus::default()
+    };
+    let mut app = App::headless_for_test();
+    let (wid, instance, view) = page(&mut app);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    app.set_system_state_handlers_for_test(handlers());
+    fresh(&mut app, policy());
+    assert!(!app.workstation_setup.suppresses_permissions());
+    let mut narrow = aterm_types::macos_setup::Selection::none();
+    narrow.set(Setting::Permissions, true);
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::widen(Plan::default(), Plan::from(narrow), send));
+    assert!(app.system_state_host.pending.is_some());
+    assert!(app.commit_glassless_native_frame(wid));
+    let active = app.system_state_presented_active(instance);
+    assert!(active);
+    assert!(expire_startup_review(&mut app, active, view));
+    app.drain_system_state_actions();
+    let mut answer = receive.try_recv().unwrap();
+    assert!(matches!(
+        answer.decision,
+        WorkstationSetupDecision::Begin(_)
+    ));
+    assert!(
+        !answer.chosen,
+        "the untouched review applied as it showed it"
+    );
+    let receipt = answer.receipt.take().expect("the watch holds the receipt");
+    assert!(app.system_state_host.pending_apply.is_some());
+    assert!(!app.can_offer_system_state(), "its admission is under way");
+    // The watch's look ended with nothing written: it refuses the Apply.
+    drop(receipt);
+    app.resolve_system_state_apply();
+    fresh(&mut app, policy());
+    assert!(app.system_state_host.pending_apply.is_none());
+    assert!(
+        !app.workstation_setup.suppresses_permissions(),
+        "the permission gate is released"
+    );
+    let (shown, _) = app.project_system_state_status(policy());
+    assert!(!shown.busy, "no run shows that nothing runs");
+    assert_eq!(shown.plan, Some(Plan::default()), "the plan in force");
+    assert!(
+        app.can_offer_system_state(),
+        "the watch may offer the review again"
+    );
 }

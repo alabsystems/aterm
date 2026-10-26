@@ -10,6 +10,16 @@ use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
+/// A glow whose ticks fold its ramps into its quads
+/// (`CursorGlow::fold_glow_ramps`): the suites here read its streams as quads.
+#[cfg(debug_assertions)]
+#[allow(dead_code)]
+pub fn quads_glow() -> CursorGlow {
+    let mut glow = CursorGlow::default();
+    glow.fold_glow_ramps(true);
+    glow
+}
+
 /// Environment variable scaling the wall-clock budgets of the release perf gates.
 #[allow(dead_code)]
 pub const BUDGET_SCALE_VAR: &str = "RK_FRAME_COST_BUDGET_SCALE";
@@ -327,6 +337,9 @@ pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
         .collect()
 }
 
+/// The replay pool, where the library builds it (a release bench that mounts
+/// this module builds none).
+#[cfg(debug_assertions)]
 #[allow(unused_imports)]
 #[cfg(debug_assertions)]
 pub use aterm_effects::test_pool::par_map;

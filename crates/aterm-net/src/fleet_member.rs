@@ -2016,15 +2016,16 @@ fn read_record<S: Read>(stream: &mut S) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a line that is not UTF-8"))
 }
 
-/// The refusal a machine that holds no join code answers a `join` with ([`serve_join`]): a
-/// member's `aterm fleet join` reads it as no issuer.
-pub const NOT_THE_ISSUER: &str = "this machine is no fleet's issuer: it holds no join code, so \
-                                  it records no members (join at the machine whose `aterm fleet \
-                                  init` wrote the code)";
+/// The refusal a machine that holds no join code answers a `join` with ([`serve_join`]), in the
+/// joining machine's words: a member's `aterm fleet join` reads it as no issuer.
+pub const NOT_THE_ISSUER: &str = "it is no fleet's issuer: it holds no join code, so it records \
+                                  no members (a join code comes from the fleet's issuer, in the \
+                                  file its `aterm fleet init` names)";
 
-/// The refusal of a join proved under a fleet left or rotated before it was recorded.
-pub const MOVED_ON: &str = "this machine left the fleet, or rotated its secret, while the join was \
-                            served, so nothing was recorded: join with the code it issues now";
+/// The refusal of a join proved under a fleet left or rotated before it was recorded, in the
+/// joining machine's words.
+pub const MOVED_ON: &str = "the issuer left the fleet, or rotated its secret, while the join was \
+                            served, so it recorded nothing: join with the code it issues now";
 
 /// The issuer's end of a join, on a stream the handshake proved for op `join` under `secret`:
 /// read the member's [`Registration`] and, while that fleet is held ([`write_held`]), record it
@@ -2076,7 +2077,8 @@ pub fn serve_join<S: Read + Write>(
             .and_then(|issuer| {
                 if reg.node == issuer.node {
                     return Err(
-                        "that node is this machine, the fleet's issuer: it does not join itself"
+                        "the registration names the issuer's own node, and the issuer does not \
+                         join itself (a Mac cloned or restored from the issuer carries its node)"
                             .to_owned(),
                     );
                 }
@@ -2138,7 +2140,8 @@ pub fn serve_join<S: Read + Write>(
 /// Why a registration ([`register`]) recorded nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unregistered {
-    /// The issuer answered and recorded nothing: its refusal, or an answer that is no join's.
+    /// The machine at the code's address answered and recorded nothing: its own words (a
+    /// member's [`NOT_THE_ISSUER`] among them), or an answer that is no join's.
     Answered(String),
     /// No answer came: the registration was not sent, the exchange failed, or time ran out.
     Unanswered(String),
@@ -2165,10 +2168,7 @@ pub fn register<S: Read + Write>(
     let line =
         read_record(stream).map_err(|e| unanswered(format!("the issuer did not answer: {e}")))?;
     if let Some(why) = line.strip_prefix("ERR ") {
-        return Err(Unregistered::Answered(format!(
-            "the issuer refused: {}",
-            aterm_codec::tty::one_line(why, 400)
-        )));
+        return Err(Unregistered::Answered(aterm_codec::tty::one_line(why, 400)));
     }
     joined_of(&line).map_err(Unregistered::Answered)
 }
@@ -2241,9 +2241,10 @@ pub fn register_by(
     }
 }
 
-/// The refusal a machine that holds no join code answers a `book` read with ([`serve_book`]).
-pub const NO_BOOK: &str = "this machine is no fleet's issuer: it holds no join code, so it \
-                           keeps no book of the fleet's members to share";
+/// The refusal a machine that holds no join code answers a `book` read with ([`serve_book`]), in
+/// the reading machine's words.
+pub const NO_BOOK: &str = "it is no fleet's issuer: it holds no join code, so it keeps no book of \
+                           the fleet's members to share";
 
 /// The word of a book read's `ERR` from a machine that holds no join code: it has no book to
 /// share, so the member's copy goes when it is the issuer that says so ([`read_whole`]).

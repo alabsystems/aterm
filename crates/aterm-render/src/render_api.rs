@@ -7,8 +7,9 @@
 use aterm_core::terminal::CursorStyle;
 
 pub use aterm_core::render::{
-    CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, GlowBlend, GlowQuad, HaloMode,
-    InkCell, RainHalo, RenderInput, SceneAtlas, SelectionClip, TrailCell, WordDecoration,
+    CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, GlowBlend, GlowEnd, GlowQuad,
+    GlowRamp, GlowRamps, HaloMode, InkCell, Laid, RainHalo, RampMark, RenderInput, SceneAtlas,
+    SelectionClip, TrailCell, WordDecoration, end_alpha, end_color, glow_end,
 };
 
 /// A row-major RGBA framebuffer packed as `0xTTRRGGBB` (`TT` is transmittance: `0` opaque, `255` transparent).

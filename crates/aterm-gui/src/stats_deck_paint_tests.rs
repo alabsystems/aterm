@@ -867,7 +867,13 @@ fn key(d: &Swept<'_>) -> Vec<String> {
     if !fits && !both_states {
         why.push(format!("no span fits \"over max\": {:?}", head.key.spans));
     }
-    let time = drawn("10 min ago") + drawn("\u{2013}10 min");
+    // The two blocks share one time axis: their strips span the same seconds, and its label
+    // stands once.
+    let time = head
+        .labels
+        .iter()
+        .find(|l| l.label == crate::stats_plan::Label::Time)
+        .map_or(0, |l| drawn(&l.text));
     if d.form == DeckForm::Folded && time != 1 {
         why.push(format!("the time label {time} times"));
     }

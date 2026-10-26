@@ -2740,7 +2740,7 @@ fn every_reason_a_fleet_read_gives_fits_its_row() {
         ),
         (
             Unreached::Deadline(Stage::Handshake, within),
-            PeerFault::Other,
+            PeerFault::Unserved,
         ),
         (Unreached::Deadline(Stage::Answer, within), PeerFault::Other),
         (
@@ -3256,6 +3256,7 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
         .expect("no book names it");
     assert!(
         refused.again
+            && refused.unserved
             && refused.why.starts_with(
                 "its issuer did not answer within 0.5s, so no book here says which Mac \
                  `zz-unbooked` is"
@@ -3326,6 +3327,34 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
         "a host no book names is read in the rest of the deadline: {:?}",
         read.peers
     );
+}
+
+#[test]
+fn a_drive_that_meets_no_listener_exits_the_same_at_its_issuer_and_at_its_peer() {
+    let (_issuer, code, serving) = issuing("closed-issuer");
+    let member = World::new("closed-issuer-member");
+    let late = World::new("closed-issuer-late");
+    let opts = || Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts(), &code));
+    ok(join(&late.places, &opts(), &code));
+    let node = member::node_id(&late.places.state).unwrap();
+    let at_peer = drive_fleet_in(&member.places, &node, HANG)
+        .err()
+        .expect("nothing listens at its place");
+    drop(serving.take());
+    let at_issuer = drive_fleet_in(&member.places, "zz-unbooked", HANG)
+        .err()
+        .expect("nothing listens at the issuer's");
+    assert!(
+        at_issuer.why.contains("try again once it answers"),
+        "{at_issuer:?}"
+    );
+    for refused in [&at_peer, &at_issuer] {
+        assert!(refused.again && !refused.unserved, "{refused:?}");
+    }
 }
 
 #[test]
@@ -3850,6 +3879,24 @@ fn a_failed_join_is_advised_by_its_kind() {
     ] {
         let said = not_recorded("192.168.1.23:7100", &unanswered, false);
         assert!(!said.contains("The issuer answered"), "{said}");
+    }
+    let older = "this machine is no fleet's issuer: it holds no join code, so it records no \
+                 members (join at the machine whose `aterm fleet init` wrote the code)";
+    for words in [member::NOT_THE_ISSUER, older] {
+        let said = not_recorded(
+            "127.0.0.1:49201",
+            &JoinFailed::Registration(words.to_owned()),
+            false,
+        );
+        assert_eq!(
+            said,
+            "this machine dialled 127.0.0.1:49201, a member of that fleet and not its issuer: it \
+             holds no join code, so it records no members\n  Nothing of the fleet was written \
+             here. A join code comes from the fleet's issuer, in the file its `aterm fleet init` \
+             names (`aterm fleet peers` on 127.0.0.1:49201 names that issuer): copy the code \
+             from there, and join again.",
+            "{words}"
+        );
     }
     let rotated = not_recorded(
         "192.168.1.23:7100",

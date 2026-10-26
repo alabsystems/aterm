@@ -325,14 +325,92 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
     assert!(turned > 0, "the sweep turns pages");
 }
 
+/// A STATUS'S BAR COMING OR GOING MOVES NO ROW, AND THE SCREEN UNDER IT ENDS ON THE NEXT
+/// CARD'S PEEK: Cursor & Motion's second screen at 102x29 is seated alike with the bar up and
+/// with none, the peek measured in the room the bar leaves, so every row in that room stands
+/// where it stood; with the bar up the screen no longer ends on a whole card over 18pt of
+/// blank.
+#[test]
+fn a_bar_coming_moves_no_row_and_the_screen_under_it_ends_on_a_peek() {
+    let cx = view_cx_at(738.0, 418.0);
+    let (mut runtime, instance, view) = paging_view("", SettingsRoute::CursorMotion);
+    // The list's second screen, as Page Down from its top turns to it.
+    let second = {
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        messages_view_state(&runtime, view)
+            .scroll_plan()
+            .expect("a list")
+            .page_after(0)
+    };
+    let screen = |runtime: &mut NativeRuntime, bar: bool| {
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.feedback = None;
+            if bar {
+                state.show_transient_status_for_test("Cursor blink turned off");
+            }
+            state.scroll_page_to(second);
+            state.page_reveal = None;
+        }
+        let compiled = compile_settings_view(runtime, instance, view, &cx);
+        let plan = messages_view_state(runtime, view)
+            .scroll_plan()
+            .expect("a list");
+        let list = painted_list(&compiled, &plan, second).expect("the list");
+        let rows = compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                node.key.as_str().starts_with("settings/row/")
+                    && node.rect.bottom() <= list.y + plan.room() + 0.5
+            })
+            .map(|node| (node.key.as_str().to_string(), node.rect))
+            .collect::<Vec<_>>();
+        let drawn_to = compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                !node.clip.is_empty()
+                    && node.rect != list
+                    && !node.key.as_str().ends_with("/thumb")
+                    && !node.key.as_str().ends_with("/scroll")
+                    && node.clip.y >= list.y - 0.5
+                    && node.clip.bottom() <= list.bottom() + 0.5
+                    && node.clip.x >= list.x - 0.5
+                    && node.clip.right() <= list.right() + 0.5
+            })
+            .map(|node| node.clip.bottom())
+            .fold(list.y, f32::max);
+        (rows, list.y + plan.room() - drawn_to, plan.gap())
+    };
+    let (calm, _, _) = screen(&mut runtime, false);
+    let (under, band, gap) = screen(&mut runtime, true);
+    assert!(!under.is_empty(), "the screen shows rows under the bar");
+    for row in &under {
+        assert!(
+            calm.contains(row),
+            "{row:?} stands where it stood with no bar: {calm:?}"
+        );
+    }
+    assert!(
+        band <= gap + 0.5,
+        "{band}pt of blank under the screen's last card with the bar up"
+    );
+}
+
 /// One walk of every page's screens holds two laws: no screen ends on blank under a card it cuts
 /// (or short of the page's bottom), and no band that holds a shared note is a control's stop.
+/// The walk is made again with a status's bar up: the bar covers the strip kept for it, and a
+/// screen measured to the strip's foot ended on a whole card over a blank band in the room the
+/// bar left (Cursor & Motion at 102x29: 18pt).
 #[test]
 fn no_screen_ends_on_blank_under_a_card_it_cuts() {
     let (mut cut_screens, mut whole_foot_screens) = (0usize, 0usize);
     let mut faults = Vec::new();
     let (mut notes, mut noted) = (0usize, Vec::new());
-    for source in ["", CHANGED] {
+    for (source, bar) in [("", false), (CHANGED, false), ("", true)] {
         for route in SettingsRoute::ALL {
             if route == SettingsRoute::Messages {
                 continue;
@@ -346,6 +424,12 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
             ] {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = paging_view(source, route);
+                if bar {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.show_transient_status_for_test("Cursor blink turned off");
+                }
                 each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
                     let Some(plan) = state.scroll_plan() else {
                         return;
@@ -354,8 +438,9 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                         return;
                     };
                     let context = format!(
-                        "{route:?} {width}x{height}{} screen {top}",
-                        if source.is_empty() { "" } else { " changed" }
+                        "{route:?} {width}x{height}{}{} screen {top}",
+                        if source.is_empty() { "" } else { " changed" },
+                        if bar { " under a bar" } else { "" }
                     );
                     for band in plan.drawn_bands(top) {
                         let (from, to) = (list.y + band.at, list.y + band.at + band.height);
@@ -1695,7 +1780,14 @@ fn a_page_turn_takes_the_keyboard_onto_its_screen() {
                     let compiled = compile_settings_view(&runtime, instance, view, &cx);
                     let state = messages_view_state(&runtime, view);
                     let plan = state.scroll_plan().expect("a list");
-                    let top = state.page_scroll.min(plan.limit());
+                    // The screen the render drew: a turn asks for a stop of the plan before
+                    // it, and the render seats the landing it took the keyboard to.
+                    let top = state
+                        .scroll_record
+                        .borrow()
+                        .as_ref()
+                        .map_or(state.page_scroll, scroll::ScrollRecord::top)
+                        .min(plan.limit());
                     let place = (top, (plan.screen(top).offset * 100.0).round() as i64);
                     if before == Some(place) {
                         break;

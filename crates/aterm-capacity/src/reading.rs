@@ -56,6 +56,11 @@ pub struct Reading {
     pub available: Option<u64>,
     /// Physical memory, bytes.
     pub physical: Option<u64>,
+    /// Memory wired down, bytes, which [`Self::available`] never holds: macOS's wired pages
+    /// (the kernel's own, and what a driver holds wired for a process, Metal's buffers on Apple
+    /// silicon), Linux's unreclaimable slab, kernel stacks and page tables. Read only where
+    /// [`Self::available`] is, since only there is admission held to what is available.
+    pub wired: Option<u64>,
     /// Swap in use, bytes.
     pub swap_used: Option<u64>,
     /// Swap allocated, bytes.
@@ -69,6 +74,19 @@ impl Reading {
     #[must_use]
     pub fn idle_cores(&self) -> Option<f64> {
         self.load5.map(|l| (f64::from(self.cores) - l).max(0.0))
+    }
+
+    /// THE MOST MEMORY THAT CAN EVER BE AVAILABLE HERE, bytes: physical memory less what is
+    /// wired ([`Self::wired`]), or all of it where nothing wired is read. Available memory
+    /// (free, inactive and purgeable pages) never holds a wired page, nor the active and
+    /// compressed pages of a process that still runs, so it always stays below this, and a need
+    /// of this much or more never fits ([`crate::never`]). This Mac (48 GiB, 2026-10-25): 3.6
+    /// GiB wired, so 44.4 GiB, with 21 to 27 GiB available under its usual load. `None` where
+    /// physical memory is unread.
+    #[must_use]
+    pub fn reachable(&self) -> Option<u64> {
+        self.physical
+            .map(|p| p.saturating_sub(self.wired.filter(|w| *w < p).unwrap_or(0)))
     }
 
     /// The live machine now, its volume the one holding `path` ([`Live`]).
@@ -144,10 +162,19 @@ impl Reading {
             load5: Some(0.0),
             available: Some(available.saturating_mul(GIB)),
             physical: Some(physical.saturating_mul(GIB)),
+            wired: None,
             swap_used: Some(0),
             swap_total: Some(0),
             volume: None,
         }
+    }
+
+    /// This reading with `gib` GiB of its memory wired ([`Self::wired`]): what a test sets.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn wired_gib(mut self, gib: u64) -> Reading {
+        self.wired = Some(gib.saturating_mul(GIB));
+        self
     }
 }
 
@@ -308,6 +335,7 @@ impl Machine for Live {
             cores,
             load1: load.map(|l| l[0]),
             load5: load.map(|l| l[1]),
+            wired: available.and(detail.map(|d| d.wired)),
             available,
             physical,
             swap_used: detail.map(|d| d.swap_used),

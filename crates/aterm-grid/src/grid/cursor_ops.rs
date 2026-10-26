@@ -119,6 +119,8 @@ impl Grid {
     }
 
     /// Margin-aware cursor forward (DECLRMM).
+    ///
+    /// Stops at the right margin, or at the screen edge for a cursor already past it.
     #[inline]
     pub fn cursor_forward_margin(&mut self, n: u16, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -128,9 +130,8 @@ impl Grid {
         self.storage.clear_pending_wrap();
         let margins = self.storage.horizontal_margins();
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
-        let in_margins =
-            self.storage.cursor.col >= margins.left && self.storage.cursor.col <= margins.right;
-        let right_bound = if in_margins {
+        // xterm `CursorForward`: the right margin binds unless the cursor is past it.
+        let right_bound = if self.storage.cursor.col <= margins.right {
             margins.right.min(max_col)
         } else {
             max_col
@@ -147,6 +148,8 @@ impl Grid {
     }
 
     /// Margin-aware cursor backward (DECLRMM).
+    ///
+    /// Stops at the left margin, or at column 0 for a cursor already left of it.
     #[inline]
     pub fn cursor_backward_margin(&mut self, n: u16, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -155,9 +158,12 @@ impl Grid {
         }
         self.storage.clear_pending_wrap();
         let margins = self.storage.horizontal_margins();
-        let in_margins =
-            self.storage.cursor.col >= margins.left && self.storage.cursor.col <= margins.right;
-        let left_bound = if in_margins { margins.left } else { 0 };
+        // xterm `CursorBack`: the left margin binds unless the cursor is left of it.
+        let left_bound = if self.storage.cursor.col >= margins.left {
+            margins.left
+        } else {
+            0
+        };
         self.storage.cursor.col = self.storage.cursor.col.saturating_sub(n).max(left_bound);
     }
 
@@ -422,9 +428,10 @@ mod tests {
     /// EVERY CURSOR MOTION LANDS WHERE XTERM PUTS IT: absolute moves clamp to
     /// the screen; CUU/CUD clamp on the margin they cross toward (even from
     /// outside the region), VPR on the screen edge; CUF/CUB and CR honour
-    /// DECLRMM margins only in margin mode and only from inside them; LF/RI
-    /// scroll at the region edge and move freely outside it; and each motion
-    /// that consumes the pending wrap clears it.
+    /// DECLRMM margins only in margin mode (CUF's right margin unless the
+    /// cursor is past it, CUB's and CR's left margin unless it is left of it);
+    /// LF/RI scroll at the region edge and move freely outside it; and each
+    /// motion that consumes the pending wrap clears it.
     #[test]
     fn every_motion_lands_where_xterm_puts_it() {
         let cases = [
@@ -649,11 +656,23 @@ mod tests {
                 10,
                 50,
             ),
+            // xterm `CursorForward` lets go of the right margin only past it.
             margins(
                 case(
-                    "CUF outside margins",
+                    "CUF from left of the margins",
                     (10, 80),
                     (0, 5),
+                    |g| g.cursor_forward_margin(100, true),
+                    (0, 50),
+                ),
+                10,
+                50,
+            ),
+            margins(
+                case(
+                    "CUF from past the right margin",
+                    (10, 80),
+                    (0, 60),
                     |g| g.cursor_forward_margin(100, true),
                     (0, 79),
                 ),
@@ -680,11 +699,23 @@ mod tests {
             ),
             margins(
                 case(
-                    "CUB outside margins",
+                    "CUB from left of the margins",
                     (10, 80),
                     (0, 5),
                     |g| g.cursor_backward_margin(100, true),
                     (0, 0),
+                ),
+                10,
+                50,
+            ),
+            // xterm `CursorBack` lets go of the left margin only left of it.
+            margins(
+                case(
+                    "CUB from past the right margin",
+                    (10, 80),
+                    (0, 60),
+                    |g| g.cursor_backward_margin(100, true),
+                    (0, 10),
                 ),
                 10,
                 50,

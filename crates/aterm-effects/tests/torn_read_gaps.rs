@@ -96,7 +96,7 @@ impl Host {
     fn with_pad(spinner: bool, pad: usize) -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         term.process(b"\x1b[?1049h\x1b[2J");
         let mut h = Self {
@@ -1208,7 +1208,7 @@ const REC_ROW: u16 = 37;
 fn replay(src: &str, torn: bool) -> (Vec<HoleFrame>, usize) {
     let now0 = Instant::now();
     let mut term = Terminal::new(REC_ROWS as u16, REC_COLS as u16);
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     glow.note_pane_columns(0, REC_COLS);
     let g = crate::common::geom(REC_ROWS, REC_COLS, REC_CW, REC_CH);
     let cfg = rainbow_cfg();

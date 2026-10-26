@@ -90,6 +90,8 @@ pub use aterm_selection as selection;
 pub mod render;
 /// The fx-layer primitive, re-exported from [`render`] beside `GlowQuad`.
 mod render_fx;
+/// A glow stream's ramps, re-exported from [`render`] beside `GlowQuad`.
+mod render_ramps;
 pub mod scrollback;
 pub mod search;
 

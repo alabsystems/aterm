@@ -585,11 +585,13 @@ impl App {
         let mut lines = Vec::new();
         for (wid, ws) in &self.windows {
             lines.push(format!(
-                "window id={} focused={} tabs={} active={}",
+                "window id={} focused={} tabs={} active={} rows={} cols={}",
                 wid.0,
                 self.frontmost_window == Some(*wid),
                 ws.tab_set.len(),
                 ws.tab_set.active_id().map_or(0, |id| id.get()),
+                ws.rows,
+                ws.cols,
             ));
             let bounds = self.content_bounds(*wid).unwrap_or_default();
             for (index, tab) in ws.tab_set.tabs().iter().enumerate() {

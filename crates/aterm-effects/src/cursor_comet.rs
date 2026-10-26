@@ -507,7 +507,11 @@ fn ring_row(
             continue;
         }
         let (xo0, xo1) = x_edges[i];
-        let (xi0, xi1) = x_edges.get(i + 1).copied().unwrap_or((cx_round, cx_round));
+        let (xi0, xi1) = if i + 1 < 4 {
+            x_edges[i + 1]
+        } else {
+            (cx_round, cx_round)
+        };
         let spans: [(i32, i32); 2] = if xi1 > xi0 {
             [(xo0, xi0), (xi1, xo1)]
         } else {

@@ -541,6 +541,19 @@ impl PublishLock {
                         .map_or_else(String::new, |bytes| reason(&bytes));
                     return Err(NotTaken::Held { lock, holder });
                 }
+                // The lock sits beside the vault, so a missing folder fails here first: name the
+                // folder the person typed, not a lock file they never asked for.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let folder = path
+                        .parent()
+                        .filter(|folder| !folder.as_os_str().is_empty())
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    return Err(NotTaken::Failed(Error::new(format!(
+                        "{}: no such folder to hold {}; create it, or check the path",
+                        folder.display(),
+                        path.display()
+                    ))));
+                }
                 Err(e) => {
                     return Err(NotTaken::Failed(Error::new(format!(
                         "{}: {e}",
@@ -1033,6 +1046,29 @@ mod tests {
         std::fs::write(&path, b"not an envelope\n").expect("write");
         publish(&source, &first).expect("replaced");
         held(&first);
+    }
+
+    /// A vault path whose folder is missing (mistyped, or a volume not mounted) is refused naming
+    /// that folder, and nothing is written. Negative control: with the folder there, it publishes.
+    #[cfg(unix)]
+    #[test]
+    fn a_publish_into_a_missing_folder_names_the_folder() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let folder = root.path().join("shared");
+        let path = folder.join("team.vault");
+        let source = Source::Path(path.clone());
+        let error = publish(&source, &version(1, b"first")).expect_err("no folder");
+        assert!(
+            error
+                .0
+                .starts_with(&format!("{}: no such folder", folder.display()))
+                && !error.0.contains(".lock"),
+            "{error}"
+        );
+        assert!(!folder.exists());
+        std::fs::create_dir(&folder).expect("folder");
+        publish(&source, &version(1, b"first")).expect("published");
+        assert!(path.exists());
     }
 
     /// While another publisher holds `<path>.lock`, a publish or replace to the path is refused,

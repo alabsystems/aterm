@@ -22,6 +22,12 @@ fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<LoginEnv
 #[path = "accounts_pool_launch_tests.rs"]
 mod launch_admission;
 
+#[path = "accounts_pool_recovery_tests.rs"]
+mod recovery;
+
+#[path = "accounts_pool_commit_tests.rs"]
+mod commit;
+
 #[path = "accounts_pool_launch_policy_tests.rs"]
 mod launch_policy;
 

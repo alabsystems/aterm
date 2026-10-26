@@ -444,8 +444,10 @@ pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
         [const { OnceLock::new() }; CliMark::ALL.len()];
     let arts = ARTS[mark as usize].get_or_init(|| {
         let b = brand(mark);
-        [Master::Sd, Master::Hd]
-            .map(|m| b.master(m).and_then(|rows| fx_art::indexed(rows, b.chars)))
+        [Master::Sd, Master::Hd].map(|m| match b.master(m) {
+            Some(rows) => fx_art::indexed(rows, b.chars),
+            None => None,
+        })
     });
     arts[master as usize].as_ref()
 }

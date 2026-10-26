@@ -446,6 +446,46 @@ fn migrate_active_tab_moves_view_to_next_window() {
 }
 
 #[test]
+fn a_moved_mixed_tab_s_terminal_takes_the_destination_leaf_grid() {
+    let mut app = App::headless_for_test();
+    let wid_a = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (session, view) =
+        app.split_active_with_stub_terminal(wid_a, crate::tab_model::SplitAxis::Horizontal);
+    let sid_b = app.next_session_id;
+    let wid_b = app.insert_logical_window(stub_session(sid_b), 60, 200);
+    app.frontmost_window = Some(wid_a);
+    app.sync_active_session();
+    let leaf_grid = |app: &App, wid: WindowId| {
+        let plan = app.active_visible_leaf_plan(wid).expect("a visible plan");
+        let leaf = plan.leaf(view).expect("the terminal leaf");
+        (
+            (leaf.rect.size.height.round() as u16).max(1),
+            (leaf.rect.size.width.round() as u16).max(1),
+        )
+    };
+    let grid = |app: &App| {
+        let t = super::term_lock(&app.pool.get(session).expect("pooled").term);
+        (t.rows(), t.cols())
+    };
+    let before = grid(&app);
+    assert_eq!(before, leaf_grid(&app, wid_a), "fixture: sized to A's leaf");
+
+    app.migrate_active_tab_to_next_window()
+        .expect("the mixed tab moves");
+    assert_eq!(app.frontmost_window, Some(wid_b), "focus follows the tab");
+    assert_eq!(app.focused_session_id(wid_b), Some(session));
+    let target = leaf_grid(&app, wid_b);
+    assert_ne!(target, before, "fixture: B's leaf differs from A's");
+    assert_eq!(
+        grid(&app),
+        target,
+        "the terminal reflows to B's leaf, as an all-terminal tab's does"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
 fn window_of_session_prefers_the_front_window_then_the_lowest_id() {
     let mut app = App::headless_for_test();
     assert_eq!(app.window_of_session(0), Some(WindowId(0)));
@@ -1128,10 +1168,10 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
         );
         assert_eq!(fp, (0, 0));
         assert!(
-            glow_out.is_empty()
+            cursor.glow.out_laid(&glow_out).is_empty()
                 && trail_out.is_empty()
                 && cursor.glow.halos().is_empty()
-                && cursor.glow.under_quads().is_empty(),
+                && cursor.glow.under_laid().is_empty(),
             "a first tick in the new layout cannot bridge to the old one"
         );
         (cell, (after.row, after.col))
@@ -1598,14 +1638,14 @@ fn live_drag_resize_scopes_to_active_tab_then_flushes_on_switch() {
     app.switch_tab_in(wid, 1);
     assert_eq!(
         size(&app, 1),
-        (24, 80),
-        "switching alone does not reflow a deferred tab"
+        (30, 100),
+        "the switch pays the deferred tab at once, not at a frame a headless window never draws"
     );
     app.resize_panes_scoped(wid, true);
     assert_eq!(
         size(&app, 1),
         (30, 100),
-        "the tab-switch flush sizes the newly-active tab to the current grid"
+        "and a frame's pass finds nothing to do"
     );
 
     app.resize_panes_scoped(wid, false);
@@ -2017,7 +2057,7 @@ fn on_focus_loss_embers_the_rainbow_ribbon_instead_of_cutting_it() {
             .fx
             .cursor()
             .glow
-            .under_quads()
+            .under_laid()
             .iter()
             .map(|q| q.alpha)
             .max()

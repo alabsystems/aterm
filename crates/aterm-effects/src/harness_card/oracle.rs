@@ -104,7 +104,11 @@ pub(super) fn lay_toned(
         return;
     };
     let mut run: Option<Rect> = None;
-    for c in on_trail.iter().map(|c| c.meet(q)).filter(|c| !c.is_empty()) {
+    for &raw in on_trail {
+        let c = raw.meet(q);
+        if c.is_empty() {
+            continue;
+        }
         run = match run {
             Some(p) if (p.y0, p.y1, p.x1) == (c.y0, c.y1, c.x0) => Some(Rect { x1: c.x1, ..p }),
             Some(p) => {
@@ -181,6 +185,25 @@ pub(super) fn lay_star(
     }
 }
 
+#[inline]
+const fn repeats_run(other: &str, c: usize, end: usize, ch: u8) -> bool {
+    let o = other.as_bytes();
+    if c > 0 && o[c - 1] == ch {
+        return false;
+    }
+    if end < o.len() && o[end] == ch {
+        return false;
+    }
+    let mut i = c;
+    while i < end {
+        if o[i] != ch {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// The kitty: its frame's art as opaque source-over rectangles.
 pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     let Some((at, pose)) = cx.kitty else {
@@ -194,23 +217,21 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
         let mut c = 0;
         while c < px.len() {
             let ch = px[c];
-            let run = px[c..].iter().take_while(|&&b| b == ch).count();
-            let repeats = |other: &str| {
-                let o = other.as_bytes();
-                o[c..c + run].iter().all(|&b| b == ch)
-                    && (c == 0 || o[c - 1] != ch)
-                    && o.get(c + run).is_none_or(|&b| b != ch)
-            };
-            let carried = r > 0 && repeats(frame[r - 1]);
-            if let (false, Some(rgb)) = (carried, inks.of(ch)) {
-                let down = frame[r + 1..]
-                    .iter()
-                    .take_while(|other| repeats(other))
-                    .count();
+            let mut end = c + 1;
+            while end < px.len() && px[end] == ch {
+                end += 1;
+            }
+            if let Some(rgb) = inks.of(ch)
+                && (r == 0 || !repeats_run(frame[r - 1], c, end, ch))
+            {
+                let mut down = 0;
+                while r + 1 + down < frame.len() && repeats_run(frame[r + 1 + down], c, end, ch) {
+                    down += 1;
+                }
                 let q = Rect {
                     x0: at.rect.x0 + c as i64 * p,
                     y0: at.rect.y0 + r as i64 * p,
-                    x1: at.rect.x0 + (c + run) as i64 * p,
+                    x1: at.rect.x0 + end as i64 * p,
                     y1: at.rect.y0 + (r + 1 + down) as i64 * p,
                 };
                 let paint = Paint {
@@ -219,7 +240,7 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
                 };
                 sink.flat(out, cx.geo.clip, q, paint);
             }
-            c += run;
+            c = end;
         }
     }
     debug_assert!(KITTY_PALETTE[0] == b'.');
@@ -311,12 +332,18 @@ impl HarnessCard {
 }
 
 /// A frame's fingerprint ([`HarnessCard::tick`]).
+#[inline]
 pub(super) fn frame_fp(under: &[GlowQuad], over: &[GlowQuad], clock: Clock) -> u64 {
     if under.is_empty() && over.is_empty() {
         return 0;
     }
     let mut h = mix(0x4841_524E_4553_5321 ^ under.len() as u64);
-    for q in under.iter().chain(over) {
+    for q in under {
+        for w in q.damage_words() {
+            h = mix(h ^ w);
+        }
+    }
+    for q in over {
         for w in q.damage_words() {
             h = mix(h ^ w);
         }

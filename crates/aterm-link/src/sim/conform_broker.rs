@@ -1,7 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SIMULATED BROKER HELD TO ASTREAM'S OWN (sim item B01).
+//! THE SIMULATED BROKER HELD TO ASTREAM'S OWN (sim item B01): a differential
+//! test of [`super::bus`]'s model against a real `astream_broker::Broker`.
+//!
+//! The simulation's exactly-once claims (the seeded worlds' laws,
+//! `FabricExactlyOnce`'s conformance in [`super::conform`]) rest on the model
+//! answering the bridge as astream does. This test plays one script on both,
+//! request by request, and compares the answers, so a pin bump of
+//! `vendor/astream` the model does not follow fails here.
+//!
+//! ## The two arms
+//!
+//! * REAL: `Broker::open_opts` on a scratch directory, opened as aterm opens
+//!   its own: [`crate::durability::Durability::options`] (the tier, the
+//!   100 ms Ordered horizon, the escalation table on the weak tiers), a fixed
+//!   `Boot::Known` and `Volume::Boot` (so a same-boot unclean stop keeps the
+//!   generation), unguarded, and [`crate::broker_rules::retain`] at every
+//!   open, or for the journal of a world whose broker was unretained, never:
+//!   what `aterm link broker` serves when setting the rules fails. Served on a
+//!   scratch Unix socket and read with astream's codec.
+//! * MODEL: `bus::Broker::new` with the same table, retained as the real arm
+//!   is, each connection a raw [`bus::SimStream`]. No held acks, refused
+//!   batches, race or mutant.
+//!
+//! ## What is compared
+//!
+//! Each decoded answer after one projection ([`project`]): a `PublishAck`'s
+//! offset and `deduped`; a `Delivery`, a `Budget` and a `Gap` whole; a
+//! refusal's code and astream-defined prefix class ([`class`]), never its
+//! words; a `Mark`'s `next`, `head`, `resume` and `oldest`, and its `durable`
+//! exactly on Strict and by [`Law`] on Ordered and Relaxed (monotone, at most
+//! the head, at least one past every escalated ack); a `Hello`'s generation,
+//! lineage, served tier, request set and retention rules, never its nonce,
+//! log id or health. A tail's `Mark`s are skipped: the model sends none.
+//!
+//! The scripts are hand-written ones per verb and edge ([`scripts`],
+//! [`long`]) and the door's journal of the seeded [`WORLDS`] ([`replay`]):
+//! what real bridges sent, on every tier with the mirror off, onto a retained
+//! broker and onto an unretained one. Every connection is ended before a
+//! restart, so a will fires at a point the script decides. A real will is
+//! waited for by `BrokerStats::wills_settled`, a real tail by its reader
+//! thread; each wait is a one-minute hang detector.
+//!
+//! Negative controls: the model with an [`ArmMutant`] must diverge: a
+//! forgotten dedup or will fence, an altered payload, and each drift this test
+//! found and `bus.rs` fixed ([`drift`]).
+//!
+//! ## WHAT IT DOES NOT COVER
+//!
+//! * A GUARDED broker: `Attach` is a `Mark` on both arms and nothing is
+//!   checked; the table's principal rule (`h-`) applies on a real broker only
+//!   to a producer a bound grant attached, and the refusals a capability draws
+//!   (expired, poisoned, unauthorized) are not drawn.
+//! * RETENTION'S CUTS: no script reaches a bound aterm's rules cut at, so a
+//!   gap notice, a `retained-from=` floor, an `oldest` above 0 and the `cut: `
+//!   retire refusal are never drawn.
+//! * POWER-LOSS CUTS: [`bus::law_check`]'s (P2-P7). The one power loss here
+//!   keeps the whole log.
+//! * A BATCH ASTREAM ROLLS BACK (a failed commit): the model's is the seeded
+//!   worlds' (`bus::State::refuse_next`), and a journalled world rolls back
+//!   none.
+//! * A WILL LIVE AT A RESTART: astream's connection threads race its
+//!   shutdown; the model fires each producer's latest will at the next open,
+//!   one outcome the race allows, and the scripts end every connection first.
+//! * TIME: a tail's catch-up, idle and durable marks and the liveness bound
+//!   they arm, the Ordered horizon's timer (judged only by [`Law`]), the
+//!   retention tick.
+//! * `Last`'s SCAN BOUND: a round of astream's visits at most `LAST_SCAN_MAX`
+//!   (65,536) index entries from the filter's literal prefix; one that stops
+//!   on an entry the filter matches answers a short page resuming there, and
+//!   past `LAST_RESUME_ROUNDS` (64) rounds the answer is an error. The model
+//!   scans without a bound; no script's index holds 65,536 entries.
+//! * A replica's refusals, and verbs the bridge never sends (`ForkSubscribe`,
+//!   `ProcessAndProduce`, `Replicate`, the conditional `Retire`).
+//! * Concurrency: one request at a time; batches and the order of an ack
+//!   against a tail's read are the held-ack worlds'.
+//! * Off Apple, the Ordered tier: astream serves it Strict (`NotApple`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
@@ -90,6 +165,9 @@ struct Real {
     conns: BTreeMap<u64, RealConn>,
     up: Option<(astream_broker::Broker, astream_broker::BrokerHandle)>,
     durability: Durability,
+    /// Retained by aterm's rules at every open, as `aterm link broker` opens its own;
+    /// otherwise the broker it serves when setting them fails.
+    retained: bool,
     boot: Boot,
     /// Producers whose `/a/will` record the log holds: what an open fires,
     /// one firing each.
@@ -178,7 +256,7 @@ impl Drop for RealConn {
 }
 
 impl Real {
-    fn new(tier: Tier) -> Self {
+    fn new(tier: Tier, retained: bool) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01")
             .tempdir_in("/tmp")
@@ -189,6 +267,7 @@ impl Real {
                 keep: Arc::new(AtomicBool::new(false)),
             },
             durability: durability(tier),
+            retained,
             boot: Boot::Known(BOOT),
             up: None,
             conns: BTreeMap::new(),
@@ -212,6 +291,11 @@ impl Real {
                 Ok(astream_broker::Prepared::Nothing)
             })
             .expect("the real broker opens");
+        // As `aterm link broker` and the fabric world harness do at every open, before
+        // anything is served: astream retains and advertises only the rules set since an open.
+        if self.retained {
+            crate::broker_rules::retain(&broker).expect("aterm's retention rules are set");
+        }
         let handle = broker.serve(self.sock()).expect("the real broker serves");
         self.up = Some((broker, handle));
         self.queued = self.will_producers.len() as u64;
@@ -366,13 +450,14 @@ struct Model {
 }
 
 impl Model {
-    fn new(tier: Tier, mutant: ArmMutant) -> Self {
+    fn new(tier: Tier, retained: bool, mutant: ArmMutant) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01-sim")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let broker = bus::Broker::new(tier, table(tier));
         lock(&broker.state).mutant = mutant;
+        lock(&broker.state).retained = retained;
         let core = Core::new(1, broker, Device::new(dir.path()));
         let process = Process::new(Arc::clone(&core), 1);
         Self {
@@ -546,6 +631,8 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
                 ext.lineage,
                 ext.requests,
                 ext.retention
+                    .as_deref()
+                    .map(|rules| astream_broker::Retention::decode(rules).ok_or(rules))
             ),
             None,
         ),
@@ -564,11 +651,17 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
     }
 }
 
-/// THE DIFFERENTIAL: `steps` on both arms at `tier`, the model with `mutant`.
+/// THE DIFFERENTIAL: `steps` on both arms at `tier`, each retained by aterm's rules, the
+/// model with `mutant`.
 fn run(tier: Tier, mutant: ArmMutant, steps: &[Step]) -> Verdict {
+    run_on(tier, true, mutant, steps)
+}
+
+/// [`run`] on two brokers each `retained` or not.
+fn run_on(tier: Tier, retained: bool, mutant: ArmMutant, steps: &[Step]) -> Verdict {
     let table = table(tier);
-    let mut real = Real::new(tier);
-    let mut model = Model::new(tier, mutant);
+    let mut real = Real::new(tier, retained);
+    let mut model = Model::new(tier, retained, mutant);
     let mut laws = [Law::default(), Law::default()];
     let mut answers = 0u64;
     for (i, step) in steps.iter().enumerate() {
@@ -1204,6 +1297,8 @@ pub(crate) mod long {
             Step::Send(1, budget(P)),
             Step::Send(1, budget(Q)),
             Step::Send(1, last("/f/f/pub/n-sim/s-4095/>", "", 10)),
+            // More subjects than `LAST_PAGE_MAX`: one page, cut at it, resuming.
+            Step::Send(1, last("/>", "", u32::MAX)),
         ]);
         s
     }
@@ -1227,22 +1322,43 @@ pub(crate) mod long {
     }
 }
 
-/// THE WORLDS whose journals are replayed: one per tier, and each with the
-/// mirror off and on ([`super::world::Opts::seed`]'s alternation), on one
-/// device that never loses power, a broker that answers every ack at once,
-/// and a disk that never fails: what a restart may lose and when an ack is
-/// read are the law check's and the held-ack worlds'.
-fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
-    let opts = super::world::Opts {
+/// THE WORLDS whose journals are replayed, `(seed, tier)`: on every tier, one
+/// with the mirror off, one mirroring onto a retained broker and one onto an
+/// unretained broker ([`super::world::Opts::seed`]'s alternations), as
+/// [`what_real_bridges_sent_astream_answers_as_the_model_did`] checks.
+const WORLDS: &[(u64, Tier)] = &[
+    (1, Tier::Strict),
+    (7, Tier::Strict),
+    (19, Tier::Strict),
+    (4, Tier::Ordered),
+    (2, Tier::Ordered),
+    (22, Tier::Ordered),
+    (5, Tier::Relaxed),
+    (3, Tier::Relaxed),
+    (18, Tier::Relaxed),
+];
+
+/// A world of [`WORLDS`], on one device that never loses power, a broker that
+/// answers every ack at once and rolls back no batch, and a disk that never
+/// fails: what a restart may lose, when an ack is read and a batch astream
+/// could not commit are the law check's and the seeded worlds'. (A batch the
+/// world's broker rolled back is one the real arm commits, so the log the
+/// journal's deliveries were read from is not the one replayed.)
+fn journalled_opts(seed: u64, tier: Tier) -> super::world::Opts {
+    super::world::Opts {
         tier: Some(tier),
         power_cuts: false,
         bus_losses: false,
         hold_acks: false,
+        refused_batches: false,
         write_errors: false,
         journal: true,
         ..super::world::Opts::seed(seed)
-    };
-    super::world::run(&opts)
+    }
+}
+
+fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
+    super::world::run(&journalled_opts(seed, tier))
 }
 
 /// Whether astream's broker serves `tier` as asked on this host: off Apple it serves an
@@ -1303,20 +1419,31 @@ fn the_model_holds_astreams_subject_budget_and_fetch_scan_bound() {
 }
 
 /// **WHAT REAL BRIDGES SENT, ASTREAM ANSWERS AS THE MODEL DID**: the door's
-/// journal of seeded worlds, replayed on both arms.
+/// journal of each of the [`WORLDS`], replayed on both arms, each retained as
+/// the world's broker was.
 #[test]
 fn what_real_bridges_sent_astream_answers_as_the_model_did() {
-    let mut failed = Vec::new();
-    let mut requests = 0usize;
-    for (seed, tier) in [
-        (1, Tier::Strict),
-        (2, Tier::Ordered),
-        (3, Tier::Relaxed),
-        (4, Tier::Ordered),
-        (6, Tier::Relaxed),
-        (7, Tier::Strict),
-    ] {
-        let out = journalled(seed, tier);
+    let worlds: Vec<(u64, super::world::Opts)> = WORLDS
+        .iter()
+        .map(|&(seed, tier)| (seed, journalled_opts(seed, tier)))
+        .collect();
+    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed] {
+        for (mirror, retained, what) in [
+            (false, None, "the mirror off"),
+            (true, Some(true), "a mirror onto a retained broker"),
+            (true, Some(false), "a mirror onto an unretained broker"),
+        ] {
+            assert!(
+                worlds.iter().any(|(_, o)| o.tier == Some(tier)
+                    && o.mirror == mirror
+                    && retained.is_none_or(|r| o.retained == r)),
+                "no journalled world on {tier} with {what}"
+            );
+        }
+    }
+    let replayed = aterm_spec::check::each(&worlds, |(seed, opts)| {
+        let tier = opts.tier.expect("a journalled world names its tier");
+        let out = super::world::run(opts);
         assert!(
             out.violations.is_empty(),
             "seed {seed}'s world broke a law: {:?}",
@@ -1328,28 +1455,144 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
             "seed {seed}'s world never restarted its broker"
         );
         if !served_here(tier) {
-            continue;
+            return (0, Ok(()));
         }
-        requests += steps.iter().filter(|s| matches!(s, Step::Send(..))).count();
-        if let Err(e) = run(tier, ArmMutant::None, &steps) {
-            failed.push(format!("seed {seed}: {e}"));
-        }
-    }
+        let requests = steps.iter().filter(|s| matches!(s, Step::Send(..))).count();
+        let verdict = run_on(tier, opts.retained, ArmMutant::None, &steps)
+            .map_err(|e| format!("seed {seed}: {e}"));
+        (requests, verdict)
+    });
+    let requests: usize = replayed.iter().map(|(n, _)| n).sum();
     eprintln!("replayed {requests} requests real bridges sent");
+    let failed: Vec<&String> = replayed
+        .iter()
+        .filter_map(|(_, v)| v.as_ref().err())
+        .collect();
     assert!(
         failed.is_empty(),
         "the model diverged:\n{}",
-        failed.join("\n")
+        failed
+            .iter()
+            .map(|e| e.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
-/// **NEGATIVE CONTROL: A MODEL THAT FORGETS ITS DEDUP OR ITS WILL FENCE, OR
-/// CHANGES A BINARY PAYLOAD, IS CAUGHT** by the scripts that hold it
-/// ([`ArmMutant::FreshDedup`], [`ArmMutant::NoWillFence`],
-/// [`ArmMutant::AlterPayload`]), and by the journal of a world.
+/// THE DRIFT each fix in `bus.rs` this test found once undid, as an
+/// [`ArmMutant`], with the script that must catch it and what it gets wrong.
+fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
+    vec![
+        (
+            ArmMutant::HelloNoLineage,
+            scripts::publishing(),
+            "a never-moved log's Hello with no lineage",
+        ),
+        (
+            ArmMutant::RefuseEveryA,
+            scripts::publishing(),
+            "a publish to an /a/ subject not astream's own",
+        ),
+        (
+            ArmMutant::NoNameBound,
+            scripts::publishing(),
+            "a name past MAX_NAME_LEN",
+        ),
+        (
+            ArmMutant::FetchNamesNoOldest,
+            scripts::publishing(),
+            "Fetch's oldest offset",
+        ),
+        (
+            ArmMutant::LastResumesOnlyBeforeMore,
+            scripts::publishing(),
+            "Last's resume after a full last page",
+        ),
+        (
+            ArmMutant::RetireOnlyAtZero,
+            scripts::retiring(),
+            "a retire at a sequence other than 0",
+        ),
+        (
+            ArmMutant::RetireIgnoresWills,
+            scripts::retiring(),
+            "a retire while a will targets the subject",
+        ),
+        (
+            ArmMutant::RetireIgnoresCharge,
+            scripts::retiring(),
+            "a retire of another producer's subject",
+        ),
+        (
+            ArmMutant::RetireAnyTarget,
+            scripts::retiring(),
+            "a retire of a reserved or malformed target",
+        ),
+        (
+            ArmMutant::WillTakesAnySubject,
+            scripts::wills(),
+            "a will on a reserved or malformed subject",
+        ),
+        (
+            ArmMutant::WillOfASecondProducer,
+            scripts::wills(),
+            "a second producer's will on one connection",
+        ),
+        (
+            ArmMutant::WillAckHalfRefused,
+            scripts::wills(),
+            "the code refusing a will in the ack half",
+        ),
+        (
+            ArmMutant::BudgetReservesNothing,
+            scripts::wills(),
+            "a will's reservation in Budget",
+        ),
+        (
+            ArmMutant::RefusedSubscribeLives,
+            scripts::wills(),
+            "the end of a refused subscribe's connection",
+        ),
+        (
+            ArmMutant::WillReservesNothing,
+            long::budgets(),
+            "a will's reservation against the subject budget",
+        ),
+        (
+            ArmMutant::PublishPastTheBudget,
+            long::budgets(),
+            "a publish's new subject past the budget",
+        ),
+        (
+            ArmMutant::WillPastTheBudget,
+            long::budgets(),
+            "a will's new subject past the budget",
+        ),
+        (
+            ArmMutant::LastPastItsPage,
+            long::budgets(),
+            "a Last page past LAST_PAGE_MAX",
+        ),
+        (
+            ArmMutant::FetchUnbounded,
+            long::scan_bound(),
+            "Fetch's scan bound",
+        ),
+        (
+            ArmMutant::Unretained,
+            scripts::publishing(),
+            "a retained broker's Hello with no retention",
+        ),
+    ]
+}
+
+/// **NEGATIVE CONTROL: A MODEL THAT FORGETS ITS DEDUP OR ITS WILL FENCE,
+/// CHANGES A BINARY PAYLOAD, OR FALLS BACK TO ANY DRIFT THIS TEST FOUND, IS
+/// CAUGHT** by the script that holds it ([`drift`]), and a forgotten dedup by
+/// the journal of a world.
 #[test]
 fn a_model_that_forgets_its_dedup_or_its_will_fence_is_caught() {
-    for (mutant, script, what) in [
+    let mut controls = vec![
         (ArmMutant::FreshDedup, scripts::publishing(), "a resend"),
         (ArmMutant::NoWillFence, scripts::wills(), "a fenced will"),
         (
@@ -1357,14 +1600,23 @@ fn a_model_that_forgets_its_dedup_or_its_will_fence_is_caught() {
             scripts::binary_payload(),
             "a changed binary payload",
         ),
-    ] {
-        let caught = run(Tier::Relaxed, mutant, &script);
-        assert!(
-            caught.is_err(),
-            "CONTROL {mutant:?}: {what} was answered as astream answers it"
-        );
-        eprintln!("CONTROL {mutant:?} caught: {}", caught.unwrap_err());
+    ];
+    controls.extend(drift());
+    let verdicts = aterm_spec::check::each(&controls, |(mutant, script, _)| {
+        run(Tier::Relaxed, *mutant, script)
+    });
+    let mut missed = Vec::new();
+    for ((mutant, _, what), verdict) in controls.iter().zip(verdicts) {
+        match verdict {
+            Err(e) => eprintln!("CONTROL {mutant:?} caught: {e}"),
+            Ok(()) => missed.push(format!("{mutant:?}: {what}")),
+        }
     }
+    assert!(
+        missed.is_empty(),
+        "CONTROL: answered as astream answers it:\n  {}",
+        missed.join("\n  ")
+    );
     let out = journalled(3, Tier::Relaxed);
     let caught = run(Tier::Relaxed, ArmMutant::FreshDedup, &replay(&out.journal));
     assert!(

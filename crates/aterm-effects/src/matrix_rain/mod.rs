@@ -1054,7 +1054,13 @@ impl MatrixRain {
     /// Latch the epoch on first call and advance the clock monotonically.
     #[inline]
     fn sync_clock(&mut self, now: Instant) {
-        let epoch = *self.epoch.get_or_insert(now);
+        let epoch = match self.epoch {
+            Some(epoch) => epoch,
+            None => {
+                self.epoch = Some(now);
+                now
+            }
+        };
         let ms = now.saturating_duration_since(epoch).as_millis() as u64;
         if ms > self.clock_ms {
             self.clock_ms = ms;
@@ -1114,8 +1120,12 @@ impl MatrixRain {
             if !self.baker.complete() && !self.material.is_empty() {
                 self.finish_material_bake();
             } else if !self.baker.complete() && (ticked || self.last_bake_tick != Some(self.tick)) {
-                let rom = self.rom.get_or_insert_with(|| decorative_master().clone());
-                self.baker.bake_tiles(rom);
+                if self.rom.is_none() {
+                    self.rom = Some(decorative_master().clone());
+                }
+                if let Some(rom) = self.rom.as_ref() {
+                    self.baker.bake_tiles(rom);
+                }
                 self.last_bake_tick = Some(self.tick);
             }
             self.ensure_col_order(geom.cols, geom.rows);
@@ -1196,8 +1206,10 @@ impl MatrixRain {
             self.last_emit_nonempty,
             vis,
             self.drain_ticks,
-            self.last_seq
-                .map_or_else(|| "none".into(), |s| s.to_string()),
+            match self.last_seq {
+                Some(s) => s.to_string(),
+                None => "none".into(),
+            },
             self.content_streak,
         )
     }
@@ -1489,8 +1501,10 @@ impl MatrixRain {
             .sort_by_key(|&c| field::rain_hash32(seed ^ ((u32::from(c) << 1) | 1)));
         let fp = self.field_params(rows);
         self.col_params_cache.clear();
-        self.col_params_cache
-            .extend((0..u32::from(cols)).map(|c| col_params(&fp, c)));
+        self.col_params_cache.reserve(usize::from(cols));
+        for c in 0..u32::from(cols) {
+            self.col_params_cache.push(col_params(&fp, c));
+        }
     }
 
     const fn field_params(&self, rows: u16) -> FieldParams {

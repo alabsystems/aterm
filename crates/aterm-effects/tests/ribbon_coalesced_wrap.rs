@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{Geom, GlowConfig, GlowStyle};
 use aterm_effects::rainbow_kitty::TypedClass;
 
 struct Wrapped {
@@ -51,7 +51,7 @@ fn wrap(coalesced: bool, glyph_width: u16, boundary_class: TypedClass) -> Wrappe
         beam: false,
         head_dx: 0.5,
     };
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     let mut quads = Vec::new();
     let mut now = Instant::now();
     const ROW: u16 = 20;

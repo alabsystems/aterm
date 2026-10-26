@@ -312,10 +312,12 @@ pub fn drain_curse_bonk_cues(
     let mut result = CurseDrain::default();
     let mut seen = [u32::MAX; 16];
     let mut seen_len = 0usize;
-    let last_col = (cols > 1).then(|| {
+    let last_col = if cols > 1 {
         let last = (cols - 1) as f32;
-        (last, 1.0 / last)
-    });
+        Some((last, 1.0 / last))
+    } else {
+        None
+    };
     for cue in decos.drain_curse_cues() {
         let location = u32::from(cue.row) << 16 | u32::from(cue.col);
         if !seen[..seen_len].contains(&location) {

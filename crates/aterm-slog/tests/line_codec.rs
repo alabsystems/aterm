@@ -779,7 +779,7 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
         "6F-5's `change=` follows `closer=`"
     );
     assert_eq!(
-        &WHY_WORDS[WHY_WORDS.len() - 4..WHY_WORDS.len() - 2],
+        &WHY_WORDS[WHY_WORDS.len() - 6..WHY_WORDS.len() - 4],
         ["mail", "burst"],
         "6F-6's two follow"
     );
@@ -891,8 +891,13 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
     assert_eq!(CHANGE_WORDS, ["add", "drop"]);
     assert!(Fields::new().word(Key::Change, "rename").is_err(), "closed");
     assert_eq!(
-        &WHY_WORDS[WHY_WORDS.len() - 2..],
+        &WHY_WORDS[WHY_WORDS.len() - 4..WHY_WORDS.len() - 2],
         ["not-carried", "log-replaced"]
+    );
+    assert_eq!(
+        &WHY_WORDS[WHY_WORDS.len() - 2..],
+        ["signin", "install"],
+        "a worker launcher's two refusals (task `why=`) follow"
     );
 
     let mark = |k: Kind, f: Fields| Rec {

@@ -155,6 +155,45 @@ impl GlowInstance {
     }
 }
 
+/// A window-space glow stream as glow instances, in its draw order: each
+/// quad, and each lit row of its ramps as the quad it stands for. Rows
+/// tagged past `rows` or not `row_active` are skipped.
+#[inline]
+fn glow_instances_into(
+    out: &mut Vec<GlowInstance>,
+    (quads, ramps): (&[aterm_render::GlowQuad], &aterm_render::GlowRamps),
+    rows: usize,
+    row_active: impl Fn(usize) -> bool,
+) {
+    if ramps.is_empty() {
+        // A stream of quads alone, as the renderer laid them before ramps.
+        for q in quads {
+            if (q.row as usize) >= rows || !row_active(q.row as usize) {
+                continue;
+            }
+            out.push(GlowInstance::of([q.x, q.y, q.w, q.h], q));
+        }
+        return;
+    }
+    let live = |row: u16| usize::from(row) < rows && row_active(usize::from(row));
+    use aterm_render::glow_ramps::Lights;
+    aterm_render::glow_ramps::each_laid(quads, ramps, |laid| match laid {
+        Lights::Quads(run) => out.extend(
+            run.iter()
+                .filter(|q| live(q.row))
+                .map(|q| GlowInstance::of([q.x, q.y, q.w, q.h], q)),
+        ),
+        Lights::Ramp(r) => {
+            if live(r.row) {
+                out.extend(
+                    r.quads(&ramps.ends)
+                        .map(|q| GlowInstance::of([q.x, q.y, q.w, q.h], &q)),
+                );
+            }
+        }
+    });
+}
+
 type BgRun = (u16, u16, [u8; 4]);
 
 #[inline]
@@ -406,6 +445,89 @@ fn fs_glow(in: GlowVsOut) -> @location(0) vec4<f32> {
     let w = max(u32(in.span.y), 1u);
     let c = glow_lerp4(in.c0, in.c1, glow_column(in.lx, in.span.y), w);
     return vec4<f32>(c) / 255.0;
+}
+
+// The bloom's lights as an item list (`aterm_render::bloom::BloomItems`,
+// whose `light` is this reader's twin; cell.metal's GLOW ITEMS spells the
+// layout out), read by instance index: a ramp reaches the bloom whole.
+@group(1) @binding(5) var<storage, read> glow_items: array<u32>;
+
+struct GlowItem {
+    rect: vec4<u32>,
+    c0: vec4<u32>,
+    c1: vec4<u32>,
+};
+
+// An end as bytes (r, g, b, a), its colour times num / den, rounded.
+fn glow_item_end(e: u32, num: u32, den: u32) -> vec4<u32> {
+    let c = ((vec3<u32>(e >> 16u, e >> 8u, e) & vec3<u32>(255u)) * num + vec3<u32>(den / 2u)) / den;
+    return vec4<u32>(c, e >> 24u);
+}
+
+fn glow_item(i: u32, widen: bool) -> GlowItem {
+    var lo = 0u;
+    var hi = glow_items[0] - 1u;
+    loop {
+        if (lo >= hi) {
+            break;
+        }
+        let mid = (lo + hi + 1u) >> 1u;
+        if (glow_items[4u + mid] <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    let s = i - glow_items[4u + lo];
+    let r = glow_items[1] + 4u * lo;
+    let xy = glow_items[r];
+    let join = glow_items[r + 2u] & 0xFFFFu;
+    let joined = glow_items[r + 2u] >> 16u;
+    let e = glow_items[2] + glow_items[r + 3u] + 2u * s;
+    let e0 = glow_items[e];
+    let e1 = glow_items[e + 1u];
+    var qw = glow_items[r + 1u] & 0xFFFFu;
+    var qh = select(1u, joined + 1u, s == join);
+    var num = 1u;
+    var den = 1u;
+    if (widen) {
+        if (qw > 0u && qw < 2u) {
+            num = num * qw;
+            den = den * 2u;
+            qw = 2u;
+        }
+        if (qh < 2u) {
+            num = num * qh;
+            den = den * 2u;
+            qh = 2u;
+        }
+    }
+    var it: GlowItem;
+    it.rect = select(
+        vec4<u32>(xy & 0xFFFFu, (xy >> 16u) + s + select(0u, joined, s > join), qw, qh),
+        vec4<u32>(0u),
+        (e0 | e1) == 0u,
+    );
+    it.c0 = glow_item_end(e0, num, den);
+    it.c1 = glow_item_end(e1, num, den);
+    return it;
+}
+
+// `vs_glow` over the item list, widened: the bloom extract's lights.
+@vertex
+fn vs_glow_items(@builtin(vertex_index) vi: u32,
+                 @builtin(instance_index) ii: u32) -> GlowVsOut {
+    let it = glow_item(ii, true);
+    let rect = vec4<f32>(it.rect);
+    let k = corner(vi);
+    let px = rect.xy + k * rect.zw;
+    var o: GlowVsOut;
+    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
+    o.span = rect.xz;
+    o.lx = k.x * rect.z;
+    o.c0 = it.c0;
+    o.c1 = it.c1;
+    return o;
 }
 
 // PHOSPHOR rain bright-head halo (One/One additive, RAW like fs_glow) with an
@@ -896,6 +1018,13 @@ fn fx_texel(l: vec2<u32>, dst: vec2<u32>, src: vec4<u32>, flags: u32) -> vec2<i3
     return vec2<i32>(src.xy + t);
 }
 
+// A Ramps item's palette row for its row `y`: the rows `src.y + 1 ..= src.y +
+// src.z` repeat row `src.y`'s ends (a run, one light as tall as its rows),
+// which the palette holds once.
+fn fx_ramp_row(y: u32, src: vec4<u32>) -> u32 {
+    return y - min(y - min(y, src.y), src.z);
+}
+
 // The Exact law: `(c, a) / 255` raw into `src + dst·(1 − a)` on the Unorm
 // view, `fs_glow`'s state: `over_premul`, `add_sat` at a = 0.
 @fragment
@@ -920,9 +1049,9 @@ fn fs_fx(in: FxVsOut) -> @location(0) vec4<f32> {
             c = fx_byte4(textureLoad(fx_rgba, t, 0));
         }
     } else {
-        // Rect (row 0) and Ramps (row l.y): the GlowQuad ramp over entries
-        // j, j + 1 at column l.x of the item's width.
-        let j = in.pal + 2u * select(0u, l.y, kind == 1u);
+        // Rect (row 0) and Ramps (row l.y's palette row): the GlowQuad ramp
+        // over entries j, j + 1 at column l.x of the item's width.
+        let j = in.pal + 2u * select(0u, fx_ramp_row(l.y, in.src), kind == 1u);
         c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(in.src.x, 1u));
     }
     return vec4<f32>(c) / 255.0;
@@ -965,7 +1094,7 @@ fn fs_fx_store(in: FxVsOut) -> @location(0) vec4<f32> {
             c = fx_byte4(textureLoad(fx_rgba, t, 0));
         }
     } else {
-        let j = in.pal + 2u * select(0u, l.y, kind == 1u);
+        let j = in.pal + 2u * select(0u, fx_ramp_row(l.y, in.src), kind == 1u);
         c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(in.src.x, 1u));
     }
     return vec4<f32>(s2l(vec3<f32>(c.rgb) / 255.0), 1.0);
@@ -1211,6 +1340,87 @@ fn vs_hdr_glow(@builtin(vertex_index) vi: u32,
     o.span = vec2<f32>(rect.x + hu.content_off.x, rect.z);
     o.c0 = c0;
     o.c1 = c1;
+    return o;
+}
+
+// The bloom's lights as an item list, unwidened (`SHADER`'s `glow_item`, its
+// twin), so the crown reads a ramp whole as the extract does.
+@group(1) @binding(5) var<storage, read> glow_items: array<u32>;
+
+struct GlowItem {
+    rect: vec4<u32>,
+    c0: vec4<u32>,
+    c1: vec4<u32>,
+};
+
+// An end as bytes (r, g, b, a), its colour times num / den, rounded.
+fn glow_item_end(e: u32, num: u32, den: u32) -> vec4<u32> {
+    let c = ((vec3<u32>(e >> 16u, e >> 8u, e) & vec3<u32>(255u)) * num + vec3<u32>(den / 2u)) / den;
+    return vec4<u32>(c, e >> 24u);
+}
+
+fn glow_item(i: u32, widen: bool) -> GlowItem {
+    var lo = 0u;
+    var hi = glow_items[0] - 1u;
+    loop {
+        if (lo >= hi) {
+            break;
+        }
+        let mid = (lo + hi + 1u) >> 1u;
+        if (glow_items[4u + mid] <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    let s = i - glow_items[4u + lo];
+    let r = glow_items[1] + 4u * lo;
+    let xy = glow_items[r];
+    let join = glow_items[r + 2u] & 0xFFFFu;
+    let joined = glow_items[r + 2u] >> 16u;
+    let e = glow_items[2] + glow_items[r + 3u] + 2u * s;
+    let e0 = glow_items[e];
+    let e1 = glow_items[e + 1u];
+    var qw = glow_items[r + 1u] & 0xFFFFu;
+    var qh = select(1u, joined + 1u, s == join);
+    var num = 1u;
+    var den = 1u;
+    if (widen) {
+        if (qw > 0u && qw < 2u) {
+            num = num * qw;
+            den = den * 2u;
+            qw = 2u;
+        }
+        if (qh < 2u) {
+            num = num * qh;
+            den = den * 2u;
+            qh = 2u;
+        }
+    }
+    var it: GlowItem;
+    it.rect = select(
+        vec4<u32>(xy & 0xFFFFu, (xy >> 16u) + s + select(0u, joined, s > join), qw, qh),
+        vec4<u32>(0u),
+        (e0 | e1) == 0u,
+    );
+    it.c0 = glow_item_end(e0, num, den);
+    it.c1 = glow_item_end(e1, num, den);
+    return it;
+}
+
+// `vs_hdr_glow` over the item list.
+@vertex
+fn vs_hdr_glow_items(@builtin(vertex_index) vi: u32,
+                     @builtin(instance_index) ii: u32) -> HdrVsOut {
+    let it = glow_item(ii, false);
+    let rect = vec4<f32>(it.rect);
+    let k = hdr_corner(vi);
+    let px = rect.xy + k * rect.zw + hu.content_off;
+    var o: HdrVsOut;
+    o.pos = vec4<f32>(2.0 * px.x / hu.screen.x - 1.0, 1.0 - 2.0 * px.y / hu.screen.y, 0.0, 1.0);
+    o.span = vec2<f32>(rect.x + hu.content_off.x, rect.z);
+    o.c0 = it.c0;
+    o.c1 = it.c1;
     return o;
 }
 
@@ -2177,6 +2387,17 @@ impl StreamId {
             Self::Cursor => "cursor",
         }
     }
+}
+
+/// A test's route for a frame's glow ramps ([`GpuRenderer::set_ramps_fx_for_test`]).
+#[doc(hidden)]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RampsFx {
+    /// In the fx stream whenever the frame carries any.
+    Always,
+    /// As the glow instances their lit rows stand for.
+    Never,
 }
 
 /// The latest encoded frame's shape ([`GpuRenderer::frame_shape`]).
@@ -5616,6 +5837,8 @@ pub struct GpuRenderer {
     glow_boost_bgl: Option<wgpu::BindGroupLayout>,
     #[cfg(wgpu_arm)]
     sdr_glow_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    #[cfg(wgpu_arm)]
+    glow_items_wgpu: GlowItemsWgpu,
     sdr_glow_boost: f32,
     deco_atlas: Option<DecoAtlas>,
     sprite_textures: SpriteTextureLookup,
@@ -5698,6 +5921,9 @@ pub struct GpuRenderer {
     fx_palette_shared_seam: bool,
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     fx_fail_seam: bool,
+    /// A test's opening rule for the frame's ramps ([`fx_gpu::ramps_open_fx`]).
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    ramp_cost_seam: Option<RampsFx>,
     gate_hits: u64,
     gate_misses: u64,
     dirty_scratch: Vec<bool>,
@@ -5709,6 +5935,14 @@ pub struct GpuRenderer {
     ligature_break_scratch: Vec<usize>,
     bloom_glow_scratch: Vec<GlowInstance>,
     bloom_quad_scratch: Vec<aterm_render::GlowQuad>,
+    /// The bloom's item list, the frame's bloom stream where
+    /// [`Self::bloom_items_live`].
+    bloom_items: aterm_render::bloom::BloomItems,
+    /// Whether this frame's bloom stream is [`Self::bloom_items`] (its glow
+    /// carries ramps) rather than [`Self::bloom_glow_scratch`].
+    bloom_items_live: bool,
+    /// A glow stream's fx instances, laid before its slot's layers.
+    glow_fx_scratch: Vec<fx_gpu::FxInstance>,
     key_scratch: Vec<Option<GlyphKey>>,
     glyph_win_scratch: Vec<Option<(i32, i32)>>,
     overshoot_surprise: bool,
@@ -6062,6 +6296,23 @@ struct FxWgpu {
     palette: Option<(wgpu::Buffer, u64)>,
     mints: u64,
     bind: Option<(u64, wgpu::BindGroup)>,
+}
+
+/// The bloom item list's wgpu side: its storage buffer and bind group (group
+/// 1, binding 5, read by the vertex stage) and the extract's and crowns' item
+/// pipelines, each built on first use. `refused` once the device refused one
+/// (a vertex stage that cannot read storage): its bloom then draws glow
+/// instances.
+#[cfg(wgpu_arm)]
+#[derive(Default)]
+struct GlowItemsWgpu {
+    bgl: Option<wgpu::BindGroupLayout>,
+    buf: Option<(wgpu::Buffer, u64)>,
+    bind: Option<wgpu::BindGroup>,
+    extract: Option<wgpu::RenderPipeline>,
+    hdr: Option<wgpu::RenderPipeline>,
+    sdr: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    refused: bool,
 }
 
 #[cfg(wgpu_arm)]
@@ -7227,6 +7478,8 @@ impl GpuRenderer {
             glow_boost_bgl: None,
             #[cfg(wgpu_arm)]
             sdr_glow_pipeline: None,
+            #[cfg(wgpu_arm)]
+            glow_items_wgpu: GlowItemsWgpu::default(),
             sdr_glow_boost: 0.0,
             deco_atlas: None,
             sprite_textures: SpriteTextureLookup::default(),
@@ -7313,6 +7566,8 @@ impl GpuRenderer {
             fx_palette_shared_seam: false,
             #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
             fx_fail_seam: false,
+            #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+            ramp_cost_seam: None,
             gate_hits: 0,
             gate_misses: 0,
             dirty_scratch: Vec::new(),
@@ -7324,6 +7579,9 @@ impl GpuRenderer {
             ligature_break_scratch: Vec::new(),
             bloom_glow_scratch: Vec::new(),
             bloom_quad_scratch: Vec::new(),
+            bloom_items: aterm_render::bloom::BloomItems::default(),
+            bloom_items_live: false,
+            glow_fx_scratch: Vec::new(),
             key_scratch: Vec::new(),
             glyph_win_scratch: Vec::new(),
             overshoot_surprise: false,
@@ -7872,6 +8130,45 @@ impl GpuRenderer {
         self.metal_arm
             .as_ref()
             .map_or_else(FxHazard::default, |c| c.live_ref().fx_hazard)
+    }
+
+    /// Test seam: where the frame's glow ramps draw, against the measured
+    /// rule ([`fx_gpu::ramps_open_fx`]; `None` restores it).
+    #[doc(hidden)]
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    pub const fn set_ramps_fx_for_test(&mut self, route: Option<RampsFx>) {
+        self.ramp_cost_seam = route;
+    }
+
+    /// Whether a frame whose fx stream draws `fx_open` puts `ramps` in it
+    /// ([`fx_gpu::ramps_open_fx`] under this renderer's rule).
+    #[inline]
+    fn ramps_open_fx(&self, fx_open: bool, ramps: [&aterm_render::GlowRamps; 2]) -> bool {
+        #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+        match self.ramp_cost_seam {
+            Some(RampsFx::Always) => return ramps.iter().any(|r| !r.is_empty()),
+            Some(RampsFx::Never) => return false,
+            None => {}
+        }
+        fx_gpu::ramps_open_fx(fx_open, ramps, fx_gpu::ramp_cost(self.ramp_arm()))
+    }
+
+    /// The arm this renderer's frames draw on, as the glow ramps' route
+    /// costs know it ([`fx_gpu::ramp_cost`]).
+    #[inline]
+    fn ramp_arm(&self) -> fx_gpu::RampArm<'_> {
+        #[cfg(target_os = "macos")]
+        if self.metal_armed {
+            return fx_gpu::RampArm::Metal;
+        }
+        #[cfg(gl_arm)]
+        if self.gl_armed {
+            return fx_gpu::RampArm::Gl;
+        }
+        #[cfg(wgpu_arm)]
+        return fx_gpu::RampArm::Wgpu(&self.ctx.backend);
+        #[cfg(not(wgpu_arm))]
+        fx_gpu::RampArm::Unarmed
     }
 
     /// Test seam, the fx hazard drill's control.
@@ -8957,9 +9254,16 @@ impl GpuRenderer {
             .map(|r| (r.x0, r.y0, r.x1, r.y1))
     }
 
+    /// Whether the heat shimmer runs: on, over fire, with additive glow laid (its quads or
+    /// its ramps' lit rows).
     #[inline]
     const fn shimmer_live(&self, input: &RenderInput) -> bool {
-        self.enable_shimmer && !input.fire_patch.is_empty() && !input.cursor_glow_add.is_empty()
+        self.enable_shimmer
+            && !input.fire_patch.is_empty()
+            && input
+                .cursor_glow_add_ramps
+                .laid(input.cursor_glow_add.len())
+                > 0
     }
 
     /// Config `hdr_glow` (default on).
@@ -9158,7 +9462,7 @@ impl GpuRenderer {
     }
 
     /// Finalize the `video` recording (a blocking drain, off the hot path) and hand the frames out.
-    pub fn video_finish(&self, win: &mut WindowGpu) -> Option<crate::video_tap::VideoTake> {
+    pub fn video_finish(&self, win: &mut WindowGpu) -> Option<crate::video_tap::UnsettledTake> {
         win.video.take().map(|t| {
             #[cfg(target_os = "macos")]
             if t.ring_is_metal() {
@@ -9814,7 +10118,7 @@ impl GpuRenderer {
             self as mtl, ClearColor, LoadAction, MtlScissorRect, PixelFormat as MPix, PrimitiveType,
         };
         let _pool = mtl::AutoreleasePool::new();
-        let (glow_count, bbox, extract_first) = self.build_bloom_glow(input);
+        let (glow_count, bbox, extract_first) = self.build_bloom_glow(input, true);
         if glow_count == 0 {
             return Ok(());
         }
@@ -9855,8 +10159,19 @@ impl GpuRenderer {
             unsafe { layer.write_buffer_from_zero(&buf, bytes) };
             Ok(buf.into_metal().into_obj())
         };
-        let insts: &[GlowInstance] = &self.bloom_glow_scratch;
-        let stream = mint_bytes(live, aterm_bits::cast_slice(insts))?;
+        let (stream, extract_row) = if self.bloom_items_live {
+            let words = self.bloom_items.words();
+            (
+                mint_bytes(live, aterm_bits::cast_slice(words))?,
+                Pipeline::GlowItems,
+            )
+        } else {
+            let insts: &[GlowInstance] = &self.bloom_glow_scratch;
+            (
+                mint_bytes(live, aterm_bits::cast_slice(insts))?,
+                Pipeline::GlowAdd,
+            )
+        };
         let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
         let cell_u = mint_bytes(
             live,
@@ -9906,10 +10221,10 @@ impl GpuRenderer {
             (s, None) => s,
             (None, Some(_)) => unreachable!("clip-only case handled above"),
         };
-        let extract_pso = live.present_pso(Pipeline::GlowAdd, MPix::Rgba8Unorm)?;
+        let extract_pso = live.present_pso(extract_row, MPix::Rgba8Unorm)?;
         let bloom_pso = live.present_pso(Pipeline::Bloom, MPix::Rgba8Unorm)?;
         let linear = &live.linear;
-        let extract_binds = Pipeline::GlowAdd.spec().binds;
+        let extract_binds = extract_row.spec().binds;
         let bloom_binds = Pipeline::Bloom.spec().binds;
 
         let mut cb = live.session.begin()?;
@@ -10902,7 +11217,7 @@ impl GpuRenderer {
         );
         let want_bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
         let want_crown = run_hdr_glow || run_sdr_glow;
-        let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input));
+        let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input, true));
         let bloom_state = bloom_glow.filter(|(count, _, _)| want_bloom && *count > 0);
         let crown_count = if want_crown {
             bloom_glow.map_or(0, |(n, _, _)| n)
@@ -11013,12 +11328,15 @@ impl GpuRenderer {
                 .as_ref()
                 .expect("ensured above when `bloom_state` is Some")
                 .clone_handle();
-            let insts: &[GlowInstance] = &self.bloom_glow_scratch;
             let sb_idx = live.submit_b_idx;
             let stream = MetalArmLive::upload_scratch_stream(
                 crate::device_layer::DeviceHandle::Metal(&live.mint),
                 &mut live.submit_b_slots[sb_idx].glow_stream,
-                aterm_bits::cast_slice(insts),
+                if self.bloom_items_live {
+                    aterm_bits::cast_slice(self.bloom_items.words())
+                } else {
+                    aterm_bits::cast_slice(&self.bloom_glow_scratch)
+                },
             )?;
             let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
             let cell_u = MetalArmLive::upload_scratch_stream(
@@ -11072,13 +11390,18 @@ impl GpuRenderer {
                 (None, Some(_)) => unreachable!("clip-only case handled above"),
             }
             .filter(|[sx0, sy0, sx1, sy1]| sx1 > sx0 && sy1 > sy0);
-            let extract_pso = live.present_pso(Pipeline::GlowAdd, dest_mpix)?;
+            let extract_row = if self.bloom_items_live {
+                Pipeline::GlowItems
+            } else {
+                Pipeline::GlowAdd
+            };
+            let extract_pso = live.present_pso(extract_row, dest_mpix)?;
             let bloom_pso = live.present_pso(Pipeline::Bloom, dest_mpix)?;
             Some((
                 half,
                 extract_pso,
                 cell_u,
-                Pipeline::GlowAdd.spec().binds,
+                extract_row.spec().binds,
                 (stream, extract_offset),
                 count as usize,
                 bloom_pso,
@@ -11187,10 +11510,11 @@ impl GpuRenderer {
             && crown_count > 0
         {
             if let Some((x, y, w, h)) = crown_scissor {
-                let row = if run_hdr_glow {
-                    Pipeline::HdrGlow
-                } else {
-                    Pipeline::SdrGlow
+                let row = match (run_hdr_glow, self.bloom_items_live) {
+                    (true, false) => Pipeline::HdrGlow,
+                    (false, false) => Pipeline::SdrGlow,
+                    (true, true) => Pipeline::HdrGlowItems,
+                    (false, true) => Pipeline::SdrGlowItems,
                 };
                 let sb_idx = live.submit_b_idx;
                 let ubuf = MetalArmLive::upload_scratch_stream(
@@ -11203,7 +11527,11 @@ impl GpuRenderer {
                     None => MetalArmLive::upload_scratch_stream(
                         crate::device_layer::DeviceHandle::Metal(&live.mint),
                         &mut live.submit_b_slots[sb_idx].glow_stream,
-                        aterm_bits::cast_slice(&self.bloom_glow_scratch[..crown_count as usize]),
+                        if self.bloom_items_live {
+                            aterm_bits::cast_slice(self.bloom_items.words())
+                        } else {
+                            aterm_bits::cast_slice(&self.bloom_glow_scratch[..crown_count as usize])
+                        },
                     )?,
                 };
                 let pso = live.present_pso(row, dest_mpix)?;
@@ -12921,11 +13249,18 @@ impl GpuRenderer {
         let crown_count = if run_hdr_glow || run_sdr_glow {
             match ungated_built {
                 Some(n) => n,
-                None => self.build_bloom_glow(input).0,
+                None => self.wgpu_bloom_glow(input).0,
             }
         } else {
             0
         };
+        if self.bloom_items_live && crown_count > 0 {
+            if run_hdr_glow {
+                self.ensure_glow_items_crown(Pipeline::HdrGlowItems, format);
+            } else if run_sdr_glow {
+                self.ensure_glow_items_crown(Pipeline::SdrGlowItems, format);
+            }
+        }
         let pipeline = &self.blit_pipelines[&format];
 
         if self.blit_uniform_written != Some(want) {
@@ -12990,11 +13325,16 @@ impl GpuRenderer {
                 && let Some((x, y, width, height)) = crown_scissor
             {
                 pass.set_scissor_rect(x, y, width, height);
-                pass.set_pipeline(
+                pass.set_pipeline(if self.bloom_items_live {
+                    self.glow_items_wgpu
+                        .hdr
+                        .as_ref()
+                        .expect("ensure_glow_items_crown sets the pipeline")
+                } else {
                     self.hdr_glow_pipeline
                         .as_ref()
-                        .expect("ensure_hdr_glow_pipeline sets the pipeline"),
-                );
+                        .expect("ensure_hdr_glow_pipeline sets the pipeline")
+                });
                 pass.set_bind_group(
                     0,
                     self.hdr_glow_bg
@@ -13002,20 +13342,27 @@ impl GpuRenderer {
                         .expect("ensure_hdr_glow_pipeline sets the bind group"),
                     &[],
                 );
-                pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
+                self.wgpu_crown_stream(&mut pass);
                 pass.draw(0..6, 0..crown_count);
             } else if run_sdr_glow
                 && crown_count > 0
                 && let Some((x, y, width, height)) = crown_scissor
             {
                 pass.set_scissor_rect(x, y, width, height);
-                pass.set_pipeline(
+                pass.set_pipeline(if self.bloom_items_live {
+                    &self
+                        .glow_items_wgpu
+                        .sdr
+                        .as_ref()
+                        .expect("ensure_glow_items_crown sets the pipeline")
+                        .1
+                } else {
                     &self
                         .sdr_glow_pipeline
                         .as_ref()
                         .expect("ensure_sdr_glow_pipeline sets the pipeline")
-                        .1,
-                );
+                        .1
+                });
                 pass.set_bind_group(
                     0,
                     self.hdr_glow_bg
@@ -13023,7 +13370,7 @@ impl GpuRenderer {
                         .expect("ensure_sdr_glow_pipeline sets the bind group"),
                     &[],
                 );
-                pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
+                self.wgpu_crown_stream(&mut pass);
                 pass.draw(0..6, 0..crown_count);
             }
         }
@@ -13691,6 +14038,164 @@ impl GpuRenderer {
         self.hdr_glow_bg = Some(bg);
     }
 
+    /// Bind the crown's lights: the item list at group 1 where the frame
+    /// blooms one, else its glow instances.
+    #[cfg(wgpu_arm)]
+    fn wgpu_crown_stream(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.bloom_items_live {
+            let bind = self.glow_items_wgpu.bind.as_ref();
+            pass.set_bind_group(1, bind.expect("its upload binds it"), &[]);
+        } else {
+            pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
+        }
+    }
+
+    /// The bloom item list's group-1 layout and extract pipeline, built on
+    /// first use; `false` where the device refuses them
+    /// ([`GlowItemsWgpu::refused`]).
+    #[cfg(wgpu_arm)]
+    fn ensure_glow_items_wgpu(&mut self) -> bool {
+        let gi = &mut self.glow_items_wgpu;
+        if gi.refused {
+            return false;
+        }
+        if gi.extract.is_some() {
+            return true;
+        }
+        let device = &self.ctx.device;
+        let bgl = gi.bgl.get_or_insert_with(|| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aterm-gpu glow items bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            })
+        });
+        let (shader, uniform_bgl) = (&self.effects.shader, &self.effects.layouts.uniform_bgl);
+        let targets = self.effects.targets;
+        let built = wgpu_scoped(device, || {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("aterm-gpu glow items layout"),
+                bind_group_layouts: &[Some(uniform_bgl), Some(&*bgl)],
+                immediate_size: 0,
+            });
+            crate::pipeline_table::build_wgpu(
+                Pipeline::GlowItems.spec(),
+                device,
+                shader,
+                &layout,
+                targets,
+            )
+        });
+        match built {
+            Ok(pipeline) => {
+                gi.extract = Some(pipeline);
+                true
+            }
+            Err(why) => {
+                crate::stderr_line!(
+                    "aterm-gpu: the device refused the bloom's item pipeline ({why}); the bloom \
+                     draws its glow instances"
+                );
+                gi.refused = true;
+                false
+            }
+        }
+    }
+
+    /// The frame's bloom stream on the wgpu arm ([`Self::build_bloom_glow`]),
+    /// its item list uploaded where it draws one.
+    #[cfg(wgpu_arm)]
+    fn wgpu_bloom_glow(&mut self, input: &RenderInput) -> (u32, Option<[u32; 4]>, u32) {
+        let items = !input.cursor_glow_add_ramps.is_empty() && self.ensure_glow_items_wgpu();
+        let built = self.build_bloom_glow(input, items);
+        if self.bloom_items_live && built.0 > 0 {
+            let device = &self.ctx.device;
+            let gi = &mut self.glow_items_wgpu;
+            let bytes: &[u8] = aterm_bits::cast_slice(self.bloom_items.words());
+            let need = align_up(bytes.len() as u64, wgpu::COPY_BUFFER_ALIGNMENT);
+            if gi.buf.as_ref().is_none_or(|(_, cap)| *cap < need) {
+                let cap = need.next_power_of_two();
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("aterm-gpu glow items"),
+                    size: cap,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                gi.bind = Some(
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("aterm-gpu glow items bg"),
+                        layout: gi
+                            .bgl
+                            .as_ref()
+                            .expect("ensure_glow_items_wgpu sets the bgl"),
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: buf.as_entire_binding(),
+                        }],
+                    }),
+                );
+                gi.buf = Some((buf, cap));
+            }
+            let (buf, _) = gi.buf.as_ref().expect("minted above");
+            self.ctx.queue.write_buffer(buf, 0, bytes);
+        }
+        built
+    }
+
+    /// The crown's item pipeline for `row` ([`Pipeline::HdrGlowItems`] or
+    /// [`Pipeline::SdrGlowItems`] onto `format`), built on first use.
+    #[cfg(wgpu_arm)]
+    fn ensure_glow_items_crown(&mut self, row: Pipeline, format: wgpu::TextureFormat) {
+        self.ensure_glow_boost_shared();
+        let built = match row {
+            Pipeline::HdrGlowItems => self.glow_items_wgpu.hdr.is_some(),
+            _ => matches!(&self.glow_items_wgpu.sdr, Some((f, _)) if *f == format),
+        };
+        if built {
+            return;
+        }
+        let device = &self.ctx.device;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("aterm-gpu glow-boost items shader"),
+            source: wgpu::ShaderSource::Wgsl(wgsl_source(row.spec().library).into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aterm-gpu glow-boost items layout"),
+            bind_group_layouts: &[
+                Some(
+                    self.glow_boost_bgl
+                        .as_ref()
+                        .expect("ensure_glow_boost_shared sets the bgl"),
+                ),
+                Some(
+                    self.glow_items_wgpu
+                        .bgl
+                        .as_ref()
+                        .expect("an item list's frame built its bgl"),
+                ),
+            ],
+            immediate_size: 0,
+        });
+        let targets = match row {
+            Pipeline::HdrGlowItems => self.ctx.pipeline_targets(),
+            _ => self.ctx.pipeline_targets().with_present(format),
+        };
+        let pipeline =
+            crate::pipeline_table::build_wgpu(row.spec(), device, &shader, &layout, targets);
+        match row {
+            Pipeline::HdrGlowItems => self.glow_items_wgpu.hdr = Some(pipeline),
+            _ => self.glow_items_wgpu.sdr = Some((format, pipeline)),
+        }
+    }
+
     #[cfg(wgpu_arm)]
     fn build_glow_boost_pipeline(
         &self,
@@ -13874,15 +14379,41 @@ impl GpuRenderer {
         dims
     }
 
-    fn build_bloom_glow(&mut self, input: &RenderInput) -> (u32, Option<[u32; 4]>, u32) {
-        let mut quads = std::mem::take(&mut self.bloom_quad_scratch);
+    /// The frame's bloom stream: `(count, bbox, extract_first)`, the extract
+    /// drawing `count` lights from `extract_first` and the crown `count` from
+    /// the first. A glow stream with ramps blooms as its item list where the
+    /// arm reads one (`items`; [`aterm_render::bloom::items_into`],
+    /// [`Self::bloom_items_live`]): its readers widen the extract's lights
+    /// themselves, so both draw every instance from the first. Any other as
+    /// its glow instances, the extract's widened copies after the crown's.
+    fn build_bloom_glow(
+        &mut self,
+        input: &RenderInput,
+        items: bool,
+    ) -> (u32, Option<[u32; 4]>, u32) {
         let f = self.fx_frame_for(input);
-        let src = self
-            .fx
-            .bloom_source(&f, input)
-            .unwrap_or(&input.cursor_glow_add);
-        let (bbox, extract_first) =
-            aterm_render::bloom::source_quads_into(src, input.rows, &mut quads);
+        self.bloom_items_live = items && !input.cursor_glow_add_ramps.is_empty();
+        if self.bloom_items_live {
+            let extra = self.fx.bloom_layers(&f, input).unwrap_or(&[]);
+            let bbox = aterm_render::bloom::items_into(
+                &input.cursor_glow_add,
+                &input.cursor_glow_add_ramps,
+                extra,
+                input.rows,
+                &mut self.bloom_items,
+            );
+            return (self.bloom_items.instances(), bbox, 0);
+        }
+        let mut quads = std::mem::take(&mut self.bloom_quad_scratch);
+        let (bbox, extract_first) = match self.fx.bloom_source(&f, input) {
+            Some(src) => aterm_render::bloom::source_quads_into(src, input.rows, &mut quads),
+            None => aterm_render::bloom::source_stream_into(
+                &input.cursor_glow_add,
+                &input.cursor_glow_add_ramps,
+                input.rows,
+                &mut quads,
+            ),
+        };
         let mut v = std::mem::take(&mut self.bloom_glow_scratch);
         v.clear();
         v.extend(
@@ -13992,10 +14523,17 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(self.effects.get(EffectPipeline::GlowAdd));
             pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
-            pass.draw(0..6, extract_first..extract_first + glow_count);
+            if self.bloom_items_live {
+                let gi = &self.glow_items_wgpu;
+                pass.set_pipeline(gi.extract.as_ref().expect("an item list's frame built it"));
+                pass.set_bind_group(1, gi.bind.as_ref().expect("its upload binds it"), &[]);
+                pass.draw(0..6, 0..glow_count);
+            } else {
+                pass.set_pipeline(self.effects.get(EffectPipeline::GlowAdd));
+                pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
+                pass.draw(0..6, extract_first..extract_first + glow_count);
+            }
         }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -14071,7 +14609,7 @@ impl GpuRenderer {
         self.ensure_present_offscreen(win, w, h);
         let bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
         let (glow_count, glow_bbox, extract_first) = if bloom {
-            self.build_bloom_glow(input)
+            self.wgpu_bloom_glow(input)
         } else {
             (0, None, 0)
         };
@@ -14159,7 +14697,7 @@ impl GpuRenderer {
 
     #[cfg(wgpu_arm)]
     fn composite_bloom_in_place(&mut self, win: &mut WindowGpu, input: &RenderInput) -> u32 {
-        let (glow_count, glow_bbox, extract_first) = self.build_bloom_glow(input);
+        let (glow_count, glow_bbox, extract_first) = self.wgpu_bloom_glow(input);
         if glow_count == 0 {
             return glow_count;
         }
@@ -14245,9 +14783,19 @@ impl GpuRenderer {
                 .max((q.color >> 8) & 0xff)
                 .max(q.color & 0xff)
         };
+        // The additive stream's lights, each lit ramp row the quad it stands for: the hot
+        // box and the heat bands are a min, a max and a max over them, so their order is free.
+        let ramps = &input.cursor_glow_add_ramps;
+        let lights = || {
+            input
+                .cursor_glow_add
+                .iter()
+                .copied()
+                .chain(ramps.items.iter().flat_map(|r| r.quads(&ramps.ends)))
+        };
         let (mut hx0, mut hx1, mut hot_top) = (u32::MAX, 0u32, u32::MAX);
-        for q in &input.cursor_glow_add {
-            if quad_brightness(q) == 0 {
+        for q in lights() {
+            if quad_brightness(&q) == 0 {
                 continue;
             }
             let qx0 = u32::from(q.x);
@@ -14288,8 +14836,8 @@ impl GpuRenderer {
         }
         let band_w = (x1 - x0) as f32 / SHIMMER_BANDS as f32;
         let mut heat = [0f32; SHIMMER_BANDS];
-        for q in &input.cursor_glow_add {
-            let b = quad_brightness(q);
+        for q in lights() {
+            let b = quad_brightness(&q);
             if b == 0 {
                 continue;
             }
@@ -15091,10 +15639,13 @@ impl GpuRenderer {
         let headroom = aterm_render::hdr::additive_headroom(win.edr_max);
         let run_hdr_glow = boost_pass && plan.glow_boost_pass && headroom > 0.0;
         let glow_count = if run_hdr_glow {
-            self.build_bloom_glow(input).0
+            self.wgpu_bloom_glow(input).0
         } else {
             0
         };
+        if self.bloom_items_live && glow_count > 0 {
+            self.ensure_glow_items_crown(Pipeline::HdrGlowItems, format);
+        }
         if run_hdr_glow {
             self.ensure_hdr_glow_pipeline();
         }
@@ -15201,11 +15752,16 @@ impl GpuRenderer {
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
             if run_hdr_glow && glow_count > 0 {
-                pass.set_pipeline(
+                pass.set_pipeline(if self.bloom_items_live {
+                    self.glow_items_wgpu
+                        .hdr
+                        .as_ref()
+                        .expect("ensure_glow_items_crown sets the pipeline")
+                } else {
                     self.hdr_glow_pipeline
                         .as_ref()
-                        .expect("ensure_hdr_glow_pipeline sets the pipeline"),
-                );
+                        .expect("ensure_hdr_glow_pipeline sets the pipeline")
+                });
                 pass.set_bind_group(
                     0,
                     self.hdr_glow_bg
@@ -15213,7 +15769,7 @@ impl GpuRenderer {
                         .expect("ensure_hdr_glow_pipeline sets the bind group"),
                     &[],
                 );
-                pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
+                self.wgpu_crown_stream(&mut pass);
                 pass.draw(0..6, 0..glow_count);
             }
         }
@@ -16146,6 +16702,8 @@ impl GpuRenderer {
             let first_party = false;
             first_party
                 || input.fx_layers.is_empty()
+                    && input.glow_under_ramps.is_empty()
+                    && input.cursor_glow_add_ramps.is_empty()
                 || self
                     .effects
                     .fx_layouts(&self.ctx.device)
@@ -17204,17 +17762,6 @@ impl GpuRenderer {
                 });
             }
         }
-        if !input.glow_under.is_empty() {
-            for q in &input.glow_under {
-                if (q.row as usize) >= rows || !row_active(q.row as usize) {
-                    continue;
-                }
-                self.inst
-                    .glow_under
-                    .push(GlowInstance::of([q.x, q.y, q.w, q.h], q));
-            }
-        }
-
         if !input.fire_patch.is_empty() {
             let pad16 = pad as u16;
             for q in &input.fire_patch {
@@ -17237,7 +17784,8 @@ impl GpuRenderer {
         self.fx.atlas_bytes = 0;
         self.fx.reader_wait = (0, 0);
         self.fx.refused = 0;
-        if fx_ok && !(input.fx_layers.is_empty() && input.fx_prefetch.is_empty()) {
+        let fx_built = fx_ok && !(input.fx_layers.is_empty() && input.fx_prefetch.is_empty());
+        if fx_built {
             let cap = self.fx_atlas_cap();
             // The companions' bodies cut where their letters lie, as the CPU composite draws
             // them (`aterm_render::Renderer::cut_knock_layers`).
@@ -17257,16 +17805,90 @@ impl GpuRenderer {
                 &mut self.inst.fx,
             );
         }
+        // A glow stream carrying ramps draws its ramps in its fx stream (the
+        // Under and Glow slots sit just after the glow streams) where their
+        // lit rows cost the arm less there than as glow instances, in an fx
+        // stream the frame draws anyway or one they open
+        // ([`fx_gpu::ramps_open_fx`]): with its quads in their order there,
+        // or, where the order cannot change a byte ([`fx_gpu::ramps_commute`]
+        // on a target whose adds store raw bytes; a WebGL2 offscreen adds in
+        // linear light, rounding each store, so there order counts), its
+        // quads as glow instances first. Elsewhere, and where fx cannot draw,
+        // it draws as the quads it stands for.
+        let ramps_fx = fx_ok
+            && self.ramps_open_fx(
+                self.inst.fx_instances() > 0,
+                [&input.glow_under_ramps, &input.cursor_glow_add_ramps],
+            );
+        let raw_adds = self.additive_is_byte_exact();
+        let fx_route = |quads: &[aterm_render::GlowQuad], ramps: &aterm_render::GlowRamps| {
+            (ramps_fx && !ramps.is_empty()).then(|| raw_adds && fx_gpu::ramps_commute(quads, ramps))
+        };
+        let under_fx = fx_route(&input.glow_under, &input.glow_under_ramps);
+        let add_fx = fx_route(&input.cursor_glow_add, &input.cursor_glow_add_ramps);
+        if !fx_built && (under_fx.is_some() || add_fx.is_some()) {
+            self.fx.palette.clear();
+        }
+        match under_fx {
+            None => glow_instances_into(
+                &mut self.inst.glow_under,
+                (&input.glow_under, &input.glow_under_ramps),
+                rows,
+                row_active,
+            ),
+            Some(true) => glow_instances_into(
+                &mut self.inst.glow_under,
+                (&input.glow_under, &aterm_render::GlowRamps::default()),
+                rows,
+                row_active,
+            ),
+            Some(false) => {}
+        }
+        for (route, stream, (quads, ramps)) in [
+            (
+                under_fx,
+                fx_gpu::FxStream::Under,
+                (&input.glow_under[..], &input.glow_under_ramps),
+            ),
+            (
+                add_fx,
+                fx_gpu::FxStream::Glow,
+                (&input.cursor_glow_add[..], &input.cursor_glow_add_ramps),
+            ),
+        ] {
+            let Some(apart) = route else {
+                continue;
+            };
+            let quads = if apart { &[][..] } else { quads };
+            let mut first = std::mem::take(&mut self.glow_fx_scratch);
+            first.clear();
+            fx_gpu::glow_stream_into(
+                (quads, ramps),
+                rows,
+                row_active,
+                &mut self.fx.palette,
+                &mut first,
+            );
+            first.extend_from_slice(&self.inst.fx[stream as usize]);
+            std::mem::swap(&mut self.inst.fx[stream as usize], &mut first);
+            first.clear();
+            self.glow_fx_scratch = first;
+        }
 
-        if !input.cursor_glow_add.is_empty() {
-            for q in &input.cursor_glow_add {
-                if (q.row as usize) >= rows || !row_active(q.row as usize) {
-                    continue;
-                }
-                self.inst
-                    .glow_add
-                    .push(GlowInstance::of([q.x, q.y, q.w, q.h], q));
-            }
+        match add_fx {
+            None => glow_instances_into(
+                &mut self.inst.glow_add,
+                (&input.cursor_glow_add, &input.cursor_glow_add_ramps),
+                rows,
+                row_active,
+            ),
+            Some(true) => glow_instances_into(
+                &mut self.inst.glow_add,
+                (&input.cursor_glow_add, &aterm_render::GlowRamps::default()),
+                rows,
+                row_active,
+            ),
+            Some(false) => {}
         }
 
         if !input.glow_halo.is_empty() {
@@ -18945,7 +19567,7 @@ impl GpuRenderer {
         let nearest = mint.sampler(SamplerDesc::NEAREST_CLAMP)?;
 
         let bloom_state = if self.enable_bloom && fx_gpu::bloom_source_live(input) {
-            let (count, bbox, extract_first) = self.build_bloom_glow(input);
+            let (count, bbox, extract_first) = self.build_bloom_glow(input, true);
             (count > 0).then_some((count, bbox, extract_first))
         } else {
             None
@@ -18956,8 +19578,17 @@ impl GpuRenderer {
         );
         let bloom_parts = if let Some((count, bbox, extract_first)) = bloom_state {
             let half = mint.texture_2d(PixelFormat::Rgba8Unorm, bw, bh, usage)?;
-            let insts: &[GlowInstance] = &self.bloom_glow_scratch;
-            let bytes: &[u8] = aterm_bits::cast_slice(insts);
+            let (bytes, extract_row): (&[u8], _) = if self.bloom_items_live {
+                (
+                    aterm_bits::cast_slice(self.bloom_items.words()),
+                    Pipeline::GlowItems,
+                )
+            } else {
+                (
+                    aterm_bits::cast_slice(&self.bloom_glow_scratch),
+                    Pipeline::GlowAdd,
+                )
+            };
             let stream = mint.buffer(bytes.len())?;
             // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
             unsafe { mtl::buffer_write(&stream, bytes) };
@@ -19021,7 +19652,7 @@ impl GpuRenderer {
                 (None, Some(_)) => unreachable!("clip-only case handled above"),
             }
             .filter(|[sx0, sy0, sx1, sy1]| sx1 > sx0 && sy1 > sy0);
-            let extract_spec = Pipeline::GlowAdd.spec();
+            let extract_spec = extract_row.spec();
             let extract_lib = crate::metal::pipelines::compile(&mdev, extract_spec)?;
             let extract_pso = crate::metal::pipelines::build(
                 &mdev,

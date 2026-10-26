@@ -152,6 +152,122 @@ fn glow_tick(
     glow.spawns()
 }
 
+/// A focus roundtrip and a status repaint leave ordinary input measurable.
+#[cfg(unix)]
+#[test]
+fn focus_reports_preserve_composer_typing_without_unparking_program_output() {
+    use std::time::Instant;
+
+    let wid = WindowId(0);
+    let focus = |app: &mut App, focused: bool, os: bool| {
+        if os {
+            app.on_focus(wid, focused);
+        } else {
+            assert_eq!(
+                app.input(wid, InputEvent::Focus(focused), Source::Human),
+                crate::input::InputOutcome::Ok
+            );
+        }
+    };
+    for os_focus in [false, true] {
+        {
+            let (mut app, pipe, cfg) = rainbow_app();
+            app.ensure_sparkle();
+            let term = app.front_terminal(wid).unwrap().term.clone();
+            term_lock(&term).process(b"\x1b[?1049h\x1b[4;1H> ");
+            let mut row = vec![' '; 40];
+            row[0] = '>';
+            let start = Instant::now();
+            {
+                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                glow.note_context(true);
+                glow.observe_caret_drawn(true);
+                glow.observe_print_anchor_glyph(Some((3, 2, 1)), Some(' '));
+                glow.observe_row(3, 2, &row, start);
+            }
+            glow_tick(&mut app, &cfg, (3, 2), start);
+            focus(&mut app, false, os_focus);
+            term_lock(&term).process(b"\x1b[?2026h\x1b[1;1Hwork\x1b[4;3H\x1b[?2026l");
+            let status_at = Instant::now();
+            {
+                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                glow.observe_print_anchor_glyph(Some((0, 5, 2)), Some('k'));
+                glow.observe_row(3, 2, &row, status_at);
+            }
+            glow_tick(&mut app, &cfg, (3, 2), status_at);
+            focus(&mut app, true, os_focus);
+            // The focus-in report can repaint a status line too, before the
+            // person types. Its print anchor remains away from the composer.
+            term_lock(&term).process(b"\x1b[?2026h\x1b[1;1Hback\x1b[4;3H\x1b[?2026l");
+            let focused_at = Instant::now();
+            {
+                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                glow.observe_print_anchor_glyph(Some((0, 5, 3)), Some('k'));
+                glow.observe_row(3, 2, &row, focused_at);
+            }
+            glow_tick(&mut app, &cfg, (3, 2), focused_at);
+            assert_eq!(
+                app.windows.get(&wid).unwrap().fx.cursor().glow.spawns(),
+                0,
+                "focus and unrelated output mint no typing"
+            );
+            for (i, glyph) in "reuse".chars().enumerate() {
+                // The real input arm records the exact glyph and sends it to the
+                // child. The row sample below is the child's visible echo.
+                human_press(&mut app, Key::Character(glyph), Modifiers::empty());
+                {
+                    let mut term = term_lock(&term);
+                    term.process(glyph.to_string().as_bytes());
+                    // A plain echo never hides the caret inside DEC 2026, so
+                    // the renderer has no repaint-blink cue to forward.
+                    assert_eq!(term.repaint_blink_epoch(), 0);
+                }
+                let col = 2 + i as u16;
+                row[usize::from(col)] = glyph;
+                let echo = Instant::now();
+                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                glow.observe_print_anchor_glyph(Some((3, col + 1, 4 + i as u64)), Some(glyph));
+                glow.observe_row(3, col + 1, &row, echo);
+                glow.tick(Some((3, col + 1)), echo, &cfg, glow_geom(), &mut Vec::new());
+            }
+            let glow = &app.windows.get(&wid).unwrap().fx.cursor().glow;
+            let cols: Vec<_> = glow
+                .v2_ribbon()
+                .unwrap()
+                .cells()
+                .iter()
+                .filter(|c| c.row == 3)
+                .map(|c| c.col)
+                .collect();
+            assert!(
+                (2..7).all(|col| cols.contains(&col)),
+                "ordinary typing after focus must light (OS focus={os_focus}): {cols:?}"
+            );
+            assert_eq!(glow.spawns(), 5);
+            let _ = drain(pipe);
+            unsafe { libc::close(pipe) };
+        }
+        // Without a key, focus and background caret motion earn no typing,
+        // including when a program moves its caret back to the composer.
+        let (mut app, pipe, cfg) = rainbow_app();
+        app.ensure_sparkle();
+        focus(&mut app, false, os_focus);
+        for (row, col) in [(3, 2), (0, 6), (3, 2)] {
+            let at = Instant::now();
+            let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+            glow.note_context(true);
+            glow.observe_caret_drawn(true);
+            glow.observe_print_anchor_glyph(Some((0, 6, 1)), Some('g'));
+            glow.observe_row(row, col, &[' '; 40], at);
+            glow.tick(Some((row, col)), at, &cfg, glow_geom(), &mut Vec::new());
+        }
+        focus(&mut app, true, os_focus);
+        assert_eq!(app.windows.get(&wid).unwrap().fx.cursor().glow.spawns(), 0);
+        let _ = drain(pipe);
+        unsafe { libc::close(pipe) };
+    }
+}
+
 /// A press that arms its own licence class at dispatch — a plain Enter
 /// (`note_return`), a plain Tab (`note_user_gesture`; was: the 8-cell black
 /// notch), a bare ⌃V (Claude Code's clipboard-image insert, whose `[Image #1] `

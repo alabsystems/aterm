@@ -3636,6 +3636,26 @@ impl IdleHost for WorkerIdle {
         Some((format!("upgrade step={step}"), kind))
     }
 
+    /// Whether a line of the ask to free space is owed this session, which its loop may offer at a
+    /// break of the agent's own background work ([`IdleHost::fact_owed`]).
+    fn fact_owed(&self) -> bool {
+        self.on()
+            && !self.beside()
+            && disk_ask_owed(self.hooks.acts.disk_board, &self.sid).is_some()
+    }
+
+    /// The ask's line at a settled break of the agent's own background work, where its turn is
+    /// over and only a shell or a monitor it left runs on ([`IdleHost::at_background_fact`]): the
+    /// same step as at an idle point ([`Self::disk_free_step`]), under the same guards. A session
+    /// whose turns end with its own background work still running (a manager awaiting its
+    /// workers) reads busy for hours, and its line would otherwise be handed on undelivered.
+    fn at_background_fact(&self, point: IdlePoint) -> Option<HostStep> {
+        if !self.on() || self.beside() || self.program_check_stuck() {
+            return None;
+        }
+        self.disk_free_step(point)
+    }
+
     /// The agent rests at a point its loop's guard withheld from this worker
     /// ([`IdleHost::at_withheld_point`]: a limit episode, a wall, the loop's own act in flight).
     fn at_withheld_point(&self, wake: bool) -> Option<String> {
@@ -4098,6 +4118,20 @@ impl IdleHost for WorkerIdle {
             until_s: reset.map(|r| r.saturating_add(grace)),
         };
         disk_ask_walled(self.hooks.acts.disk_board, &self.sid, Some(wall));
+    }
+
+    /// The lasting withhold the loop's last decided turn break holds the session at
+    /// ([`IdleHost::lasting_hold`]): the ask to free space holds the session out of its seats
+    /// while it stands ([`crate::disk_board::Board::withholds`]), as it does at a usage-limit wall.
+    fn lasting_hold(&self, hold: Option<aterm_agent::supervise::Lasting>) {
+        use aterm_agent::supervise::Lasting;
+        let withhold = hold.map(|hold| match hold {
+            Lasting::Credits { lifts_unix } => crate::disk_board::Withhold::Credits {
+                until_s: lifts_unix,
+            },
+            Lasting::Wall { wire } => crate::disk_board::Withhold::Wall { wire },
+        });
+        disk_ask_withheld(self.hooks.acts.disk_board, &self.sid, withhold);
     }
 
     /// The loop's next try ([`IdleHost::waiting`]), told to the window, which shows it beside an API wall.
@@ -4819,29 +4853,8 @@ impl WorkerIdle {
         // The loop told the finding at the turn break's decision, before it asked whether this
         // worker wants a step there ([`IdleHost::turn_break`]); it is made again as the act reads
         // it, as the line may come owed at a later look of the wait.
-        let unfit = self.disk_ask_found(point.theirs);
-        if let Some(owed) = disk_ask_owed(self.hooks.acts.disk_board, &self.sid) {
-            let held = point.held.map(Guard::word);
-            let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit, held);
-            if !step.starts_with("wait:") {
-                disk_ask_stepped(self.hooks.acts.disk_board, &self.sid);
-            }
-            aterm_log::info!(
-                "harness @{}: {} step={step}",
-                self.sid,
-                aterm_agent::harness::disk::ask::RULE_DISK_FREE
-            );
-            if step == "typed" {
-                return Some(HostStep {
-                    line: format!(
-                        "{} step={step}",
-                        aterm_agent::harness::disk::ask::RULE_DISK_FREE
-                    ),
-                    moved: true,
-                    typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact),
-                    repeat: false,
-                });
-            }
+        if let Some(step) = self.disk_free_step(point) {
+            return Some(step);
         }
         laps::lap("disk");
         if with_kept_of(&self.kept, |k| k.account.reset_owed.is_some())
@@ -4863,6 +4876,34 @@ impl WorkerIdle {
             }
         }
         step
+    }
+
+    /// The ask to free space's step at a turn break `point` describes: an idle point
+    /// ([`Self::idle_point`]) or a break of the agent's own background work where its turn is over
+    /// ([`IdleHost::at_background_fact`]). The finding is made first ([`Self::disk_ask_found`]),
+    /// then a line owed is stepped ([`Acts::disk_free`]); `Some` where it was typed.
+    fn disk_free_step(&self, point: IdlePoint) -> Option<HostStep> {
+        let unfit = self.disk_ask_found(point.theirs);
+        let owed = disk_ask_owed(self.hooks.acts.disk_board, &self.sid)?;
+        let held = point.held.map(Guard::word);
+        let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit, held);
+        if !step.starts_with("wait:") {
+            disk_ask_stepped(self.hooks.acts.disk_board, &self.sid);
+        }
+        aterm_log::info!(
+            "harness @{}: {} step={step}",
+            self.sid,
+            aterm_agent::harness::disk::ask::RULE_DISK_FREE
+        );
+        (step == "typed").then(|| HostStep {
+            line: format!(
+                "{} step={step}",
+                aterm_agent::harness::disk::ask::RULE_DISK_FREE
+            ),
+            moved: true,
+            typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact),
+            repeat: false,
+        })
     }
 
     /// The host's step at an idle point ([`Self::idle_point`], which sets a look after it while the conversation is unnamed).
@@ -9481,14 +9522,30 @@ impl HostHandle {
             && self.admits(agent.program())
     }
 
-    /// Who answers a wall of `kind` on a session this host supervises (the presence row and tab chip).
+    /// Who answers a wall of `kind` on `agent`'s session this host supervises (the presence row
+    /// and tab chip): nobody where the host does not admit `agent`, where the loop types nothing
+    /// into it ([`Program::supervisable`], the predicate its turn-end loop's every act checks
+    /// first: Codex, Grok Build and Kimi Code), or where the wall is a lost login the loop does
+    /// not carry for it ([`aterm_agent::supervise::policy::login::carried`]), so the need stays
+    /// the person's rather than a `waiting:` nothing ends; else what the policy's outlook says.
+    /// A Codex's own resumes are codex-alab's, answered beside its proven self-claim
+    /// (`crate::self_claim::wall_answer`), never here: its worker watches beside codex-alab
+    /// (`watches_only`) and takes no claim of this host's.
     pub(crate) fn wall_answer(
         &self,
+        agent: Program,
         kind: aterm_phase::WallKind,
         has_reset: bool,
     ) -> aterm_messages::presence::WallAnswer {
         use aterm_agent::supervise::policy::outlook::{Answer, answer};
         use aterm_messages::presence::WallAnswer;
+        if !self.admits(agent)
+            || !agent.supervisable()
+            || (kind == aterm_phase::WallKind::Auth
+                && !aterm_agent::supervise::policy::login::carried(agent))
+        {
+            return WallAnswer::Nobody;
+        }
         let cfg = self.shared.lock().cfg.clone();
         match answer(kind, has_reset, &cfg, cfg.enabled) {
             Answer::Nobody => WallAnswer::Nobody,
@@ -11446,6 +11503,9 @@ pub(crate) struct Startup {
     /// The supervisor's attention standing on it where that is a startup stall's own
     /// ([`STARTUP_HEAD`]): what [`restates`] compares the screen's hold with.
     pub(crate) standing: Option<String>,
+    /// Its launcher is installing its program now (`task_launch::InstallingMark`), so no agent
+    /// could have started yet.
+    pub(crate) installing: bool,
 }
 
 /// A task record's state as the deadlines judge it.
@@ -11871,7 +11931,9 @@ fn look_at_startups(
                 // screen the harness holds an act on for a hand, it falls no sooner than a
                 // whole one after that hold ends, a driver's counted from the last look
                 // that found it standing.
-                if books.waits.relaunching.contains(&w.sid) {
+                // A launcher installing the worker's program has typed nothing yet: the deadline
+                // falls a whole one after the last look that found it installing.
+                if books.waits.relaunching.contains(&w.sid) || w.installing {
                     books.off.insert(w.sid.clone(), now);
                     soonest(now + HELD_RELOOK);
                     continue;
@@ -14568,13 +14630,14 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 )
             };
             let claimable = !autopilot_off && h.ctx.fabric.hold().is_none();
-            let (record, program, agent, mut held) = {
+            let (record, program, agent, mut held, installing) = {
                 let tl = h
                     .ctx
                     .timeline
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let record = tl.task()?.clone();
+                let installing = tl.worker_installing();
                 let publication = tl.agent();
                 let agent = agent_of(publication);
                 let held = HeldRead {
@@ -14595,7 +14658,7 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                     driver: false,
                     carried,
                 };
-                (record, publication.program.clone(), agent, held)
+                (record, publication.program.clone(), agent, held, installing)
             };
             held.progress.input = h.ctx.output_echo.input_sent();
             held.person = h
@@ -14681,6 +14744,7 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 seen,
                 held,
                 standing: standing.filter(|s| s.starts_with(STARTUP_HEAD)),
+                installing,
             })
         })
         .collect()
@@ -16264,6 +16328,22 @@ fn disk_look(
     disk_ask::after_look(&looked, sids, store, note);
 }
 
+/// What aterm itself freed at this look (`bytes`, ended now), for the ask's step to record
+/// ([`disk_ask::Looked::reclaimed`]): no asked session's rise counts it.
+fn disk_reclaimed(looked: &mut disk_ask::Looked, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    looked
+        .reclaimed
+        .push(aterm_agent::harness::disk::ask::Reclaimed {
+            ended_ms: aterm_time::unix_millis()
+                .and_then(|ms| i64::try_from(ms).ok())
+                .unwrap_or(0),
+            bytes,
+        });
+}
+
 /// The look's pass ([`disk_look`]): what it read for the ask goes in `looked`.
 fn disk_look_pass(
     sids: &[String],
@@ -16351,10 +16431,15 @@ fn disk_look_pass(
         ) {
             aterm_agent::harness::cli::ReserveMove::Kept
             | aterm_agent::harness::cli::ReserveMove::StillRefused => {}
-            moved => aterm_log::info!(
-                "harness disk watch: reserve {moved:?} at {}",
-                reserve.display()
-            ),
+            moved => {
+                if let aterm_agent::harness::cli::ReserveMove::Released(bytes) = &moved {
+                    disk_reclaimed(looked, *bytes);
+                }
+                aterm_log::info!(
+                    "harness disk watch: reserve {moved:?} at {}",
+                    reserve.display()
+                );
+            }
         }
     }
     disk_sightings(board, seen, level, free, &state, now);
@@ -16458,7 +16543,8 @@ fn disk_look_pass(
         return;
     }
     let lock_path = aterm_agent::harness::disk::reserve::pass_lock_for(&home);
-    let _pass_lock = match aterm_agent::harness::disk::reserve::take_pass(&lock_path) {
+    // Held until the ask's step records what this pass freed ([`disk_ask::after_look`]).
+    looked.pass_lock = match aterm_agent::harness::disk::reserve::take_pass(&lock_path) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             aterm_log::info!(
@@ -16501,6 +16587,7 @@ fn disk_look_pass(
             unrecorded,
         } = journalled;
         let (freed, went) = disk_swept(&swept, &sized);
+        disk_reclaimed(looked, freed);
         let after = measure();
         if !swept.is_empty() {
             aterm_log::info!(
@@ -16679,6 +16766,7 @@ fn disk_look_pass(
         aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => done.freed_bytes,
         aterm_agent::harness::cli::DiskTick::Plenty => 0,
     };
+    disk_reclaimed(looked, freed_bytes);
     let went: Vec<String> = match &tick {
         aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => {
             let mut rows: Vec<(u64, String)> = done
@@ -17656,7 +17744,9 @@ fn disk_ask_fit(board: &Shelf, sid: &str, found: crate::disk_board::Unfit) {
 
 /// Tab `sid` works again (a busy read): what its worker found of the session itself at its last
 /// turn break no longer holds, as it was given something to do ([`crate::disk_board::Unfit::own`]);
-/// whose it is holds on.
+/// whose it is holds on. The loop's lasting withholds stand as its loop told them
+/// ([`IdleHost::lasting_hold`]): a break of the agent's own background work reads busy too and
+/// works past no wall it stands at, so the loop alone says when a wall's hold is over.
 fn disk_ask_busy(board: &Shelf, sid: &str) {
     let mut b = board.board_lock();
     let Some(found) = b.unfit.get_mut(sid) else {
@@ -17679,6 +17769,21 @@ fn disk_ask_walled(board: &Shelf, sid: &str, wall: Option<crate::disk_board::Wal
         }
         None => {
             b.walls.remove(sid);
+        }
+    }
+}
+
+/// Tab `sid`'s loop decided its last turn break held by a lasting withhold (`Some`) or none
+/// (`None`): the ask to free space holds it out of its seats while it holds
+/// ([`crate::disk_board::Board::withholds`]).
+fn disk_ask_withheld(board: &Shelf, sid: &str, withhold: Option<crate::disk_board::Withhold>) {
+    let mut b = board.board_lock();
+    match withhold {
+        Some(withhold) => {
+            b.withholds.insert(sid.to_owned(), withhold);
+        }
+        None => {
+            b.withholds.remove(sid);
         }
     }
 }

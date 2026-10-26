@@ -89,11 +89,17 @@ impl Default for DropletFrame {
 /// The band of water-ramp positions whose colour keeps
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 fn ramp_band_on(ground: u32) -> (f32, f32) {
-    let lum_g = crate::color_math::relative_luminance(ground);
+    let table = crate::color_math::relative_luminance_table();
+    let lum_g = crate::color_math::relative_luminance_with(table, ground);
     let lum_g_plus = lum_g + 0.05;
     #[inline]
-    const fn meets_rgb(lum_g: f32, lum_g_plus: f32, rgb: u32) -> bool {
-        let lum_w = crate::color_math::relative_luminance(rgb);
+    const fn meets_rgb(
+        table: &crate::color_math::RelativeLuminanceTable,
+        lum_g: f32,
+        lum_g_plus: f32,
+        rgb: u32,
+    ) -> bool {
+        let lum_w = crate::color_math::relative_luminance_with(table, rgb);
         let (hi_plus, lo_plus) = if lum_w > lum_g {
             (lum_w + 0.05, lum_g_plus)
         } else {
@@ -104,12 +110,12 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
     let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };
     let far_rgb = water_ramp(far);
-    if !meets_rgb(lum_g, lum_g_plus, far_rgb) {
+    if !meets_rgb(table, lum_g, lum_g_plus, far_rgb) {
         return (far, far);
     }
     let near = 1.0 - far;
     let near_rgb = water_ramp(near);
-    if meets_rgb(lum_g, lum_g_plus, near_rgb) {
+    if meets_rgb(table, lum_g, lum_g_plus, near_rgb) {
         return (0.0, 1.0);
     }
     let (mut pass, mut fail) = (far, near);
@@ -123,12 +129,15 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
             pass = mid;
         } else if mid_rgb == fail_rgb {
             fail = mid;
-        } else if meets_rgb(lum_g, lum_g_plus, mid_rgb) {
+        } else if meets_rgb(table, lum_g, lum_g_plus, mid_rgb) {
             pass = mid;
             pass_rgb = mid_rgb;
         } else {
             fail = mid;
             fail_rgb = mid_rgb;
+        }
+        if step >= 2 && pass_rgb == fail_rgb {
+            break;
         }
     }
     if dark { (pass, 1.0) } else { (0.0, pass) }

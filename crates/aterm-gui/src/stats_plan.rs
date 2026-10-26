@@ -124,21 +124,31 @@ const ROW_NAMES: [&str; 8] = [
     "Cores",
 ];
 pub(crate) const HEADER_PT: f64 = 9.5;
-const TIME_LABEL: &str = "10 min ago";
-/// The time label's short form, when the long one leaves the strip no room for a tick.
-const TIME_SHORT: &str = "\u{2013}10 min";
 /// What a strip's header keeps clear at its right end for the now marker and its beat
 /// ([`crate::stats_live`]), pt.
 pub(crate) const MARKER_ROOM: f64 = 8.0;
-/// The time scale's ticks, how long ago each is, most wanted first: the middle of the span, the
-/// last minute, two minutes, half a minute.
-const TICK_AGES: [u32; 4] = [300, 60, 120, 30];
+/// The time scale's ticks after the middle of the span, how long ago each is, most wanted
+/// first: the last minute, two minutes, half a minute, five minutes ([`tick_ages`]).
+const TICK_AGES: [u32; 4] = [60, 120, 30, 300];
+/// A Folded strip's column, seconds: the ring's own bucket, so the glide is as fast as the
+/// data allows (`docs/DESIGN-stats-deck-live-2026-10-24.md` §11).
+pub(crate) const FOLD_PERIOD_S: u32 = 10;
+/// A Folded strip's pitch, pt: one 10 s column every 10 pt, so its strips glide 1 pt a second
+/// (2 device px at 2x), fast enough to be seen moving at a glance; the span is then the
+/// strip's width in seconds (a minute in the default window).
+pub(crate) const FOLD_PITCH: f64 = 10.0;
 /// The least room between a tick's words and the words beside them, pt.
 const TICK_GAP: f64 = 6.0;
+/// How far a tick's words may stand off centre over it, as a share of their width: the tick
+/// stays under their middle half, so "–5 min" never reads as a minute later.
+const TICK_SLACK: f64 = 0.25;
+/// What the header keeps clear before a strip's left end, pt: a key span over the names ends
+/// here, and a time label standing beside the strip ends here.
+pub(crate) const STRIP_LEAD: f64 = 6.0;
 const DETAILS_LONG: &str = "Details · point at a row for more";
 const SWATCH_ADVANCE: f64 = 0.62 * HEADER_PT + 3.0;
 const MARK_ADVANCE: f64 = 1.1 * HEADER_PT;
-const KEY_GAP: f64 = 10.0;
+pub(crate) const KEY_GAP: f64 = 10.0;
 
 fn name_width(base: f64, pt: f64, m: &FaceMetrics) -> f64 {
     let widest = ROW_NAMES
@@ -184,7 +194,7 @@ impl Pen {
     }
 }
 
-/// Ten-minute heat strip geometry.
+/// Heat strip geometry: `cols` columns of `period_s` on a `pitch`, the last of them now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Strip {
     pub(crate) x: f64,
@@ -195,16 +205,41 @@ pub(crate) struct Strip {
 }
 
 impl Strip {
-    const SPAN_S: u32 = 600;
+    /// What a Full strip spans: ten minutes, its cells coarsening as it narrows (v2 §5.5).
+    const FULL_SPAN_S: u32 = 600;
 
+    /// A Full strip: ten minutes over `cols` columns.
     fn new(x: f64, cols: u32, pitch: f64) -> Self {
+        Self::of(x, cols, Self::FULL_SPAN_S / cols, pitch)
+    }
+
+    /// A Folded strip `w` pt wide: [`FOLD_PERIOD_S`] columns on [`FOLD_PITCH`], so it spans
+    /// `w` seconds and glides 1 pt a second.
+    fn folded(x: f64, w: f64) -> Self {
+        let cols = (w / FOLD_PITCH).round().max(1.0) as u32;
+        Self::of(x, cols, FOLD_PERIOD_S, FOLD_PITCH)
+    }
+
+    const fn of(x: f64, cols: u32, period_s: u32, pitch: f64) -> Self {
         Self {
             x,
             cols,
-            period_s: Self::SPAN_S / cols,
+            period_s,
             pitch,
             cell: pitch - 1.0,
         }
+    }
+
+    /// How far back the strip reaches, seconds: its left end's age when its right end is now.
+    pub(crate) const fn span_s(self) -> u32 {
+        self.cols.saturating_mul(self.period_s)
+    }
+
+    /// How fast its columns glide left, pt a second: one pitch a period (the painter measures
+    /// it in the device px it draws, `Deck::live_edge`).
+    #[cfg(test)]
+    pub(crate) fn pt_per_s(self) -> f64 {
+        self.pitch / f64::from(self.period_s.max(1))
     }
 
     /// Right edge of the last strip cell.
@@ -688,7 +723,9 @@ fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bo
     };
     let name = Col::new(x, name_width(name_base, rows.name_pt, m));
     let well = Col::new(name.end(), well_w);
-    let strip = Strip::new(well.end() + strip_gap, cols, pitch);
+    // The block's strip keeps its place (`cols` on `pitch`, 60 to 150 pt) and draws it in
+    // 10 s columns on a 10 pt pitch (§11 of the live edge's design).
+    let strip = Strip::folded(well.end() + strip_gap, f64::from(cols) * pitch);
     let e = strip.after();
     let end = x + b;
     let cores_x = if kind == BlockKind::Slim {
@@ -906,7 +943,7 @@ pub(crate) fn cores_count_text(
 /// Kind of label placed on the header line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Label {
-    /// `"10 min ago"` over a strip.
+    /// How far back the strip reaches, `"10 min ago"` ([`time_words`]), over or beside it.
     Time,
     /// Right-aligned `"now"` over a percentage column.
     Now,
@@ -1102,7 +1139,8 @@ pub(crate) struct RulerTick {
     /// The tick's x, pt.
     pub(crate) x: f64,
     /// Its words' left edge, pt: centred on the tick, or pushed along until clear of the time
-    /// label and the now marker, never so far that the words stop covering the tick.
+    /// label and the now marker, never so far that the tick leaves their middle half
+    /// ([`TICK_SLACK`]).
     pub(crate) left: f64,
     /// Its words, `–5 min`, `–30 s`.
     pub(crate) text: String,
@@ -1110,19 +1148,86 @@ pub(crate) struct RulerTick {
 
 /// The words of a tick `age_s` back.
 pub(crate) fn tick_words(age_s: u32) -> String {
+    format!("\u{2013}{}", age_words(age_s))
+}
+
+/// How long `age_s` is, in a tick's or the time label's words: `10 min`, `2.5 min`, `80 s`.
+fn age_words(age_s: u32) -> String {
     if age_s.is_multiple_of(60) {
-        format!("\u{2013}{} min", age_s / 60)
+        format!("{} min", age_s / 60)
+    } else if age_s >= 120 && age_s.is_multiple_of(30) {
+        format!("{}.5 min", age_s / 60)
     } else {
-        format!("\u{2013}{age_s} s")
+        format!("{age_s} s")
     }
 }
 
+/// The time label over (or beside) `strip`, long then short: how far back its left end is,
+/// `10 min ago` and `–10 min` on a Full strip, `1 min ago` and `–1 min` on the default
+/// window's Folded one.
+pub(crate) fn time_words(strip: Strip) -> [String; 2] {
+    let span = age_words(strip.span_s());
+    [format!("{span} ago"), format!("\u{2013}{span}")]
+}
+
+/// The ages `strip`'s scale may mark, most wanted first: the middle of its span where that is
+/// a round age (a whole minute, or a multiple of 10 s under one), then [`TICK_AGES`]; only ages
+/// inside the span, since its left end is the label's.
+pub(crate) fn tick_ages(strip: Strip) -> Vec<u32> {
+    let span = strip.span_s();
+    let mid = span / 2;
+    let round =
+        span.is_multiple_of(2) && (mid.is_multiple_of(60) || (mid < 60 && mid.is_multiple_of(10)));
+    round
+        .then_some(mid)
+        .into_iter()
+        .chain(TICK_AGES.into_iter().filter(|&age| age != mid))
+        .filter(|&age| age > 0 && age < span)
+        .collect()
+}
+
 /// Where a tick `age_s` back on `strip` goes when its words, `w` wide, must stay inside
-/// `lo..hi`, or `None` when they cannot.
+/// `lo..hi` with the tick under their middle half, or `None` when they cannot.
 fn tick_slot(strip: Strip, age_s: u32, w: f64, (lo, hi): (f64, f64)) -> Option<(f64, f64)> {
     let x = strip.end() - f64::from(age_s) / f64::from(strip.period_s.max(1)) * strip.pitch;
-    let (least, most) = (lo.max(x - w), (hi - w).min(x));
-    (least <= most).then(|| (x, (x - w / 2.0).clamp(least, most)))
+    let centred = x - w / 2.0;
+    let slack = w * TICK_SLACK;
+    let (least, most) = (lo.max(centred - slack), (hi - w).min(centred + slack));
+    (least <= most).then(|| (x, centred.clamp(least, most)))
+}
+
+/// Where the time label stands on the header line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeAt {
+    /// Over the strip's left end, the scale's ticks after it.
+    Over,
+    /// Beside the strip, ending [`STRIP_LEAD`] short of its left end (where a tick marks
+    /// it), in the free span over the names: the strip's whole header is then the scale's.
+    Beside,
+}
+
+/// Where a time label can stand, and what it leaves.
+struct TimeRoom {
+    /// The label's left edge, pt.
+    x: f64,
+    /// The key's spans with the label's own place taken out of them.
+    spans: Vec<KeySpan>,
+    /// Where the strip's own free header starts, pt.
+    from: f64,
+    /// The room it leaves the ticks' words, pt.
+    ticks: (f64, f64),
+}
+
+/// The time label and its scale as the planner settles them.
+struct TimeScale {
+    label: String,
+    /// The label's left edge, pt.
+    x: f64,
+    ticks: Vec<RulerTick>,
+    /// The tick at the strip's left end when the label stands beside it.
+    end_tick: Option<f64>,
+    /// The key's spans with what the label and the ticks leave of them.
+    spans: Vec<KeySpan>,
 }
 
 /// Complete layout plan for the header line and its legend key.
@@ -1132,6 +1237,11 @@ pub(crate) struct HeaderPlan {
     pub(crate) key: KeyPlan,
     /// The time scale over the strip that carries the time label, left to right.
     pub(crate) ruler: Vec<RulerTick>,
+    /// The tick at that strip's left end, pt, when the time label stands beside the strip
+    /// rather than over it.
+    pub(crate) time_tick: Option<f64>,
+    /// The key's items this header may place (rule K searches only these).
+    pub(crate) keys: &'static [KeyItem],
 }
 
 struct Header<'m> {
@@ -1203,11 +1313,17 @@ impl<'m> Header<'m> {
         x
     }
 
-    /// The key's spans with the time strip's own: what its label and `ticks` leave of it, short
-    /// of the now marker.
-    fn spans_with(&self, strip: Strip, label_w: f64, ticks: &[RulerTick]) -> Vec<KeySpan> {
-        let mut spans = self.spans.clone();
-        let mut x0 = strip.x + label_w + KEY_GAP;
+    /// `base` (the key's spans) with the time strip's own: what lies from `from` to the strip's
+    /// end that `ticks` leave, short of the now marker.
+    fn spans_with(
+        &self,
+        base: &[KeySpan],
+        strip: Strip,
+        from: f64,
+        ticks: &[RulerTick],
+    ) -> Vec<KeySpan> {
+        let mut spans = base.to_vec();
+        let mut x0 = from;
         let mut by_x: Vec<&RulerTick> = ticks.iter().collect();
         by_x.sort_by(|a, b| a.left.total_cmp(&b.left));
         for tick in by_x {
@@ -1227,13 +1343,11 @@ impl<'m> Header<'m> {
         spans
     }
 
-    /// The ticks a time label `label_w` wide leaves room for on `strip`, each alone, most wanted
-    /// first.
-    fn tick_room(&self, strip: Strip, label_w: f64) -> Vec<RulerTick> {
-        let room = (strip.x + label_w + TICK_GAP, strip.end() - MARKER_ROOM);
-        TICK_AGES
-            .iter()
-            .filter_map(|&age_s| {
+    /// The ticks whose words fit `room` on `strip`, each alone, most wanted first.
+    fn tick_room(&self, strip: Strip, room: (f64, f64)) -> Vec<RulerTick> {
+        tick_ages(strip)
+            .into_iter()
+            .filter_map(|age_s| {
                 let text = tick_words(age_s);
                 let (x, left) = tick_slot(strip, age_s, self.words(&text), room)?;
                 Some(RulerTick {
@@ -1246,75 +1360,147 @@ impl<'m> Header<'m> {
             .collect()
     }
 
-    /// The time label and its scale: the long label when some tick fits beside it, else the
-    /// short one, else the long one alone. The scale takes ticks in order of want while none
-    /// costs the key a weight it could place without them; when every tick costs some, the one
-    /// costing least still goes, since the scale is what says how far back the strip reaches.
-    fn ruler(&self, strip: Strip) -> (&'static str, Vec<RulerTick>) {
-        let weight = |plan: &KeyPlan| -> u32 { plan.placed.iter().map(|(i, _)| i.weight()).sum() };
-        for label in [TIME_LABEL, TIME_SHORT] {
-            let label_w = self.words(label);
-            let room = self.tick_room(strip, label_w);
-            if room.is_empty() {
-                continue;
-            }
-            let key_with = |ticks: &[RulerTick]| {
-                weight(&place_key(
-                    self.spans_with(strip, label_w, ticks),
-                    self.keys,
-                    self.m,
-                ))
-            };
-            let clear = |chosen: &[RulerTick], t: &RulerTick| {
-                let w = self.words(&t.text);
-                chosen.iter().all(|c| {
-                    let cw = self.words(&c.text);
-                    t.left + w + TICK_GAP <= c.left || c.left + cw + TICK_GAP <= t.left
-                })
-            };
-            let mut chosen: Vec<RulerTick> = Vec::new();
-            let mut best = key_with(&[]);
-            for t in &room {
-                let mut trial = chosen.clone();
-                trial.push(t.clone());
-                if clear(&chosen, t) && key_with(&trial) == best {
-                    chosen = trial;
-                }
-            }
-            if chosen.is_empty() {
-                let first = room
+    /// Where a time label `w` wide can stand `at` `strip`, or `None` when no free span over
+    /// the names ends at the strip's lead to hold it beside the strip.
+    fn time_room(&self, strip: Strip, w: f64, at: TimeAt) -> Option<TimeRoom> {
+        let hi = strip.end() - MARKER_ROOM;
+        match at {
+            TimeAt::Over => Some(TimeRoom {
+                x: strip.x,
+                spans: self.spans.clone(),
+                from: strip.x + w + KEY_GAP,
+                ticks: (strip.x + w + TICK_GAP, hi),
+            }),
+            TimeAt::Beside => {
+                let end = strip.x - STRIP_LEAD;
+                let x = end - w;
+                let at = self
+                    .spans
                     .iter()
-                    .enumerate()
-                    .max_by_key(|&(i, t)| (key_with(std::slice::from_ref(t)), usize::MAX - i))
-                    .map(|(_, t)| t.clone());
-                chosen.extend(first);
-                best = key_with(&chosen);
-                for t in &room {
+                    .position(|s| !s.strip && (s.x1 - end).abs() < 1e-9 && s.x0 <= x)?;
+                let mut spans = self.spans.clone();
+                if let Some(span) = spans.get_mut(at) {
+                    span.x1 = x - KEY_GAP;
+                }
+                spans.retain(|s| s.x1 > s.x0);
+                Some(TimeRoom {
+                    x,
+                    spans,
+                    from: end + KEY_GAP,
+                    ticks: (end + TICK_GAP, hi),
+                })
+            }
+        }
+    }
+
+    /// What `spans` let the key keep: the items rule K places, and whether the heat ramp stands
+    /// over a strip, the colours it explains.
+    fn key_keeps(&self, spans: Vec<KeySpan>) -> (Vec<KeyItem>, bool) {
+        let plan = place_key(spans, self.keys, self.m);
+        let items = plan.placed.iter().map(|&(item, _)| item).collect();
+        let ramp_over_strip = plan.placed.iter().any(|&(item, x)| {
+            item == KeyItem::Ramp
+                && plan
+                    .spans
+                    .iter()
+                    .any(|s| s.strip && s.x0 <= x + 1e-9 && x < s.x1)
+        });
+        (items, ramp_over_strip)
+    }
+
+    /// The time label and its scale. The label stands over the strip's left end in its long
+    /// form, else its short one, when that leaves a tick room; else beside the strip, long then
+    /// short; else long and alone over the strip. The scale is weighed against the key the long
+    /// label alone leaves (v2's own header, rule K): it takes ticks in order of want while the
+    /// key keeps every item it places and the heat ramp over a strip; failing that, every item;
+    /// failing that, every item but its least, "not read", since in rule K's order the scale
+    /// ranks after the ramp and before "not read". The test is the items themselves, not their
+    /// summed weights, which can hold while one item is traded for another. It never costs
+    /// "over max" or the ramp a place; where every placement would, the label stands alone.
+    fn ruler(&self, strip: Strip) -> TimeScale {
+        let [long, short] = time_words(strip);
+        let alone = strip.x + self.words(&long) + KEY_GAP;
+        let (items, ramp) = self.key_keeps(self.spans_with(&self.spans, strip, alone, &[]));
+        let but_not_read: Vec<KeyItem> = items
+            .iter()
+            .copied()
+            .filter(|&item| item != KeyItem::NotRead)
+            .collect();
+        let placements = [
+            (&long, TimeAt::Over),
+            (&short, TimeAt::Over),
+            (&long, TimeAt::Beside),
+            (&short, TimeAt::Beside),
+        ];
+        let costs = [
+            (items.as_slice(), ramp),
+            (items.as_slice(), false),
+            (but_not_read.as_slice(), false),
+        ];
+        let clear = |chosen: &[RulerTick], t: &RulerTick| {
+            let w = self.words(&t.text);
+            chosen.iter().all(|c| {
+                let cw = self.words(&c.text);
+                t.left + w + TICK_GAP <= c.left || c.left + cw + TICK_GAP <= t.left
+            })
+        };
+        for (must, ramp) in costs {
+            for (label, at) in placements {
+                let Some(TimeRoom {
+                    x,
+                    spans: base,
+                    from,
+                    ticks: room,
+                }) = self.time_room(strip, self.words(label), at)
+                else {
+                    continue;
+                };
+                let mut chosen: Vec<RulerTick> = Vec::new();
+                for t in self.tick_room(strip, room) {
                     let mut trial = chosen.clone();
                     trial.push(t.clone());
-                    if clear(&chosen, t) && key_with(&trial) == best {
+                    let (kept, r) = self.key_keeps(self.spans_with(&base, strip, from, &trial));
+                    if clear(&chosen, &t) && must.iter().all(|i| kept.contains(i)) && (r || !ramp) {
                         chosen = trial;
                     }
                 }
+                if chosen.is_empty() {
+                    continue;
+                }
+                chosen.sort_by(|a, b| a.left.total_cmp(&b.left));
+                return TimeScale {
+                    label: label.clone(),
+                    x,
+                    spans: self.spans_with(&base, strip, from, &chosen),
+                    ticks: chosen,
+                    end_tick: (at == TimeAt::Beside).then_some(strip.x),
+                };
             }
-            chosen.sort_by(|a, b| a.left.total_cmp(&b.left));
-            return (label, chosen);
         }
-        (TIME_LABEL, Vec::new())
+        TimeScale {
+            label: long,
+            x: strip.x,
+            spans: self.spans_with(&self.spans, strip, alone, &[]),
+            ticks: Vec::new(),
+            end_tick: None,
+        }
     }
 
     fn finish(mut self) -> HeaderPlan {
-        let mut ruler = Vec::new();
+        let (mut ruler, mut time_tick) = (Vec::new(), None);
         if let Some(strip) = self.time {
-            let (label, ticks) = self.ruler(strip);
-            self.spans = self.spans_with(strip, self.words(label), &ticks);
-            self.label(Label::Time, strip.x, label);
-            ruler = ticks;
+            let scale = self.ruler(strip);
+            self.spans = scale.spans;
+            self.label(Label::Time, scale.x, scale.label);
+            ruler = scale.ticks;
+            time_tick = scale.end_tick;
         }
         HeaderPlan {
             key: place_key(self.spans, self.keys, self.m),
             labels: self.labels,
             ruler,
+            time_tick,
+            keys: self.keys,
         }
     }
 }
@@ -1337,7 +1523,7 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
         head.label(Label::Now, pct.end(), "now");
     }
     if let CoresAt::Row(_) = plan.cores {
-        head.span(plan.name.x, plan.strip.x - 6.0, false);
+        head.span(plan.name.x, plan.strip.x - STRIP_LEAD, false);
     }
     if plan.kind == FullKind::Slim {
         if let (Some(bar), Some(amount)) = (plan.bar, plan.amount) {
@@ -1421,10 +1607,10 @@ pub(crate) fn header_folded(
         if let Some(pct) = block.pct {
             head.label(Label::Now, pct.end(), "now");
         }
-        let name_room = block.strip.x - 6.0 - block.name.x;
+        let name_room = block.strip.x - STRIP_LEAD - block.name.x;
         let mut strip_free = true;
         match state.filter(|_| block.amount.is_none()) {
-            None => head.span(block.name.x, block.strip.x - 6.0, false),
+            None => head.span(block.name.x, block.strip.x - STRIP_LEAD, false),
             Some(state) => {
                 let forms = [state.full, state.bare];
                 let words = if MARK_ADVANCE + m.width(state.full, HEADER_PT, true) <= name_room {
@@ -1687,7 +1873,13 @@ mod tests {
         assert_eq!(p.divider, 595.0);
         assert_eq!(details(&p), [None, None]);
         let a = p.blocks[0];
-        assert_eq!((a.strip.x, a.strip.cols, a.strip.pitch), (150.0, 30, 5.0));
+        // Its strip keeps 150 pt and draws 10 s columns on a 10 pt pitch: two and a half
+        // minutes, gliding 1 pt a second (§11 of the live edge's design).
+        assert_eq!(
+            (a.strip.x, a.strip.cols, a.strip.period_s, a.strip.pitch),
+            (150.0, 15, 10, 10.0)
+        );
+        assert_eq!((a.strip.end(), a.strip.span_s()), (299.0, 150));
         assert_eq!(a.pct, Some(Col::new(306.0, 30.0)));
         // The glance's columns, as Full wide's (§3.2).
         assert_eq!(a.amount, Some(Col::new(344.0, 96.0)));
@@ -1905,14 +2097,22 @@ mod tests {
                 }
                 assert_eq!(folded.gauge.is_some(), w >= slim_beside, "Folded W {w}");
                 for block in &folded.blocks {
-                    let period = if block.kind == BlockKind::Wide {
-                        20
-                    } else {
-                        30
+                    // 10 s columns on a 10 pt pitch over the strip's 60, 80 or 150 pt: it
+                    // spans its width in seconds and glides 1 pt a second.
+                    let width = match block.kind {
+                        BlockKind::Wide => 150,
+                        BlockKind::Mid => 80,
+                        BlockKind::Narrow | BlockKind::Slim => 60,
                     };
                     assert_eq!(
-                        (block.strip.period_s, block.strip.cols * period),
-                        (period, 600)
+                        (block.strip.period_s, block.strip.span_s()),
+                        (FOLD_PERIOD_S, width),
+                        "Folded W {w}"
+                    );
+                    assert!((block.strip.pt_per_s() - 1.0).abs() < 1e-12, "Folded W {w}");
+                    assert!(
+                        (block.strip.end() + 1.0 - block.strip.x - f64::from(width)).abs() < 1e-9,
+                        "Folded W {w}: the strip keeps its place"
                     );
                     if !folded.ground_only {
                         assert_in_order(
@@ -2147,12 +2347,14 @@ mod tests {
     #[test]
     fn the_key_goes_where_the_spec_says() {
         let m = hn();
-        let time_w = m.width(TIME_LABEL, HEADER_PT, false);
 
         // The time strip's header carries the time label, the scale's ticks (the live edge's
         // design) and the key between them; what the ticks leave no room for goes, by weight,
         // to the next free span.
         let plan = plan_full(1119.0, &m);
+        let [label, _] = time_words(plan.strip);
+        assert_eq!(label, "10 min ago", "a Full strip spans ten minutes");
+        let time_w = m.width(&label, HEADER_PT, false);
         let head = header_full(&plan, TEXT, &m);
         let after_time = plan.strip.x + time_w + KEY_GAP;
         let ticks: Vec<u32> = head.ruler.iter().map(|t| t.age_s).collect();
@@ -2222,10 +2424,16 @@ mod tests {
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
         assert_eq!(label_x(&head, Label::Time), Some(a.strip.x));
+        // Its 150 pt strip spans two and a half minutes (§11 of the live edge's design):
+        // "2.5 min ago" over its left end, and the last minute marked.
         assert_eq!(
-            head.ruler.iter().map(|t| t.age_s).collect::<Vec<_>>(),
-            [300, 60]
+            head.labels
+                .iter()
+                .find(|l| l.label == Label::Time)
+                .map(|l| l.text.as_str()),
+            Some("2.5 min ago")
         );
+        assert_eq!(head.ruler.iter().map(|t| t.age_s).collect::<Vec<_>>(), [60]);
         assert_eq!(placed(&head, KeyItem::Over), Some(b.strip.x));
         assert_eq!(
             (
@@ -2297,7 +2505,7 @@ mod tests {
             (states[0].x, states[0].text.as_str()),
             (a.name.x, "Disk full ~34 min +1")
         );
-        assert_eq!(label_x(&head, Label::Time), Some(b.strip.x));
+        assert!(time_on(&head, b.strip, &m), "{:?}", head.labels);
 
         let head = header_folded(&plan, TEXT, [Some(long), Some(long)], &m);
         let b_state = head
@@ -2309,7 +2517,19 @@ mod tests {
         assert!(
             MARK_ADVANCE + m.width(&b_state.text, HEADER_PT, true) <= b.strip.x - 6.0 - b.name.x
         );
-        assert_eq!(label_x(&head, Label::Time), Some(b.strip.x));
+        assert!(time_on(&head, b.strip, &m), "{:?}", head.labels);
+    }
+
+    /// Whether `head`'s time label stands on `strip`: over its left end, or beside it, ending
+    /// [`STRIP_LEAD`] short of it with a tick marking that end.
+    fn time_on(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> bool {
+        head.labels.iter().any(|l| {
+            l.label == Label::Time
+                && (l.x == strip.x && head.time_tick.is_none()
+                    || (l.x + m.width(&l.text, HEADER_PT, false) - (strip.x - STRIP_LEAD)).abs()
+                        < 1e-9
+                        && head.time_tick == Some(strip.x))
+        })
     }
 
     #[test]

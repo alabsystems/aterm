@@ -4440,15 +4440,10 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("layout", "TerminalLeafRestore.holds"),
     ("layout", "TerminalLeafRestore.profile"),
     ("layout", "CodexRestore.carried"),
-    // Gemini CLI is retired (agy replaces it): a leaf's `gemini` table is read only to refuse
-    // the leaf as no agent's, and no write sets it; its run's fields until a release records
-    // their omission (tests/fixtures/handoff/README.md).
+    // Gemini CLI is retired (agy replaces it): the legacy table only identifies a retired
+    // run, and no handoff writes it. v0.140.0 recorded the former fields' omission; older
+    // immutable desks continue to hold the reader to those bytes (tests/fixtures/handoff/README.md).
     ("layout", "AgentRestore.gemini"),
-    ("layout", "GeminiRestore.chats"),
-    ("layout", "GeminiRestore.env"),
-    ("layout", "GeminiRestore.home"),
-    ("layout", "GeminiRestore.session"),
-    ("layout", "GeminiRestore.started_ms"),
     ("layout", "NativeLeafRestore.metadata"),
     ("meta", "ColorRepr.stack"),
     ("meta", "CursorStyle::Hidden"),

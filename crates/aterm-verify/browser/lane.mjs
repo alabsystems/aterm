@@ -39,6 +39,15 @@
 // frames the recorded-frame differential holds to the wgpu-WebGL module's
 // recording (crates/aterm-verify/browser/wgpu-webgl/).
 //
+// Last, the gpu page (not the worker) runs `spec.glow`: the cursor glow
+// typed under a prompt, on a dark and a light page, with bloom on and off,
+// once with its beam runs laid as ramps drawn through cell.glsl's fx stream
+// and once with every row the quad it stands for, through the module's
+// dev-build lane seams; on the pages `spec.glow.art` names, every frame
+// also draws fx art of its own, the stream its ramps then ride beside. It answers each frame's digest, the ramps it laid
+// and its last frame whole, for the Rust side to hold the ramps to the
+// quads byte for byte.
+//
 // Every presented frame's readback is timed apart from render(), one entry
 // per frame, parity then differential: gl.finish() on the canvas's context
 // (`finish_ms`), the copy of the WebGL2 canvas onto a 2D canvas (`copy_ms`),
@@ -52,7 +61,9 @@
 // gpu and worker pages add readback: frame, diff: [frames], init: {
 // ready_on_return, probe: { rejected, thrown, error } } and where: { scope,
 // canvas, diff_canvas } (the global scope and canvas types the frames were
-// drawn in); a failure rejects naming the step that failed. The Rust side
+// drawn in), and the gpu page glow: [{ page, bloom, ramps, digests, laid:
+// [[ramps, lit rows]], last: frame }]; a failure rejects naming the step
+// that failed. The Rust side
 // calls it over the DevTools protocol. A browser it does not drive that way
 // opens `<kind>.html?post=1&next=<kind>,...` instead: the page fetches
 // spec.json, runs its lane, POSTs { answer } or { error } to
@@ -261,7 +272,13 @@ export async function gpu(spec, font, timings, on = documentCanvases) {
     canvas: canvas.constructor.name,
     diff_canvas: second.constructor.name,
   }
-  return { module: 'aterm-gpu-web', adapter, frames, readback, diff, timings, init, where }
+  const answer = { module: 'aterm-gpu-web', adapter, frames, readback, diff, timings, init, where }
+  // The glow scene runs on the page alone: the worker's run is held to the
+  // page's frames, and the glow's to its own oracle.
+  if (on === documentCanvases && spec.glow) {
+    answer.glow = await gpuGlow(mod, spec, font, timings)
+  }
+  return answer
 }
 
 /// The recorded-frame differential's terminal: a wider grid on a canvas of
@@ -292,6 +309,96 @@ async function gpuDiff(mod, spec, font, timings, on, canvas) {
   term.free()
   timings.free_ms = Math.round((timings.free_ms + ms(t0)) * 1000) / 1000
   return frames
+}
+
+/// Two independent 32-bit FNV-1a digests of `bytes`, as one hex string: a
+/// glow frame's identity, so the answer carries every frame's without its
+/// pixels.
+function digest(bytes) {
+  let a = 0x811c9dc5
+  let b = 0x01000193
+  for (let i = 0; i < bytes.length; i++) {
+    a = Math.imul(a ^ bytes[i], 0x01000193)
+    b = Math.imul(b ^ bytes[i], 0x1000193b) + i
+  }
+  const hex = (v) => (v >>> 0).toString(16).padStart(8, '0')
+  return hex(a) + hex(b)
+}
+
+/// The glow scene's runs (`spec.glow`): in each glow style on each page
+/// theme, with bloom (and its SDR crown) on and off, a terminal laying its
+/// cursor glow's beam runs as ramps drawn through cell.glsl's fx stream (the
+/// bloom and the crown reading the additive stream's as an item list) and one
+/// laying every row as the quad it stands for (the oracle), each typing the
+/// same keys at the same injected clock. Frame 0 is the prompt before any key
+/// (no glow); each later frame types one key, or none in the run-out. Every
+/// frame's digest comes back, with the glow ramps and lit rows it laid and
+/// the additive stream's ramps, and the last frame whole.
+///
+/// The module's first glow terminal lays its first key's under-ink bed
+/// apart from every later one's whatever its route (on Firefox, 516 quads
+/// against the 518 every later run lays, a 400 ms pause before its first
+/// frame changing neither), so a discarded run first puts every compared
+/// run in the same state.
+async function gpuGlow(mod, spec, font, timings) {
+  const g = spec.glow
+  const runs = []
+  const t0 = performance.now()
+  await glowRun(mod, spec, font, timings, g.styles[0], 'warm-up', g.themes.dark, true, false)
+  for (const style of g.styles) {
+    for (const [page, theme] of Object.entries(g.themes)) {
+      for (const bloom of [true, false]) {
+        for (const ramps of [true, false]) {
+          runs.push(await glowRun(mod, spec, font, timings, style, page, theme, bloom, ramps))
+        }
+      }
+    }
+  }
+  timings.glow_ms = ms(t0)
+  return runs
+}
+
+/// One glow run ([`gpuGlow`]) on a canvas of its own, freed after.
+async function glowRun(mod, spec, font, timings, style, page, theme, bloom, ramps) {
+  const g = spec.glow
+  const canvas = document.body.appendChild(document.createElement('canvas'))
+  const term = await step(`construct the glow AtermGpuTerminal (${style}, ${page})`, () =>
+    new mod.AtermGpuTerminal(g.rows, g.cols, font, spec.px, ...theme))
+  await step(`init(glow canvas, ${style}, ${page})`, () => term.init(canvas))
+  await step('set_glow_ramps_for_lane', () => term.set_glow_ramps_for_lane(ramps))
+  await step('set_bloom_for_lane', () => term.set_bloom_for_lane(bloom))
+  await step('set_fx_art_for_lane', () => term.set_fx_art_for_lane(g.art.includes(page)))
+  term.set_cursor_glow(true, style, undefined, undefined, g.duration_ms, g.length, g.intensity, g.radius, true)
+  const digests = []
+  const laid = []
+  let last = null
+  for (let k = 0; k < g.frames; k++) {
+    if (k === 0) {
+      term.process_str(g.prompt)
+    } else if (k <= g.keys.length) {
+      const ch = g.keys[k - 1]
+      term.note_typed_char(ch)
+      term.process_str(ch)
+    }
+    if (k > 0) term.advance_effects(g.dt_ms)
+    try {
+      term.render()
+    } catch (e) {
+      throw new Error(`glow render() (${style}, ${page}, frame ${k}): ${e && e.message ? e.message : String(e)}`)
+    }
+    const rgba = readCanvas(canvas, timings)
+    digests.push(digest(rgba))
+    laid.push(Array.from(term.glow_ramps_for_lane()))
+    if (k === g.frames - 1) {
+      last = { width: canvas.width, height: canvas.height, rgba: base64(rgba) }
+    }
+    await waitFrame(timings)
+  }
+  term.free()
+  const lose = canvas.getContext('webgl2').getExtension('WEBGL_lose_context')
+  if (lose) lose.loseContext()
+  canvas.remove()
+  return { style, page, bloom, ramps, digests, laid, last }
 }
 
 /// The gpu page's run in a dedicated module worker (worker.mjs): the page's

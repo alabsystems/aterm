@@ -429,10 +429,10 @@ impl Verb {
                 "files (status | install | remove | primer).",
             ],
             Verb::Ai => &[
-                "This machine's AI CLIs (claude, codex, agy, muse):",
-                "one working login each (status | doctor | login),",
-                "reviews one AI asks of another (review), and the",
-                "signed fleet document (fleet).",
+                "This machine's AI CLIs (claude, codex, agy, muse,",
+                "grok): one working login each (status | doctor |",
+                "login), reviews one AI asks of another (review),",
+                "and the signed fleet document (fleet).",
             ],
             Verb::Machines => &[
                 "Configure and manage a lab of Macs over SSH from",

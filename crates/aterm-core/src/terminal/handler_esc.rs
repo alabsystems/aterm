@@ -145,9 +145,11 @@ impl TerminalHandler<'_> {
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
                 );
+                // xterm `CASE_NEL`: the index reads the cursor's column before the
+                // carriage return, so past the right margin nothing scrolls.
+                self.margined_line_feed(self.modes.left_right_margin_mode);
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
-                self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             b'H' => {
                 self.grid.set_tab_stop();

@@ -707,6 +707,11 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         kind: EditKind::Bool,
     },
     NestedLeaf {
+        key: "ai.grok.use",
+        label: "Use Grok Build on this machine",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
         key: "sparkle_words.enabled",
         label: "All word effects",
         kind: EditKind::Bool,

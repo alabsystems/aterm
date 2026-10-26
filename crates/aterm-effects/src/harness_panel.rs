@@ -783,19 +783,27 @@ fn push_radial(
     if y_max <= y_min {
         return;
     }
-    let px = |v: i32| u16::try_from(v.max(0)).unwrap_or(u16::MAX);
+    #[inline]
+    const fn px(v: i32) -> u16 {
+        if v <= 0 {
+            0
+        } else if v >= u16::MAX as i32 {
+            u16::MAX
+        } else {
+            v as u16
+        }
+    }
     let x = px(cx - rxi);
     let w = px(2 * rxi);
     let rx_px = px(rxi).max(1);
     let ry_px = px(ryi).max(1);
     let row_i32 = i32::from(place.row);
     for band in -1i32..=1 {
-        let Some(row) = row_i32
-            .checked_add(band)
-            .and_then(|r| u16::try_from(r).ok())
-        else {
+        let r = row_i32 + band;
+        if r < 0 || r > i32::from(u16::MAX) {
             continue;
-        };
+        }
+        let row = r as u16;
         let top = band_top + band * ch_px;
         let y0 = top.max(y_min);
         let y1 = (top + ch_px).min(y_max);

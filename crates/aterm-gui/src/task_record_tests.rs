@@ -92,6 +92,34 @@ fn the_logs_task_words_mirror_the_task_record() {
     assert_eq!(lookup(FACT_RULE_WORDS, "hold-room"), None);
 }
 
+/// A STALL SAYS ITS CAUSE TO A PERSON: a worker refused as signed out says a person must sign
+/// in, the one step nobody else can take; a failed install says so; a shell failure and a startup
+/// stall keep "never started". Each launcher word is a mark's closed word too.
+#[test]
+fn a_stalls_words_name_a_sign_in_as_a_persons_step() {
+    assert_eq!(
+        stall_words(Some(WHY_SIGNIN)),
+        "never started: signed out, a person must sign in"
+    );
+    assert_eq!(
+        stall_words(Some(WHY_INSTALL)),
+        "never started: its program could not be installed"
+    );
+    assert_eq!(stall_words(Some("shell")), "never started");
+    assert_eq!(stall_words(Some("startup")), "never started");
+    assert_eq!(
+        stall_words(Some("held")),
+        "held at a screen aterm does not know"
+    );
+    assert_eq!(stall_words(None), "stalled");
+    for why in [WHY_SIGNIN, WHY_INSTALL] {
+        assert_eq!(
+            parse(&format!("stalled why={why}")).map(|m| m.why),
+            Ok(Some(why))
+        );
+    }
+}
+
 #[test]
 fn a_mark_parses_every_fact_and_names_what_it_refuses() {
     let path = tasks().join(format!("{SID}-1.txt"));

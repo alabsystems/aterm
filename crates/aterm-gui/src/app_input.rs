@@ -2473,8 +2473,7 @@ const fn find_suspends_action(action: keybinding::Action) -> bool {
     use keybinding::Action as A;
     matches!(
         action,
-        A::Copy
-            | A::SelectAll
+        A::SelectAll
             | A::Paste
             | A::PasteSelection
             | A::ScrollPageUp
@@ -3120,7 +3119,7 @@ pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
             ..
         }
         | InputEvent::MouseMove { buttons: 3, .. } => None,
-        InputEvent::Paste(..) => Some(true),
+        InputEvent::Paste(..) | InputEvent::Focus(_) => Some(true),
         _ => {
             let class = classify_press(ev);
             let arms_own_license = (class.typed_forward == Some(true) && !class.enter_like)
@@ -5305,13 +5304,9 @@ impl App {
                 self.input_resize_window_px(wid, width, height)
             }
             ev @ InputEvent::Focus(_) => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.fx
-                        .cursor_mut()
-                        .glow
-                        .clear_typed(std::time::Instant::now());
-                    ws.fx.cursor_mut().trail.clear_typed();
-                }
+                // Focus is not an editing or mode-changing key gesture. Keep
+                // the known hand; subsequent output still governs its moves.
+                self.clear_move_license_keeping_hand(wid);
                 let receipt = paste_order::report_ordered_or_inline(&term, &modes, &sink, &ev);
                 note_refused_report(receipt);
                 InputOutcome::Ok
@@ -6128,6 +6123,12 @@ impl App {
             return InputOutcome::RangeRejected;
         }
         if echo_to_window {
+            if !self
+                .frontmost_window
+                .is_some_and(|front| self.windows.contains_key(&front))
+            {
+                return InputOutcome::NotApplied("resize: no window to resize");
+            }
             self.apply_grid_resize(rows, cols);
         } else {
             self.apply_term_resize(wid, rows, cols);
@@ -6146,32 +6147,49 @@ impl App {
         if width == 0 || height == 0 {
             return InputOutcome::RangeRejected;
         }
-        let target = self.frontmost_window.unwrap_or(wid);
+        self.resize_window_to_px(
+            self.frontmost_window.unwrap_or(wid),
+            aterm_window::dpi::PhysicalSize::new(width, height),
+        )
+    }
+
+    /// Ask window `target` for `asked` device pixels: the platform's window takes it as the
+    /// window manager allows, a headless one as given ([`InputOutcome::NotApplied`] when no such
+    /// window stands).
+    pub(crate) fn resize_window_to_px(
+        &mut self,
+        target: WindowId,
+        asked: aterm_window::dpi::PhysicalSize<u32>,
+    ) -> InputOutcome {
+        let Some(os_window) = self.windows.get(&target).map(|ws| ws.os_window.clone()) else {
+            return InputOutcome::NotApplied("resize px: no window to resize");
+        };
         #[cfg(target_os = "linux")]
         if let Some(ws) = self.windows.get_mut(&target) {
             ws.initial_frame_settle = None;
         }
-        if let Some(w) = self
-            .windows
-            .get(&target)
-            .and_then(|ws| ws.os_window.clone())
-        {
-            // Best-effort: the WM may clamp or ignore it, so no local geometry is
-            // written on our own request, except when the backend answers `Some`
-            // (Wayland applies synchronously and sends no `Resized`): that answer is
-            // fed through the event's path.
-            if let Some(applied) =
-                w.request_inner_size(aterm_window::dpi::PhysicalSize::new(width, height))
-            {
-                crate::metrics::note_resize_arrival();
-                if let Some(ws) = self.windows.get_mut(&target) {
-                    ws.win_px = Some(applied);
-                    ws.last_resized_event_at = Some(std::time::Instant::now());
+        match os_window {
+            Some(w) => {
+                // Best-effort: the WM may clamp or ignore it, so no local geometry is
+                // written on our own request, except when the backend answers `Some`
+                // (Wayland applies synchronously and sends no `Resized`): that answer is
+                // fed through the event's path.
+                if let Some(applied) = w.request_inner_size(asked) {
+                    crate::metrics::note_resize_arrival();
+                    if let Some(ws) = self.windows.get_mut(&target) {
+                        ws.win_px = Some(applied);
+                        ws.last_resized_event_at = Some(std::time::Instant::now());
+                    }
+                    self.sync_surface_to_window(target);
+                    self.on_resize(target, applied);
+                    w.request_redraw();
                 }
-                self.sync_surface_to_window(target);
-                self.on_resize(target, applied);
-                w.request_redraw();
             }
+            // A headless window has no window manager to ask, so the size asked for is the size
+            // it gets, through the grid half of a `Resized` (the live-resize throttle, its
+            // coalescing and its trailing settle), as an edge drag would. Its frame stays the
+            // grid's ([`App::headless_frame_px`]), so the pixels a cell does not fill are left out.
+            None => self.apply_window_resized_grid(target, asked),
         }
         InputOutcome::Ok
     }
@@ -6344,7 +6362,7 @@ impl App {
             delivery: match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
                 InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
-                InputOutcome::RangeRejected => {
+                InputOutcome::RangeRejected | InputOutcome::NotApplied(_) => {
                     unreachable!("a raw key sequence cannot produce a resize range verdict")
                 }
             },
@@ -6402,7 +6420,7 @@ impl App {
             delivery: match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
                 InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
-                InputOutcome::RangeRejected => {
+                InputOutcome::RangeRejected | InputOutcome::NotApplied(_) => {
                     unreachable!("a raw key sequence cannot produce a resize range verdict")
                 }
             },
@@ -6696,7 +6714,7 @@ impl App {
             let delivery = match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
                 InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
-                InputOutcome::RangeRejected => {
+                InputOutcome::RangeRejected | InputOutcome::NotApplied(_) => {
                     unreachable!("a key repeat cannot produce a resize range verdict")
                 }
             };
@@ -7740,6 +7758,23 @@ impl App {
         field_edit_action(mods, ev).map(Action::Edit)
     }
 
+    /// Keep resolved selection commands in the rename field, which has no selection model.
+    fn rename_claims_selection_chord(&self, mods: ModifiersState, ev: &KeyEvent) -> bool {
+        matches!(
+            keybinding::resolve_chord(
+                &base_logical_key(ev),
+                ev.physical_key,
+                mods,
+                &self.keybindings,
+                &self.key_sequences,
+                |dir| self.focus_pane_would_move(dir),
+            ),
+            keybinding::ChordResolution::Action(
+                keybinding::Action::Copy | keybinding::Action::SelectAll
+            )
+        )
+    }
+
     /// Classify a keystroke aimed at the in-grid rename field into its repeatable edit.
     fn rename_repeat_action(
         &self,
@@ -7748,6 +7783,9 @@ impl App {
         ev: &KeyEvent,
     ) -> Option<(u64, crate::app_search::SearchEdit)> {
         let session = self.inline_rename_edit(wid)?.session;
+        if self.rename_claims_selection_chord(mods, ev) {
+            return None;
+        }
         Some((session, field_edit_action(mods, ev)?))
     }
 
@@ -7806,6 +7844,9 @@ impl App {
             return true;
         }
         if is_bare_modifier_key(&ev.logical_key) {
+            return true;
+        }
+        if self.rename_claims_selection_chord(mods, ev) {
             return true;
         }
         if let Some((_, edit)) = self.rename_repeat_action(wid, mods, ev) {
@@ -9070,6 +9111,20 @@ impl App {
 
     /// The licence fence ahead of a menu command, whose key equivalent never reaches `on_key`.
     pub(crate) fn fence_menu_action(&mut self, action: menu::MenuAction) {
+        // Edit can consume a command without sending any text to the page, including Paste
+        // with an empty clipboard. Match the physical-key route's interaction boundary while
+        // keeping commands owned by another visible editor away from the underlying review.
+        if matches!(
+            action,
+            menu::MenuAction::Copy | menu::MenuAction::Paste | menu::MenuAction::SelectAll
+        ) && self.front_rename_edit().is_none()
+            && let Some(wid) = self.frontmost_window
+            && self.windows.get(&wid).is_some_and(|window| {
+                !window.overlay_open() && window.tab_menu.is_none() && window.search.is_none()
+            })
+        {
+            self.interact_system_state(wid);
+        }
         match self.frontmost_window {
             Some(wid) if action == menu::MenuAction::Paste => {
                 self.clear_move_license_keeping_hand(wid);

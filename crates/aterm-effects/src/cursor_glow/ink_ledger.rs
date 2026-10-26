@@ -4,6 +4,7 @@
 //! Over-ink contrast ledger for additive cursor glow emitters.
 
 use super::*;
+use aterm_render::GlowEnd;
 
 mod letter_guard;
 pub(crate) use letter_guard::{LetterGuard, RING as LETTER_GUARD_RING};
@@ -52,6 +53,11 @@ pub(crate) struct InkLedger {
     /// One piece's slice knots, px.
     knots_x: Vec<i32>,
     knots_y: Vec<i32>,
+    /// The letter guard's cut ramps, and a run of cut ramp rows' slice knots
+    /// and ends (`guard_mask_ramps`).
+    ramp_pieces: GlowRamps,
+    run_knots: Vec<i32>,
+    run_ends: Vec<GlowEnd>,
     /// Test-only: admit a masked light as one ([`CursorGlow::over_ink_uniform`]).
     #[cfg(test)]
     uniform: bool,
@@ -67,6 +73,9 @@ pub(crate) struct InkLedger {
     /// The frame's rails laid clear of their row's ring, as `[from, to)`
     /// spans of the under stream's quads, ascending ([`Self::note_rail`]).
     rails: Vec<(u32, u32)>,
+    /// The same rails' ramps, as `[from, to)` spans of the under stream's
+    /// ramps ([`Self::note_rail_laid`]).
+    rail_ramps: Vec<(u32, u32)>,
     /// A test's negative control: the letter guard feathers its cuts into a
     /// rail laid clear of the ring as into any light (looks7 round 3).
     #[cfg(any(test, debug_assertions))]
@@ -110,12 +119,16 @@ impl InkLedger {
         halo_pieces: Vec::new(),
         knots_x: Vec::new(),
         knots_y: Vec::new(),
+        ramp_pieces: GlowRamps::EMPTY,
+        run_knots: Vec::new(),
+        run_ends: Vec::new(),
         #[cfg(test)]
         uniform: false,
         #[cfg(any(test, debug_assertions))]
         round_cuts: false,
         print: 0,
         rails: Vec::new(),
+        rail_ramps: Vec::new(),
         #[cfg(any(test, debug_assertions))]
         rails_feathered: false,
     };
@@ -221,10 +234,30 @@ impl InkLedger {
         }
     }
 
-    /// Forget the frame's rails ([`Self::note_rail`]).
+    /// [`Self::note_rail`] for a rail laid through an
+    /// [`aterm_render::RampSink`] from the stream's mark `from` to `to`
+    /// ([`aterm_render::BeamRows::mark`]): its quads, and its ramps, whose
+    /// rows the guard cuts as the quads they stand for.
+    #[inline]
+    pub(crate) fn note_rail_laid(
+        &mut self,
+        from: (usize, aterm_render::RampMark),
+        to: (usize, aterm_render::RampMark),
+    ) {
+        self.note_rail(from.0, to.0);
+        let (from, to) = (from.1.items(), to.1.items());
+        if to > from
+            && let (Ok(from), Ok(to)) = (u32::try_from(from), u32::try_from(to))
+        {
+            self.rail_ramps.push((from, to));
+        }
+    }
+
+    /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`]).
     #[inline]
     pub(crate) fn clear_rails(&mut self) {
         self.rails.clear();
+        self.rail_ramps.clear();
     }
 
     /// Fold one cut into the frame's print.
@@ -459,7 +492,11 @@ impl InkLedger {
             }
             std::array::from_fn(|band| {
                 let d2 = dx2 + dy2[band];
-                (d2 < 1.0).then_some((1.0 - d2) * (1.0 - d2))
+                if d2 < 1.0 {
+                    Some((1.0 - d2) * (1.0 - d2))
+                } else {
+                    None
+                }
             })
         };
         let reached = |(row, first, end): (i32, i32, i32)| {
@@ -550,7 +587,11 @@ impl InkLedger {
             let last = ((lo + f32::from(len) - 1.0 - o) * inv_size).floor() as i32;
             first..=last
         };
-        let stride_limit = i32::try_from(self.stride).unwrap_or(i32::MAX);
+        let stride_limit = if self.stride < i32::MAX as usize {
+            self.stride as i32
+        } else {
+            i32::MAX
+        };
         for q in quads {
             if !is_lit_additive(q) {
                 continue;
@@ -1237,7 +1278,10 @@ impl CursorGlow {
             if let Some((first, last)) = typed {
                 add((row, first, last + 1));
             }
-            let (first, last) = typed.unwrap_or((col, col));
+            let (first, last) = match typed {
+                Some(t) => t,
+                None => (col, col),
+            };
             let reach = Self::INK_LEDGER_REACH;
             let (lo, hi) = (
                 (first - reach).max(0),
@@ -1267,7 +1311,7 @@ impl CursorGlow {
         }
         let ledger = &mut self.ink_ledger;
         ledger.lines = lines;
-        if lines.iter().all(Option::is_none) {
+        if lines[0].is_none() && lines[1].is_none() && lines[2].is_none() {
             ledger.on = false;
             return;
         }
@@ -1301,7 +1345,10 @@ impl CursorGlow {
                 for col in first.max(0)..end.min(geom.cols as i32) {
                     if let Some((fg, bg)) = frame.pair(row, col) {
                         let i = slot * geom.cols + col as usize;
-                        ledger.ink[i] = fg.unwrap_or(ledger.pair.0);
+                        ledger.ink[i] = match fg {
+                            Some(c) => c,
+                            None => ledger.pair.0,
+                        };
                         ledger.under[i] = bg;
                     }
                 }
@@ -1427,10 +1474,15 @@ impl CursorGlow {
             }
             None
         };
-        if !halos.iter().any(|h| {
+        let mut any_filled = false;
+        for h in halos.iter() {
             let (row, _, _, c0, c1) = span(h);
-            h.w > 0 && first_filled_col(row, c0, c1).is_some()
-        }) {
+            if h.w > 0 && first_filled_col(row, c0, c1).is_some() {
+                any_filled = true;
+                break;
+            }
+        }
+        if !any_filled {
             return;
         }
         let mut all = std::mem::take(&mut self.ink_ledger.halo_pieces);

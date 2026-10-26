@@ -288,16 +288,16 @@ impl LaneFidelity {
             return fail(n, LANE_SETTLES, format!("the lane stopped early: {fault}"));
         }
         if !last_inert {
-            let last = ticks.last();
+            let (at, fp, quads) = match ticks.last() {
+                Some(t) => (t.at, t.frame.fp, t.out + t.under),
+                None => (0, 0, 0),
+            };
             return fail(
                 n.saturating_sub(1),
                 CLEARED_BY_END,
                 format!(
-                    "the glass is lit at the end {} ns: the last tick, at {} ns, drew fp {:#x} with {} quads",
+                    "the glass is lit at the end {} ns: the last tick, at {at} ns, drew fp {fp:#x} with {quads} quads",
                     scenario.end_ns(),
-                    last.map_or(0, |t| t.at),
-                    last.map_or(0, |t| t.frame.fp),
-                    last.map_or(0, |t| t.out + t.under)
                 ),
             );
         }

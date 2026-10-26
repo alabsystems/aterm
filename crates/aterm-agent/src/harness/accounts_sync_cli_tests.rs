@@ -10,7 +10,52 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 
+#[path = "accounts_sync_new_label_tests.rs"]
+mod new_label_tests;
+
 const NOW: i64 = 1_792_660_000;
+
+#[test]
+fn automatic_sync_refuses_a_new_label_with_retained_login_state() {
+    for cli in OTHER_CLIS {
+        let bed = Bed::new("retained-sync-label");
+        bed.keep_roster(cli);
+        let region = if cli == Cli::Kimi {
+            "region='global'\n"
+        } else {
+            ""
+        };
+        bed.secret(
+            &cli_fleet_file(cli),
+            &format!(
+                "[[account]]\nlabel='restored'\nemail='new@example.com'\nmachines=['m16']\n{region}"
+            ),
+        );
+        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+        let mut logins = accounts::Logins::default();
+        logins.labels.insert(
+            "restored".into(),
+            accounts::Binding {
+                dir: Some(
+                    bed.home
+                        .join("previous-login")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..accounts::Binding::default()
+            },
+        );
+        store.save_logins(&logins).unwrap();
+        let before = fs::read(store.logins_file()).unwrap();
+        let result = bed.sync(cli, None);
+        assert!(
+            result.is_err(),
+            "{cli:?}: sync restored a label onto an old binding: {result:?}"
+        );
+        assert!(bed.rows(cli).is_empty());
+        assert_eq!(fs::read(store.logins_file()).unwrap(), before);
+    }
+}
 
 /// A scratch home, state and config directory, `[fleet] machine = "m16"`.
 struct Bed {
@@ -157,7 +202,7 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
                 &|_| panic!("unknown records cannot dispatch a sign-in"),
                 None,
             );
-            assert_eq!(dispatch, RenewalDispatch::Failed, "{cli:?}/{bad}");
+            assert_eq!(dispatch, RenewalDispatch::Fenced, "{cli:?}/{bad}");
             assert!(guard.lock().unwrap().last_attempt.is_empty());
             assert_eq!(Bed::tree(bed._dir.path()), before);
         }
@@ -482,12 +527,25 @@ fn a_vault_file_alone_opts_no_machine_into_a_clis_pool() {
     );
 
     bed.keep_roster(Cli::Kimi);
+    let retained = sync_cli_accounts_for_init(&bed.home, &bed.state, &roster_path, NOW);
+    assert!(
+        matches!(retained.iter().find(|(cli, _)| *cli == Cli::Kimi), Some((_, Err(why))) if why.contains("retained local"))
+    );
+
+    // A fresh opt-in still imports automatically; retained labels require an
+    // explicit recovery decision instead of inheriting their previous state.
+    let bed = Bed::new("opt-in-fresh");
+    bed.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Kimi);
+    let roster_path = bed.config.join(accounts::ACCOUNTS_FILE);
     let init = sync_cli_accounts_for_init(&bed.home, &bed.state, &roster_path, NOW);
     let Some((_, Ok(CliSync::Synced(synced)))) = init.iter().find(|(cli, _)| *cli == Cli::Kimi)
     else {
         panic!("CONTROL: a kept roster syncs at init: {init:?}");
     };
     assert_eq!(synced.added, ["kimi-1"]);
+    signed_out_kimi_login(&bed, "kimi-1");
     assert_eq!(
         upkeep_over(&bed, UpkeepStep::Both),
         1,
@@ -1445,7 +1503,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     // CONTROL 1: unenrolled row without email refuses without saving `pending_pin`.
     assert!(
         codex_store
-            .select_account_for(Cli::Codex, &roster, "codex-3", now)
+            .select_account_for(Cli::Codex, &roster, &bed.roster(Cli::Codex), "codex-3", now)
             .is_err()
     );
     assert!(codex_store.load(now).unwrap().0.pending_pin.is_none());
@@ -1453,7 +1511,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     // Enrolled row pins immediately in Codex's store alone.
     assert_eq!(
         codex_store
-            .select_account_for(Cli::Codex, &roster, "codex-1", now)
+            .select_account_for(Cli::Codex, &roster, &bed.roster(Cli::Codex), "codex-1", now)
             .unwrap(),
         accounts::PinSelection::Pinned
     );
@@ -1466,7 +1524,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     // supersedes the earlier nonce.
     let stale = codex_store.request_pin("codex-2", now).unwrap();
     let accounts::PinSelection::Renew(request) = codex_store
-        .select_account_for(Cli::Codex, &roster, "codex-2", now)
+        .select_account_for(Cli::Codex, &roster, &bed.roster(Cli::Codex), "codex-2", now)
         .unwrap()
     else {
         panic!("unenrolled codex-2 with email must save a renew request");

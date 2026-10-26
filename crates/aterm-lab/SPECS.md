@@ -782,3 +782,29 @@ run-retired-agent-refused	contract	run::Run::admitted, run::Run::load, run::Run:
 file	test	primary	also
 src/run.rs	an_older_labs_gemini_cli_tab_is_refused_never_read_as_claude	run-retired-agent-refused	
 ```
+
+## 18. Added 2026-10-25: `seamless`'s privacy leg, the carry
+
+`lab seamless` plants a sentinel (`QZP6SECRET<n>`) in each kind of text one instance holds, and the
+outgoing process copies every file its update writes before the successor can read one (the keep
+seam, `ATERM_DEBUG_SEAMLESS_KEEP`, aterm-gui's `seamless-keep-seam`). The sweep reads the copies.
+The session log's own carry (a control sidecar's `log` member) is held to the Host tier: only a
+post's key and hop. The session's and terminal's own state, which the update hands over, is held
+field by field; a screen may hold the command line the shell echoed. One row, read the same way as
+§1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+seamless-carry-sweep	contract	seamless_carry::{sentinels,read_kept,Kind::of,kept_at,sweep,verdict,Judged::rendered}	∀ kept, planted, left: verdict(kept, planted, left).wrong = [] ⇔ (a) kept holds a manifest; (b) the control sidecar `.s<planted>.ctl` has ≥ 1 `log[]` line and its `log[]` sentinels ⊇ {8, 9}, a manifest's `sessions[].fabric.posts[].body` holds 6, and a screen `.s<planted>.*` holds 1 (the sweep read the log, the waiting post and the screen the plants reached); (c) every sentinel d found at place p of file f has d ∈ kept_at(Kind::of(f), p), where a control sidecar keeps only {8, 9} in `log[]` and 1 under `archive.`, a screen keeps 1, a manifest keeps the title (2), attention (3), topics (4), holds (5), a waiting post's body, key and hop (6, 8, 9) and the screen meta's titles (2) and OSC 633;E command lines (1) in their own fields, a layout keeps titles, attention and holds, and every other place, and a manifest, layout or sidecar that does not parse as its kind (read whole at `-`), keeps none; (d) the directory is 0700 and every file 0600; (e) every name the seam listed was read (no `skip`); (f) left = []. Each failed clause is one `Wrong`, its places and names as data; `rendered` is Ok exactly when none failed.	-	2	-
+```
+
+```tsv
+file	test	primary	also
+src/seamless_carry.rs	the_sentinels_are_read_in_any_case_by_their_digit	seamless-carry-sweep	
+src/seamless_carry.rs	a_carry_with_the_session_state_and_a_host_tier_log_passes	seamless-carry-sweep	
+src/seamless_carry.rs	a_content_tier_key_in_the_log_carry_is_found	seamless-carry-sweep	
+src/seamless_carry.rs	a_sentinel_outside_its_field_or_a_loose_mode_or_a_leftover_fails	seamless-carry-sweep	
+src/seamless_carry.rs	a_name_the_seam_did_not_read_fails	seamless-carry-sweep	
+src/seamless_carry.rs	a_sweep_that_read_no_planted_path_is_vacuous	seamless-carry-sweep	
+src/seamless_carry.rs	the_index_is_read_with_each_file_beside_it	seamless-carry-sweep	
+```

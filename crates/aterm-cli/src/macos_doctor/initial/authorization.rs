@@ -471,10 +471,11 @@ impl InitialSetupAuthorization {
     /// for good while the records are still the ones the review bound: the first-run decision,
     /// cancelled, naming `reviewed`, the plan the review showed ([`save_cancelled_decision`]),
     /// or, where a Restore's record stands (the review offered what a Restore brought forward),
-    /// that record held ([`Restored::held`]), which keeps what the Restore put back. Either is
-    /// one write, so a process that ends anywhere leaves whole records. `Ok(false)` when the
-    /// records changed since the review bound (a choice made meanwhile answers for it) or the
-    /// setup ended: nothing is written.
+    /// that record held ([`Restored::held`]), which keeps what the Restore put back, naming
+    /// `reviewed` too ([`save_cancelled_restore`]), so the Cancel reads and behaves as any
+    /// other. Either is one write, so a process that ends anywhere leaves whole records.
+    /// `Ok(false)` when the records changed since the review bound (a choice made meanwhile
+    /// answers for it) or the setup ended: nothing is written.
     pub fn cancel_observed(&mut self, reviewed: &Plan) -> InitialSetupObserved<bool> {
         observe_person_choice(|root| self.cancel_at(root, reviewed))
     }
@@ -493,14 +494,7 @@ impl InitialSetupAuthorization {
             return Ok(false);
         }
         match current.records.restored {
-            Some(restored) => save_restored_decision(
-                root,
-                RestoredState::Restored,
-                Restored {
-                    held: true,
-                    ..restored
-                },
-            )?,
+            Some(restored) => save_cancelled_restore(root, restored, reviewed)?,
             None => save_cancelled_decision(root, reviewed)?,
         }
         self.state = AuthorizationState::Ended;
@@ -508,9 +502,73 @@ impl InitialSetupAuthorization {
     }
 
     /// Widen the provisional plan this ticket observed to `plan`, even after its
-    /// run finished. The caller checked the observed records allow it.
-    pub(super) fn upgrade_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
-        self.persist_as(plan, Admission::Upgrade)
+    /// run finished. The caller checked the observed records allow it. A review admitted it, so
+    /// it waits for the profile lock while another holds it, as a choice does
+    /// ([`observe_person_choice`]), saying `waits` the moment it starts waiting
+    /// ([`noting_first`]); records another writer changed meanwhile are read again
+    /// ([`Self::rebind_upgrade`]).
+    pub(super) fn upgrade_observed(
+        &mut self,
+        plan: &Plan,
+        waits: impl FnMut(),
+    ) -> InitialSetupObserved<Option<u64>> {
+        observe_person(|root, before| {
+            self.upgrade_waiting(root, before, noting_first(waits, choice_lock_wait()), plan)
+        })
+    }
+
+    /// [`Self::upgrade_observed`] at `root`: `wait` waits a moment while another holds the
+    /// profile lock and says whether to ask for it again ([`observe_choice_at`]).
+    pub(super) fn upgrade_waiting(
+        &mut self,
+        root: &Path,
+        before: Option<InitialSetupObservation>,
+        wait: impl FnMut() -> bool,
+        plan: &Plan,
+    ) -> InitialSetupObserved<Option<u64>> {
+        observe_choice_at(root, before, wait, |root| {
+            self.persist_with(
+                root,
+                plan,
+                Admission::Upgrade,
+                AuthorizationWrite::persist,
+                |root| observation_at(root).map_err(|error| error.to_string()),
+            )
+        })
+    }
+
+    /// An upgrade a review admitted meets records another writer changed since this ticket
+    /// observed them (a pass that saved its progress while the upgrade waited for the profile
+    /// lock): it still widens the plan in force when that is the same provisional plan, with no
+    /// Stop, Cancel or Restore since ([`scope::upgrade_of`]), and is then admitted against the
+    /// records as they are now. Otherwise the ticket stays bound to what it observed, and the
+    /// admission ends with nothing written. Under the profile lock, before anything is written.
+    fn rebind_upgrade(&mut self, root: &Path) -> Result<(), String> {
+        let AuthorizationState::Bound(baseline) = &self.state else {
+            return Ok(());
+        };
+        let current = observation_at(root).map_err(|error| error.to_string())?;
+        if current == *baseline
+            || current.records.plan != baseline.records.plan
+            || stopped_at(root)?.is_some()
+            || scope::upgrade_of(&current.records, || true).is_none()
+        {
+            return Ok(());
+        }
+        let Ok(revision) = review_revision(&current.records) else {
+            return Ok(());
+        };
+        if plan_revision(
+            current.records.progress,
+            current.records.plan.as_ref().map(|(plan, _)| plan),
+        )
+        .is_err()
+        {
+            return Ok(());
+        }
+        self.revision = revision;
+        self.state = AuthorizationState::Bound(current);
+        Ok(())
     }
 
     /// The records this ticket observed when it was captured.
@@ -522,25 +580,17 @@ impl InitialSetupAuthorization {
     }
 
     /// The answer to the offer waits for the profile lock while another holds it, as a
-    /// choice does ([`observe_person_choice`]); the watch's own upgrade does not wait.
+    /// choice does ([`observe_person_choice`]); so does an upgrade ([`Self::upgrade_observed`]).
     fn persist_as(
         &mut self,
         plan: &Plan,
         admission: Admission,
     ) -> InitialSetupObserved<Option<u64>> {
-        let operation = |root: &Path| {
+        observe_person_choice(|root| {
             self.persist_with(root, plan, admission, AuthorizationWrite::persist, |root| {
                 observation_at(root).map_err(|error| error.to_string())
             })
-        };
-        if admission == Admission::Upgrade {
-            observe_person_mutation(
-                Err("another doctor profile pass is running".into()),
-                operation,
-            )
-        } else {
-            observe_person_choice(operation)
-        }
+        })
     }
 
     #[cfg(test)]
@@ -757,6 +807,9 @@ impl InitialSetupAuthorization {
         mut write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
+        if admission == Admission::Upgrade {
+            self.rebind_upgrade(root)?;
+        }
         let publications = match &self.state {
             AuthorizationState::Bound(baseline) => baseline.publications(),
             AuthorizationState::Writing(commit) => commit.publications.clone(),

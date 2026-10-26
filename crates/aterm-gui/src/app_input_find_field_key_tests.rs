@@ -243,6 +243,198 @@ fn the_field_claims_text_input_not_every_chord() {
 }
 
 #[test]
+fn bound_copy_copies_the_find_match_without_editing_or_repeating_the_query() {
+    use crate::keybinding::{Action, ChordResolution, KeySequences, Keybindings, resolve_chord};
+
+    let original_clipboard = crate::control::PBPASTE_STUB.with(|board| board.borrow().clone());
+    let ctrl = ModifiersState::CONTROL;
+    let ctrl_shift = ctrl | ModifiersState::SHIFT;
+    let mut failures = Vec::new();
+    for (binding, mods, code, logical, default_binding, layout_sequence) in [
+        (
+            "ctrl+shift+c",
+            ctrl_shift,
+            KeyCode::KeyC,
+            Key::Character(SmolStr::new("C")),
+            true,
+            false,
+        ),
+        (
+            "ctrl+insert",
+            ctrl,
+            KeyCode::Insert,
+            Key::Named(NamedKey::Insert),
+            true,
+            false,
+        ),
+        (
+            "ctrl+f",
+            ctrl,
+            KeyCode::KeyF,
+            Key::Character(SmolStr::new("f")),
+            false,
+            false,
+        ),
+        (
+            "ctrl+shift+c",
+            ctrl_shift,
+            KeyCode::KeyC,
+            Key::Character(SmolStr::new("с")),
+            true,
+            true,
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).unwrap().term.clone();
+        let sink = app.pool.get(0).unwrap().ctx.sink.clone();
+        term_lock(&term).process("prefix λneedle suffix\r\n".as_bytes());
+        app.search_enter();
+        type_str(&mut app, wid, "λneedle");
+        app.search_edit_in(wid, crate::app_search::SearchEdit::MoveTo(2));
+        assert_eq!(query(&app, wid), Some(("λneedle".into(), 2)));
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("λneedle"),
+            "the real search selected a Unicode match"
+        );
+        assert!(app.copy_selection_in(wid));
+        assert_eq!(
+            crate::control::pbpaste().as_deref(),
+            Some("λneedle"),
+            "the shared menu Copy path can copy the active match"
+        );
+
+        let mut table = std::collections::BTreeMap::new();
+        if !default_binding || cfg!(target_os = "macos") {
+            table.insert(binding.to_string(), "copy".to_string());
+        }
+        app.keybindings = Keybindings::resolved(Some(&table));
+        if layout_sequence {
+            app.key_sequences = KeySequences::from_config(Some(
+                &[("ctrl+shift+с".to_string(), "\\e[99~".to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+        let physical = PhysicalKey::Code(code);
+        let event = |state, repeat| {
+            KeyEvent::synthetic_for_test(
+                physical,
+                logical.clone(),
+                None,
+                KeyLocation::Standard,
+                state,
+                repeat,
+            )
+        };
+        let base = super::base_logical_key(&event(ElementState::Pressed, false));
+        assert_eq!(
+            app.keybindings.action_for(&base, physical, mods),
+            Some(Action::Copy),
+            "fixture must provide the configured Copy binding"
+        );
+        assert_eq!(
+            resolve_chord(
+                &base,
+                physical,
+                mods,
+                &app.keybindings,
+                &app.key_sequences,
+                |_| false,
+            ),
+            if layout_sequence {
+                ChordResolution::Sequence(b"\x1b[99~".to_vec())
+            } else {
+                ChordResolution::Action(Action::Copy)
+            },
+            "the layout's literal sequence must precede a physical Copy fallback"
+        );
+        assert!(crate::control::pbcopy("clipboard sentinel λ"));
+        let snapshot = |app: &App| {
+            let search = app.windows[&wid].search.as_ref().map(|search| {
+                (
+                    search.query.clone(),
+                    search.cursor,
+                    search.matches.clone(),
+                    search.current,
+                    search.direction,
+                    search.case_sensitive,
+                    search.is_regex,
+                    search.regex_error,
+                )
+            });
+            let terminal = term_lock(&term);
+            (
+                search,
+                (
+                    terminal.visible_content(),
+                    terminal.content_seq(),
+                    terminal.grid().display_offset(),
+                    terminal.text_selection().clone(),
+                ),
+                sink.input_epoch(),
+                (
+                    app.frontmost_window,
+                    app.windows[&wid].front_content,
+                    app.front_terminal(wid).map(|front| front.session),
+                ),
+            )
+        };
+        let before = snapshot(&app);
+        let expected_clipboard = if layout_sequence {
+            "clipboard sentinel λ"
+        } else {
+            "λneedle"
+        };
+        set_mods(&mut app, wid, mods);
+        for (stage, state, repeat) in [
+            ("press", ElementState::Pressed, false),
+            ("repeat", ElementState::Pressed, true),
+            ("release", ElementState::Released, false),
+        ] {
+            app.on_key(wid, event(state, repeat));
+            let after = snapshot(&app);
+            if after != before {
+                failures.push(format!(
+                    "{binding} layout_sequence={layout_sequence} {stage} changed owned state: \
+                     query={}, terminal={}, pty={}, owner={}",
+                    after.0 != before.0,
+                    after.1 != before.1,
+                    after.2 != before.2,
+                    after.3 != before.3,
+                ));
+            }
+            let copied = crate::control::pbpaste();
+            if copied.as_deref() != Some(expected_clipboard) {
+                failures.push(format!(
+                    "{binding} layout_sequence={layout_sequence} {stage}: \
+                     clipboard={copied:?}, expected={expected_clipboard:?}"
+                ));
+            }
+            let owned = if state == ElementState::Released {
+                !app.physical_press_owners.contains_key(&physical)
+                    && !app.windows[&wid].consumed_press_keys.contains(&physical)
+            } else {
+                matches!(
+                    app.physical_press_owners.get(&physical),
+                    Some(crate::PhysicalPressOwner::Consumed { window }) if *window == wid
+                ) && app.windows[&wid].consumed_press_keys.contains(&physical)
+            };
+            if !owned {
+                failures.push(format!(
+                    "{binding} layout_sequence={layout_sequence} {stage} must not repeat \
+                     a field edit or terminal input: {:?}",
+                    app.physical_press_owners.get(&physical)
+                ));
+            }
+        }
+    }
+    crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = original_clipboard);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn other_input_doors_defer_to_an_open_field() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -260,7 +452,6 @@ fn other_input_doors_defer_to_an_open_field() {
     use crate::keybinding::Action;
     for action in [
         Action::Paste,
-        Action::Copy,
         Action::ScrollToTop,
         Action::ScrollPageUp,
         Action::JumpPrevPrompt,
@@ -270,6 +461,7 @@ fn other_input_doors_defer_to_an_open_field() {
         assert!(super::find_suspends_action(action), "{action:?}");
     }
     for action in [
+        Action::Copy,
         Action::Find,
         Action::NewTab,
         Action::CloseTab,

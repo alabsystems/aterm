@@ -359,6 +359,23 @@ impl std::fmt::Debug for IdlePoint {
     }
 }
 
+/// A withhold of the loop's at a turn break that lasts past any grace, told to the host as the
+/// loop decides each break ([`IdleHost::lasting_hold`]): nothing the host would type there goes
+/// until it is over, so a host that offers the session work it would type at a break (the
+/// `disk-free@v1` seat rule's) holds it out meanwhile, as it does at a usage-limit wall
+/// ([`IdleHost::limit_wall`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lasting {
+    /// The credits hold ([`Guard::Credits`]: `[harness] usage_credits = false`, and usage credits
+    /// would carry the next turn): it lifts at `lifts_unix` (unix seconds, the reset plus the
+    /// loop's grace, or the hold's bound), `None` where the loop knows no such time.
+    Credits { lifts_unix: Option<i64> },
+    /// A wall on screen that is no usage limit ([`Guard::Wall`]), by its kind's wire word
+    /// ([`aterm_phase::WallKind::wire`]): `wall:auth`, a sign-in only a person can do, or another
+    /// the loop waits out.
+    Wall { wire: &'static str },
+}
+
 /// Reason a busy break or idle point was withheld from [`IdleHost`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guard {
@@ -2201,6 +2218,8 @@ pub struct Session<'a, C: Ctl> {
     usage_told: Option<(UsageSeen, Instant)>,
     pub(super) credits_kept: Option<CreditsKept>,
     withheld: Option<Guard>,
+    /// The lasting withhold last told the host ([`IdleHost::lasting_hold`]).
+    lasting_told: Option<Lasting>,
     hold_said: Option<HoldSaid>,
     hold: occupancy_loop::HoldWatch,
     facts: facts_loop::FactsWatch,
@@ -2463,6 +2482,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             usage_told: None,
             credits_kept: None,
             withheld: None,
+            lasting_told: None,
             hold_said: None,
             hold: occupancy_loop::HoldWatch::default(),
             facts: facts_loop::FactsWatch::default(),
@@ -3879,6 +3899,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                     && let Some(host) = opts.and_then(|o| o.idle_host.as_ref())
                 {
                     host.busy_tap();
+                    // A wall's lasting withhold is over at a live read, where the session works
+                    // past it ([`IdleHost::lasting_hold`]), and told so: the next break at a wall
+                    // tells it again. A break of the agent's own background work reads busy too,
+                    // and is no work past the wall it stands at: there the wall's hold stands, as
+                    // that break told it, or each read would publish it and take it down again.
+                    if !carried
+                        && reader.background_wait(&screen.rows).is_none()
+                        && matches!(self.lasting_told, Some(Lasting::Wall { .. }))
+                    {
+                        self.tell_lasting(host.as_ref(), None);
+                    }
                 }
             }
             if self.fx.mono() >= deadline {
@@ -6161,6 +6192,25 @@ impl<C: Ctl> Session<'_, C> {
                 .then_some(Guard::Wall)
         });
         let host = self.stall_host.clone();
+        if let Some(host) = host.as_ref() {
+            // The lasting withhold this break holds the session at: a wall that is no usage
+            // limit, or the credits hold; a break that is no break of the agent's own background
+            // work tells nothing.
+            let lasting = match unfit {
+                Some(Guard::Wall) => {
+                    wall.as_ref()
+                        .filter(|w| !w.kind.reads_limited())
+                        .map(|w| Lasting::Wall {
+                            wire: w.kind.wire(),
+                        })
+                }
+                Some(_) => self.lasting_told,
+                None => cfg
+                    .and_then(|cfg| self.credits_hold_lifts_here(cfg, &screen.rows))
+                    .map(|lifts_unix| Lasting::Credits { lifts_unix }),
+            };
+            self.tell_lasting(host.as_ref(), lasting);
+        }
         if let Some(guard) = unfit {
             *since = None;
             self.withhold(host.as_ref(), guard);
@@ -6226,6 +6276,27 @@ impl<C: Ctl> Session<'_, C> {
             self.hold_line(screen.seq, cfg, review);
             *since = None;
             line_gone = Some(Guard::HostLine);
+        } else if let Some(step) = self.background_fact(screen, cfg, host.as_ref(), review)? {
+            // The host's own fact at the break (the `disk-free@v1` ask's line), where the upgrade
+            // typed nothing: what a turn of the session's that ends with its own background work
+            // still running would otherwise never take.
+            review.note(&format!("HOST seq={} background {}", screen.seq, step.line));
+            if step.moved {
+                self.turn_end.host_moved();
+            }
+            if let Some(kind) = step.typed {
+                // Kept in a record of its own, as the occupancy door's line at such a break is
+                // (`TurnEndState::fact_typed`): an act the agent took whose answer is still
+                // awaited (a continuation, a land check) keeps its record and judges that answer,
+                // and what the loop owes past it (a compact, a reset's resume) stays owed.
+                match kind {
+                    super::policy::turn_end::HostTurn::Fact => self.turn_end.fact_typed(),
+                    kind => self.host_turn(kind, screen.seq),
+                }
+                self.hold_line(screen.seq, cfg, review);
+                *since = None;
+                line_gone = Some(Guard::HostLine);
+            }
         }
         // The stuck fact's own line (the occupancy design's §2.1 rank 4), after the host's line
         // and before the nudges.
@@ -6390,12 +6461,98 @@ impl<C: Ctl> Session<'_, C> {
     /// is made at every decided turn break, not only at one where the host owes a step. It is
     /// told once per decision: the wait's later looks at the same point find nothing new, and the
     /// host's finding reads the session's records. A point mid-turn (a box) is no turn break.
-    fn tell_break(&self, opts: &SuperviseOpts, point: &Turn) {
+    /// What lasting withhold holds the session at it is told as well ([`Self::tell_lasting`]).
+    fn tell_break(&mut self, opts: &SuperviseOpts, point: &Turn) {
         if let Some(host) = opts.idle_host.as_ref()
             && matches!(point.phase, Phase::Idle | Phase::Limited { .. })
         {
             host.turn_break(self.occupancy_theirs());
+            let lasting = self.lasting_at(&point.screen, &opts.policy);
+            self.tell_lasting(host.as_ref(), lasting);
         }
+    }
+
+    /// The lasting withhold that holds the session at the turn break `screen` draws, as the
+    /// loop's own guards would read it there, without a read of its own: a wall on screen that is
+    /// no usage limit ([`Guard::Wall`]; a usage limit's wall is the limit episode's,
+    /// [`IdleHost::limit_wall`]), else the credits hold ([`Guard::Credits`]), else none.
+    fn lasting_at(&self, screen: &Screen, cfg: &SupervisorConfig) -> Option<Lasting> {
+        let mut reading = aterm_phase::read_at(
+            self.program.as_deref(),
+            &screen.rows,
+            screen.cursor_index(),
+            None,
+        );
+        self.wall_as_decided(&mut reading, screen);
+        if let Some(wall) = reading.wall.as_ref().filter(|w| !w.kind.reads_limited()) {
+            return Some(Lasting::Wall {
+                wire: wall.kind.wire(),
+            });
+        }
+        self.credits_hold_lifts_here(cfg, &screen.rows)
+            .map(|lifts_unix| Lasting::Credits { lifts_unix })
+    }
+
+    /// Tell the host the lasting withhold the break just decided holds the session at (`hold`),
+    /// once per change ([`IdleHost::lasting_hold`]). A replay of a tape whose recording build had
+    /// no such door tells nothing, as it recorded.
+    fn tell_lasting(&mut self, host: &dyn IdleHost, hold: Option<Lasting>) {
+        if self.lasting_told == hold || self.fx.replay_lacks_host_door("host.lasting_hold") {
+            return;
+        }
+        self.lasting_told = hold;
+        host.lasting_hold(hold);
+    }
+
+    /// The host's own fact ([`IdleHost::at_background_fact`]) at a settled break of the agent's
+    /// own background work where the turn is over and only a shell or a monitor it left runs on
+    /// ([`aterm_phase::turn_over_background`]): asked only where the host owes one
+    /// ([`IdleHost::fact_owed`]), and offered where no draft stands in the composer and no hold
+    /// is on the session, by the guards an idle point's fact is ([`IdlePoint`]), as the
+    /// occupancy door's line at such a break. Those guards are judged on a `status` read made
+    /// here, as every line at a break is ([`Self::write_guards`]), and as an idle point's step
+    /// reads `status` first: the loop's last read was made at an idle point, which a session at
+    /// background breaks for hours left long before, so a person who typed since (their own
+    /// message, answered within seconds) would be inside their grace unseen. A read that says
+    /// nothing holds the fact unoffered. A replay of a tape whose recording build had no such
+    /// door offers nothing, as it recorded.
+    fn background_fact(
+        &mut self,
+        screen: &Screen,
+        cfg: Option<&SupervisorConfig>,
+        host: &dyn IdleHost,
+        review: &mut dyn Review,
+    ) -> Result<Option<HostStep>, Fail> {
+        let Some(cfg) = cfg else {
+            return Ok(None);
+        };
+        if self.fx.replay_lacks_host_door("host.at_background_fact")
+            || !aterm_phase::turn_over_background(&screen.rows)
+            || !host.fact_owed()
+        {
+            return Ok(None);
+        }
+        let guards = match self.write_guards(screen, self.fx.mono(), cfg, host)? {
+            Ok(guards) if guards.halted => Err(Guard::Halted),
+            Ok(guards) if guards.draft => Err(Guard::Draft),
+            read => read,
+        };
+        let guards = match guards {
+            Ok(guards) => guards,
+            Err(guard) => {
+                review.note(&format!(
+                    "HOST seq={} background fact held: {}",
+                    screen.seq,
+                    guard.word()
+                ));
+                return Ok(None);
+            }
+        };
+        Ok(host.at_background_fact(IdlePoint {
+            done_under_land: false,
+            held: guards.held_host_fact(),
+            theirs: guards.theirs(),
+        }))
     }
 
     fn policy_limit_holds(&self) -> bool {

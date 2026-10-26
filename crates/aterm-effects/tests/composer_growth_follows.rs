@@ -337,7 +337,7 @@ impl Host {
         let mut h = Self {
             s,
             term,
-            glow: CursorGlow::default(),
+            glow: crate::common::quads_glow(),
             cfg: cfg(),
             g: crate::common::geom(s.rows, s.cols, s.cw, s.ch),
             now,

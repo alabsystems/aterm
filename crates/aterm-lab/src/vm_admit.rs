@@ -6,7 +6,8 @@
 //! machine's capacity ledger ([`aterm_capacity`]) and waits while they do not fit beside the
 //! claims already held, naming them once a minute; it is NOT RUN at once only where the guest
 //! and the memory macOS keeps beside it ([`aterm_vz::plan::HOST_MARGIN`], the margin, never
-//! reserved) pass this Mac's memory, and an interrupt ends the wait as NOT RUN, nothing booted.
+//! reserved) reach what this Mac can ever have available, its memory less what is wired
+//! ([`aterm_capacity::never`]), and an interrupt ends the wait as NOT RUN, nothing booted.
 //! A run on a VM already up claims its vCPUs alone, which never waits. The guest's builds run
 //! as many jobs as cores the claim was granted (`CARGO_BUILD_JOBS`); the guest's shape stays
 //! the owner's.
@@ -936,6 +937,82 @@ mod tests {
             "{why}"
         );
         assert!(said.is_empty(), "nothing waited for: {said:?}");
+    }
+
+    /// NEVER-REACHABLE (`docs/DESIGN-adaptive-build-2026-10-24.md`): on a 28 GiB Mac with 4 GiB
+    /// wired and 18 GiB available, lima's boot (16 GiB and the 8 GiB margin) is NOT RUN at once,
+    /// naming the 24 GiB that Mac can ever have available, nothing waited for and nothing left in
+    /// the ledger; on this Mac's shape (48 GiB, 3.5 GiB wired, 27 GiB available) it is admitted
+    /// with no wait line. Negative control: judged against all of the memory (the old rule), the
+    /// small Mac's boot waits for memory it can never have, until the hang detector.
+    #[test]
+    fn a_boot_above_what_the_mac_can_ever_have_available_is_not_run_at_once() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("lab-vm-reach-")
+            .tempdir()
+            .expect("a scratch ledger");
+        let ledger = Ledger::at(dir.path().join("capacity"));
+        let boot = {
+            let ledger = ledger.clone();
+            std::thread::spawn(move || {
+                let mut said = Vec::new();
+                let answer = admit_in(
+                    &ledger,
+                    &Fixed::new(Reading::of_gib(28, 18, 14).wired_gib(4)),
+                    LIMA.need("lab linux exec", true),
+                    &LIMA,
+                    Admit::Wait,
+                    quick(),
+                    &mut |l| said.push(l.to_owned()),
+                    &|| Ok(()),
+                );
+                (answer.map(|a| a.jobs).map_err(|f| (f.code, f.msg)), said)
+            })
+        };
+        let detector = Instant::now() + MUST;
+        while !boot.is_finished() {
+            assert!(
+                Instant::now() < detector,
+                "lima's boot on a 28 GiB Mac with 4 GiB wired still waits after {MUST:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (answer, said) = boot.join().expect("the boot's answer");
+        let (code, why) = answer.expect_err("NOT RUN");
+        let why = why.unwrap_or_default();
+        assert_eq!(code, crate::linux::NOT_RUN, "{why}");
+        assert!(
+            why.contains(
+                "lab linux exec: aterm-linux boot (16 GiB, 8 vCPUs): needs 16 GiB and 8 GiB spare \
+                 beside it, this Mac can never have more than 24 GiB of its 28 GiB of memory \
+                 available (4 GiB of it is wired); the VM can never boot here"
+            ),
+            "{why}"
+        );
+        assert!(said.is_empty(), "nothing waited for: {said:?}");
+        assert!(ledger.list().expect("listed").is_empty(), "nothing entered");
+
+        let mac = Reading {
+            wired: Some(7 << 29),
+            ..Reading::of_gib(48, 27, 14)
+        };
+        let mut said = Vec::new();
+        let admitted = admit_in(
+            &ledger,
+            &Fixed::new(mac),
+            LIMA.need("lab linux exec", true),
+            &LIMA,
+            Admit::Wait,
+            quick(),
+            &mut |l| said.push(l.to_owned()),
+            &|| Ok(()),
+        )
+        .unwrap_or_else(|f| panic!("admitted on this Mac's shape: {:?}", f.msg));
+        assert!(admitted.claim.is_some());
+        assert!(
+            said.iter().all(|l| !l.contains("waits")),
+            "no wait line: {said:?}"
+        );
     }
 
     /// The guest's jobs are the cores the claim was granted: on 14 cores at a 5-minute load of

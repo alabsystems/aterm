@@ -78,7 +78,7 @@ impl Typist {
                 for _ in 0..FRAMES_PER_KEY {
                     *t += FRAME;
                     glow.tick(Some((row, col + k)), *t, c, *g, out);
-                    lit += usize::from(!out.is_empty());
+                    lit += usize::from(glow.out_ramps().laid(out.len()) > 0);
                 }
             });
         }

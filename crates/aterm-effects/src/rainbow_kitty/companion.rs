@@ -254,13 +254,18 @@ where
     }
 
     let mut sky_census = None;
-    if caret_row > 0
-        && ahead.probe != Probe::Blind
-        && (query.held_sky
-            || (ahead.covers_caret
-                && (caret_col.saturating_sub(WRITTEN_REACH)..caret_col)
-                    .any(|c| ink(caret_row, c) == Some(true))))
-    {
+    let mut written_before = false;
+    if caret_row > 0 && ahead.probe != Probe::Blind && !query.held_sky && ahead.covers_caret {
+        let mut c = caret_col.saturating_sub(WRITTEN_REACH);
+        while c < caret_col {
+            if ink(caret_row, c) == Some(true) {
+                written_before = true;
+                break;
+            }
+            c += 1;
+        }
+    }
+    if caret_row > 0 && ahead.probe != Probe::Blind && (query.held_sky || written_before) {
         let sky_row = caret_row - 1;
         let sky = census(rest.x, w, sky_row, caret, cols, cw, &ink);
         if sky.clear() {
@@ -689,11 +694,18 @@ impl KeepOut {
         icons: impl IntoIterator<Item = (i32, i32, i32, i32)>,
         cells: impl IntoIterator<Item = (i32, i32, i32, i32)>,
     ) {
-        let real = |b: &(i32, i32, i32, i32)| b.0 < b.1 && b.2 < b.3;
         self.cells.clear();
-        self.cells.extend(cells.into_iter().filter(real));
+        for b in cells {
+            if b.0 < b.1 && b.2 < b.3 {
+                self.cells.push(b);
+            }
+        }
         self.boxes.clear();
-        self.boxes.extend(icons.into_iter().filter(real));
+        for b in icons {
+            if b.0 < b.1 && b.2 < b.3 {
+                self.boxes.push(b);
+            }
+        }
         self.boxes.extend_from_slice(&self.cells);
     }
 
@@ -715,8 +727,11 @@ impl KeepOut {
         past: i32,
     ) {
         self.rows.clear();
-        self.rows
-            .extend(rows.into_iter().filter(|b| b.0 < b.1 && b.2 < b.3));
+        for b in rows {
+            if b.0 < b.1 && b.2 < b.3 {
+                self.rows.push(b);
+            }
+        }
         self.past = past.max(0);
     }
 

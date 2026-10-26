@@ -72,6 +72,57 @@ void vs_hdr_glow() {
 }
 #endif
 
+// vs_hdr_glow over the bloom's item list, unwidened: cell.glsl's GLOW ITEMS
+// reader (its RGBA8 word texture at the vertex stage's unit 0,
+// BindSpec::CROWN_ITEMS), so the crown reads a ramp whole as the extract does.
+#if defined(ATERM_VERTEX) && defined(ATERM_VS_vs_hdr_glow_items)
+uniform highp sampler2D aterm_t0;
+
+uint glow_item_word(uint j) {
+    uvec4 b = uvec4(roundEven(texelFetch(aterm_t0, ivec2(int(j % 1024u), int(j / 1024u)), 0)
+                              * 255.0));
+    return b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+}
+
+uvec4 glow_item_end(uint e) {
+    return uvec4(uvec3(e >> 16u, e >> 8u, e) & uvec3(255u), e >> 24u);
+}
+
+void vs_hdr_glow_items() {
+    uint i = uint(gl_InstanceID);
+    uint lo = 0u;
+    uint hi = glow_item_word(0u) - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (glow_item_word(4u + mid) <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uint s = i - glow_item_word(4u + lo);
+    uint r = glow_item_word(1u) + 4u * lo;
+    uint xy = glow_item_word(r);
+    uint jj = glow_item_word(r + 2u);
+    uint join = jj & 0xFFFFu;
+    uint joined = jj >> 16u;
+    uint e = glow_item_word(2u) + glow_item_word(r + 3u) + 2u * s;
+    uint e0 = glow_item_word(e);
+    uint e1 = glow_item_word(e + 1u);
+    uvec4 rect_u = (e0 | e1) == 0u
+        ? uvec4(0u)
+        : uvec4(xy & 0xFFFFu, (xy >> 16u) + s + (s > join ? joined : 0u),
+                glow_item_word(r + 1u) & 0xFFFFu, s == join ? joined + 1u : 1u);
+    vec4 rect = vec4(rect_u);
+    vec2 k = hdr_corner(uint(gl_VertexID));
+    vec2 px = rect.xy + k * rect.zw + hu_content_off;
+    gl_Position = vec4(2.0 * px.x / hu_screen.x - 1.0, 1.0 - 2.0 * px.y / hu_screen.y, 0.0, 1.0);
+    v_span = vec2(rect.x + hu_content_off.x, rect.z);
+    v_c0 = glow_item_end(e0);
+    v_c1 = glow_item_end(e1);
+}
+#endif
+
 // The white part of a premultiplied colour is its smallest channel.
 float white_part(vec3 c) {
     return min(min(c.r, c.g), c.b);

@@ -924,6 +924,13 @@ const fn is_block(style: CursorStyle) -> bool {
 }
 
 impl CursorFx {
+    /// A test's read of this tick's whole additive stream: [`Self::glow_scratch`] with its ramps ([`CursorGlow::out_laid`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn glow_laid(&self) -> Vec<GlowQuad> {
+        self.glow.out_laid(&self.glow_scratch)
+    }
+
     /// The per-frame preamble, before the host feeds the glow engine its row probe, print anchor
     /// and delivered inserts.
     #[inline]
@@ -956,6 +963,7 @@ impl CursorFx {
         self.comet.reset();
         self.phaser.reset();
         self.glow_scratch.clear();
+        self.glow.clear_out_ramps();
         self.trail_scratch.clear();
     }
 
@@ -1031,7 +1039,8 @@ impl CursorFx {
         };
         match (rainbow, momentum) {
             (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         }
     }
 
@@ -1066,7 +1075,11 @@ impl CursorFx {
             && glow_cfg.intensity > 0.0
             && f.focused
             && is_block(f.cursor_style);
-        let pinned_base = f.cursor_color_pinned.then_some(f.live_cursor);
+        let pinned_base = if f.cursor_color_pinned {
+            Some(f.live_cursor)
+        } else {
+            None
+        };
         let rainbow_enabled = matches!(glow_cfg.style, GlowStyle::RainbowKitty) && rainbow_block;
         let rainbow_cfg = RainbowConfig {
             enabled: rainbow_enabled,
@@ -1078,7 +1091,11 @@ impl CursorFx {
             } else {
                 None
             },
-            paint: rainbow_enabled.then(|| self.glow.caret_paint(now)),
+            paint: if rainbow_enabled {
+                Some(self.glow.caret_paint(now))
+            } else {
+                None
+            },
             ground: Some(f.default_bg & 0x00FF_FFFF),
             flare_at: if rainbow_enabled {
                 self.glow.caret_flare_at()
@@ -1396,7 +1413,11 @@ impl CursorFx {
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0
             && matches!(glow_cfg.style, GlowStyle::Laser);
-        let bolt_fill = bolt_cursor.then(|| bolt_body(glow_cfg.color, blaze, dark));
+        let bolt_fill = if bolt_cursor {
+            Some(bolt_body(glow_cfg.color, blaze, dark))
+        } else {
+            None
+        };
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
         if trail_cfg.enabled {
             crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
@@ -1422,7 +1443,16 @@ impl CursorFx {
             trail_cfg.color,
             f.shed_envelope * bed_brightness * legible,
         );
-        let candidate = resolve_block_fill(
+        let momentum_fill = match (momentum_frame.fill, sparkle_paper_gold) {
+            // The gold caret keeps the page bar, deepened in its hue.
+            (Some(fill), Some(_)) => Some(crate::color_math::floor_contrast_keeping_hue(
+                fill,
+                f.cursor_cell_bg.unwrap_or(f.default_bg) & 0x00FF_FFFF,
+                CARET_PAGE_MIN_CONTRAST + SPARKLE_PAPER_CARET_GUARD,
+            )),
+            (fill, _) => fill,
+        };
+        let block_fill = if let Some(owned) = resolve_block_fill(
             BlockFillSplice {
                 rainbow: rainbow_frame.fill,
                 forge: forge_fill,
@@ -1430,24 +1460,15 @@ impl CursorFx {
                 bolt: bolt_fill,
                 comet: comet_frame.fill,
                 droplet: droplet_frame.fill,
-                momentum: momentum_frame.fill.map(|fill| match sparkle_paper_gold {
-                    // The gold caret keeps the page bar, deepened in its hue.
-                    Some(_) => crate::color_math::floor_contrast_keeping_hue(
-                        fill,
-                        f.cursor_cell_bg.unwrap_or(f.default_bg) & 0x00FF_FFFF,
-                        CARET_PAGE_MIN_CONTRAST + SPARKLE_PAPER_CARET_GUARD,
-                    ),
-                    None => fill,
-                }),
+                momentum: momentum_fill,
                 beamrod: beamrod_frame.fill,
             },
             f.live_cursor,
             glow_cfg.color,
             f.cursor_color_pinned,
-        )
-        .map(|owned| {
+        ) {
             let ground = f.cursor_cell_bg.unwrap_or(f.default_bg);
-            match self.floor_fill_memo {
+            let floored = match self.floor_fill_memo {
                 Some(memo)
                     if memo.candidate == owned
                         && memo.ground == ground
@@ -1467,9 +1488,11 @@ impl CursorFx {
                     });
                     floored
                 }
-            }
-        });
-        let block_fill = project_block_fill(candidate, f.live_cursor, f.shed_envelope);
+            };
+            project_block_fill(Some(floored), f.live_cursor, f.shed_envelope)
+        } else {
+            None
+        };
         let glow_fp = match block_fill {
             Some(owned) => glow_fp
                 .wrapping_mul(1_000_003)

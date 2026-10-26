@@ -2080,19 +2080,8 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     let mut if_gen: Option<crate::control::ScreenGen> = None;
     let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
     let mut cause_opt: Option<crate::session_log::CauseRef> = None;
-    let mut text = rest.trim_start();
-    loop {
-        let (tok, tail) = match text.split_once(char::is_whitespace) {
-            Some((t, rest)) => (t, rest.trim_start()),
-            None => (text, ""),
-        };
-        if tok == "--" {
-            text = tail;
-            break;
-        }
-        let Some((k, v)) = tok.split_once('=') else {
-            break;
-        };
+    let (options, text) = aterm_types::control_verbs::turn_option_words(rest);
+    for (k, v) in options {
         match k {
             "idle" => match v.parse::<u64>() {
                 Ok(ms) => idle_ms = ms.clamp(1, 600_000),
@@ -2176,9 +2165,8 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
                 Some(c) if cause_opt.is_none() => cause_opt = Some(c),
                 _ => return Err(crate::session_log::CAUSE_USAGE.to_string()),
             },
-            _ => break,
+            _ => return Err(USAGE.to_string()),
         }
-        text = tail;
     }
     let timeout_ms = timeout_ms.min(600_000);
     if text.trim().is_empty() && submit != "none" {

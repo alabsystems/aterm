@@ -359,8 +359,10 @@ trait Driver {
     fn apply(&mut self, action: Action, now: Instant, caret: &mut (u16, u16));
     fn tick(&mut self, now: Instant, caret: (u16, u16)) -> Wrote;
     fn idle_probe(&self, now: Instant) -> IdleProbe;
-    /// The streams the last tick wrote: `(under, out, halos)`.
-    fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]);
+    /// The streams the last tick wrote, `(under, out, halos)`, each lit ramp
+    /// row the quad it stands for: read after the timed, allocation-counted
+    /// tick, which lays the ramps as a shipped build does.
+    fn streams(&mut self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]);
     /// Rows handed to the content witness over this driver's life.
     fn witness_feeds(&self) -> u64 {
         0
@@ -411,6 +413,10 @@ struct V2 {
     blank: Vec<bool>,
     under: Vec<GlowQuad>,
     out: Vec<GlowQuad>,
+    under_ramps: aterm_render::GlowRamps,
+    out_ramps: aterm_render::GlowRamps,
+    /// The streams as quads ([`Driver::streams`]).
+    laid: [Vec<GlowQuad>; 2],
     halos: Vec<RainHalo>,
     beams: Vec<BeamVertex>,
     cues: Vec<SoundCue>,
@@ -432,6 +438,9 @@ impl V2 {
             blank,
             under: Vec::with_capacity(MAX_QUADS),
             out: Vec::with_capacity(MAX_QUADS),
+            under_ramps: aterm_render::GlowRamps::default(),
+            out_ramps: aterm_render::GlowRamps::default(),
+            laid: [Vec::with_capacity(MAX_QUADS), Vec::with_capacity(MAX_QUADS)],
             halos: Vec::with_capacity(MAX_HALOS),
             beams: Vec::with_capacity(HOST_BEAM_SCRATCH),
             cues: Vec::with_capacity(HOST_CUE_SCRATCH),
@@ -508,24 +517,30 @@ impl Driver for V2 {
     fn tick(&mut self, now: Instant, _caret: (u16, u16)) -> Wrote {
         self.under.clear();
         self.out.clear();
+        self.under_ramps.clear();
+        self.out_ramps.clear();
         self.halos.clear();
         self.cues.clear();
         let mut fr = Frame {
             under: &mut self.under,
             out: &mut self.out,
+            under_ramps: &mut self.under_ramps,
+            out_ramps: &mut self.out_ramps,
             halos: &mut self.halos,
             beams: &mut self.beams,
             cues: &mut self.cues,
             caret: CaretSeam::default(),
             companion: None,
             fp: 0,
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            rows_cost: None,
         };
         self.eng.tick(now, self.geom, &self.cfg, &mut fr);
         let fp = fr.fp;
         let _ = self.eng.take_companion_impulse();
         Wrote {
-            under: self.under.len(),
-            out: self.out.len(),
+            under: self.under_ramps.laid(self.under.len()),
+            out: self.out_ramps.laid(self.out.len()),
             halos: self.halos.len(),
             fp,
         }
@@ -543,8 +558,13 @@ impl Driver for V2 {
         }
     }
 
-    fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]) {
-        (&self.under, &self.out, &self.halos)
+    fn streams(&mut self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]) {
+        let [under, out] = &mut self.laid;
+        under.clear();
+        out.clear();
+        self.under_ramps.expand_into(&self.under, under);
+        self.out_ramps.expand_into(&self.out, out);
+        (under, out, &self.halos)
     }
 }
 
@@ -554,6 +574,8 @@ struct Host {
     cfg: GlowConfig,
     geom: Geom,
     quads: Vec<GlowQuad>,
+    /// The streams as quads ([`Driver::streams`]).
+    laid: [Vec<GlowQuad>; 2],
     last_fp: u64,
     /// The content witness's row as the frame hold hands it over, fed before
     /// each tick.
@@ -575,6 +597,7 @@ impl Host {
             cfg: glow_config(),
             geom: geometry(),
             quads: Vec::with_capacity(MAX_QUADS),
+            laid: [Vec::with_capacity(MAX_QUADS), Vec::with_capacity(MAX_QUADS)],
             last_fp: 0,
             witness_row: vec!['x'; geometry().cols],
             witness_feeds: 0,
@@ -638,8 +661,8 @@ impl Driver for Host {
             .tick(Some(caret), now, &self.cfg, self.geom, &mut self.quads);
         self.last_fp = fp;
         Wrote {
-            under: self.glow.under_quads().len(),
-            out: self.quads.len(),
+            under: self.glow.under_ramps().laid(self.glow.under_quads().len()),
+            out: self.glow.out_ramps().laid(self.quads.len()),
             halos: self.glow.halos().len(),
             fp,
         }
@@ -657,8 +680,14 @@ impl Driver for Host {
         }
     }
 
-    fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]) {
-        (self.glow.under_quads(), &self.quads, self.glow.halos())
+    fn streams(&mut self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]) {
+        let [under, out] = &mut self.laid;
+        under.clear();
+        out.clear();
+        let glow = &self.glow;
+        glow.under_ramps().expand_into(glow.under_quads(), under);
+        glow.out_ramps().expand_into(&self.quads, out);
+        (under, out, glow.halos())
     }
 
     fn witness_feeds(&self) -> u64 {

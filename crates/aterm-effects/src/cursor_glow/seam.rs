@@ -336,12 +336,21 @@ impl CursorGlow {
             let Some(col) = key.col.checked_add(i as u16) else {
                 return 0;
             };
+            let col_idx = usize::from(col);
+            let prev_ch = match self.row_prev.get(col_idx) {
+                Some(&c) => c,
+                None => ' ',
+            };
+            let cur_ch = match self.row_cur.get(col_idx) {
+                Some(&c) => c,
+                None => ' ',
+            };
             if next.row != key.row
                 || next.col != col
                 || matches!(next.glyph, ' ' | '\0')
                 || !matches!(self.print_anchor, Some((_, _, seq)) if seq > next.print_seq)
-                || self.row_prev.get(usize::from(col)).copied().unwrap_or(' ') != ' '
-                || self.row_cur.get(usize::from(col)).copied().unwrap_or(' ') != next.glyph
+                || prev_ch != ' '
+                || cur_ch != next.glyph
             {
                 return 0;
             }
@@ -913,7 +922,10 @@ impl CursorGlow {
         } else {
             return None;
         };
-        Some(cols.get(usize::from(col)).copied().unwrap_or(' '))
+        Some(match cols.get(usize::from(col)) {
+            Some(&c) => c,
+            None => ' ',
+        })
     }
 
     /// A new glyph immediately before the observed caret, backed by the oldest eligible one-cell press and a resident hand-owned cell.
@@ -935,8 +947,14 @@ impl CursorGlow {
             return None;
         }
         let glyph_col = usize::from(col - 1);
-        let old = self.row_prev.get(glyph_col).copied().unwrap_or(' ');
-        let new = self.row_cur.get(glyph_col).copied().unwrap_or(' ');
+        let old = match self.row_prev.get(glyph_col) {
+            Some(&c) => c,
+            None => ' ',
+        };
+        let new = match self.row_cur.get(glyph_col) {
+            Some(&c) => c,
+            None => ' ',
+        };
         if old != ' ' || matches!(new, ' ' | '\0') {
             return None;
         }
@@ -1004,11 +1022,19 @@ impl CursorGlow {
         let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
         let mut changed = false;
         for (i, col) in (mid..cc).enumerate() {
-            let new = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+            let idx = usize::from(col);
+            let new = match self.row_cur.get(idx) {
+                Some(&c) => c,
+                None => ' ',
+            };
             if new == '\0' {
                 return None;
             }
-            changed |= prev.get(usize::from(col)).copied().unwrap_or(' ') != new;
+            let old = match prev.get(idx) {
+                Some(&c) => c,
+                None => ' ',
+            };
+            changed |= old != new;
             glyphs[i] = new;
         }
         if !changed {
@@ -1142,12 +1168,7 @@ impl CursorGlow {
             || prev_meta.row != row
             || prev_meta.caret != col
             || prev_meta.at > now
-            || self
-                .row_prev
-                .get(usize::from(col - 1))
-                .copied()
-                .unwrap_or(' ')
-                != ' '
+            || matches!(self.row_prev.get(usize::from(col - 1)), Some(&c) if c != ' ')
         {
             return None;
         }
@@ -1259,7 +1280,10 @@ impl CursorGlow {
         }
         let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
         for (i, col) in (landing_start..cc).enumerate() {
-            let glyph = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+            let glyph = match self.row_cur.get(usize::from(col)) {
+                Some(&c) => c,
+                None => ' ',
+            };
             if glyph == '\0' {
                 return None;
             }
@@ -1343,7 +1367,10 @@ impl CursorGlow {
         if !matches!(self.row_cur_meta, Some(m) if m.row == row && m.at == now) {
             return;
         }
-        let glyph = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+        let glyph = match self.row_cur.get(usize::from(col)) {
+            Some(&c) => c,
+            None => ' ',
+        };
         if matches!(glyph, ' ' | '\0') {
             return;
         }
@@ -1720,7 +1747,8 @@ impl CursorGlow {
             || (p.landing_row == p.row
                 && p.origin > p.landing
                 && p.origin - p.landing >= rk::ribbon::RE_ANCHOR_MIN_CELLS);
-        self.v2.set_flush_clock(reanchor.then_some(p.at));
+        self.v2
+            .set_flush_clock(if reanchor { Some(p.at) } else { None });
         let licensed = self.judging_on_rows(p.row, p.landing_row, |glow| {
             glow.with_presses_banked_through(p.at, |glow| {
                 glow.spawn_judged(
@@ -1955,7 +1983,12 @@ impl CursorGlow {
         let Some(sample) = sample else {
             return false;
         };
-        let old_end = u16::try_from(self.ink_end_in_pane(&self.row_prev)).unwrap_or(u16::MAX);
+        let old_end_usize = self.ink_end_in_pane(&self.row_prev);
+        let old_end = if old_end_usize <= u16::MAX as usize {
+            old_end_usize as u16
+        } else {
+            u16::MAX
+        };
         let Some(old_tail) = self.row_prev.get(usize::from(col)..usize::from(old_end)) else {
             return false;
         };
@@ -2077,9 +2110,11 @@ impl CursorGlow {
                 let mut ok = true;
                 let mut col = run.col0;
                 while col < col0 {
-                    if self.row_cur.get(usize::from(col)).copied().unwrap_or(' ')
-                        != run.glyphs[usize::from(col - run.col0)]
-                    {
+                    let ch = match self.row_cur.get(usize::from(col)) {
+                        Some(&c) => c,
+                        None => ' ',
+                    };
+                    if ch != run.glyphs[usize::from(col - run.col0)] {
                         ok = false;
                         break;
                     }
@@ -2258,10 +2293,11 @@ impl CursorGlow {
             now,
             ..
         } = *mv;
+        let typed_born = mv.typed_at.unwrap_or(now);
         if let Some(run) = mv.exact_typed_run
             && licence == rk::Licence::Typed
         {
-            let born = Self::sweep_born(mv.typed_at.unwrap_or(now), now);
+            let born = Self::sweep_born(typed_born, now);
             if run.source.is_some() || run.rewrap_start.is_some() {
                 self.recent_typed_run = None;
             }
@@ -2270,9 +2306,19 @@ impl CursorGlow {
             }
             self.hand_v2_typed_sweep(cr, run.landing_start, cc, born, now);
             if let Some((start, width)) = run.rewrap_start {
-                let space = (run.landing_start..cc)
-                    .rev()
-                    .find(|&col| self.row_cur.get(usize::from(col)).copied().unwrap_or(' ') == ' ');
+                let mut space = None;
+                let mut col = cc;
+                while col > run.landing_start {
+                    col -= 1;
+                    let ch = match self.row_cur.get(usize::from(col)) {
+                        Some(&c) => c,
+                        None => ' ',
+                    };
+                    if ch == ' ' {
+                        space = Some(col);
+                        break;
+                    }
+                }
                 self.v2
                     .prove_typed_rewrap((pr, pc), (cr, cc), start, width, space);
             }
@@ -2283,7 +2329,7 @@ impl CursorGlow {
             && (mv.rainbow_coalesce || !mv.re_anchor)
         {
             if licence == rk::Licence::Typed {
-                self.hand_v2_typed_sweep(cr, pc, cc, mv.typed_at.unwrap_or(now), now);
+                self.hand_v2_typed_sweep(cr, pc, cc, typed_born, now);
             } else {
                 self.recent_typed_run = None;
                 self.v2.on_event(
@@ -2292,7 +2338,7 @@ impl CursorGlow {
                         col0: pc,
                         col1: cc,
                     },
-                    mv.typed_at.unwrap_or(now),
+                    typed_born,
                 );
             }
         } else if licence == rk::Licence::Typed
@@ -2320,10 +2366,14 @@ impl CursorGlow {
                     col0: pc,
                     col1: pc + 1,
                 },
-                Self::sweep_born(mv.typed_at.unwrap_or(now), now),
+                Self::sweep_born(typed_born, now),
             );
         }
-        let landing_col0 = u16::try_from(mv.pane_col0).unwrap_or(u16::MAX);
+        let landing_col0 = if mv.pane_col0 <= u16::MAX as usize {
+            mv.pane_col0 as u16
+        } else {
+            u16::MAX
+        };
         if mv.re_anchor_lays_landing
             && !soft_wrap_paid
             && mv.lift.is_none()
@@ -2336,7 +2386,7 @@ impl CursorGlow {
                 }
             )
         {
-            let born = Self::sweep_born(mv.typed_at.unwrap_or(now), now);
+            let born = Self::sweep_born(typed_born, now);
             self.v2.on_event(
                 rk::Event::Sweep {
                     row: cr,
@@ -2357,11 +2407,19 @@ impl CursorGlow {
             }
         }
         if mv.typing && mv.shape_wrap && mv.fold_laid > 0 && !soft_wrap_paid {
-            let born = Self::sweep_born(mv.typed_at.unwrap_or(now), now);
-            let pane_col0 = u16::try_from(mv.pane_col0).unwrap_or(u16::MAX);
-            let pane_col1 =
-                u16::try_from(mv.pane_col0.saturating_add(mv.pane_cols)).unwrap_or(u16::MAX);
-            let laid = u16::try_from(mv.fold_laid).unwrap_or(u16::MAX);
+            let born = Self::sweep_born(typed_born, now);
+            let pane_col0 = landing_col0;
+            let pane_col1_usize = mv.pane_col0.saturating_add(mv.pane_cols);
+            let pane_col1 = if pane_col1_usize <= u16::MAX as usize {
+                pane_col1_usize as u16
+            } else {
+                u16::MAX
+            };
+            let laid = if mv.fold_laid <= u16::MAX as usize {
+                mv.fold_laid as u16
+            } else {
+                u16::MAX
+            };
             let landing = laid.min(cc.saturating_sub(pane_col0));
             let origin = (laid - landing).min(pane_col1.saturating_sub(pane_col0));
             if origin > 0 {
@@ -2547,7 +2605,11 @@ impl CursorGlow {
         self.last_licensed_row = Some((cr, now));
         self.insert.pending_hop = None;
         let unpaid_before = self.typed_credits_within(now) >= 1;
-        let exact_credits = exact_run.map(|_| self.type_press_ring);
+        let exact_credits = if exact_run.is_some() {
+            Some(self.type_press_ring)
+        } else {
+            None
+        };
         let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, lane, call, exact_run);
         let parked_redisplay = self.v2.engaged()
             && lane == SpawnLane::Visible
@@ -2606,7 +2668,10 @@ impl CursorGlow {
             gesture_taken,
         );
         let spare = match licence {
-            rk::Licence::Return => return_taken.or(newline_taken),
+            rk::Licence::Return => match return_taken {
+                Some(t) => Some(t),
+                None => newline_taken,
+            },
             rk::Licence::Nav => mv.nav_taken,
             rk::Licence::Typed => kill_retreat_at,
             _ => None,
@@ -2646,7 +2711,7 @@ impl CursorGlow {
                     moved_at: now,
                     hand_before,
                     unowned_before,
-                    anchor_seq: self.print_anchor.map(|(_, _, seq)| seq),
+                    anchor_seq: self.print_anchor_seq(),
                     printed_off_row: false,
                 });
             }
@@ -2780,7 +2845,7 @@ impl CursorGlow {
         let mut typed_at = fresh_stamp;
         let mut in_flight_licence = false;
         if let Some(run) = exact_typed_run {
-            typed_at = self.type_press_ring.slots[run.slot].map(|(at, _, _)| at);
+            typed_at = self.type_press_ring.slot_at(run.slot);
             in_flight_licence = fresh_stamp.is_none();
         } else if typed_at.is_none() && self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg, geom) {
             typed_at = self.type_press_ring.oldest_unpaid(now);
@@ -2793,7 +2858,10 @@ impl CursorGlow {
             None
         };
         let shape_wrap = tight_fold.is_some() || coalesced_fold.is_some();
-        let fold_cells = tight_fold.or(coalesced_fold);
+        let fold_cells = match tight_fold {
+            Some(n) => Some(n),
+            None => coalesced_fold,
+        };
         let typed_pair = typed_at.is_some();
         let owed_retreat = matches!(erase_hop, Some(EraseHop::Retreat(_)));
         let bs_pair = hint_fresh_dur(self.quench_hint, now, QUENCH_HINT_FRESH_DUR) || owed_retreat;
@@ -2842,7 +2910,10 @@ impl CursorGlow {
                 None => false,
             };
         let typed_at = if older_batch {
-            self.type_press_ring.oldest_unpaid(now).or(typed_at)
+            match self.type_press_ring.oldest_unpaid(now) {
+                Some(t) => Some(t),
+                None => typed_at,
+            }
         } else {
             typed_at
         };
@@ -2864,10 +2935,10 @@ impl CursorGlow {
         } else {
             None
         };
-        let laid_cell_end = match (soft_wrap, lift) {
-            (_, Some(_)) => None,
-            (Some(_), None) => pc.checked_add(1).map(|end| (pr, end)),
-            (None, None) => Some((cr, cc)),
+        let laid_cell_end = match (soft_wrap, lift, pc.checked_add(1)) {
+            (_, Some(_), _) | (Some(_), None, None) => None,
+            (Some(_), None, Some(end)) => Some((pr, end)),
+            (None, None, _) => Some((cr, cc)),
         };
         let witness = match call {
             SpawnCall::Live => match laid_cell_end {

@@ -4,7 +4,7 @@
 //! Dark-ground cursor-glow bed and leading rail laid beneath glyph ink.
 
 use super::*;
-use aterm_render::{GlowBlend, RibbonVertex, ribbon_beam};
+use aterm_render::{BeamRows, GlowBlend, RampSink, RibbonVertex, ribbon_beam_into};
 
 /// The contrast the theme's ink keeps over the bed alone.
 pub(super) const DARK_BED_BAR: f32 = 4.8;
@@ -669,9 +669,10 @@ pub(crate) fn air_lit(
         return;
     }
     let mut before = true;
-    for i in 0..out.len() {
+    let len = out.len();
+    for i in 0..len {
         let own = out[i];
-        let after = out.get(i + 1).copied().unwrap_or(true);
+        let after = if i + 1 < len { out[i + 1] } else { true };
         out[i] = own && before && after;
         before = own;
     }
@@ -711,14 +712,14 @@ pub(crate) fn lay_dark_bed(
     text: &TextView<'_>,
     scratch: &mut BedScratch,
     ledger: &mut InkLedger,
-    under: &mut Vec<GlowQuad>,
+    under: &mut RampSink<'_>,
 ) {
     let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
     let (inv_cw, inv_ch) = (1.0 / cwf, 1.0 / chf);
     let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
     let clip = geom.beam_clip();
     let stride = (geom.cw / 8).max(1);
-    let quad_budget = under.len().saturating_add(CursorGlow::MAX_QUADS);
+    let quad_budget = under.laid().saturating_add(CursorGlow::MAX_QUADS);
     let dy = chf * DARK_BED_DY;
     let BedScratch {
         inks,
@@ -747,7 +748,10 @@ pub(crate) fn lay_dark_bed(
         if run.is_empty() {
             continue;
         }
-        let wedge_cells = wedges.get(index).copied().unwrap_or(shape.wedge);
+        let wedge_cells = match wedges.get(index) {
+            Some(&w) => w,
+            None => shape.wedge,
+        };
         let ink = &inks[at..at + run.len()];
         let rail = rails.get(at..at + run.len());
         at += run.len();
@@ -866,7 +870,7 @@ pub(crate) fn lay_dark_bed(
                 feather_over(verts, &|x, k| vertex(x, &last, ink[ink.len() - 1], k));
             }
             if shape.dim > 0.0 {
-                ribbon_beam(
+                ribbon_beam_into(
                     under,
                     clip,
                     verts,
@@ -919,8 +923,8 @@ pub(crate) fn lay_dark_bed(
                         rail_vertex(x, &last, rail[rail.len() - 1], k)
                     });
                 }
-                let from = under.len();
-                ribbon_beam(
+                let from = under.mark();
+                ribbon_beam_into(
                     under,
                     clip,
                     verts,
@@ -930,7 +934,7 @@ pub(crate) fn lay_dark_bed(
                     GlowBlend::Over,
                 );
                 if rail_up <= 0.0 && rail_drop >= crate::cursor_glow::LETTER_GUARD_RING as f32 {
-                    ledger.note_rail(from, under.len());
+                    ledger.note_rail_laid(from, under.mark());
                 }
             }
         } else {
@@ -1024,7 +1028,7 @@ pub(crate) fn lay_dark_bed(
                     for k in 0..LEAP_LAYERS {
                         let shrink = 1.0 - k as f32 * (1.0 / LEAP_LAYERS as f32);
                         comet_beam_over(
-                            under,
+                            &mut *under,
                             clip,
                             tube,
                             2.0 * reach * LEAP_SPREAD * shrink,
@@ -1036,7 +1040,7 @@ pub(crate) fn lay_dark_bed(
             }
         }
     }
-    under.truncate(quad_budget);
+    under.keep_laid(quad_budget);
 }
 
 /// How many cells back a jump's wedge reaches from its `head` on its row, and which way it
@@ -1126,7 +1130,13 @@ fn wedge_runs(
             Some(v) => v.as_slice(),
             None => &[],
         };
-        let typed = |i: usize| !shape.leap_path || kinds.get(i).copied().unwrap_or(true);
+        let typed = |i: usize| {
+            !shape.leap_path
+                || match kinds.get(i) {
+                    Some(&k) => k,
+                    None => true,
+                }
+        };
         let mut start = 0;
         while start < run.len() {
             let kind = typed(start);
@@ -1178,66 +1188,135 @@ fn wedge_runs(
 }
 
 /// Clip the quads `out[from..]` to `(x0, y0, x1, y1)`, dropping any wholly outside.
-pub(crate) fn clip_quads_to(
-    out: &mut Vec<GlowQuad>,
-    from: usize,
-    (x0, y0, x1, y1): (i32, i32, i32, i32),
-) {
+pub(crate) fn clip_quads_to(out: &mut Vec<GlowQuad>, from: usize, rect: (i32, i32, i32, i32)) {
     let mut kept = from;
     for i in from..out.len() {
-        let q = out[i];
-        let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
-        let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
-        let (cx0, cx1) = (qx0.max(x0), qx1.min(x1));
-        let (cy0, cy1) = (qy0.max(y0), qy1.min(y1));
-        if cx0 >= cx1 || cy0 >= cy1 {
-            continue;
+        if let Some(c) = clip_quad(out[i], rect) {
+            out[kept] = c;
+            kept += 1;
         }
-        let mut c = q;
-        c.x = cx0 as u16;
-        c.y = cy0 as u16;
-        c.w = (cx1 - cx0) as u16;
-        c.h = (cy1 - cy0) as u16;
-        if cx0 != qx0 || cx1 != qx1 {
-            let inv_w = 1.0 / f32::from(q.w.max(1));
-            if q.color != q.color2 {
-                if cx0 != qx0 {
-                    c.color =
-                        crate::effect_util::lerp_rgb(q.color, q.color2, (cx0 - qx0) as f32 * inv_w);
-                }
-                if cx1 != qx1 {
-                    c.color2 =
-                        crate::effect_util::lerp_rgb(q.color, q.color2, (cx1 - qx0) as f32 * inv_w);
-                }
-            }
-            if q.alpha != 0 {
-                if q.alpha == q.alpha2 {
-                    c.alpha = q.alpha.max(1);
-                    c.alpha2 = q.alpha2.max(1);
-                } else {
-                    let lerp_a = |a: u8, b: u8, x: i32| {
-                        let t = (x - qx0) as f32 * inv_w;
-                        (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
-                    };
-                    c.alpha = if cx0 != qx0 {
-                        lerp_a(q.alpha, q.alpha2, cx0)
-                    } else {
-                        q.alpha
-                    }
-                    .max(1);
-                    c.alpha2 = if cx1 != qx1 {
-                        lerp_a(q.alpha, q.alpha2, cx1)
-                    } else {
-                        q.alpha2
-                    }
-                    .max(1);
-                }
-            }
-        }
-        out[kept] = c;
-        kept += 1;
     }
     out.truncate(kept);
+}
+
+/// [`clip_quads_to`] over a stream's lights laid since `from` (its
+/// [`BeamRows::mark`] then), its ramps with them: each ramp row is clipped
+/// as the quad it stands for (a run's rows as its one quad), and a light
+/// the clip leaves dark keeps its count as a dark quad at the stream's end,
+/// as the legacy quad stays.
+pub(crate) fn clip_stream_to(
+    out: &mut RampSink<'_>,
+    from: (usize, aterm_render::RampMark),
+    rect: (i32, i32, i32, i32),
+) {
+    let (x0, y0, x1, y1) = rect;
+    let mut darkened = 0usize;
+    let (quads, ramps) = out.stream();
+    if ramps.items.len() <= from.1.items() {
+        // Quads alone since `from`: the legacy clip.
+        clip_quads_to(quads, from.0, rect);
+        return;
+    }
+    ramps.retain_since(
+        quads,
+        from,
+        |q| match clip_quad(*q, rect) {
+            Some(c) => {
+                *q = c;
+                true
+            }
+            None => false,
+        },
+        |r, ends| {
+            let (rx0, ry0) = (i32::from(r.x), i32::from(r.y));
+            let (rx1, ry1) = (rx0 + i32::from(r.w), ry0 + i32::from(r.h));
+            let (cx0, cx1) = (rx0.max(x0), rx1.min(x1));
+            let (cy0, cy1) = (ry0.max(y0), ry1.min(y1));
+            if cx0 >= cx1 || cy0 >= cy1 {
+                return false;
+            }
+            r.keep_rows((cy0 - ry0) as u16, (cy1 - cy0) as u16);
+            if (cx0, cx1) != (rx0, rx1) {
+                for k in 0..r.h {
+                    if r.continues(k) {
+                        continue;
+                    }
+                    let e = r.ink as usize + 2 * usize::from(r.end_row(k));
+                    let Some(q) = r.row_quad(ends, k) else {
+                        continue;
+                    };
+                    let c = clip_quad(q, rect).expect("a row inside the clip keeps a quad");
+                    ends[e] = aterm_render::glow_end(c.color, c.alpha);
+                    ends[e + 1] = aterm_render::glow_end(c.color2, c.alpha2);
+                    darkened += usize::from(ends[e] | ends[e + 1] == 0);
+                }
+            }
+            (r.x, r.w) = (cx0 as u16, (cx1 - cx0) as u16);
+            true
+        },
+    );
+    for _ in 0..darkened {
+        out.quads().push(GlowQuad::default());
+    }
+}
+
+/// One quad of [`clip_quads_to`]: `q` within `(x0, y0, x1, y1)`, its ends
+/// re-ramped at a horizontal cut; `None` wholly outside.
+#[inline]
+const fn clip_quad(q: GlowQuad, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> Option<GlowQuad> {
+    #[inline]
+    const fn lerp_a(a: u8, b: u8, x: i32, qx0: i32, inv_w: f32) -> u8 {
+        let t = (x - qx0) as f32 * inv_w;
+        (a as f32 + (b as f32 - a as f32) * t).round() as u8
+    }
+    let (qx0, qy0) = (q.x as i32, q.y as i32);
+    let (qx1, qy1) = (qx0 + q.w as i32, qy0 + q.h as i32);
+    let cx0 = if qx0 > x0 { qx0 } else { x0 };
+    let cx1 = if qx1 < x1 { qx1 } else { x1 };
+    let cy0 = if qy0 > y0 { qy0 } else { y0 };
+    let cy1 = if qy1 < y1 { qy1 } else { y1 };
+    if cx0 >= cx1 || cy0 >= cy1 {
+        return None;
+    }
+    let mut c = q;
+    c.x = cx0 as u16;
+    c.y = cy0 as u16;
+    c.w = (cx1 - cx0) as u16;
+    c.h = (cy1 - cy0) as u16;
+    if cx0 != qx0 || cx1 != qx1 {
+        let w = if q.w > 1 { q.w } else { 1 };
+        let inv_w = 1.0 / w as f32;
+        if q.color != q.color2 {
+            if cx0 != qx0 {
+                c.color =
+                    crate::effect_util::lerp_rgb(q.color, q.color2, (cx0 - qx0) as f32 * inv_w);
+            }
+            if cx1 != qx1 {
+                c.color2 =
+                    crate::effect_util::lerp_rgb(q.color, q.color2, (cx1 - qx0) as f32 * inv_w);
+            }
+        }
+        if q.alpha != 0 {
+            if q.alpha == q.alpha2 {
+                c.alpha = if q.alpha > 1 { q.alpha } else { 1 };
+                c.alpha2 = if q.alpha2 > 1 { q.alpha2 } else { 1 };
+            } else {
+                let a0 = if cx0 != qx0 {
+                    lerp_a(q.alpha, q.alpha2, cx0, qx0, inv_w)
+                } else {
+                    q.alpha
+                };
+                let a1 = if cx1 != qx1 {
+                    lerp_a(q.alpha, q.alpha2, cx1, qx0, inv_w)
+                } else {
+                    q.alpha2
+                };
+                c.alpha = if a0 > 1 { a0 } else { 1 };
+                c.alpha2 = if a1 > 1 { a1 } else { 1 };
+            }
+        }
+    }
+    Some(c)
 }
 
 /// Split swept `runs` into the air segments drawn by the dark beam.
@@ -1287,7 +1366,10 @@ pub(crate) fn split_air_runs(
             None => None,
         };
         let lit = |i: usize| match row_kinds {
-            Some(kinds) => kinds.get(i).copied().unwrap_or(true),
+            Some(kinds) => match kinds.get(i) {
+                Some(&k) => k,
+                None => true,
+            },
             None => true,
         };
         let is_air = |i: usize| lit(i) && ((head && i + 1 == run.len()) || !over_text(&run[i]));
@@ -1394,7 +1476,16 @@ pub(crate) fn bridge_word_gaps(
             let Some(b) = right else {
                 continue;
             };
-            let on = |c: i32| run.iter().position(|q| cell_of(q) == (row, c));
+            let on = |c: i32| {
+                let mut qi = 0;
+                while qi < run.len() {
+                    if cell_of(&run[qi]) == (row, c) {
+                        return Some(qi);
+                    }
+                    qi += 1;
+                }
+                None
+            };
             let (Some(ja), Some(jb)) = (on(a), on(b)) else {
                 continue;
             };
@@ -1449,7 +1540,7 @@ impl CursorGlow {
         shape: BedShape,
         color: &dyn Fn(&CursorGlow, f32) -> u32,
         caret: Option<(u16, u16)>,
-        under: &mut Vec<GlowQuad>,
+        under: &mut RampSink<'_>,
     ) {
         let (ink, page) = Self::bed_pair(cfg);
         let budget = dim_budget(dark_bed_budget(ink), page, shape.dim);
@@ -1482,7 +1573,11 @@ impl CursorGlow {
         } else {
             shape
         };
-        let air = AirLight::of(page, budget, shape).filter(|_| !self.bed_air_off());
+        let air = if self.bed_air_off() {
+            None
+        } else {
+            AirLight::of(page, budget, shape)
+        };
         let lit_page = page_lit(page, dark_bed_budget(ink)) && !self.bed_air_off();
         let shape = if lit_page { shape.on_lit_page() } else { shape };
         scratch.rail_drop = if lit_page {
@@ -1579,7 +1674,7 @@ impl CursorGlow {
     }
 
     /// [`dark_bed_ink`] ([`Self::bed_unsolved`]).
-    fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
+    const fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
         if self.bed_unsolved() {
             let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
             let r = (rgb >> 16) & 0xff;
@@ -1663,7 +1758,11 @@ impl CursorGlow {
         typed_only: bool,
     ) -> usize {
         let text = TextView::new(self.probed_text_spans(), Some(&self.frame_text));
-        let typed = typed_only.then(|| &self.comet_typing[..runs_len.min(self.comet_typing.len())]);
+        let typed = if typed_only {
+            Some(&self.comet_typing[..runs_len.min(self.comet_typing.len())])
+        } else {
+            None
+        };
         split_air_runs(
             &self.comet_runs[..runs_len],
             geom,

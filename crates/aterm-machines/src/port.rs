@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod complete_input;
+mod create_new;
 mod github_api;
 pub(crate) mod github_rest;
 mod read_owned_file;
@@ -558,6 +559,9 @@ pub trait System: Sync {
     fn now(&self) -> u64;
 
     /// Exclusively create `path` with `bytes` and `mode`, failing if anything already exists.
+    /// Live prepares and orders an owned sibling file before absent-only publication. After a
+    /// successful publication, private staging cleanup is best effort and cannot turn success
+    /// into an error; process death can leave that private staging behind.
     fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         let _ = (path, bytes, mode);
         Err(io::Error::from(io::ErrorKind::Unsupported))
@@ -648,7 +652,16 @@ pub trait System: Sync {
         Box::new(())
     }
 
-    /// Return the first signal caught since [`System::catch_stops`] was armed.
+    /// Catch the same stops as [`System::catch_stops`], and once the returned handle drops (after
+    /// every disposition is back) send the one caught again, so the run finishes its step and
+    /// its cleanup, then stops as it would have. A run that must not be cut mid-step and must
+    /// not outlive a person's stop holds this.
+    fn defer_stops(&self) -> Box<dyn std::any::Any> {
+        self.catch_stops()
+    }
+
+    /// Return the first signal caught since [`System::catch_stops`] or [`System::defer_stops`]
+    /// was armed.
     fn stopped(&self) -> Option<i32> {
         None
     }
@@ -664,6 +677,12 @@ pub trait System: Sync {
     /// Whether this process holds Full Disk Access, as whoever runs the items measured it, once
     /// and without a prompt, before the run.
     fn full_disk_access(&self) -> Option<bool> {
+        None
+    }
+
+    /// The volume holding `path`, with the free space the window's disk watch holds it to
+    /// ([`aterm_capacity::reading::Volume`]), or `None` where it cannot be read.
+    fn volume(&self, _path: &Path) -> Option<aterm_capacity::reading::Volume> {
         None
     }
 
@@ -1300,17 +1319,7 @@ impl System for Live {
     }
 
     fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        f.write_all(bytes)?;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        aterm_durable::ordered(&f)
+        create_new::create(path, bytes, mode, aterm_durable::ordered)
     }
 
     fn pid_alive(&self, pid: u32) -> bool {
@@ -1385,6 +1394,10 @@ impl System for Live {
         stops::catch()
     }
 
+    fn defer_stops(&self) -> Box<dyn std::any::Any> {
+        stops::defer()
+    }
+
     fn stopped(&self) -> Option<i32> {
         stops::caught()
     }
@@ -1443,6 +1456,10 @@ impl System for Live {
 
     fn full_disk_access(&self) -> Option<bool> {
         self.full_disk_access
+    }
+
+    fn volume(&self, path: &Path) -> Option<aterm_capacity::reading::Volume> {
+        aterm_capacity::reading::Reading::now(path).volume
     }
 
     fn running_app(&self) -> Option<PathBuf> {
@@ -1623,8 +1640,8 @@ mod fake {
         pub lock_refused: Option<String>,
         /// Number of `None` readings from [`System::stopped`] before returning `SIGINT`.
         pub stop_after: Option<usize>,
-        /// The [`System::stopped`] readings so far.
-        stop_readings: Mutex<usize>,
+        /// The [`System::stopped`] readings so far (a deferral's end reads once more).
+        stop_readings: Arc<Mutex<usize>>,
         /// What [`System::ask`] answers, in order ([`Fake::answer`]).
         answers: Mutex<std::collections::VecDeque<Option<String>>>,
         /// Each [`System::run_fed`] run's key and the bytes it was fed ([`Fake::fed`]).
@@ -1636,6 +1653,9 @@ mod fake {
         pub full_disk_access: Option<bool>,
         /// What [`System::running_app`] answers: `None` unless a test names a bundle.
         pub running_app: Option<PathBuf>,
+        /// What [`System::volume`] answers for every path: `None`, unread, unless a test sets
+        /// it.
+        pub volume: Option<aterm_capacity::reading::Volume>,
         /// What [`System::awake_ms`] answers ([`Fake::awake_at`]): `None`, no awake clock,
         /// unless a test sets it.
         awake: Mutex<Option<u64>>,
@@ -2343,6 +2363,10 @@ mod fake {
             self.full_disk_access
         }
 
+        fn volume(&self, _path: &Path) -> Option<aterm_capacity::reading::Volume> {
+            self.volume.clone()
+        }
+
         fn running_app(&self) -> Option<PathBuf> {
             self.running_app.clone()
         }
@@ -2822,16 +2846,50 @@ mod fake {
             Box::new(Caught(Arc::clone(&self.calls)))
         }
 
+        fn defer_stops(&self) -> Box<dyn std::any::Any> {
+            self.calls.lock().unwrap().push("defer stops".into());
+            Box::new(Deferred {
+                calls: Arc::clone(&self.calls),
+                readings: Arc::clone(&self.stop_readings),
+                stop_after: self.stop_after,
+            })
+        }
+
         fn stopped(&self) -> Option<i32> {
-            let mut readings = self.stop_readings.lock().unwrap();
-            *readings += 1;
-            self.stop_after
-                .is_some_and(|after| *readings > after)
-                .then_some(libc::SIGINT)
+            read_stop(&self.stop_readings, self.stop_after)
         }
 
         fn ignore_hangups(&self) {
             self.calls.lock().unwrap().push("ignore hangups".into());
+        }
+    }
+
+    /// One [`System::stopped`] reading: `SIGINT` once more than `stop_after` were taken.
+    fn read_stop(readings: &Mutex<usize>, stop_after: Option<usize>) -> Option<i32> {
+        let mut readings = readings.lock().unwrap();
+        *readings += 1;
+        stop_after
+            .is_some_and(|after| *readings > after)
+            .then_some(libc::SIGINT)
+    }
+
+    /// [`Fake::defer_stops`]'s handle: its drop restores, then reads once more and records the
+    /// stop it would send again.
+    struct Deferred {
+        calls: Arc<Mutex<Vec<String>>>,
+        readings: Arc<Mutex<usize>>,
+        stop_after: Option<usize>,
+    }
+
+    impl Drop for Deferred {
+        fn drop(&mut self) {
+            self.calls.lock().unwrap().push("stops restored".into());
+            if let Some(sig) = read_stop(&self.readings, self.stop_after) {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("stop sent again: signal {sig}"));
+            }
         }
     }
 

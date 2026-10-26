@@ -277,13 +277,22 @@ impl CursorGlow {
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
             let (x1, y1) = geom.cell_center(cr, cc);
             let (o_x, o_y) = geom.cell_center(pr, pc);
-            let retarget = self.fire_meteors.iter_mut().rev().find(|m| {
-                now.saturating_duration_since(m.born).as_secs_f32() <= Self::METEOR_RETARGET_S
+            let life = (0.16 + 0.005 * dist).clamp(0.20, 0.45);
+            let mut retarget_idx = None;
+            let mut mi = self.fire_meteors.len();
+            while mi > 0 {
+                mi -= 1;
+                let m = &self.fire_meteors[mi];
+                if now.saturating_duration_since(m.born).as_secs_f32() <= Self::METEOR_RETARGET_S
                     && (m.x1 - o_x).abs() < cwf * 0.6
                     && (m.y1 - o_y).abs() < chf * 0.6
-            });
-            let life = (0.16 + 0.005 * dist).clamp(0.20, 0.45);
-            if let Some(m) = retarget {
+                {
+                    retarget_idx = Some(mi);
+                    break;
+                }
+            }
+            if let Some(mi) = retarget_idx {
+                let m = &mut self.fire_meteors[mi];
                 m.x1 = x1;
                 m.y1 = y1;
                 m.life = m.life.max(life);
@@ -1087,10 +1096,15 @@ impl CursorGlow {
                 let s_span = s.min(cur_fill - p.min(cur_fill));
                 let c0 = p.min(prev.caret as usize).min(cur_fill) as u16;
                 let c1 = (prev_fill - s_span).max(c0 as usize + 1) as u16;
-                let survivor_holds_ink = s_span > 0
-                    || cur_slice[..(c0 as usize).min(cur_slice.len())]
-                        .iter()
-                        .any(|&ch| ch != ' ');
+                let mut survivor_holds_ink = s_span > 0;
+                if !survivor_holds_ink {
+                    for &ch in &cur_slice[..(c0 as usize).min(cur_slice.len())] {
+                        if ch != ' ' {
+                            survivor_holds_ink = true;
+                            break;
+                        }
+                    }
+                }
                 if survivor_holds_ink {
                     let n = (prev.fill - cur.fill).max(1);
                     self.spawn_poof(prev.row, c0, c1, n, now, cfg, geom, voice);
@@ -1104,7 +1118,8 @@ impl CursorGlow {
         }
         let poof_hint_at = match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         };
         let erasure_proven = matches!(
             (self.row_prev_meta, self.row_cur_meta),

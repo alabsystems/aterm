@@ -18,6 +18,12 @@ pub const MAX_WORLD_CELLS: usize = MAX_WORLD_ROWS * MAX_WORLD_COLS;
 pub const MAX_WORLD_ANCHORS: usize = 8;
 const MAX_BLOCK_PROBES: usize = 64;
 const MAX_REGIONS: usize = 32;
+/// How far (cells) a rectangle's edge may run past a cell boundary without touching the cell
+/// beyond: f32 noise in a sum of fractional rows, never a reach. A stand at row 10 is
+/// `10 + 1 - 1.7` tall to its feet and judged with `+ 1.6 + 0.1` of them, which sums to
+/// 11.000001: without the slack its window took row 11, the row under its feet, at rows 10 and
+/// 12 and not at 6 or 20.
+const EDGE_SLACK: f32 = 1e-4;
 /// The sliver [`PetWorld::nearest_clear_perch`] leaves between a seat's margin and the cell edges
 /// it fills.
 const PERCH_SLACK: f32 = 0.02;
@@ -312,7 +318,10 @@ impl PetWorldFacts {
                 if block.collapsed {
                     continue;
                 }
-                let block_end = block.end_row.unwrap_or(end);
+                let block_end = match block.end_row {
+                    Some(e) => e,
+                    None => end,
+                };
                 if block.prompt_start_row >= end || block_end <= top {
                     continue;
                 }
@@ -418,7 +427,21 @@ pub struct PetWorld {
     selection_target: Option<(f32, f32)>,
     progress: Option<TaskbarProgress>,
     examined_cells: usize,
+    /// Map rows the host's chrome ([`PetReserve::protected`]) lies on, anywhere across the
+    /// pane: bit `r` for map row `r` ([`Self::host_line`]).
+    host_rows: u64,
+    /// Map rows drawn as a horizontal rule: [`RULE_STROKE`] across at least four fifths of the
+    /// observed columns ([`Self::rule_line`]).
+    rule_rows: u64,
 }
+
+const _: () = assert!(MAX_WORLD_ROWS <= u64::BITS as usize);
+
+/// The stroke a program draws its rules with (Claude Code's composer rules, the separators other
+/// agents' composers draw): a row of it across the pane is a line, not text.
+const RULE_STROKE: char = '\u{2500}';
+/// The fewest observed columns a row needs before its strokes make it a rule.
+const RULE_MIN_COLS: usize = 8;
 
 impl Default for PetWorld {
     #[inline]
@@ -452,6 +475,8 @@ impl PetWorld {
             selection_target: None,
             progress: None,
             examined_cells: 0,
+            host_rows: 0,
+            rule_rows: 0,
         }
     }
 
@@ -469,6 +494,8 @@ impl PetWorld {
         self.selection_target = None;
         self.progress = None;
         self.examined_cells = 0;
+        self.host_rows = 0;
+        self.rule_rows = 0;
     }
 
     #[inline]
@@ -502,6 +529,43 @@ impl PetWorld {
     pub const fn selection_target(&self) -> Option<(f32, f32)> {
         self.selection_target
     }
+    /// Whether the host's chrome ([`PetReserve::protected`]: a harness's lockup and switch on a
+    /// composer's upper rule, the chips on its lower one, the card) lies on pane-local `row`,
+    /// anywhere across the pane: the row is the host's line, its strokes repainted with it.
+    /// `None` before an observation and off the map.
+    #[inline]
+    #[must_use]
+    pub const fn host_line(&self, row: usize) -> Option<bool> {
+        if self.stamp.is_none() {
+            return None;
+        }
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
+        if r >= self.coverage.rows {
+            return None;
+        }
+        Some((self.host_rows >> r) & 1 == 1)
+    }
+
+    /// Whether pane-local `row` is drawn as a horizontal rule ([`RULE_STROKE`] across at least
+    /// four fifths of the observed columns): a composer's rule, whose strokes cross whatever is
+    /// drawn under them. `None` before an observation and off the map.
+    #[inline]
+    #[must_use]
+    pub const fn rule_line(&self, row: usize) -> Option<bool> {
+        if self.stamp.is_none() {
+            return None;
+        }
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
+        if r >= self.coverage.rows {
+            return None;
+        }
+        Some((self.rule_rows >> r) & 1 == 1)
+    }
+
     /// The application's last explicit state.
     #[inline]
     #[must_use]
@@ -738,6 +802,7 @@ impl PetWorld {
                 continue;
             };
             let (mut hull_lo, mut hull_hi) = (u16::MAX, 0u16);
+            let mut row_strokes = 0usize;
             let mut spans = [(0, 0); MAX_REGIONS];
             let mut n_spans = 0;
             if !exclusions.is_empty() {
@@ -749,6 +814,9 @@ impl PetWorld {
                 }
             }
             let spans = &spans[..n_spans];
+            if n_spans > 0 {
+                self.host_rows |= 1 << r;
+            }
             let mut overlay_spans = [(0, 0); MAX_REGIONS];
             let mut n_overlay = 0;
             if !overlays.is_empty() {
@@ -791,8 +859,12 @@ impl PetWorld {
                         default_bg as u8,
                     ];
                 }
-                let cell = row.get(frame_c).unwrap_or(&implicit);
+                let cell = match row.get(frame_c) {
+                    Some(c) => c,
+                    None => &implicit,
+                };
                 self.examined_cells += 1;
+                row_strokes += usize::from(cell.ch == RULE_STROKE);
                 let selected = any_selection
                     && input.selection_contains_cell(
                         frame_r,
@@ -827,7 +899,10 @@ impl PetWorld {
                     && self.glyphs[row_base + c - 1] == Some(PetGlyph::Blank)
                     && {
                         let column = frame_c + 1;
-                        let neighbour = row.get(column).unwrap_or(&implicit);
+                        let neighbour = match row.get(column) {
+                            Some(n) => n,
+                            None => &implicit,
+                        };
                         neighbour.ch == ' '
                             && !neighbour.wide
                             && neighbour.underline == UnderlineStyle::None
@@ -947,6 +1022,9 @@ impl PetWorld {
                 }
             }
             self.hull[r] = (hull_lo, hull_hi);
+            if cols >= RULE_MIN_COLS && row_strokes * 5 >= cols * 4 {
+                self.rule_rows |= 1 << r;
+            }
         }
         self.caret_cells_len = n_caret_cells as u8;
         self.ground_caret_cells_len = n_ground_caret_cells as u8;
@@ -960,7 +1038,11 @@ impl PetWorld {
                 let Some(block) = block else {
                     continue;
                 };
-                let start = block.output_row.unwrap_or(block.start_row).max(top);
+                let start = (match block.output_row {
+                    Some(r) => r,
+                    None => block.start_row,
+                })
+                .max(top);
                 let last = block.end_row.min(end).saturating_sub(1);
                 if start > last {
                     continue;
@@ -1408,8 +1490,14 @@ impl PetWorld {
         if !rect.valid() || !margin.is_finite() || margin < 0.0 {
             return Window::Degenerate;
         }
-        let (r0, c0) = (rect.row - margin, rect.col - margin);
-        let (r1, c1) = (rect.row + rect.rows + margin, rect.col + rect.cols + margin);
+        let (r0, c0) = (
+            rect.row - margin + EDGE_SLACK,
+            rect.col - margin + EDGE_SLACK,
+        );
+        let (r1, c1) = (
+            rect.row + rect.rows + margin - EDGE_SLACK,
+            rect.col + rect.cols + margin - EDGE_SLACK,
+        );
         if !r1.is_finite() || !c1.is_finite() {
             return Window::Degenerate;
         }
@@ -1420,11 +1508,23 @@ impl PetWorld {
         {
             return Window::Outside;
         }
+        let (r0, c0) = (r0.floor() as usize, c0.floor() as usize);
+        // A valid rectangle touches at least the cell it starts in, however thin.
+        let r1 = if r1.ceil() as usize > r0 {
+            r1.ceil() as usize
+        } else {
+            r0 + 1
+        };
+        let c1 = if c1.ceil() as usize > c0 {
+            c1.ceil() as usize
+        } else {
+            c0 + 1
+        };
         Window::Cells(
-            r0.floor() as usize - self.coverage.row,
-            c0.floor() as usize - self.coverage.col,
-            r1.ceil() as usize - self.coverage.row,
-            c1.ceil() as usize - self.coverage.col,
+            r0 - self.coverage.row,
+            c0 - self.coverage.col,
+            r1 - self.coverage.row,
+            c1 - self.coverage.col,
         )
     }
 
@@ -1509,7 +1609,8 @@ impl PetWorld {
     /// THE GROUND UNDER A CAT ([`Self::under_text_clearance_past_caret`]).
     #[inline]
     #[must_use]
-    /// Ground-plane under-text clearance for `rect`'s feet row while passing under labels.
+    /// Under-text clearance past the caret for a body on its way: its feet row with `margin`,
+    /// and the rows over them against every protection, the host's chrome included.
     pub const fn passing_under_text_clearance_past_caret(
         &self,
         rect: PetRect,
@@ -1533,16 +1634,11 @@ impl PetWorld {
         if feet_top <= rect.row || matches!(ground, Some(false)) {
             return ground;
         }
+        // The rows over the feet are judged against everything that protects, the host's chrome
+        // included: a body passing under the chrome is drawn under it, its head behind the
+        // host's words (a harness switch on a composer's upper rule), which the person cannot see.
         let over = PetRect::new(rect.row, rect.col, feet_top - rect.row, rect.cols);
-        let overhead = match self.window(over, margin) {
-            Window::Degenerate => Some(false),
-            Window::Outside => None,
-            Window::Cells(r0, c0, r1, c1) => Some(
-                !self.ground_split
-                    || self.blocked(self.protected_prefix.as_slice(), r0, c0, r1, c1)
-                        == self.blocked(self.ground_prefixes().1, r0, c0, r1, c1),
-            ),
-        };
+        let overhead = self.under_text_clearance_past_caret(over, margin);
         match (ground, overhead) {
             (_, Some(false)) => Some(false),
             (Some(true), Some(true)) => Some(true),
@@ -2916,6 +3012,72 @@ mod tests {
         let mut world = PetWorld::default();
         assert!(world.observe(&input, &facts, PetPane::full(&input)));
         world
+    }
+
+    /// A stand's feet window is the same at every row: a stand on row `r` (the resident's
+    /// `r + 1 - 1.7` tall body less its 0.1 clearance, with that 0.1 as the margin) reaches row
+    /// `r` and never the row under its feet. Its f32 sum is `r + 1.000001` at some rows (10 and
+    /// 12 among them), which took the row under the feet there and not at 6 or 20, so the
+    /// caret's line was a seat by its row number.
+    #[test]
+    fn a_stands_feet_window_never_takes_the_row_under_it_at_any_row() {
+        let mut term = Terminal::new(30, 40);
+        term.process(b"\x1b[1;1Hx");
+        let world = observe(&mut term);
+        for r in 2..28u16 {
+            let r = f32::from(r);
+            let feet = PetRect::new(r + 1.0 - 1.7, 3.0, 1.7 - 0.1, 5.2);
+            match world.window(feet, 0.1) {
+                Window::Cells(r0, _, r1, _) => assert_eq!(
+                    (r0, r1),
+                    ((r - 1.0) as usize, r as usize + 1),
+                    "a stand on row {r}: rows {r0}..{r1}"
+                ),
+                other => panic!("a stand on row {r}: {other:?}"),
+            }
+        }
+    }
+
+    /// A row of rule strokes across the pane is a line ([`PetWorld::rule_line`]); a row of text,
+    /// a short run of strokes and a row of other box drawing are not. Off the map it is unknown.
+    #[test]
+    fn a_row_of_rule_strokes_across_the_pane_is_a_rule_line() {
+        let mut term = Terminal::new(10, 40);
+        let rule = "\u{2500}".repeat(40);
+        let most = format!(
+            "{} alab harness {}",
+            "\u{2500}".repeat(2),
+            "\u{2500}".repeat(24)
+        );
+        let short = "\u{2500}".repeat(20);
+        let boxed = "\u{2550}".repeat(40);
+        term.process(
+            format!(
+                "\x1b[2;1H{rule}\x1b[3;1Hhello there\x1b[4;1H{most}\x1b[5;1H{short}\x1b[6;1H{boxed}"
+            )
+            .as_bytes(),
+        );
+        let world = observe(&mut term);
+        let lines: Vec<Option<bool>> = (0..7).map(|r| world.rule_line(r)).collect();
+        assert_eq!(
+            lines,
+            [
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false)
+            ],
+            "rows 0..7: blank, a rule, text, a rule a third words, half a rule, a double rule"
+        );
+        assert_eq!(world.rule_line(10), None, "off the map");
+        assert_eq!(
+            PetWorld::default().rule_line(1),
+            None,
+            "before an observation"
+        );
     }
 
     #[test]

@@ -1020,7 +1020,7 @@ fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
         // The body over columns 2..12 of row 3 and the row above.
         glow.note_pet_body(Some((16, 96, 24, 64)));
         let mut out = Vec::new();
-        glow.veil_letters_on_pet(&mut out, Some(caret), g, None);
+        glow.veil_letters_on_pet((&mut out, &mut GlowRamps::default()), Some(caret), g, None);
         out
     };
     let veil_of = |fg: [u8; 3], page: [u8; 3], on: bool| veil_at(fg, page, on, (3, 20));
@@ -1127,7 +1127,12 @@ fn the_pet_s_veil_rises_off_its_row() {
         // The body over columns 2..12 of rows 2 to 4.
         glow.note_pet_body(Some((2 * cw, 12 * cw, 2 * ch, 5 * ch)));
         let mut out = Vec::new();
-        glow.veil_letters_on_pet(&mut out, Some((3, 20)), g, None);
+        glow.veil_letters_on_pet(
+            (&mut out, &mut GlowRamps::default()),
+            Some((3, 20)),
+            g,
+            None,
+        );
         // The veil's opacity at each pixel row of one coat column, as the
         // renderer stacks it.
         let x = 7 * cw + cw / 2;
@@ -1239,7 +1244,10 @@ fn the_pet_s_veil_feathers_no_deeper_than_the_coat_s_cut() {
         glow.note_pet_body(Some((16, 96, 24, 64)));
         glow.note_veil_frame(Some((3, 20)), g);
         let mut out = Vec::new();
-        glow.veil_pet_letters(&mut out, std::slice::from_ref(&sprite));
+        glow.veil_pet_letters(
+            (&mut out, &mut GlowRamps::default()),
+            std::slice::from_ref(&sprite),
+        );
         (0..g.win_h as i32)
             .map(|y| {
                 out.iter()
@@ -1278,6 +1286,65 @@ fn the_pet_s_veil_feathers_no_deeper_than_the_coat_s_cut() {
         deep[(top - 2) as usize] > 0,
         "control: feathered its whole height, a row above the paw's tip takes the page: {:?}",
         &deep[(top - rise - 1) as usize..=top as usize]
+    );
+}
+
+/// Lane B5: the pet's veil lies beneath a published under stream's ramps
+/// as beneath its quads ([`CursorGlow::veil_pet_letters`]): laid into a
+/// stream of quads and ramps, a ramp drawn before every quad among them, it
+/// draws what the same stream's quads draw with it, in the same order.
+#[test]
+fn the_pet_s_veil_lies_beneath_a_stream_s_ramps_as_beneath_its_quads() {
+    use aterm_core::terminal::RenderCell;
+    use aterm_render::glow_end;
+    let g = geom();
+    let (fg, page) = ([0x85u8, 0x85, 0x85], [0x11u8, 0x13, 0x18]);
+    let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+    for (c, cell) in cells[3].iter_mut().enumerate() {
+        cell.ch = if c < 20 { 'o' } else { ' ' };
+        cell.fg = fg;
+        cell.bg = page;
+    }
+    // The stream as published: two quads, a ramp before the first and
+    // one between them.
+    let mut quads = vec![
+        GlowQuad::flat(3, 20, 40, 30, 6, 0x0030_2010, 0),
+        GlowQuad::flat(3, 24, 60, 40, 4, 0x0010_2030, 0x40),
+    ];
+    let mut ramps = GlowRamps::default();
+    for (at, x, y) in [(0, 18, 44), (1, 30, 50)] {
+        ramps.open(
+            at,
+            3,
+            (x, y, 36),
+            (glow_end(0x0020_2020, 0), glow_end(0x0008_1018, 0)),
+        );
+        for k in 1..6u32 {
+            ramps.extend_last(0, (glow_end(k * 0x0004_0602, 0), glow_end(0x0010_0804, 0)));
+        }
+    }
+    let mut legacy = Vec::new();
+    ramps.expand_into(&quads, &mut legacy);
+    let veiled = |stream: (&mut Vec<GlowQuad>, &mut GlowRamps)| {
+        let mut glow = CursorGlow::default();
+        glow.observe_frame_text(Some((3, 20)), &cells, Instant::now());
+        glow.note_pet_body(Some((16, 96, 24, 64)));
+        glow.note_veil_frame(Some((3, 20)), g);
+        glow.veil_pet_letters(stream, &[])
+    };
+    let laid = legacy.len();
+    assert_ne!(
+        veiled((&mut legacy, &mut GlowRamps::default())),
+        0,
+        "fixture: the veil is laid"
+    );
+    assert!(legacy.len() > laid, "fixture: the veil is laid");
+    veiled((&mut quads, &mut ramps));
+    let mut got = Vec::new();
+    ramps.expand_into(&quads, &mut got);
+    assert_eq!(
+        got, legacy,
+        "the veil lies beneath the ramps as beneath their quads"
     );
 }
 
@@ -1332,7 +1399,10 @@ fn the_pet_s_veil_keeps_to_its_silhouette() {
         glow.note_pet_body(Some((16, 96, 24, 64)));
         glow.note_veil_frame(Some((3, 20)), g);
         let mut out = Vec::new();
-        glow.veil_pet_letters(&mut out, std::slice::from_ref(&sprite));
+        glow.veil_pet_letters(
+            (&mut out, &mut GlowRamps::default()),
+            std::slice::from_ref(&sprite),
+        );
         out
     };
     // The coat (the ink's own colour) under the veil at window pixel (x, 56).
@@ -1413,9 +1483,20 @@ fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
         glow.note_word_icons([icon]);
         // The streams as a host publishes them, before its word pass.
         let (mut under, mut halos) = (glow.under_quads().to_vec(), glow.halos().to_vec());
+        let (mut out_ramps, mut under_ramps) =
+            (glow.out_ramps().clone(), glow.under_ramps().clone());
         if shade {
-            glow.shade_word_icons((&mut out, &mut under, &mut halos, &mut Vec::new()));
+            glow.shade_word_icons((
+                (&mut out, &mut out_ramps),
+                (&mut under, &mut under_ramps),
+                &mut halos,
+                &mut Vec::new(),
+            ));
         }
+        // Every light, each lit ramp row the quad it stands for.
+        let mut lights = Vec::new();
+        out_ramps.expand_into(&out, &mut lights);
+        under_ramps.expand_into(&under, &mut lights);
         let hits = |(x0, x1, y0, y1): (i32, i32, i32, i32)| {
             x0 < icon.1 && icon.0 < x1 && y0 < icon.3 && icon.2 < y1
         };
@@ -1423,8 +1504,8 @@ fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
             let (x, y) = (i32::from(x), i32::from(y));
             (x, x + i32::from(w), y, y + i32::from(h))
         };
-        out.iter()
-            .chain(&under)
+        lights
+            .iter()
             .filter(|q| q.w > 0 && q.h > 0 && hits(rect(q.x, q.y, q.w, q.h)))
             .count()
             + halos

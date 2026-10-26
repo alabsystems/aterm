@@ -245,7 +245,8 @@ impl Hints {
         reason = "Model bookkeeping: freeze the native endpoint fixture before Observe"
     )
 )]
-fn replacement_environment() {}
+#[doc(hidden)]
+pub fn db_discovery_replacement_environment() {}
 
 #[cfg(test)]
 mod admission_tests;

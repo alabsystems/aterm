@@ -63,7 +63,7 @@ impl AttemptHost<'_> {
                 for (from, to) in [("main", "away"), ("away", "main")] {
                     self.store
                         .transact_logins(NOW, &mut None, |state, logins| {
-                            accounts::move_account(state, logins, from, to);
+                            accounts::move_account(state, logins, from, to)?;
                             Ok(Vec::new())
                         })
                         .unwrap();
@@ -102,6 +102,11 @@ impl AttemptHost<'_> {
                     })
                     .unwrap();
             }
+            10 => {
+                let witness = self.store.state_witness_file();
+                std::fs::rename(&witness, witness.with_extension("retained")).unwrap();
+                std::fs::create_dir(witness).unwrap();
+            }
             _ => {}
         }
         assert_eq!(
@@ -118,6 +123,108 @@ impl AttemptHost<'_> {
                 if self.case == 6 { "another@example.test" } else { OWNER }).into_bytes(),
             code: Some(0),
         }
+    }
+}
+
+#[test]
+fn completed_cli_signins_recover_all_records_without_another_provider_login() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let tmp = tmp_dir("signin-commit-recovery");
+        let mut env = env_at(&tmp);
+        env.now = NOW;
+        let store = env.accounts_store_for(cli).unwrap();
+        let old_dir = store.login_dir("main").unwrap();
+        let old_dir = old_dir.to_str().unwrap();
+        let raw = Roster {
+            rows: vec![accounts::Row {
+                label: "main".into(),
+                dir: Some(old_dir.into()),
+                email: Some(OWNER.into()),
+                vendor: accounts::Vendor {
+                    region: (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        };
+        let roster_path = env.accounts_roster_for(cli).unwrap();
+        std::fs::write(
+            &roster_path,
+            accounts::append_rows_for(cli, "", &raw.rows).unwrap(),
+        )
+        .unwrap();
+        store
+            .transact_logins(NOW - 10, &mut None, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state,
+                    logins,
+                    "main",
+                    None,
+                    old_dir,
+                    None,
+                    NOW - 10,
+                ))
+            })
+            .unwrap();
+        let before = store.load_logins(NOW).unwrap().0;
+        let host = AttemptHost {
+            cli,
+            case: 10,
+            store: &store,
+            raw: &raw,
+            old_dir,
+            changed: Cell::new(false),
+            after: RefCell::new(None),
+            staging: RefCell::new(None),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if cli == Cli::Claude {
+            run_accounts_renew(
+                &env,
+                &host,
+                (&["main".into()], false, None),
+                &mut out,
+                &mut err,
+            );
+        } else {
+            run_accounts_renew_for(
+                cli,
+                &env,
+                &host,
+                (&["main".into()], false, None),
+                &mut out,
+                &mut err,
+            );
+        }
+        let staging = host.staging.borrow().clone().expect("provider flow ran");
+        assert!(
+            store.load(NOW).is_err(),
+            "{cli:?}: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(store.load_logins(NOW).is_err());
+        let witness = store.state_witness_file();
+        std::fs::rename(&witness, witness.with_extension("blocked")).unwrap();
+        std::fs::rename(witness.with_extension("retained"), &witness).unwrap();
+        assert_eq!(
+            run_accounts_report(cli, &env, true, &mut out, &mut err),
+            ExitCode::SUCCESS
+        );
+        let after = store.load_logins(NOW).unwrap().0;
+        assert_eq!(after.get("main").unwrap().dir.as_deref(), staging.to_str());
+        assert_eq!(after.generation_clock, before.generation_clock + 1);
+        assert!(staging.join(accounts::RENEWAL_CHECKPOINT_FILE).is_file());
+        assert!(staging.join(cli.connector().stores[0]).is_file());
+        assert_eq!(
+            store
+                .tail(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == accounts::Kind::Renewed)
+                .count(),
+            2
+        );
     }
 }
 
@@ -388,7 +495,7 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
                 &mut Vec::new(),
                 &mut Vec::new()
             ),
-            Renewal::Failed
+            Renewal::Deferred
         );
         assert!(!host.changed.get(), "no provider authentication starts");
         assert_eq!(records(&store), before);

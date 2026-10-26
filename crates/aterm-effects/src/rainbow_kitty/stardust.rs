@@ -1554,7 +1554,16 @@ impl GlyphProbe {
     #[inline]
     fn slot_for(&mut self, row: i32, width: usize) -> usize {
         let words = width.div_ceil(64);
-        let slot = if let Some(i) = self.rows[..self.live].iter().position(|r| r.row == row) {
+        let mut found = None;
+        let mut idx = 0;
+        while idx < self.live {
+            if self.rows[idx].row == row {
+                found = Some(idx);
+                break;
+            }
+            idx += 1;
+        }
+        let slot = if let Some(i) = found {
             i
         } else if self.live < Self::ROWS {
             let i = self.live;
@@ -2040,15 +2049,21 @@ impl Stardust {
     /// edge are `(x, y, born)` on its catch finish, on the frame the paw lands.
     #[inline]
     pub fn catch(&mut self, x: f32, y: f32, born: Instant, at: Instant) -> bool {
-        let Some(star) = self.stars.iter_mut().find(|s| {
-            s.gold
+        let mut found = None;
+        for s in &mut self.stars {
+            if s.gold
                 && s.class == StarClass::M1
                 && s.lane.is_sky()
                 && !s.dead(at)
                 && s.born == born
                 && s.x == x
                 && s.y == y
-        }) else {
+            {
+                found = Some(s);
+                break;
+            }
+        }
+        let Some(star) = found else {
             return false;
         };
         let before = star.finish;
@@ -2285,9 +2300,20 @@ impl Stardust {
     #[inline]
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
-        !self.reduced
-            && (self.stars.iter().any(|s| s.brisk(now))
-                || self.veil.iter().any(|v| v.age_s(now) < EDGE_IN_S))
+        if self.reduced {
+            return false;
+        }
+        for s in &self.stars {
+            if s.brisk(now) {
+                return true;
+            }
+        }
+        for v in &self.veil {
+            if v.age_s(now) < EDGE_IN_S {
+                return true;
+            }
+        }
+        false
     }
 
     /// The cadence law: the next instant a star changes what is on glass, or `None` when the sky is
@@ -3048,11 +3074,14 @@ impl Stardust {
         if self.probe.at(i32::from(from.0) - 1, from.1, g.rows) != Some(false) {
             return None;
         }
-        Some(
-            self.stars
-                .iter()
-                .position(|s| s.lane.is_sky() && !s.dead(at) && star_over_cell(s, from, g)),
-        )
+        let mut pos = None;
+        for (i, s) in self.stars.iter().enumerate() {
+            if s.lane.is_sky() && !s.dead(at) && star_over_cell(s, from, g) {
+                pos = Some(i);
+                break;
+            }
+        }
+        Some(pos)
     }
 
     fn settle(&self, star: &mut Star, fixed: bool, ctx: &Ctx<'_>) -> bool {
@@ -3072,8 +3101,11 @@ impl Stardust {
         ];
         let geom = ctx.geom;
         let origin = star.origin();
-        let home = (star.lane != StarLane::Exhaust && star.lane.throw_ms().is_some())
-            .then(|| (px_row(origin.1 as f32, geom), px_col(origin.0 as f32, geom)));
+        let home = if star.lane != StarLane::Exhaust && star.lane.throw_ms().is_some() {
+            Some((px_row(origin.1 as f32, geom), px_col(origin.0 as f32, geom)))
+        } else {
+            None
+        };
         let clear = |p: (i32, i32)| {
             on_glass(p, geom)
                 && (home == Some((px_row(p.1 as f32, geom), px_col(p.0 as f32, geom)))
@@ -3178,11 +3210,14 @@ impl Stardust {
 
     #[inline]
     fn adopt_field(&mut self, cell: (u16, u16), at: Instant, geom: Geom) -> bool {
-        let Some(s) = self
-            .stars
-            .iter_mut()
-            .find(|s| s.lane.is_sky() && star_over_cell(s, cell, geom))
-        else {
+        let mut found = None;
+        for s in &mut self.stars {
+            if s.lane.is_sky() && star_over_cell(s, cell, geom) {
+                found = Some(s);
+                break;
+            }
+        }
+        let Some(s) = found else {
             return false;
         };
         s.lane = StarLane::Field;
@@ -3315,11 +3350,22 @@ impl Stardust {
                 lit: at,
                 finish: None,
             };
-            if let Some(v) = self.veil.iter_mut().find(|v| v.row == row && v.col == col) {
-                *v = veil;
+            let mut matched = None;
+            let mut oldest: Option<(usize, Instant)> = None;
+            for (i, v) in self.veil.iter().enumerate() {
+                if v.row == row && v.col == col {
+                    matched = Some(i);
+                    break;
+                }
+                if !matches!(oldest, Some((_, best)) if v.lit >= best) {
+                    oldest = Some((i, v.lit));
+                }
+            }
+            if let Some(i) = matched {
+                self.veil[i] = veil;
             } else if self.veil.len() < AURORA_CAP {
                 self.veil.push(veil);
-            } else if let Some((i, _)) = self.veil.iter().enumerate().min_by_key(|(_, v)| v.lit) {
+            } else if let Some((i, _)) = oldest {
                 self.veil[i] = veil;
             }
         }
@@ -4693,12 +4739,15 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         own
     };
     let fits = |k: u8| {
-        over.iter().all(|&(p, ground, qmask, halo_color, halo_wt)| {
-            under_ceil_with(
+        for &(p, ground, qmask, halo_color, halo_wt) in over {
+            if !under_ceil_with(
                 table,
                 add_sat(ground, own_at(k, p, qmask, halo_color, halo_wt)),
-            )
-        })
+            ) {
+                return false;
+            }
+        }
+        true
     };
     let k = fit_byte(u8::MAX - 1, fits);
     for q in &mut frame.out[q0..] {
@@ -4747,7 +4796,59 @@ fn fit_byte(want: u8, under: impl Fn(u8) -> bool) -> u8 {
 
 #[inline]
 #[must_use]
-fn price_centre(
+const fn lay_add(base: u32, rgb: u32, k: u8) -> u32 {
+    if k == 0 {
+        base
+    } else {
+        add_sat(base, premul_rgb(rgb, k))
+    }
+}
+
+#[inline]
+#[must_use]
+const fn fit_lay_add(table: &RelativeLuminanceTable, base: u32, rgb: u32, want: u8) -> u8 {
+    if want == 0 || under_ceil_with(table, lay_add(base, rgb, want)) {
+        return want;
+    }
+    if !under_ceil_with(table, base) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (0u8, want);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if under_ceil_with(table, lay_add(base, rgb, mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline]
+#[must_use]
+const fn fit_stacked_centre(table: &RelativeLuminanceTable, base: u32, rgb: u32, want: u8) -> u8 {
+    if want == 0 || under_ceil_with(table, stacked_centre(base, rgb, want)) {
+        return want;
+    }
+    if !under_ceil_with(table, stacked_centre(base, rgb, 0)) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (0u8, want);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if under_ceil_with(table, stacked_centre(base, rgb, mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline]
+#[must_use]
+const fn price_centre(
     ground: u32,
     achromatic: bool,
     body: (u32, u8),
@@ -4755,17 +4856,10 @@ fn price_centre(
     halo: (u32, u8),
 ) -> (u8, u8, u8) {
     let table = relative_luminance_table();
-    let lay = |base: u32, rgb: u32, k: u8| {
-        if k == 0 {
-            base
-        } else {
-            add_sat(base, premul_rgb(rgb, k))
-        }
-    };
     if achromatic {
         let c0 = stacked_centre(ground, body.0, body.1);
-        let c1 = lay(c0, disc.0, disc.1);
-        let c2 = lay(c1, halo.0, halo.1);
+        let c1 = lay_add(c0, disc.0, disc.1);
+        let c2 = lay_add(c1, halo.0, halo.1);
         if under_ceil_with(table, c2) {
             return (body.1, disc.1, halo.1);
         }
@@ -4775,22 +4869,20 @@ fn price_centre(
         let cov = if under_ceil_with(table, c0) {
             body.1
         } else {
-            fit_byte(body.1, |k| {
-                under_ceil_with(table, stacked_centre(ground, body.0, k))
-            })
+            fit_stacked_centre(table, ground, body.0, body.1)
         };
         let centre = if cov == body.1 {
             c0
         } else {
             stacked_centre(ground, body.0, cov)
         };
-        let d = fit_byte(disc.1, |k| under_ceil_with(table, lay(centre, disc.0, k)));
-        let centre = lay(centre, disc.0, d);
-        let peak = fit_byte(halo.1, |k| under_ceil_with(table, lay(centre, halo.0, k)));
+        let d = fit_lay_add(table, centre, disc.0, disc.1);
+        let centre = lay_add(centre, disc.0, d);
+        let peak = fit_lay_add(table, centre, halo.0, halo.1);
         (cov, d, peak)
     } else {
-        let c0 = lay(ground, halo.0, halo.1);
-        let c1 = lay(c0, disc.0, disc.1);
+        let c0 = lay_add(ground, halo.0, halo.1);
+        let c1 = lay_add(c0, disc.0, disc.1);
         let c2 = stacked_centre(c1, body.0, body.1);
         if under_ceil_with(table, c2) {
             return (body.1, disc.1, halo.1);
@@ -4801,26 +4893,24 @@ fn price_centre(
         let peak = if under_ceil_with(table, c0) {
             halo.1
         } else {
-            fit_byte(halo.1, |k| under_ceil_with(table, lay(ground, halo.0, k)))
+            fit_lay_add(table, ground, halo.0, halo.1)
         };
         let lit = if peak == halo.1 {
             c0
         } else {
-            lay(ground, halo.0, peak)
+            lay_add(ground, halo.0, peak)
         };
         let d = if peak == halo.1 && under_ceil_with(table, c1) {
             disc.1
         } else {
-            fit_byte(disc.1, |k| under_ceil_with(table, lay(lit, disc.0, k)))
+            fit_lay_add(table, lit, disc.0, disc.1)
         };
         let lit = if peak == halo.1 && d == disc.1 {
             c1
         } else {
-            lay(lit, disc.0, d)
+            lay_add(lit, disc.0, d)
         };
-        let cov = fit_byte(body.1, |k| {
-            under_ceil_with(table, stacked_centre(lit, body.0, k))
-        });
+        let cov = fit_stacked_centre(table, lit, body.0, body.1);
         (cov, d, peak)
     }
 }
@@ -5125,6 +5215,8 @@ mod tests {
     struct Scratch {
         under: Vec<GlowQuad>,
         out: Vec<GlowQuad>,
+        under_ramps: aterm_render::GlowRamps,
+        out_ramps: aterm_render::GlowRamps,
         halos: Vec<RainHalo>,
         beams: Vec<aterm_render::BeamVertex>,
         cues: Vec<SoundCue>,
@@ -5135,12 +5227,15 @@ mod tests {
             Frame {
                 under: &mut self.under,
                 out: &mut self.out,
+                under_ramps: &mut self.under_ramps,
+                out_ramps: &mut self.out_ramps,
                 halos: &mut self.halos,
                 beams: &mut self.beams,
                 cues: &mut self.cues,
                 caret: super::super::CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
+                rows_cost: Some(aterm_render::RampCost::NEVER),
             }
         }
     }

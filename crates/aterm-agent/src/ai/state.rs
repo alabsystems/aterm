@@ -214,6 +214,17 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             );
             return row;
         }
+        Some(Kept::OptIn) => {
+            off(
+                &mut row,
+                &format!(
+                    "not installed: an opt-in program, installed only where asked (`aterm pkg \
+                     install {}`)",
+                    c.id
+                ),
+            );
+            return row;
+        }
         None => {}
     }
     if f.managed.is_none() {

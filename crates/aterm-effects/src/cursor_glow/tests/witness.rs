@@ -84,16 +84,20 @@ fn full_ribbon_row_budget_keeps_pending_source_and_caret_samples() {
     glow.v2.set_engaged(true);
     let (mut under, mut out, mut halos, mut beams, mut cues) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut under_ramps, mut out_ramps) = (GlowRamps::default(), GlowRamps::default());
     let mut tick = |glow: &mut CursorGlow, at| {
         let mut frame = rk::Frame {
             under: &mut under,
             out: &mut out,
+            under_ramps: &mut under_ramps,
+            out_ramps: &mut out_ramps,
             halos: &mut halos,
             beams: &mut beams,
             cues: &mut cues,
             caret: rk::CaretSeam::default(),
             companion: None,
             fp: 0,
+            rows_cost: Some(aterm_render::RampCost::NEVER),
         };
         glow.v2.tick(at, geom, &cfg, &mut frame);
     };

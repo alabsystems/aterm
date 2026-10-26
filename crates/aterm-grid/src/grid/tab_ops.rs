@@ -32,7 +32,8 @@ impl Grid {
         );
     }
 
-    /// Margin-aware tab (DECLRMM): stops at the right margin when inside horizontal margins.
+    /// Margin-aware tab (DECLRMM): stops at the right margin unless the cursor is already past
+    /// it, then at the screen edge, like CUF.
     #[inline]
     pub fn tab_margin(&mut self, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -42,8 +43,7 @@ impl Grid {
         let margins = self.storage.horizontal_margins();
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
         let col = self.storage.cursor.col;
-        let in_margins = col >= margins.left && col <= margins.right;
-        let right_bound = if in_margins {
+        let right_bound = if col <= margins.right {
             margins.right.min(max_col)
         } else {
             max_col

@@ -1549,6 +1549,9 @@ pub(crate) struct SettingsViewState {
     compact_navigation: bool,
     presented_width: Cell<Option<SettingsWidth>>,
     presented_plain_dock: Cell<bool>,
+    /// The list the last render laid out, in what window and at what text size
+    /// ([`SettingsViewState::unlaid`]).
+    laid_context: RefCell<Option<(scroll::ScrollContext, LogicalRect, u32)>>,
     status_set_aside: Option<String>,
     presented_motion: Cell<crate::native_app::ViewMotionCx>,
     presented_package_admission: Cell<PackageAdmission>,
@@ -1605,6 +1608,9 @@ pub(crate) struct SettingsViewState {
     navigation_scroll_limit: Cell<f32>,
     navigation_revealed: RefCell<Option<UiKey>>,
     scroll_record: RefCell<Option<scroll::ScrollRecord>>,
+    /// The heights Tab Control's live rows were laid out at, held while the person reads
+    /// ([`tabs_page::LiveRowHeights`]).
+    live_row_heights: RefCell<tabs_page::LiveRowHeights>,
     page_chrome: Cell<PageChrome>,
     page_chrome_at: Cell<Option<ChromeAt>>,
     /// The chrome the page last drew its list in at each window, text size and bars ([`page`]).
@@ -1640,9 +1646,14 @@ pub(crate) struct SettingsViewState {
     /// How many lists that seat seated under the bar ([`SettingsViewState::note_status_room`]).
     status_lists_seated: Cell<usize>,
     status_scroll: RefCell<StatusScroll>,
+    /// The reload warning's words' scroll ([`status_scroll_of`]).
+    warning_scroll: RefCell<StatusScroll>,
     page_reveal: Option<UiKey>,
     list_carried: Option<UiKey>,
     reveal_as: scroll::Reveal,
+    /// Where the control a press found whole on the screen drawn ended there, which the bar of
+    /// the status the press brings never covers ([`SettingsViewState::reveal_pressed`]).
+    pressed_at: RefCell<Option<scroll::PressedAt>>,
     style_trial_undo: Option<(UiKey, Option<u64>)>,
     chosen_style_row: Option<UiKey>,
     cursor_style_note: RefCell<Option<(String, &'static str)>>,
@@ -1760,6 +1771,7 @@ impl SettingsViewState {
             compact_navigation: false,
             presented_width: Cell::new(None),
             presented_plain_dock: Cell::new(false),
+            laid_context: RefCell::new(None),
             status_set_aside: None,
             presented_motion: Cell::new(crate::native_app::ViewMotionCx::default()),
             presented_package_admission: Cell::new(PackageAdmission::Unobserved),
@@ -1816,6 +1828,7 @@ impl SettingsViewState {
             navigation_scroll_limit: Cell::new(0.0),
             navigation_revealed: RefCell::new(None),
             scroll_record: RefCell::new(None),
+            live_row_heights: RefCell::default(),
             page_chrome: Cell::new(PageChrome::FULL),
             page_chrome_at: Cell::new(None),
             page_chromes: RefCell::new(Vec::new()),
@@ -1836,9 +1849,11 @@ impl SettingsViewState {
             status_lists: RefCell::new(None),
             status_lists_seated: Cell::new(0),
             status_scroll: RefCell::new(StatusScroll::default()),
+            warning_scroll: RefCell::new(StatusScroll::default()),
             page_reveal: None,
             list_carried: None,
             reveal_as: scroll::Reveal::Keep,
+            pressed_at: RefCell::new(None),
             style_trial_undo: None,
             chosen_style_row: None,
             cursor_style_note: RefCell::new(None),
@@ -2128,6 +2143,18 @@ impl SettingsViewState {
 
     fn record_presented_width(&self, width: SettingsWidth) {
         self.presented_width.set(Some(width));
+    }
+
+    /// Whether no render has laid out the list shown, in `viewport` at the text size now, since
+    /// it changed (a page just opened, a search typed, the window or text resized): a key that
+    /// moves by what the list shows waits for its layout ([`crate::App::dispatch_native_event`]).
+    pub(crate) fn unlaid(&self, viewport: LogicalRect) -> bool {
+        self.laid_context.borrow().as_ref()
+            != Some(&(
+                self.scroll_context(),
+                viewport,
+                settings_text_scale().to_bits(),
+            ))
     }
 
     fn bar_feedback(&self) -> Option<&String> {
@@ -3211,6 +3238,7 @@ impl SettingsViewState {
     }
 
     fn page_replaced(&mut self) {
+        self.live_row_heights.get_mut().forget();
         self.common.hovered = None;
         self.messages_tag_menu = false;
         self.theme_preview_side = None;
@@ -3292,7 +3320,8 @@ impl SettingsViewState {
     }
 
     fn status_scrolls_toward(&self, lines: i32) -> bool {
-        let scroll = self.status_scroll.borrow();
+        let focus = self.common.last_focus.as_ref().map_or("", UiKey::as_str);
+        let scroll = status_scroll_of(self, focus).borrow();
         scroll.limit > 0.01
             && if lines > 0 {
                 scroll.offset < scroll.limit - 0.01
@@ -3314,8 +3343,8 @@ impl SettingsViewState {
                     .any(|button| button.key == focus))
     }
 
-    fn scroll_status(&mut self, lines: i32) -> Option<bool> {
-        let mut scroll = self.status_scroll.borrow_mut();
+    fn scroll_status(&mut self, at: &UiKey, lines: i32) -> Option<bool> {
+        let mut scroll = status_scroll_of(self, at.as_str()).borrow_mut();
         if scroll.limit <= 0.01 {
             return None;
         }
@@ -8194,7 +8223,7 @@ impl SettingsApp {
                     return EventResult::Handled;
                 }
                 if status_scroll_target(&key)
-                    && let Some(moved) = view.scroll_status(lines)
+                    && let Some(moved) = view.scroll_status(&key, lines)
                 {
                     if moved {
                         cx.repaint(crate::native_app::DamageRegion::All);
@@ -8529,7 +8558,9 @@ impl SettingsApp {
             AppEvent::StepFocus(lines)
                 if view.status_bar_has_focus() && view.status_scrolls_toward(lines) =>
             {
-                view.scroll_status(lines);
+                if let Some(focus) = view.common.last_focus.clone() {
+                    view.scroll_status(&focus, lines);
+                }
                 true
             }
             AppEvent::StepFocus(_) if view.enters_cursor_style_list() => {
@@ -11399,6 +11430,8 @@ fn status_scroll_target(key: &UiKey) -> bool {
         "settings/feedback",
         "settings/status",
         "settings/draft-recovery/status",
+        WARNING_KEY,
+        DOCK_KEY,
     ]
     .iter()
     .any(|bar| {
@@ -11435,15 +11468,21 @@ fn settings_tree(
     state.observe_semantic_font(cx.semantic_font.as_ref());
     state.status_bar_most.set(None);
     let _bars = BarsShared::open();
+    let _words = StatusWordsShared::open();
     #[cfg(test)]
     if STATUS_BAR_LEAST.with(Cell::get) {
         state.status_bar_most.set(Some(0.0));
     }
     state.record_runtime_presentation(cx.motion, packages, update);
     let width = SettingsWidth::for_viewport(cx.viewport.width);
-    let watch_status_height = config_watch_status_bar_height(state);
+    let watch_status_height = config_watch_status_bar_height(state, cx.viewport);
     let available_height = (cx.viewport.height - watch_status_height).max(0.0);
     state.record_presented_width(width);
+    state.laid_context.replace(Some((
+        state.scroll_context(),
+        cx.viewport,
+        settings_text_scale().to_bits(),
+    )));
     let compact_status_docked =
         width == SettingsWidth::Compact && compact_status_dock_required(state, cx.viewport);
     let question_page = reset_all_question_takes_page(state, cx.viewport);
@@ -11528,8 +11567,7 @@ fn settings_tree(
 
 fn config_watch_status_bar(state: &SettingsViewState, viewport: LogicalRect) -> Option<UiNode> {
     let status = state.config_watch_status.as_ref()?;
-    let visual_status =
-        crate::native_ui::fit_native_status_label(status, (viewport.width - 32.0).max(0.0));
+    let bar = warning_bar_layout(state, viewport)?;
     Some(
         UiNode::new(
             "settings/config-watch-status",
@@ -11539,7 +11577,7 @@ fn config_watch_status_bar(state: &SettingsViewState, viewport: LogicalRect) -> 
         )
         .layout(
             Layout::column()
-                .height(Length::Fixed(config_watch_status_bar_height(state)))
+                .height(Length::Fixed(bar.height))
                 .padding(Insets::symmetric(16.0, 5.0))
                 .gap(2.0),
         )
@@ -11578,18 +11616,13 @@ fn config_watch_status_bar(state: &SettingsViewState, viewport: LogicalRect) -> 
                 }),
             )
             .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .children(vec![
-                UiNode::new(
-                    "settings/config-watch-status/detail/visual",
-                    UiContent::Text(TextSpec {
-                        text: visual_status,
-                        role: SemanticRole::Status,
-                        style: StyleRef::Plain,
-                    }),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-                .paint_only(),
-            ]),
+            .children(vec![status_words_node(
+                state,
+                "settings/config-watch-status/detail/visual",
+                status,
+                bar.words_width,
+                bar.most,
+            )]),
         ]),
     )
 }
@@ -11642,11 +11675,21 @@ fn compact_search_is_a_button(field_width: f32) -> bool {
     crate::native_ui::fit_native_field_placeholder("Search", field_width, false) != "Search"
 }
 
+/// Whether the compact toolbar's search stands open: asked for, holding words, or holding the
+/// keyboard, in its field or on its Cancel button. THE KEYBOARD ON CANCEL KEEPS IT OPEN: Tab
+/// from the field reached Cancel, which the open search alone draws, so the search closed under
+/// it, the keyboard was left on nothing drawn, and the next Tab went round to the toolbar
+/// past the list (Terminal at 178x348).
 fn compact_search_shows_its_field(state: &SettingsViewState) -> bool {
     state.search_open
         || !state.search_input.value().is_empty()
         || !state.search.is_empty()
         || state.search_has_focus()
+        || state
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|key| key.as_str() == SEARCH_CANCEL)
 }
 
 fn compact_search_open_button() -> UiNode {
@@ -12930,13 +12973,22 @@ struct StatusWords {
 }
 
 /// While open, the page's seats share the status's words: each text is wrapped at each width
-/// once a render.
-struct StatusWordsShared;
+/// once a render. Opened within an open one, it shares that one's.
+struct StatusWordsShared {
+    owns: bool,
+}
 
 impl StatusWordsShared {
     fn open() -> Self {
-        STATUS_WORDS.with(|words| words.replace(Some(StatusWords::default())));
-        Self
+        let owns = STATUS_WORDS.with(|words| {
+            let mut words = words.borrow_mut();
+            let fresh = words.is_none();
+            if fresh {
+                *words = Some(StatusWords::default());
+            }
+            fresh
+        });
+        Self { owns }
     }
 
     fn once<T: Clone>(
@@ -12966,7 +13018,9 @@ impl StatusWordsShared {
 
 impl Drop for StatusWordsShared {
     fn drop(&mut self) {
-        STATUS_WORDS.with(|words| words.replace(None));
+        if self.owns {
+            STATUS_WORDS.with(|words| words.replace(None));
+        }
     }
 }
 
@@ -13034,35 +13088,53 @@ fn plain_bar_layout(
     } else {
         full
     };
-    let undo_under = undo && broken_words(feedback, beside) > broken_words(feedback, full);
-    let words_width = if undo_under { full } else { beside };
     // A status never covers the toolbar's search the keyboard is on, nor the warning's bar.
     let over = if width == SettingsWidth::Compact {
         compact_toolbar_height()
             + if keyboard_on_toolbar_search(state) {
-                config_watch_status_bar_height(state)
+                config_watch_status_bar_height(state, viewport)
             } else {
                 0.0
             }
     } else {
         0.0
     };
-    let undo_row = if undo_under {
-        4.0 + scaled_control_height() - 10.0
-    } else {
-        0.0
-    };
-    let most_lines = ((viewport.height - over - 10.0 - undo_row) / status_line_height())
-        .floor()
-        .max(1.0) as usize;
-    let most_lines = state.status_bar_most.get().map_or(most_lines, |most| {
-        let words = if undo_under {
-            most - 4.0 - scaled_control_height()
+    // The lines the bar shows of its words, with its Undo under them or beside them.
+    let most_with = |undo_under: bool| {
+        let undo_row = if undo_under {
+            4.0 + scaled_control_height() - 10.0
         } else {
-            most - 10.0
+            0.0
         };
-        most_lines.min((words / status_line_height()).floor().max(1.0) as usize)
-    });
+        let most_lines = ((viewport.height - over - 10.0 - undo_row) / status_line_height())
+            .floor()
+            .max(1.0) as usize;
+        state.status_bar_most.get().map_or(most_lines, |most| {
+            let words = if undo_under {
+                most - 4.0 - scaled_control_height()
+            } else {
+                most - 10.0
+            };
+            most_lines.min((words / status_line_height()).floor().max(1.0) as usize)
+        })
+    };
+    // THE UNDO GOES WHERE THE WORDS BREAK LEAST AS THEY ARE SET: words longer than the bar
+    // shows scroll beside a thumb, which takes its gutter from their width
+    // ([`status_words_node_styled`]). Weighed without it, a bar shortened over a pressed control
+    // kept its Undo beside words a gutter too narrow and broke one ("au-tomatically", Software
+    // Update at 178x348).
+    let set_at = |words_width: f32, most: usize| {
+        if status_word_lines(feedback, words_width).len() > most {
+            (words_width - STATUS_THUMB_GUTTER).max(1.0)
+        } else {
+            words_width
+        }
+    };
+    let undo_under = undo
+        && broken_words(feedback, set_at(beside, most_with(false)))
+            > broken_words(feedback, set_at(full, most_with(true)));
+    let words_width = if undo_under { full } else { beside };
+    let most_lines = most_with(undo_under);
     let words = status_word_lines(feedback, words_width)
         .len()
         .clamp(1, most_lines) as f32
@@ -13108,6 +13180,46 @@ fn status_words_node_at(
     most: usize,
     line_height: f32,
 ) -> UiNode {
+    status_words_node_styled(
+        state,
+        key,
+        feedback,
+        width,
+        (most, line_height),
+        StyleRef::Plain,
+    )
+}
+
+/// The key every reload warning's node is under: its words scroll apart from a status's
+/// ([`status_scroll_of`]).
+const WARNING_KEY: &str = "settings/config-watch-status";
+
+/// The compact toolbar's dock, which a wheel over its words' padding reaches.
+const DOCK_KEY: &str = "settings/status-dock";
+
+/// Where the words under `key` keep their scroll: the reload warning's apart from the
+/// status's, so both can scroll at once. The dock itself scrolls the status's words, else the
+/// warning's.
+fn status_scroll_of<'a>(state: &'a SettingsViewState, key: &str) -> &'a RefCell<StatusScroll> {
+    let warning = key.starts_with(WARNING_KEY)
+        || (key == DOCK_KEY && state.status_scroll.borrow().limit <= 0.01);
+    if warning {
+        &state.warning_scroll
+    } else {
+        &state.status_scroll
+    }
+}
+
+/// [`status_words_node_at`] with its words in `style`, at most `most` lines `line_height`
+/// apart before the rest scroll.
+fn status_words_node_styled(
+    state: &SettingsViewState,
+    key: &str,
+    feedback: &str,
+    width: f32,
+    (most, line_height): (usize, f32),
+    style: StyleRef,
+) -> UiNode {
     let most = most.max(1);
     let mut lines = status_word_lines(feedback, width);
     let scrolls = lines.len() > most;
@@ -13121,8 +13233,9 @@ fn status_words_node_at(
         .as_ref()
         .is_some_and(|focus| focus.as_str() == words_key);
     let boxed = scrolls || (keyboard_on && lines.len() > 1);
+    let held = status_scroll_of(state, key);
     {
-        let mut scroll = state.status_scroll.borrow_mut();
+        let mut scroll = held.borrow_mut();
         if scroll.text != feedback || !scrolls {
             *scroll = StatusScroll {
                 text: feedback.to_string(),
@@ -13136,7 +13249,7 @@ fn status_words_node_at(
             UiContent::Text(TextSpec {
                 text: lines.into_iter().next().unwrap_or_default(),
                 role: SemanticRole::Status,
-                style: StyleRef::Plain,
+                style,
             }),
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill))
@@ -13152,7 +13265,7 @@ fn status_words_node_at(
                 UiContent::Text(TextSpec {
                     text,
                     role: SemanticRole::Status,
-                    style: StyleRef::Plain,
+                    style,
                 }),
             )
             .layout(
@@ -13180,7 +13293,7 @@ fn status_words_node_at(
     let shown = most.min(count) as f32 * line_height;
     let content = count as f32 * line_height;
     let offset = if scrolls {
-        let mut scroll = state.status_scroll.borrow_mut();
+        let mut scroll = held.borrow_mut();
         scroll.limit = content - shown;
         scroll.line = line_height;
         scroll.offset =
@@ -13270,12 +13383,36 @@ fn messages_feedback_inline(state: &SettingsViewState) -> bool {
         && state.undo_offer().is_none()
 }
 
-fn config_watch_status_bar_height(state: &SettingsViewState) -> f32 {
-    if state.config_watch_status.is_some() {
-        scaled_control_height() * 1.75 + 12.0
-    } else {
-        0.0
-    }
+/// The reload warning's bar under the page: its title over its words, which wrap as every
+/// status's do, on the lines they take up to half the window, the rest scrolling in the bar.
+struct WarningBar {
+    words_width: f32,
+    most: usize,
+    height: f32,
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the lines of half a window, floored and at least one"
+)]
+fn warning_bar_layout(state: &SettingsViewState, viewport: LogicalRect) -> Option<WarningBar> {
+    let status = state.config_watch_status.as_ref()?;
+    let title = scaled_control_height() * 0.75;
+    let words_width = (viewport.width - 32.0).max(0.0);
+    let line = status_line_height();
+    let most = (((viewport.height * 0.5 - 12.0 - title) / line).floor() as usize).max(1);
+    let lines = status_word_lines(status, words_width).len().clamp(1, most);
+    let words = scaled_control_height().max(lines as f32 * line);
+    Some(WarningBar {
+        words_width,
+        most,
+        height: 12.0 + title + words,
+    })
+}
+
+fn config_watch_status_bar_height(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
+    warning_bar_layout(state, viewport).map_or(0.0, |bar| bar.height)
 }
 
 fn settings_status_bars_height(
@@ -13286,7 +13423,7 @@ fn settings_status_bars_height(
     if state.measuring_calm.get() {
         return 0.0;
     }
-    feedback_bar_height(state, width, viewport) + config_watch_status_bar_height(state)
+    feedback_bar_height(state, width, viewport) + config_watch_status_bar_height(state, viewport)
 }
 
 enum DockActions {
@@ -13317,6 +13454,7 @@ const DOCK_WORDS_LEAST: f32 = 96.0;
 
 const DOCK_WORDS_MIN: f32 = 40.0;
 
+#[derive(Clone, Copy)]
 struct CompactDockLayout {
     dock_width: f32,
     watcher_share: f32,
@@ -13327,7 +13465,33 @@ struct CompactDockLayout {
     under: Option<f32>,
 }
 
+/// What a dock's layout is weighed by in a render ([`compact_dock_layout`]): the window, its
+/// actions (their kind and count), whether the reload warning shares it, whether its status is
+/// plain, and the status's words.
+type DockAt = (LogicalRect, (u8, usize), bool, bool, Option<Box<str>>);
+
+/// The compact dock laid out for `actions` and `words`, once a render for each.
 fn compact_dock_layout(
+    state: &SettingsViewState,
+    viewport: LogicalRect,
+    actions: &DockActions,
+    watcher: bool,
+    plain: bool,
+    words: Option<&str>,
+) -> CompactDockLayout {
+    let kind = match actions {
+        DockActions::None => (0, 0),
+        DockActions::Undo => (1, 0),
+        DockActions::Buttons(buttons) => (2, buttons.len()),
+    };
+    weighed(
+        |bars| &mut bars.docks,
+        (viewport, kind, watcher, plain, words.map(Box::from)),
+        || compact_dock_laid(state, viewport, actions, watcher, plain, words),
+    )
+}
+
+fn compact_dock_laid(
     state: &SettingsViewState,
     viewport: LogicalRect,
     actions: &DockActions,
@@ -13486,6 +13650,7 @@ fn stacked_bars_leave_more_room(state: &SettingsViewState, viewport: LogicalRect
 #[derive(Default)]
 struct BarsWeighed {
     docked: Weighed<(LogicalRect, Option<f32>, bool), bool>,
+    docks: Weighed<DockAt, CompactDockLayout>,
     roomier: Weighed<(LogicalRect, bool), bool>,
     headers: Weighed<LogicalRect, f32>,
     costs: Weighed<(SettingsWidth, LogicalRect, bool), f32>,
@@ -13598,7 +13763,7 @@ fn reset_all_question_takes_page(state: &SettingsViewState, viewport: LogicalRec
     let width = SettingsWidth::for_viewport(viewport.width);
     if width != SettingsWidth::Compact {
         return feedback_bar_height(state, width, viewport)
-            > viewport.height - config_watch_status_bar_height(state) + 0.01;
+            > viewport.height - config_watch_status_bar_height(state, viewport) + 0.01;
     }
     if !compact_status_dock_wanted(state, viewport) {
         return false;
@@ -13659,7 +13824,7 @@ fn reset_all_question_page(state: &SettingsViewState, viewport: LogicalRect) -> 
         } else {
             0.0
         }
-        - config_watch_status_bar_height(state);
+        - config_watch_status_bar_height(state, viewport);
     let room = (body - insets.top - insets.bottom - gap - actions_height).max(0.0);
     const PADDING: f32 = 10.0;
     let (lines, status_height, line_height) =
@@ -13764,11 +13929,13 @@ fn compact_status_dock_required_at(
     }
     let layout = compact_dock_layout(state, viewport, actions, watcher, plain, words);
     if plain && !watcher {
-        return layout.under.is_none()
-            && words.is_none_or(|_| {
-                dock_words_height(state, layout.words_width)
-                    <= compact_toolbar_height() - 16.0 + 0.01
-            });
+        // A page too short for a status's bar under its list keeps no room for one there
+        // (its toolbar docks the bar, [`settings_status_bar_cost`]), so a status longer than
+        // the row's lines docks too, the rest of its words scrolling in the row
+        // ([`dock_lines_held`]). Stood under the page instead, it took its room from the
+        // list's bottom, and the control just pressed there went up from under the pointer
+        // (Software Update at 80x26 with 2x text: 54pt).
+        return layout.under.is_none();
     }
     layout.under.is_none() || stacked_content < COMPACT_BODY_LEAST.min(floor)
 }
@@ -13816,14 +13983,16 @@ fn compact_docked_header_laid(state: &SettingsViewState, viewport: LogicalRect) 
 }
 
 fn dock_words_height(state: &SettingsViewState, words_width: f32) -> f32 {
-    let words = if state.has_unsaved_field_drafts() {
-        DraftBar::of(state).short
+    let (words, most) = if state.has_unsaved_field_drafts() {
+        (DraftBar::of(state).short, usize::MAX)
     } else if let Some(feedback) = state.bar_feedback().filter(|_| state.plain_status()) {
-        feedback.clone()
+        (feedback.clone(), dock_lines_held())
     } else {
         return 0.0;
     };
-    let lines = status_word_lines(&words, (words_width - 10.0).max(0.0)).len();
+    let lines = status_word_lines(&words, (words_width - 10.0).max(0.0))
+        .len()
+        .min(most);
     if lines <= 1 {
         0.0
     } else {
@@ -13836,6 +14005,18 @@ fn dock_line_height() -> f32 {
     status_line_height()
         .min((compact_toolbar_height() - 16.0) / 2.0)
         .max((px * 1.3).ceil())
+}
+
+/// How many of a plain status's lines the compact toolbar's row holds at the dock's spacing: a
+/// status that takes more scrolls inside the dock, its words whole to the wheel and the
+/// keyboard, so the toolbar never grows over the page under it.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a few lines of a toolbar row, floored and at least one"
+)]
+fn dock_lines_held() -> usize {
+    (((compact_toolbar_height() - 16.0 + 0.01) / dock_line_height()).floor() as usize).max(1)
 }
 
 struct CompactFeedbackParts {
@@ -13956,7 +14137,7 @@ fn compact_feedback_parts(
         "settings/status/visual",
         feedback,
         (visual_width - 10.0).max(0.0),
-        usize::MAX,
+        dock_lines_held(),
         dock_line_height(),
     )]);
     Some(CompactFeedbackParts {
@@ -14021,21 +14202,14 @@ fn compact_watch_status(state: &SettingsViewState, visual_width: f32) -> Option<
                 }),
             )
             .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .children(vec![
-                UiNode::new(
-                    "settings/config-watch-status/detail/visual",
-                    UiContent::Text(TextSpec {
-                        text: crate::native_ui::fit_native_status_label(
-                            &preferred,
-                            visual_width.max(0.0),
-                        ),
-                        role: SemanticRole::Status,
-                        style: StyleRef::Danger,
-                    }),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-                .paint_only(),
-            ]),
+            .children(vec![status_words_node_styled(
+                state,
+                "settings/config-watch-status/detail/visual",
+                &preferred,
+                visual_width.max(0.0),
+                (dock_lines_held(), dock_line_height()),
+                StyleRef::Danger,
+            )]),
         ]),
     )
 }
@@ -14549,7 +14723,7 @@ fn page(
         viewport: cx.viewport,
         scale: settings_text_scale(),
         warning: state.config_watch_status.is_some(),
-        status: bars_height > config_watch_status_bar_height(state) + 0.01,
+        status: bars_height > config_watch_status_bar_height(state, cx.viewport) + 0.01,
     };
     let drawn_at = state.page_chrome_at.get();
     let drawn_chrome = state.page_chrome.get();
@@ -16537,7 +16711,6 @@ fn settings_list_overhang(
         now: (settings_page_body_height(state, width, viewport)
             - settings_list_body_height(state, width, viewport))
         .max(0.0),
-        kept: settings_status_bar_kept(state, width, viewport),
     }
 }
 
@@ -19903,7 +20076,6 @@ fn cursor_styles_page(
     let body = steady_body.min(page_body);
     let overhang = scroll::Overhang {
         now: (page_body - body).max(0.0),
-        kept: settings_status_bar_kept(state, width, cx.viewport),
     };
     let (mut out, mut used) = pinned_heading(
         state,
@@ -23534,7 +23706,7 @@ fn settings_fields_page(
             let next = plan.span(0..1.min(plan.len()));
             let height = (list_room - gap - next).clamp(floor, natural.min(list_room).max(floor));
             preview.layout.height = Length::Fixed(height);
-            plan.insert_card(0, height, Vec::new());
+            plan.insert_card(0, height, scroll::focus_keys(&preview));
             plan.set_ids_of(0, vec![preview.key.clone()]);
             stops.insert(0, FieldStop::Card(preview));
         }
@@ -23770,6 +23942,7 @@ fn push_field_card(
                         .collect(),
                 );
                 plan.set_control_rows(split.control_rows(rows.clone()));
+                plan.set_drawn_bands(split.drawn_bands(rows.clone()));
                 let (spans, words) = split.control_spans(rows.clone());
                 plan.set_control_spans(spans);
                 plan.set_keyboard_words(words);

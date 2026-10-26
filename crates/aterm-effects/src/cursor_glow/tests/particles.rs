@@ -39,7 +39,12 @@ fn emit_one(c: &GlowConfig, g: Geom, p: Particle, age: f32) -> (Vec<GlowQuad>, V
         g,
         &mut out,
         &mut halos,
-        &mut Vec::new(),
+        &mut crate::cursor_glow::glow_sink(
+            &mut Vec::new(),
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        CursorGlow::MAX_QUADS,
     );
     (out, halos)
 }
@@ -239,6 +244,60 @@ fn stardust_is_the_body_the_plus_is_the_accent() {
     );
 }
 
+/// The particles stop where their stream's lights fill it, the lit rows of
+/// its ramps counted: given the room those leave (`cap`), a shower lays over
+/// an empty stream exactly the quads and halos it lays after as many legacy
+/// quads, each lit ramp row one, as the cap cuts it short.
+#[test]
+fn particles_stop_where_the_stream_fills_its_ramp_lights_counted() {
+    let g = geom();
+    let c = cfg(GlowStyle::Sparkle, true);
+    let now = Instant::now() + Duration::from_secs(10);
+    let shower = |held: usize, cap: usize| {
+        let mut glow = CursorGlow::default();
+        for k in 0..96u32 {
+            let hue = seed_hue(k % 17);
+            let (x, y) = (12.0 + 3.0 * k as f32, 20.0 + (k % 5) as f32 * 12.0);
+            let born = now - Duration::from_secs_f32(peak_age(hue));
+            glow.particles.push(grain(x, y, hue, born));
+        }
+        let (mut out, mut halos) = (vec![GlowQuad::default(); held], Vec::new());
+        glow.emit_particles(
+            now,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut Vec::new(),
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            cap,
+        );
+        (out.split_off(held), halos)
+    };
+    let all = shower(0, CursorGlow::MAX_QUADS);
+    assert!(
+        all.0.len() > 8 && all.1.len() > 8,
+        "the shower lays stars and halos: {} quads, {} halos",
+        all.0.len(),
+        all.1.len()
+    );
+    for room in [0, 1, 5, all.0.len() / 2] {
+        let legacy = shower(CursorGlow::MAX_QUADS - room, CursorGlow::MAX_QUADS);
+        assert!(
+            legacy.1.len() < all.1.len(),
+            "room {room}: the cap cut the shower short"
+        );
+        assert_eq!(
+            shower(0, room),
+            legacy,
+            "room {room}: the ramps' lights cap the particles as their quads do"
+        );
+    }
+}
+
 fn probed_glow(c: &GlowConfig, g: Geom, at: Instant) -> CursorGlow {
     let mut glow = CursorGlow::default();
     let mut row = [' '; 40];
@@ -277,7 +336,19 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
                 ..grain(x, y, hue, at)
             });
             let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
-            glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
+            glow.emit_particles(
+                at,
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut under,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
             (out, halos, under)
         };
         for seed in [1u32, 4, 6, 7, 16] {
@@ -318,7 +389,19 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
             glow.particles
                 .push(grain(g.cell_center(2, 14).0, 40.0, seed_hue(seed), at));
             let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
-            glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
+            glow.emit_particles(
+                at,
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut under,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
             let drew = !out.is_empty() || !halos.is_empty() || !under.is_empty();
             assert_eq!(
                 drew, dark,
@@ -334,7 +417,19 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
                 glow.particles
                     .push(grain(g.cell_center(2, col).0, 40.0, seed_hue(seed), at));
                 let (mut out, mut halos) = (Vec::new(), Vec::new());
-                glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut Vec::new());
+                glow.emit_particles(
+                    at,
+                    &c,
+                    g,
+                    &mut out,
+                    &mut halos,
+                    &mut crate::cursor_glow::glow_sink(
+                        &mut Vec::new(),
+                        &mut aterm_render::GlowRamps::default(),
+                        true,
+                    ),
+                    CursorGlow::MAX_QUADS,
+                );
                 let top = 2.0 * g.ch as f32;
                 for h in &halos {
                     let k = (f32::from(h.cy) - top) / g.ch as f32;
@@ -353,7 +448,19 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
             let mut glow = probed_glow(&c, g, at);
             glow.particles.push(grain(x, 40.0, hue, at));
             let (mut out, mut halos) = (Vec::new(), Vec::new());
-            glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut Vec::new());
+            glow.emit_particles(
+                at,
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut Vec::new(),
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
             halos
                 .iter()
                 .map(|h| (h.color >> 8) & 0xff)
@@ -405,7 +512,19 @@ fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
         .map(|p| (p.x0 as u16, p.y0 as u16))
         .unwrap();
     let mut pool_halos = Vec::new();
-    glow.emit_particles(at, &c, g, &mut out, &mut pool_halos, &mut Vec::new());
+    glow.emit_particles(
+        at,
+        &c,
+        g,
+        &mut out,
+        &mut pool_halos,
+        &mut crate::cursor_glow::glow_sink(
+            &mut Vec::new(),
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        CursorGlow::MAX_QUADS,
+    );
     assert!(
         head.len() + pool_halos.len() > CursorGlow::MAX_HALOS,
         "fixture: the pool alone overflows the budget ({} halos)",
@@ -480,7 +599,12 @@ fn a_dealt_comet_grain_glints_over_its_body() {
         g,
         &mut out,
         &mut halos,
-        &mut under,
+        &mut crate::cursor_glow::glow_sink(
+            &mut under,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        CursorGlow::MAX_QUADS,
     );
     assert!(
         out.is_empty() && halos.is_empty(),
@@ -511,7 +635,19 @@ fn the_dark_sparkle_shower_keeps_off_the_caret_and_its_moon_is_gold() {
             ..grain(x, y, seed_hue(seed), at)
         });
         let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
-        glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
+        glow.emit_particles(
+            at,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
         (out, halos)
     };
     for seed in [1u32, 4, 6, 7] {
@@ -573,7 +709,12 @@ fn the_light_sparkle_shower_is_gold_and_registers_on_white() {
             g,
             &mut out,
             &mut halos,
-            &mut under,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
         );
         let inks: Vec<(u32, u8)> = out
             .iter()
@@ -672,7 +813,19 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
             ..grain(x, y, seed_hue(seed), at)
         });
         let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
-        glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
+        glow.emit_particles(
+            at,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
         !out.is_empty() || !halos.is_empty() || !under.is_empty()
     };
     let (letter, gap, air) = (

@@ -24,6 +24,9 @@ mod discovery;
 mod owner;
 mod transport;
 
+#[cfg(any(test, debug_assertions))]
+pub use discovery::db_discovery_replacement_environment;
+
 const POLL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
 

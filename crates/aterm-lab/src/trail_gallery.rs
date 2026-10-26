@@ -37,7 +37,7 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
   --scenario    typing (default), burst, context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi,
-                settings, or all; repeatable
+                focus-roundtrip, settings, or all; repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
@@ -104,6 +104,8 @@ pub enum Scenario {
     EnterBottom,
     Idle10,
     RedrawStall,
+    /// Focus reports paint status away from an empty composer before typing resumes.
+    FocusRoundtrip,
     FoldRest,
     Cjk,
     Bidi,
@@ -112,7 +114,7 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 11] = [
+    pub const ALL: [Scenario; 12] = [
         Scenario::Typing,
         Scenario::Burst,
         Scenario::Context,
@@ -120,6 +122,7 @@ impl Scenario {
         Scenario::EnterBottom,
         Scenario::Idle10,
         Scenario::RedrawStall,
+        Scenario::FocusRoundtrip,
         Scenario::FoldRest,
         Scenario::Cjk,
         Scenario::Bidi,
@@ -136,6 +139,7 @@ impl Scenario {
             Scenario::EnterBottom => "enter-bottom",
             Scenario::Idle10 => "idle10",
             Scenario::RedrawStall => "redraw-stall",
+            Scenario::FocusRoundtrip => "focus-roundtrip",
             Scenario::FoldRest => "fold-rest",
             Scenario::Cjk => "cjk",
             Scenario::Bidi => "bidi",
@@ -457,9 +461,10 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
 
     let fold = args == ["fold"];
-    if !args.is_empty() && !fold {
+    let focus = args == ["focus"];
+    if !args.is_empty() && !fold && !focus {
         return Err(Fail::usage(
-            "the redraw fixture takes only an optional fold mode",
+            "the redraw fixture takes only an optional fold or focus mode",
         ));
     }
     let _raw = crate::sys::RawMode::enter(0)
@@ -468,7 +473,9 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut output = std::io::stdout().lock();
     let io_error = |e| Fail::usage(format!("redraw fixture: {e}"));
     output
-        .write_all(if fold {
+        .write_all(if focus {
+            b"\x1b[?1049h\x1b[?1004h\x1b[2J\x1b[8;1Hfocus ready\x1b[5;1H> "
+        } else if fold {
             b"\x1b[2J\x1b[8;1Hfold ready\x1b[5;1H> "
         } else {
             b"\x1b[2J\x1b[8;1Hredraw ready\x1b[5;1H> "
@@ -480,6 +487,23 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut restored = false;
     let mut key = [0u8; 1];
     while input.read_exact(&mut key).is_ok() {
+        if focus && key[0] == 27 {
+            let mut report = [0u8; 2];
+            input.read_exact(&mut report).map_err(io_error)?;
+            let label = match report {
+                [b'[', b'I'] => "in",
+                [b'[', b'O'] => "out",
+                _ => continue,
+            };
+            write!(
+                output,
+                "\x1b[?2026h\x1b[8;1H\x1b[2Kfocus {label}\x1b[5;{}H\x1b[?2026l",
+                text.len() + 3
+            )
+            .map_err(io_error)?;
+            output.flush().map_err(io_error)?;
+            continue;
+        }
         if fold {
             match key[0] {
                 3 | 4 => break,
@@ -498,7 +522,10 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
             0x20..=0x7e if text.len() < 80 => text.push(char::from(key[0])),
             _ => continue,
         }
-        if !redraw {
+        if focus {
+            output.write_all(&key).map_err(io_error)?;
+            output.flush().map_err(io_error)?;
+        } else if !redraw {
             write!(
                 output,
                 "\x1b[?2026h\x1b[?25l\x1b[5;1H\x1b[2K> {text}\x1b[5;{}H\x1b[?25h\x1b[?2026l",
@@ -1268,6 +1295,25 @@ impl Shot<'_> {
                 }
                 self.snap_phase("restored", FrameRead::Returned);
             }
+            Scenario::FocusRoundtrip => {
+                self.tick();
+                for (direction, expected) in [("out", "focus.out"), ("in", "focus.in")] {
+                    let sent = self.request(&["focus", direction], ReplyShape::Line);
+                    let seen = self.request(
+                        &["await", "match", expected, "timeout=60000"],
+                        ReplyShape::Line,
+                    );
+                    if sent.code != 0 || seen.code != 0 {
+                        self.note("the focus report did not reach the fixture");
+                        self.fails += 1;
+                        return Ok(());
+                    }
+                    self.tick();
+                }
+                self.snap("focused");
+                self.burst(None, &word)?;
+                self.snap_phase("typed", FrameRead::Returned);
+            }
             Scenario::FoldRest => {
                 self.tick();
                 let mut text: String =
@@ -1355,11 +1401,16 @@ impl Gallery {
             font_px.to_string(),
         ];
         args.push("-e".to_string());
-        if matches!(scenario, Scenario::RedrawStall | Scenario::FoldRest) {
+        if matches!(
+            scenario,
+            Scenario::RedrawStall | Scenario::FoldRest | Scenario::FocusRoundtrip
+        ) {
             args.push(paths().exe.to_string_lossy().into_owned());
             args.push("__trail-redraw-fixture".to_string());
             if scenario == Scenario::FoldRest {
                 args.push("fold".to_string());
+            } else if scenario == Scenario::FocusRoundtrip {
+                args.push("focus".to_string());
             }
         } else {
             args.push("/bin/sh".to_string());
@@ -1451,8 +1502,8 @@ impl Gallery {
             a.font_px.unwrap_or(f),
         );
         let config = config_lines(style, theme, &a.extras);
-        let rainbow_expected =
-            scenario == Scenario::RedrawStall && expects_rainbow(&config).map_err(usage)?;
+        let rainbow_expected = matches!(scenario, Scenario::RedrawStall | Scenario::FocusRoundtrip)
+            && expects_rainbow(&config).map_err(usage)?;
         match self.launch(&name, scenario, theme, grid, &config) {
             Err(e) => {
                 eprintln!("trail-gallery: [{name}] {e}");

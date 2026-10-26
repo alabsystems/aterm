@@ -415,15 +415,8 @@ pub(crate) enum DrawPrim {
     /// or `h` spans the rect on the other side of `(x, y)`. Each edge or
     /// band starts with a dash at its left or top end. Every length snaps to
     /// whole device pixels, a dash or gap to at least one, and each pixel is
-    /// inked once; `on <= 0` draws nothing and `off <= 0` a solid stroke.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no painter draws a dashed stroke since the merged top deck went; the prim \
-                      and its raster stay as shared renderer code"
-        )
-    )]
+    /// inked once; `on <= 0` draws nothing and `off <= 0` a solid stroke. The Deck draws a
+    /// stalled live edge's line with it.
     Dashed {
         x: f32,
         y: f32,

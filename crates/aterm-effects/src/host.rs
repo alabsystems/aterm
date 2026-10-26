@@ -112,15 +112,19 @@ impl TerminalFacts {
         let display_offset = term.grid().display_offset() as i32;
         let live_viewport = display_offset == 0;
         let cursor_visible = term.cursor_visible();
-        let caret = live_viewport.then(|| {
+        let caret = if live_viewport {
             let c = term.cursor();
-            (c.row, c.col)
-        });
+            Some((c.row, c.col))
+        } else {
+            None
+        };
         let cmd_seq = term.completed_command_seq();
-        let cmd_done = term.last_completed_command().and_then(|m| {
-            m.exit_code
-                .map(|code| (cmd_seq, code, m.exec_duration_ms()))
-        });
+        let cmd_done = match term.last_completed_command() {
+            Some(m) => m
+                .exit_code
+                .map(|code| (cmd_seq, code, m.exec_duration_ms())),
+            None => None,
+        };
         Self {
             session,
             caret,

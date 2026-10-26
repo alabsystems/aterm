@@ -654,11 +654,13 @@ impl OutputStreak {
             return StreakFrame::default();
         }
 
-        let dt = self
-            .last_tick
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            .clamp(0.0, MAX_DT_S);
+        let dt = match self.last_tick {
+            Some(t) => now
+                .saturating_duration_since(t)
+                .as_secs_f32()
+                .clamp(0.0, MAX_DT_S),
+            None => 0.0,
+        };
         self.last_tick = Some(now);
 
         if self.idle_drained(now, cfg) {
@@ -672,10 +674,10 @@ impl OutputStreak {
         }
 
         let m = self.momentum.value(now);
-        let cue = self.spend_pending(now, m, cfg, geom).or_else(|| {
-            // No-op / fallback.
-            self.close_episode_cue(now, cfg)
-        });
+        let cue = match self.spend_pending(now, m, cfg, geom) {
+            Some(c) => Some(c),
+            None => self.close_episode_cue(now, cfg),
+        };
 
         self.advance_comets(dt);
         self.advance_ribbon(dt, now, m);

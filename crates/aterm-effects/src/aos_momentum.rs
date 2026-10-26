@@ -159,11 +159,21 @@ pub const SNAPSHOT_VALID: &str = "momentum-glow.snapshot-valid";
 #[inline]
 fn offset_of(epoch: Instant, t: Instant) -> i128 {
     if let Some(after) = t.checked_duration_since(epoch) {
-        i128::try_from(after.as_nanos()).unwrap_or(i128::MAX)
+        let n = after.as_nanos();
+        if n <= i128::MAX as u128 {
+            n as i128
+        } else {
+            i128::MAX
+        }
+    } else if let Some(before) = epoch.checked_duration_since(t) {
+        let n = before.as_nanos();
+        if n <= i128::MAX as u128 {
+            -(n as i128)
+        } else {
+            i128::MIN
+        }
     } else {
-        epoch.checked_duration_since(t).map_or(i128::MIN, |before| {
-            i128::try_from(before.as_nanos()).map_or(i128::MIN, |n| -n)
-        })
+        i128::MIN
     }
 }
 
@@ -1117,8 +1127,11 @@ impl Sched {
         match *ev {
             MomentumEvent::Key { at, tau_bits } => {
                 let tau = f32::from_bits(tau_bits);
-                let now = match admit_at(s, at).and_then(|now| admit_tau(p, tau).map(|()| now)) {
-                    Ok(now) => now,
+                let now = match admit_at(s, at) {
+                    Ok(now) => match admit_tau(p, tau) {
+                        Ok(()) => now,
+                        Err(r) => return Applied::Refused(r),
+                    },
                     Err(r) => return Applied::Refused(r),
                 };
                 s.glow.on_key(now, tau);
@@ -1131,10 +1144,12 @@ impl Sched {
             }
             MomentumEvent::Tick { cur, at, geom, cfg } => {
                 let (geom, cfg) = (geom.geom(), cfg.config());
-                let admitted = admit_at(s, at)
-                    .and_then(|now| admit_tick(p, cur, &geom, &cfg).map(|budget| (now, budget)));
-                let (now, budget) = match admitted {
-                    Ok(x) => x,
+                let now = match admit_at(s, at) {
+                    Ok(now) => now,
+                    Err(r) => return Applied::Refused(r),
+                };
+                let budget = match admit_tick(p, cur, &geom, &cfg) {
+                    Ok(budget) => budget,
                     Err(r) => return Applied::Refused(r),
                 };
                 out.reserve(budget.out);
@@ -1144,10 +1159,11 @@ impl Sched {
                 Applied::Frame(frame)
             }
             MomentumEvent::Query { at, frame_interval } => {
-                let admitted = admit_at(s, at)
-                    .and_then(|now| admit_frame_interval(p, frame_interval).map(|()| now));
-                let now = match admitted {
-                    Ok(now) => now,
+                let now = match admit_at(s, at) {
+                    Ok(now) => match admit_frame_interval(p, frame_interval) {
+                        Ok(()) => now,
+                        Err(r) => return Applied::Refused(r),
+                    },
                     Err(r) => return Applied::Refused(r),
                 };
                 let answer = Applied::Schedule {
@@ -1224,14 +1240,14 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
     }
 
     fn entry(&self, schema: &MomentumSchema, state: &MomentumState) -> Result<(), EntryRefusal> {
-        state
-            .glow
-            .snapshot(schema.epoch)
-            .and_then(|s| s.validate())
-            .map_err(|r| EntryRefusal {
-                law: SNAPSHOT_VALID,
-                detail: r.to_string(),
-            })
+        let res = match state.glow.snapshot(schema.epoch) {
+            Ok(s) => s.validate(),
+            Err(r) => Err(r),
+        };
+        res.map_err(|r| EntryRefusal {
+            law: SNAPSHOT_VALID,
+            detail: r.to_string(),
+        })
     }
 
     fn step(
@@ -1394,7 +1410,10 @@ impl Contract<MomentumSchema> for NoStrandedLight {
                     }
                     if *settling && let Some(d) = *deadline {
                         let floor = at.saturating_add(nanos(*frame_interval));
-                        let limit = cold_at.map_or(floor, |c| c.saturating_add(margin).max(floor));
+                        let limit = match cold_at {
+                            Some(c) => c.saturating_add(margin).max(floor),
+                            None => floor,
+                        };
                         if d < floor || d > limit {
                             return fail(
                                 cursor,
@@ -1406,10 +1425,9 @@ impl Contract<MomentumSchema> for NoStrandedLight {
                             );
                         }
                     }
-                    forecast = if latch_current {
-                        cold_at.zip(last_tick)
-                    } else {
-                        None
+                    forecast = match (latch_current, *cold_at, last_tick) {
+                        (true, Some(c), Some(t)) => Some((c, t)),
+                        _ => None,
                     };
                 }
                 (input, obs) => {
@@ -1429,7 +1447,10 @@ impl Contract<MomentumSchema> for NoStrandedLight {
             );
         }
         if run.observations.len() != inputs.len() {
-            let cursor = run.observations.last().map_or(0, |(c, _)| *c);
+            let cursor = match run.observations.last() {
+                Some(&(c, _)) => c,
+                None => 0,
+            };
             return fail(
                 cursor,
                 RUN_MATCHES_INPUTS,
@@ -1741,8 +1762,13 @@ impl Hosted {
             Admit::Run => {}
             Admit::Queued => {
                 // A queued time past the horizon is refused on delivery; it raises no floor.
-                if let Some(at) = time_of(ev).filter(|&at| at <= horizon_ns()) {
-                    self.queued_at = Some(self.queued_at.map_or(at, |q| q.max(at)));
+                if let Some(at) = time_of(ev)
+                    && at <= horizon_ns()
+                {
+                    self.queued_at = Some(match self.queued_at {
+                        Some(q) => q.max(at),
+                        None => at,
+                    });
                 }
                 return None;
             }
@@ -1769,11 +1795,10 @@ impl Hosted {
                 e.reserve(frame_room(drawn.len().saturating_add(drawn_under.len())));
                 encode_frame(e, &frame, drawn, drawn_under);
             });
-            let (mut held_out, mut held_under) = self
-                .held
-                .take()
-                .map(|h| (h.out, h.under))
-                .unwrap_or_default();
+            let (mut held_out, mut held_under) = match self.held.take() {
+                Some(h) => (h.out, h.under),
+                None => (Vec::new(), Vec::new()),
+            };
             refill(&mut held_out, drawn);
             refill(&mut held_under, drawn_under);
             if drawn.is_empty() && drawn_under.is_empty() {
@@ -1833,9 +1858,11 @@ impl Hosted {
             Applied::Schedule { deadline, .. } => deadline,
             _ => {
                 let (sched, s) = (self.sched(), self.state());
-                (sched.is_active(s) || sched.settling(s))
-                    .then(|| now.checked_add(frame_interval))
-                    .flatten()
+                if sched.is_active(s) || sched.settling(s) {
+                    now.checked_add(frame_interval)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -2112,9 +2139,10 @@ impl MomentumHost {
             return;
         }
         let chain = LiveChain {
-            anchor: boundary.log().map_or((log_epoch, 0), |l| {
-                (l.header().log_epoch, l.header().first_cursor)
-            }),
+            anchor: match boundary.log() {
+                Some(l) => (l.header().log_epoch, l.header().first_cursor),
+                None => (log_epoch, 0),
+            },
             chain: empty_chain(),
             len: 0,
         };
@@ -2319,8 +2347,22 @@ impl MomentumHost {
         };
         let b = &h.boundary;
         let (code, state, epoch) = (h.sched(), h.state(), h.epoch());
-        let snapshot = state.glow.snapshot(epoch).ok();
-        let log = b.log();
+        let (latched, fp_last, fp_prev) = match state.glow.snapshot(epoch) {
+            Ok(s) => (
+                Some(f32::from_bits(s.latched)),
+                Some(s.fp_last),
+                Some(s.fp_prev),
+            ),
+            Err(_) => (None, None, None),
+        };
+        let (log_epoch, log_len, broken) = match b.log() {
+            Some(l) => (l.header().log_epoch, l.len(), l.broken()),
+            None => (0, 0, None),
+        };
+        let (last_query_at, next_deadline) = match h.last_query {
+            Some((at, d)) => (Some(at), d),
+            None => (None, None),
+        };
         // The host's reading: a plan's answer under the presentation guard, as the lane runs it.
         let (is_active, settling) = (h.is_active(), h.settling());
         #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
@@ -2340,16 +2382,16 @@ impl MomentumHost {
             paused: b.is_paused(),
             queued: b.queued(),
             queue_cap: b.queue_cap(),
-            log_epoch: log.map_or(0, |l| l.header().log_epoch),
-            log_len: log.map_or(0, |l| l.len()),
+            log_epoch,
+            log_len,
             input_cursor: b.pair().head.input_cursor,
-            broken: log.and_then(|l| l.broken()),
+            broken,
             checkpoint: b.checkpoint().map(|c| c.digest().short()),
             state_digest: Some(state_digest(b.schema(), state).short()),
             observation_chain: Some(h.live_chain().short()),
-            latched: snapshot.map(|s| f32::from_bits(s.latched)),
-            fp_last: snapshot.map(|s| s.fp_last),
-            fp_prev: snapshot.map(|s| s.fp_prev),
+            latched,
+            fp_last,
+            fp_prev,
             clock: state.clock,
             hot: is_active || settling,
             is_active,
@@ -2357,8 +2399,8 @@ impl MomentumHost {
             guard_moved,
             guard_firings,
             cold_at: code.cold_at(state).map(|t| offset_of(epoch, t)),
-            last_query_at: h.last_query.map(|(at, _)| at),
-            next_deadline: h.last_query.and_then(|(_, d)| d),
+            last_query_at,
+            next_deadline,
             last_frame: h.held.as_ref().map(|held| FrameSummary {
                 fill: held.frame.fill,
                 hot: held.frame.hot,
@@ -2447,8 +2489,11 @@ impl PreparedRepair {
     /// The prepare's refusal, if it refused.
     #[inline]
     #[must_use]
-    pub fn refusal(&self) -> Option<&PublishRefusal> {
-        self.prepared.as_ref().err()
+    pub const fn refusal(&self) -> Option<&PublishRefusal> {
+        match &self.prepared {
+            Ok(_) => None,
+            Err(r) => Some(r),
+        }
     }
 }
 
@@ -2518,7 +2563,10 @@ impl fmt::Display for MomentumAosStatus {
                 self.code, self.hot, self.is_active, self.settling
             );
         }
-        let opt = |v: Option<i128>| v.map_or_else(|| "none".to_owned(), |t| t.to_string());
+        let opt = |v: Option<i128>| match v {
+            Some(t) => t.to_string(),
+            None => "none".to_owned(),
+        };
         write!(
             f,
             "aos attached code={} build={} rev={} branch={} paused={} queued={}/{} log={}@{} cursor={} broken={} \
@@ -2548,14 +2596,14 @@ impl fmt::Display for MomentumAosStatus {
             opt(self.next_deadline),
         )?;
         if let Some(fr) = self.last_frame {
+            let fill = match fr.fill {
+                Some(c) => format!("{c:#08x}"),
+                None => "none".to_owned(),
+            };
             write!(
                 f,
-                " frame=fill:{} fp:{:#x} quads:{}+{}",
-                fr.fill
-                    .map_or_else(|| "none".to_owned(), |c| format!("{c:#08x}")),
-                fr.fp,
-                fr.out,
-                fr.under
+                " frame=fill:{fill} fp:{:#x} quads:{}+{}",
+                fr.fp, fr.out, fr.under
             )?;
         }
         if let (Some(moved), Some(firings)) = (self.guard_moved, self.guard_firings) {

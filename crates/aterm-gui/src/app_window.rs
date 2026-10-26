@@ -2306,7 +2306,12 @@ impl App {
     pub(crate) fn quit_barriers(&mut self) -> QuitBarrier {
         match self.prepare_quit_native_shutdown() {
             Ok(true) => {}
-            Ok(false) => return QuitBarrier::Refused,
+            Ok(false) => {
+                aterm_log::info!(
+                    "quit waits: a tab holds unsaved work, and its Review and Discard are on it"
+                );
+                return QuitBarrier::Refused;
+            }
             Err(error) => {
                 aterm_log::warn!("quit native close barrier: {error}");
                 return QuitBarrier::Refused;
@@ -2351,7 +2356,7 @@ impl App {
             aterm_log::warn!("lifeline cut in a windowed instance; leaving it open");
             return;
         }
-        self.on_quit_requested(el);
+        self.on_unattended_quit(el, "the process that started this headless aterm is gone");
     }
 
     /// A headless instance was sent a terminating signal (`owned_endpoint::arm_orderly_quit`).
@@ -2362,6 +2367,15 @@ impl App {
             crate::owned_endpoint::die_of_quit_signal();
             return;
         }
+        self.on_unattended_quit(el, "a terminating signal reached this headless aterm");
+    }
+
+    /// A Quit nobody at a window started (`cause`): no one can answer a tab's question, and the
+    /// process ends at its backstop whatever is answered, so no tab's unsaved work holds it
+    /// ([`App::prepare_quit_native_shutdown`]); documents still save on the way out.
+    #[cfg(unix)]
+    pub(crate) fn on_unattended_quit(&mut self, el: &ActiveEventLoop, cause: &'static str) {
+        self.quit_unattended.get_or_insert(cause);
         self.on_quit_requested(el);
     }
 
@@ -2573,6 +2587,18 @@ impl App {
             }
             return;
         }
+        if let W::ResizeWindowPixels { height, width } = op {
+            let asked = PhysicalSize::new(u32::from(width), u32::from(height));
+            // A headless window takes a size only where there is one to take.
+            if self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.os_window.is_some() || (width > 0 && height > 0))
+            {
+                let _ = self.resize_window_to_px(wid, asked);
+            }
+            return;
+        }
         let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) else {
             return; // headless / not yet attached: nothing to manipulate
         };
@@ -2581,14 +2607,6 @@ impl App {
             W::Iconify => w.set_minimized(true),
             W::RaiseWindow => w.focus_window(),
             W::RefreshWindow => w.request_redraw(),
-            W::ResizeWindowPixels { height, width } => {
-                #[cfg(target_os = "linux")]
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.initial_frame_settle = None;
-                }
-                let _ =
-                    w.request_inner_size(PhysicalSize::new(u32::from(width), u32::from(height)));
-            }
             W::RestoreMaximized => w.set_maximized(false),
             W::MaximizeWindow => w.set_maximized(true),
             W::UndoFullscreen => w.set_fullscreen(None),
@@ -4437,6 +4455,82 @@ mod tests {
             aterm_types::WindowOperation::ResizeWindowCells { rows: 30, cols: 90 },
         );
         assert_eq!(dims(&app), (30, 90), "the focused session re-grids");
+    }
+
+    /// `resize px` on a headless window (no window manager to ask) re-grids it from the pixels
+    /// as a drag's `Resized` does, where it once answered OK and changed nothing; with no window
+    /// to resize it answers an ERR, never OK.
+    #[test]
+    fn a_headless_window_takes_the_pixel_size_it_is_asked_for() {
+        use crate::input::{InputEvent, InputOutcome, Source};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let grid = |app: &App| (app.windows[&wid].rows, app.windows[&wid].cols);
+        assert_ne!(grid(&app), (30, 50), "precondition: another grid");
+        let frame = app.window_frame_px_for(wid, 30, 50);
+        let asked = InputEvent::ResizeWindowPx {
+            width: frame.width,
+            height: frame.height,
+        };
+        assert_eq!(app.input(wid, asked, Source::Controller), InputOutcome::Ok);
+        assert_eq!(grid(&app), (30, 50), "the grid follows the pixels");
+        let (cw, ch) = app.win_cell_size(wid);
+        let between = app.window_frame_px_for(wid, 20, 40);
+        let asked = InputEvent::ResizeWindowPx {
+            width: between.width + cw as u32 - 1,
+            height: between.height + ch as u32 - 1,
+        };
+        // Past the throttle window, so this one is not coalesced into a later settle.
+        app.windows.get_mut(&wid).unwrap().last_resize_at = None;
+        assert_eq!(app.input(wid, asked, Source::Controller), InputOutcome::Ok);
+        assert_eq!(
+            grid(&app),
+            (20, 40),
+            "pixels a cell does not fill leave the grid that fits"
+        );
+        assert!(matches!(
+            app.resize_window_to_px(WindowId(77), PhysicalSize::new(800, 600)),
+            InputOutcome::NotApplied(_)
+        ));
+    }
+
+    /// A program's pixel resize (XTWINOPS `CSI 4 ; h ; w t`) re-grids a headless window too.
+    #[test]
+    fn a_window_op_pixel_resize_re_grids_a_headless_window() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let frame = app.window_frame_px_for(wid, 18, 44);
+        app.on_window_op(
+            wid,
+            0,
+            aterm_types::WindowOperation::ResizeWindowPixels {
+                height: u16::try_from(frame.height).unwrap(),
+                width: u16::try_from(frame.width).unwrap(),
+            },
+        );
+        let ws = &app.windows[&wid];
+        assert_eq!((ws.rows, ws.cols), (18, 44));
+    }
+
+    /// A tab brought back to the front shows its terminal at its pane's grid, though a
+    /// cross-session `resize` re-gridded the session's engine while the tab was behind (it once
+    /// stayed at that grid, and a headless window, which draws no frame, never laid it out).
+    #[test]
+    fn a_tab_brought_to_the_front_shows_its_terminal_at_its_panes_grid() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = (app.windows[&wid].rows, app.windows[&wid].cols);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        // What `@0 resize 10 30` does from the control thread, and the wake it posts.
+        crate::term_lock(&term).resize(10, 30);
+        app.owe_pane_regrid(0);
+        app.switch_tab_in(wid, 0);
+        let engine = {
+            let t = crate::term_lock(&term);
+            (t.rows(), t.cols())
+        };
+        assert_eq!(engine, window, "the pane's grid, not the one set behind");
     }
 
     #[test]

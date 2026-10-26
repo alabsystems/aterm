@@ -140,13 +140,14 @@ impl Grid {
         }
     }
 
-    /// The last column a glyph printed at `col` of `row` reaches before its deferred wrap.
+    /// The last column a glyph printed at `col` of `row` reaches before its deferred wrap: the
+    /// DECSLRM right margin unless `col` is past it (xterm `dotext`), else the row's last column.
     #[inline]
     pub(super) fn last_print_col(&self, row: u16, col: u16) -> u16 {
         let max_col = self.storage.max_col_for_row(row);
         if self.storage.has_horizontal_margins {
             let margins = self.storage.horizontal_margins();
-            if col >= margins.left && col <= margins.right {
+            if col <= margins.right {
                 return margins.right.min(max_col);
             }
         }
@@ -185,10 +186,8 @@ impl Grid {
     pub fn advance_cursor_wide_wrap_ecols(&mut self, effective_cols: u16) {
         let wrap_cols = if self.storage.has_horizontal_margins {
             let margins = self.storage.horizontal_margins();
-            if !margins.is_full(self.storage.cols)
-                && self.storage.cursor.col >= margins.left
-                && self.storage.cursor.col <= margins.right
-            {
+            // Not past the right margin, as `last_print_col`.
+            if !margins.is_full(self.storage.cols) && self.storage.cursor.col <= margins.right {
                 effective_cols.min(margins.right.saturating_add(1))
             } else {
                 effective_cols
@@ -683,10 +682,8 @@ impl Grid {
 
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
-                if !margins.is_full(self.storage.cols)
-                    && cursor_col >= margins.left
-                    && cursor_col <= margins.right
-                {
+                // Not past the right margin (`last_print_col`).
+                if !margins.is_full(self.storage.cols) && cursor_col <= margins.right {
                     Some(margins.right.saturating_add(1))
                 } else {
                     None

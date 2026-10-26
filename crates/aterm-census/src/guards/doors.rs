@@ -439,6 +439,7 @@ const FENCES: &[Fence] = &[
         gate: None,
         callers: &[
             (KEY_EVENTS, "on_key_native_mode"),
+            (KEY_EVENTS, "fence_menu_action"),
             (NATIVE_EVENTS, "native_input_event"),
         ],
     },
@@ -3182,6 +3183,18 @@ impl Default for PagePress {}
     fn the_yes_inputs_are_taken_by_their_callers_alone() {
         assert_eq!(fenced(SETUP_TWIN, &[]), Vec::<String>::new());
         let cases: &[(&str, &str, &[usize])] = &[
+            (
+                KEY_EVENTS,
+                "impl App {\n    fn fence_menu_action(&mut self) {\n        \
+                 self.interact_system_state(wid);\n    }\n}\n",
+                &[],
+            ),
+            (
+                KEY_EVENTS,
+                "impl App {\n    fn dispatch_menu_action(&mut self) {\n        \
+                 self.interact_system_state(wid);\n    }\n}\n",
+                &[3],
+            ),
             (
                 MOUSE_EVENTS,
                 "impl App {\n    fn mouse_input_then_fold(&mut self) {\n        \

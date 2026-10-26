@@ -61,6 +61,7 @@ pub mod apron;
 pub mod band;
 pub mod bloom;
 pub mod bundled;
+pub mod capture_pixels;
 pub mod chrome_metrics;
 mod colr;
 pub mod deco;
@@ -73,6 +74,7 @@ pub mod font_file;
 pub mod fx;
 mod fx_damage;
 mod fx_raster;
+pub mod glow_ramps;
 pub mod hdr;
 #[cfg(any(
     all(unix, not(target_os = "macos")),
@@ -111,6 +113,7 @@ pub use fx_raster::{
     FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, KnockRect, SpriteCols,
     for_each_drawn_sprite, fx_bloom_quads, knock_rects, slice_layers,
 };
+pub use glow_ramps::{BeamRows, RampCost, RampSink};
 pub use spill::SpillBand;
 
 pub use deco::{
@@ -477,9 +480,10 @@ mod theme_from_scheme_tests {
 
 pub mod render_api;
 pub use render_api::{
-    CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowBlend, GlowQuad,
-    HaloMode, InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip,
-    TrailCell, WordDecoration,
+    CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowBlend, GlowEnd,
+    GlowQuad, GlowRamp, GlowRamps, HaloMode, InkCell, Laid, RainHalo, RampMark, Rasterizer,
+    RenderInput, RenderView, SceneAtlas, SelectionClip, TrailCell, WordDecoration, end_alpha,
+    end_color, glow_end,
 };
 
 /// Which glyph source a [`GlyphKey`] rasterizes from.
@@ -13767,16 +13771,35 @@ impl Renderer {
         input: &RenderInput,
         dirty: Option<&[bool]>,
     ) {
-        self.draw_flat_add(
+        self.draw_glow_stream(
             pixels,
-            w,
-            h,
+            (w, h),
             input.rows,
-            &input.cursor_glow_add,
+            (&input.cursor_glow_add, &input.cursor_glow_add_ramps),
             dirty,
-            0,
-            0,
         );
+    }
+
+    /// A window-space glow stream, its quads and ramps in draw order.
+    #[inline]
+    fn draw_glow_stream(
+        &self,
+        pixels: &mut [u32],
+        (w, h): (usize, usize),
+        rows: usize,
+        (quads, ramps): (&[GlowQuad], &GlowRamps),
+        dirty: Option<&[bool]>,
+    ) {
+        use glow_ramps::Lights;
+        glow_ramps::each_laid(quads, ramps, |laid| match laid {
+            Lights::Quads(run) => self.draw_flat_add(pixels, w, h, rows, run, dirty, 0, 0),
+            Lights::Ramp(ramp) => {
+                let row = usize::from(ramp.row);
+                if row < rows && dirty.is_none_or(|d| d.get(row).copied().unwrap_or(false)) {
+                    glow_ramps::draw_ramp(pixels, (w, h), ramp, &ramps.ends, (0, 0));
+                }
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13883,7 +13906,13 @@ impl Renderer {
         input: &RenderInput,
         dirty: Option<&[bool]>,
     ) {
-        self.draw_flat_add(pixels, w, h, input.rows, &input.glow_under, dirty, 0, 0);
+        self.draw_glow_stream(
+            pixels,
+            (w, h),
+            input.rows,
+            (&input.glow_under, &input.glow_under_ramps),
+            dirty,
+        );
     }
 
     fn draw_fire_patch(
@@ -15668,10 +15697,12 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         cursor_trail,
         cursor_trail_color,
         cursor_glow_add,
+        cursor_glow_add_ramps,
         cursor_glow_add_damage,
         glow_halo,
         glow_halo_damage,
         glow_under,
+        glow_under_ramps,
         glow_under_damage,
         fire_patch,
         fire_patch_damage,
@@ -15755,8 +15786,10 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     if drop_effect_payloads {
         if cursor_glow_add_damage.is_valid() {
             dst.cursor_glow_add.clear();
+            dst.cursor_glow_add_ramps.clear();
         } else {
             dst.cursor_glow_add.clone_from(cursor_glow_add);
+            dst.cursor_glow_add_ramps.clone_from(cursor_glow_add_ramps);
         }
         if glow_halo_damage.is_valid() {
             dst.glow_halo.clear();
@@ -15765,8 +15798,10 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         }
         if glow_under_damage.is_valid() {
             dst.glow_under.clear();
+            dst.glow_under_ramps.clear();
         } else {
             dst.glow_under.clone_from(glow_under);
+            dst.glow_under_ramps.clone_from(glow_under_ramps);
         }
         if fire_patch_damage.is_valid() {
             dst.fire_patch.clear();
@@ -15779,8 +15814,10 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
             .same_content(cursor_glow_add_damage)
             != Some(true)
             || dst.cursor_glow_add.len() != cursor_glow_add.len()
+            || dst.cursor_glow_add_ramps.items.len() != cursor_glow_add_ramps.items.len()
         {
             dst.cursor_glow_add.clone_from(cursor_glow_add);
+            dst.cursor_glow_add_ramps.clone_from(cursor_glow_add_ramps);
         }
         if dst.glow_halo_damage.same_content(glow_halo_damage) != Some(true)
             || dst.glow_halo.len() != glow_halo.len()
@@ -15789,8 +15826,10 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         }
         if dst.glow_under_damage.same_content(glow_under_damage) != Some(true)
             || dst.glow_under.len() != glow_under.len()
+            || dst.glow_under_ramps.items.len() != glow_under_ramps.items.len()
         {
             dst.glow_under.clone_from(glow_under);
+            dst.glow_under_ramps.clone_from(glow_under_ramps);
         }
         if dst.fire_patch_damage.same_content(fire_patch_damage) != Some(true)
             || dst.fire_patch.len() != fire_patch.len()
@@ -15932,6 +15971,37 @@ fn effect_stream_changed<T: PartialEq>(
         return !(prev_damage.was_empty() == Some(true) && current.is_empty());
     }
     prev != current
+}
+
+/// [`effect_stream_changed`] for a glow stream, its ramps beside its quads.
+#[inline]
+fn glow_stream_changed(
+    (prev, prev_ramps): (&[GlowQuad], &GlowRamps),
+    (current, current_ramps): (&[GlowQuad], &GlowRamps),
+    prev_damage: &EffectStreamDamage,
+    current_damage: &EffectStreamDamage,
+) -> bool {
+    if let Some(same) = prev_damage.same_content(current_damage) {
+        return !same;
+    }
+    if prev_damage.is_valid() {
+        return !(prev_damage.was_empty() == Some(true)
+            && current.is_empty()
+            && current_ramps.is_empty());
+    }
+    prev != current || prev_ramps != current_ramps
+}
+
+/// Every row a glow stream's quads and ramps are tagged with.
+#[inline]
+fn glow_stream_rows<'a>(
+    quads: &'a [GlowQuad],
+    ramps: &'a GlowRamps,
+) -> impl Iterator<Item = usize> + 'a {
+    quads
+        .iter()
+        .map(|quad| usize::from(quad.row))
+        .chain(ramps.items.iter().map(|ramp| usize::from(ramp.row)))
 }
 
 #[inline]
@@ -16271,8 +16341,10 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
 
     input.cursor_trail.is_empty()
         && absent(&input.cursor_glow_add, &input.cursor_glow_add_damage)
+        && (input.cursor_glow_add_damage.is_valid() || input.cursor_glow_add_ramps.is_empty())
         && absent(&input.glow_halo, &input.glow_halo_damage)
         && absent(&input.glow_under, &input.glow_under_damage)
+        && (input.glow_under_damage.is_valid() || input.glow_under_ramps.is_empty())
         && absent(&input.fire_patch, &input.fire_patch_damage)
         && input.word_decorations.iter().all(|d| d.dy == 0)
         && input.char_fg.is_empty()
@@ -16634,9 +16706,12 @@ pub fn compute_dirty_rows(
         }
     }
 
-    let glow_changed = effect_stream_changed(
-        &prev_input.cursor_glow_add,
-        &input.cursor_glow_add,
+    let glow_changed = glow_stream_changed(
+        (
+            &prev_input.cursor_glow_add,
+            &prev_input.cursor_glow_add_ramps,
+        ),
+        (&input.cursor_glow_add, &input.cursor_glow_add_ramps),
         &prev_input.cursor_glow_add_damage,
         &input.cursor_glow_add_damage,
     );
@@ -16645,16 +16720,14 @@ pub fn compute_dirty_rows(
             dirty,
             &prev_input.cursor_glow_add_damage,
             &input.cursor_glow_add_damage,
-            prev_input
-                .cursor_glow_add
-                .iter()
-                .map(|quad| usize::from(quad.row))
-                .chain(
-                    input
-                        .cursor_glow_add
-                        .iter()
-                        .map(|quad| usize::from(quad.row)),
-                ),
+            glow_stream_rows(
+                &prev_input.cursor_glow_add,
+                &prev_input.cursor_glow_add_ramps,
+            )
+            .chain(glow_stream_rows(
+                &input.cursor_glow_add,
+                &input.cursor_glow_add_ramps,
+            )),
         );
     }
 
@@ -16677,9 +16750,9 @@ pub fn compute_dirty_rows(
         );
     }
 
-    let glow_under_changed = effect_stream_changed(
-        &prev_input.glow_under,
-        &input.glow_under,
+    let glow_under_changed = glow_stream_changed(
+        (&prev_input.glow_under, &prev_input.glow_under_ramps),
+        (&input.glow_under, &input.glow_under_ramps),
         &prev_input.glow_under_damage,
         &input.glow_under_damage,
     );
@@ -16688,11 +16761,8 @@ pub fn compute_dirty_rows(
             dirty,
             &prev_input.glow_under_damage,
             &input.glow_under_damage,
-            prev_input
-                .glow_under
-                .iter()
-                .map(|quad| usize::from(quad.row))
-                .chain(input.glow_under.iter().map(|quad| usize::from(quad.row))),
+            glow_stream_rows(&prev_input.glow_under, &prev_input.glow_under_ramps)
+                .chain(glow_stream_rows(&input.glow_under, &input.glow_under_ramps)),
         );
     }
 
@@ -18482,9 +18552,12 @@ impl BeamClip {
     }
 }
 
+/// Lay the uniform rect `(x, y, w, h)` clipped to `clip`, a piece per cell
+/// row band it crosses: through [`BeamRows::rect`] where `stacked` (a
+/// column's pieces, one above the next), else each as its own quad.
 #[allow(clippy::too_many_arguments)]
-fn push_glow_rect(
-    out: &mut Vec<GlowQuad>,
+fn push_glow_rect<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     x: i32,
     y: i32,
@@ -18492,6 +18565,7 @@ fn push_glow_rect(
     h: i32,
     premul: u32,
     alpha: u8,
+    stacked: bool,
 ) {
     if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) || clip.cell_h <= 0 {
         return;
@@ -18507,24 +18581,41 @@ fn push_glow_rect(
     while yy < y1 {
         let row_rel = (yy - clip.origin_y).div_euclid(clip.cell_h);
         let band_end = (clip.origin_y + (row_rel + 1) * clip.cell_h).min(y1);
-        out.push(GlowQuad {
-            row: row_rel.max(0) as u16,
-            x: x0 as u16,
-            y: yy as u16,
-            w: (x1 - x0) as u16,
-            h: (band_end - yy) as u16,
-            color: premul,
-            alpha,
-            color2: premul,
-            alpha2: alpha,
-        });
+        let (tag, piece) = (
+            row_rel.max(0) as u16,
+            (
+                x0 as u16,
+                yy as u16,
+                (x1 - x0) as u16,
+                (band_end - yy) as u16,
+            ),
+        );
+        if stacked {
+            out.rect(row_rel, tag, piece, (premul, alpha));
+        } else {
+            out.quad(GlowQuad {
+                row: tag,
+                x: piece.0,
+                y: piece.1,
+                w: piece.2,
+                h: piece.3,
+                color: premul,
+                alpha,
+                color2: premul,
+                alpha2: alpha,
+            });
+        }
         yy = band_end;
     }
 }
 
+/// One slab of a beam: across its minor axis, an antialiased edge piece,
+/// the full-coverage core and the far edge. An x-major slab's pieces stack
+/// in its column, laid as one ramp's rows where `out` lays ramps and a run
+/// of three lights rides one ([`BeamRows::rides`]).
 #[allow(clippy::too_many_arguments)]
-fn emit_aa_slab(
-    out: &mut Vec<GlowQuad>,
+fn emit_aa_slab<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     horizontal: bool,
     c: f32,
@@ -18543,6 +18634,13 @@ fn emit_aa_slab(
     let cov = cov as f32;
     let il = lo.floor() as i32;
     let ih = hi.ceil() as i32;
+    // A stacked slab's run within one band carries at most its edge, a core
+    // piece and its far edge: where three lights cannot ride one ramp, its
+    // pieces lay as the quads the sink would keep.
+    let stacked = !horizontal && ih - il > 1 && out.rides(3);
+    if stacked {
+        out.slab();
+    }
     let mut slab = |a: i32, width: i32, f: f32| {
         if width <= 0 {
             return;
@@ -18554,9 +18652,9 @@ fn emit_aa_slab(
         let premul = premul_rgb(color, aa);
         let alpha = if over { aa } else { 0 };
         if horizontal {
-            push_glow_rect(out, clip, a, p, width, len, premul, alpha);
+            push_glow_rect(out, clip, a, p, width, len, premul, alpha, false);
         } else {
-            push_glow_rect(out, clip, p, a, len, width, premul, alpha);
+            push_glow_rect(out, clip, p, a, len, width, premul, alpha, stacked);
         }
     };
     if ih - il <= 1 {
@@ -18688,10 +18786,10 @@ impl BeamScratch {
     }
 }
 
-/// Rasterize a thick antialiased additive polyline (the cursor comet beam) into per-cell-row [`GlowQuad`]s.
+/// Rasterize a thick antialiased additive polyline (the cursor comet beam) into per-cell-row [`GlowQuad`]s, or ramps where `out` lays them ([`BeamRows`]).
 #[inline]
-pub fn comet_beam(
-    out: &mut Vec<GlowQuad>,
+pub fn comet_beam<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     verts: &[BeamVertex],
     thickness: f32,
@@ -18703,8 +18801,8 @@ pub fn comet_beam(
 
 /// [`comet_beam`]'s source-over twin, for a light ground where additive light cannot show.
 #[inline]
-pub fn comet_beam_over(
-    out: &mut Vec<GlowQuad>,
+pub fn comet_beam_over<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     verts: &[BeamVertex],
     thickness: f32,
@@ -18715,8 +18813,8 @@ pub fn comet_beam_over(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn beam_polyline(
-    out: &mut Vec<GlowQuad>,
+fn beam_polyline<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     verts: &[BeamVertex],
     thickness: f32,
@@ -18907,7 +19005,23 @@ pub fn ribbon_beam(
     max_quads: usize,
     blend: GlowBlend,
 ) -> bool {
-    let start = out.len();
+    ribbon_beam_into(out, clip, verts, shoulder, step, max_quads, blend)
+}
+
+/// [`ribbon_beam`] into any [`BeamRows`] sink: a slab's one-pixel rows laid
+/// as its quads or, through a [`RampSink`], as one ramp per band, the
+/// `max_quads` budget counting each lit row alike.
+#[allow(clippy::too_many_arguments)]
+pub fn ribbon_beam_into<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    shoulder: f32,
+    step: usize,
+    max_quads: usize,
+    blend: GlowBlend,
+) -> bool {
+    let start = out.mark();
     if ribbon_beam_ordered(out, clip, verts, shoulder, step, max_quads, blend, false) {
         return true;
     }
@@ -18919,8 +19033,8 @@ pub fn ribbon_beam(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ribbon_beam_ordered(
-    out: &mut Vec<GlowQuad>,
+fn ribbon_beam_ordered<S: BeamRows>(
+    out: &mut S,
     clip: BeamClip,
     verts: &[RibbonVertex],
     shoulder: f32,
@@ -18974,8 +19088,9 @@ fn ribbon_beam_ordered(
                 let col1 = lerp_rgb_f(a.color, b.color, t1);
                 let mut row_rel = (y0 - clip.origin_y).div_euclid(clip.cell_h);
                 let mut band_end = clip.origin_y + (row_rel + 1) * clip.cell_h;
+                out.slab();
                 for y in y0..y1 {
-                    if out.len() + 2 > max_quads {
+                    if out.laid() + 2 > max_quads {
                         return false;
                     }
                     if y >= band_end {
@@ -19016,17 +19131,13 @@ fn ribbon_beam_ordered(
                                 GlowBlend::Add => 0,
                                 GlowBlend::Over => c,
                             };
-                            out.push(GlowQuad {
-                                row: row_rel.max(0) as u16,
-                                x: rect_x0 as u16,
-                                y: y as u16,
-                                w: (rect_x1 - rect_x0) as u16,
-                                h: 1,
-                                color: premul0,
-                                alpha,
-                                color2: premul1,
-                                alpha2: alpha,
-                            });
+                            out.row(
+                                row_rel,
+                                row_rel.max(0) as u16,
+                                (rect_x0 as u16, y as u16, (rect_x1 - rect_x0) as u16),
+                                (premul0, alpha),
+                                (premul1, alpha),
+                            );
                         }
                     }
                 }
@@ -19257,8 +19368,8 @@ pub const LASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
 
 /// Emit the full layered-bloom comet beam for one contiguous run of swept-cell samples (broad aura under a white-hot core) into per-cell-row [`GlowQuad`]s.
 #[inline]
-pub fn comet_glow_quads(
-    out: &mut Vec<GlowQuad>,
+pub fn comet_glow_quads<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     run: &[CometSample],
     core_px: f32,
@@ -19270,8 +19381,8 @@ pub fn comet_glow_quads(
 
 /// Emit the phaser streak ([`PHASER_LAYERS`]: a near-cell-height band of spectrum under a tight halo), as [`comet_glow_quads`] does the comet.
 #[inline]
-pub fn phaser_streak_quads(
-    out: &mut Vec<GlowQuad>,
+pub fn phaser_streak_quads<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     run: &[CometSample],
     core_px: f32,
@@ -19291,8 +19402,8 @@ pub fn phaser_streak_quads(
 
 /// Emit the beam tube ([`BEAM_LAYERS`]: a solid luminous rod in a deep-space sleeve), as [`comet_glow_quads`] does the comet.
 #[inline]
-pub fn beam_glow_quads(
-    out: &mut Vec<GlowQuad>,
+pub fn beam_glow_quads<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     run: &[CometSample],
     core_px: f32,
@@ -19304,9 +19415,9 @@ pub fn beam_glow_quads(
 
 /// Shared body of [`comet_glow_quads`] / [`phaser_streak_quads`] / [`beam_glow_quads`], without the per-call scratch they build.
 #[allow(clippy::too_many_arguments)]
-pub fn layered_beam_quads_with(
+pub fn layered_beam_quads_with<S: BeamRows + ?Sized>(
     scratch: &mut BeamScratch,
-    out: &mut Vec<GlowQuad>,
+    out: &mut S,
     clip: BeamClip,
     run: &[CometSample],
     core_px: f32,
@@ -19347,8 +19458,8 @@ pub fn layered_beam_quads_with(
 }
 
 #[inline]
-fn layered_beam_quads(
-    out: &mut Vec<GlowQuad>,
+fn layered_beam_quads<S: BeamRows + ?Sized>(
+    out: &mut S,
     clip: BeamClip,
     run: &[CometSample],
     core_px: f32,
@@ -30949,8 +31060,8 @@ mod ribbon_beam_tests {
 #[cfg(test)]
 mod comet_beam_tests {
     use super::{
-        BeamClip, BeamVertex, CometSample, GlowQuad, comet_beam, comet_beam_over, premul_rgb,
-        rdp_keep_indices, rdp_simplify,
+        BeamClip, BeamVertex, CometSample, GlowQuad, GlowRamps, RampCost, RampSink, comet_beam,
+        comet_beam_over, premul_rgb, rdp_keep_indices, rdp_simplify,
     };
 
     fn v(x: f32, y: f32, cov: u8) -> BeamVertex {
@@ -30959,6 +31070,71 @@ mod comet_beam_tests {
             y,
             color: 0x0050_FA7B,
             cov,
+        }
+    }
+
+    /// A comet beam laid into a ramp sink is its legacy quads: an x-major
+    /// slab's column rides one ramp per band where a run of three lights
+    /// (its edge, a core piece and its far edge) pays, its core the ramp's
+    /// run (each of whose rows reads the core's ends), every other piece a
+    /// quad, in the legacy stream's order and count; where three lights do
+    /// not pay (the measured costs) the slab lays only quads.
+    #[test]
+    fn a_comet_beam_laid_as_ramps_is_its_quads() {
+        let clip = BeamClip::grid(320, 96, 16);
+        let paths = [
+            vec![v(4.0, 8.0, 40), v(150.0, 21.0, 200), v(300.0, 29.5, 120)],
+            vec![v(20.0, 2.0, 200), v(28.0, 90.0, 90)],
+            vec![v(4.0, 8.0, 40), v(90.0, 37.0, 200), v(140.0, 70.0, 120)],
+        ];
+        let three = RampCost {
+            light: 30,
+            ramp: 76,
+        };
+        assert_eq!(three.floor(), 3);
+        assert_eq!(crate::glow_ramps::RAMP_COST.floor(), 4);
+        for cost in [RampCost::ALWAYS, three, crate::glow_ramps::RAMP_COST] {
+            let rides = cost.floor() <= 3;
+            let (mut fewer, mut runs) = (0usize, 0usize);
+            for path in &paths {
+                for (thick, step) in [(1.0, 1), (3.0, 1), (5.5, 2), (14.0, 1)] {
+                    for over in [false, true] {
+                        let (mut legacy, mut quads, mut ramps) =
+                            (Vec::new(), Vec::new(), GlowRamps::default());
+                        {
+                            let mut sink = RampSink::new(&mut quads, &mut ramps).costed(cost);
+                            if over {
+                                comet_beam_over(&mut legacy, clip, path, thick, step, 0.0);
+                                comet_beam_over(&mut sink, clip, path, thick, step, 0.0);
+                            } else {
+                                comet_beam(&mut legacy, clip, path, thick, step, 0.0);
+                                comet_beam(&mut sink, clip, path, thick, step, 0.0);
+                            }
+                        }
+                        let mut got = Vec::new();
+                        ramps.expand_into(&quads, &mut got);
+                        let what =
+                            format!("{cost:?} thick {thick} step {step} over {over} path {path:?}");
+                        assert_eq!(got, legacy, "{what}");
+                        assert_eq!(ramps.laid(quads.len()), legacy.len(), "{what}");
+                        assert_eq!(ramps.lit, ramps.count_lit(), "{what}");
+                        assert!(rides || ramps.is_empty(), "{what}");
+                        for r in &ramps.items {
+                            let head = r.row_ends(&ramps.ends, r.join);
+                            for k in r.join + 1..=r.join + r.joined {
+                                assert_eq!(r.row_ends(&ramps.ends, k), head, "{what}: {r:?}");
+                            }
+                            runs += usize::from(r.joined > 0);
+                        }
+                        fewer += usize::from(ramps.items.len() + quads.len() < legacy.len());
+                    }
+                }
+            }
+            assert_eq!(
+                fewer > 0 && runs > 0,
+                rides,
+                "{cost:?}: the fixtures lay columns as ramps where three lights pay"
+            );
         }
     }
 

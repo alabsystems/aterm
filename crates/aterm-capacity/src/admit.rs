@@ -82,17 +82,27 @@ fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)
 }
 
-/// Why `need` can never be admitted on the machine `reading` reads: all the memory the Mac has or more, its margin included (what is available, free, inactive and purgeable pages, never holds the kernel's wired pages, so it is always less than all of it), or more disk than its volume holds above the floor. `None` when it can.
+/// Why `need` can never be admitted on the machine `reading` reads: all the memory that can ever be available there or more, its margin included ([`Reading::reachable`]: physical memory less what is wired, which what is available never reaches), or more disk than its volume holds above the floor. `None` when it can.
 #[must_use]
 pub fn never(need: &Need, reading: &Reading) -> Option<String> {
-    if let Some(physical) = reading.physical
-        && need.mem.saturating_add(need.margin) >= physical
+    if need.mem > 0
+        && let (Some(physical), Some(reach)) = (reading.physical, reading.reachable())
+        && need.mem.saturating_add(need.margin) >= reach
     {
+        let ceiling = if reach < physical {
+            format!(
+                "{HOST} can never have more than {} of its {} of memory available ({} of it is wired)",
+                gib(reach),
+                gib(physical),
+                gib(physical - reach)
+            )
+        } else {
+            format!("{HOST} has {} of memory", gib(physical))
+        };
         return Some(format!(
-            "{}: needs {}, {HOST} has {} of memory",
+            "{}: needs {}, {ceiling}",
             need.what,
-            mem_and_margin(need.mem, need.margin),
-            gib(physical)
+            mem_and_margin(need.mem, need.margin)
         ));
     }
     if need.disk > 0

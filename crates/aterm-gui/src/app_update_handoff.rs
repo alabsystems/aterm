@@ -2284,6 +2284,9 @@ fn prepare_outgoing_artifacts(
         };
     let layout_at = std::time::Instant::now();
     aterm_log::info!("update apply: layout sidecar — {layout_seal}");
+    // The keep seam's first copy (inert in a shipped build): every file is written and the grant
+    // has not gone, so the successor has opened none of them.
+    crate::seamless::keep_attempt(nonce);
     if job.cancel.try_recv().is_ok() {
         return Err(PreparationFailure::Cancelled);
     }

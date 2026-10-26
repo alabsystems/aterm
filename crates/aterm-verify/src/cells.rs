@@ -727,6 +727,10 @@ pub fn resolve_roots(
     Ok((graph, paths))
 }
 
+/// Where a cell's missing std comes from: provision's rustup row adds every cell's std to
+/// stable, with clippy ([`crate::provision::stable::CELL_TARGETS`]).
+const PROVISION_RUSTUP: &str = "targo --unverified verify provision rustup";
+
 /// One cell, end to end: its graph, its shims, its toolchain, the lint of its roots, and (off
 /// wasm32) the all-targets pass over its workspace members.
 fn check_cell(
@@ -818,7 +822,7 @@ fn check_cell(
         Ok(None) => {
             return CellOutcome::Skipped {
                 why: "no rustup toolchain has its std".to_string(),
-                fix: format!("rustup target add {} --toolchain stable", cell.triple),
+                fix: PROVISION_RUSTUP.to_string(),
             };
         }
         Err(e) => return could_not("NO-TOOLCHAIN", vec![e]),

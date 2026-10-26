@@ -178,6 +178,7 @@ fn the_newest_column_ends_under_the_now_marker() {
         (DeckForm::Full, 550.0),
         (DeckForm::Folded, 1119.0),
         (DeckForm::Folded, 800.0),
+        (DeckForm::Folded, 600.0),
     ] {
         for s in [1.0, 2.0] {
             let prims = paint(&snap, form, w, s, DeckLive::STILL);
@@ -226,7 +227,11 @@ fn the_newest_column_ends_under_the_now_marker() {
                     y0 <= px(top, s) && y1 >= px(last, s) - 0.01,
                     "{at}: the line {y0}..{y1}"
                 );
-                assert_eq!(line, ink(inks.words, crate::stats_live::LINE_ALPHA), "{at}");
+                assert_eq!(
+                    line,
+                    ink(inks.words, 0xFF),
+                    "{at}: the line in solid words ink"
+                );
                 assert!(
                     rings_at(&prims, (cx, cy)).is_empty(),
                     "{at}: a still deck rings nothing"
@@ -316,6 +321,199 @@ fn the_strips_glide_left_by_the_part_of_the_period_run() {
     }
 }
 
+/// The shift, `-max..=max` device px, that best lines `b`'s pixel row `y` up with `a`'s over
+/// `x0..x1` (`b[x]` against `a[x + shift]`, so a positive shift is content gone left), and the
+/// mean channel difference left there and with no shift at all.
+fn best_shift(
+    a: &[u8],
+    b: &[u8],
+    pw: u32,
+    y: u32,
+    (x0, x1): (u32, u32),
+    max: i32,
+) -> (i32, f64, f64) {
+    let at = |img: &[u8], x: i64| -> [u8; 4] {
+        let i = (y as usize * pw as usize + x as usize) * 4;
+        img.get(i..i + 4)
+            .and_then(|p| <[u8; 4]>::try_from(p).ok())
+            .unwrap_or_default()
+    };
+    let cost = |d: i32| -> f64 {
+        let (lo, hi) = (
+            i64::from(x0) + i64::from(max),
+            i64::from(x1) - i64::from(max),
+        );
+        let mut sum = 0.0;
+        for x in lo..hi {
+            let (p, q) = (at(b, x), at(a, x + i64::from(d)));
+            sum += p
+                .iter()
+                .zip(q)
+                .map(|(&u, v)| f64::from(u.abs_diff(v)))
+                .sum::<f64>();
+        }
+        sum / (hi - lo).max(1) as f64
+    };
+    let best = (-max..=max)
+        .min_by(|&p, &q| cost(p).total_cmp(&cost(q)))
+        .unwrap_or(0);
+    (best, cost(best), cost(0))
+}
+
+/// The owner's ask, "I want to see a shifting to the left animation" (2026-10-24), where he
+/// looks: the default window, Folded at about 600 pt and focused. Its strips glide at least a
+/// device pixel a second (one 10 s column on a 10 pt pitch: 1 px a second at 1x, 2 at 2x), as
+/// every Folded width's do, each move a whole pixel; and on the raster two seconds of glide
+/// carry the strip's pixels that far left, measured as two screenshots are: by the shift that
+/// best lines the later frame's strip up with the earlier's. The label over it still names
+/// what the strip spans (`the_time_scale_marks_how_far_back_at_every_width`).
+#[test]
+fn the_default_window_is_seen_gliding_left() {
+    use crate::stats_live::glide_step;
+    use std::time::Duration;
+    let m = deck_metrics();
+    for w in (300..=2560).map(f64::from) {
+        let p = plan::plan_folded(w, &m);
+        if p.ground_only {
+            continue;
+        }
+        for b in p.blocks {
+            for s in [1.0, 2.0] {
+                assert!(
+                    b.strip.pt_per_s() * s >= 1.0,
+                    "Folded {w} pt {s}x glides {} px a second: {:?}",
+                    b.strip.pt_per_s() * s,
+                    b.strip
+                );
+            }
+        }
+    }
+    // NEGATIVE CONTROL: a Full strip keeps its ten minutes, and at 1x glides under a pixel a
+    // second (Full is drawn only where it is chosen).
+    let full = plan::plan_full(1119.0, &m).strip;
+    assert_eq!(full.span_s(), 600);
+    assert!(full.pt_per_s() < 1.0, "{full:?}");
+
+    let mut snap = scene(Scene::Calm);
+    snap.at_unix_ms = OPEN;
+    let (form, w) = (DeckForm::Folded, 600.0);
+    let d = strips(form, w)[0];
+    assert_eq!(
+        (d.strip.period_s, d.strip.span_s()),
+        (10, 60),
+        "the default window's strip spans a minute of 10 s columns"
+    );
+    let glide = |ms: i64| DeckLive {
+        glide_ms: Some(ms),
+        beat: None,
+        fresh: true,
+    };
+    for s in [1.0, 2.0] {
+        let g = geom_at(w, s, form);
+        let (_, _, out) = deck_paint_live(&g, &scene_input(&snap, form));
+        let step = glide_step(out.glide_px_per_s);
+        assert!(
+            (out.glide_px_per_s - d.strip.pt_per_s() * s).abs() < 1e-9,
+            "{s}x: {out:?}"
+        );
+        assert!(
+            (out.glide_px_per_s * step.as_secs_f64() - 1.0).abs() < 1e-9
+                && step <= Duration::from_secs(1),
+            "{s}x: each move a whole pixel, at least one a second ({step:?})"
+        );
+        let want = 2.0 * d.strip.pt_per_s() * s;
+        let (t1, t2) = (OPEN + 2_000, OPEN + 4_000);
+        // The prims: every cell of the first row, the newest included, `want` px left.
+        let cells = |ms| row_cells(&paint(&snap, form, w, s, glide(ms)), &d, s);
+        let (before, after) = (cells(t1), cells(t2));
+        assert_eq!(before.len(), after.len(), "{s}x");
+        assert!(
+            before.len() > d.strip.cols as usize,
+            "CONTROL {s}x: {before:?}"
+        );
+        for (a, b) in before.iter().zip(&after) {
+            assert!(
+                (a - b - want as f32).abs() < 1e-3,
+                "{s}x: a cell at {a} stands at {b} two seconds on, not {want} px left"
+            );
+        }
+        // The raster, read as two screenshots are.
+        let raster = |ms| {
+            let mut input = scene_input(&snap, form);
+            input.live = glide(ms);
+            let (prims, _) = deck_paint(&g, &input);
+            crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0; 4]).0
+        };
+        let (a, b) = (raster(t1), raster(t2));
+        let y = (px(d.top, s) + px(d.cell, s) / 2.0) as u32;
+        let span = (px(d.strip.x, s) as u32, px(d.strip.end(), s) as u32);
+        let (shift, left, unmoved) = best_shift(&a, &b, g.w as u32, y, span, 8);
+        assert_eq!(f64::from(shift), want, "{s}x: the strip moved {shift} px");
+        assert!(left < 1.0, "{s}x: {left} left after lining up");
+        assert!(
+            unmoved > 10.0,
+            "CONTROL {s}x: the frames differ ({unmoved})"
+        );
+    }
+}
+
+/// A Folded strip draws the newest of its row's 10 s columns, never the oldest: with the CPU
+/// hot for its last 70 seconds and cold for the nine minutes before, every CPU cell of the
+/// default window's minute is hot, and with the hour the other way round every one is cold.
+#[test]
+fn a_folded_strip_draws_the_newest_ten_second_columns() {
+    let (form, w) = (DeckForm::Folded, 600.0);
+    let d = strips(form, w)[0];
+    let cpu = Resource::Cpu.index();
+    let painted = |hot_last: bool, s: f64| -> Vec<[u8; 4]> {
+        let mut snap = scene(Scene::Calm);
+        let view = &mut snap.resources[cpu];
+        let cap = view.capacity.expect("the scene's CPU capacity");
+        let ring: Vec<aterm_vitals::Cell> = (0..61)
+            .map(|i| {
+                let hot = (i >= 54) == hot_last;
+                let v = Some(if hot { cap } else { 0.0 });
+                aterm_vitals::Cell {
+                    mean: v,
+                    max: v,
+                    over: false,
+                }
+            })
+            .collect();
+        view.ring = ring.into();
+        let prims = paint(&snap, form, w, s, DeckLive::STILL);
+        let xs = row_cells(&prims, &d, s);
+        prims
+            .iter()
+            .filter_map(|p| match *p {
+                DrawPrim::Panel {
+                    x, y, w, h, fill, ..
+                } if xs.contains(&x)
+                    && (w - px(d.strip.cell, s)).abs() < 0.01
+                    && (y + h - (px(d.top, s) + px(d.cell, s))).abs() < 0.01 =>
+                {
+                    Some(fill)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let inks = super::tests::dark_inks();
+    let (hot, cold) = (
+        ink(inks.heat[usize::from(ink::heat_step(1.0))], 0xFF),
+        ink(inks.heat[usize::from(ink::heat_step(0.0))], 0xFF),
+    );
+    assert_ne!(hot, cold, "CONTROL: the ramp's ends differ");
+    for s in [1.0, 2.0] {
+        let newest = painted(true, s);
+        assert_eq!(newest.len(), d.strip.cols as usize, "{s}x: {newest:?}");
+        assert!(newest.iter().all(|&f| f == hot), "{s}x: {newest:?}");
+        let oldest = painted(false, s);
+        assert_eq!(oldest.len(), d.strip.cols as usize, "{s}x");
+        assert!(oldest.iter().all(|&f| f == cold), "{s}x: {oldest:?}");
+    }
+}
+
 /// When readings stop the marker turns grey and hollow and rings nothing, so a frozen deck never
 /// looks live; while they come a beat's ring widens around the dot and fades.
 #[test]
@@ -338,8 +536,29 @@ fn a_stalled_deck_greys_its_marker_and_beats_nothing() {
         vec![((DOT_R * s) as f32, ink(inks.hollow, 0xFF))],
         "a hollow grey ring in the dot's place"
     );
-    let (_, _, line) = line_under(&stale, at.0).expect("the line stays");
-    assert_eq!(line, ink(inks.hollow, 0xFF), "the line greys");
+    assert!(
+        line_under(&stale, at.0).is_none(),
+        "no solid line under a stalled marker"
+    );
+    let dashed: Vec<[u8; 4]> = stale
+        .iter()
+        .filter_map(|p| match *p {
+            DrawPrim::Dashed {
+                x,
+                w,
+                on,
+                off,
+                color,
+                ..
+            } if w == 0.0 && x <= at.0 && at.0 <= x + 2.0 && on > 0.0 && off > 0.0 => Some(color),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dashed,
+        vec![ink(inks.hollow, 0xFF)],
+        "the line greys and breaks into dashes"
+    );
     assert_ne!(
         inks.hollow, inks.words,
         "CONTROL: grey is not the words' ink"
@@ -372,6 +591,266 @@ fn a_stalled_deck_greys_its_marker_and_beats_nothing() {
         ring(&paint(&snap, form, w, s, beat(0.999))).is_none(),
         "the beat ends unseen"
     );
+}
+
+/// The relative luminance of `c` (WCAG 2).
+fn luminance(c: [u8; 4]) -> f64 {
+    let ch = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.039_28 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+}
+
+fn contrast(a: [u8; 4], b: [u8; 4]) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The now marker's line as rastered: the contrast of its pixels with the ground beside it
+/// (the best and the median along its run), and how many breaks the run has.
+fn line_as_drawn(rgba: &[u8], pw: u32, d: &Drawn, s: f64) -> (f64, f64, usize) {
+    let lw = (0.75 * s).round().max(1.0);
+    let cx = (d.strip.end() + LINE_DX) * s;
+    let x = (cx - lw / 2.0).round() as usize;
+    let ground_x = x + lw as usize + 1;
+    let (y0, y1) = (px(d.top, s) as usize, px(d.last, s) as usize);
+    let at = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * pw as usize + x) * 4;
+        rgba.get(i..i + 4)
+            .and_then(|p| <[u8; 4]>::try_from(p).ok())
+            .unwrap_or_default()
+    };
+    let mut seen: Vec<f64> = (y0..y1)
+        .map(|y| contrast(at(x, y), at(ground_x, y)))
+        .collect();
+    let breaks = seen
+        .windows(2)
+        .filter(|w| w[0] >= 1.5 && w[1] < 1.1)
+        .count();
+    seen.sort_by(f64::total_cmp);
+    let best = seen.last().copied().unwrap_or(1.0);
+    let median = seen.get(seen.len() / 2).copied().unwrap_or(1.0);
+    (best, median, breaks)
+}
+
+/// Review of 2026-10-24: live and stalled must differ by more than a dot. In both themes, at
+/// both scales and in both forms, the live line as rastered stands out from the ground more
+/// than the stalled one (it was the other way round in the light theme), and the stalled line
+/// is broken into dashes, so a frozen deck reads as frozen with motion off.
+#[test]
+fn the_live_line_outranks_the_stalled_one_in_both_themes() {
+    let snap = scene(Scene::Calm);
+    for (ground, inks) in [
+        ("dark", super::tests::dark_inks()),
+        ("light", super::paint_tests::light_inks()),
+    ] {
+        for (form, w) in [
+            (DeckForm::Full, 1119.0),
+            (DeckForm::Folded, 1119.0),
+            (DeckForm::Folded, 600.0),
+        ] {
+            for s in [1.0, 2.0] {
+                let g = geom_at(w, s, form);
+                let raster = |live: DeckLive| {
+                    let mut input = scene_input(&snap, form);
+                    input.inks = inks;
+                    input.live = live;
+                    let (prims, _) = deck_paint(&g, &input);
+                    crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0; 4])
+                };
+                let (live, _, _) = raster(DeckLive::STILL);
+                let (stale, pw, _) = raster(DeckLive::STALE);
+                for d in strips(form, w) {
+                    let at = format!("{ground} {form:?} {w} pt {s}x, strip at {}", d.strip.x);
+                    let (live_best, live_mid, live_breaks) = line_as_drawn(&live, pw, &d, s);
+                    let (stale_best, _, stale_breaks) = line_as_drawn(&stale, pw, &d, s);
+                    assert!(live_mid >= 4.5, "{at}: the live line at {live_mid:.2}:1");
+                    assert_eq!(live_breaks, 0, "{at}: the live line is whole");
+                    assert!(
+                        live_best >= 1.3 * stale_best,
+                        "{at}: live {live_best:.2}:1, stalled {stale_best:.2}:1"
+                    );
+                    assert!(
+                        stale_best >= 2.0,
+                        "CONTROL {at}: the stalled line is drawn ({stale_best:.2}:1)"
+                    );
+                    assert!(
+                        stale_breaks >= 3,
+                        "{at}: the stalled line breaks {stale_breaks} times"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A time-scale tick is a mark, not a dot: at least two device px tall at 1× as at 2×, one px
+/// wide, ending short of the strip's top and its over-max caps; the strip's left-end tick under
+/// a label beside it too.
+#[test]
+fn a_tick_is_a_mark_at_both_scales() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    let mut checked = 0;
+    for (form, w) in [
+        (DeckForm::Full, 1119.0),
+        (DeckForm::Folded, 1119.0),
+        (DeckForm::Folded, 600.0),
+        (DeckForm::Full, 550.0),
+    ] {
+        for s in [1.0, 2.0] {
+            let input = scene_input(&snap, form);
+            let words = DeckWords::new(&input, &m);
+            let laid = lay(&geom_at(w, s, form), &input, &words, &m, true);
+            let head = laid.head.as_ref().expect("a header");
+            let top = strips(form, w)
+                .iter()
+                .map(|d| px(d.top, s))
+                .fold(f32::MAX, f32::min);
+            let caps = if s >= 2.0 {
+                ((1.5 * s).round() + (0.5 * s).round()) as f32
+            } else {
+                0.0
+            };
+            let xs: Vec<f64> = head
+                .ruler
+                .iter()
+                .map(|t| t.x)
+                .chain(head.time_tick)
+                .collect();
+            assert!(!xs.is_empty(), "{form:?} {w} pt {s}x: a scale");
+            for x in xs {
+                let at = format!("{form:?} {w} pt {s}x, tick at {x}");
+                let want = (x * s) as f32;
+                let mark = laid.prims.iter().find_map(|p| match *p {
+                    DrawPrim::Panel { x, y, w, h, .. }
+                        if w <= 1.01 && (x + w / 2.0 - want).abs() <= 1.0 && y < top =>
+                    {
+                        Some((y, w, h))
+                    }
+                    _ => None,
+                });
+                let (y, mw, h) = mark.unwrap_or_else(|| panic!("{at}: no mark"));
+                assert!(h >= 2.0, "{at}: {mw}x{h} px");
+                assert!(
+                    y + h <= top - caps,
+                    "{at}: ends at {} into the strip at {top}",
+                    y + h
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 8, "CONTROL: {checked} ticks");
+}
+
+/// The owner's default window (80 columns of the 12 px font, about 600 pt) draws v2's Folded
+/// deck: from there to the width where Folded's strips widen, with the face the app draws its
+/// header in, the header carries a time scale (review of 2026-10-24: it carried none below
+/// about 700 pt).
+#[test]
+fn the_default_window_carries_a_time_scale() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let m = deck_metrics();
+    let snap = scene(Scene::Calm);
+    let (mut drew, mut bare) = (0, Vec::new());
+    for form in [DeckForm::Folded, DeckForm::Full] {
+        let input = scene_input(&snap, form);
+        let words = DeckWords::new(&input, &m);
+        for w in (360..=1200).step_by(8).map(f64::from) {
+            for s in [1.0, 2.0] {
+                let laid = lay(&geom_at(w, s, form), &input, &words, &m, true);
+                let Some(head) = laid.head.as_ref() else {
+                    continue;
+                };
+                if !head.labels.iter().any(|l| l.label == plan::Label::Time) {
+                    continue;
+                }
+                drew += 1;
+                if head.ruler.is_empty() {
+                    bare.push(format!("{form:?} {w} pt {s}x"));
+                }
+            }
+        }
+    }
+    assert!(drew > 300, "CONTROL: {drew} headers drew the time label");
+    assert!(bare.is_empty(), "no scale at {bare:?}");
+}
+
+/// Every frame the live edge asks for draws something new (review of 2026-10-24): with
+/// readings landing each second, each glide frame between them moves the card's pixels, at the
+/// slowest widths too; past the open column's end the glide holds and asks none.
+#[test]
+fn every_glide_frame_moves_the_cards_pixels() {
+    use crate::stats_live::{LiveFacts, glide_step, open_start_ms};
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let ms0 = OPEN + 1_234;
+    let wall = |t: Instant| ms0 + i64::try_from((t - t0).as_millis()).unwrap_or(0);
+    let mut asked = 0;
+    for (form, w, s) in [
+        (DeckForm::Folded, 600.0, 2.0),
+        (DeckForm::Folded, 1119.0, 1.0),
+        (DeckForm::Folded, 1119.0, 2.0),
+        (DeckForm::Full, 1119.0, 1.0),
+        (DeckForm::Full, 1119.0, 2.0),
+    ] {
+        let g = geom_at(w, s, form);
+        let snap_at = |at_ms: i64| {
+            let mut snap = scene(Scene::Calm);
+            snap.at_unix_ms = at_ms;
+            snap
+        };
+        let first = snap_at(ms0);
+        let (_, _, out) = deck_paint_live(&g, &scene_input(&first, form));
+        assert!(
+            out.glide_px_per_s > 0.0 && out.glide_period_s > 0,
+            "CONTROL: the card glides and its strips share one period (else nothing holds): {out:?}"
+        );
+        let raster = |snap: &Snapshot, live: DeckLive| {
+            let mut input = scene_input(snap, form);
+            input.live = live;
+            let (prims, _) = deck_paint(&g, &input);
+            crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0; 4]).0
+        };
+        let period = out.glide_period_s;
+        for r in 0..8_u32 {
+            let landed = t0 + Duration::from_secs(u64::from(r));
+            let at_ms = wall(landed);
+            let snap = snap_at(at_ms);
+            let facts = LiveFacts {
+                landed: Some(landed),
+                stale_after: Duration::from_secs(3),
+                motion: true,
+                beat: false,
+                step: glide_step(out.glide_px_per_s),
+                glide_end_ms: Some(open_start_ms(at_ms, period) + i64::from(period) * 1000),
+            };
+            let mut now = landed;
+            let mut was = raster(&snap, facts.live(now, wall(now)));
+            while let Some(next) = facts.next_change(now, wall(now)) {
+                if next >= landed + Duration::from_secs(1) {
+                    break;
+                }
+                let drawn = raster(&snap, facts.live(next, wall(next)));
+                assert_ne!(
+                    drawn,
+                    was,
+                    "{form:?} {w} pt {s}x: reading {r}, a frame at {:?} drew nothing new",
+                    next - landed
+                );
+                asked += 1;
+                was = drawn;
+                now = next;
+            }
+        }
+    }
+    assert!(asked >= 10, "CONTROL: {asked} glide frames asked");
 }
 
 /// A frame that moves only the live edge re-rasters only the card's rects its layers moved, and
@@ -606,15 +1085,23 @@ fn deck_live_gallery() {
             "beat",
             DeckLive {
                 glide_ms: Some(OPEN + 1_000),
-                beat: Some(0.2),
+                beat: crate::stats_live::beat_phase(0),
                 fresh: true,
             },
         ),
         ("stalled", DeckLive::STALE),
     ];
+    // The mockups' widths, and the owner's default window (80 columns, about 600 pt).
+    const WIDTHS: [(f64, f64); 5] = [
+        (1119.0, 2.0),
+        (550.0, 2.0),
+        (1119.0, 1.0),
+        (600.0, 2.0),
+        (600.0, 1.0),
+    ];
     let mut written = 0;
     for (name, live) in frames {
-        for (w, s) in [(1119.0, 2.0), (550.0, 2.0), (1119.0, 1.0)] {
+        for (w, s) in WIDTHS {
             for form in [DeckForm::Full, DeckForm::Folded] {
                 for (ground, inks) in [
                     ("dark", super::tests::dark_inks()),
@@ -646,5 +1133,5 @@ fn deck_live_gallery() {
             }
         }
     }
-    assert_eq!(written, frames.len() * 3 * 2 * 2);
+    assert_eq!(written, frames.len() * WIDTHS.len() * 2 * 2);
 }

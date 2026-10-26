@@ -195,7 +195,7 @@ fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
     app.redraw_window(wid);
     let ws = &app.windows[&wid];
     assert!(
-        ws.input_scratch.cursor_glow_add.is_empty(),
+        ws.input_scratch.glow_add_laid().is_empty(),
         "disabling the effect must erase the prior glow on this frame"
     );
     let unchanged_before = ws.redraws_proved_unchanged;

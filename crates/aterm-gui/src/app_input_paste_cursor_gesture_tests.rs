@@ -62,9 +62,9 @@ fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
     let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
     let fingerprint = glow.tick(Some((2, 3)), now, &cfg, geom, &mut out);
     let admitted = fingerprint != 0
-        || !out.is_empty()
+        || !glow.out_laid(&out).is_empty()
         || !glow.halos().is_empty()
-        || !glow.under_quads().is_empty();
+        || !glow.under_laid().is_empty();
 
     drop(ordering_pin);
     super::paste_order::await_drain_for_test(&sink);
@@ -547,7 +547,7 @@ fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
         );
         assert_eq!(ws.fx.cursor().glow.spawns(), 1);
         assert!(
-            !ws.fx.cursor().glow_scratch.is_empty(),
+            !ws.fx.cursor().glow_laid().is_empty(),
             "{queued_keys} keys: the licensed sweep must emit visible light"
         );
         assert_eq!(

@@ -855,6 +855,8 @@ pub const WHY_WORDS: &[&str] = &[
     "burst",
     "not-carried",
     "log-replaced",
+    "signin",
+    "install",
 ];
 
 /// Closed `input verb=` vocabulary.

@@ -435,6 +435,17 @@ pub const LOCAL_NETWORK_UNTOLD: &str = "macOS does not tell apps whether it is o
 /// nothing since says how it was answered ([`Standing::Untold`]).
 pub const LOCAL_NETWORK_ASKED: &str = "macOS asked you, and does not tell apps your answer";
 
+/// The GitHub repositories row's note while Apple's Command Line Tools, which every clone runs,
+/// are not installed: a person's remedy (`init_observe::Wait::CommandLineTools`), which System
+/// State's page starts in a terminal tab of its own (design §3.3).
+pub const COMMAND_LINE_TOOLS_MISSING: &str = "Install Apple's Command Line Tools";
+
+/// The placeholder that makes `softwareupdate -l` list Apple's Command Line Tools: an install
+/// through `softwareupdate` keeps it while it runs. It can outlive a crashed installer, so
+/// System State also requires a live installer process before saying Installing (design §3.3).
+pub const COMMAND_LINE_TOOLS_INSTALLING: &str =
+    "/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress";
+
 /// One read-only observation of one row. `now` is `None` when nothing could be
 /// read; a guessed value is never shown.
 #[derive(Clone, Debug, PartialEq, Eq)]

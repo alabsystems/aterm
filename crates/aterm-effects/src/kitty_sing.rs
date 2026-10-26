@@ -376,7 +376,10 @@ impl KittySing {
             }
         } else {
             let departure = self.handover_from.take();
-            self.release(departure.unwrap_or(now));
+            self.release(match departure {
+                Some(d) => d,
+                None => now,
+            });
             self.run = Some(ch);
             self.count = 1;
         }
@@ -499,8 +502,13 @@ impl KittySing {
         }
         let remaining = self.cooldown_remaining(now);
         if !remaining.is_zero() {
+            let ms = remaining.as_millis();
             return Err(ArmRefusal::Cooldown {
-                remaining_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                remaining_ms: if ms < u128::from(u64::MAX) {
+                    ms as u64
+                } else {
+                    u64::MAX
+                },
             });
         }
         let arm = ArmedCelebration {
@@ -550,7 +558,10 @@ impl KittySing {
             let next = anchor + Duration::from_secs_f32(SING_BAR_SECONDS * (bar + 1) as f32);
             return Some(next.min(ext.ends_at).max(now + Duration::from_micros(1)));
         }
-        let release = self.wind_start(now).unwrap_or(ext.ends_at);
+        let release = match self.wind_start(now) {
+            Some(start) => start,
+            None => ext.ends_at,
+        };
         if !ext.outro_taken {
             return Some(release.max(now));
         }

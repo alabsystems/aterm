@@ -41,7 +41,8 @@ use crate::supervise::policy::turn_end::{
 };
 use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
-    Guard, HostStep, IdlePoint, ProbeMiss, ProbeNo, StallSeen, StuckSurvey, UsageSeen, WaitPlan,
+    Guard, HostStep, IdlePoint, Lasting, ProbeMiss, ProbeNo, StallSeen, StuckSurvey, UsageSeen,
+    WaitPlan,
 };
 use crate::supervise::tap_clock::{TapWindow, UsageWindow};
 
@@ -223,6 +224,7 @@ tape_arg_debug!(
     u64,
     i64,
     IdlePoint,
+    Lasting,
     Restart,
     WaitPlan,
     Act,

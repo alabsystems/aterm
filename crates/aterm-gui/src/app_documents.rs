@@ -1329,19 +1329,23 @@ impl App {
             let Some(buffer) = state.buffer.as_mut() else {
                 return Err("editor buffer is not attached".to_string());
             };
-            let host_scroll = matches!(
-                event,
-                AppEvent::ScrollLines(_)
-                    | AppEvent::EditorViewportChanged { .. }
-                    | AppEvent::TextInput(TextInputEvent::Preedit { .. })
-            );
+            let blocked_diagnostic =
+                matches!(event, AppEvent::EditorConfigDiagnosticNavigate { .. })
+                    && buffer.minibuffer_active();
+            let host_scroll = blocked_diagnostic
+                || matches!(
+                    event,
+                    AppEvent::ScrollLines(_)
+                        | AppEvent::EditorViewportChanged { .. }
+                        | AppEvent::TextInput(TextInputEvent::Preedit { .. })
+                );
             let mut follow = if host_scroll {
                 Follow::Scrolled
             } else {
                 Follow::Reveal
             };
             let reduced_by_input = matches!(event, AppEvent::EditorInput(_));
-            if !reduced_by_input {
+            if !reduced_by_input && !blocked_diagnostic {
                 state.preedit.clear();
                 state.preedit_caret = None;
                 if !host_scroll {
@@ -1432,22 +1436,26 @@ impl App {
                     "Config completion became stale; edit and try again".to_string(),
                 )]),
                 AppEvent::EditorConfigDiagnosticNavigate { .. } => {
-                    let Some((selected, target)) = config_diagnostic_navigation else {
-                        return Ok(Some(EventResult::Handled));
-                    };
-                    let snapshot = store
-                        .snapshot(document)
-                        .ok_or_else(|| "editor document disappeared".to_string())?;
-                    if target > snapshot.text.len() || !snapshot.text.is_char_boundary(target) {
-                        Err(crate::native_editor::EditorError::InvalidSelections)
+                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
+                        Ok(effects)
                     } else {
-                        state.config_diagnostic_selected = selected;
-                        buffer.selections = vec![Selection {
-                            anchor: target,
-                            head: target,
-                        }];
-                        buffer.primary = 0;
-                        Ok(Vec::new())
+                        let Some((selected, target)) = config_diagnostic_navigation else {
+                            return Ok(Some(EventResult::Handled));
+                        };
+                        let snapshot = store
+                            .snapshot(document)
+                            .ok_or_else(|| "editor document disappeared".to_string())?;
+                        if target > snapshot.text.len() || !snapshot.text.is_char_boundary(target) {
+                            Err(crate::native_editor::EditorError::InvalidSelections)
+                        } else {
+                            state.config_diagnostic_selected = selected;
+                            buffer.selections = vec![Selection {
+                                anchor: target,
+                                head: target,
+                            }];
+                            buffer.primary = 0;
+                            Ok(Vec::new())
+                        }
                     }
                 }
                 #[cfg(any(a11y_tree, test))]
@@ -2658,7 +2666,23 @@ impl App {
                     return;
                 }
             };
-        self.switch_tab_in(wid, index);
+        let focused = self.windows.get_mut(&wid).is_some_and(|window| {
+            let focused = window.tab_set.switch_to_index(index)
+                && window
+                    .tab_set
+                    .active_mut()
+                    .is_some_and(|tab| tab.set_focus(target_view));
+            if focused {
+                window.last_present = None;
+            }
+            focused
+        });
+        if !focused {
+            self.set_editor_view_status(source_view, "The requested buffer could not take focus");
+            return;
+        }
+        self.resync_active_or_window(wid);
+        self.palette_sync_native_scope(wid);
         self.set_editor_view_status(target_view, &format!("Switched to buffer {title}"));
         self.refresh_native_presentation(wid, instance, target_view);
         self.request_native_redraw(wid);
@@ -2699,25 +2723,26 @@ impl App {
                 .tabs()
                 .iter()
                 .enumerate()
-                .filter_map(|(index, tab)| {
-                    tab.root.leaves().into_iter().find_map(|view| {
-                        let crate::tab_model::View::Native(native) =
-                            self.view_store.get(view).copied()?
-                        else {
-                            return None;
-                        };
-                        let NativeApp::Editor(editor) = self.native_runtime.app(native.instance)?
-                        else {
-                            return None;
-                        };
-                        let uri = self.document_store.canonical_uri(editor.document)?;
-                        (editor.title == query || uri == query).then_some((
-                            index,
-                            native.instance,
-                            view,
-                            editor.title.clone(),
-                        ))
-                    })
+                .flat_map(|(index, tab)| {
+                    tab.root.leaves().into_iter().map(move |view| (index, view))
+                })
+                .filter_map(|(index, view)| {
+                    let crate::tab_model::View::Native(native) =
+                        self.view_store.get(view).copied()?
+                    else {
+                        return None;
+                    };
+                    let NativeApp::Editor(editor) = self.native_runtime.app(native.instance)?
+                    else {
+                        return None;
+                    };
+                    let uri = self.document_store.canonical_uri(editor.document)?;
+                    (editor.title == query || uri == query).then_some((
+                        index,
+                        native.instance,
+                        view,
+                        editor.title.clone(),
+                    ))
                 })
                 .collect::<Vec<_>>()
         });
@@ -2751,7 +2776,9 @@ impl App {
                     format!("No open editor buffer named `{query}`; no document changed")
                 }
             } else {
-                format!("Buffer name `{query}` is ambiguous; use its full file URI")
+                format!(
+                    "Buffer name `{query}` is ambiguous; use a unique file URI or select the intended pane"
+                )
             });
         };
         Ok((wid, *index, *instance, *target_view, title.clone()))
@@ -3684,7 +3711,7 @@ impl App {
                 }
                 self.refresh_aggregate_tab_presentation(close.window, close.tab);
                 self.promote_terminal_projection_if_needed(close.window, close.tab);
-                self.resize_panes(close.window);
+                self.resize_panes_after_collapse(close.window);
                 self.resync_active_or_window(close.window);
                 self.request_native_redraw(close.window);
             }
@@ -6420,6 +6447,15 @@ mod tests {
         let wid = WindowId(0);
         let document = app.native_runtime.document_id(instance).unwrap();
         commit(&mut app, wid, "theme = \"Dracula\"\n");
+        let draft = app.document_store.snapshot(document).unwrap();
+        assert_eq!(app.document_store.failed_checkpoint_seq(document), None);
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+        assert!(app.native_documents.pending_closes.is_empty());
+        assert!(app.native_documents.pending_window_closes.is_empty());
+        assert!(app.native_documents.pending_quit.is_none());
         let lock_path = dir.join(".aterm.toml.aterm-write.lock");
         let held = crate::native_document_host::HeldAdvisoryLock::lock(
             std::fs::OpenOptions::new()
@@ -6454,6 +6490,18 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"");
         assert_eq!(app.document_store.dirty(document), Some(true));
+        assert_eq!(
+            app.document_store.failed_checkpoint_seq(document),
+            Some(draft.seq)
+        );
+        let mut failures = Vec::new();
+        if app.document_store.phase(document) != Some(crate::document_store::DocumentPhase::Active)
+        {
+            failures.push("ordinary Save failure froze the document without a close intent");
+        }
+        assert!(app.native_documents.pending_closes.is_empty());
+        assert!(app.native_documents.pending_window_closes.is_empty());
+        assert!(app.native_documents.pending_quit.is_none());
         let save = app
             .native_runtime
             .commands(instance, view)
@@ -6463,12 +6511,52 @@ mod tests {
             .expect("Manual Save command");
         assert!(save.enabled, "busy failure remains explicitly retryable");
 
+        commit(&mut app, wid, "# edited after refusal\n");
+        let edited = app.document_store.snapshot(document).unwrap();
+        let retry_text = format!("{}# edited after refusal\n", draft.text);
+        assert_eq!(
+            app.document_store.failed_checkpoint_seq(document),
+            Some(draft.seq)
+        );
+        if edited.seq <= draft.seq || edited.text.as_ref() != retry_text {
+            failures.push("real text input after Save failure did not update the draft");
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+
         drop(held);
         app.save_document_checkpoint(document, view)
             .expect("Manual Save retry succeeds after lock release");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "theme = \"Dracula\"\n");
+        let durable = fs::read_to_string(&path).unwrap();
+        if durable != retry_text {
+            failures.push("Save retry did not persist the edited draft");
+        }
+        assert_eq!(
+            app.document_store.checkpoint_seq(document),
+            Some(edited.seq)
+        );
         assert_eq!(app.document_store.dirty(document), Some(false));
+        assert_eq!(app.document_store.failed_checkpoint_seq(document), None);
+        if app.document_store.phase(document) != Some(crate::document_store::DocumentPhase::Active)
+        {
+            failures.push("successful Save retry left the document frozen");
+        }
+        commit(&mut app, wid, "# edited after retry\n");
+        let later = app.document_store.snapshot(document).unwrap();
+        let later_text = format!("{retry_text}# edited after retry\n");
+        if later.seq <= edited.seq || later.text.as_ref() != later_text {
+            failures.push("real text input after successful Save retry did not update the draft");
+        }
+        if app.document_store.dirty(document) != Some(true) {
+            failures.push("the edit after successful Save retry was not marked dirty");
+        }
+        assert_eq!(app.document_store.failed_checkpoint_seq(document), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), durable);
+        assert!(app.native_documents.pending_closes.is_empty());
+        assert!(app.native_documents.pending_window_closes.is_empty());
+        assert!(app.native_documents.pending_quit.is_none());
         let _ = fs::remove_dir_all(dir);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
@@ -7775,6 +7863,211 @@ mod tests {
 
         drive_native(&mut app, key(Key::Named(NamedKey::F8), Modifiers::SHIFT));
         assert_eq!(editor_buffer(&app, view).primary_selection().head, first);
+
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        let live_config = app.native_config_service.snapshot();
+        let navigation = [
+            (
+                "editor/config-problem-previous-button",
+                "editor/config-problem-previous",
+            ),
+            (
+                "editor/config-problem-next-button",
+                "editor/config-problem-next",
+            ),
+        ];
+        let position = |app: &App| {
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("Manual remains attached");
+            };
+            let buffer = state.buffer.as_ref().unwrap();
+            (
+                buffer.minibuffer.clone(),
+                buffer.selections.clone(),
+                buffer.primary,
+                buffer.viewport_anchor,
+                state.config_diagnostic_selected,
+            )
+        };
+        let press_f8 = |app: &mut App, previous: bool| {
+            app.windows.get_mut(&wid).unwrap().mods = if previous {
+                aterm_window::keyboard::ModifiersState::SHIFT
+            } else {
+                aterm_window::keyboard::ModifiersState::empty()
+            };
+            for state in [
+                aterm_window::event::ElementState::Pressed,
+                aterm_window::event::ElementState::Released,
+            ] {
+                app.on_key(
+                    wid,
+                    aterm_window::event::KeyEvent::synthetic_for_test(
+                        aterm_window::keyboard::PhysicalKey::Code(
+                            aterm_window::keyboard::KeyCode::F8,
+                        ),
+                        aterm_window::keyboard::Key::Named(aterm_window::keyboard::NamedKey::F8),
+                        None,
+                        aterm_window::keyboard::KeyLocation::Standard,
+                        state,
+                        false,
+                    ),
+                );
+            }
+        };
+        let mut prompt_failures = Vec::new();
+        for command in [
+            EditorCommand::GotoLine,
+            EditorCommand::ExecuteCommand,
+            EditorCommand::SwitchBuffer,
+            EditorCommand::KillBuffer,
+            EditorCommand::IncrementalSearch,
+        ] {
+            app.dispatch_native_event(wid, AppEvent::EditorSetSelection { anchor: 1, head: 5 })
+                .unwrap();
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(command))
+                .unwrap();
+            app.dispatch_native_event(
+                wid,
+                AppEvent::EditorInput(EditorInput::Text(
+                    if command == EditorCommand::GotoLine {
+                        "2"
+                    } else {
+                        "first"
+                    }
+                    .into(),
+                )),
+            )
+            .unwrap();
+            assert!(matches!(
+                (command, &editor_buffer(&app, view).minibuffer),
+                (EditorCommand::GotoLine, Minibuffer::GotoLine { .. })
+                    | (EditorCommand::ExecuteCommand, Minibuffer::Command { .. })
+                    | (EditorCommand::SwitchBuffer, Minibuffer::Buffer { .. })
+                    | (EditorCommand::KillBuffer, Minibuffer::Prompt { .. })
+                    | (EditorCommand::IncrementalSearch, Minibuffer::Search { .. })
+            ));
+            let commands = app.native_runtime.commands(instance, view).unwrap();
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            for (key, action) in navigation {
+                if commands
+                    .iter()
+                    .find(|item| item.id.as_str() == action)
+                    .unwrap()
+                    .enabled
+                    || compiled
+                        .semantic(&crate::native_ui::UiKey::new(key))
+                        .unwrap()
+                        .state
+                        .unwrap()
+                        .enabled
+                {
+                    prompt_failures
+                        .push(format!("{command:?}: {action} offered during the prompt"));
+                }
+            }
+            // Keep a valid scrolled viewport whose caret is outside it: refusing
+            // a document gesture must not reveal that caret behind the prompt.
+            let offscreen = source.match_indices("# spacer\n").nth(250).unwrap().0;
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+                panic!("Manual remains attached");
+            };
+            state.buffer.as_mut().unwrap().viewport_anchor = offscreen;
+            assert!(editor_buffer(&app, view).primary_selection().head < offscreen);
+            let retained = position(&app);
+            for previous in [false, true] {
+                press_f8(&mut app, previous);
+                if position(&app) != retained {
+                    prompt_failures.push(format!(
+                        "{command:?}: F8 previous={previous} moved prompt-owned state"
+                    ));
+                }
+            }
+            for (key, action) in navigation {
+                if app
+                    .act_app(crate::app_control::ActRequest {
+                        view,
+                        ui_key: key.into(),
+                        action: action.into(),
+                        value: None,
+                    })
+                    .is_ok()
+                {
+                    prompt_failures.push(format!("{command:?}: {action} control did not refuse"));
+                }
+                if position(&app) != retained {
+                    prompt_failures.push(format!(
+                        "{command:?}: {action} control moved prompt-owned state"
+                    ));
+                }
+                let target = crate::palette::NativeCommandTarget {
+                    window: wid,
+                    instance,
+                    view,
+                    generation: app.native_runtime.view_generation(view).unwrap(),
+                    action: crate::native_ui::ActionId::new(action),
+                };
+                if app.activate_native_palette_target(&target).is_ok() {
+                    prompt_failures.push(format!("{command:?}: {action} palette did not refuse"));
+                }
+                if position(&app) != retained {
+                    prompt_failures.push(format!(
+                        "{command:?}: {action} palette moved prompt-owned state"
+                    ));
+                }
+            }
+            for previous in [false, true] {
+                app.dispatch_native_event(
+                    wid,
+                    AppEvent::EditorConfigDiagnosticNavigate { previous },
+                )
+                .unwrap();
+                if position(&app) != retained {
+                    prompt_failures.push(format!(
+                        "{command:?}: direct previous={previous} moved prompt-owned state"
+                    ));
+                }
+            }
+            let after_prompt = app.document_store.snapshot(document).unwrap();
+            assert_eq!(after_prompt.seq, original.seq);
+            assert_eq!(after_prompt.text, original.text);
+            assert_eq!(app.document_store.dirty(document), Some(false));
+            assert_eq!(fs::read_to_string(&path).unwrap(), source);
+            let current_config = app.native_config_service.snapshot();
+            assert_eq!(current_config.revision, live_config.revision);
+            assert_eq!(current_config.text, live_config.text);
+
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::Abort))
+                .unwrap();
+            assert!(!editor_buffer(&app, view).minibuffer_active());
+            let commands = app.native_runtime.commands(instance, view).unwrap();
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            for (key, action) in navigation {
+                assert!(
+                    commands
+                        .iter()
+                        .find(|item| item.id.as_str() == action)
+                        .unwrap()
+                        .enabled
+                );
+                assert!(
+                    compiled
+                        .semantic(&crate::native_ui::UiKey::new(key))
+                        .unwrap()
+                        .state
+                        .unwrap()
+                        .enabled
+                );
+            }
+            let current = position(&app).4;
+            press_f8(&mut app, false);
+            assert_eq!(
+                editor_buffer(&app, view).primary_selection().head,
+                if current == 0 { second } else { first },
+                "navigation resumes after cancelling {command:?}"
+            );
+        }
+        assert!(prompt_failures.is_empty(), "{prompt_failures:#?}");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -8851,6 +9144,25 @@ mod tests {
                 .contains_key(&wid)
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A quit nobody at a window started (a headless aterm whose launcher is gone, a
+    /// supervisor's signal) is not held by an unsaved Settings draft nobody can save or discard:
+    /// it was refused without a word and the aterm lingered to its 30 s backstop.
+    #[test]
+    fn an_unattended_quit_is_not_held_by_a_settings_draft() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, view) = app.active_native_view(wid).unwrap();
+        enter_settings_draft(&mut app, wid, view);
+        assert_eq!(
+            app.quit_barriers(),
+            crate::app_window::QuitBarrier::Refused,
+            "CONTROL: a person's Quit waits on the draft"
+        );
+        app.quit_unattended = Some("the process that started this headless aterm is gone");
+        assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Ready);
     }
 
     #[test]
@@ -9930,6 +10242,39 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn submit_buffer_query(app: &mut App, command: char, query: &str) {
+        drive_native(app, key(Key::Character('x'), Modifiers::CTRL));
+        drive_native(app, key(Key::Character(command), Modifiers::empty()));
+        drive_native(app, InputEvent::Text(query.to_string()));
+        drive_native(app, key(Key::Named(NamedKey::Enter), Modifiers::empty()));
+    }
+
+    fn restored_editor_pair(first: &str, second: &str, zoomed: bool) -> App {
+        let mut app = App::headless_for_test();
+        let mut layout = app.capture_restore_manifest().windows.remove(0);
+        layout.tabs.clear();
+        layout.native_tabs.clear();
+        layout.tab_order.clear();
+        layout.active_item = Some(0);
+        let leaf = |uri: &str| {
+            crate::restore::RestoredSplitTree::leaf(crate::restore::RestoredView::Native(
+                crate::restore::NativeLeafRestore::document("editor", uri.to_string()),
+            ))
+        };
+        layout.restored_tabs = vec![crate::restore::RestoredTab {
+            root: crate::restore::RestoredSplitTree::Split {
+                axis: crate::restore::SplitKind::Horizontal,
+                ratio: 0.6,
+                first: Box::new(leaf(first)),
+                second: Box::new(leaf(second)),
+            },
+            focused_path: vec![crate::restore::RestoreBranch::Second],
+            zoomed,
+        }];
+        app.restore_into_window(WindowId(0), layout);
+        app
+    }
+
     #[test]
     fn shipping_c_x_b_switches_only_to_an_exact_open_editor_buffer() {
         let dir = fresh_dir("aterm-app-editor-buffer");
@@ -9996,6 +10341,292 @@ mod tests {
             app.document_store.snapshot(second_document).unwrap().seq,
             second_before.seq
         );
+
+        let elsewhere = dir.join("elsewhere.txt");
+        fs::write(&elsewhere, "another window").unwrap();
+        let elsewhere_uri = file_uri(&elsewhere);
+        let remote_session = app.next_session_id;
+        let remote = app.insert_logical_window(crate::stub_session(remote_session), 24, 80);
+        app.open_document_tab_in_window(remote, AppKind::Editor, &elsewhere_uri)
+            .unwrap();
+        let (remote_instance, _) = app.active_native_view(remote).unwrap();
+        let remote_document = app.native_runtime.document_id(remote_instance).unwrap();
+        let elsewhere_query = app
+            .document_store
+            .canonical_uri(remote_document)
+            .unwrap()
+            .to_string();
+        let remote_before = app.document_store.snapshot(remote_document).unwrap();
+        let remote_tabs = app.windows[&remote].tab_set.tabs().to_vec();
+        app.frontmost_window = Some(WindowId(0));
+        app.sync_active_session();
+        let local_tabs = app.windows[&WindowId(0)].tab_set.tabs().to_vec();
+        for command in ['b', 'k'] {
+            submit_buffer_query(&mut app, command, &elsewhere_query);
+            assert_eq!(app.frontmost_window, Some(WindowId(0)));
+            assert_eq!(app.windows[&WindowId(0)].tab_set.tabs(), local_tabs);
+            assert_eq!(app.windows[&remote].tab_set.tabs(), remote_tabs);
+            let after = app.document_store.snapshot(remote_document).unwrap();
+            assert_eq!(
+                (after.seq, after.text),
+                (remote_before.seq, remote_before.text.clone())
+            );
+            assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "another window");
+        }
+
+        let left = dir.join("left");
+        let right = dir.join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        let left_path = left.join("shared.txt");
+        let right_path = right.join("shared.txt");
+        let left_uri = file_uri(&left_path);
+        let right_uri = file_uri(&right_path);
+        let wid = WindowId(0);
+        let mut failures = Vec::new();
+        for terminal_sibling in [false, true] {
+            for zoomed in [false, true] {
+                for by_uri in [false, true] {
+                    fs::write(&left_path, "first bytes").unwrap();
+                    fs::write(&right_path, "second bytes").unwrap();
+                    let mut app = if terminal_sibling {
+                        let mut app = App::headless_for_test();
+                        app.open_document_tab(AppKind::Editor, &left_uri).unwrap();
+                        app.split_active_with_stub_terminal(
+                            wid,
+                            crate::tab_model::SplitAxis::Horizontal,
+                        );
+                        app.windows
+                            .get_mut(&wid)
+                            .unwrap()
+                            .tab_set
+                            .active_mut()
+                            .unwrap()
+                            .zoomed = zoomed;
+                        app.open_document_tab(AppKind::Editor, &right_uri).unwrap();
+                        app
+                    } else {
+                        restored_editor_pair(&left_uri, &right_uri, zoomed)
+                    };
+                    let target = app.windows[&wid]
+                        .tab_set
+                        .tabs()
+                        .iter()
+                        .find(|tab| tab.root.len() == 2)
+                        .unwrap();
+                    let target_tab = target.id;
+                    let target_root = target.root.clone();
+                    let target_view = target_root.leaves()[0];
+                    let target_instance = match app.view_store.get(target_view).unwrap() {
+                        crate::tab_model::View::Native(native) => native.instance,
+                        _ => panic!("first split leaf is the requested editor"),
+                    };
+                    let document = app.native_runtime.document_id(target_instance).unwrap();
+                    let (source_instance, source_view) = app.active_native_view(wid).unwrap();
+                    let source_document = app.native_runtime.document_id(source_instance).unwrap();
+                    assert_ne!(source_document, document);
+                    assert_ne!(target.focus, target_view, "the target starts unfocused");
+                    let before_source = app.document_store.snapshot(source_document).unwrap();
+                    let before = app.document_store.snapshot(document).unwrap();
+                    let count = (app.windows[&wid].tab_set.len(), app.view_store.len());
+                    let query = if by_uri {
+                        app.document_store
+                            .canonical_uri(document)
+                            .unwrap()
+                            .to_string()
+                    } else {
+                        let Some(NativeApp::Editor(editor)) =
+                            app.native_runtime.app(target_instance)
+                        else {
+                            panic!("target Editor");
+                        };
+                        assert_ne!(
+                            editor.title, "shared.txt",
+                            "real titles disambiguate distinct files"
+                        );
+                        editor.title.clone()
+                    };
+                    let case = format!(
+                        "terminal_sibling={terminal_sibling}, zoomed={zoomed}, by_uri={by_uri}"
+                    );
+                    let resolved = app
+                        .resolve_open_editor_buffer(source_view, &query)
+                        .expect("the admitted unique title or canonical URI resolves before input");
+                    assert_eq!(
+                        (resolved.2, resolved.3),
+                        (target_instance, target_view),
+                        "{case}"
+                    );
+                    submit_buffer_query(&mut app, 'b', &query);
+                    if app.active_native_view(wid) != Some((target_instance, target_view))
+                        || app.windows[&wid].tab_set.active().unwrap().focus != target_view
+                    {
+                        failures.push(format!(
+                            "{case}: Switch Buffer did not focus the resolved editor leaf"
+                        ));
+                    }
+                    if !app.native_input_event(wid, &InputEvent::Text("chosen ".to_string())) {
+                        failures.push(format!(
+                            "{case}: subsequent editor input had no native owner"
+                        ));
+                    }
+                    if let Err(why) = app.save_front_document() {
+                        failures.push(format!(
+                            "{case}: File Save did not reach the chosen editor: {why}"
+                        ));
+                    }
+                    let after = app.document_store.snapshot(document).unwrap();
+                    if after.text.as_ref() != "chosen first bytes"
+                        || after.seq <= before.seq
+                        || app.document_store.checkpoint_seq(document) != Some(after.seq)
+                        || app.document_store.dirty(document) != Some(false)
+                        || fs::read_to_string(&left_path).unwrap() != "chosen first bytes"
+                    {
+                        failures.push(format!(
+                            "{case}: chosen editor did not receive and save the input"
+                        ));
+                    }
+                    let source_after = app.document_store.snapshot(source_document).unwrap();
+                    if (source_after.seq, source_after.text)
+                        != (before_source.seq, before_source.text.clone())
+                        || fs::read_to_string(&right_path).unwrap() != "second bytes"
+                    {
+                        failures.push(format!("{case}: the prior source editor received the chosen editor's input or Save"));
+                    }
+                    assert!(matches!(
+                        &editor_buffer(&app, source_view).minibuffer,
+                        Minibuffer::Inactive
+                    ));
+                    let target = app.windows[&wid].tab_set.get(target_tab).unwrap();
+                    assert_eq!(target.root, target_root);
+                    assert_eq!(target.zoomed, zoomed);
+                    assert_eq!(
+                        (app.windows[&wid].tab_set.len(), app.view_store.len()),
+                        count
+                    );
+                    assert_eq!(app.frontmost_window, Some(wid));
+                    assert!(app.structural_invariants_ok());
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shipping_buffer_queries_refuse_ambiguous_views_before_switch_or_kill() {
+        let dir = fresh_dir("aterm-app-editor-buffer-ambiguity");
+        let path = dir.join("shared.txt");
+        fs::write(&path, "shared bytes").unwrap();
+        let uri = file_uri(&path);
+        let wid = WindowId(0);
+        let mut failures = Vec::new();
+        for separate_tabs in [false, true] {
+            for zoomed in [false, true] {
+                if separate_tabs && zoomed {
+                    continue;
+                }
+                for command in ['b', 'k'] {
+                    for by_uri in [false, true] {
+                        let mut app = restored_editor_pair(&uri, &uri, zoomed);
+                        if separate_tabs {
+                            let mut layout = app.capture_restore_manifest().windows.remove(0);
+                            let pair = layout.restored_tabs.remove(0);
+                            let crate::restore::RestoredSplitTree::Split { first, second, .. } =
+                                pair.root
+                            else {
+                                panic!("restored pair");
+                            };
+                            layout.restored_tabs = [*first, *second]
+                                .into_iter()
+                                .map(|root| crate::restore::RestoredTab {
+                                    root,
+                                    focused_path: Vec::new(),
+                                    zoomed: false,
+                                })
+                                .collect();
+                            layout.active_item = Some(1);
+                            app.restore_into_window(wid, layout);
+                        }
+                        let (_, source_view) = app.active_native_view(wid).unwrap();
+                        let before_tabs = app.windows[&wid].tab_set.tabs().to_vec();
+                        let views = before_tabs
+                            .iter()
+                            .flat_map(|tab| tab.root.leaves())
+                            .collect::<Vec<_>>();
+                        assert_eq!(views.len(), 2);
+                        let before_views = views
+                            .iter()
+                            .map(|&view| {
+                                (
+                                    view,
+                                    app.native_runtime.view_generation(view),
+                                    editor_buffer(&app, view).selections.clone(),
+                                    editor_buffer(&app, view).viewport_anchor,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let document = editor_buffer(&app, source_view).document;
+                        assert!(
+                            views
+                                .iter()
+                                .all(|&view| editor_buffer(&app, view).document == document),
+                            "both restored views share the admitted canonical document"
+                        );
+                        let query = if by_uri {
+                            app.document_store
+                                .canonical_uri(document)
+                                .unwrap()
+                                .to_string()
+                        } else {
+                            "shared.txt".to_string()
+                        };
+                        let before = app.document_store.snapshot(document).unwrap();
+                        let checkpoint = app.document_store.checkpoint_seq(document);
+                        let count = app.view_store.len();
+                        let case = format!(
+                            "separate_tabs={separate_tabs}, zoomed={zoomed}, command={command}, query={query}"
+                        );
+                        if app.resolve_open_editor_buffer(source_view, &query).is_ok() {
+                            failures.push(format!(
+                                "{case}: an ambiguous view query resolved to one sibling"
+                            ));
+                        }
+                        submit_buffer_query(&mut app, command, &query);
+                        if app.windows[&wid].tab_set.tabs() != before_tabs
+                            || app.view_store.len() != count
+                        {
+                            failures.push(format!(
+                                "{case}: ambiguous switch/kill changed topology or focus"
+                            ));
+                        }
+                        for (view, generation, selections, viewport) in before_views {
+                            if app.native_runtime.view_generation(view) != generation {
+                                failures.push(format!(
+                                    "{case}: ambiguous switch/kill detached view {view:?}"
+                                ));
+                                continue;
+                            }
+                            let buffer = editor_buffer(&app, view);
+                            if buffer.selections != selections || buffer.viewport_anchor != viewport
+                            {
+                                failures.push(format!(
+                                    "{case}: ambiguous switch/kill changed view {view:?}"
+                                ));
+                            }
+                        }
+                        let after = app.document_store.snapshot(document).unwrap();
+                        assert_eq!((after.seq, after.text), (before.seq, before.text));
+                        assert_eq!(app.document_store.checkpoint_seq(document), checkpoint);
+                        assert_eq!(app.document_store.dirty(document), Some(false));
+                        assert_eq!(fs::read_to_string(&path).unwrap(), "shared bytes");
+                        assert_eq!(app.frontmost_window, Some(wid));
+                        assert!(app.structural_invariants_ok());
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -10091,6 +10722,72 @@ mod tests {
                 .to_string_lossy()
                 .contains(".preserved-")),
             "conflicting draft material remains in the private recovery directory"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_dirty_document_leaf_that_closes_inside_a_split_quiet_holds_the_take_back() {
+        let dir = fresh_dir("aterm-doc-close-split-hold");
+        let path = dir.join("held.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, editor_view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "safe ");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        // An odd width splits evenly either side of the divider, so the document's close hands
+        // the sibling back exactly the grid the split took.
+        app.windows.get_mut(&wid).unwrap().cols = 81;
+        app.resize_panes(wid);
+        let grid = |app: &App, session: u64| {
+            let t = crate::term_lock(&app.pool.get(session).expect("live session").term);
+            (t.rows(), t.cols())
+        };
+        let (sibling, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let beside = grid(&app, sibling);
+        let _ = app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Vertical);
+        let narrowed = grid(&app, sibling);
+        assert!(
+            narrowed.1 < beside.1 && narrowed.0 == beside.0,
+            "the split narrows the sibling at once: {beside:?} -> {narrowed:?}"
+        );
+        app.split_regrid_holds
+            .prolong(std::time::Duration::from_secs(60));
+
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .active_mut()
+            .unwrap()
+            .set_focus(editor_view);
+        app.sync_active_session();
+        app.close_active_tab();
+
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        assert!(
+            !tab.root.contains(editor_view),
+            "the saved document leaf left the tab"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "safe before\n");
+        assert_eq!(
+            grid(&app, sibling),
+            narrowed,
+            "the take-back to the grid the split took is withheld inside the quiet"
+        );
+        let due = app
+            .split_regrid_hold_deadline()
+            .expect("a withheld take-back owes one wake");
+        app.service_split_regrid_holds(due);
+        assert_eq!(
+            grid(&app, sibling),
+            beside,
+            "the take-back lands after the quiet"
         );
         let _ = fs::remove_dir_all(dir);
     }

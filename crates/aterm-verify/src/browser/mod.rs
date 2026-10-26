@@ -60,6 +60,40 @@ const DIFF_FRAMES: [&str; 7] = [
     "\x1b[4 qcursor",
 ];
 
+/// The glow scene's grid (`spec.glow`): the gpu page types [`GLOW_KEYS`]
+/// under the cursor glow, one key a frame after the prompt's frame, then
+/// runs out, in each of [`GLOW_STYLES`] on each of [`GLOW_THEMES`] (beside
+/// fx art on [`GLOW_ART`]'s) with bloom on and off, its beam runs laid as
+/// ramps and as quads ([`judge::glow`]).
+const GLOW_ROWS: u16 = 6;
+const GLOW_COLS: u16 = 32;
+const GLOW_PROMPT: &str = "~ $ ";
+const GLOW_KEYS: &str = "echo ramps";
+/// Frames of the run-out after the last key: the ribbon's tail settling.
+const GLOW_RUNOUT: usize = 4;
+/// Every frame of a glow run: the prompt's, a key's each, the run-out.
+const GLOW_FRAMES: usize = 1 + GLOW_KEYS.len() + GLOW_RUNOUT;
+/// The injected clock's step a frame, ms: a brisk typist's 25 keys a second.
+const GLOW_DT_MS: f64 = 40.0;
+/// The glow styles the scene types under: the Rainbow Kitty's ribbon lays
+/// its ramps under the ink; the comet's slabs lay theirs in the additive
+/// stream on a dark page, the ones the bloom and its crown read.
+const GLOW_STYLES: [&str; 2] = ["rainbow kitty", "comet"];
+/// The light page's theme: fg, bg, cursor, selection.
+const LIGHT: [u32; 4] = [0x0020_2020, 0x00FA_FAF7, 0x0000_0000, 0x00B4_C8E6];
+/// The page themes the glow runs on: fg, bg, cursor, selection.
+const GLOW_THEMES: [(&str, [u32; 4]); 4] = [
+    ("dark", THEME),
+    ("light", LIGHT),
+    ("dark art", THEME),
+    ("light art", LIGHT),
+];
+/// The pages whose every frame also draws fx art of its own (exact rects at
+/// Under, Glow and Over, a linear sprite at Over: the streams the pet's and
+/// the word icons' frames open), each beside its page without it: there the
+/// ramps run's ramps ride the fx stream the art opens.
+const GLOW_ART: [(&str, &str); 2] = [("dark art", "dark"), ("light art", "light")];
+
 /// The pages, beside this crate.
 fn pages_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("browser")
@@ -77,6 +111,24 @@ fn spec() -> Value {
             "rows": DIFF_ROWS,
             "cols": DIFF_COLS,
             "frames": DIFF_FRAMES.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        },
+        "glow": {
+            "rows": GLOW_ROWS,
+            "cols": GLOW_COLS,
+            "prompt": GLOW_PROMPT,
+            "keys": GLOW_KEYS,
+            "frames": GLOW_FRAMES,
+            "dt_ms": GLOW_DT_MS,
+            "styles": GLOW_STYLES,
+            "duration_ms": 400,
+            "length": 24,
+            "intensity": 0.9,
+            "radius": 0.8,
+            "themes": GLOW_THEMES
+                .iter()
+                .map(|(page, theme)| ((*page).to_string(), json!(theme.to_vec())))
+                .collect::<aterm_json::Map>(),
+            "art": GLOW_ART.map(|(art, _)| art),
         },
     })
 }
@@ -599,6 +651,38 @@ fn session(
     }
     let recording = recorded::read(&recorded::wgpu_webgl_dir());
     let mut failures = held(r, &say, &session, gpu, &recording, &dir.join("gpu-frames"));
+    let pages: Vec<&str> = GLOW_THEMES.iter().map(|(page, _)| *page).collect();
+    let glow = judge::glow(gpu, &GLOW_STYLES, &pages, &GLOW_ART, GLOW_FRAMES);
+    for line in &glow.lines {
+        r.raw(say(line.clone()));
+    }
+    failures.extend(glow.failures);
+    let glow_dir = dir.join("glow-frames");
+    let last = recorded::Recording {
+        module: gpu.module.clone(),
+        browser: session.product.clone(),
+        adapter: gpu.adapter.clone(),
+        frames: gpu
+            .glow
+            .iter()
+            .map(|g| {
+                let bloom = if g.bloom { "on" } else { "off" };
+                let drawn = if g.ramps { "ramps" } else { "quads" };
+                let style = g.style.replace(' ', "-");
+                (
+                    format!("{style}-{}-bloom-{bloom}-{drawn}", g.page),
+                    g.last.clone(),
+                )
+            })
+            .collect(),
+    };
+    match recorded::write(&glow_dir, &last) {
+        Ok(()) => r.raw(say(format!(
+            "the glow runs' last frames in {}",
+            glow_dir.display()
+        ))),
+        Err(why) => r.raw(say(format!("could not write the glow frames: {why}"))),
+    }
     if let Some((before, earlier)) = first {
         let across = judge::across(
             before,
@@ -1298,6 +1382,7 @@ mod tests {
                 timings: t,
                 init: None,
                 drawn: None,
+                glow: Vec::new(),
             },
             load_ms: None,
             evaluate_ms: 0.0,

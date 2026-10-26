@@ -3351,6 +3351,7 @@ fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
 #[test]
 fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
     let mut pressed = [0, 0];
+    let mut veils = Vec::new();
     for route in [
         SettingsRoute::Terminal,
         SettingsRoute::Security,
@@ -3361,6 +3362,9 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
         SettingsRoute::TextFonts,
         SettingsRoute::CursorMotion,
     ] {
+        // The last three end on a switch cut at their top, drawn with its name (Cursor &
+        // Motion's Serious Mode, Security's Secure Keyboard Entry, Keyboard & Input's paste
+        // check): a stop a last screen would draw nothing of is given up instead.
         for (width, height) in [
             (584.0, 348.0),
             (584.0, 376.0),
@@ -3368,6 +3372,9 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
             (1_074.0, 684.0),
             (1_193.0, 516.0),
             (1_564.0, 854.0),
+            (584.0, 391.0),
+            (738.0, 430.0),
+            (1_074.0, 443.0),
         ] {
             for last in [false, true] {
                 let mut lab = Lab::new("");
@@ -3414,10 +3421,18 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                             .map(|node| node.value.clone());
                         (key, top, bottom, fade, live)
                     }
-                    None if last => match veiled() {
-                        Some((key, top, bottom)) => (key, top, bottom, None, None),
-                        None => continue,
-                    },
+                    None if last => {
+                        // A last screen gives up a stop it would draw nothing of over its first
+                        // (`ScrollPlan::last_screen`): no cut switch is veiled at its top, a
+                        // band of blank card a press there scrolled in.
+                        if let Some((key, top, bottom)) = veiled() {
+                            veils.push(format!(
+                                "{route:?} {width}×{height}: {key} veiled at the top \
+                                 ({top}..{bottom})"
+                            ));
+                        }
+                        continue;
+                    }
                     None => continue,
                 };
                 let control = UiKey::new(format!("settings/control/{key}"));
@@ -3502,6 +3517,7 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
             }
         }
     }
+    assert!(veils.is_empty(), "{}", veils.join("\n"));
     assert!(
         pressed.iter().all(|count| *count > 0),
         "some screens cut a switch at each edge: {pressed:?}"
@@ -3523,6 +3539,9 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
         SettingsRoute::TextFonts,
         SettingsRoute::CursorMotion,
     ] {
+        // The last three end on a switch cut at their top, drawn with its name (Cursor &
+        // Motion's Serious Mode, Security's Secure Keyboard Entry, Keyboard & Input's paste
+        // check): a stop a last screen would draw nothing of is given up instead.
         for (width, height) in [
             (584.0, 348.0),
             (584.0, 376.0),
@@ -3530,6 +3549,9 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
             (1_074.0, 684.0),
             (1_193.0, 516.0),
             (1_564.0, 854.0),
+            (584.0, 391.0),
+            (738.0, 430.0),
+            (1_074.0, 443.0),
         ] {
             for last in [false, true] {
                 let switches = |compiled: &crate::native_ui::CompiledUi| {
@@ -5086,6 +5108,82 @@ fn every_status_line(lab: &mut Lab, width: f32, height: f32, prefix: &str) -> Ve
     lines.into_values().collect()
 }
 
+/// THE RELOAD WARNING WRAPS AS EVERY STATUS DOES: its bar under the page sets the warning on
+/// the lines it takes, and its form docked in the compact toolbar on the row's lines, the rest
+/// scrolling there to the wheel; neither cuts it to one line with an ellipsis, as
+/// `fit_native_status_label` did to both while every other status wrapped.
+#[test]
+fn the_reload_warning_wraps_as_every_status_does() {
+    const WARNING: &str = "aterm.toml reload rejected: the file is not a valid aterm \
+                           configuration. Fix it in Manual; the running settings remain active.";
+    at_each_text_scale(&[1.0, 2.0], "reload warning", |scale| {
+        let mut wrapped = 0;
+        for (width, height) in [
+            (444.0, 572.0),
+            (584.0, 348.0),
+            (864.0, 292.0),
+            (1_074.0, 684.0),
+        ] {
+            let context = format!("{width}x{height} at {scale}x");
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(SettingsRoute::Terminal);
+            lab.state_mut().config_watch_status = Some(WARNING.to_string());
+            let compiled = lab.compile(width, height);
+            let docked = compiled
+                .semantic(&UiKey::new("settings/status-dock"))
+                .is_some();
+            let prefix = "settings/config-watch-status/detail/visual";
+            let mut lines = std::collections::BTreeMap::<usize, String>::new();
+            let mut read = |compiled: &crate::native_ui::CompiledUi| {
+                let before = lines.len();
+                for node in &compiled.paint {
+                    let index = if node.key.as_str() == prefix {
+                        Some(0)
+                    } else {
+                        node.key
+                            .as_str()
+                            .strip_prefix(prefix)
+                            .and_then(|rest| rest.strip_prefix("/line-"))
+                            .and_then(|index| index.parse().ok())
+                    };
+                    if let (Some(index), UiContent::Text(spec)) = (index, &node.content)
+                        && node.clip.height >= node.rect.height - 0.5
+                    {
+                        lines.insert(index, spec.text.clone());
+                    }
+                }
+                lines.len() > before
+            };
+            read(&compiled);
+            let unfit = compiled.fit_failures();
+            assert!(unfit.is_empty(), "{context}: {unfit:?}");
+            for _ in 0..32 {
+                lab.dispatch(AppEvent::ScrollAt {
+                    lines: 1,
+                    key: UiKey::new(format!("{prefix}/words")),
+                });
+                if !read(&lab.compile(width, height)) {
+                    break;
+                }
+            }
+            let every = lines.into_values().collect::<Vec<_>>();
+            let shown = every.join(" ");
+            let bare = |text: &str| text.split_whitespace().collect::<String>();
+            let words = if docked {
+                format!("Reload warning: {WARNING}")
+            } else {
+                WARNING.to_string()
+            };
+            assert!(
+                !shown.contains('\u{2026}') && bare(&shown) == bare(&words),
+                "{context}: the warning reads {every:#?}, not {words:?}"
+            );
+            wrapped += usize::from(every.len() > 1);
+        }
+        assert!(wrapped > 0, "some window wraps the warning");
+    });
+}
+
 #[test]
 fn a_status_is_read_whole_and_nothing_pressed_moves() {
     const FAILURE: &str = "~/.config/aterm isn\u{2019}t writable \u{b7} check its permissions";
@@ -5274,10 +5372,24 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 .is_some_and(|(plan, was)| {
                                     plan.room() < was.height + status_line_height() + 0.5
                                 });
+                        // A status the toolbar's dock takes for the control the person is on
+                        // scrolls in the dock's row (`weigh_plain_dock`).
+                        let docked = after
+                            .semantic(&UiKey::new("settings/status-dock"))
+                            .is_some();
+                        // A bar that stops over the switch just pressed, the switch where it
+                        // was, scrolls the rest of its words (`pressed_bottom`).
+                        let held = after
+                            .semantic(&UiKey::new("settings/feedback"))
+                            .zip(was)
+                            .is_some_and(|(bar, was)| {
+                                after.semantic(&pressed).map(|node| node.rect) == Some(was)
+                                    && bar.rect.y <= was.bottom() + status_line_height() + 0.5
+                            });
                         let from_the_top =
                             bare(&feedback).starts_with(&bare(&read)) && !read.is_empty();
                         if bare(&read) != bare(&feedback)
-                            && !(scrolls && (fills || bounded) && from_the_top)
+                            && !(scrolls && (fills || bounded || docked || held) && from_the_top)
                         {
                             faults
                                 .lock()
@@ -5382,17 +5494,20 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
                         && (node.clip.height - node.rect.height).abs() < 0.5
                 })
         };
+        // Each status takes the toolbar's dock, the rest of its words scrolling there
+        // (`compact_status_dock_required_at`): it takes no room from the list, so the wheel's
+        // way back draws the switch whole where it was.
         for (status, message, cut) in [
             (
                 "a short status",
                 "~/.config/aterm isn\u{2019}t writable \u{b7} check its permissions",
-                Some(false),
+                Some(true),
             ),
             (
                 "a long path's status",
                 "/Volumes/Shared Drive/Users//someone/dotfiles/config/aterm \
                  isn\u{2019}t writable \u{b7} check its permissions",
-                None,
+                Some(true),
             ),
         ] {
             // Top Settings as it lists with a trail drawn (Windows draws none by default).
@@ -5422,7 +5537,8 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
             assert_eq!(
                 drawn(&back),
                 cut,
-                "under {status} the wheel back up draws the switch cut by the room's edge: {:?}",
+                "under {status} the wheel back up draws the switch whole ({cut:?}) or cut by the \
+                 room's edge: {:?}",
                 back.paint
                     .iter()
                     .find(|node| node.key == switch)
@@ -5535,9 +5651,14 @@ fn a_status_never_covers_the_switch_the_person_pressed() {
             switch.is_some_and(|(rect, clip)| clip == rect && rect.bottom() <= bar.y + 0.5),
             "the switch is whole over the bar: {switch:?}, bar {bar:?}"
         );
+        assert!(
+            switch.is_some_and(|(rect, _)| (rect.bottom() - bar.y).abs() < 0.5),
+            "the switch moves no further than the bar at its least covers it: {switch:?}, bar \
+             {bar:?}"
+        );
         let read = status_words(&after, "settings/status/visual");
         assert!(
-            read.starts_with("Allow programs") && !read.contains('\u{2026}'),
+            read.starts_with("Allow") && !read.contains('\u{2026}'),
             "the status starts at its first words, none cut: {read:?}"
         );
         assert_eq!(
@@ -5855,8 +5976,14 @@ fn a_save_that_failed_is_read_whole_in_a_short_bar() {
     });
 }
 
+/// A SWITCH A TALLER STATUS WOULD COVER STAYS UNDER THE POINTER, ITS NAME WHOLE: at 584x348
+/// with 2x text Appearance's theme-mode switch sits where the bar of the status its press
+/// brings would stand over it at its least, on a page that kept no room for that bar. The
+/// status takes the toolbar's dock instead, its words past the row's two lines scrolling in
+/// it and every one of them reached, so the switch stays where it was, its name drawn whole
+/// over it. It went up by its hidden part before, under a bar standing under the page.
 #[test]
-fn a_switch_a_taller_status_moves_keeps_its_name() {
+fn a_switch_a_taller_status_would_cover_stays_and_keeps_its_name() {
     at_each_text_scale(&[2.0], "status press", |_| {
         let mut lab = Lab::new("");
         lab.state_mut().navigate(SettingsRoute::Appearance);
@@ -5876,9 +6003,20 @@ fn a_switch_a_taller_status_moves_keeps_its_name() {
         lab.commit("settings/theme-mode", None);
         let after = lab.compile(584.0, 348.0);
         let now = rect_of(&after, "settings/theme-mode");
+        let feedback = lab.state().feedback.clone().unwrap_or_default();
         assert!(
-            lab.state().feedback.is_some() && now.y < was.y - 0.5,
-            "the status's bar moves the switch: {was:?} to {now:?}"
+            !feedback.is_empty() && now == was,
+            "the status moves the switch: {was:?} to {now:?}"
+        );
+        assert!(
+            after
+                .semantic(&UiKey::new("settings/status-dock"))
+                .is_some()
+                && after
+                    .paint
+                    .iter()
+                    .any(|node| node.key.as_str() == "settings/status/visual/thumb"),
+            "the status takes the dock, its words scrolling in it"
         );
         let name = name(&after);
         assert!(
@@ -5886,6 +6024,18 @@ fn a_switch_a_taller_status_moves_keeps_its_name() {
                 |(rect, clip)| clip.height >= rect.height - 0.5 && clip.width >= rect.width - 0.5
             ),
             "the switch's name is drawn whole over it: {name:?}"
+        );
+        let every = every_status_line(&mut lab, 584.0, 348.0, "settings/status/visual");
+        let bare = |text: &str| {
+            text.split_whitespace()
+                .filter(|word| *word != FACT_SEPARATOR.trim())
+                .collect::<String>()
+        };
+        assert_eq!(bare(&every.join(" ")), bare(&feedback), "{every:#?}");
+        assert_eq!(
+            rect_of(&lab.compile(584.0, 348.0), "settings/theme-mode"),
+            was,
+            "reading the words moves nothing"
         );
     });
 }
@@ -6180,82 +6330,116 @@ fn a_press_on_softwares_cut_auto_update_row_only_scrolls_it_in() {
     );
 }
 
+/// A STATUS NEVER MOVES THE SWITCH A PRESS FOUND WHOLE ON A COMPACT PAGE
+/// THAT KEEPS NO ROOM FOR IT: at 80x24 and 80x26, with 1x and 2x text, where
+/// the page keeps no room under its list for the status bar a change brings up
+/// (its toolbar docks that bar), the last switch drawn whole on the first screen
+/// that draws one is pressed, and the status the press brings up takes the dock
+/// — on the lines the toolbar's row holds, the rest scrolling in it, every word
+/// in its label — so the switch stays where it was, under the pointer, and no
+/// bar stands over it. Software Update's "Install updates automatically turned
+/// on · This copy can't update; the setting is saved" took two lines of the dock
+/// at 1x (SC7) and three at 2x; it stood under the page instead and took its
+/// room from the list's bottom: the switch went 54pt up at 80x26 with 2x text.
 #[test]
 fn a_status_never_moves_a_switch_pressed_whole_on_a_compact_page() {
-    let mut pressed = 0;
-    let mut faults = Vec::new();
-    for route in SettingsRoute::ALL {
-        if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
-            continue;
-        }
-        for (width, height) in [(584.0, 348.0), (584.0, 376.0)] {
-            let mut lab = Lab::new("");
-            lab.state_mut().navigate(route);
-            let before = lab.compile(width, height);
-            let Some((key, rect)) = before
-                .paint
-                .iter()
-                .rfind(|node| {
-                    matches!(node.content, UiContent::Switch(_))
-                        && node.clip == node.rect
-                        && before.semantic(&node.key).is_some()
-                })
-                .map(|node| (node.key.clone(), node.rect))
-            else {
+    at_each_text_scale(&[1.0, 2.0], "a press under a docked status", |scale| {
+        let mut pressed = 0;
+        let mut faults = Vec::new();
+        for route in SettingsRoute::ALL {
+            if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
                 continue;
-            };
-            let Some(crate::native_ui::SemanticValue::Bool(on)) =
-                before.semantic(&key).map(|node| node.value.clone())
-            else {
-                continue;
-            };
-            let setting = key
-                .as_str()
-                .trim_start_matches("settings/control/")
-                .to_string();
-            lab.state_mut().common.last_focus = Some(key.clone());
-            let Some((patch, operation)) = lab.invoke(
-                &format!("settings/set/{setting}"),
-                Some(SemanticInput::Bool(!on)),
-            ) else {
-                continue;
-            };
-            lab.carry(patch, operation);
-            let after = lab.compile(width, height);
-            pressed += 1;
-            let context = format!("{route:?} {width}×{height} {setting}");
-            let now = after
-                .paint
-                .iter()
-                .find(|node| node.key == key)
-                .map(|node| node.rect);
-            if now != Some(rect) {
-                faults.push(format!("{context}: moved from {rect:?} to {now:?}"));
             }
-            if let Some(bar) = after
-                .paint
-                .iter()
-                .find(|node| node.key.as_str() == "settings/feedback")
-                .filter(|bar| {
-                    bar.rect
-                        .intersect(rect)
-                        .is_some_and(|over| over.height > 0.5 && over.width > 0.5)
-                })
-            {
-                faults.push(format!(
-                    "{context}: {:?} under the bar {:?}",
-                    rect, bar.rect
-                ));
+            for (width, height) in [(584.0, 348.0), (584.0, 376.0)] {
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                let mut found = None;
+                for _ in 0..8 {
+                    let before = lab.compile(width, height);
+                    found = before
+                        .paint
+                        .iter()
+                        .rfind(|node| {
+                            matches!(node.content, UiContent::Switch(_))
+                                && node.clip == node.rect
+                                && before.semantic(&node.key).is_some()
+                        })
+                        .map(|node| (node.key.clone(), node.rect));
+                    let last = lab
+                        .state()
+                        .scroll_shown()
+                        .is_none_or(|(plan, shown)| shown.end >= plan.len());
+                    if found.is_some() || last {
+                        break;
+                    }
+                    lab.dispatch(AppEvent::ScrollPage(1));
+                }
+                let Some((key, rect)) = found else {
+                    continue;
+                };
+                let compiled = lab.compile(width, height);
+                let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                    compiled.semantic(&key).map(|node| node.value.clone())
+                else {
+                    continue;
+                };
+                let setting = key
+                    .as_str()
+                    .trim_start_matches("settings/control/")
+                    .to_string();
+                lab.state_mut().common.last_focus = Some(key.clone());
+                let Some((patch, operation)) = lab.invoke(
+                    &format!("settings/set/{setting}"),
+                    Some(SemanticInput::Bool(!on)),
+                ) else {
+                    continue;
+                };
+                lab.carry(patch, operation);
+                let after = lab.compile(width, height);
+                pressed += 1;
+                let context = format!("{route:?} {width}×{height} at {scale}× {setting}");
+                let now = after
+                    .paint
+                    .iter()
+                    .find(|node| node.key == key)
+                    .map(|node| node.rect);
+                if now != Some(rect) {
+                    faults.push(format!("{context}: moved from {rect:?} to {now:?}"));
+                }
+                if let Some(bar) = after
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "settings/feedback")
+                    .filter(|bar| {
+                        bar.rect
+                            .intersect(rect)
+                            .is_some_and(|over| over.height > 0.5 && over.width > 0.5)
+                    })
+                {
+                    faults.push(format!(
+                        "{context}: {:?} under the bar {:?}",
+                        rect, bar.rect
+                    ));
+                }
+                let Some(status) = lab.state().bar_feedback().cloned() else {
+                    continue;
+                };
+                let read = after
+                    .semantic(&UiKey::new("settings/status"))
+                    .is_some_and(|node| node.label == status);
+                if !read {
+                    faults.push(format!("{context}: the status's label is not {status:?}"));
+                }
             }
         }
-    }
-    assert!(
-        faults.is_empty(),
-        "{} faults:\n{}",
-        faults.len(),
-        faults.join("\n")
-    );
-    assert!(pressed > 0, "some page presses a switch");
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(pressed > 0, "some page presses a switch");
+    });
 }
 
 /// The role and painted kind of `key`'s control.
@@ -6410,4 +6594,219 @@ fn a_refused_typed_number_is_not_what_the_preview_names() {
         let _ = lab.dispatch_outcome(AppEvent::TextInput(TextInputEvent::Submit));
         assert_eq!(named(&mut lab), want, "typed {typed}, then Return");
     }
+}
+
+/// A BAR HELD OVER A PRESS KEEPS ITS ROOM WHEN THE LIST SCROLLS: at 178x348 with 1x text
+/// Software Update's switch is pressed, and the bar of its status stops over it, its words
+/// scrolling; the wheel over the list, and back, leaves the bar the room it took, every word
+/// still read in it. A scroll ended the press and the bar grew over the list to show every
+/// word at once: from 98pt to 186pt of the page's 268pt.
+#[test]
+fn a_bar_held_over_a_press_keeps_its_room_when_the_list_scrolls() {
+    at_each_text_scale(&[1.0], "a held bar under a scroll", |_| {
+        let (width, height) = (178.0, 348.0);
+        let mut lab = Lab::new("");
+        lab.state_mut().navigate(SettingsRoute::SoftwareUpdate);
+        let key = UiKey::new("settings/control/update.enabled");
+        let mut before = lab.compile(width, height);
+        for _ in 0..4 {
+            if before.semantic(&key).is_some() {
+                break;
+            }
+            lab.dispatch(AppEvent::ScrollPage(1));
+            before = lab.compile(width, height);
+        }
+        let was = rect_of(&before, "settings/control/update.enabled");
+        lab.state_mut().common.last_focus = Some(key.clone());
+        let (patch, operation) = lab
+            .invoke(
+                "settings/set/update.enabled",
+                Some(SemanticInput::Bool(false)),
+            )
+            .expect("writes");
+        lab.carry(patch, operation);
+        let pressed = lab.compile(width, height);
+        let bar = rect_of(&pressed, "settings/feedback");
+        assert_eq!(rect_of(&pressed, "settings/control/update.enabled"), was);
+        assert!(
+            bar.y >= was.bottom() - 0.5
+                && pressed
+                    .paint
+                    .iter()
+                    .any(|node| node.key.as_str() == "settings/status/visual/thumb"),
+            "the bar {bar:?} stops over the switch {was:?}, its words scrolling"
+        );
+        for lines in [1, -1] {
+            lab.dispatch(AppEvent::ScrollAt {
+                lines,
+                key: UiKey::new("settings/list"),
+            });
+            let scrolled = lab.compile(width, height);
+            assert_eq!(
+                rect_of(&scrolled, "settings/feedback"),
+                bar,
+                "the wheel ({lines}) over the list leaves the bar its room"
+            );
+        }
+        let feedback = lab.state().feedback.clone().unwrap_or_default();
+        let every = every_status_line(&mut lab, width, height, "settings/status/visual");
+        let bare = |text: &str| {
+            text.split_whitespace()
+                .filter(|word| *word != FACT_SEPARATOR.trim())
+                .collect::<String>()
+        };
+        assert_eq!(bare(&every.join(" ")), bare(&feedback), "{every:#?}");
+    });
+}
+
+/// A STATUS'S BAR STOPS OVER THE CONTROL THE PERSON PRESSED: in narrow and short windows, with
+/// 1x and 2x text, the last switch the first screen that shows one draws whole is pressed, and
+/// the bar of the status the press brings up stands under the page no higher than the
+/// switch's foot, the rest of its words scrolling in it, so the switch stays under the
+/// pointer. Only where the page gave the bar's room to its rows and the bar at its least, one
+/// line of words, still covers the switch does the switch go up, by no more than that least
+/// covers. The bar grew over the switch to show its words whole and the list moved the switch
+/// up by what it covered: Software Update's at 178x348 with 1x text went up 73pt under a
+/// six-line bar, Security's at 178x348 with 2x text 156pt under a four-line one.
+#[test]
+fn a_status_bar_stops_over_the_control_the_person_pressed() {
+    at_each_text_scale(&[1.0, 2.0], "a bar over a pressed switch", |scale| {
+        let mut pressed = 0;
+        let mut held = 0;
+        let mut faults = Vec::new();
+        for (width, height) in [
+            (164.0, 348.0),
+            (178.0, 348.0),
+            (234.0, 348.0),
+            (178.0, 420.0),
+            (304.0, 348.0),
+            (444.0, 292.0),
+            (584.0, 348.0),
+            (1_074.0, 684.0),
+        ] {
+            for route in SettingsRoute::ALL {
+                if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+                    continue;
+                }
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                let mut found = None;
+                for _ in 0..8 {
+                    let before = lab.compile(width, height);
+                    found = before
+                        .paint
+                        .iter()
+                        .rfind(|node| {
+                            matches!(node.content, UiContent::Switch(_))
+                                && node.clip == node.rect
+                                && before
+                                    .semantic(&node.key)
+                                    .is_some_and(|live| live.rect == node.rect)
+                        })
+                        .map(|node| (node.key.clone(), node.rect));
+                    let last = lab
+                        .state()
+                        .scroll_shown()
+                        .is_none_or(|(plan, shown)| shown.end >= plan.len());
+                    if found.is_some() || last {
+                        break;
+                    }
+                    lab.dispatch(AppEvent::ScrollPage(1));
+                }
+                let Some((key, was)) = found else {
+                    continue;
+                };
+                let compiled = lab.compile(width, height);
+                let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                    compiled.semantic(&key).map(|node| node.value.clone())
+                else {
+                    continue;
+                };
+                let setting = key
+                    .as_str()
+                    .trim_start_matches("settings/control/")
+                    .to_string();
+                lab.state_mut().common.last_focus = Some(key.clone());
+                let Some((patch, operation)) = lab.invoke(
+                    &format!("settings/set/{setting}"),
+                    Some(SemanticInput::Bool(!on)),
+                ) else {
+                    continue;
+                };
+                lab.carry(patch, operation);
+                let after = lab.compile(width, height);
+                let context = format!("{route:?} {width}x{height} at {scale}x {setting}");
+                let docked = after
+                    .semantic(&UiKey::new("settings/status-dock"))
+                    .is_some();
+                let Some(bar) = after
+                    .semantic(&UiKey::new("settings/feedback"))
+                    .map(|node| node.rect)
+                    .filter(|_| !docked)
+                else {
+                    continue;
+                };
+                pressed += 1;
+                let now = after
+                    .paint
+                    .iter()
+                    .find(|node| node.key == key)
+                    .map(|node| node.rect);
+                if now == Some(was) {
+                    if bar.y < was.bottom() - 0.5 {
+                        faults.push(format!("{context}: the bar {bar:?} covers {was:?}"));
+                    }
+                    if after
+                        .paint
+                        .iter()
+                        .any(|node| node.key.as_str() == "settings/status/visual/thumb")
+                    {
+                        held += 1;
+                    }
+                    continue;
+                }
+                let lines = after
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        node.key
+                            .as_str()
+                            .starts_with("settings/status/visual/line-")
+                            && node.clip.height >= node.rect.height - 0.5
+                    })
+                    .count();
+                let room_bottom = lab.state().scroll_plan().zip(now).and_then(|(plan, now)| {
+                    after
+                        .semantics
+                        .iter()
+                        .find(|node| {
+                            node.role == SemanticRole::List
+                                && node.key.as_str() != "settings/navigation/list"
+                                && node.rect.contains(now.x + 1.0, now.y + 1.0)
+                        })
+                        .map(|list| list.rect.y + plan.room())
+                });
+                let least_cut = room_bottom.is_some_and(|bottom| {
+                    now.is_some_and(|now| (was.y - now.y - (was.bottom() - bottom)).abs() < 0.5)
+                });
+                if lines > 1 || !least_cut {
+                    faults.push(format!(
+                        "{context}: moved from {was:?} to {now:?} under the bar {bar:?} \
+                         showing {lines} lines (the room ends at {room_bottom:?})"
+                    ));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(pressed > 20, "{pressed} presses under a bar");
+        assert!(
+            held > 0,
+            "some bar stops over its switch, its words scrolling"
+        );
+    });
 }

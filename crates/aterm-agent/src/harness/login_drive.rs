@@ -1108,48 +1108,49 @@ pub fn login_route(req: &Request<'_>, over_ssh: bool) -> Result<&'static Route, 
         })
 }
 
-/// `accounts login <label> --cli <id>`'s command: `req`'s sign-in on this terminal, where the
-/// CLI shows its own URL and code. At the desk it may open the person's browser, and its
-/// environment is [`child_env`]'s with this process's `PATH`. Over SSH (`over_ssh`) a browser
-/// it opened would be this machine's, not the person's, so there a [`SignIn::no_opener`] CLI gets
-/// the opener-free `PATH` ([`child_program`], whose directory the [`LoginPath`] holds) and a
-/// [`SignIn::no_desk`] one runs under `no_desk` ([`NO_DESK`]), and it prints its URL for the
-/// person to open where they are; a route that calls back to this machine runs as the CLI's
-/// device route there ([`login_route`]). A Codex browser route runs `codex login`, the app
-/// server being the harness's alone.
+/// A sign-in a person runs on this terminal, as [`off_this_desk`] makes it.
+#[derive(Debug)]
+pub struct DeskSafe {
+    /// What runs: the CLI, or [`SANDBOX_EXEC`] in front of it.
+    pub program: PathBuf,
+    /// Its arguments: the CLI's own, behind [`no_desk_argv`]'s where it runs under the sandbox.
+    pub args: Vec<OsString>,
+    /// The child's `PATH`: this process's, or the opener-free directory [`Self::held`] holds.
+    pub path: OsString,
+    /// The opener-free `PATH`'s directory, removed when it drops.
+    pub held: LoginPath,
+}
+
+/// `program args…` as a sign-in a person runs on this terminal, where the CLI shows its own URL
+/// and code. At the desk it runs as given with this process's `PATH`, and may open the
+/// person's browser. Over SSH (`over_ssh`) a browser it opened would be this machine's, on a
+/// desk nobody is at, not the person's, so there a CLI whose `signin` is [`SignIn::no_opener`]
+/// gets the opener-free `PATH` ([`child_program`], whose directory [`DeskSafe::held`] holds),
+/// and one whose [`SignIn::no_desk`] names this system runs under `no_desk` ([`NO_DESK`]), its
+/// program found on this process's `PATH` first; it prints its URL for the person to open where
+/// they are. `product` names the CLI in a refusal. `accounts login` ([`login_command`]) and
+/// `aterm ai login` (`crate::ai::login::sign_in`) both run their CLI so.
 /// # Errors
-/// Over SSH, no private `PATH` could be made, a no-desk CLI's sandbox is missing or cannot
-/// run here ([`sandbox_refusal`]), or the route calls back here and the CLI has no device route
-/// ([`login_route`]).
-pub fn login_command(
-    req: &Request<'_>,
-    home: &Path,
-    var: &dyn Fn(&str) -> Option<OsString>,
+/// Over SSH, a no-desk CLI's sandbox is missing or cannot run here ([`sandbox_refusal`]),
+/// which is checked before anything is made, or no private `PATH` could be made.
+pub fn off_this_desk(
+    signin: Option<&SignIn>,
+    product: &str,
+    (program, args): (PathBuf, Vec<OsString>),
     (over_ssh, no_desk): (bool, Option<&Path>),
-) -> Result<(aterm_uds::spawnfd::Command, LoginPath), String> {
-    let route = login_route(req, over_ssh)?;
-    let program = program_of(req.cli, home);
-    let signin = req.signin();
-    let opener_free = over_ssh && signin.is_some_and(|s| s.no_opener);
-    let (program, path, held) = if opener_free {
-        child_program(&program, None, true, &req.store.dir, var)
-            .map_err(|e| format!("no private PATH could be made: {e}"))?
-    } else {
-        (program, var("PATH").unwrap_or_default(), None)
-    };
-    let env = signin
-        .map(|signin| child_env(req.cli, signin, req.staging, &path, var))
-        .unwrap_or_default();
-    let mut args: Vec<OsString> = match route.drive {
-        Drive::AppServer => vec![OsString::from("login")],
-        Drive::Lines { .. } => child_args(route, req.row.vendor.region)
-            .into_iter()
-            .map(OsString::from)
-            .collect(),
-    };
-    let mut program = program;
-    if over_ssh && signin.is_some_and(|s| s.no_desk.contains(&std::env::consts::OS)) {
-        let product = req.cli.connector().product;
+    store_dir: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<DeskSafe, String> {
+    let parent = var("PATH").unwrap_or_default();
+    if !over_ssh {
+        return Ok(DeskSafe {
+            program,
+            args,
+            path: parent,
+            held: None,
+        });
+    }
+    let sandbox = if signin.is_some_and(|s| s.no_desk.contains(&std::env::consts::OS)) {
         let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
             return Err(format!(
                 "over SSH, {product} would open this machine's default browser, and the sandbox \
@@ -1163,15 +1164,72 @@ pub fn login_command(
                  that stops it cannot run here: {why}"
             ));
         }
-        let parent = var("PATH").unwrap_or_default();
-        let resolved = on_path(&program, &parent).unwrap_or(program);
-        let mut wrapped = no_desk_argv(&resolved, &[]);
-        wrapped.append(&mut args);
-        args = wrapped;
-        program = sandbox.to_path_buf();
-    }
-    let mut cmd = aterm_uds::spawnfd::command(&program);
-    cmd.args(&args)
+        Some(sandbox)
+    } else {
+        None
+    };
+    let (program, path, held) = if signin.is_some_and(|s| s.no_opener) {
+        child_program(&program, None, true, store_dir, var)
+            .map_err(|e| format!("no private PATH could be made: {e}"))?
+    } else {
+        (program, parent.clone(), None)
+    };
+    let Some(sandbox) = sandbox else {
+        return Ok(DeskSafe {
+            program,
+            args,
+            path,
+            held,
+        });
+    };
+    let resolved = on_path(&program, &parent).unwrap_or(program);
+    let mut wrapped = no_desk_argv(&resolved, &[]);
+    wrapped.extend(args);
+    Ok(DeskSafe {
+        program: sandbox.to_path_buf(),
+        args: wrapped,
+        path,
+        held,
+    })
+}
+
+/// `accounts login <label> --cli <id>`'s command: `req`'s sign-in on this terminal, kept off
+/// this machine's desk over SSH (`over_ssh`) as [`off_this_desk`] says, its environment
+/// [`child_env`]'s with the `PATH` that gives; a route that calls back to this machine runs as
+/// the CLI's device route there ([`login_route`]). A Codex browser route runs `codex login`,
+/// the app server being the harness's alone.
+/// # Errors
+/// Over SSH, the route calls back here and the CLI has no device route ([`login_route`]), or
+/// [`off_this_desk`] refuses (a no-desk CLI's sandbox is missing or cannot run here, or no
+/// private `PATH` could be made).
+pub fn login_command(
+    req: &Request<'_>,
+    home: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    (over_ssh, no_desk): (bool, Option<&Path>),
+) -> Result<(aterm_uds::spawnfd::Command, LoginPath), String> {
+    let route = login_route(req, over_ssh)?;
+    let signin = req.signin();
+    let args: Vec<OsString> = match route.drive {
+        Drive::AppServer => vec![OsString::from("login")],
+        Drive::Lines { .. } => child_args(route, req.row.vendor.region)
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    };
+    let kept = off_this_desk(
+        signin,
+        req.cli.connector().product,
+        (program_of(req.cli, home), args),
+        (over_ssh, no_desk),
+        &req.store.dir,
+        var,
+    )?;
+    let env = signin
+        .map(|signin| child_env(req.cli, signin, req.staging, &kept.path, var))
+        .unwrap_or_default();
+    let mut cmd = aterm_uds::spawnfd::command(&kept.program);
+    cmd.args(&kept.args)
         .env_clear()
         .envs(
             env.iter()
@@ -1182,7 +1240,7 @@ pub fn login_command(
     if let Some(term) = var("TERM") {
         cmd.env("TERM", term);
     }
-    Ok((cmd, held))
+    Ok((cmd, kept.held))
 }
 
 #[cfg(test)]

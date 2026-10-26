@@ -709,12 +709,14 @@ impl LineInks {
     const INV_LINE_INK_STEPS: f32 = 1.0 / LINE_INK_STEPS as f32;
 
     #[inline]
-    fn solve(&mut self, palette: CardPalette, ground: u32) {
-        if self.key == Some((palette, ground)) {
+    const fn solve(&mut self, palette: CardPalette, ground: u32) {
+        if matches!(self.key, Some((p, g)) if p as u8 == palette as u8 && g == ground) {
             return;
         }
-        for (i, ink) in self.ink.iter_mut().enumerate() {
-            *ink = palette.text_at(i as f32 * Self::INV_LINE_INK_STEPS, ground);
+        let mut i = 0;
+        while i < self.ink.len() {
+            self.ink[i] = palette.text_at(i as f32 * Self::INV_LINE_INK_STEPS, ground);
+            i += 1;
         }
         self.key = Some((palette, ground));
     }
@@ -893,11 +895,17 @@ impl CardPalette {
 
 #[inline]
 const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
-    let y_bg = relative_luminance(ground & 0x00FF_FFFF);
+    let table = crate::color_math::relative_luminance_table();
+    let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
     let y_bg_plus = y_bg + 0.05;
     #[inline]
-    const fn holds(y_bg: f32, y_bg_plus: f32, c: u32) -> bool {
-        let y = relative_luminance(c);
+    const fn holds(
+        table: &crate::color_math::RelativeLuminanceTable,
+        y_bg: f32,
+        y_bg_plus: f32,
+        c: u32,
+    ) -> bool {
+        let y = crate::color_math::relative_luminance_with(table, c);
         let (num, den) = if y >= y_bg {
             (y + 0.05, y_bg_plus)
         } else {
@@ -905,7 +913,7 @@ const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
         };
         num / den >= PAPER_MARK_CONTRAST
     }
-    if holds(y_bg, y_bg_plus, rgb) {
+    if holds(table, y_bg, y_bg_plus, rgb) {
         return rgb;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -919,7 +927,7 @@ const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
         } else if mid_rgb == hi_rgb {
             false
         } else {
-            holds(y_bg, y_bg_plus, mid_rgb)
+            holds(table, y_bg, y_bg_plus, mid_rgb)
         };
         if passes {
             lo = mid;
@@ -1680,7 +1688,11 @@ fn kitty_rect(g: &Geo, s: &CardScene) -> Option<KittyAt> {
         return None;
     }
     let at = kitty_place(g, kitty_art(g, s), p, g.col(col));
-    (at.rect.meet(g.inner()).meet(g.clip) == at.rect).then_some(at)
+    if at.rect.meet(g.inner()).meet(g.clip) == at.rect {
+        Some(at)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -1743,7 +1755,9 @@ fn trail_rect(g: &Geo, s: &CardScene, seat: Option<KittyAt>) -> Option<(Rect, i6
     }
     let inner = g.inner();
     let (tx0, mut tx1) = (g.col(c0).max(inner.x0), g.col(c1).min(inner.x1));
-    if let Some(seat) = seat.filter(|seat| tx1 >= seat.rect.x0) {
+    if let Some(seat) = seat
+        && tx1 >= seat.rect.x0
+    {
         tx1 = tx1.max(seat.rear());
     }
     if tx1 <= tx0 {
@@ -1865,7 +1879,10 @@ fn glint_spots_at(
         return out;
     }
     let m = flare + 1;
-    let free = seat.map_or(t.x1, |at| at.rect.x0.min(t.x1));
+    let free = match seat {
+        Some(at) => at.rect.x0.min(t.x1),
+        None => t.x1,
+    };
     let room = Rect {
         x0: t.x0.max(region.x0) + m,
         y0: (t.y0 + amp).max(region.y0) + m,
@@ -2114,7 +2131,9 @@ impl HarnessCard {
         self.seed = seed;
         self.still = false;
         self.flows = true;
-        self.glint0.get_or_insert(now);
+        if self.glint0.is_none() {
+            self.glint0 = Some(now);
+        }
         self.drawn = None;
         if let Ride::Since(from) = self.ride
             && now.saturating_duration_since(from) >= Duration::from_millis(RIDE_MS)
@@ -2314,7 +2333,7 @@ impl HarnessCard {
             return None;
         };
         let ms = ms_between(start, now);
-        (ms < EPISODE_MS).then_some(ms)
+        if ms < EPISODE_MS { Some(ms) } else { None }
     }
 
     /// Returns the next animation wake instant for the current frame, or `None` if at rest.
@@ -2466,7 +2485,9 @@ impl HarnessCard {
                         self.fade0 = Some(now);
                     }
                 }
-                self.glint0.get_or_insert(now);
+                if self.glint0.is_none() {
+                    self.glint0 = Some(now);
+                }
                 self.flow_at(now)
             }
         }
@@ -2568,7 +2589,10 @@ impl HarnessCard {
         let (wc, wr) = at.wand.unwrap_or((at.col, at.row));
         let wc_f = f32::from(wc);
         let dy_rows = f32::from(at.row) - f32::from(wr);
-        let active_glint = clock.glint.filter(|&(_, up)| up > 0.0);
+        let active_glint = match clock.glint {
+            Some((ms, up)) if up > 0.0 => Some((ms, up)),
+            _ => None,
+        };
         let glint_at = |c: u16| match active_glint {
             Some((ms, up)) => {
                 let d = cell_distance(f32::from(c) - wc_f, dy_rows);
@@ -2644,20 +2668,26 @@ const fn line_floor(rgb: u32, ground: u32) -> u32 {
 /// Mixes `rgb` toward white to reach WCAG relative luminance `floor` on a `2^-14` step grid.
 #[inline]
 pub(crate) const fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
-    if relative_luminance(rgb) >= floor {
+    let table = crate::color_math::relative_luminance_table();
+    if crate::color_math::relative_luminance_with(table, rgb) >= floor {
         return rgb;
     }
     #[inline]
-    const fn reaches(rgb: u32, floor: f32, t: f32) -> bool {
-        relative_luminance(mix_rgb(rgb, WHITE, t)) >= floor
+    const fn reaches(
+        table: &crate::color_math::RelativeLuminanceTable,
+        rgb: u32,
+        floor: f32,
+        t: f32,
+    ) -> bool {
+        crate::color_math::relative_luminance_with(table, mix_rgb(rgb, WHITE, t)) >= floor
     }
     let (mut short, mut step) = (0.0f32, 0.25f32);
     let mut i = 0;
     while i < 7 {
         let (a, b, c) = (
-            reaches(rgb, floor, short + step),
-            reaches(rgb, floor, short + 2.0 * step),
-            reaches(rgb, floor, short + 3.0 * step),
+            reaches(table, rgb, floor, short + step),
+            reaches(table, rgb, floor, short + 2.0 * step),
+            reaches(table, rgb, floor, short + 3.0 * step),
         );
         short += step * ((!a as u8) + (!b as u8) + (!c as u8)) as f32;
         step *= 0.25;
@@ -2696,9 +2726,12 @@ pub enum DarkMark {
 #[must_use]
 pub fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
     let (rgb, ground) = (rgb & 0x00FF_FFFF, ground & 0x00FF_FFFF);
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
     let reads = |c: u32| {
         let lit = add_sat(ground, premul_rgb(c, STAR_PRINT_FULL as u8));
-        contrast_ratio(lit, ground) >= MARK_CONTRAST
+        let ll = crate::color_math::relative_luminance_with(table, lit);
+        (ll.max(lg) + 0.05) / (ll.min(lg) + 0.05) >= MARK_CONTRAST
     };
     if reads(rgb) {
         return DarkMark::Light(rgb);
@@ -3066,10 +3099,13 @@ impl<'a> Emit<'a> {
             Some(at) if ride(self.clock) < 1.0 => tx1.min(at.rear()),
             _ => tx1,
         };
-        let held = kitty
-            .map(|at| at.rect.x0 - rim_px(at.p, g.t))
-            .filter(|&held| drawn > held)
-            .unwrap_or(i64::MAX);
+        let held = match kitty {
+            Some(at) => {
+                let h = at.rect.x0 - rim_px(at.p, g.t);
+                if drawn > h { h } else { i64::MAX }
+            }
+            None => i64::MAX,
+        };
         let seg = if self.clock.t_ms.is_some() || self.clock.flow.is_some() {
             (TRAIL_SEG_CELLS * g.cw).max((len + MAX_TRAIL_SEGMENTS - 1) / MAX_TRAIL_SEGMENTS)
         } else {
@@ -3166,7 +3202,10 @@ impl<'a> Emit<'a> {
             return;
         };
         let glints = self.glint_spots();
-        let Some(trail) = self.trail_lay().filter(|_| glints.n > 0) else {
+        if glints.n == 0 {
+            return;
+        }
+        let Some(trail) = self.trail_lay() else {
             return;
         };
         let (rest, flare) = (glints.rest, glints.flare);
@@ -3338,7 +3377,10 @@ impl<'a> Emit<'a> {
                 return;
             }
             let mut centre = (x.clamp(lo.0, hi.0 - 1), y.clamp(lo.1, hi.1 - 1));
-            if let Some(b) = band.filter(|b| b.x1 - b.x0 > 2 * m && b.y1 - b.y0 > 2 * m) {
+            if let Some(b) = band
+                && b.x1 - b.x0 > 2 * m
+                && b.y1 - b.y0 > 2 * m
+            {
                 centre = (
                     centre.0.clamp(b.x0 + m, b.x1 - m - 1),
                     centre.1.clamp(b.y0 + m, b.y1 - m - 1),
@@ -3399,7 +3441,10 @@ impl<'a> Emit<'a> {
             Some(r) if self.rides() => r.checked_sub(RIDE_MS),
             _ => self.clock.t_ms,
         };
-        let t = age.filter(|&t| t < BURST_MS)?;
+        let t = match age {
+            Some(t) if t < BURST_MS => t,
+            _ => return None,
+        };
         let region = self.star_region?;
         let g = self.geo;
         let ((cx, mid), half_w) = match self.seat {
@@ -3413,7 +3458,8 @@ impl<'a> Emit<'a> {
             }
         };
         let tau = t as f32 * INV_BURST_MS;
-        let fly = 1.0 - (1.0 - tau).powi(3);
+        let u = 1.0 - tau;
+        let fly = 1.0 - u * u * u;
         let rx = (half_w as f32 + 2.0 * g.cw as f32).max(3.0 * g.cw as f32);
         let ry = 0.85 * g.ch as f32;
         let reach = 0.35 + 0.65 * fly;

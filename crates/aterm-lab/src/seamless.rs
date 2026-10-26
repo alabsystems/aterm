@@ -4,6 +4,10 @@
 //! `seamless`: drives a windowed private instance across a seamless update
 //! (`ATERM_DEBUG_SEAMLESS_REEXEC=1` and `aterm ctl update apply`) and verifies session-log readers
 //! across it, then judges present latency on fresh instances against a `--baseline` aterm.
+//!
+//! Its privacy leg plants a sentinel in each kind of text one instance holds, has the outgoing
+//! process keep a copy of every file its update writes (`ATERM_DEBUG_SEAMLESS_KEEP`), and sweeps
+//! the copies ([`crate::seamless_carry`]).
 
 use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
@@ -581,9 +585,10 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
     let bin = world.dir.join("bin");
     let mode = world.dir.join("standin.mode");
     let updroot = world.dir.join("updroot");
+    let keep_root = world.dir.join("keep");
     let laid = (|| -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
-        for d in [&bin, &updroot] {
+        for d in [&bin, &updroot, &keep_root] {
             std::fs::create_dir_all(d)?;
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -601,6 +606,10 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
     env.push((
         "ATERM_UPDATE_ROOT".into(),
         updroot.to_string_lossy().into_owned(),
+    ));
+    env.push((
+        "ATERM_DEBUG_SEAMLESS_KEEP".into(),
+        keep_root.to_string_lossy().into_owned(),
     ));
     let mut inst = Instance::start(
         &world,
@@ -623,7 +632,13 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
         sock: world.sock.clone(),
     };
     let mut pids = Vec::new();
-    let ran = legs(&desk, &mut inst, &fabric, &mode, &bin, &mut pids);
+    let lay = Lay {
+        mode: &mode,
+        bin: &bin,
+        dir: &world.dir,
+        keep: &keep_root,
+    };
+    let ran = legs(&desk, &mut inst, &fabric, &lay, &mut pids);
     pids.extend(bridge_pid(&fabric.state));
     pids.sort_unstable();
     pids.dedup();
@@ -784,16 +799,25 @@ fn bridge_pid(state: &Path) -> Option<i32> {
         .filter(|p| *p > 1)
 }
 
+/// Where the update world's files are: the stand-in's mode file, its `bin`, the world itself
+/// (the privacy leg's scripts) and the folder the keep seam copies the carry into.
+struct Lay<'a> {
+    mode: &'a Path,
+    bin: &'a Path,
+    dir: &'a Path,
+    keep: &'a Path,
+}
+
 /// Every leg across the update, in order.
 #[allow(clippy::too_many_lines)]
 fn legs(
     desk: &Desk,
     inst: &mut Instance,
     fabric: &Fabric,
-    mode: &Path,
-    bin: &Path,
+    lay: &Lay<'_>,
     ended: &mut Vec<i32>,
 ) -> Result<Vec<(&'static str, Verdict)>, Fail> {
+    let (mode, bin) = (lay.mode, lay.bin);
     let die = |e: String| Fail::die(format!("seamless: {e}"));
     let Some(parent) = server_pid(&desk.sock) else {
         return Err(die("no pid answers the control socket".into()));
@@ -812,6 +836,14 @@ fn legs(
         "seamless: aterm pid={parent} sock={} shell tab {a}, stand-in tab {b}",
         desk.sock.display()
     );
+    let planted = plant(desk, lay.dir)?;
+    match &planted {
+        Ok(p) => println!(
+            "seamless: privacy tabs {} (local {}, every sentinel) and {} (its mail)",
+            p.p, p.local_p, p.q
+        ),
+        Err(why) => println!("seamless: a privacy plant did not land: {why}"),
+    }
     let at_a = format!("@{a}");
     let at_b = format!("@{b}");
 
@@ -866,6 +898,12 @@ fn legs(
         )));
     }
 
+    // The bridge is stopped from here until the successor answers, so the plants' second post
+    // waits in P's outbox across the update; the run's end lets it go if a leg fails first.
+    let planted = planted.and_then(|p| plant_waiting(desk, &p, old_bridge).map(|()| p));
+    if let Err(why) = &planted {
+        println!("seamless: a privacy plant did not land: {why}");
+    }
     let applied = desk.ctl_within(APPLY, &["update", "apply"]);
     println!(
         "seamless: update apply answered {}: {}",
@@ -900,6 +938,20 @@ fn legs(
         mail_at.elapsed().as_secs(),
         if parent_gone { "ended" } else { "STILL RUNS" }
     );
+    if let Ok(p) = &planted {
+        // The plants' post waited and their hold stood across the update so the carry holds
+        // them; the old bridge goes on, and a standing hold refuses the window verbs (`hwkey`)
+        // across the instance, so both end here.
+        if let Some(bridge) = old_bridge {
+            let _ = crate::sys::kill(bridge, libc::SIGCONT);
+        }
+        let lifted = desk.ctl(&["hold", &p.p, "off"]);
+        println!(
+            "seamless: the old bridge {old_bridge:?} let go; the plants' hold on @{} lifted: {}",
+            p.p,
+            lifted.first()
+        );
+    }
 
     let latch = mail_link(desk, &b, mode, mail, &marked, mail_at)?;
     let redial_close = redial_ends(&mut need_close)?;
@@ -921,6 +973,15 @@ fn legs(
     let person = person_keys(desk, &a, &b)?;
     events.end();
     ended.extend(bridge_pid(&fabric.state));
+    if let Ok(p) = &planted {
+        let at_q = format!("@{}", p.q);
+        println!(
+            "seamless: after the update @{}'s log holds {} mail dir=in (the delivered post, then the waiting one)",
+            p.q,
+            mail_count(&desk.ctl(&[&at_q, "log", "kinds=mail"]).stdout)
+        );
+    }
+    let privacy = carry_privacy(planted, lay.keep, parent)?;
     Ok(vec![
         ("gap", gap),
         ("topics", topics),
@@ -929,7 +990,257 @@ fn legs(
         ("redial75", redial_close),
         ("latch", latch),
         ("hwkey", person),
+        ("privacy", privacy),
     ])
+}
+
+/// The privacy leg's tabs: `p`, which holds every sentinel, and `q`, which `p` mails.
+struct Planted {
+    p: String,
+    local_p: String,
+    q: String,
+}
+
+/// A `sh` script that reports, through the shell's own marks (OSC 133 and 633;E, signed with the
+/// tab's nonce when it has one), a command whose second word is `secret`, and prints only
+/// `ran-42`: the command line reaches the terminal's marks and the session log, never the screen.
+fn marked_script(secret: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         n=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
+         printf '\\033]133;A%s\\007$ \\033]133;B%s\\007\\033]633;E;echo {secret} 42%s\\007\\r\\n\\033]133;C%s\\007ran-%s\\r\\n\\033]133;D;0%s\\007' \
+         \"$n\" \"$n\" \"$n\" \"$n\" \"$((40+2))\" \"$n\"\n"
+    )
+}
+
+/// THE PRIVACY LEG'S PLANTS (§5 leg 7, the places one instance holds): on a fresh tab P, a
+/// command's later word twice, once as the shell's marks report it (`QZP6SECRET1`, through
+/// [`marked_script`], which prints none of it) and once typed (`echo QZP6SECRET1 42`, the path a
+/// command line normally takes: echoed onto the screen); a title (2, from a script, so the typed
+/// line holds none); an attention text (3); a topic name (4); and a mail to a second tab Q with
+/// its body (6), `key=` (8) and `via=` hop (9), delivered. A second post and the hold, which
+/// stand across the update, are [`plant_waiting`]'s. `Err` names a plant that did not land (the
+/// leg fails with it); a tab that cannot be made at all ends the run.
+fn plant(desk: &Desk, dir: &Path) -> Result<Result<Planted, String>, Fail> {
+    let die = |e: String| Fail::die(format!("seamless: {e}"));
+    let spawn = || -> Result<String, Fail> {
+        let spawned = desk.ok(&["spawn"]).map_err(die)?;
+        let sid = spawned
+            .first()
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_string)
+            .ok_or_else(|| die(format!("spawn answered {}", spawned.first())))?;
+        desk.ok(&[&format!("@{sid}"), "ready"]).map_err(die)?;
+        Ok(sid)
+    };
+    let (p, q) = (spawn()?, spawn()?);
+    let at_p = format!("@{p}");
+    let marked = dir.join("marked.sh");
+    let title = dir.join("title.sh");
+    let written = std::fs::write(&marked, marked_script("QZP6SECRET1"))
+        .and_then(|()| std::fs::write(&title, "printf '\\033]0;QZP6SECRET2\\007'\n"));
+    if let Err(e) = written {
+        return Ok(Err(format!("the plants' scripts: {e}")));
+    }
+    let typed = |script: &Path| -> Result<(), String> {
+        desk.ok(&[&at_p, "send", &format!("sh {}", script.display())])?;
+        desk.ok(&[&at_p, "key", "enter"]).map(|_| ())
+    };
+    let held_by = |args: &[&str], digit: u8| {
+        crate::seamless_carry::sentinels(desk.ctl(args).stdout.as_bytes()).contains(&digit)
+    };
+    if let Err(e) = typed(&marked) {
+        return Ok(Err(e));
+    }
+    let ran = until(HANG, || {
+        desk.ctl(&[&at_p, "log"])
+            .stdout
+            .lines()
+            .any(|l| l.contains(" cmd ") && l.contains("detail=echo"))
+            .then_some(())
+    })?;
+    if ran.is_none() {
+        return Ok(Err(format!(
+            "@{p}'s log holds no `cmd` run with detail=echo a minute after the marked command"
+        )));
+    }
+    if let Err(e) = typed(&title) {
+        return Ok(Err(e));
+    }
+    if until(HANG, || {
+        held_by(&[&at_p, "log", "tier=content"], 2).then_some(())
+    })?
+    .is_none()
+    {
+        return Ok(Err(format!(
+            "@{p}'s log holds no title mark at the content tier a minute after the title script"
+        )));
+    }
+    if let Err(e) = desk
+        .ok(&[&at_p, "send", TYPED_LINE])
+        .and_then(|_| desk.ok(&[&at_p, "key", "enter"]))
+    {
+        return Ok(Err(e));
+    }
+    if until(HANG, || {
+        desk.ctl(&[&at_p, "text"])
+            .stdout
+            .lines()
+            .any(|l| l.trim_end() == TYPED_ECHO)
+            .then_some(())
+    })?
+    .is_none()
+    {
+        return Ok(Err(format!(
+            "@{p}'s screen shows no `{TYPED_ECHO}` a minute after the typed `{TYPED_LINE}`"
+        )));
+    }
+    for line in [
+        vec![at_p.as_str(), "meta", "set", "attention", "QZP6SECRET3"],
+        vec![at_p.as_str(), "topic", "add", "qzp6secret4"],
+    ] {
+        if let Err(e) = desk.ok(&line) {
+            return Ok(Err(e));
+        }
+    }
+    let to = format!("to=@{q}");
+    if let Err(e) = desk.ok(&[
+        &at_p,
+        "post",
+        &to,
+        "kind=note",
+        "key=QZP6SECRET8",
+        "via=h-qzp6secret9",
+        "QZP6SECRET6",
+    ]) {
+        return Ok(Err(e));
+    }
+    let at_q = format!("@{q}");
+    if until(HANG, || {
+        (mail_count(&desk.ctl(&[&at_q, "log", "kinds=mail"]).stdout) > 0).then_some(())
+    })?
+    .is_none()
+    {
+        return Ok(Err(format!(
+            "@{p}'s mail never reached @{q}'s log as mail dir=in"
+        )));
+    }
+    let Some(local_p) = desk
+        .sessions()
+        .into_iter()
+        .find(|(_, s)| *s == p)
+        .map(|(l, _)| l)
+    else {
+        return Ok(Err(format!("`sessions` lists no local id for @{p}")));
+    };
+    Ok(Ok(Planted { p, local_p, q }))
+}
+
+/// The privacy leg's typed command line: its second word is the sentinel `1`.
+const TYPED_LINE: &str = "echo QZP6SECRET1 42";
+
+/// What the shell prints for [`TYPED_LINE`].
+const TYPED_ECHO: &str = "QZP6SECRET1 42";
+
+/// THE WAITING POST AND THE HOLD (§5 leg 7's mail body and hold reason, across the update): the
+/// bridge `bridge` is stopped (`SIGSTOP`, by its pid) so a post from P to Q (its body 6, `key=` 8
+/// and `via=` hop 9, each beside a `w`, a key of its own) stays in P's outbox, then P is held
+/// with the reason 5. Both stand across the update so its carry holds them; [`legs`] lets the
+/// bridge go (`SIGCONT`) and lifts the hold once the successor answers, since a standing hold
+/// refuses `hwkey` across the instance. On `Err`, which names what did not land, the bridge is
+/// let go here.
+fn plant_waiting(desk: &Desk, planted: &Planted, bridge: Option<i32>) -> Result<(), String> {
+    let Some(bridge) = bridge else {
+        return Err("no bridge pid to stop, so no post can wait across the update".to_string());
+    };
+    let _ = crate::sys::kill(bridge, libc::SIGSTOP);
+    let at_p = format!("@{}", planted.p);
+    let to = format!("to=@{}", planted.q);
+    let made = desk
+        .ok(&[
+            &at_p,
+            "post",
+            &to,
+            "kind=note",
+            "key=QZP6SECRET8w",
+            "via=h-qzp6secret9w",
+            "QZP6SECRET6 waits",
+        ])
+        .and_then(|_| desk.ok(&["hold", &planted.p, "on", "reason=QZP6SECRET5"]));
+    if made.is_err() {
+        let _ = crate::sys::kill(bridge, libc::SIGCONT);
+    }
+    made.map(|_| ())
+}
+
+/// The attempt `parent` kept under `keep` (`<parent>-<nonce>/`), if it kept exactly one.
+fn kept_folder(keep: &Path, parent: i32) -> Result<PathBuf, String> {
+    let prefix = format!("{parent}-");
+    let folders: Vec<PathBuf> = std::fs::read_dir(keep)
+        .map_err(|e| format!("{}: {e}", keep.display()))?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect();
+    match folders.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!(
+            "the outgoing process {parent} kept no carry under {} (is the aterm a debug or dev-seams build? the keep seam is ATERM_DEBUG_SEAMLESS_KEEP)",
+            keep.display()
+        )),
+        many => Err(format!("the outgoing process kept {} attempts", many.len())),
+    }
+}
+
+/// The files `parent`'s handoffs left in `dir` (`seamless-<parent>-…`).
+fn left_by(dir: &Path, parent: i32) -> Vec<String> {
+    let prefix = format!("seamless-{parent}-");
+    let mut left: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    left.sort();
+    left
+}
+
+/// THE PRIVACY LEG (§5 leg 7, the carry): the files the outgoing process `parent` kept, swept by
+/// [`crate::seamless_carry::verdict`]; and none of its handoff's files may still be in the control
+/// directory a minute after it ended (the successor consumes the manifest, the layout, the grids
+/// and the stamps; the outgoing process retires the sidecars after the proof).
+fn carry_privacy(
+    planted: Result<Planted, String>,
+    keep: &Path,
+    parent: i32,
+) -> Result<Verdict, Fail> {
+    let planted = match planted {
+        Ok(p) => p,
+        Err(why) => return Ok(Verdict::Fail(format!("a plant did not land: {why}"))),
+    };
+    let kept = match kept_folder(keep, parent).and_then(|f| crate::seamless_carry::read_kept(&f)) {
+        Ok(kept) => kept,
+        Err(why) => return Ok(Verdict::Fail(why)),
+    };
+    let left = match &kept.dir {
+        Some((_, dir)) => {
+            let dir = Path::new(dir);
+            until(HANG, || left_by(dir, parent).is_empty().then_some(()))?;
+            left_by(dir, parent)
+        }
+        None => Vec::new(),
+    };
+    Ok(
+        match crate::seamless_carry::verdict(&kept, &planted.local_p, &left).rendered() {
+            Ok(said) => Verdict::Pass(format!(
+                "@{} (local {}): {said}",
+                planted.p, planted.local_p
+            )),
+            Err(why) => Verdict::Fail(format!("@{} (local {}): {why}", planted.p, planted.local_p)),
+        },
+    )
 }
 
 const WATCH_TIMEOUT: &str = "timeout=600000";

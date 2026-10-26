@@ -242,7 +242,7 @@ impl Core {
             win_h: (rows * ch) as u16,
             head: 0,
         };
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         if o.pane_columns {
             glow.note_pane_columns(0, cols);
         }

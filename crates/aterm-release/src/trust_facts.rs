@@ -1035,9 +1035,25 @@ pub struct Host {
     /// front only when its recorded peak, with the margin its check claims, is not below the
     /// RAM ([`peak_seen`]). A record or plan from before the probe has the ceiling.
     pub uncapped: bool,
+    /// The most memory that can ever be available here, bytes: the RAM less what is wired
+    /// ([`aterm_capacity::Reading::reachable`]), which the launch gate's claims are held to; 0
+    /// where unread, and in a facts record, which keeps it only in a refusal's row
+    /// ([`peak_seen`]).
+    pub reach: u64,
 }
 
 impl Host {
+    /// The bound a claim must be below for the launch gate ever to admit it ([`peak_seen`]):
+    /// [`Self::reach`] where read and below the RAM, else the RAM. The gate is held to it too
+    /// (`trust_lane::Admission::held_to`), so it and the plan judge against one bound.
+    pub(crate) const fn admits_below(&self) -> u64 {
+        if self.reach > 0 && self.reach < self.mem {
+            self.reach
+        } else {
+            self.mem
+        }
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn ram_gib(&self) -> String {
         let g = self.mem as f64 / GIB;
@@ -1316,6 +1332,9 @@ impl HostObs {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
     pub outcome: String,
+    /// The ceiling it was held to, `-` for none, in one of two units: a `held` or `cap-bound`
+    /// row's verifier ceiling in GiB (`6.0`, as [`HostObs::ceil`]), a [`PEAK`] row's reach in
+    /// bytes ([`peak_seen`]).
     pub ceil: String,
     pub peak: String,
     pub when: String,
@@ -1458,8 +1477,8 @@ pub(crate) fn memory_refusal(
 }
 
 /// The [`Seen::outcome`] of a library refused because its last recorded check's peak, with
-/// the margin its check claims, is not below this host's RAM ([`peak_seen`]): its `peak` is
-/// that peak in bytes, its `when` the cost history's stamp.
+/// the margin its check claims, is not below what this host can ever have available
+/// ([`peak_seen`]): its `peak` is that peak in bytes, its `when` the cost history's stamp.
 pub const PEAK: &str = "peak";
 
 /// A check claims its library's last recorded peak plus a fifth of it, and at least
@@ -1478,16 +1497,22 @@ pub fn peak_claim(maxrss: u64) -> u64 {
 }
 
 /// A library whose last recorded check peaked at `maxrss` bytes (the cost history's largest
-/// process, stamped `when`) so near this host's RAM that its claim ([`peak_claim`]) is not
-/// below it: what is available never reaches all of the RAM, so the launch gate could never
-/// admit it ([`aterm_capacity::never`]), and a peak above the RAM cannot fit at all. It is
-/// refused up front whatever the prover's ceiling. `None` when its claim is below the RAM,
-/// or the RAM is unread.
+/// process, stamped `when`) so near this host's memory that its claim ([`peak_claim`]) is not
+/// below what can ever be available ([`Host::reach`], the RAM less what is wired, else the
+/// RAM): what is available never reaches that, so the launch gate could never admit it
+/// ([`aterm_capacity::never`]), and a peak above the RAM cannot fit at all. It is refused up
+/// front whatever the prover's ceiling, its row's ceiling the reach it was held to (`-` where
+/// that was the RAM). `None` when its claim is below that, or the RAM is unread.
 #[must_use]
 pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
-    (host.mem > 0 && peak_claim(maxrss) >= host.mem).then(|| Seen {
+    let below = host.admits_below();
+    (host.mem > 0 && peak_claim(maxrss) >= below).then(|| Seen {
         outcome: PEAK.into(),
-        ceil: "-".into(),
+        ceil: if below < host.mem {
+            below.to_string()
+        } else {
+            "-".into()
+        },
         peak: maxrss.to_string(),
         when: if when.is_empty() {
             "-".into()
@@ -1498,8 +1523,9 @@ pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
 }
 
 /// The one line a [`PEAK`] refusal says: the peak, its date and this host's RAM, and the
-/// claim when the peak itself is below the RAM. Its token is the claim, the RAM a host
-/// needs to admit it. `None` for any other [`Seen`].
+/// claim when the peak itself is below the RAM, with the memory that can ever be available
+/// where the row holds it ([`peak_seen`]). Its token is the claim, the memory a host must be
+/// able to make available to admit it. `None` for any other [`Seen`].
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refusal> {
     let peak: u64 = seen.peak.parse().ok().filter(|_| seen.outcome == PEAK)?;
@@ -1510,10 +1536,18 @@ pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refus
         _ => String::new(),
     };
     let ram = format!("{:.1} GB ({} GiB) of RAM", gb(host.mem), host.ram_gib());
+    let reach = seen.ceil.parse::<u64>().ok().filter(|r| *r < host.mem);
     let why = if peak > host.mem {
         format!(
             "its last check peaked at {:.2} GB{on}, above this host's {ram}",
             gb(peak)
+        )
+    } else if let Some(reach) = reach {
+        format!(
+            "its last check peaked at {:.2} GB{on}, and with its margin it claims {:.2} GB, not below the {:.1} GB of this host's {ram} that can ever be available, the rest being wired",
+            gb(peak),
+            gb(claim),
+            gb(reach)
         )
     } else {
         format!(
@@ -2972,7 +3006,7 @@ pub fn judge(
             host.ram_gib()
         )),
         None if host.mem > 0 => out.push_str(&format!(
-            "HOST: {} GiB RAM, no verifier ceiling (this prover's trustc takes none): refused up front only for a recorded peak whose claim is not below the RAM\n",
+            "HOST: {} GiB RAM, no verifier ceiling (this prover's trustc takes none): refused up front only for a recorded peak whose claim is not below what it can ever have available\n",
             host.ram_gib()
         )),
         None => out.push_str("HOST: memory unreadable, nothing refused up front\n"),
@@ -3419,6 +3453,7 @@ impl Plan {
                 "remeasure" => p.remeasure = v == "1",
                 "host-mem" => p.facts.host.mem = v.parse().map_err(|_| bad())?,
                 "host-mem-os" => p.facts.host.memtotal = v == "MemTotal",
+                "host-reach" => p.facts.host.reach = v.parse().map_err(|_| bad())?,
                 "driver-ceiling" => p.facts.host.uncapped = ceiling_word(v).ok_or_else(bad)?,
                 // The host's one-minute load as the run began and as it ended: provenance only.
                 "load-start" | "load-end" => {}
@@ -3498,8 +3533,9 @@ impl Plan {
     /// Evaluates up-front memory admission for all crates and returns the rewritten plan text.
     /// `peaks` is each library's last recorded check from the cost history: its largest
     /// process's peak RSS in bytes and when it was recorded. A peak whose claim is not below
-    /// this host's RAM is refused whatever the prover ([`peak_seen`]); the RAM / 8 model
-    /// refuses only under a prover that takes a ceiling ([`Host::uncapped`]).
+    /// what can ever be available on this host (the RAM less what is wired, else the RAM) is
+    /// refused whatever the prover ([`peak_seen`]); the RAM / 8 model refuses only under a
+    /// prover that takes a ceiling ([`Host::uncapped`]).
     pub fn admit(
         &self,
         peaks: &BTreeMap<String, (u64, String)>,

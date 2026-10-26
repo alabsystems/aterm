@@ -16,6 +16,25 @@ use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
+#[path = "accounts_sync_commit.rs"]
+mod sync_commit;
+pub(super) use sync_commit::SyncTarget;
+
+#[path = "accounts_directory.rs"]
+mod directory;
+pub(super) use directory::retained_directory_owner;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountDirectoryAdmission",
+        action = "AnotherCase",
+        reason = "Model bookkeeping selects a filesystem and retained-owner fixture"
+    )
+)]
+#[doc(hidden)]
+pub fn directory_admission_environment() {}
+
 /// The roster's file name, beside `aterm.toml`.
 pub const ACCOUNTS_FILE: &str = "accounts.toml";
 
@@ -2626,18 +2645,44 @@ pub fn note_displaced(
     out
 }
 
-/// Moves what is on record of the account the row `from` held to `to`, the label the roster
-/// gives that account now, where a fleet gave `from` to another account and the account is the
-/// default login's under both labels: its observations (walls, samples, auth word) and its
-/// binding, where `to` has none of its own, and every session, the active account and the
-/// previous one that named it by `from`. `from` is left with nothing on record, so the account
-/// the fleet gave it to starts with no walls, no auth word and no turns served.
-pub fn move_account(state: &mut State, logins: &mut Logins, from: &str, to: &str) {
+/// Relabels one account's observations, binding, selections, sessions, claims and rollback
+/// references. The caller establishes that both labels denote the same account and persists
+/// the change under the writer lock. A move to itself preserves every field.
+/// # Errors
+/// Either label is invalid, or the destination retains any local account reference. Refusal
+/// changes neither snapshot. A successful move leaves generation allocation to the transaction.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountRename",
+        action = "Move",
+        project = "aterm_agent::harness::accounts::rename_tests::rename_transition"
+    )
+)]
+pub fn move_account(
+    state: &mut State,
+    logins: &mut Logins,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    for label in [from, to] {
+        if let Some(why) = label_refusal(label) {
+            return Err(format!("cannot relabel `{label}`: {why}"));
+        }
+    }
+    if from == to {
+        return Ok(());
+    }
+    if label_is_retained(state, logins, to) {
+        return Err(format!(
+            "cannot move `{from}` to `{to}`: the destination retains local login or account state; choose an unused label; nothing was written"
+        ));
+    }
     if let Some(record) = state.accounts.remove(from) {
-        state.accounts.entry(to.to_owned()).or_insert(record);
+        state.accounts.insert(to.to_owned(), record);
     }
     if let Some(binding) = logins.labels.remove(from) {
-        logins.labels.entry(to.to_owned()).or_insert(binding);
+        logins.labels.insert(to.to_owned(), binding);
     }
     for named in state
         .sessions
@@ -2645,11 +2690,53 @@ pub fn move_account(state: &mut State, logins: &mut Logins, from: &str, to: &str
         .map(|session| &mut session.account)
         .chain(state.active.as_mut())
         .chain(state.previous.as_mut())
+        .chain(
+            state
+                .pending_pin
+                .iter_mut()
+                .map(|request| &mut request.label),
+        )
+        .chain(state.probe.iter_mut().map(|claim| &mut claim.account))
+        .chain(state.reset.iter_mut().map(|claim| &mut claim.account))
+        .chain(
+            state
+                .undo
+                .iter_mut()
+                .filter_map(|undo| undo.previous.as_mut()),
+        )
     {
         if named == from {
             to.clone_into(named);
         }
     }
+    Ok(())
+}
+
+fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
+    logins.labels.contains_key(label)
+        || state.accounts.contains_key(label)
+        || state.active.as_deref() == Some(label)
+        || state.previous.as_deref() == Some(label)
+        || state
+            .pending_pin
+            .as_ref()
+            .is_some_and(|pin| pin.label() == label)
+        || state
+            .sessions
+            .values()
+            .any(|session| session.account == label)
+        || state
+            .probe
+            .as_ref()
+            .is_some_and(|claim| claim.account == label)
+        || state
+            .reset
+            .as_ref()
+            .is_some_and(|claim| claim.account == label)
+        || state
+            .undo
+            .iter()
+            .any(|undo| undo.previous.as_deref() == Some(label))
 }
 
 /// Drops what is on record of the account the row `label` held, where a fleet gave the label to
@@ -6710,10 +6797,16 @@ impl Store {
         open_retained_file(&self.dir.join(LOCK_FILE), "lock")
     }
 
+    fn finish_account_lock(&self, held: Lock) -> io::Result<Lock> {
+        self.sync_writer_barrier()?;
+        Ok(held)
+    }
+
     /// Acquires `accounts.lock`, blocking until the lock is available.
     /// # Errors
     /// The directory or lock file cannot be made, the opened path is not a regular file,
-    /// the platform refuses a link, or the lock failed.
+    /// the platform refuses a link, the lock failed, or the sync receipt is unreadable or
+    /// its directory barrier fails.
     pub fn acquire(&self) -> io::Result<Lock> {
         let file: std::fs::File = self.lock_file()?;
         loop {
@@ -6723,7 +6816,7 @@ impl Store {
             )]
             let taken = file.lock();
             match taken {
-                Ok(()) => return Ok(Lock(file)),
+                Ok(()) => return self.finish_account_lock(Lock(file)),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -6734,7 +6827,10 @@ impl Store {
     /// # Errors
     /// As [`Store::acquire`].
     pub fn try_acquire(&self) -> io::Result<Option<Lock>> {
-        Ok(Self::try_take(self.lock_file()?)?.ok())
+        Self::try_take(self.lock_file()?)?
+            .ok()
+            .map(|held| self.finish_account_lock(held))
+            .transpose()
     }
 
     fn try_take(file: std::fs::File) -> io::Result<Result<Lock, std::fs::File>> {
@@ -6755,13 +6851,13 @@ impl Store {
     /// As [`Store::acquire`].
     pub fn acquire_within(&self, ladder: &[std::time::Duration]) -> io::Result<Option<Lock>> {
         let mut file = match Self::try_take(self.lock_file()?)? {
-            Ok(lock) => return Ok(Some(lock)),
+            Ok(lock) => return self.finish_account_lock(lock).map(Some),
             Err(file) => file,
         };
         for pause in ladder {
             std::thread::sleep(*pause);
             file = match Self::try_take(file)? {
-                Ok(lock) => return Ok(Some(lock)),
+                Ok(lock) => return self.finish_account_lock(lock).map(Some),
                 Err(file) => file,
             };
         }
@@ -6883,6 +6979,7 @@ impl Store {
     /// A file that cannot be read, is larger than [`MAX_LOGINS_BYTES`], is not UTF-8, or that
     /// [`Logins::from_json`] refuses (not JSON, or JSON of another schema or of none).
     /// Also refuses an absent snapshot whose witness remains or cannot be inspected.
+    /// A pending, damaged or lost sync receipt, or a sync spanning this read, also refuses.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -6892,7 +6989,8 @@ impl Store {
         )
     )]
     pub fn load_logins(&self, now: i64) -> Result<(Logins, Option<String>), String> {
-        match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
+        let receipt = self.sync_read_receipt()?;
+        let result = match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
             Ok(None) => self.absent_logins(),
             Ok(Some(text)) => match Logins::from_json(&text, now) {
                 Ok(logins) => Ok((logins, None)),
@@ -6901,7 +6999,9 @@ impl Store {
                 }
             },
             Err(e) => Err(format!("{LOGINS_FILE}: {e}")),
-        }
+        };
+        self.check_sync_read_receipt(&receipt)?;
+        result
     }
 
     /// Checks that local state and login bindings can be read before starting a sign-in.
@@ -6922,6 +7022,29 @@ impl Store {
             .map_err(|why| format!("{why} ({})", self.state_file().display()))?;
         self.load_logins(now)
             .map_err(|why| format!("{why} ({})", self.logins_file().display()))?;
+        Ok(())
+    }
+
+    /// Refuses new roster labels that would inherit retained login or account state.
+    /// The caller holds the account writer lock from the current roster read through
+    /// publication. This reads existing snapshots and does not clear old records.
+    /// # Errors
+    /// As [`Self::load`] or [`Self::load_logins`], or a label remains referenced by
+    /// either snapshot, including pending selections, claims and rollback state.
+    pub(super) fn check_new_labels(&self, labels: &[&str], now: i64) -> Result<(), String> {
+        let (state, _) = self
+            .load(now)
+            .map_err(|why| format!("{why} ({})", self.state_file().display()))?;
+        let (logins, _) = self
+            .load_logins(now)
+            .map_err(|why| format!("{why} ({})", self.logins_file().display()))?;
+        for &label in labels {
+            if label_is_retained(&state, &logins, label) {
+                return Err(format!(
+                    "`{label}` still has retained local login or account state; choose an unused label; nothing was written"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -6991,6 +7114,7 @@ impl Store {
     /// hold a pin, walls and signed-out words, so a transaction stops without saving and a
     /// read-only caller must not infer availability from a replacement empty state. An absent
     /// snapshot also refuses when retained publication evidence exists or cannot be inspected.
+    /// A pending, damaged or lost sync receipt, or a sync spanning this read, also refuses.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -7048,6 +7172,7 @@ impl Store {
         )
     )]
     pub fn load(&self, now: i64) -> Result<(State, Option<String>), String> {
+        let receipt = self.sync_read_receipt()?;
         let mut state = match read_bounded(&self.state_file(), MAX_STATE_BYTES) {
             Ok(None) => self.absent_state()?,
             Ok(Some(text)) => State::from_json(&text, now)
@@ -7073,6 +7198,7 @@ impl Store {
                 });
             }
         }
+        self.check_sync_read_receipt(&receipt)?;
         Ok((state, note))
     }
 
@@ -7198,14 +7324,24 @@ impl Store {
         aterm_durable::durable_dir(&self.dir)
     }
 
-    /// Appends `events` to `ledger.jsonl` ([`LEDGER_MAX_BYTES`]).
+    /// Appends `events` to `ledger.jsonl` under the account writer lock ([`LEDGER_MAX_BYTES`]).
     /// # Errors
-    /// The directory cannot be made or the append or the cut failed.
+    /// The directory or lock cannot be acquired, a pending or damaged sync receipt refuses,
+    /// or the append or the cut failed.
     pub fn append(&self, events: &[Event]) -> io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let held = self.acquire()?;
+        self.append_held(&held, events)
+    }
+
+    fn append_held(&self, _held: &Lock, events: &[Event]) -> io::Result<()> {
         use std::io::Write as _;
         if events.is_empty() {
             return Ok(());
         }
+        self.sync_read_receipt().map_err(io::Error::other)?;
         self.ensure()?;
         let mut text = String::new();
         for event in events {
@@ -7236,11 +7372,12 @@ impl Store {
             .collect())
     }
 
-    /// Runs an atomic read-modify-write transaction on `state.json` and `ledger.jsonl` under
+    /// Serializes a read-modify-write transaction on `state.json` and `ledger.jsonl` under
     /// `accounts.lock`.
     /// # Errors
     /// [`Store::load`]'s refusal, naming the file; `edit`'s own, with nothing written; or
-    /// the file that could not be locked or written, by path.
+    /// the file that could not be locked or written, by path. A later write failure can leave
+    /// an earlier file published; this legacy API has no multi-file recovery receipt.
     pub fn transact(
         &self,
         now: i64,
@@ -7290,59 +7427,164 @@ impl Store {
     }
 
     /// Pins an eligible account, or saves an explicit sign-in request for an unenrolled or
-    /// signed-out account. Eligibility uses the current login bindings under `accounts.lock`.
+    /// signed-out account. Re-reads the selected row and current login bindings under
+    /// `accounts.lock`; the row must still equal its captured configuration. Publication uses
+    /// a durable receipt, including its history and notification.
     /// # Errors
     /// An unknown label, a sign-in target without an email, unavailable entropy, or a bounded
-    /// state/login transaction refusal. A store error never becomes a sign-in request.
+    /// state/login transaction refusal, a changed row, or a different provider's store.
+    /// A store error never becomes a sign-in request. An admitted interrupted write fences
+    /// readers until its exact images recover.
     pub fn select_account(
         &self,
         file_roster: &Roster,
+        roster_path: &Path,
         label: &str,
         now: i64,
     ) -> Result<PinSelection, String> {
-        self.select_account_for(Cli::Claude, file_roster, label, now)
+        self.select_account_for(Cli::Claude, file_roster, roster_path, label, now)
     }
 
     /// [`Self::select_account`] for `cli`'s pool ([`enrolled_for`]).
     /// # Errors
     /// As [`Self::select_account`], or when `cli` has no sign-in flow for an unenrolled or
     /// signed-out row.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSelectionCommit",
+            action = "Select",
+            project = "aterm_agent::harness::accounts::selection_commit_tests::selection_transition"
+        )
+    )]
     pub fn select_account_for(
         &self,
         cli: Cli,
         file_roster: &Roster,
+        roster_path: &Path,
         label: &str,
         now: i64,
     ) -> Result<PinSelection, String> {
+        if cli != self.cli {
+            return Err("account selection targets another provider's store".into());
+        }
         let mut selected = PinSelection::Pinned;
-        self.transact_logins_within(&LOCK_LADDER, now, &mut None, |state, logins| {
-            let roster = bound(file_roster, logins);
-            let enrolled = enrolled_for(cli, &roster);
-            match pin_refusal(state, &roster, &enrolled, label) {
-                None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
-                Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
-                Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
-                    if cli != Cli::Claude && cli.accounts().signin.is_none() {
-                        return Err(why.message(label));
-                    }
-                    if roster
-                        .row(label)
-                        .and_then(|row| row.email.as_ref())
-                        .is_none()
-                    {
-                        return Err(format!("`{label}` has no sign-in email"));
-                    }
-                    let nonce = aterm_uds::rand::hex_token::<16>()
-                        .map_err(|e| format!("account selection: {e}"))?;
-                    let request = PinRequest::new(label, nonce)
-                        .ok_or_else(|| "invalid account selection request".to_owned())?;
-                    state.pending_pin = Some(request.clone());
-                    selected = PinSelection::Renew(request);
-                    Ok(Vec::new())
+        self.transact_pool_logins_within(
+            &LOCK_LADDER,
+            roster_path,
+            now,
+            &mut None,
+            |raw, state, logins| {
+                if raw.row(label) != file_roster.row(label) {
+                    return Err("selected account configuration changed; nothing selected".into());
                 }
-            }
-        })?;
+                let roster = bound(raw, logins);
+                let enrolled = enrolled_for(cli, &roster);
+                match pin_refusal(state, &roster, &enrolled, label) {
+                    None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
+                    Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
+                    Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
+                        if cli != Cli::Claude && cli.accounts().signin.is_none() {
+                            return Err(why.message(label));
+                        }
+                        if roster
+                            .row(label)
+                            .and_then(|row| row.email.as_ref())
+                            .is_none()
+                        {
+                            return Err(format!("`{label}` has no sign-in email"));
+                        }
+                        let nonce = aterm_uds::rand::hex_token::<16>()
+                            .map_err(|e| format!("account selection: {e}"))?;
+                        let request = PinRequest::new(label, nonce)
+                            .ok_or_else(|| "invalid account selection request".to_owned())?;
+                        state.pending_pin = Some(request.clone());
+                        selected = PinSelection::Renew(request);
+                        Ok(Vec::new())
+                    }
+                }
+            },
+        )?;
         Ok(selected)
+    }
+
+    /// Admits authentication only while its captured policy and parent binding remain
+    /// current, and a supplied selection still owns its nonce. The bounded writer lock
+    /// covers recovery and all admission reads; it is
+    /// released before authentication, so a later selection can supersede completion.
+    /// This does not edit the request, budget, bindings or history. Earlier admitted writes
+    /// may recover before the check.
+    /// # Errors
+    /// An unavailable writer, unreadable account records or roster, or recovery failure.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountQueuedSelection",
+            action = "Check",
+            project = "aterm_agent::harness::accounts_sync::request_admission_tests::admission_transition"
+        )
+    )]
+    pub(in crate::harness) fn admit_renewal_attempt(
+        &self,
+        policy: RenewalPolicy<'_>,
+        request: Option<&PinRequest>,
+        now: i64,
+    ) -> Result<bool, String> {
+        let mut admitted = false;
+        self.transact_renewal_within(&LOCK_LADDER, now, &mut None, policy, |state, _| {
+            admitted = request.is_none_or(|request| {
+                request.label() == policy.row.label && state.pending_pin.as_ref() == Some(request)
+            });
+            Ok(Vec::new())
+        })?;
+        Ok(admitted)
+    }
+
+    /// Completes a saved selection after sign-in, only while its nonce still owns it and
+    /// its selected row still matches. An ineligible or changed account cancels only this
+    /// request so a completed worker does not restart authentication indefinitely.
+    /// # Errors
+    /// A roster, lock or durable account commit failure. An admitted failure retains the
+    /// receipt until recovery; it never dispatches a new login from a partial update.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSelectionCommit",
+            action = "Complete",
+            project = "aterm_agent::harness::accounts::selection_commit_tests::selection_transition"
+        )
+    )]
+    pub(in crate::harness) fn complete_requested_pin_at(
+        &self,
+        roster_path: &Path,
+        expected: &Roster,
+        request: &PinRequest,
+        now: i64,
+    ) -> Result<bool, String> {
+        let mut pinned = false;
+        self.transact_pool_logins_within(
+            &LOCK_LADDER,
+            roster_path,
+            now,
+            &mut None,
+            |raw, state, logins| {
+                if state.pending_pin.as_ref() != Some(request) {
+                    return Ok(Vec::new());
+                }
+                let roster = bound(raw, logins);
+                let enrolled = enrolled_for(self.cli, &roster);
+                if raw.row(request.label()) != expected.row(request.label())
+                    || pin_refusal(state, &roster, &enrolled, request.label()).is_some()
+                {
+                    state.pending_pin = None;
+                    return Ok(Vec::new());
+                }
+                let event = complete_requested_pin(state, &roster, &enrolled, request, now);
+                pinned = event.is_some();
+                Ok(event.into_iter().collect())
+            },
+        )?;
+        Ok(pinned)
     }
 
     /// Cancels this request after startup or login failure, preserving a newer choice.
@@ -7358,13 +7600,15 @@ impl Store {
         Ok(())
     }
 
-    /// Runs an atomic transaction over both `state.json` and `logins.json` under `accounts.lock`
+    /// Serializes edits to `state.json` and `logins.json` under `accounts.lock`
     /// ([`Store::transact`]).
     /// A renewal or change to a binding's location, proved identity or existence consumes
     /// a generation. Multiple changes to one label consume it once per transaction.
     /// # Errors
     /// As [`Store::transact`], for either file, or a renewed binding is missing or its
-    /// generation is exhausted. The edit's own external effects are not rolled back.
+    /// generation is exhausted. A later write failure can leave earlier files published;
+    /// this legacy transaction has no multi-file crash receipt. The edit's own external
+    /// effects are not rolled back.
     pub fn transact_logins(
         &self,
         now: i64,
@@ -7441,9 +7685,10 @@ impl Store {
     /// account edits share the account lock. A noncooperating filesystem writer can still
     /// change the roster after its read; this does not prove provider identity.
     /// # Errors
-    /// As [`Self::transact_logins_within`], an unreadable or changed roster, or a changed
-    /// effective target row or login generation. A refused policy runs no edit; subsequent edit or write failures
-    /// retain the transaction's ordinary multi-file publication guarantees.
+    /// An unreadable or changed roster, a changed target row or generation, lock contention,
+    /// or a commit failure. A refused policy runs no edit. After admission, a durable receipt
+    /// fences readers until the exact state, bindings and ledger recover together. A
+    /// conflicting roster edit refuses recovery and preserves the pending receipt.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -7460,10 +7705,9 @@ impl Store {
         policy: RenewalPolicy<'_>,
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
-        self.transact_logins_within(ladder, now, note, |state, logins| {
-            let raw = Roster::load_for(self.cli, policy.roster_path)?;
-            if raw != *policy.roster
-                || bound(&raw, logins).row(&policy.row.label) != Some(policy.row)
+        self.transact_roster_logins_within(ladder, policy.roster_path, now, note, |raw, state, logins| {
+            if raw != policy.roster
+                || bound(raw, logins).row(&policy.row.label) != Some(policy.row)
             {
                 return Err(format!(
                     "account `{}` configuration or login changed during sign-in; nothing recorded",
@@ -7551,7 +7795,7 @@ impl Store {
     )]
     fn transact_held(
         &self,
-        _held: &Lock,
+        held: &Lock,
         now: i64,
         note: &mut Option<String>,
         edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
@@ -7579,7 +7823,7 @@ impl Store {
             self.save(&state)
                 .map_err(|e| format!("{}: {e}", self.state_file().display()))?;
         }
-        self.append(&events)
+        self.append_held(held, &events)
             .map_err(|e| format!("{}: {e}", self.ledger_path().display()))?;
         if events.iter().any(Event::wakes) {
             self.touch_wake()
@@ -7588,6 +7832,25 @@ impl Store {
         Ok(events)
     }
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSelectionCommit",
+        action = "AnotherProvider",
+        reason = "Select a native account provider fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSelectionCommit",
+        action = "AnotherCase",
+        reason = "Select a policy, supersession or write-failure fixture."
+    )
+)]
+#[doc(hidden)]
+pub fn account_selection_environment() {}
 
 /// Outcome of a [`record_wall`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8212,8 +8475,31 @@ mod observation_tests;
 mod renewal_policy_tests;
 
 #[cfg(test)]
+#[path = "accounts_renewal_commit_tests.rs"]
+mod renewal_commit_tests;
+
+#[cfg(test)]
+#[path = "accounts_selection_commit_tests.rs"]
+mod selection_commit_tests;
+
+#[cfg(test)]
 #[path = "accounts_generation_tests.rs"]
 mod generation_tests;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRename",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the native transition stages each source and destination fixture before calling Move"
+    )
+)]
+#[doc(hidden)]
+pub fn account_rename_environment() {}
+
+#[cfg(test)]
+#[path = "accounts_rename_tests.rs"]
+pub(super) mod rename_tests;
 
 #[cfg(test)]
 #[path = "accounts_lock_tests.rs"]

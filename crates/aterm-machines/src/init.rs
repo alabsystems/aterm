@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// `aterm init` usage, printed by `--help` and after a usage error.
 pub const USAGE: &str = "\
 aterm init [--plan | --check] [--json] [--develop | --no-develop]
-           [--only <item,...>]
+           [--only <item,...>] [--vault <url|path>]
     Set up this Mac for this account, applying and reading back each item;
     safe to run again. Run as the logged-in user, without sudo.
 
@@ -37,10 +37,11 @@ aterm init [--plan | --check] [--json] [--develop | --no-develop]
     Spotlight (rustup's minimal profile, no rust-docs, build caches in .noindex
     folders). It joins the secrets vault (aterm help secrets): the ALab vault
     when it answers on this network (asking only its join password), else the
-    one you name. A [github] table in ~/.config/aterm/init.toml keeps its token
-    in the login keychain (unless git's own helpers, such as the secrets
-    vault's, already hand it back), clones the owner's repositories into ~ and
-    fast-forwards each clean checkout that is behind (aterm help init).
+    one --vault names; with neither, it asks nothing. A [github] table in
+    ~/.config/aterm/init.toml keeps its token in the login keychain (unless
+    git's own helpers, such as the secrets vault's, already hand it back),
+    clones the owner's repositories into ~ and fast-forwards each clean
+    checkout that is behind (aterm help init).
 
     Last, on a develop machine (one `aterm init --develop` recorded), the
     develop items.
@@ -65,11 +66,16 @@ aterm init [--plan | --check] [--json] [--develop | --no-develop]
               workstation (every console-only step); a develop id such as
               develop.checkout or develop.checkout@~/aterm, a family (profile,
               checkout, tooling), or develop.
+    --vault   Join this secrets vault (a URL, #<signer> pin allowed, or a
+              path) when this Mac has none: read once at once, and asked for
+              again while nothing answers there.
     --help    Show this help without inspecting or changing the Mac.
 
-    Exit: 0 done; when only items that stood aside are left, 75 if one waits
-    on a lock (such as an install pass's store lock), else 77 if one waits on
-    a permission you grant, else 69 (the network, or an admin's approval); 1
+    Exit: 0 done, a vault join an admin has yet to approve included (the
+    subscriber finishes it); when only items that stood aside are left, 75 if
+    one waits on a lock (such as an install pass's store lock) or on another
+    step (GitHub's sign-in on that join: run init again once it is approved),
+    else 77 if one waits on a permission you grant, else 69 (the network); 1
     anything else; 2 usage.
 ";
 
@@ -90,6 +96,8 @@ struct Options {
     only: Vec<String>,
     /// `--develop` (`Some(true)`) or `--no-develop` (`Some(false)`).
     develop: Option<bool>,
+    /// `--vault`: the vault to join when this Mac has none.
+    vault: Option<String>,
 }
 
 impl Options {
@@ -113,6 +121,23 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             Some(arg) => arg.strip_prefix("--only="),
             None => None,
         };
+        let vault = match arg.to_str() {
+            Some("--vault") => Some(
+                args.next()
+                    .and_then(|source| source.to_str())
+                    .ok_or("--vault takes a vault URL or path")?,
+            ),
+            Some(arg) => arg.strip_prefix("--vault="),
+            None => None,
+        };
+        if let Some(source) = vault {
+            // A flag after a bare `--vault` is a missing value, not a vault named `--plan`.
+            if source.trim().is_empty() || source.starts_with('-') {
+                return Err("--vault takes a vault URL or path".into());
+            }
+            options.vault = Some(source.to_owned());
+            continue;
+        }
         if let Some(words) = only {
             let words: Vec<String> = words
                 .split(',')
@@ -152,6 +177,9 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     }
     if options.develop.is_some() && options.only.iter().any(|word| word == "workstation") {
         return Err("--develop and --no-develop cannot be combined with --only workstation".into());
+    }
+    if options.vault.is_some() && !options.workstation() {
+        return Err("--vault joins in the workstation layer, which this run leaves out".into());
     }
     Ok(options)
 }
@@ -247,6 +275,16 @@ pub fn main_entry(
         eprintln!("aterm init: run in your own macOS login and home directory");
         return ExitCode::FAILURE;
     }
+    // The look for the ALab vault overlaps reading the Mac (its context and the develop
+    // layer); the secrets step takes its answer as the workstation groups are prepared, which
+    // is before the base layer runs, so every question comes before any change.
+    let ahead =
+        (options.action == Action::Apply && options.workstation() && options.vault.is_none())
+            .then(crate::init_secrets::look_ahead)
+            .flatten();
+    let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode| {
+        prepare_groups(sys, ctx, mode, ahead.clone(), options.vault.as_deref())
+    };
     let sys = Live::new().with_full_disk_access(if options.workstation() {
         full_disk_access()
     } else {
@@ -262,7 +300,7 @@ pub fn main_entry(
                 &options,
                 &Front {
                     base: &|applies| base(applies),
-                    groups: &prepare_groups,
+                    groups: &groups,
                     targo: composed.targo.clone(),
                     cwd: cwd.as_deref(),
                 },
@@ -297,7 +335,12 @@ pub fn main_entry(
         }
     } else {
         for row in &rows {
-            println!("{}: {}", word(row.outcome), row.title);
+            let word = if waiting(row) {
+                "waiting"
+            } else {
+                word(row.outcome)
+            };
+            println!("{word}: {}", row.title);
             if let (Some(from), Some(to)) = (&row.from, &row.to) {
                 println!("    {from} → {to}");
             } else if let (Outcome::Ok, Some(Layer::Develop), Some(now)) =
@@ -311,6 +354,9 @@ pub fn main_entry(
         }
         let summary = match (options.action, complete) {
             (Action::Plan, true) => "plan ready; no changes applied",
+            (_, true) if rows.iter().any(waits_by_itself) => {
+                "done; the vault join finishes by itself once an admin approves it"
+            }
             (_, true) => "all requested settings verified",
             (_, false) => "settings still need attention; see the rows above",
         };
@@ -524,28 +570,44 @@ fn converge(
     )?)
 }
 
-/// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`).
+/// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`): a run
+/// left only by rows that stood aside exits with the first of 75, 77 and 69 one of them maps to
+/// ([`aterm_converge::StoodAside::exit_status`]). A row waiting on an admin counts as done
+/// ([`counts`]).
 fn status(rows: &[ItemReport], action: Action) -> u8 {
-    use aterm_converge::StoodAside;
     if complete(rows, action) {
         return 0;
     }
     let incomplete: Vec<&ItemReport> = rows.iter().filter(|row| !counts(row, action)).collect();
-    if incomplete.is_empty() || incomplete.iter().any(|row| row.stood_aside.is_none()) {
-        return 1;
-    }
-    let any = |kind: fn(&StoodAside) -> bool| {
-        incomplete
-            .iter()
-            .any(|row| row.stood_aside.as_ref().is_some_and(kind))
-    };
-    if any(|aside| matches!(aside, StoodAside::Lock(_))) {
-        75
-    } else if any(|aside| matches!(aside, StoodAside::Permission(_))) {
-        77
-    } else {
-        69
-    }
+    let codes: Option<Vec<u8>> = incomplete
+        .iter()
+        .map(|row| {
+            row.stood_aside
+                .as_ref()
+                .map(aterm_converge::StoodAside::exit_status)
+        })
+        .collect();
+    let codes = codes.unwrap_or_default();
+    [75, 77, 69]
+        .into_iter()
+        .find(|code| codes.contains(code))
+        .unwrap_or(1)
+}
+
+/// Whether `row` waits on another person (an admin approving this Mac's vault join) and
+/// finishes by itself: the subscriber, which runs without this run or its person, lands the
+/// join. A row waiting for that join (GitHub's sign-in) waits too, but only another run
+/// finishes it.
+fn waits_by_itself(row: &ItemReport) -> bool {
+    crate::init_secrets::finishes_by_itself(row)
+}
+
+/// Whether `row` waits on anything: on an admin, or on a row that does.
+fn waiting(row: &ItemReport) -> bool {
+    matches!(
+        row.stood_aside,
+        Some(aterm_converge::StoodAside::Waiting(_))
+    )
 }
 
 /// The workstation items shared by init, doctor and first-launch setup.
@@ -1224,15 +1286,28 @@ type Group = (Vec<Box<dyn Item>>, Place);
 type Prepare<'a> = dyn Fn(&dyn System, &Ctx, Mode) -> Result<Vec<Group>, String> + 'a;
 
 /// Prepare workstation groups, reading optional profiles and prompting for vault credentials
-/// before probing.
-fn prepare_groups(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<Group>, String> {
+/// before probing; the look for the ALab vault answers with `ahead`'s, and `vault` is
+/// `--vault`'s.
+fn prepare_groups(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    ahead: Option<Arc<crate::init_secrets::Lookahead>>,
+    vault: Option<&str>,
+) -> Result<Vec<Group>, String> {
     if ctx.console.is_none() {
         return Ok(vec![(
             vec![Box::new(WorkstationAtConsole)],
             workstation_place(Class::Person),
         )]);
     }
-    let secrets = crate::init_secrets::items(sys, ctx, crate::init_secrets::live(ctx)?, mode)?;
+    let secrets = crate::init_secrets::items(
+        sys,
+        ctx,
+        crate::init_secrets::live(ctx, ahead)?,
+        mode,
+        vault,
+    )?;
     groups(sys, ctx, secrets)
 }
 
@@ -1260,7 +1335,11 @@ impl Item for WorkstationAtConsole {
 }
 
 /// Workstation item groups in run order, each paired with its [`Place`].
-fn groups(sys: &dyn System, ctx: &Ctx, secrets: Vec<Box<dyn Item>>) -> Result<Vec<Group>, String> {
+fn groups(
+    sys: &dyn System,
+    ctx: &Ctx,
+    secrets: crate::init_secrets::Secrets,
+) -> Result<Vec<Group>, String> {
     let place = workstation_place;
     Ok(vec![
         (
@@ -1274,8 +1353,11 @@ fn groups(sys: &dyn System, ctx: &Ctx, secrets: Vec<Box<dyn Item>>) -> Result<Ve
         ),
         (crate::init_spotlight::items(ctx)?, place(Class::Asked)),
         (crate::init_accounts::items(ctx)?, place(Class::Preference)),
-        (secrets, place(Class::Install)),
-        (crate::init_github::items(sys, ctx)?, place(Class::Install)),
+        (secrets.items, place(Class::Install)),
+        (
+            crate::init_github::items(sys, ctx, secrets.waited_on.as_deref())?,
+            place(Class::Install),
+        ),
     ])
 }
 
@@ -1470,12 +1552,14 @@ fn complete(rows: &[ItemReport], action: Action) -> bool {
     !rows.is_empty() && rows.iter().all(|row| counts(row, action))
 }
 
-/// Whether `row` counts as done for `action`.
+/// Whether `row` counts as done for `action`: a row that waits on an admin's approval does
+/// ([`waits_by_itself`]).
 fn counts(row: &ItemReport, action: Action) -> bool {
     matches!(
         row.outcome,
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     ) || (action == Action::Plan && row.outcome == Outcome::Planned)
+        || waits_by_itself(row)
 }
 
 const fn word(outcome: Outcome) -> &'static str {
@@ -2573,7 +2657,15 @@ mod tests {
                 len: profile.len() as u64,
             },
         );
-        let groups = groups(&sys, &alice, Vec::new()).unwrap();
+        let groups = groups(
+            &sys,
+            &alice,
+            crate::init_secrets::Secrets {
+                items: Vec::new(),
+                waited_on: None,
+            },
+        )
+        .unwrap();
         let bound = crate::engine::bind(
             groups.iter().flat_map(|(items, place)| {
                 items.iter().map(move |item| (item.as_ref(), place.clone()))
@@ -2749,7 +2841,28 @@ mod tests {
                 help: false,
                 only: Vec::new(),
                 develop: None,
+                vault: None,
             }
+        );
+        let vault = |args: &[&str]| {
+            options(&args.iter().map(OsString::from).collect::<Vec<_>>()).map(|o| o.vault)
+        };
+        assert_eq!(
+            vault(&["--vault", "https://vault.example/v1/lab"])
+                .unwrap()
+                .as_deref(),
+            Some("https://vault.example/v1/lab")
+        );
+        assert_eq!(
+            vault(&["--vault=~/vault.txt"]).unwrap().as_deref(),
+            Some("~/vault.txt")
+        );
+        assert!(vault(&["--vault"]).is_err());
+        assert!(vault(&["--vault="]).is_err());
+        assert!(vault(&["--vault", "--plan"]).is_err(), "a flag is no vault");
+        assert!(
+            vault(&["--vault=~/vault.txt", "--only", "base"]).is_err(),
+            "the vault joins in the workstation layer"
         );
         assert_eq!(
             options(&[
@@ -2912,7 +3025,7 @@ mod tests {
                 )]
             } else {
                 let before = sys.calls();
-                let groups = prepare_groups(&sys, &ctx, Mode::Apply).unwrap();
+                let groups = prepare_groups(&sys, &ctx, Mode::Apply, None, None).unwrap();
                 assert_eq!(sys.calls(), before, "no workstation preparation over SSH");
                 assert_eq!(groups[0].0[0].id(), "init.workstation");
                 groups
@@ -2964,8 +3077,27 @@ mod tests {
         let lock = || Some(StoodAside::Lock("held".into()));
         let offline = || Some(StoodAside::Offline("down".into()));
         let permission = || Some(StoodAside::Permission("not granted".into()));
+        let waiting = || Some(StoodAside::Waiting("waiting for an admin".into()));
         let done = row(Outcome::Changed, None);
         assert_eq!(status(std::slice::from_ref(&done), Action::Apply), 0);
+        let vault = || ItemReport {
+            id: "init.secrets@alice".into(),
+            ..row(Outcome::Blocked, waiting())
+        };
+        // A vault join an admin has yet to approve, made now or on an earlier run, is done
+        // for this run: the subscriber finishes it.
+        for action in [Action::Apply, Action::Check] {
+            assert_eq!(status(&[done.clone(), vault()], action), 0);
+        }
+        // A row waiting for that join is left for another run.
+        assert_eq!(
+            status(&[vault(), row(Outcome::Blocked, waiting())], Action::Apply),
+            75
+        );
+        assert_eq!(
+            status(&[vault(), row(Outcome::Blocked, offline())], Action::Apply),
+            69
+        );
         assert_eq!(
             status(
                 &[done.clone(), row(Outcome::Blocked, lock())],

@@ -72,7 +72,10 @@ fn round(
         gpu.present_swapchain_standin_for_test(&mut win_a, input, *invert, None, None, (w, h));
         gpu.video_after_present(&mut win_a, i as u64 + 1);
     }
-    let take_a = gpu.video_finish(&mut win_a).expect("swapchain take");
+    let take_a = gpu
+        .video_finish(&mut win_a)
+        .expect("swapchain take")
+        .settle();
 
     let mut win_b = aterm_gpu::WindowGpu::new();
     gpu.virtual_begin(&mut win_b, w, h, opts(half_res))
@@ -85,7 +88,7 @@ fn round(
         );
         gpu.video_after_present(&mut win_b, i as u64 + 1);
     }
-    let take_b = gpu.video_finish(&mut win_b).expect("virtual take");
+    let take_b = gpu.video_finish(&mut win_b).expect("virtual take").settle();
 
     assert_eq!(
         take_a.frames.len(),
@@ -255,7 +258,8 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     gpu.video_after_present(&mut present_win, 1);
     let take = gpu
         .video_finish(&mut present_win)
-        .expect("production present take");
+        .expect("production present take")
+        .settle();
     assert_eq!(take.frames.len(), 1, "one present must yield one frame");
     let frame = &take.frames[0];
     assert_eq!((frame.w, frame.h), (dw as u32, dh as u32));
@@ -384,7 +388,8 @@ fn overflowing_frame_crop_is_the_visible_intersection() {
     gpu.video_after_present(&mut present_win, 1);
     let take = gpu
         .video_finish(&mut present_win)
-        .expect("production present take");
+        .expect("production present take")
+        .settle();
     let frame = &take.frames[0];
     assert_eq!((frame.w, frame.h), (dw as u32, dh as u32));
 
@@ -443,7 +448,7 @@ fn one_shot_presented_snapshot_is_independent_from_video() {
         .presented_snapshot_take(&mut win)
         .and_then(aterm_gpu::video_tap::RawCapture::convert)
         .expect("one-shot take");
-    let video = gpu.video_finish(&mut win).expect("video take");
+    let video = gpu.video_finish(&mut win).expect("video take").settle();
 
     assert_eq!(video.dropped, 0);
     assert_eq!(video.decimated, 0);

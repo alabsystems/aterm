@@ -100,6 +100,9 @@ pub enum PeerFault {
     NoNetwork,
     /// Connect refused to this process (`EPERM`/`EACCES`, such as sandbox or firewall).
     NotPermitted,
+    /// Took the connection and sent no fleet handshake in time (a stopped, frozen or overloaded
+    /// aterm), so the survey was not sent: alone in a read, exit 2.
+    Unserved,
 }
 
 /// Aggregate result from [`FleetSurveyFn`].
@@ -1364,14 +1367,19 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
     format!("[{}]\n", hosts.join(","))
 }
 
-/// Entry point for `aterm ctl survey`.
+/// Entry point for `aterm ctl survey`, each fleet peer's read cut to ctl's own `--timeout`
+/// (`total`, none for `--timeout 0`) where that is shorter.
 pub(crate) fn run_survey(
     parts: &[String],
     sock: Option<&str>,
     pid: Option<u32>,
+    total: Option<Option<Duration>>,
     local: &crate::LocalVerbs,
 ) -> io::Result<ExitCode> {
-    let args = parse_args(parts).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut args = parse_args(parts).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if let Some(Some(total)) = total {
+        args.within = args.within.min(total);
+    }
     if args.brief {
         return match brief::local_brief(sock, pid, args.budget) {
             Ok(text) => {
@@ -1443,7 +1451,7 @@ pub(crate) fn read_survey(
                 "ERR survey --fleet and --host need the fleet client the `aterm` binary links; \
                  this standalone aterm-ctl has none (run `aterm ctl survey …`)"
                     .to_owned(),
-                2,
+                1,
             );
         }
     };
@@ -1478,6 +1486,7 @@ pub(crate) fn read_survey(
     };
     let mut notes: Vec<String> = Vec::new();
     let mut alone = None;
+    let mut unserved = false;
     if let Some(peers) = peers {
         let peers = match peers {
             Ok(read) => {
@@ -1497,6 +1506,9 @@ pub(crate) fn read_survey(
             }],
         };
         notes.extend(fleet_note(&peers).map(str::to_owned));
+        unserved = replies.is_empty()
+            && !peers.is_empty()
+            && peers.iter().all(|peer| peer.fault == PeerFault::Unserved);
         replies.extend(peers.into_iter().map(|peer| HostReply {
             label: peer.label,
             remote: true,
@@ -1507,20 +1519,25 @@ pub(crate) fn read_survey(
     }
     notes.extend(facts_note(&replies));
     let answered = !remote || replies.iter().any(|reply| reply.answer.is_ok());
+    let code = match (answered, unserved) {
+        (true, _) => 0,
+        (false, true) => crate::EXIT_UNREACHABLE,
+        (false, false) => 1,
+    };
     let mut text = if args.json {
         match args.sid.as_deref() {
             None => render_json(&replies),
             Some(sid) => {
                 let only = only_sid(&replies, sid);
                 if only.is_empty() {
-                    return Printed::refused(sid_not_found(&replies, sid, remote), 1);
+                    return Printed::refused(sid_not_found(&replies, sid, remote), code.max(1));
                 }
                 render_json(&only)
             }
         }
     } else if let Some(sid) = args.sid.as_deref() {
         let Some(text) = render_sid(&replies, sid, own) else {
-            return Printed::refused(sid_not_found(&replies, sid, remote), 1);
+            return Printed::refused(sid_not_found(&replies, sid, remote), code.max(1));
         };
         with_data_line(&text)
     } else if args.host.is_some() {
@@ -1543,7 +1560,7 @@ pub(crate) fn read_survey(
     Printed {
         err,
         out: Some(text),
-        code: u8::from(!answered),
+        code,
     }
 }
 

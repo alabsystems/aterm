@@ -174,6 +174,35 @@ fn dch_still_shifts_only_within_the_margins() {
     );
 }
 
+/// ICH and DCH from outside the margins, left or right of them, change nothing,
+/// not even a pending wrap: xterm's `InsertChar`/`DeleteChar` return before their
+/// `ResetWrap`.
+#[test]
+fn ich_and_dch_outside_the_margins_change_nothing() {
+    for col in [2, 15, 19] {
+        for insert in [true, false] {
+            let mut grid = Grid::new(3, 20);
+            for c in "ABCDEFGHIJKLMNOPQRST".chars() {
+                grid.write_char(c);
+            }
+            grid.set_horizontal_margins(4, 10);
+            grid.set_cursor(0, col);
+            grid.set_pending_wrap(col == 19);
+            if insert {
+                grid.insert_chars_margin(3, true);
+            } else {
+                grid.delete_chars_margin(3, true);
+            }
+            assert_eq!(
+                grid.row_text(0).unwrap_or_default(),
+                "ABCDEFGHIJKLMNOPQRST",
+                "col {col}, insert {insert}: nothing moved"
+            );
+            assert_eq!(grid.pending_wrap(), col == 19, "col {col}: the wrap stays");
+        }
+    }
+}
+
 #[test]
 fn decic_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);

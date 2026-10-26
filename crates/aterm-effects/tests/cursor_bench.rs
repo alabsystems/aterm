@@ -36,7 +36,7 @@ pub(crate) fn config(style: GlowStyle) -> GlowConfig {
 /// integrator, `rainbow.disp` stays 0, and only the cheaper resting path is measured.
 #[test]
 fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
-    use aterm_effects::cursor_glow::{CursorGlow, Geom};
+    use aterm_effects::cursor_glow::Geom;
     use std::time::Instant;
     let config = config(GlowStyle::RainbowKitty);
     let geometry = Geom {
@@ -51,7 +51,7 @@ fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
         head: 0,
     };
     let row = 12u16;
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     let mut quads = Vec::new();
     let mut now = Instant::now();
     let mut col = 0u16;

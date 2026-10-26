@@ -3,11 +3,45 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-25: `host-line-head-law` (§1) now says how the stand on top of the host's line is taken
+> while the person types: as a perch, its soles clear of the line by the clearance a hold asks of a
+> body (with the soles on the line the stand passed and the hold did not, and a cat watching a
+> deletion there stepped and sat by turns); its slide past the letters over it within 12 columns of
+> the caret's column (a 29-column slide at a turn's end launched a hop short of where the caret
+> settled: two flights), unless the cat already stands where the slide goes (resting past the
+> letters, the first key would have flown it back to the caret); and never in a rule
+> (`PetWorld::rule_line`: a row, in a pane at least eight columns wide, whose cells are at least four
+> fifths `─`), so over a reserved first line of the composer the ladder seats the cat as before. Two
+> tests retire to it (§2), and the escort-grace test now ends on that perch (row 18.85, not 19). The
+> effects suite's
+> `a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles` now wants the turn-end bound,
+> with the harness on, on the top of the composer's upper rule, two rows over the caret, not on the
+> caret's line under the rule. Two motion laws the resident's runs to its rest seat reached:
+> `chase-convergence-and-facing` keeps a skid once drawn on glass `STILL_SECS` (a run crossing its
+> seat at 9.3 cells a second had shown it one 16 ms frame), and `flight-choreography` holds a stand
+> that ends a stride `STAND_MIN` before a leap leaves it, as it already held it against every other
+> pose (a stream watch's stop under a long insert, then the wrap's leap, left it 3 ms short). One
+> test each (§2).
+
 > 2026-10-25: `pw-reading-kept` (§1) lets the pet keep its console reading of a redraw whose fill
 > consumed the terminal's damage when nothing that reading was read from moved, so an idle or typing
 > frame that reused its snapshot, or refilled it without re-extracting a row (a split's focused pane, a
 > window with chrome rows), classifies no cell; its three tests are in §2. The counts elsewhere in this
 > file were taken before it.
+
+> 2026-10-24: `host-line-head-law` (§1, new) is the resident pet's rule at the host's line: no stand
+> or seat puts its body under a line whose reserved cells would cover its head (aterm's footer now holds
+> the top rule it repaints with its lockup and switch whole, strokes and all); while the person types
+> the escort's stand there is taken on top of the line, its head off the letters over that row; the
+> line coming up onto that stand carries the cat up (`protected-surface-yield` now names that ride);
+> the pet's cell windows ignore f32 noise at an edge, which had refused the caret's line at some rows
+> (10, 12, 13) and not others. Four tests retire to it (§2): one new, three whose contract it changed
+> (the label and switch tests renamed: the cat walks on top of the line, no longer under it; the
+> escort-grace test now ends over the line). `idle-frame-laws` gains
+> `a_tail_flick_a_seat_comes_into_never_shows_its_last_present`: a seat that comes into a tail beat
+> with under two frames of its pose left does not begin it. Three agent-pane fixtures now hold the top
+> rule from the first frame (`AgentPane::hosted`): their "home under the footer" premise had come from
+> the rounding noise.
 
 > 2026-10-24: `wd-kitty-cursor-emission` (§1) now also says the flying head never starts above the grid
 > top (row 0 and the row-1 sky seat used to put a fifth of it above the first row, where a top pane's open
@@ -377,14 +411,14 @@ offer-soundness	refinement	PetBrain::{next_change_deadline,next_change_secs,mote
 needs-frames-motion	contract	PetBrain::{needs_frames,tick}	needs_frames holds whenever anything moves (flight, landing, speed, a glide of at least a pixel even on a zero-dt re-tick, pet hold, latched pet or trick, deferral, fade with a caret, ZeePop or Dust); the ZeePop never decides it alone, and landing Dust holds the train for a bounded beat.	0,1,2,3,7	4
 gait-by-speed-and-distance	contract	PetBrain::{tick,gait_index,plant_stride}; CYCLE_WALK/LWALK/RUN	Walk vs Run vs the lateral walk is chosen by the gait pace (the chase speed averaged over GAIT_TAU, reset by a turn, let down at GAIT_REST_TAU at rest, dropped by a flight) with hysteresis kept across a stop; a gait is worn GAIT_DWELL before another, never dropping to a slower one while the speed rises, except past its frame-rate ceiling (WALK_CEIL, AMBLE_CEIL), which takes the faster one at once; a leg after a rest of GAIT_DWELL or a flight picks afresh; the stride advances by distance over the gait's stride cells, so a gallop cycle covers at least 3 cells, every beat lasts at least 2 ticks, walk frames step one beat at a time across a gait flip, and runs carry no lift.	0,1,2,3,7	6
 keep-ahead-lead	contract	PetBrain::{lead,rhythm_open,pace,station_now,station_drift,on_move}	Each move adds 1/VEL_TAU to the decaying velocity estimate, and the pause does not decay the move that ends it; lead() > 0 only during a same-direction rhythm of RHYTHM_MOVES within RHYTHM_WINDOW; fast runs lead past the station, slow or alternating typing never leads, a pause eases back, a pounce mid-rhythm lands ahead, and a forced crossing aims at most station + LEAD_MAX and never runs.	0,1,2,3,7	8
-chase-convergence-and-facing	contract	PetBrain::tick (follower, facing, drift-brake)	Under a parked caret the follower converges to station_safe without ringing; once the caret rests the step never crosses the station faster than RUN_SPEED and the drift-brake never arms from a chase; facing follows travel with FLIP_SPEED hysteresis and the first moving frame faces the gap; a sleeper turns only through travel; a held repeating jump still moves the pet.	0,1,2,3,5,7	7
+chase-convergence-and-facing	contract	PetBrain::tick (follower, facing, drift-brake)	Under a parked caret the follower converges to station_safe without ringing; once the caret rests the step never crosses the station faster than RUN_SPEED and the drift-brake never arms from a chase; facing follows travel with FLIP_SPEED hysteresis and the first moving frame faces the gap; a sleeper turns only through travel; a held repeating jump still moves the pet; a skid once drawn stays on glass STILL_SECS from its brake before the arrival takes the cat.	0,1,2,3,5,7	8
 wall-side	contract	PetBrain::{update_wall,station_now,tick}; pending_wall_transit	wall_side flips to the caret's left when the led station overhangs and back only past WALL_RETURN_MARGIN; a flip with nothing in the air is crossed by one small arc; a flight that already crossed consumes the transit; at the wall the Startle faces the caret; a far caret behind earns the shoulder peek.	0,1,2,3	5
-flight-choreography	contract	PetBrain::{tick,flight_pose,coil_envelope,emit,spawn_dust}	Every caret flight is Crouch, Leap, Land; PetLaunch is the coil's last frame and never airborne; pounces and hops show rise, hero and descend, a short Enter is the tucked hop; the body leaves the floor and lands on the baseline; horizontal flight stretches width; volume changes at most 2% per tick (3% at the cut) and touchdown at most 0.12 in scale_y; the landing squash grows with span and the recovery lands on a contact frame; the screen-crossing show plays its whole sequence with dust.	0,1,2,3,5,7	13
+flight-choreography	contract	PetBrain::{tick,flight_pose,coil_envelope,emit,spawn_dust}	Every caret flight is Crouch, Leap, Land; PetLaunch is the coil's last frame and never airborne; pounces and hops show rise, hero and descend, a short Enter is the tucked hop; the body leaves the floor and lands on the baseline; horizontal flight stretches width; volume changes at most 2% per tick (3% at the cut) and touchdown at most 0.12 in scale_y; the landing squash grows with span and the recovery lands on a contact frame; the screen-crossing show plays its whole sequence with dust; a flight asked for from a stand that ends a stride leaves no sooner than STAND_MIN into the stand (deferred_arc).	0,1,2,3,5,7	14
 show-door	contract	PetBrain::{on_move,leave_ground,predicted_tier,launch_big,begin_big_arc}; quiet_leap; pending_big_jump; bound2	The show plays iff a chosen move opened it (a large same-row jump, a standing gap of BIG_GAP_FRAC during a hold, or a joyful word jump), never for a line change, wrap, snap home or post-burst trip; a snap home is one quiet bound; tiers by span (hop/pounce up to POUNCE_SPAN_MAX, bound beyond, two bounds past TWO_BOUND_FRAC unless the touch point is inked); every bound is paced at quiet_speed_max.	0,1,2,3,7,10	11
 new-line-law	contract	PetBrain::{tick,on_move,caret_delta,notices,at_rest}	Every new-line shape (Enters onto 1- and 3-row prompts at any column and width, from any state or behind a one-frame hide, margin and scrolled wraps, printed lines, wide or suggested prompts through the ink seam) reacts with one or two lawful flights, no Startle, at most one notice beat (only from rest), no gather, dust or run, paws down within the shape's bound, rows at most 8 per second, ending on the prompt row without leaving the glass.	0,1,2,3,5,7	14
 retreat-reactions	contract	PetBrain::{on_move,age_gesture_windows}	A retreat under STARTLE_COLS flinches (Perk with a duck), a bigger one or a run of them Startles facing the caret, once a run of deletes for STARTLE_HOLD (a held Backspace neither extends it nor fires it again, and the pet follows the caret back; a forward move or a line change ends the run's bottle), FROLIC_REVERSALS reversals Frolic, and a Startle consumed by an ink hop is never replayed.	0,1,2,3,7	5
 settle-ladder	contract	PetBrain::{tick,enter_settled}; loaf_after; groom_after; groom_skip; wake arm	After arrival: Stand until SIT_AFTER, then Sit or Purr, loaf at loaf_after(seed), groom (second wash skipped iff groom_skip), Sleep at SLEEP_AFTER plus a tick at any cadence down to 1 Hz with a breathing swell; the next key wakes through front then hind stretch inside WAKE_DUR with one ZeePop; each arrival deals a fresh seed; even seeds yawn into the loaf; the loaf peeks before sleep.	0,1,2,3,5,7	14
-idle-frame-laws	invariant	PetBrain::tick (settled arm); sit_tail; sit_blink_beat; sit_glance_left; side_on_holds; tail_room	For every seed, settled idle frames have lift 0, a constant row, per-tick col step <= 0.01 and total drift <= PECK_CLEAR; every idle pose run lasts at least 2 ticks; the tail changes side only between its tip-up frames; no side-on beat is cut by the look; the glance never flips facing.	0,1,2,3,5,7	5
+idle-frame-laws	invariant	PetBrain::tick (settled arm); sit_tail; sit_blink_beat; sit_glance_left; side_on_holds; tail_room	For every seed, settled idle frames have lift 0, a constant row, per-tick col step <= 0.01 and total drift <= PECK_CLEAR; every idle pose run lasts at least 2 ticks; the tail changes side only between its tip-up frames; no side-on beat is cut by the look; the glance never flips facing.	0,1,2,3,5,7	6
 seat-beat-reachability	table-property	PetBrain::tick (seat beats); beat_deal; sit_tail; sit_blink_beat; sit_glance_left; twitch_up	Over all 256 seeds the seat deals silence, single and double flicks; blinks are dealt single or double; face-on seats either never glance or glance and return (or yawn into the loaf); every side-on beat is reachable; the head tips toward a caret off the seat's row; a working cat still gets its whole sit window; one long dwell in three loafs; an output pulse twitches the ear per pose and mote_serial parity.	0,1,2,3,5,7	12
 contentment-purr	contract	PetBrain::{purring,emit}; content ledger	content rises by CONTENT_PER_CELL per cell travelled, capped, and decays (faster while moving); purring() iff Purr, or Sit/Loaf with content >= PURR_GATE; a purring frame swells by at least PURR_DEPTH; the long dwell wears Purr on seeds with seed mod 3 != 0 and Loaf otherwise; a purring cat floats notes and hearts, never grid-aligned.	0,1,2,3,7	3
 mote-laws	invariant	PetBrain::{spawn_mote,tend_motes,resolve_motes,zee_ink_fade}; Mote::{drift,look_steps}	At most ZEE_ALIVE_MAX Zees, born under 3 Hz; every drawn mote is off-grid and rotated; a Zee wears exactly its ZEE_STEPS looks; a visible Zee or ZeePop never enters an inked band and frees its slot at alpha 0.	0,1,2,3,7	3
@@ -958,7 +992,8 @@ pet-surface-seam-refines-model	refinement	CompanionOwner::{observe,prepare,tick,
 pet-torn-frame-hold	refinement	TerminalFacts::read; CompanionOwner; PetBrain HIDDEN_HOLD_MAX hold; aterm_models_effects::console_cursor_home_model	Under the shipping contract a torn full repaint never moves or fades a settled pet for any bracket length, typing keeps it at the composer, and a finished frame's hidden caret is held within HIDDEN_HOLD_MAX then followed (ConsoleCursorHome).	0,1,2,10,12	7
 pet-hidden-caret-bounded-hold	contract	PetBrain::tick (caret, caret_drawn); tennis watch; scroll compensation; flight birth	A hidden but known caret is followed after a bounded hold; the tennis watch never blocks travel; scroll compensation never lifts the body off the glass; a flight is not advanced on its birth tick.	0,1,2,3	2
 pet-visibility-hold	contract	PetBrain visibility hold; PetFrame::alpha; set_console_presentable	Typing never blanks or cuts the pet; an output burst only fades it by bounded steps; with the console gate off there is no veto at all.	0,1,2,3,7	4
-protected-surface-yield	contract	PetFrame::under_ink; PetBrain visibility veto; console placement pass	Over ordinary ink the body stays whole and renders under the glyphs; on a protected surface it moves off or goes to alpha 0: down with the rows round it where they moved down together (content_ride, whole rows, no column), else to the nearest perch; a flight's arc is flattened (a half, a quarter, none) where it would rise into protected cells.	0,1,2	2
+protected-surface-yield	contract	PetFrame::under_ink; PetBrain visibility veto; console placement pass	Over ordinary ink the body stays whole and renders under the glyphs; on a protected surface it moves off or goes to alpha 0: down with the rows round it where they moved down together (content_ride, whole rows, no column), up with the host's line it stands on where that line came up with the rows over it (line_ride), else to the nearest perch; a flight's arc is flattened (a half, a quarter, none) where it would rise into protected cells.	0,1,2	2
+host-line-head-law	contract	PetBrain::{console_station,over_the_hosts_line,past_letters_above,line_ride}; PetWorld::{host_line,rule_line,window}; aterm-gui PetChrome (claude_footer holds its top rule whole)	No stand or seat puts the body under a host's line whose reserved cells would cover its head; while the person types, an escort's stand there is taken on top of the line at the caret's column (its head off the letters over that row, sliding right past them as beside the caret but no more than LINE_SLIDE_REACH columns, unless the cat already stands there on that row), as a perch whose body a hold keeps (its soles clear of the line by LINE_PERCH_GAP), and never with its body in a rule (PetWorld::rule_line); and the cat comes down to the caret's line where the line leaves room for its head; where the top of the line has no room (the card right over it, the first rows) the ladder seats it clear of the line. A cell window is the same at every row: an edge within 1e-4 of a cell boundary does not take the cell beyond.	0,1,2	6
 escort-primacy	equivalence	PetBrain::{tick,set_console_presentable,station}; console_reason	Unless the console layer is genuinely resident, the presentable brain moves exactly like its plain-escort twin at caret + STATION_LEAD; a resident body settles within a cell of the escort.	0,1,2,4,5	6
 escort-locomotion-speed-limit	contract	PetBrain chase and flight; console placement pass	The body moves at most 1.2 cells between grounded frames, never crosses the pane in a frame, and trails a typing caret by at most 4 cells.	0,1,2,3,7	3
 pet-wake-liveness	contract	PetBrain::{needs_frames,next_change_deadline,pending_pets,console_resident_handoff_pending}	Whenever visible work is owed the brain asks for frames or a timely deadline, and when nothing is owed it asks for neither; stale completions start nothing, delayed ones get their full hold, flights keep their arcs, perches translate with scroll, and reduced-motion reading is opaque at once.	0,1,2,5,7	11
@@ -1641,12 +1676,14 @@ src/kitty_pet.rs	a_shed_frame_after_a_verdict_never_strands_the_frame_lane	pet-i
 src/kitty_pet.rs	a_short_new_line_does_not_stand_down_the_next_show	show-door	
 src/kitty_pet.rs	a_sibling_pane_s_burst_earns_one_look	room-facts-no-wake	
 src/kitty_pet.rs	a_single_backspace_flinches_without_the_full_bottle	retreat-reactions	
+src/kitty_pet.rs	a_skid_once_drawn_stays_a_still_poses_floor	chase-convergence-and-facing	
 src/kitty_pet.rs	a_sleeper_is_woken_for_a_trick_but_sleep_is_done_and_stretch_is_the_wake	trick-performance	
 src/kitty_pet.rs	a_slow_caret_walks_laterally_and_a_brisk_one_trots	gait-by-speed-and-distance	
 src/kitty_pet.rs	a_snap_home_is_a_jump_not_a_fright	show-door	
 src/kitty_pet.rs	a_spent_watch_rearms_once_the_stream_ends	pet-idle-to-zero	
 src/kitty_pet.rs	a_stale_peek_expires	bat-and-look	
 src/kitty_pet.rs	a_stale_pet_expires	petting-affection	
+src/kitty_pet.rs	a_stand_that_ends_a_stride_holds_a_stride_before_a_leap	flight-choreography	
 src/kitty_pet.rs	a_startle_shoved_off_its_spot_is_not_replayed	retreat-reactions	
 src/kitty_pet.rs	a_streaming_pane_is_followed_with_or_without_shell_integration	stream-watch	
 src/kitty_pet.rs	a_streaming_pane_perks_the_sitter	stream-watch	
@@ -1681,6 +1718,7 @@ src/kitty_pet.rs	creeping_toy_pins_the_stakeout	pointer-play
 src/kitty_pet.rs	departures_cap_at_the_documented_bound_and_drop_the_oldest	departure-lane	
 src/kitty_pet.rs	every_cat_pose_has_a_distinct_dog_counterpart	dog-skin-table	
 src/kitty_pet.rs	every_dealt_idle_frame_holds_at_least_two_ticks	idle-frame-laws	
+src/kitty_pet.rs	a_tail_flick_a_seat_comes_into_never_shows_its_last_present	idle-frame-laws	
 src/kitty_pet.rs	every_idle_deal_goes_byte_stable_by_the_breath_window	pet-idle-to-zero	
 src/kitty_pet.rs	every_new_line_reaction_is_lawful_and_brief	new-line-law	
 src/kitty_pet.rs	every_trick_is_heard_performs_something_observable_and_releases_the_lane	trick-performance	
@@ -1752,6 +1790,7 @@ src/kitty_pet.rs	typing_echo_never_perks	stream-watch
 src/kitty_pet.rs	wall_hysteresis_does_not_flip_flop_at_the_crossing	wall-side	
 src/kitty_pet.rs	wave_one_latches_arm_and_release_the_frame_lane	pet-idle-to-zero	
 src/kitty_pet.rs	work_outranks_the_bat	bat-and-look	
+src/kitty_pet/console_life.rs	a_cat_stopped_in_the_escorts_grace_never_sets_out_under_the_chrome_to_turn_back	host-line-head-law	
 src/kitty_pet/console_life.rs	a_carried_ghost_keeps_what_its_own_slot_drew	console-ghost-rules	
 src/kitty_pet/console_life.rs	a_commanded_sleep_survives_an_executing_block	console-trick-interplay	
 src/kitty_pet/console_life.rs	a_departing_ghost_over_a_protected_line_fades_with_the_body_instead_of_vanishing	console-ghost-rules	
@@ -1780,6 +1819,9 @@ src/kitty_pet/console_life.rs	progress_baselines_each_command_and_duplicate_repo
 src/kitty_pet/console_life.rs	repair_holds_its_body_in_the_inspect_pose	console-attention	
 src/kitty_pet/console_life.rs	streamed_output_lets_a_trick_expire_and_the_resident_takes_its_perch_back	console-trick-interplay	
 src/kitty_pet/console_life.rs	suppressed_failure_still_hushes_celebration_for_a_finite_window	console-attention	
+src/kitty_pet/console_life.rs	the_stand_over_the_hosts_line_is_a_perch_a_hold_keeps_and_never_in_a_rule	host-line-head-law	
+src/kitty_pet/console_life.rs	typed_up_to_a_label_on_the_rule_the_cat_walks_on_top_of_the_line	host-line-head-law	
+src/kitty_pet/console_life.rs	typing_into_a_hosted_composer_never_draws_the_cat_under_its_upper_rule	host-line-head-law	protected-surface-yield
 src/kitty_pet/full_screen_tests.rs	a_full_screen_program_stands_down_a_vigil_armed_before_it	full-screen-repaint-refinement	
 src/kitty_pet/full_screen_tests.rs	a_full_screen_repaint_is_not_output	full-screen-repaint-refinement	
 src/kitty_pet/full_screen_tests.rs	a_live_stare_lets_go_the_tick_the_full_screen_comes_up	note-full-screen	
@@ -1950,6 +1992,7 @@ src/pet_stroke.rs	scale_changes_do_not_change_the_stroke_threshold	ps-scale-inva
 src/pet_world.rs	a_full_clear_moves_the_running_blocks_anchor_onto_what_followed_it	pw-anchors	
 src/pet_world.rs	a_pane_local_default_background_decides_ink_column_by_column	pw-classify	
 src/pet_world.rs	a_protected_cell_the_map_sees_vetoes_a_body_half_outside_it	pw-clearance-planes	
+src/pet_world.rs	a_row_of_rule_strokes_across_the_pane_is_a_rule_line	host-line-head-law	
 src/pet_world.rs	budget_overflow_and_missing_rows_are_unknown_not_empty	pw-clearance-planes	
 src/pet_world.rs	cursor_protection_does_not_erase_or_invent_actual_ink	pw-classify	
 src/pet_world.rs	every_source_a_reading_reads_moves_its_key	pw-reading-kept	
@@ -3016,6 +3059,7 @@ tests/pet_resident_standoff.rs	the_resident_settles_where_the_escort_settles	esc
 tests/pet_typing_beside_its_guess.rs	a_guessed_letter_never_throws_the_pet_off_its_seat	pw-classify	
 tests/pet_typing_beside_its_guess.rs	the_legs_keep_one_gait_while_typing	gait-by-speed-and-distance	
 tests/pet_typing_beside_its_guess.rs	the_pet_rides_the_composer_down_when_its_chips_come_onto_it	protected-surface-yield	
+tests/pet_typing_beside_its_guess.rs	the_pet_walks_on_top_of_the_composer_over_the_harness_switch	host-line-head-law	protected-surface-yield
 tests/pet_typing_beside_its_guess.rs	a_wrap_typed_through_is_one_bound	no-teleport-law	
 tests/phrase_pause_gaps.rs	an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit	typed-columns-owned	
 tests/rainbow_kitty_v2_frame_cost.rs	rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero	rk-v2-steady-tick-contract	

@@ -29,6 +29,8 @@ pub mod client;
 #[cfg(unix)]
 pub mod fsx;
 #[cfg(unix)]
+pub mod heard;
+#[cfg(unix)]
 pub mod materialize;
 #[cfg(unix)]
 pub mod network;
@@ -40,7 +42,7 @@ pub mod service;
 mod secret;
 pub use secret::SecretBytes;
 
-/// The ALab vault: what `aterm init` offers when Enter is pressed.
+/// The ALab vault: what `aterm init` joins when it answers on this network.
 pub const ALAB_DEFAULT_URL: &str = aterm_types::macos_setup::DEFAULT_VAULT_URL;
 
 /// The ALab vault's signing key ([`ALAB_DEFAULT_URL`], [`ALAB_RETIRED`]).

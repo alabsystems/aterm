@@ -10,6 +10,9 @@ use atpkg::caller_shell::ProcArgs;
 
 use super::upgrade::{self, Dialect};
 
+#[path = "worker_grok.rs"]
+pub mod grok;
+
 /// How a starter's process is known to run a row's CLI, and the program a
 /// worker's line types for it ([`starter_of`]).
 #[derive(Clone, Copy)]
@@ -17,9 +20,9 @@ enum Launches {
     /// Claude Code: read by its relaunch's own reader
     /// (`relaunch::caller_claude`).
     Claude,
-    /// A CLI whose image is named by its word: its own path, or — where
-    /// `store_build` says it is a build in atpkg's store — atpkg's managed
-    /// twin (the path its relaunch lane types), else the word.
+    /// A CLI whose image is named by its word (agy, Muse Code, Grok Build): its
+    /// own path, or — where `store_build` says it is a build in atpkg's store —
+    /// atpkg's managed twin (the path its relaunch lane types), else the word.
     Image { store_build: fn(&Path) -> bool },
     /// codex-alab: an image of ALab bytes ([`super::codex_alab::alab_bytes`]),
     /// typed as atpkg's managed twin where that twin execs ALab bytes too, else
@@ -53,7 +56,15 @@ pub struct WorkerCli {
     /// the ones its relaunch lane carries that move its config or say how it
     /// reaches its provider.
     flags: fn(&[String]) -> Result<Vec<String>, String>,
+    /// Why a worker carrying this environment must not start, under the user's home: a CLI
+    /// that, signed out, opens a sign-in page by itself and never reads its task
+    /// ([`WorkerCli::signed_out`]); `None` for a CLI with no such hazard.
+    login: Option<LoginGate>,
 }
+
+/// Why a worker carrying an environment (its variables, then the user's home where known) must
+/// not start: a CLI's sign-in floor ([`grok::signed_out`]).
+type LoginGate = fn(&[(String, String)], Option<&Path>) -> Option<String>;
 
 /// No flag of a starter's rides: Claude Code (whose relaunch reads none).
 const fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
@@ -129,7 +140,7 @@ fn codex_home_env(args: &ProcArgs, user: &Path) -> Vec<(String, String)> {
 }
 
 /// Every worker harness `spawn` can start, one row per harness.
-pub static WORKERS: [WorkerCli; 4] = [
+pub static WORKERS: [WorkerCli; 5] = [
     WorkerCli {
         agent: Program::Claude,
         word: "claude",
@@ -141,6 +152,7 @@ pub static WORKERS: [WorkerCli; 4] = [
         launches: Launches::Claude,
         homes: |_, _| Vec::new(),
         flags: no_flags,
+        login: None,
     },
     WorkerCli {
         agent: Program::Codex,
@@ -159,6 +171,7 @@ pub static WORKERS: [WorkerCli; 4] = [
             Err(upgrade::ArgvRefusal::NotResumable(_)) => Ok(Vec::new()),
             Err(upgrade::ArgvRefusal::UnknownFlag(flag)) => Err(flag),
         },
+        login: None,
     },
     WorkerCli {
         agent: Program::Agy,
@@ -173,6 +186,7 @@ pub static WORKERS: [WorkerCli; 4] = [
         },
         homes: |args, home| super::upgrade_agy::relaunch_env(|n| args.env_var(n), home),
         flags: |argv| Ok(super::upgrade_agy::config_flags(argv)),
+        login: None,
     },
     WorkerCli {
         agent: Program::Muse,
@@ -196,6 +210,22 @@ pub static WORKERS: [WorkerCli; 4] = [
                 | upgrade::ArgvRefusal::NotResumable(flag) => flag,
             })
         },
+        login: None,
+    },
+    WorkerCli {
+        agent: Program::Grok,
+        word: grok::PROGRAM,
+        operand: upgrade::TASK_OPERAND,
+        model_flag: "--model",
+        trust_flag: None,
+        nicety: &[grok::NO_SELF_UPDATE],
+        dirs: &[grok::HOME_ENV],
+        launches: Launches::Image {
+            store_build: grok::store_build,
+        },
+        homes: |args, home| grok::relaunch_env(|n| args.env_var(n), home),
+        flags: grok::config_flags,
+        login: Some(grok::signed_out),
     },
 ];
 
@@ -218,6 +248,51 @@ pub struct Starter {
 }
 
 impl WorkerCli {
+    /// Why nothing would see this row's worker end, or `None` where something does: aterm's
+    /// engine reads and answers an agent whose screen policy acts on it
+    /// ([`Program::supervisable`]), and codex-alab supervises itself under its proven claim.
+    /// Any other worker's task would stay `working` whatever it did, and
+    /// `await task` would never wake on it, so `spawn` refuses it (fail closed) until its
+    /// reader reads its turn end.
+    ///
+    /// This refusal is all that keeps Grok Build workers from starting today, and flipping
+    /// `supervisable(Grok)` lifts it. The sign-in floor behind [`Self::signed_out`] then stands
+    /// alone: it refuses a missing, empty or refused sign-in file, not an expired one grok has
+    /// not refused yet (`docs/DESIGN-harness-repos-2026-10-24.md` D40). The Grok worker tests
+    /// pin the refusal, so the flip turns them red and is made on purpose.
+    #[must_use]
+    pub fn end_unseen(&self) -> Option<String> {
+        if matches!(self.launches, Launches::Alab) || self.agent.supervisable() {
+            return None;
+        }
+        Some(format!(
+            "{} is read here, not supervised: no reader sees its turn end yet, so its task \
+             could never be marked done and `await task` would never wake on it; no worker was \
+             started",
+            self.agent.product()
+        ))
+    }
+
+    /// The atpkg program `spawn agent=<word>` installs where it is absent: a vendor row outside
+    /// the default set (Grok Build), which no machine installs unasked, so a lead naming it is
+    /// the opt-in; once installed, atpkg's update pass keeps it current. `None` for a row the
+    /// default set keeps (its pass installs it) and for one atpkg does not ship.
+    #[must_use]
+    pub fn on_demand(&self) -> Option<&'static str> {
+        atpkg::vendor_direct::spec(self.word)
+            .filter(|spec| !spec.default_set)
+            .map(|spec| spec.program)
+    }
+
+    /// Why a worker on `starter` must not start under the user's home `user` (`None`: not
+    /// known): a CLI that, signed out, opens a sign-in page by itself and never reads its task
+    /// (Grok Build, [`grok::signed_out`]). `None` to start it. [`admit`] asks this first, before
+    /// anything is installed.
+    #[must_use]
+    pub fn signed_out(&self, starter: &Starter, user: Option<&Path>) -> Option<String> {
+        self.login.and_then(|login| login(&starter.env, user))
+    }
+
     /// Whether the worker's first prompt may hold a blank line
     /// ([`aterm_phase::ScreenReader::bounds_messages`]).
     #[must_use]
@@ -256,6 +331,133 @@ impl WorkerCli {
             ..self.plain()
         }
     }
+}
+
+/// What a worker's launcher found of the program its CLI runs ([`ensure_program`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    /// A program the default set keeps, or one atpkg does not ship: nothing to install.
+    Kept,
+    /// An on-demand program ([`WorkerCli::on_demand`]) already installed.
+    Present,
+    /// An on-demand program atpkg's verified install laid just now.
+    Installed,
+}
+
+/// Make sure the program `cli` runs is there before its worker's line is typed: an on-demand
+/// program ([`WorkerCli::on_demand`]) that is not `present` is installed by `install` (atpkg's
+/// verified install, as `aterm pkg install <program>` runs it), unless `held` names why a person
+/// keeps it off this machine (`[packages] exclude`, or a removal), which a lead's spawn does not
+/// override.
+///
+/// # Errors
+///
+/// Why no worker can start: the program is held back, its install failed, or the install left
+/// nothing installed (atpkg serves no build for this machine).
+pub fn ensure_program(
+    cli: &WorkerCli,
+    present: impl Fn(&str) -> bool,
+    held: impl FnOnce(&str) -> Option<String>,
+    install: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<Readiness, String> {
+    let Some(program) = cli.on_demand() else {
+        return Ok(Readiness::Kept);
+    };
+    if present(program) {
+        return Ok(Readiness::Present);
+    }
+    if let Some(why) = held(program) {
+        return Err(format!(
+            "{program} is not installed and {why}, so `spawn agent={}` installs nothing",
+            cli.word
+        ));
+    }
+    install(program).map_err(|why| format!("atpkg's install of {program} failed: {why}"))?;
+    if !present(program) {
+        return Err(format!(
+            "atpkg's install of {program} left no {program} installed (no build serves this \
+             machine, or its install was refused)"
+        ));
+    }
+    Ok(Readiness::Installed)
+}
+
+/// Why a worker's launcher starts no worker ([`admit`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The CLI is signed out for the login its line would start on ([`WorkerCli::signed_out`]).
+    /// Only a person can sign in.
+    SignedOut(String),
+    /// The CLI's program is not installed and is held back, or its install failed
+    /// ([`ensure_program`]).
+    Program(String),
+}
+
+impl Refused {
+    /// The refusal's words.
+    #[must_use]
+    pub fn why(&self) -> &str {
+        match self {
+            Self::SignedOut(why) | Self::Program(why) => why,
+        }
+    }
+}
+
+/// A worker's starter that its launcher admitted ([`admit`]). [`fn@line`] takes one in place of
+/// a bare [`Starter`], so no line can be written without the sign-in and install checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    starter: Starter,
+    readiness: Readiness,
+}
+
+impl Admitted {
+    /// The starter the line carries.
+    #[must_use]
+    pub const fn starter(&self) -> &Starter {
+        &self.starter
+    }
+
+    /// What admission found of the CLI's program.
+    #[must_use]
+    pub const fn readiness(&self) -> Readiness {
+        self.readiness
+    }
+
+    /// `starter` taken as admitted, for this crate's line tests.
+    #[cfg(test)]
+    pub(crate) const fn assumed(starter: Starter) -> Self {
+        Self {
+            starter,
+            readiness: Readiness::Kept,
+        }
+    }
+}
+
+/// ADMIT A WORKER BEFORE ITS LINE IS WRITTEN, SIGN-IN FIRST. A CLI that, signed out, opens a
+/// sign-in page by itself ([`WorkerCli::signed_out`]) is refused before anything is installed.
+/// Installing it would put a signed-out program on every shell's `PATH` (atpkg lays its
+/// `agents/<program>` twin), where any agent that typed its name would open that page in the
+/// person's browser. Only a starter that passes the sign-in check gets
+/// [`ensure_program`]'s install, through `present`, `held` and `install`.
+///
+/// # Errors
+///
+/// [`Refused::SignedOut`] before `present`, `held` or `install` is asked, else
+/// [`ensure_program`]'s refusal as [`Refused::Program`].
+pub fn admit(
+    cli: &WorkerCli,
+    starter: Starter,
+    user: Option<&Path>,
+    present: impl Fn(&str) -> bool,
+    held: impl FnOnce(&str) -> Option<String>,
+    install: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<Admitted, Refused> {
+    if let Some(why) = cli.signed_out(&starter, user) {
+        return Err(Refused::SignedOut(why));
+    }
+    let readiness = ensure_program(cli, present, held, install).map_err(Refused::Program)?;
+    Ok(Admitted { starter, readiness })
 }
 
 /// Read process `pid` under `home` as a starter of `cli`'s kind, or `None`.
@@ -330,7 +532,8 @@ pub struct Fresh<'a> {
     pub trusted_here: bool,
 }
 
-/// Format the shell command line a worker runs at its first prompt.
+/// Format the shell command line a worker runs at its first prompt, for the starter [`admit`]
+/// admitted.
 ///
 /// # Errors
 /// The line exceeds its budget, a carried directory is relative, the starter's argv holds a flag
@@ -339,9 +542,10 @@ pub struct Fresh<'a> {
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
-    starter: &Starter,
+    admitted: &Admitted,
     fresh: &Fresh<'_>,
 ) -> Result<String, String> {
+    let starter = &admitted.starter;
     let args = starter.args.as_ref().map_err(|flag| {
         format!(
             "the starter's {} argv holds `{flag}`, which no table here knows",

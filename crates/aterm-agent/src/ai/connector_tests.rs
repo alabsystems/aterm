@@ -24,15 +24,23 @@ fn every_row_is_a_package_and_the_connections_follow_its_order() {
     assert_eq!(ids(), order);
 }
 
+/// GROK BUILD IS A CONNECTION, KIMI CODE NOT YET: atpkg serves both outside its default set;
+/// Grok Build's row is a connection (its review, its sign-in, its doctor row), in `VENDORS`
+/// order after the default set's, and Kimi Code's row is read by its account pool alone.
 #[test]
-fn a_pooled_row_atpkg_does_not_serve_is_no_connection() {
+fn grok_is_a_connection_and_kimi_is_not_yet() {
     for row in [&GROK, &KIMI] {
-        assert!(!ROWS.iter().any(|r| r.id == row.id), "{} is a row", row.id);
-        assert_eq!(connector(row.id).map(|c| c.id), None);
-        assert!(!connections().any(|c| c.id == row.id), "{}", row.id);
-        assert!(!ids().contains(&row.id));
+        let spec = atpkg::vendor_direct::spec(row.id).expect("a VENDORS program");
+        assert!(!spec.default_set, "{} is opt-in", row.id);
         assert!(!row.measured, "no lab pass ran {}'s commands", row.id);
     }
+    assert!(ROWS.iter().any(|r| r.id == GROK.id), "grok is a row");
+    assert_eq!(connector("grok").map(|c| c.product), Some("Grok Build"));
+    assert!(connections().any(|c| c.id == "grok"));
+    assert_eq!(ids().last(), Some(&"grok"), "after the default set's");
+    assert!(!ROWS.iter().any(|r| r.id == KIMI.id), "kimi is a row");
+    assert_eq!(connector(KIMI.id).map(|c| c.id), None);
+    assert!(!ids().contains(&KIMI.id));
     assert_eq!(connector("claude").map(|c| c.id), Some("claude"));
     assert_eq!(connector("nope").map(|c| c.id), None);
 }

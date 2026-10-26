@@ -572,7 +572,7 @@ fn a_light_ground_wears_round_veils_and_serious_mode_drops_the_light() {
         "source-over veils"
     );
     assert!(
-        app.windows[&wid].input_scratch.glow_under.is_empty(),
+        app.windows[&wid].input_scratch.glow_under_laid().is_empty(),
         "nothing under the glyph"
     );
     let strip = strip_rows(&app, wid);

@@ -14,6 +14,12 @@ const LINE: &str = "aterm init --only base.clt";
 
 thread_local! {
     static INSTALL_LAN_TRIGGERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static INSTALL_EXTERNAL_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn external_installer_running() -> bool {
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(count.get() + 1));
+    true
 }
 
 fn publish_run(app: &mut App, revision: u64, running: Vec<Setting>) {
@@ -57,7 +63,7 @@ fn book(app: &mut App, wid: WindowId, revision: u64) -> u64 {
     app.workstation_setup.developer_tools = Install::Opening {
         wanted: Some(revision),
     };
-    let id = test_support::book(app, wid, install_tab_then(revision, LINE.into()));
+    let id = test_support::book_unasked(app, wid, install_tab_then(revision, LINE.into()));
     assert!(
         !app.developer_tools_install_due(true, false, false),
         "a second request must not start another shell while the first is pending"
@@ -144,6 +150,88 @@ fn clt_landing_defers_a_run_that_started_another_stage() {
     assert_retry_lands_once(&mut app, wid, 4);
 }
 
+#[test]
+fn clt_landing_an_external_installer_holds_the_automatic_request() {
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_probe = Some(external_installer_running);
+    assert_eq!(
+        app.developer_tools_install_step(),
+        Some(ToolsInstall::Installing),
+        "the same local evidence already tells the page installation is running"
+    );
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    assert!(
+        !app.developer_tools_install_due(true, false, false),
+        "an external installer needs no competing automatic password tab"
+    );
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+    assert!(!app.workstation_setup.developer_tools_mark.opened());
+    app.workstation_setup.developer_tools_probe = Some(|| false);
+    assert_retry_lands_once(&mut app, wid, 4);
+}
+
+#[test]
+fn clt_landing_defers_an_installer_that_started_while_the_shell_spawned() {
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_probe = Some(|| false);
+    assert!(app.developer_tools_install_due(true, false, false));
+    let id = book(&mut app, wid, 4);
+    app.workstation_setup.developer_tools_probe = Some(external_installer_running);
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    assert_deferred(&mut app, wid, id, Install::Wanted(4));
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    assert!(
+        !app.workstation_setup.developer_tools_mark.opened(),
+        "a refused landing consumes no once-per-Mac automatic attempt"
+    );
+    app.workstation_setup.developer_tools_probe = Some(|| false);
+    assert_retry_lands_once(&mut app, wid, 4);
+}
+
+#[test]
+fn clt_landing_a_stale_manual_install_press_defers_to_the_live_installer() {
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_probe = Some(external_installer_running);
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    let before = tabs(&app);
+    app.headless = false;
+    let started = app.press_developer_tools_install();
+    app.headless = true;
+    assert!(!started, "a stale Install button starts no competing shell");
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    assert_eq!(tabs(&app), before);
+    assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+    assert!(!app.workstation_setup.developer_tools_mark.opened());
+    assert!(app.system_state_frontmost_in(wid));
+}
+
+#[test]
+fn clt_landing_a_manual_shell_defers_when_an_installer_started_since_the_press() {
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_probe = Some(|| false);
+    app.workstation_setup.developer_tools = Install::Pressed;
+    let id = test_support::book_unasked(&mut app, wid, pressed_tab_then(LINE.into()));
+    app.workstation_setup.developer_tools_probe = Some(external_installer_running);
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    assert_deferred(&mut app, wid, id, Install::Opened);
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    assert!(!app.workstation_setup.developer_tools_mark.opened());
+
+    // A later explicit press can land once the other installer is gone.
+    app.workstation_setup.developer_tools_probe = Some(|| false);
+    app.workstation_setup.developer_tools = Install::Pressed;
+    let before = tabs(&app);
+    let id = test_support::book_unasked(&mut app, wid, pressed_tab_then(LINE.into()));
+    let (landed, read) = land(&mut app, wid, id);
+    assert!(landed);
+    assert_eq!(tabs(&app), before + 1);
+    assert_eq!(drain(&read), format!("exec {LINE}; exit $?\r").as_bytes());
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+    assert!(app.developer_tools_install_active());
+    assert!(drain(&read).is_empty(), "the command was submitted once");
+}
+
 /// A key typed while the shell starts defers the landing: the tab would take the next keys,
 /// and those were meant for System State. Once the keys are quiet again, it lands once.
 #[test]
@@ -154,6 +242,88 @@ fn clt_landing_defers_while_the_person_types() {
     app.last_keystroke_at = Some(now);
     assert_deferred(&mut app, wid, id, Install::Wanted(4));
     app.last_keystroke_at = now.checked_sub(std::time::Duration::from_secs(3));
+    assert_retry_lands_once(&mut app, wid, 4);
+}
+
+/// The tick's decision books exactly one shell, which lands once and types the install; a
+/// program with no line to type spends the attempt and books nothing.
+#[test]
+fn clt_landing_a_due_tick_books_one_shell_that_lands_once() {
+    let (mut app, wid) = page();
+    let (window, ask, then) = app
+        .begin_developer_tools_install(|| Some(LINE.into()))
+        .expect("due");
+    assert_eq!(window, wid);
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::Opening { wanted: Some(4) }
+    );
+    assert!(
+        app.begin_developer_tools_install(|| Some(LINE.into()))
+            .is_none(),
+        "one shell at a time"
+    );
+    let before = tabs(&app);
+    let id = test_support::book_as(&mut app, wid, &ask, then);
+    let (landed, read) = land(&mut app, wid, id);
+    assert!(landed);
+    assert_eq!(tabs(&app), before + 1);
+    assert_eq!(drain(&read), format!("exec {LINE}; exit $?\r").as_bytes());
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+
+    let (mut app, _) = page();
+    assert!(app.begin_developer_tools_install(|| None).is_none());
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+}
+
+/// A shell that never started posts no "open the tab again" notice: nobody asked for this tab.
+/// The attempt is spent, as any opening's is. A tab a person asked for still says it failed.
+#[test]
+fn clt_landing_a_failed_shell_tells_nobody_to_open_it_again() {
+    let failed = |app: &mut App, wid: WindowId, id: u64| {
+        app.install_spawned_tab(TabSpawned {
+            id,
+            window: wid,
+            session: Err(std::io::Error::other(
+                "fork: Resource temporarily unavailable",
+            )),
+            reader_gate: None,
+        })
+    };
+    // Booked as the tick asks, so the tick's ask is what keeps it quiet.
+    let (mut app, wid) = page();
+    let (window, ask, then) = app
+        .begin_developer_tools_install(|| Some(LINE.into()))
+        .expect("due");
+    let id = test_support::book_as(&mut app, window, &ask, then);
+    let notices = app.messages.live_rows().count();
+    assert!(!failed(&mut app, wid, id));
+    assert_eq!(app.messages.live_rows().count(), notices);
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+    assert!(!app.developer_tools_install_due(true, false, false));
+
+    let (mut app, wid) = page();
+    let notices = app.messages.live_rows().count();
+    let asked = test_support::book(&mut app, wid, crate::tab_spawn::TabSpawnThen::Nothing);
+    assert!(!failed(&mut app, wid, asked));
+    assert_eq!(
+        app.messages.live_rows().count(),
+        notices + 1,
+        "a person's own tab still says it failed"
+    );
+}
+
+/// An unsettled read of the run withholds the install until a settled one returns: the landing
+/// defers, the request stays wanted and its attempt unspent.
+#[test]
+fn clt_landing_defers_while_the_runs_read_is_unsettled() {
+    let (mut app, wid) = page();
+    let id = book(&mut app, wid, 4);
+    let mut unsettled = app.system_state_host.latest_status().clone();
+    unsettled.changing = true;
+    app.publish_system_state(unsettled);
+    assert_deferred(&mut app, wid, id, Install::Wanted(4));
+    publish_run(&mut app, 4, Vec::new());
     assert_retry_lands_once(&mut app, wid, 4);
 }
 
@@ -501,4 +671,56 @@ fn clt_landing_system_state_shutdown_cannot_republish_a_retired_front_page() {
     assert!(app.pool.get(pending).is_none());
     assert!(drain(&read).is_empty(), "shutdown typed no install command");
     assert_eq!(app.messages.live_rows().count(), notices);
+}
+
+/// aterm opens the tab by itself once per Mac (design §3.3): its landing writes this Mac's
+/// mark, and a later launch that reads the mark never opens the tab by itself, though its run
+/// wants the tools again. Install… is the way then.
+#[test]
+fn clt_landing_opens_the_tab_by_itself_once_per_mac() {
+    let dir = aterm_tempfile::tempdir().expect("a config directory");
+    let mark = dir.path().join("command-line-tools-tab");
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
+    assert!(!app.workstation_setup.developer_tools_mark.opened());
+    assert_retry_lands_once(&mut app, wid, 4);
+    assert!(mark.is_file(), "the landing marks this Mac");
+
+    let (mut later, _) = page();
+    later.workstation_setup.developer_tools_mark = Mark::at(mark);
+    assert!(later.workstation_setup.developer_tools_mark.opened());
+    assert_eq!(later.workstation_setup.developer_tools, Install::Wanted(4));
+    assert!(
+        !later.developer_tools_install_due(true, false, false),
+        "a later launch never opens it by itself"
+    );
+}
+
+/// Install… opens the tab on a person's press (design §3.3), whatever this Mac's mark says and
+/// with no run asking: the line is typed once, the page then reads the tab asking for the
+/// password, and a second press opens no second tab while it is open.
+#[test]
+fn clt_landing_install_opens_the_tab_on_a_press() {
+    let dir = aterm_tempfile::tempdir().expect("a config directory");
+    let mark = dir.path().join("command-line-tools-tab");
+    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_mark = Mark::at(mark);
+    app.workstation_setup.developer_tools = Install::Pressed;
+    assert_eq!(app.developer_tools_install_step(), None);
+    let before = tabs(&app);
+    let id = test_support::book(&mut app, wid, pressed_tab_then(LINE.into()));
+    let (landed, read) = land(&mut app, wid, id);
+    assert!(landed);
+    assert_eq!(tabs(&app), before + 1);
+    assert_eq!(drain(&read), format!("exec {LINE}; exit $?\r").as_bytes());
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+    assert_eq!(
+        app.developer_tools_install_step(),
+        Some(ToolsInstall::Password)
+    );
+    app.headless = false;
+    assert!(!app.press_developer_tools_install(), "one tab at a time");
+    app.headless = true;
+    assert_eq!(tabs(&app), before + 1);
 }

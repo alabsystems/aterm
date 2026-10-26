@@ -1911,6 +1911,104 @@ fn another_holders_claim_is_named_apart_from_this_hosts() {
     assert_eq!(read(&app), (true, true, true), "another holder's claim");
 }
 
+/// A rostered harness's scoped claim (contract v3) stands aterm down for exactly its scope
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 4): grok-alab's `relaunch,upgrade` speaks
+/// for no box and no wall, so a box on its session still needs the person, where any other
+/// holder's claim presses it.
+#[test]
+fn a_relaunch_and_upgrade_claim_leaves_the_boxes_to_the_person() {
+    let (mut app, sid) = app_with_stub();
+    let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
+    let fixture = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::TRUST);
+    {
+        let pooled = app.pool.get(sid).expect("pooled");
+        let mut t = crate::term_lock(&pooled.term);
+        t.resize(45, 120);
+        let mut bytes = String::from("\x1b[H\x1b[2J");
+        for (i, row) in fixture[8..=23].iter().enumerate() {
+            bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+        }
+        t.process(bytes.as_bytes());
+    }
+    let _ = take_posts();
+    looking_at(&app, &[]);
+    sweep(&mut app, Instant::now());
+    assert_eq!(published(&app, sid).word, "prompt");
+    let read = |app: &App| {
+        let handle = app.store.read().unwrap().by_local(sid).cloned();
+        let handle = handle.as_ref().expect("the session");
+        let f = app.need_facts_with(
+            handle,
+            |_| false,
+            &Default::default(),
+            crate::metrics::now_us(),
+            0,
+        );
+        (
+            (f.supervised, f.other_supervisor, f.claim_live),
+            crate::needs::of(&f).need.map(|n| n.word),
+        )
+    };
+    let unclaimed = read(&app);
+    assert_eq!(unclaimed.0, (false, false, false), "no claim");
+    assert!(unclaimed.1.is_some(), "a box nobody presses needs you");
+
+    let holder = "grok-alab@4242";
+    let aterm_agent::harness::contract::Words::Scoped(claim) =
+        aterm_agent::harness::contract::read(holder, &["contract=3", "scope=relaunch,upgrade"])
+    else {
+        panic!("grok-alab's claim reads as a scoped claim");
+    };
+    let scoped = crate::harness_claim::Scoped {
+        proven: crate::self_claim::Proven {
+            pid: 4242,
+            start: "stand-in".to_string(),
+        },
+        claim,
+    };
+    let now_us = crate::metrics::now_us();
+    assert!(
+        crate::session_timeline::claim_supervisor_scoped(
+            &ctx,
+            holder,
+            None,
+            scoped,
+            now_us,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
+    {
+        let meta = ctx.meta.lock().unwrap();
+        let live = meta.live_claim(now_us).expect("the scoped claim stands");
+        use aterm_agent::harness::contract::Scope;
+        assert!(live.takes(Scope::Relaunch) && live.takes(Scope::Upgrade));
+        assert!(!live.takes(Scope::Approvals) && !live.takes(Scope::Walls));
+        assert!(meta.claim_proven(now_us) && !meta.supervisor_proven(now_us));
+    }
+    assert_eq!(
+        read(&app),
+        ((false, false, true), unclaimed.1),
+        "a relaunch,upgrade claim presses no box, so the box still needs you"
+    );
+
+    assert!(crate::session_timeline::release_supervisor_held_by(
+        &ctx,
+        holder,
+        now_us,
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(
+        crate::session_timeline::claim_supervisor(&ctx, "drive-watch", None, None, now_us),
+        Ok(true)
+    );
+    assert_eq!(
+        read(&app),
+        ((true, true, true), None),
+        "an unscoped claim takes every duty, the box among them"
+    );
+}
+
 /// A prompt box raises one menu row and one notification per transition when not focused or headless.
 #[test]
 fn a_box_raises_one_menu_row_and_one_notification_per_transition() {

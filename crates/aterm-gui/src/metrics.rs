@@ -1554,48 +1554,21 @@ pub(crate) fn note_prediction_shown(
     window.shown_through = through;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NativeInputRevision {
-    instance: crate::tab_model::AppInstanceId,
-    view: crate::tab_model::ViewId,
-    generation: u64,
-    config: u64,
-    update: u64,
-    document: Option<u64>,
-    presentation: u64,
-}
-
-impl From<crate::app_native::NativeUiCompileStamp> for NativeInputRevision {
-    fn from(stamp: crate::app_native::NativeUiCompileStamp) -> Self {
-        Self {
-            instance: stamp.instance,
-            view: stamp.view,
-            generation: stamp.generation,
-            config: stamp.config_revision,
-            update: stamp.update_revision,
-            document: stamp.document_seq,
-            presentation: stamp.presentation_revision,
-        }
-    }
-}
-
-/// Native edges awaiting the revision they changed.
+/// Native edges awaiting the first present of their page's pixels drawn after them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PendingNativeInputStamp {
-    revision: Option<NativeInputRevision>,
+    /// The view the open edges were typed into and the paint serial their answer is drawn at
+    /// or after (`App::note_native_paint`).
+    awaited: Option<(crate::tab_model::ViewId, u64)>,
     edges: PendingInputStamp,
 }
 
 impl PendingNativeInputStamp {
-    fn advance(&mut self, before: NativeInputRevision, after: NativeInputRevision) -> bool {
-        if before.instance != after.instance || before.view != after.view || before == after {
-            return false;
-        }
-        if self.revision != Some(before) {
+    fn advance(&mut self, view: crate::tab_model::ViewId, serial: u64) {
+        if self.awaited.is_some_and(|(was, _)| was != view) {
             self.edges = PendingInputStamp::default();
         }
-        self.revision = Some(after);
-        true
+        self.awaited = Some((view, serial));
     }
 
     /// Whether a key a native page took is still waiting on its present.
@@ -1610,24 +1583,30 @@ pub(crate) fn native_input_arrival() -> u64 {
     METRICS.input_arrival_ns(now_ns())
 }
 
-/// Arm a keystroke a native page took (`arrival_ns` from [`native_input_arrival`]) in its window's native ring ([`WindowPresentState::pending_native_input`]) when its dispatch moved the page from revision `before` to `after`.
+/// Arm a keystroke a native page took (`arrival_ns` from [`native_input_arrival`]) in its window's
+/// native ring ([`WindowPresentState::pending_native_input`]): its dispatch changed what `view`
+/// draws, which the page's pixels show from paint serial `serial` on.
 pub(crate) fn note_native_window_input(
     pending: &mut PendingNativeInputStamp,
-    before: crate::app_native::NativeUiCompileStamp,
-    after: crate::app_native::NativeUiCompileStamp,
+    view: crate::tab_model::ViewId,
+    serial: u64,
     arrival_ns: u64,
 ) {
-    if pending.advance(before.into(), after.into()) {
-        METRICS.note_native_window_input(&mut pending.edges, arrival_ns, now_ns());
-    }
+    pending.advance(view, serial);
+    METRICS.note_native_window_input(&mut pending.edges, arrival_ns, now_ns());
 }
 
-/// A present that put a native page's new pixels on glass.
+/// A present that put `view`'s pixels of paint serial `serial` on glass for the first time: the
+/// answer of every key it was awaited for at or before that serial.
 pub(crate) fn record_native_content_present(
     pending: &mut PendingNativeInputStamp,
-    presented: crate::app_native::NativeUiCompileStamp,
+    view: crate::tab_model::ViewId,
+    serial: u64,
 ) {
-    if pending.revision != Some(NativeInputRevision::from(presented)) {
+    if !pending
+        .awaited
+        .is_some_and(|(awaited, from)| awaited == view && serial >= from)
+    {
         return;
     }
     let mut taken = std::mem::take(pending);
@@ -2037,9 +2016,13 @@ type FxStream = (&'static str, fn(&aterm_render::RenderInput) -> usize);
 
 static FX_STREAMS: [FxStream; 14] = [
     ("trail", |i| i.cursor_trail.len()),
-    ("glow_add", |i| i.cursor_glow_add.len()),
+    ("glow_add", |i| {
+        i.cursor_glow_add_ramps.laid(i.cursor_glow_add.len())
+    }),
     ("glow_halo", |i| i.glow_halo.len()),
-    ("glow_under", |i| i.glow_under.len()),
+    ("glow_under", |i| {
+        i.glow_under_ramps.laid(i.glow_under.len())
+    }),
     ("fire_patch", |i| i.fire_patch.len()),
     ("fire_halo", |i| i.fire_halo.len()),
     ("nova_add", |i| i.nova_add.len()),

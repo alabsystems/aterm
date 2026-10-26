@@ -377,6 +377,8 @@ const HEADER_HIT_FOLDED: f64 = 12.5;
 const GRID_FROM_FULL: f64 = 14.5;
 const GRID_FROM_FOLDED: f64 = 12.5;
 const SMALL_PT: f64 = 9.5;
+/// The least height of a time-scale tick, device px.
+const TICK_MIN_PX: f32 = 2.0;
 const MARK_EM: f64 = 1.1;
 const STATE_GAP: f64 = 6.0;
 const STRIP_PERIODS: [u32; 3] = [10, 20, 30];
@@ -443,8 +445,9 @@ struct RowWords {
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
     /// forms, longest first (rule F).
     strip_text: Option<Vec<Txt>>,
-    /// The strip's columns at each of [`STRIP_PERIODS`]: the span's, oldest first and the open
-    /// one last, and the one before them, which the glide slides out at the left.
+    /// The strip's columns at each of [`STRIP_PERIODS`]: ten minutes', oldest first and the
+    /// open one last, and the one before them, which the glide slides out at the left; a strip
+    /// that spans less draws the newest of them ([`RowWords::strip_cols`]).
     cols: [Vec<HeatCell>; 3],
     bar: Option<BarFill>,
     /// The amount's forms on each ladder ([`Table::ladder`]): the glance's in Full wide and mid
@@ -558,10 +561,9 @@ impl DeckWords {
     /// Whether a strip of `strip`'s period draws an over mark: in any column it holds, the one
     /// the glide slides out included, so the key holds still while the strips glide.
     fn over_shown(&self, strip: &Strip) -> bool {
-        let k = period_ix(strip);
-        self.rows.iter().any(|row| {
-            row.strip_text.is_none() && row.cols.get(k).is_some_and(|c| c.iter().any(|c| c.over))
-        })
+        self.rows
+            .iter()
+            .any(|row| row.strip_text.is_none() && row.strip_cols(strip).iter().any(|c| c.over))
     }
 
     fn clusters(&self) -> Vec<Cluster<'_>> {
@@ -689,6 +691,21 @@ fn period_ix(strip: &Strip) -> usize {
         .iter()
         .position(|&p| p == strip.period_s)
         .unwrap_or(0)
+}
+
+impl RowWords {
+    /// What `strip` draws of this row: the newest `strip.cols + 1` of its columns at the
+    /// strip's period, oldest first and the open one last, the one the glide slides out at the
+    /// left included. A Full strip spans ten minutes and takes them all; a Folded one spans its
+    /// width in seconds (`stats_plan::FOLD_PITCH`) and takes the newest of the 10 s columns.
+    fn strip_cols(&self, strip: &Strip) -> &[HeatCell] {
+        let cols = self
+            .cols
+            .get(period_ix(strip))
+            .map_or(&[][..], Vec::as_slice);
+        let n = strip.cols as usize + 1;
+        cols.get(cols.len().saturating_sub(n)..).unwrap_or_default()
+    }
 }
 
 const fn ladder_ix(details: bool, cols: bool) -> usize {
@@ -840,6 +857,9 @@ struct Deck<'a> {
     /// only these), and the fastest strip's glide, device px a second.
     live_rects: Vec<(LiveLayer, Rect)>,
     glide_px_per_s: f64,
+    /// The strips' column period, s: `None` before the first strip, `Some(0)` when two strips'
+    /// periods differ (their open columns end at different moments, so the glide never holds).
+    glide_period: Option<u32>,
     tab: &'a str,
     machine: &'static str,
     /// Hits by precedence: the first containing the pointer wins.
@@ -875,6 +895,7 @@ impl<'a> Deck<'a> {
             at_ms: input.snap.map(|snap| snap.at_unix_ms),
             live_rects: Vec::new(),
             glide_px_per_s: 0.0,
+            glide_period: None,
             tab: &input.tab_label,
             machine: input.locale.platform.machine(),
             hits_first: Vec::new(),
@@ -1198,6 +1219,11 @@ impl<'a> Deck<'a> {
         self.glide_px_per_s = self
             .glide_px_per_s
             .max(pitch_px / f64::from(strip.period_s.max(1)));
+        self.glide_period = Some(match self.glide_period {
+            None => strip.period_s,
+            Some(p) if p == strip.period_s => p,
+            Some(_) => 0,
+        });
         let x = strip.end() + live::LINE_DX;
         let cy = base - live::DOT_RISE;
         let reach = live::DOT_R + live::BEAT_REACH;
@@ -1227,15 +1253,28 @@ impl<'a> Deck<'a> {
         let (cx, cyp, r) = ((x * s) as f32, (cy * s) as f32, (r_pt * s) as f32);
         let y1 = self.px(last);
         let y0 = (cyp + r).min(y1);
-        let line_alpha = if fresh { live::LINE_ALPHA } else { 0xFF };
-        self.p.prims.push(panel(
-            (cx - lw / 2.0).round(),
-            y0,
-            lw,
-            y1 - y0,
-            0.0,
-            rgba(ink, line_alpha),
-        ));
+        let lx = (cx - lw / 2.0).round();
+        if fresh {
+            // Solid words ink: the strongest neutral on the card, so "now" outranks its grey.
+            self.p
+                .prims
+                .push(panel(lx, y0, lw, y1 - y0, 0.0, rgba(ink, 0xFF)));
+        } else {
+            // Dashed hollow ink: a stopped line reads as stopped by its shape as well as its
+            // ink, in either theme and with motion off. A dashed band with no width is a
+            // vertical dashed line `lw` px thick.
+            let dash = (live::STALE_DASH * s).round().max(1.0) as f32;
+            self.p.prims.push(DrawPrim::Dashed {
+                x: lx,
+                y: y0,
+                w: 0.0,
+                h: y1 - y0,
+                width: lw,
+                on: dash,
+                off: dash,
+                color: rgba(ink, 0xFF),
+            });
+        }
         let clear = [0, 0, 0, 0];
         if !fresh {
             self.p.prims.push(DrawPrim::Ring {
@@ -1542,10 +1581,7 @@ impl<'a> Deck<'a> {
                 );
             }
             None => {
-                let cols = row
-                    .cols
-                    .get(period_ix(&t.strip))
-                    .map_or(&[][..], Vec::as_slice);
+                let cols = row.strip_cols(&t.strip);
                 self.strip(&t.strip, top, rows.cell, cols);
             }
         }
@@ -1798,11 +1834,24 @@ impl<'a> Deck<'a> {
                 words2,
                 None,
             );
-            let w = (0.5 * self.s).round().max(1.0) as f32;
-            let (y0, y1) = (self.px(base + 1.0), self.px(base + 2.5));
-            let x = (tick.x * self.s) as f32 - w / 2.0;
-            self.rect((x.round(), y0, w, (y1 - y0).max(1.0)), 0.0, words2);
+            self.tick_mark(tick.x, base);
         }
+        if let Some(x) = head.time_tick {
+            self.tick_mark(x, base);
+        }
+    }
+
+    /// A time-scale tick at `x` pt under the header line at `base`: one device px wide (half a
+    /// point at 2×), from a point under the baseline to 2.5 pt under it and never under
+    /// [`TICK_MIN_PX`] tall, so at 1× it reads as a tick and not a stray dot; it ends short of
+    /// the strip's top (and its caps) in both forms.
+    fn tick_mark(&mut self, x: f64, base: f64) {
+        let w = (0.5 * self.s).round().max(1.0) as f32;
+        let y0 = self.px(base + 1.0);
+        let y1 = self.px(base + 2.5).max(y0 + TICK_MIN_PX);
+        let x = ((x * self.s) as f32 - w / 2.0).round();
+        let words2 = self.inks.words2;
+        self.rect((x, y0, w, y1 - y0), 0.0, words2);
     }
 
     fn two_inks(&mut self, x: f64, base: f64, text: &str, sep: &str) {
@@ -2133,6 +2182,9 @@ pub(crate) struct LiveOut {
     pub(crate) rects: Vec<(LiveLayer, Rect)>,
     /// The fastest strip's glide, device px a second.
     pub(crate) glide_px_per_s: f64,
+    /// The strips' column period, s: 0 with no strip, or when strips' periods differ (the glide
+    /// then never holds at an open column's end, `LiveFacts::glide_end_ms`).
+    pub(crate) glide_period_s: u32,
 }
 
 /// What the Deck's layout reads that its live edge never moves: the snapshot's words and the
@@ -2227,6 +2279,7 @@ pub(crate) fn deck_paint_kept(
     let out = LiveOut {
         rects: std::mem::take(&mut deck.live_rects),
         glide_px_per_s: deck.glide_px_per_s,
+        glide_period_s: deck.glide_period.unwrap_or(0),
     };
     (deck.p.prims, hits, out)
 }
@@ -2533,7 +2586,7 @@ impl crate::App {
                 .set((key, prims_fp(&prims) ^ u64::from(f.dy).rotate_left(40)));
             *ws.stats_hits.borrow_mut() = hits;
             ws.deck_live_drawn.set(Some(f.live.key()));
-            ws.deck_glide.set(out.glide_px_per_s);
+            ws.deck_glide.set((out.glide_px_per_s, out.glide_period_s));
             *ws.deck_live_rects.borrow_mut() = out.rects;
         }
         prims

@@ -16,6 +16,9 @@ pub use crate::render_fx::{
     FxRamps, FxRect, FxRowRuns, FxRun, FxSlot, FxSpace, FxSprite, FxTexels, PxRect,
     fx_layer_builds, fx_payload_copies,
 };
+pub use crate::render_ramps::{
+    GlowEnd, GlowRamp, GlowRamps, Laid, RampMark, end_alpha, end_color, glow_end,
+};
 
 /// One faded cell of the cursor motion trail, painted in the trail colour at `alpha` over its own background, in the cursor's viewport coordinates (after the tab-strip splice and any split-pane offset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +179,8 @@ pub struct GlowQuadWords {
 
 impl GlowQuadWords {
     const GRADIENT_TAG: u64 = 0x4752_0000_0000_0000;
+    /// Tags a ramp's header word ([`EffectStreamDamage::refresh_glow`]).
+    const RAMP_TAG: u64 = 0x5241_0000_0000_0000;
 
     /// The live words as a slice.
     #[must_use]
@@ -423,6 +428,53 @@ impl EffectStreamDamage {
         }
         self.fingerprint = fingerprint.finish();
         self.len = values.len();
+        self.valid = true;
+    }
+
+    /// [`Self::refresh`] for a glow stream: its quads, then each of its ramps
+    /// ([`GlowRamps`]) in its own words ([`GlowRamp::damage_words`], its run
+    /// and its place among the quads included) and the ends it keeps, its
+    /// band's row marked.
+    #[inline]
+    fn refresh_glow(&mut self, quads: &[GlowQuad], ramps: &GlowRamps, grid_rows: usize) {
+        if ramps.is_empty() {
+            self.refresh(quads, grid_rows, |quad| quad.row, hash_glow_quad);
+            return;
+        }
+        let len = quads.len() + ramps.items.len();
+        let mut fingerprint = EffectStreamFingerprint::new(len);
+        self.rows.clear();
+        self.rows.resize(grid_rows.div_ceil(u64::BITS as usize), 0);
+        let rows = &mut self.rows;
+        let mut mark = |row: u16| {
+            let row = usize::from(row);
+            if let Some(word) = rows.get_mut(row / u64::BITS as usize) {
+                *word |= 1_u64 << (row % u64::BITS as usize);
+            }
+        };
+        for quad in quads {
+            hash_glow_quad(quad, &mut fingerprint);
+            mark(quad.row);
+        }
+        for ramp in &ramps.items {
+            let [band, run, at] = ramp.damage_words();
+            fingerprint.write_pair(band, run | GlowQuadWords::RAMP_TAG);
+            let (ends, rest) = ramp.kept_ends(&ramps.ends).as_chunks::<4>();
+            for e in ends {
+                fingerprint.write_pair(
+                    u64::from(e[0]) | u64::from(e[1]) << 32,
+                    u64::from(e[2]) | u64::from(e[3]) << 32,
+                );
+            }
+            let last = match *rest {
+                [a, b, ..] => u64::from(a) | u64::from(b) << 32,
+                _ => 0,
+            };
+            fingerprint.write_pair(at, last);
+            mark(ramp.row);
+        }
+        self.fingerprint = fingerprint.finish();
+        self.len = len;
         self.valid = true;
     }
 }
@@ -1091,10 +1143,14 @@ pub struct RenderInput {
     pub cursor_trail_color: u32,
     /// The cursor aurora's light quads (comet, bloom crown, landing ring, sparks), under the crisp cursor.
     pub cursor_glow_add: Vec<GlowQuad>,
+    /// The ramps drawn among [`cursor_glow_add`](Self::cursor_glow_add)'s quads ([`GlowRamps`]).
+    pub cursor_glow_add_ramps: GlowRamps,
     /// Radial cursor-effect light (fire embers, crown) with the [`RainHalo`] integer falloff, drawn after the aurora and before the nova and rain streams.
     pub glow_halo: Vec<RainHalo>,
     /// Under-glyph additive light (the fire body glyphs sit inside as silhouettes).
     pub glow_under: Vec<GlowQuad>,
+    /// The ramps drawn among [`glow_under`](Self::glow_under)'s quads ([`GlowRamps`]).
+    pub glow_under_ramps: GlowRamps,
     /// Per-pixel procedural fire-field patches, drawn at the [`glow_under`](RenderInput::glow_under) slot so engulfed glyphs read as silhouettes.
     pub fire_patch: Vec<FirePatch>,
     /// Producer-built compact damage metadata for [`cursor_glow_add`](Self::cursor_glow_add).
@@ -1415,8 +1471,10 @@ impl PartialEq for RenderInput {
             && self.cursor_trail == other.cursor_trail
             && self.cursor_trail_color == other.cursor_trail_color
             && self.cursor_glow_add == other.cursor_glow_add
+            && self.cursor_glow_add_ramps == other.cursor_glow_add_ramps
             && self.glow_halo == other.glow_halo
             && self.glow_under == other.glow_under
+            && self.glow_under_ramps == other.glow_under_ramps
             && self.fire_patch == other.fire_patch
             && self.cursor_fill_override == other.cursor_fill_override
             && self.bloom_gate == other.bloom_gate
@@ -1575,19 +1633,23 @@ impl RenderInput {
         self.bloom_gate = source.bloom_gate;
 
         macro_rules! copy_effect_stream {
-            ($field:ident, $damage:ident) => {
+            ($damage:ident, $($field:ident),+) => {
                 if retain_effect_payloads || !source.$damage.is_valid() {
-                    self.$field.clone_from(&source.$field);
+                    $(self.$field.clone_from(&source.$field);)+
                 } else {
-                    self.$field.clear();
+                    $(self.$field.clear();)+
                 }
                 self.$damage.refill_from(&source.$damage);
             };
         }
-        copy_effect_stream!(cursor_glow_add, cursor_glow_add_damage);
-        copy_effect_stream!(glow_halo, glow_halo_damage);
-        copy_effect_stream!(glow_under, glow_under_damage);
-        copy_effect_stream!(fire_patch, fire_patch_damage);
+        copy_effect_stream!(
+            cursor_glow_add_damage,
+            cursor_glow_add,
+            cursor_glow_add_ramps
+        );
+        copy_effect_stream!(glow_halo_damage, glow_halo);
+        copy_effect_stream!(glow_under_damage, glow_under, glow_under_ramps);
+        copy_effect_stream!(fire_patch_damage, fire_patch);
 
         self.word_decorations.clone_from(&source.word_decorations);
         self.ink.clone_from(&source.ink);
@@ -1651,16 +1713,15 @@ impl RenderInput {
     /// Rebuild the four compact cursor-effect damage records, after all frontend composition (splices, clipping, chrome suppression).
     pub fn refresh_cursor_effect_damage(&mut self) {
         let rows = self.rows;
-        self.cursor_glow_add_damage.refresh(
+        self.cursor_glow_add_damage.refresh_glow(
             &self.cursor_glow_add,
+            &self.cursor_glow_add_ramps,
             rows,
-            |quad| quad.row,
-            hash_glow_quad,
         );
         self.glow_halo_damage
             .refresh(&self.glow_halo, rows, |halo| halo.row, hash_rain_halo);
         self.glow_under_damage
-            .refresh(&self.glow_under, rows, |quad| quad.row, hash_glow_quad);
+            .refresh_glow(&self.glow_under, &self.glow_under_ramps, rows);
         self.fire_patch_damage
             .refresh(&self.fire_patch, rows, |patch| patch.row, hash_fire_patch);
     }
@@ -1680,8 +1741,10 @@ impl RenderInput {
             cursor_trail: Vec::new(),
             cursor_trail_color: 0,
             cursor_glow_add: Vec::new(),
+            cursor_glow_add_ramps: GlowRamps::default(),
             glow_halo: Vec::new(),
             glow_under: Vec::new(),
+            glow_under_ramps: GlowRamps::default(),
             fire_patch: Vec::new(),
             cursor_glow_add_damage: EffectStreamDamage::default(),
             glow_halo_damage: EffectStreamDamage::default(),
@@ -1923,6 +1986,15 @@ impl RenderInput {
             q.y = q.y.saturating_add(pixel_dy);
             q.row = shift_tag(q.y);
         }
+        for r in self
+            .cursor_glow_add_ramps
+            .items
+            .iter_mut()
+            .chain(&mut self.glow_under_ramps.items)
+        {
+            r.y = r.y.saturating_add(pixel_dy);
+            r.row = shift_tag(r.y);
+        }
         for q in &mut self.fire_patch {
             q.y = q.y.saturating_add(pixel_dy);
             q.base_y = q.base_y.saturating_add(pixel_dy);
@@ -2116,13 +2188,35 @@ impl RenderInput {
             }))
     }
 
+    /// A test's read of the whole additive glow stream: `cursor_glow_add` with every lit ramp row the quad it stands for, in draw order.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn glow_add_laid(&self) -> Vec<GlowQuad> {
+        let mut all = Vec::new();
+        self.cursor_glow_add_ramps
+            .expand_into(&self.cursor_glow_add, &mut all);
+        all
+    }
+
+    /// A test's read of the whole under-ink glow stream: `glow_under` with every lit ramp row the quad it stands for, in draw order.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn glow_under_laid(&self) -> Vec<GlowQuad> {
+        let mut all = Vec::new();
+        self.glow_under_ramps
+            .expand_into(&self.glow_under, &mut all);
+        all
+    }
+
     /// Drop every host-owned visual effect layer, leaving only terminal cell content (grid, cursor position/colour, selection, images).
     pub fn clear_overlays(&mut self) {
         self.cursor_effect_style_override = None;
         self.cursor_trail.clear();
         self.cursor_glow_add.clear();
+        self.cursor_glow_add_ramps.clear();
         self.glow_halo.clear();
         self.glow_under.clear();
+        self.glow_under_ramps.clear();
         self.fire_patch.clear();
         self.cursor_glow_add_damage = EffectStreamDamage::default();
         self.glow_halo_damage = EffectStreamDamage::default();
@@ -4263,6 +4357,58 @@ mod rain_channel_tests {
             Some(false),
             "the compact damage revision must detect a payload change"
         );
+    }
+
+    /// A glow stream's damage record tells apart two ramp streams that draw
+    /// different rows: a ramp's run (`join`, `joined`) and where its kept
+    /// ends start (`ink`) change what it draws as its box and its ends do.
+    #[test]
+    fn the_glow_damage_record_sees_a_ramps_run_and_its_ends() {
+        use crate::render_ramps::{GlowRamp, GlowRamps, glow_end};
+        let stream = |join: u16, ink: u32| {
+            let mut ramps = GlowRamps {
+                items: vec![GlowRamp {
+                    at: 0,
+                    row: 1,
+                    x: 4,
+                    y: 20,
+                    w: 6,
+                    h: 4,
+                    join,
+                    joined: 1,
+                    ink,
+                }],
+                ends: (1..=8).map(|c| glow_end(c * 0x10, 0)).collect(),
+                lit: 0,
+            };
+            ramps.lit = ramps.count_lit();
+            let mut input = RenderInput::empty();
+            input.rows = 4;
+            input.glow_under_ramps = ramps;
+            input.refresh_cursor_effect_damage();
+            input
+        };
+        let drawn = |input: &RenderInput| {
+            let mut quads = Vec::new();
+            input.glow_under_ramps.expand_into(&[], &mut quads);
+            quads
+        };
+        let base = stream(1, 0);
+        assert_eq!(
+            base.glow_under_damage
+                .same_content(&stream(1, 0).glow_under_damage),
+            Some(true),
+            "the same stream is the same content"
+        );
+        for (what, other) in [("its run", stream(2, 0)), ("its ends", stream(1, 2))] {
+            assert_ne!(drawn(&base), drawn(&other), "{what}: the rows drawn differ");
+            assert_eq!(
+                base.glow_under_damage
+                    .same_content(&other.glow_under_damage),
+                Some(false),
+                "{what}: the damage record sees the change"
+            );
+        }
     }
 }
 

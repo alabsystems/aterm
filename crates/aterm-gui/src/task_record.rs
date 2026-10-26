@@ -56,6 +56,14 @@ impl TaskState {
 /// `why=` value written when Autopilot Land lands the work.
 pub(crate) const WHY_LANDED: &str = "landed";
 
+/// `why=` of a worker its launcher refused because its CLI is signed out, which only a person
+/// can fix (`task_launch::refused_why`).
+pub(crate) const WHY_SIGNIN: &str = "signin";
+
+/// `why=` of a worker its launcher refused because its program is held back or failed to
+/// install (`task_launch::refused_why`).
+pub(crate) const WHY_INSTALL: &str = "install";
+
 /// Closed `why=` vocabulary for task state transitions.
 pub(crate) const TASK_WHY: &[&str] = &[
     WHY_LANDED,
@@ -67,7 +75,24 @@ pub(crate) const TASK_WHY: &[&str] = &[
     "held",
     "turn",
     "moved",
+    WHY_SIGNIN,
+    WHY_INSTALL,
 ];
+
+/// A stalled task's words for a person, by its `why=` (the need's `what` and the menu bar's
+/// row). A worker refused as signed out says that a person must sign in, the one step nobody
+/// else can take.
+#[must_use]
+pub(crate) fn stall_words(why: Option<&str>) -> String {
+    match why {
+        Some("held") => "held at a screen aterm does not know".to_string(),
+        Some("startup" | "shell") => "never started".to_string(),
+        Some(WHY_SIGNIN) => "never started: signed out, a person must sign in".to_string(),
+        Some(WHY_INSTALL) => "never started: its program could not be installed".to_string(),
+        Some(why) => format!("stalled ({why})"),
+        None => "stalled".to_string(),
+    }
+}
 
 /// Default `from=` value when a task is started by `ctl` without a caller session ID.
 pub(crate) const FROM_CTL: &str = "ctl";

@@ -20,8 +20,9 @@ pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
 /// The tools' package receipt (its version is the report's).
 pub const CLT_RECEIPT: &str = "com.apple.pkg.CLTools_Executables";
 
-/// The placeholder that makes `softwareupdate -l` list the tools.
-pub const PLACEHOLDER: &str = "/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress";
+/// The placeholder that makes `softwareupdate -l` list the tools, which System State reads as
+/// an install running.
+pub const PLACEHOLDER: &str = aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING;
 
 /// `softwareupdate`.
 pub const SOFTWAREUPDATE: &str = "/usr/sbin/softwareupdate";
@@ -204,9 +205,26 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
 impl CommandLineTools {
     fn install(sys: &dyn System) -> Result<(), String> {
         // A closed tab (SIGHUP), a Ctrl-C or a Ctrl-\ reaches this run, never `softwareupdate`
-        // (its own process group): caught, it lets the running step finish and the placeholder
-        // guard remove the placeholder, which would otherwise refuse every later install.
-        let _stops = sys.catch_stops();
+        // (its own process group): deferred, it lets the running step finish and the placeholder
+        // guard remove the placeholder, which would otherwise refuse every later install, and
+        // then ends the run as it would have, so a stop meant for a whole apply is not lost.
+        let _stops = sys.defer_stops();
+        let installed = Self::install_placeheld(sys);
+        if let Some(signal) = sys.stopped() {
+            say(&format!(
+                "stopped by signal {signal} {}; nothing more of this run happens",
+                if installed.is_ok() {
+                    "with the tools installed"
+                } else {
+                    "before the tools were installed"
+                }
+            ));
+        }
+        installed
+    }
+
+    /// The install with softwareupdate's on-demand placeholder in place, removed when it ends.
+    fn install_placeheld(sys: &dyn System) -> Result<(), String> {
         sys.create_new(Path::new(PLACEHOLDER), b"", 0o644)
             .map_err(|e| format!("{PLACEHOLDER}: {e}"))?;
         let _placeholder = Placeholder { sys };
@@ -593,17 +611,14 @@ Software Update found the following new or updated software:\n\
         assert!(why.starts_with("stopped by signal"), "{why}");
         let calls = sys.calls();
         let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
-        let caught = at("catch stops").expect("stops caught");
+        let caught = at("defer stops").expect("stops caught");
         let created = at("create /tmp/.com.apple.dt.CommandLineTools").expect("placeholder");
         assert!(
             caught < created,
             "caught before the placeholder exists: {calls:?}"
         );
         assert!(at("/usr/sbin/softwareupdate -i").is_none(), "{calls:?}");
-        assert!(
-            at("remove /tmp/.com.apple.dt.CommandLineTools").is_some(),
-            "{calls:?}"
-        );
+        assert_stop_sent_after_the_placeholder_goes(&calls);
         assert!(sys.written(PLACEHOLDER).is_none());
 
         let unstopped = Fake::root();
@@ -615,13 +630,55 @@ Software Update found the following new or updated software:\n\
             )
             .on(PKGUTIL, Ran::ok(RECEIPT));
         CommandLineTools::install(&unstopped).unwrap();
+        let calls = unstopped.calls();
         assert!(
-            unstopped
-                .calls()
+            calls
                 .iter()
                 .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")),
             "the negative control installs"
         );
+        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
+        let removed =
+            at("remove /tmp/.com.apple.dt.CommandLineTools").expect("placeholder removed");
+        let restored = at("stops restored").expect("stops restored");
+        assert!(
+            removed < restored,
+            "the stops stay caught until the placeholder is gone: {calls:?}"
+        );
+        assert!(at("stop sent again").is_none(), "{calls:?}");
+    }
+
+    /// The placeholder is removed, then the stops are restored, then the one caught is sent again.
+    fn assert_stop_sent_after_the_placeholder_goes(calls: &[String]) {
+        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
+        let removed =
+            at("remove /tmp/.com.apple.dt.CommandLineTools").expect("placeholder removed");
+        let restored = at("stops restored").expect("stops restored");
+        let sent = at("stop sent again: signal 2").expect("the stop is sent again");
+        assert!(removed < restored && restored < sent, "{calls:?}");
+    }
+
+    /// A stop during the install itself lets it finish and verify, then ends the run: the item
+    /// is Ok, and the next item of the apply never starts.
+    #[test]
+    fn a_stop_during_the_install_finishes_it_then_ends_the_run() {
+        let mut sys = Fake::root();
+        sys.stop_after = Some(1);
+        sys.on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+            .on(
+                "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+                installed_quietly(),
+            )
+            .on(PKGUTIL, Ran::ok(RECEIPT));
+        CommandLineTools::install(&sys).unwrap();
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")),
+            "{calls:?}"
+        );
+        assert_stop_sent_after_the_placeholder_goes(&calls);
     }
 
     #[test]

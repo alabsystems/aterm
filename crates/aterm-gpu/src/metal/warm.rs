@@ -506,24 +506,24 @@ impl PresentKnobs {
     #[inline]
     const fn bind(self, row: Pipeline) -> bool {
         match row {
-            Pipeline::Bloom => self.bloom,
+            Pipeline::Bloom | Pipeline::GlowItems => self.bloom,
             Pipeline::Shimmer => self.shimmer,
-            Pipeline::HdrGlow => self.hdr_glow,
-            Pipeline::SdrGlow => self.sdr_glow,
+            Pipeline::HdrGlow | Pipeline::HdrGlowItems => self.hdr_glow,
+            Pipeline::SdrGlow | Pipeline::SdrGlowItems => self.sdr_glow,
             _ => true,
         }
     }
 }
 
 /// The destinations a present binds `row` against under `knobs`: the tray card the Rgba8Unorm
-/// present copy; the blit and the SDR crown the swapchain, at f16 too where one may exist
+/// present copy; the blit and the SDR crowns the swapchain, at f16 too where one may exist
 /// ([`PresentKnobs::hdr_glow`]). Any other row draws into an offscreen whose format does not
 /// depend on the destination: one build.
 #[inline]
 const fn destinations(row: Pipeline, knobs: PresentKnobs) -> &'static [PixelFormat] {
     match row {
         Pipeline::Tray => &[PixelFormat::Rgba8Unorm],
-        Pipeline::Blit | Pipeline::SdrGlow if knobs.hdr_glow => {
+        Pipeline::Blit | Pipeline::SdrGlow | Pipeline::SdrGlowItems if knobs.hdr_glow => {
             &[PixelFormat::Bgra8Unorm, PixelFormat::Rgba16Float]
         }
         _ => &[PixelFormat::Bgra8Unorm],
@@ -1042,38 +1042,44 @@ mod tests {
             "the first frames' rows come last: {all:?}"
         );
         let f16 = |i: &WarmItem| matches!(i, WarmItem::Pipeline(_, PixelFormat::Rgba16Float));
-        for (off, row) in [
-            (PresentKnobs { bloom: false, ..on }, Pipeline::Bloom),
+        for (off, rows) in [
+            (
+                PresentKnobs { bloom: false, ..on },
+                &[Pipeline::Bloom, Pipeline::GlowItems][..],
+            ),
             (
                 PresentKnobs {
                     shimmer: false,
                     ..on
                 },
-                Pipeline::Shimmer,
+                &[Pipeline::Shimmer],
             ),
             (
                 PresentKnobs {
                     hdr_glow: false,
                     ..on
                 },
-                Pipeline::HdrGlow,
+                &[Pipeline::HdrGlow, Pipeline::HdrGlowItems],
             ),
             (
                 PresentKnobs {
                     sdr_glow: false,
                     ..on
                 },
-                Pipeline::SdrGlow,
+                &[Pipeline::SdrGlow, Pipeline::SdrGlowItems],
             ),
         ] {
             let left = bindable(off, true);
             let dropped: Vec<&WarmItem> = all.iter().filter(|i| !left.contains(i)).collect();
             assert!(
-                !dropped.is_empty()
-                    && dropped.iter().all(|i| {
-                        matches!(i, WarmItem::Pipeline(r, _) if *r == row)
-                            || (!off.hdr_glow && f16(i))
-                    }),
+                rows.iter().all(|row| {
+                    dropped
+                        .iter()
+                        .any(|i| matches!(i, WarmItem::Pipeline(r, _) if r == row))
+                }) && dropped.iter().all(|i| {
+                    matches!(i, WarmItem::Pipeline(r, _) if rows.contains(r))
+                        || (!off.hdr_glow && f16(i))
+                }),
                 "{off:?} dropped {dropped:?}"
             );
             assert!(

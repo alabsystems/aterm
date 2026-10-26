@@ -14066,6 +14066,23 @@ impl TurnEndState {
         !cfg.usage_credits && self.credits_held(read, program, now).is_some()
     }
 
+    /// WHEN THE CREDITS HOLD THAT STANDS at `now` under `cfg` LIFTS ([`Self::credits_hold_stands`]):
+    /// `Some(None)` where it knows no such time (a model's bucket with no reset read), `None`
+    /// where no hold stands.
+    #[must_use]
+    pub fn credits_hold_lifts(
+        &self,
+        read: Option<&CreditsCarry>,
+        program: Program,
+        cfg: &SupervisorConfig,
+        now: Instant,
+    ) -> Option<Option<Instant>> {
+        if cfg.usage_credits {
+            return None;
+        }
+        self.credits_held(read, program, now).map(|held| held.lifts)
+    }
+
     fn credits_held(
         &self,
         read: Option<&CreditsCarry>,

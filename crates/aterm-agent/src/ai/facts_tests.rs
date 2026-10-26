@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::ai::connector::{CLAUDE, CODEX};
+use crate::ai::connector::{CLAUDE, CODEX, GROK};
 use crate::ai::testing::machine;
 
 fn gather_with(
@@ -91,6 +91,42 @@ fn exclude_and_credential_variables_are_read() {
     let f = gather_with(&b, &[("OPENAI_API_KEY", "sk-x")], &["codex"], &CODEX);
     assert_eq!(f.kept, Some(Kept::Excluded));
     assert_eq!(f.env_credentials, vec!["OPENAI_API_KEY"]);
+}
+
+/// AN OPT-IN PROGRAM NOBODY ASKED FOR IS KEPT OFF: Grok Build, outside atpkg's default set, is
+/// off while neither installed nor found on `PATH`, where a default-set program's absence is an
+/// install owed; installed, or a copy aterm does not manage found, it is read as any other.
+#[test]
+fn an_opt_in_program_is_kept_off_until_installed_or_found() {
+    if !atpkg::vendor_direct::served_here(GROK.id) {
+        let b = machine(&[]);
+        assert_eq!(
+            gather_with(&b, &[], &[], &GROK).kept,
+            Some(Kept::Unavailable)
+        );
+        return;
+    }
+    let b = machine(&[]);
+    assert_eq!(gather_with(&b, &[], &[], &GROK).kept, Some(Kept::OptIn));
+    assert_eq!(
+        gather_with(&b, &[], &[], &CODEX).kept,
+        None,
+        "a default-set program owes its install"
+    );
+    let bin = b.home.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    std::fs::write(bin.join("grok"), "#!/bin/sh\n").expect("a copy");
+    let path = bin.display().to_string();
+    let found = gather_with(&b, &[("PATH", path.as_str())], &[], &GROK);
+    assert_eq!(
+        (found.kept, found.foreign),
+        (None, Some(bin.join("grok"))),
+        "a copy aterm does not manage"
+    );
+    let b = machine(&["grok"]);
+    let installed = gather_with(&b, &[], &[], &GROK);
+    assert_eq!(installed.kept, None);
+    assert!(installed.managed.is_some());
 }
 
 #[test]

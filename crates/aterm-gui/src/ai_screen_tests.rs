@@ -55,6 +55,16 @@ fn reading() -> AiReading {
                     "not used on this machine ([ai.muse] use = false)",
                 )
             },
+            AiCli {
+                version: None,
+                ..cli(
+                    "grok",
+                    State::Off,
+                    Mark::Note,
+                    "not installed: an opt-in program, installed only where asked (`aterm pkg \
+                     install grok`)",
+                )
+            },
         ],
         store_note: None,
         held: None,

@@ -608,7 +608,11 @@ fn the_sparkle_comet_burns_gold_with_nothing_under_its_letters() {
             &TextView::new(blank, Some(&frame)),
             &mut scratch,
             &mut ledger,
-            &mut under,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
         );
         let mut glass = Glass::new(g, BG);
         glass.add_quads(&under);
@@ -919,7 +923,11 @@ fn the_comet_bed_is_a_wedge_and_every_run_rises_from_its_tail() {
             &text,
             &mut scratch,
             &mut ledger,
-            &mut under,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
         );
         bed_alpha_at(&under, g.cell_center(ROW, col).0 as u16)
     };
@@ -979,7 +987,11 @@ fn lumen_under(
         &text,
         &mut scratch,
         &mut ledger,
-        &mut under,
+        &mut crate::cursor_glow::glow_sink(
+            &mut under,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
     );
     under
 }
@@ -1016,9 +1028,17 @@ fn the_bridge_onto_the_caret_stays_in_its_cell() {
                 &c,
                 g,
                 Some((ROW, START + 8)),
-                &mut light,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut light,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
                 &mut halos,
-                &mut under,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut under,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
             );
             light
         };
@@ -1220,7 +1240,11 @@ fn a_leap_bed_is_one_tube_across_a_short_gap() {
             &TextView::new(TextSpans::default(), Some(&frame)),
             &mut scratch,
             &mut ledger,
-            &mut under,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
         );
         let mut glass = Glass::new(g, BG);
         glass.add_quads(&under);
@@ -1724,6 +1748,92 @@ fn a_run_the_hand_has_left_melts_out_over_its_last_letter() {
             square >= 0.6,
             "control, dark {dark}: cut square, the bar drops by only {square:.2}"
         );
+    }
+}
+
+/// A stream's lights laid since a mark, clipped to a box
+/// ([`clip_stream_to`]), are its legacy quads clipped ([`clip_quads_to`]):
+/// every ramp row re-ramped at a horizontal cut as its quad is, rows and
+/// quads outside dropped, each quad among the ramps clipped in its place,
+/// and the lights before the mark untouched. A lit row the cut leaves no
+/// light keeps its count as the legacy quad does, as a dark quad, and a
+/// ramp's run is clipped as the one quad it stands for.
+#[test]
+fn a_clipped_stream_is_its_quads_clipped() {
+    use aterm_render::{GlowRamps, RampSink, glow_end};
+    let quad = |x: u16, y: u16, w: u16, (c, a): (u32, u8), (c2, a2): (u32, u8)| GlowQuad {
+        row: 0,
+        x,
+        y,
+        w,
+        h: 1,
+        color: c,
+        alpha: a,
+        color2: c2,
+        alpha2: a2,
+    };
+    let rect = (22, 3, 30, 9);
+    let mut quads = vec![quad(0, 0, 40, (0x0010_2030, 0x40), (0x0030_2010, 0x40))];
+    let mut ramps = GlowRamps::default();
+    let from = (quads.len(), ramps.mark());
+    // An over ramp the box cuts on both sides and at its top, a quad laid
+    // after it, then an additive ramp whose faint row the cut darkens.
+    let over = |k: u32| {
+        (
+            glow_end(0x0040_6080 + k * 0x0001_0101, 0xA0),
+            glow_end(0x0002_0408, 0x10 + k as u8),
+        )
+    };
+    ramps.open(quads.len(), 0, (4, 1, 40), over(0));
+    for k in 1..7 {
+        ramps.extend_last(0, over(k));
+    }
+    quads.push(quad(2, 5, 32, (0x0080_4020, 0), (0x0000_0000, 0)));
+    ramps.open(quads.len(), 0, (0, 4, 40), (glow_end(0x0001_0000, 0), 0));
+    ramps.extend_last(1, (glow_end(0x0060_6060, 0), glow_end(0x0020_2020, 0)));
+    quads.push(quad(31, 4, 5, (0x0050_5050, 0), (0x0050_5050, 0)));
+    // A column's ramp: an edge row above the box, a run the box's top cuts
+    // into and its left side re-ramps, an edge row.
+    let edge = (glow_end(0x0010_1010, 0), glow_end(0x0010_1010, 0));
+    ramps.open_run(quads.len(), 0, (20, 1, 8), 1, edge);
+    assert!(ramps.extend_run(0, 4, (glow_end(0x0060_2000, 0), glow_end(0x0000_4060, 0))));
+    assert!(ramps.extend_run(0, 1, edge));
+    let mut want = Vec::new();
+    ramps.expand_into(&quads, &mut want);
+    clip_quads_to(&mut want, from.0, rect);
+    assert!(
+        want.iter().any(|q| (q.x, q.y, q.w, q.h) == (22, 3, 6, 3)),
+        "premise: the box cuts the run's quad"
+    );
+    let mut sink = RampSink::new(&mut quads, &mut ramps);
+    clip_stream_to(&mut sink, from, rect);
+    drop(sink);
+    let mut got = Vec::new();
+    ramps.expand_into(&quads, &mut got);
+    let dark = |q: &GlowQuad| q.color | q.color2 == 0 && q.alpha | q.alpha2 == 0;
+    assert_eq!(got.len(), want.len(), "the clip keeps the legacy count");
+    assert!(want.iter().any(dark), "premise: the cut darkens a lit row");
+    let lit = |v: &[GlowQuad]| v.iter().filter(|q| !dark(q)).copied().collect::<Vec<_>>();
+    assert_eq!(
+        lit(&got),
+        lit(&want),
+        "each light is its quad clipped, in order"
+    );
+    assert_eq!(
+        got[0],
+        quad(0, 0, 40, (0x0010_2030, 0x40), (0x0030_2010, 0x40))
+    );
+    let runs: Vec<_> = ramps.items.iter().filter(|r| r.joined > 0).collect();
+    assert_eq!(runs.len(), 1, "the run stays one light");
+    for r in runs {
+        let head = r.row_ends(&ramps.ends, r.join);
+        for k in r.join + 1..=r.join + r.joined {
+            assert_eq!(
+                r.row_ends(&ramps.ends, k),
+                head,
+                "every run row reads its cut ends"
+            );
+        }
     }
 }
 

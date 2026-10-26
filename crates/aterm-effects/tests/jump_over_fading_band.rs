@@ -107,7 +107,7 @@ impl Host {
     fn new(composer: Composer, words: WordKeys) -> Self {
         let mut term = Terminal::new(composer.rows() as u16, COLS as u16);
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         term.process(b"\x1b[?1049h\x1b[2J");
         term.process(format!("\x1b[{};{}H", composer.row() + 1, composer.col0() + 1).as_bytes());

@@ -136,9 +136,17 @@ struct World {
     parked_at: Option<i64>,
     /// When the last line went (the cooldown's clock).
     last_line: Option<i64>,
-    /// The free figure when the last line went: a look that reads [`ask::FREED_MIN`] more is the
-    /// model's `Frees`, whatever the lease then says.
+    /// The free figure when the last line went: a look whose best figure since ([`World::best`])
+    /// is [`ask::FREED_MIN`] more than it and what aterm's own passes freed since
+    /// ([`World::aterm_since`]) is the model's `Frees`, whatever the lease then says.
     free_at: u64,
+    /// The most free space a look read since the last line went, as the lease keeps it.
+    best: u64,
+    /// Every pass of aterm's own the world ran ([`World::pass`]): when it ended, and what it freed.
+    passes: Vec<ask::Reclaimed>,
+    /// Each host's passes its look has yet to step the lease with: a host holds the pass lock from
+    /// its pass until its step ([`World::end`]), so another host's look meanwhile reads it passing.
+    pending: [Vec<ask::Reclaimed>; 2],
     hosts: [HostId; 2],
     /// The hosts whose processes ended ([`World::succeed`]), each with when.
     dead: Vec<(HostId, i64)>,
@@ -276,6 +284,9 @@ impl World {
             parked_at: None,
             last_line: None,
             free_at: 0,
+            best: 0,
+            passes: Vec::new(),
+            pending: [Vec::new(), Vec::new()],
             hosts: [
                 HostId {
                     pid: 101,
@@ -546,12 +557,23 @@ impl World {
             .filter(|&o| o != h)
             .flat_map(|o| self.left[o].clone())
             .collect();
-        if self.s["phase"] == 3 && self.s["rose"] == 0 && self.free >= self.free_at + ask::FREED_MIN
+        // What aterm's own passes freed is no rise to the model: only the rest is `Frees`.
+        let aterm = self.aterm_since();
+        self.best = self.best.max(self.free);
+        if self.s["phase"] == 3
+            && self.s["rose"] == 0
+            && self.best >= self.free_at + aterm + ask::FREED_MIN
         {
             self.fire("Frees")?;
         }
         let short = self.free < FLOORS[h];
         let lost = self.unrecorded[h].take();
+        let reclaimed = std::mem::take(&mut self.pending[h]);
+        let passing = !self.pending[1 - h].is_empty();
+        if passing {
+            self.trail
+                .push(format!("host {h} looks while host {}'s pass runs", 1 - h));
+        }
         if !short && ask::rests(&self.lease(), KEY, lost.as_ref().map(|t| t.at)) {
             self.trail.push(format!("host {h} look: rests"));
             self.unrecorded[h] = lost;
@@ -589,6 +611,8 @@ impl World {
             barred: &barred,
             live: &live,
             held: &held_now,
+            reclaimed: &reclaimed,
+            passing,
             alive: &alive,
         };
         let (recorded, said, after) = ask::transact(&self.dir.0, &ask::LOCK_LADDER, |l| {
@@ -867,6 +891,7 @@ impl World {
                 });
                 self.last_line = Some(self.now);
                 self.free_at = self.free;
+                self.best = self.free;
                 self.fire("TypeALost")
             }
             other => Err(self.fail(format!("a lost record at @{sid}'s turn break: {other:?}"))),
@@ -905,6 +930,7 @@ impl World {
                 if typed.is_some() {
                     self.last_line = Some(now);
                     self.free_at = free;
+                    self.best = free;
                     self.fire(&format!("Type{}", letter(&sid)))?;
                 }
                 Ok(())
@@ -1015,6 +1041,45 @@ impl World {
         self.trail.push(format!("free +{gib} GiB"));
         self.follow()
     }
+
+    /// Host `h`'s own pass frees `gib` GiB now, under the pass lock it holds until its look steps
+    /// the lease ([`World::end`]), which records it: another host's look meanwhile reads it
+    /// passing. A pass waits while the other host's holds the lock.
+    fn pass(&mut self, h: usize, gib: u64) -> Result<(), String> {
+        if !self.pending[1 - h].is_empty() {
+            self.trail
+                .push(format!("host {h} pass: the other host's holds the lock"));
+            return Ok(());
+        }
+        let freed = ask::Reclaimed {
+            ended_ms: self.now,
+            bytes: gib * GIB,
+        };
+        self.passes.push(freed);
+        self.pending[h].push(freed);
+        self.free += gib * GIB;
+        self.trail.push(format!("host {h} pass frees {gib} GiB"));
+        self.follow()
+    }
+
+    /// Host `h`'s look with a pass that frees `gib` GiB: its take-over, the pass, its step.
+    fn look_passing(&mut self, h: usize, gib: u64) -> Result<(), String> {
+        self.begin(h)?;
+        self.pass(h, gib)?;
+        self.end(h)
+    }
+
+    /// What aterm's own passes freed since the last line: every pass that ended at or after it,
+    /// as the lease takes them out of the rise (`ask::Entry::reclaimed`).
+    fn aterm_since(&self) -> u64 {
+        self.last_line.map_or(0, |line| {
+            self.passes
+                .iter()
+                .filter(|p| p.ended_ms >= line)
+                .map(|p| p.bytes)
+                .sum()
+        })
+    }
 }
 
 /// The scripted episode, at a free figure only the first host reads short: the first host
@@ -1109,6 +1174,71 @@ fn two_hosts_stepping_the_real_lease_take_only_the_models_steps() {
         "Frees",
         "Freed",
     ] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
+/// A's line goes, and aterm's own passes on both hosts keep freeing space after it: the second
+/// host's pass frees 3 GiB, then the first's 2 GiB, and neither is A's, so the lease settles
+/// nothing; then the second host's next pass frees 2 GiB while the first host looks, and that look
+/// settles nothing while the pass holds the lock; once the second host's look records it, A frees
+/// 1 GiB itself, and that settles the episode.
+fn aterm_passes(w: &mut World) -> Result<(), String> {
+    w.to(0)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.turn_break(0)?;
+    w.wait(60_000)?;
+    w.look_passing(1, 3)?;
+    w.wait(60_000)?;
+    w.look_passing(0, 2)?;
+    w.wait(60_000)?;
+    w.begin(1)?;
+    w.pass(1, 2)?;
+    w.look(0)?;
+    w.end(1)?;
+    w.wait(60_000)?;
+    w.look(0)?;
+    w.frees(1)?;
+    w.look(0)?;
+    Ok(())
+}
+
+#[test]
+fn space_aterms_own_passes_free_on_either_host_never_settles_the_asked_sessions_episode() {
+    let mut w = World::new("aterm-passes");
+    aterm_passes(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .skip_while(|t| !t.contains("turn break @s-a: typed=Some"))
+        .filter_map(|t| {
+            t.strip_prefix("host ")
+                .and_then(|t| t.split_once(" look: "))
+        })
+        .map(|(_, t)| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Asked", "Asked", "Asked", "Asked", "Asked", "Freed"],
+        "aterm's passes settle nothing, the session's own GiB does: {:#?}",
+        w.trail
+    );
+    assert_eq!(w.s["phase"], 4, "settled: {:#?}", w.trail);
+    assert_eq!(
+        w.trail.iter().filter(|t| *t == "model Frees").count(),
+        1,
+        "only the session's own GiB is a rise: {:#?}",
+        w.trail
+    );
+    for action in ["OpenH", "ElectA", "TypeA", "Frees", "Freed"] {
         assert!(
             w.trail.iter().any(|t| t == &format!("model {action}")),
             "the script reaches {action}: {:#?}",
@@ -2159,8 +2289,9 @@ fn a_round_with_only_held_sessions_waits_for_one_to_be_past() {
     }
 }
 
-/// A fixed-seed walk over every host's looks, turn breaks and releases and the world's moves.
-fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
+/// A fixed-seed walk over every host's looks, turn breaks and releases and the world's moves, and,
+/// with `passes`, aterm's own passes on either host, some still running at the other's look.
+fn walk(w: &mut World, seed: u64, steps: usize, passes: bool) -> Result<(), String> {
     let mut x = seed;
     let mut next = move || {
         x ^= x << 13;
@@ -2171,7 +2302,7 @@ fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
     for _ in 0..steps {
         let h = usize::from(next() % 2 == 0);
         let at = usize::try_from(place(w.free)).unwrap_or(0);
-        match next() % 26 {
+        match next() % if passes { 30 } else { 26 } {
             0 => w.to(usize::try_from(next() % 5).unwrap_or(0))?,
             1 => w.to(at.saturating_sub(1))?,
             2 => w.to((at + 1).min(4))?,
@@ -2190,6 +2321,13 @@ fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
             12..=17 => w.look(h)?,
             18..=21 => w.turn_break(h)?,
             22 | 23 => w.release(h)?,
+            26 | 27 => w.look_passing(h, 1 + next() % 3)?,
+            28 if w.pending[h].is_empty() => {
+                w.begin(h)?;
+                w.pass(h, 1 + next() % 2)?;
+            }
+            28 | 29 if !w.pending[h].is_empty() => w.end(h)?,
+            28 | 29 => w.look(h)?,
             _ => {
                 let sid = ["s-a", "s-b", "s-c"][usize::try_from(next() % 3).unwrap_or(0)];
                 let on = !w.held.contains(&sid);
@@ -2205,7 +2343,7 @@ fn fixed_seed_walks_of_the_real_lease_take_only_the_models_steps() {
     let mut reached = std::collections::BTreeSet::new();
     for seed in 1..=24u64 {
         let mut w = World::new("walk");
-        walk(&mut w, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 400)
+        walk(&mut w, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 400, false)
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         reached.extend(
             w.trail
@@ -2233,6 +2371,52 @@ fn fixed_seed_walks_of_the_real_lease_take_only_the_models_steps() {
         "Wall",
         "Past",
         "ReturnC",
+    ] {
+        assert!(
+            reached.contains(action),
+            "no walk reached {action}: {reached:?}"
+        );
+    }
+}
+
+#[test]
+fn fixed_seed_walks_with_aterms_own_passes_take_only_the_models_steps() {
+    let mut reached = std::collections::BTreeSet::new();
+    for seed in 1..=24u64 {
+        let mut w = World::new("walk-passes");
+        walk(&mut w, seed.wrapping_mul(0x2545_f491_4f6c_dd1d), 400, true)
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let mut asked = false;
+        for t in &w.trail {
+            if t == "model TypeA" || t == "model TypeB" || t == "model TypeC" {
+                asked = true;
+            } else if t.starts_with("model ") && !t.starts_with("model Type") {
+                asked &= !matches!(
+                    t.as_str(),
+                    "model Freed" | "model HandOffAsked" | "model OutAsked" | "model End"
+                );
+            } else if asked && t.contains(" pass frees ") {
+                reached.insert("a pass while asked".to_owned());
+            } else if asked && t.contains("'s pass runs") {
+                reached.insert("a look while asked and another pass runs".to_owned());
+            }
+        }
+        reached.extend(
+            w.trail
+                .iter()
+                .filter_map(|t| t.strip_prefix("model "))
+                .map(str::to_owned),
+        );
+    }
+    for action in [
+        "OpenH",
+        "TypeA",
+        "Frees",
+        "Freed",
+        "HandOffAsked",
+        "End",
+        "a pass while asked",
+        "a look while asked and another pass runs",
     ] {
         assert!(
             reached.contains(action),
@@ -2524,4 +2708,28 @@ fn a_look_that_drops_an_ended_hosts_nominee_before_its_successor_looks_is_reject
         caught.contains("dropped the nominee of an ended host"),
         "{caught}"
     );
+}
+
+/// NEGATIVE CONTROL of `FreedOnlyByAgent`: a step that counts none of the passes the hosts
+/// recorded (`Fault::CreditAterm`, the lease before them) settles the episode on the second
+/// host's pass, and the checker rejects that settle.
+#[test]
+fn a_lease_that_credits_aterms_own_passes_to_the_asked_session_is_rejected() {
+    let mut w = World::new("credit-aterm");
+    let caught = ask::fault::with(ask::fault::Fault::CreditAterm, || aterm_passes(&mut w))
+        .expect_err("the checker must reject a settle on space aterm freed");
+    assert!(caught.contains("`Freed` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL of `FreedOnlyByAgent`, for a pass still running: a look that settles while
+/// another host holds the pass lock (`Fault::SettleWhilePassing`) settles the episode on the
+/// space the second host's running pass freed, and the checker rejects that settle.
+#[test]
+fn a_lease_that_settles_while_another_hosts_pass_runs_is_rejected() {
+    let mut w = World::new("settle-passing");
+    let caught = ask::fault::with(ask::fault::Fault::SettleWhilePassing, || {
+        aterm_passes(&mut w)
+    })
+    .expect_err("the checker must reject a settle on a running pass's space");
+    assert!(caught.contains("`Freed` is not enabled"), "{caught}");
 }

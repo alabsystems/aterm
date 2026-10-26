@@ -860,6 +860,13 @@ impl Gen {
             reset_unix: self.pick(&[None, Some(NOW - 60), Some(NOW + 60)]),
             now_unix: NOW,
             told: crate::needs::ToldNeeds::default(),
+            grok_signin: self.pick(&[
+                None,
+                None,
+                Some(GrokSignin::Running),
+                Some(GrokSignin::SignedIn),
+                Some(GrokSignin::Idle),
+            ]),
         }
     }
 }
@@ -2028,4 +2035,82 @@ fn a_program_claim_never_stands_over_a_word_its_reader_names() {
         ..facts()
     });
     assert_eq!(quiet.need, None, "unknown and no claim");
+}
+
+/// Grok's sign-in walls fold into the machine's one sign-in: while it runs, every walled Grok
+/// session waits on it (its need stands on the session that leads it, attention
+/// `signin:grok`); signed out with none running, every walled Grok session carries the same
+/// machine need, which a surface lists once ([`machine_wide`]); signed in, each session is told
+/// to restart its grok. Claude's sign-in wall keeps its own per-session need.
+#[test]
+fn two_grok_auth_walls_give_one_need() {
+    let walled = |rev: u64, signin: Option<GrokSignin>| NeedFacts {
+        agent: Some(AgentFact {
+            word: "wall:auth",
+            detail: None,
+            rev,
+            subject: None,
+        }),
+        grok_signin: signin,
+        ..facts()
+    };
+    // Signed out, nothing running: two sessions, one machine need.
+    let a = of(&walled(7, Some(GrokSignin::Idle))).need.expect("a need");
+    let b = of(&walled(9, Some(GrokSignin::Idle))).need.expect("a need");
+    assert_eq!(
+        (a.word, a.what.as_str()),
+        (NeedWord::Login, GROK_SIGNIN_WHAT)
+    );
+    assert_eq!(b.what, a.what);
+    assert!(machine_wide(&a) && machine_wide(&b));
+    assert!(GROK_SIGNIN_WHAT.len() <= ROW_WHAT_MAX);
+    // The walled grok's own sign-in runs (its code on its screen, its page open): the need
+    // points at it, never at a second device flow with another code.
+    assert!(
+        !a.what.contains("aterm harness signin") && a.what.contains("on its screen"),
+        "{}",
+        a.what
+    );
+    // A sign-in runs: no need on either walled session, a wait in Grok's words.
+    for rev in [7, 9] {
+        let verdict = of(&walled(rev, Some(GrokSignin::Running)));
+        assert_eq!(verdict.need, None);
+        let wait = verdict.waiting.expect("waits on the machine's sign-in");
+        assert_eq!(wait.word, WaitWord::Login);
+        assert_eq!(wait_words(&wait, true), GROK_SIGNIN_WAIT);
+    }
+    // ... while the leader's own session carries the one need, the code first.
+    let leader = NeedFacts {
+        attention: vec![entry(
+            aterm_agent::harness::grok_signin::NEED_OWNER,
+            &aterm_agent::harness::grok_signin::need_text(
+                "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
+                Some("WMRT-8KQZ"),
+            ),
+            Some(AttentionKind::Ask),
+        )],
+        ..facts()
+    };
+    let need = of(&leader).need.expect("the leader's need");
+    assert_eq!(need.word, NeedWord::Ask);
+    assert!(need.what.contains("WMRT-8KQZ"), "{}", need.what);
+    // Signed in: a per-session restart, never the machine need.
+    let signed = of(&walled(7, Some(GrokSignin::SignedIn)))
+        .need
+        .expect("a need");
+    assert_eq!(signed.what, GROK_SIGNED_IN_WHAT);
+    assert!(!machine_wide(&signed));
+    // CONTROL: Claude's sign-in wall (no Grok fact) keeps its own per-session need.
+    let claude = of(&walled(7, None)).need.expect("a need");
+    assert_eq!(claude.what, "logged out: log in there");
+    assert!(!machine_wide(&claude));
+    let carried = of(&NeedFacts {
+        wall_answer: WallAnswer::Harness,
+        supervised: true,
+        ..walled(7, None)
+    });
+    assert_eq!(
+        carried.waiting.map(|w| wait_words(&w, false)),
+        Some("signing Claude back in".to_string())
+    );
 }

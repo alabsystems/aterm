@@ -144,11 +144,15 @@ fn a_reading_speaks_for_three_of_the_slower_cadence() {
 }
 
 #[test]
-fn the_glide_steps_a_quarter_pixel_within_its_bounds() {
-    // 10 px a 10 s column: a quarter pixel every 250 ms.
-    assert_eq!(glide_step(1.0), Duration::from_millis(250));
-    // Fast strips are held to eight frames a second, slow ones to one each 2 s.
+fn the_glide_steps_a_whole_pixel_within_its_bounds() {
+    // A Folded strip at 2x, 2 px a second: a whole pixel every 500 ms, every other frame of
+    // the grid; at 1x, 1 px a second: a pixel a second.
+    assert_eq!(glide_step(2.0), Duration::from_millis(500));
+    assert_eq!(glide_step(1.0), Duration::from_secs(1));
+    assert_eq!(glide_step(4.0), FRAME);
+    // Fast strips are held to the grid's four frames a second, slow ones to one each 2 s.
     assert_eq!(glide_step(100.0), GLIDE_STEP_MIN);
+    assert_eq!(GLIDE_STEP_MIN, FRAME);
     assert_eq!(glide_step(0.01), GLIDE_STEP_MAX);
     // No strip on the card: the least wait, never a zero or a panic.
     for px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
@@ -163,61 +167,182 @@ fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
         motion,
         beat,
         step: Duration::from_millis(250),
+        glide_end_ms: None,
     }
+}
+
+/// `t` on the wall clock when `t0` is `ms0`.
+fn wall(t0: Instant, ms0: i64, t: Instant) -> i64 {
+    ms0 + i64::try_from(t.saturating_duration_since(t0).as_millis()).unwrap_or(i64::MAX)
 }
 
 #[test]
 fn a_fresh_reading_beats_once_and_the_strips_glide() {
     let t0 = Instant::now();
+    let ms0 = OPEN + 1_234;
     let f = facts(t0, true, true);
-    let at = f.live(t0, OPEN + 1_234);
+    let at = f.live(t0, ms0);
     assert_eq!(
         at.glide_ms,
         Some(OPEN + 1_000),
         "quantized to the glide's step"
     );
-    assert_eq!(at.beat, Some(0.0));
+    assert_eq!(at.beat, beat_phase(0));
     assert!(at.fresh);
-    // The beat moves in whole frames and ends.
-    let mid = f.live(t0 + Duration::from_millis(130), OPEN);
-    assert_eq!(mid.beat, Some(120.0 / 840.0));
-    let after = f.live(t0 + BEAT, OPEN);
+    // Inside a frame of the grid nothing moves: the edge stands as at the frame's moment.
+    let ms = Duration::from_millis;
+    assert_eq!(f.live(t0 + ms(130), ms0 + 130), at);
+    // Each frame of the grid beats wider and fainter, and the glide moves with it.
+    let one = f.live(t0 + FRAME, ms0 + 250);
+    assert_eq!(one.beat, beat_phase(1));
+    assert_eq!(one.glide_ms, Some(OPEN + 1_250));
+    assert!(beat_phase(1) > beat_phase(0) && beat_phase(2) > beat_phase(1));
+    // The beat rings for its frames and ends; the strips glide on.
+    assert_eq!(FRAME * BEAT_FRAMES, ms(750));
+    let after = f.live(t0 + FRAME * BEAT_FRAMES, ms0 + 750);
     assert_eq!(after.beat, None);
-    assert!(after.fresh && after.glide_ms.is_some());
-    // The next frame is the beat's next, then the glide's step.
-    assert_eq!(
-        f.next_change(t0, OPEN + 1_100),
-        Some(t0 + BEAT_FRAME),
-        "the beat frames first"
-    );
-    assert_eq!(
-        f.next_change(t0 + BEAT, OPEN + 1_100),
-        Some(t0 + BEAT + Duration::from_millis(150)),
-        "then the glide's step"
-    );
-    // Without the beat (serious mode, a card over the deck) the glide alone.
+    assert!(after.fresh && after.glide_ms == Some(OPEN + 1_750));
+    // The next frame is the grid's next.
+    assert_eq!(f.next_change(t0, ms0), Some(t0 + FRAME));
+    assert_eq!(f.next_change(t0 + ms(10), ms0 + 10), Some(t0 + FRAME));
+    // Without the beat (serious mode, a card over the deck) the glide alone, on the grid.
     let quiet = facts(t0, true, false);
-    assert_eq!(quiet.live(t0, OPEN).beat, None);
-    assert_eq!(
-        quiet.next_change(t0, OPEN + 1_100),
-        Some(t0 + Duration::from_millis(150))
-    );
-    // Every frame the schedule names changes what the deck draws.
+    assert_eq!(quiet.live(t0, ms0).beat, None);
+    assert_eq!(quiet.next_change(t0, ms0 - 134), Some(t0 + FRAME));
+    // Every frame the schedule names lies on the grid (or is the grey) and changes what the
+    // deck draws.
     let mut now = t0;
-    let mut ms = OPEN + 1_100;
-    for _ in 0..40 {
-        let Some(next) = f.next_change(now, ms) else {
-            break;
-        };
-        let dt = next - now;
-        let ms_next = ms + i64::try_from(dt.as_millis()).unwrap_or(0);
+    let mut frames = 0;
+    while let Some(next) = f.next_change(now, wall(t0, ms0, now)) {
+        let on_grid = (next - t0).as_nanos().is_multiple_of(FRAME.as_nanos());
+        assert!(on_grid || next == t0 + f.stale_after, "{:?}", next - t0);
         assert_ne!(
-            f.live(now, ms),
-            f.live(next, ms_next),
-            "a frame at {dt:?} moved nothing"
+            f.live(now, wall(t0, ms0, now)),
+            f.live(next, wall(t0, ms0, next)),
+            "a frame at {:?} moved nothing",
+            next - t0
         );
         now = next;
-        ms = ms_next;
+        frames += 1;
+        assert!(frames < 100, "the schedule never ends");
+    }
+    assert_eq!(f.live(now, wall(t0, ms0, now)), DeckLive::STALE);
+}
+
+/// Once the open column has run out, every column stands in its slot until a reading opens the
+/// next: the glide holds and asks no frame that would draw the same strips.
+#[test]
+fn the_glide_holds_at_the_open_columns_end() {
+    let t0 = Instant::now();
+    let ms0 = OPEN + 9_400;
+    let end = OPEN + 10_000;
+    let f = LiveFacts {
+        glide_end_ms: Some(end),
+        ..facts(t0, true, false)
+    };
+    let ms = Duration::from_millis;
+    assert_eq!(f.live(t0, ms0).glide_ms, Some(OPEN + 9_250));
+    assert_eq!(f.live(t0 + ms(500), ms0 + 500).glide_ms, Some(OPEN + 9_750));
+    assert_eq!(f.live(t0 + ms(750), ms0 + 750).glide_ms, Some(end));
+    assert_eq!(f.live(t0 + ms(1_000), ms0 + 1_000).glide_ms, Some(end));
+    assert!(
+        (open_frac(OPEN, end, 10) - 1.0).abs() < EPS,
+        "CONTROL: run out"
+    );
+    // Three frames to the end, then only the grey.
+    assert_eq!(f.next_change(t0, ms0), Some(t0 + FRAME));
+    assert_eq!(
+        f.next_change(t0 + FRAME * 2, ms0 + 500),
+        Some(t0 + FRAME * 3)
+    );
+    assert_eq!(
+        f.next_change(t0 + FRAME * 3, ms0 + 750),
+        Some(t0 + f.stale_after),
+        "past the column's end nothing glides"
+    );
+    // Unbounded, the same clock would glide on.
+    let on = LiveFacts {
+        glide_end_ms: None,
+        ..f
+    };
+    assert_eq!(
+        on.next_change(t0 + FRAME * 3, ms0 + 750),
+        Some(t0 + FRAME * 4)
+    );
+}
+
+/// Frames the live edge asks of one window over `secs` seconds of readings every `cadence`,
+/// its strips gliding `px_per_s` on `period_s` columns, counting each reading's own frame,
+/// and the frames that would have drawn nothing new.
+fn frames_over(
+    cadence: Duration,
+    px_per_s: f64,
+    period_s: u32,
+    beat: bool,
+    secs: u32,
+) -> (usize, Vec<String>) {
+    let t0 = Instant::now();
+    let ms0 = OPEN + 3_456;
+    let readings =
+        u32::try_from(Duration::from_secs(u64::from(secs)).as_nanos() / cadence.as_nanos())
+            .unwrap_or(0);
+    let (mut frames, mut idle) = (0, Vec::new());
+    for r in 0..readings {
+        let landed = t0 + cadence * r;
+        let at_ms = wall(t0, ms0, landed);
+        let f = LiveFacts {
+            landed: Some(landed),
+            stale_after: stale_after(cadence, None),
+            motion: true,
+            beat,
+            step: glide_step(px_per_s),
+            glide_end_ms: Some(open_start_ms(at_ms, period_s) + i64::from(period_s) * 1000),
+        };
+        frames += 1;
+        let until = landed + cadence;
+        let mut now = landed;
+        while let Some(next) = f.next_change(now, wall(t0, ms0, now)) {
+            if next >= until {
+                break;
+            }
+            if f.live(now, wall(t0, ms0, now)) == f.live(next, wall(t0, ms0, next)) {
+                idle.push(format!("reading {r}: {:?}", next - landed));
+            }
+            frames += 1;
+            now = next;
+        }
+    }
+    (frames, idle)
+}
+
+/// The cost bound (§6): a focused, live deck asks at most four frames a second, whatever its
+/// strips' speed and the readings' cadence, and none that draws nothing new; with the beat it
+/// still moves on most of them, so it looks live.
+#[test]
+fn the_live_edge_asks_at_most_four_frames_a_second() {
+    let ms = Duration::from_millis;
+    for cadence in [ms(1_000), ms(500), ms(2_000)] {
+        for (px_per_s, period_s) in [
+            (0.2, 30),
+            (0.27, 30),
+            (0.5, 20),
+            (1.2, 10),
+            (2.0, 10),
+            (40.0, 10),
+        ] {
+            for beat in [true, false] {
+                let secs = 30;
+                let (frames, idle) = frames_over(cadence, px_per_s, period_s, beat, secs);
+                let per_s = frames as f64 / f64::from(secs);
+                let what =
+                    format!("{cadence:?} readings, {px_per_s} px/s on {period_s} s, beat {beat}");
+                assert!(per_s <= 4.0, "{what}: {per_s} frames a second");
+                assert!(idle.is_empty(), "{what}: {idle:?}");
+                if beat && cadence == ms(1_000) {
+                    assert!(per_s >= 3.0, "CONTROL {what}: the beat draws ({per_s})");
+                }
+            }
+        }
     }
 }
 
@@ -317,51 +442,109 @@ fn header_pt_words(m: &FaceMetrics, text: &str) -> f64 {
     m.width(text, plan::HEADER_PT, false)
 }
 
+/// The seconds a scale's words name, read as a person reads them: `10 min ago`, `–2.5 min`,
+/// `–80 s`; `None` for anything else.
+fn read_age(words: &str) -> Option<f64> {
+    let words = words.strip_suffix(" ago").unwrap_or(words);
+    let words = words.strip_prefix('\u{2013}').unwrap_or(words);
+    let (n, unit) = words.split_once(' ')?;
+    let n: f64 = n.parse().ok()?;
+    match unit {
+        "min" => Some(n * 60.0),
+        "s" => Some(n),
+        _ => None,
+    }
+}
+
+/// How far back the strip reaches as drawn, seconds: its width in pitches, a period each.
+fn drawn_span(strip: Strip) -> f64 {
+    (strip.end() + (strip.pitch - strip.cell) - strip.x) / strip.pitch * f64::from(strip.period_s)
+}
+
+#[test]
+fn the_scales_words_read_as_their_ages() {
+    // NEGATIVE CONTROL for `read_age`: it reads what a person reads, and nothing else.
+    assert_eq!(read_age("10 min ago"), Some(600.0));
+    assert_eq!(read_age("\u{2013}2.5 min"), Some(150.0));
+    assert_eq!(read_age("\u{2013}80 s"), Some(80.0));
+    assert_eq!(read_age("now"), None);
+    assert_eq!(read_age("10 minutes"), None);
+    for age in [30, 40, 60, 80, 120, 150, 300, 600] {
+        assert_eq!(
+            read_age(&plan::tick_words(age)),
+            Some(f64::from(age)),
+            "{age}"
+        );
+    }
+}
+
 /// What is wrong with `head`'s time scale over `strip`.
 fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String> {
     let mut why = Vec::new();
     let Some(time) = head.labels.iter().find(|l| l.label == Label::Time) else {
         return vec!["no time label".into()];
     };
-    if !["10 min ago", "\u{2013}10 min"].contains(&time.text.as_str()) {
-        why.push(format!("the time label says {:?}", time.text));
+    // The label names how far back the strip reaches as drawn.
+    if !plan::time_words(strip).contains(&time.text)
+        || read_age(&time.text).is_none_or(|age| (age - drawn_span(strip)).abs() > EPS)
+    {
+        why.push(format!(
+            "the time label says {:?} over {} s of strip",
+            time.text,
+            drawn_span(strip)
+        ));
     }
-    // A tick fits when its words can cover its point inside what the short label and the
-    // marker leave of the strip: then the scale must not be empty.
-    let short_lo = strip.x + header_pt_words(m, "\u{2013}10 min") + 6.0;
-    let room = strip.end() - MARKER_ROOM;
-    let fits = [300_u32, 60, 120, 30].iter().any(|&age| {
-        let x = strip.end() - f64::from(age) / f64::from(strip.period_s) * strip.pitch;
-        let w = header_pt_words(m, &plan::tick_words(age));
-        short_lo.max(x - w) <= (room - w).min(x)
-    });
-    if head.ruler.is_empty() && fits {
-        why.push("a tick fits and none says how far back the strip reaches".into());
+    let time_w = header_pt_words(m, &time.text);
+    // The label stands over the strip's left end, or beside it: ending STRIP_LEAD short of
+    // the strip, whose left end a tick then marks.
+    let lo = if (time.x - strip.x).abs() < EPS {
+        if head.time_tick.is_some() {
+            why.push("a tick at the strip's end under a label over it".into());
+        }
+        strip.x + time_w + 6.0
+    } else {
+        if (time.x + time_w - (strip.x - plan::STRIP_LEAD)).abs() > EPS {
+            why.push(format!(
+                "the label beside the strip spans {}..{}",
+                time.x,
+                time.x + time_w
+            ));
+        }
+        if head.time_tick != Some(strip.x) {
+            why.push(format!("the strip's end tick is {:?}", head.time_tick));
+        }
+        strip.x
+    };
+    if head.ruler.is_empty()
+        && let Some(could) = scale_could_go(head, strip, m)
+    {
+        why.push(format!(
+            "no tick says how far back the strip reaches: {could}"
+        ));
     }
-    if !head.ruler.is_empty() && time.text != "10 min ago" && !fits {
-        why.push("the short label with no tick that fits".into());
-    }
-    let lo = strip.x + header_pt_words(m, &time.text);
     let hi = strip.end() - MARKER_ROOM;
     for (i, t) in head.ruler.iter().enumerate() {
         let want = strip.end() - f64::from(t.age_s) / f64::from(strip.period_s) * strip.pitch;
         if (t.x - want).abs() > EPS {
             why.push(format!("{} at {}, not {want}", t.text, t.x));
         }
-        if t.text != plan::tick_words(t.age_s) || t.age_s >= 600 {
+        if read_age(&t.text) != Some(f64::from(t.age_s)) || f64::from(t.age_s) >= drawn_span(strip)
+        {
             why.push(format!("{} for {} s", t.text, t.age_s));
         }
         let w = header_pt_words(m, &t.text);
-        if t.left > t.x + EPS || t.left + w < t.x - EPS {
+        // The tick stands under the middle half of its words.
+        let off = (t.left + w / 2.0 - t.x).abs();
+        if off > w / 4.0 + EPS {
             why.push(format!(
-                "{} at {}..{} leaves its tick {}",
+                "{} at {}..{} stands {off} pt off its tick {}",
                 t.text,
                 t.left,
                 t.left + w,
                 t.x
             ));
         }
-        if t.left < lo || t.left + w > hi + EPS {
+        if t.left < lo - EPS || t.left + w > hi + EPS {
             why.push(format!(
                 "{} at {}..{} leaves {lo}..{hi}",
                 t.text,
@@ -370,7 +553,7 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
             ));
         }
         if let Some(next) = head.ruler.get(i + 1)
-            && t.left + w > next.left
+            && t.left + w + 6.0 > next.left + EPS
         {
             why.push(format!("{} meets {}", t.text, next.text));
         }
@@ -378,14 +561,97 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
     why
 }
 
+/// Why a header that carries no scale could have carried one, or `None` when it could not: no
+/// tick's words fit under their middle half beside either label over the strip, and with the
+/// label beside the strip every tick that fits there costs the key an item other than "not
+/// read" by rule K's own search ([`plan::place_key`]), which the scale never does.
+fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<String> {
+    let hi = strip.end() - MARKER_ROOM;
+    let tick = |age: u32| {
+        let x = strip.end() - f64::from(age) / f64::from(strip.period_s) * strip.pitch;
+        (x, header_pt_words(m, &plan::tick_words(age)))
+    };
+    let ages = plan::tick_ages(strip);
+    let labels = plan::time_words(strip);
+    for label in &labels {
+        let lo = strip.x + header_pt_words(m, label) + 6.0;
+        for &age in &ages {
+            let (x, w) = tick(age);
+            if lo.max(x - 0.75 * w) <= (hi - w).min(x - 0.25 * w) {
+                return Some(format!("{} fits beside {label:?}", plan::tick_words(age)));
+            }
+        }
+    }
+    let kept = |spans: Vec<plan::KeySpan>| -> Vec<plan::KeyItem> {
+        plan::place_key(spans, head.keys, m)
+            .placed
+            .iter()
+            .map(|&(item, _)| item)
+            .collect()
+    };
+    let now = kept(head.key.spans.clone());
+    let lead = strip.x - plan::STRIP_LEAD;
+    let is_lead = |s: &plan::KeySpan| !s.strip && (s.x1 - lead).abs() < EPS;
+    let on_strip =
+        |s: &plan::KeySpan| s.strip && s.x0 >= strip.x - EPS && s.x1 <= strip.end() + EPS;
+    let name = head.key.spans.iter().copied().find(is_lead)?;
+    for label in &labels {
+        let x = lead - header_pt_words(m, label);
+        if name.x0 > x {
+            continue;
+        }
+        for &age in &ages {
+            let (tx, w) = tick(age);
+            let (least, most) = (strip.x.max(tx - 0.75 * w), (hi - w).min(tx - 0.25 * w));
+            if least > most {
+                continue;
+            }
+            let left = (tx - w / 2.0).clamp(least, most);
+            let mut spans: Vec<plan::KeySpan> = head
+                .key
+                .spans
+                .iter()
+                .copied()
+                .filter(|s| !is_lead(s) && !on_strip(s))
+                .collect();
+            for (x0, x1, strip) in [
+                (name.x0, x - plan::KEY_GAP, false),
+                (lead + plan::KEY_GAP, left - plan::KEY_GAP, true),
+                (left + w + plan::KEY_GAP, hi, true),
+            ] {
+                if x1 > x0 {
+                    spans.push(plan::KeySpan { x0, x1, strip });
+                }
+            }
+            let trial = kept(spans);
+            if now
+                .iter()
+                .all(|item| *item == plan::KeyItem::NotRead || trial.contains(item))
+            {
+                return Some(format!(
+                    "{label:?} beside the strip with {} keeps the key",
+                    plan::tick_words(age)
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// T-G4's widths, both faces, both forms: wherever the header carries the time label, a scale
-/// says how far back the strip reaches, each tick at its age from now and its words over it.
+/// says how far back the strip reaches, each tick at its age from now under the middle of its
+/// words. Where the strip is too short for the label and a tick, the label stands beside it;
+/// the scale is missing only where every placement would cost the key "over max" or the ramp
+/// ([`scale_could_go`]), which on the Mac's face (Helvetica Neue's metrics) is nowhere.
 #[test]
 fn the_time_scale_marks_how_far_back_at_every_width() {
-    let faces = [FaceMetrics::helvetica_neue(), FaceMetrics::test_stack()];
+    let faces = [
+        ("Helvetica Neue", FaceMetrics::helvetica_neue()),
+        ("the test stack", FaceMetrics::test_stack()),
+    ];
     let mut failed = Vec::new();
-    let (mut drew, mut scaled) = (0, 0);
-    for m in &faces {
+    let (mut drew, mut beside, mut bare_hn) = (0, 0, 0);
+    for (face, m) in &faces {
         for form in [DeckForm::Full, DeckForm::Folded] {
             for w in (160..=5120).step_by(3).map(f64::from) {
                 let Some((head, strip)) = head_of(form, w, m) else {
@@ -395,10 +661,11 @@ fn the_time_scale_marks_how_far_back_at_every_width() {
                     continue;
                 }
                 drew += 1;
-                scaled += usize::from(!head.ruler.is_empty());
+                beside += usize::from(head.time_tick.is_some());
+                bare_hn += usize::from(head.ruler.is_empty() && *face == "Helvetica Neue");
                 for why in ruler_faults(&head, strip, m) {
                     if failed.len() < 30 {
-                        failed.push(format!("{form:?} {w} pt: {why}"));
+                        failed.push(format!("{face}, {form:?} {w} pt: {why}"));
                     }
                 }
             }
@@ -409,22 +676,32 @@ fn the_time_scale_marks_how_far_back_at_every_width() {
         "CONTROL: {drew} headers carried the time label"
     );
     assert!(
-        scaled * 10 > drew * 9,
-        "CONTROL: {scaled} of {drew} headers carry a scale"
+        beside > 0 && beside < drew / 2,
+        "CONTROL: {beside} of {drew} labels stand beside their strip"
     );
+    assert_eq!(bare_hn, 0, "headers without a scale on the Mac's face");
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// The scale at the widths the mockups draw, and at each strip's period: the ticks, left to
-/// right, by age.
+/// The scale at the widths the mockups draw and the owner's default window, and at each
+/// strip's period: the ticks, by age. Where "–1 min" stands near the strip's end (Full 550,
+/// Folded 1119 and 800) its words cannot keep the tick under their middle half and clear the
+/// marker, so "–2 min" stands instead (with words free to slide until their edge sits on the
+/// tick, "–1 min" stood there).
 #[test]
 fn the_time_scale_at_the_mockups_widths() {
     let m = FaceMetrics::helvetica_neue();
-    let ages = |form, w| -> (u32, Vec<u32>) {
+    let ages = |form, w| -> (u32, String, Vec<u32>) {
         let (head, strip) = head_of(form, w, &m).expect("the table is drawn");
         let mut ages: Vec<u32> = head.ruler.iter().map(|t: &RulerTick| t.age_s).collect();
         ages.sort_unstable();
-        (strip.period_s, ages)
+        let label = head
+            .labels
+            .iter()
+            .find(|l| l.label == Label::Time)
+            .map(|l| l.text.clone())
+            .unwrap_or_default();
+        (strip.period_s, label, ages)
     };
     let got = [
         (DeckForm::Full, 2560.0),
@@ -433,19 +710,30 @@ fn the_time_scale_at_the_mockups_widths() {
         (DeckForm::Full, 800.0),
         (DeckForm::Full, 550.0),
         (DeckForm::Folded, 1119.0),
+        (DeckForm::Folded, 800.0),
+        (DeckForm::Folded, 600.0),
     ]
     .map(|(form, w)| ages(form, w));
     assert_eq!(
         got,
         [
-            (10, vec![60, 120, 300]),
-            (10, vec![60, 120, 300]),
-            (10, vec![60, 300]),
-            (10, vec![60, 300]),
-            (30, vec![60]),
-            (20, vec![60, 300]),
+            (10, "10 min ago".into(), vec![60, 120, 300]),
+            (10, "10 min ago".into(), vec![60, 120, 300]),
+            (10, "10 min ago".into(), vec![60, 300]),
+            (10, "10 min ago".into(), vec![60, 300]),
+            (30, "10 min ago".into(), vec![120]),
+            (10, "2.5 min ago".into(), vec![60]),
+            (10, "80 s ago".into(), vec![30]),
+            (10, "1 min ago".into(), vec![30]),
         ]
     );
+    // The owner's default window (Folded at about 600 pt): the label stands beside block A's
+    // strip and the strip's whole header is the scale's, "–30 s" centred over its middle.
+    let (head, strip) = head_of(DeckForm::Folded, 600.0, &m).expect("the table is drawn");
+    assert_eq!(head.time_tick, Some(strip.x));
+    let mid = &head.ruler[0];
+    let w = header_pt_words(&m, &mid.text);
+    assert!((mid.left + w / 2.0 - mid.x).abs() < EPS, "{mid:?}");
 }
 
 /// A headless App whose one focused window draws the v2 deck, holding a reading that landed at
@@ -478,11 +766,11 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     assert!(facts.motion && facts.beat, "{facts:?}");
     assert_eq!(facts.landed, Some(t0));
     let live = facts.live(t0, OPEN);
-    assert!(live.fresh && live.glide_ms.is_some() && live.beat == Some(0.0));
-    // The beat's next frame, or the glide's next step on the wall clock if that comes first.
+    assert!(live.fresh && live.glide_ms.is_some() && live.beat == beat_phase(0));
+    // The grid's next frame, which beats.
     let next = app.stats_live_deadline(t0);
     assert!(
-        next.is_some_and(|at| at > t0 && at <= t0 + BEAT_FRAME),
+        next.is_some_and(|at| at > t0 && at <= t0 + FRAME),
         "{next:?}"
     );
 

@@ -800,9 +800,9 @@ fn a_value_restore_could_not_reach_is_part_of_the_calm_line_and_no_failure() {
 }
 
 /// A setup pass says what its readings cannot in row names (§3.6): a change that did not take
-/// is its row's failure, which the headline names and shows; one it could not confirm is said
-/// calmly; and what its rollback put back is one calm line in a Restore's words, never a
-/// preference key.
+/// is its row's failure, which the headline names and shows, its reason on its row and what
+/// comes next in the note; one it could not confirm is said calmly; and what its rollback put
+/// back is one calm line in a Restore's words, never a preference key.
 #[test]
 fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
     let mut rolled = RestoreOutcome::of([
@@ -825,15 +825,27 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
     assert_eq!(
         status.notes(&plan),
         [
-            "Widgets failed. The change did not take, and aterm could not put back its value \
-             from before.",
-            "Dock failed. The change did not take.",
+            "Widgets and Dock failed. Set up now tries again.",
             "Rust in Spotlight could not be confirmed.",
             "aterm put back what it could not finish. Dock is as it was. Natural scrolling comes \
              back at your next login.",
             JOURNAL_NOTE,
         ]
     );
+    for (setting, reason) in [
+        (
+            Setting::Widgets,
+            "The change did not take, and aterm could not put back its value from before.",
+        ),
+        (Setting::Dock, "The change did not take."),
+    ] {
+        let row = row_view(Subject::Setting(setting), &status, plan.selection);
+        assert_eq!(
+            (row.chip, row.note.as_deref()),
+            (Some(Chip::Failed), Some(reason)),
+            "{setting:?} keeps its reason"
+        );
+    }
     let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
     assert_eq!(
         (head.text.as_str(), head.show),
@@ -2833,6 +2845,44 @@ fn a_cancelled_review_leaves_every_group_as_is_with_one_calm_line_and_set_up_now
     assert_eq!(
         (answer.changed, answer.chosen),
         (Some(Selection::none()), false)
+    );
+}
+
+/// The person cancelled the review that offered what a Restore brought forward (§3.3): the page
+/// reads as after any Cancel, its one calm line beside Set up now, every group at Leave as is and
+/// nothing lit, with the Restore's own line still saying what it put back.
+#[test]
+fn a_cancel_after_a_restore_reads_as_any_cancel_beside_the_restores_line() {
+    let mut app = SystemStateApp::new(Plan::default());
+    let status = SetupStatus {
+        plan: Some(Plan::from(Selection::none())),
+        cancelled: true,
+        finished: true,
+        observed: vec![reading(
+            Subject::Access(Access::FullDiskAccess),
+            Standing::NeedsYou,
+            Some("Off"),
+        )],
+        rows: restore_rows(&RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)])),
+        ..SetupStatus::default()
+    };
+    app.publish(status.clone());
+    assert!(app.plan.selection.is_empty(), "every group at Leave as is");
+    assert_eq!(
+        app.notes(&app.reviewed_plan()),
+        [
+            CANCELLED_NOTE.to_owned(),
+            "Restore previous settings finished. Dock is as it was.".to_owned()
+        ]
+    );
+    let headline = app.headline();
+    assert_eq!(headline.text, "Everything is left as is");
+    assert!(headline.start, "Set up now beside it");
+    assert!(!app.needs_attention(), "no diamond");
+    assert_eq!(
+        crate::system_state_access::menu_line(&status, false),
+        None,
+        "no menu line"
     );
 }
 
@@ -5790,7 +5840,8 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
         Some(Chip::Failed)
     );
     assert!(stopped.notes(&plan).is_empty(), "the row says why");
-    // A step the run could not finish, with its own reason in the page's note.
+    // A step the run could not finish keeps its own reason on its row; the page's note says
+    // what comes next.
     let mut step = status_of("set-up");
     step.rows = pass_rows(&PassOutcome {
         rolled_back: None,
@@ -5802,14 +5853,24 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
     assert_eq!(station(&step, Setting::Dock), 'D');
     assert_eq!(
         step.notes(&plan),
-        [format!(
-            "Dock did not finish this time. The change did not take. {RETRIES_NOTE}"
-        )]
+        [format!("Dock did not finish this time. {RETRIES_NOTE}")]
+    );
+    let dock = Subject::Setting(Setting::Dock);
+    assert_eq!(
+        row_view(dock, &step, Selection::all()).note.as_deref(),
+        Some("The change did not take.")
     );
     step.retrying = false;
     assert_eq!(agree(&step), "1 step failed: Dock");
     assert_eq!(station(&step, Setting::Dock), 'E');
-    assert_eq!(step.notes(&plan), ["Dock failed. The change did not take."]);
+    assert_eq!(
+        step.notes(&plan),
+        [format!("Dock failed. {SET_UP_NOW_NOTE}")]
+    );
+    assert_eq!(
+        row_view(dock, &step, Selection::all()).note.as_deref(),
+        Some("The change did not take.")
+    );
 }
 
 /// What every signal says of one row (design §3.6): the headline, the row's chip, the village's
@@ -6249,7 +6310,7 @@ fn review_rows_read_as_what_apply_will_do() {
     assert_eq!(row.open, Some(Access::FullDiskAccess));
 }
 
-/// One line under the review's buttons says what each does, while Apply counts down and once
+/// One line above the review's buttons says what each does, while Apply counts down and once
 /// a click stopped it (design §3.3).
 #[test]
 fn the_review_says_what_apply_and_cancel_do() {
@@ -6469,4 +6530,204 @@ fn the_cancelled_scenario_is_one_calm_line_beside_set_up_now() {
     for subject in Subject::all() {
         assert!(!app.reviewed_row(subject).managed, "{subject:?}");
     }
+}
+
+/// A first-launch review closed unanswered, and the page opened again in that launch (§3.3),
+/// reads as the review did: calm, `Setup has not started` with Set up now, and every row as
+/// what Set up now will do. No row needs you, offers Open or draws the village's error look,
+/// since nobody approved the permission steps, and neither the tab nor the menu bar says a
+/// thing.
+#[test]
+fn a_closed_review_reads_its_rows_as_what_set_up_now_will_do() {
+    let status = status_of("review-closed");
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status.clone());
+    let headline = app.headline();
+    assert_eq!(headline.text, NOT_STARTED);
+    assert!(headline.start && headline.open.is_none());
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+    for access in [Access::FullDiskAccess, Access::Debugger] {
+        let row = app.reviewed_row(Subject::Access(access));
+        assert_eq!(
+            row.chip,
+            Some(Chip::WillChange { busy: false }),
+            "{access:?}"
+        );
+        assert!(row.open.is_none(), "{access:?}");
+        assert!(!app.can_open_access(access), "{access:?}");
+    }
+    let village = village_spec(&app.status, &app.reviewed_rows(), &app.reviewed_plan(), 0);
+    assert!(!village.contains('E'), "no error look: {village}");
+}
+
+/// The review of the groups the ALab signal adds (§3.5) stills only what it adds: Full Disk
+/// Access, which the plan in force (Permissions) waits on, still needs the person, with its Open,
+/// the headline, the tab's diamond and the menu line, while the added groups read as what Apply
+/// will do.
+#[test]
+fn a_widen_review_keeps_the_needs_you_of_the_plan_in_force() {
+    let (send, _receive) = mpsc::channel();
+    let mut app = SystemStateApp::new(permissions_only());
+    assert!(app.offer(Request::widen(Plan::default(), permissions_only(), send)));
+    let status = status_of("widen-review");
+    app.publish(status.clone());
+    assert!(app.reviewing_widen());
+    let fda = app.reviewed_row(Subject::Access(Access::FullDiskAccess));
+    assert_eq!(fda.chip, Some(Chip::NeedsYou));
+    assert_eq!(fda.open, Some(Access::FullDiskAccess));
+    assert!(app.can_open_access(Access::FullDiskAccess));
+    let headline = app.headline();
+    assert_eq!(headline.text, "Needs you: Full Disk Access");
+    assert_eq!(headline.open, Some(Access::FullDiskAccess));
+    assert!(!headline.start, "the review's own Apply answers it");
+    assert!(app.needs_attention());
+    assert_eq!(
+        crate::system_state_access::menu_line(&status, false).map(|line| line.label),
+        Some("System State: Full Disk Access needs you".to_owned())
+    );
+    let dock = app.reviewed_row(Subject::Setting(Setting::Dock));
+    assert!(dock.managed, "the review sets the added groups up");
+    assert_eq!(dock.chip, Some(Chip::WillChange { busy: false }));
+    assert_eq!(app.notes(&app.reviewed_plan()), [ALAB_ADDED_NOTE]);
+}
+
+/// Apple's Command Line Tools, which the GitHub repositories wait on (§3.3): the page reads what
+/// their install does. Their tab asking for the password needs the person now, as the debugger
+/// step's dialog does; Apple's installer running is a wait that ends by itself, calm; and the
+/// tools missing, with no tab open and nothing installing them, need the person, with Install…
+/// on the row, which a press asks the window for.
+#[test]
+fn the_command_line_tools_row_reads_what_their_install_does() {
+    use crate::system_state_access::menu_line;
+    let repositories = Subject::Setting(Setting::Repositories);
+    let page = |name: &str| {
+        let status = status_of(name);
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status.clone());
+        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
+        let button = compiled.semantic(&UiKey::new(INSTALL_TOOLS)).is_some();
+        (app, menu_line(&status, false), button)
+    };
+
+    let (app, line, button) = page("clt-password");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(app.headline().text, TOOLS_PASSWORD_HEADLINE);
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert_eq!(row.note.as_deref(), Some(TOOLS_PASSWORD_NOTE));
+    assert!(!row.install_tools && !button, "its tab is open");
+    assert!(app.needs_attention());
+    let line = line.expect("the person is needed now");
+    assert_eq!(line.note.as_deref(), Some(TOOLS_PASSWORD_HEADLINE));
+
+    let (app, line, button) = page("clt-installing");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.standing, Some(Standing::Waiting));
+    assert_eq!(row.chip, Some(Chip::WillChange { busy: false }));
+    assert_eq!(row.note.as_deref(), Some(INSTALLING_TOOLS_NOTE));
+    assert!(!row.install_tools && !button);
+    assert_eq!(app.headline().text, "1 step waiting: GitHub repositories");
+    assert!(!app.needs_attention(), "a wait that ends by itself");
+    assert!(line.is_none(), "{line:?}");
+
+    let (mut app, line, button) = page("clt-missing");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(app.headline().text, "Needs you: GitHub repositories");
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert_eq!(
+        row.note.as_deref(),
+        Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING)
+    );
+    assert!(row.install_tools && button);
+    assert!(app.needs_attention());
+    assert_eq!(
+        line.map(|line| line.label),
+        Some("System State: GitHub repositories needs you".to_owned())
+    );
+    app.by_person = true;
+    act(&mut app, INSTALL_TOOLS);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::InstallDeveloperTools { by_person: true })
+    ));
+}
+
+/// A step the run could not finish keeps its reason on its row (§3.6), in the words its step
+/// decided (`GitHub can't be reached`, never GitHub's own), and the page's note then says only
+/// what comes next: no line says it twice.
+#[test]
+fn a_failed_step_keeps_its_reason_on_its_row() {
+    let status = status_of("failed");
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status.clone());
+    let row = app.reviewed_row(Subject::Setting(Setting::Repositories));
+    assert_eq!(row.chip, Some(Chip::Failed));
+    assert_eq!(row.note.as_deref(), Some(GITHUB_UNREACHED));
+    assert_eq!(
+        app.notes(&app.reviewed_plan()),
+        [format!("GitHub repositories failed. {SET_UP_NOW_NOTE}")]
+    );
+    // While the run still tries it again, the row keeps the same reason under its waiting chip.
+    let mut retrying = status;
+    retrying.retrying = true;
+    app.publish(retrying);
+    let row = app.reviewed_row(Subject::Setting(Setting::Repositories));
+    assert_eq!(row.chip, Some(Chip::WillChange { busy: false }));
+    assert_eq!(row.note.as_deref(), Some(GITHUB_UNREACHED));
+    assert_eq!(
+        app.notes(&app.reviewed_plan()),
+        [format!(
+            "GitHub repositories did not finish this time. {RETRIES_NOTE}"
+        )]
+    );
+}
+
+/// While a newer aterm's setup is in force (§3.2) each row keeps its reading's own note, and the
+/// vault's fields take no words, as its Join takes no press: this aterm joins nothing.
+#[test]
+fn a_newer_aterms_page_keeps_row_notes_and_reads_the_vault_as_it_stands() {
+    let mut app = SystemStateApp::opened();
+    app.publish(status_of("newer"));
+    assert!(app.status.newer());
+    assert!(!app.vault_editable());
+    app.vault_open = Some(true);
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
+    // The page as drawn: this aterm knows no plan, so its rows are the readings as they stand.
+    let heard: Vec<&str> = compiled
+        .semantics
+        .iter()
+        .map(|node| node.label.as_str())
+        .filter(|label| !label.is_empty())
+        .collect();
+    let lan = heard
+        .iter()
+        .position(|label| *label == "Local Network: unknown")
+        .unwrap_or_else(|| panic!("{heard:?}"));
+    assert_eq!(
+        heard.get(lan + 1).copied(),
+        Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
+        "{heard:?}"
+    );
+    for key in [
+        "system-state/url",
+        "system-state/password",
+        "system-state/vault/join",
+    ] {
+        let state = compiled
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("{key} is shown"))
+            .state;
+        assert!(
+            state.is_some_and(|state| !state.enabled),
+            "{key} takes nothing"
+        );
+    }
+    let before = app.url.value().to_owned();
+    let mut view = SystemStateViewState::default();
+    app.act(
+        &mut view,
+        "system-state/url",
+        Some(SemanticInput::Text("http://elsewhere.local".to_owned())),
+    );
+    assert_eq!(app.url.value(), before, "the address stays as it stands");
 }

@@ -1678,6 +1678,154 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
         settings,
         crate::native_app::RecoveryOutcome::Opened { .. }
     ));
+
+    let mut failures = Vec::new();
+    for existing_settings in [false, true] {
+        use crate::native_app::{AppViewState, NativeApp, RecoveryApp, RecoveryCapability};
+        use crate::native_settings::SettingsRoute;
+
+        let mut app = App::headless_for_test();
+        let target = WindowId(0);
+        let previous_settings = existing_settings.then(|| {
+            assert!(app.open_settings_tab_in_window(target, SettingsRoute::Appearance));
+            let (instance, view) = app.active_native_view(target).unwrap();
+            (
+                app.windows[&target].tab_set.active_id().unwrap(),
+                instance,
+                view,
+            )
+        });
+        let (_, recovery_tab, recovery_view) = app
+            .install_new_native_tab(
+                target,
+                NativeApp::Recovery(RecoveryApp {
+                    restore_tag: "settings".to_string(),
+                    reason: "The saved view state did not match the reopened app".to_string(),
+                    metadata: "route: /text-fonts\nfile: file:///tmp/not-authority".to_string(),
+                    capability: Some(RecoveryCapability::Settings {
+                        route: SettingsRoute::About.path().to_string(),
+                    }),
+                }),
+                AppViewState::Recovery(Default::default()),
+                crate::tab_model::TabPresentation {
+                    title: "Recovery".to_string(),
+                    icon: Some(crate::tab_model::TabIconKind::Recovery),
+                    indicators: Default::default(),
+                    conn: None,
+                    closable: true,
+                    tooltip: None,
+                },
+            )
+            .unwrap();
+        let target_tabs = app.windows[&target].tab_set.tabs().to_vec();
+        let session = app.next_session_id;
+        let front = app.insert_logical_window(crate::stub_session(session), 24, 100);
+        assert!(app.open_settings_tab_in_window(front, SettingsRoute::TextFonts));
+        let (front_instance, front_view) = app.active_native_view(front).unwrap();
+        app.act_app(crate::app_control::ActRequest {
+            view: front_view,
+            ui_key: format!("settings/control/{}", crate::prefs::EDIT_FONT_PX),
+            action: format!("settings/set/{}", crate::prefs::EDIT_FONT_PX),
+            value: None,
+        })
+        .unwrap();
+        app.dispatch_native_view_event(
+            front,
+            front_view,
+            AppEvent::TextInput(crate::native_app::TextInputEvent::Commit("9".to_string())),
+        )
+        .unwrap();
+        let settings_state = |app: &App, view| {
+            let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
+                panic!("Settings view remains attached")
+            };
+            (
+                state.route,
+                state.editing_field.clone(),
+                state.field_inputs.clone(),
+                state.carried_field_drafts(),
+                state.common.last_focus.clone(),
+            )
+        };
+        let front_before = settings_state(&app, front_view);
+        assert_eq!(front_before.0, SettingsRoute::TextFonts);
+        assert_eq!(front_before.1.as_deref(), Some(crate::prefs::EDIT_FONT_PX));
+        assert_eq!(front_before.2[crate::prefs::EDIT_FONT_PX].value(), "9");
+        assert_eq!(front_before.3.carried.len(), 1);
+        assert!(
+            !app.native_runtime
+                .presentation(front_instance, front_view)
+                .unwrap()
+                .closable
+        );
+        let topology = |app: &App, window| {
+            let tabs = &app.windows[&window].tab_set;
+            (
+                tabs.active_id(),
+                tabs.tabs()
+                    .iter()
+                    .map(|tab| (tab.id, tab.root.clone(), tab.focus))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let front_topology = topology(&app, front);
+        let config = app.native_config_service.snapshot();
+        assert_eq!(app.frontmost_window, Some(front));
+        assert_eq!(app.active_native_view(target).unwrap().1, recovery_view);
+
+        let retry = app.act_app(crate::app_control::ActRequest {
+            view: recovery_view,
+            ui_key: "recovery/retry".to_string(),
+            action: "recovery/retry".to_string(),
+            value: None,
+        });
+        if let Err(error) = retry {
+            failures.push(format!(
+                "existing={existing_settings}: advertised Retry refused: {error}"
+            ));
+        }
+        let opened = app.active_native_view(target).and_then(|(instance, view)| {
+            matches!(app.native_runtime.view_state(view), Some(AppViewState::Settings(state)) if state.route == SettingsRoute::About)
+                .then_some((app.windows[&target].tab_set.active_id().unwrap(), instance, view))
+        });
+        if opened.is_none() || previous_settings.is_some_and(|previous| Some(previous) != opened) {
+            failures.push(format!("existing={existing_settings}: Retry did not open or reuse Settings in its owning window"));
+        }
+        let expected_tabs = target_tabs.len() + usize::from(!existing_settings);
+        if app.windows[&target].tab_set.len() != expected_tabs {
+            failures.push(format!(
+                "existing={existing_settings}: Retry added no Settings view to its owning window"
+            ));
+        }
+        for tab in &target_tabs {
+            let retained = app.windows[&target].tab_set.get(tab.id).unwrap();
+            assert_eq!(retained.root, tab.root);
+            assert_eq!(retained.focus, tab.focus);
+        }
+        assert!(app.windows[&target].tab_set.get(recovery_tab).is_some());
+        let Some(AppViewState::Recovery(state)) = app.native_runtime.view_state(recovery_view)
+        else {
+            panic!("Retry keeps its recovery view")
+        };
+        assert!(state.pending.is_none());
+        assert!(state.notice.is_some());
+        if settings_state(&app, front_view) != front_before {
+            failures.push(format!("existing={existing_settings}: Retry changed the foreground Settings route, field or draft"));
+        }
+        if topology(&app, front) != front_topology {
+            failures.push(format!(
+                "existing={existing_settings}: Retry changed the foreground topology"
+            ));
+        }
+        assert_eq!(app.frontmost_window, Some(front));
+        assert_eq!(
+            app.active_native_view(front),
+            Some((front_instance, front_view))
+        );
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -9684,6 +9832,199 @@ fn the_harness_switch_write_turns_the_whole_harness_off() {
     );
 }
 
+/// PAGE DOWN SENT BEFORE A PAGE'S FIRST FRAME STEPS BY THAT PAGE: Settings steps its list by
+/// the screens its last layout recorded, so a page just opened from another, sent Page Down
+/// before any frame drew it, took the step of the page before (Terminal at 80x24 skipped
+/// Bidirectional text, or went to its end). The host lays the page out first.
+#[test]
+fn page_down_before_a_pages_first_frame_steps_by_that_page() {
+    use crate::native_settings::SettingsRoute;
+    let shown = |from: SettingsRoute, drawn_first: bool| {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 80;
+            ws.rows = 24;
+        }
+        assert!(app.open_settings_tab(from));
+        let _ = app.compiled_native_ui(wid).unwrap();
+        assert!(app.open_settings_tab(SettingsRoute::Terminal));
+        if drawn_first {
+            let _ = app.compiled_native_ui(wid).unwrap();
+        }
+        app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollPage(1))
+            .unwrap();
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        let list = compiled
+            .semantic(&crate::native_ui::UiKey::new("settings/list"))
+            .expect("the page lists its settings")
+            .rect;
+        compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.key.as_str().starts_with("settings/row/")
+                    && node.rect.y >= list.y - 0.5
+                    && node.rect.bottom() <= list.bottom() + 0.5
+            })
+            .map(|node| node.key.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+    let drawn = shown(SettingsRoute::Home, true);
+    assert!(!drawn.is_empty(), "the second screen shows rows");
+    // A window resized since the page's last frame steps by the page at its new size.
+    let resized = |drawn_first: bool| {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 80;
+            ws.rows = 40;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Terminal));
+        let _ = app.compiled_native_ui(wid).unwrap();
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.rows = 24;
+        }
+        if drawn_first {
+            let _ = app.compiled_native_ui(wid).unwrap();
+        }
+        app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollPage(1))
+            .unwrap();
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        compiled
+            .semantics
+            .iter()
+            .filter(|node| node.key.as_str().starts_with("settings/row/") && !node.offscreen)
+            .map(|node| (node.key.as_str().to_string(), node.rect.y.round() as i32))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        resized(false),
+        resized(true),
+        "Page Down before a resized window's first frame lands where it does after it"
+    );
+    let faults = SettingsRoute::ALL
+        .into_iter()
+        .filter(|from| *from != SettingsRoute::Terminal)
+        .filter_map(|from| {
+            let fast = shown(from, false);
+            (fast != drawn).then(|| format!("from {from:?}: {fast:?}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        faults.is_empty(),
+        "Page Down before the first frame lands where it does after it, {drawn:?}:\n{}",
+        faults.join("\n")
+    );
+}
+
+/// AT 220x12 WITH 2x TEXT TAB ENTERS EVERY SETTINGS LIST AND REACHES EVERY CONTROL IT DRAWS:
+/// the window shows a list a row or two tall beside a sidebar whose cut rows take no focus;
+/// from the search field, Tab and Shift-Tab each reach every control some screen of the page's
+/// list draws (Page Down by Page Down), the list scrolling to each in turn.
+#[test]
+fn tab_reaches_every_control_of_a_settings_list_at_220x12() {
+    use crate::native_settings::SettingsRoute;
+    let preferences = crate::native_appearance::current_preferences();
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: 2.0,
+            ..preferences
+        },
+    );
+    let chrome = |key: &crate::native_ui::UiKey| {
+        let key = key.as_str();
+        key.starts_with("settings/nav/")
+            || key.starts_with("settings/search")
+            || key.starts_with("settings/compact-navigation")
+    };
+    let fresh = |route: SettingsRoute| {
+        let mut app = App::headless_for_test();
+        if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+            ws.cols = 220;
+            ws.rows = 12;
+        }
+        assert!(app.open_settings_tab(route));
+        app
+    };
+    let mut faults = Vec::new();
+    let mut walked = 0;
+    for route in SettingsRoute::ALL {
+        if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+            continue;
+        }
+        let wid = WindowId(0);
+        let mut app = fresh(route);
+        let mut drawn = std::collections::BTreeSet::new();
+        // Page to the list's end: until a page turn draws the same screen. A screen of words
+        // alone (Ai's notes at 2x) is passed, not taken for the end.
+        let mut screen_before = None;
+        for _ in 0..48 {
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            let screen = compiled
+                .paint
+                .iter()
+                .map(|node| (node.key.as_str().to_string(), node.rect.y.to_bits()))
+                .collect::<Vec<_>>();
+            if screen_before.as_ref() == Some(&screen) {
+                break;
+            }
+            drawn.extend(
+                compiled
+                    .focus_order
+                    .iter()
+                    .filter(|key| !chrome(key))
+                    .map(|key| key.as_str().to_string()),
+            );
+            screen_before = Some(screen);
+            if app
+                .dispatch_native_event(wid, crate::native_app::AppEvent::ScrollPage(1))
+                .is_err()
+            {
+                break;
+            }
+        }
+        if drawn.is_empty() {
+            continue;
+        }
+        walked += 1;
+        for backwards in [false, true] {
+            let mut app = fresh(route);
+            let _ = app.compiled_native_ui(wid).unwrap();
+            let (_, view) = app.active_native_view(wid).expect("Settings");
+            app.focus_native_control(
+                wid,
+                view,
+                crate::native_ui::UiKey::new("settings/search"),
+                true,
+            )
+            .unwrap();
+            let mut reached = std::collections::BTreeSet::new();
+            for _ in 0..(2 * drawn.len() + 12) {
+                app.move_native_focus(wid, backwards).unwrap();
+                let _ = app.compiled_native_ui(wid).unwrap();
+                if let Some(key) = app
+                    .native_runtime
+                    .view_state(view)
+                    .and_then(|state| state.common().last_focus.clone())
+                {
+                    reached.insert(key.as_str().to_string());
+                }
+            }
+            let missed = drawn.difference(&reached).collect::<Vec<_>>();
+            if !missed.is_empty() {
+                faults.push(format!(
+                    "{route:?} {}: Tab never reaches {missed:?}",
+                    if backwards { "backwards" } else { "forwards" }
+                ));
+            }
+        }
+    }
+    crate::native_appearance::install_preferences(preferences);
+    assert!(walked > 10, "{walked} pages walked");
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
 #[test]
 fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
     let preferences = crate::native_appearance::current_preferences();
@@ -9797,4 +10138,77 @@ fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
         );
     }
     crate::native_appearance::install_preferences(preferences);
+}
+
+/// TAB FROM THE COMPACT TOOLBAR'S SEARCH GOES ON INTO THE LIST: in a narrow window whose
+/// toolbar shows the search field, Tab from the field reaches its Cancel button, drawn, and
+/// then the list's first control, each drawn as the keyboard lands on it. Cancel, which only
+/// the open search draws, closed the search as it took the keyboard: the keyboard was left on
+/// nothing drawn and the next Tab went round to the toolbar past every control of the list
+/// (Terminal at 178x348, with 1x and 2x text).
+#[test]
+fn tab_from_the_compact_search_field_goes_on_into_the_list() {
+    use crate::native_settings::SettingsRoute;
+    let preferences = crate::native_appearance::current_preferences();
+    let mut faults = Vec::new();
+    for scale in [1.0_f32, 2.0] {
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences {
+                text_scale: scale,
+                ..preferences
+            },
+        );
+        for cols in [24_u16, 26, 30] {
+            for (route, first) in [
+                (SettingsRoute::Terminal, "settings/control/scrollback_lines"),
+                (
+                    SettingsRoute::Security,
+                    "settings/control/allow_osc52_query",
+                ),
+            ] {
+                let mut app = App::headless_for_test();
+                if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+                    ws.cols = cols;
+                    ws.rows = 24;
+                }
+                assert!(app.open_settings_tab(route));
+                let wid = WindowId(0);
+                let compiled = app.compiled_native_ui(wid).unwrap();
+                let search = crate::native_ui::UiKey::new("settings/search");
+                if !compiled.focus_order.contains(&search) {
+                    continue;
+                }
+                let (_, view) = app.active_native_view(wid).expect("Settings");
+                app.focus_native_control(wid, view, search, true).unwrap();
+                let _ = app.compiled_native_ui(wid).unwrap();
+                let mut walk = Vec::new();
+                for _ in 0..2 {
+                    app.move_native_focus(wid, false).unwrap();
+                    let compiled = app.compiled_native_ui(wid).unwrap();
+                    let focus = app
+                        .native_runtime
+                        .view_state(view)
+                        .and_then(|state| state.common().last_focus.clone());
+                    let drawn = focus.as_ref().is_some_and(|key| {
+                        compiled
+                            .paint
+                            .iter()
+                            .any(|node| node.key == *key && node.clip == node.rect)
+                    });
+                    walk.push((
+                        focus.map_or_else(String::new, |key| key.as_str().to_string()),
+                        drawn,
+                    ));
+                }
+                let context = format!("{route:?} at {cols} columns, {scale}x text");
+                if walk.iter().any(|(_, drawn)| !drawn)
+                    || walk.last().map(|(key, _)| key.as_str()) != Some(first)
+                {
+                    faults.push(format!("{context}: Tab from Search walks {walk:?}"));
+                }
+            }
+        }
+    }
+    crate::native_appearance::install_preferences(preferences);
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
 }

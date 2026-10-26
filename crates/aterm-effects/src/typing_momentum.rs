@@ -133,8 +133,8 @@ impl TypingMomentum {
         if self.value(at) <= threshold {
             return Some(at);
         }
-        self.low_crossing(threshold.max(SNAP_ZERO))
-            .map(|crossing| crossing + std::time::Duration::from_millis(1))
+        let crossing = self.low_crossing(threshold.max(SNAP_ZERO))?;
+        Some(crossing + std::time::Duration::from_millis(1))
     }
 }
 

@@ -180,6 +180,8 @@ mod screen;
 #[cfg(target_os = "macos")]
 mod seamless;
 #[cfg(target_os = "macos")]
+mod seamless_carry;
+#[cfg(target_os = "macos")]
 mod selftest;
 #[cfg(target_os = "macos")]
 mod settings_witness;
@@ -481,10 +483,12 @@ Outside any lab (no jail, no stub):
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
                                  OPENS A WINDOW, one at a time: one instance of a debug or dev-seams aterm across a real
                                  seamless update (ATERM_DEBUG_SEAMLESS_REEXEC=1, `update apply`), legs gap, topics,
-                                 gaptopic, redial, redial75, latch and hwkey; then present: N (default 4, at least 2)
-                                 fresh instances each of the tested and the baseline aterm, alternating, the tested
-                                 medians judged against the baseline runs (n_present inside their range,
-                                 present_p50/p95/p99_ms at most their highest) (~1-2 min, plus ~1 min a run)
+                                 gaptopic, redial, redial75, latch, hwkey and privacy (the files the update wrote, kept
+                                 by ATERM_DEBUG_SEAMLESS_KEEP and swept for planted sentinels); then present: N
+                                 (default 4, at least 2) fresh instances each of the tested and the baseline aterm,
+                                 alternating, the tested medians judged against the baseline runs (n_present inside
+                                 their range, present_p50/p95/p99_ms at most their highest) (~1-2 min, plus ~1 min a
+                                 run)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  key-only transcript/rollout reducer for harness step fixtures (verifies reader equivalence before writing)
   ptyrec <log> -- <cmd> [args...]

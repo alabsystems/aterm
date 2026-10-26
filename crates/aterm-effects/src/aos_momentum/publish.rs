@@ -136,8 +136,8 @@ impl Published {
 
     /// What each queued input returned, once each, in order, through the new pair.
     #[inline]
-    pub fn delivered(&self) -> &[Result<MomentumObservation, StepRefusal>] {
-        &self.delivered
+    pub const fn delivered(&self) -> &[Result<MomentumObservation, StepRefusal>] {
+        self.delivered.as_slice()
     }
 
     /// The bundle, the result consumed.

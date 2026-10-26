@@ -144,6 +144,10 @@ pub enum Kept {
     Excluded,
     /// Uninstalled here on purpose (`aterm pkg uninstall`).
     Removed,
+    /// Not installed, no copy aterm does not manage found either, and outside atpkg's default
+    /// set: installed only where a person asked (`aterm pkg install <program>`), so its absence
+    /// is no install this machine owes.
+    OptIn,
 }
 
 /// Accounts v2's view of the Claude row that serves this machine.
@@ -483,6 +487,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
     let home = home_of(c, m.var, m.home.as_deref());
     let home_exists = home.as_ref().is_ok_and(|h| h.exists());
     let managed = m.pkg.as_ref().and_then(|l| managed_of(l, c.id));
+    let foreign = foreign_of(c.id, m.var, m.pkg.as_ref());
     let kept = if !atpkg::vendor_direct::served_here(c.id) {
         Some(Kept::Unavailable)
     } else if m.exclude.iter().any(|e| e == c.id) {
@@ -493,6 +498,11 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
             .is_some_and(|l| l.removed_programs().contains(c.id))
     {
         Some(Kept::Removed)
+    } else if managed.is_none()
+        && foreign.is_none()
+        && atpkg::vendor_direct::spec(c.id).is_some_and(|spec| !spec.default_set)
+    {
+        Some(Kept::OptIn)
     } else {
         None
     };
@@ -533,7 +543,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
         connector: c,
         kept,
         managed,
-        foreign: foreign_of(c.id, m.var, m.pkg.as_ref()),
+        foreign,
         home,
         home_exists,
         login_file,

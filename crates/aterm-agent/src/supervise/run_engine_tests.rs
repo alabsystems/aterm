@@ -3665,6 +3665,8 @@ struct TestHost {
     limits: std::sync::Mutex<Vec<bool>>,
     /// Each limit wall told ([`IdleHost::limit_wall`]), its `reset_unix`.
     walls: std::sync::Mutex<Vec<Option<i64>>>,
+    /// Each lasting withhold told ([`IdleHost::lasting_hold`]), in order.
+    lasting: std::sync::Mutex<Vec<Option<crate::supervise::Lasting>>>,
     exceptions: std::sync::Mutex<Vec<Option<&'static str>>>,
     turn_ends: std::sync::atomic::AtomicUsize,
     withheld: std::sync::Mutex<Vec<Guard>>,
@@ -3837,6 +3839,9 @@ impl IdleHost for TestHost {
     }
     fn limit_wall(&self, reset_unix: Option<i64>) {
         self.walls.lock().unwrap().push(reset_unix);
+    }
+    fn lasting_hold(&self, hold: Option<crate::supervise::Lasting>) {
+        self.lasting.lock().unwrap().push(hold);
     }
     fn withheld(&self, guard: Guard) {
         self.withheld.lock().unwrap().push(guard);
@@ -7231,6 +7236,90 @@ fn the_host_is_told_each_turn_break_whether_or_not_it_wants_a_step_there() {
         breaks.len(),
         1,
         "one decided turn break, told once though {asked} looks asked for a step: {breaks:?}"
+    );
+}
+
+/// A turn break at a sign-in wall (`wall:auth`) is a lasting withhold of the loop's: nothing the
+/// host would type there goes until a person signs in again. The host is told so as the loop
+/// decides the break, whether or not it wants a step there, once, and told it is over at the
+/// next break with none (signed in again with no turn between), so the window's seat rule
+/// (`disk-free@v1`) holds the session out of its seats meanwhile rather than electing a session
+/// whose line could not go.
+#[test]
+fn the_host_is_told_a_sign_in_wall_holds_the_session_at_its_turn_break() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let host = Arc::new(TestHost::default());
+    host.owns.store(true, Ordering::SeqCst);
+    host.finds_nothing.store(true, Ordering::SeqCst);
+    let mut m = Mock::new(vec![login_lost_screen(), idle_screen()]);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    m.vanish_after = Some(0);
+    m.cursor_on_caret = true;
+    let _ = hosted_with_host(
+        &mut m,
+        &full,
+        &host,
+        Stop::reached(
+            |h| h.lasting.lock().unwrap().len() >= 2,
+            Duration::from_secs(60),
+        ),
+        None,
+    );
+    let lasting = host.lasting.lock().unwrap().clone();
+    assert_eq!(
+        lasting,
+        [
+            Some(crate::supervise::Lasting::Wall {
+                wire: aterm_phase::WallKind::Auth.wire()
+            }),
+            None
+        ],
+        "told at the wall's break, and that it was over at the next: {lasting:?}"
+    );
+}
+
+/// A wall's lasting withhold is told over at the session's next live read, as it works past it
+/// ([`IdleHost::lasting_hold`]). A later break at the same wall is told again: the loop's record
+/// of what it told goes with the host's, or the session, back at its wall after a retry, would be
+/// seated by the window's seat rule (`disk-free@v1`) and elected at a break its line could not go.
+#[test]
+fn a_wall_the_session_worked_past_and_came_back_to_is_told_again() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let host = Arc::new(TestHost::default());
+    host.owns.store(true, Ordering::SeqCst);
+    host.finds_nothing.store(true, Ordering::SeqCst);
+    let mut m = Mock::new(vec![
+        login_lost_screen(),
+        busy_screen(),
+        login_lost_screen(),
+    ]);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    m.vanish_after = Some(0);
+    m.cursor_on_caret = true;
+    let _ = hosted_with_host(
+        &mut m,
+        &full,
+        &host,
+        Stop::reached(
+            |h| h.lasting.lock().unwrap().len() >= 3,
+            Duration::from_secs(60),
+        ),
+        None,
+    );
+    let wall = Some(crate::supervise::Lasting::Wall {
+        wire: aterm_phase::WallKind::Auth.wire(),
+    });
+    let lasting = host.lasting.lock().unwrap().clone();
+    assert_eq!(
+        lasting,
+        [wall, None, wall],
+        "told at each break at the wall, and over at the live read between: {lasting:?}"
     );
 }
 

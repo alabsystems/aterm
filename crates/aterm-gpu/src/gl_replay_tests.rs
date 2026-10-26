@@ -1462,7 +1462,11 @@ fn the_gl_video_tap_records_what_the_wgpu_tap_records() {
             assert!(gpu.present_virtual(&mut win, input, false, None, None));
             gpu.video_after_present(&mut win, t);
         }
-        takes.push(gpu.video_finish(&mut win).expect("a recording was live"));
+        takes.push(
+            gpu.video_finish(&mut win)
+                .expect("a recording was live")
+                .settle(),
+        );
     }
     let (wgpu_take, gl_take) = (&takes[0], &takes[1]);
     assert!(armed.last_frame_on_gl(), "the armed recording drew on GL");

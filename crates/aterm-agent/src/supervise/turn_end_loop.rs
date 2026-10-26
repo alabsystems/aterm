@@ -417,6 +417,21 @@ impl<C: Ctl> Session<'_, C> {
             .credits_hold_stands(read.as_ref(), reader.program(), cfg, self.fx.mono())
     }
 
+    /// When the credits hold that stands for a turn the host would type on `rows` lifts, in unix
+    /// seconds ([`Self::credits_hold_here`]): `Some(None)` where the loop knows no such time,
+    /// `None` where no hold stands.
+    pub(super) fn credits_hold_lifts_here(
+        &self,
+        cfg: &SupervisorConfig,
+        rows: &[String],
+    ) -> Option<Option<i64>> {
+        let reader = self.reader(rows);
+        let read = self.credits_carry(reader.credits(rows).as_ref());
+        self.turn_end
+            .credits_hold_lifts(read.as_ref(), reader.program(), cfg, self.fx.mono())
+            .map(|lifts| lifts.map(|at| self.unix_of(at)))
+    }
+
     /// Usage credits carry the session ([`Self::note_credits`]).
     pub(super) fn credits_carry(
         &self,

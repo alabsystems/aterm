@@ -167,13 +167,16 @@ pub(super) fn run_lane(app: &mut App, from: Instant) -> Parked {
     }
 }
 
-/// Count of momentum glow quads in the active presentation stream.
+/// Count of momentum glow lights in the active presentation stream, every
+/// lit ramp row the quad it stands for.
 pub(super) fn presented_glow(app: &App, light: bool) -> usize {
     let input = &app.windows[&WID].input_scratch;
     if light {
-        input.glow_under.len()
+        input.glow_under_ramps.laid(input.glow_under.len())
     } else {
-        input.cursor_glow_add.len()
+        input
+            .cursor_glow_add_ramps
+            .laid(input.cursor_glow_add.len())
     }
 }
 
@@ -589,8 +592,8 @@ fn a_paused_glow_is_not_drawn_once_serious_mode_or_its_switch_turns_it_off() {
             let ws = &app.windows[&WID];
             assert_eq!(
                 (
-                    ws.input_scratch.cursor_glow_add.len(),
-                    ws.input_scratch.glow_under.len()
+                    ws.input_scratch.glow_add_laid().len(),
+                    ws.input_scratch.glow_under_laid().len()
                 ),
                 (0, 0),
                 "{why}, light={light}: no held light"

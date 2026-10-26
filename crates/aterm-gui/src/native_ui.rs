@@ -873,14 +873,32 @@ pub(crate) struct TextFieldSpec {
     pub(crate) end_button: bool,
 }
 
-fn text_field_hint_width(control: &Control<TextFieldSpec>, width: f32) -> f32 {
-    text_field_hint(control, width).map_or(0.0, |hint| {
-        crate::tray_raster::ui_text_width(hint, native_type_px(TypeStep::Caption).get())
-            + TEXT_FIELD_SWATCH_GAP
-    })
+/// The radius of the dot that stands for a field's trailing hint where its words do not fit.
+const TEXT_FIELD_HINT_MARK: f32 = 3.5;
+
+/// What a field shows at its end for its trailing hint ([`TextFieldSpec::trailing_hint`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FieldHint<'a> {
+    /// The hint's words, where they leave the value at least their own room.
+    Words(&'a str),
+    /// A FIELD TOO NARROW FOR ITS HINT'S WORDS STILL MARKS ITSELF: a dot in their colour, so a
+    /// person can tell which field the hint is on (at 22 columns the field holding the one
+    /// unsaved draft the dock counted dropped "Unsaved" and looked like every other field).
+    Mark,
 }
 
-fn text_field_hint(control: &Control<TextFieldSpec>, width: f32) -> Option<&str> {
+fn text_field_hint_width(control: &Control<TextFieldSpec>, width: f32) -> f32 {
+    match text_field_hint(control, width) {
+        Some(FieldHint::Words(hint)) => {
+            crate::tray_raster::ui_text_width(hint, native_type_px(TypeStep::Caption).get())
+                + TEXT_FIELD_SWATCH_GAP
+        }
+        Some(FieldHint::Mark) => 2.0 * TEXT_FIELD_HINT_MARK + TEXT_FIELD_SWATCH_GAP,
+        None => 0.0,
+    }
+}
+
+fn text_field_hint(control: &Control<TextFieldSpec>, width: f32) -> Option<FieldHint<'_>> {
     let hint = control.spec.trailing_hint.as_deref()?;
     let taken = crate::tray_raster::ui_text_width(hint, native_type_px(TypeStep::Caption).get())
         + TEXT_FIELD_SWATCH_GAP;
@@ -888,7 +906,14 @@ fn text_field_hint(control: &Control<TextFieldSpec>, width: f32) -> Option<&str>
         - 2.0 * TEXT_FIELD_HORIZONTAL_PADDING
         - text_field_swatch_space(control)
         - text_field_end_button_space(control);
-    (words - taken >= taken).then_some(hint)
+    let mark = 2.0 * TEXT_FIELD_HINT_MARK + TEXT_FIELD_SWATCH_GAP;
+    if words - taken >= taken {
+        Some(FieldHint::Words(hint))
+    } else if words - mark >= mark {
+        Some(FieldHint::Mark)
+    } else {
+        None
+    }
 }
 
 fn text_field_end_button_space(control: &Control<TextFieldSpec>) -> f32 {
@@ -2216,7 +2241,35 @@ impl UiContent {
         .filter(|description| !description.trim().is_empty())
     }
 
+    /// Whether the keyboard lands on this content: the one rule a page's Tab order and a list's
+    /// stops both read (`focus_keys` in the Settings list). Two rules drifted apart: Software
+    /// Update's release notes, selectable words, were a Tab stop on the screen that drew them
+    /// and no stop of the list, so Tab past that screen never reached them (220x12, 2x text).
+    pub(crate) fn focusable(&self) -> bool {
+        match self {
+            Self::Group(_) | Self::Text(_) => false,
+            Self::Button(control) => control.state.enabled,
+            Self::Switch(control) => control.state.enabled,
+            Self::Slider(control) => control.state.enabled,
+            Self::TextField(control) => control.state.enabled,
+            Self::ColorWheel(control) => control.state.enabled,
+            Self::RichText(spec) => spec.selectable,
+            Self::MarkdownBlock(spec) => spec.selectable,
+            Self::TextViewport(spec) => spec.selectable,
+            Self::SettingsPreview(spec) => spec.pause_control(),
+            Self::Custom(spec) => spec.focusable,
+        }
+    }
+
     fn semantic(&self) -> SemanticProjection {
+        let projection = self.projection();
+        SemanticProjection {
+            focusable: self.focusable(),
+            ..projection
+        }
+    }
+
+    fn projection(&self) -> SemanticProjection {
         match self {
             Self::Group(spec) => SemanticProjection {
                 role: spec.role,
@@ -5788,22 +5841,31 @@ fn paint_compiled_node(
                 });
             }
             prims.push(DrawPrim::ClipPop);
-            if let Some(hint) = text_field_hint(control, rect.width) {
-                let caption = native_type_px(TypeStep::Caption);
-                let width = crate::tray_raster::ui_text_width(hint, caption.get());
-                prims.push(text_prim(
-                    rect.right()
-                        - TEXT_FIELD_HORIZONTAL_PADDING
-                        - text_field_swatch_space(control)
-                        - text_field_end_button_space(control)
-                        - width,
-                    row_baseline(rect.y, rect.height, caption.get()),
-                    hint.to_string(),
-                    caption,
-                    TextWeight::Regular,
-                    TextFace::Ui,
-                    rgba(quiet_text(&roles), 255),
-                ));
+            let hint_end = rect.right()
+                - TEXT_FIELD_HORIZONTAL_PADDING
+                - text_field_swatch_space(control)
+                - text_field_end_button_space(control);
+            match text_field_hint(control, rect.width) {
+                Some(FieldHint::Words(hint)) => {
+                    let caption = native_type_px(TypeStep::Caption);
+                    let width = crate::tray_raster::ui_text_width(hint, caption.get());
+                    prims.push(text_prim(
+                        hint_end - width,
+                        row_baseline(rect.y, rect.height, caption.get()),
+                        hint.to_string(),
+                        caption,
+                        TextWeight::Regular,
+                        TextFace::Ui,
+                        rgba(quiet_text(&roles), 255),
+                    ));
+                }
+                Some(FieldHint::Mark) => prims.push(DrawPrim::Dot {
+                    cx: hint_end - TEXT_FIELD_HINT_MARK,
+                    cy: rect.y + rect.height / 2.0,
+                    r: TEXT_FIELD_HINT_MARK,
+                    color: rgba(quiet_text(&roles), 255),
+                }),
+                None => {}
             }
             if let Some(color) = control.spec.swatch {
                 let (top, height) = if control.spec.swatch_line {
@@ -11099,6 +11161,63 @@ pub(crate) mod tests {
             .expect("the field is audited");
         assert!(audit.contains("overflow=true"), "{audit}");
         assert!(audit.contains(&format!("painted={painted:?}")), "{audit}");
+    }
+
+    /// A FIELD TOO NARROW FOR ITS HINT'S WORDS MARKS ITSELF WITH A DOT: at 22 columns (a 118pt
+    /// field) the field holding an unsaved draft dropped "Unsaved" and drew nothing in its
+    /// place, while the dock counted the draft. A wide field keeps the words; the dot stands
+    /// inside the field's end, vertically centred, where the words would end.
+    #[test]
+    fn a_field_too_narrow_for_its_hint_words_marks_itself() {
+        use crate::widget::DrawPrim;
+        let paint = |width: f32| {
+            let control = Control::new(
+                TextFieldSpec {
+                    label: "Scrollback limit".to_string(),
+                    placeholder: Some("100000 (default)".to_string()),
+                    secret: false,
+                    visual_value: Some("5000".to_string()),
+                    input: None,
+                    swatch: None,
+                    swatch_line: false,
+                    trailing_hint: Some("Unsaved".to_string()),
+                    description: None,
+                    end_button: false,
+                },
+                ActionId::new("set/scrollback"),
+            )
+            .value(SemanticValue::Text("5000".to_string()));
+            let prims = UiTree::new(UiNode::new("field", UiContent::TextField(control)))
+                .compile(LogicalRect::new(0.0, 0.0, width, 46.0))
+                .unwrap()
+                .tray(aterm_render::Theme::default(), 13.0)
+                .prims;
+            let words = prims
+                .iter()
+                .any(|prim| matches!(prim, DrawPrim::Text { s, .. } if s == "Unsaved"));
+            let dots = prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    DrawPrim::Dot { cx, cy, r, .. } => Some((*cx, *cy, *r)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (words, dots)
+        };
+        let (words, dots) = paint(300.0);
+        assert!(
+            words && dots.is_empty(),
+            "a wide field says Unsaved: {dots:?}"
+        );
+        let (words, dots) = paint(118.0);
+        assert!(!words, "the narrow field has no room for the words");
+        assert!(
+            matches!(dots[..], [(cx, cy, r)]
+                if cx + r <= 118.0 - TEXT_FIELD_HORIZONTAL_PADDING + 0.01
+                    && cx - r > 118.0 / 2.0
+                    && (cy - 23.0).abs() < 0.01),
+            "one dot at the field's end: {dots:?}"
+        );
     }
 
     #[test]

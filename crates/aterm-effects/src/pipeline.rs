@@ -532,11 +532,10 @@ impl EffectsPipeline {
             Some(_) => return None, // a step due now → display-rAF
             None => None,           // deep asleep, hidden or gone
         };
-        let rain_ms = self
-            .rain
-            .as_ref()
-            .filter(|rain| rain.is_active())
-            .map(|rain| rain.next_tick_in_ms() as f64);
+        let rain_ms = match &self.rain {
+            Some(rain) if rain.is_active() => Some(rain.next_tick_in_ms() as f64),
+            _ => None,
+        };
         let streak_ms = if let Some(streak) = self.streak.as_deref() {
             match streak.next_change_deadline(now, self.streak_cfg.idle_secs) {
                 Some(d) if d > now => Some(d.duration_since(now).as_secs_f64() * 1000.0),
@@ -686,24 +685,29 @@ impl EffectsPipeline {
     pub fn note_console_input(&mut self, kind: PetInputKind) {
         let now = self.now();
         self.companion.note_console_input(now, kind);
-        let editing = |me: &mut Self| {
-            me.cursor.cadence.on_keystroke(now);
-            me.rain_material_editing = true;
-            if let Some(rain) = me.rain.as_deref_mut() {
-                rain.note_keystroke();
-            }
-        };
         match kind {
             PetInputKind::Delete => {
-                editing(self);
+                self.cursor.cadence.on_keystroke(now);
+                self.rain_material_editing = true;
+                if let Some(rain) = self.rain.as_deref_mut() {
+                    rain.note_keystroke();
+                }
                 self.cursor.glow.note_backspace(now);
             }
             PetInputKind::Kill => {
-                editing(self);
+                self.cursor.cadence.on_keystroke(now);
+                self.rain_material_editing = true;
+                if let Some(rain) = self.rain.as_deref_mut() {
+                    rain.note_keystroke();
+                }
                 self.cursor.glow.note_kill(now, true);
             }
             PetInputKind::KillForward => {
-                editing(self);
+                self.cursor.cadence.on_keystroke(now);
+                self.rain_material_editing = true;
+                if let Some(rain) = self.rain.as_deref_mut() {
+                    rain.note_keystroke();
+                }
                 self.cursor.glow.note_kill(now, false);
             }
             PetInputKind::Navigate => self.cursor.glow.note_navigation(now),
@@ -868,7 +872,10 @@ impl EffectsPipeline {
             enabled,
             duration: Duration::from_millis(duration_ms.clamp(30, 2000)),
             max_len: (length as usize).clamp(1, 512),
-            color: color.unwrap_or(theme_cursor) & 0x00FF_FFFF,
+            color: match color {
+                Some(c) => c,
+                None => theme_cursor,
+            } & 0x00FF_FFFF,
             intensity: 0.0,
             warmth: 0.0,
         };
@@ -1239,9 +1246,15 @@ impl EffectsPipeline {
         let refs: Vec<&str> = self.languages.iter().map(String::as_str).collect();
         let mut over = self.override_toml.clone().unwrap_or_default();
         over.push_str(&self.custom_lexicon);
-        let over = (!over.is_empty()).then_some(over);
-        let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(&refs, over.as_deref())
-            .unwrap_or_else(|_| aterm_lexicon::Lexicon::with_languages(&refs));
+        let over_ref = if over.is_empty() {
+            None
+        } else {
+            Some(over.as_str())
+        };
+        let lexicon = match aterm_lexicon::Lexicon::with_languages_and_override(&refs, over_ref) {
+            Ok(lex) => lex,
+            Err(_) => aterm_lexicon::Lexicon::with_languages(&refs),
+        };
         self.lexicon_conflicts = lexicon.conflicts().to_vec();
         self.sparkle = Some(Resolved {
             cfg: self.deco_cfg.clone(),
@@ -1483,9 +1496,11 @@ impl EffectsPipeline {
             );
             input.cursor_trail.clear();
             input.cursor_glow_add.clear();
+            input.cursor_glow_add_ramps.clear();
             input.glow_halo.clear();
             input.fire_patch.clear();
             input.glow_under.clear();
+            input.glow_under_ramps.clear();
             input.char_fg.clear();
             input.fire_halo.clear();
             #[cfg(test)]
@@ -1530,8 +1545,11 @@ impl EffectsPipeline {
             MotionPolicy::resolve(MotionMode::Auto, self.deco_cfg.reduced_motion, focused);
         let motion_amp = cursor_motion.amplitude(MotionEffect::CursorGlow);
         let animate = cursor_motion.animate(MotionEffect::CursorGlow);
-        let cur = (live_viewport && input.cursor_visible)
-            .then_some((input.cursor_row as u16, input.cursor_col as u16));
+        let cur = if live_viewport && input.cursor_visible {
+            Some((input.cursor_row as u16, input.cursor_col as u16))
+        } else {
+            None
+        };
         self.glow_cfg.dark_theme =
             input.default_bg == aterm_core::render::COLOR_UNSET || theme_is_dark(input.default_bg);
         self.glow_cfg.theme_fg = input.default_fg;
@@ -1591,13 +1609,14 @@ impl EffectsPipeline {
                     live_cursor: term_cursor_color,
                     cursor_color_pinned,
                     default_bg,
-                    cursor_cell_bg: cur.and_then(|(row, col)| {
-                        input
-                            .cells
-                            .get(usize::from(row))?
-                            .get(usize::from(col))
-                            .map(|cell| aterm_render::rgb_to_u32(cell.bg))
-                    }),
+                    cursor_cell_bg: if let Some((row, col)) = cur
+                        && let Some(r) = input.cells.get(usize::from(row))
+                        && let Some(cell) = r.get(usize::from(col))
+                    {
+                        Some(aterm_render::rgb_to_u32(cell.bg))
+                    } else {
+                        None
+                    },
                     geom: glow_geom,
                     focused,
                     shed_envelope: 1.0,
@@ -1637,7 +1656,7 @@ impl EffectsPipeline {
             let _ = self
                 .cursor
                 .glow
-                .veil_pet_letters(&mut input.glow_under, &[]);
+                .veil_pet_letters((&mut input.glow_under, &mut input.glow_under_ramps), &[]);
         }
         if self.trail_cfg.enabled {
             input.cursor_trail_color = fx.trail_color;
@@ -1658,7 +1677,11 @@ impl EffectsPipeline {
             cols: cols as u16,
         };
         let mut facts = TerminalFacts::read(term, term.render_identity(), scrolled);
-        facts.caret = live_viewport.then_some((input.cursor_row as u16, input.cursor_col as u16));
+        facts.caret = if live_viewport {
+            Some((input.cursor_row as u16, input.cursor_col as u16))
+        } else {
+            None
+        };
         facts.cursor_visible = cur.is_some();
         facts.live_viewport = live_viewport;
         facts.display_offset = if cursor_snapshot_coherent {
@@ -1737,11 +1760,18 @@ impl EffectsPipeline {
                     0
                 } else if input.cells.len() >= rows && input.line_sizes.len() >= rows {
                     let epoch = term.damage_epoch();
-                    let rescan = self.decos.needs_rescan(epoch).then(|| WordRescan {
-                        birth: now,
-                        cursor: live_viewport
-                            .then_some((input.cursor_row as u16, input.cursor_col as u16)),
-                    });
+                    let rescan = if self.decos.needs_rescan(epoch) {
+                        Some(WordRescan {
+                            birth: now,
+                            cursor: if live_viewport {
+                                Some((input.cursor_row as u16, input.cursor_col as u16))
+                            } else {
+                                None
+                            },
+                        })
+                    } else {
+                        None
+                    };
                     let fp = self
                         .word_grid(&WordGrid {
                             now,
@@ -1879,10 +1909,11 @@ impl EffectsPipeline {
                         content_seq: term.content_seq(),
                         execute_edge,
                         cmd_done: term_cmd_done(term),
-                        scan: (display_offset == 0
+                        scan: if display_offset == 0
                             && input.cells.len() >= rows
-                            && input.line_sizes.len() >= rows)
-                            .then_some(RainScan {
+                            && input.line_sizes.len() >= rows
+                        {
+                            Some(RainScan {
                                 cells: &input.cells,
                                 line_sizes: &input.line_sizes,
                                 images: &input.images,
@@ -1890,7 +1921,10 @@ impl EffectsPipeline {
                                 cols,
                                 default_bg: input.default_bg,
                                 epoch,
-                            }),
+                            })
+                        } else {
+                            None
+                        },
                         cursor: cur,
                         geom,
                         tick: RainTickInput {

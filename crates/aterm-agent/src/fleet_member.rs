@@ -1354,7 +1354,7 @@ enum JoinFailed {
         /// The node the machine that answered proved, when it proved one.
         proved: Option<String>,
     },
-    /// It was; the issuer refused, or answered no join (its words).
+    /// It was; the machine that answered refused, or answered no join (its words).
     Registration(String),
     /// It was; no answer to the registration came.
     Unanswered(String),
@@ -1511,10 +1511,10 @@ fn not_recorded(issuer_at: &str, why: &JoinFailed, minted: bool) -> String {
             }
         }
         Advice::NoIssuer => format!(
-            "{issuer_at} did not record this machine: {why}\n  {nothing} The code names a \
-             machine that issues no fleet now — a member, or one that left — so no aterm there \
-             will record this one. Copy the code from the machine whose `aterm fleet init` \
-             wrote it (its `aterm fleet peers` lists the members), and join again."
+            "this machine dialled {issuer_at}, a member of that fleet and not its issuer: it \
+             holds no join code, so it records no members\n  {nothing} A join code comes from \
+             the fleet's issuer, in the file its `aterm fleet init` names (`aterm fleet peers` on \
+             {issuer_at} names that issuer): copy the code from there, and join again."
         ),
         Advice::PastTheLan => format!(
             "the issuer at {issuer_at} was not dialled: {why}\n  {nothing} A fleet's machines \
@@ -3531,7 +3531,7 @@ fn drive_fleet_in(
                     return Err(aterm_ctl::DriveRefused {
                         again: true,
                         left: None,
-                        unserved: false,
+                        unserved: missed.unserved,
                         why: format!(
                             "{why}; try again once it answers (`aterm fleet peers` says why it \
                              does not)"
@@ -3563,7 +3563,7 @@ fn drive_fleet_in(
             aterm_ctl::DriveRefused {
                 again: drive_again(&why),
                 left: None,
-                unserved: matches!(why, Unreached::Deadline(member::Stage::Handshake, _)),
+                unserved: unserved(&why),
                 // The peer is named once: a reason that names its host already goes alone.
                 why: if said.contains(&peer.host) {
                     said
@@ -3586,6 +3586,8 @@ struct Missed {
     /// The issuer did not answer, so a read once it answers may bring the book: an issuer that
     /// answered with no book (an older aterm, none, not now, another node) is told once.
     silent: bool,
+    /// The issuer took the connection and sent no fleet handshake in time ([`unserved`]).
+    unserved: bool,
 }
 
 impl Missed {
@@ -3595,6 +3597,7 @@ impl Missed {
             why => Self {
                 why: format!("its issuer's book could not be read ({why})"),
                 silent: false,
+                unserved: false,
             },
         }
     }
@@ -3607,10 +3610,12 @@ impl Missed {
                     within.as_secs_f64()
                 ),
                 silent: true,
+                unserved: unserved(why),
             },
             why => Self {
                 why: format!("its issuer's book could not be read ({why})"),
                 silent: drive_again(why),
+                unserved: false,
             },
         }
     }
@@ -3629,6 +3634,7 @@ impl Missed {
                 _ => Self {
                     why: format!("its issuer's book could not be read ({why})"),
                     silent: false,
+                    unserved: false,
                 },
             }),
         }
@@ -3679,6 +3685,13 @@ fn drive_again(why: &Unreached) -> bool {
         Unreached::Connect(_, e) => e.kind() == io::ErrorKind::ConnectionRefused,
         _ => false,
     }
+}
+
+/// Whether the aterm dialled took the connection and sent no fleet handshake in time (stopped,
+/// frozen or overloaded), so nothing was asked of it: exit 2 ([`aterm_ctl::DriveRefused`],
+/// [`aterm_ctl::PeerFault::Unserved`]).
+const fn unserved(why: &Unreached) -> bool {
+    matches!(why, Unreached::Deadline(member::Stage::Handshake, _))
 }
 
 fn failure_words(failure: Failure) -> String {
@@ -3865,6 +3878,8 @@ fn fault_of(why: &Unreached) -> aterm_ctl::PeerFault {
         PeerFault::NoNetwork
     } else if why.not_permitted() {
         PeerFault::NotPermitted
+    } else if unserved(why) {
+        PeerFault::Unserved
     } else {
         PeerFault::Other
     }

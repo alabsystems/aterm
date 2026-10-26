@@ -307,12 +307,15 @@ impl CardFrames {
         };
         let slot = self.next;
         self.next = (slot + 1) % RING;
-        let (under, over) = self.ring[slot].get_or_insert_with(|| {
-            (
+        if self.ring[slot].is_none() {
+            self.ring[slot] = Some((
                 Arc::new(FxContent::default()),
                 Arc::new(FxContent::default()),
-            )
-        });
+            ));
+        }
+        let Some((under, over)) = &mut self.ring[slot] else {
+            unreachable!()
+        };
         refill(under, |items, palette| fill_under(cx, items, palette));
         refill(over, |items, palette| fill_over(cx, arts, items, palette));
         (Arc::clone(under), Arc::clone(over))
@@ -369,6 +372,17 @@ impl RimArt {
     }
 
     fn of(frame: &[&str], p: i64, rim: i64) -> Option<Self> {
+        #[inline]
+        const fn all_zero(slice: &[u8]) -> bool {
+            let mut i = 0;
+            while i < slice.len() {
+                if slice[i] != 0 {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
         if rim == 0 || p == 0 {
             return None;
         }
@@ -388,10 +402,7 @@ impl RimArt {
                 let row = (y + rim) as usize * wu;
                 let x0 = row + rx0;
                 let x1 = row + rx1;
-                debug_assert!(
-                    data[x0..x1].iter().all(|&t| t == 0),
-                    "rim strips overlap on row {y}"
-                );
+                debug_assert!(all_zero(&data[x0..x1]), "rim strips overlap on row {y}");
                 data[x0..x1].fill(k);
             }
         });
@@ -566,9 +577,16 @@ impl CardArts {
     }
 
     #[inline]
-    fn star(&self, arm: i64, gold: bool) -> Option<&StarArt> {
-        let i = usize::try_from(arm.checked_sub(1)?).ok()?;
-        self.stars.get(i)?[usize::from(gold)].as_ref()
+    const fn star(&self, arm: i64, gold: bool) -> Option<&StarArt> {
+        if arm < 1 {
+            return None;
+        }
+        let i = (arm - 1) as usize;
+        if i < self.stars.len() {
+            self.stars[i][gold as usize].as_ref()
+        } else {
+            None
+        }
     }
 }
 
@@ -872,13 +890,13 @@ fn tone_rects(b: Rect, covers: &[Rect], mut lay: impl FnMut(Rect, bool)) {
         }
         let white = if white.0 < white.1 { white } else { (0, 0) };
         let cap = cols.len();
-        match n.checked_sub(1).map(|last| &mut cols[last]) {
-            Some(prev) if prev.1 == x0 && prev.2 == white => prev.1 = x1,
-            _ if n < cap => {
-                cols[n] = (x0, x1, white);
-                n += 1;
-            }
-            _ => debug_assert!(false, "more column runs than a trail has segments"),
+        if n > 0 && cols[n - 1].1 == x0 && cols[n - 1].2 == white {
+            cols[n - 1].1 = x1;
+        } else if n < cap {
+            cols[n] = (x0, x1, white);
+            n += 1;
+        } else {
+            debug_assert!(false, "more column runs than a trail has segments");
         }
     };
     let mut x = b.x0;

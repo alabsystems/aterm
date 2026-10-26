@@ -4,7 +4,7 @@
 //! `machines-root-door`: root tools `aterm machines` runs stay inside its crate.
 
 use super::rules::{CENSUS_CRATE, PRODUCT, test_path};
-use super::{Bound, Finding, Line, Rule, SourceFile, Tree, has};
+use super::{Bound, Finding, Line, Rule, SourceFile, Tree, brace_close, has, hits};
 
 const MACHINES_CRATE: &str = "crates/aterm-machines/";
 
@@ -19,6 +19,7 @@ const ROOT_TOOLS: &[&str] = &[
 ];
 
 const AGENT_PATH: &str = "aterm_machines::agent";
+const INSTALLER_PROBE: &str = "crates/aterm-gui/src/clt_install/probe.rs";
 
 const ROSETTA_INSTALL: (&str, &str, &str) = (
     "crates/atpkg/src/platform/unix.rs",
@@ -30,11 +31,14 @@ pub(super) const MACHINES_ROOT_DOOR: Rule = Rule {
     id: "machines-root-door",
     why: "installer, softwareupdate, visudo, /etc/sudoers.d, pmset, socketfilterfw and \
           systemsetup act as root on a whole Mac: only aterm-machines' agent, under the \
-          owner's ruling M1 and one digest-pinned sudoers rule, may name them, and nothing \
-          outside the crate reaches `aterm_machines::agent` past `cli::main_entry`. The one \
-          exception is not root work (ruling R1): atpkg's Rosetta 2 install, the whole argv \
+          owner's ruling M1 and one digest-pinned sudoers rule, may name them for execution, \
+          and nothing outside the crate reaches `aterm_machines::agent` past \
+          `cli::main_entry`. The one execution exception is not root work (ruling R1): \
+          atpkg's Rosetta 2 install, the whole argv \
           [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"] in \
-          crates/atpkg/src/platform/unix.rs, which installs as the user with no administrator",
+          crates/atpkg/src/platform/unix.rs, which installs as the user with no administrator. \
+          The GUI installer probe may only compare softwareupdate's executable identity \
+          in a closed boolean helper, without binding or executing the path",
     scope: &[MACHINES_CRATE],
     check: machines_root_door,
 };
@@ -48,31 +52,68 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             continue;
         }
         for line in file.shipped_lines() {
-            let why = if let Some(tool) = ROOT_TOOLS.iter().find(|t| line.text.contains(*t)) {
-                if is_rosetta_install(file, &line, tool) {
-                    continue;
-                }
-                Some(format!(
+            if let Some(tool) = ROOT_TOOLS.iter().find(|t| line.text.contains(*t))
+                && !is_rosetta_install(file, &line, tool)
+                && !is_installer_identity(file, &line, tool)
+            {
+                let why = format!(
                     "names `{tool}`, a root tool only aterm-machines' agent runs{}",
                     if *tool == ROSETTA_INSTALL.1 {
-                        " (atpkg's one exception is its Rosetta 2 install, as the whole argv \
-                         array in crates/atpkg/src/platform/unix.rs)"
+                        " (the one execution exception is atpkg's Rosetta 2 install, as the \
+                         whole argv array in crates/atpkg/src/platform/unix.rs; the GUI \
+                         installer probe may only compare its executable identity)"
                     } else {
                         ""
                     }
-                ))
-            } else if reaches_agent(line.code) {
-                Some(format!(
+                );
+                out.push(file.finding(MACHINES_ROOT_DOOR.id, line.no, why));
+            }
+            if reaches_agent(line.code) {
+                let why = format!(
                     "reaches `{AGENT_PATH}`; its one door is `aterm_machines::cli::main_entry`"
-                ))
-            } else {
-                None
-            };
-            if let Some(why) = why {
+                );
                 out.push(file.finding(MACHINES_ROOT_DOOR.id, line.no, why));
             }
         }
     }
+}
+
+fn is_installer_identity(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
+    if file.rel != INSTALLER_PROBE
+        || tool != ROSETTA_INSTALL.1
+        || line.text.matches(tool).count() != 1
+        || ROOT_TOOLS
+            .iter()
+            .any(|other| *other != tool && line.text.contains(other))
+    {
+        return false;
+    }
+    let lexed = file.lexed();
+    let line_at: usize = lexed
+        .code
+        .split_inclusive('\n')
+        .take(line.no - 1)
+        .map(str::len)
+        .sum();
+    let Some(literal) = line.text.find(tool) else {
+        return false;
+    };
+    let literal_at = line_at + literal;
+    // The whole helper must consume the path as a boolean, never expose it as a value.
+    hits(&lexed.code, "fn", Bound::Word).any(|at| {
+        let Some(open) = lexed.code[at..].find('{').map(|offset| at + offset) else {
+            return false;
+        };
+        let Some(close) = brace_close(&lexed.code, open) else {
+            return false;
+        };
+        at <= literal_at
+            && literal_at < close
+            && squeeze(&lexed.text[at..open])
+                == "fnis_softwareupdate(path:&::std::path::Path)->bool"
+            && squeeze(&lexed.text[open + 1..close])
+                == format!("path==::std::path::Path::new(\"{tool}\")")
+    })
 }
 
 fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
@@ -250,8 +291,79 @@ mod tests {
             found
                 .iter()
                 .filter(|f| f.detail.contains("softwareupdate"))
-                .all(|f| f.detail.contains("one exception is its Rosetta 2 install")),
+                .all(|f| f
+                    .detail
+                    .contains("one execution exception is atpkg's Rosetta 2 install")),
             "a refused spelling names the admitted one: {found:#?}"
         );
+    }
+
+    #[test]
+    fn the_installer_probe_only_names_softwareupdate_as_a_closed_path_identity() {
+        let identity = "fn is_softwareupdate(path: &::std::path::Path) -> bool { path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\") }\n";
+        let wrapped = "fn is_softwareupdate(path: &::std::path::Path) -> bool {\n\
+                       path == ::std::path::Path::new(\n\
+                       \"/usr/sbin/softwareupdate\"\n\
+                       )\n\
+                       }\n";
+        for allowed in [identity, wrapped] {
+            assert!(
+                run(&MACHINES_ROOT_DOOR, &[(INSTALLER_PROBE, allowed)]).is_empty(),
+                "a complete boolean identity, regardless of wrapping: {allowed}"
+            );
+        }
+        for refused in [
+            "fn is_softwareupdate(path: &::std::path::Path) -> bool { let tool = ::std::path::Path::new(\"/usr/sbin/softwareupdate\"); path == tool }\n",
+            "fn is_softwareupdate(path: &::std::path::Path) -> bool { spawnfd::command(\"/usr/sbin/softwareupdate\"); true }\n",
+            "fn is_softwareupdate(path: &::std::path::Path) -> bool { extra(); path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\") }\n",
+            "fn is_softwareupdate(path: &::std::path::Path) -> bool { path != ::std::path::Path::new(\"/usr/sbin/softwareupdate\") }\n",
+            "fn is_softwareupdate(path: &::std::path::Path) -> &::std::path::Path { ::std::path::Path::new(\"/usr/sbin/softwareupdate\") }\n",
+            "fn is_softwareupdate(path: &::std::path::Path) -> bool { path == ::std::path::Path::new(\"/usr/bin/pmset\") }\n",
+            "fn is_softwareupdate(path: &::std::path::Path) -> bool { path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\") } const TOOL: &str = \"/usr/sbin/softwareupdate\";\n",
+        ] {
+            let found = run(&MACHINES_ROOT_DOOR, &[(INSTALLER_PROBE, refused)]);
+            assert!(
+                !found.is_empty(),
+                "an executable path must not escape: {refused}"
+            );
+        }
+        assert!(
+            !run(
+                &MACHINES_ROOT_DOOR,
+                &[("crates/aterm-gui/src/other.rs", identity)]
+            )
+            .is_empty(),
+            "the read-only probe does not open other files"
+        );
+    }
+
+    #[test]
+    fn an_alias_with_an_executing_constructor_is_not_a_path_identity() {
+        let source = "use crate::ExecutingPath as Path;\n\
+                      #[derive(PartialEq)] struct ExecutingPath;\n\
+                      impl ExecutingPath { fn new(executable: &str) -> &'static Self { let _ = spawnfd::command(executable).status(); &ExecutingPath } }\n\
+                      fn is_softwareupdate(path: &Path) -> bool { path == Path::new(\"/usr/sbin/softwareupdate\") }\n";
+        let found = run(&MACHINES_ROOT_DOOR, &[(INSTALLER_PROBE, source)]);
+        assert_eq!(spots(&found), [format!("{INSTALLER_PROBE}:4")]);
+    }
+
+    #[test]
+    fn admitted_tool_spellings_never_hide_agent_access_on_the_same_line() {
+        for (rel, admitted) in [
+            (
+                INSTALLER_PROBE,
+                "fn is_softwareupdate(path: &::std::path::Path) -> bool { path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\") }",
+            ),
+            (
+                ROSETTA_INSTALL.0,
+                "const ARGV: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"];",
+            ),
+        ] {
+            let source =
+                format!("{admitted} fn forbidden() {{ aterm_machines::agent::main(a, s); }}\n");
+            let found = run(&MACHINES_ROOT_DOOR, &[(rel, &source)]);
+            assert_eq!(found.len(), 1, "{found:#?}");
+            assert!(found[0].detail.contains("reaches `aterm_machines::agent`"));
+        }
     }
 }

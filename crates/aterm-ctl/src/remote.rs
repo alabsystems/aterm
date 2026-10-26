@@ -9,6 +9,8 @@ use std::io::{self, BufReader, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use aterm_types::control_verbs::turn_option_words;
+
 use super::{
     EXIT_TIMEOUT, LocalVerbs, SELF_SID_ENV, await_task, bytes_payload, malformed_header_error,
     print_frame_answer, print_payload, print_stdout_line, read_frame_answer, read_status_line,
@@ -42,8 +44,10 @@ pub struct DriveRefused {
     pub again: bool,
     /// Why the dial reached no Mac this machine may hold a tab on, with this machine's node.
     pub left: Option<Left>,
-    /// The peer took the connection and sent no fleet handshake within the deadline, so the
-    /// request was not sent: exit 2, as for an instance that accepted and did not serve.
+    /// The request was not sent because an aterm on its way took the connection and sent no fleet
+    /// handshake within the deadline: the peer, or this machine's issuer, read for which Mac the
+    /// word names (a refusal that says `try again once it answers`): exit 2, as for an instance
+    /// that accepted and did not serve.
     pub unserved: bool,
 }
 
@@ -129,25 +133,6 @@ const TURN_WAIT_MS: u64 = 20_000;
 /// 30 s, the dial and the reply inside it.
 const TURN_MAX_MS: u64 = aterm_types::control_verbs::DRIVE_TURN_MAX_MS;
 
-/// The options a `turn` reads before its text (`help turn`).
-const TURN_OPTIONS: &[&str] = &[
-    "idle",
-    "timeout",
-    "submit",
-    "settle",
-    "submit_window",
-    "presses",
-    "submit_verify",
-    "trim",
-    "typed",
-    "cadence",
-    "cap",
-    "yield",
-    "if-gen",
-    "if-rows",
-    "cause",
-];
-
 fn refused(why: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, why.into())
 }
@@ -161,14 +146,25 @@ pub(crate) fn run(
 ) -> io::Result<ExitCode> {
     validate_request_parts(parts)?;
     if survey::is_survey(parts) {
-        let mut parts = parts.to_vec();
-        if !parts
+        if let Some(at) = parts
             .iter()
-            .any(|p| p == "--host" || p == "--fleet" || p.starts_with("--host="))
+            .position(|p| p == "--host" || p == "--fleet" || p.starts_with("--host="))
         {
-            parts.extend(["--host".to_owned(), host.to_owned()]);
+            let named = match (parts[at].as_str(), parts.get(at + 1)) {
+                ("--host", Some(other)) => format!("--host {other}"),
+                (word, _) => word.to_owned(),
+            };
+            return Err(refused(format!(
+                "--host {} and survey's own `{}` each name the machines a survey reads: give one \
+                 (`aterm ctl survey --host <h>` reads one peer, `aterm ctl survey --fleet` every \
+                 one)",
+                aterm_codec::tty::one_line(host, 80),
+                aterm_codec::tty::one_line(&named, 80)
+            )));
         }
-        return survey::run_survey(&parts, None, None, local);
+        let mut parts = parts.to_vec();
+        parts.extend(["--host".to_owned(), host.to_owned()]);
+        return survey::run_survey(&parts, None, None, total, local);
     }
     let Some(drive) = local.fleet_drive else {
         return Err(io::Error::new(
@@ -211,7 +207,9 @@ pub(crate) fn run(
     }
     let mut parts = parts.to_vec();
     if verb == "turn" {
-        turn_wait(&mut parts, host)?;
+        let words = turn_wait(args, selector, host)?;
+        parts.truncate(parts.len() - args.len());
+        parts.push(words);
     }
     let mut request = request_line(&parts)?;
     validate_request_line_len(&request, Some(verb))?;
@@ -232,7 +230,7 @@ pub(crate) fn run(
 fn left_holding(host: &str, sid: &str, left: &Left, why: &str) -> String {
     let (host, sid) = (
         aterm_codec::tty::one_line(host, 80),
-        aterm_codec::tty::one_line(sid, 40),
+        aterm_codec::tty::one_line(sid.trim_start_matches('@'), 40),
     );
     let (node, again) = match left {
         Left::Fleet(node) => (
@@ -288,45 +286,47 @@ fn is_sid(word: &str) -> bool {
 /// `if-supervisor=` fence and a leading `cause=`.
 const TURN_LEADING: &[&str] = &["id=", "if-supervisor=", "cause="];
 
-/// A turn's wait over a drive to `host`: its `timeout=`, at most [`TURN_MAX_MS`], or
-/// [`TURN_WAIT_MS`] added where it names none; a longer one is refused, naming the waits that work
-/// for a worker's turn and for any other session's.
-fn turn_wait(parts: &mut Vec<String>, host: &str) -> io::Result<()> {
-    let at = parts
-        .iter()
-        .position(|p| p == "turn")
-        .ok_or_else(usage_error)?;
-    let mut options = at + 1;
-    while let Some(word) = parts.get(options) {
+/// A turn's words after its verb (`args`) over a drive to `host`, read as the driven Mac reads
+/// them (past the [`TURN_LEADING`] words, [`turn_option_words`]): its last `timeout=`, at most
+/// [`TURN_MAX_MS`], or [`TURN_WAIT_MS`] added where it names none; a longer one is refused,
+/// naming the waits that work for a worker's turn and for any other session's. A `timeout=` that
+/// is no number goes as it is, for the driven Mac's own usage error.
+fn turn_wait(args: &[String], session: Option<&str>, host: &str) -> io::Result<String> {
+    let line = args.join(" ");
+    let mut options = line.trim_start();
+    loop {
+        let (word, tail) = options
+            .split_once(char::is_whitespace)
+            .map_or((options, ""), |(word, tail)| (word, tail.trim_start()));
         if word == "--" {
-            options += 1;
+            options = tail;
             break;
         }
         if !TURN_LEADING.iter().any(|lead| word.starts_with(lead)) {
             break;
         }
-        options += 1;
+        options = tail;
     }
-    let named = parts[options..]
-        .iter()
-        .map_while(|word| {
-            let (key, value) = word.split_once('=')?;
-            TURN_OPTIONS.contains(&key).then_some((key, value))
-        })
-        .find(|(key, _)| *key == "timeout")
-        .map(|(_, value)| value.to_owned());
-    match named {
-        None => {
-            parts.insert(options, format!("timeout={TURN_WAIT_MS}"));
-            Ok(())
+    let waits: Result<Vec<u64>, _> = turn_option_words(options)
+        .0
+        .into_iter()
+        .filter(|(key, _)| *key == "timeout")
+        .map(|(_, ms)| ms.parse::<u64>())
+        .collect();
+    match waits.as_deref() {
+        Ok([]) => {
+            let leading = line[..line.len() - options.len()].trim_end();
+            let wait = format!("timeout={TURN_WAIT_MS}");
+            let words = [leading, &wait, options];
+            Ok(words
+                .into_iter()
+                .filter(|words| !words.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "))
         }
-        Some(ms) if ms.parse::<u64>().is_ok_and(|ms| ms <= TURN_MAX_MS) => Ok(()),
-        Some(_) => {
+        Ok([.., ms]) if *ms > TURN_MAX_MS => {
             let host = aterm_codec::tty::one_line(host, 80);
-            let session = parts
-                .first()
-                .filter(|word| word.starts_with('@'))
-                .map_or("@<sid>", String::as_str);
+            let session = session.unwrap_or("@<sid>");
             Err(refused(format!(
                 "a turn over the fleet waits at most timeout={TURN_MAX_MS} (its connection lasts \
                  30 s): give it a shorter timeout=, or say settle=submitted and then wait for a \
@@ -335,6 +335,7 @@ fn turn_wait(parts: &mut Vec<String>, host: &str) -> io::Result<()> {
                  {session} status` (or `text`)"
             )))
         }
+        _ => Ok(line),
     }
 }
 

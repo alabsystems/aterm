@@ -162,6 +162,94 @@ fragment float4 fs_glow(GlowVsOut in [[stage_in]]) {
     return float4(glow_src(in)) / 255.0;
 }
 
+// ---------------------------------------------------------------- GLOW ITEMS
+// The bloom's lights as an item list (aterm_render::bloom::BloomItems, whose
+// `light` is this reader's twin), so a ramp reaches the extract whole: 4 header
+// words (the item count, the word the records start at, the word the ends start
+// at, the instance count), each item's first instance, each item's record
+// (x | y << 16, w | h << 16, join | joined << 16, its first end counted from the
+// ends' start), then the ends (0x00RRGGBB | alpha << 24). Instance i draws row
+// s = i - first of the last item whose first instance is at most i: the quad
+// (x, y + s, w, 1), its run (s == join) joined + 1 rows tall and the rows after
+// it joined lower, between ends 2s and 2s + 1, and nothing where both are zero.
+// `widen` lifts a side under the half-res texel (BLOOM_DOWNSCALE, 2) to it and
+// scales the colour by the share it covered, rounded, as the extract's copies of
+// thin lights are. The list sits where an instance stream would
+// (ffi.rs::INSTANCE_STREAM_SLOT), read by instance id.
+struct GlowItem {
+    uint4 rect;
+    uint4 c0;
+    uint4 c1;
+};
+
+// An end as bytes (r, g, b, a), its colour times num / den, rounded.
+static inline uint4 glow_item_end(uint e, uint num, uint den) {
+    uint3 c = ((uint3(e >> 16u, e >> 8u, e) & 0xFFu) * num + den / 2u) / den;
+    return uint4(c, e >> 24u);
+}
+
+static inline GlowItem glow_item(device const uint* w, uint i, bool widen) {
+    uint lo = 0u;
+    uint hi = w[0] - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (w[4u + mid] <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uint s = i - w[4u + lo];
+    uint r = w[1] + 4u * lo;
+    uint xy = w[r];
+    uint join = w[r + 2u] & 0xFFFFu;
+    uint joined = w[r + 2u] >> 16u;
+    uint e = w[2] + w[r + 3u] + 2u * s;
+    uint e0 = w[e];
+    uint e1 = w[e + 1u];
+    uint qw = w[r + 1u] & 0xFFFFu;
+    uint qh = s == join ? joined + 1u : 1u;
+    uint num = 1u;
+    uint den = 1u;
+    if (widen) {
+        if (qw > 0u && qw < 2u) {
+            num *= qw;
+            den *= 2u;
+            qw = 2u;
+        }
+        if (qh < 2u) {
+            num *= qh;
+            den *= 2u;
+            qh = 2u;
+        }
+    }
+    GlowItem it;
+    it.rect = (e0 | e1) == 0u
+        ? uint4(0u)
+        : uint4(xy & 0xFFFFu, (xy >> 16u) + s + (s > join ? joined : 0u), qw, qh);
+    it.c0 = glow_item_end(e0, num, den);
+    it.c1 = glow_item_end(e1, num, den);
+    return it;
+}
+
+// vs_glow over the item list, widened: the bloom extract's lights.
+vertex GlowVsOut vs_glow_items(uint vi [[vertex_id]],
+                               uint ii [[instance_id]],
+                               device const uint* items [[buffer(30)]],
+                               constant Uniforms& u [[buffer(0)]]) {
+    GlowItem it = glow_item(items, ii, true);
+    float4 rect = float4(it.rect);
+    float2 k = corner(vi);
+    float2 px = rect.xy + k * rect.zw;
+    GlowVsOut o;
+    o.pos = float4(to_ndc(px, u), 0.0, 1.0);
+    o.span = rect.xz;
+    o.lx = k.x * rect.z;
+    o.c0 = it.c0;
+    o.c1 = it.c1;
+    return o;
+}
+
 // ---------------------------------------------------------------- RAIN HALO
 // RAIN_GLOW_ATTRS: 0 => Uint16x4, 1 => Unorm8x4, 2 => Uint16x4.
 struct RainVsIn {
@@ -675,6 +763,13 @@ static inline uint2 fx_texel(uint2 l, uint2 dst, uint4 src, uint flags) {
     return src.xy + t;
 }
 
+// A Ramps item's palette row for its row y: the rows src.y + 1 ..= src.y +
+// src.z repeat row src.y's ends (a run, one light as tall as its rows), which
+// the palette holds once.
+static inline uint fx_ramp_row(uint y, uint4 src) {
+    return y - min(y - min(y, src.y), src.z);
+}
+
 // Law F's (c, a) at this fragment, as bytes, or false where the item writes
 // nothing.
 static inline bool fx_paint(FxVsOut in, texture2d<float> fx_r8,
@@ -698,9 +793,9 @@ static inline bool fx_paint(FxVsOut in, texture2d<float> fx_r8,
             c = fx_byte4(fx_rgba.read(t));
         }
     } else {
-        // Rect (row 0) and Ramps (row l.y): the GlowQuad ramp over entries
-        // j, j + 1 at column l.x of the item's width.
-        uint j = in.pal + 2u * (kind == 1u ? l.y : 0u);
+        // Rect (row 0) and Ramps (row l.y's palette row): the GlowQuad ramp
+        // over entries j, j + 1 at column l.x of the item's width.
+        uint j = in.pal + 2u * (kind == 1u ? fx_ramp_row(l.y, in.src) : 0u);
         c = glow_lerp4(fx_ink(pal, j), fx_ink(pal, j + 1u), l.x, max(in.src.x, 1u));
     }
     return true;

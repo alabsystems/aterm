@@ -458,10 +458,10 @@ fn clean_composed_capture_strips_effect_shape_and_restores_decscusr() {
     assert!(clean.cursor_effect_style_override.is_none());
     assert!(clean.cursor_fill_override.is_none());
     assert!(
-        clean.cursor_glow_add.is_empty()
+        clean.glow_add_laid().is_empty()
             && clean.glow_halo.is_empty()
             && clean.fire_patch.is_empty()
-            && clean.glow_under.is_empty()
+            && clean.glow_under_laid().is_empty()
             && clean.cursor_trail.is_empty()
     );
     assert_eq!(
@@ -741,7 +741,7 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
     ));
     let window = app.windows.get_mut(&wid).expect("test window");
     assert!(
-        !window.fx.cursor_mut().glow_scratch.is_empty(),
+        !window.fx.cursor().glow_laid().is_empty(),
         "the typed cursor move really spawned the fire whose cue was drained"
     );
     assert!(
@@ -754,7 +754,7 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
             .is_none(),
         "muted/headless Advance discards cues immediately; no later unmute can replay them"
     );
-    let retained_glow = window.fx.cursor_mut().glow_scratch.clone();
+    let retained_glow = window.fx.cursor().glow_laid();
     let retained_trail = window.fx.cursor_mut().trail_scratch.clone();
 
     assert!(app.composed_cursor_frame(
@@ -764,7 +764,7 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
         },
     ));
     let window = app.windows.get_mut(&wid).expect("test window");
-    assert_eq!(window.fx.cursor_mut().glow_scratch, retained_glow);
+    assert_eq!(window.fx.cursor().glow_laid(), retained_glow);
     assert_eq!(window.fx.cursor_mut().trail_scratch, retained_trail);
     assert!(
         window
@@ -809,7 +809,7 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
         .fx
         .cursor()
         .glow
-        .under_quads()
+        .under_laid()
         .len();
     assert!(
         live_quads > 0,
@@ -836,7 +836,7 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
     {
         let window = app.windows.get(&wid).expect("test window");
         assert!(
-            window.input_scratch.glow_under.is_empty(),
+            window.input_scratch.glow_under_laid().is_empty(),
             "the history frame projects none of the band"
         );
         assert!(
@@ -858,7 +858,7 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
     advance(&mut app, t0 + Duration::from_millis(68));
     let window = app.windows.get(&wid).expect("test window");
     assert!(
-        !window.fx.cursor().glow.under_quads().is_empty(),
+        !window.fx.cursor().glow.under_laid().is_empty(),
         "the first live frame after a history retain drew nothing: the hide armed over \
          history was taken by it"
     );
@@ -890,8 +890,8 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
     {
         let window = app.windows.get(&wid).expect("test window");
         assert!(
-            !window.fx.cursor().glow_scratch.is_empty()
-                && !window.fx.cursor().glow.under_quads().is_empty(),
+            !window.fx.cursor().glow_laid().is_empty()
+                && !window.fx.cursor().glow.under_laid().is_empty(),
             "negative control retains a genuinely charged composed cursor frame"
         );
         assert!(window.composed_cursor_effect_valid);
@@ -921,16 +921,16 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
         !window.composed_cursor_effect_valid
             && !window.fx.cursor().glow.is_active()
             && !window.fx.cursor().trail.is_active()
-            && window.fx.cursor().glow_scratch.is_empty()
-            && window.fx.cursor().glow.under_quads().is_empty()
+            && window.fx.cursor().glow_laid().is_empty()
+            && window.fx.cursor().glow.under_laid().is_empty()
             && window.fx.cursor().trail_scratch.is_empty(),
         "exact history extraction retires both retained engines and their frame vectors"
     );
     assert!(
-        window.input_scratch.cursor_glow_add.is_empty()
+        window.input_scratch.glow_add_laid().is_empty()
             && window.input_scratch.glow_halo.is_empty()
             && window.input_scratch.fire_patch.is_empty()
-            && window.input_scratch.glow_under.is_empty()
+            && window.input_scratch.glow_under_laid().is_empty()
             && window.input_scratch.cursor_trail.is_empty()
             && window.input_scratch.cursor_effect_style_override.is_none()
             && window.input_scratch.cursor_fill_override.is_none(),
@@ -2262,8 +2262,8 @@ fn coherence_observation(app: &App, wid: WindowId) -> CoherenceObservation {
         cursor_effect_style: window.input_scratch.cursor_effect_style_override,
         cursor_color: window.input_scratch.cursor_color,
         cursor_fill: window.input_scratch.cursor_fill_override,
-        glow: window.fx.cursor().glow_scratch.clone(),
-        under: window.fx.cursor().glow.under_quads().to_vec(),
+        glow: window.fx.cursor().glow_laid(),
+        under: window.fx.cursor().glow.under_laid(),
     }
 }
 
@@ -2604,6 +2604,131 @@ fn a_composed_cursor_frame_keeps_the_pet_s_veil() {
         off.is_empty(),
         "fixture: with the veil off the full frame lays {} quads",
         off.len()
+    );
+}
+
+/// The bloom box of `wid`'s focused leaf, as the composed route computes it for a split pane.
+fn focused_leaf_fx_clip(app: &App, wid: WindowId) -> Option<(u16, u16, u16, u16)> {
+    let plan = app.active_visible_leaf_plan(wid).expect("a visible plan");
+    let leaf = plan
+        .leaves
+        .iter()
+        .find(|leaf| leaf.focused)
+        .expect("a focused leaf");
+    let (cell_w, cell_h) = app.win_cell_size(wid);
+    app.composed_cursor_effect_clip(
+        wid,
+        ComposedCursorEffectPane {
+            row: leaf.rect.origin.y.round().max(0.0) as usize,
+            col: leaf.rect.origin.x.round().max(0.0) as usize,
+            pane_rows: (leaf.rect.size.height.round() as usize).max(1),
+            pane_cols: (leaf.rect.size.width.round() as usize).max(1),
+            cell_w,
+            cell_h,
+        },
+    )
+    .map(|clip| (clip.x0, clip.y0, clip.x1, clip.y1))
+}
+
+/// A split frame grows its bloom and shimmer within its focused pane, and a mixed frame within
+/// its focused terminal leaf, not the box the tab the window showed before left; once a native
+/// leaf has focus, within no terminal box at all.
+#[test]
+fn a_mixed_frame_clips_its_bloom_to_its_focused_terminal_leaf() {
+    let (mut app, wid, _) = pure_fixture("fire");
+    let t0 = Instant::now();
+    app.focus_pane(crate::pane::FocusDir::Left);
+    assert!(redraw_pure(&mut app, wid, t0), "the split tab composes");
+    let split_box = focused_leaf_fx_clip(&app, wid);
+    assert!(split_box.is_some(), "fixture: the left pane has a box");
+    assert_eq!(
+        app.windows[&wid].input_scratch.fx_clip, split_box,
+        "a split frame keeps its bloom to its focused pane"
+    );
+
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    let plan = app.active_visible_leaf_plan(wid).expect("the mixed plan");
+    let native_view = plan
+        .leaves
+        .iter()
+        .find(|leaf| !leaf.focused)
+        .expect("the Settings leaf")
+        .view;
+    let mixed_box = focused_leaf_fx_clip(&app, wid);
+    assert!(mixed_box.is_some(), "fixture: the terminal leaf has a box");
+    assert_ne!(mixed_box, split_box, "fixture: the boxes differ");
+    for arrived_with in [split_box, None] {
+        app.windows
+            .get_mut(&wid)
+            .expect("the window")
+            .input_scratch
+            .fx_clip = arrived_with;
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Advance(t0)),
+            )
+            .is_some()
+        );
+        assert_eq!(
+            app.windows[&wid].input_scratch.fx_clip, mixed_box,
+            "the focused terminal leaf's box replaces {arrived_with:?}"
+        );
+    }
+
+    app.windows
+        .get_mut(&wid)
+        .expect("the window")
+        .tab_set
+        .active_mut()
+        .expect("the mixed tab")
+        .set_focus(native_view);
+    app.sync_window(wid);
+    assert!(
+        app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+            wid,
+            Some(ComposedCursorFxClock::Advance(
+                t0 + Duration::from_millis(16)
+            )),
+        )
+        .is_some()
+    );
+    assert_eq!(
+        app.windows[&wid].input_scratch.fx_clip, None,
+        "native focus draws no cursor effects and keeps no terminal box"
+    );
+}
+
+/// A capture clips its bloom as the live frame does: a split's within its focused pane, a sole
+/// pane's within no box, whatever box the frame before left.
+#[test]
+fn a_capture_clips_its_bloom_as_the_live_frame_does() {
+    let (mut app, wid, _) = pure_fixture("fire");
+    let t0 = Instant::now();
+    assert!(
+        app.prepare_terminal_capture_grid_with_cursor_fx(wid, ComposedCursorFxClock::Advance(t0))
+            .is_some()
+    );
+    let split_box = focused_leaf_fx_clip(&app, wid);
+    assert!(split_box.is_some(), "fixture: the focused pane has a box");
+    assert_eq!(
+        app.windows[&wid].input_scratch.fx_clip, split_box,
+        "a split capture keeps its bloom to its focused pane"
+    );
+
+    let sole = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(sole));
+    assert!(
+        app.prepare_terminal_capture_grid_with_cursor_fx(
+            wid,
+            ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16)),
+        )
+        .is_some()
+    );
+    assert_eq!(
+        app.windows[&wid].input_scratch.fx_clip, None,
+        "a sole pane's capture lets its bloom spread, as its live frame does"
     );
 }
 

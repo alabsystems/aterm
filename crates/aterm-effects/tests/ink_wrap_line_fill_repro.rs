@@ -163,7 +163,7 @@ struct Run {
 
 fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     let mut blink_seen = 0u64;
     let c = cfg(style);
     let g = geom();
@@ -241,7 +241,7 @@ fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
 
 fn run_zsh(style: GlowStyle, total: usize) -> Run {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     let mut blink_seen = 0u64;
     let c = cfg(style);
     let g = geom();

@@ -101,11 +101,14 @@ pub enum Wait {
     GitHub,
     /// Something already in the home folder sits where a repository goes.
     InTheWay,
+    /// The disk has no room for the repositories left: each clone would take free space below
+    /// the line the window's disk watch keeps.
+    DiskSpace,
 }
 
 impl Wait {
     /// Every reason, for the round trip.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::CommandLineTools,
         Self::Settings,
         Self::Token,
@@ -115,6 +118,7 @@ impl Wait {
         Self::OtherAccount,
         Self::GitHub,
         Self::InTheWay,
+        Self::DiskSpace,
     ];
 
     fn slug(self) -> &'static str {
@@ -128,18 +132,20 @@ impl Wait {
             Self::OtherAccount => "other-account",
             Self::GitHub => "github",
             Self::InTheWay => "in-the-way",
+            Self::DiskSpace => "disk-space",
         }
     }
 
-    /// What ends this wait (design §3.6): GitHub answering again, by itself
-    /// ([`FailureKind::Transient`]), or a person's act for every other reason, which no pass
+    /// What ends this wait (design §3.6): GitHub answering again, or room on the disk (which the
+    /// disk watch, a finished download or a person frees), each tried again by itself while the
+    /// run has tries left ([`FailureKind::Transient`]), or a person's act for every other reason, which no pass
     /// retries: the token the vault syncs is refused, missing, unusable or another account's,
     /// aterm's GitHub settings cannot be used, a folder is in a repository's place, or Apple's
     /// Command Line Tools are not installed ([`FailureKind::NeedsPerson`]).
     #[must_use]
     pub const fn kind(self) -> FailureKind {
         match self {
-            Self::Unreached | Self::GitHub => FailureKind::Transient,
+            Self::Unreached | Self::GitHub | Self::DiskSpace => FailureKind::Transient,
             Self::CommandLineTools
             | Self::Settings
             | Self::Token
@@ -156,7 +162,7 @@ impl Wait {
     #[must_use]
     pub const fn note(self) -> &'static str {
         match self {
-            Self::CommandLineTools => "Install Apple's Command Line Tools",
+            Self::CommandLineTools => aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING,
             Self::Settings => "Fix aterm's GitHub settings; aterm doctor says how",
             Self::Token => "Add your GitHub token to the Secrets vault",
             Self::TokenUnusable => "Fix your GitHub token file; aterm doctor says how",
@@ -165,6 +171,7 @@ impl Wait {
             Self::OtherAccount => "Your GitHub token is for another account; replace it",
             Self::GitHub => "Can't read your repositories from GitHub",
             Self::InTheWay => "A folder blocks a repository; aterm doctor names it",
+            Self::DiskSpace => "Not enough free disk space for the rest",
         }
     }
 
@@ -361,6 +368,19 @@ const fn rank(standing: Standing) -> u8 {
         Standing::NeedsYou => 6,
         Standing::Failed => 7,
     }
+}
+
+/// Why a part of a row failed, where the step that stopped it decided a reason
+/// ([`Reading::Waits`]): the page's words for a step a run could not finish ([`Wait::note`],
+/// System State design §3.6), never the engine's line, which the log keeps.
+#[must_use]
+pub fn failure_note(rows: &[&ItemReport]) -> Option<&'static str> {
+    rows.iter()
+        .filter(|row| standing(row) == Standing::Failed)
+        .find_map(|row| match Reading::of(row) {
+            Some(Reading::Waits(wait)) => Some(wait.note()),
+            _ => None,
+        })
 }
 
 /// One setting's row from the rows its items reported; no rows is an unknown row. Its
@@ -1076,6 +1096,33 @@ mod tests {
         failed.outcome = Outcome::Failed;
         let read = observation(Setting::Repositories, &[&failed]);
         assert_eq!((read.standing, read.note), (Standing::Failed, None));
+    }
+
+    /// A step that failed gives the reason it decided ([`failure_note`]), the page's words for
+    /// it; a failed part that decided none, and a part that only waits, give none.
+    #[test]
+    fn a_failed_part_gives_the_reason_its_step_decided() {
+        let blocked = |wait: Option<Wait>, why: &str| ItemReport {
+            why: Some(why.to_owned()),
+            detail: wait.map(|wait| Reading::Waits(wait).token()),
+            ..row(Outcome::Blocked, None, None)
+        };
+        let line = "GET https://api.github.com/user: connection refused";
+        let mut failed = blocked(Some(Wait::Unreached), line);
+        failed.outcome = Outcome::Failed;
+        assert_eq!(failure_note(&[&failed]), Some(Wait::Unreached.note()));
+        let mut silent = blocked(None, line);
+        silent.outcome = Outcome::Failed;
+        assert_eq!(failure_note(&[&silent]), None);
+        assert_eq!(
+            failure_note(&[&blocked(Some(Wait::Unreached), line)]),
+            None,
+            "a wait is no failure"
+        );
+        assert_eq!(
+            failure_note(&[&silent, &failed]),
+            Some(Wait::Unreached.note())
+        );
     }
 
     /// A row that differs has no description (design §3.3): a planned part's `from → to` and its

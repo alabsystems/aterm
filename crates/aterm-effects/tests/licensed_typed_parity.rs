@@ -93,7 +93,7 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
     let g = geom();
     let c = cfg(style);
     let tc = trail_cfg();
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     let mut trail = CursorTrail::default();
     let mut out: Vec<GlowQuad> = Vec::new();
     let mut trail_out = Vec::new();
@@ -171,7 +171,7 @@ fn earned_light_survives_a_cold_program_move() {
     let tc = trail_cfg();
     for style in ALL_STYLES {
         let c = cfg(style);
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         let mut trail = CursorTrail::default();
         let mut out: Vec<GlowQuad> = Vec::new();
         let mut trail_out = Vec::new();
@@ -208,7 +208,7 @@ fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty);
     let tc = trail_cfg();
-    let mut glow = CursorGlow::default();
+    let mut glow = crate::common::quads_glow();
     let mut trail = CursorTrail::default();
     let mut out: Vec<GlowQuad> = Vec::new();
     let mut trail_out = Vec::new();
@@ -289,7 +289,7 @@ const ALL_STYLES: [GlowStyle; 9] = [
 #[test]
 fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
     let retreat = |style, delay, backspace| {
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         let mut trail = CursorTrail::default();
         let mut out = Vec::new();
         let mut trail_out = Vec::new();

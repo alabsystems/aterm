@@ -27,6 +27,105 @@ pub(crate) const TABS_TO_AI: &str = "tabs/to-ai";
 /// Gap between a spreadsheet row's text columns and its `Show tab` button.
 const ROW_GAP: f32 = 12.0;
 
+/// THE ROOM TAB CONTROL'S LIVE WORDS WERE LAID OUT IN, HELD WHILE THE PERSON READS. A refresh
+/// rewrites a row's words every second (vitals, an address, a status, how long ago, a program's
+/// title), and in a proportional font a digit, a bar or a spinner glyph can move a wrap point: a
+/// block of words measured from its words alone gained and lost a line under a still reader, and
+/// every line under it moved with it, in its row and below. Here each block that wraps (a row's
+/// title, vitals and detail, a tab's title and status, a summary fact, a whole row) keeps the room
+/// it was laid out in under it and grows when its words need more, never shrinking while the
+/// layout stands; the layout starts over (each block measured afresh) at a new column width or
+/// text size, when the page is opened again, and at Refresh.
+#[derive(Debug, Default)]
+pub(crate) struct LiveRowHeights {
+    /// The column width and text size the room was measured at.
+    layout: Option<(u32, u32)>,
+    /// Each block's room by its key (a height, or a count of lines).
+    held: aterm_hash::FxHashMap<String, f32>,
+    /// The blocks the render under way laid out; the rest are let go at its end.
+    seen: aterm_hash::FxHashSet<String>,
+}
+
+impl LiveRowHeights {
+    /// Start the layout over.
+    pub(crate) fn forget(&mut self) {
+        self.layout = None;
+        self.held.clear();
+        self.seen.clear();
+    }
+
+    /// Begin a render of the page in a `width` column at the current text size.
+    fn begin(&mut self, width: f32) {
+        let layout = (width.to_bits(), settings_text_scale().to_bits());
+        if self.layout != Some(layout) {
+            self.forget();
+            self.layout = Some(layout);
+        }
+        self.seen.clear();
+    }
+
+    /// End the render: the blocks it no longer laid out are let go.
+    fn end(&mut self) {
+        let seen = std::mem::take(&mut self.seen);
+        self.held.retain(|key, _| seen.contains(key));
+    }
+
+    /// The room block `key` is laid out in, `needed` being what its words take now.
+    fn room(&mut self, key: &str, needed: f32) -> f32 {
+        self.seen.insert(key.to_string());
+        let held = self.held.entry(key.to_string()).or_insert(needed);
+        *held = held.max(needed);
+        *held
+    }
+
+    /// The lines block `key` is laid out in, `needed` being how many its words take now.
+    fn lines(&mut self, key: &str, needed: usize) -> usize {
+        self.room(key, needed as f32) as usize
+    }
+
+    /// A block of words (`node`, `height` the height its words take) at the room held for it:
+    /// what its words do not fill stays under them.
+    fn block(&mut self, mut block: (UiNode, f32)) -> (UiNode, f32) {
+        self.hold(std::slice::from_mut(&mut block));
+        block
+    }
+
+    /// Lay out `rows` (each a node and the height it takes) at the room held for each.
+    fn hold(&mut self, rows: &mut [(UiNode, f32)]) {
+        for (node, height) in rows.iter_mut() {
+            let room = self.room(node.key.as_str(), *height);
+            if room > *height {
+                *height = room;
+                node.layout = node.layout.height(Length::Fixed(room));
+            }
+        }
+    }
+
+    /// [`Self::hold`] the rows of a card authored whole (`card`'s children, as the list splits it
+    /// into stops), the card growing by what its rows grew.
+    fn hold_card_rows(&mut self, card: &mut (UiNode, f32)) {
+        let (node, height) = card;
+        let mut rows: Vec<(UiNode, f32)> = std::mem::take(&mut node.children)
+            .into_iter()
+            .map(|row| {
+                let tall = match row.layout.height {
+                    Length::Fixed(tall) => tall,
+                    _ => 0.0,
+                };
+                (row, tall)
+            })
+            .collect();
+        let before: f32 = rows.iter().map(|(_, tall)| tall).sum();
+        self.hold(&mut rows);
+        let grown = rows.iter().map(|(_, tall)| tall).sum::<f32>() - before;
+        node.children = rows.into_iter().map(|(row, _)| row).collect();
+        if grown > 0.0 {
+            *height += grown;
+            node.layout = node.layout.height(Length::Fixed(*height));
+        }
+    }
+}
+
 /// Action ID for raising a local tab by its process-local session ID.
 #[must_use]
 pub(crate) fn show_tab_action(local_id: u64) -> String {
@@ -75,6 +174,7 @@ impl SettingsApp {
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
         if action == TABS_REFRESH {
+            view.live_row_heights.get_mut().forget();
             cx.harness(HarnessRequest::Refresh);
             view.feedback = Some("Refreshing computers, sessions, and tabs\u{2026}".to_string());
         } else if let Some(rest) = action.strip_prefix(TABS_SHOW_PREFIX)
@@ -110,7 +210,13 @@ pub(super) fn tabs_page(
     );
     let room = (settings_list_body_height(state, width, viewport) - heading_height)
         .max(scaled_control_height());
-    let cards = tabs_cards(tabs, width, page_width, room);
+    let cards = tabs_cards(
+        tabs,
+        width,
+        page_width,
+        room,
+        &mut state.live_row_heights.borrow_mut(),
+    );
     let mut out = heading;
     out.push(scroll::list_page_peeking(
         state,
@@ -132,38 +238,49 @@ fn tabs_cards(
     width: SettingsWidth,
     card_width: f32,
     room: f32,
+    held: &mut LiveRowHeights,
 ) -> Vec<(UiNode, f32)> {
     let inner = card_text_width(card_width);
     let label_width = fact_label_width(&tabs.summary_rows, inner);
+    held.begin(card_width);
     let mut cards = Vec::new();
-    cards.extend(metadata_cards(
+    let mut summary = metadata_cards(
         "tabs/summary",
         ("FLEET & TAB SUMMARY", "SUMMARY"),
         &tabs.summary_rows,
         card_width,
         label_width,
-    ));
+    );
+    for card in &mut summary {
+        held.hold_card_rows(card);
+    }
+    cards.extend(summary);
     cards.push(tabs_actions(tabs, card_width));
+    let mut spreadsheet = spreadsheet_rows(tabs, width, inner, room, held);
+    held.hold(&mut spreadsheet);
     cards.extend(row_cards(
         "tabs/spreadsheet",
         (
             "Sessions and tabs spreadsheet",
             ("SESSIONS & TABS SPREADSHEET", "SESSIONS & TABS"),
         ),
-        spreadsheet_rows(tabs, width, inner, room),
+        spreadsheet,
         room,
         card_width,
     ));
+    let mut computers = computer_rows(tabs, width, inner, held);
+    held.hold(&mut computers);
     cards.extend(row_cards(
         "tabs/computers",
         (
             "Accessible computers",
             ("ACCESSIBLE COMPUTERS", "COMPUTERS"),
         ),
-        computer_rows(tabs, width, inner),
+        computers,
         room,
         card_width,
     ));
+    held.end();
     cards
 }
 
@@ -266,6 +383,7 @@ fn computer_rows(
     tabs: &TabControlProjection,
     _width: SettingsWidth,
     inner: f32,
+    held: &mut LiveRowHeights,
 ) -> Vec<(UiNode, f32)> {
     if !tabs.observed {
         return vec![header_line(
@@ -288,15 +406,16 @@ fn computer_rows(
         return rows;
     }
     for comp in &tabs.computers {
-        rows.push(computer_row(comp, inner));
+        rows.push(computer_row(comp, inner, held));
     }
     rows
 }
 
 /// One accessible computer: its name, state and address, its vitals where it
 /// reports them, and its system and sessions, each wrapped to the card's
-/// column, never cut ("m110-MacBook-P…" at 22 columns).
-fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
+/// column, never cut ("m110-MacBook-P…" at 22 columns), each in the room
+/// held for it while the person reads ([`LiveRowHeights`]).
+fn computer_row(comp: &TabComputer, inner: f32, held: &mut LiveRowHeights) -> (UiNode, f32) {
     let key = format!("tabs/computer/{}", comp.id);
     let line1 = format!(
         "{} \u{b7} {} \u{b7} {}",
@@ -338,11 +457,11 @@ fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
     } else {
         format!("{line1} \u{2014} {line2}")
     };
-    let mut parts = vec![title_words(format!("{key}/title"), &line1, inner)];
+    let mut parts = vec![held.block(title_words(format!("{key}/title"), &line1, inner))];
     if has_vitals {
-        parts.push(detail_words(format!("{key}/vitals"), &comp.vitals, inner));
+        parts.push(held.block(detail_words(format!("{key}/vitals"), &comp.vitals, inner)));
     }
-    parts.push(detail_words(format!("{key}/detail"), &line2, inner));
+    parts.push(held.block(detail_words(format!("{key}/detail"), &line2, inner)));
     let total_height = parts.iter().map(|(_, height)| height).sum::<f32>()
         + 4.0 * parts.len().saturating_sub(1) as f32;
     let node = UiNode::new(key, UiContent::Group(GroupSpec::new(full_label)))
@@ -361,6 +480,7 @@ fn spreadsheet_rows(
     width: SettingsWidth,
     inner: f32,
     room: f32,
+    held: &mut LiveRowHeights,
 ) -> Vec<(UiNode, f32)> {
     if !tabs.observed {
         return vec![header_line(
@@ -404,7 +524,7 @@ fn spreadsheet_rows(
         let count = group_rows.len();
         for (idx, row) in group_rows.into_iter().enumerate() {
             let is_last = idx + 1 == count;
-            rows.push(spreadsheet_row(row, is_last, width, (inner, room)));
+            rows.push(spreadsheet_row(row, is_last, width, (inner, room), held));
         }
     }
     rows
@@ -479,6 +599,7 @@ fn spreadsheet_row(
     is_last: bool,
     width: SettingsWidth,
     (inner, room): (f32, f32),
+    held: &mut LiveRowHeights,
 ) -> (UiNode, f32) {
     let control_height = scaled_control_height();
     let compact = width == SettingsWidth::Compact;
@@ -550,12 +671,30 @@ fn spreadsheet_row(
             + status.len().max(1) as f32 * detail_line_height();
         (title, status, height, words_width)
     };
+    // The title and the status each keep the lines they were laid out in while the person reads
+    // (blank lines under the words where they now take fewer), so neither moves the other or the
+    // row ([`LiveRowHeights`]); the lines beside the button and under it are held apart.
+    let held_lines_in = |held: &mut LiveRowHeights, text_width: f32, at: &str| {
+        let (mut title, mut status, _, words_width) = lines_in(text_width);
+        let title_count = held.lines(&format!("{key}/title{at}"), title.len().max(1));
+        let status_count = held.lines(&format!("{key}/status{at}"), status.len().max(1));
+        title.resize(title_count, String::new());
+        status.resize(status_count, String::new());
+        let height = title_count as f32 * title_line_height()
+            + 4.0
+            + status_count as f32 * detail_line_height();
+        (title, status, height, words_width)
+    };
     let beside_width = (inner - button_width - ROW_GAP).max(0.0);
     let beside = show_button.is_some()
         && !compact
-        && lines_in(beside_width).2.max(button_height) <= room + 0.01;
+        && held_lines_in(held, beside_width, "/beside")
+            .2
+            .max(button_height)
+            <= room + 0.01;
     let text_width = if beside { beside_width } else { inner };
-    let (title_lines, status_lines, text_height, words_width) = lines_in(text_width);
+    let (title_lines, status_lines, text_height, words_width) =
+        held_lines_in(held, text_width, if beside { "/beside" } else { "" });
     let stem = if is_last { "" } else { "   \u{2502}" };
     let line_row = |index: usize,
                     glyph: &str,

@@ -156,16 +156,9 @@ fn blit_footprint(
     ]
 }
 
-fn crown_footprint(
-    quads: &[GlowInstance],
-    [ox, oy]: [f32; 2],
-    (x, y, w, h): (u32, u32, u32, u32),
-) -> [u32; 4] {
-    let scissor = [x, y, x.saturating_add(w), y.saturating_add(h)];
-    if !ox.is_finite() || !oy.is_finite() {
-        return scissor;
-    }
-    let Some([x0, y0, x1, y1]) = quads
+/// The union of `quads`' rects that draw, offscreen px.
+fn glow_footprint(quads: &[GlowInstance]) -> Option<[u32; 4]> {
+    quads
         .iter()
         .map(|q| q.rect.map(u32::from))
         .filter(|[_, _, qw, qh]| *qw > 0 && *qh > 0)
@@ -178,7 +171,40 @@ fn crown_footprint(
                 a[3].max(b[3]),
             ]
         })
-    else {
+}
+
+/// Bind an extract's or a crown's lights for `row`: the item list at the
+/// row's vertex unit where it reads one, else the glow instances `stream`.
+fn bind_glow_lights(
+    pass: &mut crate::gl::encoder::GlPass<'_, '_>,
+    live: &GlArmLive,
+    row: Pipeline,
+    stream: Option<&(GlBuffer, usize)>,
+) {
+    match row.spec().binds.vertex_items {
+        Some(unit) => {
+            let items = live
+                .glow_items
+                .as_ref()
+                .expect("written with the frame's list");
+            pass.bind_texture(items, live.nearest(), unit, true);
+        }
+        None => pass.set_stream(&stream.expect("uploaded with the frame's lights").0),
+    }
+}
+
+/// The crown's drawn footprint in destination px: `lit` (offscreen px, the
+/// union of its lights) placed at `[ox, oy]` and clipped to the scissor.
+fn crown_footprint(
+    lit: Option<[u32; 4]>,
+    [ox, oy]: [f32; 2],
+    (x, y, w, h): (u32, u32, u32, u32),
+) -> [u32; 4] {
+    let scissor = [x, y, x.saturating_add(w), y.saturating_add(h)];
+    if !ox.is_finite() || !oy.is_finite() {
+        return scissor;
+    }
+    let Some([x0, y0, x1, y1]) = lit else {
         return [0, 0, 0, 0];
     };
     let place =
@@ -286,7 +312,7 @@ impl GpuRenderer {
         want.encode_srgb = if raw { 0.0 } else { 1.0 };
         let want_bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
         let want_crown = run_hdr_glow || run_sdr_glow;
-        let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input));
+        let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input, true));
         let bloom_state = bloom_glow.filter(|(count, _, _)| want_bloom && *count > 0);
         let crown_count = if want_crown {
             bloom_glow.map_or(0, |(n, _, _)| n)
@@ -332,9 +358,17 @@ impl GpuRenderer {
         for row in [Pipeline::Blit, Pipeline::SdrGlow] {
             live.ensure_pipeline(row)?;
         }
+        let (extract_row, crown_row) = if self.bloom_items_live {
+            (Pipeline::GlowItems, Pipeline::SdrGlowItems)
+        } else {
+            (Pipeline::GlowAdd, Pipeline::SdrGlow)
+        };
         if bloom_state.is_some() {
-            live.ensure_pipeline(Pipeline::GlowAdd)?;
+            live.ensure_pipeline(extract_row)?;
             live.ensure_pipeline(Pipeline::Bloom)?;
+        }
+        if run_sdr_glow && crown_count > 0 {
+            live.ensure_pipeline(crown_row)?;
         }
         if shimmer_region.is_some() {
             live.ensure_pipeline(Pipeline::Shimmer)?;
@@ -449,11 +483,21 @@ impl GpuRenderer {
         let staged = (|| -> Result<(), String> {
             live.dev
                 .write_buffer(&bufs.blit, aterm_bits::bytes_of(&want))?;
+            if self.bloom_items_live && (bloom_state.is_some() || crown_count > 0) {
+                gl_arm::write_fx_palette(
+                    &live.dev,
+                    &mut live.glow_items,
+                    self.bloom_items.words(),
+                )?;
+            }
             if let (Some((count, _, extract_first)), Some((cell, bloom))) =
                 (bloom_state, bloom_uniforms.as_ref())
             {
-                let insts = &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
-                upload_glow(live, &mut bufs.extract, aterm_bits::cast_slice(insts))?;
+                if !self.bloom_items_live {
+                    let insts =
+                        &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
+                    upload_glow(live, &mut bufs.extract, aterm_bits::cast_slice(insts))?;
+                }
                 live.dev
                     .write_buffer(&bufs.bloom_cell, aterm_bits::bytes_of(cell))?;
                 live.dev
@@ -496,8 +540,10 @@ impl GpuRenderer {
             if let Some(hu) = crown.filter(|_| crown_count > 0) {
                 live.dev
                     .write_buffer(&bufs.crown, aterm_bits::bytes_of(&hu))?;
-                let insts = &self.bloom_glow_scratch[..crown_count as usize];
-                upload_glow(live, &mut bufs.crown_stream, aterm_bits::cast_slice(insts))?;
+                if !self.bloom_items_live {
+                    let insts = &self.bloom_glow_scratch[..crown_count as usize];
+                    upload_glow(live, &mut bufs.crown_stream, aterm_bits::cast_slice(insts))?;
+                }
             }
             Ok(())
         })();
@@ -541,9 +587,16 @@ impl GpuRenderer {
         if let (Some((count, _, extract_first)), Some((cell, bloom))) =
             (bloom_state, bloom_uniforms.as_ref())
         {
-            let insts = &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
             let inputs = &mut win.gl_bloom_inputs;
-            inputs.extend_from_slice(aterm_bits::cast_slice(insts));
+            // The extract's lights: its item list (tagged) or its glow instances.
+            if self.bloom_items_live {
+                inputs.push(1);
+                inputs.extend_from_slice(aterm_bits::cast_slice(self.bloom_items.words()));
+            } else {
+                let insts = &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
+                inputs.push(0);
+                inputs.extend_from_slice(aterm_bits::cast_slice(insts));
+            }
             inputs.extend_from_slice(aterm_bits::bytes_of(cell));
             inputs.extend_from_slice(aterm_bits::bytes_of(bloom));
             for v in bloom_scissor.unwrap_or([u32::MAX; 4]) {
@@ -580,7 +633,6 @@ impl GpuRenderer {
         }
         if let Some((count, _, _)) = bloom_state {
             let half = win.gl_bloom_half.as_ref().expect("ensured above");
-            let (stream, _) = bufs.extract.as_ref().expect("uploaded above");
             {
                 let mut pass = frame.begin_pass(
                     half,
@@ -594,15 +646,15 @@ impl GpuRenderer {
                     None,
                     (
                         &bufs.bloom_cell,
-                        Pipeline::GlowAdd
+                        extract_row
                             .spec()
                             .binds
                             .vertex_uniform
-                            .expect("row 4 has a vertex uniform"),
+                            .expect("the extract rows have a vertex uniform"),
                     ),
                 )?;
-                pass.set_pipeline(pipe(Pipeline::GlowAdd));
-                pass.set_stream(stream);
+                pass.set_pipeline(pipe(extract_row));
+                bind_glow_lights(&mut pass, live, extract_row, bufs.extract.as_ref());
                 pass.draw(6, count)?;
             }
             let binds = Pipeline::Bloom.spec().binds;
@@ -705,14 +757,15 @@ impl GpuRenderer {
             if run_sdr_glow
                 && crown_count > 0
                 && let Some(scissor) = crown_scissor
-                && let Some((stream, _)) = bufs.crown_stream.as_ref()
+                && (self.bloom_items_live || bufs.crown_stream.is_some())
             {
-                crown_drawn = crown_footprint(
-                    &self.bloom_glow_scratch[..crown_count as usize],
-                    want.content_off,
-                    scissor,
-                );
-                let crown_binds = Pipeline::SdrGlow.spec().binds;
+                let lit = if self.bloom_items_live {
+                    self.bloom_items.footprint()
+                } else {
+                    glow_footprint(&self.bloom_glow_scratch[..crown_count as usize])
+                };
+                crown_drawn = crown_footprint(lit, want.content_off, scissor);
+                let crown_binds = crown_row.spec().binds;
                 pass.bind_uniform(
                     &bufs.crown,
                     crown_binds
@@ -720,8 +773,8 @@ impl GpuRenderer {
                         .expect("the crown rows bind a vertex uniform"),
                 );
                 pass.set_scissor(Some(scissor));
-                pass.set_pipeline(pipe(Pipeline::SdrGlow));
-                pass.set_stream(stream);
+                pass.set_pipeline(pipe(crown_row));
+                bind_glow_lights(&mut pass, live, crown_row, bufs.crown_stream.as_ref());
                 pass.draw(6, crown_count)?;
             }
         }
@@ -1168,24 +1221,28 @@ mod tests {
             quad(300, 50, 10, 0),
             quad(90, 60, 5, 40),
         ];
+        let lit = glow_footprint(&quads);
         assert_eq!(
-            crown_footprint(&quads, [0.0, 0.0], scissor),
+            crown_footprint(lit, [0.0, 0.0], scissor),
             [90, 40, 120, 100],
             "the box of the quads that draw (an empty one draws nothing)"
         );
         assert_eq!(
-            crown_footprint(&quads, [3.0, -50.0], scissor),
+            crown_footprint(lit, [3.0, -50.0], scissor),
             [93, 0, 123, 50],
             "placed by content_off, clipped to the scissor"
         );
         assert_eq!(
-            crown_footprint(&quads, [0.5, 0.0], (0, 0, 100, 600)),
+            crown_footprint(lit, [0.5, 0.0], (0, 0, 100, 600)),
             [90, 40, 100, 100],
             "a fractional placement covers both pixels, inside the scissor"
         );
-        assert_eq!(crown_footprint(&[], [0.0, 0.0], scissor), [0, 0, 0, 0]);
         assert_eq!(
-            crown_footprint(&quads, [f32::NAN, 0.0], scissor),
+            crown_footprint(glow_footprint(&[]), [0.0, 0.0], scissor),
+            [0, 0, 0, 0]
+        );
+        assert_eq!(
+            crown_footprint(lit, [f32::NAN, 0.0], scissor),
             [0, 0, 800, 600],
             "an unplaceable crown covers its scissor"
         );

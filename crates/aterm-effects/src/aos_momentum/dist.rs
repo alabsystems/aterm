@@ -1122,22 +1122,22 @@ impl Coordinator {
     /// Each worker's hello, by id.
     #[inline]
     #[must_use]
-    pub fn declared(&self) -> &[Option<Declared>] {
-        &self.declared
+    pub const fn declared(&self) -> &[Option<Declared>] {
+        self.declared.as_slice()
     }
 
     /// The workers refused for a foreign hello.
     #[inline]
     #[must_use]
-    pub fn foreign(&self) -> &[(WorkerId, &'static str)] {
-        &self.foreign
+    pub const fn foreign(&self) -> &[(WorkerId, &'static str)] {
+        self.foreign.as_slice()
     }
 
     /// Every accepted job's round trip, in acceptance order, across the command's searches.
     #[inline]
     #[must_use]
-    pub fn trips(&self) -> &[Trip] {
-        &self.trips
+    pub const fn trips(&self) -> &[Trip] {
+        self.trips.as_slice()
     }
 
     /// A new worker, or `None` past the limit.

@@ -401,14 +401,123 @@ fn a_stream_of_small_claims_does_not_overtake_a_waiting_large_one() {
     drop(b);
 }
 
-/// A need of all the memory can never fit: what is available never holds the kernel's wired
-/// pages. One byte less can, once the machine is that free.
+/// A need of all the memory that can ever be available or more can never fit: what is available
+/// never holds a wired page ([`Reading::reachable`]). On a 28 GiB machine with 4 GiB wired, 16
+/// GiB with 8 GiB spare beside it reaches the 24 GiB ceiling and is refused, naming it, and a
+/// byte less is not. With nothing wired read, the ceiling is all of the memory.
 #[test]
-fn a_need_of_all_the_memory_can_never_fit() {
+fn a_need_of_all_the_memory_that_can_ever_be_available_can_never_fit() {
+    let r = Reading::of_gib(28, 18, 14).wired_gib(4);
+    assert_eq!(r.reachable(), Some(24 * GIB));
+    let boot = never(&Need::new("boot").mem_gib(16).margin(8 * GIB), &r).expect("refused");
+    names(
+        &boot,
+        &[
+            "boot",
+            "needs 16 GiB and 8 GiB spare beside it",
+            "more than 24 GiB of its 28 GiB of memory available",
+            "4 GiB of it is wired",
+        ],
+    );
+    let less = Need::new("less").mem(16 * GIB - 1).margin(8 * GIB);
+    assert_eq!(never(&less, &r), None);
     let r = Reading::of_gib(48, 40, 14);
-    let all = crate::never(&Need::new("all").mem_gib(48), &r).expect("refused");
+    let all = never(&Need::new("all").mem_gib(48), &r).expect("refused");
     names(&all, &["all", "needs 48 GiB", "48 GiB of memory"]);
-    assert_eq!(crate::never(&Need::new("less").mem(48 * GIB - 1), &r), None);
+    assert_eq!(never(&Need::new("less").mem(48 * GIB - 1), &r), None);
+}
+
+/// NEVER-REACHABLE's acceptance: on a 28 GiB machine with 4 GiB wired and 18 GiB available,
+/// lima's 16 GiB boot with 8 GiB spare beside it is refused at once, before it enters the
+/// ledger, naming the 24 GiB ceiling, with no wait line. On this Mac's shape (48 GiB, 3.5 GiB
+/// wired) the same boot is admitted at once with 27 GiB available, and with 20 GiB it waits,
+/// short by 4 GiB, until 24 GiB is. Negative control: judged against all of the memory (the
+/// old rule), the 28 GiB machine's boot waits for memory it can never have, until the hang
+/// detector.
+#[test]
+fn a_need_above_what_can_ever_be_available_is_refused_at_once_naming_the_ceiling() {
+    let s = scratch("reach");
+    let boot = || Need::new("lima boot").mem_gib(16).margin(8 * GIB);
+    let quick = Pace {
+        poll: Duration::from_millis(10),
+        line_every: Duration::from_secs(60),
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let ledger = s.ledger.clone();
+    let refusing = std::thread::spawn(move || {
+        admit_with(
+            &ledger,
+            &Fixed::new(Reading::of_gib(28, 18, 14).wired_gib(4)),
+            boot(),
+            Admit::Wait,
+            quick,
+            &mut |l| {
+                let _ = tx.send(l.to_owned());
+            },
+        )
+        .map(|c| c.record().need.what.clone())
+    });
+    until_within(MUST_HAPPEN, "the boot's answer on a 28 GiB machine", || {
+        refusing.is_finished().then_some(())
+    });
+    match refusing.join().expect("the refusal") {
+        Err(e @ Error::Never(_)) => names(
+            &e.to_string(),
+            &[
+                "lima boot: needs 16 GiB and 8 GiB spare beside it",
+                "more than 24 GiB of its 28 GiB of memory available (4 GiB of it is wired)",
+                "it can never be admitted here",
+            ],
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let said: Vec<String> = rx.try_iter().collect();
+    assert!(said.is_empty(), "no wait line: {said:?}");
+    assert!(
+        s.ledger.list().expect("listed").is_empty(),
+        "nothing entered"
+    );
+
+    let mac = |available: u64| Reading {
+        wired: Some(7 * GIB / 2),
+        ..Reading::of_gib(48, available, 14)
+    };
+    let mut said = Vec::new();
+    let claim = admit_with(
+        &s.ledger,
+        &Fixed::new(mac(27)),
+        boot(),
+        Admit::Wait,
+        quick,
+        &mut |l| said.push(l.to_owned()),
+    )
+    .expect("admitted on this Mac's shape");
+    assert!(said.is_empty(), "no wait line: {said:?}");
+    drop(claim);
+
+    let m = Arc::new(Fixed::new(mac(20)));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (ledger, machine) = (s.ledger.clone(), Arc::clone(&m));
+    let waiting = std::thread::spawn(move || {
+        admit_with(&ledger, &*machine, boot(), Admit::Wait, quick, &mut |l| {
+            let _ = tx.send(l.to_owned());
+        })
+        .map(|c| c.record().need.what.clone())
+    });
+    let first = rx.recv_timeout(MUST_HAPPEN).expect("the boot's wait line");
+    names(
+        &first,
+        &["lima boot", "memory short by 4 GiB", "20 GiB available"],
+    );
+    assert!(!waiting.is_finished(), "it waits while there is no room");
+    m.set(mac(24));
+    until_within(
+        MUST_HAPPEN,
+        "the boot's admission at 24 GiB available",
+        || waiting.is_finished().then_some(()),
+    );
+    let admitted = waiting.join().expect("the admission").expect("admitted");
+    assert_eq!(admitted, "lima boot");
 }
 
 /// Negative control: a 60 GiB need on that machine is refused at once, before it enters the

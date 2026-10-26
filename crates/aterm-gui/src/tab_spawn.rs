@@ -109,11 +109,15 @@ impl SpawnPlace {
         }
     }
 
-    fn failed(self, app: &mut App, error: &str) -> String {
+    /// Log why the spawn failed and, for a tab a person asked for, tell them; a tab nobody asked
+    /// for ([`SpawnAsk::unasked`]) asks nobody to open it again, and its caller logs it.
+    fn failed(self, app: &mut App, error: &str, unasked: bool) -> String {
         match self {
             Self::Tab => {
                 crate::logging::stderr_line!("aterm-gui: could not open a new tab: {error}");
-                app.post_message(crate::message_reporters::new_tab_failed(error));
+                if !unasked {
+                    app.post_message(crate::message_reporters::new_tab_failed(error));
+                }
                 error.to_string()
             }
             Self::Split(_) => {
@@ -1098,7 +1102,7 @@ impl App {
     ) {
         let (window, place, grid) = self.reserve_window();
         let Some(proxy) = self.proxy.clone() else {
-            let why = place.failed(self, "no event loop to host the new window");
+            let why = place.failed(self, "no event loop to host the new window", false);
             then.answer(self, window, Err(why));
             return;
         };
@@ -1523,7 +1527,7 @@ impl App {
             .find(|t| t.id == id)
             .map(|t| t.grid);
         let adopted_spare = spare_grid.is_some();
-        let (place, parent, colors, grid, then, admission, theme, background) = match self
+        let (place, parent, colors, grid, then, admission, theme, background, unasked) = match self
             .tab_spawns
             .in_flight
             .iter()
@@ -1540,6 +1544,7 @@ impl App {
                     t.admission,
                     t.theme,
                     t.background,
+                    t.unasked,
                 )
             }
             None => (
@@ -1551,13 +1556,14 @@ impl App {
                 SpawnAdmission::Plain,
                 None,
                 false,
+                false,
             ),
         };
         let new_window = matches!(place, SpawnPlace::Window { .. });
         let admission_plain = matches!(admission, SpawnAdmission::Plain);
         let outcome = match session {
             _ if os.exiting() => Err(QUITTING.to_string()),
-            Err(e) => Err(place.failed(self, &e.to_string())),
+            Err(e) => Err(place.failed(self, &e.to_string(), unasked)),
             Ok(_) if !then.may_land(self, window) => {
                 Err("the request is no longer ready to open its tab".to_string())
             }
@@ -1640,7 +1646,7 @@ impl App {
                             sid
                         })
                     }
-                    Err(e) => Err(place.failed(self, &e)),
+                    Err(e) => Err(place.failed(self, &e, unasked)),
                 }
             }
         };
@@ -1971,6 +1977,31 @@ pub(crate) mod test_support {
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });
+        id
+    }
+
+    /// Book an in-flight tab nobody asked for ([`SpawnAsk::unasked`]), as [`book`] does.
+    #[cfg(unix)]
+    pub(crate) fn book_unasked(app: &mut App, wid: WindowId, then: TabSpawnThen) -> u64 {
+        book_as(
+            app,
+            wid,
+            &SpawnAsk {
+                unasked: true,
+                ..SpawnAsk::default()
+            },
+            then,
+        )
+    }
+
+    /// Book an in-flight tab as `ask` would ([`SpawnAsk::unasked`] carried over), as [`book`]
+    /// does.
+    #[cfg(unix)]
+    pub(crate) fn book_as(app: &mut App, wid: WindowId, ask: &SpawnAsk, then: TabSpawnThen) -> u64 {
+        let id = book(app, wid, then);
+        if let Some(booked) = app.tab_spawns.in_flight.iter_mut().find(|t| t.id == id) {
+            booked.unasked = ask.unasked;
+        }
         id
     }
 

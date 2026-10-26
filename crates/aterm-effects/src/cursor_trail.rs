@@ -581,9 +581,13 @@ impl CursorTrail {
         } else if declined_hidden_relocation {
             self.clear_typed();
         } else if completed_hidden_reappearance {
-            let fresh_nav = self
-                .nav_hint
-                .filter(|t| now.saturating_duration_since(*t) <= Self::NAV_HINT_FRESH_DUR);
+            let fresh_nav = if let Some(t) = self.nav_hint
+                && now.saturating_duration_since(t) <= Self::NAV_HINT_FRESH_DUR
+            {
+                Some(t)
+            } else {
+                None
+            };
             self.clear_typed();
             self.nav_hint = fresh_nav;
         } else if unseeded_visible {

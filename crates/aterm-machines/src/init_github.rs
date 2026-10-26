@@ -71,10 +71,17 @@ pub(super) struct Github {
 }
 
 /// Add GitHub authentication and repository reconciliation only when explicitly configured.
+/// The credential waits for the item `secrets` names, when one does: the secrets vault this run
+/// joins, or this Mac waits to be let into, writes the token file it reads
+/// ([`crate::init_secrets::Secrets::waited_on`]).
 ///
 /// # Errors
 /// The local profile cannot be admitted or decoded. Its contents are never quoted.
-pub fn items(sys: &dyn System, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+pub fn items(
+    sys: &dyn System,
+    ctx: &Ctx,
+    secrets: Option<&str>,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init GitHub requires exactly one local user".into());
     };
@@ -89,6 +96,7 @@ pub fn items(sys: &dyn System, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
         Box::new(Auth {
             user: user.clone(),
             config: config.clone(),
+            after: secrets.map(str::to_owned),
         }),
         repos::item(user, &config, recorded),
     ])
@@ -307,6 +315,8 @@ fn answered(sys: &dyn System, user: &User, config: &Github) -> Result<Option<Sec
 struct Auth {
     user: User,
     config: Github,
+    /// The secrets item it waits for ([`items`]).
+    after: Option<String>,
 }
 
 impl Item for Auth {
@@ -321,6 +331,9 @@ impl Item for Auth {
             "GitHub credential for {} in the login keychain and HTTPS git helper",
             self.config.account
         )
+    }
+    fn after(&self) -> Vec<String> {
+        self.after.iter().cloned().collect()
     }
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
         let (helper, held) = match readiness(sys, &self.user, &self.config) {
@@ -524,6 +537,7 @@ mod tests {
             Auth {
                 user: u.clone(),
                 config,
+                after: None,
             },
             ctx(&[u]),
         )
@@ -558,7 +572,7 @@ mod tests {
     #[test]
     fn config_is_opt_in_and_never_echoes_invalid_or_inline_credentials() {
         let (sys, _auth, context) = fixture();
-        assert!(items(&sys, &context).unwrap().is_empty());
+        assert!(items(&sys, &context, None).unwrap().is_empty());
         let u = &context.users[0];
         let parsed = decode(
             b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n",
@@ -650,7 +664,7 @@ mod tests {
             script::holds_nothing(&sys, Some(&u));
             sys.on_github_api(&u, "/user", Err("refused (output withheld)".into()));
             let rows = engine::run(
-                &items(&sys, &context).unwrap(),
+                &items(&sys, &context, None).unwrap(),
                 mode,
                 &sys,
                 &context,

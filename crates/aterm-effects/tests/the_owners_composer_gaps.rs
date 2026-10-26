@@ -202,8 +202,15 @@ impl Composer {
 const BACKSPACE: char = '\u{8}';
 
 /// A fixture surface owns the production family.
-#[derive(Default)]
 pub(crate) struct PresentedGlow(aterm_effects::pipeline::EffectsPipeline);
+
+impl Default for PresentedGlow {
+    fn default() -> Self {
+        let mut fx = aterm_effects::pipeline::EffectsPipeline::default();
+        fx.cursor_mut().glow.fold_glow_ramps(true);
+        Self(fx)
+    }
+}
 
 impl Deref for PresentedGlow {
     type Target = CursorGlow;

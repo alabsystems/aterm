@@ -270,7 +270,14 @@ impl crate::App {
             .iter()
             .map(|&(id, _, _)| id)
             .collect();
-        self.write_person_stamps_of(&live, path)
+        let written = self.write_person_stamps_of(&live, path);
+        if written.is_some() {
+            // The keep seam's second copy (inert in a shipped build), of what the stamps added:
+            // after the grant, inside the Commit window, before the Commit that lets the
+            // successor read the stamps.
+            crate::seamless::keep_attempt(nonce);
+        }
+        written
     }
 
     fn write_person_stamps_of(

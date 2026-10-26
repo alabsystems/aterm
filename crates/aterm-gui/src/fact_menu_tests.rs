@@ -1308,7 +1308,7 @@ fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_
         |_, _| Err(()),
     ));
     assert!(codex_store.load(NOW + 3).unwrap().0.pending_pin.is_none());
-    assert!(super::select_menu_account_for(
+    assert!(!super::select_menu_account_for(
         Cli::Codex,
         (&roster_path, &state, Some(&home)),
         &AccountLabel::new("codex-3").unwrap(),
@@ -1321,6 +1321,19 @@ fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_
     ));
     assert_eq!(dispatched.len(), 1);
     assert!(codex_store.load(NOW + 4).unwrap().0.pending_pin.is_none());
+
+    let before = codex_store.load(NOW + 5).unwrap().0;
+    std::fs::rename(codex_store.ledger_path(), state.join("retained-ledger")).unwrap();
+    std::fs::create_dir(codex_store.ledger_path()).unwrap();
+    assert!(!super::select_menu_account_for(
+        Cli::Codex,
+        (&roster_path, &state, Some(&home)),
+        &AccountLabel::new("codex-1").unwrap(),
+        NOW + 5,
+        true,
+        |_, _| panic!("a failed selection must not dispatch authentication"),
+    ));
+    assert_eq!(codex_store.load(NOW + 5).unwrap().0, before);
 }
 
 /// THE ACCOUNT MENU'S WHY NEVER ASKS THE PERSON FOR THE WEEK (owner ruling R-12): no line under

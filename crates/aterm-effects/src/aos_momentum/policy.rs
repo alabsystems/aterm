@@ -689,7 +689,7 @@ pub(super) struct ItemFacts<'a> {
 
 impl<'a> ItemFacts<'a> {
     /// `item`'s facts.
-    pub(super) fn of(item: &'a Item) -> ItemFacts<'a> {
+    pub(super) const fn of(item: &'a Item) -> ItemFacts<'a> {
         ItemFacts {
             id: item.id(),
             kind: item.kind(),
@@ -941,13 +941,13 @@ impl AcceptancePolicy {
     /// The corpus items with their baseline, in corpus order.
     #[inline]
     #[must_use]
-    pub fn items(&self) -> &[ItemPin] {
-        &self.terms.items
+    pub const fn items(&self) -> &[ItemPin] {
+        self.terms.items.as_slice()
     }
 
     /// The baseline's `T`, `P` and `Z` summed over `split`.
     #[must_use]
-    pub fn totals(&self, split: CorpusSplit) -> Totals {
+    pub const fn totals(&self, split: CorpusSplit) -> Totals {
         let items = self.terms.items.as_slice();
         let mut t = Totals {
             ticks: 0,
@@ -957,7 +957,11 @@ impl AcceptancePolicy {
         let mut i = 0;
         while i < items.len() {
             let pin = items[i];
-            if pin.split == split {
+            if matches!(
+                (pin.split, split),
+                (CorpusSplit::Train, CorpusSplit::Train)
+                    | (CorpusSplit::HeldOut, CorpusSplit::HeldOut)
+            ) {
                 t.ticks = t.ticks.saturating_add(pin.baseline.ticks);
                 t.presented = t.presented.saturating_add(pin.baseline.presented);
                 t.wasted = t.wasted.saturating_add(pin.baseline.wasted);
@@ -970,8 +974,8 @@ impl AcceptancePolicy {
     /// The grid, in [`GRID_V1`]'s order.
     #[inline]
     #[must_use]
-    pub fn grid(&self) -> &[SchedulePlan] {
-        &self.terms.grid
+    pub const fn grid(&self) -> &[SchedulePlan] {
+        self.terms.grid.as_slice()
     }
 
     /// The budgets.
@@ -988,8 +992,8 @@ impl AcceptancePolicy {
     /// The codes a plan may replace, by artifact name, and how.
     #[inline]
     #[must_use]
-    pub fn bases(&self) -> &[(&'static str, Replace)] {
-        &self.terms.bases
+    pub const fn bases(&self) -> &[(&'static str, Replace)] {
+        self.terms.bases.as_slice()
     }
 
     /// How a plan may replace the live code `live`.

@@ -6227,6 +6227,19 @@ impl EditorApp {
                 .is_some_and(|buffer| !buffer.minibuffer_active())
     }
 
+    /// Whether diagnostic navigation can move this view without interrupting its prompt.
+    pub(crate) fn can_navigate_config_diagnostics(&self, view: &EditorViewState) -> bool {
+        self.config_editor
+            && self
+                .config_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.diagnostic_count() > 0)
+            && view
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.minibuffer_active())
+    }
+
     /// Line-start index for `snapshot`, built once per document revision.
     fn line_index(
         &self,
@@ -6358,17 +6371,19 @@ impl NativeAppModel for EditorApp {
                 EventResult::Handled
             }
             AppEvent::EditorConfigDiagnosticNavigate { previous } if self.config_editor => {
-                let count = self.config_analysis.as_ref().map_or(
-                    0,
-                    crate::native_config_language::ConfigAnalysis::diagnostic_count,
-                );
-                view.config_diagnostic_selected = config_diagnostic_selection_transition(
-                    view.config_diagnostic_selected,
-                    count,
-                    previous,
-                );
-                view.common.presentation_revision =
-                    view.common.presentation_revision.saturating_add(1);
+                if self.can_navigate_config_diagnostics(view) {
+                    let count = self.config_analysis.as_ref().map_or(
+                        0,
+                        crate::native_config_language::ConfigAnalysis::diagnostic_count,
+                    );
+                    view.config_diagnostic_selected = config_diagnostic_selection_transition(
+                        view.config_diagnostic_selected,
+                        count,
+                        previous,
+                    );
+                    view.common.presentation_revision =
+                        view.common.presentation_revision.saturating_add(1);
+                }
                 EventResult::Handled
             }
             _ => EventResult::Bubble,
@@ -6554,14 +6569,7 @@ impl NativeAppModel for EditorApp {
         );
         let focused = view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
         let buffer_ready = view.buffer.is_some();
-        let config_diagnostic_count = if self.config_editor {
-            self.config_analysis.as_ref().map_or(
-                0,
-                crate::native_config_language::ConfigAnalysis::diagnostic_count,
-            )
-        } else {
-            0
-        };
+        let can_navigate_config_diagnostics = self.can_navigate_config_diagnostics(view);
         let command_button = |key: &'static str,
                               visual_label: &'static str,
                               width: f32,
@@ -6634,12 +6642,12 @@ impl NativeAppModel for EditorApp {
                 "editor/config-problem-previous-button" => (
                     "Prev Issue: the previous config problem (Shift-F8)",
                     "editor/config-problem-previous",
-                    config_diagnostic_count > 0,
+                    can_navigate_config_diagnostics,
                 ),
                 "editor/config-problem-next-button" => (
                     "Next Issue: the next config problem (F8)",
                     "editor/config-problem-next",
-                    config_diagnostic_count > 0,
+                    can_navigate_config_diagnostics,
                 ),
                 _ => (
                     "Commands: run a command by name (M-x)",
@@ -7279,13 +7287,13 @@ impl NativeAppModel for EditorApp {
                     id: ActionId::new("editor/config-problem-next"),
                     title: "Config: Next Problem".to_string(),
                     shortcut: Some("F8".to_string()),
-                    enabled: diagnostic_count > 0,
+                    enabled: self.can_navigate_config_diagnostics(view),
                 },
                 Command {
                     id: ActionId::new("editor/config-problem-previous"),
                     title: "Config: Previous Problem".to_string(),
                     shortcut: Some("Shift-F8".to_string()),
-                    enabled: diagnostic_count > 0,
+                    enabled: self.can_navigate_config_diagnostics(view),
                 },
             ]);
         }

@@ -275,6 +275,26 @@ pub struct Seat {
     pub at_break: bool,
 }
 
+/// What one of a host's own passes freed on a volume ([`Look::reclaimed`], [`Entry::reclaimed`]):
+/// space aterm reclaimed itself, which an asked session's rise never counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reclaimed {
+    /// When the pass ended (unix ms).
+    pub ended_ms: i64,
+    /// What it freed, as its removals measured it.
+    pub bytes: u64,
+}
+
+/// How long the lease keeps a pass's record ([`Entry::reclaimed`]): an asked session's answer is
+/// judged until [`ANSWER_MS`] after its line, and a line whose record was lost (a full disk) is
+/// recorded at its host's next look, so a pass older than this is before every line still judged.
+pub const RECLAIMED_KEEP_MS: i64 = 2 * ANSWER_MS + DELIVER_MS;
+
+/// The most passes the lease keeps a record of a volume ([`Entry::reclaimed`]); past it the two
+/// oldest are kept as one, ended at the later end, so none of what they freed is ever credited to
+/// a session asked between them.
+pub const MAX_RECLAIMED: usize = 32;
+
 /// What one host's disk look read of one volume ([`step`]).
 pub struct Look<'a> {
     /// Unix ms.
@@ -310,12 +330,20 @@ pub struct Look<'a> {
     pub live: &'a [String],
     /// This host's sessions the seat rule would seat but for what holds them now and passes, each
     /// with what holds it ([`HeldBy`]): an unspent usage-limit wall, a box escalated to their
-    /// owner, the owner's hold or a person's take-over, or a draft left standing in the composer.
+    /// owner, the owner's hold or a person's take-over, a draft left standing in the composer, the
+    /// loop's credits hold, a sign-in wall, or another wall its loop waits at.
     /// None of them is in [`Self::seats`]; an elected one among them goes back to the episode at
     /// no election's cost ([`Said::Returned`]), as it could not take its line before its
     /// deadline, and is nominated again once past; a round with nobody else to elect waits for one
     /// of them to be past ([`Said::Waiting`], [`Entry::held`]) instead of running out.
     pub held: &'a [(String, HeldBy)],
+    /// What this host's own passes freed on the volume since its last step the lease took, each
+    /// with when it ended: recorded in an open episode ([`Entry::reclaimed`]), so an asked
+    /// session's rise counts only space aterm did not free itself, whichever host's pass freed it.
+    pub reclaimed: &'a [Reclaimed],
+    /// Another instance's pass holds the pass lock as this host looks: it may be freeing space
+    /// that no host has recorded yet, so this look settles no asked episode.
+    pub passing: bool,
     /// Whether another host's process still runs ([`HostId::alive`]).
     pub alive: &'a dyn Fn(&HostId) -> bool,
 }
@@ -360,11 +388,30 @@ pub enum HeldBy {
     /// A draft left standing in its composer: it passes once the draft is sent or cleared.
     #[serde(rename = "draft")]
     Draft,
+    /// Its loop's credits hold (`credits-hold@v1`, `[harness] usage_credits = false`): usage
+    /// credits would carry its next turn, so the loop types nothing until its usage limit resets.
+    #[serde(rename = "credits")]
+    Credits,
+    /// A sign-in wall (`wall:auth`): its login is gone, and only a person's browser brings it back.
+    #[serde(rename = "sign-in")]
+    SignIn,
+    /// Another wall that is no usage limit, which its loop waits at (an API error, an overload,
+    /// a full context, the memory banner): it passes once the wall does.
+    #[serde(rename = "wall")]
+    Wall,
 }
 
 impl HeldBy {
     /// Every hold, in order.
-    pub const ALL: [HeldBy; 4] = [HeldBy::Limit, HeldBy::Box, HeldBy::Hold, HeldBy::Draft];
+    pub const ALL: [HeldBy; 7] = [
+        HeldBy::Limit,
+        HeldBy::Box,
+        HeldBy::Hold,
+        HeldBy::Draft,
+        HeldBy::Credits,
+        HeldBy::SignIn,
+        HeldBy::Wall,
+    ];
 
     /// The word a look, the lease's record and a turn break's `wait:<why>` say.
     #[must_use]
@@ -374,6 +421,9 @@ impl HeldBy {
             HeldBy::Box => "box",
             HeldBy::Hold => "hold",
             HeldBy::Draft => "draft",
+            HeldBy::Credits => "credits",
+            HeldBy::SignIn => "sign-in",
+            HeldBy::Wall => "wall",
         }
     }
 
@@ -393,15 +443,21 @@ impl HeldBy {
             (HeldBy::Hold, true) => "on hold (yours, or a person's take-over)",
             (HeldBy::Hold, false) => "on hold (its owner's, or a person's take-over)",
             (HeldBy::Draft, _) => "with a draft left in its prompt",
+            (HeldBy::Credits, _) => "waiting out its usage limit rather than spend usage credits",
+            (HeldBy::SignIn, true) => "at a sign-in only you can do",
+            (HeldBy::SignIn, false) => "at a sign-in only its owner can do",
+            (HeldBy::Wall, _) => "at an error its loop waits out",
         }
     }
 
     /// What ends it.
     const fn past(self) -> &'static str {
         match self {
-            HeldBy::Limit | HeldBy::Box => "it is past",
+            HeldBy::Limit | HeldBy::Box | HeldBy::Wall => "it is past",
             HeldBy::Hold => "its hold is lifted",
             HeldBy::Draft => "its draft is sent or cleared",
+            HeldBy::Credits => "its usage limit resets",
+            HeldBy::SignIn => "it is signed in again",
         }
     }
 }
@@ -469,6 +525,9 @@ impl Held {
             Some(HeldBy::Box) => &[HeldBy::Box],
             Some(HeldBy::Hold) => &[HeldBy::Hold],
             Some(HeldBy::Draft) => &[HeldBy::Draft],
+            Some(HeldBy::Credits) => &[HeldBy::Credits],
+            Some(HeldBy::SignIn) => &[HeldBy::SignIn],
+            Some(HeldBy::Wall) => &[HeldBy::Wall],
             None => &[HeldBy::Limit, HeldBy::Box],
         }
     }
@@ -618,6 +677,13 @@ pub struct Entry {
     /// within the round's [`NOMINATE_MS`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<Held>,
+    /// What aterm's own passes freed on the volume while the episode was open, as each host's
+    /// look reported its own ([`Look::reclaimed`]), for [`RECLAIMED_KEEP_MS`] and at most
+    /// [`MAX_RECLAIMED`]: an asked session's rise is measured past every pass that ended at or
+    /// after its line ([`aterm_since`]), so the cleanup pass that keeps running while the volume
+    /// is short is never credited to the session asked. Kept only while an episode is open.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed: Vec<Reclaimed>,
 }
 
 impl Entry {
@@ -969,6 +1035,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     if entry.episode_ms.is_some() {
         hold(entry, look);
         note_held(entry, look);
+        note_reclaimed(entry, look);
     }
     let now = look.now_ms;
     match entry.phase.clone() {
@@ -1061,7 +1128,31 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
         } => {
             let pick = adopt(entry, pick, look.host, look.alive, &[look.live]);
             let best = best_free.max(look.free);
-            let rose = best.saturating_sub(free_at);
+            // The rise past the line's figure and past what aterm's own passes freed since, on any
+            // host: the cleanup pass runs on while the volume is short, and what it reclaims is
+            // not the asked session's.
+            let rose = best
+                .saturating_sub(free_at)
+                .saturating_sub(aterm_since(entry, typed_ms));
+            // Another instance's pass may be freeing space no host has recorded yet: the rise is
+            // judged at a look after it, which reads its record.
+            let passing = look.passing;
+            #[cfg(any(test, debug_assertions))]
+            let passing = passing && !fault::armed(fault::Fault::SettleWhilePassing);
+            if rose >= FREED_MIN && passing {
+                entry.phase = Phase::Asked {
+                    pick: pick.clone(),
+                    typed_ms,
+                    until_ms,
+                    free_at,
+                    best_free: best,
+                };
+                return Said::Asked {
+                    pick,
+                    until_ms,
+                    rose,
+                };
+            }
             if rose >= FREED_MIN {
                 entry.phase = Phase::Settled {
                     at_ms: now,
@@ -1460,6 +1551,41 @@ fn note_held(entry: &mut Entry, look: &Look<'_>) {
     }));
     let over = entry.held.len().saturating_sub(MAX_NOMINEES);
     entry.held.drain(..over);
+}
+
+/// Record what this look's host's own passes freed ([`Look::reclaimed`]) in the open episode
+/// ([`Entry::reclaimed`]), oldest first, keeping [`RECLAIMED_KEEP_MS`] of them, and every one since
+/// the line an asked session's answer is judged against however long ago it went, and at most
+/// [`MAX_RECLAIMED`]: past it the two oldest are kept as one, ended at the later end, which credits
+/// aterm, never a session asked between them, with what both freed.
+fn note_reclaimed(entry: &mut Entry, look: &Look<'_>) {
+    entry.reclaimed.extend(look.reclaimed.iter().copied());
+    entry.reclaimed.sort_by_key(|r| r.ended_ms);
+    let mut keep_from = look.now_ms.saturating_sub(RECLAIMED_KEEP_MS);
+    if let Phase::Asked { typed_ms, .. } = &entry.phase {
+        keep_from = keep_from.min(*typed_ms);
+    }
+    entry.reclaimed.retain(|r| r.ended_ms >= keep_from);
+    while entry.reclaimed.len() > MAX_RECLAIMED {
+        let first = entry.reclaimed.remove(0);
+        let second = &mut entry.reclaimed[0];
+        second.bytes = second.bytes.saturating_add(first.bytes);
+    }
+}
+
+/// What aterm's own passes freed on `entry`'s volume since a line typed at `typed_ms`, as every
+/// host recorded its own ([`Entry::reclaimed`]): a pass that ended at or after the line, all of
+/// it, so a pass the line went in the middle of is aterm's whole, never the asked session's.
+fn aterm_since(entry: &Entry, typed_ms: i64) -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::CreditAterm) {
+        return 0;
+    }
+    entry
+        .reclaimed
+        .iter()
+        .filter(|r| r.ended_ms >= typed_ms)
+        .fold(0u64, |a, r| a.saturating_add(r.bytes))
 }
 
 /// The held sessions ([`Entry::held`]) not picked this episode, or gone back to it
@@ -2080,7 +2206,9 @@ const HOLDER_PATH_CAP: usize = 56;
 /// to remove and how to confirm, then `(rule disk-free@v1)`, in at most [`LINE_CAP`]
 /// characters. A holder's path is said only in plain characters (letters, digits, `/._-~+@:,=`
 /// and spaces) and clipped; any other is said as "a build directory", so a folder's name
-/// carries nothing planted into an agent's prompt.
+/// carries nothing planted into an agent's prompt. A line too long for both holders names the
+/// largest alone, and one too long for that names it with its path clipped to the room left
+/// ([`clip_within`]), so a line whose pass left a holder never says it names none.
 #[must_use]
 pub fn line(l: &Line<'_>) -> String {
     let used = l.total.saturating_sub(l.free);
@@ -2110,31 +2238,52 @@ pub fn line(l: &Line<'_>) -> String {
         plain(&l.mount.display().to_string()).unwrap_or_else(|| "its volume".to_owned()),
         human_bytes(l.free),
     );
-    let holders: Vec<String> = l.holders.iter().take(2).map(|h| holder(h, l)).collect();
-    let mut keep = holders.len();
-    loop {
-        let named = if keep == 0 {
-            " aterm's report names no holder it can size: `aterm harness disk` lists them."
-                .to_owned()
-        } else {
-            format!(" Largest left: {}.", holders[..keep].join("; "))
-        };
-        let text = format!("{HEAD}{fact}{named} {SAFE} {CONFIRM} (rule {RULE_DISK_FREE})");
-        if keep == 0 || text.chars().count() <= LINE_CAP {
+    let said =
+        |named: &str| format!("{HEAD}{fact}{named} {SAFE} {CONFIRM} (rule {RULE_DISK_FREE})");
+    let largest = |named: &[String]| format!(" Largest left: {}.", named.join("; "));
+    let holders: Vec<String> = l
+        .holders
+        .iter()
+        .take(2)
+        .map(|h| holder(h, l, &shown_path(holder_path(h), l.home)))
+        .collect();
+    for keep in (1..=holders.len()).rev() {
+        let text = said(&largest(&holders[..keep]));
+        if text.chars().count() <= LINE_CAP {
             return text;
         }
-        keep -= 1;
     }
+    // Not even the largest fits as it is usually said: it is said with its path clipped to the
+    // room the line leaves it, so a line with a holder to name never says it has none, and the
+    // asked tab's own keeps its mark.
+    if let Some(first) = l.holders.first() {
+        let bare = said(&largest(&[holder(first, l, "")])).chars().count();
+        if let Some(shown) =
+            shown_path_within(holder_path(first), l.home, LINE_CAP.saturating_sub(bare))
+        {
+            return said(&largest(&[holder(first, l, &shown)]));
+        }
+        return said(" `aterm harness disk` lists the largest holders left.");
+    }
+    said(" aterm's report names no holder it can size: `aterm harness disk` lists them.")
 }
 
-fn holder(h: &Hog, l: &Line<'_>) -> String {
+/// The path holder `h` is said by: the checkout it builds for, or its own directory.
+fn holder_path(h: &Hog) -> &Path {
+    h.serves.as_deref().unwrap_or(&h.path)
+}
+
+/// Holder `h` as the line says it, its path ([`holder_path`]) said as `shown`:
+/// `<checkout>'s builds <size>`, or `<directory> <size>`, marked `(this tab's)` when it builds
+/// for the asked session's checkout.
+fn holder(h: &Hog, l: &Line<'_>, shown: &str) -> String {
     let mine = l
         .checkout
         .zip(h.serves.as_deref())
         .is_some_and(|(c, s)| c == s);
     let place = match h.serves.as_deref() {
-        Some(s) if s != h.path => format!("{}'s builds", shown_path(s, l.home)),
-        _ => shown_path(&h.path, l.home),
+        Some(s) if s != h.path => format!("{shown}'s builds"),
+        _ => shown.to_owned(),
     };
     format!(
         "{place} {}{}",
@@ -2143,12 +2292,90 @@ fn holder(h: &Hog, l: &Line<'_>) -> String {
     )
 }
 
+/// What a path any other character than the plain ones would spell is said as ([`plain`]).
+const UNSAID_PATH: &str = "a build directory";
+
 fn shown_path(p: &Path, home: Option<&Path>) -> String {
+    said_path(p, home).map_or_else(|| UNSAID_PATH.to_owned(), |t| clip(&t))
+}
+
+/// `p` home-relative (`~/…`) and whole, when every character of it is a plain one ([`plain`]).
+fn said_path(p: &Path, home: Option<&Path>) -> Option<String> {
     let text = match home.and_then(|h| p.strip_prefix(h).ok()) {
         Some(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
         _ => p.display().to_string(),
     };
-    plain(&text).map_or_else(|| "a build directory".to_owned(), |t| clip(&t))
+    plain(&text)
+}
+
+/// [`shown_path`] in at most `room` characters ([`clip_within`]). `None`: not even its clipped
+/// form fits.
+fn shown_path_within(p: &Path, home: Option<&Path>, room: usize) -> Option<String> {
+    match said_path(p, home) {
+        Some(text) => clip_within(&text, room),
+        None => (UNSAID_PATH.chars().count() <= room).then(|| UNSAID_PATH.to_owned()),
+    }
+}
+
+/// The fewest characters of a path's last component [`clip_within`] keeps.
+const LAST_KEPT_MIN: usize = 3;
+
+/// `text`, a path as [`said_path`] says it, in at most `room` characters: clipped in its middle,
+/// so it keeps its leading `~/` or `/`, as many whole components after that as fit, and its last
+/// component (`~/aterm/…/worktree-name`). A last component too long for that is clipped in
+/// its own middle (`~/…/worktr…e-name`). `None`: not even [`LAST_KEPT_MIN`] characters of it fit.
+fn clip_within(text: &str, room: usize) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= room {
+        return Some(text.to_owned());
+    }
+    let lead = if text.starts_with("~/") {
+        2
+    } else {
+        usize::from(text.starts_with('/'))
+    };
+    let last_at = chars
+        .iter()
+        .rposition(|&c| c == '/')
+        .map_or(0, |at| at + 1)
+        .max(lead);
+    let last = &chars[last_at..];
+    // `…/` stands for what lies between the lead and the last component.
+    let between = if last_at > lead { "…/" } else { "" };
+    let marks = between.chars().count();
+    if lead + marks + last.len() <= room {
+        // As much of what comes first as fits, cut where a component ends.
+        let fits = room - marks - last.len();
+        let head = chars[..fits]
+            .iter()
+            .rposition(|&c| c == '/')
+            .map_or(lead, |at| at + 1)
+            .max(lead);
+        return Some(
+            chars[..head]
+                .iter()
+                .copied()
+                .chain(between.chars())
+                .chain(last.iter().copied())
+                .collect(),
+        );
+    }
+    let kept = room.checked_sub(lead + marks + 1)?;
+    if kept < LAST_KEPT_MIN {
+        return None;
+    }
+    let tail = kept / 2;
+    let head = kept - tail;
+    Some(
+        chars[..lead]
+            .iter()
+            .copied()
+            .chain(between.chars())
+            .chain(last[..head].iter().copied())
+            .chain(std::iter::once('…'))
+            .chain(last[last.len() - tail..].iter().copied())
+            .collect(),
+    )
 }
 
 /// `text` when every character is a plain one (letters, digits, `/._-~+@:,=` and spaces).
@@ -2377,11 +2604,13 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                 free_at,
                 best_free,
             } => format!(
-                "asked @{} at {}: free {} then, {} at best since; it needs +{} by {}",
+                "asked @{} at {}: free {} then, {} at best since, {} of it freed by aterm's own \
+                 passes, which is not the session's; it needs +{} more by {}",
                 pick.sid,
                 at(*typed_ms),
                 human_bytes(*free_at),
                 human_bytes(*best_free),
+                human_bytes(aterm_since(e, *typed_ms)),
                 human_bytes(FREED_MIN),
                 at(*until_ms)
             ),
@@ -2562,6 +2791,15 @@ pub mod fault {
         /// found nobody to elect or wait for at another host's look while the successor's pass
         /// ran, and ran the episode out.
         TakeOverByRule,
+        /// [`super::step`] counts none of what aterm's own passes freed since an asked session's
+        /// line ([`super::Entry::reclaimed`]), as before the lease recorded them: the cleanup
+        /// pass that runs on while the volume is short settled the episode in the session's name,
+        /// and nobody else was asked for six hours.
+        CreditAterm,
+        /// [`super::step`] settles an asked episode while another instance's pass holds the pass
+        /// lock ([`super::Look::passing`]): space that pass freed, which no host has recorded yet,
+        /// is credited to the asked session.
+        SettleWhilePassing,
     }
 
     thread_local! {

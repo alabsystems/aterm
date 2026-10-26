@@ -909,9 +909,11 @@ pub(crate) fn select_menu_account_for(
     if label.row(&roster).is_none() {
         return false;
     }
-    if let Ok(accounts::PinSelection::Renew(request)) =
-        store.select_account_for(cli, &roster, label.as_str(), now)
-    {
+    let selection = match store.select_account_for(cli, &roster, roster_path, label.as_str(), now) {
+        Ok(selection) => selection,
+        Err(_) => return false,
+    };
+    if let accounts::PinSelection::Renew(request) = selection {
         if let (true, Some(home)) = (upkeep_live, home) {
             if dispatch(request.clone(), home.to_path_buf()).is_err() {
                 let _ = store.cancel_pin_request(&request, now);

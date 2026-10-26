@@ -303,7 +303,10 @@ impl TrickFlash {
         if len == 0 {
             return;
         }
-        let base_y = self.lookup_base_y(pane.or(scope));
+        let base_y = self.lookup_base_y(match pane {
+            Some(p) => Some(p),
+            None => scope,
+        });
         self.slot = Some(Slot {
             at: now,
             pane,
@@ -401,7 +404,11 @@ impl TrickFlash {
             self.slot = None;
             return;
         };
-        let grid_cols = u16::try_from(cols).unwrap_or(u16::MAX);
+        let grid_cols = if cols < usize::from(u16::MAX) {
+            cols as u16
+        } else {
+            u16::MAX
+        };
         self.slot = match slot.located {
             Some(loc) => match follow(
                 &slot,
@@ -903,7 +910,11 @@ fn locate(
         && row < rows
     {
         load_row(row, row_buf);
-        let cursor_col = (usize::from(cursor.0) == row).then_some(cursor.1);
+        let cursor_col = if usize::from(cursor.0) == row {
+            Some(cursor.1)
+        } else {
+            None
+        };
         found = find_word(slot, row_buf, cursor_col, false).map(|hit| (row, hit));
         let left_behind = cursor.0 != slot.caret.0 || cursor.1 < slot.caret.1;
         if found.is_none() && delta == 0 && left_behind {

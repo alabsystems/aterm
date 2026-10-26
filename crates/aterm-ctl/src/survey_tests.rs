@@ -1906,7 +1906,61 @@ fn the_fleet_clients_closing_line_ends_the_read_within_its_budget() {
         here,
         None,
     );
-    assert_eq!((printed.code, printed.out), (2, None));
+    assert_eq!((printed.code, printed.out), (1, None));
+}
+
+fn silent_peer(fault: PeerFault) -> FleetRead {
+    FleetRead {
+        peers: vec![PeerSurvey {
+            label: "lab-01".to_owned(),
+            answer: Err("stub-silent-7a2f".to_owned()),
+            fault,
+            unproven: false,
+            node: None,
+        }],
+        note: None,
+        alone: None,
+    }
+}
+
+fn frozen_peer(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+    Ok(silent_peer(PeerFault::Unserved))
+}
+
+fn refusing_peer(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+    Ok(silent_peer(PeerFault::Other))
+}
+
+#[test]
+fn a_fleet_read_no_aterm_served_exits_2_as_a_drive_of_it_does() {
+    let parts = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
+    let sid = format!("s-{:04x}{:016x}", 1, 3);
+    let none_here = || Err(("stub-none-here-91c0".to_owned(), 2));
+    let reads: [(&[&str], FleetSurveyFn, u8); 6] = [
+        (&["survey", "--host", "lab-01"], frozen_peer, 2),
+        (&["survey", "--host", "lab-01", "--json"], frozen_peer, 2),
+        (
+            &["survey", "--host", "lab-01", "--sid", &sid],
+            frozen_peer,
+            2,
+        ),
+        (&["survey", "--host", "lab-01"], refusing_peer, 1),
+        (
+            &["survey", "--host", "lab-01", "--sid", &sid],
+            refusing_peer,
+            1,
+        ),
+        (&["survey", "--fleet"], frozen_peer, 1),
+    ];
+    for (words, fleet, code) in reads {
+        let printed = read_survey(
+            &parse_args(&parts(words)).unwrap(),
+            Some(fleet),
+            none_here,
+            None,
+        );
+        assert_eq!(printed.code, code, "{words:?}: {printed:?}");
+    }
 }
 
 #[test]
@@ -2195,4 +2249,53 @@ fn an_agents_active_goal_is_quoted_under_its_line_before_what_it_was_asked() {
         "a facts reply's goal flag is no words to quote"
     );
     assert_eq!(excerpts(&s, false)[0].word, "goal");
+}
+
+static ASKED_WITHIN: std::sync::Mutex<Vec<Duration>> = std::sync::Mutex::new(Vec::new());
+
+fn asked_within(ask: &FleetAsk<'_>) -> Result<FleetRead, String> {
+    ASKED_WITHIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(ask.within);
+    Ok(FleetRead::default())
+}
+
+#[test]
+fn ctls_own_timeout_bounds_a_fleet_survey_where_it_is_shorter() {
+    let parts = |line: &str| -> Vec<String> { line.split_whitespace().map(String::from).collect() };
+    let local = crate::LocalVerbs {
+        fleet_survey: Some(asked_within),
+        ..crate::LocalVerbs::NONE
+    };
+    let secs = Duration::from_secs;
+    for (total, line, within) in [
+        (Some(Some(secs(1))), "survey --host m7", secs(1)),
+        (Some(Some(secs(1))), "survey --host m7 --timeout 5", secs(1)),
+        (Some(Some(secs(6))), "survey --host m7", FLEET_WITHIN),
+        (Some(Some(secs(6))), "survey --host m7 --timeout 5", secs(5)),
+        (Some(None), "survey --host m7 --timeout 5", secs(5)),
+        (None, "survey --host m7", FLEET_WITHIN),
+    ] {
+        ASKED_WITHIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        run_survey(&parts(line), None, None, total, &local).expect("a read");
+        assert_eq!(
+            *ASKED_WITHIN.lock().unwrap_or_else(|p| p.into_inner()),
+            [within],
+            "{total:?} {line}"
+        );
+    }
+    ASKED_WITHIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    crate::remote::run("m7", &parts("survey"), Some(Some(secs(1))), &local).expect("a read");
+    assert_eq!(
+        *ASKED_WITHIN.lock().unwrap_or_else(|p| p.into_inner()),
+        [secs(1)],
+        "--timeout 1 --host m7 survey"
+    );
 }

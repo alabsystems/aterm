@@ -201,7 +201,19 @@ fn sparkle_grains_on_a_light_page_are_ink_not_light() {
         }
         assert!(glow.particles.len() >= 4, "a warm run bursts sparkles");
         let (mut quads, mut halos) = (Vec::new(), Vec::new());
-        glow.emit_particles(t, &c, g, &mut quads, &mut halos, &mut Vec::new());
+        glow.emit_particles(
+            t,
+            &c,
+            g,
+            &mut quads,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut Vec::new(),
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
         if dark {
             assert!(
                 !quads.is_empty(),
@@ -368,7 +380,18 @@ fn lightning_flashes(unlimited: bool) -> (usize, usize) {
     let mut frame = |glow: &mut CursorGlow, at: Instant, caret: (u16, u16)| {
         glow.tick(Some(caret), at, &c, g, &mut out);
         let mut bolts = Vec::new();
-        glow.emit_bolts(at, &c, g, &mut bolts, &mut verts, &mut Vec::new());
+        glow.emit_bolts(
+            at,
+            &c,
+            g,
+            &mut crate::cursor_glow::glow_sink(
+                &mut bolts,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut verts,
+            &mut Vec::new(),
+        );
         glass.px.fill(c.theme_bg);
         glass.add_quads(&bolts);
         meter.sample(&glass, at.saturating_duration_since(t0).as_secs_f32());
@@ -543,7 +566,18 @@ fn a_crackle_keeps_the_letter_it_crosses_readable() {
             ..CursorGlow::default()
         };
         let (mut quads, mut verts) = (Vec::new(), Vec::new());
-        glow.emit_bolts(born, &c, g, &mut quads, &mut verts, &mut Vec::new());
+        glow.emit_bolts(
+            born,
+            &c,
+            g,
+            &mut crate::cursor_glow::glow_sink(
+                &mut quads,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut verts,
+            &mut Vec::new(),
+        );
         assert!(!quads.is_empty(), "the crackle draws");
         let mut glass = Glass::new(g, c.theme_bg);
         for y in 34..47 {
@@ -594,7 +628,23 @@ fn typing_streak_flashes(style: GlowStyle, chords: bool, text: bool, knobs: (u64
         glow.tick(caret, at, &c, g, &mut out);
         let (mut quads, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
         glow.begin_ink_ledger(&c, g, caret);
-        glow.emit_comet(at, &c, g, caret, &mut quads, &mut halos, &mut under);
+        glow.emit_comet(
+            at,
+            &c,
+            g,
+            caret,
+            &mut crate::cursor_glow::glow_sink(
+                &mut quads,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+        );
         glow.emit_crown(at, &c, g, caret, &mut halos, &mut under);
         glass.px.fill(c.theme_bg);
         glass.add_quads(&under);
@@ -712,7 +762,18 @@ fn a_jump_strike_holds_its_light_over_the_text_it_crosses() {
         glow.tick(Some((5, 2)), t, &c, g, &mut out);
         let at = t + Duration::from_millis(8);
         let mut bolts = Vec::new();
-        glow.emit_bolts(at, &c, g, &mut bolts, &mut Vec::new(), &mut Vec::new());
+        glow.emit_bolts(
+            at,
+            &c,
+            g,
+            &mut crate::cursor_glow::glow_sink(
+                &mut bolts,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         let (mut over_text, mut over_air, mut white_on_text) = (0u32, 0u32, false);
         for q in &bolts {
             let row = usize::from(q.y) / g.ch;

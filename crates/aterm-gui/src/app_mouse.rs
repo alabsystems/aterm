@@ -809,9 +809,12 @@ struct MouseCellMapping {
 /// The `pointer` verb's answer.
 pub(crate) type PointerReply = Result<PointerAt, String>;
 
-/// Where the front window's pointer IS, as the `pointer` verb says it (cs-25).
+/// The pointer's presented location or acknowledgement of a dispatched action (cs-25).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PointerAt {
+    Dispatched {
+        readback_error: String,
+    },
     Absent,
     Grid {
         cell: (i32, u16),
@@ -1628,11 +1631,7 @@ impl App {
             return false;
         }
         // A pinned or keyboard lens's ⌘C copies its instrument's sentence.
-        if self.windows.get(&wid).is_some_and(|ws| {
-            ws.stats_lens
-                .open
-                .is_some_and(|l| l.how != crate::stats_lens::Opened::Hover)
-        }) {
+        if self.stats_lens_copy_ready(wid).is_some() {
             return self.copy_stats_sentence(wid);
         }
         if self.active_native_view(wid).is_some() {
@@ -1836,6 +1835,16 @@ impl App {
         }
         if let Some(session) = seen {
             self.note_human_acted_on(wid, session);
+        }
+    }
+
+    /// Dispatch one pointer request and read the frame its event left.
+    pub(crate) fn pointer_request(&mut self, action: PointerAction) -> PointerReply {
+        let status = matches!(&action, PointerAction::Status);
+        let cell = self.pointer_cmd(action)?;
+        match self.pointer_reply(cell) {
+            Err(readback_error) if !status => Ok(PointerAt::Dispatched { readback_error }),
+            reply => reply,
         }
     }
 
@@ -5753,7 +5762,10 @@ mod pointer_license_tests {
                 .last()
                 .unwrap()
                 .licence,
-            !out.is_empty() || !ws.fx.cursor_mut().glow.under_quads().is_empty(),
+            {
+                let glow = &ws.fx.cursor().glow;
+                !glow.out_laid(&out).is_empty() || !glow.under_laid().is_empty()
+            },
         )
     }
 
@@ -6024,13 +6036,10 @@ mod tests {
         use super::{NativePointerTarget, PointerAt};
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
-        let cell = app
-            .pointer_cmd(PointerAction::Move { row: 2, col: 3 })
+        let at = app
+            .pointer_request(PointerAction::Move { row: 2, col: 3 })
             .expect("a terminal move");
-        assert!(matches!(
-            app.pointer_reply(cell),
-            Ok(PointerAt::Grid { cell: (2, 3), .. })
-        ));
+        assert!(matches!(at, PointerAt::Grid { cell: (2, 3), .. }));
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorStyles));
         let (_, view) = app.active_native_view(wid).expect("Settings in front");
         let compiled = app.compiled_native_ui(wid).expect("the page compiles");
@@ -6045,28 +6054,28 @@ mod tests {
                 .view_state(view)
                 .and_then(|state| state.common().hovered.clone())
         };
-        let cell = app
-            .pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+        let at = app
+            .pointer_request(PointerAction::MoveNative(NativePointerTarget::Key(
                 row.as_str().to_string(),
             )))
             .expect("the move aims at the row");
         assert_eq!(hovered(&app), Some(row.clone()), "the row is hovered");
-        match app.pointer_reply(cell) {
-            Ok(PointerAt::Native {
+        match at {
+            PointerAt::Native {
                 view: at,
                 key: Some(key),
                 ..
-            }) => {
+            } => {
                 assert_eq!(at, view.get());
                 assert_eq!(key, row.as_str());
             }
             other => panic!("a native answer, never a grid cell: {other:?}"),
         }
-        let cell = app
-            .pointer_cmd(PointerAction::Leave)
+        let at = app
+            .pointer_request(PointerAction::Leave)
             .expect("the pointer leaves");
         assert_eq!(hovered(&app), None, "leaving clears the hover");
-        assert_eq!(app.pointer_reply(cell), Ok(PointerAt::Absent));
+        assert_eq!(at, PointerAt::Absent);
     }
 
     #[test]
@@ -6300,58 +6309,104 @@ mod tests {
 
     #[test]
     fn a_pointer_reply_on_glass_reads_the_frame_its_event_left() {
-        use super::{NativePointerTarget, PointerAt, WheelUnit};
-        let (mut app, wid, view) = settings_at_1000_by_600_in(
-            crate::scripted_redraw_fixture::scripted_app(),
-            crate::native_settings::SettingsRoute::KeyboardInput,
-        );
+        use super::{NativePointerTarget, PointerAt};
+        use crate::native_settings::SettingsRoute;
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        // Keep the render-cost feedback latch fixed: this test scripts a failed
+        // commit, not a wall-clock-dependent motion-policy transition.
+        let motion_anchor = std::time::Instant::now();
+        app.perf_reduced = true;
+        app.perf_flip_at = Some(motion_anchor);
+        app.perf_shed_dwell = std::time::Duration::MAX;
+        let (mut app, wid, view) = settings_at_1000_by_600_in(app, SettingsRoute::KeyboardInput);
         assert!(
             !app.commit_glassless_native_frame(wid),
             "the window has glass"
         );
         app.redraw_window(wid);
-        let switch = "settings/control/copy_on_select";
-        let reply = |app: &mut crate::App, action| {
-            let cell = app.pointer_cmd(action).expect("the pointer acts");
-            match app.pointer_reply(cell) {
-                Ok(PointerAt::Native { view: at, key, .. }) => {
-                    assert_eq!(at, view.get());
-                    key
-                }
-                other => panic!("the reply reads the presented frame: {other:?}"),
+        let first_key = format!("settings/nav{}", SettingsRoute::WindowTabs.path());
+        let second_key = format!("settings/nav{}", SettingsRoute::KeyboardInput.path());
+        let artifact = app
+            .retained_native_leaf_artifact(wid, view, true)
+            .expect("the initial Settings page is presented");
+        for key in [&first_key, &second_key] {
+            let shown = artifact
+                .compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key.as_str())
+                .expect("both fixed rail rows are presented");
+            let hit = artifact
+                .compiled
+                .hits
+                .iter()
+                .find(|hit| hit.key.as_str() == key.as_str())
+                .expect("both fixed rail rows are actionable");
+            assert!(!shown.clip.is_empty(), "{key} is visible");
+            assert!(!hit.rect.is_empty(), "{key} has a pointer target");
+            assert!(
+                shown.clip.contains(
+                    hit.rect.x + hit.rect.width / 2.0,
+                    hit.rect.y + hit.rect.height / 2.0,
+                ),
+                "{key}'s pointer target lies inside its visible clip"
+            );
+        }
+        let reply = |app: &mut crate::App, action: PointerAction| match app
+            .pointer_request(action.clone())
+        {
+            Ok(PointerAt::Native { view: at, key, .. }) => {
+                assert_eq!(at, view.get());
+                key
             }
+            other => panic!("the reply for {action:?} reads the presented frame: {other:?}"),
         };
-        let value = |app: &crate::App| {
-            app.compiled_native_ui(wid)
-                .expect("the page compiles")
-                .semantic(&crate::native_ui::UiKey::new(switch))
-                .map(|node| (node.value.clone(), node.state))
+        let state = |app: &crate::App| match app.native_runtime.view_state(view) {
+            Some(crate::native_app::AppViewState::Settings(settings)) => {
+                (settings.route, settings.common.content_epoch)
+            }
+            _ => panic!("Settings remains attached"),
         };
+        let untouched = state(&app);
+        assert_eq!(untouched.0, SettingsRoute::KeyboardInput);
+        assert!(
+            app.pointer_request(PointerAction::Click).is_err(),
+            "no position is a pre-dispatch refusal"
+        );
+        assert!(
+            app.pointer_request(PointerAction::MoveNative(NativePointerTarget::Key(
+                "settings/no-such-control".into()
+            )))
+            .is_err(),
+            "an invalid target is a pre-dispatch refusal"
+        );
+        assert_eq!(state(&app), untouched);
         let hovered = reply(
             &mut app,
-            PointerAction::MoveNative(NativePointerTarget::Key(switch.into())),
+            PointerAction::MoveNative(NativePointerTarget::Key(first_key.clone())),
         );
-        assert_eq!(hovered.as_deref(), Some(switch), "the hover is presented");
-        let before = value(&app);
+        assert_eq!(
+            hovered.as_deref(),
+            Some(first_key.as_str()),
+            "the hover is presented"
+        );
+        let before = state(&app);
         let _ = reply(&mut app, PointerAction::Click);
-        assert_ne!(value(&app), before, "the click acted");
-        let wheel = PointerAction::Wheel {
-            dx: 0.0,
-            dy: 1.0,
-            unit: WheelUnit::Lines,
-            aim: None,
-        };
-        let _ = reply(&mut app, wheel);
+        assert_eq!(
+            state(&app).0,
+            SettingsRoute::WindowTabs,
+            "the click navigated"
+        );
+        assert_ne!(state(&app).1, before.1, "the click changed actual content");
         let status = reply(&mut app, PointerAction::Status);
-        let compiled = app.compiled_native_ui(wid).expect("the page compiles");
         let (x, y) = app.windows[&wid].last_cursor_px;
         let (artifact, local_x, local_y) = app
             .retained_native_leaf_at_pointer(wid, x, y)
             .expect("the frame under the pointer is presented");
-        assert_eq!(artifact.compiled.paint.len(), compiled.paint.len());
         assert_eq!(
             status,
-            compiled
+            artifact
+                .compiled
                 .hit_test(local_x, local_y)
                 .map(|hit| hit.key.as_str().to_string()),
             "the reply names what the page now holds there"
@@ -6360,14 +6415,39 @@ mod tests {
         let commits = surface(&mut app).commits();
         let _ = reply(&mut app, PointerAction::Status);
         assert_eq!(surface(&mut app).commits(), commits, "nothing changed");
+        let hovered = reply(
+            &mut app,
+            PointerAction::MoveNative(NativePointerTarget::Key(second_key.clone())),
+        );
+        assert_eq!(
+            hovered.as_deref(),
+            Some(second_key.as_str()),
+            "the next rail row is presented"
+        );
+        assert!(app.perf_reduced, "the scripted motion latch stays fixed");
+        assert_eq!(app.perf_flip_at, Some(motion_anchor));
+        assert_eq!(app.perf_shed_dwell, std::time::Duration::MAX);
         surface(&mut app).fail_next(crate::present::scripted::ScriptedOutcome::FailCommit);
-        let wheel_up = PointerAction::Wheel {
-            dx: 0.0,
-            dy: -1.0,
-            unit: WheelUnit::Lines,
-            aim: None,
-        };
-        let cell = app.pointer_cmd(wheel_up).expect("the wheel turns");
+        let before_commits = surface(&mut app).commits();
+        let before_click = state(&app);
+        let dispatched = app.pointer_request(PointerAction::Click);
+        assert_eq!(
+            state(&app).0,
+            SettingsRoute::KeyboardInput,
+            "the failed present cannot undo the real navigation click"
+        );
+        assert_ne!(
+            state(&app).1,
+            before_click.1,
+            "the failed present cannot undo the actual content change"
+        );
+        assert_eq!(
+            surface(&mut app).commits(),
+            before_commits,
+            "the scripted failed commit leaves no new frame"
+        );
+        let after_click = state(&app);
+        let cell = app.pointer_readback(wid);
         assert_eq!(
             app.pointer_reply(cell),
             Err(
@@ -6375,6 +6455,30 @@ mod tests {
                  (pointer status reads it)"
                     .to_string()
             )
+        );
+        // Hold the existing retry policy parked so this read-only control cannot
+        // opportunistically present a later frame or depend on a wall-clock backoff.
+        app.windows.get_mut(&wid).unwrap().present_retry.parked = true;
+        let commits = surface(&mut app).commits();
+        assert!(
+            app.pointer_request(PointerAction::Status).is_err(),
+            "Status still refuses unavailable positional readback"
+        );
+        assert_eq!(state(&app), after_click, "Status never replays the click");
+        assert_eq!(
+            surface(&mut app).commits(),
+            commits,
+            "the parked surface stays unpresented"
+        );
+        assert_eq!(
+            dispatched,
+            Ok(PointerAt::Dispatched {
+                readback_error:
+                    "the page under the pointer changed and its next frame is not presented yet \
+                                 (pointer status reads it)"
+                        .to_string(),
+            }),
+            "an already-dispatched click must not look like a rejected request"
         );
     }
 

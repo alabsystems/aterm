@@ -206,6 +206,8 @@ pub(crate) enum InputOutcome {
     WriteFailed,
     /// The session's input queue refused the event and NOTHING of it was written.
     QueueFull,
+    /// A geometry request found no window to change, so nothing was applied; the words say why.
+    NotApplied(&'static str),
 }
 
 impl InputOutcome {

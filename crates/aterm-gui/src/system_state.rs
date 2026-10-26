@@ -102,6 +102,23 @@ pub struct SetupStatus {
     /// page shows the plan the review showed with Set up now, calm, and lights nothing for the
     /// permissions nobody approved: no Needs you, no diamond, no menu line. Filled by the worker.
     pub unanswered: bool,
+    /// Where an install of Apple's Command Line Tools stands, which the GitHub repositories row
+    /// waits on while they are missing (§3.3): its tab asks for the person's password, or the
+    /// installer runs. `None`: neither, so the row's Install… button opens the tab. Filled by
+    /// the window (`App::developer_tools_install_step`), never by the worker.
+    pub developer_tools: Option<ToolsInstall>,
+}
+
+/// An install of Apple's Command Line Tools under way (§3.3), as the window sees it
+/// ([`SetupStatus::developer_tools`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolsInstall {
+    /// Its terminal tab waits for the person's password: they are needed now, and typing it is
+    /// the one thing that changes the outcome.
+    Password,
+    /// The installer runs (its on-demand placeholder, or Apple's own installer, is there): the
+    /// row waits, calmly, and moves on once the tools arrive.
+    Installing,
 }
 
 /// A read-only Check again or a Restore the window started: the worker is
@@ -218,6 +235,7 @@ impl SetupStatus {
                 row,
                 name: row.name.as_str(),
                 check: false,
+                on_row: false,
             })
             .chain(
                 self.check
@@ -229,6 +247,7 @@ impl SetupStatus {
                         row,
                         name: row.name.strip_prefix("Check: ").unwrap_or(&row.name),
                         check: true,
+                        on_row: false,
                     }),
             )
     }
@@ -338,6 +357,25 @@ impl SetupStatus {
             && (row.detail == RETRIES_NOTE || (self.retrying && row.detail != TRIED_TWICE))
     }
 
+    /// The reason a step the last run could not finish gives for `row` (§3.6): its words, in the
+    /// page's terms (`The change did not take.`, `GitHub can't be reached`), which the row keeps
+    /// as its note where its reading gives none. Never a Check's (a read, whose note says to
+    /// press it again), a Restore's, a whole sentence said alone ([`Said::whole`]), or the words
+    /// of what comes next a vault try carries ([`RETRIES_NOTE`], [`TRIED_TWICE`]).
+    fn step_reason<'a>(&'a self, plan: &'a Plan, row: Subject) -> Option<&'a str> {
+        self.results(Some(plan))
+            .find(|result| {
+                !result.check
+                    && subject_named(result.name) == Some(row)
+                    && matches!(result.row.status.as_str(), "error" | "failed")
+                    && !result.whole()
+                    && !result.row.detail.trim().is_empty()
+                    && result.row.detail != RETRIES_NOTE
+                    && result.row.detail != TRIED_TWICE
+            })
+            .map(|result| result.row.detail.as_str())
+    }
+
     /// The notes the page shows under its headline, in the page's own words
     /// (§3.6): first, while a run aterm widened by itself goes, why its groups
     /// changed ([`WIDENED_NOTE`]); then the results an observation cannot say
@@ -366,7 +404,7 @@ impl SetupStatus {
         // names it is said for, in the order first seen.
         let mut alike: Vec<(Said<'_>, Vec<&str>)> = Vec::new();
         let mut at_login: Vec<String> = Vec::new();
-        for result in self.results(Some(plan)) {
+        for mut result in self.results(Some(plan)) {
             // A step naming a row that needs a person is said by that row and the headline,
             // which name the person's remedy (§3.6): a note that it failed, or that aterm tries
             // it again, would say otherwise.
@@ -380,6 +418,21 @@ impl SetupStatus {
             if result.row.status == NOTED && self.said_elsewhere(plan, &result.row.detail) {
                 continue;
             }
+            // A step's reason its row keeps as its note is said there: the note says what comes
+            // next.
+            result.on_row = !result.check
+                && subject_named(result.name).is_some_and(|subject| {
+                    manages(plan.selection, subject)
+                        && row_view_for_source(
+                            subject,
+                            self,
+                            plan.selection,
+                            Some(plan.vault_url.as_str()),
+                        )
+                        .note
+                        .as_deref()
+                            == Some(result.row.detail.as_str())
+                });
             match result.row.status.as_str() {
                 "not started" | "error" | "failed" | "unverified" | "restored" | NOTED => {
                     match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
@@ -437,10 +490,11 @@ impl SetupStatus {
     }
 }
 
-/// The calm note a run aterm widened by itself carries while it goes (§3.5): it heard the ALab
-/// vault, so the groups it had left as is are set up now.
+/// The calm note a run aterm widened by itself carries while it goes (§3.5): it heard this
+/// Mac's ALab signal (the vault, or vault or fleet membership), so the groups it had left as
+/// is are set up now. It names that fact as [`ALAB_ADDED_NOTE`] does.
 pub(crate) const WIDENED_NOTE: &str =
-    "aterm found the ALab vault on this network, so it is setting up the rest of this Mac.";
+    "This Mac is an ALab Mac, so aterm is setting up its profile.";
 
 /// The calm line while a person's Cancel of the first-launch review stands
 /// ([`SetupStatus::cancelled`]), beside Set up now.
@@ -559,12 +613,14 @@ fn subject_named(name: &str) -> Option<Subject> {
 }
 
 /// One result the page can say ([`SetupStatus::results`]): its row, the name the page says it
-/// under, and whether a Check took it.
+/// under, whether a Check took it, and whether the row it names keeps its words as its note
+/// ([`SetupStatus::step_reason`]), which the page's note then leaves out.
 #[derive(Clone, Copy)]
 struct Said<'a> {
     row: &'a SetupStatusRow,
     name: &'a str,
     check: bool,
+    on_row: bool,
 }
 
 /// The page's rows for what a Restore did (design §3.4), in System State's own row names,
@@ -917,14 +973,20 @@ impl Said<'_> {
     }
 
     /// Whether `other` goes in the same note as this result, under its own name: they came out
-    /// alike, from a run or both from a Check, with the same words (the rows of a stage that
-    /// failed as a whole). A whole sentence is said alone.
+    /// alike, from a run or both from a Check, with the same words left to say (the rows of a
+    /// stage that failed as a whole, or rows that each keep their own reason). A whole sentence
+    /// is said alone.
     fn alike(&self, other: &Self) -> bool {
         !self.whole()
             && !other.whole()
             && self.check == other.check
             && self.row.status == other.row.status
-            && self.row.detail == other.row.detail
+            && self.said_detail() == other.said_detail()
+    }
+
+    /// The words the result carries that the page's note says: none where its row keeps them.
+    fn said_detail(&self) -> &str {
+        if self.on_row { "" } else { &self.row.detail }
     }
 
     /// The note's words for `names`, the rows said alike ([`Self::alike`]), in the page's own
@@ -936,11 +998,13 @@ impl Said<'_> {
     /// still manages them), as it starts a setup run that could not go ([`SETUP_ROW`]) again.
     /// A step aterm tries again by itself (`retried`, [`SetupStatus::retries_by_itself`]) is
     /// no failure: it did not finish this time, for the reason it carries if one, and aterm tries
-    /// again by itself (§3.5).
+    /// again by itself (§3.5). A reason its rows keep as their notes ([`Self::said_detail`]) is
+    /// said there, not here again.
     fn words(&self, names: &[&str], retried: bool, managed: bool) -> String {
         if self.whole() {
             return self.row.detail.clone();
         }
+        let detail = self.said_detail();
         let list = crate::toolchain_words::and_list(
             &names
                 .iter()
@@ -967,13 +1031,13 @@ impl Said<'_> {
             "restored" => format!("{list} finished."),
             other => format!("{list}: {other}."),
         };
-        let because = format!("{} {RETRIES_NOTE}", self.row.detail);
-        let then = if retried && !self.row.detail.is_empty() && self.row.detail != RETRIES_NOTE {
+        let because = format!("{detail} {RETRIES_NOTE}");
+        let then = if retried && !detail.is_empty() && detail != RETRIES_NOTE {
             Some(because.as_str())
         } else if retried {
             Some(RETRIES_NOTE)
-        } else if !self.row.detail.is_empty() {
-            Some(self.row.detail.as_str())
+        } else if !detail.is_empty() {
+            Some(detail)
         } else if failed_step {
             Some(SET_UP_NOW_NOTE)
         } else {
@@ -998,8 +1062,8 @@ pub(crate) const REVIEW_HEADLINE: &str = "Review this Mac's setup";
 pub(crate) const NEWER_HEADLINE: &str = "A newer aterm manages this Mac's setup";
 
 /// What the first launch's review says above its buttons, while it counts down and once a
-/// click stopped it (§3.3).
-pub(crate) const REVIEW_NOTE: &str = "Apply sets up this Mac as shown; Cancel leaves it as it is.";
+/// click stopped it (§3.3): one line at the narrowest window (46 columns).
+pub(crate) const REVIEW_NOTE: &str = "Apply sets up what is shown; Cancel changes nothing.";
 
 /// The headline while a setup run that did not finish as a whole waits for aterm to try it
 /// again by itself (§3.5), and no row waits.
@@ -1145,6 +1209,9 @@ pub(crate) enum SystemStateAction {
     /// The Secrets vault row's Turn On Sync: this Mac's sync, which the
     /// person turned off, goes on again (`InitialSetupHandlers::sync_on`).
     TurnSyncOn { by_person: bool },
+    /// The GitHub repositories row's Install…: the terminal tab that installs Apple's Command
+    /// Line Tools opens now (`App::press_developer_tools_install`).
+    InstallDeveloperTools { by_person: bool },
 }
 
 /// The key of the Secrets vault row's Turn On Sync button.
@@ -1212,6 +1279,9 @@ pub(crate) struct RowView {
     /// The Secrets vault row's quiet Turn On Sync button: the person turned
     /// this Mac's sync off, which reads in place as their choice (§3.3).
     pub(crate) turn_on_sync: bool,
+    /// The GitHub repositories row's Install… button: Apple's Command Line Tools are missing
+    /// and nothing installs them, so a press opens their terminal tab (§3.3).
+    pub(crate) install_tools: bool,
     /// Where the row stands (`None`: not read yet).
     pub(crate) standing: Option<Standing>,
     /// What a screen reader hears for the row.
@@ -1318,6 +1388,7 @@ fn row_view_as(
             note: None,
             open: None,
             turn_on_sync: false,
+            install_tools: false,
             standing,
             label: format!("{name}: {spoken_read}, left as is"),
         };
@@ -1336,6 +1407,7 @@ fn row_view_as(
             note: note.filter(|note| !note.trim().is_empty()),
             open: None,
             turn_on_sync: false,
+            install_tools: false,
             standing,
             label: format!("{name}: not needed"),
         };
@@ -1374,24 +1446,38 @@ fn row_view_as(
         Some(Standing::NeedsYou) if review => Some(Standing::Differs),
         standing => standing,
     };
+    // Apple's Command Line Tools, which the repositories wait on (§3.3): an install running is a
+    // wait that ends by itself, its tab asking for the password needs the person now, and
+    // missing tools nothing installs offer Install….
+    let tools = (!review && subject == Subject::Setting(Setting::Repositories))
+        .then(|| status.tools_wait(reading))
+        .flatten();
+    let standing = if tools == Some(ToolsWait::Installing) {
+        note = Some(INSTALLING_TOOLS_NOTE.to_owned());
+        Some(Standing::Waiting)
+    } else {
+        standing
+    };
     let open = match subject {
         Subject::Access(access) if standing == Some(Standing::NeedsYou) && !asking => Some(access),
         _ => None,
     };
     // A setting read in place at a value other than aterm's is the person's
-    // opt-out (the vault's Sync off): its row turns it back on, quietly.
-    let turn_on_sync = subject == Subject::Setting(Setting::Secrets)
+    // opt-out (the vault's Sync off): its row turns it back on, quietly, unless it reads as what
+    // Apply will do, which acts on nothing yet.
+    let turn_on_sync = !review
+        && subject == Subject::Setting(Setting::Secrets)
         && standing == Some(Standing::InPlace)
         && wanted != subject.wanted();
     // A step the last run said of this row (§3.6): one the page says failed takes the failed
     // chip, though the row reads in place, and one aterm tries again by itself the waiting one,
     // as the headline and the village say them. A step whose row needs a person says nothing of
     // its own: the row's reading says it.
+    let plan = Plan {
+        selection,
+        vault_url: vault_url.unwrap_or_default().to_owned(),
+    };
     let step = {
-        let plan = Plan {
-            selection,
-            vault_url: vault_url.unwrap_or_default().to_owned(),
-        };
         let said: Vec<Failure> = status
             .result_failures(Some(&plan))
             .filter(|failure| !failure.restore && !failure.check && failure.row == Some(subject))
@@ -1494,6 +1580,8 @@ fn row_view_as(
         Some(Standing::NeedsYou) => {
             note = if asking {
                 Some(PASSWORD_NOTE.to_owned())
+            } else if tools == Some(ToolsWait::Password) {
+                Some(TOOLS_PASSWORD_NOTE.to_owned())
             } else {
                 explained()
             };
@@ -1537,6 +1625,14 @@ fn row_view_as(
         }
         _ => (chip, label),
     };
+    // A step said of this row keeps its reason on the row where the reading gives none (§3.6):
+    // the page's note then says only what comes next, so no line says it twice.
+    if step.is_some()
+        && note.as_deref().is_none_or(|note| note.trim().is_empty())
+        && !matches!(standing, Some(Standing::NeedsYou | Standing::Failed))
+    {
+        note = status.step_reason(&plan, subject).map(str::to_owned);
+    }
     if unconfirmed {
         note = Some(UNCONFIRMED_NOTE.to_owned());
     }
@@ -1556,6 +1652,7 @@ fn row_view_as(
         note,
         open,
         turn_on_sync,
+        install_tools: tools == Some(ToolsWait::Missing),
         standing,
         label,
     }
@@ -1575,6 +1672,62 @@ pub(crate) const WAITING_NOTE: &str = "Can't be set up yet";
 pub(crate) const PASSWORD_NOTE: &str =
     "Waiting for your administrator password in the SamplingTools dialog";
 
+/// The headline while the Command Line Tools tab asks for the person's password
+/// ([`ToolsInstall::Password`]): they are needed there now (§3.2).
+pub(crate) const TOOLS_PASSWORD_HEADLINE: &str =
+    "Enter your password in the Command Line Tools tab";
+
+/// The GitHub repositories row's note while the Command Line Tools tab asks for the password,
+/// which takes the place of its Install… button.
+pub(crate) const TOOLS_PASSWORD_NOTE: &str =
+    "Waiting for your password in the Command Line Tools tab";
+
+/// The GitHub repositories row's calm note while Apple's Command Line Tools install
+/// ([`ToolsInstall::Installing`]): nobody needs to act, and the row moves on once they arrive.
+pub(crate) const INSTALLING_TOOLS_NOTE: &str = "Installing Apple's Command Line Tools…";
+
+/// The GitHub repositories row's button while Apple's Command Line Tools are missing and nothing
+/// installs them: it opens their terminal tab, whose one password prompt installs them.
+pub(crate) const INSTALL_TOOLS: &str = "system-state/row/repositories/install";
+
+/// Where the GitHub repositories row stands on Apple's Command Line Tools, which every clone
+/// runs (§3.3), once its reading needs a person to install them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolsWait {
+    /// Nothing installs them: the row's Install… opens their tab.
+    Missing,
+    /// Their tab asks for the person's password.
+    Password,
+    /// The installer runs.
+    Installing,
+}
+
+impl SetupStatus {
+    /// [`ToolsWait`] for `reading`, the GitHub repositories row's: `None` unless it needs a person
+    /// for want of Apple's Command Line Tools ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING`],
+    /// typed where the wait is decided).
+    fn tools_wait(&self, reading: Option<&Observation>) -> Option<ToolsWait> {
+        let reading = reading?;
+        (reading.standing == Standing::NeedsYou
+            && reading.note.as_deref()
+                == Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING))
+        .then_some(match self.developer_tools {
+            None => ToolsWait::Missing,
+            Some(ToolsInstall::Password) => ToolsWait::Password,
+            Some(ToolsInstall::Installing) => ToolsWait::Installing,
+        })
+    }
+
+    /// [`Self::tools_wait`] of the GitHub repositories reading for the plan in force.
+    pub(crate) fn repositories_tools_wait(&self) -> Option<ToolsWait> {
+        let repositories = Subject::Setting(Setting::Repositories);
+        self.tools_wait(
+            self.observations_for(self.plan.as_ref().map(|plan| plan.vault_url.as_str()))
+                .find(|observation| observation.subject == repositories),
+        )
+    }
+}
+
 /// The note of a row read in place that the last run, or a Check, could not confirm
 /// ([`SetupStatus::unconfirmed`]): the headline counts it, and its Show lands here.
 pub(crate) const UNCONFIRMED_NOTE: &str = "Not confirmed";
@@ -1585,7 +1738,8 @@ pub(crate) const AT_LOGIN_NOTE: &str = "Fully in effect after your next login";
 
 /// Every row as it reads now and nothing more, in page order (§3.2): while a newer aterm's setup
 /// is in force ([`SetupStatus::newer`]) this aterm knows no plan, so no row is managed, wanted
-/// or due to change, and none has a chip, a note or a button. A row not read yet reads `—`.
+/// or due to change, and none has a chip or a button. A row keeps its reading's own note (what
+/// it waits on, why it was not read), and a row not read yet reads `—`.
 fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
     Subject::all()
         .into_iter()
@@ -1597,18 +1751,27 @@ fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
             let now = reading
                 .and_then(|observation| observation.now.clone())
                 .filter(|now| !now.trim().is_empty());
-            let label = now.as_deref().map_or_else(
-                || format!("{}: not read", subject.name()),
-                |now| format!("{}: {}", subject.name(), now.replace(" · ", " ")),
-            );
+            // A reading macOS answers nothing for (Local Network) is unknown, as on the managed
+            // page: no read is still to come.
+            let label = match (
+                now.as_deref(),
+                reading.map(|observation| observation.standing),
+            ) {
+                (Some(now), _) => format!("{}: {}", subject.name(), now.replace(" · ", " ")),
+                (None, Some(Standing::Untold)) => format!("{}: unknown", subject.name()),
+                (None, _) => format!("{}: not read", subject.name()),
+            };
             RowView {
                 subject,
                 managed: false,
                 value: RowValue::One(now.unwrap_or_else(|| "—".to_owned())),
                 chip: None,
-                note: None,
+                note: reading
+                    .and_then(|observation| observation.note.clone())
+                    .filter(|note| !note.trim().is_empty()),
                 open: None,
                 turn_on_sync: false,
+                install_tools: false,
                 standing: reading.map(|observation| observation.standing),
                 label,
             }
@@ -1817,6 +1980,19 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             start: true,
             ..Headline::line(NOT_STARTED)
         };
+    }
+    // The Command Line Tools tab asks for the password the install needs (§3.3): the person is
+    // needed there now, as for the debugger step's dialog.
+    let repositories = Subject::Setting(Setting::Repositories);
+    if rows.iter().any(|row| {
+        row.subject == repositories && row.managed && row.standing == Some(Standing::NeedsYou)
+    }) && status.tools_wait(
+        status
+            .observations_for(plan.map(|plan| plan.vault_url.as_str()))
+            .find(|observation| observation.subject == repositories),
+    ) == Some(ToolsWait::Password)
+    {
+        return Headline::line(TOOLS_PASSWORD_HEADLINE);
     }
     let needs: Vec<&RowView> = rows
         .iter()
@@ -2627,6 +2803,14 @@ impl SystemStateApp {
         self.plan_known
     }
 
+    /// Whether the vault's address and password take words: while nothing runs, and this aterm
+    /// could join with them. Before the plan in force is read they take a draft, which Join
+    /// sends once it is ([`Self::plan_known`]); while a newer aterm's setup is in force this
+    /// aterm joins nothing, so they read as they stand, as its Join does.
+    pub(crate) fn vault_editable(&self) -> bool {
+        !self.status.busy && !self.status.newer()
+    }
+
     pub(crate) fn can_offer(&self) -> bool {
         !self.status.busy
             && !self.request.as_ref().is_some_and(Request::pending)
@@ -2872,16 +3056,43 @@ impl SystemStateApp {
         }
     }
 
-    /// A row as the page shows it: for the plan as reviewed, and, while the first launch's review
-    /// is up, as what Apply will do ([`row_view_as`]).
+    /// A row as the page shows it: for the plan as reviewed, and as what Apply, or Set up now,
+    /// will do ([`row_view_as`]) where nothing the person approved runs it yet
+    /// ([`Self::reads_as_review`]).
     fn reviewed_row(&self, subject: Subject) -> RowView {
         row_view_as(
             subject,
             &self.status,
             self.plan.selection,
             Some(self.url.value().trim()),
-            self.reviewing(),
+            self.reads_as_review(subject),
         )
+    }
+
+    /// Whether `subject`'s row reads as what Apply, or Set up now, will do (§3.3): every row
+    /// while the first launch's review is up, or after it was closed unanswered (nothing was
+    /// approved, so nothing waits on anyone yet), and, in the review of the groups the ALab
+    /// signal adds (§3.5), the rows those groups add. A row the plan in force manages keeps its
+    /// real reading there, with its buttons and signals: that review's Apply changes none of it.
+    fn reads_as_review(&self, subject: Subject) -> bool {
+        if self.status.unanswered {
+            return true;
+        }
+        if !self.reviewing() {
+            return false;
+        }
+        match self.request.as_ref().map(Request::kind) {
+            Some(OfferKind::Widen { in_force }) => !manages(in_force.selection, subject),
+            _ => true,
+        }
+    }
+
+    /// Whether the page's own signals are still (§3.3, §3.6): while the first launch's review is
+    /// up its headline is the one signal, on a tab in front, and a review closed unanswered
+    /// approved nothing. The review of the groups the ALab signal adds stills nothing: its tab
+    /// never takes focus, and the plan in force goes on under it.
+    pub(crate) fn signals_still(&self) -> bool {
+        self.status.unanswered || (self.reviewing() && !self.reviewing_widen())
     }
 
     fn reviewed_rows(&self) -> Vec<RowView> {
@@ -2920,11 +3131,20 @@ impl SystemStateApp {
     /// when none is; a Check's result still belongs to its exact plan alone.
     pub(crate) fn headline(&self) -> Headline {
         if self.reviewing() {
-            return if self.status.busy {
-                Headline::before_plan(&self.status)
-            } else {
-                Headline::line(REVIEW_HEADLINE)
-            };
+            if self.status.busy {
+                return Headline::before_plan(&self.status);
+            }
+            // The review of the groups the ALab signal adds says what the plan in force needs of
+            // a person, as its rows, the diamond and the menu line do; its own Apply is in the
+            // footer, so the headline offers no Set up now beside it.
+            if self.reviewing_widen() && self.needs_attention() {
+                let plan = self.reviewed_plan();
+                return Headline {
+                    start: false,
+                    ..headline(&self.status, &self.reviewed_rows(), Some(&plan))
+                };
+            }
+            return Headline::line(REVIEW_HEADLINE);
         }
         if !self.plan_known {
             return Headline::before_plan(&self.status);
@@ -2942,18 +3162,18 @@ impl SystemStateApp {
         headline(&status, &self.judged_rows(&in_force), Some(&in_force))
     }
 
+    /// A row read as what Apply will do offers no Open ([`Self::reads_as_review`]).
     pub(crate) fn can_open_access(&self, access: Access) -> bool {
-        !self.reviewing()
-            && self.plan_known
-            && self.reviewed_row(Subject::Access(access)).open == Some(access)
+        self.plan_known && self.reviewed_row(Subject::Access(access)).open == Some(access)
     }
 
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
-    /// failed and the run no longer retries it (§3.5). Never while the first launch's review is
-    /// up: its headline is the one signal, and its tab is in front (§3.3).
+    /// failed and the run no longer retries it (§3.5). Never while the page's signals are still
+    /// ([`Self::signals_still`]): the first launch's review, whose headline is the one signal on
+    /// a tab in front, or one closed unanswered, which approved nothing (§3.3). In the review of
+    /// the groups the ALab signal adds, the rows the plan in force manages say it as ever.
     pub(crate) fn needs_attention(&self) -> bool {
-        // A review closed unanswered approved nothing: nothing needs anyone yet (§3.3).
-        if self.reviewing() || self.status.unanswered {
+        if self.signals_still() {
             return false;
         }
         let signal = self.status.failures_signal();
@@ -3366,13 +3586,21 @@ impl SystemStateApp {
                 self.vault_open = Some(!self.vault_shown());
             }
             TURN_ON_SYNC => {
-                if !self.reviewing() && self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
+                if self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
                     self.actions.push_back(SystemStateAction::TurnSyncOn {
                         by_person: self.by_person,
                     });
                 }
             }
-            "system-state/vault/join" if !self.status.busy && self.plan_known => {
+            INSTALL_TOOLS => {
+                if self.plan_known && self.reviewed_rows().iter().any(|row| row.install_tools) {
+                    self.actions
+                        .push_back(SystemStateAction::InstallDeveloperTools {
+                            by_person: self.by_person,
+                        });
+                }
+            }
+            "system-state/vault/join" if self.vault_editable() && self.plan_known => {
                 self.vault_open = Some(true);
                 self.plan.selection.set(Setting::Secrets, true);
                 if self.reviewing() {
@@ -3385,7 +3613,7 @@ impl SystemStateApp {
                     changed,
                 );
             }
-            "system-state/url" | "system-state/password" if !self.status.busy => {
+            "system-state/url" | "system-state/password" if self.vault_editable() => {
                 // A field someone fills shows: a draft is never hidden.
                 self.vault_open = Some(true);
                 view.common.last_focus = Some(UiKey::new(key));
@@ -3512,14 +3740,14 @@ impl NativeAppModel for SystemStateApp {
                 true
             }
             AppEvent::TextInput(event) => {
-                if !self.status.busy && event != TextInputEvent::Cancel {
+                if self.vault_editable() && event != TextInputEvent::Cancel {
                     self.type_into(view, event);
                 }
                 true
             }
             #[cfg(any(a11y_tree, test))]
             AppEvent::InsertText(text) => {
-                if !self.status.busy {
+                if self.vault_editable() {
                     self.type_into(view, TextInputEvent::Commit(text));
                 }
                 true
@@ -4085,6 +4313,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 "Enter your password for {}",
                 Access::Debugger.name()
             )),
+            Headline::line(TOOLS_PASSWORD_HEADLINE),
             Headline {
                 open: Some(Access::Debugger),
                 ..Headline::line(needs.clone())
@@ -4637,6 +4866,9 @@ impl<'a, 'b> Page<'a, 'b> {
             if row.turn_on_sync {
                 self.span(TURN_ON_SYNC.to_owned(), top + y, height);
             }
+            if row.install_tools {
+                self.span(INSTALL_TOOLS.to_owned(), top + y, height);
+            }
             children.push(node);
             y += height;
             if row.subject == Subject::Setting(Setting::Secrets) {
@@ -5016,21 +5248,31 @@ impl<'a, 'b> Page<'a, 'b> {
         };
         let name_text = row.subject.name();
         // The button's key, label, face and shortest face.
+        // A row read as what Apply will do has none (`row_view_as`).
         let face = row
             .open
-            .filter(|_| !self.app.reviewing())
             .map(|access| {
                 let (label, short) = open_words(access);
                 let visual = (access == Access::Debugger).then_some(short);
                 (format!("{key}/open"), label, visual, Some(short))
             })
             .or_else(|| {
-                (row.turn_on_sync && !self.app.reviewing()).then(|| {
+                row.turn_on_sync.then(|| {
                     (
                         TURN_ON_SYNC.to_owned(),
                         "Turn On Sync".to_owned(),
                         None,
                         None,
+                    )
+                })
+            })
+            .or_else(|| {
+                row.install_tools.then(|| {
+                    (
+                        INSTALL_TOOLS.to_owned(),
+                        "Install Command Line Tools…".to_owned(),
+                        Some("Install…"),
+                        Some("Install…"),
                     )
                 })
             });
@@ -5414,7 +5656,7 @@ impl<'a, 'b> Page<'a, 'b> {
             return out;
         }
         let field_w = (m.card_inner - indent).clamp(40.0, 420.0);
-        let enabled = !self.app.status.busy;
+        let enabled = self.app.vault_editable();
         let caption = |key: &str, words: &str| {
             let (node, height) = words_node(
                 key,
@@ -5639,6 +5881,10 @@ fn rule(key: String) -> UiNode {
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 const GITHUB_STOPPED: &str = "GitHub stopped answering partway through.";
 
+/// Why a step of the repositories failed, in `init_observe`'s words (`Wait::Unreached`).
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+pub(crate) const GITHUB_UNREACHED: &str = "GitHub can't be reached";
+
 /// The repositories' note where GitHub refuses the token the vault syncs, in
 /// `init_observe`'s words (`Wait::TokenRefused`).
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
@@ -5653,7 +5899,9 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token: renew 
 /// `queued-choice`, `queued-restore`, `set-aside`, `set-aside-non-alab`, `startup-retry`,
 /// `restore-failed`, `setup-retried`, `failed-retrying`, `github-sign-in`, `vault-unreadable`,
 /// `join-refused`, `vault-not-joined`, `vault-held`, `newer`, `restoring`, the first launch's
-/// review, `review` and `review-stopped` ([`fixture_review`]), and `cancelled`, after it.
+/// review, `review`, `review-stopped` and `review-widened` ([`fixture_review`]), `cancelled`
+/// and `review-closed` after it, the review of the groups the ALab signal adds, `widen-review`,
+/// and Apple's Command Line Tools: `clt-password`, `clt-installing` and `clt-missing`.
 /// Each draws only what the worker gives the page: the readings `init_observe` and the
 /// worker's probes make, and the rows a run, a Check or a Restore reports.
 /// Debug and dev-seam builds only: a release build carries none of
@@ -5943,12 +6191,13 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
         }
         "failed" => {
-            // The run's GitHub repositories step, which GitHub stopped answering partway
-            // through, once the run's tries are spent: aterm no longer tries it by itself, and
-            // Set up now does, so the headline, the row, the menu line and the diamond say it
-            // failed, and the note names Set up now. The worker's page says the stage under its
-            // row in no words of the stage's own (`items_page`; the log keeps GitHub's), and the
-            // row reads the clones the run made.
+            // The run's GitHub repositories step, which could not reach GitHub on its last try,
+            // once the run's tries are spent: aterm no longer tries it by itself, and Set up now
+            // does, so the headline, the row, the menu line and the diamond say it failed. The
+            // worker's page says it under its row in the reason the step decided
+            // (`init_observe::failure_note`; the log keeps GitHub's words), which the row keeps
+            // as its note, so the page's note names Set up now alone; the row reads the clones
+            // the run made.
             status.observed = with(
                 in_place(),
                 vec![setting(Setting::Repositories, Differs, Some("3 of 12"))],
@@ -5956,7 +6205,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.rows = vec![SetupStatusRow {
                 name: Setting::Repositories.name().into(),
                 status: "error".into(),
-                detail: String::new(),
+                detail: GITHUB_UNREACHED.into(),
             }];
         }
         "github-sign-in" => {
@@ -6344,6 +6593,55 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.plan = Some(Plan::from(Selection::none()));
             status.cancelled = true;
         }
+        "review-closed" => {
+            // The first launch's review a person closed unanswered, and the page opened again in
+            // that launch (§3.3): nothing was approved, so it reads as the review did, calm, with
+            // Set up now.
+            status = fixture_status("review")?;
+            status.unanswered = true;
+        }
+        "review-widened" => {
+            // The first launch's review on a Mac whose ALab signal the worker heard while it was
+            // up (§3.3): offered Permissions alone, it widens in place to the whole profile
+            // ([`fixture_review`]), and the page says why.
+            status = fixture_status("review")?;
+            let mut selection = Selection::none();
+            selection.set(Setting::Permissions, true);
+            status.plan = Some(Plan::from(selection));
+        }
+        "widen-review" => {
+            // The review of the groups the ALab signal adds to a plan that set up Permissions
+            // alone (§3.5), while that plan waits on Full Disk Access: the grant still needs the
+            // person, with its Open and its signals, and only the added groups read as what
+            // Apply will do.
+            let mut selection = Selection::none();
+            selection.set(Setting::Permissions, true);
+            status = fixture_status("non-alab")?;
+            status.plan = Some(Plan::from(selection));
+            let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
+            fda.detail = Some(
+                "Full Disk Access keeps macOS from interrupting programs you run here with \
+                 privacy dialogs. Only you can switch it on, in System Settings."
+                    .to_owned(),
+            );
+            status.observed = with(status.observed, vec![fda]);
+        }
+        "clt-password" | "clt-installing" | "clt-missing" => {
+            // The GitHub repositories wait on Apple's Command Line Tools (§3.3), which the
+            // window installs in a terminal tab of its own: the tab asking for the password
+            // (`clt-password`), Apple's installer running (`clt-installing`), or the tools
+            // missing with no tab open and nothing installing them (`clt-missing`), where the
+            // row offers Install….
+            let mut repositories = setting(Setting::Repositories, NeedsYou, None);
+            repositories.note =
+                Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING.to_owned());
+            status.observed = with(in_place(), vec![untold_lan(), repositories]);
+            status.developer_tools = match name {
+                "clt-password" => Some(ToolsInstall::Password),
+                "clt-installing" => Some(ToolsInstall::Installing),
+                _ => None,
+            };
+        }
         "review" | "review-stopped" => {
             // The first launch's review on a fresh signed Mac ([`fixture_review`]): every group
             // set up, most rows to change, and Full Disk Access and Debugger access, which a
@@ -6369,10 +6667,10 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     Some(status)
 }
 
-/// How a scenario shows the first launch's review (`review`, `review-stopped`): the page is
-/// offered the plan a fresh launch offers, and draws the scenario's status under it, its
-/// countdown going or stopped by a click. Its answer goes nowhere, as every action of a
-/// scenario is inert. Debug and dev-seam builds only.
+/// How a scenario shows a review (`review`, `review-stopped`, `review-widened`,
+/// `widen-review`): the page is offered the plan a launch offers, and draws the scenario's
+/// status under it, its countdown going or stopped by a click. Its answer goes nowhere, as
+/// every action of a scenario is inert. Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FixtureReview {
@@ -6380,6 +6678,12 @@ pub(crate) enum FixtureReview {
     Counting,
     /// A click stopped the countdown (`Apply`).
     Stopped,
+    /// Offered Permissions alone, the review widens in place to the whole profile once the
+    /// ALab signal is heard (§3.3).
+    Widened,
+    /// The review of the groups the ALab signal adds to a plan that set up Permissions alone
+    /// (§3.5).
+    Widen,
 }
 
 /// The review the scenario `name` shows, if one ([`FixtureReview`]).
@@ -6388,6 +6692,8 @@ pub(crate) fn fixture_review(name: &str) -> Option<FixtureReview> {
     match name {
         "review" => Some(FixtureReview::Counting),
         "review-stopped" => Some(FixtureReview::Stopped),
+        "review-widened" => Some(FixtureReview::Widened),
+        "widen-review" => Some(FixtureReview::Widen),
         _ => None,
     }
 }

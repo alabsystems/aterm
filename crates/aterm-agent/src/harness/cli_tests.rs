@@ -11,6 +11,9 @@ use super::*;
 use crate::harness::host_path::{self, abs};
 use crate::supervise::run::CtlReply;
 
+#[path = "cli_label_retention_tests.rs"]
+mod label_retention;
+
 fn tmp_dir(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-harness-cli-{tag}-"))
@@ -1469,6 +1472,8 @@ fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
         barred: &[],
         live: &live,
         held: &[],
+        reclaimed: &[],
+        passing: false,
         alive: &alive,
     };
     let t = env.now * 1000;
@@ -4993,7 +4998,7 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
         let (code, out, err) = acc(form.clone(), &env, host);
         assert_eq!(code, exit(1), "{form:?}: {out}");
         assert!(
-            err.contains(&store.state_file().display().to_string()),
+            err.contains("state.json") && err.contains("schema 2"),
             "{form:?} names the file: {err}"
         );
         assert!(!out.contains("pinned"), "{form:?} claims nothing: {out}");
@@ -7232,9 +7237,12 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
     assert_eq!(code, exit(0), "{err}");
     assert!(out.starts_with("sol: the active account, pinned"), "{out}");
     assert!(env.state.join("accounts-kimi").join("state.json").is_file());
+    let shared = env.accounts_store().shared_dir();
     assert!(
-        !env.state.join("accounts").exists(),
-        "Claude Code's store is untouched"
+        every_file(&shared)
+            .iter()
+            .all(|(path, _)| path == &shared.join(accounts::SIGNIN_LOCK_FILE)),
+        "the machine-wide sign-in lock is shared, but Claude Code's account data is untouched"
     );
     let json = run_line("accounts --cli kimi --json", &env).1;
     let doc: Value = aterm_json::from_str(json.trim()).expect("one document");
@@ -7469,6 +7477,9 @@ mod identity;
 #[path = "cli_adopt_identity_tests.rs"]
 mod adopt_identity;
 
+#[path = "cli_adopt_source_tests.rs"]
+mod adopt_source;
+
 #[path = "cli_attempt_generation_tests.rs"]
 mod attempt_generation;
 
@@ -7489,3 +7500,45 @@ mod admission;
 
 #[path = "cli_signin_lock_tests.rs"]
 mod signin_lock;
+
+/// `signin` takes `--cli grok` alone, and `--wait` belongs to it.
+#[test]
+fn signin_parses_for_grok_alone_and_wait_belongs_to_it() {
+    for (line, want) in [
+        (
+            "signin --cli grok",
+            Cmd::Signin {
+                wait: false,
+                json: false,
+            },
+        ),
+        (
+            "signin --cli grok --wait --json",
+            Cmd::Signin {
+                wait: true,
+                json: true,
+            },
+        ),
+        (
+            "--wait signin --cli grok",
+            Cmd::Signin {
+                wait: true,
+                json: false,
+            },
+        ),
+        ("signin --help", Cmd::Help(HelpPage::Signin)),
+    ] {
+        let (got, _) = parse(&words(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert_eq!(got, want, "{line}");
+    }
+    for line in [
+        "signin",
+        "signin --cli claude",
+        "signin --cli grok extra",
+        "versions --wait",
+        "usage --wait",
+    ] {
+        assert!(parse(&words(line)).is_err(), "{line} should be refused");
+    }
+    assert!(help_page(HelpPage::Signin).contains("NEEDS YOU: approve Grok Build sign-in"));
+}

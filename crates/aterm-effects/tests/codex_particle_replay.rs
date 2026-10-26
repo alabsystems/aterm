@@ -106,7 +106,7 @@ impl Host {
 
     fn new_with(g: Geom, composer_row: Option<u16>) -> Self {
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, g.cols);
         Self {
             term: Terminal::new(g.rows as u16, g.cols as u16),

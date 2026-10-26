@@ -8,11 +8,13 @@ use crate::ai::testing::{Box3, FakeFetcher, FakeRunner, machine, ran};
 fn env_of(b: &Box3, config: &str, extra: &[(&str, &str)], tty: bool) -> Env {
     let cfg = b.dir.path().join("aterm.toml");
     std::fs::write(&cfg, config).expect("config");
+    // The system's own directories, never the host's PATH: a CLI someone installed by hand
+    // there (a `~/.grok/bin/grok`) would read as one aterm does not manage.
     let mut vars = vec![
         ("HOME".to_string(), b.home.display().to_string()),
         (
             "PATH".to_string(),
-            std::env::var("PATH").unwrap_or_default(),
+            "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
         ),
     ];
     vars.extend(
@@ -80,8 +82,12 @@ fn aterm_ai_looks_and_runs_nothing() {
     );
     assert!(out.contains("claude:     off "), "{out}");
     assert!(
+        out.contains("grok:       off            not installed: an opt-in program"),
+        "an opt-in program nobody installed is off, no need: {out}"
+    );
+    assert!(
         out.contains("reviews:    on · nobody: no other AI CLI is used here (when codex asks)"),
-        "{out}"
+        "an off row is asked by no review: {out}"
     );
     assert!(
         out.contains("\nhealth: FAIL — 1 CLI needs you (codex); next: aterm ai doctor\n"),
@@ -647,4 +653,99 @@ fn login_of_a_pool_cli_that_is_no_connection_runs_its_pools_renewal() {
         "{err}"
     );
     assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+}
+
+/// `aterm ai login grok` WHERE NOBODY INSTALLED IT RUNS NOTHING: Grok Build is off as an opt-in
+/// program, so its sign-in is refused with that fact (exit 2), no install and no vendor login.
+#[test]
+fn logging_in_an_opt_in_program_nobody_installed_runs_nothing() {
+    if !atpkg::vendor_direct::served_here("grok") {
+        return;
+    }
+    let b = machine(&["codex"]);
+    let env = env_of(&b, ONLY_CODEX, &[], true);
+    let runner = FakeRunner::quiet();
+    let (code, out, err) = run_cli(&env, &runner, &["login", "grok"]);
+    assert_eq!(code, 2, "{out}{err}");
+    assert!(out.contains("an opt-in program"), "{out}");
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+}
+
+/// OVER SSH, `aterm ai login grok` AND `aterm ai doctor` (which `doctor --on`/`--fleet` run on
+/// each machine over `ssh -t`) RUN THE CLI'S OWN SIGN-IN UNDER THE NO-DESK SANDBOX: Grok
+/// Build's `grok login --device-auth` and Codex's `codex login` open the default browser
+/// through LaunchServices whatever their `PATH`, which over SSH is a desk nobody is at.
+/// CONTROL: at the desk the same verbs run the CLI plainly.
+#[cfg(target_os = "macos")]
+#[test]
+fn over_ssh_the_doctor_and_login_run_the_cli_under_the_no_desk_sandbox() {
+    use crate::harness::login_drive::NO_DESK;
+    let ssh = [("SSH_CONNECTION", "10.0.0.2 52000 10.0.0.3 22")];
+    let terminal = |runner: &FakeRunner| -> Vec<(String, Vec<String>)> {
+        runner
+            .calls()
+            .into_iter()
+            .filter(|c| c.terminal)
+            .map(|c| (c.program, c.args))
+            .collect()
+    };
+    let b = machine(&["codex"]);
+    let shim = b.pkg.agents_dir().join("codex").display().to_string();
+    let runner = FakeRunner::quiet();
+    let _ = run_cli(&env_of(&b, ONLY_CODEX, &ssh, true), &runner, &["doctor"]);
+    assert_eq!(
+        terminal(&runner),
+        [(
+            "sandbox-exec".to_string(),
+            vec![
+                "-p".to_string(),
+                NO_DESK.to_string(),
+                shim.clone(),
+                "login".to_string()
+            ]
+        )]
+    );
+    let runner = FakeRunner::quiet();
+    let _ = run_cli(&env_of(&b, ONLY_CODEX, &[], true), &runner, &["doctor"]);
+    assert_eq!(
+        terminal(&runner),
+        [("codex".to_string(), vec!["login".to_string()])],
+        "CONTROL"
+    );
+    if !atpkg::vendor_direct::served_here("grok") {
+        return;
+    }
+    let b = machine(&["grok"]);
+    let shim = b.pkg.agents_dir().join("grok").display().to_string();
+    let runner = FakeRunner::quiet();
+    let (_, out, err) = run_cli(
+        &env_of(&b, ONLY_CODEX, &ssh, true),
+        &runner,
+        &["login", "grok"],
+    );
+    assert_eq!(
+        terminal(&runner),
+        [(
+            "sandbox-exec".to_string(),
+            vec![
+                "-p".to_string(),
+                NO_DESK.to_string(),
+                shim,
+                "login".to_string(),
+                "--device-auth".to_string()
+            ]
+        )],
+        "{out}{err}"
+    );
+    let runner = FakeRunner::quiet();
+    let (_, out, err) = run_cli(
+        &env_of(&b, ONLY_CODEX, &[], true),
+        &runner,
+        &["login", "grok"],
+    );
+    assert_eq!(
+        terminal(&runner),
+        [("grok".to_string(), vec!["login".to_string()])],
+        "CONTROL: {out}{err}"
+    );
 }

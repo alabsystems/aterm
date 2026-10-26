@@ -217,10 +217,12 @@ impl CursorGlow {
                 puff.y0 > top
             });
             self.bolts.retain_mut(|bolt| {
+                let mut any_above = false;
                 for (_, y) in &mut bolt.pts {
                     *y -= dy;
+                    any_above |= *y > top;
                 }
-                bolt.pts.iter().any(|&(_, y)| y > top)
+                any_above
             });
         }
 
@@ -385,8 +387,10 @@ impl CursorGlow {
                     return true;
                 };
                 let first_in = px.inside(y0);
-                if bolt.pts[1..].iter().any(|&(_, y)| px.inside(y) != first_in) {
-                    return false;
+                for &(_, y) in &bolt.pts[1..] {
+                    if px.inside(y) != first_in {
+                        return false;
+                    }
                 }
                 if !first_in {
                     return true;

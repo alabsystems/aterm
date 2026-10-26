@@ -4477,9 +4477,16 @@ impl CursorScene {
             cursor_cat.frame(now)
         });
         if keep {
+            // The scene keeps its glow as quads (its post passes read them),
+            // every lit ramp row the quad it stands for.
+            let quads = |quads: &[GlowQuad], ramps: &aterm_render::GlowRamps| {
+                let mut all = Vec::new();
+                ramps.expand_into(quads, &mut all);
+                all
+            };
             *kept = SceneStep {
-                glow_add: fx.glow_scratch.clone(),
-                glow_under: fx.glow.under_quads().to_vec(),
+                glow_add: quads(&fx.glow_scratch, fx.glow.out_ramps()),
+                glow_under: quads(fx.glow.under_quads(), fx.glow.under_ramps()),
                 glow_halo: fx.glow.halos().to_vec(),
                 fire_patch: fx.glow.patches().to_vec(),
                 char_fg: fx.glow.charred().to_vec(),

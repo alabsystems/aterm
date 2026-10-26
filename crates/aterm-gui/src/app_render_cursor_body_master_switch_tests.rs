@@ -24,7 +24,7 @@ fn one_focused_block_frame(trail_on: bool, style: &str) -> (usize, bool) {
     let tick = app.cursor_frame(wid, fx).expect("cursor fx tick");
     let window = app.windows.get(&wid).expect("headless window");
     (
-        window.fx.cursor().glow_scratch.len(),
+        window.fx.cursor().glow_laid().len(),
         tick.block_fill.is_some(),
     )
 }
@@ -75,7 +75,7 @@ fn switching_the_master_on_at_runtime_lights_the_body_on_the_next_frame() {
             .expect("window")
             .fx
             .cursor()
-            .glow_scratch
+            .glow_laid()
             .is_empty()
             && dark_tick.block_fill.is_none(),
         "precondition: the master is off, so this frame draws no body"
@@ -88,7 +88,7 @@ fn switching_the_master_on_at_runtime_lights_the_body_on_the_next_frame() {
     let lit_tick = app.cursor_frame(wid, lit).expect("lit frame");
     let window = app.windows.get(&wid).expect("headless window");
     assert!(
-        !window.fx.cursor().glow_scratch.is_empty(),
+        !window.fx.cursor().glow_laid().is_empty(),
         "a master switched on at runtime must publish its glow stream on the next frame"
     );
     assert!(
@@ -121,7 +121,7 @@ fn a_master_off_window_typed_into_fast_lights_no_momentum_glow() {
             CursorFxInputs::sample_for_test(t0 + std::time::Duration::from_millis(24 * 40));
         fx.cur = Some((2, 2));
         let tick = app.cursor_frame(wid, fx).expect("tick");
-        let lit = !app.windows[&wid].fx.cursor().glow_scratch.is_empty();
+        let lit = !app.windows[&wid].fx.cursor().glow_laid().is_empty();
         if master {
             assert!(
                 lit,
@@ -143,7 +143,7 @@ fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
     let (app, wid, _) = ribbon_witness_take("rainbow kitty", t0);
     let window = &app.windows[&wid];
     assert!(
-        !window.fx.cursor().glow.under_quads().is_empty(),
+        !window.fx.cursor().glow.under_laid().is_empty(),
         "fixture: the rainbow kitty band is on the frame"
     );
     assert!(
@@ -154,11 +154,11 @@ fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
     let (app, wid, _) = ribbon_witness_take("off", t0);
     let window = &app.windows[&wid];
     assert!(
-        !window.fx.cursor().glow_scratch.is_empty(),
+        !window.fx.cursor().glow_laid().is_empty(),
         "control: the off style still lights glow_add, which the any-quad witness counted"
     );
     assert!(
-        window.fx.cursor().glow.under_quads().is_empty(),
+        window.fx.cursor().glow.under_laid().is_empty(),
         "the off style composes no glow_under, so the witness reads 0"
     );
 }

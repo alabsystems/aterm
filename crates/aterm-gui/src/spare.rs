@@ -2816,6 +2816,7 @@ impl Wake {
             | Wake::KittyCollection { .. }
             | Wake::KittyWear { .. }
             | Wake::TypingMomentum { .. }
+            | Wake::PaneRegridOwed { .. }
             | Wake::ReadSessionStatus { .. }
             | Wake::ReadSessionStatuses { .. }
             | Wake::Story { .. }

@@ -89,9 +89,11 @@ fn project(dst: &mut RenderInput, clip: Option<ComposedCursorEffectClip>, layers
         dst,
         FocusedComposedCursorEffects {
             glow_add: &[],
+            glow_add_ramps: &aterm_core::render::GlowRamps::default(),
             glow_halo: &[],
             fire_patch: &[],
             glow_under: &[],
+            glow_under_ramps: &aterm_core::render::GlowRamps::default(),
             char_fg: &[],
             fire_halo: &[],
             trail: &[],

@@ -291,8 +291,8 @@ impl Scenario {
     /// The inputs at their offsets.
     #[inline]
     #[must_use]
-    pub fn events(&self) -> &[(u64, Exo)] {
-        &self.events
+    pub const fn events(&self) -> &[(u64, Exo)] {
+        self.events.as_slice()
     }
 
     /// The end, in ns from the origin.
@@ -304,7 +304,7 @@ impl Scenario {
 
     /// How many keys it types.
     #[must_use]
-    pub fn keys(&self) -> usize {
+    pub const fn keys(&self) -> usize {
         let events = self.events.as_slice();
         let mut n = 0usize;
         let mut i = 0;
@@ -319,7 +319,7 @@ impl Scenario {
 
     /// Whether every presentation change comes at the instant of a key.
     #[must_use]
-    pub fn presentation_moves_only_at_keys(&self) -> bool {
+    pub const fn presentation_moves_only_at_keys(&self) -> bool {
         let events = self.events.as_slice();
         let mut i = 0;
         while i < events.len() {
@@ -721,15 +721,15 @@ impl LaneRun {
     /// Every call, as the event an attached host records for it (so no reset of a glow at rest).
     #[inline]
     #[must_use]
-    pub fn calls(&self) -> &[MomentumEvent] {
-        &self.calls
+    pub const fn calls(&self) -> &[MomentumEvent] {
+        self.calls.as_slice()
     }
 
     /// Every tick, in order.
     #[inline]
     #[must_use]
-    pub fn ticks(&self) -> &[LaneTick] {
-        &self.ticks
+    pub const fn ticks(&self) -> &[LaneTick] {
+        self.ticks.as_slice()
     }
 
     /// The counts.
@@ -827,7 +827,10 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         self.counts.keys += 1;
         self.keyed = true;
         let v = vsync_after(t, self.f_ns);
-        self.next_frame = Some(self.next_frame.map_or(v, |f| f.min(v)));
+        self.next_frame = Some(match self.next_frame {
+            Some(f) => f.min(v),
+            None => v,
+        });
         Ok(())
     }
 
@@ -965,12 +968,16 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
 pub fn run<G: Glow + ?Sized>(g: &mut G, scenario: &Scenario, origin: Instant) -> LaneRun {
     let mut lane = Lane::new(g, origin, scenario.frame_interval_ns);
     let mut present = scenario.start;
-    let mut inputs = scenario.events.iter().peekable();
+    let events = scenario.events.as_slice();
+    let mut idx = 0usize;
     let mut last_input = 0u64;
     loop {
-        let (t, input) = match (inputs.peek().map(|&&(at, _)| at), lane.next_frame) {
-            (Some(e), Some(f)) if f < e => (f, None),
-            (Some(e), _) => (e, inputs.next().map(|&(_, exo)| exo)),
+        let (t, input) = match (events.get(idx), lane.next_frame) {
+            (Some(&(e, _)), Some(f)) if f < e => (f, None),
+            (Some(&(e, exo)), _) => {
+                idx += 1;
+                (e, Some(exo))
+            }
             (None, Some(f)) => (f, None),
             (None, None) => break,
         };

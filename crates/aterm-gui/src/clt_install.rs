@@ -7,8 +7,13 @@
 //! `aterm init --only base.clt`: its one sudo prompt is the person's, in the tab, and the
 //! run's park wakes once the tools are there (System State design §3.3).
 //!
-//! The tab opens once per launch, and only while System State is the front view of a focused
-//! window, no setup stage or macOS prompt is running, and the keyboard was quiet for 2.5 s.
+//! aterm opens the tab by itself once per Mac ([`Mark`]: a person who closed it without
+//! installing is not asked again by a later launch), and only while System State is the front
+//! view of a focused window, no setup stage or macOS prompt is running, and the keyboard was
+//! quiet for 2.5 s. The GitHub repositories row's Install… opens it on a person's press at any
+//! time ([`App::press_developer_tools_install`]), and the page reads where the install stands
+//! ([`App::developer_tools_install_step`]): the tab asking for the password, the installer
+//! running, or neither.
 //! Keys typed while it spawns stay in System State ([`crate::tab_spawn::SpawnAsk::unasked`]).
 //! The same checks run before landing: a busy, hidden or typed-into destination defers the
 //! request without opening an empty tab or consuming its attempt. Stop or a pass that no
@@ -18,6 +23,9 @@
 
 use crate::App;
 use crate::Wake;
+use crate::system_state::ToolsInstall;
+
+mod probe;
 
 /// Where this launch's install stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,6 +38,9 @@ pub(crate) enum Install {
     /// A shell is starting, with the latest request retained until it can land.
     /// Stop or a pass that no longer needs the tools can withdraw it meanwhile.
     Opening { wanted: Option<u64> },
+    /// A person's press of Install… started a shell, which lands once its own check passes
+    /// ([`App::press_developer_tools_install`]), whatever run is admitted.
+    Pressed,
     /// The tab was opened (or its opening failed): never again this launch, so a closed tab
     /// or a password left untyped costs one tab per launch at most.
     Opened,
@@ -87,6 +98,83 @@ impl Install {
 /// What the tab's line gives `aterm`: the install item alone, with its one password prompt.
 pub(crate) const ARGS: [&str; 3] = ["init", "--only", "base.clt"];
 
+/// The once-per-Mac mark that the Command Line Tools tab has opened on this Mac: a small file
+/// beside aterm's config, written as the tab lands. While it is there aterm never opens the tab
+/// by itself again, so a person who closed it without installing is not asked again at the next
+/// launch; the GitHub repositories row's Install… still opens it on their press.
+#[derive(Debug, Default)]
+pub(crate) struct Mark {
+    path: Option<std::path::PathBuf>,
+    opened: bool,
+}
+
+/// The mark's file name, beside aterm's config.
+#[cfg(not(test))]
+const MARK: &str = "command-line-tools-tab";
+
+impl Mark {
+    /// This Mac's mark, read once at launch. A mark that cannot be read counts as there: aterm
+    /// asks no one twice for want of a reading. Tests read none.
+    pub(crate) fn for_launch() -> Self {
+        #[cfg(test)]
+        {
+            Self::default()
+        }
+        #[cfg(not(test))]
+        {
+            let path = crate::app_config::config_path()
+                .and_then(|config| config.parent().map(|dir| dir.join(MARK)));
+            let opened = path.as_deref().is_some_and(|path| {
+                !matches!(std::fs::symlink_metadata(path), Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound)
+            });
+            Self { path, opened }
+        }
+    }
+
+    /// A mark kept at `path`, as a launch reads it (a test's).
+    #[cfg(all(test, unix))]
+    pub(crate) fn at(path: std::path::PathBuf) -> Self {
+        let opened = path.exists();
+        Self {
+            path: Some(path),
+            opened,
+        }
+    }
+
+    /// Whether the tab has opened on this Mac before.
+    pub(crate) const fn opened(&self) -> bool {
+        self.opened
+    }
+
+    /// The tab landed: never by itself again on this Mac. A write that fails leaves the mark for
+    /// this launch alone, and says so in the log.
+    fn note_opened(&mut self) {
+        if std::mem::replace(&mut self.opened, true) {
+            return;
+        }
+        if let Some(path) = &self.path
+            && let Err(error) = crate::config_marker::write_marker(
+                path,
+                "opened\n",
+                64,
+                crate::durable::Flush::Ordered,
+            )
+        {
+            aterm_log::warn!(
+                "System State: the Command Line Tools tab's mark was not written: {error}"
+            );
+        }
+    }
+}
+
+/// Whether Apple's Command Line Tools are installing on this Mac now: the on-demand placeholder
+/// with a live `softwareupdate`, or the exact executable of Apple's installer app. A stale
+/// placeholder alone says nothing ([`probe`]).
+pub(crate) fn installing_now() -> bool {
+    probe::installing_now()
+}
+
 /// The owned installer child, including its retained result after an exit notification.
 pub(crate) struct Terminal {
     session: u64,
@@ -131,22 +219,9 @@ fn install_tab_then(revision: u64, line: String) -> crate::tab_spawn::TabSpawnTh
                 app.workstation_setup.developer_tools = Install::Opened;
                 match landed {
                     Ok(sid) => {
+                        app.workstation_setup.developer_tools_mark.note_opened();
                         app.dispatch_developer_tools_install(revision, |app| {
-                            let session = app
-                                .store
-                                .read()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .by_sid(&aterm_session::SessionId::new(&sid))
-                                .map(|handle| handle.local_id);
-                            if let Some(session) = session {
-                                // Record before writing: even an immediate exec failure's exit
-                                // must release the slot and leave its explanation in the tab.
-                                app.workstation_setup.developer_tools_session = Some(Terminal {
-                                    session,
-                                    finished: false,
-                                });
-                                app.type_into_new_session(&sid, &install_line(&line));
-                            }
+                            app.start_developer_tools_install(&sid, &line);
                         });
                         // Only a real landing changes frontness. A refused spawn during
                         // shutdown must not republish the still-retained setup window.
@@ -162,7 +237,147 @@ fn install_tab_then(revision: u64, line: String) -> crate::tab_spawn::TabSpawnTh
     }
 }
 
+/// [`install_tab_then`] for a person's press of Install…: its own landing check, and no run's
+/// revision to answer to, since the press is the person's yes.
+fn pressed_tab_then(line: String) -> crate::tab_spawn::TabSpawnThen {
+    crate::tab_spawn::TabSpawnThen::Before {
+        check: Box::new(move |app, window| app.prepare_pressed_install_landing(window)),
+        then: Box::new(move |app, landed| {
+            if app.workstation_setup.developer_tools == Install::Pressed {
+                app.workstation_setup.developer_tools = Install::Opened;
+                match landed {
+                    Ok(sid) => {
+                        app.workstation_setup.developer_tools_mark.note_opened();
+                        app.start_developer_tools_install(&sid, &line);
+                        app.publish_system_state_front();
+                    }
+                    Err(why) => aterm_log::warn!(
+                        "System State: the Command Line Tools install tab did not open: {why}"
+                    ),
+                }
+            }
+            app.release_unused_access_dialog(std::time::Instant::now());
+        }),
+    }
+}
+
 impl App {
+    /// Type the install's line into its landed tab `sid`, recording the tab first: even an
+    /// immediate exec failure's exit must release the slot and leave its explanation in the tab.
+    fn start_developer_tools_install(&mut self, sid: &str, line: &str) {
+        let session = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_sid(&aterm_session::SessionId::new(sid))
+            .map(|handle| handle.local_id);
+        if let Some(session) = session {
+            self.workstation_setup.developer_tools_session = Some(Terminal {
+                session,
+                finished: false,
+            });
+            self.type_into_new_session(sid, &install_line(line));
+        }
+    }
+
+    /// Where an install of Apple's Command Line Tools stands for System State's page (design
+    /// §3.3): a live installer, else the tab's installer child alive, asking for the password,
+    /// else neither.
+    pub(crate) fn developer_tools_install_step(&self) -> Option<ToolsInstall> {
+        if self.developer_tools_installing() {
+            Some(ToolsInstall::Installing)
+        } else if self.developer_tools_install_active() {
+            Some(ToolsInstall::Password)
+        } else {
+            None
+        }
+    }
+
+    /// The same local installer evidence drives the displayed wait and each dispatch boundary.
+    fn developer_tools_installing(&self) -> bool {
+        self.workstation_setup
+            .developer_tools_probe
+            .is_some_and(|installing| installing())
+    }
+
+    /// A person's press of the GitHub repositories row's Install… (design §3.3): the tab opens
+    /// now, whatever run is admitted and whether or not it opened on this Mac before, landing
+    /// once System State is still the front view of its window and no macOS dialog this process
+    /// started is up. `true` when its shell started; `false` starts nothing: a headless
+    /// instance, an installer already running, a tab open or opening, a dialog up, or no front
+    /// page.
+    pub(crate) fn press_developer_tools_install(&mut self) -> bool {
+        if self.headless
+            || self.developer_tools_install_active()
+            || matches!(
+                self.workstation_setup.developer_tools,
+                Install::Opening { .. } | Install::Pressed
+            )
+            || self.access_dialog_up()
+        {
+            return false;
+        }
+        let Some(window) = self
+            .windows
+            .keys()
+            .find(|id| self.system_state_frontmost_in(**id))
+            .copied()
+        else {
+            return false;
+        };
+        if self.developer_tools_installing() {
+            return false;
+        }
+        #[cfg(not(windows))]
+        let line = crate::ledger_key::own_front_door()
+            .and_then(|exe| crate::ai_screen::launch_line(&exe, &ARGS));
+        #[cfg(windows)]
+        let line: Option<String> = None;
+        let Some(line) = line else {
+            aterm_log::warn!(
+                "System State: this program's path has no line to type; Install… opens no tab"
+            );
+            return false;
+        };
+        self.workstation_setup.developer_tools = Install::Pressed;
+        aterm_log::info!(
+            "System State: Install… starts the Command Line Tools tab (`aterm {}`)",
+            ARGS.join(" ")
+        );
+        self.open_off_loop(
+            window,
+            crate::tab_spawn::SpawnPlace::Tab,
+            crate::tab_spawn::SpawnAsk {
+                unasked: true,
+                exec_command: Some(waiting_shell_command()),
+                ..crate::tab_spawn::SpawnAsk::default()
+            },
+            pressed_tab_then(line),
+        );
+        true
+    }
+
+    /// The landing check of a pressed tab: System State still the front view of `window`, no
+    /// installer running and the dialog slot free, which the child holds through its lifetime.
+    /// A tab that cannot land opens nothing, and the button stays for another press.
+    fn prepare_pressed_install_landing(&mut self, window: crate::WindowId) -> bool {
+        if self.workstation_setup.developer_tools != Install::Pressed {
+            return false;
+        }
+        if self.system_state_frontmost_in(window)
+            && !self.access_dialog_up()
+            && !self.developer_tools_installing()
+            && self.reserve_access_dialog()
+        {
+            return true;
+        }
+        self.workstation_setup.developer_tools = Install::Opened;
+        aterm_log::info!(
+            "System State: the Command Line Tools tab Install… asked for did not land"
+        );
+        false
+    }
+
     pub(crate) fn developer_tools_install_active(&self) -> bool {
         self.workstation_setup
             .developer_tools_session
@@ -203,15 +418,19 @@ impl App {
     }
 
     /// [`Install::due`] for a want this run still authorizes, once the keyboard was quiet for
-    /// 2.5 s ([`crate::hands_off_keys`]): the landed tab takes the window's keys.
+    /// 2.5 s ([`crate::hands_off_keys`]): the landed tab takes the window's keys. Never once the
+    /// tab has opened on this Mac ([`Mark`]): Install… is the way then. A live installer holds
+    /// the request until it ends, without consuming this Mac's automatic attempt.
     fn developer_tools_install_due(&self, front: bool, running: bool, dialog_up: bool) -> bool {
-        crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
+        !self.workstation_setup.developer_tools_mark.opened()
+            && crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
             && matches!(self.workstation_setup.developer_tools, Install::Wanted(revision)
             if self.developer_tools_install_authorized(revision))
             && self
                 .workstation_setup
                 .developer_tools
                 .due(front, running, dialog_up)
+            && !self.developer_tools_installing()
     }
 
     fn developer_tools_install_authorized(&self, revision: u64) -> bool {
@@ -240,6 +459,7 @@ impl App {
             && self.system_state_frontmost_in(window)
             && self.system_state_host.latest_status().running.is_empty()
             && !self.access_dialog_up()
+            && !self.developer_tools_installing()
             && self.reserve_access_dialog()
         {
             return true;
@@ -266,58 +486,71 @@ impl App {
     /// Open the install's tab if it is due ([`Install::due`]); else it waits for the next
     /// status, which comes each second while a window is up.
     pub(crate) fn tick_developer_tools_install(&mut self) {
-        if self.headless
-            || !self.developer_tools_install_due(
-                self.system_state_frontmost(),
-                !self.system_state_host.latest_status().running.is_empty(),
-                self.access_dialog_up(),
-            )
-        {
+        if self.headless {
             return;
         }
-        let Some(window) = self
-            .windows
-            .keys()
-            .find(|id| self.system_state_frontmost_in(**id))
-            .copied()
-        else {
+        let Some((window, ask, then)) = self.begin_developer_tools_install(|| {
+            #[cfg(not(windows))]
+            let line = crate::ledger_key::own_front_door()
+                .and_then(|exe| crate::ai_screen::launch_line(&exe, &ARGS));
+            #[cfg(windows)]
+            let line: Option<String> = None;
+            line
+        }) else {
             return;
-        };
-        let Install::Wanted(revision) = self.workstation_setup.developer_tools else {
-            return;
-        };
-        self.workstation_setup.developer_tools = Install::Opened;
-        #[cfg(not(windows))]
-        let line = crate::ledger_key::own_front_door()
-            .and_then(|exe| crate::ai_screen::launch_line(&exe, &ARGS));
-        #[cfg(windows)]
-        let line: Option<String> = None;
-        let Some(line) = line else {
-            aterm_log::warn!(
-                "System State: this program's path has no line to type; the Command Line Tools \
-                 install opens no tab"
-            );
-            return;
-        };
-        self.workstation_setup.developer_tools = Install::Opening {
-            wanted: Some(revision),
         };
         aterm_log::info!(
             "System State: starting the Command Line Tools install tab (`aterm {}`)",
             ARGS.join(" ")
         );
-        self.open_off_loop(
-            window,
-            crate::tab_spawn::SpawnPlace::Tab,
-            crate::tab_spawn::SpawnAsk {
-                unasked: true,
-                // The worker must not start installation before the UI's landing check.
-                // Use a known shell without owner rc hooks or the app's global `-e`.
-                exec_command: Some(waiting_shell_command()),
-                ..crate::tab_spawn::SpawnAsk::default()
-            },
-            install_tab_then(revision, line),
-        );
+        self.open_off_loop(window, crate::tab_spawn::SpawnPlace::Tab, ask, then);
+    }
+
+    /// When the install is due, the window its tab opens in, how it spawns and what it does once
+    /// it lands (typing `line`, read only then), with the request now Opening. A program with no
+    /// line to type spends the launch's attempt and opens nothing.
+    fn begin_developer_tools_install(
+        &mut self,
+        line: impl FnOnce() -> Option<String>,
+    ) -> Option<(
+        crate::WindowId,
+        crate::tab_spawn::SpawnAsk,
+        crate::tab_spawn::TabSpawnThen,
+    )> {
+        if !self.developer_tools_install_due(
+            self.system_state_frontmost(),
+            !self.system_state_host.latest_status().running.is_empty(),
+            self.access_dialog_up(),
+        ) {
+            return None;
+        }
+        let window = self
+            .windows
+            .keys()
+            .find(|id| self.system_state_frontmost_in(**id))
+            .copied()?;
+        let Install::Wanted(revision) = self.workstation_setup.developer_tools else {
+            return None;
+        };
+        self.workstation_setup.developer_tools = Install::Opened;
+        let Some(line) = line() else {
+            aterm_log::warn!(
+                "System State: this program's path has no line to type; the Command Line Tools \
+                 install opens no tab"
+            );
+            return None;
+        };
+        self.workstation_setup.developer_tools = Install::Opening {
+            wanted: Some(revision),
+        };
+        let ask = crate::tab_spawn::SpawnAsk {
+            unasked: true,
+            // The worker must not start installation before the UI's landing check.
+            // Use a known shell without owner rc hooks or the app's global `-e`.
+            exec_command: Some(waiting_shell_command()),
+            ..crate::tab_spawn::SpawnAsk::default()
+        };
+        Some((window, ask, install_tab_then(revision, line)))
     }
 }
 
@@ -403,6 +636,17 @@ mod tests {
         ));
         answer.receipt.take().unwrap().accept();
         app.resolve_system_state_apply();
+    }
+
+    #[test]
+    fn clt_install_a_pass_withdraws_its_own_revisions_want_and_never_a_newer_one() {
+        assert_eq!(Install::Wanted(4).withdrawn_by(4), Install::Unasked);
+        assert_eq!(Install::Wanted(4).withdrawn_by(5), Install::Unasked);
+        assert_eq!(Install::Wanted(5).withdrawn_by(4), Install::Wanted(5));
+        let opening = |wanted| Install::Opening { wanted };
+        assert_eq!(opening(Some(4)).withdrawn_by(4), opening(None));
+        assert_eq!(opening(Some(5)).withdrawn_by(4), opening(Some(5)));
+        assert_eq!(Install::Opened.withdrawn_by(9), Install::Opened);
     }
 
     #[test]

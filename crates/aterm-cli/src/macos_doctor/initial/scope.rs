@@ -228,7 +228,7 @@ impl InitialSetupAuthorization {
 /// holds it for as long as it stands ([`Restored`]), whatever was admitted since:
 /// widening would set again the groups the Restore put back and sign Messages and
 /// FaceTime out, which nothing undoes.
-fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Option<Plan> {
+pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Option<Plan> {
     let Some((plan, true)) = records.plan.as_ref() else {
         return None;
     };
@@ -295,6 +295,9 @@ pub struct SetupUpgrade {
 #[derive(Default)]
 pub struct InitialSetupUpgrade {
     attempt: Option<(InitialSetupAuthorization, Plan)>,
+    /// Said the moment this upgrade's write finds the profile lock another setup holds and
+    /// starts waiting for it ([`Self::noting_wait`]).
+    waits: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl InitialSetupUpgrade {
@@ -326,8 +329,20 @@ impl InitialSetupUpgrade {
         self.attempt = None;
     }
 
+    /// Say `waits` the moment this upgrade's write finds the profile lock another setup holds
+    /// and starts waiting for it, as a choice does ([`InitialSetupRestart::noting_wait`]):
+    /// System State shows the review's Apply waiting from then, never a run going (design
+    /// §3.3, §3.5). It replaces any earlier one.
+    pub fn noting_wait(&mut self, waits: impl FnMut() + Send + 'static) {
+        self.waits = Some(Box::new(waits));
+    }
+
     /// Widen the provisional plan once its review admits it ([`provisional_setup_widened`]), or
-    /// finish the held attempt's commit: what it widened, or `None` when nothing changed.
+    /// finish the held attempt's commit: what it widened, or `None` when nothing changed. It
+    /// waits for the profile lock while another setup holds it, at most a choice's wait, and
+    /// is then admitted against the records as they are, while it still widens the plan in
+    /// force ([`InitialSetupAuthorization::upgrade_observed`]); past that wait it fails with
+    /// [`SETUP_BUSY`], its attempt kept.
     pub fn persist(&mut self) -> Result<Option<SetupUpgrade>, String> {
         if aterm_types::dirs::runs_under_private_state_root() {
             self.attempt = None;
@@ -341,12 +356,20 @@ impl InitialSetupUpgrade {
             PersonScope::Unresolved(why) => return Err(why),
             PersonScope::Person => {}
         }
-        self.persist_with(
-            &state_root()?,
-            alab_mac,
-            live_configured_vault,
-            |ticket, full| ticket.upgrade_observed(full).result,
-        )
+        let mut waits = self.waits.take();
+        let persisted = state_root().and_then(|root| {
+            self.persist_with(&root, alab_mac, live_configured_vault, |ticket, full| {
+                ticket
+                    .upgrade_observed(full, || {
+                        if let Some(waits) = waits.as_mut() {
+                            waits();
+                        }
+                    })
+                    .result
+            })
+        });
+        self.waits = waits;
+        persisted
     }
 
     fn persist_with(
@@ -367,8 +390,10 @@ impl InitialSetupUpgrade {
             // unresolved shutdown debt and must not rebind a later publication.
             return Err("the failed setup publication could not be identified".into());
         }
-        let from = ticket.revision();
         let result = admit(ticket, full);
+        // Read after the admission: one that met records another writer changed meanwhile, and
+        // still widened the plan in force, widened their revision.
+        let from = ticket.revision();
         if result.is_ok() || (!ticket.pending() && !ticket.publication_unknown()) {
             self.attempt = None;
         }
@@ -1018,8 +1043,12 @@ mod tests {
         );
     }
 
+    /// A prepared upgrade meets records another writer published since it observed them. Over
+    /// a Restore it writes nothing; over the same provisional plan published again (a pass, a
+    /// resume) it still widens the plan in force, so it is admitted against the records as they
+    /// are now (design §3.5).
     #[test]
-    fn a_prepared_provisional_upgrade_does_not_replace_a_new_publication_or_stop() {
+    fn a_prepared_provisional_upgrade_does_not_replace_a_restore_but_widens_the_same_plan() {
         for stopped in [false, true] {
             let root = aterm_tempfile::tempdir().unwrap();
             let narrow = provisional(root.path());
@@ -1033,13 +1062,23 @@ mod tests {
                     &json!({"profile":PROFILE,"state":"restored"}),
                 )
                 .unwrap();
+                let winner = observation_at(root.path()).unwrap();
+                assert_eq!(ticket.upgrade_at(root.path(), &full).result.unwrap(), None);
+                assert_eq!(observation_at(root.path()).unwrap(), winner);
             } else {
-                // Equal content under a new publication is still another writer's decision.
                 save_plan_as(root.path(), &narrow, true).unwrap();
+                assert!(
+                    ticket
+                        .upgrade_at(root.path(), &full)
+                        .result
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    saved_plan(root.path()).unwrap().unwrap().selection,
+                    Selection::all()
+                );
             }
-            let winner = observation_at(root.path()).unwrap();
-            assert_eq!(ticket.upgrade_at(root.path(), &full).result.unwrap(), None);
-            assert_eq!(observation_at(root.path()).unwrap(), winner);
         }
     }
 
@@ -1173,6 +1212,172 @@ mod tests {
         assert!(!upgrade.pending() && upgrade.widens_from().is_none());
         let admitted = progress(root.path()).unwrap().unwrap();
         assert_eq!((admitted.revision, admitted.admitted), (finished.to, true));
+    }
+
+    /// The review's Apply meets the profile lock busy past its wait (a retry pass, `aterm doctor
+    /// --apply`, a Full Disk Access follow-up), and that pass saves its progress before it lets
+    /// go. The held attempt's next look reads the records again: the plan in force is still the
+    /// same provisional plan, so the widen is admitted against them, never dropped (design §3.5).
+    #[test]
+    fn a_widen_apply_that_met_a_busy_lock_is_admitted_over_a_pass_that_saved_meanwhile() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        let mut upgrade = InitialSetupUpgrade::default();
+        let held = HeldLock::try_take(root.path()).unwrap().unwrap();
+        let first = upgrade.persist_with(
+            root.path(),
+            || true,
+            || Ok(None),
+            |ticket, full| ticket.upgrade_at(root.path(), full).result,
+        );
+        assert_eq!(first, Err("busy".to_string()));
+        assert!(upgrade.pending(), "the busy look keeps the attempt");
+        // The pass that held the lock saves its progress (any write: a new publication).
+        let history = progress(root.path()).unwrap().unwrap();
+        save_progress(root.path(), history).unwrap();
+        drop(held);
+        let second = upgrade
+            .persist_with(
+                root.path(),
+                || panic!("the held attempt is finished, not looked for again"),
+                || Ok(None),
+                |ticket, full| ticket.upgrade_at(root.path(), full).result,
+            )
+            .unwrap()
+            .expect("the review's Apply is admitted");
+        assert_eq!(second.from, history.revision);
+        assert!(!upgrade.pending());
+        assert_eq!(
+            saved_plan(root.path()).unwrap().unwrap().selection,
+            Selection::all()
+        );
+        let admitted = progress(root.path()).unwrap().unwrap();
+        assert_eq!((admitted.revision, admitted.admitted), (second.to, true));
+        assert!(!widens_at(root.path()).unwrap(), "nothing left to widen");
+    }
+
+    /// The same busy look, but the writer that held the lock changed the plan in force: a Stop of
+    /// its run, the person's Cancel of the widen, a Restore, or another plan. The widen no longer
+    /// applies to the plan in force, so the next look writes nothing and ends the attempt; the
+    /// watch then refuses the review's Apply and the page shows the plan in force.
+    #[test]
+    fn a_widen_apply_that_met_a_busy_lock_is_not_admitted_over_a_changed_plan() {
+        for change in ["stop", "cancel", "restore", "another plan"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let narrow = provisional(root.path());
+            if change == "stop" {
+                let mut unfinished = progress(root.path()).unwrap().unwrap();
+                unfinished.done = 0;
+                unfinished.completed = false;
+                save_progress(root.path(), unfinished).unwrap();
+            }
+            let mut upgrade = InitialSetupUpgrade::default();
+            let held = HeldLock::try_take(root.path()).unwrap().unwrap();
+            let first = upgrade.persist_with(
+                root.path(),
+                || true,
+                || Ok(None),
+                |ticket, full| ticket.upgrade_at(root.path(), full).result,
+            );
+            assert_eq!(first, Err("busy".to_string()), "{change}");
+            match change {
+                "stop" => {
+                    let revision = progress(root.path()).unwrap().unwrap().revision;
+                    request_stop_at(root.path(), revision).unwrap();
+                }
+                "cancel" => assert!(decline_widen_at(root.path()).unwrap()),
+                "restore" => write_json(
+                    &root.path().join("first-run.json"),
+                    &json!({"profile":PROFILE,"state":"restored"}),
+                )
+                .unwrap(),
+                _ => {
+                    let mut other = narrow.clone();
+                    other.selection.set(Setting::Spotlight, true);
+                    save_plan_as(root.path(), &other, true).unwrap();
+                }
+            }
+            drop(held);
+            let changed = observation_at(root.path()).unwrap();
+            let second = upgrade.persist_with(
+                root.path(),
+                || panic!("the held attempt is finished, not looked for again"),
+                || Ok(None),
+                |ticket, full| ticket.upgrade_at(root.path(), full).result,
+            );
+            assert_eq!(second, Ok(None), "{change}");
+            assert!(!upgrade.pending(), "{change}: the attempt ends");
+            assert!(
+                observation_at(root.path()).unwrap() == changed,
+                "{change}: nothing written"
+            );
+        }
+    }
+
+    /// The review's Apply waits for the profile lock another setup holds, as a choice does, and
+    /// says so the moment it starts waiting; once that setup lets go, having saved its progress,
+    /// the widen is admitted in the same press. One whose wait runs out is refused busy, its
+    /// ticket kept for the next look.
+    #[test]
+    fn a_widen_apply_waits_for_the_profile_lock_and_says_so() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        let (mut ticket, full) = prepare_upgrade(root.path(), || true, || Ok(None))
+            .unwrap()
+            .unwrap();
+        let mut held = Some(HeldLock::try_take(root.path()).unwrap().unwrap());
+        let mut noted = 0;
+        let admitted = ticket.upgrade_waiting(
+            root.path(),
+            None,
+            noting_first(
+                || noted += 1,
+                || {
+                    if held.is_some() {
+                        let history = progress(root.path()).unwrap().unwrap();
+                        save_progress(root.path(), history).unwrap();
+                        held = None;
+                    }
+                    true
+                },
+            ),
+            &full,
+        );
+        assert!(
+            admitted.result.unwrap().is_some(),
+            "admitted once the lock was free"
+        );
+        assert_eq!(noted, 1, "said once, as it started waiting");
+        assert_eq!(
+            saved_plan(root.path()).unwrap().unwrap().selection,
+            Selection::all()
+        );
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        let (mut ticket, full) = prepare_upgrade(root.path(), || true, || Ok(None))
+            .unwrap()
+            .unwrap();
+        let _held = HeldLock::try_take(root.path()).unwrap().unwrap();
+        let refused = ticket.upgrade_waiting(root.path(), None, || false, &full);
+        assert_eq!(refused.result, Err(SETUP_BUSY.to_string()));
+        assert!(ticket.pending(), "kept for the next look");
+    }
+
+    /// A Stop that came during the last stage of aterm's provisional run was spent: the run
+    /// completed, and its records hold no Stop. They still let the plan widen, so the next
+    /// launch may offer the widen review; in the launch that pressed Stop the watch offers none
+    /// (`provisional_setup_widens_here` in the binary).
+    #[test]
+    fn a_stop_spent_on_a_finished_provisional_run_leaves_its_widen_to_a_later_launch() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        let revision = progress(root.path()).unwrap().unwrap().revision;
+        super::super::request_stop_at(root.path(), revision).unwrap();
+        assert!(
+            widens_at(root.path()).unwrap(),
+            "the finished run's spent Stop holds no widening on record"
+        );
     }
 
     /// aterm's provisional plan, its run `finished` or not, widened on the ALab signal, and a

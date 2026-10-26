@@ -135,7 +135,7 @@ struct Host {
 impl Host {
     fn new() -> Self {
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         Self {
             term: Terminal::new(ROWS as u16, COLS as u16),

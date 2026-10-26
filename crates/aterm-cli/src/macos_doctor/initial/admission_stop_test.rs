@@ -44,6 +44,14 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         Self::startup(root)
     }
 
+    /// The actual bring-forward writer, under the profile lock, as a launch runs it: the run it
+    /// staged for the launch's offer, if any. A startup bound after it reviews what it brought
+    /// forward ([`Self::startup`]).
+    pub fn bring_forward(&self) -> Result<Option<u64>, String> {
+        let _lock = HeldLock::take(self.root)?;
+        bring_forward_restored_observing_using(self.root, |_| Ok(()), |_| {}, save_progress)
+    }
+
     /// The actual bring-forward writer with a refused write, or a visible rename
     /// whose namespace flush fails. No service or OS preference port is reached.
     pub fn bring_forward_progress_error(

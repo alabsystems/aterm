@@ -1297,8 +1297,13 @@ fn the_journal_across_a_quit_and_a_kill() {
         rows.get(1).is_some_and(|r| r.starts_with("1 open - ")),
         "{since}"
     );
-    let node = a.text("log n");
-    assert!(node.contains(" amend n start prev_end=clean "), "{node}");
+    // The recovery census amends the start on a background thread of its own, which can run
+    // after the launch reports ready: wait for its amend, at the hang detector.
+    until("the relaunch's start amended prev_end=clean", || {
+        a.text("log n")
+            .contains(" amend n start prev_end=clean ")
+            .then_some(())
+    });
 
     // A SIGKILL by PID, then a relaunch.
     let pid = a.pid();
@@ -1306,8 +1311,11 @@ fn the_journal_across_a_quit_and_a_kill() {
     assert!(!aterm_uds::process::pid_alive(pid), "{pid} still runs");
     a.launch();
     a.wait_ready(&owner);
-    let node = a.text("log n");
-    assert!(node.contains(" amend n start prev_end=killed "), "{node}");
+    until("the relaunch's start amended prev_end=killed", || {
+        a.text("log n")
+            .contains(" amend n start prev_end=killed ")
+            .then_some(())
+    });
     for (path, bytes) in journals(&a) {
         assert_eq!(mode_of(&path), 0o600, "{}", path.display());
         assert!(!holds(&bytes, "QZP6SECRET1"), "{}", path.display());

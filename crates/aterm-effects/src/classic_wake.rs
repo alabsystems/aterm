@@ -8,13 +8,13 @@ use std::time::Duration;
 use aterm_time::Instant;
 
 use aterm_render::{
-    BeamVertex, CometSample, GlowQuad, HaloMode, RainHalo, comet_beam_over, comet_glow_quads,
-    premul_rgb,
+    BeamRows, BeamVertex, CometSample, GlowQuad, HaloMode, RainHalo, RampSink, comet_beam_over,
+    comet_glow_quads, premul_rgb,
 };
 
 use crate::cursor_glow::{
     BedScratch, BedShape, CursorGlow, Geom, GlowConfig, InkLedger, LIGHT_BODY_ALPHA_CAP,
-    LIGHT_MARK_QUADS, LightGround, TextView, clip_quads_to, hsv2rgb, lay_dark_bed, push_halo_rows,
+    LIGHT_MARK_QUADS, LightGround, TextView, clip_stream_to, hsv2rgb, lay_dark_bed, push_halo_rows,
     push_ink_ellipse, push_soft_veil, split_air_runs,
 };
 use crate::effect_util::{lerp_rgb, push_fx_rect as push_rect};
@@ -429,9 +429,9 @@ impl ClassicWake {
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
-        out: &mut Vec<GlowQuad>,
+        out: &mut RampSink<'_>,
         halos: &mut Vec<RainHalo>,
-        under: &mut Vec<GlowQuad>,
+        under: &mut RampSink<'_>,
         ink: WakeInk<'_>,
     ) -> u64 {
         out.clear();
@@ -507,34 +507,34 @@ impl ClassicWake {
 
         if cfg.dark_theme && cfg.classic_mono && !self.mono_unbedded() {
             self.emit_mono_dark(now, cfg, geom, cur, out, under, ink.text, ink.ledger);
-            out.truncate(Self::MAX_QUADS);
-            under.truncate(Self::MAX_QUADS);
+            out.keep_laid(Self::MAX_QUADS);
+            under.keep_laid(Self::MAX_QUADS);
             let from = halos.len();
             self.emit_mono_crown(now, cfg, geom, cur, halos);
             ink.ledger
                 .admit_halos_masked(halos, from, InkLedger::HEAD_FLOOR);
-            if out.len() < Self::MAX_QUADS {
-                let from = out.len();
-                self.emit_ring(now, cfg, geom, out);
-                let to = out.len();
+            if out.laid() < Self::MAX_QUADS {
+                let from = out.quads().len();
+                self.emit_ring(now, cfg, geom, out.quads());
+                let to = out.quads().len();
                 ink.ledger
-                    .admit_masked(out, from..to, InkLedger::FLYING_FLOOR);
+                    .admit_masked(out.quads(), from..to, InkLedger::FLYING_FLOOR);
             }
-            out.truncate(Self::MAX_QUADS);
+            out.keep_laid(Self::MAX_QUADS);
         } else if cfg.dark_theme {
             self.emit_comet(now, cfg, geom, cur, out);
-            out.truncate(Self::MAX_QUADS);
-            if out.len() < Self::MAX_QUADS {
-                self.emit_crown(now, cfg, geom, cur, out);
+            out.keep_laid(Self::MAX_QUADS);
+            if out.laid() < Self::MAX_QUADS {
+                self.emit_crown(now, cfg, geom, cur, out.quads());
             }
-            if out.len() < Self::MAX_QUADS {
-                self.emit_ring(now, cfg, geom, out);
+            if out.laid() < Self::MAX_QUADS {
+                self.emit_ring(now, cfg, geom, out.quads());
             }
-            out.truncate(Self::MAX_QUADS);
+            out.keep_laid(Self::MAX_QUADS);
         } else {
-            self.emit_light_crown(now, cfg, geom, cur, under);
+            self.emit_light_crown(now, cfg, geom, cur, under.quads());
             self.emit_light_comet(now, cfg, geom, cur, under, ink.text);
-            under.truncate(Self::MAX_QUADS);
+            under.keep_laid(Self::MAX_QUADS);
             if let Some(ring) = &mut self.ring
                 && let Some((r, c)) = cur
                 && usize::from(r) < geom.rows
@@ -547,7 +547,7 @@ impl ClassicWake {
         }
 
         let mut fp: u64 = 0;
-        for q in out.iter() {
+        for q in out.quads().iter() {
             fp = fp.wrapping_mul(1_000_003).wrapping_add(
                 ((q.row as u64) << 40)
                     ^ ((q.x as u64) << 28)
@@ -557,7 +557,7 @@ impl ClassicWake {
                     ^ ((q.color as u64) << 20),
             );
         }
-        for q in under.iter() {
+        for q in under.quads().iter() {
             fp = fp.wrapping_mul(1_000_003).wrapping_add(
                 ((q.row as u64) << 40)
                     ^ ((q.x as u64) << 28)
@@ -577,7 +577,27 @@ impl ClassicWake {
                 }
             }
         }
-        if !under.is_empty() || !halos.is_empty() {
+        for ramps in [&*out.ramps(), &*under.ramps()] {
+            for r in &ramps.items {
+                fp = fp.wrapping_mul(1_000_003).wrapping_add(
+                    (u64::from(r.at) << 32)
+                        ^ (u64::from(r.row) << 40)
+                        ^ (u64::from(r.x) << 28)
+                        ^ (u64::from(r.y) << 16)
+                        ^ (u64::from(r.w) << 8)
+                        ^ u64::from(r.h)
+                        ^ (u64::from(r.joined) << 48)
+                        ^ (u64::from(r.join) << 56),
+                );
+                let ink = r.ink as usize;
+                for e in ramps.ends[ink..ink + r.end_count()].as_chunks::<2>().0 {
+                    fp = fp
+                        .wrapping_mul(1_000_003)
+                        .wrapping_add(u64::from(e[0]) << 32 | u64::from(e[1]));
+                }
+            }
+        }
+        if under.laid() > 0 || !halos.is_empty() {
             fp = fp.max(1);
         }
         fp
@@ -770,7 +790,7 @@ impl ClassicWake {
         cfg: &GlowConfig,
         geom: Geom,
         cur: Option<(u16, u16)>,
-        out: &mut Vec<GlowQuad>,
+        out: &mut RampSink<'_>,
     ) {
         let live = self.build_runs(now, cfg, geom, cur);
         if live == 0 {
@@ -786,7 +806,7 @@ impl ClassicWake {
             if r.len() < 2 {
                 let s0 = r[0];
                 push_rect(
-                    out,
+                    out.quads(),
                     geom,
                     s0.x as i32 - s / 2,
                     s0.y as i32 - s / 2,
@@ -812,8 +832,8 @@ impl ClassicWake {
         cfg: &GlowConfig,
         geom: Geom,
         cur: Option<(u16, u16)>,
-        out: &mut Vec<GlowQuad>,
-        under: &mut Vec<GlowQuad>,
+        out: &mut RampSink<'_>,
+        under: &mut RampSink<'_>,
         text: TextView<'_>,
         ledger: &mut InkLedger,
     ) {
@@ -895,11 +915,11 @@ impl ClassicWake {
             } else {
                 None
             };
-            let from = out.len();
+            let from = out.mark();
             if r.len() < 2 {
                 let s0 = r[0];
                 push_rect(
-                    out,
+                    out.quads(),
                     geom,
                     s0.x as i32 - s / 2,
                     s0.y as i32 - s / 2,
@@ -913,7 +933,7 @@ impl ClassicWake {
                 self.comet_color(cfg, pos)
             });
             if let Some(cell) = stub {
-                clip_quads_to(out, from, cell);
+                clip_stream_to(out, from, cell);
             }
         }
     }
@@ -947,7 +967,7 @@ impl ClassicWake {
         cfg: &GlowConfig,
         geom: Geom,
         cur: Option<(u16, u16)>,
-        under: &mut Vec<GlowQuad>,
+        under: &mut RampSink<'_>,
         text: TextView<'_>,
     ) {
         #[cfg(test)]
@@ -981,7 +1001,7 @@ impl ClassicWake {
         let mut verts = std::mem::take(&mut self.light_verts);
         let mut last_ink: Option<(u32, u32)> = None;
         for run in &self.comet_runs[..live] {
-            if under.len() >= Self::MAX_QUADS {
+            if under.laid() >= Self::MAX_QUADS {
                 break;
             }
             verts.clear();
@@ -1061,7 +1081,11 @@ impl ClassicWake {
         }
         let age_ms = now.saturating_duration_since(self.last_move?).as_millis() as u64;
         let window = self.crown_window_ms.max(1);
-        (age_ms < window).then(|| ((cr, cc), 1.0 - age_ms as f32 / window as f32))
+        if age_ms < window {
+            Some(((cr, cc), 1.0 - age_ms as f32 / window as f32))
+        } else {
+            None
+        }
     }
 
     fn emit_crown(
@@ -1206,7 +1230,7 @@ impl ClassicWake {
         let age = now.saturating_duration_since(ring.born).as_secs_f32();
         let t = (age / ring.life).clamp(0.0, 1.0);
         let cov = (200.0 * (1.0 - t) * cfg.intensity) as u8;
-        (cov > 0).then_some((ring, t, cov))
+        if cov > 0 { Some((ring, t, cov)) } else { None }
     }
 
     fn emit_ring(&self, now: Instant, cfg: &GlowConfig, geom: Geom, out: &mut Vec<GlowQuad>) {
@@ -1361,22 +1385,25 @@ mod tests {
     struct Rig {
         w: ClassicWake,
         out: Vec<GlowQuad>,
+        out_ramps: aterm_render::GlowRamps,
         halos: Vec<RainHalo>,
         under: Vec<GlowQuad>,
+        under_ramps: aterm_render::GlowRamps,
         ledger: InkLedger,
         spans: crate::cursor_glow::TextSpans,
     }
 
     impl Rig {
+        /// One tick, its ramps laid as the quads they stand for.
         fn tick(&mut self, cur: Option<(u16, u16)>, now: Instant, c: &GlowConfig, g: Geom) -> u64 {
             self.w.tick(
                 cur,
                 now,
                 c,
                 g,
-                &mut self.out,
+                &mut crate::cursor_glow::glow_sink(&mut self.out, &mut self.out_ramps, true),
                 &mut self.halos,
-                &mut self.under,
+                &mut crate::cursor_glow::glow_sink(&mut self.under, &mut self.under_ramps, true),
                 WakeInk {
                     text: crate::cursor_glow::TextView::new(self.spans, None),
                     ledger: &mut self.ledger,

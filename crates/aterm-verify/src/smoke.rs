@@ -7,6 +7,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use crate::exec::group;
+
 /// macOS `sockaddr_un.sun_path` byte ceiling.
 pub const SUN_LEN: usize = 104;
 
@@ -54,66 +56,103 @@ pub fn metric_ms_whole(line: &str, field: &str) -> Option<u64> {
     found.map(|d| d.parse::<u64>().unwrap_or(u64::MAX))
 }
 
-/// Sends `-<sig>` to `pid` via `/bin/kill` and returns `(delivered, stderr)`.
-#[must_use]
-pub fn signal(pid: u32, sig: &str) -> (bool, String) {
-    let killer = if Path::new("/bin/kill").exists() {
-        "/bin/kill"
-    } else {
-        "kill"
-    };
-    match Command::new(killer)
-        .arg(format!("-{sig}"))
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(o) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stderr).into_owned(),
-        ),
-        Err(e) => (false, e.to_string()),
+/// How long the smoke's instance has to leave after its group's `SIGTERM` before the group is
+/// `SIGKILL`ed.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// The wait for a `SIGKILL`ed group to hold nothing but its leader: a hang detector, never a
+/// budget.
+const GROUP_GONE: Duration = Duration::from_secs(60);
+
+/// The smoke's instance, leading a process group of its own. What it starts as it goes (a lane's
+/// `atpkg machine` read, its consent sentinel's `log stream`) stays in that group when the instance
+/// dies and launchd adopts it, so [`SmokeChild::retire`] ends it with the instance, by the group
+/// and not by a pid: nothing the instance started outlives the smoke into verify's run-end check
+/// or the next timed run.
+pub struct SmokeChild {
+    child: Child,
+    /// The group's custody while its leader is unreaped, and its place on the interrupt list.
+    live: group::Live,
+}
+
+impl SmokeChild {
+    /// Spawn `cmd` as the leader of a new process group, its stdin `/dev/null`: the group is in
+    /// the background, so a member that read a terminal would stop on `SIGTTIN`. `made` gets the
+    /// group's id while the spawn still holds off an interrupt's sweep, so the run records the
+    /// group before anything can end it.
+    /// # Errors
+    /// The run was interrupted before the spawn, or the spawn failed.
+    pub fn spawn(cmd: &mut Command, made: impl FnOnce(u32)) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+        let spawning = group::Spawning::begin();
+        if group::stopping() {
+            return Err(std::io::Error::other(
+                "the run was interrupted before this child started",
+            ));
+        }
+        let child = cmd.stdin(Stdio::null()).process_group(0).spawn()?;
+        let live = group::Live::enter(child.id());
+        made(child.id());
+        drop(spawning);
+        Ok(Self { child, live })
+    }
+
+    /// The leader's pid, which is the group's id.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the leader has exited, seen without reaping it, so its group id names no other
+    /// group; a wait that fails reads as exited.
+    pub fn exited(&mut self) -> bool {
+        self.live.exited(&mut self.child, false).unwrap_or(true)
+    }
+
+    /// End the instance and everything in its group, then reap it: `SIGTERM` the group,
+    /// `SIGKILL` it once [`TERM_GRACE`] passes with the leader still there, and once the leader
+    /// has exited `SIGKILL` the group until it holds nothing but the unreaped leader (a child
+    /// forked as one signal went out takes the next), until [`GROUP_GONE`] passes, or until the
+    /// group's custody is lost and no signal may go to its id. `sweep`
+    /// reads the group before the leader is reaped, and names what is still there. True only when
+    /// the leader exited 0 or died of a signal sent here.
+    pub fn retire(mut self, sweep: impl FnOnce(u32)) -> bool {
+        use std::os::unix::process::ExitStatusExt as _;
+        let pgid = self.child.id();
+        let term_sent = self.live.term().is_ok();
+        let mut kill_sent = false;
+        let grace = std::time::Instant::now() + TERM_GRACE;
+        while !self.exited() {
+            if std::time::Instant::now() >= grace {
+                kill_sent = self.live.kill().is_ok();
+                let _ = self.live.exited(&mut self.child, true);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let gone = std::time::Instant::now() + GROUP_GONE;
+        while self.live.holds(pgid) && others_in(pgid) && std::time::Instant::now() < gone {
+            let _ = self.live.kill();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match self.live.reap_stage_sweeping(&mut self.child, true, sweep) {
+            Ok(Some(st)) => match (st.code(), st.signal()) {
+                (Some(0), _) => true,
+                (_, Some(15)) => term_sent,
+                (_, Some(9)) => kill_sent,
+                _ => false,
+            },
+            _ => false,
+        }
     }
 }
 
-/// Retires and reaps `child` (TERM, 2s wait, then KILL), returning `(ok, stderr_from_kill)`.
-/// Succeeds only on exit 0 or death by a signal sent here.
-pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
-    use std::os::unix::process::ExitStatusExt;
-
-    let pid = child.id();
-    let mut noise = String::new();
-    let (term_sent, err) = signal(pid, "TERM");
-    noise.push_str(&err);
-
-    let mut exited = false;
-    for _ in 0..40 {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                exited = true;
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    let mut kill_sent = false;
-    if !exited && matches!(child.try_wait(), Ok(None)) {
-        let (sent, err) = signal(pid, "KILL");
-        kill_sent = sent;
-        noise.push_str(&err);
-    }
-    let ok = match child.wait() {
-        Ok(st) => match (st.code(), st.signal()) {
-            (Some(0), _) => true,
-            (_, Some(15)) => term_sent,
-            (_, Some(9)) => kill_sent,
-            _ => false,
-        },
-        Err(_) => false,
-    };
-    (ok, noise)
+/// Whether group `pgid` lists a member besides its leader (Apple lists the unreaped leader, and a
+/// killed member until launchd reaps it); a group no listing reads counts as empty.
+fn others_in(pgid: u32) -> bool {
+    let leader = i32::try_from(pgid).unwrap_or(0);
+    aterm_uds::process::group_members(pgid)
+        .is_some_and(|members| members.pids.iter().any(|&pid| pid != leader))
 }
 
 /// Block until `pid` — a child of this process that ends by itself — has EXITED:
@@ -292,40 +331,82 @@ mod tests {
         );
     }
 
+    /// `script` under `/bin/sh` as a [`SmokeChild`], and the first line it printed.
+    fn smoke_child(script: &str) -> (SmokeChild, String) {
+        use std::io::BufRead as _;
+        let mut child = SmokeChild::spawn(
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            |_| {},
+        )
+        .expect("spawn");
+        let mut line = String::new();
+        std::io::BufReader::new(child.child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("read the child's word");
+        (child, line)
+    }
+
     #[test]
     fn retiring_a_live_child_terms_it_and_reaps_exactly_once() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn");
-        let (ok, noise) = retire_smoke_child(&mut child);
-        assert!(ok, "a TERM we sent is a clean retirement");
-        assert!(noise.is_empty(), "teardown must be quiet: {noise}");
+        let (child, ready) = smoke_child("echo up; exec sleep 30");
+        assert_eq!(ready, "up\n");
+        let pid = i32::try_from(child.id()).expect("pid");
+        assert!(child.retire(|_| {}), "a TERM we sent is a clean retirement");
+        assert_eq!(
+            aterm_uds::process::process_presence(pid),
+            aterm_uds::process::ProcessPresence::Absent,
+            "the leader is reaped"
+        );
     }
 
     #[test]
     fn a_child_that_ignores_term_is_killed_within_the_budget() {
-        use std::io::BufRead as _;
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; echo ignoring; exec sleep 120"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn");
-        let mut ready = String::new();
-        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
-            .read_line(&mut ready)
-            .expect("read the child's word");
+        let (child, ready) = smoke_child("trap '' TERM; echo ignoring; exec sleep 120");
         assert_eq!(ready, "ignoring\n", "the child set its trap");
         let start = std::time::Instant::now();
-        let (ok, _) = retire_smoke_child(&mut child);
-        assert!(ok, "KILL after the budget is still a retirement we caused");
         assert!(
-            start.elapsed() < Duration::from_secs(60),
+            child.retire(|_| {}),
+            "KILL after the budget is still a retirement we caused"
+        );
+        assert!(
+            start.elapsed() < GROUP_GONE,
             "the run is never hung by teardown: {:?}",
             start.elapsed()
+        );
+    }
+
+    /// The subject's `atpkg machine` read, started as the smoke's window went, outlived it in the
+    /// window's group. Here the helper ignores `SIGTERM` and sleeps on, so it is still there,
+    /// held, when the instance dies: only the teardown can end it.
+    #[test]
+    fn retiring_the_instance_ends_the_helper_it_left_in_its_group() {
+        let (child, line) = smoke_child(
+            "(trap '' TERM; exec /bin/sh -c 'echo $$; exec /bin/sleep 600') & exec /bin/sleep 600",
+        );
+        let helper: i32 = line.trim().parse().expect("the helper's pid");
+        let leader = i32::try_from(child.id()).expect("pid");
+        let mut swept = None;
+        assert!(
+            child.retire(|pgid| swept = aterm_uds::process::group_members(pgid)),
+            "a TERM we sent is a clean retirement"
+        );
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(
+                swept.map(|m| m.pids),
+                Some(vec![leader]),
+                "the sweep finds the unreaped leader alone in its group"
+            );
+        }
+        assert!(
+            matches!(
+                aterm_uds::process::process_presence(helper),
+                aterm_uds::process::ProcessPresence::Absent
+                    | aterm_uds::process::ProcessPresence::Exited
+            ),
+            "the helper (pid {helper}) outlived the smoke's instance"
         );
     }
 }

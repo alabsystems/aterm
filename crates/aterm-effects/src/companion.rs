@@ -1066,7 +1066,10 @@ impl CompanionOwner {
                     facts.session,
                     facts.wrap_serial,
                 );
-            if let Some((x, y)) = host.pointer_px.or(self.pointer_px) {
+            if let Some((x, y)) = match host.pointer_px {
+                Some(p) => Some(p),
+                None => self.pointer_px,
+            } {
                 pointer = pet_pointer_cell(
                     (f64::from(x), f64::from(y)),
                     host.geometry.origin_px,
@@ -1174,10 +1177,9 @@ impl CompanionOwner {
         if self.resight_frame.is_none() && !any_own {
             return;
         }
-        let pending = self.resight_frame.map(|f| f.glass);
         self.resight_offered = false;
         for g in glass {
-            self.resight_offered |= pending == Some(g);
+            self.resight_offered |= matches!(self.resight_frame, Some(f) if f.glass == g);
             let mut i = 0;
             while i < self.own_glass.len() {
                 if let Some(own) = &mut self.own_glass[i] {
@@ -1254,7 +1256,11 @@ impl CompanionOwner {
             CaptureMode::StaticCapture => self.pet.tick_static_capture(t.sense),
         };
         self.last_static = t.sense.reduced_motion;
-        self.last_shed_tick = t.shed_active.then_some(t.sense.now);
+        self.last_shed_tick = if t.shed_active {
+            Some(t.sense.now)
+        } else {
+            None
+        };
         let on_glass = t.visible && pet_frame.alpha > 0;
         let kitty_alpha = if !t.pet_mode {
             shed_companion_alpha(t.sing.flying_alpha, t.shed_envelope)
@@ -1363,7 +1369,10 @@ impl CompanionOwner {
             return (
                 0,
                 SyncLookOutcome {
-                    worn: self.pet.worn_pair().unwrap_or(pair),
+                    worn: match self.pet.worn_pair() {
+                        Some(w) => w,
+                        None => pair,
+                    },
                     parked: false,
                 },
             );
@@ -1401,7 +1410,11 @@ impl CompanionOwner {
             coat,
             iris,
             pet: t.pet,
-            page: (!aterm_render::theme_is_dark(fallback.bg)).then_some(fallback.bg),
+            page: if aterm_render::theme_is_dark(fallback.bg) {
+                None
+            } else {
+                Some(fallback.bg)
+            },
         };
         if let Some(pet_fp) = decos.pet_cursor(frame, free) {
             fp ^= pet_fp.rotate_left(29);

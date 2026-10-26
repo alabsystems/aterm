@@ -63,6 +63,11 @@ int-bag-mlp = []
 # Test and debug builds have them without it; aterm-lab is to turn it on in
 # stage D, and no release binary names it.
 aos-learn = ["aos-candidates"]
+# DEVELOPMENT SEAMS in an optimized build: the cursor glow's cost for its beams' runs
+# (`CursorGlow::set_ramp_cost`), which the effects harness's `--ramp-cost` sweep sets
+# (`docs/measured/card-engine-b5-2026-10-24.md`, round 3). Test and debug builds have it
+# without this; aterm-bench's `dev-seams` forwards here, and no release binary names it.
+dev-seams = []
 
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on

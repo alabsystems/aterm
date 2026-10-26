@@ -236,8 +236,11 @@ pub fn disk_await_liveness() -> aterm_spec::derive::Liveness {
 ///   out (5); `aged`: a settled or out episode parked a cooldown ago, so a look that reads the
 ///   volume short opens a new one in its place (`Expire`, then the opening);
 /// - `pX`: X was elected this episode; `lX`: the lines X took this episode; `asks`: the lines
-///   the lease counted; `cool`: a line went within the cooldown; `rose`: free space rose a GiB
-///   since a line; `raised`: the owner's disk line says the asks ran out. A's `pA` says more: 1,
+///   the lease counted; `cool`: a line went within the cooldown; `rose`: the asked session freed
+///   a GiB since a line (what aterm's own passes free meanwhile, on either host, recorded in the
+///   lease or still under way, the lease takes out of the rise it judges, so to the model it is
+///   no rise and no step: `rose` stays 0); `raised`: the owner's disk line says the asks ran out.
+///   A's `pA` says more: 1,
 ///   elected; 2, gone back to the episode as its host held it while owed (`ReturnA`), so it may
 ///   be elected once more; 3, elected that once more and owed. A 3 is kept only while A is owed,
 ///   and a 2 is dropped as the episode parks, as nothing there reads them;
@@ -628,6 +631,11 @@ pub fn disk_free_ask_model() -> Model {
                 sret = if (wA == 1 && pA == 2) { 1 } else { 0 };
                 wA = 0;
             }
+            action FreedUnrisen when (Buggy == 18 && free <= 3 && phase == 3 && rose == 0) {
+                phase = 4;
+                owner = 0;
+                pA = if (pA == 2) { 0 } else { pA };
+            }
             action ExpireEarly when (
                 Buggy == 12 && phase > 3 && cool == 0 && done == 1 && free <= 2
             ) {
@@ -662,6 +670,7 @@ pub fn disk_free_ask_model() -> Model {
             invariant HeldIsReleased: swall == 0;
             invariant HeldIsWaitedFor: swait == 0;
             invariant ReturnedIsWaitedFor: sret == 0;
+            invariant FreedOnlyByAgent: phase <= 3 || phase > 4 || rose == 1;
             bound PhaseBox: phase <= 5;
             bound AsksBox: asks <= 3;
             bound FreeBox: free <= 4;

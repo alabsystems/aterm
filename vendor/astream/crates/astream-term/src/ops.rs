@@ -106,6 +106,14 @@ pub enum ScreenOp {
         /// G1 rather than G0.
         g1: bool,
     },
+    /// Set the left and right margins (DECSLRM under DECLRMM) to 0-based
+    /// inclusive columns `[left, right]`, `left < right`; homes the cursor.
+    SetLeftRightMargins {
+        /// The left margin (0-based, inclusive).
+        left: u16,
+        /// The right margin (0-based, inclusive).
+        right: u16,
+    },
     /// Scroll the region up `n` lines (`SU`); the cursor stays.
     ScrollUp(u16),
     /// Scroll the region down `n` lines (`SD`); the cursor stays.

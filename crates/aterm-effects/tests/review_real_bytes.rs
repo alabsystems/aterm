@@ -267,7 +267,7 @@ struct ReplayHost {
 impl ReplayHost {
     fn new(take: &Take) -> Self {
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, take.cols);
         Self {
             term: Terminal::new(take.rows as u16, take.cols as u16),
@@ -554,7 +554,7 @@ impl Composer {
         let mut term = Terminal::new(COMPOSER_ROWS as u16, cols as u16);
         term.process(b"\x1b[?1049h\x1b[2J");
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, cols);
         let mut h = Self {
             term,

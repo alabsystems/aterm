@@ -100,7 +100,8 @@ Leave as is, and their rows still show the value now and the value setup wants. 
 aterm finds the ALab signal while the first-launch review is up, an untouched review
 shows the whole profile and counts 30 seconds again; once its own plan has run, System
 State offers the added groups as a review of their own, in its tab without taking
-yours, and Cancel there keeps the plan as yours. A Stop while it widens puts that plan
+yours, and Cancel there keeps the plan as yours; after you press Stop, no such review
+comes for the run you stopped in that launch. A Stop while it widens puts that plan
 back as yours, never widened again; a plan you shaped, or a Restore left, is never
 changed, and pressing any group,
 even to what it already is, makes the plan yours. The first launch shows what setup
@@ -131,7 +132,8 @@ Setup choices:
 Approved setup resumes unfinished steps on later launches, silently, and so does a
 choice cut short by a quit or a crash, which still sets only what it changed. A choice
 made while another setup holds the records (another aterm, or aterm doctor in a
-terminal) waits for it and is applied when it finishes, as is a Restore; a later choice
+terminal) waits for it and is applied when it finishes, as are a Restore and the ALab
+review's Apply; a later choice
 replaces it until it starts writing, and the page says it waits, with no failure. A saved setup record that
 cannot be parsed twice in a row is kept beside itself as <name>.unreadable, and setup
 goes on as from a fresh one: your Mac settings left as they are, aterm's permissions
@@ -146,7 +148,10 @@ times, and System State shows it waiting meanwhile, saying Failed only once thos
 are spent. It then stays Failed until something it waits on changes, you press Check
 again or Set up now or make a choice, or aterm launches again; switching windows does not
 try it again. One only you can fix (a GitHub token to renew in the vault, Apple's Command
-Line Tools to install) reads Needs you with what to do; System State reads GitHub
+Line Tools to install) reads Needs you with what to do. Apple's Command Line Tools install
+in a terminal tab of their own, which aterm opens by itself once per Mac and where you type
+your password; while they install the GitHub repositories row waits calmly, and once that
+tab is closed without them, the row's Install… opens it again. System State reads GitHub
 repositories again whenever you return to it, and by itself only once a renewed token
 reaches this Mac through the vault. A join turns sync on; with sync turned off since, the join lands
 once you turn it on again (`aterm secrets agent on`), and the run does not wait for it.
@@ -578,7 +583,7 @@ LIMITS
         name: "ai",
         tagline: "this machine's AI CLIs: one working login each, the doctor, reviews across AIs",
         body: Some(
-            r#"ai — this machine's AI CLIs (`aterm ai`): `claude`, `codex`, `agy` and `muse`.
+            r#"ai — this machine's AI CLIs (`aterm ai`): `claude`, `codex`, `agy`, `muse` and `grok`.
 
   aterm ai [status] | doctor | login <cli> | review | fleet   (`aterm ai --help`)
 
@@ -589,8 +594,10 @@ THE DOCTOR
   `--on <host>,…` or `--fleet` checks other machines over ssh). `aterm ai login
   claude` runs `aterm harness accounts renew`; `aterm ai login codex|grok|kimi` runs
   `aterm harness accounts renew <label> --cli <cli>` where this machine keeps that
-  CLI's roster (`accounts-<cli>.toml`). Where it does not, codex runs its own login,
-  and grok and kimi (no rows of `aterm ai` yet) say how to add a row and run nothing.
+  CLI's roster (`accounts-<cli>.toml`). Where it does not, codex and grok run their
+  own login (grok's `login --device-auth` over SSH), and kimi (no row of `aterm ai`
+  yet) says how to add a row and runs nothing. grok is installed only where a person
+  asks (`aterm pkg install grok`); until then its row is `off` and needs nobody.
   A renewal whose page waits on a person stops `needs-sign-in` and prints
   `NEEDS YOU: sign <label> in once…`. `aterm harness accounts browser <label> --cli
   <cli>` opens that row's own browser profile in a window at the vendor's sign-in page.
@@ -651,8 +658,10 @@ signs it in as `account`, git's credential settings and the keychain are left as
 are. It clones `owner`'s repositories the token can reach into `~/<repo>`. A clean
 checkout behind GitHub's default branch is fast-forwarded from origin, running no
 hook; any other is left as it is, saying why. With no secrets vault configured,
-`init` first offers to join the ALab vault (`http://alab-secrets.local:7484/v1/alab`)
-or one you name (`aterm help secrets`).
+`init` joins the ALab vault (`http://alab-secrets.local:7484/v1/alab`) when it answers
+on this network, asking only its join password, or the vault `--vault <url|path>`
+names; with neither it asks nothing, and a vault join an admin has yet to approve
+finishes by itself (`aterm help secrets`).
 "#,
         ),
     },
@@ -1021,6 +1030,12 @@ HOW IT WORKS & GOTCHAS
     kimi's flag is `--auto` (Never Ask), so aterm's `--yolo` takes over Kimi's own
     `-y`/`--yolo` (Ask When Needed) and drops `-y`, `--yes` and `--auto-approve` beside it.
     The agent's own updater (`claude update`) runs `aterm pkg update <program>`.
+  * Signed out, grok opens accounts.x.ai in the default browser on every launch. Inside a
+    session its twin first runs `aterm harness signin --cli grok --wait`: one sandboxed
+    sign-in for the machine, one need with its code and page, no page opened; grok runs
+    only once that exits 0, else the twin exits 69. `login`, `logout`, `--help`, `-p`, the
+    one-shot options and the local subcommands (`doctor`, `mcp`, `inspect`, …) skip it, and
+    so does `--no-harness`; `dashboard` and every other subcommand are gated.
   * A toolchain build stages at once and goes live once no running build holds the old
     one (`aterm pkg lease`). A `trust` build whose `rustc` and `trustc` differ runs from
     a copy-on-write exec root, `<prefix>/compat/trust/<build>/`.
@@ -2366,8 +2381,14 @@ AGENTS
   transcript), `agent=agy` (Antigravity CLI, on the model its quota rotation picks:
   `aterm harness agy pick`), `agent=muse` (Muse Code). `agent=codex` is codex-alab,
   which carries itself: it trusts its folder by its own rule (`harness policy`'s
-  approve level and trust roots), and `result` reads its rollout. `agent=gemini`, the
-  retired Gemini CLI, is refused by name: agy replaces it.
+  approve level and trust roots), and `result` reads its rollout. `agent=grok` (Grok
+  Build) is refused (`ERR spawn agent=grok: …`) until aterm reads its turn end. Then
+  a worker with no usable sign-in file (missing, empty or refused) is `stalled
+  why=signin` before anything is installed (only a person signs in: signed out, Grok
+  Build opens xAI's sign-in page by itself), and a missing `grok` is then installed
+  by atpkg's verified install (naming it opts the Mac in; a hold or a failed install
+  is `stalled why=install`).
+  `agent=gemini`, the retired Gemini CLI, is refused by name: agy replaces it.
 
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<abs-path>] - < task
@@ -2375,7 +2396,7 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
   aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
   aterm ctl --host <h> @<w> result | status | text | screen
   aterm ctl --host <h> @<w> turn [settle=submitted] '<line>' | key <k> | send <text>
-  aterm ctl --host <h> hold <w> on|off
+  aterm ctl --host <h> hold <w> on|off   (<w> bare: no @)
   aterm ctl --host <h> @<w> close
 
 THE SURVEY & CHANNELS

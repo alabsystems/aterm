@@ -1258,6 +1258,30 @@ pub(crate) struct NativeUiCompileStamp {
     pub(crate) paint_revision: u64,
 }
 
+impl NativeUiCompileStamp {
+    /// Whether `other` compiles the same content: the same view at the same lifecycle, config,
+    /// update, document and presentation revisions (geometry and paint left out).
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        (
+            self.instance,
+            self.view,
+            self.generation,
+            self.config_revision,
+            self.update_revision,
+            self.document_seq,
+            self.presentation_revision,
+        ) == (
+            other.instance,
+            other.view,
+            other.generation,
+            other.config_revision,
+            other.update_revision,
+            other.document_seq,
+            other.presentation_revision,
+        )
+    }
+}
+
 fn native_appearance_revision(preferences: crate::native_appearance::AppearancePreferences) -> u64 {
     use std::hash::{Hash, Hasher};
 
@@ -2259,7 +2283,27 @@ impl App {
             Some(existing) => union_native_damage(existing, damage),
             None => damage,
         });
+        cache.native_paint_serial = cache.native_paint_serial.wrapping_add(1);
         window.last_present = None;
+    }
+
+    /// The paint serial of `view` in window `wid`: it rises with every change to what the view
+    /// draws, and a raster carries the serial it was painted at.
+    pub(crate) fn native_paint_serial(&self, wid: WindowId, view: crate::tab_model::ViewId) -> u64 {
+        self.windows
+            .get(&wid)
+            .and_then(|window| window.leaf_render_cache.get(&view))
+            .map_or(0, |cache| cache.native_paint_serial)
+    }
+
+    /// Raise `view`'s paint serial past every raster painted so far: what the view draws changed
+    /// now, and only pixels painted from here on show it.
+    fn note_native_paint(&mut self, wid: WindowId, view: crate::tab_model::ViewId) -> u64 {
+        self.windows.get_mut(&wid).map_or(0, |window| {
+            let cache = window.leaf_render_cache.entry(view).or_default();
+            cache.native_paint_serial = cache.native_paint_serial.wrapping_add(1);
+            cache.native_paint_serial
+        })
     }
 
     fn repaint_native_view(
@@ -2798,6 +2842,26 @@ impl App {
         {
             self.interact_system_state_view(wid, view);
         }
+        // A KEY THAT MOVES BY WHAT THE PAGE SHOWS ACTS ON THE PAGE AS IT IS NOW: Settings steps
+        // its list by the screens its last layout recorded, so a list no render has laid out
+        // since it changed (a page just opened, a search typed, the window or text resized) is
+        // laid out first. Page Down sent before a page's first frame took the step of the page
+        // before it (Terminal at 80x24 skipped Bidirectional text opened from Manual, went to its
+        // end from Messages). A key on a list already laid out compiles nothing.
+        if matches!(
+            event,
+            AppEvent::ScrollPage(_)
+                | AppEvent::ScrollLines(_)
+                | AppEvent::ScrollAt { .. }
+                | AppEvent::StepFocus(_)
+        ) && let Ok(viewport) = self.native_ui_viewport(wid)
+            && matches!(
+                self.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Settings(state)) if state.unlaid(viewport)
+            )
+        {
+            let _ = self.compiled_native_ui(wid);
+        }
         let event = match event {
             AppEvent::ScrollAt { lines, .. } if kind != crate::native_app::AppKind::Settings => {
                 AppEvent::ScrollLines(lines)
@@ -3056,7 +3120,7 @@ impl App {
         }
     }
 
-    /// Time only a handled native input that changed the current view's revision.
+    /// Time only a handled native input that changed what the current view draws.
     pub(crate) fn timed_native_input_event(
         &mut self,
         wid: WindowId,
@@ -3067,6 +3131,7 @@ impl App {
             return self.native_input_event(wid, event);
         };
         let before = self.native_ui_compile_stamp(wid).ok();
+        let painted = before.map(|stamp| self.native_paint_serial(wid, stamp.view));
         let serial = self
             .windows
             .get(&wid)
@@ -3077,17 +3142,26 @@ impl App {
             .get(&wid)
             .zip(serial)
             .is_some_and(|(window, before)| window.native_dispatch_serial != before);
+        // The key is answered by any change to what its page draws: what it compiles from (an
+        // edit, a route) or damage to its pixels without a recompile (a focus move, a scroll, a
+        // caret step), timed to the first present of pixels painted after it.
         if taken
             && dispatched
             && let (Some(before), Ok(after)) = (before, self.native_ui_compile_stamp(wid))
-            && let Some(window) = self.windows.get_mut(&wid)
+            && before.instance == after.instance
+            && before.view == after.view
+            && (!before.same_content(&after)
+                || painted != Some(self.native_paint_serial(wid, after.view)))
         {
-            crate::metrics::note_native_window_input(
-                &mut window.present_metrics.pending_native_input,
-                before,
-                after,
-                arrival,
-            );
+            let serial = self.note_native_paint(wid, after.view);
+            if let Some(window) = self.windows.get_mut(&wid) {
+                crate::metrics::note_native_window_input(
+                    &mut window.present_metrics.pending_native_input,
+                    after.view,
+                    serial,
+                    arrival,
+                );
+            }
         }
         taken
     }
@@ -3343,12 +3417,22 @@ impl App {
                 ..
             } = event
         {
-            let _ = self.dispatch_native_event(
-                wid,
-                AppEvent::EditorConfigDiagnosticNavigate {
-                    previous: mods.contains(Modifiers::SHIFT),
-                },
+            let allowed = matches!(
+                (
+                    self.native_runtime.app(instance),
+                    self.native_runtime.view_state(active_view),
+                ),
+                (Some(crate::native_app::NativeApp::Editor(editor)), Some(crate::native_app::AppViewState::Editor(view)))
+                    if editor.can_navigate_config_diagnostics(view)
             );
+            if allowed {
+                let _ = self.dispatch_native_event(
+                    wid,
+                    AppEvent::EditorConfigDiagnosticNavigate {
+                        previous: mods.contains(Modifiers::SHIFT),
+                    },
+                );
+            }
             return true;
         }
         if !editor_active
@@ -3716,12 +3800,13 @@ impl App {
         if let Some(state) = self.native_runtime.view_state_mut(view) {
             state.common_mut().focus_visible = focus_visible;
         }
+        self.note_native_handled_dispatch(wid);
         self.request_redraw_all_windows();
         Ok(outcome.result)
     }
 
     fn move_native_focus(&mut self, wid: WindowId, backwards: bool) -> Result<(), String> {
-        let (instance, view) = self
+        let (_, view) = self
             .active_native_view(wid)
             .ok_or_else(|| "active tab is not a native app".to_string())?;
         let current = self
@@ -3823,19 +3908,7 @@ impl App {
             }
             key
         };
-        self.invalidate_native_view_cache(wid, view, DamageRegion::All);
-        let outcome = self
-            .native_runtime
-            .dispatch(instance, view, AppEvent::FocusChanged(Some(key)))
-            .map_err(|error| format!("native focus failed: {error:?}"))?;
-        for effect in outcome.effects {
-            self.execute_native_effect(wid, instance, view, effect)?;
-        }
-        if let Some(state) = self.native_runtime.view_state_mut(view) {
-            state.common_mut().focus_visible = true;
-        }
-        self.request_redraw_all_windows();
-        Ok(())
+        self.focus_native_control(wid, view, key, true).map(|_| ())
     }
 
     fn native_space_types_into_search(&self, wid: WindowId) -> bool {
@@ -6379,7 +6452,7 @@ impl App {
                         message: "That Settings page no longer exists".to_string(),
                     };
                 };
-                if self.open_settings_tab(route) {
+                if self.open_settings_tab_in_window(wid, route) {
                     RecoveryOutcome::Opened {
                         message: format!("Reopened Settings · {}", route.label()),
                     }
@@ -9828,10 +9901,9 @@ impl App {
         let failed_checkpoints = documents
             .iter()
             .filter(|document| {
-                matches!(
-                    self.document_store.phase(**document),
-                    Some(crate::document_store::DocumentPhase::Blocked { .. })
-                )
+                self.document_store
+                    .failed_checkpoint_seq(**document)
+                    .is_some()
             })
             .count();
         let pending_checkpoints = documents

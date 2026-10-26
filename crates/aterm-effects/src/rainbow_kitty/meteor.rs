@@ -9,8 +9,9 @@ use aterm_time::Instant;
 use std::time::Duration;
 
 use aterm_render::{
-    BeamClip, BeamVertex, GlowBlend, GlowQuad, HaloMode, RainHalo, RibbonVertex, comet_beam,
-    premul_rgb, ribbon_beam, ribbon_beam_v,
+    BeamClip, BeamRows, BeamVertex, GlowBlend, GlowEnd, GlowQuad, GlowRamps, HaloMode, RainHalo,
+    RampMark, RampSink, RibbonVertex, end_alpha, end_color, glow_end, premul_rgb, ribbon_beam_into,
+    ribbon_beam_v,
 };
 
 use crate::cursor_glow::{BandPx, Geom, InkRole, band_row, night_rgb};
@@ -526,7 +527,7 @@ const _: () = assert!(
     "a spike root inside the landing cell's own rows is light on the caret, not from it"
 );
 
-/// The aa fringe [`comet_beam`] adds outside the nominal stroke, in `ch`.
+/// The aa fringe [`comet_beam`](aterm_render::comet_beam) adds outside the nominal stroke, in `ch`.
 pub const BURST_AA_SUPPORT_CH: f32 = 0.04;
 
 const _: () = assert!(
@@ -584,7 +585,7 @@ pub const BURST_SEC_THICK_CH: [f32; 3] = [0.22, 0.15, 0.08];
 /// How much of the root's coverage the tip keeps.
 pub const BURST_TIP_FADE: f32 = 0.45;
 
-/// The floor of [`comet_beam`]'s major-axis stride for a core spike, px.
+/// The floor of [`comet_beam`](aterm_render::comet_beam)'s major-axis stride for a core spike, px.
 pub const BURST_STEP_PX: usize = 2;
 
 /// The core's stride as a share of the cell, floored at [`BURST_STEP_PX`].
@@ -634,7 +635,7 @@ pub const JET_STATIONS_PER_CELL: usize = SLABS_PER_CELL;
 /// How many cells each side of the caret the landing row is probed.
 pub const JET_PROBE_CELLS: i32 = 14;
 
-/// The floor of [`comet_beam`]'s major-axis stride for a jet, px.
+/// The floor of [`comet_beam`](aterm_render::comet_beam)'s major-axis stride for a jet, px.
 pub const JET_STEP_PX: usize = 4;
 
 /// The jets' stride as a share of the cell, floored at [`JET_STEP_PX`].
@@ -1601,10 +1602,21 @@ impl Meteors {
         if self.reduced {
             return false;
         }
-        self.live.iter().any(|m| match m.retired_at {
-            Some(_) => now < m.end(),
-            None => now < m.arrival() + ROOT_SUCK_DUR,
-        }) || self.landings.iter().any(|l| now < l.moving_until())
+        for m in &self.live {
+            let active = match m.retired_at {
+                Some(_) => now < m.end(),
+                None => now < m.arrival() + ROOT_SUCK_DUR,
+            };
+            if active {
+                return true;
+            }
+        }
+        for l in &self.landings {
+            if now < l.moving_until() {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -1612,10 +1624,21 @@ impl Meteors {
         if self.reduced {
             return false;
         }
-        self.live.iter().any(|m| match m.retired_at {
-            Some(_) => now < m.end(),
-            None => now < m.arrival() + PIN_DUR,
-        }) || self.landings.iter().any(|l| now < l.pin.at + PIN_DUR)
+        for m in &self.live {
+            let active = match m.retired_at {
+                Some(_) => now < m.end(),
+                None => now < m.arrival() + PIN_DUR,
+            };
+            if active {
+                return true;
+            }
+        }
+        for l in &self.landings {
+            if now < l.pin.at + PIN_DUR {
+                return true;
+            }
+        }
+        false
     }
 
     /// The cadence law: the next instant a meteor changes what is on glass, `None` at rest.
@@ -1888,14 +1911,19 @@ impl Meteors {
             let mut landed = None;
             for (i, x) in self.live.iter().enumerate() {
                 if x.retired_at.is_none() {
-                    fallback.get_or_insert(i);
+                    if fallback.is_none() {
+                        fallback = Some(i);
+                    }
                     if !x.in_flight_at(at) {
                         landed = Some(i);
                         break;
                     }
                 }
             }
-            let Some(i) = landed.or(fallback) else {
+            let Some(i) = (match landed {
+                Some(i) => Some(i),
+                None => fallback,
+            }) else {
                 break;
             };
             self.live[i].retired_at = Some(at);
@@ -2309,6 +2337,69 @@ impl<'a> Behind<'a> {
         }
     }
 
+    /// [`Self::cut_quads`] for the ramps laid since `from`: each lit row in a
+    /// band's reach keeps the light [`Self::at`] leaves it at the slab's
+    /// centre column, as the quad it stands for is cut (a row left under a
+    /// 255th of its light is no light). A train's slabs never overlap, so
+    /// cutting a row in place draws what laying its piece last drew. A row
+    /// the cut leaves lit but of no colour is the dark piece the quad's cut
+    /// lays, laid into `quads` as that piece: it draws nothing, and every
+    /// count of the stream counts it as the legacy one does.
+    fn cut_ramps(self, (quads, ramps): (&mut Vec<GlowQuad>, &mut GlowRamps), from: RampMark) {
+        if !self.on || self.keep.rows().is_empty() {
+            return;
+        }
+        let k0 = from.items();
+        for i in k0..ramps.items.len() {
+            let r = ramps.items[i];
+            debug_assert_eq!(r.joined, 0, "a train lays rows, no run: {r:?}");
+            let (x0, y0) = (i32::from(r.x), i32::from(r.y));
+            let (x1, y1) = (x0 + i32::from(r.w), y0 + i32::from(r.h));
+            if self.zone((x0, x1), (y0, y1)).is_none() {
+                continue;
+            }
+            let cx = 0.5 * (x0 + x1) as f32;
+            for row in 0..r.h {
+                let y = y0 + i32::from(row);
+                let k = r.ink as usize + 2 * usize::from(row);
+                let (a, b) = (ramps.ends[k], ramps.ends[k + 1]);
+                if a | b == 0 || self.zone((x0, x1), (y, y + 1)).is_none() {
+                    continue;
+                }
+                let s = self.at(cx, y as f32 + 0.5);
+                let (a, b) = if s * 255.0 < 1.0 {
+                    (0, 0)
+                } else if s < 1.0 {
+                    let cov = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+                    let scale = |e: GlowEnd| {
+                        glow_end(
+                            premul_rgb(end_color(e), cov),
+                            (f32::from(end_alpha(e)) * s).round() as u8,
+                        )
+                    };
+                    (scale(a), scale(b))
+                } else {
+                    continue;
+                };
+                ramps.ends[k] = a;
+                ramps.ends[k + 1] = b;
+                if a | b == 0 {
+                    ramps.lit -= 1;
+                    if s * 255.0 >= 1.0 {
+                        quads.push(GlowQuad {
+                            row: r.row,
+                            x: r.x,
+                            y: y as u16,
+                            w: r.w,
+                            h: 1,
+                            ..GlowQuad::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// [`Self::cut_quads`] for the head's lights: a halo's rect splits
     /// losslessly, its falloff held by its centre and radii.
     fn cut_halos(self, halos: &mut Vec<RainHalo>, from: usize) {
@@ -2563,40 +2654,62 @@ fn draw_train(
     let light = !ctx.cfg.dark_theme;
 
     build_stations(verts, m, f, ctx, Layer::Colour, (square, clean, warm), text);
-    let from = frame.under.len();
-    let cap = from + UNDER_QUAD_CAP;
     let blend = if light {
         GlowBlend::Over
     } else {
         GlowBlend::Add
     };
-    rasterize(frame.under, clip, verts, f.axis, step, cap, blend);
-    text.cut_quads(frame.under, from);
+    rasterize(
+        &mut frame.under_sink(),
+        clip,
+        verts,
+        (f.axis, step),
+        UNDER_QUAD_CAP,
+        blend,
+        text,
+    );
 
     if light {
         return;
     }
     build_stations(verts, m, f, ctx, Layer::White, (square, clean, warm), text);
-    let from = frame.out.len();
-    let cap = from + WHITE_QUAD_CAP;
-    rasterize(frame.out, clip, verts, f.axis, step, cap, GlowBlend::Add);
-    text.cut_quads(frame.out, from);
+    rasterize(
+        &mut frame.out_sink(),
+        clip,
+        verts,
+        (f.axis, step),
+        WHITE_QUAD_CAP,
+        GlowBlend::Add,
+        text,
+    );
 }
 
+/// Lay one train into `out` within `cap` lights of what it holds, then take
+/// it out of the lettered rows' bands ([`Behind::cut_quads`]): an x-major
+/// train's slabs as ramps, a y-major one's column strips as quads.
 #[inline]
 fn rasterize(
-    out: &mut Vec<GlowQuad>,
+    out: &mut RampSink<'_>,
     clip: BeamClip,
     verts: &[RibbonVertex],
-    axis: Axis,
-    step: usize,
+    (axis, step): (Axis, usize),
     cap: usize,
     blend: GlowBlend,
+    text: Behind<'_>,
 ) {
+    let (from, ramps_from) = out.mark();
     match axis {
-        Axis::Horizontal => ribbon_beam(out, clip, verts, 1.0, step, cap, blend),
-        Axis::Vertical => ribbon_beam_v(out, clip, verts, 1.0, step, cap, blend),
-    };
+        Axis::Horizontal => {
+            let cap = out.laid() + cap;
+            ribbon_beam_into(out, clip, verts, 1.0, step, cap, blend);
+        }
+        Axis::Vertical => {
+            let cap = out.quads().len() + cap;
+            ribbon_beam_v(out.quads(), clip, verts, 1.0, step, cap, blend);
+        }
+    }
+    text.cut_quads(out.quads(), from);
+    text.cut_ramps(out.stream(), ramps_from);
 }
 
 fn build_stations(
@@ -2653,10 +2766,11 @@ fn build_stations(
     let ends_peak = if light || square || !clean || ease_head + ease_tail <= span * (30.0 / 32.0) {
         1.0
     } else {
-        (0..=32)
-            .map(|i| ends(span * i as f32 / 32.0))
-            .fold(0.0f32, f32::max)
-            .max(1e-3)
+        let mut peak = 1e-3_f32;
+        for i in 0..=32 {
+            peak = peak.max(ends((span * i as f32) * (1.0 / 32.0)));
+        }
+        peak
     };
     let inv_ends_peak = 1.0 / ends_peak;
     let inv_colour_fall = 1.0 / (COLOUR_FALLOFF_SHARE * f.l);
@@ -2665,12 +2779,7 @@ fn build_stations(
     let fine = END_EASE_STATIONS as f32;
     let inv_fine = 1.0 / fine;
     let inv_body_n = 1.0 / ((n - 1) as f32);
-    let head_zone = (0..END_EASE_STATIONS).map(|i| ease_head * (i as f32) * inv_fine);
-    let body = (0..n)
-        .map(|k| span * (k as f32) * inv_body_n)
-        .filter(|&s| s >= ease_head && s <= span - ease_tail);
-    let tail_zone =
-        (1..=END_EASE_STATIONS).map(|i| span - ease_tail * (fine - i as f32) * inv_fine);
+    let tail_start = span - ease_tail;
     let light_cap = if rail > 0.0 {
         LIGHT_RAIL_ALPHA_CAP
     } else {
@@ -2682,7 +2791,45 @@ fn build_stations(
     let lay_step = (1.0 / cw) * WALK_LAY_RATE * gain;
     let mut last_paper_rgb: Option<((u32, u32), u32)> = None;
     let mut last_warm_gain: Option<(u32, f32)> = None;
-    for s in head_zone.chain(body).chain(tail_zone) {
+    let mut phase = 0u8;
+    let mut idx = 0usize;
+    loop {
+        let s = match phase {
+            0 => {
+                if idx < END_EASE_STATIONS {
+                    let s = ease_head * (idx as f32) * inv_fine;
+                    idx += 1;
+                    s
+                } else {
+                    phase = 1;
+                    idx = 0;
+                    continue;
+                }
+            }
+            1 => {
+                if idx < n {
+                    let s = span * (idx as f32) * inv_body_n;
+                    idx += 1;
+                    if s < ease_head || s > tail_start {
+                        continue;
+                    }
+                    s
+                } else {
+                    phase = 2;
+                    idx = 1;
+                    continue;
+                }
+            }
+            _ => {
+                if idx <= END_EASE_STATIONS {
+                    let s = span - ease_tail * (fine - idx as f32) * inv_fine;
+                    idx += 1;
+                    s
+                } else {
+                    break;
+                }
+            }
+        };
         let end_ease = ends(s);
         if end_ease <= 0.0 {
             continue;
@@ -3205,7 +3352,7 @@ fn burst_lance(
     }
     let clip = ctx.geom.beam_clip();
     let inv_cw = 1.0 / (ctx.geom.cw as f32).max(1.0);
-    let page = light.then_some(ctx.cfg.theme_bg);
+    let page = if light { Some(ctx.cfg.theme_bg) } else { None };
     let inv_span = 1.0 / span;
     let inv_stations = 1.0 / (BURST_SEC_STATIONS - 1) as f32;
     let light_ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
@@ -3257,7 +3404,7 @@ fn burst_lance(
                     cov: (cov * (1.0 - BURST_TIP_FADE * t)).clamp(0.0, 255.0) as u8,
                 });
             }
-            comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+            frame.lay_beam(clip, thick, step);
         }
         s0 = s1;
     }
@@ -3287,7 +3434,7 @@ fn burst_jet(
     let clip = ctx.geom.beam_clip();
     let ink_gain = if light { LIGHT_INK_GAIN } else { 1.0 };
     let alpha_cap = if light { LIGHT_ALPHA_CAP } else { 255.0 };
-    let page = light.then_some(ctx.cfg.theme_bg);
+    let page = if light { Some(ctx.cfg.theme_bg) } else { None };
     let step = burst_step(ch, JET_STEP_CH_SHARE, JET_STEP_PX);
     let sec_end = [root + span * JET_SEC_SHARE[0], tip];
     let inv_cw = 1.0 / cw;
@@ -3318,7 +3465,7 @@ fn burst_jet(
             let cell = (dx * inv_cw).round() as i32;
             if !sky.row_blank(cell) {
                 if !light && !frame.beams.is_empty() {
-                    comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+                    frame.lay_beam(clip, thick, step);
                     frame.beams.clear();
                 }
                 continue;
@@ -3329,7 +3476,7 @@ fn burst_jet(
             let c = (cov * fade * ink_gain).min(alpha_cap);
             if c < 1.0 {
                 if !light && !frame.beams.is_empty() {
-                    comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+                    frame.lay_beam(clip, thick, step);
                     frame.beams.clear();
                 }
                 continue;
@@ -3354,7 +3501,7 @@ fn burst_jet(
             }
         }
         if !light {
-            comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+            frame.lay_beam(clip, thick, step);
         }
         s0 = s1;
     }
@@ -3379,7 +3526,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     }
     let light = !ctx.cfg.dark_theme;
     let mut light_ink_memo: Option<(u32, u32)> = None;
-    let cap = frame.out.len() + BURST_QUAD_CAP;
+    let cap = frame.out_ramps.laid(frame.out.len()) + BURST_QUAD_CAP;
     let rise_px = (FAN_RISE_MAX_CH * ch - 1.0).max(1.0);
     let n = usize::from(b.n).min(BURST_N_MAX);
     let root = BURST_ROOT_CH * ch;
@@ -3392,7 +3539,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     let half_root_thick = sec_thick[0] * 0.5;
     let core_step = burst_step(ch, BURST_STEP_CH_SHARE, BURST_STEP_PX);
     for slot in 0..n {
-        if frame.out.len() >= cap {
+        if frame.out_ramps.laid(frame.out.len()) >= cap {
             break;
         }
         let i = usize::from(b.order[slot]);
@@ -3425,7 +3572,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     }
     for (k, &len_share) in JET_LEN_SHARE.iter().enumerate() {
         for si in 0..2 {
-            if frame.out.len() >= cap {
+            if frame.out_ramps.laid(frame.out.len()) >= cap {
                 return;
             }
             let dir = b.jet_dir[k * 2 + si];
@@ -3552,8 +3699,11 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
             }
             let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
             if ink > 0 {
-                let c = *light_stops[stop]
-                    .get_or_insert_with(|| paper_mark_ink(spectrum_stop(stop), ctx.cfg.theme_bg));
+                let c = match light_stops[stop] {
+                    Some(c) => c,
+                    None => *light_stops[stop]
+                        .insert(paper_mark_ink(spectrum_stop(stop), ctx.cfg.theme_bg)),
+                };
                 push_ink_rect(frame.out, geom, (x - arm, y, 2 * arm + 1, 1), c, ink);
                 push_ink_rect(frame.out, geom, (x, y - arm, 1, 2 * arm + 1), c, ink);
             }
@@ -3677,9 +3827,11 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> La
             t_land: m.t_land,
             band: m.band,
         },
-        burst: m
-            .ring
-            .then(|| mint_burst(mix32(seed ^ 0xB0B5), at, m.cells)),
+        burst: if m.ring {
+            Some(mint_burst(mix32(seed ^ 0xB0B5), at, m.cells))
+        } else {
+            None
+        },
         flash: m.ring,
         fan: Fan {
             at,
@@ -3887,6 +4039,8 @@ mod tests {
     struct Scratch {
         under: Vec<GlowQuad>,
         out: Vec<GlowQuad>,
+        under_ramps: aterm_render::GlowRamps,
+        out_ramps: aterm_render::GlowRamps,
         halos: Vec<RainHalo>,
         beams: Vec<BeamVertex>,
         cues: Vec<SoundCue>,
@@ -3897,12 +4051,15 @@ mod tests {
             Frame {
                 under: &mut self.under,
                 out: &mut self.out,
+                under_ramps: &mut self.under_ramps,
+                out_ramps: &mut self.out_ramps,
                 halos: &mut self.halos,
                 beams: &mut self.beams,
                 cues: &mut self.cues,
                 caret: CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
+                rows_cost: Some(aterm_render::RampCost::NEVER),
             }
         }
         fn clear(&mut self) {
@@ -4604,6 +4761,72 @@ mod tests {
             dark.iter().any(|q| near(&l, q)),
             "control: the dark pin's arms reach by the block"
         );
+    }
+
+    /// A train's ramps cut behind a lettered row are the quads their rows
+    /// stand for cut ([`Behind::cut_ramps`], lane B5): the same lights, and
+    /// a row the cut leaves lit but of no colour is the dark piece the
+    /// quad's cut lays, so the stream counts alike (the negative control
+    /// lays no dark piece).
+    #[test]
+    fn ramps_cut_behind_text_are_their_quads_cut() {
+        let mut keep = KeepOut::default();
+        keep.set_rows([(40, 200, 60, 80)]);
+        let cut = |text: Behind<'_>, dark_pieces: bool| {
+            // Two slabs down through the row's band: dim additive rows (the
+            // eased edge cuts the dimmest to no colour) and source-over ones.
+            let lead = GlowQuad::flat(2, 0, 50, 4, 4, 0x0010_1010, 0);
+            let (mut legacy, mut quads) = (vec![lead], vec![lead]);
+            let mut ramps = GlowRamps::default();
+            let mark = ramps.mark();
+            {
+                let mut sink =
+                    RampSink::new(&mut quads, &mut ramps).costed(aterm_render::RampCost::ALWAYS);
+                for (x, over) in [(60u16, false), (120, true)] {
+                    sink.slab();
+                    for y in 50u16..92 {
+                        let band = i32::from(y / 20);
+                        let c = u32::from(1 + y % 4) * 0x0001_0101;
+                        let (a, b) = if over {
+                            ((c * 8, 0x40), (c * 6, 0x30))
+                        } else {
+                            ((c, 0), (c * 2, 0))
+                        };
+                        sink.row(band, band as u16, (x, y, 24), a, b);
+                        legacy.row(band, band as u16, (x, y, 24), a, b);
+                    }
+                }
+            }
+            text.cut_quads(&mut legacy, 1);
+            if dark_pieces {
+                text.cut_ramps((&mut quads, &mut ramps), mark);
+            } else {
+                let mut none = Vec::new();
+                text.cut_ramps((&mut none, &mut ramps), mark);
+            }
+            let mut got = Vec::new();
+            ramps.expand_into(&quads, &mut got);
+            let key = |q: &GlowQuad| (q.y, q.x, q.w, q.h, q.color, q.alpha, q.color2, q.alpha2);
+            got.sort_by_key(key);
+            legacy.sort_by_key(key);
+            let dark = legacy
+                .iter()
+                .filter(|q| q.color | q.color2 == 0 && q.alpha | q.alpha2 == 0)
+                .count();
+            (got == legacy, ramps.laid(quads.len()) == legacy.len(), dark)
+        };
+        for text in [
+            Behind::bodies(&keep, true),
+            Behind::bodies(&keep, true).guarded(),
+        ] {
+            let (same, counted, dark) = cut(text, true);
+            assert!(same && counted, "the cut ramps are the cut quads");
+            assert!(dark > 0, "premise: the cut leaves a dark piece");
+            assert!(
+                !cut(text, false).1,
+                "control: without its dark pieces the stream counts short"
+            );
+        }
     }
 
     /// The head's own lights at `at`, alone: each live meteor's head drawn

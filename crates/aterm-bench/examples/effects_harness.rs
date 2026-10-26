@@ -268,19 +268,25 @@ const WAYS: [Way; 5] = [
 
 fn clear_streams(input: &mut RenderInput) {
     input.glow_under.clear();
+    input.glow_under_ramps.clear();
     input.nova_add.clear();
     input.cursor_glow_add.clear();
+    input.cursor_glow_add_ramps.clear();
     input.glow_halo.clear();
     input.fire_patch.clear();
     input.char_fg.clear();
     input.fire_halo.clear();
 }
 
+/// The frame's fx lights, a glow stream's lit ramp rows each the quad it
+/// stands for.
 fn fx_quads(input: &RenderInput) -> u64 {
     [
-        input.glow_under.len(),
+        input.glow_under_ramps.laid(input.glow_under.len()),
         input.nova_add.len(),
-        input.cursor_glow_add.len(),
+        input
+            .cursor_glow_add_ramps
+            .laid(input.cursor_glow_add.len()),
         input.glow_halo.len(),
         input.fire_patch.len(),
         input.char_fg.len(),
@@ -313,6 +319,13 @@ struct Sample {
     raster: Spent,
     fx_quads: u64,
     under_quads: u64,
+    /// The ramps the glow streams carry (`glow_under`, `cursor_glow_add`).
+    under_ramps: u64,
+    add_ramps: u64,
+    /// The lights the two streams' ramps carry, and the rows of ends they
+    /// keep (a run's rows one), for the ramps' cost model.
+    ramp_lights: u64,
+    ramp_rows: u64,
     /// The pipeline scenes' sprites ([`sprite_items`]).
     sprites: u64,
     /// The texel bytes the frame uploaded, across its arms ([`pipeline_scene`]).
@@ -438,6 +451,60 @@ struct Rig {
     frames: usize,
     reference: Reference,
     refs: Vec<RefSample>,
+    /// The sweep's cost for the beams' runs (`--ramp-cost`), in place of the
+    /// measured one.
+    ramp_cost: Option<aterm_render::RampCost>,
+}
+
+/// The cost sweep's knobs (`docs/measured/card-engine-b5-2026-10-24.md`, round 3): the beams'
+/// runs folded under `--ramp-cost LIGHT,RAMP` (`never`: every row its quad) in place of the
+/// measured cost, and their ramps drawn by `--ramps-fx fx` in the fx stream or by
+/// `--ramps-fx instances` as the glow instances their rows stand for, in place of the measured
+/// rule. Both are development seams; a harness run without them lays and draws what a shipped
+/// build does.
+struct Knobs {
+    ramp_cost: Option<aterm_render::RampCost>,
+    ramps_fx: Option<aterm_gpu::RampsFx>,
+}
+
+impl Knobs {
+    fn from_args() -> Self {
+        let value = |flag: &str| std::env::args().skip_while(|a| a != flag).nth(1);
+        let ramp_cost = value("--ramp-cost").map(|v| {
+            if v == "never" {
+                return aterm_render::RampCost::NEVER;
+            }
+            let parts: Vec<u32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            match parts[..] {
+                [light, ramp] => aterm_render::RampCost { light, ramp },
+                _ => fail(format!("--ramp-cost {v}: LIGHT,RAMP in ns, or never")),
+            }
+        });
+        let ramps_fx = value("--ramps-fx").map(|v| match v.as_str() {
+            "fx" => aterm_gpu::RampsFx::Always,
+            "instances" => aterm_gpu::RampsFx::Never,
+            _ => fail(format!("--ramps-fx {v}: fx or instances")),
+        });
+        Self {
+            ramp_cost,
+            ramps_fx,
+        }
+    }
+
+    /// The knobs as the report names them (`measured` where unset).
+    fn names(&self) -> (String, &'static str) {
+        let cost = match self.ramp_cost {
+            None => "measured".to_string(),
+            Some(aterm_render::RampCost::NEVER) => "never".to_string(),
+            Some(c) => format!("{},{}", c.light, c.ramp),
+        };
+        let route = match self.ramps_fx {
+            None => "measured",
+            Some(aterm_gpu::RampsFx::Always) => "fx",
+            Some(aterm_gpu::RampsFx::Never) => "instances",
+        };
+        (cost, route)
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "wgpu-oracle"))]
@@ -460,7 +527,7 @@ fn skip(why: impl std::fmt::Display) -> ! {
 }
 
 impl Rig {
-    fn new() -> Self {
+    fn new(knobs: &Knobs) -> Self {
         let font = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
@@ -490,6 +557,7 @@ impl Rig {
         if wgpu {
             on_wgpu(&mut gpu);
         }
+        gpu.set_ramps_fx_for_test(knobs.ramps_fx);
         let (cw, ch) = cpu.cell_size();
         if gpu.cell_size() != (cw, ch) {
             fail("the two presenters disagree on the cell");
@@ -523,6 +591,7 @@ impl Rig {
             frames: 0,
             reference: Reference::new(),
             refs: Vec::new(),
+            ramp_cost: knobs.ramp_cost,
         }
     }
 
@@ -679,7 +748,13 @@ impl Rig {
             splice_ns,
             raster,
             fx_quads: fx_quads(input),
-            under_quads: input.glow_under.len() as u64,
+            under_quads: input.glow_under_ramps.laid(input.glow_under.len()) as u64,
+            under_ramps: input.glow_under_ramps.items.len() as u64,
+            add_ramps: input.cursor_glow_add_ramps.items.len() as u64,
+            ramp_lights: (input.glow_under_ramps.lit + input.cursor_glow_add_ramps.lit) as u64,
+            ramp_rows: ((input.glow_under_ramps.ends.len()
+                + input.cursor_glow_add_ramps.ends.len())
+                / 2) as u64,
             sprites: 0,
             uploads: 0,
             reader_waits: arms.iter().map(|a| a.shape.fx_reader_waits).sum(),
@@ -923,7 +998,7 @@ struct GlowHost {
 
 impl GlowHost {
     fn new(rig: &Rig, style: GlowStyle) -> Self {
-        Self {
+        let mut host = Self {
             fx: EffectsPipeline::for_window(),
             cfg: GlowConfig {
                 classic_mono: false,
@@ -951,7 +1026,11 @@ impl GlowHost {
             above: Vec::new(),
             below: Vec::new(),
             last_fp: 0,
+        };
+        if let Some(cost) = rig.ramp_cost {
+            host.glow().set_ramp_cost(cost);
         }
+        host
     }
 
     fn glow(&mut self) -> &mut CursorGlow {
@@ -1408,6 +1487,9 @@ fn pipeline_scene(
     let mut p = EffectsPipeline::new();
     p.set_focused(true);
     setup(&mut p);
+    if let Some(cost) = rig.ramp_cost {
+        p.cursor_mut().glow.set_ramp_cost(cost);
+    }
     let mut input = RenderInput::empty();
     let mut win = Win::new();
     Rig::extract(&mut term, &mut input);
@@ -1524,6 +1606,91 @@ fn pet_scene(rig: &mut Rig, seed: u64) -> Run {
     )
 }
 
+/// The icons scene's keys and cadence (pipeline ticks a key).
+const ICON_KEYS: usize = 48;
+const ICON_EVERY: usize = 3;
+/// What the icons scene types: feline words, each drawn under its icon by
+/// the word pass once typed.
+const ICON_PROSE: &[u8] = b"the cat naps; a kitty purrs by the cat flap ";
+
+/// The word icons' shade ([`CursorGlow::shade_word_icons`]) under the
+/// ribbon: the pipeline types feline words under the rainbow kitty, the word
+/// pass draws their icons on the typed row, and each frame the shade lifts
+/// the ribbon's light off them, its ramps cut in place.
+fn icons_scene(rig: &mut Rig) -> Run {
+    pipeline_scene(
+        rig,
+        "icons",
+        ICON_KEYS * ICON_EVERY + RUNOUT_TICKS,
+        |p| {
+            p.set_cursor_glow(
+                true,
+                "rainbow kitty",
+                aterm_effects::cursor_fx::TrailColor::Automatic,
+                None,
+                400,
+                24,
+                0.9,
+                0.8,
+                true,
+                0x0050_FA7B,
+            );
+            p.set_sparkle_enabled(true);
+            p.set_sparkle_classes(false, true, false);
+            p.set_sparkle_feline("cat", true, true, false);
+        },
+        |tick, p, term, input| {
+            if !tick.is_multiple_of(ICON_EVERY) || tick / ICON_EVERY >= ICON_KEYS {
+                return false;
+            }
+            type_char(
+                p,
+                term,
+                input,
+                ICON_PROSE[(tick / ICON_EVERY) % ICON_PROSE.len()],
+            );
+            true
+        },
+    )
+}
+
+/// `--frames PATH`: every measured frame of every scene, one tab-separated line each (its scene,
+/// run and place in the run; the ramps and the lit rows they carry; its main present's
+/// instances, fx instances, build, stage and encode CPU nanoseconds and GPU nanoseconds), the
+/// points the ramps' route costs are fitted on (`docs/measured/card-engine-b5-2026-10-24.md`,
+/// round 3): a scene's frames are the same frames in every process, so two processes drawing
+/// them by two routes pair frame by frame.
+fn write_frames(path: &str, scenes: &[Scene]) {
+    let mut out = String::from(
+        "scene\trun\tframe\tunder_ramps\tadd_ramps\tlit\tinstances\tfx_instances\tbuild_ns\t\
+         stage_ns\tencode_ns\tgpu_ns\n",
+    );
+    for scene in scenes {
+        for (r, run) in scene.runs.iter().enumerate() {
+            for (k, x) in run.samples.iter().enumerate() {
+                let a = x.off();
+                let _ = writeln!(
+                    out,
+                    "{}\t{r}\t{k}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    scene.name,
+                    x.under_ramps,
+                    x.add_ramps,
+                    x.ramp_lights,
+                    a.shape.total_instances(),
+                    a.shape.fx_instances,
+                    a.shape.build_ns,
+                    a.shape.stage_ns,
+                    a.encode_ns,
+                    a.gpu_ns.unwrap_or(0),
+                );
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(path, out) {
+        fail(format!("--frames {path}: {e}"));
+    }
+}
+
 fn pct(v: &mut [f64], p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -1536,6 +1703,11 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 type Figure = fn(&Sample) -> Option<f64>;
 
 type RefFigure = fn(&RefSample) -> Option<f64>;
+
+/// The mean of `v` (`0` when empty): a cost model sums a frame's costs.
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len().max(1) as f64
+}
 
 fn ns(v: u64) -> f64 {
     v as f64
@@ -1644,8 +1816,12 @@ impl Scene {
             format!("{s}_n"),
             self.runs.iter().map(|run| run.samples.len()).sum::<usize>() as u64,
         );
-        let timed: [(&str, Figure); 19] = [
+        let timed: [(&str, Figure); 21] = [
             ("emit", |x| Some(ns(x.emit.wall_ns))),
+            // The whole frame: its emission, splice and present.
+            ("frame_present", |x| {
+                Some(ns(x.emit.wall_ns + x.splice_ns + x.off().present_ns()))
+            }),
             ("emit_cpu", |x| Some(ns(x.emit.cpu_ns))),
             ("splice", |x| Some(ns(x.splice_ns))),
             ("raster", |x| Some(ns(x.raster.wall_ns))),
@@ -1654,6 +1830,9 @@ impl Scene {
             ("encode_cpu", |x| Some(ns(x.off().call_cpu_ns))),
             ("build", |x| Some(ns(x.off().shape.build_ns))),
             ("stage", |x| Some(ns(x.off().shape.stage_ns))),
+            ("build_stage", |x| {
+                Some(ns(x.off().shape.build_ns + x.off().shape.stage_ns))
+            }),
             ("gpu", |x| x.off().gpu_ns.map(ns)),
             ("present", |x| Some(ns(x.off().present_ns()))),
             ("thin_encode", |x| Some(ns(x.thin().encode_ns))),
@@ -1675,6 +1854,7 @@ impl Scene {
             r.num(format!("{s}_{what}_p50_us"), us(pct(&mut v, 50.0)));
             r.num(format!("{s}_{what}_p95_us"), us(pct(&mut v, 95.0)));
             r.num(format!("{s}_{what}_p99_us"), us(pct(&mut v, 99.0)));
+            r.num(format!("{s}_{what}_mean_us"), us(mean(&v)));
         }
         let mut present = self.pooled(|x| Some(ns(x.off().present_ns())));
         let present_p95 = pct(&mut present, 95.0).max(1.0);
@@ -1735,7 +1915,10 @@ impl Scene {
             format!("{s}_build_stage_pct"),
             100.0 * pct(&mut build_stage, 50.0) / present_p95,
         );
-        let counts: [(&str, Figure); 13] = [
+        // `ramp_frames` and `fx_frames` are 1 on a frame carrying a glow ramp
+        // or drawing an fx stream: their means are the shares of such frames,
+        // what the fx stream's opening costs a scene is weighed by.
+        let counts: [(&str, Figure); 19] = [
             ("passes", |x| Some(f64::from(x.off().shape.passes))),
             ("drop_passes", |x| Some(f64::from(x.drop().shape.passes))),
             ("split_passes", |x| Some(f64::from(x.split().shape.passes))),
@@ -1749,6 +1932,16 @@ impl Scene {
             ("instance_bytes", |x| Some(ns(x.off().shape.instance_bytes))),
             ("fx_quads", |x| Some(ns(x.fx_quads))),
             ("under_quads", |x| Some(ns(x.under_quads))),
+            ("under_ramps", |x| Some(ns(x.under_ramps))),
+            ("add_ramps", |x| Some(ns(x.add_ramps))),
+            ("ramp_lights", |x| Some(ns(x.ramp_lights))),
+            ("ramp_rows", |x| Some(ns(x.ramp_rows))),
+            ("ramp_frames", |x| {
+                Some(f64::from(u8::from(x.under_ramps + x.add_ramps > 0)))
+            }),
+            ("fx_frames", |x| {
+                Some(f64::from(u8::from(x.off().shape.fx_instances > 0)))
+            }),
             ("dirty_rows", |x| Some(ns(x.dirty_rows))),
             ("fx_instances", |x| {
                 Some(f64::from(x.off().shape.fx_instances))
@@ -1763,6 +1956,7 @@ impl Scene {
             let mut v = self.pooled(f);
             r.int(format!("{s}_{what}_p50"), pct(&mut v, 50.0) as u64);
             r.int(format!("{s}_{what}_max"), pct(&mut v, 100.0) as u64);
+            r.num(format!("{s}_{what}_mean"), mean(&v));
         }
         let uploaded: u64 = self.pooled(|x| Some(ns(x.uploads))).iter().sum::<f64>() as u64;
         r.int(
@@ -1870,6 +2064,7 @@ impl Scene {
             }
             let p50 = pct(&mut v, 50.0);
             r.num(format!("{s}_{what}_kins_p50"), p50 / 1_000.0);
+            r.num(format!("{s}_{what}_kins_mean"), mean(&v) / 1_000.0);
             r.num(format!("{s}_{what}_kins_p95"), pct(&mut v, 95.0) / 1_000.0);
             let p50s = self.run_p50s(f);
             let fastest = p50s.iter().copied().fold(f64::INFINITY, f64::min).max(1.0);
@@ -1961,7 +2156,7 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
 fn main() {
     if std::env::args().skip(1).any(|a| a == "--help") {
         println!(
-            "effects_harness [--light] [--wgpu] [--damage] [--only a,b,...]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet; fx_sparse under --damage)"
+            "effects_harness [--light] [--wgpu] [--damage] [--only a,b,...] [--ramp-cost LIGHT,RAMP|never] [--ramps-fx fx|instances] [--frames PATH]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet, icons; fx_sparse under --damage)"
         );
         return;
     }
@@ -1973,7 +2168,8 @@ fn main() {
         fail("could not install the GPU-time sink");
     }
     aterm_pty::declare_interactive_thread();
-    let mut rig = Rig::new();
+    let knobs = Knobs::from_args();
+    let mut rig = Rig::new(&knobs);
     let clocked = rig.clock != "none";
     let counted = rig.counter != "none";
     eprintln!(
@@ -2007,6 +2203,7 @@ fn main() {
             ("rain", true),
             ("cats", true),
             ("pet", true),
+            ("icons", true),
         ]
     };
     let mut scenes: Vec<Scene> = cards
@@ -2082,6 +2279,9 @@ fn main() {
         if wanted("pet") {
             runs.push(("pet", pet_scene(&mut rig, seed)));
         }
+        if wanted("icons") {
+            runs.push(("icons", icons_scene(&mut rig)));
+        }
         if run < WARMUP {
             for (name, run) in runs {
                 if let Some(scene) = scenes.iter_mut().find(|s| s.name == name) {
@@ -2096,6 +2296,9 @@ fn main() {
             }
         }
         eprintln!("effects_harness: run {}/{RUNS} done", run + 1 - WARMUP);
+    }
+    if let Some(path) = std::env::args().skip_while(|a| a != "--frames").nth(1) {
+        write_frames(&path, &scenes);
     }
     if counted {
         for scene in &scenes {
@@ -2118,6 +2321,9 @@ fn main() {
         "fetch_probe",
         rig.gpu.fetch_probe().map_or("unminted", FetchProbe::name),
     );
+    let (ramp_cost, ramps_fx) = knobs.names();
+    report.text("ramp_cost", &ramp_cost);
+    report.text("ramps_fx", ramps_fx);
     report.int("runs", RUNS as u64);
     report.int("warmup", WARMUP as u64);
     report.int("rows", ROWS as u64);

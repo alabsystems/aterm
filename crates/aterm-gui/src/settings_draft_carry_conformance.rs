@@ -691,6 +691,7 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
         )
         .unwrap();
         let snapshot = app.document_store.snapshot(document).unwrap();
+        let checkpoint = app.document_store.checkpoint_seq(document);
         let pending = app.native_documents.persistence.begin(&snapshot).unwrap();
         app.native_runtime.set_document_saving(document, true);
         let error = app
@@ -711,25 +712,47 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
             )
             .unwrap_err();
         assert!(error.contains("the disk is full"), "{error}");
-        assert!(matches!(
+        assert_eq!(
             app.document_store.phase(document),
-            Some(crate::document_store::DocumentPhase::Blocked { .. })
-        ));
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().seq,
+            snapshot.seq
+        );
+        assert_eq!(app.document_store.checkpoint_seq(document), checkpoint);
+        assert_eq!(
+            app.document_store.failed_checkpoint_seq(document),
+            Some(snapshot.seq)
+        );
         (app, document)
     };
 
     let (file, uri, journals) = desk("windowed");
     let (mut app, document) = failed_save(true, &uri, &journals);
+    let failed = app.document_store.snapshot(document).unwrap();
+    let checkpoint = app.document_store.checkpoint_seq(document);
     app.dispatch_native_event(
         wid(),
         AppEvent::TextInput(TextInputEvent::Commit("more ".into())),
     )
     .unwrap();
-    assert_eq!(
-        &*app.document_store.snapshot(document).unwrap().text,
-        "unsaved on disk\n",
-        "the failed checkpoint froze the outgoing editor at the head it could not save"
+    let outgoing = app.document_store.snapshot(document).unwrap();
+    assert!(
+        outgoing.seq > failed.seq,
+        "outgoing input commits after Save failure"
     );
+    assert_eq!(
+        outgoing.text.as_ref(),
+        "unsaved more on disk\n",
+        "the handoff must carry the newer editable draft, not just the failed save's bytes"
+    );
+    assert_eq!(app.document_store.checkpoint_seq(document), checkpoint);
+    assert_eq!(
+        app.document_store.failed_checkpoint_seq(document),
+        Some(failed.seq)
+    );
+    assert_eq!(app.document_store.dirty(document), Some(true));
     let token = app
         .revalidate_native_update_safety()
         .expect("a failed checkpoint whose draft is journaled no longer holds the update");
@@ -758,27 +781,29 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
     successor.restore_into_window(wid(), tab_only_layout(&layout, "editor"));
     let (instance, _) = successor.active_native_view(wid()).unwrap();
     let reopened = successor.native_runtime.document_id(instance).unwrap();
+    let restored = successor.document_store.snapshot(reopened).unwrap();
     assert_eq!(
-        &*successor.document_store.snapshot(reopened).unwrap().text,
-        "unsaved on disk\n",
-        "the successor holds the text the failed save could not write"
+        restored.text, outgoing.text,
+        "the successor holds every edit through the failed save and subsequent input"
     );
     assert_eq!(successor.document_store.dirty(reopened), Some(true));
     successor
         .dispatch_native_event(
             wid(),
-            AppEvent::TextInput(TextInputEvent::Commit("more ".into())),
+            AppEvent::TextInput(TextInputEvent::Commit("later ".into())),
         )
         .unwrap();
+    let edited = successor.document_store.snapshot(reopened).unwrap();
+    assert!(edited.seq > restored.seq);
     assert!(
-        successor
-            .document_store
-            .snapshot(reopened)
-            .unwrap()
-            .text
-            .contains("more "),
-        "the successor's editor takes edits again, to be saved there"
+        edited.text.contains("later "),
+        "the successor's editor takes a distinct later edit"
     );
+    assert_eq!(
+        edited.text.replacen("later ", "", 1),
+        outgoing.text.as_ref()
+    );
+    assert_eq!(successor.document_store.dirty(reopened), Some(true));
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "on disk\n",

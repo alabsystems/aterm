@@ -138,7 +138,7 @@ pub(crate) fn recovery_transition(
                 12 => {
                     store
                         .transact_logins(NOW, &mut None, |state, logins| {
-                            accounts::move_account(state, logins, "account", "moved");
+                            accounts::move_account(state, logins, "account", "moved")?;
                             Ok(Vec::new())
                         })
                         .unwrap();
@@ -220,7 +220,7 @@ pub(crate) fn recovery_transition(
                 for (from, to) in [(from, to), (to, from)] {
                     store
                         .transact_logins(NOW - 20, &mut None, |state, logins| {
-                            accounts::move_account(state, logins, from, to);
+                            accounts::move_account(state, logins, from, to)?;
                             Ok(Vec::new())
                         })
                         .unwrap();

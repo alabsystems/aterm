@@ -105,6 +105,8 @@ struct Document {
     projection: Arc<str>,
     revision: u64,
     checkpoint_seq: Seq,
+    /// A failed checkpoint remains evidence until a durable acknowledgement covers its sequence.
+    failed_checkpoint: Option<Seq>,
     /// Each attached view's published sequence, updated in the same synchronous lane as the Surface commit, before another input event can be routed.
     views: BTreeMap<DocumentViewId, Seq>,
     phase: DocumentPhase,
@@ -178,6 +180,7 @@ impl DocumentStore {
             projection,
             revision: 1,
             checkpoint_seq: head,
+            failed_checkpoint: None,
             views: BTreeMap::new(),
             phase: DocumentPhase::Suspended,
         };
@@ -240,6 +243,13 @@ impl DocumentStore {
         self.documents
             .get(&id)
             .map(|document| document.checkpoint_seq)
+    }
+
+    /// The failed checkpoint no later durable acknowledgement has covered, independent of close state.
+    pub fn failed_checkpoint_seq(&self, id: DocumentId) -> Option<Seq> {
+        self.documents
+            .get(&id)
+            .and_then(|document| document.failed_checkpoint)
     }
 
     pub fn phase(&self, id: DocumentId) -> Option<DocumentPhase> {
@@ -442,6 +452,12 @@ impl DocumentStore {
         if durable > document.head() {
             return Err(DocumentError::CheckpointAheadOfHead);
         }
+        if document
+            .failed_checkpoint
+            .is_some_and(|failed| durable >= failed)
+        {
+            document.failed_checkpoint = None;
+        }
         if durable > document.checkpoint_seq {
             document.checkpoint_seq = durable;
         }
@@ -458,6 +474,7 @@ impl DocumentStore {
         }
     }
 
+    /// Record a checkpoint failure without starting a close; an existing close keeps its frozen sequence.
     pub fn checkpoint_fail(&mut self, id: DocumentId) -> Result<Seq, DocumentError> {
         let document = self
             .documents
@@ -465,11 +482,12 @@ impl DocumentStore {
             .ok_or(DocumentError::UnknownDocument)?;
         let requested = match document.phase {
             DocumentPhase::Closing { requested } | DocumentPhase::Blocked { requested } => {
+                document.phase = DocumentPhase::Blocked { requested };
                 requested
             }
             DocumentPhase::Active | DocumentPhase::Suspended => document.head(),
         };
-        document.phase = DocumentPhase::Blocked { requested };
+        document.failed_checkpoint = Some(requested);
         Ok(requested)
     }
 
@@ -773,6 +791,77 @@ mod tests {
     }
 
     #[test]
+    fn failed_checkpoint_keeps_open_documents_editable() {
+        for attached in [false, true] {
+            let (mut store, id) = open();
+            assert_eq!(store.failed_checkpoint_seq(id), None);
+            if attached {
+                store.attach_view(id, DocumentViewId(7)).unwrap();
+            }
+            let phase = store.phase(id);
+            assert_eq!(
+                phase,
+                Some(if attached {
+                    DocumentPhase::Active
+                } else {
+                    DocumentPhase::Suspended
+                })
+            );
+            let checkpoint = store.checkpoint_seq(id);
+            let base = store.snapshot(id).unwrap().seq;
+            let DocumentTxnOutcome::Committed { seq, .. } = store.transact(
+                id,
+                base,
+                vec![TextEdit {
+                    range: 0..0,
+                    insert: "x".into(),
+                }],
+            ) else {
+                panic!("the open document accepts an edit");
+            };
+
+            assert_eq!(store.checkpoint_fail(id).unwrap(), seq);
+            assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+            assert_eq!(store.phase(id), phase);
+            assert_eq!(store.checkpoint_seq(id), checkpoint);
+            assert_eq!(store.view_count(id), Some(usize::from(attached)));
+            let DocumentTxnOutcome::Committed { seq: later, .. } = store.transact(
+                id,
+                seq,
+                vec![TextEdit {
+                    range: 0..0,
+                    insert: "y".into(),
+                }],
+            ) else {
+                panic!("a failed ordinary checkpoint cannot freeze editing");
+            };
+            assert!(later > seq);
+            assert_eq!(store.snapshot(id).unwrap().text.as_ref(), "yxhello\nworld");
+            assert_eq!(store.phase(id), phase);
+            assert_eq!(store.dirty(id), Some(true));
+            assert_eq!(store.checkpoint_seq(id), checkpoint);
+            assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+            assert_eq!(
+                store.checkpoint_ack(id, base).unwrap(),
+                DocumentCloseReadiness::Pending { requested: later }
+            );
+            assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+            assert_eq!(
+                store.checkpoint_ack(id, seq).unwrap(),
+                DocumentCloseReadiness::Pending { requested: later }
+            );
+            assert_eq!(store.failed_checkpoint_seq(id), None);
+            assert_eq!(store.dirty(id), Some(true));
+            assert_eq!(
+                store.checkpoint_ack(id, later).unwrap(),
+                DocumentCloseReadiness::Ready { requested: later }
+            );
+            assert_eq!(store.phase(id), phase);
+            assert_eq!(store.dirty(id), Some(false));
+        }
+    }
+
+    #[test]
     fn failed_checkpoint_preserves_views_until_retry() {
         let (mut store, id) = open();
         let view = DocumentViewId(7);
@@ -788,19 +877,79 @@ mod tests {
         ) else {
             panic!("commit");
         };
-        store.prepare_close(id, &[view]).unwrap();
-        store.checkpoint_fail(id).unwrap();
-        assert!(matches!(
+        assert_eq!(
             store.prepare_close(id, &[view]).unwrap(),
-            DocumentCloseReadiness::Blocked { .. }
-        ));
-        assert_eq!(store.view_count(id), Some(1));
-        assert!(matches!(
+            DocumentCloseReadiness::Pending { requested: seq }
+        );
+        assert_eq!(
+            store.phase(id),
+            Some(DocumentPhase::Closing { requested: seq })
+        );
+        let late_edit = || {
+            vec![TextEdit {
+                range: 0..0,
+                insert: "late".into(),
+            }]
+        };
+        assert_eq!(
+            store.transact(id, seq, late_edit()),
+            DocumentTxnOutcome::Rejected(DocumentError::Closing)
+        );
+        for _ in 0..2 {
+            assert_eq!(store.checkpoint_fail(id).unwrap(), seq);
+            assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+            assert_eq!(
+                store.phase(id),
+                Some(DocumentPhase::Blocked { requested: seq })
+            );
+            assert_eq!(
+                store.prepare_close(id, &[view]).unwrap(),
+                DocumentCloseReadiness::Blocked { requested: seq }
+            );
+            assert_eq!(
+                store.transact(id, seq, late_edit()),
+                DocumentTxnOutcome::Rejected(DocumentError::Closing)
+            );
+            assert_eq!(store.snapshot(id).unwrap().seq, seq);
+            assert_eq!(store.snapshot(id).unwrap().text.as_ref(), "xhello\nworld");
+            assert_eq!(store.checkpoint_seq(id), Some(base));
+            assert_eq!(store.view_count(id), Some(1));
+        }
+        store.abort_close(id).unwrap();
+        assert_eq!(store.phase(id), Some(DocumentPhase::Active));
+        assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+        assert_eq!(
+            store.prepare_close(id, &[view]).unwrap(),
+            DocumentCloseReadiness::Pending { requested: seq }
+        );
+        assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+        assert_eq!(store.checkpoint_fail(id).unwrap(), seq);
+        assert_eq!(
             store.checkpoint_retry(id).unwrap(),
-            DocumentCloseReadiness::Pending { .. }
-        ));
-        store.checkpoint_ack(id, seq).unwrap();
+            DocumentCloseReadiness::Pending { requested: seq }
+        );
+        assert_eq!(store.failed_checkpoint_seq(id), Some(seq));
+        assert_eq!(
+            store.phase(id),
+            Some(DocumentPhase::Closing { requested: seq })
+        );
+        assert_eq!(
+            store.commit_detach(id, &[view]),
+            Err(DocumentError::CloseNotReady)
+        );
+        assert_eq!(
+            store.checkpoint_ack(id, seq).unwrap(),
+            DocumentCloseReadiness::Ready { requested: seq }
+        );
+        assert_eq!(store.failed_checkpoint_seq(id), None);
+        assert_eq!(
+            store.transact(id, seq, late_edit()),
+            DocumentTxnOutcome::Rejected(DocumentError::Closing)
+        );
         store.commit_detach(id, &[view]).unwrap();
+        assert_eq!(store.view_count(id), Some(0));
+        assert_eq!(store.phase(id), Some(DocumentPhase::Suspended));
+        assert_eq!(store.snapshot(id).unwrap().text.as_ref(), "xhello\nworld");
     }
 
     /// An ack past head is refused: `NativeSaveIntentLatch` relies on this for `durable <= head`.
@@ -809,11 +958,31 @@ mod tests {
         let (mut store, id) = open();
         let head = store.snapshot(id).unwrap().seq;
         let before = store.checkpoint_seq(id);
+        assert_eq!(store.checkpoint_fail(id).unwrap(), head);
+        assert_eq!(store.failed_checkpoint_seq(id), Some(head));
+        // Even a clean document's failed save remains evidence: the previously
+        // durable head is not a new acknowledgement of that failure.
+        let older = Seq(head
+            .0
+            .checked_sub(1)
+            .expect("opening appends a spine event"));
+        assert_eq!(
+            store.checkpoint_ack(id, older).unwrap(),
+            DocumentCloseReadiness::Ready { requested: head }
+        );
+        assert_eq!(store.checkpoint_seq(id), before);
+        assert_eq!(store.failed_checkpoint_seq(id), Some(head));
         assert_eq!(
             store.checkpoint_ack(id, Seq(head.0 + 1)),
             Err(DocumentError::CheckpointAheadOfHead)
         );
         assert_eq!(store.checkpoint_seq(id), before);
+        assert_eq!(store.failed_checkpoint_seq(id), Some(head));
+        assert_eq!(
+            store.checkpoint_ack(id, head).unwrap(),
+            DocumentCloseReadiness::Ready { requested: head }
+        );
+        assert_eq!(store.failed_checkpoint_seq(id), None);
     }
 
     #[test]

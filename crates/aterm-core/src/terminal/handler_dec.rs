@@ -847,8 +847,8 @@ impl TerminalHandler<'_> {
             };
             self.grid.set_cursor_following_content(row, col);
             if state.pending_wrap {
-                let max_col = self.grid.effective_cols_for_row(row).saturating_sub(1);
-                self.grid.set_pending_wrap(col >= max_col);
+                self.grid
+                    .set_pending_wrap(super::handler_state::at_a_line_end(self.grid, row, col));
             }
             self.style.update_cached_colors();
             self.grid.set_cursor_template(

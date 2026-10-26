@@ -56,6 +56,7 @@ pub const ENV_DEFAULT_EDITOR: &str = "ATERM_DEFAULT_EDITOR";
 /// Exact environment variable names stripped before spawning a PTY child.
 pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_DEBUG_SEAMLESS_REEXEC",
+    "ATERM_DEBUG_SEAMLESS_KEEP",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_DEBUG_STATUS_BARS",
     "ATERM_DEBUG_PASTE_FILE",
@@ -182,6 +183,7 @@ mod tests {
             ENV_EDGE_SIGNAL,
             ENV_OBSERVE_SESSION_ID,
             "ATERM_DEBUG_SEAMLESS_REEXEC",
+            "ATERM_DEBUG_SEAMLESS_KEEP",
             "ATERM_DEBUG_RELAUNCH_NUDGE",
             "ATERM_DEBUG_STATUS_BARS",
             "ATERM_DEBUG_CLIPBOARD_FILE",

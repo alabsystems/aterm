@@ -12,6 +12,45 @@ pub const MAX_TASK_BYTES: usize = 64 * 1024;
 /// The longest `timeout=` a `turn` over another Mac's drive takes (the step-in).
 pub const DRIVE_TURN_MAX_MS: u64 = 22_000;
 
+/// The options a `turn` reads before its text, past its leading `id=`, `if-supervisor=` and `cause=`.
+pub const TURN_OPTIONS: [&str; 15] = [
+    "idle",
+    "timeout",
+    "submit",
+    "submit_window",
+    "presses",
+    "submit_verify",
+    "settle",
+    "trim",
+    "typed",
+    "cadence",
+    "cap",
+    "yield",
+    "if-gen",
+    "if-rows",
+    "cause",
+];
+
+/// A `turn`'s options and its text as the server reads them from `rest` (past the leading `id=`, `if-supervisor=` and `cause=`): each `<option>=<value>` word of [`TURN_OPTIONS`] up to a `--`, which is taken, or the first word that is none, then the text verbatim.
+#[must_use]
+pub fn turn_option_words(rest: &str) -> (Vec<(&str, &str)>, &str) {
+    let mut options = Vec::new();
+    let mut text = rest.trim_start();
+    loop {
+        let (word, tail) = text
+            .split_once(char::is_whitespace)
+            .map_or((text, ""), |(word, tail)| (word, tail.trim_start()));
+        if word == "--" {
+            return (options, tail);
+        }
+        match word.split_once('=') {
+            Some((key, value)) if TURN_OPTIONS.contains(&key) => options.push((key, value)),
+            _ => return (options, text),
+        }
+        text = tail;
+    }
+}
+
 /// The line a server answers a worker's spawn head (`spawn … agent=<word> len=<n>`) with when it will read the n bytes of task that follow, its newline included.
 #[must_use]
 pub fn task_frame_go(len: usize) -> String {
@@ -836,7 +875,7 @@ pub const VERBS: &[VerbSpec] = &[
          denied: …` and closes the connection. Under `[fleet] allow = \"drive\"`, a node named by \
          `aterm fleet allow drive --from` and proved by its key also runs, as Owner, `@<sid> \
          status|text|screen|result|turn|key|send` on a hosted session, `hold <sid> on|off`, \
-         `spawn agent=<claude|codex|agy|muse>` with its task, `await task`, and `@<sid> close` \
+         `spawn agent=<claude|codex|agy|muse|grok>` with its task, `await task`, and `@<sid> close` \
          on a worker it spawned (`aterm help fleet`).",
     )
     .input(Input::NONE)
@@ -2195,14 +2234,16 @@ pub const VERBS: &[VerbSpec] = &[
              [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] \
              [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] \
              [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] \
-             [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`; they end at `--` or the \
-             first word that is not one of them (text that starts `<option>=` needs `--`, or \
-             `-- --` when no option but a leading `id=`, `if-supervisor=` or `cause=` comes \
-             before it). `presses=<n>` (default 3, max 10) retries the submit within \
-             `submit_window=<ms>` (default 2000). `settle=match:<re>` settles when a visible row \
-             matches; `settle=gone:<re>` waits for `<re>` to appear within `submit_window` and \
-             then leave (an idle settle when it never shows); `settle=submitted` returns once the \
-             submit is verified (`status=submitted`). `submit_verify=auto` (the default) \
+             [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`; they end at the first \
+             word that is not one of them, or at a `--` after one of them. A `--` before all of \
+             them (first, or after only a leading `id=`, `if-supervisor=` or `cause=`) ends only \
+             those leading ones, and the turn's options are read after it: text that starts \
+             `<option>=` needs `-- --` there, and one `--` after an option. `presses=<n>` \
+             (default 3, max 10) retries the submit within `submit_window=<ms>` (default 2000). \
+             `settle=match:<re>` settles when a visible row matches; `settle=gone:<re>` waits \
+             for `<re>` to appear within `submit_window` and then leave (an idle settle when it \
+             never shows); `settle=submitted` returns once the submit is verified \
+             (`status=submitted`). `submit_verify=auto` (the default) \
              verifies a Claude Code submit by the typed text leaving the composer, a shell's by \
              its command block, and any other program's (one with no shell integration among \
              them) by the screen, as `seq` does: content that moves, or the cursor leaving the \
@@ -2458,9 +2499,13 @@ pub const VERBS: &[VerbSpec] = &[
          modifiers. `move <r> <c>` targets window cell `<r>,<c>` (negative rows are the chrome \
          bands above row 0, e.g. `move -1 <c>`), replying `OK at=<row>,<col> px=<x>,<y>`; on a \
          native view `move key=<ui-key>` or `move xy=<x>,<y>` replies `OK at=native view=<id> \
-         x=<x> y=<y> key=<ui-key|-> px=<x>,<y>` (`ERR the page under the pointer changed …` while \
-         a changed view's next frame is unpresented). `pointer leave`, and `status` with no \
-         position, reply `OK at=-`. \
+         x=<x> y=<y> key=<ui-key|-> px=<x>,<y>`. If the action was dispatched but its position \
+         cannot be read back, replies `OK dispatched=1 readback=unavailable detail=<pct>` \
+         without position fields: inspect `status` or the view, never replay the action on \
+         that account. Dispatch does not guarantee a target-specific effect. `status` still \
+         returns an error when its frame is unavailable; transport failures can leave an \
+         action's outcome unknown. `pointer leave`, and `status` with no position, reply \
+         `OK at=-`. \
          `click` (Owner-only; 10 a minute on band capsules, else `ERR busy notice: 10 presses a \
          minute retry_ms=<ms>`) left-clicks where the pointer is. `wheel dy=<n> [dx=<n>] \
          [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]` scrolls (each `|n|<=10000`, not both 0). \
@@ -2476,10 +2521,12 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "resize <r> <c>: resize the engine + PTY (grid first, window echoed to match).",
-        "`resize px <w> <h>` resizes the front window in physical pixels and lets the grid follow \
-         from the platform resize event (measure with `metrics` `resize_present` and `dims` \
-         `layer_*`); accepted only for the focused pane of the front window's active tab (`ERR \
-         resize px: only the focused pane of the front window's active tab` otherwise).",
+        "With an app tab (Settings) in front, both forms resize the front window. `resize px <w> \
+         <h>` resizes the front window in physical pixels and lets the grid follow from the \
+         platform resize event (measure with `metrics` `resize_present` and `dims` `layer_*`); a \
+         headless window takes the size asked for, as the grid that fits it; accepted only for \
+         the focused pane of the front window's active tab (`ERR resize px: only the focused \
+         pane of the front window's active tab` otherwise).",
     )
     .input(Input::PTY.with(Input::FENCES)),
     v("focus", Write, Status, Session, "focus <in|out>: send a focus report", "")
@@ -2834,7 +2881,7 @@ pub const VERBS: &[VerbSpec] = &[
          connected=controlled|controller place=window|tab of=<sid> [cwd=<path>]` mints a `both` \
          connection with `of=<sid>` (`controller` sets `ATERM_OBSERVE_SESSION_ID`; `place=window` \
          is `ERR headless` without a GUI). Worker form (Owner-only): `spawn … \
-         agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
+         agent=<claude|codex|agy|muse|grok> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
          len=<n>` replies `GO <n>`, reads `<n>` task bytes (`1..=65536`, no NUL; `ERR spawn \
          agent=<word>: the task is <n> bytes (max 65536)` beyond; `agent=gemini`, the retired \
          Gemini CLI, is `ERR spawn agent=gemini: Gemini CLI is no longer supported: agy replaces \
@@ -2850,7 +2897,16 @@ pub const VERBS: &[VerbSpec] = &[
          if no agent composer (for `codex`, no proven claim) within 120 s of `since_ms=`, or \
          `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
          unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
-         false`, `headless = false`, or `autopilot = \"off\"`).",
+         false`, `headless = false`, or `autopilot = \"off\"`), and with `ERR spawn \
+         agent=<word>: <why>` for an agent whose turn end no reader sees yet (`grok`, until \
+         aterm reads Grok Build's turn end). Then a Grok Build worker with no usable sign-in \
+         file (a pooled `GROK_AUTH_PATH`, else `<GROK_HOME or ~/.grok>/auth.json`, missing, \
+         empty or one grok refused) is `stalled why=signin` before anything is installed, and \
+         only a person signs in; a missing `grok` is then installed by atpkg's \
+         verified install (naming it opts the machine in; `[packages] exclude` or a person's \
+         removal holds it back, and a hold or a failed install is `stalled why=install`); the \
+         startup deadline waits while it installs, and a launcher whose task is no longer \
+         `working` types nothing.",
     )
     .input(Input::NONE),
     v(
@@ -2880,8 +2936,9 @@ pub const VERBS: &[VerbSpec] = &[
          program_state=`, a codex's or Grok Build's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
          harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
-         (`why=startup|shell|held`; it resumes `working why=moved` or `working why=turn`). `why=` \
-         is `landed|marker|done-check|exit|shell|startup|held|turn|moved`. `rev=` increments on \
+         (`why=startup|shell|held|signin|install`; it resumes `working why=moved` or `working \
+         why=turn`). `why=` is `landed|marker|done-check|exit|shell|startup|held|turn|moved|\
+         signin|install`. `rev=` increments on \
          record changes and on `meta set attention owner=supervisor|needs|codex-alab` changes \
          (`status` and `sessions` carry `task_state=<state|-> task_rev=<n>`, `subscribe … events` \
          emits `EVENT <local> task rev=<n> state=<s> attention=<0|1> [why=<w>] [exit=<n>]`, and \

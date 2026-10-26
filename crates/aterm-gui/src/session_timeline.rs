@@ -716,6 +716,30 @@ impl SupervisorClaim {
     pub(crate) fn is_proven(&self) -> bool {
         self.identity().is_some()
     }
+
+    /// Whether the claim takes `duty` on its session (`docs/DESIGN-harness-repos-2026-10-24.md`
+    /// §8.1 item 4, §8.3): a rostered harness's scoped claim (contract v3, [`Self::scoped`]) takes
+    /// exactly the duties its scope names, and aterm keeps every other one; every other claim
+    /// (codex-alab's v2 self-claim, any foreign holder's) takes them all, as it always has.
+    #[must_use]
+    pub(crate) fn takes(&self, duty: aterm_agent::harness::contract::Scope) -> bool {
+        self.scoped
+            .as_ref()
+            .is_none_or(|s| s.claim.scopes.contains(duty))
+    }
+
+    /// Whether the claim speaks for its session's boxes and walls, so aterm raises no need for
+    /// them while it stands ([`crate::needs::NeedFacts::other_supervisor`]): it [takes](Self::takes)
+    /// `approvals`, `questions` and `walls` alike. One fact stands for all three, so a scope naming
+    /// only some of them speaks for none (a person hears of a box a harness might press, never
+    /// misses one nobody does); grok-alab's `relaunch,upgrade` speaks for none.
+    #[must_use]
+    pub(crate) fn speaks_for_boxes_and_walls(&self) -> bool {
+        use aterm_agent::harness::contract::Scope;
+        [Scope::Approvals, Scope::Questions, Scope::Walls]
+            .into_iter()
+            .all(|duty| self.takes(duty))
+    }
 }
 
 /// Whether `token` is a well-formed attention owner key or supervisor holder name.
@@ -1853,6 +1877,8 @@ pub(crate) struct SessionTimeline {
     handoff_ceiling: Option<u64>,
     task: Option<crate::task_record::TaskRecord>,
     worker_launch: Option<(std::time::Instant, String)>,
+    /// The worker's launcher is installing its program now (`task_launch::InstallingMark`).
+    worker_installing: bool,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
     program_shown: Option<ShownProgram>,
@@ -2690,6 +2716,18 @@ impl SessionTimeline {
     /// What the worker's launcher did with its line, and when.
     pub(crate) const fn worker_launch(&self) -> Option<&(std::time::Instant, String)> {
         self.worker_launch.as_ref()
+    }
+
+    /// Note whether the worker's launcher is installing its program now
+    /// (`task_launch::InstallingMark`).
+    pub(crate) fn set_worker_installing(&mut self, installing: bool) {
+        self.worker_installing = installing;
+    }
+
+    /// Whether the worker's launcher is installing its program now. The startup deadline does
+    /// not judge the worker while it is (`harness_host::look_at_startups`).
+    pub(crate) const fn worker_installing(&self) -> bool {
+        self.worker_installing
     }
 
     /// Publish the session's need verdict ([`Self::need`]).

@@ -369,7 +369,9 @@ impl App {
     fn palette_live_for_window(&self, wid: Option<crate::WindowId>) -> PaletteLive {
         let window = wid.and_then(|wid| self.windows.get(&wid));
         let has_selection = wid.is_some_and(|wid| {
-            if self.active_native_view(wid).is_some() {
+            if let Some(ready) = self.stats_lens_copy_ready(wid) {
+                ready
+            } else if self.active_native_view(wid).is_some() {
                 self.native_has_selection(wid)
             } else {
                 self.terminal_selection_in(wid, |term| {
@@ -495,13 +497,8 @@ impl App {
             false
         } else if self.front_rename_edit().is_some() {
             true
-        } else if self.front().is_some_and(|window| {
-            window
-                .stats_lens
-                .open
-                .is_some_and(|lens| lens.how != crate::stats_lens::Opened::Hover)
-        }) {
-            self.vitals.snapshot.is_some()
+        } else if let Some(ready) = front.and_then(|wid| self.stats_lens_copy_ready(wid)) {
+            ready
         } else if let Some(wid) = front.filter(|wid| self.active_native_view(*wid).is_some()) {
             self.native_has_selection(wid)
         } else if let Some(wid) = front {
@@ -662,7 +659,8 @@ impl App {
         self.settle_pointer_drags(wid);
         let _ = self.palette_claims_pointer(wid);
         self.invalidate_native_ui_cache(wid);
-        self.overlay_a11y_update();
+        #[cfg(a11y_tree)]
+        self.push_a11y_tree(wid);
         Ok(())
     }
 
@@ -2477,45 +2475,125 @@ mod tests {
 
     #[test]
     fn menu_copy_preserves_a_pinned_stats_sentence_owner_over_native_content() {
-        use crate::menu::{menu_live, set_menu_live};
+        use crate::menu::{MenuAction, menu_live, set_menu_live};
+        use crate::native_app::{AppEvent, TextInputEvent};
         use crate::stats_lens::Opened;
         use crate::stats_paint::{Bar, Instrument};
 
         let before = menu_live();
         let _stats = crate::stats_deck::tests::attach_stats();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.config
-            .sys
-            .get_or_insert_with(Default::default)
-            .stats_bars = Some("sill".into());
-        app.windows.get_mut(&wid).unwrap().metrics.pad = 24;
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        assert!(app.native_selection_text(wid).is_none());
-        app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
-        app.open_stats_lens(wid, Instrument::Cpu, Bar::Global, Opened::Pinned);
-        assert!(app.windows[&wid].stats_lens.open.is_some());
-        assert!(app.stats_lens_sentence(wid).is_some());
-        app.publish_menu_live();
-        assert!(menu_live().has_selection);
-        app.vitals.snapshot = None;
-        app.publish_menu_live();
-        assert!(
-            !menu_live().has_selection,
-            "no sentence exists without its snapshot"
-        );
-        app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
-        app.palette_enter();
-        app.publish_menu_live();
-        assert!(
-            !menu_live().has_selection,
-            "the palette takes input before the lens"
-        );
-        app.palette_exit();
-        app.close_stats_lens(wid);
-        app.publish_menu_live();
-        assert!(!menu_live().has_selection);
+        let mut readiness_mismatches = Vec::new();
+        for native in [false, true] {
+            for selected in [false, true] {
+                let mut app = App::headless_for_test();
+                let wid = WindowId(0);
+                let terminal = app.pool.get(0).unwrap().term.clone();
+                crate::term_lock(&terminal).process(b"terminal selection");
+                app.config
+                    .sys
+                    .get_or_insert_with(Default::default)
+                    .stats_bars = Some("sill".into());
+                app.windows.get_mut(&wid).unwrap().metrics.pad = 24;
+                if native {
+                    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                    if selected {
+                        app.find_requested_in(wid);
+                        app.dispatch_native_event(
+                            wid,
+                            AppEvent::TextInput(TextInputEvent::Commit("native selection".into())),
+                        )
+                        .unwrap();
+                    }
+                }
+                if selected {
+                    app.select_all_in(wid);
+                }
+                let content_selection = if native {
+                    app.native_selection_text(wid)
+                } else {
+                    app.window_selection_text(wid)
+                };
+                assert_eq!(content_selection.is_some(), selected);
+                let terminal_before = {
+                    let term = crate::term_lock(&terminal);
+                    (term.content_seq(), term.selection_to_string())
+                };
+                let snapshot = std::sync::Arc::new(crate::stats_deck::tests::snapshot());
+                for how in [Opened::Pinned, Opened::Keyboard, Opened::Hover] {
+                    app.vitals.snapshot = Some(snapshot.clone());
+                    app.open_stats_lens(wid, Instrument::Cpu, Bar::Global, how);
+                    assert!(app.windows[&wid].stats_lens.open.is_some());
+                    for has_snapshot in [true, false] {
+                        app.vitals.snapshot = has_snapshot.then(|| snapshot.clone());
+                        let expected = if how == Opened::Hover {
+                            content_selection.clone()
+                        } else {
+                            app.stats_lens_sentence(wid)
+                        };
+                        assert_eq!(
+                            expected.is_some(),
+                            how == Opened::Hover && selected
+                                || how != Opened::Hover && has_snapshot
+                        );
+                        app.publish_menu_live();
+                        if menu_live().has_selection != expected.is_some() {
+                            readiness_mismatches.push(format!(
+                                "menu native={native} selected={selected} {how:?} snapshot={has_snapshot}"
+                            ));
+                        }
+                        app.palette_enter();
+                        app.publish_menu_live();
+                        assert!(!menu_live().has_selection, "the palette owns menu input");
+                        let palette = app.windows[&wid].palette().unwrap();
+                        for (ready, source) in [
+                            (app.palette_live().has_selection, "palette predicate"),
+                            (
+                                palette.action_by_name("Copy") == Ok(MenuAction::Copy),
+                                "palette row",
+                            ),
+                        ] {
+                            if ready != expected.is_some() {
+                                readiness_mismatches.push(format!(
+                                    "{source} native={native} selected={selected} {how:?} snapshot={has_snapshot}"
+                                ));
+                            }
+                        }
+                        assert!(crate::control::pbcopy("keep clipboard"));
+                        assert!(
+                            !app.copy_selection_in(wid),
+                            "Copy cannot reach behind the palette"
+                        );
+                        assert_eq!(crate::control::pbpaste().as_deref(), Some("keep clipboard"));
+                        app.palette_exit();
+                        assert_eq!(app.windows[&wid].stats_lens.open.unwrap().how, how);
+                        assert_eq!(app.copy_selection_in(wid), expected.is_some());
+                        assert_eq!(
+                            crate::control::pbpaste().as_deref(),
+                            expected.as_deref().or(Some("keep clipboard"))
+                        );
+                        assert_eq!(
+                            if native {
+                                app.native_selection_text(wid)
+                            } else {
+                                app.window_selection_text(wid)
+                            },
+                            content_selection
+                        );
+                        let term = crate::term_lock(&terminal);
+                        assert_eq!(
+                            (term.content_seq(), term.selection_to_string()),
+                            terminal_before
+                        );
+                    }
+                    app.close_stats_lens(wid);
+                }
+                app.publish_menu_live();
+                assert_eq!(menu_live().has_selection, selected);
+                assert_eq!(app.palette_live().has_selection, selected);
+            }
+        }
         set_menu_live(before);
+        assert!(readiness_mismatches.is_empty(), "{readiness_mismatches:#?}");
     }
 
     #[test]

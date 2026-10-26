@@ -136,7 +136,7 @@ impl Host {
     fn with_composer(contract: Contract, after: &str) -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         term.process(
             format!(

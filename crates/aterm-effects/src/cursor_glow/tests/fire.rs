@@ -1008,7 +1008,19 @@ fn fire_embers_keep_off_probed_glyph_cells() {
             born: at,
         });
         let (mut out, mut halos) = (Vec::new(), Vec::new());
-        glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut Vec::new());
+        glow.emit_particles(
+            at,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut Vec::new(),
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
         halos
             .iter()
             .filter(|h| h.mode == HaloMode::Add)
@@ -2589,7 +2601,19 @@ fn the_light_fire_stands_up_out_of_the_line_and_its_embers_are_beads() {
         born: at,
     });
     let (mut out, mut halos) = (Vec::new(), Vec::new());
-    glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut Vec::new());
+    glow.emit_particles(
+        at,
+        &c,
+        g,
+        &mut out,
+        &mut halos,
+        &mut crate::cursor_glow::glow_sink(
+            &mut Vec::new(),
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        CursorGlow::MAX_QUADS,
+    );
     assert!(halos.is_empty(), "a light ember is a bead, not a veil");
     assert!(
         !out.is_empty() && out.iter().all(|q| q.alpha > 0),
@@ -3290,7 +3314,14 @@ fn a_word_icon_wears_no_fire() {
             let mut halos = glow.halos().to_vec();
             let mut patches = glow.patches().to_vec();
             if shade {
-                glow.shade_word_icons((&mut out, &mut under, &mut halos, &mut patches));
+                // This crate's unit tests fold the ramps into the quads
+                // (`CursorGlow::fold_glow_ramps`): the streams carry none.
+                glow.shade_word_icons((
+                    (&mut out, &mut GlowRamps::default()),
+                    (&mut under, &mut GlowRamps::default()),
+                    &mut halos,
+                    &mut patches,
+                ));
             }
             n += out
                 .iter()

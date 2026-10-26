@@ -1104,6 +1104,40 @@ fn local_account(email: &str, machine: &str, used: &BTreeSet<String>) -> Option<
         })
 }
 
+// A label can be reassigned by the fleet; only the explicit login address carries
+// the retained canonical-identity assertion to a new label. Ambiguity grants none.
+fn retained_login_row<'a>(existing: Option<&'a Roster>, email: &str) -> Option<&'a Row> {
+    if accounts::email_refusal(email).is_some() {
+        return None;
+    }
+    let mut rows = existing?.rows.iter().filter(|row| {
+        row.email
+            .as_deref()
+            .is_some_and(|held| accounts::email_matches(held, email))
+    });
+    let row = rows.next()?;
+    rows.next().is_none().then_some(row)
+}
+
+fn default_identity_hint<'a>(
+    existing: Option<&'a Roster>,
+    observed: Option<&'a str>,
+) -> Option<&'a str> {
+    observed
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .or_else(|| {
+            existing
+                .and_then(|roster| roster.row_for_login(None))
+                .filter(|row| {
+                    row.email
+                        .as_deref()
+                        .is_some_and(|email| accounts::email_refusal(email).is_none())
+                })
+                .and_then(Row::expected_identity_email)
+        })
+}
+
 /// Build the machine's [`Roster`] from `fleet` for `machine`. The row whose email is
 /// `default_email` is the default login's (no `dir`); where none of `machine`'s rows has that
 /// email, the default login holds an account they do not list, and the roster lists it too, as
@@ -1111,7 +1145,17 @@ fn local_account(email: &str, machine: &str, used: &BTreeSet<String>) -> Option<
 /// the label `existing` already gives that account where the fleet gives it to no account, else
 /// a new one ([`local_account`], unique among the fleet's labels and `existing`'s), so no label
 /// is kept on an account it is not and an account keeps its label while it can.
+/// With no observed profile email, the prior default row's declared identity remains the hint.
+/// An explicit alias expectation follows its unique login address across label changes.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAliasRelabel",
+        action = "Build",
+        project = "aterm_agent::harness::accounts_sync::alias_relabel_tests::alias_transition"
+    )
+)]
 pub fn build_machine_roster(
     fleet: &FleetRoster,
     machine: &str,
@@ -1123,15 +1167,9 @@ pub fn build_machine_roster(
     if fleet_rows.is_empty() {
         return existing.cloned().unwrap_or_default();
     }
-    let default_email = default_email.map(str::trim).filter(|de| !de.is_empty());
+    let default_email = default_identity_hint(existing, default_email);
     let matches_identity = |acct: &FleetAccount, email: &str| {
-        let expected = existing
-            .and_then(|roster| roster.row(&acct.label))
-            .filter(|row| {
-                row.email
-                    .as_deref()
-                    .is_some_and(|login| accounts::email_matches(login, &acct.email))
-            })
+        let expected = retained_login_row(existing, &acct.email)
             .and_then(Row::expected_identity_email)
             .unwrap_or(&acct.email);
         accounts::email_matches(expected, email)
@@ -1150,15 +1188,13 @@ pub fn build_machine_roster(
                 .or_else(|| {
                     let mut used: BTreeSet<String> =
                         fleet.accounts.iter().map(|a| a.label.clone()).collect();
-                    let kept = existing
-                        .and_then(|ex| {
-                            ex.rows.iter().find(|r| {
-                                r.expected_identity_email()
-                                    .is_some_and(|re| accounts::email_matches(re, de))
-                            })
+                    let kept = existing.and_then(|ex| {
+                        ex.rows.iter().find(|r| {
+                            r.expected_identity_email()
+                                .is_some_and(|re| accounts::email_matches(re, de))
                         })
-                        .filter(|row| !used.contains(&row.label));
-                    if let Some(kept) = kept {
+                    });
+                    if let Some(kept) = kept.filter(|row| !used.contains(&row.label)) {
                         return local_account(
                             kept.email.as_deref().unwrap_or(de),
                             machine,
@@ -1174,7 +1210,11 @@ pub fn build_machine_roster(
                             .iter()
                             .flat_map(|ex| ex.rows.iter().map(|r| r.label.clone())),
                     );
-                    local_account(de, machine, &used)
+                    local_account(
+                        kept.and_then(|row| row.email.as_deref()).unwrap_or(de),
+                        machine,
+                        &used,
+                    )
                 })
         });
     if let Some(acct) = &unlisted {
@@ -1211,18 +1251,13 @@ pub fn build_machine_roster(
         let browser = acct
             .browser
             .clone()
-            .or_else(|| existing_row.and_then(|r| r.browser.clone()));
+            .or_else(|| retained_login_row(existing, &acct.email).and_then(|r| r.browser.clone()));
         rows.push(Row {
             label: acct.label.clone(),
             class: acct.class,
             dir,
             email: Some(acct.email.clone()),
-            identity_email: existing_row
-                .filter(|row| {
-                    row.email
-                        .as_deref()
-                        .is_some_and(|email| accounts::email_matches(email, &acct.email))
-                })
+            identity_email: retained_login_row(existing, &acct.email)
                 .and_then(|row| row.identity_email.clone()),
             browser,
             was: Vec::new(),
@@ -1347,7 +1382,7 @@ pub fn configured_source(config: Option<&Path>, roster: Option<&Path>) -> Option
 
 /// Where this machine's Claude Code roster rows come from, in the order a sync from init reads
 /// its sources ([`sync_accounts_for_init`]): what `aterm harness accounts` says of its list, and
-/// where `accounts add` lists a row so that the next sync keeps it ([`fleet_origin`]).
+/// where `accounts add` or `adopt-default` lists a row so that the next sync keeps it ([`fleet_origin`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetOrigin {
     /// No fleet file and no source: `accounts.toml` is the list, as it was written.
@@ -1502,7 +1537,7 @@ fn opt_in_of(text: &str) -> Option<OptIn> {
 }
 
 /// Whether `fleet`, whose file records `opt_in`, is this machine's own list, which this machine
-/// writes (`accounts add` lists a row there): a fleet discovery made ([`OptIn::Discovered`]), or
+/// writes (`accounts add` or `adopt-default` lists a row there): a fleet discovery made ([`OptIn::Discovered`]), or
 /// a `named` one whose every row names one and the same machine alone. A fleet from a vault, a
 /// sheet or a URL lists the fleet's machines and stays as its source wrote it.
 fn fleet_of_this_machine(opt_in: Option<OptIn>, fleet: &FleetRoster) -> bool {
@@ -2182,6 +2217,31 @@ fn sync_lock_ladder() -> Vec<Duration> {
         .collect()
 }
 
+fn default_relocation(
+    existing: &Roster,
+    next: &Roster,
+) -> Result<Option<(String, String)>, String> {
+    let Some((was, now)) = existing.row_for_login(None).zip(next.row_for_login(None)) else {
+        return Ok(None);
+    };
+    if was.label == now.label
+        || !was
+            .email
+            .as_deref()
+            .zip(now.email.as_deref())
+            .is_some_and(|(was, now)| accounts::email_matches(was, now))
+    {
+        return Ok(None);
+    }
+    if existing.row(&now.label).is_some() {
+        return Err(format!(
+            "cannot relabel `{}` to `{}`: the previous roster already uses that label; choose an unused label; no new sync was published",
+            was.label, now.label
+        ));
+    }
+    Ok(Some((was.label.clone(), now.label.clone())))
+}
+
 fn persist_accounts_sync(
     store: &accounts::Store,
     roster_path: &Path,
@@ -2203,6 +2263,8 @@ fn persist_accounts_sync(
                 ladder.iter().sum::<Duration>().as_millis()
             )
         })?;
+    let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
+    let recovered = store.recover_sync_held(&held, &write_to)?;
     let fleet_path = roster_path
         .parent()
         .map(|p| p.join(FLEET_ROSTER_FILE))
@@ -2224,7 +2286,6 @@ fn persist_accounts_sync(
             );
         }
     }
-    let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
     let existing = Roster::load(&write_to).map_err(|why| {
         format!(
             "the roster at {} is refused: {why}; the roster is unchanged",
@@ -2232,6 +2293,14 @@ fn persist_accounts_sync(
         )
     })?;
     let roster = build_machine_roster(fleet, machine, store, Some(&existing), default_email);
+    if let Some(expected) = default_identity_hint(Some(&existing), default_email)
+        && !roster
+            .row_for_login(None)
+            .and_then(Row::expected_identity_email)
+            .is_some_and(|actual| accounts::email_matches(actual, expected))
+    {
+        return Err("the generated roster cannot represent the known default login; retain that account or free a row; no new sync was published".into());
+    }
     if roster.rows.is_empty() {
         return Err(format!(
             "no active Claude accounts found for machine `{machine}` in {}",
@@ -2241,6 +2310,37 @@ fn persist_accounts_sync(
     let roster_toml = format_roster_toml(&roster)
         .map_err(|why| format!("generated roster refused admission: {why}"))?;
     let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
+    // Source publication must not replace the account authority whose before images
+    // the local commit is about to retain, even through an existing path alias.
+    let destination = |path: &Path| -> Result<PathBuf, String> {
+        fs::canonicalize(path)
+            .or_else(|_| {
+                path.parent()
+                    .zip(path.file_name())
+                    .ok_or_else(|| io::Error::other("destination has no parent or name"))
+                    .and_then(|(parent, name)| {
+                        fs::canonicalize(parent).map(|parent| parent.join(name))
+                    })
+            })
+            .or_else(|_| std::path::absolute(path))
+            .map_err(|why| why.to_string())
+    };
+    let authority_dir = destination(&store.dir)?;
+    let authority_roster = destination(&write_to)?;
+    for path in std::iter::once(fleet_write_to.as_path()).chain(
+        fleet_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.publish)
+            .map(|snapshot| snapshot.path.as_path()),
+    ) {
+        let target = destination(path)?;
+        if target.starts_with(&authority_dir) || target == authority_roster {
+            return Err(format!(
+                "sync auxiliary destination {} overlaps the account store or roster; no new sync was published",
+                path.display()
+            ));
+        }
+    }
     let fleet_toml = fleet.to_toml_for(Some(opt_in));
     let default_row_label = roster.row_for_login(None).map(|r| r.label.clone());
     // The labels the fleet gave another account than the one the roster gave them: what is on
@@ -2249,28 +2349,35 @@ fn persist_accounts_sync(
         .rows
         .iter()
         .filter(|row| {
-            existing
-                .row(&row.label)
-                .and_then(|was| was.email.as_deref())
-                .zip(row.email.as_deref())
-                .is_some_and(|(was, now)| !accounts::email_matches(was, now))
+            existing.row(&row.label).is_some_and(|was| {
+                match (was.email.as_deref(), row.email.as_deref()) {
+                    (Some(was), Some(now)) => !accounts::email_matches(was, now),
+                    (None, Some(_)) => true,
+                    _ => false,
+                }
+            })
         })
         .map(|row| row.label.clone())
         .collect();
-    // The default login's account under a new label because the fleet gave its old one to
-    // another account: its record moves with it, and nothing was written over.
-    let default_moved = existing.row_for_login(None).and_then(|was| {
-        let now_row = roster.row_for_login(None)?;
-        (relabelled.contains(&was.label)
-            && now_row.label != was.label
-            && existing.row(&now_row.label).is_none()
-            && was
-                .email
-                .as_deref()
-                .zip(now_row.email.as_deref())
-                .is_some_and(|(was, now)| accounts::email_matches(was, now)))
-        .then(|| (was.label.clone(), now_row.label.clone()))
-    });
+    // A default login retains its state when its label moves, whether or not the old
+    // label is reused. Only an unchanged login address permits this metadata relocation.
+    let default_moved = default_relocation(&existing, &roster)?;
+    let legacy_assignments: Vec<&str> = roster
+        .rows
+        .iter()
+        .filter(|row| {
+            row.email.is_some()
+                && existing
+                    .row(&row.label)
+                    .is_some_and(|was| was.email.is_none())
+        })
+        .map(|row| row.label.as_str())
+        .collect();
+    if !legacy_assignments.is_empty() {
+        store
+            .check_new_labels(&legacy_assignments, now)
+            .map_err(|why| format!("cannot assign an identity to a retained legacy row: {why}"))?;
+    }
     // The row the default login held before: where the profile now names another row's account,
     // the vendor's own sign-in wrote over the one login that row had here. A label the fleet gave
     // another account was written over by no sign-in.
@@ -2293,7 +2400,8 @@ fn persist_accounts_sync(
     let mut publishing = false;
     // A sync that finds what is already there writes nothing: each file is replaced only where
     // its bytes differ, so a periodic caller rewrites no file and wakes no watcher.
-    let mut changed = false;
+    let roster_held = accounts::roster_text(&write_to)?;
+    let mut changed = recovered || roster_held.as_deref() != Some(roster_toml.as_str());
     let mut publish_if_changed = |path: &Path, held: Option<&[u8]>, text: &str, mode| {
         if held == Some(text.as_bytes()) {
             return Ok(());
@@ -2302,44 +2410,30 @@ fn persist_accounts_sync(
         super::upgrade_models::write_atomic_mode(path, text, mode)
             .map_err(|why| format!("could not write {}: {why}", path.display()))
     };
-    let roster_held = fs::read(&write_to).ok();
     let fleet_held = fs::read(&fleet_write_to).ok();
     let mut state_changed = false;
     let events = store
-        .transact_logins_held(&held, now, &mut note, |state, logins| {
-            publishing = true;
+        .transact_sync_held(&held, now, &mut note, accounts::SyncTarget {
+            path: &write_to,
+            before: roster_held.as_deref(),
+            after: &roster_toml,
+            mode: keep_mode,
+        }, |state, logins| {
             let before = (state.clone(), logins.clone());
+            if let Some((from, to)) = &default_moved {
+                accounts::move_account(state, logins, from, to)?;
+            }
             for label in &relabelled {
-                match &default_moved {
-                    Some((from, to)) if from == label => {
-                        accounts::move_account(state, logins, from, to);
-                    }
-                    _ => accounts::forget_account(state, logins, label),
+                if default_moved.as_ref().is_none_or(|(from, _)| from != label) {
+                    accounts::forget_account(state, logins, label);
                 }
             }
             for row in &roster.rows {
-                if let Some(dir) = &row.dir {
-                    aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
-                        .and_then(|()| {
-                            aterm_types::fs_restricted::ensure_private_dir(Path::new(dir))
-                        })
-                        .map_err(|why| format!("could not create {dir}: {why}"))?;
+                if let Some(dir) = row.dir.as_deref()
+                    && let Some(owner) = accounts::retained_directory_owner(logins, &roster.rows, &row.label, dir)?
+                {
+                    return Err(format!("cannot use `{}`: its login directory is retained by `{owner}`; choose an unused label; nothing was written", row.label));
                 }
-            }
-            publish_if_changed(&write_to, roster_held.as_deref(), &roster_toml, keep_mode)?;
-            publish_if_changed(
-                &fleet_write_to,
-                fleet_held.as_deref(),
-                &fleet_toml,
-                fleet_mode,
-            )?;
-            for expected in fleet_snapshots.iter().filter(|snapshot| snapshot.publish) {
-                publish_if_changed(
-                    &expected.path,
-                    expected.bytes.as_deref(),
-                    &fleet_toml,
-                    Some(0o600),
-                )?;
             }
             let mut events = Vec::new();
             if let Some(label) = &default_row_label {
@@ -2405,12 +2499,27 @@ fn persist_accounts_sync(
             }
             state_changed = (&*state, &*logins) != (&before.0, &before.1);
             Ok(events)
+        }, || {
+            publishing = true;
+            for row in &roster.rows {
+                if let Some(dir) = &row.dir {
+                    aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
+                        .and_then(|()| aterm_types::fs_restricted::ensure_private_dir(Path::new(dir)))
+                        .map_err(|why| format!("could not create {dir}: {why}"))?;
+                }
+            }
+            publish_if_changed(&fleet_write_to, fleet_held.as_deref(), &fleet_toml, fleet_mode)?;
+            for expected in fleet_snapshots.iter().filter(|snapshot| snapshot.publish) {
+                publish_if_changed(&expected.path, expected.bytes.as_deref(), &fleet_toml, Some(0o600))?;
+            }
+            Ok(())
         })
         .map_err(|why| {
             if publishing {
                 format!(
-                    "sync publication did not complete: {why}; roster, fleet, login directories \
-                     or account state may already have changed; inspect them before syncing again"
+                    "sync publication did not complete: {why}; any pending local commit is \
+                     retained for the next sync to resume; auxiliary fleet sources or login \
+                     directories may already have changed"
                 )
             } else {
                 format!("sync refused before roster publication: {why}")
@@ -2478,6 +2587,14 @@ fn run_accounts_sync_with(
         );
         return ExitCode::FAILURE;
     };
+    let store = env.accounts_store();
+    let recovered_commit = match store.recover_sync_within(how.ladder, &roster_path) {
+        Ok(recovered) => recovered,
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts sync: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     let (fleet, opt_in) = match load_fleet_source_with(env, source, how.fetch) {
         Ok(f) => f,
         Err(why) => {
@@ -2495,7 +2612,6 @@ fn run_accounts_sync_with(
         return ExitCode::FAILURE;
     };
 
-    let store = env.accounts_store();
     let prelim_roster =
         build_machine_roster(&fleet, &machine, &store, None, default_email.as_deref());
     let standing_walls = env
@@ -2522,6 +2638,7 @@ fn run_accounts_sync_with(
             return ExitCode::FAILURE;
         }
     };
+    let changed = changed || recovered_commit;
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
@@ -2704,7 +2821,7 @@ fn sync_machine(
 
 /// The text each fleet file of `files` ([`FleetOrigin::Local`]) holds with `row` listed as one
 /// more account of this machine ([`sync_machine`]), which the next sync then keeps; a file that
-/// lists it already is left out. Nothing is written here: `accounts add` writes them, under the
+/// lists it already is left out. Nothing is written here: `accounts add` or `adopt-default` writes them, under the
 /// accounts lock, before the roster.
 /// # Errors
 /// `row` has no email (a fleet lists each account by its email), a file cannot be read or is
@@ -3188,6 +3305,9 @@ fn sync_called_for(
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
 ) -> bool {
+    if accounts::Store::at(state_dir).sync_needs_recovery() {
+        return true;
+    }
     let secrets = home.join(".secrets");
     let configured = configured_source(Some(config), Some(roster_path));
     let unconfigured_with_secrets = configured.is_none()
@@ -3622,6 +3742,8 @@ fn sync_accounts_for_init_with(
     before_sync: impl FnOnce(),
     fetch_uncaptured: &Fetch<'_>,
 ) -> Result<InitSynced, String> {
+    let recovered_commit =
+        accounts::Store::at(state_dir).recover_sync_within(&sync_lock_ladder(), roster_path)?;
     let config_path = roster_path
         .parent()
         .map(|p| p.join("aterm.toml"))
@@ -3767,7 +3889,8 @@ fn sync_accounts_for_init_with(
         .as_ref()
         .and_then(|said| said.get("changed"))
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(true)
+        || recovered_commit;
     let to_sign_in: Vec<String> = said
         .as_ref()
         .and_then(|said| said.get("needs_renew"))
@@ -3836,7 +3959,8 @@ pub struct Resync {
     /// Claude Code's sync ran: the roster was missing (at most once per 10 minutes) or something
     /// it is made from changed ([`sync_called_for`]).
     pub synced: bool,
-    /// Why that sync failed, where it did (no source found, a refusal); nothing was written.
+    /// Why the sync failed. Recovery may have completed a previous commit before this
+    /// attempt refused its source or encountered another publication error.
     pub failed: Option<String>,
     /// It changed a file, the account state or the ledger. A sync that finds what is already
     /// there writes nothing.
@@ -4042,6 +4166,16 @@ fn load_cli_fleet(
     Ok(Some(fleet))
 }
 
+fn sync_cli_with(
+    cli: Cli,
+    paths: (&Path, &Path, &Path),
+    source: (Option<&str>, Option<&str>),
+    now: i64,
+    reads: (&Fetch<'_>, &[Duration]),
+) -> Result<CliSync, String> {
+    sync_cli_with_replan(cli, paths, source, now, reads, || {})
+}
+
 /// Sync `cli`'s pool (a CLI of [`OTHER_CLIS`]) on this machine from its fleet
 /// ([`load_cli_fleet`]): where its roster (`accounts-<cli>.toml`) stands beside `config`, or a
 /// `source` is named, this machine's fleet rows the roster does not list are added to it, each
@@ -4050,12 +4184,22 @@ fn load_cli_fleet(
 /// It writes the roster and the CLI's store alone, never `~/.secrets`; a row the roster has is
 /// never changed or removed, and a fleet row whose label or email the roster lists otherwise is
 /// left out ([`CliSynced::kept`]). Under the CLI's store lock, waited for on `ladder`.
-fn sync_cli_with(
+/// New labels require readable, unoccupied local state and an idle sign-in lock.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSyncNewLabels",
+        action = "Sync",
+        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::new_label_tests::sync_transition"
+    )
+)]
+fn sync_cli_with_replan(
     cli: Cli,
     (home, state_dir, config): (&Path, &Path, &Path),
     (source, machine_override): (Option<&str>, Option<&str>),
     now: i64,
     (fetch, ladder): (&Fetch<'_>, &[Duration]),
+    after_unlock: impl FnOnce(),
 ) -> Result<CliSync, String> {
     let product = cli.connector().product;
     let roster_path = accounts::roster_beside_for(config, cli)
@@ -4064,6 +4208,8 @@ fn sync_cli_with(
     if !named && !roster_path.is_file() {
         return Ok(CliSync::Off);
     }
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    store.recover_sync_within(ladder, &roster_path)?;
     let env = quiet_env(home, state_dir, config, now);
     let Some(fleet) = load_cli_fleet(cli, &env, home, source, fetch)? else {
         return Ok(CliSync::NoSource);
@@ -4089,92 +4235,119 @@ fn sync_cli_with(
         })
         .map(|a| a.label.clone())
         .collect();
-    let store = accounts::Store::at_for(state_dir, cli, home);
-    let lock = store
-        .acquire_within(ladder)
-        .map_err(|why| format!("{}: {why}", store.dir.display()))?
-        .ok_or_else(|| {
-            format!(
-                "{} at {}: another `aterm harness accounts` or a window holds it; nothing was \
+    let take_writer = || {
+        store
+            .acquire_within(ladder)
+            .map_err(|why| format!("{}: {why}", store.dir.display()))?
+            .ok_or_else(|| {
+                format!(
+                    "{} at {}: another `aterm harness accounts` or a window holds it; nothing was \
                  synced, so run the sync again",
-                accounts::LOCK_HELD,
-                store.dir.display()
+                    accounts::LOCK_HELD,
+                    store.dir.display()
+                )
+            })
+    };
+    let mut lock = take_writer()?;
+    let mut creation_signin = None;
+    let mut after_unlock = Some(after_unlock);
+    let (write_to, total, added, kept) = loop {
+        let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
+        let existing_text = accounts::roster_text(&write_to)?.unwrap_or_default();
+        let existing = Roster::parse_for(cli, &existing_text).map_err(|why| {
+            format!(
+                "the roster at {} is refused: {why}; the roster is unchanged",
+                roster_path.display()
             )
         })?;
-    let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
-    let existing_text = accounts::roster_text(&write_to)?.unwrap_or_default();
-    let existing = Roster::parse_for(cli, &existing_text).map_err(|why| {
-        format!(
-            "the roster at {} is refused: {why}; the roster is unchanged",
-            roster_path.display()
-        )
-    })?;
-    let mut rows = Vec::new();
-    let mut added = Vec::new();
-    let mut kept = Vec::new();
-    for acct in mine {
-        let listed_email = |row: &Row| {
-            row.email
-                .as_deref()
-                .is_some_and(|email| accounts::email_matches(email, &acct.email))
-                || (cli == Cli::Codex
-                    && row
-                        .expected_identity_email()
-                        .is_some_and(|email| accounts::email_matches(email, &acct.email)))
-        };
-        match (
-            existing.row(&acct.label),
-            existing.rows.iter().find(|row| listed_email(row)),
-        ) {
-            (Some(row), _) if listed_email(row) => {}
-            (None, None) => {
-                let dir = store
-                    .login_dir(&acct.label)
-                    .ok_or_else(|| format!("`{}` names no login directory", acct.label))?;
-                let dir = dir
-                    .to_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| format!("the login directory {} is not UTF-8", dir.display()))?;
-                rows.push(Row {
-                    label: acct.label.clone(),
-                    class: acct.class,
-                    dir: Some(dir),
-                    email: Some(acct.email.clone()),
-                    identity_email: None,
-                    browser: acct.browser.clone(),
-                    was: Vec::new(),
-                    vendor: acct.vendor,
-                });
-                added.push(acct.label.clone());
+        let mut rows = Vec::new();
+        let mut added = Vec::new();
+        let mut kept = Vec::new();
+        for acct in &mine {
+            let listed_email = |row: &Row| {
+                row.email
+                    .as_deref()
+                    .is_some_and(|email| accounts::email_matches(email, &acct.email))
+                    || (cli == Cli::Codex
+                        && row
+                            .expected_identity_email()
+                            .is_some_and(|email| accounts::email_matches(email, &acct.email)))
+            };
+            match (
+                existing.row(&acct.label),
+                existing.rows.iter().find(|row| listed_email(row)),
+            ) {
+                (Some(row), _) if listed_email(row) => {}
+                (None, None) => {
+                    let dir = store
+                        .login_dir(&acct.label)
+                        .ok_or_else(|| format!("`{}` names no login directory", acct.label))?;
+                    let dir = dir.to_str().map(str::to_owned).ok_or_else(|| {
+                        format!("the login directory {} is not UTF-8", dir.display())
+                    })?;
+                    rows.push(Row {
+                        label: acct.label.clone(),
+                        class: acct.class,
+                        dir: Some(dir),
+                        email: Some(acct.email.clone()),
+                        identity_email: None,
+                        browser: acct.browser.clone(),
+                        was: Vec::new(),
+                        vendor: acct.vendor,
+                    });
+                    added.push(acct.label.clone());
+                }
+                _ => kept.push(acct.label.clone()),
             }
-            _ => kept.push(acct.label.clone()),
         }
-    }
-    let mut total = existing.rows.len() + rows.len();
-    if !rows.is_empty() {
-        if existing.rows.is_empty() {
-            rows.insert(
-                0,
-                Row {
-                    label: ACCOUNTS_OWN_LABEL.to_owned(),
-                    ..Row::default()
-                },
-            );
-            total += 1;
+        let mut total = existing.rows.len() + rows.len();
+        if !rows.is_empty() {
+            if existing.rows.is_empty() {
+                rows.insert(
+                    0,
+                    Row {
+                        label: ACCOUNTS_OWN_LABEL.to_owned(),
+                        ..Row::default()
+                    },
+                );
+                total += 1;
+            }
+            let text = accounts::append_rows_for(cli, &existing_text, &rows).map_err(|why| {
+                format!("the synced rows do not admit: {why}; the roster is unchanged")
+            })?;
+            if creation_signin.is_none() {
+                // New rows need both locks. Release the writer before trying the
+                // sign-in lock, then read and plan again under a fresh writer lock.
+                drop(lock);
+                if let Some(after_unlock) = after_unlock.take() {
+                    after_unlock();
+                }
+                creation_signin = Some(
+                    store
+                        .signin_now()
+                        .map_err(|why| format!("{}: {why}", store.shared_dir().display()))?
+                        .ok_or_else(|| {
+                            format!("{}; no new account rows were synced", accounts::SIGNIN_HELD)
+                        })?,
+                );
+                lock = take_writer()?;
+                continue;
+            }
+            store.check_new_rows(&rows, &existing, now)?;
+            aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
+                .map_err(|why| format!("{}: {why}", store.logins_dir().display()))?;
+            for dir in rows.iter().filter_map(|row| row.dir.as_deref()) {
+                aterm_types::fs_restricted::ensure_private_dir(Path::new(dir))
+                    .map_err(|why| format!("could not create {dir}: {why}"))?;
+            }
+            super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
+                .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
         }
-        let text = accounts::append_rows_for(cli, &existing_text, &rows).map_err(|why| {
-            format!("the synced rows do not admit: {why}; the roster is unchanged")
-        })?;
-        aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
-            .map_err(|why| format!("{}: {why}", store.logins_dir().display()))?;
-        for dir in rows.iter().filter_map(|row| row.dir.as_deref()) {
-            aterm_types::fs_restricted::ensure_private_dir(Path::new(dir))
-                .map_err(|why| format!("could not create {dir}: {why}"))?;
-        }
-        super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
-            .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
-    }
+        break (write_to, total, added, kept);
+    };
     drop(lock);
+    // Recovery takes the sign-in lock too and must see this publication ended.
+    drop(creation_signin);
     let recovered =
         recover_interrupted_staging_renewals_for(cli, &store, &write_to, &AUTO_RENEW_GUARD, now);
     // A sync that added nothing wrote nothing, and wakes no watcher.
@@ -4193,6 +4366,17 @@ fn sync_cli_with(
         kept,
     }))
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSyncNewLabels",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: choose retained snapshots, source rows, or a competing sign-in"
+    )
+)]
+#[doc(hidden)]
+pub fn account_sync_new_labels_environment() {}
 
 /// `aterm harness accounts sync --cli <id> [<source>] [--machine <mN>] [--json]`
 /// ([`sync_cli_with`]).
@@ -4645,19 +4829,25 @@ fn note_background_end(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if renewal == super::cli::Renewal::NeedsPerson {
         guard.parked.insert(label.to_owned(), now);
-    } else if renewal != super::cli::Renewal::Busy {
+    } else if !matches!(
+        renewal,
+        super::cli::Renewal::Busy | super::cli::Renewal::Deferred
+    ) {
         guard.parked.remove(label);
     }
 }
 
 /// Whether Claude Code's store or any pooled CLI's store under `state_dir` holds a saved
-/// explicit account selection (`pending_pin`).
+/// explicit account selection (`pending_pin`) or an unfinished account commit that upkeep
+/// must recover before it can determine whether a selection is pending.
 #[must_use]
 pub fn any_pending_pin(state_dir: &Path, now: i64) -> bool {
     accounts::Cli::ALL.into_iter().any(|cli| {
-        accounts::Store::at_for(state_dir, cli, Path::new(""))
-            .load(now)
-            .is_ok_and(|(state, _)| state.pending_pin.is_some())
+        let store = accounts::Store::at_for(state_dir, cli, Path::new(""));
+        store.sync_needs_recovery()
+            || store
+                .load(now)
+                .is_ok_and(|(state, _)| state.pending_pin.is_some())
     })
 }
 
@@ -5368,6 +5558,34 @@ fn recover_interrupted_staging_renewals_for(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
 ) -> bool {
+    recover_interrupted_staging_renewals_with(
+        cli,
+        store,
+        roster_path,
+        renew_guard,
+        now,
+        &accounts::LOCK_LADDER,
+        || {},
+    )
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountRecoveryLock",
+        action = "Recover",
+        project = "aterm_agent::harness::accounts_sync::recovery_lock_tests::recovery_lock_transition"
+    )
+)]
+fn recover_interrupted_staging_renewals_with(
+    cli: Cli,
+    store: &accounts::Store,
+    roster_path: &Path,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    now: i64,
+    ladder: &[Duration],
+    mut on_locked: impl FnMut(),
+) -> bool {
     if renew_guard
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5375,8 +5593,12 @@ fn recover_interrupted_staging_renewals_for(
     {
         return false;
     }
+    let mut any_recovered = match store.recover_sync_within(ladder, roster_path) {
+        Ok(recovered) => recovered,
+        Err(_) => return false,
+    };
     let Ok(entries) = fs::read_dir(store.logins_dir()) else {
-        return false;
+        return any_recovered;
     };
     struct Candidate {
         prefix: String,
@@ -5422,16 +5644,29 @@ fn recover_interrupted_staging_renewals_for(
         })
         .collect();
     if candidates.is_empty() {
-        return false;
+        return any_recovered;
     }
-    if store
-        .shared_dir()
-        .join(accounts::SIGNIN_LOCK_FILE)
-        .is_file()
-        && matches!(store.signin_now(), Ok(None))
-    {
-        return false;
-    }
+    // Recovery publishes a sign-in too. Keep the machine-wide guard until every
+    // candidate transaction ends, including when the lock file did not exist.
+    // The account writer is acquired below, in the same order as fresh sign-ins.
+    let Ok(Some(_signin)) = store.signin_now() else {
+        return any_recovered;
+    };
+    on_locked();
+    // The unlocked scan is only a hint. Refresh proofs after admission so a
+    // removed or changed checkpoint cannot be published from that earlier read.
+    candidates.retain_mut(|candidate| {
+        if fs::canonicalize(&candidate.dir).ok().as_ref() != Some(&candidate.actual_dir) {
+            return false;
+        }
+        let Some(proof) =
+            accounts::read_renewal_checkpoint_for(cli, &candidate.dir, &candidate.actual_dir, now)
+        else {
+            return false;
+        };
+        candidate.proof = proof;
+        true
+    });
     // A check can match a row other than the requested staging prefix. Prefer
     // its recorded completion clock across prefixes, then numeric sequence
     // within a prefix for equal clocks. Neither is a vendor credential age.
@@ -5444,7 +5679,6 @@ fn recover_interrupted_staging_renewals_for(
             .then_with(|| a.dir.cmp(&b.dir))
     });
 
-    let mut any_recovered = false;
     let mut recovered_labels = BTreeSet::new();
     for Candidate {
         dir,
@@ -5456,58 +5690,66 @@ fn recover_interrupted_staging_renewals_for(
         if recovered_labels.contains(&proof.label) {
             continue;
         }
+        // All candidates use the same writer. Do not multiply its contention
+        // wait by the number of checkpoints while holding every provider's sign-in.
+        let Ok(Some(writer)) = store.acquire_within(ladder) else {
+            on_locked();
+            break;
+        };
         let mut note = None;
         if store
-            .transact_logins(now, &mut note, |state, logins| {
-                // A checkpoint can outlive the configuration read by upkeep.
-                // Every provider resolves its identity policy under the writer lock.
-                let current = Roster::load_for(cli, roster_path)?;
-                let file_roster = &current;
-                let referenced = file_roster
-                    .rows
-                    .iter()
-                    .flat_map(|row| row.dir.iter().chain(row.was.iter().flatten()))
-                    .chain(
-                        logins
-                            .labels
-                            .values()
-                            .flat_map(|entry| entry.dir.iter().chain(entry.was.iter().flatten())),
-                    )
-                    .any(|held| {
-                        Path::new(held) == dir
-                            || fs::canonicalize(held).is_ok_and(|path| path == actual_dir)
-                    });
-                if referenced {
-                    return Ok(Vec::new());
-                }
-                // Another process may have renewed or limited this account
-                // since the staging check. Decide under its lock.
-                let bound = accounts::bound(file_roster, logins);
-                let enrolled = accounts::enrolled_for(cli, &bound);
-                let Some(row) = bound.row(&proof.label).filter(|r| {
-                    if cli == Cli::Codex && proof.proved_by != Some(accounts::Proof::Status) {
-                        return false;
+            .transact_roster_logins_held(
+                &writer,
+                roster_path,
+                now,
+                &mut note,
+                |current, state, logins| {
+                    // A checkpoint can outlive the configuration read by upkeep.
+                    // Every provider resolves its identity policy under the writer lock.
+                    let file_roster = current;
+                    let referenced =
+                        file_roster
+                            .rows
+                            .iter()
+                            .flat_map(|row| row.dir.iter().chain(row.was.iter().flatten()))
+                            .chain(logins.labels.values().flat_map(|entry| {
+                                entry.dir.iter().chain(entry.was.iter().flatten())
+                            }))
+                            .any(|held| {
+                                Path::new(held) == dir
+                                    || fs::canonicalize(held).is_ok_and(|path| path == actual_dir)
+                            });
+                    if referenced {
+                        return Ok(Vec::new());
                     }
-                    let expected = if matches!(cli, Cli::Claude | Cli::Codex) {
-                        r.expected_identity_email()
-                    } else {
-                        r.email.as_deref()
+                    // Another process may have renewed or limited this account
+                    // since the staging check. Decide under its lock.
+                    let bound = accounts::bound(file_roster, logins);
+                    let enrolled = accounts::enrolled_for(cli, &bound);
+                    let Some(row) = bound.row(&proof.label).filter(|r| {
+                        if cli == Cli::Codex && proof.proved_by != Some(accounts::Proof::Status) {
+                            return false;
+                        }
+                        let expected = if matches!(cli, Cli::Claude | Cli::Codex) {
+                            r.expected_identity_email()
+                        } else {
+                            r.email.as_deref()
+                        };
+                        expected.is_some_and(|em| accounts::email_matches(em, &proof.email))
+                    }) else {
+                        return Ok(Vec::new());
                     };
-                    expected.is_some_and(|em| accounts::email_matches(em, &proof.email))
-                }) else {
-                    return Ok(Vec::new());
-                };
-                let account = state.accounts.get(&row.label);
-                // Wall time can move backward. Only the binding captured under the writer
-                // lock when this checkpoint was created can accept its completion.
-                if !proof.parent.matches(logins, &row.label) {
-                    return Ok(Vec::new());
-                }
-                let is_limited = account.is_some_and(|a| a.limited_until(now).is_some());
-                let newer_auth =
-                    account.is_some_and(|a| a.auth_at.is_some_and(|at| at >= proof.checked_at));
-                let newer_binding = logins.labels.get(&row.label).is_some_and(|binding| {
-                    binding
+                    let account = state.accounts.get(&row.label);
+                    // Wall time can move backward. Only the binding captured under the writer
+                    // lock when this checkpoint was created can accept its completion.
+                    if !proof.parent.matches(logins, &row.label) {
+                        return Ok(Vec::new());
+                    }
+                    let is_limited = account.is_some_and(|a| a.limited_until(now).is_some());
+                    let newer_auth =
+                        account.is_some_and(|a| a.auth_at.is_some_and(|at| at >= proof.checked_at));
+                    let newer_binding = logins.labels.get(&row.label).is_some_and(|binding| {
+                        binding
                             .renewed_at
                             .iter()
                             .chain(binding.ended_at.iter())
@@ -5517,37 +5759,40 @@ fn recover_interrupted_staging_renewals_for(
                             // A notice keeps an end, not its observation clock.
                             // An old checkpoint must not clear an undated notice.
                             || binding.notice_end.is_some()
-                });
-                let is_signed_out = state
-                    .accounts
-                    .get(&row.label)
-                    .is_some_and(|a| a.auth == accounts::Auth::SignedOut);
-                let needs_recovery = !enrolled.contains(&row.label) || is_signed_out;
-                if is_limited || newer_auth || newer_binding || !needs_recovery {
-                    return Ok(Vec::new());
-                }
-                let own_dir = file_roster.row(&row.label).and_then(|r| r.dir.as_deref());
-                let events = accounts::note_renewed(
-                    state,
-                    logins,
-                    &row.label,
-                    own_dir,
-                    &proof.dir,
-                    proof.subscription.as_deref(),
-                    proof.checked_at,
-                );
-                if !events.is_empty()
-                    && let Some(proved_by) = proof.proved_by
-                {
-                    accounts::note_identity(logins, &row.label, proved_by, Some(&proof.email));
-                }
-                Ok(events)
-            })
+                    });
+                    let is_signed_out = state
+                        .accounts
+                        .get(&row.label)
+                        .is_some_and(|a| a.auth == accounts::Auth::SignedOut);
+                    let needs_recovery = !enrolled.contains(&row.label) || is_signed_out;
+                    if is_limited || newer_auth || newer_binding || !needs_recovery {
+                        return Ok(Vec::new());
+                    }
+                    let own_dir = file_roster.row(&row.label).and_then(|r| r.dir.as_deref());
+                    let events = accounts::note_renewed(
+                        state,
+                        logins,
+                        &row.label,
+                        own_dir,
+                        &proof.dir,
+                        proof.subscription.as_deref(),
+                        proof.checked_at,
+                    );
+                    if !events.is_empty()
+                        && let Some(proved_by) = proof.proved_by
+                    {
+                        accounts::note_identity(logins, &row.label, proved_by, Some(&proof.email));
+                    }
+                    Ok(events)
+                },
+            )
             .is_ok_and(|events| !events.is_empty())
         {
             recovered_labels.insert(proof.label);
             any_recovered = true;
         }
+        drop(writer);
+        on_locked();
     }
     any_recovered
 }
@@ -5747,19 +5992,78 @@ pub enum RenewalDispatch {
     Started,
     /// The selected account was already eligible and the exact saved request was pinned.
     Recovered,
-    /// Another renewal owns admission; keep the request for a later upkeep.
+    /// Another renewal or account writer owns admission; keep the request for a later upkeep.
     Held,
-    /// Startup or store access failed; this attempt cannot proceed.
+    /// Definite startup, authentication or policy failure; this attempt cannot proceed.
     Failed,
+    /// Account records are unreadable or recovery is fenced; retain the saved selection
+    /// and start no authentication until the store is healthy.
+    Fenced,
     /// A newer selection or an explicit cancellation replaced this request.
     Superseded,
 }
 
 impl RenewalDispatch {
+    fn store_refusal(why: &str) -> Self {
+        if why == accounts::LOCK_HELD {
+            Self::Held
+        } else {
+            Self::Fenced
+        }
+    }
+
     fn progressed(self) -> bool {
         matches!(self, Self::Started | Self::Recovered)
     }
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountQueuedSelection",
+        action = "Lock",
+        project = "aterm_agent::harness::accounts_sync::request_admission_tests::admission_transition"
+    )
+)]
+fn renewal_signin_admission(store: &accounts::Store) -> Result<accounts::Lock, RenewalDispatch> {
+    match store.signin_now() {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(RenewalDispatch::Held),
+        Err(_) => Err(RenewalDispatch::Fenced),
+    }
+}
+
+fn queued_pin_admitted(
+    store: &accounts::Store,
+    policy: accounts::RenewalPolicy<'_>,
+    request: Option<&accounts::PinRequest>,
+    now: i64,
+) -> bool {
+    request.is_none_or(|_| {
+        store
+            .admit_renewal_attempt(policy, request, now)
+            .unwrap_or(false)
+    })
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountQueuedSelection",
+        action = "AnotherProvider",
+        reason = "The native conformance projection chooses one of four provider fixtures."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountQueuedSelection",
+        action = "AnotherCase",
+        reason = "The native projection chooses a bounded stale-work or local-refusal scenario."
+    )
+)]
+#[doc(hidden)]
+pub fn account_queued_selection_environment() {}
 
 fn resume_pending_pin(
     home: &Path,
@@ -5780,9 +6084,12 @@ fn resume_pending_pin_for(
     fx: &UpkeepEffects<'_>,
 ) -> Option<RenewalDispatch> {
     let store = accounts::Store::at_for(state_dir, cli, home);
+    if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
+        return Some(RenewalDispatch::store_refusal(&why));
+    }
     let request = match store.load(now) {
         Ok((state, _)) => state.pending_pin?,
-        Err(_) => return Some(RenewalDispatch::Failed),
+        Err(why) => return Some(RenewalDispatch::store_refusal(&why)),
     };
     let result = renew_requested_pin_for(
         cli,
@@ -5869,30 +6176,36 @@ fn renew_requested_pin_for(
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
     let store = accounts::Store::at_for(state_dir, cli, home);
+    if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
+        return RenewalDispatch::store_refusal(&why);
+    }
     match store.load(now) {
         Ok((state, _)) if state.pending_pin.as_ref() == Some(&request) => {}
         Ok(_) => return RenewalDispatch::Superseded,
-        Err(_) => return RenewalDispatch::Failed,
+        Err(why) => return RenewalDispatch::store_refusal(&why),
     }
     recover_interrupted_staging_renewals_for(cli, &store, roster_path, renew_guard, now);
-    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
-        return RenewalDispatch::Failed;
-    };
     let mut disposition = RenewalDispatch::Superseded;
     let mut target = None;
-    if store
-        .transact_logins_within(&accounts::LOCK_LADDER, now, &mut None, |st, logins| {
+    if let Err(why) = store.transact_pool_logins_within(
+        &accounts::LOCK_LADDER,
+        roster_path,
+        now,
+        &mut None,
+        |raw, st, logins| {
             if st.pending_pin.as_ref() != Some(&request) {
                 return Ok(Vec::new());
             }
-            let roster = accounts::bound(&file_roster, logins);
+            let roster = accounts::bound(raw, logins);
             let enrolled = accounts::enrolled_for(cli, &roster);
             let Some(next_row) = roster.row(request.label()).cloned() else {
-                return Err("selected account is no longer in the roster".into());
+                st.pending_pin = None;
+                disposition = RenewalDispatch::Failed;
+                return Ok(Vec::new());
             };
             let mut probe = st.clone();
             if accounts::pin(&mut probe, &roster, &enrolled, request.label(), now).is_err() {
-                target = Some((next_row, logins.clone()));
+                target = Some((raw.clone(), next_row, logins.clone()));
                 return Ok(Vec::new());
             }
             disposition = RenewalDispatch::Recovered;
@@ -5901,12 +6214,11 @@ fn renew_requested_pin_for(
                     .into_iter()
                     .collect(),
             )
-        })
-        .is_err()
-    {
-        return RenewalDispatch::Failed;
+        },
+    ) {
+        return RenewalDispatch::store_refusal(&why);
     }
-    let Some((next_row, logins)) = target else {
+    let Some((file_roster, next_row, logins)) = target else {
         return disposition;
     };
     spawn_row_renewal(
@@ -6214,8 +6526,8 @@ fn spawn_row_renewal(
         );
     }
     let store = accounts::Store::at(state_dir);
-    if store.check_signin_state(now).is_err() {
-        return RenewalDispatch::Failed;
+    if let Err(why) = store.check_signin_state(now) {
+        return RenewalDispatch::store_refusal(&why);
     }
     if next_row.email.is_none() {
         return RenewalDispatch::Failed;
@@ -6223,48 +6535,49 @@ fn spawn_row_renewal(
     let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
     // The automatic ladder ([`ladder_route`]) decides an upkeep's renewal and records how it
     // ends; a person's own choice (a pin request, a click) takes the routes it always took.
-    let (has_mailbox, has_headless_profile, unattended) = match ladder {
-        Some(ctx) => match ladder_route(home, &store, &next_row, now, renew_guard, ctx) {
-            LadderStep::Go {
-                route,
-                read,
-                inputs,
-            } => (
-                route == super::sign_in_ladder::Route::Mailbox,
-                route == super::sign_in_ladder::Route::Profile,
-                Some((route, read, inputs, std::sync::Arc::clone(&ctx.log))),
-            ),
-            LadderStep::Held => return RenewalDispatch::Held,
-            LadderStep::NoRoute => return RenewalDispatch::Failed,
-        },
-        None => {
-            let has_mailbox = mailbox_dir.is_some()
-                || has_configured_mailbox_for_row(
-                    Some(home),
-                    &store,
-                    Some(&next_row.label),
-                    next_row.email.as_deref(),
-                );
-            let has_headless_profile = logins
-                .get(&next_row.label)
-                .and_then(|b| b.wrong_at)
-                .is_none()
-                && super::headless_oauth::has_browser_profile(
-                    &store.dir,
-                    &next_row.label,
-                    next_row.email.as_deref(),
-                )
-                && super::headless_oauth::find_headless_browser(Some(home)).is_some();
-            if !allow_default_browser
-                && next_row.browser.is_none()
-                && !has_mailbox
-                && !has_headless_profile
-            {
-                return RenewalDispatch::Failed;
+    let (has_mailbox, has_headless_profile, unattended) =
+        match ladder.filter(|_| pin_request.is_none()) {
+            Some(ctx) => match ladder_route(home, &store, &next_row, now, renew_guard, ctx) {
+                LadderStep::Go {
+                    route,
+                    read,
+                    inputs,
+                } => (
+                    route == super::sign_in_ladder::Route::Mailbox,
+                    route == super::sign_in_ladder::Route::Profile,
+                    Some((route, read, inputs, std::sync::Arc::clone(&ctx.log))),
+                ),
+                LadderStep::Held => return RenewalDispatch::Held,
+                LadderStep::NoRoute => return RenewalDispatch::Failed,
+            },
+            None => {
+                let has_mailbox = mailbox_dir.is_some()
+                    || has_configured_mailbox_for_row(
+                        Some(home),
+                        &store,
+                        Some(&next_row.label),
+                        next_row.email.as_deref(),
+                    );
+                let has_headless_profile = logins
+                    .get(&next_row.label)
+                    .and_then(|b| b.wrong_at)
+                    .is_none()
+                    && super::headless_oauth::has_browser_profile(
+                        &store.dir,
+                        &next_row.label,
+                        next_row.email.as_deref(),
+                    )
+                    && super::headless_oauth::find_headless_browser(Some(home)).is_some();
+                if !allow_default_browser
+                    && next_row.browser.is_none()
+                    && !has_mailbox
+                    && !has_headless_profile
+                {
+                    return RenewalDispatch::Failed;
+                }
+                (has_mailbox, has_headless_profile, None)
             }
-            (has_mailbox, has_headless_profile, None)
-        }
-    };
+        };
     let next_label = next_row.label.clone();
     let Some(next_email) = next_row.email.clone() else {
         return RenewalDispatch::Failed;
@@ -6286,10 +6599,9 @@ fn spawn_row_renewal(
     // sign-in (a vendor's renewal, `accounts browser`'s window, another process's) holds it this
     // renewal is Held, so a pin request stays pending for a later upkeep, with no cooldown
     // started and nothing woken, and the lock taken here is held by the work it starts.
-    let signin = match accounts::Store::at(state_dir).signin_now() {
-        Ok(Some(signin)) => signin,
-        Ok(None) => return RenewalDispatch::Held,
-        Err(_) => return RenewalDispatch::Failed,
+    let signin = match renewal_signin_admission(&store) {
+        Ok(signin) => signin,
+        Err(disposition) => return disposition,
     };
     reconcile_browser_window_unpark(
         renew_guard,
@@ -6318,12 +6630,27 @@ fn spawn_row_renewal(
         )
     });
     let run_seam = ladder.and_then(|ctx| ctx.run_attempt.clone());
+    let captured_logins = logins.clone();
     let started = start_auto_renew(
         permit,
         move || {
             use super::cli::Renewal;
 
             let store = accounts::Store::at(&state_owned);
+            if !queued_pin_admitted(
+                &store,
+                accounts::RenewalPolicy {
+                    roster_path: &roster_owned,
+                    roster: &file_roster,
+                    row: &next_row,
+                    logins: &captured_logins,
+                },
+                pin_request.as_ref(),
+                now,
+            ) {
+                return;
+            }
+            let deferred = std::cell::Cell::new(false);
             // How the last run's `claude auth login` exited, for the words of one that made no
             // login (`sign_in_ladder::how_it_ended`).
             let exited: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
@@ -6338,20 +6665,8 @@ fn spawn_row_renewal(
                     row: &next_row,
                     logins: attempt_logins,
                 };
-                if store
-                    .transact_renewal_within(
-                        &accounts::LOCK_LADDER,
-                        now,
-                        &mut None,
-                        policy,
-                        |_, _| Ok(Vec::new()),
-                    )
-                    .is_err()
-                {
-                    return Renewal::Failed;
-                }
                 let Ok(staging) = store.claim_staging_dir(&next_label) else {
-                    return Renewal::Failed;
+                    return Renewal::Deferred;
                 };
                 let Some(staging_text) = staging.to_str().map(str::to_owned) else {
                     let _ = fs::remove_dir_all(&staging);
@@ -6443,18 +6758,33 @@ fn spawn_row_renewal(
                 )
             };
             let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| {
-                if store.check_signin_state(now).is_err() {
-                    return Renewal::Failed;
+                let snapshot = &captured_logins;
+                if !store
+                    .admit_renewal_attempt(
+                        accounts::RenewalPolicy {
+                            roster_path: &roster_owned,
+                            roster: &file_roster,
+                            row: &next_row,
+                            logins: snapshot,
+                        },
+                        pin_request.as_ref(),
+                        now,
+                    )
+                    .unwrap_or(false)
+                {
+                    deferred.set(true);
+                    return Renewal::Deferred;
                 }
-                let Ok((snapshot, _)) = store.load_logins(now) else {
-                    return Renewal::Failed;
-                };
-                *attempt_snapshot.borrow_mut() = Some(snapshot.clone());
+                *attempt_snapshot.borrow_mut() = Some((*snapshot).clone());
                 exited.set(None);
                 let result = match &run_seam {
                     Some(run) => run(browser, force_headless),
-                    None => live_attempt(browser, force_headless, &snapshot),
+                    None => live_attempt(browser, force_headless, snapshot),
                 };
+                if matches!(result, Renewal::Busy | Renewal::Deferred) {
+                    deferred.set(true);
+                    return result;
+                }
                 if result != Renewal::Renewed
                     && store
                         .transact_logins_within(
@@ -6462,14 +6792,15 @@ fn spawn_row_renewal(
                             now,
                             &mut None,
                             |_, current| {
-                                accounts::RenewalParent::capture(&snapshot, &next_label)
+                                accounts::RenewalParent::capture(snapshot, &next_label)
                                     .require_current(current, &next_label)?;
                                 Ok(Vec::new())
                             },
                         )
                         .is_err()
                 {
-                    Renewal::Failed
+                    deferred.set(true);
+                    Renewal::Deferred
                 } else {
                     result
                 }
@@ -6477,7 +6808,9 @@ fn spawn_row_renewal(
             let how = |renewal: Renewal| super::sign_in_ladder::how_it_ended(renewal, exited.get());
             let _signin = signin;
             let ran = (|| -> Result<(), String> {
-                store.check_signin_state(now)?;
+                store
+                    .check_signin_state(now)
+                    .inspect_err(|_| deferred.set(true))?;
                 let opener = resolve_opener_link(&home_owned, &store);
                 // Unattended, nothing that opens a window is ever a fallback: neither the row's
                 // desk browser profile nor the system's default browser.
@@ -6517,6 +6850,9 @@ fn spawn_row_renewal(
                 }
                 Err(how(result))
             })();
+            if deferred.get() {
+                return;
+            }
             let renewed = ran.is_ok();
             let now_done = crate::supervise::limit::unix_now().max(now);
             if let Some((route, read, inputs, log)) = &unattended {
@@ -6559,21 +6895,8 @@ fn spawn_row_renewal(
                     let _ = store.cancel_pin_request(request, now_done);
                     return;
                 }
-                let mut note = None;
-                let _ = store.transact_logins_within(
-                    &accounts::LOCK_LADDER,
-                    now_done,
-                    &mut note,
-                    |st, logins| {
-                        let bound = accounts::bound(&file_roster, logins);
-                        let enrolled = accounts::enrolled(&bound);
-                        Ok(accounts::complete_requested_pin(
-                            st, &bound, &enrolled, request, now_done,
-                        )
-                        .into_iter()
-                        .collect())
-                    },
-                );
+                let _ =
+                    store.complete_requested_pin_at(&roster_owned, &file_roster, request, now_done);
             }
         },
         spawn_renewal,
@@ -6641,8 +6964,8 @@ fn spawn_vendor_renewal_with(
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
     let store = accounts::Store::at_for(state_dir, cli, home);
-    if store.check_signin_state(now).is_err() {
-        return RenewalDispatch::Failed;
+    if let Err(why) = store.check_signin_state(now) {
+        return RenewalDispatch::store_refusal(&why);
     }
     if next_row.email.is_none()
         || cli.accounts().signin.as_ref().is_none()
@@ -6679,10 +7002,9 @@ fn spawn_vendor_renewal_with(
         }
         None => browser_window_signed_in_token(&store, &next_row.label, 0),
     };
-    match store.signin_now() {
-        Ok(Some(probe)) => drop(probe),
-        Ok(None) => return RenewalDispatch::Held,
-        Err(_) => return RenewalDispatch::Failed,
+    match renewal_signin_admission(&store) {
+        Ok(probe) => drop(probe),
+        Err(disposition) => return disposition,
     }
     let key = format!("{}:{}", cli.id(), next_row.label);
     if let Some(binding) = existing_binding {
@@ -6726,6 +7048,19 @@ fn spawn_vendor_renewal_with(
     start_auto_renew(
         permit,
         move || {
+            if !queued_pin_admitted(
+                &store,
+                accounts::RenewalPolicy {
+                    roster_path: &roster_path,
+                    roster: &file_roster,
+                    row: &next_row,
+                    logins: &captured_logins,
+                },
+                pin_request.as_ref(),
+                now,
+            ) {
+                return;
+            }
             let renewal = super::cli::renew_one_for(
                 cli,
                 now,
@@ -6741,23 +7076,14 @@ fn spawn_vendor_renewal_with(
                 let now_done = crate::supervise::limit::unix_now().max(now);
                 match renewal {
                     super::cli::Renewal::Renewed => {
-                        let mut note = None;
-                        let _ = store.transact_logins_within(
-                            &accounts::LOCK_LADDER,
+                        let _ = store.complete_requested_pin_at(
+                            &roster_path,
+                            &file_roster,
+                            request,
                             now_done,
-                            &mut note,
-                            |st, logins| {
-                                let bound = accounts::bound(&file_roster, logins);
-                                let enrolled = accounts::enrolled_for(cli, &bound);
-                                Ok(accounts::complete_requested_pin(
-                                    st, &bound, &enrolled, request, now_done,
-                                )
-                                .into_iter()
-                                .collect())
-                            },
                         );
                     }
-                    super::cli::Renewal::Busy => {}
+                    super::cli::Renewal::Busy | super::cli::Renewal::Deferred => {}
                     _ => {
                         let _ = store.cancel_pin_request(request, now_done);
                     }
@@ -7374,9 +7700,43 @@ fn pools_html(pools: &[CliPool], now: i64) -> String {
 #[doc(hidden)]
 pub fn account_recovery_policy_environment() {}
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRecoveryLock",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: conformance stages each contention and checkpoint fixture before running the bound Recover"
+    )
+)]
+#[doc(hidden)]
+pub fn account_recovery_lock_environment() {}
+
 #[cfg(test)]
 #[path = "accounts_recovery_policy_tests.rs"]
 mod recovery_policy_tests;
+
+#[cfg(test)]
+#[path = "accounts_recovery_lock_tests.rs"]
+mod recovery_lock_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_rename_tests.rs"]
+mod rename_tests;
+
+#[cfg(test)]
+#[path = "accounts_alias_relabel_tests.rs"]
+mod alias_relabel_tests;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountAliasRelabel",
+        action = "AnotherCase",
+        reason = "Fixture selection for retained login identity and relocation scenarios."
+    )
+)]
+#[doc(hidden)]
+pub fn alias_relabel_environment() {}
 
 #[cfg(test)]
 mod tests {
@@ -7975,13 +8335,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .is_err()
         );
         assert_eq!(
-            Roster::load(&target)
-                .unwrap()
-                .row("m8")
-                .unwrap()
-                .browser
-                .as_deref(),
-            Some("new profile")
+            fs::read(&target).unwrap(),
+            before_roster,
+            "an auxiliary publication failure preserves the admitted roster"
         );
         assert!(saved.fleet_path.is_dir());
         fs::remove_dir(&saved.fleet_path).unwrap();
@@ -10453,7 +10809,10 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
         };
-        let select = |label| match store.select_account(&roster, label, UPKEEP_NOW).unwrap() {
+        let select = |label| match store
+            .select_account(&roster, &w.roster(), label, UPKEEP_NOW)
+            .unwrap()
+        {
             accounts::PinSelection::Renew(request) => request,
             accounts::PinSelection::Pinned => panic!("the fixture login is absent"),
         };
@@ -10571,6 +10930,26 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .cancel_pin_request(&final_request, UPKEEP_NOW)
             .unwrap();
         assert_eq!(store.load(UPKEEP_NOW).unwrap().0, pinned);
+
+        let retry = store.request_pin("m27", UPKEEP_NOW).unwrap();
+        let before_fault = store.load(UPKEEP_NOW).unwrap().0;
+        let ledger = store.ledger_path();
+        let retained = ledger.with_extension("retained");
+        fs::rename(&ledger, &retained).unwrap();
+        fs::create_dir(&ledger).unwrap();
+        assert_eq!(
+            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
+            Some(RenewalDispatch::Fenced)
+        );
+        assert_eq!(store.load(UPKEEP_NOW).unwrap().0, before_fault);
+        assert_eq!(before_fault.pending_pin.as_ref(), Some(&retry));
+        fs::rename(&ledger, ledger.with_extension("obstruction")).unwrap();
+        fs::rename(&retained, &ledger).unwrap();
+        assert_eq!(
+            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
+            Some(RenewalDispatch::Recovered)
+        );
+        assert!(store.load(UPKEEP_NOW).unwrap().0.pending_pin.is_none());
     }
 
     /// A PERSON'S PIN OF A CLAUDE CODE ROW WAITS OUT ANOTHER CLI'S SIGN-IN: while a vendor's
@@ -10606,7 +10985,10 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             into_queue.lock().unwrap().push(work);
             Ok(())
         };
-        let request = match store.select_account(&roster, "m27", UPKEEP_NOW).unwrap() {
+        let request = match store
+            .select_account(&roster, &w.roster(), "m27", UPKEEP_NOW)
+            .unwrap()
+        {
             accounts::PinSelection::Renew(request) => request,
             accounts::PinSelection::Pinned => panic!("the fixture login is absent"),
         };
@@ -11295,7 +11677,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             if case == "checkpoint" {
                 fs::write(&checkpoint, b"unrecognized private work").unwrap();
             } else if case == "ledger" {
-                store.save(&accounts::State::default()).unwrap();
+                let mut state = accounts::State::default();
+                accounts::note_auth(
+                    &mut state,
+                    "main",
+                    accounts::Auth::SignedOut,
+                    UPKEEP_NOW - 1,
+                );
+                store.save(&state).unwrap();
                 fs::create_dir(store.ledger_path()).unwrap();
             } else if case == "missing-snapshot" {
                 fs::create_dir(store.ledger_path()).unwrap();
@@ -11347,13 +11736,10 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                         assert!(store.ledger_path().is_dir());
                     } else {
                         let binding = store.load_logins(UPKEEP_NOW).unwrap().0;
-                        assert_eq!(
-                            binding.get("main").unwrap().dir.as_deref(),
-                            staging.to_str()
-                        );
+                        assert!(binding.get("main").is_none());
                         assert_eq!(
                             store.load(UPKEEP_NOW).unwrap().0.account("main").auth,
-                            accounts::Auth::Ok
+                            accounts::Auth::SignedOut
                         );
                         let proof = accounts::read_renewal_checkpoint(
                             &staging,
@@ -11364,6 +11750,36 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                         assert_eq!(proof.dir, staging.to_str().unwrap());
                         assert_eq!(proof.checked_at, UPKEEP_NOW);
                         assert!(store.ledger_path().is_dir());
+                        fs::rename(
+                            store.ledger_path(),
+                            dir.path().join("retained-ledger-obstruction"),
+                        )
+                        .unwrap();
+                        assert!(recover_interrupted_staging_renewals_with(
+                            Cli::Claude,
+                            &store,
+                            &roster_path,
+                            &std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default())),
+                            UPKEEP_NOW,
+                            &[],
+                            || {},
+                        ));
+                        assert_eq!(
+                            store
+                                .load_logins(UPKEEP_NOW)
+                                .unwrap()
+                                .0
+                                .get("main")
+                                .unwrap()
+                                .dir
+                                .as_deref(),
+                            staging.to_str()
+                        );
+                        assert_eq!(
+                            store.load(UPKEEP_NOW).unwrap().0.account("main").auth,
+                            accounts::Auth::Ok
+                        );
+                        assert_eq!(fs::read(staging.join(".claude.json")).unwrap(), profile);
                     }
                 }
                 "wrong-account" => {
@@ -12490,3 +12906,7 @@ mod resync_tests;
 #[cfg(test)]
 #[path = "accounts_sync_ladder_tests.rs"]
 mod ladder_tests;
+
+#[cfg(test)]
+#[path = "accounts_request_admission_tests.rs"]
+mod request_admission_tests;

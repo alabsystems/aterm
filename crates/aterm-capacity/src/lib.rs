@@ -4,16 +4,17 @@
 //! `aterm-capacity` — ONE READER OF THE MACHINE AND ONE LEDGER OF CLAIMS ON IT
 //! (`docs/DESIGN-adaptive-build-2026-10-24.md`, CAP-1).
 //!
-//! [`Reading`] is the machine now: cores, load, available and physical memory, swap, and one
-//! volume's free space above its floor: the floor the window's disk watch holds it to, from the
-//! same knobs and the same measured room ([`floor::Watch`]). The
+//! [`Reading`] is the machine now: cores, load, available, wired and physical memory, swap,
+//! and one volume's free space above its floor: the floor the window's disk watch holds it
+//! to, from the same knobs and the same measured room ([`floor::Watch`]). The
 //! [`Ledger`] holds every session's claims: a tool that needs memory, cores, disk or a quiet
 //! machine calls [`admit`] before its work starts and holds the [`Claim`] while it runs. Admit
 //! waits, with no deadline, until the need fits beside the claims already held and those that
 //! waited longer (first in, first out; a later claim goes first only when it fits beside every
 //! earlier one's reservation), printing one line a minute that names the shortfall and each
 //! holder. That is admission, not a retry. It refuses at once only a need that can never fit
-//! here: all the memory the Mac has or more, or more disk than the volume holds above its floor.
+//! here: all the memory that can ever be available or more (physical memory less what is
+//! wired, [`Reading::reachable`]), or more disk than the volume holds above its floor.
 //!
 //! A claim's memory reservation is its declared peak less what its holder's process tree
 //! already uses, so memory in use is not counted twice: a process is counted toward its

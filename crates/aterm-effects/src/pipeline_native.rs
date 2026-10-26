@@ -379,6 +379,7 @@ impl EffectsPipeline {
         self.flying_sky_row = None;
         self.rain = None;
         self.cursor.glow_scratch.clear();
+        self.cursor.glow.clear_out_ramps();
         self.cursor.trail_scratch.clear();
         self.clear_word_scratch();
         self.rain_scratch.clear();
@@ -447,9 +448,10 @@ impl EffectsPipeline {
             ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => ScrollChange::default(),
             ContentScrollDelta::Translate(translated_rows) => {
                 self.cursor.scroll_translate(translated_rows);
-                self.flying_sky_row = self
-                    .flying_sky_row
-                    .and_then(|r| r.checked_sub(translated_rows));
+                self.flying_sky_row = match self.flying_sky_row {
+                    Some(r) => r.checked_sub(translated_rows),
+                    None => None,
+                };
                 ScrollChange {
                     translated_rows,
                     ..ScrollChange::default()
@@ -596,9 +598,15 @@ impl EffectsPipeline {
     #[inline]
     pub fn publish_cursor(&mut self, input: &mut RenderInput) {
         std::mem::swap(&mut input.cursor_glow_add, &mut self.cursor.glow_scratch);
+        self.cursor
+            .glow
+            .swap_out_ramps(&mut input.cursor_glow_add_ramps);
         self.cursor.glow.swap_halos(&mut input.glow_halo);
         self.cursor.glow.swap_patches(&mut input.fire_patch);
         self.cursor.glow.swap_under_quads(&mut input.glow_under);
+        self.cursor
+            .glow
+            .swap_under_ramps(&mut input.glow_under_ramps);
         self.cursor.glow.swap_charred(&mut input.char_fg);
         self.cursor.glow.swap_halo_cells(&mut input.fire_halo);
         input.cursor_trail.clone_from(&self.cursor.trail_scratch);
@@ -637,8 +645,8 @@ impl EffectsPipeline {
             return;
         }
         self.cursor.glow.shade_word_icons((
-            &mut input.cursor_glow_add,
-            &mut input.glow_under,
+            (&mut input.cursor_glow_add, &mut input.cursor_glow_add_ramps),
+            (&mut input.glow_under, &mut input.glow_under_ramps),
             &mut input.glow_halo,
             &mut input.fire_patch,
         ));
@@ -785,7 +793,11 @@ impl EffectsPipeline {
                     f.now,
                     geom,
                     grid.default_bg,
-                    (grid.display_offset == 0).then_some(grid.cursor),
+                    if grid.display_offset == 0 {
+                        Some(grid.cursor)
+                    } else {
+                        None
+                    },
                 );
                 out.rescanned = true;
             }
@@ -958,20 +970,27 @@ impl EffectsPipeline {
             },
             ink,
         );
-        self.flying_sky_row = (seat.lift_rows > 0 && !seat.over_ink).then_some(cell.0);
+        self.flying_sky_row = if seat.lift_rows > 0 && !seat.over_ink {
+            Some(cell.0)
+        } else {
+            None
+        };
         // A lifted seat's top is the footprint's own, which stops at the grid top as the drawn head does.
         let seat_y = if seat.lift_rows == 0 {
             seat.y
         } else {
-            self.decos
+            match self
+                .decos
                 .kitty_cursor_footprint(crate::word_decorations::KittyCursorLayout {
                     geom,
                     cursor: cell,
                     look: cat_frame.render_look(),
                     bob: cat_frame.bob,
                     lift: f32::from(seat.lift_rows),
-                })
-                .map_or(seat.y.max(0), |lifted| lifted.y)
+                }) {
+                Some(lifted) => lifted.y,
+                None => seat.y.max(0),
+            }
         };
         let dx = seat.x.saturating_sub(rest.x);
         if dx != 0 && geom.cell_w > 0 {
@@ -1041,10 +1060,10 @@ impl EffectsPipeline {
         if self.pet_veil_stale {
             return;
         }
-        let _ = self
-            .cursor
-            .glow
-            .veil_pet_letters(&mut input.glow_under, &self.free_scratch);
+        let _ = self.cursor.glow.veil_pet_letters(
+            (&mut input.glow_under, &mut input.glow_under_ramps),
+            &self.free_scratch,
+        );
     }
 
     /// The pet's level rules and senses before its tick ([`CompanionOwner::prepare`]), reading the
@@ -1244,9 +1263,10 @@ impl EffectsPipeline {
             self.streak = None;
             return None;
         };
-        let engine = self
-            .streak
-            .get_or_insert_with(|| Box::new(OutputStreak::new(s.seed)));
+        let engine = match &mut self.streak {
+            Some(engine) => &mut **engine,
+            None => self.streak.insert(Box::new(OutputStreak::new(s.seed))),
+        };
         if let Some(boundary_at) = s.echo.boundary_at {
             engine.note_turn_boundary(boundary_at);
         }
@@ -1305,6 +1325,8 @@ impl EffectsPipeline {
             return (0, None);
         }
         let place = pane.place;
+        let win_w = usize::from(place.cols) * place.cell_w as usize;
+        let win_h = usize::from(place.rows) * place.cell_h as usize;
         let geom = Geom {
             cw: place.cell_w as usize,
             ch: place.cell_h as usize,
@@ -1312,10 +1334,16 @@ impl EffectsPipeline {
             cols: usize::from(place.cols),
             origin_x: 0,
             origin_y: 0,
-            win_w: u16::try_from(usize::from(place.cols) * place.cell_w as usize)
-                .unwrap_or(u16::MAX),
-            win_h: u16::try_from(usize::from(place.rows) * place.cell_h as usize)
-                .unwrap_or(u16::MAX),
+            win_w: if win_w < usize::from(u16::MAX) {
+                win_w as u16
+            } else {
+                u16::MAX
+            },
+            win_h: if win_h < usize::from(u16::MAX) {
+                win_h as u16
+            } else {
+                u16::MAX
+            },
             head: 0,
         };
         let cfg = StreakConfig {
@@ -1426,7 +1454,10 @@ fn rain_engine(
     rain: &mut Option<Box<MatrixRain>>,
     cfg: impl FnOnce() -> RainConfig,
 ) -> &mut MatrixRain {
-    rain.get_or_insert_with(|| Box::new(MatrixRain::new(cfg())))
+    match rain {
+        Some(engine) => engine,
+        None => rain.insert(Box::new(MatrixRain::new(cfg()))),
+    }
 }
 
 /// One receipt arms its licences at its delivery instant: the insert half

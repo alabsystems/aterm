@@ -74,7 +74,10 @@ impl<'a> Iterator for CommandsIter<'a> {
         } else {
             self.word.get(..cut)
         };
-        Some(half.unwrap_or(self.word))
+        Some(match half {
+            Some(h) => h,
+            None => self.word,
+        })
     }
 }
 
@@ -195,7 +198,7 @@ impl Word {
     #[inline]
     fn pop(&mut self) -> Option<char> {
         let c = self.as_str().chars().next_back()?;
-        let width = u8::try_from(c.len_utf8()).unwrap_or(u8::MAX);
+        let width = c.len_utf8() as u8;
         self.len = self.len.saturating_sub(width);
         Some(c)
     }
@@ -621,18 +624,20 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
-    pub fn rekey(&mut self, session: u64) {
-        if self.session == Some(session) {
+    pub const fn rekey(&mut self, session: u64) {
+        if matches!(self.session, Some(s) if s == session) {
             return;
         }
         if let Some(old) = self.session {
             let dirty = self.line.line_chars > 0 || self.line.poisoned;
             self.forget(old);
             if dirty {
-                self.dirty.rotate_right(1);
-                if let Some(front) = self.dirty.first_mut() {
-                    *front = Some(old);
+                let mut i = SESSION_MEMORY - 1;
+                while i > 0 {
+                    self.dirty[i] = self.dirty[i - 1];
+                    i -= 1;
                 }
+                self.dirty[0] = Some(old);
             }
         }
         self.session = Some(session);
@@ -760,14 +765,14 @@ impl TrickListener {
         )
     )]
     #[inline]
-    pub fn note_line_reset(&mut self) -> TrickFeed<'_> {
+    pub const fn note_line_reset(&mut self) -> TrickFeed<'_> {
         let out = self.fresh_line();
         self.feed(out, false)
     }
 
     /// Ctrl+Z or Ctrl+\: a shell at its prompt keeps the line through them, while under a program the tty flushes it, so only a provably empty line (unpoisoned, nothing counted) is reset; any other is a break.
     #[inline]
-    pub fn note_job_chord(&mut self) -> TrickFeed<'_> {
+    pub const fn note_job_chord(&mut self) -> TrickFeed<'_> {
         if self.line.line_chars == 0 && !self.line.poisoned {
             self.note_line_reset()
         } else {
@@ -810,14 +815,14 @@ impl TrickListener {
 
     /// Tab, Esc, arrows, Home / End / PgUp / PgDn, any other chord, raw controller bytes, a paste: poisoned until a reset.
     #[inline]
-    pub fn note_break(&mut self) -> TrickFeed<'_> {
+    pub const fn note_break(&mut self) -> TrickFeed<'_> {
         let out = self.poison();
         self.feed(out, false)
     }
 
     /// A press at a prompt whose tty swallows input (a password): poisons the line, so a passphrase cannot move the pet.
     #[inline]
-    pub fn note_no_echo(&mut self) -> TrickFeed<'_> {
+    pub const fn note_no_echo(&mut self) -> TrickFeed<'_> {
         let out = self.poison();
         self.feed(out, false)
     }
@@ -1162,7 +1167,10 @@ impl TrickListener {
                 let guess = self.line.guess.take();
                 match self.line.tentative {
                     Some(trick) => Some(Verdict::Confirm { trick }),
-                    None => guess.or(held),
+                    None => match guess {
+                        Some(g) => Some(g),
+                        None => held,
+                    },
                 }
             }
             Some((TrickRole::Filler, _)) => {
@@ -1191,8 +1199,10 @@ impl TrickListener {
         )
     )]
     #[inline]
-    fn deliver_tail(&mut self, now: Instant, fed: u32) -> Option<Outcome> {
-        let verdict = self.line.tail.take()?;
+    const fn deliver_tail(&mut self, now: Instant, fed: u32) -> Option<Outcome> {
+        let Some(verdict) = self.line.tail.take() else {
+            return None;
+        };
         self.deliver(now, verdict, fed)
     }
 
@@ -1212,7 +1222,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
-    fn deliver(&mut self, now: Instant, verdict: Verdict, fed: u32) -> Option<Outcome> {
+    const fn deliver(&mut self, now: Instant, verdict: Verdict, fed: u32) -> Option<Outcome> {
         match verdict {
             Verdict::Fire {
                 trick,
@@ -1272,7 +1282,7 @@ impl TrickListener {
         )
     )]
     #[inline]
-    fn go_impure(&mut self) -> Option<Outcome> {
+    const fn go_impure(&mut self) -> Option<Outcome> {
         self.line.pure = false;
         self.line.held = None;
         self.line.tail = None;
@@ -1293,7 +1303,7 @@ impl TrickListener {
         )
     )]
     #[inline]
-    fn poison(&mut self) -> Option<Outcome> {
+    const fn poison(&mut self) -> Option<Outcome> {
         self.line.poisoned = true;
         self.line.held = None;
         self.line.tail = None;

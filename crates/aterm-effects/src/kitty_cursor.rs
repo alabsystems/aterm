@@ -936,7 +936,9 @@ impl CursorCat {
             return;
         }
         if !presentable {
-            self.collection_paused_at.get_or_insert(now);
+            if self.collection_paused_at.is_none() {
+                self.collection_paused_at = Some(now);
+            }
             return;
         }
         let Some(paused_at) = self.collection_paused_at.take() else {

@@ -36,6 +36,7 @@ pub mod excerpt;
 pub mod flight;
 pub mod footer;
 pub mod goal;
+pub mod grok_signin;
 pub mod headless_oauth;
 pub mod lanes;
 pub mod laps;

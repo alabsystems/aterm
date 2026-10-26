@@ -145,15 +145,11 @@ impl Drop for KeyboardWords {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Overhang {
     pub(crate) now: f32,
-    pub(crate) kept: f32,
 }
 
 impl Overhang {
     /// No strip: a list that keeps no room for a bar.
-    pub(crate) const NONE: Self = Self {
-        now: 0.0,
-        kept: 0.0,
-    };
+    pub(crate) const NONE: Self = Self { now: 0.0 };
 }
 
 /// How a screen that does not show the whole list ends at the list's bottom edge.
@@ -180,6 +176,7 @@ pub(super) struct ScrollPlan {
     within: Shared<Vec<UiKey>>,
     previews: Shared<Vec<UiKey>>,
     control_rows: Shared<Vec<(f32, f32, f32)>>,
+    drawn_bands: Shared<Vec<DrawnPart>>,
     spans: Shared<Vec<(UiKey, f32, f32)>>,
     words: Shared<Option<(UiKey, Words)>>,
     ink: Vec<f32>,
@@ -187,7 +184,6 @@ pub(super) struct ScrollPlan {
     first_controls: Vec<Option<f32>>,
     room: f32,
     overhang: f32,
-    kept: f32,
     given: f32,
     held_start: Option<(usize, bool)>,
     gap: f32,
@@ -371,6 +367,7 @@ impl ScrollPlan {
         } else {
             vec![(0.0, 0.0, height)]
         });
+        std::sync::Arc::make_mut(&mut self.drawn_bands).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.keys).push(keys);
         std::sync::Arc::make_mut(&mut self.ids).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.within).push(Vec::new());
@@ -399,6 +396,7 @@ impl ScrollPlan {
                 vec![(0.0, 0.0, height)]
             },
         );
+        std::sync::Arc::make_mut(&mut self.drawn_bands).insert(index, Vec::new());
         std::sync::Arc::make_mut(&mut self.keys).insert(index, keys);
         std::sync::Arc::make_mut(&mut self.ids).insert(index, Vec::new());
         std::sync::Arc::make_mut(&mut self.within).insert(index, Vec::new());
@@ -453,6 +451,13 @@ impl ScrollPlan {
         }
         if let Some(last) = std::sync::Arc::make_mut(&mut self.control_rows).last_mut() {
             *last = rows;
+        }
+    }
+
+    /// Say what the last stop added draws, band by band ([`drawn_bands_in`]).
+    pub(super) fn set_drawn_bands(&mut self, bands: Vec<DrawnPart>) {
+        if let Some(last) = std::sync::Arc::make_mut(&mut self.drawn_bands).last_mut() {
+            *last = bands;
         }
     }
 
@@ -549,6 +554,7 @@ impl ScrollPlan {
         self.set_control_spans(spans);
         self.set_keyboard_words(words);
         self.set_control_rows(control_rows_in(node, height));
+        self.set_drawn_bands(drawn_bands_in(node, height));
         self.set_first_controls(first_control_row(node, height).map(|(top, tall)| top + tall));
         let content = content_extent(node, height);
         self.set_ink(content.map_or(0.0, |(top, tall)| top + tall));
@@ -622,6 +628,7 @@ impl ScrollPlan {
         } else {
             vec![(0.0, 0.0, height)]
         });
+        std::sync::Arc::make_mut(&mut self.drawn_bands).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.keys).push(keys);
         std::sync::Arc::make_mut(&mut self.ids).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.within).push(Vec::new());
@@ -769,11 +776,17 @@ impl ScrollPlan {
         // ACTIVITY's 64pt head stays over its 32pt rows at 150x47, 8pt to spare rather than 40pt,
         // and the Sound page's bonks, rows of 66pt under a 40pt caption, start whole at the top
         // at 102x29, 5pt to spare rather than 31pt.
+        // Past its caption, a filler its seat cuts through every word and control draws nothing
+        // of them (a row cut through its words draws not at all): a band of blank card stood over
+        // the screen's first stop (Cursor & Motion at 738x418 under a status's bar: 32pt of
+        // Effect policy's card, Serious Mode's row cut away). It is given up as well.
+        let blank = caption.is_none() && self.draws_nothing_from(start, flush);
         let group = self.groups[start].is_some();
         let cut = group && matches!(caption, Some(caption) if !caption.kept);
         let kept = group && matches!(caption, Some(caption) if caption.kept);
         let headed = start < top
             && (kept
+                || blank
                 || cut
                     && self.span(start + 1..n) + 0.5 >= self.span(start..n) - self.lead_of(start));
         let (offset, caption) = if headed {
@@ -842,6 +855,22 @@ impl ScrollPlan {
             .find_map(|stop| self.first_controls[stop].map(|end| self.stop_top(0, stop) + end))
             .unwrap_or(0.0);
         first.max(second)
+    }
+
+    /// Whether a screen that starts `offset` into stop `index` draws nothing of it: every word
+    /// and control of it cut by the screen's top, which draws them only whole, and every picture
+    /// above it ([`Self::last_screen`]). A stop measured for none says no.
+    pub(super) fn draws_nothing_from(&self, index: usize, offset: f32) -> bool {
+        let parts = &self.drawn_bands[index];
+        let top = self.stop_top(index, index);
+        !parts.is_empty()
+            && parts.iter().all(|part| {
+                if part.whole {
+                    top + part.top < offset - 0.5
+                } else {
+                    top + part.bottom <= offset + 0.5
+                }
+            })
     }
 
     /// How many of the list's stops the screen that starts with each cuts.
@@ -1342,14 +1371,32 @@ impl ScrollPlan {
         self.peek_need(&self.screen(top.min(self.limit())))
     }
 
+    /// What `screen` lacks of the next card's least peek and the padding over its first stop a
+    /// seat may scroll into. THE PEEK IS MEASURED IN THE ROOM A BAR LEAVES: a status's bar
+    /// covers the strip kept for it, so a peek in the strip alone left a screen ending on a
+    /// whole card over a blank band while the bar was up (Cursor & Motion at 102x29: 18pt). The
+    /// room the bar leaves is the room with or without it, so rows stay where they were when
+    /// the bar comes or goes; a taller status's bar is measured as one the page kept room for.
     fn peek_need(&self, screen: &Screen) -> Option<(f32, f32)> {
-        let next = screen.drawn.end;
         let first = screen.view.start;
-        if next >= self.len() || self.gap <= 0.01 || !self.starts_run(next) {
+        if self.gap <= 0.01 {
             return None;
         }
-        let reach = self.room + self.kept;
-        let shows = reach - (self.card_top(screen.drawn.start, next) - screen.offset);
+        let reach = self.room + self.given;
+        let start = screen.drawn.start;
+        // The first stop that room does not reach, as a screen drawn to it ends: what the
+        // strip under the room draws besides with no bar up is no peek the room shows.
+        let next = (first + 1..self.len()).find(|&stop| {
+            if self.starts_run(stop) {
+                self.card_top(start, stop) - screen.offset > reach - PEEK_MIN + 0.01
+            } else {
+                self.stop_top(start, stop) - screen.offset >= reach - 0.01
+            }
+        })?;
+        if !self.starts_run(next) {
+            return None;
+        }
+        let shows = reach - (self.card_top(start, next) - screen.offset);
         let padding = match self.groups[first] {
             Some(group) => self.captions[group]
                 .map_or(self.ink_top[first], |(top, _)| top.min(self.lead_of(first))),
@@ -1887,6 +1934,18 @@ impl ScrollPlan {
         }
         best.map_or(near.min(self.limit()), |(top, _)| top)
     }
+}
+
+/// Where a press found its control on the screen drawn ([`SettingsViewState::reveal_pressed`]):
+/// the list it was on, the control, where it ended down from the list's top, the status shown
+/// as it was pressed, and the status the press brought, once it came.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PressedAt {
+    context: ScrollContext,
+    key: UiKey,
+    bottom: f32,
+    before: Option<String>,
+    status: Option<String>,
 }
 
 /// What a page's reveal ([`SettingsViewState::page_reveal`]) is.
@@ -2936,10 +2995,34 @@ impl SettingsViewState {
         self.reveal_as = Reveal::Keep;
     }
 
-    /// Keep control `key` in view at the next render.
+    /// Keep control `key` in view at the next render, where the screen drawn showed it whole.
     pub(super) fn reveal_pressed(&mut self, key: UiKey) {
+        let at = self.drawn_bottom(&key).map(|bottom| PressedAt {
+            context: self.scroll_context(),
+            key: key.clone(),
+            bottom,
+            before: self.bar_feedback().cloned(),
+            status: None,
+        });
+        self.pressed_at.replace(at);
         self.page_reveal = Some(key);
         self.reveal_as = Reveal::Pressed;
+    }
+
+    /// Where control `key` ends, down from the list's top, on the screen last drawn, where that
+    /// screen showed it whole in the list's room.
+    fn drawn_bottom(&self, key: &UiKey) -> Option<f32> {
+        let record = self.scroll_record.borrow();
+        let record = record.as_ref().filter(|record| record.unscrolled(self))?;
+        let (plan, top) = record.place();
+        let index = plan.stop_holding(key).or_else(|| plan.stop_of(key))?;
+        let (from, to) = plan.control_span(index, key)?;
+        let screen = plan.screen(top.min(plan.limit()));
+        if !screen.drawn.contains(&index) {
+            return None;
+        }
+        let at = plan.stop_top(screen.drawn.start, index) - screen.offset;
+        (at + from >= -0.01 && at + to <= plan.room + 0.01).then_some(at + to)
     }
 
     /// Handle a pointer press on a control preview picture in the list strip.
@@ -3167,7 +3250,41 @@ impl SettingsViewState {
             };
             overrun = overrun.max(note(plan.stop_top(upper, lower) + to - from, false));
         }
+        // A CONTROL THE PERSON PRESSED STAYS WHERE IT WAS PRESSED: the bar shortens, down to
+        // its least, until the room under it still holds the control where the screen last
+        // drawn showed it; the rest of the status's words scroll in the bar. It grew over the
+        // control instead and the list moved the control up from under the pointer by what it
+        // covered (Software Update at 178x348: 73pt).
+        if let Some(bottom) = self.pressed_bottom() {
+            overrun = overrun.max(note(bottom, false));
+        }
         overrun
+    }
+
+    /// Where the control a press revealed ended on the screen it was pressed on
+    /// ([`Self::reveal_pressed`]): while the press holds, and after, for as long as the status
+    /// that came with it stands on that list, so the bar keeps the room it took when it came.
+    /// Let go when a scroll ended the press, the bar grew back over the list to show every word
+    /// (Software Update at 178x348: from 98pt to 186pt of the page's 268pt).
+    fn pressed_bottom(&self) -> Option<f32> {
+        let mut held = self.pressed_at.borrow_mut();
+        let at = held.as_mut()?;
+        let status = self.bar_feedback();
+        let gone = at.context != self.scroll_context()
+            || match (&at.status, status) {
+                (Some(came), now) => now != Some(came),
+                (None, _) => false,
+            };
+        if gone {
+            *held = None;
+            return None;
+        }
+        if at.status.is_none() && status != at.before.as_ref() {
+            at.status = status.cloned();
+        }
+        let pressing =
+            self.reveal_as == Reveal::Pressed && self.page_reveal.as_ref() == Some(&at.key);
+        (pressing || at.status.is_some()).then_some(at.bottom)
     }
 
     /// The record of the screen `plan` ([`ListLaid::planned`]) would leave seated, `record` the
@@ -3464,6 +3581,101 @@ fn keys_within(node: &UiNode, out: &mut Vec<UiKey>) {
     }
 }
 
+/// A band a stop draws, from its top ([`drawn_bands_in`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DrawnPart {
+    pub(super) top: f32,
+    pub(super) bottom: f32,
+    /// Drawn only whole where an edge crosses it: words, and a control, which is drawn cut only
+    /// with its name whole beside it.
+    pub(super) whole: bool,
+}
+
+/// What `node`, laid out `height` tall, draws, band by band from its top: each line of words
+/// and each control, drawn only whole where a list's edge crosses it, and each picture (a
+/// preview, a swatch), drawn as far as it shows. A line reserved empty draws nothing.
+pub(super) fn drawn_bands_in(node: &UiNode, height: f32) -> Vec<DrawnPart> {
+    fn walk(node: &UiNode, top: f32, height: f32, out: &mut Vec<DrawnPart>) {
+        if height <= 0.01 {
+            return;
+        }
+        let part = |whole: bool| DrawnPart {
+            top,
+            bottom: top + height,
+            whole,
+        };
+        match &node.content {
+            UiContent::Group(_) => {}
+            UiContent::Text(spec) => {
+                // Its line, centred in its box, is what an edge cuts.
+                if !spec.text.trim().is_empty() {
+                    let (px, _) = crate::native_ui::text_paint_metrics(spec.role, spec.style);
+                    let line = (px * 1.25).min(height);
+                    let at = top + (height - line) / 2.0;
+                    out.push(DrawnPart {
+                        top: at,
+                        bottom: at + line,
+                        whole: true,
+                    });
+                }
+                return;
+            }
+            UiContent::RichText(_) => {
+                out.push(part(true));
+                return;
+            }
+            _ => {
+                out.push(part(is_control(node)));
+                return;
+            }
+        }
+        let layout = &node.layout;
+        let inner = (height - layout.padding.top - layout.padding.bottom).max(0.0);
+        let length = |length: Length, available: f32| match length {
+            Length::Fill => None,
+            Length::Fixed(value) => Some(value),
+            Length::Fraction(value) => Some(available * value),
+        };
+        if layout.flow == Flow::Column {
+            let gaps = layout.gap * node.children.len().saturating_sub(1) as f32;
+            let available = (inner - gaps).max(0.0);
+            let fixed: f32 = node
+                .children
+                .iter()
+                .filter_map(|child| length(child.layout.height, available))
+                .sum();
+            let fills = node
+                .children
+                .iter()
+                .filter(|child| child.layout.height == Length::Fill)
+                .count();
+            let fill = if fills == 0 {
+                0.0
+            } else {
+                (available - fixed).max(0.0) / fills as f32
+            };
+            let mut y = top + layout.padding.top - layout.offset;
+            for child in &node.children {
+                let tall = length(child.layout.height, available)
+                    .unwrap_or(fill)
+                    .max(0.0);
+                walk(child, y, tall, out);
+                y += tall + layout.gap;
+            }
+        } else {
+            for child in &node.children {
+                let tall = length(child.layout.height, inner)
+                    .map_or(inner, |value| value.min(inner))
+                    .max(0.0);
+                walk(child, top + layout.padding.top, tall, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, 0.0, height, &mut out);
+    out
+}
+
 /// Each control under `node`, with `node` laid out `height` tall: its key, top and height; and
 /// the words naming the keyboard's control there ([`KeyboardWords`]).
 pub(super) fn control_spans_in(node: &UiNode, height: f32) -> ControlSpans {
@@ -3688,15 +3900,17 @@ pub(super) fn focus_keys(node: &UiNode) -> Vec<UiKey> {
             out.extend(segmented_control_key(node));
             return;
         }
-        let focusable = match &node.content {
-            UiContent::Button(control) => control.state.enabled || control.state.busy,
-            UiContent::Switch(control) => control.state.enabled || control.state.busy,
-            UiContent::Slider(control) => control.state.enabled || control.state.busy,
-            UiContent::TextField(control) => control.state.enabled || control.state.busy,
-            UiContent::ColorWheel(control) => control.state.enabled || control.state.busy,
-            UiContent::Custom(spec) => spec.focusable,
+        // What the page's Tab order takes ([`UiContent::focusable`]), and a control busy saving,
+        // which takes the keyboard again once it is done.
+        let busy = match &node.content {
+            UiContent::Button(control) => control.state.busy,
+            UiContent::Switch(control) => control.state.busy,
+            UiContent::Slider(control) => control.state.busy,
+            UiContent::TextField(control) => control.state.busy,
+            UiContent::ColorWheel(control) => control.state.busy,
             _ => false,
         };
+        let focusable = node.content.focusable() || busy;
         if focusable {
             out.push(node.key.clone());
         }
@@ -3712,7 +3926,6 @@ pub(super) fn focus_keys(node: &UiNode) -> Vec<UiKey> {
 /// Give `plan` its `room` and the strip under it a page keeps for a status bar ([`Overhang`]).
 pub(super) fn seat_room(plan: &mut ScrollPlan, room: f32, overhang: Overhang) {
     let now = overhang.now.max(0.0);
-    let kept = overhang.kept.max(0.0);
     let n = plan.len();
     let fits = now > 0.0
         && plan.span(0..n) <= room + now + 0.01
@@ -3720,11 +3933,9 @@ pub(super) fn seat_room(plan: &mut ScrollPlan, room: f32, overhang: Overhang) {
     if fits {
         plan.set_room(room + now);
         plan.overhang = 0.0;
-        plan.kept = 0.0;
     } else {
         plan.set_room(room);
         plan.overhang = now;
-        plan.kept = kept;
     }
 }
 
@@ -4089,6 +4300,25 @@ impl SplitCard {
             if let Some((at, tall)) = control_extent(node, *height) {
                 out.push((top, top + at, tall));
             }
+            top += height + self.gap;
+        }
+        out
+    }
+
+    /// What `rows` draw, band by band, from the top of the first ([`drawn_bands_in`]).
+    pub(super) fn drawn_bands(&self, rows: Range<usize>) -> Vec<DrawnPart> {
+        let mut top = 0.0;
+        let mut out = Vec::new();
+        for (node, height) in &self.rows[rows] {
+            out.extend(
+                drawn_bands_in(node, *height)
+                    .into_iter()
+                    .map(|part| DrawnPart {
+                        top: part.top + top,
+                        bottom: part.bottom + top,
+                        ..part
+                    }),
+            );
             top += height + self.gap;
         }
         out
@@ -4626,6 +4856,7 @@ fn plan_items_measured(
                     }
                     plan.set_within(within);
                     plan.set_control_rows(card.control_rows(rows.clone()));
+                    plan.set_drawn_bands(card.drawn_bands(rows.clone()));
                     let (spans, words) = card.control_spans(rows.clone());
                     plan.set_control_spans(spans);
                     plan.set_keyboard_words(words);
@@ -4914,14 +5145,7 @@ mod tests {
             plan.set_ink(4.0 + control + note);
             plan.card(60.0, vec![UiKey::new("after")]);
             plan.card(60.0, Vec::new());
-            seat_room(
-                &mut plan,
-                140.0,
-                Overhang {
-                    now: overhang,
-                    kept: 44.0,
-                },
-            );
+            seat_room(&mut plan, 140.0, Overhang { now: overhang });
             plan
         };
         let shown = plan(44.0, 18.0, 36.0);
@@ -4941,14 +5165,7 @@ mod tests {
         words.card(80.0, Vec::new());
         words.card(58.0, Vec::new());
         words.card(60.0, Vec::new());
-        seat_room(
-            &mut words,
-            140.0,
-            Overhang {
-                now: 44.0,
-                kept: 44.0,
-            },
-        );
+        seat_room(&mut words, 140.0, Overhang { now: 44.0 });
         assert_eq!(words.view(0), 0..1, "words alone are shown in the room");
         assert_eq!(words.screen(0).live, 140.0);
     }
@@ -5494,14 +5711,7 @@ mod tests {
         for index in 0..5 {
             plan.card(40.0, vec![UiKey::new(format!("control/{index}"))]);
         }
-        seat_room(
-            &mut plan,
-            100.0,
-            Overhang {
-                now: 60.0,
-                kept: 60.0,
-            },
-        );
+        seat_room(&mut plan, 100.0, Overhang { now: 60.0 });
         let screen = plan.screen(0);
         assert_eq!(screen.view, 0..2, "two cards in the room");
         assert!(
@@ -5587,14 +5797,7 @@ mod tests {
         assert_eq!(screen.drawn, 0..2);
         assert_eq!(screen.height, whole.room());
         let mut fading = plan.clone();
-        seat_room(
-            &mut fading,
-            105.0,
-            Overhang {
-                now: 40.0,
-                kept: 40.0,
-            },
-        );
+        seat_room(&mut fading, 105.0, Overhang { now: 40.0 });
         let screen = fading.screen(0);
         assert_eq!((screen.view, screen.drawn), (0..1, 0..2));
         assert_eq!(screen.height, 145.0, "drawn on to the page's bottom");
@@ -5702,14 +5905,7 @@ mod tests {
             "past the caption: the row the edge cuts fades from its top"
         );
         let mut fading = plan(true);
-        seat_room(
-            &mut fading,
-            100.0,
-            Overhang {
-                now: 30.0,
-                kept: 30.0,
-            },
-        );
+        seat_room(&mut fading, 100.0, Overhang { now: 30.0 });
         let screen = fading.screen(0);
         assert_eq!(
             (screen.height, screen.edge_caption),
@@ -6063,7 +6259,7 @@ mod tests {
         plan.set_control_rows(vec![(0.0, 4.0, 36.0)]);
         plan.set_ink(70.0);
         plan.set_ink_top(4.0);
-        seat_room(&mut plan, 326.0, Overhang { now, kept: 44.0 });
+        seat_room(&mut plan, 326.0, Overhang { now });
         plan
     }
 
@@ -6107,7 +6303,7 @@ mod tests {
         plan.set_ink_top(8.0);
         let end = |now: f32| {
             let mut plan = plan.clone();
-            seat_room(&mut plan, 200.0, Overhang { now, kept: 44.0 });
+            seat_room(&mut plan, 200.0, Overhang { now });
             let screen = plan.screen(plan.limit());
             let at = plan.stop_top(screen.drawn.start, plan.len() - 1) - screen.offset;
             (
@@ -6138,14 +6334,7 @@ mod tests {
         plan.set_control_spans(vec![(UiKey::new("row"), 12.0, 36.0)]);
         plan.set_control_rows(vec![(0.0, 12.0, 36.0)]);
         plan.card(60.0, vec![UiKey::new("after")]);
-        seat_room(
-            &mut plan,
-            255.0,
-            Overhang {
-                now: 44.0,
-                kept: 44.0,
-            },
-        );
+        seat_room(&mut plan, 255.0, Overhang { now: 44.0 });
         let screen = plan.screen(0);
         assert_eq!(plan.shown(0), 0..1);
         assert_eq!(
@@ -6164,14 +6353,7 @@ mod tests {
         ]);
         card.set_control_rows(vec![(0.0, 20.0, 96.0)]);
         card.card(60.0, Vec::new());
-        seat_room(
-            &mut card,
-            250.0,
-            Overhang {
-                now: 44.0,
-                kept: 44.0,
-            },
-        );
+        seat_room(&mut card, 250.0, Overhang { now: 44.0 });
         assert_eq!(card.screen(0).live, 232.0);
         assert!(card.draws_control_live(1, &UiKey::new("one"), 0));
         assert!(!card.draws_control_live(1, &UiKey::new("two"), 0));
@@ -6186,6 +6368,49 @@ mod tests {
         assert_eq!(card.live_control(2, &UiKey::new("two"), 0), None);
         let whole = cards(&[100.0, 100.0, 100.0], 230.0, 10.0);
         assert_eq!(whole.screen(0).live, 230.0);
+    }
+
+    /// THE LIST'S END LEAVES NO ROW CUT TO NOTHING UNDER ITS CAPTION: a card whose first row
+    /// puts its words over its switch (a compact row at 2x text), and whose end the last
+    /// screen anchors so that row's switch is cut away under the caption kept over the rows,
+    /// starts that screen at the next row, the room left under the list's end, where it drew
+    /// a blank band under the caption. CONTROL: where the switch shows under the caption, the
+    /// screen is anchored on the end as before.
+    #[test]
+    fn the_last_screen_draws_no_row_cut_to_nothing_under_its_caption() {
+        let plan = |room: f32| {
+            let mut plan = ScrollPlan::new(10.0);
+            let group = plan.group(54.0, 40.0);
+            plan.set_caption(group, 14.0, 36.0);
+            plan.row(group, 108.0, vec![UiKey::new("gpu")]);
+            plan.set_control_rows(vec![(0.0, 44.0, 64.0)]);
+            plan.set_ink(108.0);
+            plan.row(group, 144.0, vec![UiKey::new("rewind")]);
+            plan.set_control_rows(vec![(0.0, 80.0, 64.0)]);
+            plan.set_ink(144.0);
+            seat_room(&mut plan, room, Overhang::NONE);
+            plan
+        };
+        let cut = plan(230.0);
+        assert_eq!(cut.limit(), 1);
+        let screen = cut.screen(1);
+        assert_eq!(
+            (screen.drawn.clone(), screen.offset),
+            (1..2, 0.0),
+            "the cut row is not drawn: {screen:?}"
+        );
+        assert_eq!(cut.shown(1), 1..2, "the last row shown whole");
+        assert!(
+            cut.card_bottom(1, 1) < cut.room(),
+            "the room left goes under the list's end"
+        );
+        let shows = plan(268.0);
+        let screen = shows.screen(shows.limit());
+        assert_eq!(
+            screen.drawn.start, 0,
+            "a row whose switch shows under the caption is drawn: {screen:?}"
+        );
+        assert!(screen.offset > 0.0);
     }
 
     #[test]

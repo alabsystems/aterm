@@ -532,28 +532,283 @@ pub(crate) fn twin_prelude(
         return String::new();
     }
     let mut s = sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs);
+    // The sign-in block reads the launch as typed (it skips `--no-harness` itself), ahead of
+    // the yolo block, so a launch it stops never prints the yolo block's `running` line.
+    if let Some(row) = crate::vendor_direct::spec(program)
+        && let Some(gate) = &row.signin_gate
+    {
+        let skip: Vec<&str> = gate
+            .local
+            .iter()
+            .chain(row.self_update_verbs.iter())
+            .copied()
+            .collect();
+        s.push_str(&sh_signin_prelude(program, row.product, gate, &skip));
+    }
     s.push_str(&sh_yolo_prelude(program, yolo, verbs));
+    #[cfg(any(unix, test))]
     s.push_str(&sh_harness_prelude(program, prefix));
     s
 }
 
-/// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`]): once the
-/// harness's tool is on `<prefix>/bin`, the twin execs it with `run --` and the argv the yolo block
-/// left, so the session runs under the harness (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step
-/// 6); `--no-alab-harness`, `--no-harness` (each sets `ATERM_NO_HARNESS=1` above) or the variable
-/// itself runs the vendor alone, and so does a harness that is not installed. Empty for an agent
-/// with no such harness.
+/// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`]): once a
+/// LIVE build of the harness is installed, the twin execs `<prefix>/bin/<tool> run --` with the
+/// argv the yolo block left, so the session runs under the harness
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 6, §11 D32); `--no-alab-harness`,
+/// `--no-harness` (each sets `ATERM_NO_HARNESS=1` above) or the variable itself runs the vendor
+/// alone, and so does a harness that is not installed.
+///
+/// Live means what [`resolve_shim`] and the claim's image rule read (`crates/aterm-gui/src/
+/// harness_claim.rs`): `bin/<tool>` is an atpkg shim whose `exec '<target>' "$@"` line names an
+/// executable file inside a ready store build of the harness (`store/<harness>/<digits>/` with
+/// `<digits>.ready`), or anywhere while the harness is dev-linked (its link marker exists), or it
+/// is a link to an executable file. A tombstone (a yanked or revoked harness: no `exec` line,
+/// [`crate::activate::install_tombstone_shim`]), a shim whose build was removed or never finished,
+/// and a target whose path holds a quote all fall through to the vendor, so the harness never
+/// stands between the person and a working vendor build. Empty for an agent with no such
+/// harness.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_harness_prelude(program: &str, prefix: &Path) -> String {
     let Some((harness, tool)) = crate::harness::twin_harness(program) else {
         return String::new();
     };
+    let layout = crate::store::Layout {
+        prefix: prefix.to_path_buf(),
+    };
     let exe = sh_shim_quote(&prefix.join("bin").join(tool));
+    let store = sh_shim_quote(layout.program_current(harness).parent().unwrap_or(prefix));
+    let marker = sh_shim_quote(&layout.link_marker(harness));
     format!(
-        "# atpkg: {harness}, the harness, runs this session once it is installed \
-         (`--no-alab-harness` runs {program} alone).\n\
-         if [ \"${{ATERM_NO_HARNESS-}}\" != 1 ] && [ -x {exe} ]; then exec {exe} run -- \"$@\"; fi\n"
+        "# atpkg: {harness}, the harness, runs this session once a live build of it is installed \
+         (`--no-alab-harness` runs {program} alone); a yanked, removed or unfinished one never stands in the way.\n\
+         if [ \"${{ATERM_NO_HARNESS-}}\" != 1 ] && [ -f {exe} ] && [ -x {exe} ]; then\n\
+         \x20 __alab=\n\
+         \x20 if [ -h {exe} ]; then __alab={exe}\n\
+         \x20 else\n\
+         \x20   while IFS= read -r __alab_l || [ -n \"$__alab_l\" ]; do\n\
+         \x20     case $__alab_l in \"exec '\"*\"' \\\"\\$@\\\"\") __alab=${{__alab_l#\"exec '\"}}; __alab=${{__alab%\"' \\\"\\$@\\\"\"}} ;; esac\n\
+         \x20   done < {exe}\n\
+         \x20   case $__alab in\n\
+         \x20     *\"'\"*) __alab= ;;\n\
+         \x20     {store}/*) __alab_b=${{__alab#{store}/}}; __alab_b=${{__alab_b%%/*}}\n\
+         \x20       case $__alab_b in ''|*[!0-9]*) __alab= ;; *) [ -f {store}/\"$__alab_b\".ready ] || __alab= ;; esac ;;\n\
+         \x20     *) [ -f {marker} ] || __alab= ;;\n\
+         \x20   esac\n\
+         \x20 fi\n\
+         \x20 if [ -n \"$__alab\" ] && [ -f \"$__alab\" ] && [ -x \"$__alab\" ]; then exec {exe} run -- \"$@\"; fi\n\
+         fi\n"
     )
+}
+
+/// Whether `name` may be embedded in the sign-in block as a variable name: `[A-Z_][A-Z0-9_]*`.
+fn is_shell_safe_env_name(name: &str) -> bool {
+    name.bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Whether `part` may be embedded in the sign-in block as one path component.
+fn is_shell_safe_component(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// THE SIGN-IN BLOCK of a program's twin and `bin/` shim ([`crate::vendor_direct::SigninGate`]):
+/// under aterm (`ATERM_CHILD=1`, no `ATERM_NO_HARNESS` and no `--no-harness` or
+/// `--no-alab-harness` ahead of a literal `--`), an interactive launch (no one-shot option
+/// and no subcommand of `skip` before a literal `--`) that its environment and files say is
+/// signed out runs `aterm harness signin --cli <cli> --wait` first, and runs the program only
+/// once that exits 0; otherwise it exits 69 with one line. Outside aterm it does nothing.
+/// Renders empty where any word it would embed is not shell-safe (fail closed: no block,
+/// never a half-quoted one).
+#[must_use]
+pub(crate) fn sh_signin_prelude(
+    program: &str,
+    product: &str,
+    gate: &crate::vendor_direct::SigninGate,
+    skip: &[&str],
+) -> String {
+    let crate::vendor_direct::SigninGate {
+        cli,
+        credential_env,
+        login_file_env,
+        home_env,
+        home_default,
+        login_file,
+        one_shot,
+        local: _,
+    } = *gate;
+    if crate::store::ToolName::new(program).is_none()
+        || !crate::selfupdate::is_shell_safe_verb(program)
+        || !crate::selfupdate::is_shell_safe_verb(cli)
+        || !credential_env
+            .iter()
+            .chain([login_file_env, home_env].iter())
+            .all(|n| is_shell_safe_env_name(n))
+        || !is_shell_safe_component(home_default)
+        || !is_shell_safe_component(login_file)
+        || one_shot.is_empty()
+        || !one_shot
+            .iter()
+            .all(|f| crate::yolo::is_shell_safe_marker(f))
+        || !skip
+            .iter()
+            .all(|w| crate::selfupdate::is_shell_safe_verb(w))
+        || product.is_empty()
+        || !product
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'-'))
+    {
+        return String::new();
+    }
+    let mut s = String::from("# atpkg: sign-in gate \u{2014} under aterm a signed-out ");
+    s.push_str(program);
+    s.push_str(" is signed in once for this machine by `aterm harness signin --cli ");
+    s.push_str(cli);
+    s.push_str(
+        "` (sandboxed: one sign-in and one need, no page opened) before an interactive launch, \
+         and runs only once that signs it in (aterm help pkg).\n",
+    );
+    let words = crate::yolo::word_options(program);
+    let alts = |list: &[&str]| -> Option<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for f in list {
+            if !crate::yolo::is_shell_safe_marker(f) {
+                return None;
+            }
+            for spelled in std::iter::once(sh_quote_str(f)).chain(
+                f.starts_with("--")
+                    .then(|| format!("{}=*", sh_quote_str(f))),
+            ) {
+                if !seen.contains(&spelled) {
+                    seen.push(spelled);
+                }
+            }
+        }
+        Some(seen.join("|"))
+    };
+    let Some(once) = alts(one_shot) else {
+        return String::new();
+    };
+    let value_options: Vec<&str> = words
+        .values
+        .iter()
+        .copied()
+        .filter(|v| !one_shot.contains(v))
+        .collect();
+    let (Some(takes), Some(maybe)) = (alts(&value_options), alts(words.optional)) else {
+        return String::new();
+    };
+    s.push_str(
+        "if [ \"${ATERM_CHILD-}\" = 1 ] && [ -z \"${ATERM_NO_HARNESS-}\" ]; then\n  \
+         __atpkg_gate=1\n  \
+         __atpkg_v=0\n  \
+         __atpkg_first=1\n  \
+         for __atpkg_a in \"$@\"; do\n    \
+         if [ \"$__atpkg_v\" = 1 ]; then __atpkg_v=0; continue; fi\n    \
+         if [ \"$__atpkg_v\" = 2 ]; then\n      \
+         __atpkg_v=0\n      \
+         case \"$__atpkg_a\" in -*) ;; *) continue ;; esac\n    \
+         fi\n    \
+         case \"$__atpkg_a\" in\n      \
+         --) break ;;\n      \
+         '--no-harness'|'--no-alab-harness') __atpkg_gate=0; break ;;\n      ",
+    );
+    s.push_str(&once);
+    s.push_str(") __atpkg_gate=0; break ;;\n");
+    // A `--opt=value` spelling carries its own value, so only the bare one takes the next word.
+    let bare = |alt: &str| {
+        alt.split('|')
+            .filter(|a| !a.ends_with("=*"))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    if !value_options.is_empty() {
+        s.push_str("      ");
+        s.push_str(&bare(&takes));
+        s.push_str(") __atpkg_v=1 ;;\n");
+    }
+    if !words.optional.is_empty() {
+        s.push_str("      ");
+        s.push_str(&bare(&maybe));
+        s.push_str(") __atpkg_v=2 ;;\n");
+    }
+    s.push_str("      -*) ;;\n      *)\n        if [ \"$__atpkg_first\" = 1 ]; then\n          __atpkg_first=0\n");
+    if !skip.is_empty() {
+        let mut uniq: Vec<&str> = Vec::new();
+        for w in skip {
+            if !uniq.contains(w) {
+                uniq.push(w);
+            }
+        }
+        s.push_str("          case \"$__atpkg_a\" in ");
+        s.push_str(
+            &uniq
+                .iter()
+                .map(|w| sh_quote_str(w))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+        s.push_str(") __atpkg_gate=0; break ;; esac\n");
+    }
+    s.push_str("        fi\n        ;;\n");
+    s.push_str("    esac\n  done\n  if [ \"$__atpkg_gate\" = 1 ]; then\n    if ");
+    s.push_str(
+        &credential_env
+            .iter()
+            .map(|n| format!("[ -n \"${{{n}-}}\" ]"))
+            .collect::<Vec<_>>()
+            .join(" || "),
+    );
+    s.push_str("; then\n      __atpkg_gate=0\n");
+    // A login grok refused carries `<file>.refused` at least as new as itself (aterm's
+    // `harness::grok_signin::mark_refused`), and is signed out until a newer login replaces it.
+    let file_test = |path: &str| {
+        format!(
+            "[ -f \"{path}\" ] && [ -s \"{path}\" ] && {{ [ ! -e \"{path}.refused\" ] || [ \"{path}\" -nt \"{path}.refused\" ]; }}"
+        )
+    };
+    s.push_str(&format!(
+        "    elif [ -n \"${{{login_file_env}-}}\" ]; then\n      \
+         if {}; then __atpkg_gate=0; fi\n",
+        file_test(&format!("${login_file_env}"))
+    ));
+    s.push_str(&format!(
+        "    elif [ -n \"${{{home_env}-}}\" ]; then\n      \
+         if {}; then __atpkg_gate=0; fi\n",
+        file_test(&format!("${home_env}/{login_file}"))
+    ));
+    s.push_str(&format!(
+        "    elif [ -n \"${{HOME-}}\" ] && {}; then\n      __atpkg_gate=0\n    fi\n  fi\n",
+        file_test(&format!("$HOME/{home_default}/{login_file}"))
+    ));
+    let missing = format!(
+        "{program}: signed out of {product}, and aterm (which signs this machine in once) is \
+         not on PATH; nothing was started"
+    );
+    let refused = format!(
+        "{program}: not signed in to {product} (aterm harness signin --cli {cli} says why \
+         above); nothing was started"
+    );
+    s.push_str(
+        "  if [ \"$__atpkg_gate\" = 1 ]; then\n    \
+         __atpkg_aterm=$(command -v aterm 2>/dev/null) || __atpkg_aterm=\n    \
+         if [ -z \"$__atpkg_aterm\" ]; then\n      printf '%s\\n' ",
+    );
+    s.push_str(&sh_quote_str(&missing));
+    s.push_str(" 1>&2\n      exit 69\n    fi\n    if ! \"$__atpkg_aterm\" harness signin --cli ");
+    s.push_str(&sh_quote_str(cli));
+    s.push_str(" --wait; then\n      printf '%s\\n' ");
+    s.push_str(&sh_quote_str(&refused));
+    s.push_str(" 1>&2\n      exit 69\n    fi\n  fi\nfi\n");
+    s
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that `exec`s the store binary.
@@ -2219,15 +2474,19 @@ mod sh_shim_tests {
     }
 
     /// THE HARNESS HAND-OFF EXECUTED: grok's laid twin execs `<prefix>/bin/grok-alab run --` with
-    /// the argv its yolo block left once grok-alab is installed, runs the store build alone under
-    /// `--no-alab-harness`, `--no-harness` or `ATERM_NO_HARNESS=1`, and before grok-alab is
-    /// installed; no other agent's twin carries the hand-off.
+    /// the argv its yolo block left once a LIVE grok-alab is installed (a shim into a ready store
+    /// build, or into its checkout while dev-linked), runs the store build alone under
+    /// `--no-alab-harness`, `--no-harness` or `ATERM_NO_HARNESS=1`, before grok-alab is installed,
+    /// and whenever `bin/grok-alab` is not live: a yanked/revoked tombstone, a shim whose build was
+    /// removed or never marked ready, a checkout shim with no dev link. No other agent's twin
+    /// carries the hand-off.
     #[cfg(unix)]
     #[test]
     fn the_grok_twin_hands_its_session_to_grok_alab_once_installed() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = crate::testdir::dir("atpkg-sh-harness-twin-");
         let script = |path: &Path, tag: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(
                 path,
                 format!("#!/bin/sh\nprintf '{tag}'\nprintf '<%s>' \"$@\"\nprintf '\\n'\n"),
@@ -2238,16 +2497,22 @@ mod sh_shim_tests {
         let target = root.join("store-build");
         script(&target, "V");
         let prefix = root.join("Application Support").join("pkg");
+        let layout = crate::store::Layout {
+            prefix: prefix.clone(),
+        };
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         let prelude = twin_prelude("grok", &prefix, None, &[], &crate::yolo::policy_of("grok"));
-        assert_eq!(
+        // `ATERM_NO_HARNESS` is read twice, once per block that `--no-harness` takes away: the
+        // hand-off's guard, and the sign-in block's guard (its own test below). Each is there once.
+        let reads = |also: &str| {
             prelude
                 .lines()
-                .filter(|l| l.contains("ATERM_NO_HARNESS-"))
-                .count(),
-            1,
-            "{prelude}"
-        );
+                .filter(|l| l.contains("ATERM_NO_HARNESS-") && l.contains(also))
+                .count()
+        };
+        assert_eq!(reads("bin/grok-alab'"), 1, "the hand-off: {prelude}");
+        assert_eq!(reads("ATERM_CHILD-"), 1, "the sign-in guard: {prelude}");
+        assert_eq!(reads(""), 2, "{prelude}");
         let twin = root.join("grok");
         std::fs::write(
             &twin,
@@ -2256,26 +2521,64 @@ mod sh_shim_tests {
         .unwrap();
         std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(resolve_shim(&twin).as_deref(), Some(target.as_path()));
+        // The twin as laid (its `#!/bin/sh`), and under every other POSIX shell here (Linux's
+        // /bin/sh is dash), each answering alike. Outside aterm and with no `aterm` on PATH, so
+        // grok's sign-in block (its own test below) never runs here, and never reaches a real
+        // `aterm` on a signed-out machine.
+        let shells: Vec<&str> = ["/bin/dash", "/usr/bin/dash", "/bin/bash"]
+            .into_iter()
+            .filter(|s| Path::new(s).exists())
+            .collect();
         let run = |args: &[&str], no_harness: bool| {
-            let out = aterm_spec::wait::past_text_busy(|| {
-                let mut cmd = std::process::Command::new(&twin);
-                cmd.args(args).env_remove("ATERM_NO_HARNESS");
-                if no_harness {
-                    cmd.env("ATERM_NO_HARNESS", "1");
-                }
-                cmd.output()
-            })
-            .unwrap();
-            assert!(out.status.success(), "{args:?}: {out:?}");
-            String::from_utf8_lossy(&out.stdout).into_owned()
+            let once = |shell: Option<&str>| {
+                let out = aterm_spec::wait::past_text_busy(|| {
+                    let mut cmd = match shell {
+                        Some(sh) => {
+                            let mut c = std::process::Command::new(sh);
+                            c.arg(&twin);
+                            c
+                        }
+                        None => std::process::Command::new(&twin),
+                    };
+                    cmd.args(args)
+                        .env_remove("ATERM_NO_HARNESS")
+                        .env_remove("ATERM_CHILD")
+                        .env("PATH", "/usr/bin:/bin");
+                    if no_harness {
+                        cmd.env("ATERM_NO_HARNESS", "1");
+                    }
+                    cmd.output()
+                })
+                .unwrap();
+                assert!(out.status.success(), "{shell:?} {args:?}: {out:?}");
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            let laid = once(None);
+            for sh in &shells {
+                assert_eq!(once(Some(sh)), laid, "{sh} {args:?}");
+            }
+            laid
         };
-        let alone = run(&["-m", "grok-4", "fix it"], false);
+        let argv = ["-m", "grok-4", "fix it"];
+        let alone = run(&argv, false);
         assert!(
             alone.starts_with("V<"),
             "not installed: the store build: {alone}"
         );
-        script(&prefix.join("bin").join("grok-alab"), "H");
-        let handed = run(&["-m", "grok-4", "fix it"], false);
+        // A live grok-alab: atpkg's shim into a ready store build.
+        let alab_bin = prefix.join("bin").join("grok-alab");
+        let build_dir = layout.build_dir("grok-alab", 1_000);
+        let build_exe = build_dir.join("bin").join("grok-alab");
+        script(&build_exe, "H");
+        let ready = prefix.join("store").join("grok-alab").join("1000.ready");
+        std::fs::write(&ready, "ok\n").unwrap();
+        let lay_shim = |to: &Path| {
+            std::fs::write(&alab_bin, sh_shim_content(to)).unwrap();
+            std::fs::set_permissions(&alab_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(resolve_shim(&alab_bin).as_deref(), Some(to));
+        };
+        lay_shim(&build_exe);
+        let handed = run(&argv, false);
         assert_eq!(
             handed,
             format!("H<run><-->{}", alone.strip_prefix('V').unwrap()),
@@ -2289,7 +2592,36 @@ mod sh_shim_tests {
             run(&["--no-harness", "-m", "grok-4", "fix it"], false),
             alone
         );
-        assert_eq!(run(&["-m", "grok-4", "fix it"], true), alone);
+        assert_eq!(run(&argv, true), alone);
+        // A yanked or revoked grok-alab: atpkg's tombstone at bin/grok-alab (executable, exits 70,
+        // no exec line) never stands between the person and grok.
+        crate::platform::install_tombstone_shim(
+            &alab_bin,
+            "atpkg: grok-alab was yanked/revoked — run `aterm pkg update`",
+        )
+        .unwrap();
+        assert!(
+            resolve_shim(&alab_bin).is_none(),
+            "a tombstone execs nothing"
+        );
+        assert_eq!(run(&argv, false), alone, "a tombstone: grok alone");
+        // A shim whose build is not marked ready, then one whose build was removed.
+        lay_shim(&build_exe);
+        assert_eq!(run(&argv, false), handed, "the control: live again");
+        std::fs::remove_file(&ready).unwrap();
+        assert_eq!(run(&argv, false), alone, "an unfinished build: grok alone");
+        std::fs::write(&ready, "ok\n").unwrap();
+        std::fs::remove_dir_all(&build_dir).unwrap();
+        assert_eq!(run(&argv, false), alone, "a removed build: grok alone");
+        // A shim into a checkout runs only while grok-alab is dev-linked.
+        let checkout_exe = root.join("checkout").join("target").join("grok-alab");
+        script(&checkout_exe, "H");
+        lay_shim(&checkout_exe);
+        assert_eq!(run(&argv, false), alone, "no dev link: grok alone");
+        let marker = layout.link_marker("grok-alab");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "program = \"grok-alab\"\n").unwrap();
+        assert_eq!(run(&argv, false), handed, "dev-linked: the harness");
         for other in ["claude", "codex", "agy", "muse", "kimi"] {
             let prelude = twin_prelude(other, &prefix, None, &[], &crate::yolo::policy_of(other));
             assert!(
@@ -2336,9 +2668,13 @@ mod sh_shim_tests {
             assert_eq!(resolve_shim(&twin).as_deref(), Some(target.as_path()));
             twin
         };
+        // Outside aterm, so grok's sign-in block (its own test below) stays out of these runs.
         let run = |twin: &Path, args: &[&str]| {
             let out = aterm_spec::wait::past_text_busy(|| {
-                std::process::Command::new(twin).args(args).output()
+                std::process::Command::new(twin)
+                    .args(args)
+                    .env_remove("ATERM_CHILD")
+                    .output()
             })
             .unwrap();
             assert!(out.status.success(), "{args:?}: {out:?}");
@@ -2576,6 +2912,336 @@ mod sh_shim_tests {
         assert_eq!(run(&kimi, &["--yolo"]).0, "<--auto>\n");
         assert_eq!(run(&kimi, &["-y", "--yolo"]).0, "<--auto>\n");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// THE SIGN-IN BLOCK EXECUTED: grok's laid twin over a store build that prints its argv,
+    /// with a stand-in `aterm` on `PATH` that records each call and exits as told. Under aterm a
+    /// signed-out interactive launch runs `aterm harness signin --cli grok --wait` before the
+    /// exec and runs grok only on its exit 0; a one-shot option, a subcommand, a signed-in
+    /// environment or a launch outside aterm never calls it.
+    #[cfg(unix)]
+    #[test]
+    fn the_signin_block_gates_a_signed_out_interactive_grok_on_aterm() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::testdir::dir("atpkg-sh-signin-twin-");
+        let target = root.join("store-build");
+        std::fs::write(&target, b"#!/bin/sh\nprintf '<%s>' \"$@\"\nprintf '\\n'\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let calls = root.join("aterm.calls");
+        let code = root.join("aterm.exit");
+        let aterm = bin.join("aterm");
+        std::fs::write(
+            &aterm,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit \"$(cat '{}')\"\n",
+                calls.display(),
+                code.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&aterm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        let prelude = twin_prelude(
+            "grok",
+            &root.join("pkg"),
+            None,
+            &[],
+            &crate::yolo::policy_of("grok"),
+        );
+        assert!(prelude.contains("# atpkg: sign-in gate"), "{prelude}");
+        assert!(
+            !prelude.lines().any(|l| l.trim().starts_with("exec '")),
+            "{prelude}"
+        );
+        assert!(
+            !prelude.lines().any(|l| l.trim().starts_with("export ")),
+            "{prelude}"
+        );
+        let twin = root.join("grok");
+        std::fs::write(
+            &twin,
+            sh_shim_content_twin(&target, &crate::shim_env::ShimEnv::NONE, None, &prelude),
+        )
+        .unwrap();
+        std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_shim(&twin).as_deref(), Some(target.as_path()));
+
+        let path_with = format!("{}:/usr/bin:/bin", bin.display());
+        // One launch: (exit code, stdout, stderr, aterm's calls).
+        let run = |args: &[&str], env: &[(&str, &str)], exit: u8| {
+            let _ = std::fs::remove_file(&calls);
+            std::fs::write(&code, exit.to_string()).unwrap();
+            let out = aterm_spec::wait::past_text_busy(|| {
+                let mut cmd = std::process::Command::new(&twin);
+                cmd.args(args)
+                    .env_clear()
+                    .env("PATH", &path_with)
+                    .env("HOME", &home);
+                for (k, v) in env {
+                    cmd.env(k, v);
+                }
+                cmd.output()
+            })
+            .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                std::fs::read_to_string(&calls).unwrap_or_default(),
+            )
+        };
+        let child = [("ATERM_CHILD", "1")];
+        let signin = "harness signin --cli grok --wait\n";
+
+        // Signed out, interactive: aterm runs first, and grok only on its exit 0.
+        for args in [
+            &[][..],
+            &["fix it"][..],
+            &["-m", "grok-4", "fix it"][..],
+            &["-m", "login"][..],
+            &["-w", "login"][..],
+            &["-w", "feat", "--resume"][..],
+            &["--effort=high", "fix it"][..],
+            &["--", "login"][..],
+            &["fix it", "login"][..],
+            // Subcommands that open the interactive screen, or may, are gated too: `dashboard`
+            // is in the yolo row's skip list (it takes no permission flag), not a local one.
+            &["dashboard"][..],
+            &["-m", "grok-4", "dashboard"][..],
+            &["sessions"][..],
+            &["-w", "feat", "sessions"][..],
+            &["models"][..],
+            &["agent", "stdio"][..],
+            &["some-future-verb"][..],
+        ] {
+            let (exit, stdout, stderr, called) = run(args, &child, 0);
+            assert_eq!(exit, Some(0), "{args:?}: {stderr}");
+            assert_eq!(called, signin, "{args:?}");
+            assert!(stdout.starts_with('<'), "{args:?}: grok ran: {stdout:?}");
+            let (exit, stdout, stderr, called) = run(args, &child, 1);
+            assert_eq!(exit, Some(69), "{args:?}: {stderr}");
+            assert_eq!(called, signin, "{args:?}");
+            assert_eq!(stdout, "", "{args:?}: grok never ran");
+            assert_eq!(
+                stderr,
+                "grok: not signed in to Grok Build (aterm harness signin --cli grok says why \
+                 above); nothing was started\n",
+                "{args:?}"
+            );
+        }
+        // aterm missing: one line, exit 69, nothing run.
+        let (exit, stdout, stderr, called) = {
+            let _ = std::fs::remove_file(&calls);
+            let out = std::process::Command::new(&twin)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("ATERM_CHILD", "1")
+                .output()
+                .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                std::fs::read_to_string(&calls).unwrap_or_default(),
+            )
+        };
+        assert_eq!(
+            (exit, stdout.as_str(), called.as_str()),
+            (Some(69), "", ""),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "grok: signed out of Grok Build, and aterm (which signs this machine in once) is \
+             not on PATH; nothing was started\n"
+        );
+
+        // One-shot options, subcommands and `--no-harness` never call aterm, and grok runs.
+        for args in [
+            &["login"][..],
+            &["logout"][..],
+            &["login", "--device-auth"][..],
+            &["--help"][..],
+            &["-h"][..],
+            &["--version"][..],
+            &["-v"][..],
+            &["-p", "hi"][..],
+            &["--print=hi"][..],
+            &["--single", "hi"][..],
+            &["-m", "grok-4", "-p", "hi"][..],
+            &["fix it", "-p", "hi"][..],
+            &["update"][..],
+            &["mcp", "list"][..],
+            &["doctor"][..],
+            &["leader", "kill"][..],
+            &["-w", "feat", "inspect"][..],
+            &["--no-harness"][..],
+            &["--no-alab-harness", "fix it"][..],
+        ] {
+            let (exit, stdout, stderr, called) = run(args, &child, 1);
+            assert_eq!(exit, Some(0), "{args:?}: {stderr}");
+            assert_eq!(called, "", "{args:?}");
+            assert!(stdout.starts_with('<'), "{args:?}: {stdout:?}");
+        }
+
+        // Signed in by its environment or files: aterm is never called.
+        let auth = home.join(".grok").join("auth.json");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let pooled = elsewhere.join("pooled.json");
+        std::fs::write(elsewhere.join("auth.json"), b"{}").unwrap();
+        std::fs::write(&pooled, b"{}").unwrap();
+        let elsewhere_s = elsewhere.display().to_string();
+        let pooled_s = pooled.display().to_string();
+        for env in [
+            &[("GROK_AUTH", "x")][..],
+            &[("XAI_API_KEY", "x")][..],
+            &[("GROK_HOME", elsewhere_s.as_str())][..],
+            &[("GROK_AUTH_PATH", pooled_s.as_str())][..],
+            &[("ATERM_NO_HARNESS", "1")][..],
+        ] {
+            let mut all = child.to_vec();
+            all.extend_from_slice(env);
+            let (exit, stdout, _, called) = run(&[], &all, 1);
+            assert_eq!((exit, called.as_str()), (Some(0), ""), "{env:?}");
+            assert!(stdout.starts_with('<'), "{env:?}");
+        }
+        // An empty login file is signed out; the program's own home file signs it in.
+        std::fs::write(&auth, b"").unwrap();
+        assert_eq!(run(&[], &child, 1).0, Some(69));
+        std::fs::write(&auth, b"{}").unwrap();
+        let (exit, _, _, called) = run(&[], &child, 1);
+        assert_eq!((exit, called.as_str()), (Some(0), ""));
+        // A login grok refused (`auth.json.refused` at least as new) is signed out, and the gate
+        // asks aterm; a newer login signs it in again.
+        let marker = home.join(".grok").join("auth.json.refused");
+        std::fs::write(&marker, b"").unwrap();
+        let marked = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&auth)
+            .unwrap()
+            .set_modified(marked - std::time::Duration::from_secs(5))
+            .unwrap();
+        let (exit, stdout, _, called) = run(&[], &child, 1);
+        assert_eq!(
+            (exit, stdout.as_str(), called.as_str()),
+            (Some(69), "", signin)
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&auth)
+            .unwrap()
+            .set_modified(marked + std::time::Duration::from_secs(5))
+            .unwrap();
+        let (exit, _, _, called) = run(&[], &child, 1);
+        assert_eq!((exit, called.as_str()), (Some(0), ""), "a newer login");
+        std::fs::remove_file(&marker).unwrap();
+        // A named login file is authoritative: an empty one is signed out even beside a
+        // signed-in home.
+        let empty = root.join("empty.json");
+        std::fs::write(&empty, b"").unwrap();
+        let empty_s = empty.display().to_string();
+        let (exit, _, _, called) = run(&[], &[child[0], ("GROK_AUTH_PATH", empty_s.as_str())], 1);
+        assert_eq!((exit, called.as_str()), (Some(69), signin));
+        std::fs::remove_file(&auth).unwrap();
+
+        // Outside aterm the twin is unchanged: signed out, it runs grok and never calls aterm.
+        for args in [&[][..], &["fix it"][..]] {
+            let (exit, stdout, _, called) = run(args, &[], 1);
+            assert_eq!((exit, called.as_str()), (Some(0), ""), "{args:?}");
+            assert!(stdout.starts_with('<'), "{args:?}");
+            let (_, stdout, _, _) = run(args, &[("ATERM_CHILD", "0")], 1);
+            assert!(stdout.starts_with('<'), "{args:?}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_signin_block_renders_for_grok_alone_and_fail_closed() {
+        let gate = crate::vendor_direct::GROK_SIGNIN_GATE;
+        let grok = sh_signin_prelude("grok", "Grok Build", &gate, &["login"]);
+        assert!(grok.starts_with("# atpkg: sign-in gate"), "{grok}");
+        assert!(
+            grok.contains("harness signin --cli 'grok' --wait"),
+            "{grok}"
+        );
+        for program in ["claude", "codex", "kimi", "muse", "agy"] {
+            let prelude = twin_prelude(
+                program,
+                Path::new("/p"),
+                None,
+                &[],
+                &crate::yolo::policy_of(program),
+            );
+            assert!(!prelude.contains("sign-in gate"), "{program}");
+        }
+        use crate::vendor_direct::SigninGate;
+        for bad in [
+            SigninGate {
+                cli: "Grok",
+                ..gate
+            },
+            SigninGate { cli: "g'k", ..gate },
+            SigninGate {
+                credential_env: &["GROK AUTH"],
+                ..gate
+            },
+            SigninGate {
+                credential_env: &["$(x)"],
+                ..gate
+            },
+            SigninGate {
+                login_file_env: "a-b",
+                ..gate
+            },
+            SigninGate {
+                home_env: "",
+                ..gate
+            },
+            SigninGate {
+                home_default: "..",
+                ..gate
+            },
+            SigninGate {
+                home_default: "a/b",
+                ..gate
+            },
+            SigninGate {
+                login_file: "a\"b",
+                ..gate
+            },
+            SigninGate {
+                one_shot: &[],
+                ..gate
+            },
+            SigninGate {
+                one_shot: &["--x'y"],
+                ..gate
+            },
+            SigninGate {
+                one_shot: &["*"],
+                ..gate
+            },
+        ] {
+            assert_eq!(
+                sh_signin_prelude("grok", "Grok Build", &bad, &["login"]),
+                "",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(sh_signin_prelude("grok", "Grok's", &gate, &[]), "");
+        assert_eq!(sh_signin_prelude("grok", "", &gate, &[]), "");
+        assert_eq!(
+            sh_signin_prelude("grok", "Grok Build", &gate, &["esac"]),
+            ""
+        );
+        assert_eq!(sh_signin_prelude("grok", "Grok Build", &gate, &["a|b"]), "");
+        assert_eq!(sh_signin_prelude("../x", "Grok Build", &gate, &[]), "");
     }
 
     #[test]

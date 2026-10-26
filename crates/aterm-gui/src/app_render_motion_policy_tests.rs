@@ -110,7 +110,7 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     assert_eq!(live_tick.motion, MotionPolicy::Full);
     let ws = app.windows.get(&wid).expect("window");
     assert!(
-        !ws.fx.cursor().glow.under_quads().is_empty(),
+        !ws.fx.cursor().glow.under_laid().is_empty(),
         "an unfocused window paints the trail its typing earned \
          (the v0.48–v0.50 real-window blackout frame)"
     );
@@ -126,7 +126,7 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     );
     let ws = app.windows.get(&wid).expect("window");
     assert!(
-        ws.fx.cursor().glow.under_quads().is_empty() && ws.fx.cursor().glow_scratch.is_empty(),
+        ws.fx.cursor().glow.under_laid().is_empty() && ws.fx.cursor().glow_laid().is_empty(),
         "the drained unfocused window holds no resident trail"
     );
 }

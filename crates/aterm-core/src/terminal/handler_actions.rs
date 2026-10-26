@@ -150,11 +150,12 @@ impl ActionSink for TerminalHandler<'_> {
             }
             0x09 => self.grid.tab_margin(self.modes.left_right_margin_mode), // HT
             0x0A..=0x0C => {
+                // xterm `CASE_VMOT`: the index, then LNM's carriage return.
+                self.margined_line_feed(self.modes.left_right_margin_mode);
                 if self.modes.new_line_mode {
                     self.grid
                         .carriage_return_margin(self.modes.left_right_margin_mode);
                 }
-                self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             0x0D => self
                 .grid
@@ -166,9 +167,10 @@ impl ActionSink for TerminalHandler<'_> {
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             0x85 => {
+                // NEL, as ESC E: the index, then the carriage return.
+                self.margined_line_feed(self.modes.left_right_margin_mode);
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
-                self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             0x88 => self.grid.set_tab_stop(), // HTS - same as ESC H
             0x8D => {

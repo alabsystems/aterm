@@ -666,7 +666,19 @@ fn a_light_water_drop_is_clear_blue() {
             born: at,
         });
         let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
-        glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
+        glow.emit_particles(
+            at,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
         (out, halos)
     };
     let (ink, halos) = drop(false);

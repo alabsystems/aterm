@@ -122,7 +122,7 @@ pub(crate) fn renewal_transition(
                     for (from, to) in [("main", "moved"), ("moved", "main")] {
                         store
                             .transact_logins(NOW, &mut None, |state, logins| {
-                                move_account(state, logins, from, to);
+                                move_account(state, logins, from, to)?;
                                 Ok(Vec::new())
                             })
                             .unwrap();

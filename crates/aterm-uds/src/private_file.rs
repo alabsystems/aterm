@@ -670,6 +670,28 @@ mod tests {
         }
         assert_eq!(mode_of(&granted), 0o700);
 
+        // Open by its mode bits AND by an access list: refused for the list, its mode
+        // left as it was. astream-sys judges the list before the mode. Were the mode
+        // judged first, `judge_private_dir` would answer `Open(0o755)`, so
+        // `aterm fabric on --dry-run` would promise only a `chmod 700`, and
+        // `ensure_private_dir` would narrow the owner's directory to 0700 before its
+        // second look found the list and refused it: the mode changed for nothing.
+        // Both are caught here, by the `unwrap_err` and by the mode check below.
+        let wide = dir_in(root.path(), "wide", 0o755);
+        chmod(&[
+            "+a".as_ref(),
+            "everyone allow read".as_ref(),
+            wide.as_os_str(),
+        ]);
+        for refusal in [
+            judge_private_dir(&wide).unwrap_err(),
+            ensure_private_dir(&wide).unwrap_err(),
+        ] {
+            assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(refusal.to_string().contains("chmod -N"), "{refusal}");
+        }
+        assert_eq!(mode_of(&wide), 0o755, "a refused directory is not narrowed");
+
         let parent = dir_in(root.path(), "parent", 0o700);
         chmod(&[
             "+a".as_ref(),

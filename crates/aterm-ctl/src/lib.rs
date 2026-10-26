@@ -64,8 +64,10 @@ OPTIONS:
                   spawn agent=claude [cwd=<absolute>] - < task, await task
                   @<w> since=0 (the first wait; later ones @<w>:<rev>),
                   @<w> result|status|text|screen|turn|key|send|close,
-                  hold <w> on|off. `aterm help workers`. `--host H survey` is
-                  `survey --host H`, a fleet read that needs no drive grant.
+                  hold <w> on|off (its sid bare, no @). `aterm help workers`.
+                  `--host H survey` is `survey --host H`, a fleet read that
+                  needs no drive grant (and names no --fleet or --host of
+                  its own).
     --timeout SECS
                   deadline on each socket read and write, in seconds (default
                   900, 0 = none; --timeout=SECS also works). Raise it for a
@@ -73,11 +75,13 @@ OPTIONS:
                   --host it bounds each drive connection, handshake and reply,
                   whose own deadline is 28 s; a shorter one is taken, and cuts
                   a `turn` whose own wait (timeout=, 20 s unless named) runs
-                  past it. On `subscribe`, an explicit --timeout instead caps
-                  the whole watch (frames so far are flushed, then exit 124);
-                  without one, or with 0, the watch runs until the stream
-                  ends. The wait for a successor (exit 75) spends what is left
-                  of it.
+                  past it. A fleet survey (`survey --fleet`, `--host`) takes
+                  it the same way: each peer's read (3 s, or survey's own
+                  --timeout) is cut to a shorter one. On `subscribe`, an
+                  explicit --timeout instead caps the whole watch (frames so
+                  far are flushed, then exit 124); without one, or with 0,
+                  the watch runs until the stream ends. The wait for a
+                  successor (exit 75) spends what is left of it.
     --completions SHELL
                   print a bash, zsh or fish completion script and exit.
     -h, --help    print this help and exit.
@@ -90,16 +94,22 @@ EXIT CODES:
          instance answered. Also 0 when stdout's reader closes it (`| head`).
     1    a usage or connect error, or an ERR reply. For `ls`/`instances`/
          `windows`: the socket directory was read and holds no instance — the
-         only case that prints `no live aterm instances found`.
+         only case that prints `no live aterm instances found`. For a fleet
+         survey (`survey --fleet`, `--host`): no machine it read answered
+         (each row names why), and not each one as row 2 says.
     2    could not reach: the instance accepted the connection but did not
          serve it within 10 s (or a shorter --timeout; --timeout 0 waits
-         without bound), so the request was not sent; with --host, the peer
-         took the connection and sent no fleet handshake within 28 s (or a
-         shorter --timeout): an aterm stopped, frozen or overloaded, the
-         request not sent. For `ls`/`instances`/`windows`: no socket found
-         answered, or the directory is missing, unreadable or unresolvable
-         (every variable it is read from unset); stderr names each socket's
-         cause and a hint.
+         without bound), so the request was not sent. With --host, an aterm
+         took the connection and sent no fleet handshake in time: a drive's
+         peer within 28 s (or a shorter --timeout); this machine's issuer,
+         read for which Mac a word no book here holds names (a refusal that
+         says `try again once it answers`); or the peer a `survey --host`
+         read, within its deadline. That aterm is stopped, frozen or
+         overloaded, and the request was not sent; any other refusal, a
+         connection refused or hung up included, exits 1. For `ls`/
+         `instances`/`windows`: no socket found answered, or the directory
+         is missing, unreadable or unresolvable (every variable it is read
+         from unset); stderr names each socket's cause and a hint.
     124  timeout: the client's deadline fired, or the server reported one (a
          `turn` with status=timeout, or `OK timeout` from await/ready/wait);
          for `ls`/`instances`/`windows`, every socket found timed out.
@@ -3168,8 +3178,8 @@ fn exit_for(e: &io::Error) -> ExitCode {
     }
 }
 
-/// Whether `e` is a drive whose peer took the connection and sent no fleet handshake, so the
-/// request was not sent ([`DriveRefused::unserved`]).
+/// Whether `e` is a drive whose peer, or the issuer it read first, took the connection and sent
+/// no fleet handshake, so the request was not sent ([`DriveRefused::unserved`]).
 fn is_unserved(e: &io::Error) -> bool {
     e.get_ref()
         .and_then(|inner| inner.downcast_ref::<DriveRefused>())
@@ -3615,7 +3625,13 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return run_sys_instances_all(&request_parts, sock.as_deref(), pid);
     }
     if survey::is_survey(&request_parts) {
-        return survey::run_survey(&request_parts, sock.as_deref(), pid, &local);
+        return survey::run_survey(
+            &request_parts,
+            sock.as_deref(),
+            pid,
+            timeout_explicit.then_some(deadline),
+            &local,
+        );
     }
     if let Some(reply) = client_help_reply(&request_parts, help_asked) {
         print_framed_lines(&reply)?;

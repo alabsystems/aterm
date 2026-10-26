@@ -135,7 +135,7 @@ impl Host {
     fn new(shape: Shape) -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         let (row, col0, prefix) = match shape {
             Shape::Claude => ((ROWS - 3) as u16, 4, "│ > "),

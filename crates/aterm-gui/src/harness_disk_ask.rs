@@ -32,12 +32,74 @@ pub(super) struct Looked {
     pub(super) done: Option<ask::Done>,
     /// Another instance's pass held the pass lock: it may be freeing space now.
     pub(super) contended: bool,
+    /// What this look's own pass, and a reserve it released, freed, each with when it ended: the
+    /// step records it in the lease ([`ask::Look::reclaimed`]), so no asked session's rise counts
+    /// it.
+    pub(super) reclaimed: Vec<ask::Reclaimed>,
+    /// The pass lock this look's pass took, held until the step has recorded what the pass freed
+    /// ([`after_look`]): another instance's look meanwhile reads a pass running
+    /// ([`ask::Look::passing`]), never the space it freed unrecorded.
+    pub(super) pass_lock: Option<disk::reserve::PassLock>,
 }
 
-/// One of this process's sessions the ask could go to, and where it works.
+/// This process's passes the lease has yet to record, by volume key: a step the lease's lock kept
+/// from landing records them at the next.
+static UNRECORDED_PASSES: Mutex<Vec<(String, ask::Reclaimed)>> = Mutex::new(Vec::new());
+
+/// This process's passes on `key` the lease has yet to record, `this` look's added, oldest first:
+/// at most [`ask::MAX_RECLAIMED`], past it the two oldest kept as one, as the lease keeps them.
+fn passes_unrecorded(key: &str, this: &[ask::Reclaimed]) -> Vec<ask::Reclaimed> {
+    let mut all = UNRECORDED_PASSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    all.extend(this.iter().map(|r| (key.to_owned(), *r)));
+    let mut mine: Vec<ask::Reclaimed> = all
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, r)| *r)
+        .collect();
+    mine.sort_by_key(|r| r.ended_ms);
+    while mine.len() > ask::MAX_RECLAIMED {
+        let first = mine.remove(0);
+        mine[0].bytes = mine[0].bytes.saturating_add(first.bytes);
+    }
+    all.retain(|(k, _)| k != key);
+    all.extend(mine.iter().map(|r| (key.to_owned(), *r)));
+    mine
+}
+
+/// The lease recorded `recorded` of this process's passes on `key` (or has no episode open to
+/// record them in): they are no longer this process's to report.
+fn passes_recorded(key: &str, recorded: &[ask::Reclaimed]) {
+    UNRECORDED_PASSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|(k, r)| k != key || !recorded.contains(r));
+}
+
+/// Whether another instance's pass holds the pass lock of `home`'s volume now: it may have freed
+/// space this look read that its host's step has yet to record.
+fn another_pass_runs(home: &Path) -> bool {
+    let path = disk::reserve::pass_lock_for(home);
+    match disk::reserve::take_pass(&path) {
+        Ok(Some(_free)) => false,
+        Ok(None) => true,
+        Err(e) => {
+            aterm_log::debug!(
+                "harness disk watch: the pass lock {} could not be read ({e}); the ask's step \
+                 takes no pass to be running",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+/// One of this process's sessions the ask could go to, and the checkout it works in, of those
+/// the pass's holders might serve ([`checkout_of`]).
 struct Seated {
     seat: ask::Seat,
-    cwd: PathBuf,
+    checkout: Option<PathBuf>,
 }
 
 /// The last word each volume's step said here, so a standing state is journalled once.
@@ -88,7 +150,7 @@ pub(super) fn before_pass(sids: &[String], store: &Store) {
     }
     let Rule {
         barred, live, held, ..
-    } = rule(store, sids, &key, &[], false);
+    } = rule(store, sids, &key, &Left::NONE, false);
     let alive = |h: &ask::HostId| h.alive();
     let roster = ask::Roster {
         host: &host,
@@ -153,13 +215,17 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     let key = reading.key.spelled();
     let host = ask::HostId::this();
     let now = now_ms();
+    let reclaimed = passes_unrecorded(&key, &looked.reclaimed);
     if look_rests(&state, &key, level) {
         // At or above the floor with no episode open, and no line of this process's that the
-        // lease has yet to record: nothing to step, no lock to take.
+        // lease has yet to record: nothing to step, no lock to take, and no line a pass's space
+        // could be credited to.
+        passes_recorded(&key, &reclaimed);
         crate::disk_board::publish(|b| {
             b.asks.retain(|_, o| o.key != key);
             b.unfit.retain(|sid, _| sids.contains(sid));
             b.walls.retain(|sid, _| sids.contains(sid));
+            b.withholds.retain(|sid, _| sids.contains(sid));
         });
         *OWNER.lock().unwrap_or_else(PoisonError::into_inner) = None;
         journal(
@@ -191,9 +257,23 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         barred,
         live,
         held,
-    } = rule(store, sids, &key, &holders, true);
+    } = rule(
+        store,
+        sids,
+        &key,
+        &Left {
+            holders: &holders,
+            home: Some(&home),
+            root: &checkout_root,
+            there: &dir_there,
+        },
+        true,
+    );
     let seats: Vec<ask::Seat> = seated.iter().map(|s| s.seat.clone()).collect();
     let alive = |h: &ask::HostId| h.alive();
+    // Read after the volume: a pass that freed space this look read has either been recorded by
+    // its host's step, which it makes before it lets the lock go, or holds the lock still.
+    let passing = looked.pass_lock.is_none() && another_pass_runs(&home);
     let look = ask::Look {
         now_ms: now,
         host: &host,
@@ -209,6 +289,8 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         barred: &barred,
         live: &live,
         held: &held,
+        reclaimed: &reclaimed,
+        passing,
         alive: &alive,
     };
     let unrecorded = typed_last(&key);
@@ -220,7 +302,10 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         (said, lease.entry(&key).cloned())
     });
     let (said, entry) = match stepped {
-        Ok(Some(stepped)) => stepped,
+        Ok(Some(stepped)) => {
+            passes_recorded(&key, &reclaimed);
+            stepped
+        }
         Ok(None) => {
             aterm_log::debug!(
                 "harness disk watch: {} is held; the ask steps at the next look",
@@ -244,7 +329,6 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     });
     let owed = owed_here.and_then(|sid| {
         let s = seated.iter().find(|s| s.seat.sid == sid)?;
-        let checkout = checkout_of(&holders, &s.cwd);
         let text = ask::line(&ask::Line {
             mount: &reading.mount,
             total: reading.total,
@@ -265,7 +349,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
                 .or(done)
                 .unwrap_or(ask::Done::Spent),
             holders: &holders,
-            checkout,
+            checkout: s.checkout.as_deref(),
             home: Some(&home),
         });
         Some((sid, text))
@@ -273,6 +357,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     crate::disk_board::publish(|b| {
         b.unfit.retain(|sid, _| sids.contains(sid));
         b.walls.retain(|sid, _| sids.contains(sid));
+        b.withholds.retain(|sid, _| sids.contains(sid));
         b.asks
             .retain(|sid, o| o.key != key || owed.as_ref().is_some_and(|(s, _)| s == sid));
         if let Some((sid, text)) = &owed {
@@ -453,7 +538,13 @@ fn judge(f: &Facts) -> Judged {
 /// [`ask::HeldBy`] here by its word):
 /// - `hold` while the owner's hold or a person's take-over stands on it (`halted`: the fabric's
 ///   hold, `status hold=1`), whatever its agent reads;
-/// - `limited` while its agent reads `limited` at a wall its loop has open and has not yet taken
+/// - `credits` while its loop's credits hold stands (`withhold`,
+///   [`crate::disk_board::Withhold::holds`] at `now_s`: until it lifts);
+/// - `sign-in` while its agent reads a sign-in wall (`wall:auth`) or its loop held its last turn
+///   break at one: only a person's browser brings the login back;
+/// - `wall` while its loop held its last turn break at another wall that is no usage limit;
+/// - `limited` while its agent reads a usage-limit wall (a `wall:<kind>` word of a kind
+///   [`aterm_phase::WallKind::reads_limited`]) its loop has open and has not yet taken
 ///   as spent (`wall`, [`crate::disk_board::Wall::holds`] at `now_s`: before its reset and the
 ///   loop's grace, when the loop rests there and its line could go);
 /// - `box` while its agent reads a box (`prompt`, `question`) its loop escalated to its owner
@@ -461,7 +552,8 @@ fn judge(f: &Facts) -> Judged {
 /// - `draft` while its agent reads `idle` with a draft standing in its composer (`drafted`: the
 ///   same typed text this process's last look read there, [`Draft::stands`]).
 ///
-/// A box no rule answers waits on a person, and a wall on its reset: neither turn ends, so a line
+/// A box no rule answers waits on a person, a sign-in on a person too, and a wall on its reset:
+/// none of those turns ends, and the credits hold types nothing at the turns that do, so a line
 /// owed would wait out its delivery window. A hold and a draft keep the session at a turn break,
 /// but the fenced write refuses every try there (`wait:held`, `wait:draft`) while they last, so a
 /// line owed would wait it out as well, its claim stretching it to the delivery window and a
@@ -470,19 +562,50 @@ fn held_of(
     word: &str,
     escalated: bool,
     wall: Option<&crate::disk_board::Wall>,
+    withhold: Option<&crate::disk_board::Withhold>,
     halted: bool,
     drafted: bool,
     now_s: i64,
 ) -> Option<ask::HeldBy> {
+    use crate::disk_board::Withhold;
+    let sign_in = aterm_phase::WallKind::Auth.wire();
     if halted {
         return Some(ask::HeldBy::Hold);
     }
+    match withhold.filter(|w| w.holds(now_s)) {
+        Some(Withhold::Credits { .. }) => return Some(ask::HeldBy::Credits),
+        Some(Withhold::Wall { wire }) if *wire == sign_in => return Some(ask::HeldBy::SignIn),
+        Some(Withhold::Wall { .. }) => return Some(ask::HeldBy::Wall),
+        None => {}
+    }
     match word {
-        "limited" if wall.is_some_and(|w| w.holds(now_s)) => Some(ask::HeldBy::Limit),
+        w if w == sign_in => Some(ask::HeldBy::SignIn),
+        w if limit_word(w) && wall.is_some_and(|w| w.holds(now_s)) => Some(ask::HeldBy::Limit),
         "prompt" | "question" if escalated => Some(ask::HeldBy::Box),
         "idle" if drafted => Some(ask::HeldBy::Draft),
         _ => None,
     }
+}
+
+/// Whether `word`, an agent's published word, is a wall of a kind its loop reads as a usage limit
+/// ([`aterm_phase::WallKind::reads_limited`]): the usage windows, a model's bucket, spend, and an
+/// API error, whose rate limit (429) alone does (the word does not say which; the loop's limit
+/// episode, [`crate::disk_board::Board::walls`], does).
+fn limit_word(word: &str) -> bool {
+    use aterm_phase::{ApiCause, WallKind};
+    [
+        WallKind::UsageSession,
+        WallKind::UsageWeekly,
+        WallKind::ModelBucket { consent: false },
+        WallKind::Spend,
+        WallKind::ApiError {
+            code: Some(429),
+            retryable: true,
+            cause: ApiCause::Server,
+        },
+    ]
+    .iter()
+    .any(|kind| kind.reads_limited() && kind.wire() == word)
 }
 
 /// What a session's composer held as a look read it ([`draft_in`]).
@@ -714,6 +837,7 @@ fn judged(read: Vec<Read>, key: &str) -> Vec<(Read, Judged)> {
                     r.word,
                     r.escalated,
                     b.walls.get(&r.sid),
+                    b.withholds.get(&r.sid),
                     r.halted,
                     drafted,
                     now_s,
@@ -744,11 +868,37 @@ struct Rule {
     held: Vec<(String, ask::HeldBy)>,
 }
 
+/// What the pass left that a seat counts ([`rule`]): its largest holders, `$HOME`, and how a
+/// directory is read as a checkout's root ([`checkout_root`]) and as there at all
+/// ([`dir_there`]), which a test replaces so it reads no disk.
+struct Left<'a> {
+    holders: &'a [Hog],
+    home: Option<&'a Path>,
+    root: &'a dyn Fn(&Path) -> bool,
+    there: &'a dyn Fn(&Path) -> bool,
+}
+
+impl Left<'static> {
+    /// Nothing left: no seat holds anything, and no directory is read.
+    const NONE: Self = Self {
+        holders: &[],
+        home: None,
+        root: &unread,
+        there: &unread,
+    };
+}
+
+/// No directory is read: none is a checkout's root, or there ([`Left::NONE`]).
+const fn unread(_: &Path) -> bool {
+    false
+}
+
 /// The seat rule over this process's live sessions on volume `key` (its spelling), `sids` the
-/// supervised ones and `holders` what the pass left. A look's own rule (`remember`, after its
-/// pass) keeps what each composer held for the next look ([`DRAFTS`]); the take-over before the
-/// pass reads it alone.
-fn rule(store: &Store, sids: &[String], key: &str, holders: &[Hog], remember: bool) -> Rule {
+/// supervised ones and `left` what the pass left, each seat holding what its own checkout's
+/// builds hold ([`checkout_of`], [`held_in`]). A look's own rule (`remember`, after its pass)
+/// keeps what each composer held for the next look ([`DRAFTS`]); the take-over before the pass
+/// reads it alone.
+fn rule(store: &Store, sids: &[String], key: &str, left: &Left<'_>, remember: bool) -> Rule {
     let mut out = Rule {
         seated: Vec::new(),
         barred: Vec::new(),
@@ -776,14 +926,17 @@ fn rule(store: &Store, sids: &[String], key: &str, holders: &[Hog], remember: bo
         match (judged, r.cwd) {
             (Judged::Barred(_), _) => out.barred.push(r.sid),
             (Judged::Held(why), _) => out.held.push((r.sid, why)),
-            (Judged::Seat, Some(cwd)) => out.seated.push(Seated {
-                seat: ask::Seat {
-                    held: held_under(holders, &cwd),
-                    sid: r.sid,
-                    at_break: r.at_break,
-                },
-                cwd,
-            }),
+            (Judged::Seat, Some(cwd)) => {
+                let checkout = checkout_of(left.holders, &cwd, left.home, left.root, left.there);
+                out.seated.push(Seated {
+                    seat: ask::Seat {
+                        held: held_in(left.holders, checkout.as_deref()),
+                        sid: r.sid,
+                        at_break: r.at_break,
+                    },
+                    checkout,
+                });
+            }
             (Judged::Seat | Judged::Unseated, _) => {}
         }
     }
@@ -802,19 +955,66 @@ fn judge_at(store: &Store, sid: &str, key: &str) -> Judged {
         .unwrap_or(Judged::Unseated)
 }
 
-/// The checkout `cwd` works in, of those `holders` serve: the deepest one it sits under, so a
-/// worktree nested in another checkout is its own.
-fn checkout_of<'a>(holders: &'a [Hog], cwd: &Path) -> Option<&'a Path> {
-    holders
+/// The most directories [`checkout_of`] looks into for a session's own checkout.
+const CHECKOUT_WALK: usize = 32;
+
+/// Whether `dir` is a checkout's root: it holds a `.git`, a repository's directory or a
+/// worktree's or submodule's file, as the disk look's discovery reads one
+/// ([`disk::discover::worktree_root_of`]). One `lstat`, made off the UI thread by the look's
+/// step ([`after_look`]).
+fn checkout_root(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// Whether `dir` is there, a directory: a session's own directory may have been removed under it
+/// (a worktree its session landed and removed). One `stat`, made off the UI thread by the look's
+/// step ([`after_look`]).
+fn dir_there(dir: &Path) -> bool {
+    std::fs::metadata(dir).is_ok_and(|m| m.is_dir())
+}
+
+/// The checkout `cwd` works in, of those `holders` might serve: the deepest checkout a holder
+/// serves that `cwd` sits under, or, nearer, the first directory from `cwd` up, short of that one,
+/// that `root` reads as a checkout's root ([`checkout_root`]). So a worktree nested in another
+/// checkout is its own whether or not the pass lists a holder of its own: `holders` are only its
+/// largest ([`disk::MAX_HOGS`]), and a build of its own already reclaimed is none of them. `root`
+/// is asked of no directory at or above that served checkout or above `home`, and of at most
+/// [`CHECKOUT_WALK`]. When it finds no root, `there` is asked once whether `cwd` itself is there:
+/// a removed directory holds no `.git` to find, so a worktree removed under its session would
+/// read as the checkout around it. `None`: no holder serves a checkout `cwd` sits under, so none
+/// of them is its own, and nothing is asked; or `cwd`, below the served checkout, is gone, so
+/// which checkout it was is unknown, and none of them is its own.
+fn checkout_of(
+    holders: &[Hog],
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &dyn Fn(&Path) -> bool,
+    there: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let served = holders
         .iter()
         .filter_map(|h| h.serves.as_deref())
         .filter(|c| cwd.starts_with(c))
-        .max_by_key(|c| c.components().count())
+        .max_by_key(|c| c.components().count())?;
+    for dir in cwd
+        .ancestors()
+        .take_while(|dir| *dir != served)
+        .take(CHECKOUT_WALK)
+    {
+        if root(dir) {
+            return Some(dir.to_path_buf());
+        }
+        if Some(dir) == home {
+            break;
+        }
+    }
+    (cwd == served || there(cwd)).then(|| served.to_path_buf())
 }
 
-/// What `holders` hold for the checkout `cwd` works in ([`checkout_of`]).
-fn held_under(holders: &[Hog], cwd: &Path) -> u64 {
-    let Some(checkout) = checkout_of(holders, cwd) else {
+/// What `holders` hold for `checkout` ([`checkout_of`]): only the builds that serve it exactly,
+/// never a checkout around it.
+fn held_in(holders: &[Hog], checkout: Option<&Path>) -> u64 {
+    let Some(checkout) = checkout else {
         return 0;
     };
     holders
@@ -1225,34 +1425,52 @@ mod tests {
     /// or at a box its loop escalated to its owner, cannot take a line before its delivery window
     /// ends: the look holds it out of its seats. A seat rule that seated such a tab elected it,
     /// often first (its checkout the largest), and the line waited out its window and was handed
-    /// on as undelivered, spending an election with nothing typed.
+    /// on as undelivered, spending an election with nothing typed. The wall is read by the word
+    /// its agent publishes, `wall:<kind>`, of a kind its loop reads as a usage limit: the seat
+    /// rule once matched a `limited` no agent publishes, and held no session at a wall at all.
     #[test]
     fn a_session_at_an_unspent_wall_or_an_escalated_box_is_held() {
         use crate::disk_board::Wall;
         let wall = |until_s| Wall { until_s };
         let now = 1_000_000;
         let held = |word, escalated, wall: Option<&Wall>| {
-            held_of(word, escalated, wall, false, false, now)
+            held_of(word, escalated, wall, None, false, false, now)
         };
-        assert_eq!(
-            held("limited", false, Some(&wall(Some(now + 1)))),
-            Some(ask::HeldBy::Limit)
-        );
-        assert_eq!(
-            held("limited", false, Some(&wall(None))),
-            Some(ask::HeldBy::Limit),
-            "no reset known: held until the loop closes the wall"
-        );
-        assert_eq!(
-            held("limited", false, Some(&wall(Some(now)))),
-            None,
-            "spent: the loop rests there, and the line can go"
-        );
-        assert_eq!(
-            held("limited", false, None),
-            None,
-            "no wall the loop has open"
-        );
+        for word in [
+            "wall:usage-session",
+            "wall:usage-weekly",
+            "wall:model-bucket",
+            "wall:spend",
+            "wall:api-error",
+        ] {
+            assert_eq!(
+                held(word, false, Some(&wall(Some(now + 1)))),
+                Some(ask::HeldBy::Limit),
+                "{word}"
+            );
+            assert_eq!(
+                held(word, false, Some(&wall(None))),
+                Some(ask::HeldBy::Limit),
+                "{word}: no reset known: held until the loop closes the wall"
+            );
+            assert_eq!(
+                held(word, false, Some(&wall(Some(now)))),
+                None,
+                "{word}: spent: the loop rests there, and the line can go"
+            );
+            assert_eq!(
+                held(word, false, None),
+                None,
+                "{word}: no wall the loop has open (an API error that is no rate limit)"
+            );
+        }
+        for word in ["wall:context", "wall:overloaded", "wall:memory"] {
+            assert_eq!(
+                held(word, false, Some(&wall(None))),
+                None,
+                "{word}: no usage limit's wall"
+            );
+        }
         assert_eq!(
             held("idle", false, Some(&wall(None))),
             None,
@@ -1269,6 +1487,107 @@ mod tests {
         assert_eq!(held("busy", true, None), None);
     }
 
+    /// What this process's passes freed is kept for the lease until a step lands it: a step the
+    /// lease's lock kept from landing reports it again at the next, merged past the lease's own
+    /// bound so nothing is lost, and a landed step forgets it.
+    #[test]
+    fn a_pass_the_lease_has_yet_to_record_is_reported_until_a_step_records_it() {
+        let key = "dev:unrecorded-passes-test";
+        let at = |ended_ms, bytes| ask::Reclaimed { ended_ms, bytes };
+        assert_eq!(passes_unrecorded(key, &[at(10, 1)]), [at(10, 1)]);
+        assert_eq!(
+            passes_unrecorded(key, &[at(20, 2)]),
+            [at(10, 1), at(20, 2)],
+            "the step that missed the lease reports its pass again"
+        );
+        assert!(
+            passes_unrecorded("dev:another-volume", &[]).is_empty(),
+            "by volume"
+        );
+        let more: Vec<ask::Reclaimed> = (0..40).map(|i| at(100 + i, 1)).collect();
+        let kept = passes_unrecorded(key, &more);
+        assert_eq!(kept.len(), ask::MAX_RECLAIMED);
+        assert_eq!(
+            kept.iter().map(|r| r.bytes).sum::<u64>(),
+            43,
+            "nothing lost"
+        );
+        passes_recorded(key, &kept);
+        assert!(
+            passes_unrecorded(key, &[]).is_empty(),
+            "recorded: forgotten"
+        );
+    }
+
+    /// Another instance's pass holds the pass lock from its pass until its own step has recorded
+    /// what it freed: a look meanwhile reads it running ([`ask::Look::passing`]), and settles no
+    /// asked episode on the space it freed.
+    #[test]
+    fn a_look_reads_another_instances_pass_running_while_its_lock_is_held() {
+        let home = aterm_tempfile::TempDir::new().expect("a scratch home");
+        assert!(!another_pass_runs(home.path()), "nobody's pass");
+        let lock = disk::reserve::take_pass(&disk::reserve::pass_lock_for(home.path()))
+            .expect("the lock opens")
+            .expect("nobody holds it");
+        assert!(another_pass_runs(home.path()), "a pass holds it");
+        drop(lock);
+        assert!(!another_pass_runs(home.path()), "let go");
+    }
+
+    /// The loop's lasting withholds hold a session out of the seats for as long as they stand, as
+    /// a usage-limit wall does: its credits hold (`[harness] usage_credits = false`, the default),
+    /// which types nothing at its turn breaks until the limit resets, and a sign-in wall
+    /// (`wall:auth`), which only a person's browser moves. Seated, such a session was elected,
+    /// typed nothing for the delivery window and a grace, and was handed on as undelivered; as
+    /// the only seat, the episode then parked for six hours with nothing freed.
+    #[test]
+    fn a_session_its_loop_holds_for_credits_or_a_sign_in_is_held_until_it_is_past() {
+        use crate::disk_board::Withhold;
+        let now = 1_000_000;
+        let held = |word, withhold: Option<&Withhold>| {
+            held_of(word, false, None, withhold, false, false, now)
+        };
+        let credits = |until_s| Withhold::Credits { until_s };
+        assert_eq!(
+            held("idle", Some(&credits(Some(now + 1)))),
+            Some(ask::HeldBy::Credits)
+        );
+        assert_eq!(
+            held("busy", Some(&credits(None))),
+            Some(ask::HeldBy::Credits),
+            "no lift time known: held until its loop finds it lifted"
+        );
+        assert_eq!(
+            held("idle", Some(&credits(Some(now)))),
+            None,
+            "lifted: its loop types at the next turn break"
+        );
+        let auth = Withhold::Wall {
+            wire: aterm_phase::WallKind::Auth.wire(),
+        };
+        assert_eq!(held("idle", Some(&auth)), Some(ask::HeldBy::SignIn));
+        assert_eq!(
+            held("wall:auth", None),
+            Some(ask::HeldBy::SignIn),
+            "its agent reads the sign-in wall before its loop decides a break there"
+        );
+        assert_eq!(
+            held(
+                "idle",
+                Some(&Withhold::Wall {
+                    wire: "wall:overloaded"
+                })
+            ),
+            Some(ask::HeldBy::Wall)
+        );
+        assert_eq!(held("idle", None), None);
+        assert_eq!(
+            ask::HeldBy::Credits.word(),
+            "credits",
+            "the lease and the journal name it"
+        );
+    }
+
     /// A session the owner holds (or a person took over: `status hold=1`), or whose composer
     /// holds a draft that stands at a rest, keeps to a turn break, and the fenced write refuses
     /// every try there (`wait:held`, `wait:draft`): the look holds it, as a wall or a box. Read as
@@ -1278,23 +1597,23 @@ mod tests {
     #[test]
     fn a_held_session_or_one_whose_draft_stands_at_a_rest_is_held() {
         let now = 1_000_000;
-        for word in ["idle", "busy", "prompt", "limited"] {
+        for word in ["idle", "busy", "prompt", "wall:usage-session"] {
             assert_eq!(
-                held_of(word, false, None, true, false, now),
+                held_of(word, false, None, None, true, false, now),
                 Some(ask::HeldBy::Hold),
                 "{word}: the hold refuses any typed line"
             );
         }
         assert_eq!(
-            held_of("idle", false, None, false, true, now),
+            held_of("idle", false, None, None, false, true, now),
             Some(ask::HeldBy::Draft)
         );
         assert_eq!(
-            held_of("busy", false, None, false, true, now),
+            held_of("busy", false, None, None, false, true, now),
             None,
             "a draft queued while it works goes with its turn"
         );
-        assert_eq!(held_of("idle", false, None, false, false, now), None);
+        assert_eq!(held_of("idle", false, None, None, false, false, now), None);
         let seat = Facts {
             supervised: true,
             program: Some(Program::Claude),
@@ -1399,12 +1718,12 @@ mod tests {
         assert!(crate::fabric::apply_hold_for_test(&*h.ctx, None));
         draw("fix the flaky test");
         let first = read();
-        let _ = rule(&store, &sids, key, &[], false);
+        let _ = rule(&store, &sids, key, &Left::NONE, false);
         let before_pass = read();
-        let _ = rule(&store, &sids, key, &[], true);
+        let _ = rule(&store, &sids, key, &Left::NONE, true);
         let second = read();
         draw("");
-        let _ = rule(&store, &sids, key, &[], true);
+        let _ = rule(&store, &sids, key, &Left::NONE, true);
         let forgotten = DRAFTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1504,7 +1823,7 @@ mod tests {
             b.sessions.insert(h.local_id, at);
         }
         let read = || {
-            let r = rule(&store, &sids, &key, &[], true);
+            let r = rule(&store, &sids, &key, &Left::NONE, true);
             (
                 r.seated
                     .iter()
@@ -1749,7 +2068,7 @@ mod tests {
             },
         );
         let key = "fsid:9000";
-        let found = rule(&store, &sids, key, &[], false);
+        let found = rule(&store, &sids, key, &Left::NONE, false);
         let bars: Vec<Option<&'static str>> =
             (0..5).map(|i| bar_at(&store, &sid(i), key)).collect();
         crate::disk_board::SHELF.board_lock().unfit.remove(&sid(2));
@@ -1799,21 +2118,28 @@ mod tests {
                 Some("/u/aterm/.claude/worktrees/w"),
             ),
         ];
-        assert_eq!(
-            held_under(&holders, Path::new("/u/aterm/crates/x")),
-            42 << 30
-        );
-        assert_eq!(held_under(&holders, Path::new("/u/atermx")), 0);
-        assert_eq!(held_under(&holders, Path::new("/u/loose")), 0);
+        let roots = ["/u/aterm", "/u/aterm/.claude/worktrees/w", "/u/trust"];
+        let root = |dir: &Path| roots.iter().any(|r| dir == Path::new(r));
+        let there = |_: &Path| true;
+        let home = Some(Path::new("/u"));
+        let held_under = |cwd: &str| {
+            held_in(
+                &holders,
+                checkout_of(&holders, Path::new(cwd), home, &root, &there).as_deref(),
+            )
+        };
+        assert_eq!(held_under("/u/aterm/crates/x"), 42 << 30);
+        assert_eq!(held_under("/u/atermx"), 0);
+        assert_eq!(held_under("/u/loose"), 0);
         // A worktree nested in a checkout is its own checkout, not the one around it.
         let nested = Path::new("/u/aterm/.claude/worktrees/w/crates");
-        assert_eq!(held_under(&holders, nested), 3 << 30);
+        assert_eq!(held_under("/u/aterm/.claude/worktrees/w/crates"), 3 << 30);
         assert_eq!(
-            checkout_of(&holders, nested),
+            checkout_of(&holders, nested, home, &root, &there).as_deref(),
             Some(Path::new("/u/aterm/.claude/worktrees/w"))
         );
         assert_eq!(
-            checkout_of(&holders, Path::new("/u/aterm")),
+            checkout_of(&holders, Path::new("/u/aterm"), home, &root, &there).as_deref(),
             Some(Path::new("/u/aterm"))
         );
         let key = "dev:typed-here";
@@ -1829,6 +2155,225 @@ mod tests {
         assert!(typed_here(key, "s-a", 1_000 + ask::COOLDOWN_MS - 1));
         assert!(!typed_here(key, "s-b", 2_000));
         assert!(!typed_here(key, "s-a", 1_000 + ask::COOLDOWN_MS));
+    }
+
+    #[test]
+    fn a_worktree_nested_in_a_checkout_with_no_holder_of_its_own_holds_nothing_of_the_checkouts() {
+        let hog = |path: &str, gib: u64, serves: &str| Hog {
+            path: PathBuf::from(path),
+            bytes: gib << 30,
+            bytes_partial: false,
+            why: String::new(),
+            serves: Some(PathBuf::from(serves)),
+        };
+        // The pass's holders: the enclosing checkout's builds, and none of the worktree's (past
+        // the five largest, or its idle build already reclaimed).
+        let holders = [
+            hog(
+                "/u/Library/Caches/aterm/cargo-build.noindex/a",
+                61,
+                "/u/aterm",
+            ),
+            hog("/u/trust/build", 30, "/u/trust"),
+        ];
+        let roots = ["/u/aterm", "/u/aterm/.claude/worktrees/v", "/u/trust"];
+        let looked = Mutex::new(Vec::<PathBuf>::new());
+        let root = |dir: &Path| {
+            looked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(dir.to_path_buf());
+            roots.iter().any(|r| dir == Path::new(r))
+        };
+        let there = |_: &Path| true;
+        let home = Path::new("/u");
+        let looked_at =
+            || std::mem::take(&mut *looked.lock().unwrap_or_else(PoisonError::into_inner));
+        let said = |checkout: Option<&Path>| {
+            ask::line(&ask::Line {
+                mount: Path::new("/System/Volumes/Data"),
+                total: 1000 << 30,
+                free: 18 << 30,
+                floor: 25 << 30,
+                emergency: false,
+                done: ask::Done::Spent,
+                holders: &holders,
+                checkout,
+                home: Some(home),
+            })
+        };
+        let wt = Path::new("/u/aterm/.claude/worktrees/v/crates/x");
+        let checkout = checkout_of(&holders, wt, Some(home), &root, &there);
+        assert_eq!(
+            checkout.as_deref(),
+            Some(Path::new("/u/aterm/.claude/worktrees/v"))
+        );
+        assert_eq!(held_in(&holders, checkout.as_deref()), 0);
+        let text = said(checkout.as_deref());
+        assert!(text.contains("~/aterm's builds 61.0 GiB"), "{text}");
+        assert!(!text.contains("(this tab's)"), "{text}");
+        // It looks only between the tab's directory and the checkout around it, and stops at the
+        // first root.
+        assert_eq!(
+            looked_at(),
+            [
+                PathBuf::from("/u/aterm/.claude/worktrees/v/crates/x"),
+                PathBuf::from("/u/aterm/.claude/worktrees/v/crates"),
+                PathBuf::from("/u/aterm/.claude/worktrees/v"),
+            ]
+        );
+        // The worktree's root itself is its own too.
+        let at_root = checkout_of(
+            &holders,
+            Path::new("/u/aterm/.claude/worktrees/v"),
+            Some(home),
+            &root,
+            &there,
+        );
+        assert_eq!(held_in(&holders, at_root.as_deref()), 0);
+        looked_at();
+        // A tab in the checkout itself still holds its builds, and is told they are its own.
+        for cwd in ["/u/aterm", "/u/aterm/crates/x"] {
+            let checkout = checkout_of(&holders, Path::new(cwd), Some(home), &root, &there);
+            assert_eq!(checkout.as_deref(), Some(Path::new("/u/aterm")), "{cwd}");
+            assert_eq!(held_in(&holders, checkout.as_deref()), 61 << 30, "{cwd}");
+            let text = said(checkout.as_deref());
+            assert!(
+                text.contains("~/aterm's builds 61.0 GiB (this tab's)"),
+                "{text}"
+            );
+            assert!(!looked_at().contains(&PathBuf::from("/u/aterm")), "{cwd}");
+        }
+        // No holder serves a checkout around the tab: nothing is read, and nothing is its own.
+        assert_eq!(
+            checkout_of(&holders, Path::new("/u/other/x"), Some(home), &root, &there),
+            None
+        );
+        assert!(looked_at().is_empty());
+        // Nothing above `$HOME` is read for a root.
+        let wide = [hog("/c/root-build", 5, "/")];
+        assert_eq!(
+            checkout_of(
+                &wide,
+                Path::new("/h/u/p/q"),
+                Some(Path::new("/h/u")),
+                &root,
+                &there
+            )
+            .as_deref(),
+            Some(Path::new("/"))
+        );
+        assert_eq!(
+            looked_at(),
+            [
+                PathBuf::from("/h/u/p/q"),
+                PathBuf::from("/h/u/p"),
+                PathBuf::from("/h/u")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_worktree_removed_under_its_session_holds_nothing_of_the_checkout_around_it() {
+        // ~/aterm's builds are the one holder left; the tab's shell last said it works in a
+        // worktree nested in ~/aterm that has since been removed (its session landed it), so no
+        // `.git` is left to find between its directory and ~/aterm.
+        let holders = [Hog {
+            path: PathBuf::from("/u/Library/Caches/aterm/cargo-build.noindex/a"),
+            bytes: 61 << 30,
+            bytes_partial: false,
+            why: String::new(),
+            serves: Some(PathBuf::from("/u/aterm")),
+        }];
+        let roots = ["/u/aterm", "/u/aterm/.claude/worktrees/v"];
+        let root = |dir: &Path| roots.iter().any(|r| dir == Path::new(r));
+        let gone = Path::new("/u/aterm/.claude/worktrees/gone");
+        let asked = Mutex::new(Vec::<PathBuf>::new());
+        let there = |dir: &Path| {
+            asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(dir.to_path_buf());
+            !dir.starts_with(gone) && !dir.starts_with("/u/aterm/.claude/worktrees/v/tmp")
+        };
+        let asked_of =
+            || std::mem::take(&mut *asked.lock().unwrap_or_else(PoisonError::into_inner));
+        let home = Path::new("/u");
+        let of = |cwd: &str| checkout_of(&holders, Path::new(cwd), Some(home), &root, &there);
+        for cwd in [
+            "/u/aterm/.claude/worktrees/gone/crates",
+            "/u/aterm/.claude/worktrees/gone",
+        ] {
+            let checkout = of(cwd);
+            assert_eq!(checkout, None, "{cwd}");
+            assert_eq!(held_in(&holders, checkout.as_deref()), 0, "{cwd}");
+            let text = ask::line(&ask::Line {
+                mount: Path::new("/System/Volumes/Data"),
+                total: 1000 << 30,
+                free: 18 << 30,
+                floor: 25 << 30,
+                emergency: false,
+                done: ask::Done::Spent,
+                holders: &holders,
+                checkout: checkout.as_deref(),
+                home: Some(home),
+            });
+            assert!(text.contains("~/aterm's builds 61.0 GiB"), "{text}");
+            assert!(!text.contains("(this tab's)"), "{text}");
+            // Only the tab's own directory is asked, once the walk found no root.
+            assert_eq!(asked_of(), [PathBuf::from(cwd)], "{cwd}");
+        }
+        // A directory removed inside a worktree that is still there is that worktree's: its
+        // `.git` is found, and nothing more is asked.
+        assert_eq!(
+            of("/u/aterm/.claude/worktrees/v/tmp/x").as_deref(),
+            Some(Path::new("/u/aterm/.claude/worktrees/v"))
+        );
+        assert!(asked_of().is_empty());
+        // A tab whose directory is there, in ~/aterm or in ~/aterm itself, still holds its builds.
+        assert_eq!(
+            of("/u/aterm/crates/x").as_deref(),
+            Some(Path::new("/u/aterm"))
+        );
+        assert_eq!(asked_of(), [PathBuf::from("/u/aterm/crates/x")]);
+        assert_eq!(of("/u/aterm").as_deref(), Some(Path::new("/u/aterm")));
+        assert!(asked_of().is_empty());
+    }
+
+    #[test]
+    fn a_checkouts_root_is_read_off_its_git_directory_or_a_worktrees_git_file() {
+        let dir = aterm_tempfile::TempDir::new().expect("owned checkouts");
+        let repo = dir.path().join("repo");
+        let wt = repo.join(".claude").join("worktrees").join("w");
+        std::fs::create_dir_all(repo.join(".git")).expect("the checkout's .git");
+        std::fs::create_dir_all(wt.join("crates")).expect("the worktree");
+        std::fs::write(wt.join(".git"), "gitdir: ../../../.git/worktrees/w\n")
+            .expect("the worktree's .git file");
+        assert!(checkout_root(&repo));
+        assert!(checkout_root(&wt));
+        assert!(!checkout_root(&wt.join("crates")));
+        let holders = [Hog {
+            path: repo.join("target"),
+            bytes: 61 << 30,
+            bytes_partial: false,
+            why: String::new(),
+            serves: Some(repo.clone()),
+        }];
+        let of = |cwd: &Path| checkout_of(&holders, cwd, None, &checkout_root, &dir_there);
+        let checkout = of(&wt.join("crates"));
+        assert_eq!(checkout.as_deref(), Some(wt.as_path()));
+        assert_eq!(held_in(&holders, checkout.as_deref()), 0);
+        std::fs::create_dir_all(repo.join("crates")).expect("the checkout's own directory");
+        let checkout = of(&repo.join("crates"));
+        assert_eq!(held_in(&holders, checkout.as_deref()), 61 << 30);
+        // The worktree removed under its session: no `.git` is left to find, and its directory is
+        // gone, so it is not read as the checkout around it.
+        assert!(dir_there(&wt.join("crates")));
+        std::fs::remove_dir_all(&wt).expect("the worktree removed");
+        assert!(!dir_there(&wt.join("crates")));
+        assert_eq!(of(&wt.join("crates")), None);
+        assert_eq!(of(&wt), None);
+        assert_eq!(of(&repo).as_deref(), Some(repo.as_path()));
     }
 
     /// A lease in `state` that owes host `host`'s session `sid` its line on volume `key`, elected

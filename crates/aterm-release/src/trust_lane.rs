@@ -744,8 +744,9 @@ pub fn auto_slots(cores: usize) -> usize {
 /// plus a margin ([`trust_facts::peak_claim`]), or with no peak recorded [`HEAVY_BYTES`] or
 /// half of `ram` (this host's RAM, when read), whichever is less, so a host of any size can
 /// admit a library it has not measured. A claim is never cut to fit the RAM: one that is not
-/// below it is refused up front ([`trust_facts::peak_seen`]), and under `--try-refused` it
-/// starts at once ([`Admission::admit`]).
+/// below what can ever be available (the RAM less what is wired) is refused up front
+/// ([`trust_facts::peak_seen`]), and under `--try-refused` it starts at once
+/// ([`Admission::admit`]).
 #[must_use]
 pub fn claim_need(cost: Option<&Cost>, ram: u64) -> u64 {
     match cost.filter(|c| c.maxrss > 0) {
@@ -766,7 +767,7 @@ pub struct Cost {
     pub when: String,
 }
 
-const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all, and each check claims its peak and a margin before it starts (a claim not below the RAM is refused up front)";
+const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all, and each check claims its peak and a margin before it starts (a claim not below what can ever be available, the RAM less what is wired, is refused up front)";
 
 /// The committed seed's first line ([`trust_facts::COSTS`]), above [`COSTS_HEADER`].
 const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library's newer row of this file and its git directory's aterm-release/trust-costs.tsv is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, claiming 16 GiB or half the RAM, whichever is less.";
@@ -960,15 +961,21 @@ impl Admitted {
 /// blocking `aterm_capacity::admit` would hold the slots still, so no running check could end
 /// and let its claim go. While it waits it says, once a minute, what it is short of and who
 /// holds it. Under `--admit now` each claim is taken at once, saying what it would have waited
-/// for. A claim the machine can never admit ([`aterm_capacity::never`]: all its RAM or more,
-/// which the plan refuses up front where it reads the RAM, unless `--try-refused`) waits for
-/// nothing: it is taken at once, saying so. With no ledger (no home) or one that cannot be
-/// written, a check starts unclaimed and says so.
+/// for. A claim the machine can never admit ([`aterm_capacity::never`]: all the memory it can
+/// ever have available or more, its RAM less what is wired) and that is not below the plan's
+/// bound either ([`Admission::held_to`]), which the plan refuses up front unless
+/// `--try-refused`, waits for nothing: it is taken at once, saying so. One below the bound
+/// was admitted by the plan while less was wired, and waits for that to fall like any other.
+/// With no ledger (no home) or one that cannot be written, a check starts unclaimed and says
+/// so.
 pub struct Admission<'m> {
     ledger: Option<aterm_capacity::Ledger>,
     machine: &'m dyn aterm_capacity::Machine,
     mode: aterm_capacity::Admit,
     pace: aterm_capacity::Pace,
+    /// The bound the run's plan held each claim below (`trust_facts::Host::admits_below`); 0
+    /// where none was read.
+    bound: u64,
     head: Option<Head>,
 }
 
@@ -1000,8 +1007,18 @@ impl<'m> Admission<'m> {
             machine,
             mode,
             pace,
+            bound: 0,
             head: None,
         }
+    }
+
+    /// This admission held to the plan's `bound` (`trust_facts::Host::admits_below`, as the
+    /// plan read it): a claim below it that can never fit now waits rather than starts at once,
+    /// since only more being wired than when the plan read it keeps it out.
+    #[must_use]
+    pub const fn held_to(mut self, bound: u64) -> Admission<'m> {
+        self.bound = bound;
+        self
     }
 
     /// Admits `job` at `now` (the slots' clock), saying through `say` what it waits for: its
@@ -1028,12 +1045,20 @@ impl<'m> Admission<'m> {
         }
         let need = aterm_capacity::Need::new(what.clone()).mem(job.need);
         // A need no amount of waiting could meet would hold its place at the head of this
-        // run and of every claimant's queue on the machine for good.
-        let never = self
+        // run and of every claimant's queue on the machine for good. The plan refused up front
+        // every claim not below its bound, so one below it that can never fit now fit when the
+        // plan read the machine: more is wired since, and it waits for that to fall.
+        let mut never = self
             .head
             .is_none()
             .then(|| aterm_capacity::never(&need, &self.machine.read(None)))
             .flatten();
+        if let Some(why) = never.take_if(|_| job.need < self.bound) {
+            say(&format!(
+                "capacity: {why}; {} could be available when this run was planned, so it waits for what is wired to fall",
+                aterm_capacity::gib(self.bound)
+            ));
+        }
         if let Some(why) = &never {
             say(&format!(
                 "capacity: {why}: it can never be admitted here, so it starts at once and holds its claim"
@@ -1335,6 +1360,9 @@ trait Bench {
     fn cache(&self) -> Option<PathBuf>;
     /// This host's RAM in bytes (0 unread) and whether it was read as Linux's `MemTotal`.
     fn memory(&self) -> (u64, bool);
+    /// The most memory that can ever be available here, bytes: the RAM less what is wired
+    /// ([`aterm_capacity::Reading::reachable`]); 0 unread.
+    fn reach(&self) -> u64;
     /// The host's one-minute load average now; `None` when it cannot be read.
     fn load(&self) -> Option<f64>;
     /// Whether `driver`'s `trustc -Z help` lists the verifier's memory ceiling flag
@@ -1422,6 +1450,11 @@ impl Bench for Machine {
         host_memory()
     }
 
+    fn reach(&self) -> u64 {
+        use aterm_capacity::Machine as _;
+        aterm_capacity::Live.read(None).reachable().unwrap_or(0)
+    }
+
     fn load(&self) -> Option<f64> {
         aterm_sysprobe::load_average().map(|l| l[0])
     }
@@ -1482,7 +1515,8 @@ impl Bench for Machine {
                 &aterm_capacity::Live,
                 cfg.admit,
                 aterm_capacity::Pace::default(),
-            ),
+            )
+            .held_to(prep.bound),
             out: Box::new(&mut *out),
         };
         let ran = run_slots(jobs, slots, cfg.budget, &mut real, done);
@@ -1536,10 +1570,13 @@ struct Prepared {
     files: Option<Filing>,
     jobs: usize,
     mem: u64,
+    /// The bound the plan held each claim below ([`trust_facts::Host::admits_below`]), which
+    /// the launch gate is held to ([`Admission::held_to`]).
+    bound: u64,
     cores: usize,
     costs_path: Option<PathBuf>,
     /// Each library's last recorded cost ([`read_costs`]): the order, the claims and the
-    /// up-front refusals for a claim not below the RAM are all read from it.
+    /// up-front refusals for a claim not below what can ever be available are all read from it.
     costs: BTreeMap<String, Cost>,
     /// The host's one-minute load as the run began ([`load_word`]).
     load_start: String,
@@ -1791,6 +1828,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     };
     let selected = select(&libs, names.as_deref())?;
     let (mem, memtotal) = bench.memory();
+    let reach = bench.reach();
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let jobs = cfg.jobs.unwrap_or_else(|| auto_slots(cores));
     let ceiling = driver_ceiling(bench, &driver, state.as_deref(), out);
@@ -1830,6 +1868,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             "host-mem-os",
             if memtotal { "MemTotal" } else { "-" }.into(),
         ),
+        ("host-reach", reach.to_string()),
         ("driver-ceiling", if ceiling { "yes" } else { "no" }.into()),
         ("now", utc_now()),
         ("load-start", load_start.clone()),
@@ -1890,6 +1929,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         files: filing,
         jobs,
         mem,
+        bound: parsed.facts.host.admits_below(),
         cores,
         costs_path,
         costs,
@@ -2745,7 +2785,8 @@ const CEILING_CACHE_HEADER: &str = "# trust lane: whether each prover's trustc t
 /// prover build: the answer is kept in `state`'s [`CEILING_CACHE`] under its trustc's path, size
 /// and modification time, which a store build never changes. A probe that cannot read the
 /// answer is said on `out` and taken as no ceiling: the RAM / 8 model then refuses nothing,
-/// and a library is still refused for a recorded peak whose claim is not below the RAM.
+/// and a library is still refused for a recorded peak whose claim is not below what can ever
+/// be available.
 fn driver_ceiling(
     bench: &mut dyn Bench,
     driver: &Driver,
@@ -6295,6 +6336,68 @@ mod tests {
         }
     }
 
+    /// NEVER-REACHABLE (`docs/DESIGN-adaptive-build-2026-10-24.md`): the gate is held to the
+    /// plan's bound. A 44.2 GiB claim, which a plan that read 44.5 GiB could ever be available
+    /// let through, meets a reading of 4 GiB wired (44 GiB at most available): it waits,
+    /// saying so, and is admitted once wired falls back to 3.5 GiB and 44.4 GiB is available.
+    /// A claim not below the bound, which only `--try-refused` lets past the plan, still starts
+    /// at once. Negative control: judged by its own reading alone, the gate took the 44.2 GiB
+    /// claim at once.
+    #[test]
+    fn a_claim_the_plan_admitted_waits_while_more_is_wired_than_the_plan_read() {
+        let (_d, l) = ledger();
+        let at = |wired: u64, available: u64| aterm_capacity::Reading {
+            wired: Some(wired),
+            available: Some(available),
+            ..aterm_capacity::Reading::of_gib(48, 0, 14)
+        };
+        let m = aterm_capacity::Fixed::new(at(4 * GIB, 21 * GIB));
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Wait).held_to(48 * GIB - 7 * GIB / 2);
+        let planned = Job {
+            need: 442 * GIB / 10,
+            ..job("alpha")
+        };
+        let mut said = Vec::new();
+        let waits = g.admit(&planned, Duration::ZERO, &mut |s| said.push(s.to_string()));
+        assert!(waits.is_none(), "{said:?}");
+        assert_eq!(said.len(), 2, "the bound's line, then the wait's: {said:?}");
+        for (line, named) in [
+            (0, "capacity: trust check alpha: needs 44.2 GiB, this "),
+            (
+                0,
+                " can never have more than 44 GiB of its 48 GiB of memory available (4 GiB of it is wired); 44.5 GiB could be available when this run was planned, so it waits for what is wired to fall",
+            ),
+            (1, "capacity: trust check alpha waits (0s): memory short by"),
+        ] {
+            assert!(
+                said[line].contains(named),
+                "{said:?} does not name {named:?}"
+            );
+        }
+        m.set(at(7 * GIB / 2, 444 * GIB / 10));
+        let admitted = g.admit(&planned, Duration::from_secs(2), &mut |s| {
+            said.push(s.to_string())
+        });
+        assert!(admitted.is_some(), "admitted once wired fell: {said:?}");
+        assert_eq!(l.list().unwrap().len(), 1, "its claim held");
+        drop(admitted);
+        assert!(l.list().unwrap().is_empty(), "its claim let go");
+        let forced = Job {
+            need: 45 * GIB,
+            ..job("beta")
+        };
+        said.clear();
+        let at_once = g.admit(&forced, Duration::from_secs(4), &mut |s| {
+            said.push(s.to_string())
+        });
+        assert!(at_once.is_some(), "{said:?}");
+        assert!(
+            said.iter()
+                .any(|s| s.contains("it can never be admitted here, so it starts at once")),
+            "{said:?}"
+        );
+    }
+
     #[test]
     fn a_check_over_its_budget_is_ended_and_marked() {
         let mut f = fake(&[("quick", 2)]);
@@ -6606,6 +6709,8 @@ mod tests {
         drivers_asked: usize,
         /// The host's RAM, and whether it was read as `MemTotal`.
         mem: (u64, bool),
+        /// The most memory that can ever be available on the host ([`Bench::reach`]).
+        reach: u64,
         /// What the prover's `trustc -Z help` says of the memory ceiling flag.
         ceiling: Result<bool, String>,
         /// How often the run read `trustc -Z help`.
@@ -6661,6 +6766,9 @@ mod tests {
         fn memory(&self) -> (u64, bool) {
             self.mem
         }
+        fn reach(&self) -> u64 {
+            self.reach
+        }
         fn load(&self) -> Option<f64> {
             self.load
         }
@@ -6687,6 +6795,7 @@ mod tests {
                         line_every: Duration::from_secs(60),
                     },
                 )
+                .held_to(prep.bound)
             });
             let mut quick = Quick {
                 root: prep.root.clone(),
@@ -6820,6 +6929,7 @@ mod tests {
             updated: None,
             drivers_asked: 0,
             mem: (48 * GIB, false),
+            reach: 0,
             ceiling: Ok(false),
             ceiling_probes: 0,
             gate: None,
@@ -6872,6 +6982,9 @@ mod tests {
         }
         fn memory(&self) -> (u64, bool) {
             self.site.memory()
+        }
+        fn reach(&self) -> u64 {
+            self.site.reach()
         }
         fn load(&self) -> Option<f64> {
             self.site.load()
@@ -7541,6 +7654,99 @@ mod tests {
             (Outcome::Pass, 1),
             "{said}"
         );
+    }
+
+    /// NEVER-REACHABLE (`docs/DESIGN-adaptive-build-2026-10-24.md`): on a 48 GiB host of which
+    /// 44.5 GiB can ever be available (3.5 GiB wired), a library whose claim falls between the
+    /// two (a 38 GiB peak claims 45.6 GiB) is refused up front in one line naming the peak, the
+    /// claim and that ceiling, its plan row keeping the ceiling, and no check starts. A 37 GiB
+    /// peak (44.4 GiB) runs; under `--try-refused` the refused one starts at once at the gate,
+    /// which says it can never be admitted, naming the ceiling. Negative control: with nothing
+    /// read of what can be available (the old rule, the RAM), the 38 GiB peak's check starts,
+    /// though no wait could ever admit its claim.
+    #[test]
+    fn a_claim_above_what_can_ever_be_available_is_refused_up_front() {
+        let reach = 48 * GIB - 7 * GIB / 2;
+        let mut s = with_peak(38 * GIB, false);
+        s.reach = reach;
+        let (outcome, said, _) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::Narrowed(l) if l == &["alpha: needs ~45.6 GiB"]),
+            "{outcome:?}: {said}"
+        );
+        assert!(s.started.is_empty(), "no check starts: {said}");
+        assert!(
+            said.contains("trust: alpha not verified here: its last check peaked at 40.80 GB on 2026-10-20, and with its margin it claims 48.96 GB, not below the 47.8 GB of this host's 51.5 GB (48 GiB) of RAM that can ever be available, the rest being wired\n"),
+            "{said}"
+        );
+        let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+        for row in [
+            format!("\nhost-reach {reach}\n"),
+            format!(
+                "\nrefused alpha\tpeak\t{reach}\t{}\t2026-10-20T17:45:18Z\n",
+                38 * GIB
+            ),
+        ] {
+            assert!(plan.contains(&row), "{row:?} in {plan}");
+        }
+        let mut fits = with_peak(37 * GIB, false);
+        fits.reach = reach;
+        let (outcome, said, _) = run_site(&mut fits);
+        assert_eq!((outcome, fits.started.len()), (Outcome::Pass, 1), "{said}");
+        let mut forced = with_peak(38 * GIB, false);
+        (forced.reach, forced.cfg.try_refused) = (reach, true);
+        let dir = tmp("trust-reach-site");
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let mac = aterm_capacity::Reading {
+            wired: Some(7 * GIB / 2),
+            ..aterm_capacity::Reading::of_gib(48, 28, 14)
+        };
+        forced.gate = Some((aterm_capacity::Fixed::new(mac), ledger.clone()));
+        let (outcome, said, _) = run_site(&mut forced);
+        assert_eq!(
+            (outcome, forced.started.len()),
+            (Outcome::Pass, 1),
+            "{said}"
+        );
+        assert!(
+            said.contains("needs 45.6 GiB, this Mac can never have more than 44.5 GiB of its 48 GiB of memory available (3.5 GiB of it is wired): it can never be admitted here, so it starts at once and holds its claim\n")
+                || said.contains("needs 45.6 GiB, this machine can never have more than 44.5 GiB of its 48 GiB of memory available (3.5 GiB of it is wired): it can never be admitted here, so it starts at once and holds its claim\n"),
+            "{said}"
+        );
+        assert!(ledger.list().unwrap().is_empty(), "its claim let go");
+        let mut old = with_peak(38 * GIB, false);
+        let (outcome, said, _) = run_site(&mut old);
+        assert_eq!((outcome, old.started.len()), (Outcome::Pass, 1), "{said}");
+    }
+
+    /// NEVER-REACHABLE: the plan's bound reaches the launch gate. On a 48 GiB host whose plan
+    /// read 44.5 GiB that can ever be available, a library whose claim is below that (a 36.8
+    /// GiB peak claims 44.2 GiB) runs past the plan and meets a gate that reads 4 GiB wired, 44
+    /// GiB at most available: without `--try-refused` it waits for what is wired to fall, and
+    /// no check starts before the run ends at [`GATE_HANG`]. Negative control: a gate judging by
+    /// its own reading alone started it at once.
+    #[test]
+    fn a_claim_the_plan_admitted_does_not_start_at_once_when_more_is_wired_at_the_gate() {
+        let mut s = with_peak(368 * GIB / 10, false);
+        s.reach = 48 * GIB - 7 * GIB / 2;
+        let dir = tmp("trust-wired-site");
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let mac = aterm_capacity::Reading {
+            wired: Some(4 * GIB),
+            ..aterm_capacity::Reading::of_gib(48, 21, 14)
+        };
+        s.gate = Some((aterm_capacity::Fixed::new(mac), ledger));
+        let (outcome, said, _) = run_site(&mut s);
+        assert!(s.started.is_empty(), "{outcome:?}: {said}");
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why) if why.starts_with("interrupted")),
+            "{outcome:?}: {said}"
+        );
+        assert!(
+            said.contains("44.5 GiB could be available when this run was planned, so it waits for what is wired to fall\n"),
+            "{said}"
+        );
+        assert!(!said.contains("starts at once"), "{said}");
     }
 
     /// `--try-refused` on a library whose recorded peak is above the RAM, with the launch gate

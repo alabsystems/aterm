@@ -33,12 +33,15 @@
 //! icons finds nothing to lift.
 
 use super::*;
-use aterm_core::render::{FxArt, FxTexels};
+use aterm_core::render::{FxArt, FxTexels, GlowEnd, GlowRamp, GlowRamps, Laid};
 use aterm_render::sprites::FreeSprite;
 use std::sync::Arc;
 
 /// A window-pixel box `(x0, x1, y0, y1)`, right and bottom exclusive.
 type PxBox = (i32, i32, i32, i32);
+
+/// A glow stream the shade cuts: its quads and its ramps beside them.
+pub type ShadeStream<'a> = (&'a mut Vec<GlowQuad>, &'a mut GlowRamps);
 
 /// The least art alpha that counts a texel as the icon's drawn face: the
 /// middle of its anti-aliased edge, so a light ends where the edge reads.
@@ -88,30 +91,41 @@ impl CursorGlow {
     /// touches a word icon the last word pass drew: a fire's ember keeps off
     /// it whole, as the sky's stars keep off it ([`rk::companion::KeepOut`]),
     /// where the shade would leave a crescent of it.
-    pub(super) fn near_word_icon(&self, (x, y): (f32, f32), reach: f32) -> bool {
+    #[inline]
+    pub(super) const fn near_word_icon(&self, (x, y): (f32, f32), reach: f32) -> bool {
         let Some((ox, oy, _)) = self.keep_geom else {
             return false;
         };
         let (x, y) = (x - ox as f32, y - oy as f32);
-        self.word_icons.iter().any(|&(x0, x1, y0, y1)| {
-            x + reach >= x0 as f32
+        let icons = self.word_icons.as_slice();
+        let mut i = 0;
+        while i < icons.len() {
+            let (x0, x1, y0, y1) = icons[i];
+            if x + reach >= x0 as f32
                 && x - reach < x1 as f32
                 && y + reach >= y0 as f32
                 && y - reach < y1 as f32
-        })
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Lift this frame's light off the word icons the word pass just drew
     /// ([`Self::note_word_icon_sprites`]), in the streams the host draws:
-    /// `over` the over-text quads, `under` the under-text quads, `halos` the
-    /// halos and `patches` a fire's field patches; an icon noted with no art
-    /// ([`Self::note_word_icons`]) is cut as its box. Each word pass's icons
-    /// shade once. Returns whether anything was lifted.
+    /// `over` the over-text stream, `under` the under-text stream, `halos`
+    /// the halos and `patches` a fire's field patches; an icon noted with no
+    /// art ([`Self::note_word_icons`]) is cut as its box. A stream's ramps
+    /// are cut in place: the rows an icon reaches as the quads they stand
+    /// for would be, the rest kept as ramps. Each word pass's icons shade
+    /// once. Returns whether anything was lifted.
     pub fn shade_word_icons(
         &mut self,
         (over, under, halos, patches): (
-            &mut Vec<GlowQuad>,
-            &mut Vec<GlowQuad>,
+            ShadeStream<'_>,
+            ShadeStream<'_>,
             &mut Vec<RainHalo>,
             &mut Vec<FirePatch>,
         ),
@@ -122,16 +136,22 @@ impl CursorGlow {
         let Some((ox, oy, _)) = self.keep_geom else {
             return false;
         };
+        let (over, under) = ((over.0, over.1), (under.0, under.1));
         let mut lifted = self.v2.engaged()
             && lift_stars(
                 (self.v2.sky_marks(), self.v2.sky_mark_lights()),
                 &self.word_icons,
                 (ox, oy),
-                (&mut *over, &mut *under, &mut *halos),
+                (
+                    (&mut *over.0, &mut *over.1),
+                    (&mut *under.0, &mut *under.1),
+                    &mut *halos,
+                ),
             );
         let mut patch_pieces = std::mem::take(&mut self.icon_patches);
         let mut bands = std::mem::take(&mut self.icon_scratch);
         let mut pieces = std::mem::take(&mut self.icon_quads);
+        let mut piece_ramps = std::mem::take(&mut self.icon_ramps);
         let mut halo_pieces = std::mem::take(&mut self.icon_halos);
         let mut cut = std::mem::take(&mut self.icon_cut);
         for (i, &icon) in self.word_icons.iter().enumerate() {
@@ -140,13 +160,15 @@ impl CursorGlow {
                 continue;
             }
             drawn_rows(icon, self.word_icon_src.get(i), (ox, oy), &mut bands);
-            lifted |= shade_quads(over, &bands, (&mut pieces, &mut cut));
-            lifted |= shade_quads(under, &bands, (&mut pieces, &mut cut));
+            for stream in [(&mut *over.0, &mut *over.1), (&mut *under.0, &mut *under.1)] {
+                lifted |= shade_stream(stream, &bands, (&mut pieces, &mut piece_ramps, &mut cut));
+            }
             lifted |= shade_halos(halos, &bands, (&mut halo_pieces, &mut cut));
             lifted |= shade_patches(patches, &bands, (&mut patch_pieces, &mut cut));
         }
         self.icon_scratch = bands;
         self.icon_quads = pieces;
+        self.icon_ramps = piece_ramps;
         self.icon_halos = halo_pieces;
         self.icon_patches = patch_pieces;
         self.icon_cut = cut;
@@ -162,7 +184,7 @@ fn lift_stars(
     (marks, keys): (&[rk::stardust::SkyMark], &[u64]),
     icons: &[PxBox],
     (ox, oy): (i32, i32),
-    (over, under, halos): (&mut Vec<GlowQuad>, &mut Vec<GlowQuad>, &mut Vec<RainHalo>),
+    (over, under, halos): (ShadeStream<'_>, ShadeStream<'_>, &mut Vec<RainHalo>),
 ) -> bool {
     if marks.is_empty() || icons.is_empty() {
         return false;
@@ -171,15 +193,19 @@ fn lift_stars(
     for mark in marks {
         let r = mark.reach / 2;
         let (x, y) = (mark.at.0 - ox, mark.at.1 - oy);
-        if !icons
-            .iter()
-            .any(|&(x0, x1, y0, y1)| x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1)
-        {
+        let mut hit = false;
+        for &(x0, x1, y0, y1) in icons {
+            if x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1 {
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
             continue;
         }
-        let own = keys
-            .get(mark.lights.0 as usize..mark.lights.1 as usize)
-            .unwrap_or_default();
+        let Some(own) = keys.get(mark.lights.0 as usize..mark.lights.1 as usize) else {
+            continue;
+        };
         if own.is_empty() {
             continue;
         }
@@ -188,18 +214,19 @@ fn lift_stars(
         };
         let star_quad =
             |q: &GlowQuad| inside(quad_box(q)) && own.contains(&rk::stardust::sky_quad_key(q));
-        let (nq, nu, nh) = (over.len(), under.len(), halos.len());
+        let (nq, nu, nh) = (over.0.len(), under.0.len(), halos.len());
+        // A star's lights are quads of their own, never a ramp's rows.
         if nq > 0 {
-            over.retain(|q| !star_quad(q));
+            over.1.retain_quads(over.0, |q| !star_quad(q));
         }
         if nu > 0 {
-            under.retain(|q| !star_quad(q));
+            under.1.retain_quads(under.0, |q| !star_quad(q));
         }
         if nh > 0 {
             halos
                 .retain(|h| !(inside(halo_box(h)) && own.contains(&rk::stardust::sky_halo_key(h))));
         }
-        lifted |= over.len() != nq || under.len() != nu || halos.len() != nh;
+        lifted |= over.0.len() != nq || under.0.len() != nu || halos.len() != nh;
     }
     lifted
 }
@@ -208,6 +235,12 @@ fn lift_stars(
 const fn quad_box(q: &GlowQuad) -> PxBox {
     let (x, y) = (q.x as i32, q.y as i32);
     (x, x + q.w as i32, y, y + q.h as i32)
+}
+
+#[inline]
+const fn ramp_box(r: &GlowRamp) -> PxBox {
+    let (x, y) = (r.x as i32, r.y as i32);
+    (x, x + r.w as i32, y, y + r.h as i32)
 }
 
 #[inline]
@@ -223,6 +256,7 @@ const fn halo_box(h: &RainHalo) -> PxBox {
 /// sprite's silhouette sat a texel off what it drew: the companion's paw
 /// and chin, drawn from the art row above the one read, peeked through the
 /// page veil as specks between the letters (looks7 round 2).
+#[inline]
 const fn stamp_texel(l: i32, art: i32, dest: i32, flip: bool) -> i32 {
     let t = l * art / dest;
     if flip { art - 1 - t } else { t }
@@ -259,10 +293,14 @@ fn drawn_rows_ref(
     (texel, edge): (impl Fn(i32, i32, i32, bool) -> i32, u8),
 ) {
     out.clear();
-    let Some((art, dest, flip_x)) = src.filter(|(art, _, _)| !art.is_empty()) else {
+    let Some((art, dest, flip_x)) = src else {
         out.push(icon);
         return;
     };
+    if art.is_empty() {
+        out.push(icon);
+        return;
+    }
     let (bx0, by0) = (dest.0 + ox, dest.2 + oy);
     let (w, h) = (dest.1 - dest.0, dest.3 - dest.2);
     if w <= 0 || h <= 0 {
@@ -442,11 +480,10 @@ fn shade_quads(
     if quads.is_empty() || bands.is_empty() {
         return false;
     }
-    let (bx0, bx1, by0, by1) = bands_bounds(bands);
+    let bounds = bands_bounds(bands);
     let mut any = false;
     for (i, q) in quads.iter().enumerate() {
-        let b = quad_box(q);
-        if b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1 || !cut_rect(b, bands, cut) {
+        if !reached(quad_box(q), bands, bounds, cut) {
             if any {
                 pieces.push(*q);
             }
@@ -457,68 +494,261 @@ fn shade_quads(
             pieces.extend_from_slice(&quads[..i]);
             any = true;
         }
-        let w = i32::from(q.w);
-        let w_max = w.max(1);
-        let half_w = w / 2;
-        let half_w_max = w_max / 2;
-        let (a0, a1) = (i32::from(q.alpha), i32::from(q.alpha2));
-        let flat_c = q.color == q.color2;
-        let flat_a = q.alpha == q.alpha2;
-        let flat = flat_c && flat_a;
-        let (ca, cb) = (
-            (
-                ((q.color >> 16) & 0xff) as i32,
-                ((q.color >> 8) & 0xff) as i32,
-                (q.color & 0xff) as i32,
-            ),
-            (
-                ((q.color2 >> 16) & 0xff) as i32,
-                ((q.color2 >> 8) & 0xff) as i32,
-                (q.color2 & 0xff) as i32,
-            ),
-        );
-        let lerp_c = |k: i32| {
-            let wk = w_max - k;
-            let ch =
-                |c0: i32, c1: i32| ((c0 * wk + c1 * k + half_w_max) / w_max).clamp(0, 255) as u32;
-            (ch(ca.0, cb.0) << 16) | (ch(ca.1, cb.1) << 8) | ch(ca.2, cb.2)
-        };
-        for &(xa, xb, ya, yb) in cut.iter() {
-            let (ka, kb) = (xa - b.0, xb - b.0);
-            let whole = ka == 0 && kb == w;
-            let (color, color2, alpha, alpha2) = if flat || whole {
-                (q.color, q.color2, q.alpha, q.alpha2)
-            } else {
-                let (c1, c2) = if flat_c {
-                    (q.color, q.color2)
-                } else {
-                    (lerp_c(ka), lerp_c(kb))
-                };
-                let (al1, al2) = if flat_a {
-                    (q.alpha, q.alpha2)
-                } else {
-                    let a = |k: i32| (a0 * (w - k) + a1 * k + half_w) / w_max;
-                    (a(ka).clamp(0, 255) as u8, a(kb).clamp(0, 255) as u8)
-                };
-                (c1, c2, al1, al2)
-            };
-            pieces.push(GlowQuad {
-                x: xa as u16,
-                y: ya as u16,
-                w: (xb - xa) as u16,
-                h: (yb - ya) as u16,
-                color,
-                alpha,
-                color2,
-                alpha2,
-                ..*q
-            });
-        }
+        push_pieces(q, cut, pieces);
     }
     if any {
         std::mem::swap(quads, pieces);
     }
     any
+}
+
+/// Whether the icon's drawn rows (`bands`, within `bounds`) reach the box
+/// `b`, its pieces outside them then in `cut` ([`cut_rect`]).
+#[inline]
+fn reached(b: PxBox, bands: &[PxBox], bounds: PxBox, cut: &mut Vec<PxBox>) -> bool {
+    let (bx0, bx1, by0, by1) = bounds;
+    !(b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1) && cut_rect(b, bands, cut)
+}
+
+/// [`shade_quads`] for a stream with ramps: each quad cut as there, and of
+/// each ramp the icon's rows reach the rows they reach (a run whole where
+/// any of its rows is) cut as the quads they stand for, the rows between
+/// and around kept as ramps, all in the stream's order. Returns whether
+/// any light was cut; a stream nothing was cut from stays as laid, and
+/// costs no copy: the stream is rebuilt only once a light is known reached.
+fn shade_stream(
+    (quads, ramps): ShadeStream<'_>,
+    bands: &[PxBox],
+    (pieces, piece_ramps, cut): (&mut Vec<GlowQuad>, &mut GlowRamps, &mut Vec<PxBox>),
+) -> bool {
+    if ramps.is_empty() {
+        return shade_quads(quads, bands, (pieces, cut));
+    }
+    if bands.is_empty() {
+        return false;
+    }
+    let bounds = bands_bounds(bands);
+    let mut any_reached = false;
+    for q in quads.iter() {
+        if reached(quad_box(q), bands, bounds, cut) {
+            any_reached = true;
+            break;
+        }
+    }
+    if !any_reached {
+        for r in &ramps.items {
+            if ramp_reached(r, &ramps.ends, (bands, bounds), cut) {
+                any_reached = true;
+                break;
+            }
+        }
+    }
+    if !any_reached {
+        return false;
+    }
+    pieces.clear();
+    piece_ramps.clear();
+    let mut any = false;
+    ramps.in_order(quads.len(), |laid| match laid {
+        Laid::Quads(run) => {
+            for q in &quads[run] {
+                if reached(quad_box(q), bands, bounds, cut) {
+                    push_pieces(q, cut, pieces);
+                    any = true;
+                } else {
+                    pieces.push(*q);
+                }
+            }
+        }
+        Laid::Ramp(k) => {
+            any |= shade_ramp(
+                &ramps.items[k],
+                &ramps.ends,
+                (bands, bounds),
+                (&mut *pieces, &mut *piece_ramps, &mut *cut),
+            );
+        }
+    });
+    if any {
+        std::mem::swap(quads, pieces);
+        std::mem::swap(ramps, piece_ramps);
+    }
+    any
+}
+
+/// Whether `ramp`'s box lies clear of the icon's drawn rows' `bounds`.
+#[inline]
+const fn ramp_clear(ramp: &GlowRamp, (bx0, bx1, by0, by1): PxBox) -> bool {
+    let rb = ramp_box(ramp);
+    rb.1 <= bx0 || rb.0 >= bx1 || rb.3 <= by0 || rb.2 >= by1
+}
+
+/// Each span of `ramp`'s rows a band of `bands` reaches, widened to its run
+/// where it meets it, spans that touch merged, top to bottom.
+fn ramp_spans(ramp: &GlowRamp, bands: &[PxBox], mut each: impl FnMut((u16, u16))) {
+    let rb = ramp_box(ramp);
+    let run = if ramp.joined > 0 {
+        Some((ramp.join, ramp.join + ramp.joined + 1))
+    } else {
+        None
+    };
+    let mut span: Option<(u16, u16)> = None;
+    for b in bands {
+        if !(b.0 < rb.1 && b.1 > rb.0 && b.3 > rb.2 && b.2 < rb.3) {
+            continue;
+        }
+        let mut s = (
+            (b.2 - rb.2).max(0) as u16,
+            (b.3 - rb.2).min(i32::from(ramp.h)) as u16,
+        );
+        if let Some((j0, j1)) = run
+            && j0 < s.1
+            && s.0 < j1
+        {
+            s = (s.0.min(j0), s.1.max(j1));
+        }
+        span = match span {
+            Some(p) if s.0 <= p.1 => Some((p.0, p.1.max(s.1))),
+            Some(p) => {
+                each(p);
+                Some(s)
+            }
+            None => Some(s),
+        };
+    }
+    if let Some(p) = span {
+        each(p);
+    }
+}
+
+/// Whether the icon's drawn rows reach any light of `ramp` (its ends in
+/// `ends`): the lights [`shade_ramp`] would cut.
+fn ramp_reached(
+    ramp: &GlowRamp,
+    ends: &[GlowEnd],
+    (bands, bounds): (&[PxBox], PxBox),
+    cut: &mut Vec<PxBox>,
+) -> bool {
+    if ramp_clear(ramp, bounds) {
+        return false;
+    }
+    let mut hit = false;
+    ramp_spans(ramp, bands, |(a, e)| {
+        if hit {
+            return;
+        }
+        for r in a..e {
+            if let Some(q) = ramp.row_quad(ends, r)
+                && reached(quad_box(&q), bands, bounds, cut)
+            {
+                hit = true;
+                break;
+            }
+        }
+    });
+    hit
+}
+
+/// Lay `ramp` (its ends in `ends`) after `pieces` with the icon's drawn
+/// rows cut out of it: each span of rows a band reaches (widened to its run
+/// where it meets it, [`ramp_spans`]) as the quads its lights stand for,
+/// cut ([`push_pieces`]), and each span between as a ramp of those rows.
+/// Returns whether any light was cut.
+fn shade_ramp(
+    ramp: &GlowRamp,
+    ends: &[GlowEnd],
+    (bands, bounds): (&[PxBox], PxBox),
+    (pieces, piece_ramps, cut): (&mut Vec<GlowQuad>, &mut GlowRamps, &mut Vec<PxBox>),
+) -> bool {
+    if ramp_clear(ramp, bounds) {
+        piece_ramps.copy_rows(ramp, ends, pieces.len(), (0, ramp.h));
+        return false;
+    }
+    let (mut next, mut any) = (0u16, false);
+    let mut lay = |(a, e): (u16, u16), next: &mut u16, any: &mut bool| {
+        if a > *next {
+            piece_ramps.copy_rows(ramp, ends, pieces.len(), (*next, a - *next));
+        }
+        for r in a..e {
+            let Some(q) = ramp.row_quad(ends, r) else {
+                continue;
+            };
+            if reached(quad_box(&q), bands, bounds, cut) {
+                push_pieces(&q, cut, pieces);
+                *any = true;
+            } else {
+                pieces.push(q);
+            }
+        }
+        *next = e;
+    };
+    ramp_spans(ramp, bands, |p| lay(p, &mut next, &mut any));
+    if next < ramp.h {
+        piece_ramps.copy_rows(ramp, ends, pieces.len(), (next, ramp.h - next));
+    }
+    any
+}
+
+/// Lay `q`'s pieces outside the icon's drawn rows (`cut`, [`cut_rect`]'s),
+/// each continuing the quad's horizontal gradient.
+fn push_pieces(q: &GlowQuad, cut: &[PxBox], pieces: &mut Vec<GlowQuad>) {
+    let b = quad_box(q);
+    let w = i32::from(q.w);
+    let w_max = w.max(1);
+    let half_w = w / 2;
+    let half_w_max = w_max / 2;
+    let (a0, a1) = (i32::from(q.alpha), i32::from(q.alpha2));
+    let flat_c = q.color == q.color2;
+    let flat_a = q.alpha == q.alpha2;
+    let flat = flat_c && flat_a;
+    let (ca, cb) = (
+        (
+            ((q.color >> 16) & 0xff) as i32,
+            ((q.color >> 8) & 0xff) as i32,
+            (q.color & 0xff) as i32,
+        ),
+        (
+            ((q.color2 >> 16) & 0xff) as i32,
+            ((q.color2 >> 8) & 0xff) as i32,
+            (q.color2 & 0xff) as i32,
+        ),
+    );
+    let lerp_c = |k: i32| {
+        let wk = w_max - k;
+        let ch = |c0: i32, c1: i32| ((c0 * wk + c1 * k + half_w_max) / w_max).clamp(0, 255) as u32;
+        (ch(ca.0, cb.0) << 16) | (ch(ca.1, cb.1) << 8) | ch(ca.2, cb.2)
+    };
+    for &(xa, xb, ya, yb) in cut {
+        let (ka, kb) = (xa - b.0, xb - b.0);
+        let whole = ka == 0 && kb == w;
+        let (color, color2, alpha, alpha2) = if flat || whole {
+            (q.color, q.color2, q.alpha, q.alpha2)
+        } else {
+            let (c1, c2) = if flat_c {
+                (q.color, q.color2)
+            } else {
+                (lerp_c(ka), lerp_c(kb))
+            };
+            let (al1, al2) = if flat_a {
+                (q.alpha, q.alpha2)
+            } else {
+                let a = |k: i32| (a0 * (w - k) + a1 * k + half_w) / w_max;
+                (a(ka).clamp(0, 255) as u8, a(kb).clamp(0, 255) as u8)
+            };
+            (c1, c2, al1, al2)
+        };
+        pieces.push(GlowQuad {
+            x: xa as u16,
+            y: ya as u16,
+            w: (xb - xa) as u16,
+            h: (yb - ya) as u16,
+            color,
+            alpha,
+            color2,
+            alpha2,
+            ..*q
+        });
+    }
 }
 
 /// Cut every halo of `halos` the icon's drawn rows reach ([`cut_rect`]);
@@ -692,6 +922,144 @@ mod tests {
             !cut_rect((0, 50, 0, 20), &bands, &mut pieces),
             "a light clear of the icon is untouched"
         );
+    }
+
+    /// A stream's ramps shade as the quads they stand for: the rows the
+    /// face's drawn rows reach are cut as their quads are (a run whole where
+    /// any of its rows is reached), the rows above and below stay ramps, a
+    /// ramp clear of the face stays whole, all in the stream's order. A
+    /// stream the face reaches nothing of stays as laid.
+    #[test]
+    fn a_stream_s_ramps_shade_as_their_quads() {
+        let icon = (100, 112, 40, 50);
+        let mut bands = Vec::new();
+        drawn_rows(icon, Some(&face(icon, 0..12, false)), (0, 0), &mut bands);
+        let ends = |k: u16, a: u8| {
+            let c = 0x0020_3040 + u32::from(k) * 0x0003_0201;
+            (
+                aterm_render::glow_end(c, a),
+                aterm_render::glow_end(c ^ 0x0011_1111, a / 2),
+            )
+        };
+        let quads = vec![
+            GlowQuad::gradient(0, 90, 38, 30, 6, 0x0030_0810, 0x30, 0x0008_1030, 0x50),
+            GlowQuad::flat(0, 200, 40, 10, 4, 0x0010_2030, 0),
+        ];
+        let mut ramps = GlowRamps::default();
+        // Rows 30..61 across the face (its rows 42..48), its run over rows
+        // 40..44 across the face's top, a dark row at 50.
+        ramps.open(1, 0, (95, 30, 30), ends(0, 0x40));
+        for k in 1..30 {
+            if k == 10 {
+                assert!(ramps.extend_run(0, 4, ends(k, 0)));
+            } else if !(11..14).contains(&k) {
+                ramps.extend_last(
+                    u16::from(k == 20),
+                    ends(k, if k % 3 == 0 { 0x60 } else { 0 }),
+                );
+            }
+        }
+        // A ramp clear of the face.
+        ramps.open(2, 0, (10, 10, 20), ends(40, 0));
+        for k in 41..48 {
+            ramps.extend_last(0, ends(k, 0));
+        }
+        let mut legacy = Vec::new();
+        ramps.expand_into(&quads, &mut legacy);
+        let (mut cut, mut pieces, mut piece_ramps) = (Vec::new(), Vec::new(), GlowRamps::default());
+        let (mut q, mut r) = (quads.clone(), ramps.clone());
+        assert!(shade_stream(
+            (&mut q, &mut r),
+            &bands,
+            (&mut pieces, &mut piece_ramps, &mut cut)
+        ));
+        assert!(shade_quads(&mut legacy, &bands, (&mut pieces, &mut cut)));
+        let mut got = Vec::new();
+        r.expand_into(&q, &mut got);
+        assert_eq!(got, legacy, "the ramps shade as their quads");
+        assert_eq!(r.lit, r.count_lit());
+        let kept: Vec<_> = r.items.iter().map(|k| (k.x, k.y, k.h)).collect();
+        assert_eq!(
+            kept,
+            [(95, 30, 10), (95, 48, 13), (10, 10, 8)],
+            "the rows above and below the face, and the ramp clear of it, stay ramps"
+        );
+        // A stream clear of the face stays as laid.
+        let (mut q, mut r) = (quads[1..].to_vec(), GlowRamps::default());
+        r.open(1, 0, (10, 10, 20), ends(40, 0));
+        let laid = (q.clone(), r.clone());
+        assert!(!shade_stream(
+            (&mut q, &mut r),
+            &bands,
+            (&mut pieces, &mut piece_ramps, &mut cut)
+        ));
+        assert_eq!((q, r), laid);
+    }
+
+    /// A stream with ramps that the face reaches nothing of costs the shade
+    /// no copy, even where its lights lie inside the face's drawn rows'
+    /// bounds, beside the rows: it stays as laid, and the scratch the shade
+    /// rebuilds a stream in is left as it was.
+    #[test]
+    fn a_stream_the_face_reaches_nothing_of_is_not_copied() {
+        let icon = (100, 112, 40, 50);
+        let mut bands = Vec::new();
+        drawn_rows(icon, Some(&face(icon, 0..12, false)), (0, 0), &mut bands);
+        let end = aterm_render::glow_end(0x0020_3040, 0);
+        // The face's top corners, each two rows tall: the rows there span
+        // 103..109, the rows below them 102..110.
+        let mut quads = vec![GlowQuad::flat(0, 102, 42, 1, 2, 0x0010_2030, 0)];
+        let mut ramps = GlowRamps::default();
+        ramps.open(1, 0, (109, 42, 1), (end, end));
+        ramps.extend_last(0, (end, end));
+        let bounds = bands_bounds(&bands);
+        let (b, rb) = (quad_box(&quads[0]), ramp_box(&ramps.items[0]));
+        for (x0, x1, y0, y1) in [b, rb] {
+            assert!(
+                x0 >= bounds.0 && x1 <= bounds.1 && y0 >= bounds.2 && y1 <= bounds.3,
+                "inside the drawn rows' bounds {bounds:?}"
+            );
+        }
+        let laid = (quads.clone(), ramps.clone());
+        let sentinel = GlowQuad::flat(0, 1, 1, 1, 1, 0x0001_0203, 0);
+        let mut held = GlowRamps::default();
+        held.open(0, 7, (1, 1, 1), (end, 0));
+        let (mut pieces, mut piece_ramps, mut cut) = (vec![sentinel], held.clone(), Vec::new());
+        assert!(!shade_stream(
+            (&mut quads, &mut ramps),
+            &bands,
+            (&mut pieces, &mut piece_ramps, &mut cut)
+        ));
+        assert_eq!((quads, ramps), laid, "the stream stays as laid");
+        assert_eq!(pieces, [sentinel], "its quads are not copied");
+        assert_eq!(piece_ramps, held, "nor its ramps");
+        // Beside that quad, a ramp the face reaches through its rows, and one
+        // it reaches only through its run (rows 40..44, the face's from 42):
+        // each stream is shaded as its quads are.
+        for run in [false, true] {
+            let mut quads = vec![GlowQuad::flat(0, 102, 42, 1, 2, 0x0010_2030, 0)];
+            let mut ramps = GlowRamps::default();
+            if run {
+                ramps.open_run(1, 0, (100, 40, 12), 4, (end, end));
+            } else {
+                ramps.open(1, 0, (100, 43, 12), (end, end));
+                ramps.extend_last(0, (end, end));
+            }
+            let mut legacy = Vec::new();
+            ramps.expand_into(&quads, &mut legacy);
+            assert!(
+                shade_stream(
+                    (&mut quads, &mut ramps),
+                    &bands,
+                    (&mut pieces, &mut piece_ramps, &mut cut)
+                ),
+                "run {run}: the ramp is reached"
+            );
+            assert!(shade_quads(&mut legacy, &bands, (&mut pieces, &mut cut)));
+            let mut got = Vec::new();
+            ramps.expand_into(&quads, &mut got);
+            assert_eq!(got, legacy, "run {run}: shaded as its quads");
+        }
     }
 
     /// A mirrored icon reads its texels mirrored: a face drawn only in the
@@ -924,13 +1292,18 @@ mod tests {
         );
         let mut over: Vec<GlowQuad> = star.iter().chain(&far).copied().chain([wash]).collect();
         let (mut under, mut halos) = (Vec::new(), Vec::new());
+        let (mut over_ramps, mut under_ramps) = (GlowRamps::default(), GlowRamps::default());
         // An icon just right of the near star, its arm reaching it.
         let icon = [(48, 70, 30, 60)];
         assert!(lift_stars(
             (&[near, away], &keys),
             &icon,
             (0, 0),
-            (&mut over, &mut under, &mut halos)
+            (
+                (&mut over, &mut over_ramps),
+                (&mut under, &mut under_ramps),
+                &mut halos
+            )
         ));
         assert!(
             star.iter().all(|q| !over.contains(q)),

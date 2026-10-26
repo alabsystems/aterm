@@ -3,7 +3,7 @@
 
 //! The cursor aurora's bloom and SDR crown, one law for both renderers.
 
-use crate::{Frame, GlowQuad};
+use crate::{Frame, GlowEnd, GlowQuad, GlowRamp, GlowRamps};
 
 /// Half-resolution divisor for the bloom target.
 pub const BLOOM_DOWNSCALE: u32 = 2;
@@ -36,61 +36,398 @@ pub fn source_quads_into(
     rows: usize,
     out: &mut Vec<GlowQuad>,
 ) -> (Option<[u32; 4]>, usize) {
-    let ds = BLOOM_DOWNSCALE as u16;
-    out.clear();
-    let (mut bx0, mut by0, mut bx1, mut by1) = (u16::MAX, u16::MAX, 0u16, 0u16);
-    let mut any_thin = false;
-    for q in glow {
-        if usize::from(q.row) >= rows {
-            continue;
+    source_into(rows, out, |x| glow.iter().for_each(|q| x.add(*q)))
+}
+
+/// [`source_quads_into`] for a glow stream with ramps: its lights in draw
+/// order, each lit ramp row the quad it stands for.
+pub fn source_stream_into(
+    glow: &[GlowQuad],
+    ramps: &GlowRamps,
+    rows: usize,
+    out: &mut Vec<GlowQuad>,
+) -> (Option<[u32; 4]>, usize) {
+    source_into(rows, out, |x| {
+        use crate::glow_ramps::Lights;
+        crate::glow_ramps::each_laid(glow, ramps, |laid| match laid {
+            Lights::Quads(run) => run.iter().for_each(|q| x.add(*q)),
+            Lights::Ramp(ramp) => {
+                if usize::from(ramp.row) < rows {
+                    ramp.quads(&ramps.ends).for_each(|q| x.add(q));
+                }
+            }
+        });
+    })
+}
+
+/// Header words before an item list's first instances ([`BloomItems::words`]).
+pub const ITEM_HEAD: usize = 4;
+
+/// The bloom's lights as the GPU's item readers draw them: the extract set
+/// of [`source_stream_into`] (and the crown's, its lights unwidened) in the
+/// stream's draw order, with no ramp row expanded.
+///
+/// Each item is one of the stream's quads or one of its ramps, both shaped
+/// as a ramp: a quad `h` rows tall is a ramp whose run is all of them, so it
+/// keeps one row of ends. Instance `i` of the item draw is row `s = i -
+/// first` of the last item whose first instance `first` is at most `i`, and
+/// draws the quad that row stands for ([`aterm_core::render::GlowRamp::quads`]),
+/// or nothing where both its ends are zero; the extract widens each to a
+/// half-res texel as [`source_quads_into`] widens its copies.
+/// [`BloomItems::light`] is the readers' twin (`glow_item` in `cell.metal`,
+/// `hdr_glow.metal`, their WGSL twins and `cell.glsl`, `hdr_glow.glsl`).
+#[derive(Clone, Debug, Default)]
+pub struct BloomItems {
+    first: Vec<u32>,
+    recs: Vec<[u32; 4]>,
+    ends: Vec<u32>,
+    words: Vec<u32>,
+    instances: u32,
+    footprint: Option<[u32; 4]>,
+}
+
+impl BloomItems {
+    /// The words the GPU reads: [`ITEM_HEAD`] header words (the item count,
+    /// the word its records start at, the word its ends start at, the
+    /// instance count), each item's first instance, each item's record
+    /// (`x | y << 16`, `w | h << 16`, `join | joined << 16` and its first
+    /// end, counted from the ends' start), then the ends
+    /// ([`aterm_core::render::GlowEnd`]): the ramps' own, then two a quad.
+    #[must_use]
+    #[inline]
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
+    /// The instances an item draw draws: every row of ends its items keep.
+    #[must_use]
+    #[inline]
+    pub const fn instances(&self) -> u32 {
+        self.instances
+    }
+
+    /// The union of the rects its lit rows draw unwidened (the crown's
+    /// footprint), `[x0, y0, x1, y1]`, or `None` where nothing draws.
+    #[must_use]
+    #[inline]
+    pub const fn footprint(&self) -> Option<[u32; 4]> {
+        self.footprint
+    }
+
+    /// How many items the list holds.
+    #[must_use]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.first.len()
+    }
+
+    /// Whether the list holds no item.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.first.is_empty()
+    }
+
+    /// What instance `i` draws, read off [`Self::words`] as the GPU reads
+    /// them: its quad (its `row` tag 0), widened to a half-res texel with its
+    /// colour scaled down to match where `widen` (the extract), or `None`
+    /// where its row is dark or `i` is past the list.
+    #[must_use]
+    pub fn light(&self, i: u32, widen: bool) -> Option<GlowQuad> {
+        let w = &self.words;
+        let n = *w.first()? as usize;
+        if n == 0 || i >= w[3] {
+            return None;
         }
-        any_thin |= (q.w > 0 && q.w < ds) || (q.h > 0 && q.h < ds);
+        let first = &w[ITEM_HEAD..ITEM_HEAD + n];
+        let k = first.partition_point(|&f| f <= i) - 1;
+        let s = i - first[k];
+        let rec = &w[w[1] as usize + 4 * k..][..4];
+        let e = w[2] as usize + rec[3] as usize + 2 * s as usize;
+        let (e0, e1) = (w[e], w[e + 1]);
+        if e0 | e1 == 0 {
+            return None;
+        }
+        let lo = |v: u32| (v & 0xFFFF) as u16;
+        let hi = |v: u32| (v >> 16) as u16;
+        let (join, joined) = (u32::from(lo(rec[2])), u32::from(hi(rec[2])));
+        let mut q = GlowQuad {
+            row: 0,
+            x: lo(rec[0]),
+            y: (u32::from(hi(rec[0])) + s + if s > join { joined } else { 0 }) as u16,
+            w: lo(rec[1]),
+            h: if s == join { joined as u16 + 1 } else { 1 },
+            color: crate::end_color(e0),
+            alpha: crate::end_alpha(e0),
+            color2: crate::end_color(e1),
+            alpha2: crate::end_alpha(e1),
+        };
+        if widen {
+            widen_to_texel(&mut q);
+        }
+        Some(q)
+    }
+}
+
+/// `q` widened to a half-res texel each way, its colour scaled down by the
+/// share of the texel it covers: the extract's copy of a thin light
+/// ([`source_quads_into`]).
+#[inline]
+fn widen_to_texel(q: &mut GlowQuad) {
+    let ds = BLOOM_DOWNSCALE as u16;
+    let (w1, num_w, den_w) = if q.w > 0 && q.w < ds {
+        (ds, u32::from(q.w), u32::from(ds))
+    } else {
+        (q.w, 1, 1)
+    };
+    let (h1, num_h, den_h) = if q.h > 0 && q.h < ds {
+        (ds, u32::from(q.h), u32::from(ds))
+    } else {
+        (q.h, 1, 1)
+    };
+    let (num, den) = (num_w * num_h, den_w * den_h);
+    if den > 1 {
+        let scale = |c: u32| {
+            let ch = |sh: u32| (((c >> sh) & 0xff) * num + den / 2) / den;
+            (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        };
+        q.color = scale(q.color);
+        q.color2 = scale(q.color2);
+    }
+    q.w = w1;
+    q.h = h1;
+}
+
+/// The bloom's item list ([`BloomItems`]) of a glow stream with ramps, then
+/// `extra` lights (the fx layers' that bloom), for a frame of `rows` grid
+/// rows, into `out`; returns the lights' bounding box, as
+/// [`source_stream_into`] does for the same stream.
+pub fn items_into(
+    glow: &[GlowQuad],
+    ramps: &GlowRamps,
+    extra: &[GlowQuad],
+    rows: usize,
+    out: &mut BloomItems,
+) -> Option<[u32; 4]> {
+    use crate::glow_ramps::Lights;
+    out.first.clear();
+    out.recs.clear();
+    out.ends.clear();
+    let mut list = Items {
+        rows,
+        quad_ink: u32::try_from(ramps.ends.len()).unwrap_or(u32::MAX),
+        out,
+        bounds: Bounds::EMPTY,
+        foot: None,
+        instances: 0,
+    };
+    crate::glow_ramps::each_laid(glow, ramps, |laid| match laid {
+        Lights::Quads(run) => run.iter().for_each(|q| list.quad(q)),
+        Lights::Ramp(ramp) => list.ramp(ramp, &ramps.ends),
+    });
+    extra.iter().for_each(|q| list.quad(q));
+    let Items {
+        out,
+        bounds,
+        foot,
+        instances,
+        ..
+    } = list;
+    out.instances = instances;
+    out.footprint = foot;
+    let n = out.first.len();
+    let place = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    let w = &mut out.words;
+    w.clear();
+    w.extend_from_slice(&[
+        place(n),
+        place(ITEM_HEAD + n),
+        place(ITEM_HEAD + 5 * n),
+        instances,
+    ]);
+    w.extend_from_slice(&out.first);
+    w.extend(out.recs.iter().flatten());
+    w.extend_from_slice(&ramps.ends);
+    w.extend_from_slice(&out.ends);
+    bounds.rect()
+}
+
+/// An item list being gathered ([`items_into`]).
+struct Items<'a> {
+    rows: usize,
+    /// Where the next quad's ends go among the list's ends.
+    quad_ink: u32,
+    out: &'a mut BloomItems,
+    bounds: Bounds,
+    /// The union of the rects its lit rows draw unwidened.
+    foot: Option<[u32; 4]>,
+    instances: u32,
+}
+
+impl Items<'_> {
+    #[inline]
+    fn quad(&mut self, q: &GlowQuad) {
+        if usize::from(q.row) >= self.rows {
+            return;
+        }
+        self.bounds.add(q);
+        if q.w == 0 || q.h == 0 {
+            return;
+        }
+        self.lit(q);
+        self.out.first.push(self.instances);
+        self.instances += 1;
+        self.out.recs.push([
+            u32::from(q.x) | u32::from(q.y) << 16,
+            u32::from(q.w) | u32::from(q.h) << 16,
+            u32::from(q.h - 1) << 16,
+            self.quad_ink,
+        ]);
+        self.out.ends.push(crate::glow_end(q.color, q.alpha));
+        self.out.ends.push(crate::glow_end(q.color2, q.alpha2));
+        self.quad_ink += 2;
+    }
+
+    /// Add a lit row `q`'s unwidened rect to the footprint.
+    #[inline]
+    fn lit(&mut self, q: &GlowQuad) {
+        let (x, y) = (u32::from(q.x), u32::from(q.y));
+        let r = [x, y, x + u32::from(q.w), y + u32::from(q.h)];
+        self.foot = Some(self.foot.map_or(r, |f| {
+            [
+                f[0].min(r[0]),
+                f[1].min(r[1]),
+                f[2].max(r[2]),
+                f[3].max(r[3]),
+            ]
+        }));
+    }
+
+    #[inline]
+    fn ramp(&mut self, r: &GlowRamp, ends: &[GlowEnd]) {
+        if usize::from(r.row) >= self.rows {
+            return;
+        }
+        // Its rows run down the one column, each below the last, so its
+        // first and last lit rows bound them all.
+        let kept = r.kept_ends(ends).as_chunks::<2>().0;
+        let lit = |e: &[GlowEnd; 2]| e[0] | e[1] != 0;
+        let Some(top) = kept.iter().position(lit) else {
+            return;
+        };
+        let foot = kept.iter().rposition(lit).unwrap_or(top);
+        for s in [top, foot] {
+            // A row of kept ends below the run sits `joined` rows lower.
+            let s = s as u16;
+            let row = s + if s > r.join { r.joined } else { 0 };
+            if let Some(q) = r.row_quad(ends, row) {
+                self.bounds.add(&q);
+                self.lit(&q);
+            }
+        }
+        self.out.first.push(self.instances);
+        self.instances += u32::from(r.h - r.joined);
+        self.out.recs.push([
+            u32::from(r.x) | u32::from(r.y) << 16,
+            u32::from(r.w) | u32::from(r.h) << 16,
+            u32::from(r.join) | u32::from(r.joined) << 16,
+            r.ink,
+        ]);
+    }
+}
+
+/// The bounding box of an extract set's lights, each side at least a
+/// half-res texel.
+#[derive(Clone, Copy)]
+struct Bounds {
+    bbox: (u16, u16, u16, u16),
+    any: bool,
+}
+
+impl Bounds {
+    const EMPTY: Self = Self {
+        bbox: (u16::MAX, u16::MAX, 0, 0),
+        any: false,
+    };
+
+    #[inline]
+    fn add(&mut self, q: &GlowQuad) {
+        let ds = BLOOM_DOWNSCALE as u16;
         let ew = if q.w > 0 { q.w.max(ds) } else { 0 };
         let eh = if q.h > 0 { q.h.max(ds) } else { 0 };
-        bx0 = bx0.min(q.x);
-        by0 = by0.min(q.y);
-        bx1 = bx1.max(q.x.saturating_add(ew));
-        by1 = by1.max(q.y.saturating_add(eh));
-        out.push(*q);
+        let (bx0, by0, bx1, by1) = &mut self.bbox;
+        *bx0 = (*bx0).min(q.x);
+        *by0 = (*by0).min(q.y);
+        *bx1 = (*bx1).max(q.x.saturating_add(ew));
+        *by1 = (*by1).max(q.y.saturating_add(eh));
+        self.any = true;
     }
+
+    #[inline]
+    fn rect(self) -> Option<[u32; 4]> {
+        let (bx0, by0, bx1, by1) = self.bbox;
+        self.any.then_some([
+            u32::from(bx0),
+            u32::from(by0),
+            u32::from(bx1),
+            u32::from(by1),
+        ])
+    }
+}
+
+/// The extract set being gathered: its lights so far, their bounds and
+/// whether any is thinner than a half-res texel.
+struct Extract<'a> {
+    rows: usize,
+    out: &'a mut Vec<GlowQuad>,
+    bounds: Bounds,
+    any_thin: bool,
+}
+
+impl Extract<'_> {
+    #[inline]
+    fn add(&mut self, q: GlowQuad) {
+        let ds = BLOOM_DOWNSCALE as u16;
+        if usize::from(q.row) >= self.rows {
+            return;
+        }
+        self.any_thin |= (q.w > 0 && q.w < ds) || (q.h > 0 && q.h < ds);
+        self.bounds.add(&q);
+        self.out.push(q);
+    }
+}
+
+fn source_into(
+    rows: usize,
+    out: &mut Vec<GlowQuad>,
+    lights: impl FnOnce(&mut Extract<'_>),
+) -> (Option<[u32; 4]>, usize) {
+    out.clear();
+    let mut x = Extract {
+        rows,
+        out,
+        bounds: Bounds::EMPTY,
+        any_thin: false,
+    };
+    lights(&mut x);
+    let Extract {
+        out,
+        bounds,
+        any_thin,
+        ..
+    } = x;
     let n = out.len();
     let extract_first = if any_thin {
         for i in 0..n {
             let mut q = out[i];
-            let (w1, num_w, den_w) = if q.w > 0 && q.w < ds {
-                (ds, u32::from(q.w), u32::from(ds))
-            } else {
-                (q.w, 1, 1)
-            };
-            let (h1, num_h, den_h) = if q.h > 0 && q.h < ds {
-                (ds, u32::from(q.h), u32::from(ds))
-            } else {
-                (q.h, 1, 1)
-            };
-            let (num, den) = (num_w * num_h, den_w * den_h);
-            if den > 1 {
-                let scale = |c: u32| {
-                    let ch = |sh: u32| (((c >> sh) & 0xff) * num + den / 2) / den;
-                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
-                };
-                q.color = scale(q.color);
-                q.color2 = scale(q.color2);
-            }
-            q.w = w1;
-            q.h = h1;
+            widen_to_texel(&mut q);
             out.push(q);
         }
         n
     } else {
         0
     };
-    let bbox = (n > 0).then_some([
-        u32::from(bx0),
-        u32::from(by0),
-        u32::from(bx1),
-        u32::from(by1),
-    ]);
-    (bbox, extract_first)
+    (bounds.rect(), extract_first)
 }
 
 /// The bloom's tunables for one frame.
@@ -468,5 +805,164 @@ mod tests {
         }
         assert_eq!(large.pixels, saturated.pixels);
         assert!(large.pixels.iter().any(|&p| p != 0x0010_1010));
+    }
+
+    /// A stream for the item list's law: quads before, between and after
+    /// its ramps (a tall one, a one-pixel-wide one, an over light, an empty
+    /// one, one past the frame's rows), ramps with and without a run, dark
+    /// rows inside one and at both its ends, a dark ramp, a one-pixel-wide
+    /// ramp and a ramp past the frame's rows.
+    fn stream() -> (Vec<GlowQuad>, GlowRamps, Vec<GlowQuad>) {
+        let quad = |row, x, y, w, h, c: u32, a| GlowQuad {
+            color2: c.rotate_left(8) & 0x00FF_FFFF,
+            alpha2: a,
+            ..GlowQuad::flat(row, x, y, w, h, c, a)
+        };
+        let mut glow = vec![
+            quad(0, 3, 2, 6, 3, 0x0030_2010, 0),
+            quad(1, 9, 20, 1, 1, 0x00FF_8040, 0),
+            quad(1, 40, 21, 0, 1, 0x0011_1111, 0),
+        ];
+        let mut ramps = GlowRamps::default();
+        let mut lay = |glow: &Vec<GlowQuad>, row, x, y, w, rows: &[(u32, u32)], run: (u16, u16)| {
+            let ink = ramps.ends.len() as u32;
+            for &(a, b) in rows {
+                ramps.ends.extend([a, b]);
+            }
+            ramps.items.push(GlowRamp {
+                at: glow.len() as u32,
+                row,
+                x,
+                y,
+                w,
+                h: rows.len() as u16 + run.1,
+                join: run.0,
+                joined: run.1,
+                ink,
+            });
+        };
+        let lit = |k: u32| (0x0010_2030 + k * 0x0003_0507, 0x0050_4030 - k * 0x0001_0203);
+        let rows: Vec<_> = (0..7).map(lit).collect();
+        lay(&glow, 1, 12, 17, 9, &rows, (0, 0));
+        glow.push(quad(1, 30, 18, 4, 2, 0x8020_4060, 0x80));
+        lay(&glow, 1, 14, 18, 7, &rows[..5], (2, 3));
+        let mut dark = rows.clone();
+        for k in [0, 3, 6] {
+            dark[k] = (0, 0);
+        }
+        lay(&glow, 2, 5, 33, 11, &dark, (0, 0));
+        lay(&glow, 2, 7, 34, 4, &[(0, 0), (0, 0)], (0, 0));
+        lay(&glow, 2, 21, 35, 1, &rows[..4], (1, 2));
+        glow.push(quad(2, 2, 40, 5, 0, 0x0001_0101, 0));
+        lay(&glow, 9, 1, 150, 6, &rows, (0, 0));
+        glow.push(quad(9, 1, 160, 5, 1, 0x0001_0101, 0));
+        glow.push(quad(2, 50, 44, 2, 1, 0x00F0_F0F0, 0));
+        ramps.lit = ramps.count_lit();
+        let extra = vec![
+            quad(1, 60, 19, 3, 1, 0x0000_FF00, 0),
+            quad(2, 61, 36, 8, 4, 0x00FF_0000, 0),
+        ];
+        (glow, ramps, extra)
+    }
+
+    /// The item list draws the extract set and the crown's lights: instance
+    /// by instance its lit rows are the stream's lights, the crown's in
+    /// their order and the extract's widened as its copies are, with the
+    /// extra lights after them, and both bound alike.
+    #[test]
+    fn the_item_list_draws_its_streams_extract_set() {
+        let (glow, ramps, extra) = stream();
+        let rows = 4;
+        let drawn = |set: &[GlowQuad]| -> Vec<GlowQuad> {
+            set.iter()
+                .filter(|q| q.w > 0 && q.h > 0)
+                .map(|q| GlowQuad {
+                    row: 0,
+                    color: q.color & 0x00FF_FFFF,
+                    color2: q.color2 & 0x00FF_FFFF,
+                    ..*q
+                })
+                .collect()
+        };
+        let union = |set: &[GlowQuad]| -> Option<[u32; 4]> {
+            drawn(set)
+                .iter()
+                .map(|q| {
+                    let (x, y) = (u32::from(q.x), u32::from(q.y));
+                    [x, y, x + u32::from(q.w), y + u32::from(q.h)]
+                })
+                .reduce(|a, b| {
+                    [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]
+                })
+        };
+        let mut items = BloomItems::default();
+        for extra in [&[][..], &extra[..]] {
+            let mut all = Vec::new();
+            ramps.expand_into(&glow, &mut all);
+            all.extend_from_slice(extra);
+            let mut set = Vec::new();
+            let (bbox, first) = source_quads_into(&all, rows, &mut set);
+            let n = if first > 0 { first } else { set.len() };
+            if extra.is_empty() {
+                let mut walked = Vec::new();
+                assert_eq!(
+                    source_stream_into(&glow, &ramps, rows, &mut walked),
+                    (bbox, first)
+                );
+                assert_eq!(walked, set);
+            }
+            assert!(first > 0, "the stream has thin lights to widen");
+            let got = items_into(&glow, &ramps, extra, rows, &mut items);
+            assert_eq!(
+                got, bbox,
+                "the list bounds its lights as the extract set does"
+            );
+            let read = |widen| -> Vec<GlowQuad> {
+                (0..items.instances() + 3)
+                    .filter_map(|i| items.light(i, widen))
+                    .collect()
+            };
+            assert_eq!(read(false), drawn(&set[..n]), "the crown's lights");
+            assert_eq!(read(true), drawn(&set[first..]), "the extract's copies");
+            assert_eq!(items.footprint(), union(&set[..n]), "the crown's footprint");
+            assert!(items.len() < drawn(&set[..n]).len(), "ramps ride whole");
+        }
+        // Each ramp alone: its first and last lit rows bound it.
+        for ramp in &ramps.items {
+            let alone = GlowRamps {
+                items: vec![GlowRamp { at: 0, ..*ramp }],
+                ends: ramps.ends.clone(),
+                lit: 0,
+            };
+            let mut set = Vec::new();
+            let (bbox, _) = source_stream_into(&[], &alone, rows, &mut set);
+            assert_eq!(
+                items_into(&[], &alone, &[], rows, &mut items),
+                bbox,
+                "{ramp:?}"
+            );
+            let mut lit = Vec::new();
+            alone.expand_into(&[], &mut lit);
+            lit.retain(|q| usize::from(q.row) < rows);
+            assert_eq!(items.footprint(), union(&lit), "{ramp:?}");
+        }
+        let skipped = ramps
+            .items
+            .iter()
+            .filter(|r| usize::from(r.row) >= rows)
+            .count();
+        assert!(skipped > 0 && ramps.items.iter().any(|r| r.joined > 0));
+        // A stream with nothing to bloom lists nothing and bounds nothing.
+        assert_eq!(
+            items_into(&[], &GlowRamps::default(), &[], rows, &mut items),
+            None
+        );
+        assert!(items.is_empty() && items.instances() == 0 && items.light(0, true).is_none());
+        assert_eq!(items.footprint(), None);
     }
 }

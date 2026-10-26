@@ -101,6 +101,9 @@ USAGE:
                                                  hurry, defer, or skip one tab's upgrade
     aterm harness upgrade models [set <id>,<id>,...]
                                                  show or set the upgrade model priority list
+    aterm harness signin --cli grok [--wait] [--json]
+                                                 sign this machine in to Grok Build once: sandboxed, one
+                                                 sign-in and one need however many sessions ask
     aterm harness versions [--json]              incremental numeric version of each CLI harness
     aterm harness tap                            Claude Code statusLine usage tap (`[harness] usage_tap`)
 
@@ -140,8 +143,37 @@ OPTIONS:
     --auto              accounts use: clear the pin
     --machine <mN>      accounts sync, serve: override machine id (`m8`, `m14`, \u{2026})
     --bind <addr:port>  accounts serve: listen address (default `127.0.0.1:8741`)
+    --wait              signin: wait for a sign-in another session runs instead of exiting 75
     --json              emit JSON
     -h, --help, help    print help (`aterm harness <verb> --help` for one verb)
+";
+
+const HELP_SIGNIN: &str = "\
+`signin --cli grok` signs this machine in to Grok Build once, for every session on it. Signed
+out, Grok Build opens accounts.x.ai in the default browser on every launch; under aterm its
+launch runs this first (atpkg's `grok` twin, grok-alab), so nothing opens a page.
+  - Signed in is read from files and the environment, never by running grok: `GROK_AUTH` or
+    `XAI_API_KEY` set, else the file `GROK_AUTH_PATH` names, else
+    `${GROK_HOME:-~/.grok}/auth.json`, non-empty. Signed in, it exits 0 at once. A login grok
+    refused (a `<file>.refused` beside it at least as new, which the window writes when a grok
+    started after that login still draws its sign-in screen) counts as signed out.
+  - Signed out, it takes `<state>/signin-grok.lock`: one sign-in at a time on this machine.
+    `--wait` waits for one another session runs and never starts a second; without it a held
+    lock exits 75.
+  - The sign-in is `grok login --device-auth` in a private staging home under
+    `/usr/bin/sandbox-exec` (LaunchServices, Apple events, `open` and app launches denied),
+    after a try of the sandbox: a missing or refusing sandbox runs nothing (exit 69). Its page
+    must be https on auth.x.ai or accounts.x.ai.
+  - Its page and code become one need, `NEEDS YOU: approve Grok Build sign-in, code <code>, at
+    <url>`, printed here as a link and published on this session (attention `signin:grok`).
+    aterm opens no page: you open it and approve the code.
+  - Once grok says it signed in, its login is written 0600 to `${GROK_HOME:-~/.grok}/auth.json`
+    (one already there that is not refused is kept), the need comes down, and the accounts
+    ledger (`ledger accounts --cli grok`) keeps the page's host, the flow and the outcome only.
+    It waits 15 minutes at most.
+  - After a sign-in that ended without a login (an expired code), a launch from a terminal
+    starts a new one; a background caller waits 6 hours. It never retries by itself.
+  Exit 0 signed in, 69 not signed in, 75 another sign-in runs (no `--wait`).
 ";
 
 const HELP_AGY: &str = "\
@@ -351,11 +383,16 @@ VERBS:
     `[fleet] accounts_source` or the vault's files write it, `add` writes nothing and names
     that source. The report's `list:` line (`--json`: `list.origin`) says which it is:
     `discovered` for a list found on this Mac.
+    New labels must have no retained local account state. If the implicit `main`
+    conflicts, use `adopt-default <unused-label>` to name the default login first.
   - `accounts adopt-default <label> --email <e> [--identity-email <e>] [--browser <b>]`
     Lists the machine's default login (no `dir`) as a renewable row. With
     `--identity-email`, its current Claude subscription must report that canonical
     address; `--email` remains the address used for sign-in. This records metadata,
-    not a new credential or proof that the login will remain usable.
+    not a new credential or proof that the login will remain usable. A locally owned
+    fleet source is updated too; a read-only source is named and nothing is written.
+    Retained login or account state under the label refuses adoption. Creation also
+    waits briefly for any managed sign-in, then refuses while it remains in flight.
   - `accounts login <label>`
     Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` (plain `claude auth login` for the
     default row) in a terminal, then checks once with `claude auth status --json` (20 s cap)
@@ -435,7 +472,8 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     CLI's store, never `~/.secrets`. With no
     source named it reads nothing unless the roster exists: a vault file alone opts no
     machine in, and `aterm init`, `aterm secrets` and a window sync each CLI whose roster this
-    machine keeps.
+    machine keeps. A new label with retained local login or account state is refused.
+    Additions also yield to an ongoing sign-in; unchanged rosters can still sync.
   - `accounts renew <label>… [--due] --cli <id>` runs the CLI's own sign-in in a fresh
     staging home (Codex's app server, or its `login --device-auth`; Grok's `login
     --device-auth` or `--oauth`; Kimi's `login --region <region>`), one machine-wide sign-in
@@ -995,6 +1033,13 @@ pub enum Cmd {
         /// The JSON form.
         json: bool,
     },
+    /// `signin --cli grok`: this machine's one Grok Build sign-in ([`super::grok_signin`]).
+    Signin {
+        /// `--wait`: wait for a sign-in another session runs.
+        wait: bool,
+        /// The JSON form.
+        json: bool,
+    },
     /// Print a help page ([`help_page`]) and exit 0.
     Help(HelpPage),
 }
@@ -1025,6 +1070,8 @@ pub enum HelpPage {
     Tap,
     /// `agy --help`: agy's quota pools, their tracking, and model rotation.
     Agy,
+    /// `signin --help`: the machine's one Grok Build sign-in.
+    Signin,
 }
 
 fn help_reset(takes: impl Fn(ResetKind) -> bool, anchors: &[Anchor]) -> String {
@@ -1147,6 +1194,7 @@ pub fn help_page(page: HelpPage) -> String {
         ),
         HelpPage::UpgradeStatus => ("upgrade", true, &[HELP_UPGRADE_STATUS]),
         HelpPage::Versions => ("versions", false, &[HELP_VERSIONS]),
+        HelpPage::Signin => ("signin", false, &[HELP_SIGNIN]),
         HelpPage::Tap => ("tap", false, &[HELP_TAP]),
     };
     let mut entries: Vec<String> = Vec::new();
@@ -1204,6 +1252,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut here = false;
     let mut agy = false;
     let mut refresh = false;
+    let mut wait = false;
     let mut email: Option<String> = None;
     let mut identity_email: Option<String> = None;
     let mut browser: Option<String> = None;
@@ -1232,6 +1281,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "--here" => here = true,
             "--agy" => agy = true,
             "--refresh" => refresh = true,
+            "--wait" => wait = true,
             "--email" => {
                 email = Some(value(i, "--email")?);
                 i += 1;
@@ -1325,6 +1375,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             Some("upgrade") => HelpPage::Upgrade,
             Some("versions" | "version") => HelpPage::Versions,
             Some("tap") => HelpPage::Tap,
+            Some("signin") => HelpPage::Signin,
             _ => HelpPage::Verbs,
         };
         return Ok((Cmd::Help(page), over));
@@ -1372,6 +1423,25 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 return Err(format!("{verb} takes no operand, not {:?}", &rest[1..]));
             }
             Cmd::Versions { json }
+        }
+        "signin" => {
+            if rest.len() > 1 {
+                return Err(format!("signin takes no operand, not {:?}", &rest[1..]));
+            }
+            match pool.take().as_deref() {
+                Some("grok") => {}
+                Some(other) => {
+                    return Err(format!(
+                        "signin serves `--cli grok` alone, not {:?}",
+                        super::one_line(other, 40)
+                    ));
+                }
+                None => return Err("signin takes `--cli grok`".to_string()),
+            }
+            Cmd::Signin {
+                wait: std::mem::take(&mut wait),
+                json,
+            }
         }
         "limits" => Cmd::Limits {
             sid: sid_operand(&rest[1..])?,
@@ -1578,6 +1648,9 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
         }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
+    if wait {
+        return Err("--wait belongs to `signin`".to_string());
+    }
     if !owner.is_empty() && !matches!(cmd, Cmd::UpgradeOwner { .. }) {
         return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
     }
@@ -5141,6 +5214,18 @@ extern "C" fn note_window_interrupt(_: libc::c_int) {
     WINDOW_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether one of [`WINDOW_END_SIGNALS`] arrived under a live [`WindowEnds::hold`].
+#[cfg(unix)]
+fn window_end_noted() -> bool {
+    WINDOW_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Non-Unix: no signal is held.
+#[cfg(not(unix))]
+fn window_end_noted() -> bool {
+    false
+}
+
 /// The signals that end `accounts browser`'s window as Ctrl-C does ([`WindowEnds`]): Ctrl-C
 /// (SIGINT), its terminal closing (SIGHUP, which a closed tab sends its foreground job), a stop
 /// (SIGTERM) and Ctrl-\ (SIGQUIT). The window is in its own process group, so none reaches it.
@@ -5629,6 +5714,15 @@ fn accounts_read_roster_for(cli: Cli, env: &Env, err: &mut dyn Write) -> Option<
         );
         return None;
     };
+    if let Some(store) = env.accounts_store_for(cli)
+        && let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, &path)
+    {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts: {why}; account commit remains pending"
+        );
+        return None;
+    }
     match Roster::load_for(cli, &path) {
         Ok(roster) => Some((path, roster)),
         Err(why) => {
@@ -6365,6 +6459,20 @@ fn run_accounts_report(
         let _ = accounts_read_roster_for(cli, env, err);
         return ExitCode::from(1);
     };
+    let Some(store) = env.accounts_store_for(cli) else {
+        let _ = writeln!(err, "aterm harness accounts: {}", no_home_for(cli));
+        return ExitCode::from(1);
+    };
+    if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, &path) {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts: {why}; account commit remains pending"
+        );
+        if json {
+            let _ = writeln!(out, "{}", accounts_refused_json(&path, &why, env.now));
+        }
+        return ExitCode::from(1);
+    }
     let roster = match Roster::load_for(cli, &path) {
         Ok(roster) => roster,
         Err(why) => {
@@ -6374,10 +6482,6 @@ fn run_accounts_report(
             }
             return ExitCode::from(1);
         }
-    };
-    let Some(store) = env.accounts_store_for(cli) else {
-        let _ = writeln!(err, "aterm harness accounts: {}", no_home_for(cli));
-        return ExitCode::from(1);
     };
     let (state, note) = match store.load(env.now) {
         Ok(read) => read,
@@ -6563,6 +6667,14 @@ pub(super) fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), Strin
     Ok((write_to, keep_mode))
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountCreateLabel",
+        action = "Create",
+        project = "aterm_agent::harness::cli::tests::label_retention::creation_transition"
+    )
+)]
 fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, String> {
     let label = asked.label.as_str();
     if let Some(why) = accounts::label_refusal(label) {
@@ -6597,9 +6709,11 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
             dir.display()
         ));
     }
+    let _signing = creation_signin_guard(&store)?;
     let _held = store
-        .acquire()
-        .map_err(|e| format!("{}: {e}", store.dir.display()))?;
+        .acquire_within(&accounts::LOCK_LADDER)
+        .map_err(|e| format!("{}: {e}", store.dir.display()))?
+        .ok_or_else(|| accounts::LOCK_HELD.to_string())?;
     let (write_to, keep_mode) = roster_target(&path)?;
     let existing = accounts::roster_text(&write_to)?.unwrap_or_default();
     let roster = Roster::parse_for(cli, &existing).map_err(|why| {
@@ -6625,6 +6739,12 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
              (the row with no dir); pick another label for the new account"
         ));
     }
+    store.check_new_labels(&[label], env.now)?;
+    if listed_own {
+        store.check_new_labels(&[ACCOUNTS_OWN_LABEL], env.now).map_err(|why| {
+            format!("the first add also lists this machine's default login as `{ACCOUNTS_OWN_LABEL}`; {why}. To name the default login differently, use `accounts adopt-default <unused-label>` first")
+        })?;
+    }
     let own = accounts::Row {
         label: ACCOUNTS_OWN_LABEL.to_owned(),
         ..accounts::Row::default()
@@ -6633,12 +6753,13 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
         dir: Some(dir_text.to_owned()),
         ..asked.clone()
     };
-    let fleets = fleet_rows_for_add(cli, env, &path, &asked)?;
+    let fleets = fleet_rows_for_write(cli, env, &path, &asked)?;
     let rows = if listed_own {
         vec![own, asked]
     } else {
         vec![asked]
     };
+    store.check_new_rows(&rows, &roster, env.now)?;
     let text = accounts::append_rows_for(cli, &existing, &rows).map_err(|why| {
         let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Dedicated, None);
         if listed_own && own.is_some_and(|own| why.contains(&own)) {
@@ -6656,18 +6777,12 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
         .map_err(|e| format!("{}: {e}", dir.display()))?;
     // The fleet first: a fleet that lists the row and a roster that does not yet is mended by
     // the next sync, never the other way round.
-    for (fleet, fleet_text) in &fleets {
-        let (fleet_to, fleet_mode) = roster_target(fleet)?;
-        super::upgrade_models::write_atomic_mode(&fleet_to, fleet_text, fleet_mode).map_err(
-            |e| {
-                format!(
-                    "{}: {e}; the roster is unchanged (the login directory {} was made)",
-                    fleet_to.display(),
-                    dir.display()
-                )
-            },
-        )?;
-    }
+    write_fleet_rows(&fleets).map_err(|why| {
+        format!(
+            "{why}; the roster is unchanged (the login directory {} was made)",
+            dir.display()
+        )
+    })?;
     super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode).map_err(|e| {
         format!(
             "{}: {e}; the roster is unchanged (the login directory {} was made)",
@@ -6684,7 +6799,16 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
     })
 }
 
-/// Where `accounts add` lists `asked` beside the roster at `path` so that the next sync keeps it
+/// Take the sign-in lock before the writer lock, as a managed renewal does.
+/// New rows cannot reuse a label while an earlier sign-in is still in flight.
+fn creation_signin_guard(store: &accounts::Store) -> Result<accounts::Lock, String> {
+    store
+        .signin_within()
+        .map_err(|why| format!("{}: {why}", store.shared_dir().display()))?
+        .ok_or_else(|| format!("{}; account metadata is unchanged", accounts::SIGNIN_HELD))
+}
+
+/// Where `accounts add` or `adopt-default` lists `asked` beside the roster at `path` so that the next sync keeps it
 /// ([`super::accounts_sync::fleet_origin`]): nowhere for a roster no fleet writes or another
 /// CLI's (its sync removes no row); each local fleet file of Claude Code's, with the text it then
 /// holds ([`super::accounts_sync::list_in_local_fleet`]).
@@ -6692,7 +6816,7 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
 /// The roster is written from a source this machine reads and does not write (`[fleet]
 /// accounts_source`, the vault's files), which would drop the row at its next sync; or the
 /// local fleet refuses the row.
-fn fleet_rows_for_add(
+fn fleet_rows_for_write(
     cli: Cli,
     env: &Env,
     path: &Path,
@@ -6714,11 +6838,23 @@ fn fleet_rows_for_add(
     Err(format!(
         "this machine's accounts come from {}, which a sync writes {} from and this machine does \
          not write, so a row listed here alone would be dropped at the next sync: {from} (its \
-         email, and this machine among its `machines`), then run `aterm harness accounts sync`; \
+         email, and this machine among its `machines`) before changing the local roster; \
          nothing was written",
         origin.words(),
         path.display()
     ))
+}
+
+/// Persist owned source metadata before its derived local roster. Individual files are
+/// atomic; if a later file fails, earlier source membership remains available for sync.
+/// Default-home and canonical-identity fields still depend on the local roster.
+fn write_fleet_rows(fleets: &[(PathBuf, String)]) -> Result<(), String> {
+    for (fleet, text) in fleets {
+        let (target, mode) = roster_target(fleet)?;
+        super::upgrade_models::write_atomic_mode(&target, text, mode)
+            .map_err(|why| format!("{}: {why}", target.display()))?;
+    }
+    Ok(())
 }
 
 fn ask_login(host: &dyn AccountsHost, dir: Option<&str>, made: bool) -> LoginCheck {
@@ -6757,11 +6893,15 @@ fn record_plain_login(
 
 fn signin_records_ready(
     store: &accounts::Store,
+    roster: &Path,
     now: i64,
     verb: &str,
     err: &mut dyn Write,
 ) -> bool {
-    match store.check_signin_state(now) {
+    match store
+        .recover_sync_within(&accounts::LOCK_LADDER, roster)
+        .and_then(|_| store.check_signin_state(now))
+    {
         Ok(()) => true,
         Err(why) => {
             let _ = writeln!(
@@ -6795,7 +6935,7 @@ fn signin_guard(
                 err,
                 "aterm harness accounts {verb}: {label}: the sign-in lock could not be taken ({why}); nothing was run"
             );
-            Err(Renewal::Failed)
+            Err(Renewal::Deferred)
         }
     }
 }
@@ -6846,7 +6986,7 @@ fn run_accounts_login(
         );
         return ExitCode::from(1);
     }
-    if !signin_records_ready(&store, env.now, "login", err) {
+    if !signin_records_ready(&store, &path, env.now, "login", err) {
         return ExitCode::from(1);
     }
     if !host.stdin_is_terminal() {
@@ -6990,7 +7130,6 @@ fn run_accounts_use(
                     return ExitCode::from(1);
                 }
             };
-            let enrolled = accounts::enrolled_for(cli, &roster);
             let remedy = match roster.row(label) {
                 None => format!(
                     "`aterm harness accounts add <label>{}` lists an account",
@@ -7002,12 +7141,29 @@ fn run_accounts_use(
                     sign_in_verb(row)
                 ),
             };
-            accounts_transact(&store, now, err, |state| {
-                accounts::pin(state, &roster, &enrolled, label, now)
-                    .map(|event| vec![event.because("the owner's word")])
-                    .map_err(|why| format!("{why}; {remedy}"))
-            })
-            .map(|_| format!("{label}: the active account, pinned\n{ACCOUNTS_USE_RECORDED}"))
+            let mut note = None;
+            let result = store.transact_pool_logins_within(
+                &accounts::LOCK_LADDER,
+                &path,
+                now,
+                &mut note,
+                |current, state, logins| {
+                    if current.row(label) != raw.row(label) {
+                        return Err(
+                            "selected account configuration changed; nothing selected".into()
+                        );
+                    }
+                    let roster = accounts::bound(current, logins);
+                    let enrolled = accounts::enrolled_for(cli, &roster);
+                    accounts::pin(state, &roster, &enrolled, label, now)
+                        .map(|event| vec![event.because("the owner's word")])
+                        .map_err(|why| format!("{why}; {remedy}"))
+                },
+            );
+            if let Some(note) = note {
+                let _ = writeln!(err, "aterm harness accounts: {note}");
+            }
+            result.map(|_| format!("{label}: the active account, pinned\n{ACCOUNTS_USE_RECORDED}"))
         }
         None => accounts_transact(&store, now, err, |state| {
             Ok(accounts::unpin(state, "auto", now).into_iter().collect())
@@ -7040,6 +7196,22 @@ fn run_accounts_use(
         machine = "AccountAdoptIdentity",
         action = "Adopt",
         project = "aterm_agent::harness::cli::tests::adopt_identity::adopt_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAdoptSource",
+        action = "Adopt",
+        project = "aterm_agent::harness::cli::tests::adopt_source::adopt_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountCreateLabel",
+        action = "Create",
+        project = "aterm_agent::harness::cli::tests::label_retention::creation_transition"
     )
 )]
 fn run_accounts_adopt(
@@ -7086,6 +7258,7 @@ fn run_accounts_adopt(
                 );
             }
         }
+        let _signing = creation_signin_guard(&store)?;
         let _held = store
             .acquire_within(&accounts::LOCK_LADDER)
             .map_err(|e| format!("{}: {e}", store.dir.display()))?
@@ -7111,8 +7284,13 @@ fn run_accounts_adopt(
                 own.label
             ));
         }
+        store.check_new_rows(std::slice::from_ref(row), &roster, env.now)?;
         let text = accounts::append_rows_for(cli, &existing, std::slice::from_ref(row))?;
+        let fleets = fleet_rows_for_write(cli, env, &path, row)?;
         let (write_to, keep_mode) = roster_target(&path)?;
+        write_fleet_rows(&fleets).map_err(|why| {
+            format!("{why}; the local roster is unchanged; any source files already written are retained for sync")
+        })?;
         super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
             .map_err(|e| format!("{}: {e}; the roster is unchanged", write_to.display()))?;
         Ok(path)
@@ -7151,6 +7329,28 @@ fn run_accounts_adopt(
 )]
 #[doc(hidden)]
 pub fn account_adopt_identity_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountAdoptSource",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: choose the authoritative source and its current metadata"
+    )
+)]
+#[doc(hidden)]
+pub fn account_adopt_source_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountCreateLabel",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: choose retained snapshots, a concurrent probe change or lock contention"
+    )
+)]
+#[doc(hidden)]
+pub fn account_create_label_environment() {}
 
 fn machines_to_renew(
     env: &Env,
@@ -7198,6 +7398,9 @@ pub(super) enum Renewal {
     Failed,
     /// Another sign-in held `signin.lock` past `signin_within`, so nothing ran.
     Busy,
+    /// Local admission or its captured state became unavailable; retain a saved selection
+    /// for a fresh attempt rather than interpreting this as an authentication failure.
+    Deferred,
     /// Another CLI's sign-in stopped where only a person can go on (its page waits on one, or a
     /// block page, or its time ran out), so a background renewal of the row waits for one
     /// ([`super::accounts_sync`]'s backoff).
@@ -7296,7 +7499,7 @@ fn renew_one(
     let Some(email) = row.email.as_deref() else {
         return Renewal::Failed;
     };
-    if !signin_records_ready(store, env.now, "renew", err) {
+    if !signin_records_ready(store, policy.roster_path, env.now, "renew", err) {
         return Renewal::Failed;
     }
     let say = |err: &mut dyn Write, what: &str| {
@@ -7570,7 +7773,7 @@ fn run_accounts_renew(
     };
     let store = env.accounts_store();
     let now = env.now;
-    if !signin_records_ready(&store, now, "renew", err) {
+    if !signin_records_ready(&store, &path, now, "renew", err) {
         return ExitCode::from(1);
     }
     if due && labels.is_empty() {
@@ -7917,8 +8120,8 @@ fn sign_in_plan(
         own_dir,
     } = policy;
     let label = row.label.as_str();
-    if !signin_records_ready(store, now, verb, err) {
-        return Err(Renewal::Failed);
+    if !signin_records_ready(store, roster_path, now, verb, err) {
+        return Err(Renewal::Deferred);
     }
     let say = |err: &mut dyn Write, what: &str| {
         let _ = writeln!(err, "aterm harness accounts {verb}: {label}: {what}");
@@ -7953,7 +8156,7 @@ fn sign_in_plan(
         })
     {
         say(err, &format!("{why}; nothing was run"));
-        return Err(Renewal::Failed);
+        return Err(Renewal::Deferred);
     }
     let default_home = store.default_home();
     if cli == Cli::Codex
@@ -7980,7 +8183,7 @@ fn sign_in_plan(
                     store.logins_dir().display()
                 ),
             );
-            return Err(Renewal::Failed);
+            return Err(Renewal::Deferred);
         }
     };
     let Some(staging_text) = staging.to_str().map(str::to_owned) else {
@@ -8004,7 +8207,7 @@ fn sign_in_plan(
                     default_home.display()
                 ),
             );
-            return Err(Renewal::Failed);
+            return Err(Renewal::Deferred);
         }
     }
     Ok(SignInPlan {
@@ -8332,29 +8535,46 @@ fn bind_signed_in(
         row.email.as_deref()
     }
     .unwrap_or("");
-    let done = accounts_transact_logins(store, now, err, |state, logins| {
-        // Roster writers use this store lock. Recheck after the provider probe
-        // and before creating any recoverable completion checkpoint.
-        plan.parent.require_current(logins, label)?;
-        policy_unchanged()?;
-        if !email.is_empty() {
-            accounts::write_renewal_checkpoint_for(
-                cli,
+    let mut note = None;
+    let done = store.transact_roster_logins_within(
+        &accounts::LOCK_LADDER,
+        roster_path,
+        now,
+        &mut note,
+        |_, state, logins| {
+            // Roster writers use this store lock. Recheck after the provider probe
+            // and before creating any recoverable completion checkpoint.
+            plan.parent.require_current(logins, label)?;
+            policy_unchanged()?;
+            if !email.is_empty() {
+                accounts::write_renewal_checkpoint_for(
+                    cli,
+                    label,
+                    email,
+                    &plan.staging_text,
+                    None,
+                    Some(proof),
+                    now,
+                    logins,
+                )
+                .map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
+            }
+            let events = accounts::note_renewed(
+                state,
+                logins,
                 label,
-                email,
+                own_dir,
                 &plan.staging_text,
                 None,
-                Some(proof),
                 now,
-                logins,
-            )
-            .map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
-        }
-        let events =
-            accounts::note_renewed(state, logins, label, own_dir, &plan.staging_text, None, now);
-        accounts::note_identity(logins, label, proof, (!email.is_empty()).then_some(email));
-        Ok(events)
-    });
+            );
+            accounts::note_identity(logins, label, proof, (!email.is_empty()).then_some(email));
+            Ok(events)
+        },
+    );
+    if let Some(note) = note {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
     match done {
         Ok(_) => {
             let (var, value) = accounts::login_env_for(
@@ -8619,7 +8839,7 @@ fn run_accounts_renew_for(
         return ExitCode::from(1);
     };
     let now = env.now;
-    if !signin_records_ready(&store, now, "renew", err) {
+    if !signin_records_ready(&store, &path, now, "renew", err) {
         return ExitCode::from(1);
     }
     if due && labels.is_empty() {
@@ -8945,7 +9165,7 @@ fn run_accounts_browser(
         let _ = writeln!(err, "aterm harness accounts browser: {}", no_home_for(cli));
         return ExitCode::from(1);
     };
-    if !signin_records_ready(&store, env.now, "browser", err) {
+    if !signin_records_ready(&store, &path, env.now, "browser", err) {
         return ExitCode::from(1);
     }
     if let Some(why) = no_window_desk() {
@@ -9876,7 +10096,81 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::AccountsOf(of) => run_accounts_of(of, env, &LiveAccounts, out, err),
         Cmd::AccountsAll { json } => run_accounts_all(*json, env, &LiveAccounts, out, err),
         Cmd::Versions { json } => run_versions(*json, out),
+        Cmd::Signin { wait, json } => run_signin(env, *wait, *json, out, err),
     }
+}
+
+/// `signin --cli grok [--wait] [--json]`: this machine's one Grok Build sign-in
+/// ([`super::grok_signin`]), its need on this terminal and session, its end on `out`.
+fn run_signin(
+    env: &Env,
+    wait: bool,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    use super::grok_signin as gate;
+    use std::io::IsTerminal as _;
+    let var = |name: &str| std::env::var_os(name);
+    let program =
+        super::login_drive::program_of(Cli::Grok, env.home.as_deref().unwrap_or(Path::new("/")));
+    let in_session = !env.sid.is_empty() || std::env::var_os("ATERM_SESSION_ID").is_some();
+    let ctl = in_session
+        .then(|| crate::own_exe().ok())
+        .flatten()
+        .map(|exe| crate::CtlClient::own_at(exe, env.sock.clone()));
+    let ends = WindowEnds::hold();
+    let stopped = || window_end_noted();
+    let now = limit::unix_now;
+    let link = io::stderr().is_terminal();
+    let mut owner = gate::SessionOwner {
+        err,
+        link,
+        ctl,
+        up: false,
+    };
+    let store = accounts::Store::at_for(
+        &env.state,
+        Cli::Grok,
+        env.home.as_deref().unwrap_or(Path::new("/")),
+    );
+    let mut ledger = |why: &str| {
+        let event = accounts::Event::new(
+            limit::unix_now(),
+            accounts::Kind::SignIn,
+            gate::LEDGER_ACCOUNT,
+        )
+        .because(why);
+        let _ = store.append(&[event]);
+    };
+    let ended = gate::run(
+        &gate::Gate {
+            state: &env.state,
+            home: env.home.as_deref(),
+            var: &var,
+            program: (&program, &[]),
+            sandbox: Some(Path::new(super::login_drive::SANDBOX_EXEC)),
+            hang: super::login_drive::HANG,
+            wait,
+            ack: io::stdin().is_terminal(),
+            stopped: &stopped,
+            now: &now,
+        },
+        &mut owner,
+        &mut ledger,
+    );
+    drop(ends);
+    if json {
+        let mut o = Map::new();
+        o.insert("cli".to_owned(), Value::from("grok"));
+        o.insert("outcome".to_owned(), Value::from(ended.word()));
+        o.insert("signed_in".to_owned(), Value::from(ended.exit() == 0));
+        o.insert("line".to_owned(), Value::from(ended.line()));
+        let _ = writeln!(out, "{}", Value::Object(o));
+    } else {
+        let _ = writeln!(out, "{}", ended.line());
+    }
+    ExitCode::from(ended.exit())
 }
 
 fn run_versions(json: bool, out: &mut dyn Write) -> ExitCode {

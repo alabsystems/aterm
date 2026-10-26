@@ -1067,14 +1067,20 @@ impl ConsentState {
         !slot.in_flight && slot.entry.is_none()
     }
 
-    /// Publish a completed debugger result on a test instance.
+    /// Publish a completed debugger result on a test instance, read as just taken until
+    /// [`aterm_spec::wait::MUST_HAPPEN`] has passed. The debugger step ages a reading by the
+    /// wall clock against [`crate::debugger_access::ASK_PROBE_FRESH`] while its test moves the
+    /// step's own clock: stamped now, the looks after it would have five seconds to spend it, a
+    /// latency budget that a look's durable write, queued behind every other test's under load,
+    /// outruns.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn publish_debugger_for_test(
         &mut self,
         probe: DebuggerProbe,
         self_hardened: SelfHardening,
     ) {
-        self.publish_debugger_aged_for_test(probe, self_hardened, Duration::ZERO);
+        let at = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        self.publish_debugger_at_for_test(probe, self_hardened, at);
     }
 
     /// Publish a completed debugger result aged by `age` on a test instance.
@@ -1085,11 +1091,21 @@ impl ConsentState {
         self_hardened: SelfHardening,
         age: Duration,
     ) {
-        self.probes.live = true;
-        let _ = self.shared.hardening.set(self_hardened);
         let at = Instant::now()
             .checked_sub(age)
             .expect("a monotonic clock that far back");
+        self.publish_debugger_at_for_test(probe, self_hardened, at);
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn publish_debugger_at_for_test(
+        &mut self,
+        probe: DebuggerProbe,
+        self_hardened: SelfHardening,
+        at: Instant,
+    ) {
+        self.probes.live = true;
+        let _ = self.shared.hardening.set(self_hardened);
         self.shared.debugger.seed_for_test(
             DebuggerEntry {
                 probe,

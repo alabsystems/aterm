@@ -2633,6 +2633,7 @@ fn tab_controls_summary_keeps_its_labels_whole_at_large_type() {
             active_ai: 1,
         }],
         tabs: Vec::new(),
+        fleet: crate::harness_screen::FleetScope::Account,
     };
     at_each_text_scale(&[1.0, 2.0], "Tab Control's summary", |scale| {
         for (width, height) in [(504.0, 628.0), (924.0, 640.0)] {
@@ -3169,6 +3170,7 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 show_local_id: None,
             },
         ],
+        fleet: crate::harness_screen::FleetScope::Account,
     };
     let (mut runtime, instance, view) = setup();
     assert!(runtime.replace_settings_harness(state.clone(), 1));
@@ -3925,4 +3927,270 @@ fn the_occupancy_row_shows_the_mode_and_nothing_writes_it() {
     };
     assert_eq!(acting("occupancy"), 0, "no control writes it");
     assert!(acting("autopilot") > 0, "an editable key's control acts");
+}
+
+/// A refresh that rewrites a Tab Control row's words in fewer lines leaves the row at the height
+/// it was laid out at, so the rows under it stay where they stand for a still reader: a row once
+/// lost and gained a line every few seconds as its vitals' digits moved a wrap point, and every
+/// row under it moved with it. Refresh lays the page out afresh.
+#[test]
+fn a_live_row_keeps_its_height_while_the_person_reads() {
+    use crate::harness_screen::{FleetScope, TabComputer, TabControlState};
+    use crate::native_settings::tabs_page::TABS_REFRESH;
+    let computer = |id: &str, vitals: &str| TabComputer {
+        id: id.to_string(),
+        name: id.to_string(),
+        address: "192.168.1.90 \u{b7} m111.local".to_string(),
+        os_version: "Mac16,5 \u{b7} macOS (Darwin 26) \u{b7} OpenSSH_10.3".to_string(),
+        status: "online".to_string(),
+        vitals: vitals.to_string(),
+        instances: 1,
+        tabs: 1,
+        ai_clis: 0,
+        active_ai: 0,
+    };
+    let long = "CPU 79% \u{2595}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2591}\u{2591}\u{258f} \
+                \u{2586}\u{2586}\u{2586}\u{2587}\u{2587}\u{2587} (14c \u{b7} Performance:88% \
+                Efficiency:56%) \u{b7} GPU 0% (Apple M4 Max 32c) \u{b7} RAM 29.5 GiB/36.0 GiB \
+                (82% \u{b7} warn \u{b7} wired 3.7 GiB \u{b7} comp 15.5 GiB \u{b7} swap 2.6 GiB) \
+                \u{b7} Disk 666 GiB/926 GiB (71% \u{b7} 260 GiB free)";
+    let short = "CPU 9% \u{b7} GPU 0% \u{b7} RAM 29.5 GiB/36.0 GiB";
+    let with = |vitals: &str| {
+        let mut state = fixture();
+        state.tabs = TabControlState {
+            computers: vec![computer("local", vitals), computer("lan/m2", "")],
+            tabs: Vec::new(),
+            fleet: FleetScope::Account,
+        };
+        state
+    };
+    let cx = view_cx_at(504.0, 1_600.0);
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_harness(with(long), 1));
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Tabs),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let rect = |runtime: &mut NativeRuntime, key: &str| {
+        compile_settings_view(runtime, instance, view, &cx)
+            .paint
+            .iter()
+            .find(|paint| paint.key.as_str() == key)
+            .unwrap_or_else(|| panic!("{key} is painted"))
+            .rect
+    };
+    let local = rect(&mut runtime, "tabs/computer/local");
+    let detail = rect(&mut runtime, "tabs/computer/local/detail");
+    let under = rect(&mut runtime, "tabs/computer/lan/m2");
+    assert!(runtime.replace_settings_harness(with(short), 2));
+    assert_eq!(
+        rect(&mut runtime, "tabs/computer/local"),
+        local,
+        "the row keeps its height"
+    );
+    assert_eq!(
+        rect(&mut runtime, "tabs/computer/local/detail"),
+        detail,
+        "the row's line under its vitals stays where it stood: the room the vitals took is \
+         kept under them, not at the row's foot"
+    );
+    assert_eq!(
+        rect(&mut runtime, "tabs/computer/lan/m2"),
+        under,
+        "the row under it stays where it stood"
+    );
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(TABS_REFRESH),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let afresh = rect(&mut runtime, "tabs/computer/local");
+    assert!(
+        afresh.height < local.height,
+        "CONTROL: measured afresh, the shorter words take less: {afresh:?} against {local:?}"
+    );
+    assert!(rect(&mut runtime, "tabs/computer/lan/m2").y < under.y);
+}
+
+/// A tab whose title a refresh rewrites in fewer lines (a program's spinner glyph, a shorter
+/// title) keeps its status line where it stood, and its row keeps its height: the lines the title
+/// took are kept under it while the person reads. Refresh lays the row out afresh.
+#[test]
+fn a_tabs_status_line_keeps_its_place_while_its_title_changes() {
+    use crate::harness_screen::{FleetScope, TabControlState, TabSpreadsheetRow};
+    use crate::native_settings::tabs_page::TABS_REFRESH;
+    let tab = |title: &str| TabSpreadsheetRow {
+        key: "local/0".to_string(),
+        computer: "m111".to_string(),
+        instance: "this aterm (pid 7)".to_string(),
+        place: "Tab 1 (80\u{d7}24)".to_string(),
+        sid: "s-5f90d5e126a626f5f5b0".to_string(),
+        title: title.to_string(),
+        state: "alive".to_string(),
+        program: "claude".to_string(),
+        is_ai_cli: true,
+        ai_status: "working".to_string(),
+        autopilot: "land".to_string(),
+        human: "3m ago".to_string(),
+        vitals: "CPU 12% \u{b7} RAM 300 MiB".to_string(),
+        show_local_id: None,
+    };
+    let long = "\u{2733} Settings page audit and cursor styles, the lab isolation and tooling \
+                cluster, reviewed adversarially before it lands";
+    let short = "\u{2733} Settings";
+    let with = |title: &str| {
+        let mut state = fixture();
+        state.tabs = TabControlState {
+            computers: Vec::new(),
+            tabs: vec![tab(title)],
+            fleet: FleetScope::Account,
+        };
+        state
+    };
+    let cx = view_cx_at(504.0, 1_600.0);
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_harness(with(long), 1));
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Tabs),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let status_and_row = |runtime: &NativeRuntime| {
+        let paint = compile_settings_view(runtime, instance, view, &cx).paint;
+        let status = paint
+            .iter()
+            .find(|node| {
+                node.key.as_str().starts_with("tabs/row/local/0/words/")
+                    && matches!(&node.content, UiContent::Text(text) if text.text.starts_with("AI CLI:"))
+            })
+            .expect("the tab's status line is painted")
+            .rect;
+        let row = paint
+            .iter()
+            .find(|node| node.key.as_str() == "tabs/row/local/0")
+            .expect("the tab's row is painted")
+            .rect;
+        (status, row)
+    };
+    let (status, row) = status_and_row(&runtime);
+    assert!(runtime.replace_settings_harness(with(short), 2));
+    assert_eq!(
+        status_and_row(&runtime),
+        (status, row),
+        "the status line and the row stay where they stood"
+    );
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(TABS_REFRESH),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let (afresh, _) = status_and_row(&runtime);
+    assert!(
+        afresh.y < status.y,
+        "CONTROL: laid out afresh, the shorter title takes fewer lines: {afresh:?} against \
+         {status:?}"
+    );
+}
+
+/// A computer the fleet lists above the screen moves nothing on it, and the next render with no
+/// event between draws that same screen: one render once re-anchored the list by what its
+/// screen showed and the next drew the old stop number in the new numbering, a computer further
+/// on (Tab Control paged into its LAN computers, m14 drawn where m13 stood).
+#[test]
+fn a_computer_listed_above_the_screen_moves_nothing_on_it() {
+    use crate::harness_screen::{FleetScope, TabComputer, TabControlState};
+    let computer = |n: usize| TabComputer {
+        id: format!("lan/m{n}"),
+        name: format!("m{n}-MacBook-Pro-M4-Max-36GB-1TB"),
+        address: format!("192.168.1.{n} \u{b7} m{n}.local"),
+        os_version: "Mac16,5 \u{b7} Darwin 26 \u{b7} OpenSSH_10.3".to_string(),
+        status: "advertised (lan)".to_string(),
+        vitals: String::new(),
+        instances: 0,
+        tabs: 0,
+        ai_clis: 0,
+        active_ai: 0,
+    };
+    let with = |numbers: &[usize]| {
+        let mut state = fixture();
+        state.tabs = TabControlState {
+            computers: numbers.iter().map(|n| computer(*n)).collect(),
+            tabs: Vec::new(),
+            fleet: FleetScope::Account,
+        };
+        state
+    };
+    let fleet: Vec<usize> = (1..=14).collect();
+    let cx = view_cx_at(320.0, 420.0);
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_harness(with(&fleet), 1));
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Tabs),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let screen = |runtime: &NativeRuntime| {
+        compile_settings_view(runtime, instance, view, &cx)
+            .paint
+            .iter()
+            .filter(|paint| {
+                paint.key.as_str().starts_with("tabs/computer/lan/")
+                    && paint.key.as_str().matches('/').count() == 3
+            })
+            .map(|paint| (paint.key.as_str().to_string(), paint.rect))
+            .collect::<Vec<_>>()
+    };
+    let mut page = 0;
+    let before = loop {
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.scroll_page_to(page);
+        }
+        let shown = screen(&runtime);
+        let past_m6 = |(key, _): &(String, crate::native_ui::LogicalRect)| {
+            key.strip_prefix("tabs/computer/lan/m")
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| n >= 6)
+        };
+        if !shown.is_empty() && shown.iter().all(past_m6) {
+            break shown;
+        }
+        page += 1;
+        assert!(page < 200, "a screen deep in the computers");
+    };
+    let mut grown = vec![0];
+    grown.extend(&fleet);
+    assert!(runtime.replace_settings_harness(with(&grown), 2));
+    let first = screen(&runtime);
+    let second = screen(&runtime);
+    assert_eq!(first, before, "the screen holds its place");
+    assert_eq!(second, first, "and the next render draws it again");
 }

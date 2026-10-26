@@ -45,7 +45,7 @@ impl Host {
         let now = Instant::now();
         let mut h = Self {
             term,
-            glow: CursorGlow::default(),
+            glow: crate::common::quads_glow(),
             cfg: rainbow_cfg(),
             g: crate::common::geom(usize::from(rows), usize::from(cols), CW, CH),
             now,

@@ -5,6 +5,17 @@ use super::*;
 
 use std::path::Path;
 
+/// [`super::line`] for `starter` taken as admitted: these tests check the line's form, and
+/// [`admit`]'s own tests check admission.
+fn line(
+    cli: &WorkerCli,
+    dialect: Dialect,
+    starter: &Starter,
+    fresh: &Fresh<'_>,
+) -> Result<String, String> {
+    super::line(cli, dialect, &Admitted::assumed(starter.clone()), fresh)
+}
+
 /// The row of `agent`, which every test here names.
 fn row(agent: Program) -> &'static WorkerCli {
     worker_cli(agent).unwrap_or_else(|| panic!("no worker row for {agent:?}"))
@@ -24,8 +35,9 @@ fn proc_args(argv: &[&str], env: &[&str]) -> ProcArgs {
 /// and the program it starts — a stand-in that writes its argv
 /// NUL-separated, named as the CLI — gets the trust flag (Muse Code's, where
 /// the folder is the trusted one), `--model <m>`, then the task file's text
-/// with its trailing newlines trimmed: Claude Code's, codex-alab's and Muse
-/// Code's after `--`, agy's as the attached value of `--prompt-interactive=`.
+/// with its trailing newlines trimmed: Claude Code's, codex-alab's, Muse
+/// Code's and Grok Build's after `--`, agy's as the attached value of
+/// `--prompt-interactive=`.
 #[cfg(unix)]
 #[test]
 fn every_workers_first_line_hands_the_task_over_as_one_argument() {
@@ -47,7 +59,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
         shells.retain(|(_, sh)| Path::new(sh).exists());
     }
     let prompt_flag = format!("--prompt-interactive={trimmed}");
-    let cases: [(Program, Vec<&str>, &str); 4] = [
+    let cases: [(Program, Vec<&str>, &str); 5] = [
         (
             Program::Claude,
             vec!["--model", "m-1.5", "--", trimmed],
@@ -67,6 +79,11 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             Program::Muse,
             vec!["--trust-workspace", "--model", "m-1.5", "--", trimmed],
             "XDG_DATA_HOME",
+        ),
+        (
+            Program::Grok,
+            vec!["--model", "m-1.5", "--", trimmed],
+            "GROK_HOME",
         ),
     ];
     for (agent, want, home_var) in cases {
@@ -99,7 +116,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             line(cli, Dialect::Zsh, &starter, &fresh).unwrap_or_else(|e| panic!("{agent:?}: {e}"));
         assert!(line.ends_with(cli.operand), "{agent:?}: {line}");
         for (dialect, shell) in &shells {
-            let line = super::line(cli, *dialect, &starter, &fresh)
+            let line = self::line(cli, *dialect, &starter, &fresh)
                 .unwrap_or_else(|e| panic!("{agent:?} {shell}: {e}"));
             let argv_out = tmp
                 .path()
@@ -157,7 +174,13 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             Program::Agy => super::super::upgrade_agy::rewrite_argv(&process(&["agy"]), None),
             Program::Muse => super::super::upgrade_muse::rewrite_argv(&process(&["muse"]), None),
             Program::Codex => super::super::codex_alab::rewrite_argv(&process(&["codex"]), None),
-            Program::Grok | Program::Kimi | Program::Generic => unreachable!(),
+            // aterm has no Grok Build relaunch lane (grok-alab carries its relaunches): a Grok
+            // worker's own argv, read as the starter of the next Grok worker, lends it nothing,
+            // neither its task nor its model.
+            Program::Grok => super::grok::config_flags(&process(&["grok"]))
+                .map_err(super::super::upgrade::ArgvRefusal::UnknownFlag)
+                .inspect(|kept| assert!(kept.is_empty(), "{kept:?}")),
+            Program::Kimi | Program::Generic => unreachable!(),
         }
         .unwrap_or_else(|e| panic!("{agent:?}: the lane refused the worker's argv: {e:?}"));
         assert!(
@@ -394,7 +417,7 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
 fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
     let user = Path::new("/Users//u");
     let args = |argv: &[&str]| proc_args(argv, &[]);
-    for agent in [Program::Agy, Program::Muse] {
+    for agent in [Program::Agy, Program::Muse, Program::Grok] {
         let cli = row(agent);
         let word = cli.word;
         let own = PathBuf::from(format!("/usr/local/bin/{word}"));

@@ -1558,11 +1558,7 @@ fn a_streamed_quote_then_ctrl_u_at_every_pause_and_pacing() {
     holds_but(
         all_cases(),
         |id| id.starts_with("a3.p1."),
-        |id| {
-            id.contains("/gap1/")
-                && (erased_before_it_stood_twin_min(id, 60)
-                    || (id.ends_with("/pet") && pause_of(id) <= 60))
-        },
+        |id| id.contains("/gap1/") && erased_before_it_stood_twin_min(id, 60),
     );
 }
 

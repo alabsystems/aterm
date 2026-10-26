@@ -2631,7 +2631,7 @@ impl TrailSynth {
 
     fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
         // Same-sig bars skip this, and it draws no rng.
-        if self.last_riff_sig.is_some_and(|old| old != sig) {
+        if matches!(self.last_riff_sig, Some(old) if old != sig) {
             for v in &mut self.voices {
                 if v.on && v.celebration && v.damp <= 0.0 {
                     v.damp = CELEBRATION_DAMP_S;

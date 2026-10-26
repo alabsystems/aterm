@@ -306,6 +306,7 @@ pub fn pass_lock_for(home: &Path) -> PathBuf {
 }
 
 /// Cross-instance non-blocking flock guard for a disk-watch pass.
+#[derive(Debug)]
 pub struct PassLock(std::fs::File);
 
 impl Drop for PassLock {

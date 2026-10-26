@@ -50,6 +50,10 @@ struct At<'a> {
     /// What holds [`Self::held`]: a usage-limit wall unless a test says otherwise.
     hold: HeldBy,
     dead: Vec<u32>,
+    /// What this host's own passes freed since its last step ([`Look::reclaimed`]).
+    reclaimed: Vec<Reclaimed>,
+    /// Another instance's pass holds the pass lock ([`Look::passing`]).
+    passing: bool,
 }
 
 impl<'a> At<'a> {
@@ -69,6 +73,8 @@ impl<'a> At<'a> {
             held: Vec::new(),
             hold: HeldBy::Limit,
             dead: Vec::new(),
+            reclaimed: Vec::new(),
+            passing: false,
         }
     }
 
@@ -109,6 +115,8 @@ impl<'a> At<'a> {
                 barred: &self.barred,
                 live: &self.live,
                 held: &held,
+                reclaimed: &self.reclaimed,
+                passing: self.passing,
                 alive: &alive,
             },
         )
@@ -678,6 +686,250 @@ fn the_line_goes_once_then_free_space_rising_settles_the_episode_and_rising_past
             Said::Opened { done: Done::Spent }
         ),
         "the cooldown is over"
+    );
+}
+
+/// aterm's own cleanup keeps running every few minutes while the volume is short, and reclaims
+/// caches that went idle since its last pass. What it frees after an asked session's line is not
+/// the session's: each host's look records its own passes in the lease, and the rise the session
+/// is judged by is measured past every pass, its own host's or another's, that ended at or after
+/// the line. Before this, a pass that freed a GiB or more inside the answer window settled the
+/// episode in the session's name ("@s-a freed 3 GiB after aterm asked it; nobody else is asked")
+/// and parked it for six hours, the volume still short.
+#[test]
+fn space_aterms_own_passes_free_after_the_line_is_never_the_asked_sessions() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let before = T0 + NOMINATE_MS + 5_000;
+    one.reclaimed = vec![Reclaimed {
+        ended_ms: before,
+        bytes: 4 * GIB,
+    }];
+    assert!(matches!(
+        one.step(&mut lease, before + 1_000),
+        Said::Owed { .. }
+    ));
+    one.reclaimed.clear();
+    let t = before + 10_000;
+    assert!(matches!(
+        at_break(&mut lease, KEY, &h1, "s-a", t, false),
+        Break::Yours
+    ));
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    // The second host's pass frees 3 GiB after the line; its look reads the rise and records it.
+    two.free = 23 * GIB;
+    two.reclaimed = vec![Reclaimed {
+        ended_ms: t + 50_000,
+        bytes: 3 * GIB,
+    }];
+    assert!(
+        matches!(
+            two.step(&mut lease, t + 60_000),
+            Said::Asked { rose: 0, .. }
+        ),
+        "the other host's own pass freed it"
+    );
+    two.reclaimed.clear();
+    one.free = 23 * GIB;
+    assert!(
+        matches!(
+            one.step(&mut lease, t + 90_000),
+            Said::Asked { rose: 0, .. }
+        ),
+        "the asked session's host reads the other host's record: still aterm's"
+    );
+    // The first host's own pass frees 2 GiB more.
+    one.free = 25 * GIB;
+    one.reclaimed = vec![Reclaimed {
+        ended_ms: t + 110_000,
+        bytes: 2 * GIB,
+    }];
+    assert!(
+        matches!(
+            one.step(&mut lease, t + 120_000),
+            Said::Asked { rose: 0, .. }
+        ),
+        "its own host's pass: aterm's too"
+    );
+    one.reclaimed.clear();
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        e.reclaimed.iter().map(|r| r.bytes).sum::<u64>(),
+        9 * GIB,
+        "each pass is recorded once, the one before the line among them: {:?}",
+        e.reclaimed
+    );
+    // The session itself frees 1.5 GiB: that, and only that, is its rise.
+    one.free = 25 * GIB + 3 * GIB / 2;
+    assert_eq!(
+        one.step(&mut lease, t + 180_000),
+        Said::Freed {
+            sid: "s-a".to_owned(),
+            freed: 3 * GIB / 2
+        },
+        "the pass before the line is in the line's figure; the two after are not the session's"
+    );
+    assert!(
+        matches!(
+            phase(&lease),
+            Phase::Settled { freed, .. } if *freed == 3 * GIB / 2
+        ),
+        "the owner reads what the session freed"
+    );
+    one.reads(FLOOR + END_MARGIN);
+    assert!(matches!(
+        one.step(&mut lease, t + 240_000),
+        Said::Ended { .. }
+    ));
+    assert!(
+        lease.entry(KEY).expect("entry").reclaimed.is_empty(),
+        "the record goes with its episode"
+    );
+}
+
+/// The record of aterm's passes is bounded: past [`MAX_RECLAIMED`] the two oldest are kept as
+/// one, ended at the later end, so what they freed still counts as aterm's for every line after
+/// the first; past [`RECLAIMED_KEEP_MS`] a pass is before any line still judged, and goes.
+#[test]
+fn the_record_of_aterms_passes_keeps_what_they_freed_within_its_bound() {
+    let h1 = host(1);
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    let n = i64::try_from(MAX_RECLAIMED).expect("small") + 8;
+    one.reclaimed = (0..n)
+        .map(|i| Reclaimed {
+            ended_ms: T0 + i * 1_000,
+            bytes: GIB,
+        })
+        .collect();
+    let now = T0 + n * 1_000;
+    one.step(&mut lease, now);
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(e.reclaimed.len(), MAX_RECLAIMED);
+    assert_eq!(
+        e.reclaimed.iter().map(|r| r.bytes).sum::<u64>(),
+        u64::try_from(n).expect("small") * GIB,
+        "nothing aterm freed is dropped"
+    );
+    assert_eq!(
+        e.reclaimed[0],
+        Reclaimed {
+            ended_ms: T0 + 8_000,
+            bytes: 9 * GIB
+        },
+        "the oldest kept as one, ended at the later end"
+    );
+    one.reclaimed.clear();
+    one.step(&mut lease, now + RECLAIMED_KEEP_MS + 1);
+    assert!(lease.entry(KEY).expect("entry").reclaimed.is_empty());
+}
+
+/// NEGATIVE CONTROL of `space_aterms_own_passes_free_after_the_line_is_never_the_asked_sessions`:
+/// the step that counts none of the recorded passes (`fault::CreditAterm`, the lease before them)
+/// settles the episode on the other host's pass.
+#[test]
+fn a_step_that_credits_aterms_own_passes_to_the_asked_session_settles_on_them() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let t = T0 + NOMINATE_MS + 10_000;
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    two.free = 23 * GIB;
+    two.reclaimed = vec![Reclaimed {
+        ended_ms: t + 50_000,
+        bytes: 3 * GIB,
+    }];
+    let said = fault::with(fault::Fault::CreditAterm, || {
+        two.step(&mut lease, t + 60_000)
+    });
+    assert!(matches!(said, Said::Freed { .. }), "{said:?}");
+}
+
+/// Another instance's pass may be freeing space as a host looks, and its own look records what
+/// it freed only once the pass is over: while it holds the pass lock (`Look::passing`), a look
+/// that reads the volume risen settles nothing, and the deadline hands nothing on, so the pass's
+/// record, at its host's step, takes what it freed out of the rise. The pass's host steps the
+/// lease before it lets its pass lock go, so no look falls between the two.
+#[test]
+fn a_look_while_another_instances_pass_runs_settles_nothing_until_that_pass_is_recorded() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let t = T0 + NOMINATE_MS + 10_000;
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    // The second host's pass is under way: 2 GiB of its 3 freed so far.
+    one.free = 22 * GIB;
+    one.passing = true;
+    assert!(
+        matches!(one.step(&mut lease, t + ANSWER_MS), Said::Asked { .. }),
+        "a rise read while another pass runs is not judged, nor is the deadline"
+    );
+    let settled = fault::with(fault::Fault::SettleWhilePassing, || {
+        one.step(&mut lease.clone(), t + ANSWER_MS)
+    });
+    assert!(
+        matches!(settled, Said::Freed { .. }),
+        "CONTROL: a step that judges it settles on the other pass: {settled:?}"
+    );
+    one.passing = false;
+    two.free = 23 * GIB;
+    two.reclaimed = vec![Reclaimed {
+        ended_ms: t + ANSWER_MS + 20_000,
+        bytes: 3 * GIB,
+    }];
+    assert!(
+        matches!(
+            two.step(&mut lease, t + ANSWER_MS + 30_000),
+            Said::Handoff {
+                why: Miss::NothingFreed,
+                ..
+            }
+        ),
+        "the pass recorded: nothing was the session's, and its time is over"
+    );
+}
+
+/// The record keeps every pass since the asked line however long the hosts go without a look
+/// (the Mac asleep): a look hours after the line still takes out what aterm freed after it, so
+/// the session, freeing nothing, is handed on rather than settled in its name.
+#[test]
+fn a_pass_after_the_line_stays_aterms_however_late_the_next_look_comes() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let t = T0 + NOMINATE_MS + 10_000;
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    two.free = 23 * GIB;
+    two.reclaimed = vec![Reclaimed {
+        ended_ms: t + 50_000,
+        bytes: 3 * GIB,
+    }];
+    assert!(matches!(
+        two.step(&mut lease, t + 60_000),
+        Said::Asked { rose: 0, .. }
+    ));
+    one.free = 23 * GIB;
+    let late = t + RECLAIMED_KEEP_MS + 60_000;
+    assert!(
+        matches!(
+            one.step(&mut lease, late),
+            Said::Handoff {
+                why: Miss::NothingFreed,
+                ..
+            }
+        ),
+        "the pass is still aterm's: {:?}",
+        lease.entry(KEY).map(|e| &e.reclaimed)
     );
 }
 
@@ -2703,6 +2955,103 @@ fn a_long_holder_path_is_clipped_and_holders_drop_before_the_line_passes_its_cap
 }
 
 #[test]
+fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
+    let home = "/Users//u";
+    let at = |mount: &str, own: &str| {
+        let holders = [hog(
+            "/Users//u/Library/Caches/aterm/cargo-build.noindex/w/.cargo-build",
+            61,
+            Some(own),
+        )];
+        line(&Line {
+            mount: Path::new(mount),
+            total: 1000 * GIB,
+            free: 18 * GIB,
+            floor: 25 * GIB,
+            emergency: false,
+            done: Done::Spent,
+            holders: &holders,
+            checkout: Some(Path::new(own)),
+            home: Some(Path::new(home)),
+        })
+    };
+    // The asked tab's own worktree, nested in a checkout under a long name, on the common
+    // below-floor sentence: as usually said (clipped to its cap, then `'s builds 61.0 GiB (this
+    // tab's)`) it is longer than the room the line leaves, and the line once dropped it and said
+    // aterm's report named no holder.
+    let own = "/Users//u/aterm/.claude/worktrees/disk-free-round7-a-worktree-with-a-long-name";
+    let text = at("/System/Volumes/Data", own);
+    assert!(text.chars().count() <= LINE_CAP, "{}", text.chars().count());
+    assert!(!text.contains("names no holder"), "{text}");
+    assert!(
+        text.contains("'s builds 61.0 GiB (this tab's). Free what"),
+        "{text}"
+    );
+    assert!(text.ends_with("(rule disk-free@v1)"), "{text}");
+    // A volume whose name leaves the holder's path exactly `room` characters, measured off the
+    // line itself, so the path as usually said (whole, or clipped to `HOLDER_PATH_CAP`) overflows
+    // the cap by far whatever the line's other words come to.
+    let room = 30;
+    let short = at("/Volumes/v", "/Users//u/w");
+    assert!(short.contains(" Largest left: ~/w's builds"), "{short}");
+    let bare = short.chars().count() - "~/w".len();
+    let pad = LINE_CAP
+        .checked_sub(room + bare)
+        .expect("the line leaves a holder's path more than `room` characters");
+    let mount = format!("/Volumes/v{}", "v".repeat(pad));
+    for (own, shown) in [
+        // Whole components of its lead that fit, and its last one.
+        (
+            "/Users//u/aterm/.claude/worktrees/disk-free-round7-own",
+            "~/aterm/…/disk-free-round7-own",
+        ),
+        // A last component too long for the room is clipped in its own middle.
+        (own, "~/…/disk-free-rou…-a-long-name"),
+    ] {
+        let usual = shown_path(Path::new(own), Some(Path::new(home)));
+        assert!(usual.chars().count() > room + 10, "{usual}");
+        let text = at(&mount, own);
+        assert_eq!(text.chars().count(), LINE_CAP, "{text}");
+        assert!(
+            text.contains(&format!(
+                " Largest left: {shown}'s builds 61.0 GiB (this tab's). Free what"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("names no holder"), "{text}");
+    }
+    // A volume whose name leaves no room for any path is still not said to have no holder.
+    let crowded = format!("/Volumes/{}", "x".repeat(LINE_CAP));
+    let text = at(&crowded, own);
+    assert!(!text.contains("names no holder"), "{text}");
+    assert!(
+        text.contains("`aterm harness disk` lists the largest holders left."),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_clipped_path_keeps_its_lead_and_its_last_component() {
+    let wt = "~/aterm/.claude/worktrees/round7";
+    assert_eq!(clip_within(wt, 64).as_deref(), Some(wt));
+    let clipped = clip_within(wt, 20).expect("room for the last component");
+    assert_eq!(clipped, "~/aterm/…/round7");
+    let clipped = clip_within(wt, 25).expect("room for more of it");
+    assert_eq!(clipped, "~/aterm/.claude/…/round7");
+    assert!(clipped.chars().count() <= 25);
+    // A last component too long for the room is clipped in its own middle.
+    let long = "/a/b/very-long-last-component";
+    let clipped = clip_within(long, 12).expect("room for a little of it");
+    assert_eq!(clipped, "/…/very…nent");
+    assert_eq!(clipped.chars().count(), 12);
+    assert_eq!(
+        clip_within("~/name-too-long-for-it", 9).as_deref(),
+        Some("~/nam…-it")
+    );
+    assert_eq!(clip_within(long, 6), None);
+}
+
+#[test]
 fn rows_say_each_decision_and_the_reader_explains_the_lease() {
     let (h1, h2) = (host(1), host(2));
     let mut lease = Lease::default();
@@ -2846,6 +3195,76 @@ fn the_owners_line_says_a_round_after_a_line_waits_on_held_sessions() {
         !said.contains("one other session is asked"),
         "nobody is asked: {said}"
     );
+}
+
+/// The loop's lasting withholds hold a session as a wall does: its credits hold (it types nothing
+/// until the usage limit resets rather than spend usage credits), a sign-in only the owner can
+/// do, and another wall the loop waits out. A round that waits on one says what holds the session
+/// and what ends the wait, in the owner's words, and the lease records it by its own word.
+#[test]
+fn a_round_that_waits_on_a_loops_lasting_withhold_says_what_holds_it_and_what_ends_the_wait() {
+    let (h1, h2) = (host(1), host(2));
+    for (hold, word, at, past) in [
+        (
+            HeldBy::Credits,
+            "credits",
+            "waiting out its usage limit rather than spend usage credits",
+            "its usage limit resets",
+        ),
+        (
+            HeldBy::SignIn,
+            "sign-in",
+            "at a sign-in only you can do",
+            "it is signed in again",
+        ),
+        (
+            HeldBy::Wall,
+            "wall",
+            "at an error its loop waits out",
+            "it is past",
+        ),
+    ] {
+        let mut lease = Lease::default();
+        let mut one = At::short(&h1, Vec::new());
+        one.held = vec!["s-a".to_owned()];
+        one.hold = hold;
+        one.live = one.held.clone();
+        one.supervised = one.held.clone();
+        let two = At::short(&h2, Vec::new());
+        assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+        let round = T0 + NOMINATE_MS;
+        let said = two.step(&mut lease, round);
+        assert_eq!(
+            said,
+            Said::Waiting {
+                held: vec!["s-a".to_owned()],
+                why: vec![hold]
+            }
+        );
+        let e = lease.entry(KEY).cloned().expect("entry");
+        assert_eq!(
+            owner_line(&e, round).expect("waiting"),
+            format!(
+                "Every agent session that could free space is {at}: aterm asks one once {past} \
+                 (`aterm harness disk why`)"
+            )
+        );
+        assert_eq!(hold.word(), word);
+        assert_eq!(HeldBy::from_word(word), Some(hold));
+        assert!(
+            lease.encode().contains(&format!("\"why\":\"{word}\"")),
+            "{}",
+            lease.encode()
+        );
+        assert_eq!(
+            Lease::decode(&lease.encode()),
+            Lease {
+                schema: 1,
+                ..lease.clone()
+            },
+            "the hold round-trips the lease file"
+        );
+    }
 }
 
 /// A round that waits on a session held by the owner's hold (or a person's take-over) or by a

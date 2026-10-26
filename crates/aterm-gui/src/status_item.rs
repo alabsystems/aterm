@@ -1469,8 +1469,17 @@ impl Glance {
             go_of.insert(session, at);
             Some(at)
         };
+        // A machine's need (Grok Build signed out) stands in every session it reaches, and is
+        // listed once, on the first.
+        let mut machine: Vec<&str> = Vec::new();
         for row in rows {
             let Some(need) = &row.need else { continue };
+            if crate::needs::machine_wide(need) {
+                if machine.contains(&need.what.as_str()) {
+                    continue;
+                }
+                machine.push(need.what.as_str());
+            }
             let Some(at) = go(&mut g, row.id) else {
                 continue;
             };
@@ -2048,15 +2057,6 @@ pub(crate) fn clock_words(unix: i64) -> Option<String> {
     Some(format!("{:02}:{:02}", local / 3600, (local % 3600) / 60))
 }
 
-fn stall_words(why: Option<&str>) -> String {
-    match why {
-        Some("held") => "held at a screen aterm does not know".to_string(),
-        Some("startup" | "shell") => "never started".to_string(),
-        Some(why) => format!("stalled ({why})"),
-        None => "stalled".to_string(),
-    }
-}
-
 fn age_suffix(since: Option<i64>, now_unix: i64) -> String {
     since.map_or_else(String::new, |at| {
         format!(" \u{b7} {}", age_words(now_unix - at))
@@ -2272,7 +2272,7 @@ fn worker_line(w: &WorkerRow, now_unix: i64) -> String {
         TaskState::Stalled => format!(
             "\u{25c6} {} \u{2014} stalled: {} \u{b7} {age}",
             w.label,
-            stall_words(w.why)
+            crate::task_record::stall_words(w.why)
         ),
         TaskState::Done if w.result_bytes > 0 => format!(
             "\u{2713} {} \u{2014} {} {age} \u{b7} {}",
@@ -5939,6 +5939,37 @@ mod tests {
             Some(face(&stuck)),
             "the colour alone re-faces it"
         );
+    }
+
+    /// Two Grok sessions on a sign-in wall while this machine is signed out are one need on
+    /// the menu (the machine's one sign-in), where two Claude sign-in walls stay two.
+    #[test]
+    fn two_grok_sign_in_walls_are_one_menu_need() {
+        let grok = |id: u64, rev: u64| {
+            row_of(
+                id,
+                "grok",
+                &NeedFacts {
+                    grok_signin: Some(crate::needs::GrokSignin::Idle),
+                    ..agent_facts("wall:auth", rev)
+                },
+            )
+        };
+        let g = local_glance(&[grok(1, 3), grok(2, 4)], &[], 0, None);
+        assert_eq!(g.needs.len(), 1, "{:?}", g.needs);
+        assert_eq!(g.needs[0].what, crate::needs::GROK_SIGNIN_WHAT);
+        assert_eq!(g.needs[0].label, grok(1, 3).named());
+        // CONTROL: Claude's sign-in walls are each their session's.
+        let g = local_glance(
+            &[
+                agent_row(1, "a", "wall:auth", 3),
+                agent_row(2, "b", "wall:auth", 4),
+            ],
+            &[],
+            0,
+            None,
+        );
+        assert_eq!(g.needs.len(), 2, "{:?}", g.needs);
     }
 
     #[test]

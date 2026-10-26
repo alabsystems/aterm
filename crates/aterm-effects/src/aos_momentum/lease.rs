@@ -418,9 +418,10 @@ impl Ledger {
     }
 
     /// Every worker's state, by id.
+    #[inline]
     #[must_use]
-    pub fn workers(&self) -> &[WorkerState] {
-        &self.workers
+    pub const fn workers(&self) -> &[WorkerState] {
+        self.workers.as_slice()
     }
 
     /// The current search's job `slot`.
@@ -436,21 +437,26 @@ impl Ledger {
     }
 
     /// The current search's jobs, by slot.
+    #[inline]
     #[must_use]
-    pub fn jobs(&self) -> &[JobState] {
-        &self.jobs
+    pub const fn jobs(&self) -> &[JobState] {
+        self.jobs.as_slice()
     }
 
     /// The late results of the current search's job `slot` that wait for its claim, to be
     /// compared with it when it is accepted (design §11.5).
     #[must_use]
     pub fn awaiting(&self, slot: u32) -> &[Digest] {
-        self.stale.get(&slot).map_or(&[], Vec::as_slice)
+        match self.stale.get(&slot) {
+            Some(v) => v.as_slice(),
+            None => &[],
+        }
     }
 
     /// Whether no worker holds or is draining a lease.
+    #[inline]
     #[must_use]
-    pub fn quiescent(&self) -> bool {
+    pub const fn quiescent(&self) -> bool {
         let workers = self.workers.as_slice();
         let mut i = 0;
         while i < workers.len() {
@@ -467,7 +473,7 @@ impl Ledger {
 
     /// The earliest time a [`Self::tick`] can change anything.
     #[must_use]
-    pub fn next_deadline(&self) -> Option<Nanos> {
+    pub const fn next_deadline(&self) -> Option<Nanos> {
         let workers = self.workers.as_slice();
         let mut best: Option<Nanos> = None;
         let mut i = 0;
@@ -500,15 +506,19 @@ impl Ledger {
         Ok(())
     }
 
-    fn set_worker(&mut self, w: WorkerId, s: WorkerState) {
-        if let Some(slot) = self.workers.get_mut(index(w.0)) {
-            *slot = s;
+    const fn set_worker(&mut self, w: WorkerId, s: WorkerState) {
+        let workers = self.workers.as_mut_slice();
+        let idx = index(w.0);
+        if idx < workers.len() {
+            workers[idx] = s;
         }
     }
 
-    fn set_job(&mut self, slot: u32, s: JobState) {
-        if let Some(j) = self.jobs.get_mut(index(slot)) {
-            *j = s;
+    const fn set_job(&mut self, slot: u32, s: JobState) {
+        let jobs = self.jobs.as_mut_slice();
+        let idx = index(slot);
+        if idx < jobs.len() {
+            jobs[idx] = s;
         }
     }
 
@@ -817,7 +827,7 @@ impl Ledger {
                 self.refuse(w, LeaseRefusal::NotJoined { worker: w }, now, &mut out);
             }
             Some(WorkerState::Busy { lease, k: last, .. }) if lease == sent => {
-                if k < self.limits.items && last.is_none_or(|last| k > last) {
+                if k < self.limits.items && !matches!(last, Some(last) if k <= last) {
                     self.set_worker(
                         w,
                         WorkerState::Busy {
@@ -837,7 +847,7 @@ impl Ledger {
                 k: last,
                 answered,
             }) if lease == sent => {
-                if k < self.limits.items && last.is_none_or(|last| k > last) {
+                if k < self.limits.items && !matches!(last, Some(last) if k <= last) {
                     self.set_worker(
                         w,
                         WorkerState::Draining {

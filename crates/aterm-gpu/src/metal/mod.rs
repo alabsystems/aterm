@@ -1469,7 +1469,10 @@ mod tests {
             "non-vacuity: distinct inputs must present distinct bytes"
         );
         assert_ne!(presented[1], presented[2], "as above");
-        let take = armed.video_finish(&mut win).expect("a recording was live");
+        let take = armed
+            .video_finish(&mut win)
+            .expect("a recording was live")
+            .settle();
         assert_eq!(
             (take.frames.len(), take.dropped),
             (N, 0),

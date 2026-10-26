@@ -65,7 +65,7 @@ struct Rig {
 impl Rig {
     fn new() -> Self {
         Self {
-            glow: CursorGlow::default(),
+            glow: crate::common::quads_glow(),
             g: geom(),
             out: Vec::new(),
         }

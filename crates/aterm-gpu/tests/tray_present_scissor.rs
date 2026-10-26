@@ -42,7 +42,7 @@ fn harvest(
         );
         gpu.video_after_present(&mut win, i as u64 + 1);
     }
-    let take = gpu.video_finish(&mut win).expect("virtual take");
+    let take = gpu.video_finish(&mut win).expect("virtual take").settle();
     assert_eq!(
         take.frames.len(),
         seq.len(),

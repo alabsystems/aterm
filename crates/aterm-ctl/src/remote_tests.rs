@@ -68,28 +68,72 @@ fn a_drive_names_each_session_by_its_sid() {
     }
 }
 
+fn turn_sent(parts: &[&str]) -> io::Result<String> {
+    let parts: Vec<String> = parts.iter().map(|part| (*part).to_owned()).collect();
+    let (selector, rest) = split_selector(&parts);
+    turn_wait(&rest[1..], selector, "lab-mini")
+}
+
 #[test]
 fn a_turn_over_a_drive_waits_inside_its_connection() {
-    let mut bare = words("@s-a1 turn fix the test");
-    turn_wait(&mut bare, "lab-mini").unwrap();
-    assert_eq!(bare, words("@s-a1 turn timeout=20000 fix the test"));
-    let mut named = words("@s-a1 turn settle=submitted timeout=15000 go");
-    turn_wait(&mut named, "lab-mini").unwrap();
-    assert_eq!(named, words("@s-a1 turn settle=submitted timeout=15000 go"));
-    let mut in_text = words("@s-a1 turn set timeout=90000 in the config");
-    turn_wait(&mut in_text, "lab-mini").unwrap();
-    assert_eq!(in_text[2], "timeout=20000", "{in_text:?}");
-    for long in ["timeout=60000", "timeout=soon"] {
-        let refusal = turn_wait(&mut words(&format!("@s-a1 turn {long} go")), "lab-mini")
-            .expect_err(long)
-            .to_string();
-        assert!(
-            refusal.contains("give it a shorter timeout=, or say settle=submitted")
-                && refusal.contains("`aterm ctl --host lab-mini await task @s-a1:<task_rev>`")
-                && refusal.contains("`aterm ctl --host lab-mini @s-a1 status` (or `text`)"),
-            "{long}: {refusal}"
-        );
+    let sent = |line: &str| turn_sent(&line.split_whitespace().collect::<Vec<_>>()).unwrap();
+    assert_eq!(
+        sent("@s-a1 turn fix the test"),
+        "timeout=20000 fix the test"
+    );
+    assert_eq!(
+        sent("@s-a1 turn settle=submitted timeout=15000 go"),
+        "settle=submitted timeout=15000 go"
+    );
+    assert_eq!(
+        sent("@s-a1 turn set timeout=90000 in the config"),
+        "timeout=20000 set timeout=90000 in the config"
+    );
+    let refusal = turn_sent(&["@s-a1", "turn", "timeout=60000", "go"])
+        .expect_err("past the cap")
+        .to_string();
+    assert!(
+        refusal.contains("give it a shorter timeout=, or say settle=submitted")
+            && refusal.contains("`aterm ctl --host lab-mini await task @s-a1:<task_rev>`")
+            && refusal.contains("`aterm ctl --host lab-mini @s-a1 status` (or `text`)"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a_turns_timeout_over_a_drive_is_the_one_the_driven_mac_reads() {
+    for (parts, wire) in [
+        (
+            &["@s-a1", "turn", "--", "timeout=5000 echo T2"][..],
+            "-- timeout=5000 echo T2",
+        ),
+        (
+            &["@s-a1", "turn", "timeout=1 x", "timeout=99999"][..],
+            "timeout=1 x timeout=99999",
+        ),
+        (
+            &["@s-a1", "turn", "timeout=99999", "timeout=5000", "go"][..],
+            "timeout=99999 timeout=5000 go",
+        ),
+        (
+            &["@s-a1", "turn", "timeout=abc", "go"][..],
+            "timeout=abc go",
+        ),
+        (
+            &["@s-a1", "turn", "--", "--", "timeout=99999"][..],
+            "-- timeout=20000 -- timeout=99999",
+        ),
+        (
+            &["@s-a1", "turn", "idle=5", "--", "timeout=99999"][..],
+            "timeout=20000 idle=5 -- timeout=99999",
+        ),
+    ] {
+        assert_eq!(turn_sent(parts).unwrap(), wire, "{parts:?}");
     }
+    let refusal = turn_sent(&["@s-a1", "turn", "timeout=5000", "timeout=60000", "go"])
+        .expect_err("the last timeout= is the one read")
+        .to_string();
+    assert!(refusal.contains("at most timeout=22000"), "{refusal}");
 }
 
 #[test]
@@ -97,34 +141,34 @@ fn a_turns_leading_options_keep_their_place_over_a_drive() {
     for (sent, wire) in [
         (
             "@s-a1 turn id=7f:3:41 run the tests",
-            "@s-a1 turn id=7f:3:41 timeout=20000 run the tests",
+            "id=7f:3:41 timeout=20000 run the tests",
         ),
         (
             "@s-a1 turn if-supervisor=h-9 idle=600 go",
-            "@s-a1 turn if-supervisor=h-9 timeout=20000 idle=600 go",
+            "if-supervisor=h-9 timeout=20000 idle=600 go",
         ),
         (
             "@s-a1 turn cause=@12 id=k:1:2 go",
-            "@s-a1 turn cause=@12 id=k:1:2 timeout=20000 go",
+            "cause=@12 id=k:1:2 timeout=20000 go",
         ),
         (
             "@s-a1 turn id=k:1:2 settle=submitted timeout=9000 go",
-            "@s-a1 turn id=k:1:2 settle=submitted timeout=9000 go",
+            "id=k:1:2 settle=submitted timeout=9000 go",
         ),
         (
             "@s-a1 turn -- id=k literal",
-            "@s-a1 turn -- timeout=20000 id=k literal",
+            "-- timeout=20000 id=k literal",
         ),
+        ("@s-a1 turn id=k", "id=k timeout=20000"),
     ] {
-        let mut parts = words(sent);
-        turn_wait(&mut parts, "lab-mini").unwrap();
-        assert_eq!(parts, words(wire), "{sent}");
+        let parts: Vec<&str> = sent.split_whitespace().collect();
+        assert_eq!(turn_sent(&parts).unwrap(), wire, "{sent}");
     }
     for long in [
         "@s-a1 turn id=k:1:2 timeout=60000 go",
         "@s-a1 turn if-supervisor=h-9 id=k timeout=60000 go",
     ] {
-        let refusal = turn_wait(&mut words(long), "lab-mini")
+        let refusal = turn_sent(&long.split_whitespace().collect::<Vec<_>>())
             .expect_err(long)
             .to_string();
         assert!(
@@ -202,6 +246,28 @@ fn what_never_crosses_the_fleet_is_refused_here() {
 }
 
 #[test]
+fn a_survey_over_a_host_that_names_its_own_machines_is_refused() {
+    for (line, word) in [
+        ("survey --fleet", "--fleet"),
+        ("survey --host c93a8940", "--host c93a8940"),
+        ("survey --json --host=c93a8940", "--host=c93a8940"),
+    ] {
+        let refusal = run("93bfb599", &words(line), None, &LocalVerbs::NONE)
+            .expect_err(line)
+            .to_string();
+        assert_eq!(
+            refusal,
+            format!(
+                "--host 93bfb599 and survey's own `{word}` each name the machines a survey reads: \
+                 give one (`aterm ctl survey --host <h>` reads one peer, `aterm ctl survey \
+                 --fleet` every one)"
+            ),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     fn left(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
         Err(DriveRefused {
@@ -225,6 +291,10 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
          fleet it issued went with its leave)"
     );
     assert!(!off.contains("stands until"), "{off}");
+    let at = run("lab-mini", &words("hold @s-a1 off"), None, &local)
+        .expect_err("no fleet")
+        .to_string();
+    assert_eq!(at, off, "the remedy names the bare sid a hold takes");
     for other in ["hold s-a1 on", "@s-a1 status"] {
         let said = run("lab-mini", &words(other), None, &local)
             .expect_err(other)

@@ -38,7 +38,7 @@ fn band_peak(app: &App, wid: WindowId) -> u8 {
         .fx
         .cursor()
         .glow
-        .under_quads()
+        .under_laid()
         .iter()
         .map(|q| q.alpha)
         .max()
@@ -52,14 +52,14 @@ fn band_light(app: &App, wid: WindowId) -> u64 {
         .fx
         .cursor()
         .glow
-        .under_quads()
+        .under_laid()
         .iter()
         .map(|q| (rgb(q.color) + rgb(q.color2)) * u64::from(q.w) * u64::from(q.h))
         .sum()
 }
 
 fn band_span(app: &App, wid: WindowId) -> Option<(i32, i32)> {
-    let quads = app.windows[&wid].fx.cursor().glow.under_quads();
+    let quads = app.windows[&wid].fx.cursor().glow.under_laid();
     let l = quads.iter().map(|q| i32::from(q.x)).min()?;
     let r = quads
         .iter()
@@ -326,7 +326,7 @@ fn a_history_viewport_hides_the_band_and_the_live_viewport_returns_it_on_its_own
             false,
         );
         assert_eq!(
-            app.windows[&wid].fx.cursor().glow.under_quads().len(),
+            app.windows[&wid].fx.cursor().glow.under_laid().len(),
             0,
             "+{ms} ms of history composes no ribbon quad (A4)"
         );

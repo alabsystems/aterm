@@ -28548,6 +28548,7 @@ fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) ->
         seen,
         held,
         standing: None,
+        installing: false,
     }
 }
 
@@ -28575,6 +28576,7 @@ fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
         seen: StartupSeen::Unread,
         held: Some(read),
         standing: None,
+        installing: false,
     }
 }
 
@@ -28911,6 +28913,57 @@ fn the_startup_deadline_marks_no_off_worker() {
                 agent: Program::Claude
             }
         )]
+    );
+}
+
+/// AN INSTALL IS NO START THAT NEVER CAME. A worker whose launcher is still installing its
+/// program (Grok Build, installed on demand, with atpkg waiting up to 30 minutes for its lock and
+/// downloading about 100 MB) holds its shell's prompt, because nothing has been typed yet. Its
+/// record has been `working` since the spawn. The deadline does not judge it while the install
+/// runs, and falls a whole deadline after the last look that found it installing. CONTROL: the
+/// same worker, not installing, is stalled at the deadline counted from its record.
+#[test]
+fn the_startup_deadline_waits_out_a_launchers_install() {
+    let w = Arc::new(StartupWorld::default());
+    let hooks = w.hooks();
+    let none = OffSessions::default();
+    let t0 = Instant::now() + Duration::from_secs(3 * 3600);
+    let installing = |on: bool| Startup {
+        installing: on,
+        ..startup(
+            "s-a",
+            StartupState::Working,
+            t0,
+            StartupSeen::Holds(no_agent()),
+        )
+    };
+    let mut books = Startups::default();
+    w.set(vec![installing(true)]);
+    let late = t0 + 15 * STARTUP_DEADLINE;
+    for at in [t0, t0 + STARTUP_DEADLINE, late] {
+        assert_eq!(
+            look_at_startups(&mut books, at, true, &none, &hooks),
+            Some(at + HELD_RELOOK)
+        );
+    }
+    assert!(w.marks().is_empty(), "an install in hand is no stall");
+    w.set(vec![installing(false)]);
+    let typed = late + HELD_RELOOK;
+    assert_eq!(
+        look_at_startups(&mut books, typed, true, &none, &hooks),
+        Some(late + STARTUP_DEADLINE)
+    );
+    assert!(w.marks().is_empty(), "a whole deadline after the install");
+    look_at_startups(&mut books, late + STARTUP_DEADLINE, true, &none, &hooks);
+    assert_eq!(w.marks(), [stalled("s-a", no_agent())]);
+
+    let mut plain = Startups::default();
+    look_at_startups(&mut plain, t0, true, &none, &hooks);
+    look_at_startups(&mut plain, t0 + STARTUP_DEADLINE, true, &none, &hooks);
+    assert_eq!(
+        w.marks(),
+        [stalled("s-a", no_agent())],
+        "CONTROL: not installing, the deadline counts from the record"
     );
 }
 
@@ -32976,6 +33029,143 @@ fn the_disk_free_line_waits_out_a_persons_grace_and_is_released_from_a_session_t
         "the act is told what holds each turn break"
     );
     assert!(disk_ask_owed(&BOARD, "s-df-held").is_none());
+}
+
+/// A session whose turns end with its own background shell still running (a manager awaiting its
+/// workers in a background `aterm ctl await task`) reads busy for hours and comes to no idle point.
+/// Its loop offers the disk-free line owed it at such a break once it settles
+/// ([`IdleHost::at_background_fact`]), and the worker steps it there as at an idle point: the same
+/// act, the same guards. Before, the worker typed only the upgrade's notice there, and the line was
+/// handed on undelivered after its delivery window, and as the only seat the episode parked for
+/// six hours with nothing freed.
+#[test]
+fn the_disk_free_line_goes_at_a_background_break_where_the_turn_is_over() {
+    use aterm_agent::supervise::IdleHost;
+    static BOARD: Shelf = Shelf::new();
+    let world = Arc::new(World::default());
+    type Calls = Vec<(String, Option<&'static str>, Option<&'static str>)>;
+    let calls: Arc<Mutex<Calls>> = Arc::default();
+    let c = Arc::clone(&calls);
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_free: Arc::new(move |sid, owed, unfit, held| {
+            assert!(owed.text.ends_with("(rule disk-free@v1)"), "{}", owed.text);
+            c.lock().unwrap().push((sid.to_string(), unfit, held));
+            match (unfit, held) {
+                (Some(why), _) => format!("released:{why}"),
+                (None, Some(why)) => format!("wait:{why}"),
+                (None, None) => "typed".to_string(),
+            }
+        }),
+        finished: Arc::new(|_, _, _| Some(false)),
+        tasked: Arc::new(|_, _, _| Some(true)),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let mut idle = idle_of(
+        hooks,
+        Program::Claude,
+        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+    );
+    idle.sid = "s-df-manager".to_string();
+    assert!(!idle.fact_owed(), "nothing owed: nothing to offer");
+    assert_eq!(
+        idle.at_background_fact(IdlePoint::default())
+            .map(|s| s.line),
+        None
+    );
+    BOARD.publish(|b| {
+        b.asks.insert(
+            "s-df-manager".to_string(),
+            crate::disk_board::AskOwed {
+                key: "dev:1".to_string(),
+                text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)".to_string(),
+            },
+        );
+    });
+    assert!(idle.fact_owed(), "an owed line is offered at the break");
+    assert_eq!(
+        idle.at_background_fact(IdlePoint {
+            held: Some(Guard::Person),
+            ..IdlePoint::default()
+        })
+        .map(|s| s.line),
+        None,
+        "a person's grace: nothing typed"
+    );
+    assert!(idle.fact_owed(), "and the line still owed");
+    let step = idle
+        .at_background_fact(IdlePoint::default())
+        .expect("a break nothing holds types it");
+    assert_eq!(step.line, "disk-free@v1 step=typed");
+    assert_eq!(
+        step.typed,
+        Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact)
+    );
+    assert!(!idle.fact_owed(), "typed once");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            ("s-df-manager".to_string(), None, Some("person")),
+            ("s-df-manager".to_string(), None, None),
+        ]
+    );
+}
+
+/// The loop's lasting withholds at a session's turn breaks ([`IdleHost::lasting_hold`]: its credits
+/// hold, a sign-in wall, another wall that is no usage limit) go on the board every disk look
+/// seats sessions by, so the look holds the session out of its seats rather than electing one whose
+/// line would not go. Each stands until its loop says it is over (a wall once the session works
+/// past it, the credits hold once it lifts): a busy read alone ends neither, as a break of the
+/// agent's own background work at a wall reads busy too and is no work past it.
+#[test]
+fn the_loops_lasting_withholds_go_on_the_board_the_look_seats_by() {
+    use crate::disk_board::Withhold;
+    use aterm_agent::supervise::{IdleHost, Lasting};
+    static BOARD: Shelf = Shelf::new();
+    let world = Arc::new(World::default());
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let mut idle = idle_of(
+        hooks,
+        Program::Claude,
+        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+    );
+    idle.sid = "s-df-walled".to_string();
+    let on_board = || BOARD.board_lock().withholds.get("s-df-walled").copied();
+    idle.lasting_hold(Some(Lasting::Wall { wire: "wall:auth" }));
+    assert_eq!(on_board(), Some(Withhold::Wall { wire: "wall:auth" }));
+    idle.busy_tap();
+    assert_eq!(
+        on_board(),
+        Some(Withhold::Wall { wire: "wall:auth" }),
+        "a busy read may be a break of its own background work, still at the wall"
+    );
+    idle.lasting_hold(None);
+    assert_eq!(on_board(), None, "its loop read it working past the wall");
+    idle.lasting_hold(Some(Lasting::Credits {
+        lifts_unix: Some(1_800_000_000),
+    }));
+    assert_eq!(
+        on_board(),
+        Some(Withhold::Credits {
+            until_s: Some(1_800_000_000)
+        })
+    );
+    idle.busy_tap();
+    assert_eq!(
+        on_board(),
+        Some(Withhold::Credits {
+            until_s: Some(1_800_000_000)
+        }),
+        "a turn carried on credits is still held: the loop types nothing at its end"
+    );
+    idle.lasting_hold(None);
+    assert_eq!(on_board(), None, "its loop says it is over");
 }
 
 /// The loop tells the worker of every decided turn break before it asks whether the worker wants a

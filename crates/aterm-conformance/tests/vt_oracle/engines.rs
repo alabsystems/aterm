@@ -68,8 +68,13 @@ pub struct Snap {
     pub rows: u16,
     /// Row-major, `rows * cols` cells.
     pub cells: Vec<CellView>,
-    /// `(row, col)`, 0-based; `col == cols` while a wrap is pending.
+    /// `(row, col)`, 0-based; `col` is one past the cursor's column while a
+    /// wrap is pending (`cols` at the screen's edge, one past a right
+    /// margin under DECSLRM).
     pub cursor: (u16, u16),
+    /// A wrap is pending, which tells a cursor one past a right margin from
+    /// one really standing on the column after it.
+    pub wrap: bool,
     pub cursor_visible: bool,
     pub alt_screen: bool,
 }
@@ -110,6 +115,9 @@ impl Snap {
         }
         if self.cursor != other.cursor {
             return Some(format!("cursor {:?} vs {:?}", self.cursor, other.cursor));
+        }
+        if self.wrap != other.wrap {
+            return Some(format!("wrap pending {} vs {}", self.wrap, other.wrap));
         }
         if self.cursor_visible != other.cursor_visible {
             return Some(format!(
@@ -177,6 +185,7 @@ impl Astream {
             rows,
             cells,
             cursor: s.cursor(),
+            wrap: s.wrap_pending(),
             cursor_visible: s.cursor_visible(),
             alt_screen: s.is_altscreen(),
         }
@@ -263,6 +272,7 @@ impl Aterm {
             rows,
             cells,
             cursor: (cur.row, col),
+            wrap: grid.pending_wrap(),
             cursor_visible: self.term.cursor_visible(),
             alt_screen: self.term.is_alternate_screen(),
         }

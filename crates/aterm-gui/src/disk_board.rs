@@ -280,8 +280,38 @@ pub(crate) struct Board {
     /// and the session's agent reads `limited`, the ask holds it out of its seats and waits for
     /// it to be past rather than running out (`crate::harness_disk_ask`).
     pub(crate) walls: BTreeMap<String, Wall>,
+    /// The lasting withhold of its loop's a session of this process stands at (`sid -> withhold`),
+    /// as its loop decided its last turn break and its worker published it
+    /// (`crate::harness_host`'s `WorkerIdle::lasting_hold`, again whenever it changes): the
+    /// credits hold until it lifts, or a wall that is no usage limit until the loop finds it gone
+    /// or reads the session working past it (a live read, never a break of its own background
+    /// work). While it holds ([`Withhold::holds`]) the ask holds the session
+    /// out of its seats and waits for it to be past rather than electing a session whose loop
+    /// would type it nothing (`crate::harness_disk_ask`).
+    pub(crate) withholds: BTreeMap<String, Withhold>,
     /// The next demand's id.
     next_demand: u64,
+}
+
+/// A lasting withhold of a session's loop at its turn breaks ([`Board::withholds`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Withhold {
+    /// The credits hold (`credits-hold@v1`): its loop types nothing until `until_s` (unix seconds:
+    /// the usage limit's reset plus the loop's grace, or the hold's bound); `None`, until its loop
+    /// finds it lifted.
+    Credits { until_s: Option<i64> },
+    /// A wall on screen that is no usage limit, by its kind's wire word (`wall:auth`, ...).
+    Wall { wire: &'static str },
+}
+
+impl Withhold {
+    /// Whether it holds the session from a line at `now_s` (unix seconds).
+    pub(crate) fn holds(&self, now_s: i64) -> bool {
+        match self {
+            Withhold::Credits { until_s } => until_s.is_none_or(|until| now_s < until),
+            Withhold::Wall { .. } => true,
+        }
+    }
 }
 
 /// A usage-limit wall a session's loop has open ([`Board::walls`]).
@@ -366,6 +396,7 @@ impl Board {
             asks: BTreeMap::new(),
             unfit: BTreeMap::new(),
             walls: BTreeMap::new(),
+            withholds: BTreeMap::new(),
             next_demand: 1,
         }
     }

@@ -1799,6 +1799,27 @@ fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
     present(&mut app, true);
     assert!(!pending(&app), "the present of the page's answer closes it");
 
+    // A key that moves focus or scrolls repaints the page without recompiling it: it is timed
+    // all the same, to the first present of pixels painted after it.
+    for (named, what) in [
+        (NamedKey::Tab, "a focus move"),
+        (NamedKey::PageDown, "a page turn"),
+        (NamedKey::PageUp, "a page turn back"),
+    ] {
+        type_key(&mut app, key(Key::Named(named)));
+        assert!(pending(&app), "{what} repaints the page: its slice is open");
+        present(&mut app, false);
+        assert!(
+            pending(&app),
+            "{what}: pixels already shown are not its answer"
+        );
+        present(&mut app, true);
+        assert!(
+            !pending(&app),
+            "{what}: the present of its pixels closes it"
+        );
+    }
+
     type_key(&mut app, key(Key::Character('b')));
     assert!(pending(&app));
     let presentation = app.windows[&wid]
@@ -1833,8 +1854,8 @@ fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
     .unwrap();
     present(&mut app, true);
     assert!(
-        pending(&app),
-        "a different revision cannot close the old edge"
+        !pending(&app),
+        "pixels painted after the key show its answer, whatever else changed since"
     );
     type_key(&mut app, key(Key::Character('d')));
     present(&mut app, true);

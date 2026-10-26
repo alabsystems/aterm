@@ -1129,18 +1129,12 @@ fn strip_version_chrome_line(
     }
 }
 
-#[cfg_attr(
-    not(any(target_os = "macos", windows)),
-    expect(
-        clippy::large_enum_variant,
-        reason = "without a window photograph's variant (macOS, Windows) an image job is the \
-                  largest by far; a job is one per capture, moved once"
-    )
-)]
 pub(crate) enum EncodeJob {
     Image {
         pixels: CapturePixels,
-        metadata: Option<PendingMetadata>,
+        /// Boxed: an `image --meta`'s model is most of an image job, and unboxed, whether it
+        /// clears clippy's `large_enum_variant` margin turns on the variants a platform compiles.
+        metadata: Option<Box<PendingMetadata>>,
         target: control_auth::ConfinedImage,
         want_bytes: bool,
         cancel: crate::control::CaptureCancellation,
@@ -1161,7 +1155,8 @@ pub(crate) enum EncodeJob {
         handoff: crate::control::ReplyRetentionPermit,
     },
     VideoDump {
-        take: aterm_gpu::video_tap::VideoTake,
+        /// The finished recording, its last conversions settled on the export's lane.
+        take: aterm_gpu::video_tap::UnsettledTake,
         mode: crate::VideoMode,
         keys_enabled: bool,
         inputs: Vec<(u64, crate::VideoInputSample)>,
@@ -2109,6 +2104,13 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
         } => {
             use std::fmt::Write as _;
 
+            if cancel.is_cancelled() {
+                fail_video_dump(dir, &reply, "request cancelled before export");
+                return;
+            }
+            // The frames the conversion lane still owes land here, on the export's lane: the
+            // UI thread that finished the recording never waits on a conversion.
+            let take = take.settle();
             if cancel.is_cancelled() {
                 fail_video_dump(dir, &reply, "request cancelled before export");
                 return;
@@ -5603,7 +5605,7 @@ impl App {
                 .as_ref()
                 .unwrap_or(&self.windows[&front].input_scratch);
             match self.image_metadata(front, &context, model, facts, frame_metadata) {
-                Ok(metadata) => Some(metadata),
+                Ok(metadata) => Some(Box::new(metadata)),
                 Err(error) => {
                     let _ = reply.send(Err(error));
                     return;
@@ -11201,11 +11203,11 @@ mod encode_worker_tests {
                 let cell = std::sync::Arc::new(std::sync::OnceLock::new());
                 let published = blank_metadata();
                 cell.set(published.clone()).expect("first");
-                PendingMetadata {
+                Box::new(PendingMetadata {
                     metadata: published,
                     raster_is_pixels: false,
                     cell,
-                }
+                })
             });
             let permit = CapturePermit::try_reserve(&held, pixels.peak_bytes())
                 .expect("the budget is empty");
@@ -12051,7 +12053,7 @@ mod encode_worker_tests {
         }
         run_encode_job(
             EncodeJob::VideoDump {
-                take,
+                take: take.into(),
                 handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
                 mode: crate::VideoMode::SwapchainTap,
                 keys_enabled: false,
@@ -14465,7 +14467,7 @@ mod headless_cursor_fx_tests {
         {
             let ws = app.windows.get(&wid).expect("headless window 0");
             assert!(
-                !ws.input_scratch.cursor_glow_add.is_empty(),
+                !ws.input_scratch.glow_add_laid().is_empty(),
                 "a headless capture right after a cursor move carries live fire quads"
             );
         }
@@ -14475,7 +14477,7 @@ mod headless_cursor_fx_tests {
         );
         let ws = app.windows.get(&wid).expect("headless window 0");
         assert!(
-            ws.input_scratch.cursor_glow_add.is_empty(),
+            ws.input_scratch.glow_add_laid().is_empty(),
             "31 s idle: the fire must decay to exactly zero quads in the capture"
         );
         let ember = ws

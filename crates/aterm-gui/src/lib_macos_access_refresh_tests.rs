@@ -1176,7 +1176,8 @@ fn other_dialog(app: &App) -> crate::debugger_access::StepMoment {
 }
 
 /// The debugger probe's answer on this stand-in Mac: debugger access off, the
-/// account an admin, this aterm hardened — the facts under which aterm asks.
+/// account an admin, this aterm hardened — the facts under which aterm asks. It
+/// reads as just taken until the hang detector's minute has passed.
 fn debugger_reads_off_as(app: &mut App, hardened: aterm_containment::consent::SelfHardening) {
     use aterm_containment::consent::{
         DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,

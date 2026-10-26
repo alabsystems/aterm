@@ -15,9 +15,17 @@ pub(crate) const GIT: &str = crate::items::github::CLT_GIT;
 const READ_BUDGET: Duration = Duration::from_secs(300);
 /// `git fetch origin` of a large history.
 const FETCH_BUDGET: Duration = Duration::from_secs(1800);
-/// No repository hook runs under a git that changes a ref or a worktree: a hook directory that does
-/// not exist, for this one run (no configuration is written).
-pub(crate) const NO_HOOKS: [&str; 2] = ["-c", "core.hooksPath=/dev/null"];
+/// Nothing else runs under a git that changes a ref or a worktree, for this one run (no
+/// configuration is written): no repository hook (a hook directory that does not exist), and no
+/// automatic maintenance. A merge or a fetch otherwise ends by starting `git maintenance run
+/// --auto --detach`, whose fork can still hold the run's stdout in its process group when git
+/// exits, and a drain that sees it refuses the run's output ([`System::run_complete_stdout`]).
+pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "maintenance.auto=false",
+];
 
 /// CLT git as `user`, in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`) and no
 /// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git).
@@ -698,7 +706,7 @@ pub(crate) fn align(
         sys,
         &git(user, Some(path))
             .budget(FETCH_BUDGET)
-            .args(NO_HOOKS)
+            .args(NO_SIDE_RUNS)
             .args(["fetch", "--quiet", "--no-recurse-submodules", "origin"]),
         "fetch",
     )?;
@@ -742,7 +750,7 @@ pub(crate) fn align(
     };
     let merge = run(
         sys,
-        &git(user, Some(path)).args(NO_HOOKS).args([
+        &git(user, Some(path)).args(NO_SIDE_RUNS).args([
             "-c",
             "submodule.recurse=false",
             "merge",

@@ -90,12 +90,12 @@ struct Knobs {
     /// lockup `    claude ` (the icon's sprite over its two blank cells, and
     /// the name) written at its left and the lit switch ` alab harness ●
     /// on ` at its right (`claude_footer::compose_top` repaints the rule's
-    /// whole run).
+    /// whole run, and `pet_chrome` reserves that run whole, its strokes
+    /// included: the host's line).
     brand: bool,
     /// The composer's upper rule reserved from end to end, its strokes
-    /// included (`PetChrome::note_painted` reserves only the words and marks
-    /// on it): no stand on the composer's first line, so the cat rests under
-    /// the composer while it is typed, beside the chips.
+    /// included, with no harness on it: the host's line without its lockup
+    /// and switch.
     rule_walled: bool,
     /// The composer's first line itself reserved from end to end: no stand
     /// on it for the escort either, so the cat rests under the composer,
@@ -134,6 +134,9 @@ struct Shot {
     caret: (u16, u16),
     /// The composer's bottom rule's row on this present, when one is drawn.
     rule: Option<usize>,
+    /// The last column holding a letter on the row over the drawn body's feet row, when any:
+    /// the head law slides a stand past them.
+    letters_over: Option<u16>,
 }
 
 struct Host {
@@ -282,6 +285,7 @@ impl Host {
             let (mark, switch) = (f32::from(BRAND_MARK_COLS), f32::from(BRAND_SWITCH_COLS));
             chips.push(PetRect::new(top as f32, 2.0, 1.0, mark));
             chips.push(PetRect::new(top as f32, cols - 2.0 - switch, 1.0, switch));
+            chips.push(PetRect::new(top as f32, 0.0, 1.0, cols));
         }
         if let Some((top, _)) = rules.filter(|_| self.knobs.rule_walled) {
             chips.push(PetRect::new(top as f32, 0.0, 1.0, cols));
@@ -350,6 +354,11 @@ impl Host {
             self.now,
         );
         let caret = self.term.cursor();
+        let letters_over = (frame.row.round() as usize)
+            .checked_sub(1)
+            .and_then(|r| input.cells.get(r))
+            .and_then(|row| row.iter().rposition(|c| c.ch.is_alphanumeric()))
+            .map(|c| c as u16);
         self.shots.push(Shot {
             ms: self.ms(),
             frame,
@@ -357,6 +366,7 @@ impl Host {
             guess,
             caret: (caret.row, caret.col),
             rule,
+            letters_over,
         });
     }
 
@@ -1069,10 +1079,13 @@ fn a_wrap_typed_through_is_one_bound() {
                 1,
                 "{name}: the wrap at {start} ms: flights (ms, col, row) {launches:?}"
             );
+            let launched = launches[0].0;
             let landed = after
                 .windows(2)
                 .find(|w| {
-                    w[0].frame.action == PetAction::Leap && w[1].frame.action != PetAction::Leap
+                    w[0].ms >= launched
+                        && w[0].frame.action == PetAction::Leap
+                        && w[1].frame.action != PetAction::Leap
                 })
                 .map(|w| w[1])
                 .expect("the bound lands");
@@ -1155,8 +1168,13 @@ fn a_flight_across_the_hosts_chrome_never_blinks_out() {
     assert!(flights > 10, "the takes fly ({flights} flights)");
 }
 
+/// THE HEAD LAW AT THE HOST'S LINE (2026-10-24, the owner: "the cursor kitty pet is drawn
+/// BELOW the top line and I can't see it"): typed on past the harness's switch, the cat walks on
+/// top of the composer's upper rule, the host's line, by the caret, whole and at full presence.
+/// Until then it walked the composer's line under the switch, its head behind the switch's words
+/// and the rule's strokes (1f8cc63681).
 #[test]
-fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
+fn the_pet_walks_on_top_of_the_composer_over_the_harness_switch() {
     let knobs = Knobs {
         chips: true,
         brand: true,
@@ -1174,19 +1192,46 @@ fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
         "the take types the line on past the switch: {}",
         line.len()
     );
-    let off: Vec<(u64, (u16, u16), f32, f32)> = line
+    // On top of the rule: the feet on the row over it, never lower (the body would reach into
+    // the rule) and not a half row higher. By the caret: within STAND_REACH columns of it, or
+    // where the head law stopped the stand, just past the letters over its row (a body there
+    // keeps its head off them, so the veil never dims it).
+    let on_top = |s: &Shot| {
+        let over = f32::from(s.caret.0) - 2.0;
+        s.frame.row <= over + 0.01 && s.frame.row > over - 0.5
+    };
+    let by_caret = |s: &Shot| {
+        (s.frame.col - f32::from(s.caret.1)).abs() <= STAND_REACH
+            || s.letters_over.is_some_and(|last| {
+                s.frame.col > f32::from(s.caret.1)
+                    && s.frame.col >= f32::from(last) + 1.0
+                    && s.frame.col <= f32::from(last) + 1.1
+            })
+    };
+    let off: Vec<_> = line
         .iter()
-        .filter(|s| {
-            (s.frame.row - f32::from(s.caret.0)).abs() >= 0.5
-                || (s.frame.col - f32::from(s.caret.1)).abs() > STAND_REACH
+        .filter(|s| !on_top(s) || !by_caret(s) || s.frame.alpha < 255)
+        .map(|s| {
+            let f = s.frame;
+            (s.ms, s.caret, f.col, f.row, f.alpha, s.letters_over)
         })
-        .map(|s| (s.ms, s.caret, s.frame.col, s.frame.row))
         .collect();
     assert!(
         off.is_empty(),
-        "{} presents off the caret's line or farther than {STAND_REACH} columns from it: {:?}",
+        "{} of {} presents off the top of the upper rule, away from the caret, or veiled \
+         (ms, caret, col, row, alpha, last letter over its row): {:?}",
         off.len(),
+        line.len(),
         &off[..off.len().min(6)]
+    );
+    let slid = line
+        .iter()
+        .filter(|s| (s.frame.col - f32::from(s.caret.1)).abs() > STAND_REACH)
+        .count();
+    assert!(
+        slid < line.len() / 10,
+        "the head law's slide past the letters is the exception: {slid} of {} presents",
+        line.len()
     );
 }
 
@@ -1652,7 +1697,10 @@ fn generating_flights() -> Vec<HostFlights> {
 /// 424 ms, no key behind any of them. The cat waits the walk out in the
 /// crouch it gathered at the first move and bounds once, out of that crouch,
 /// onto the row where the composer stops, at 120 and 60 Hz, echo as recorded
-/// and 150 ms late, with and without the host's chrome.
+/// and 150 ms late, with and without the host's chrome. With the harness on,
+/// whose top rule the host holds whole, that row is the top of the composer's
+/// upper rule, over the caret's line (aterm-effects SPECS
+/// `host-line-head-law`): on the caret's line its head would be under the rule.
 ///
 /// NEGATIVE CONTROL (as run on main before the fix): 2 flights at
 /// 60 Hz and 3 at 120 Hz in every host, the first landing on row 20 or 25
@@ -1663,7 +1711,7 @@ fn generating_flights() -> Vec<HostFlights> {
 /// bound in every host.
 #[test]
 fn a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles() {
-    for (label, echo, _, flights, grounded) in generating_flights() {
+    for (label, echo, harness, flights, grounded) in generating_flights() {
         let turn_end: Vec<_> = flights
             .iter()
             .zip(&grounded)
@@ -1688,9 +1736,15 @@ fn a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles() {
             "{label}: the turn's end, flights (ms, caret, landing at (col, row), caret): {seen:?}"
         );
         let (_, _, landed, caret) = turn_end[0];
+        // The caret settles on the composer's first line, under its upper rule.
+        let row = if harness {
+            f32::from(caret.0) - 2.0
+        } else {
+            f32::from(caret.0)
+        };
         assert!(
-            (landed.row - f32::from(caret.0)).abs() < 0.5,
-            "{label}: the bound came down on row {} with the caret on row {}",
+            (landed.row - row).abs() < 0.5,
+            "{label}: the bound came down on row {} with the caret on row {} (row {row} wanted)",
             landed.row,
             caret.0
         );

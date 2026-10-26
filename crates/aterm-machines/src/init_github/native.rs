@@ -160,6 +160,18 @@ impl Item for NativeRepositories {
                     .ready()
                     && credential_ready(sys, &self.user, &plan.account, &plan.token)?);
             self.ensure_current().map_err(Block::from)?;
+            // Signed in, with no repository left that fits: the row waits for room instead of
+            // a pass that would clone nothing.
+            let volume = sys.volume(Path::new(&self.user.home));
+            let left: Vec<String> = missing
+                .iter()
+                .filter_map(|repo| repos::no_room(volume.as_ref(), repo))
+                .collect();
+            if ready && !missing.is_empty() && left.len() == missing.len() {
+                let why =
+                    repos::short_of_room(volume.as_ref(), &left, CHECK_AGAIN).unwrap_or_default();
+                return Err(Block::of(Wait::DiskSpace)(why));
+            }
             Ok::<_, Block>((plan.repositories.len(), missing.len(), ready))
         })();
         self.reading.set(match &check {
@@ -184,7 +196,14 @@ impl Item for NativeRepositories {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        let plan = self.plan(sys).map_err(|block| block.why)?;
+        let plan = self.plan(sys).map_err(|block| {
+            // Why it stopped, where this step decided it: the failed row keeps it for System
+            // State's page (`init_observe::failure_note`), the engine's line for the log.
+            if let Some(wait) = block.wait {
+                self.reading.set(Some(Reading::Waits(wait)));
+            }
+            block.why
+        })?;
         let missing = repos::missing(sys, &self.user, &plan.repositories)?;
         let current = || self.ensure_current();
         current()?;
@@ -199,7 +218,13 @@ impl Item for NativeRepositories {
                 Git::keychain().store(sys, Some(&self.user), GITHUB, &plan.account, &plan.token)?;
             }
         }
+        let home = Path::new(&self.user.home);
+        let mut left = Vec::new();
         for repo in missing {
+            if let Some(name) = repos::no_room(sys.volume(home).as_ref(), &repo) {
+                left.push(name);
+                continue;
+            }
             if self.captured.is_some() {
                 repos::clone_one_guarded(sys, &self.user, &repo, &plan.account, &current)?;
             } else {
@@ -207,7 +232,12 @@ impl Item for NativeRepositories {
             }
         }
         current()?;
-        Ok(())
+        let Some(why) = repos::short_of_room(sys.volume(home).as_ref(), &left, CHECK_AGAIN) else {
+            return Ok(());
+        };
+        // The failed row keeps the page's words for it (`init_observe::failure_note`).
+        self.reading.set(Some(Reading::Waits(Wait::DiskSpace)));
+        Err(why)
     }
 
     fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
@@ -278,6 +308,11 @@ impl From<String> for Block {
         Self { why, wait: None }
     }
 }
+
+/// What a first-launch pass that left repositories for room tells the person to do once there is
+/// room ([`repos::short_of_room`]): `aterm init` clones nothing without a `[github]` profile,
+/// and System State's run tries again by itself only for its first tries.
+const CHECK_AGAIN: &str = "press Check again in System State, or launch aterm again";
 
 impl NativeRepositories {
     fn ensure_current(&self) -> Result<(), String> {
@@ -809,6 +844,18 @@ mod tests {
                 Some(Wait::InTheWay),
             ),
             (
+                "no room on the disk",
+                {
+                    let (mut sys, item) = fixture();
+                    sys.volume = Some(volume(9 * GIB));
+                    answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
+                    script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+                    script::alike(&sys, &item.user);
+                    (sys, item)
+                },
+                Some(Wait::DiskSpace),
+            ),
+            (
                 "another login",
                 {
                     let (mut sys, item) = fixture();
@@ -845,6 +892,23 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A step that fails as it applies keeps the reason it decided (System State design §3.6):
+    /// GitHub not answering as the run lists the repositories leaves the failed row the page's
+    /// words for it (`init_observe::failure_note`), never GitHub's own.
+    #[test]
+    fn an_apply_github_did_not_answer_keeps_the_reason_it_decided() {
+        let (sys, item) = bare();
+        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        source(&sys, "/Users//alice/.secrets/gh_access_token");
+        sys.fail_github_api(&item.user, "/user", GithubFailure::Unreached);
+        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        assert!(item.apply(&sys, &context).is_err(), "GitHub did not answer");
+        assert_eq!(
+            item.detail(&sys, &context),
+            Some(Reading::Waits(Wait::Unreached).token())
+        );
     }
 
     /// git's github.com settings unset, then as `configure` leaves them.
@@ -1010,6 +1074,125 @@ mod tests {
         item.apply(&sys, &context(&item)).unwrap();
         let approve = script::credential(Some(&item.user), "approve");
         assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
+    }
+
+    const GIB: u64 = aterm_capacity::floor::GIB;
+
+    /// A data volume of 100 GiB with `free` bytes free and a floor of 8 GiB.
+    fn volume(free: u64) -> aterm_capacity::reading::Volume {
+        aterm_capacity::reading::Volume {
+            mount: "/System/Volumes/Data".into(),
+            total: 100 * GIB,
+            free,
+            floor: 8 * GIB,
+            room: 8 * GIB,
+        }
+    }
+
+    /// One repository GitHub sizes at 2 GiB, whose clone takes about 10 GiB.
+    fn huge() -> aterm_json::Value {
+        aterm_json::json!([{"id":1,"name":"huge","owner":{"login":"alice"},
+            "full_name":"alice/huge","private":true,
+            "clone_url":"https://github.com/alice/huge.git",
+            "default_branch":"main","size":2 * 1024 * 1024}])
+    }
+
+    /// The first-launch inventory leaves a repository the disk has no room for above the disk
+    /// watch's floor and names it; with no reading of the volume it tries the clone. Before
+    /// the sign-in is set up, the plan still changes, so the credentials are set up.
+    #[test]
+    fn a_repository_the_disk_has_no_room_for_is_not_cloned() {
+        let (mut sys, item) = fixture();
+        sys.volume = Some(volume(12 * GIB));
+        answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
+        credential_commands(&sys, &item.user, TOKEN);
+        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        assert!(
+            matches!(item.probe(&sys, &context), Probe::Change { .. }),
+            "{:?}",
+            sys.calls()
+        );
+
+        // One that fits beside one that does not: the plan changes, so the one that fits arrives.
+        let (mut sys, item) = fixture();
+        sys.volume = Some(volume(12 * GIB));
+        let mut both = huge();
+        both.as_array_mut()
+            .unwrap()
+            .push(repository("alice", "small", 2));
+        answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), both);
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        let probed = item.probe(&sys, &context);
+        assert!(matches!(probed, Probe::Change { .. }), "{probed:?}");
+
+        for read in [true, false] {
+            let (mut sys, item) = fixture();
+            sys.volume = read.then(|| volume(12 * GIB));
+            answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
+            script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+            script::alike(&sys, &item.user);
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            // Room comes back by itself, so the row waits and the run tries again; it never
+            // parks the run as a person's step would (design §3.6).
+            let probed = item.probe(&sys, &context);
+            assert_eq!(matches!(probed, Probe::Blocked { .. }), read, "{probed:?}");
+            let why = item.apply(&sys, &context).unwrap_err();
+            let tried = sys.calls().iter().any(|call| call.contains("alice/huge"));
+            if read {
+                assert_eq!(
+                    why,
+                    "1 repository not cloned, for want of disk space: ~/huge (about 10 GiB); \
+                     /System/Volumes/Data has 12 GiB free and keeps 8 GiB free; free space, \
+                     then press Check again in System State, or launch aterm again"
+                );
+                assert!(!tried, "{:?}", sys.calls());
+            } else {
+                assert!(tried, "{why}: {:?}", sys.calls());
+            }
+        }
+
+        // The disk fills between the plan and the pass: the failed row keeps the reason the
+        // pass decided, for the page (`init_observe::failure_note`).
+        let (mut sys, item) = fixture();
+        sys.volume = Some(volume(60 * GIB));
+        answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        let probed = item.probe(&sys, &context);
+        assert!(matches!(probed, Probe::Change { .. }), "{probed:?}");
+        sys.volume = Some(volume(12 * GIB));
+        assert!(item.apply(&sys, &context).is_err());
+        assert_eq!(
+            item.detail(&sys, &context),
+            Some(Reading::Waits(Wait::DiskSpace).token())
+        );
+
+        // A vault snapshot that went stale outranks the room: the run waits for the new one,
+        // whose repositories and token may differ, instead of for disk space.
+        let (mut sys, mut item) = fixture();
+        sys.volume = Some(volume(12 * GIB));
+        let inputs = InitialRepositoryInputs::capture(&sys, &context).unwrap();
+        answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        let sys = Arc::new(sys);
+        let observed = Arc::clone(&sys);
+        // Stale from the sign-in lookup on, which the plan's own checks come before.
+        item.captured = Some(Captured {
+            inputs,
+            current: Box::new(move || {
+                Ok(!observed
+                    .calls()
+                    .iter()
+                    .any(|call| call.contains("credential fill")))
+            }),
+        });
+        match item.probe(&*sys, &context) {
+            Probe::Blocked { why } => assert!(why.contains("vault changed"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(item.detail(&*sys, &context), None);
     }
 
     #[test]

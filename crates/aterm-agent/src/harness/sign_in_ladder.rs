@@ -220,6 +220,10 @@ pub(super) fn how_it_ended(renewal: super::cli::Renewal, code: Option<i32>) -> S
         Renewal::WrongAccount => "another account signed in".to_owned(),
         Renewal::Failed => "the sign-in did not finish".to_owned(),
         Renewal::Busy => "another sign-in held the sign-in lock, so nothing ran".to_owned(),
+        Renewal::Deferred => {
+            "local sign-in state changed or was unavailable; deferred for a fresh attempt"
+                .to_owned()
+        }
         Renewal::NeedsPerson => "its page waited on a person".to_owned(),
     }
 }

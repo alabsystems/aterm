@@ -362,7 +362,7 @@ fn sessionless_front_window_resize(
     {
         return None;
     }
-    let parsed = control_input::parse_resize_px(rest)?;
+    let parsed = control_input::parse_window_resize(rest);
     Some(
         match native_control_decision(false, true, principal, NativeControlTarget::App) {
             NativeControlDecision::WithoutSession => parsed,
@@ -6157,6 +6157,8 @@ fn drive_gate(
     spawned: &dyn Fn(&SessionId) -> bool,
 ) -> Result<DriveLine, String> {
     const SID: &str = "a drive names a session this Mac hosts by its sid (@s-…)";
+    const HOLD_SID: &str = "a drive's hold names a session this Mac hosts by its bare sid, with \
+                            no @: hold s-… on|off [reason=<pct>]";
     let request = Request::parse(line.to_owned());
     if request.frame().is_some() || request.post_frame().is_some() {
         return Err("a drive serves no frame but a worker's task".to_owned());
@@ -6195,7 +6197,7 @@ fn drive_gate(
                                 [reason=<pct>]"
                         .to_owned());
                 }
-                let sid = hosted(sid).ok_or_else(|| SID.to_owned())?;
+                let sid = hosted(sid).ok_or_else(|| HOLD_SID.to_owned())?;
                 Ok(DriveLine::Act {
                     line: line.to_owned(),
                     write: Some(DriveAct {
@@ -6278,7 +6280,7 @@ fn drive_spawn(
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
 ) -> Result<String, String> {
-    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|codex|agy|muse> \
+    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|codex|agy|muse|grok> \
                          [model=<m>] [cwd=<absolute>] [from=<sid>] [raise=false] len=<n>";
     let tokens = control_media::split_quoted_tokens(rest).ok_or(USAGE)?;
     let (mut agent, mut framed, mut raise) = (false, false, false);
@@ -8438,19 +8440,14 @@ fn deliver(
 }
 
 fn front_routed_resize(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
-    let event = match control_input::parse_resize_px(rest) {
-        Some(Err(usage)) => return usage,
-        Some(Ok(event)) => event,
-        None => match control_input::parse_resize(rest) {
-            Ok((rows, cols)) => InputEvent::Resize {
-                rows,
-                cols,
-                echo_to_window: true,
-            },
-            Err(error) => return error,
-        },
-    };
-    control_input::input_reply_to_str(post_input_reply_to(proxy, vec![event], Some(session)))
+    match control_input::parse_window_resize(rest) {
+        Ok(event) => control_input::input_reply_to_str(post_input_reply_to(
+            proxy,
+            vec![event],
+            Some(session),
+        )),
+        Err(usage) => usage,
+    }
 }
 
 fn parse_scroll_intent(rest: &str) -> Result<ScrollIntent, String> {
@@ -8617,6 +8614,9 @@ fn cross_resize(
     }
     let cell_px = term_lock(term).host_cell_pixel_size();
     aterm_pty::resize_with_cell_px(master, rows, cols, cell_px);
+    if let Some(proxy) = proxy {
+        let _ = proxy.send_event(Wake::PaneRegridOwed { session });
+    }
     ctx.cast
         .lock()
         .unwrap_or_else(|p| p.into_inner())

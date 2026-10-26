@@ -74,6 +74,9 @@ pub(crate) struct GlArmLive {
     /// written in turn.
     fx_palettes: [Option<GlTexture>; fx_gpu::FX_PALETTE_RING],
     fx_palette_next: usize,
+    /// The bloom's item list (`aterm_render::bloom::BloomItems`) as the
+    /// vertex stage reads it: an RGBA8 texture 1024 words a row.
+    pub(crate) glow_items: Option<GlTexture>,
 }
 
 impl GlArmLive {
@@ -109,6 +112,7 @@ impl GlArmLive {
             fx_tex: std::array::from_fn(|_| None),
             fx_palettes: std::array::from_fn(|_| None),
             fx_palette_next: 0,
+            glow_items: None,
         })
     }
 
@@ -851,7 +855,7 @@ impl GpuRenderer {
         win: &mut WindowGpu,
         input: &RenderInput,
     ) -> Result<(), String> {
-        let (glow_count, bbox, extract_first) = self.build_bloom_glow(input);
+        let (glow_count, bbox, extract_first) = self.build_bloom_glow(input, true);
         if glow_count == 0 {
             return Ok(());
         }
@@ -863,18 +867,29 @@ impl GpuRenderer {
         let text_blend =
             u32::from(self.cpu.text_blending() == aterm_render::TextBlending::LinearCorrected);
         let live = self.gl_arm.as_mut().ok_or("the GL arm is not minted")?;
-        live.ensure_pipeline(Pipeline::GlowAdd)?;
+        let extract_row = if self.bloom_items_live {
+            Pipeline::GlowItems
+        } else {
+            Pipeline::GlowAdd
+        };
+        live.ensure_pipeline(extract_row)?;
         live.ensure_pipeline(Pipeline::Bloom)?;
         let (format, alias, raw) = Self::gl_post_plan(live);
         let (bw, bh) = ((fw / BLOOM_DOWNSCALE).max(1), (fh / BLOOM_DOWNSCALE).max(1));
         let half = live.dev.texture_2d(format, bw, bh, alias)?;
-        let insts = &self.bloom_glow_scratch[extract_first as usize..];
-        let stream = live.dev.buffer(
-            crate::gl::resources::GlBufferRole::Instance,
-            std::mem::size_of_val(insts),
-        )?;
-        live.dev
-            .write_buffer(&stream, aterm_bits::cast_slice(insts))?;
+        let stream = if self.bloom_items_live {
+            write_fx_palette(&live.dev, &mut live.glow_items, self.bloom_items.words())?;
+            None
+        } else {
+            let insts = &self.bloom_glow_scratch[extract_first as usize..];
+            let stream = live.dev.buffer(
+                crate::gl::resources::GlBufferRole::Instance,
+                std::mem::size_of_val(insts),
+            )?;
+            live.dev
+                .write_buffer(&stream, aterm_bits::cast_slice(insts))?;
+            Some(stream)
+        };
         let cell_u = Self::gl_post_uniform(
             live,
             aterm_bits::bytes_of(&Uniforms {
@@ -924,7 +939,7 @@ impl GpuRenderer {
             (None, Some(_)) => unreachable!("clip-only case handled above"),
         };
         let live = &*live;
-        let extract = live.pipelines[Pipeline::GlowAdd as usize]
+        let extract = live.pipelines[extract_row as usize]
             .as_ref()
             .expect("ensured above");
         let bloom = live.pipelines[Pipeline::Bloom as usize]
@@ -953,7 +968,14 @@ impl GpuRenderer {
                 (&cell_u, cell_binding),
             )?;
             pass.set_pipeline(extract);
-            pass.set_stream(&stream);
+            match stream.as_ref() {
+                Some(stream) => pass.set_stream(stream),
+                None => {
+                    let items = live.glow_items.as_ref().expect("written above");
+                    let unit = extract_row.spec().binds.vertex_items;
+                    pass.bind_texture(items, &live.nearest, unit.expect("GLOW_ITEMS"), true);
+                }
+            }
             pass.draw(6, glow_count)?;
         }
         let composite = |frame: &mut crate::gl::encoder::GlFrame<'_>,

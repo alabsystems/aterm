@@ -165,10 +165,12 @@ pub(crate) fn lens_geom(
 /// What the How to read lens says to a reader, and what its ⌘C copies.
 pub(crate) fn how_to_read_words(platform: Platform) -> String {
     format!(
-        "Each row is one resource. The row covers the last 10 minutes, oldest on the left; each \
-         cell is 10 seconds. Colour runs from cold, 0 percent of the resource's maximum, to hot, \
-         100 percent. A mark above a cell means the resource ran over its maximum. An outlined \
-         cell, or a short line, was not read. The bar shows {} in grey, aterm in green and this \
+        "Each row is one resource, oldest on the left and now at the right end, under the dot; \
+         the label over the strips says how far back they reach: one to two and a half minutes \
+         folded, 10 in the full deck. Each cell is 10 seconds (20 or 30 in a narrow full deck). \
+         Colour runs from cold, 0 percent of the resource's maximum, to hot, 100 percent. A mark \
+         above a cell means the resource ran over its maximum. An outlined cell, or a short \
+         line, was not read. The bar shows {} in grey, aterm in green and this \
          tab in bright green.",
         platform.machine()
     )
@@ -3110,7 +3112,7 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                     p,
                     "Cells",
                     &[
-                        "10 seconds each, 10 minutes a row".into(),
+                        "10 seconds each, now at the right".into(),
                         "10 s each".into(),
                     ],
                 );
@@ -3297,9 +3299,10 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     LensDoc {
         name: "How to read",
         sources: vec!["the grammar every row shares".into()],
-        explainer: "Each row is one resource over the last 10 minutes, oldest on the left. \
-                    Each cell is 10 seconds (20 or 30 in a narrow deck), coloured by its share \
-                    of the resource's maximum."
+        explainer: "Each row is one resource, oldest on the left and now at the right end; \
+                    the label over the strips says how far back they reach. Each cell is 10 \
+                    seconds (20 or 30 in a narrow full deck), coloured by its share of the \
+                    resource's maximum."
             .into(),
         answer: None,
         sections,
@@ -4237,6 +4240,16 @@ impl crate::App {
         }
         self.close_stats_lens(wid);
         false
+    }
+
+    /// Whether a pinned or keyboard lens owns Copy, and whether its sentence is available.
+    /// `Some(false)` retains ownership when the snapshot is unavailable.
+    pub(crate) fn stats_lens_copy_ready(&self, wid: crate::WindowId) -> Option<bool> {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.stats_lens.open)
+            .filter(|lens| lens.how != Opened::Hover)
+            .map(|_| self.vitals.snapshot.is_some())
     }
 
     /// The open lens's sentence.

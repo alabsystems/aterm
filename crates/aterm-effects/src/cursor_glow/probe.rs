@@ -188,7 +188,11 @@ impl CursorGlow {
             return;
         }
         let line = |row: i32| &cells[(row - r0) as usize];
-        ft.cols = (lo..=hi).map(|r| line(r).len()).max().unwrap_or(0);
+        let mut max_cols = 0usize;
+        for r in lo..=hi {
+            max_cols = max_cols.max(line(r).len());
+        }
+        ft.cols = max_cols;
         let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         let n_rows = (hi - lo + 1) as usize;
         ft.rows.reserve(n_rows);
@@ -196,17 +200,16 @@ impl CursorGlow {
         for row in lo..=hi {
             let line = line(row);
             let glyph = |c: &aterm_core::terminal::RenderCell| c.ch != ' ' || c.wide;
-            let mut first_glyph: Option<i32> = None;
-            let mut last_glyph = 0i32;
+            let mut glyph_span: Option<(i32, i32)> = None;
             let n_cols = line.len().min(ft.cols);
             for (c, cell) in line[..n_cols].iter().enumerate() {
                 let is_glyph = glyph(cell);
                 if is_glyph {
                     let ci = c0 + c as i32;
-                    if first_glyph.is_none() {
-                        first_glyph = Some(ci);
-                    }
-                    last_glyph = ci + 1;
+                    glyph_span = Some(match glyph_span {
+                        Some((first, _)) => (first, ci + 1),
+                        None => (ci, ci + 1),
+                    });
                 }
                 ft.pairs.push(Some((
                     if is_glyph { Some(rgb(cell.fg)) } else { None },
@@ -216,7 +219,7 @@ impl CursorGlow {
             if n_cols < ft.cols {
                 ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
             }
-            ft.rows.push(first_glyph.map(|f| (f, last_glyph)));
+            ft.rows.push(glyph_span);
         }
     }
 
@@ -244,10 +247,15 @@ impl CursorGlow {
         self.unsettle();
         self.row_cur.clear();
         self.row_cur.extend_from_slice(cols);
-        let fill = match cols.iter().rposition(|&c| c != ' ') {
-            Some(i) => (i + 1).min(u16::MAX as usize) as u16,
-            None => 0,
-        };
+        let mut fill = 0u16;
+        let mut idx = cols.len();
+        while idx > 0 {
+            idx -= 1;
+            if cols[idx] != ' ' {
+                fill = (idx + 1).min(u16::MAX as usize) as u16;
+                break;
+            }
+        }
         self.row_cur_meta = Some(RowProbe {
             row,
             caret,
@@ -287,11 +295,7 @@ impl CursorGlow {
                 None => None,
             }
         };
-        let last_cell = match self.last {
-            Some(cell) => Some(cell),
-            None => self.last_visible.map(|(cell, _)| cell),
-        };
-        let caret_move = if let Some((from, _)) = last_cell
+        let caret_move = if let Some((from, _)) = self.cursor_anchor()
             && let Some(to) =
                 self.witness_rows[..self.witness_rows_n.min(self.witness_rows.len())].first()
         {
@@ -333,10 +337,17 @@ impl CursorGlow {
             return None;
         }
         let n = self.witness_rows_n;
-        let slot = match self.witness_rows[..n.min(self.witness_rows.len())]
-            .iter()
-            .position(|s| s.row == row)
-        {
+        let cap = n.min(self.witness_rows.len());
+        let mut found = None;
+        let mut idx = 0;
+        while idx < cap {
+            if self.witness_rows[idx].row == row {
+                found = Some(idx);
+                break;
+            }
+            idx += 1;
+        }
+        let slot = match found {
             Some(i) => i,
             None => {
                 if n >= CURSOR_WITNESS_ROWS {

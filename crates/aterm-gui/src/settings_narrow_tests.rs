@@ -2325,6 +2325,7 @@ pub(super) fn every_page_runtime_over(
             tab("local/7", "fix the build of the settings page", true, 7),
             tab("local/8", "zsh", false, 8),
         ],
+        fleet: crate::harness_screen::FleetScope::Account,
     };
     assert!(runtime.replace_settings_harness(harness, 1));
     (runtime, instance, view)

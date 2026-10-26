@@ -36,7 +36,7 @@ impl Host {
         term.process(format!("\x1b[{};1H", row + 1).as_bytes());
         let mut h = Self {
             term,
-            glow: CursorGlow::default(),
+            glow: crate::common::quads_glow(),
             cfg: rainbow_cfg(),
             g: geom(ROWS, COLS, CW, CH),
             now: Instant::now(),

@@ -349,7 +349,7 @@ impl CandidateRefusal {
 
     /// The item it was refused on, if it got as far as one.
     #[must_use]
-    pub fn item(&self) -> Option<&str> {
+    pub const fn item(&self) -> Option<&str> {
         match self {
             CandidateRefusal::Budget { .. } | CandidateRefusal::Decode(_) => None,
             CandidateRefusal::Entry { item, .. }
@@ -357,7 +357,7 @@ impl CandidateRefusal {
             | CandidateRefusal::LaneNotLogged { item }
             | CandidateRefusal::LaneNotReproduced { item }
             | CandidateRefusal::StrandedLight { item, .. }
-            | CandidateRefusal::LaneFidelity { item, .. } => Some(item),
+            | CandidateRefusal::LaneFidelity { item, .. } => Some(item.as_str()),
         }
     }
 }
@@ -634,12 +634,12 @@ impl<T> Winner<T> {
 
     /// Offers an admitted candidate's training totals and plan, with what to return for it.
     fn offer(&mut self, totals: Totals, plan: SchedulePlan, with: T) {
-        let key = |t: &Totals, p: &SchedulePlan| (t.ticks, t.wasted, p.encode());
-        if self
-            .best
-            .as_ref()
-            .is_none_or(|(t, p, _)| key(&totals, &plan) < key(t, p))
-        {
+        let cand_key = (totals.ticks, totals.wasted, plan.encode());
+        let beats = match &self.best {
+            Some((t, p, _)) => cand_key < (t.ticks, t.wasted, p.encode()),
+            None => true,
+        };
+        if beats {
             self.best = Some((totals, plan, with));
         }
     }
@@ -851,7 +851,10 @@ fn spread_map<I: Sync, T: Send + Sync>(
     });
     let mut out = Vec::with_capacity(items.len());
     for (slot, item) in slots.into_iter().zip(items) {
-        out.push(slot.into_inner().unwrap_or_else(|| f(item)));
+        out.push(match slot.into_inner() {
+            Some(v) => v,
+            None => f(item),
+        });
     }
     out
 }
@@ -1006,7 +1009,10 @@ fn first_contradiction(done: &[(Task, Result<Done, Contradiction>)]) -> Option<C
     let mut best: Option<&Contradiction> = None;
     for (_, d) in done {
         if let Err(c) = d
-            && best.is_none_or(|b| (c.slot, c.ordinal) < (b.slot, b.ordinal))
+            && match best {
+                Some(b) => (c.slot, c.ordinal) < (b.slot, b.ordinal),
+                None => true,
+            }
         {
             best = Some(c);
         }
@@ -1048,14 +1054,14 @@ impl Distributed<'_> {
     /// The jobs, by slot.
     #[inline]
     #[must_use]
-    pub fn jobs(&self) -> &[Job] {
-        &self.jobs
+    pub const fn jobs(&self) -> &[Job] {
+        self.jobs.as_slice()
     }
 
     /// The claims recorded, by slot (tests only).
     #[cfg(test)]
-    pub(super) fn claims(&self) -> &[Option<Claim>] {
-        &self.claims
+    pub(super) const fn claims(&self) -> &[Option<Claim>] {
+        self.claims.as_slice()
     }
 
     /// The check level.
@@ -1130,8 +1136,11 @@ impl Distributed<'_> {
         };
         for (at, cid, job) in distinct {
             let verdict = match job {
-                Ok(slot) => match verdicts.get_mut(index(slot)).and_then(Option::take) {
-                    Some(v) => v,
+                Ok(slot) => match verdicts.get_mut(index(slot)) {
+                    Some(v) => match v.take() {
+                        Some(v) => v,
+                        None => return (Err(DistNoOutcome::Unclaimed { slot }), judged),
+                    },
                     None => return (Err(DistNoOutcome::Unclaimed { slot }), judged),
                 },
                 Err(r) => Judged::Refused(r),
@@ -1418,8 +1427,8 @@ impl Evaluator {
     /// The build it judges in.
     #[inline]
     #[must_use]
-    pub fn build(&self) -> &str {
-        &self.build
+    pub const fn build(&self) -> &str {
+        self.build.as_str()
     }
 
     /// The digest of the corpus it judges on.
@@ -1866,12 +1875,11 @@ impl Evaluator {
             let distinct = fold.distinct(&budgets, &proposed);
             let trained = spread_map(spread, &distinct, &|d| self.train(d.bytes));
             for (d, judged) in distinct.iter().zip(trained) {
-                fold.take(
-                    round,
-                    d.index,
-                    d.cid,
-                    judged.map_or_else(Judged::Refused, Judged::Admitted),
-                );
+                let judged = match judged {
+                    Ok(t) => Judged::Admitted(t),
+                    Err(r) => Judged::Refused(r),
+                };
+                fold.take(round, d.index, d.cid, judged);
             }
         }
         fold.end(self, Mode::Search)
@@ -1956,7 +1964,10 @@ impl Evaluator {
             if c.kind() == ClaimKind::Admitted {
                 let t = c.totals();
                 let key = (t.ticks, t.wasted, j.plan.encode());
-                if best_key.is_none_or(|bk| key < bk) {
+                if match best_key {
+                    Some(bk) => key < bk,
+                    None => true,
+                } {
                     best_key = Some(key);
                     best = Some(j.slot);
                 }
@@ -2054,7 +2065,11 @@ impl Evaluator {
         let mut verdicts = Vec::with_capacity(jobs.len());
         for (j, c) in jobs.iter().zip(claims) {
             let slot = index(j.slot);
-            let v = match (c.kind(), refused.get_mut(slot).and_then(Option::take)) {
+            let taken_refusal = match refused.get_mut(slot) {
+                Some(r) => r.take(),
+                None => None,
+            };
+            let v = match (c.kind(), taken_refusal) {
                 (ClaimKind::Refused, Some(r)) => Judged::Refused(r),
                 (ClaimKind::Admitted, None) if dominated.get(slot) == Some(&true) => {
                     Judged::Dominated {
@@ -2622,8 +2637,8 @@ impl LookToken {
     /// Its plan list, sorted and deduplicated.
     #[inline]
     #[must_use]
-    pub fn list(&self) -> &[[u8; PLAN_LEN]] {
-        &self.bound.list
+    pub const fn list(&self) -> &[[u8; PLAN_LEN]] {
+        self.bound.list.as_slice()
     }
 
     /// Its list's digest, under [`LIST_DOMAIN`].
@@ -2674,8 +2689,8 @@ impl ReadToken {
     /// Its plan list, sorted and deduplicated.
     #[inline]
     #[must_use]
-    pub fn list(&self) -> &[[u8; PLAN_LEN]] {
-        &self.bound.list
+    pub const fn list(&self) -> &[[u8; PLAN_LEN]] {
+        self.bound.list.as_slice()
     }
 
     /// Its list's digest, under [`LIST_DOMAIN`].
@@ -2726,8 +2741,8 @@ impl ReplayToken {
     /// Its plan list, sorted and deduplicated.
     #[inline]
     #[must_use]
-    pub fn list(&self) -> &[[u8; PLAN_LEN]] {
-        &self.bound.list
+    pub const fn list(&self) -> &[[u8; PLAN_LEN]] {
+        self.bound.list.as_slice()
     }
 
     /// Its list's digest, under [`LIST_DOMAIN`].

@@ -893,7 +893,7 @@ impl Item for Submodules {
                     &self
                         .git()
                         .budget(LONG_BUDGET)
-                        .args(checkout::NO_HOOKS)
+                        .args(checkout::NO_SIDE_RUNS)
                         .args([
                             "submodule",
                             "update",

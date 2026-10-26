@@ -109,7 +109,7 @@ impl Host {
     fn new(cols: usize, min_rows: usize, spinner: bool, pad: usize) -> Self {
         let mut term = Terminal::new(ROWS as u16, cols as u16);
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, cols);
         term.process(b"\x1b[?1049h\x1b[2J");
         let mut h = Self {
@@ -693,7 +693,7 @@ mod codex {
     /// bracket (the hold's cap).
     pub(super) fn replay(torn: bool, honor_sync: bool) -> (Vec<(u64, String)>, usize) {
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, C_COLS);
         let mut h = C {
             term: Terminal::new(C_ROWS as u16, C_COLS as u16),

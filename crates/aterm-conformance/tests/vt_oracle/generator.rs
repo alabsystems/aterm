@@ -54,19 +54,26 @@ pub enum Kind {
     Origin { set: bool },
     /// DECSTBM, valid or not.
     Region,
+    /// `CSI ? 69 h` (`set`) or `l`: left/right margin mode.
+    Lrmm { set: bool },
+    /// DECSLRM (`CSI Pl ; Pr s` under DECLRMM), valid or not.
+    Margins,
 }
 
 /// What [`Track`] knows of one DECSC slot: it was written with origin mode
-/// on, and a DECSTBM has come since.
+/// on, a DECSTBM or DECSLRM has come since, and the left/right margins have
+/// moved since (`decrc_of_a_wrap_after_the_margins_moved`) or may have left
+/// the wrap it saved off a line end ([`Track::wrap_off_a_line_end`]).
 #[derive(Clone, Copy, Debug, Default)]
 struct OriginSlot {
     origin: bool,
     region_moved: bool,
+    margins_moved: bool,
 }
 
 impl OriginSlot {
     fn blocks_restore(self) -> bool {
-        self.origin && self.region_moved
+        (self.origin && self.region_moved) || self.margins_moved
     }
 }
 
@@ -130,6 +137,15 @@ struct Track {
     main_slot: OriginSlot,
     /// The alternate screen's.
     alt_slot: OriginSlot,
+    /// DECLRMM is on, so `CSI s` sets margins rather than saving the cursor.
+    lrmm: bool,
+    /// A DECSLRM has come under DECLRMM since it was last reset, so the margins
+    /// may be narrower than the screen.
+    narrowed: bool,
+    /// A DECLRMM reset of narrowed margins has come, which can leave a wrap
+    /// pending on the old right margin, mid-line: a slot saved since may hold
+    /// one (`decrc_of_a_wrap_a_declrmm_reset_left_mid_line`).
+    wrap_off_a_line_end: bool,
 }
 
 impl Track {
@@ -158,12 +174,15 @@ impl Track {
                     || (caps.alt_persists && !(self.ris_dropped_slot && caps.ris_keeps_alt));
                 slot_known && !self.slot().blocks_restore()
             }
+            // Without DECLRMM `CSI Pl ; Pr s` is a cursor save the tracking misses.
+            Kind::Margins => self.lrmm,
             Kind::Alt { .. }
             | Kind::Plain
             | Kind::Save
             | Kind::Reset
             | Kind::Origin { .. }
-            | Kind::Region => true,
+            | Kind::Region
+            | Kind::Lrmm { .. } => true,
         }
     }
 
@@ -178,7 +197,8 @@ impl Track {
     fn save(&mut self) {
         let slot = OriginSlot {
             origin: self.origin,
-            region_moved: false,
+            margins_moved: self.wrap_off_a_line_end,
+            ..OriginSlot::default()
         };
         if self.in_alt {
             self.alt_slot = slot;
@@ -228,6 +248,22 @@ impl Track {
             Kind::Region => {
                 self.main_slot.region_moved = true;
                 self.alt_slot.region_moved = true;
+            }
+            Kind::Margins => {
+                self.narrowed = true;
+                for slot in [&mut self.main_slot, &mut self.alt_slot] {
+                    slot.region_moved = true;
+                    slot.margins_moved = true;
+                }
+            }
+            Kind::Lrmm { set } => {
+                self.lrmm = set;
+                if !set {
+                    self.wrap_off_a_line_end |= self.narrowed;
+                    self.narrowed = false;
+                    self.main_slot.margins_moved = true;
+                    self.alt_slot.margins_moved = true;
+                }
             }
             Kind::Plain => {}
         }
@@ -399,7 +435,7 @@ impl Gen {
         let (cols, rows, caps) = (self.cols, self.rows, self.caps);
         let lim = cols.max(rows);
         let r = &mut self.r;
-        let plain = match r.below(36) {
+        let plain = match r.below(38) {
             0..=8 => {
                 let n = run_len(r, cols);
                 text(r, n)
@@ -463,12 +499,16 @@ impl Gen {
                 };
                 return (Kind::Region, t);
             }
+            // Where the fold knows DECLRMM the save is `ESC 7`: `CSI s` is
+            // DECSLRM while the mode is on, and a shrink can turn it on.
             26 => {
                 return if !self.track.admits(Kind::Restore, caps) || r.chance(1, 2) {
-                    (
-                        Kind::Save,
-                        r.pick(&[b"\x1b7".as_slice(), b"\x1b[s"]).to_vec(),
-                    )
+                    let saves: &[&[u8]] = if caps.lr_margins {
+                        &[b"\x1b7"]
+                    } else {
+                        &[b"\x1b7", b"\x1b[s"]
+                    };
+                    (Kind::Save, r.pick(saves).to_vec())
                 } else {
                     let t = r.pick(&[b"\x1b8".as_slice(), b"\x1b[u"]).to_vec();
                     (Kind::Restore, after_restore(caps, t))
@@ -522,6 +562,21 @@ impl Gen {
                     t.extend(text(r, n));
                 }
                 t
+            }
+            // Left/right margins: DECLRMM on more often than off, and while it
+            // is on, DECSLRM with valid, empty, inverted and overlong pairs and
+            // the bare reset, all as `num` draws them.
+            36 | 37 if caps.lr_margins => {
+                return if self.track.lrmm && r.chance(3, 4) {
+                    let t = match r.below(4) {
+                        0 => csi("", 's'),
+                        _ => csi(&format!("{};{}", num(r, cols), num(r, cols)), 's'),
+                    };
+                    (Kind::Margins, t)
+                } else {
+                    let set = r.chance(3, 4);
+                    (Kind::Lrmm { set }, csi("?69", if set { 'h' } else { 'l' }))
+                };
             }
             _ => {
                 let n = run_len(r, cols);

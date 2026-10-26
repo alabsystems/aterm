@@ -36,10 +36,12 @@ aterm-aos = { workspace = true }
 aterm-objc = { workspace = true }
 
 [features]
-# The effects harness's pass-economy ablation (`GpuRenderer::set_unorm_ablation`) is a
-# development seam: the `effects` lane names this on its command line for its `--release` run
-# (a debug build has the seam anyway). No dependency's manifest turns it on.
-dev-seams = ["aterm-gpu/dev-seams"]
+# The effects harness's development seams: the pass-economy ablation
+# (`GpuRenderer::set_unorm_ablation`) and the glow ramps' sweep knobs (`--ramp-cost`, the beam
+# runs' cost; `--ramps-fx`, their GPU route). The `effects` lane names this on its command line
+# for its `--release` run (a debug build has the seams anyway). No dependency's manifest turns it
+# on.
+dev-seams = ["aterm-gpu/dev-seams", "aterm-effects/dev-seams"]
 # On macOS, the effects harness's `--wgpu` record: the wgpu arm (the Windows and BSD presenter
 # and its timestamp-query clock) beside Metal. The lane never names it.
 wgpu-oracle = ["aterm-gpu/wgpu-oracle"]

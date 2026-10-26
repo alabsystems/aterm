@@ -165,7 +165,16 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
         if c.is_ascii_alphabetic() {
             h = aterm_hash::fnv_mix_u64(h, u64::from(c.to_ascii_lowercase() as u8));
         } else if c.is_ascii() {
-            if tok_chars[i + 1..].iter().all(char::is_ascii) {
+            let mut j = i + 1;
+            let mut rest_ascii = true;
+            while j < tok_chars.len() {
+                if !tok_chars[j].is_ascii() {
+                    rest_ascii = false;
+                    break;
+                }
+                j += 1;
+            }
+            if rest_ascii {
                 return None;
             }
             ascii_ok = false;
@@ -176,7 +185,11 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
         }
     }
     if ascii_ok {
-        return (tok_chars.len() >= 2).then(|| mix(h));
+        return if tok_chars.len() >= 2 {
+            Some(mix(h))
+        } else {
+            None
+        };
     }
     tok.clear();
     tok.extend(tok_chars.iter().copied());

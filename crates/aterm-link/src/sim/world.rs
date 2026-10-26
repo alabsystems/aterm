@@ -4,9 +4,10 @@
 //! Deterministic fabric simulation world and fault/settle scheduler.
 //!
 //! Drives [`FLEET`], [`NODE`], and [`PERSON`] sessions from [`Opts::seed`] across bus mirrors
-//! ([`Opts::mirror`]), broker restarts ([`bus::Stop`]), held acks ([`Opts::hold_acks`],
-//! [`bus::Broker::answer_held`]), disk write errors ([`Opts::write_errors`], [`Device::fill`]),
-//! whole-machine [`Opts::power_cuts`] ([`Opts::torn_device`]), and isolated [`Opts::bus_losses`].
+//! ([`Opts::mirror`]) over a retained broker or an unretained one ([`Opts::retained`]), broker
+//! restarts ([`bus::Stop`]), held acks ([`Opts::hold_acks`], [`bus::Broker::answer_held`]), disk
+//! write errors ([`Opts::write_errors`], [`Device::fill`]), whole-machine [`Opts::power_cuts`]
+//! ([`Opts::torn_device`]), and isolated [`Opts::bus_losses`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
@@ -137,8 +138,13 @@ pub(crate) struct Opts {
     pub(crate) torn_device: bool,
     /// The bus mirror: `[fabric] log = "turns"`, the sessions' logs mirrored onto their `ev` faces.
     pub(crate) mirror: bool,
+    /// The broker is retained by aterm's rules ([`bus::State::retained`]); unretained, a
+    /// mirror takes its capped path with no window ledger.
+    pub(crate) retained: bool,
     /// Held acks: the broker answers some acks late.
     pub(crate) hold_acks: bool,
+    /// The broker rolls back some of the node's batches ([`bus::State::refuse_next`]).
+    pub(crate) refused_batches: bool,
     /// A sibling under this node's id.
     pub(crate) sibling: bool,
     /// A sibling that races an attach ([`bus::Race`]).
@@ -173,7 +179,10 @@ impl Opts {
             lossless_device: false,
             torn_device: true,
             mirror: (seed / 2) % 2 == 1,
+            // The found seeds that met their bug over an unretained broker (122) keep it.
+            retained: (seed / 16).is_multiple_of(2),
             hold_acks: (seed / 4) % 2 == 1,
+            refused_batches: true,
             sibling: false,
             race: false,
             alias: false,
@@ -268,6 +277,12 @@ pub(crate) struct Stats {
     pub(crate) alias_ghost_retired: u64,
     /// `ms` of the live sessions' logs the bus held once settled.
     pub(crate) mirrored: u64,
+    /// Passes of a mirroring bridge whose last attach found the broker retaining its `ev`
+    /// faces ([`Opts::retained`]): the mirror's window path.
+    pub(crate) mirror_retained_passes: u64,
+    /// Passes of a mirroring bridge whose last attach found the broker unretained: the
+    /// mirror's capped path, with no window ledger.
+    pub(crate) mirror_unretained_passes: u64,
     /// Torn state files a bridge moved into the state dir's quarantine after a power cut.
     pub(crate) set_aside: u64,
     /// Of those, how many the bridges told aterm of (`link set-aside`).
@@ -425,6 +440,7 @@ impl World {
         };
         let broker = bus::Broker::new(tier, table);
         lock(&broker.state).mutant = opts.arm;
+        lock(&broker.state).retained = opts.retained;
         if opts.journal {
             broker.keep_journal();
         }
@@ -787,7 +803,16 @@ impl World {
         self.stats.passes += 1;
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| live.bridge.pass(&mut live.backoff)));
         match r {
-            Ok(None) => self.live = Some(live),
+            Ok(None) => {
+                if self.opts.mirror {
+                    match live.bridge.broker_retention_read() {
+                        Some(true) => self.stats.mirror_retained_passes += 1,
+                        Some(false) => self.stats.mirror_unretained_passes += 1,
+                        None => {}
+                    }
+                }
+                self.live = Some(live);
+            }
             Ok(Some(ended)) => {
                 self.note(format!("bridge ended: {ended:?}"));
                 live.process.kill();
@@ -1105,10 +1130,12 @@ impl World {
             12 => self.core.broker.horizon(),
             14 => {
                 let n = 1 + u32::try_from(self.rng.below(2)).unwrap_or(0);
-                lock(&self.core.broker.state).refuse_next = n;
-                self.note(format!(
-                    "broker refuses the next {n} of the node's publishes and commits"
-                ));
+                if self.opts.refused_batches {
+                    lock(&self.core.broker.state).refuse_next = n;
+                    self.note(format!(
+                        "broker refuses the next {n} of the node's publishes and commits"
+                    ));
+                }
             }
             15 => self.log_record(),
             16 => self.open_one(),

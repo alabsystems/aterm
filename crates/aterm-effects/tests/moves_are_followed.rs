@@ -2198,8 +2198,6 @@ fn the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy() {
                 id.contains("/10-9/") || id.contains("/10-11/") || id.starts_with("d4.t1c.");
             let threshold = if id.starts_with("d4.t1.torn_move/paced/") {
                 120
-            } else if id.starts_with("d4.t1.torn_move/pet/") {
-                STICKY_PACED
             } else {
                 tear_read_as_copy(id)
             };
@@ -2227,7 +2225,7 @@ fn the_limit_a_move_onto_a_row_a_copy_stood_on_for_twin_min_melts() {
         all_cases(),
         |id| id.starts_with("d4.t8."),
         |id| {
-            let threshold = if id.contains("/paced/") || id.contains("/pet/") {
+            let threshold = if id.contains("/paced/") {
                 STICKY_PACED
             } else {
                 tear_read_as_copy(id)

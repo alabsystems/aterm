@@ -281,7 +281,7 @@ impl Host {
     fn new(composer: Composer, seam: Seam) -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         let now = Instant::now();
-        let mut glow = CursorGlow::default();
+        let mut glow = crate::common::quads_glow();
         glow.note_pane_columns(0, COLS);
         match composer {
             Composer::Zsh => term.process(format!("\x1b[{};1H% ", ROW + 1).as_bytes()),

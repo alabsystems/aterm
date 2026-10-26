@@ -168,21 +168,20 @@ impl CursorGlow {
         let mut boxes = std::mem::take(&mut self.keep_out_scratch);
         boxes.clear();
         let page = cfg.theme_bg & 0x00FF_FFFF;
-        let caret_row = cur.map(|(r, _)| i32::from(r));
         let ft = &self.frame_text;
         let mut rows = std::mem::take(&mut self.keep_rows_scratch);
         rows.clear();
         let mut last_ground: Option<(u32, bool)> = None;
         for i in 0..ft.rows.len() {
             let row = ft.lo + i as i32;
-            if Some(row) == caret_row {
+            if matches!(cur, Some((cr, _)) if i32::from(cr) == row) {
                 continue;
             }
             let y0 = oy + row * ch;
-            let row_pairs = ft
-                .pairs
-                .get(i * ft.cols..(i + 1) * ft.cols)
-                .unwrap_or_default();
+            let row_pairs = match ft.pairs.get(i * ft.cols..(i + 1) * ft.cols) {
+                Some(s) => s,
+                None => &[],
+            };
             let mut run: Option<i32> = None;
             let mut span: Option<(i32, i32)> = None;
             for (idx, pair) in row_pairs.iter().copied().enumerate() {

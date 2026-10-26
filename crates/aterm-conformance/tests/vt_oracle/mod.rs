@@ -209,11 +209,14 @@ fn the_written_answers_see_text_cursor_rendition_and_buffer() {
         ink.cells[0].ink.underline = !ink.cells[0].ink.underline;
         let mut buffer = good.clone();
         buffer.alt_screen = !buffer.alt_screen;
+        let mut wrap = good.clone();
+        wrap.wrap = !wrap.wrap;
         for (what, bad) in [
             ("glyph", glyph),
             ("cursor", cursor),
             ("rendition", ink),
             ("buffer", buffer),
+            ("pending wrap", wrap),
         ] {
             assert!(
                 e.want.missed_by(&bad).is_some(),
@@ -249,6 +252,7 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
         scroll_up_down: false,
         newline_mode: false,
         charsets: false,
+        lr_margins: false,
     };
     let program = |kinds: &[Kind]| Program {
         cols: 4,
