@@ -4056,9 +4056,14 @@ macos_disk_local() { # <dev> <list>
 # the device /dev shows when a line has it at /dev (a fixed folder, so a line
 # forged to say so vouches for nothing else). A line that starts with no
 # /dev/disk node (a network share's, a FUSE daemon's own name) gives none, so
-# no server is asked. Status 1 when the mount table or a node cannot be read.
+# no server is asked, and nor, for any line that names it, does a node no
+# stat reads (a disk image detached since the table was printed): each node
+# is read once, so no line's refusal of a disk is lost while another line
+# names it local, and a volume of that node, whose device no other node's is,
+# refuses as one no line names. Status 1 when the mount table, or /dev for a
+# devfs line, cannot be read.
 macos_mount_disks() {
-	local table l s i devfs="" IFS=$' \t\n'
+	local table l s i j d devfs="" IFS=$' \t\n'
 	local -a kinds=() nodes=() devs
 	table="$(macos_mounts 2>/dev/null)" && [[ -n "$table" ]] || return 1
 	while IFS= read -r l; do
@@ -4078,11 +4083,18 @@ macos_mount_disks() {
 			printf '%s %s\n' "${devfs:i:1}" "${devs[0]}"
 		done
 	fi
-	[[ ${#nodes[@]} -gt 0 ]] || return 0
-	devs=($(disk_devices "${nodes[@]}" 2>/dev/null || :))
-	[[ ${#devs[@]} -eq ${#nodes[@]} ]] || return 1
+	devs=()
 	for ((i = 0; i < ${#nodes[@]}; i++)); do
-		printf '%s %s\n' "${kinds[i]}" "${devs[i]}"
+		for ((j = 0; j < i; j++)); do
+			[[ "${nodes[j]}" != "${nodes[i]}" ]] || break
+		done
+		if [[ $j -lt $i ]]; then
+			d="${devs[j]}"
+		else
+			d="$(disk_devices "${nodes[i]}" 2>/dev/null)" || d=""
+		fi
+		devs[i]="$d"
+		[[ -z "$d" ]] || printf '%s %s\n' "${kinds[i]}" "$d"
 	done
 }
 
