@@ -1913,8 +1913,9 @@ folder_types() {
 
 /// The Mac's mount table for that walk: the fixture's macOS-only mounts, then the host's own.
 /// The lines naming `$W/hm/x on $W/sys`, `$W/hm/y on $W/obin/cc` and `$W/hm/z on /usr/bin`
-/// each mount a folder whose name holds ` on `. Each `/dev/disk9s<n>` has the device
-/// `$W/nodes` gives it: `$W/gr` is a graft that shows Preboot's device with no mount of its
+/// each mount a folder whose name holds ` on `. Each `/dev/disk999s<n>` has the device
+/// `$W/nodes` gives it, a disk number no host reaches, so a disk image the host has attached
+/// never takes a fixture's device: `$W/gr` is a graft that shows Preboot's device with no mount of its
 /// own, `$W/un` a volume no line names, `$W/fs` a FUSE volume over a local one, `$W/uf` an
 /// account's disk that a forged local line names too, and `$W/lf` a local volume with a tree.
 const FOREIGN_MACOS: &str = r#"mkdir -p "$W/gr/d" "$W/un/d" "$W/lf/d" "$W/lf/t/x" "$W/fs/d" "$W/uf/d" &&
@@ -1927,7 +1928,7 @@ printf '%s\n' "1:50 - /System/Volumes/Data$W/fl" "1:51 - $W/stack" \
 n=1
 for d in 0:40 8:1 1:50 0:42 1:71 1:51 1:52 1:53 0:44 1:54 0:45 0:46 1:73 1:74 1:75 1:60 1:76 1:77 \
 	1:78 1:62 1:79; do
-	echo "/dev/disk9s$n $d" >>"$W/nodes"
+	echo "/dev/disk999s$n $d" >>"$W/nodes"
 	n=$((n + 1))
 done
 disk_devices() {
@@ -1939,30 +1940,30 @@ disk_devices() {
 	return "$s"
 }
 macos_mounts() {
-	printf '%s\n' "/dev/disk9s1 on $W/vol (apfs, local, nodev, nosuid, journaled, mounted by someone)" \
-		"//u@h/s on $W/net (smbfs, nodev, nosuid)" "/dev/disk9s2 on $W/ok (apfs, local, journaled)" \
-		"/dev/disk9s3 on /System/Volumes/Data$W/fl (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s4 on $W/tree/sub (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s5 on $W/stack (apfs, local, journaled)" \
-		"/dev/disk9s6 on $W/stack (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s7 on $W/tree2/at on it (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s8 on /System/Volumes/Data$W/tree3/sub (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s9 on $W/pbin/cc (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s10 on $W/sib (old) (apfs, local, nodev, nosuid, mounted by someone)" \
+	printf '%s\n' "/dev/disk999s1 on $W/vol (apfs, local, nodev, nosuid, journaled, mounted by someone)" \
+		"//u@h/s on $W/net (smbfs, nodev, nosuid)" "/dev/disk999s2 on $W/ok (apfs, local, journaled)" \
+		"/dev/disk999s3 on /System/Volumes/Data$W/fl (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s4 on $W/tree/sub (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s5 on $W/stack (apfs, local, journaled)" \
+		"/dev/disk999s6 on $W/stack (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s7 on $W/tree2/at on it (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s8 on /System/Volumes/Data$W/tree3/sub (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s9 on $W/pbin/cc (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s10 on $W/sib (old) (apfs, local, nodev, nosuid, mounted by someone)" \
 		"x on y on $W/dn (macfuse, nodev, nosuid, synchronous, mounted by someone)" \
 		"x on on $W/dno (macfuse, nodev, nosuid, synchronous, mounted by someone)" \
 		"u@h:/x on on $W/xt/sub (nfs, nodev, nosuid)" \
-		"/dev/disk9s11 on $ABC (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s12 on $W/fm/prog (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s13 on $W/hm/x on $W/sys (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s14 on $W/hm/y on $W/obin/cc (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s15 on $W/hm/z on /usr/bin (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s11 on $ABC (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s12 on $W/fm/prog (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s13 on $W/hm/x on $W/sys (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s14 on $W/hm/y on $W/obin/cc (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk999s15 on $W/hm/z on /usr/bin (apfs, local, nodev, nosuid, mounted by someone)" \
 		"$W/net/g on $W/xg/gone (macfuse, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s16 on $W/lf (apfs, local, journaled)" \
-		"/dev/disk9s19 on $W/lt/sub (apfs, local, journaled)" \
-		"/dev/disk9s20 on $W/hm/q (apfs, local, journaled)" "/dev/disk9s20 on $W/u" \
+		"/dev/disk999s16 on $W/lf (apfs, local, journaled)" \
+		"/dev/disk999s19 on $W/lt/sub (apfs, local, journaled)" \
+		"/dev/disk999s20 on $W/hm/q (apfs, local, journaled)" "/dev/disk999s20 on $W/u" \
 		"f (apfs, local, nodev, nosuid, mounted by someone)" \
-		"/dev/disk9s21 on $W/fs (apfs, local, journaled)" \
+		"/dev/disk999s21 on $W/fs (apfs, local, journaled)" \
 		"x on $W/fs (macfuse, nodev, nosuid, mounted by someone)" \
 		"/dev/disk1 x on $W/xj (macfuse, nodev, nosuid, mounted by someone)"
 	/sbin/mount
@@ -2149,14 +2150,37 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
                  grep -Fxc -e \"$W/net\" -e \"$W/net/g\" -e \"$W/vol\" -e \"$W/fs\" \"$W/ids\"",
                 "0",
             ),
-            // A disk whose node cannot be read refuses a volume, with no
-            // word from the shell, and a line that only starts like a node's
-            // is no disk's.
+            // A node no stat reads (a disk image detached since the table
+            // was printed) vouches for no volume, its own refusing as one no
+            // line names, and takes no other's, with no word from the shell.
             (
                 "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; \
-                 echo \"/dev/disk9s99 on $W/gone2 (apfs, local, journaled)\"; }; \
+                 echo \"/dev/disk999s99 on $W/gone2 (apfs, local, journaled)\"; }; \
+                 folder_failing sealed_entry \"$W/lf/d\" 2>&1",
+                "",
+            ),
+            (
+                "eval \"base_$(declare -f disk_devices)\"; \
+                 disk_devices() { [ \"$1\" != /dev/disk999s16 ] || return 1; base_disk_devices \"$@\"; }; \
                  folder_failing sealed_entry \"$W/lf/d\" 2>&1",
                 "$W/lf",
+            ),
+            // One read of a node serves every line that names it: a read
+            // that would fail after one passed loses no account's line.
+            (
+                ": >\"$W/asked20\"; eval \"base_$(declare -f disk_devices)\"; disk_devices() { \
+                 if [ \"$1\" = /dev/disk999s20 ]; then n=\"$(wc -l <\"$W/asked20\")\"; echo >>\"$W/asked20\"; \
+                 [ $((n % 2)) -eq 0 ] || return 1; fi; base_disk_devices \"$@\"; }; \
+                 folder_failing sealed_entry \"$W/uf/d\"",
+                "$W/uf",
+            ),
+            // A line that only starts like a node's is no disk's.
+            (
+                "echo \"/dev/disk999s16x 1:60\" >>\"$W/nodes\"; eval \"base_$(declare -f macos_mounts)\"; \
+                 macos_mounts() { base_macos_mounts; \
+                 echo \"/dev/disk999s16x on $W/zz (apfs, local, mounted by someone)\"; }; \
+                 folder_failing sealed_entry \"$W/lf/d\"",
+                "",
             ),
             // The kernel's own devfs at /dev passes, but not one a line says
             // an account mounted there.

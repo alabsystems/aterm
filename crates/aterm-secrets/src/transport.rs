@@ -324,7 +324,8 @@ fn local_network_gate(ip: IpAddr, error: &std::io::Error) -> bool {
 }
 
 /// A failure to talk to the server. No route to a LAN address is
-/// [`ErrorKind::LocalNetworkPending`], and says where the gate is.
+/// [`ErrorKind::LocalNetworkPending`], and says where the gate is; a request past its deadline
+/// is [`ErrorKind::TimedOut`].
 fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
     let text = format!(
         "{what} {}: {}",
@@ -345,6 +346,9 @@ fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
             ),
         );
     }
+    if matches!(error, aterm_http::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut) {
+        return Error::of_kind(ErrorKind::TimedOut, text);
+    }
     Error::new(text)
 }
 
@@ -364,6 +368,16 @@ pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Resu
             Answer::Foreign(why) => Err(Error::new(why)),
         },
         Source::Path(path) => Ok(read_path(path)?.map_or(Fetched::Missing, Fetched::Body)),
+    }
+}
+
+/// [`fetch`] of the vault at `url` as one try of a bounded wait: the whole request, lookup to
+/// last byte, within `total`, with no [`FETCH_MARGIN`], so a long-poll the server holds for its
+/// own time ends at `total` too, failing [`ErrorKind::TimedOut`].
+pub fn fetch_within(url: &str, after: Option<u64>, total: Duration) -> crate::Result<Fetched> {
+    match get_via(&client(total), url, after, None).map_err(|unheard| unheard.why)? {
+        Answer::Fetched(fetched) => Ok(fetched),
+        Answer::Foreign(why) => Err(Error::new(why)),
     }
 }
 
@@ -528,15 +542,15 @@ pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
                 .send(envelope)
                 .map_err(|e| transport_error("publishing to", url, &e))?;
             if response.is_success() {
-                Ok(())
-            } else {
-                Err(refused(
-                    "publishing to",
-                    url,
-                    response.status(),
-                    response.body(),
-                ))
+                return Ok(());
             }
+            let error = refused("publishing to", url, response.status(), response.body());
+            // The server answers 409 only before it stores anything ([`ErrorKind::NotStored`]).
+            Err(if response.status() == 409 {
+                Error::of_kind(crate::ErrorKind::NotStored, error.0)
+            } else {
+                error
+            })
         }
         Source::Path(path) => write_path(path, envelope),
     }
@@ -620,12 +634,15 @@ pub(crate) enum NotTaken {
 impl PublishLock {
     pub(crate) fn take(path: &std::path::Path) -> crate::Result<Self> {
         Self::taken(path, false).map_err(|refused| match refused {
-            NotTaken::Held { lock, holder } => Error::new(format!(
-                "{}: another publish to this vault holds it{}; if none is running, remove it and \
-                 publish again",
-                lock.display(),
-                held_by(&holder)
-            )),
+            NotTaken::Held { lock, holder } => Error::of_kind(
+                crate::ErrorKind::NotStored,
+                format!(
+                    "{}: another publish to this vault holds it{}; if none is running, remove it \
+                     and publish again",
+                    lock.display(),
+                    held_by(&holder)
+                ),
+            ),
             NotTaken::Failed(e) => e,
         })
     }
@@ -790,12 +807,15 @@ fn write_path_held(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()>
             && held.name == new.name
             && held.seq >= new.seq
         {
-            return Err(Error::new(format!(
-                "seq {} is not newer than seq {}, which {} holds",
-                new.seq,
-                held.seq,
-                path.display()
-            )));
+            return Err(Error::of_kind(
+                crate::ErrorKind::NotStored,
+                format!(
+                    "seq {} is not newer than seq {}, which {} holds",
+                    new.seq,
+                    held.seq,
+                    path.display()
+                ),
+            ));
         }
     }
     crate::fsx::write_atomic(path, envelope, 0o644)
@@ -917,8 +937,13 @@ pub fn post_verdict(url: &str, recipient: &str, tag: &str) -> crate::Result<()> 
 /// `GET <url>/join/verdict`: each `(age1…, tag)` an admin Mac refused ([`post_verdict`]). A
 /// server that keeps no verdicts (an older one answers `404`) has none.
 pub fn list_verdicts(url: &str) -> crate::Result<Vec<(String, String)>> {
+    list_verdicts_within(url, VERDICT_EXCHANGE)
+}
+
+/// [`list_verdicts`], the whole exchange within `total` (at most [`VERDICT_EXCHANGE`]).
+pub fn list_verdicts_within(url: &str, total: Duration) -> crate::Result<Vec<(String, String)>> {
     let target = verdict_url(url);
-    let response = client(VERDICT_EXCHANGE)
+    let response = client(total.min(VERDICT_EXCHANGE))
         .get(&target)
         .limit(JOINS_BODY)
         .send(&[])
@@ -1739,6 +1764,24 @@ mod tests {
         assert!(
             took < FETCH_MARGIN,
             "the look waited the fetch margin past its total: {took:?}"
+        );
+        drop(silent);
+    }
+
+    /// A bounded wait's try ([`fetch_within`]) ends at its own total on a server that holds it,
+    /// with no [`FETCH_MARGIN`] after it, as a timeout its caller hears as no news.
+    #[test]
+    fn a_bounded_fetch_ends_at_its_total_as_a_timeout() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
+        let total = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let error = fetch_within(&url, Some(3), total).expect_err("a server that never answers");
+        let took = started.elapsed();
+        assert_eq!(error.kind(), ErrorKind::TimedOut, "{error:?}");
+        assert!(
+            took < FETCH_MARGIN,
+            "the try waited the fetch margin past its total: {took:?}"
         );
         drop(silent);
     }

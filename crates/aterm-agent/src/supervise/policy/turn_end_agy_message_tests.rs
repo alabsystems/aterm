@@ -200,13 +200,34 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
                 LAND_NUDGE,
                 &[
                     Suffix::Open(&open),
-                    Suffix::Repo(&crate::harness::repo_work::RepoRead::Found(repo.clone())),
+                    Suffix::Repo(
+                        &crate::harness::repo_work::RepoRead::Found(repo.clone()),
+                        RepoAsk::All,
+                    ),
                     Suffix::Fixed(DONE_CHECK_REVERSIBLE),
                     Suffix::Fixed(NEEDS_ACK),
                 ],
                 rules,
             ),
         );
+        for n in 0..DONE_ANGLES.len() {
+            add(
+                &format!("done-check-{}-fitted", n + 1),
+                fitted_act(
+                    &done_check_words(n),
+                    &[
+                        Suffix::Open(&open),
+                        Suffix::Repo(
+                            &crate::harness::repo_work::RepoRead::Found(repo.clone()),
+                            RepoAsk::Own,
+                        ),
+                        Suffix::Fixed(DONE_CHECK_REVERSIBLE),
+                        Suffix::Fixed(NEEDS_ACK),
+                    ],
+                    rules,
+                ),
+            );
+        }
         add("done-check", done_check_text(rules, false));
         add("done-check-irreversible", done_check_text(rules, true));
         add("continue", continuation_text(&cfg(), rules));

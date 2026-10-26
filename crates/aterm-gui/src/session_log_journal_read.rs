@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Disk journal reader for `log @<sid>` and `brief @<sid>` of sessions from earlier processes,
+//! Disk journal reader for `@<sid> log` and `@<sid> brief` of sessions from earlier processes,
 //! run on the control worker thread within bounded index and decode budgets.
 
 #[cfg(unix)]

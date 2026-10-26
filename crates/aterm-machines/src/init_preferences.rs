@@ -699,6 +699,9 @@ struct Desktop {
     user: User,
     kind: DesktopKind,
     before: Mutex<Vec<(Target, Read<PValue>)>>,
+    /// What the last probe found to change, which the apply after it writes (the engine
+    /// applies only right after a probe that found a change), so the apply reads nothing again.
+    planned: Mutex<Option<Changes>>,
     /// The pass's one relaunch of what the desktop items write ([`DesktopActivation`]).
     activation: Arc<DesktopActivation>,
     /// What the last probe read, for System State.
@@ -765,6 +768,7 @@ impl Desktop {
             user: user.clone(),
             kind,
             before: Mutex::new(Vec::new()),
+            planned: Mutex::new(None),
             activation: Arc::clone(activation),
             reading: LastReading::default(),
         }
@@ -828,16 +832,19 @@ impl Desktop {
         }
     }
 
+    /// What this item's keys hold now and what each that differs is to become: one reading,
+    /// each domain read once ([`defaults::Exports`]).
     fn changes(&self, sys: &dyn System) -> Result<Changes, String> {
         let apps = if self.kind == DesktopKind::Dock {
             dock_apps_available(sys, &self.user)?
         } else {
             Vec::new()
         };
+        let mut exports = defaults::Exports::default();
         let mut changes = Vec::new();
         for (domain, key, wanted) in self.kind.reached(self.reach()) {
             let target = self.target(domain, key);
-            let read = target.read(sys);
+            let read = exports.read(sys, &target);
             let want = match wanted {
                 Wanted::NoWidgets => widgets::cleared(sys, &self.user, &read)?,
                 Wanted::DockApps => unmet(&read, dock_apps(&apps), |now, want| {
@@ -882,6 +889,9 @@ struct DesktopActivation {
     /// Each marker the pass's items looked at, and whether it was pending at the first
     /// look, until the pass's relaunch discharges it ([`DesktopActivation::earlier`]).
     seen: Mutex<Vec<(&'static str, bool)>>,
+    /// Each marker an item of the pass began ([`DesktopActivation::begin`]), until the pass's
+    /// relaunch discharges it: another item of the family writes behind the same marker.
+    begun: Mutex<Vec<&'static str>>,
 }
 
 type Obligation = (DesktopKind, &'static str);
@@ -893,7 +903,20 @@ impl DesktopActivation {
             reach,
             owed: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
+            begun: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Begin `marker` ([`crate::init_activation::begin`]) once per pass: an item of the pass
+    /// that began it already put it on disk, ordered before that item's writes and so before
+    /// this one's.
+    fn begin(&self, sys: &dyn System, marker: &'static str) -> Result<(), String> {
+        let mut begun = self.begun.lock().unwrap_or_else(PoisonError::into_inner);
+        if !begun.contains(&marker) {
+            crate::init_activation::begin(sys, &self.user, marker)?;
+            begun.push(marker);
+        }
+        Ok(())
     }
 
     fn earlier(&self, sys: &dyn System, marker: &'static str) -> Result<bool, String> {
@@ -1011,13 +1034,16 @@ impl Activation for DesktopActivation {
         )))
     }
 
-    fn activate(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
+    fn activate(&self, sys: &dyn System, ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
         let due = self.obligations(sys)?;
         let processes = self.consumers(&due);
-        let answers =
-            crate::init_activation::relaunch_settled(sys, &self.user, &processes, |process| {
-                self.look(sys, &due, process)
-            });
+        let answers = crate::init_activation::relaunch_settled(
+            sys,
+            &self.user,
+            defaults::Session::of(&self.user, ctx),
+            &processes,
+            |process| self.look(sys, &due, process),
+        );
         let mut failed: Vec<(String, String)> = Vec::new();
         for &(kind, marker) in &due {
             let readers = kind.readers(self.reach, marker);
@@ -1052,6 +1078,10 @@ impl Activation for DesktopActivation {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(looked, _)| !due.iter().any(|(_, marker)| marker == looked));
+        self.begun
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|begun| !due.iter().any(|(_, marker)| marker == begun));
         Ok(failed)
     }
 }
@@ -1096,6 +1126,7 @@ impl Item for Desktop {
 
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
         self.reading.set(None);
+        *self.planned.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let pending = match self.pending(sys) {
             Ok(pending) => pending,
             Err(why) => return Probe::Unusable { why },
@@ -1117,9 +1148,10 @@ impl Item for Desktop {
                         .join(", ")
                 };
                 *self.before.lock().unwrap_or_else(PoisonError::into_inner) = changes
-                    .into_iter()
-                    .map(|(target, read, _)| (target, read))
+                    .iter()
+                    .map(|(target, read, _)| (target.clone(), read.clone()))
                     .collect();
+                *self.planned.lock().unwrap_or_else(PoisonError::into_inner) = Some(changes);
                 if ctx.disrupt {
                     Probe::Change {
                         from,
@@ -1134,14 +1166,22 @@ impl Item for Desktop {
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.carry_legacy(sys)?;
-        let changes = self.changes(sys)?;
+        let planned = self
+            .planned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let changes = match planned {
+            Some(changes) => changes,
+            None => self.changes(sys)?,
+        };
         let mut owed = false;
         for marker in self.kind.markers(self.reach()) {
             let writes = changes
                 .iter()
                 .any(|(target, _, _)| self::marker(self.kind, &target.domain) == marker);
             if writes || crate::init_activation::pending(sys, &self.user, marker)? {
-                crate::init_activation::begin(sys, &self.user, marker)?;
+                self.activation.begin(sys, marker)?;
                 owed = true;
             }
         }
@@ -1241,29 +1281,41 @@ fn aterm_paths(user: &User) -> [String; 2] {
     ]
 }
 
-fn aterm_candidates(sys: &dyn System, user: &User) -> Vec<String> {
+/// Where aterm may be pinned from, in order: the bundle this aterm runs from, under the
+/// spelling of the usual path ([`aterm_paths`]) it is when it is one (wherever a link there
+/// leads), else where it is when that copy lasts ([`aterm_toolchain::lasting`]); then the usual
+/// paths. With the running copy when it was passed over for not lasting (a disk image, an App
+/// Translocation copy, a temporary or cache directory).
+fn aterm_candidates(sys: &dyn System, user: &User) -> (Vec<String>, Option<PathBuf>) {
     let mut paths = aterm_paths(user).to_vec();
+    let Some(running) = sys.running_app() else {
+        return (paths, None);
+    };
     let canonical = |path: &str| {
         sys.canonicalize(Path::new(path))
             .unwrap_or_else(|_| path.into())
     };
-    if let Some(running) = sys.running_app()
-        && let Some(at) = paths.iter().position(|path| canonical(path) == running)
-    {
-        let own = paths.remove(at);
-        paths.insert(0, own);
-    }
-    paths
+    let own = match paths.iter().position(|path| canonical(path) == running) {
+        Some(at) => paths.remove(at),
+        None if aterm_toolchain::lasting::lasting(&running) => {
+            running.to_string_lossy().into_owned()
+        }
+        None => return (paths, Some(running)),
+    };
+    paths.insert(0, own);
+    (paths, None)
 }
 
-/// The [`DOCK_APPS`] as installed, aterm at the first of [`aterm_candidates`] that holds it.
+/// The [`DOCK_APPS`] as installed, aterm at the first of [`aterm_candidates`] that holds it,
+/// resolved at each reading so the pin follows the app when it moves.
 /// # Errors
 /// An app is missing, unreadable, or another app: the Dock is left untouched.
 fn dock_apps_available(sys: &dyn System, user: &User) -> Result<Vec<DockApp>, String> {
     let [(_, aterm, label), others @ ..] = DOCK_APPS;
     let mut apps = Vec::with_capacity(DOCK_APPS.len());
     let mut why = Vec::new();
-    for path in aterm_candidates(sys, user) {
+    let (candidates, fleeting) = aterm_candidates(sys, user);
+    for path in candidates {
         match installed_app(sys, user, &path, aterm, label) {
             Ok(()) => {
                 apps.push((path, aterm, label));
@@ -1275,12 +1327,19 @@ fn dock_apps_available(sys: &dyn System, user: &User) -> Result<Vec<DockApp>, St
     }
     if apps.is_empty() {
         let [usual, own] = aterm_paths(user);
+        let running = fleeting.map_or_else(String::new, |copy| {
+            format!(
+                "; it runs from {}, a copy that goes away (a disk image or App Translocation \
+                 copy): move aterm.app to /Applications",
+                copy.display()
+            )
+        });
         return Err(if why.iter().all(|(missing, _)| *missing) {
-            format!("{label} is not installed at {usual} or {own}; Dock left untouched")
+            format!("{label} is not installed at {usual} or {own}{running}; Dock left untouched")
         } else {
             let why: Vec<String> = why.into_iter().map(|(_, line)| line).collect();
             format!(
-                "no {label} to pin ({}); Dock left untouched",
+                "no {label} to pin ({}){running}; Dock left untouched",
                 why.join(", ")
             )
         });
@@ -1756,6 +1815,90 @@ pub(crate) mod tests {
         }
     }
 
+    /// The pin is the copy this aterm runs from wherever that copy lasts, and never a copy
+    /// that goes away (an App Translocation copy, a disk image): with nothing installed where
+    /// aterm installs, the row says it runs from such a copy, and the Dock is left untouched.
+    /// Negative control: a pin limited to `/Applications` and `~/Applications` reads this
+    /// lasting copy as not installed.
+    #[test]
+    fn the_dock_pins_the_running_copy_where_it_lasts_and_never_a_copy_that_goes_away() {
+        let who = user("alice", 501);
+        let usual_path = DOCK_APPS[0].0;
+        let own = "/Users//alice/Applications/aterm.app";
+        let lasting = "/Users//alice/Developer/aterm.app";
+        let translocated = "/private/var/folders/x/AppTranslocation/Y/d/aterm.app";
+        for (running, usual, pinned) in [
+            (lasting, false, Ok(lasting)),
+            (translocated, true, Ok(usual_path)),
+            (
+                translocated,
+                false,
+                Err(format!(
+                    "aterm is not installed at {usual_path} or {own}; it runs from \
+                     {translocated}, a copy that goes away (a disk image or App Translocation \
+                     copy): move aterm.app to /Applications; Dock left untouched"
+                )),
+            ),
+        ] {
+            let (mut sys, desk) = desktop_with(&who, Desk::before(), false);
+            sys.running_app = Some(PathBuf::from(running));
+            for (path, bundle, _) in &DOCK_APPS[1..] {
+                installed_at(&sys, &who, path, bundle);
+            }
+            installed_at(&sys, &who, running, "com.aterm.aterm");
+            if usual {
+                installed_at(&sys, &who, usual_path, "com.aterm.aterm");
+            }
+            let run = pass(
+                &sys,
+                selected_desktop_items(&who, &[Setting::Dock]),
+                Mode::Apply,
+            );
+            let case = format!("{running} {usual}");
+            match pinned {
+                Ok(aterm) => {
+                    assert_eq!(
+                        run.rows[0].outcome,
+                        Outcome::Changed,
+                        "{case}: {:?}",
+                        run.rows
+                    );
+                    let mut apps = vec![(aterm.to_owned(), DOCK_APPS[0].1, DOCK_APPS[0].2)];
+                    apps.extend(
+                        DOCK_APPS[1..]
+                            .iter()
+                            .map(|&(path, bundle, label)| (path.to_owned(), bundle, label)),
+                    );
+                    let desk = desk.lock().unwrap();
+                    let now = desk.read(DOCK, "persistent-apps").unwrap();
+                    assert!(same_apps(&sys, now, &dock_apps(&apps)), "{case}: {now:?}");
+                }
+                Err(expected) => {
+                    assert_eq!(
+                        run.rows[0].outcome,
+                        Outcome::Unknown,
+                        "{case}: {:?}",
+                        run.rows
+                    );
+                    assert_eq!(
+                        run.rows[0].why.as_deref(),
+                        Some(expected.as_str()),
+                        "{case}"
+                    );
+                    assert!(
+                        !desk
+                            .lock()
+                            .unwrap()
+                            .events
+                            .iter()
+                            .any(|e| e.starts_with("write ")),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_pin_reads_back_as_the_path_it_was_made_from() {
         for path in [
@@ -1898,13 +2041,18 @@ pub(crate) mod tests {
         assert_eq!(DesktopKind::Dock.reading(&absent), None);
     }
 
+    /// The marker's barriers ([`crate::init_activation::begin`]) come before any write: a pass
+    /// whose barrier fails writes nothing, and its retry, which finds the marker the failed pass
+    /// left, orders the whole chain again before its first write. A first pass orders only the
+    /// directories whose entries it changed (the marker's, and the parent of each it created),
+    /// and a later marker in the directory that is there orders that directory alone.
     #[test]
     fn a_failed_namespace_flush_allows_no_write_and_a_retry_flushes_the_whole_chain() {
         let who = user("alice", 501);
         let windowmanager = "alice$ /usr/bin/defaults export com.apple.WindowManager -";
         let finder = "alice$ /usr/bin/defaults export com.apple.finder -";
         let c = ctx(std::slice::from_ref(&who));
-        let directories = [
+        let chain = [
             "/Users//alice/Library/Application Support/aterm/init-activation",
             "/Users//alice/Library/Application Support/aterm",
             "/Users//alice/Library/Application Support",
@@ -1913,9 +2061,35 @@ pub(crate) mod tests {
             "/Users",
             "/",
         ];
-        for (failed_at, directory) in directories.iter().enumerate() {
+        let ordered = |calls: &[String]| -> Vec<String> {
+            calls
+                .iter()
+                .filter(|call| call.starts_with("ordered-dir "))
+                .cloned()
+                .collect()
+        };
+        let expected: Vec<String> = chain
+            .iter()
+            .map(|dir| format!("ordered-dir {dir}"))
+            .collect();
+        // The first pass creates `aterm` and `init-activation`: it changes the entries of
+        // those two and of `Application Support`.
+        for (failed_at, directory) in chain[..3].iter().enumerate() {
             let mut sys = Fake::root();
             sys.euid = who.uid;
+            for home in &chain[2..5] {
+                sys.stat_of(
+                    home,
+                    Stat {
+                        uid: who.uid,
+                        gid: who.gid,
+                        mode: 0o700,
+                        dir: true,
+                        symlink: false,
+                        len: 0,
+                    },
+                );
+            }
             sys.on(windowmanager, export("<dict><key>EnableStandardClickToShowDesktop</key><false/><key>StandardHideDesktopIcons</key><true/><key>StageManagerHideDesktopIcons</key><true/></dict>"));
             sys.on(
                 finder,
@@ -1938,16 +2112,7 @@ pub(crate) mod tests {
                         && !call.contains("pgrep")
                         && !call.contains("killall"))
             );
-            let flushes: Vec<_> = calls
-                .iter()
-                .filter(|call| call.starts_with("durable-dir "))
-                .cloned()
-                .collect();
-            let expected: Vec<_> = directories
-                .iter()
-                .map(|dir| format!("durable-dir {dir}"))
-                .collect();
-            assert_eq!(flushes, expected[..=failed_at]);
+            assert_eq!(ordered(&calls), expected[..=failed_at]);
             sys.durable_dir_fails(Path::new(directory), None);
             let retry = calls.len();
             item.apply(&sys, &c).unwrap();
@@ -1958,18 +2123,24 @@ pub(crate) mod tests {
                 .iter()
                 .position(|call| call.contains("/usr/bin/defaults write"))
                 .unwrap();
-            let flushed_before_write: Vec<_> = retry_calls[..first_write]
-                .iter()
-                .filter(|call| call.starts_with("durable-dir "))
-                .cloned()
-                .collect();
-            assert_eq!(flushed_before_write, expected);
+            assert_eq!(ordered(&retry_calls[..first_write]), expected);
             assert_eq!(
                 retry_calls
                     .iter()
                     .filter(|call| call.contains("/usr/bin/defaults write"))
                     .count(),
                 2
+            );
+            // Another family's first marker in the directory that is there.
+            let later = sys.calls().len();
+            crate::init_activation::begin(&sys, &who, "dock").unwrap();
+            assert_eq!(ordered(&sys.calls()[later..]), expected[..1]);
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| !call.starts_with("durable-dir ")),
+                "a barrier, never a full flush: {:?}",
+                sys.calls()
             );
         }
     }
@@ -1983,7 +2154,7 @@ pub(crate) mod tests {
     struct Desk {
         prefs: Vec<(String, String, PValue)>,
         /// Each running process, its pid, and, while it is starting, the tiles it read and
-        /// the sleeps left until its start is past.
+        /// the sleeps ([`System::sleep`]) left until its start is past.
         running: Vec<(&'static str, u32, Starting)>,
         next_pid: u32,
         /// How many sleeps a Dock takes to get past its start.
@@ -2161,10 +2332,6 @@ pub(crate) mod tests {
                     self.kill(fake, process);
                     Some(Ran::ok(""))
                 }
-                ("/bin/sleep", ["1"]) => {
-                    self.tick();
-                    Some(Ran::ok(""))
-                }
                 _ => None,
             }
         }
@@ -2264,6 +2431,8 @@ pub(crate) mod tests {
         let desk = Arc::new(Mutex::new(desk));
         let model = Arc::clone(&desk);
         sys.simulate(move |fake, cmd| model.lock().unwrap().answer(fake, cmd));
+        let model = Arc::clone(&desk);
+        sys.on_sleep(move |_, _| model.lock().unwrap().tick());
         (sys, desk)
     }
 
@@ -2719,10 +2888,10 @@ pub(crate) mod tests {
 
         let (sys, desk) = desktop_of(&who, Desk::before());
         let pins = Target::user(DOCK, "persistent-apps", &who);
-        defaults::relaunch(&sys, &who, "Dock").unwrap();
+        defaults::relaunch(&sys, &who, defaults::Session::Ask, "Dock").unwrap();
         sys.run(&pins.write_cmd(&dock_apps(&usual_dock_apps())))
             .unwrap();
-        defaults::relaunch(&sys, &who, "Dock").unwrap();
+        defaults::relaunch(&sys, &who, defaults::Session::Ask, "Dock").unwrap();
         let desk = desk.lock().unwrap();
         assert_eq!(
             desk.read(DOCK, "persistent-apps"),
@@ -2735,21 +2904,7 @@ pub(crate) mod tests {
     /// `sys` answering as `who`, logged in at this Mac's console, the way
     /// `init::prepare_workstation_selected` resolves the account.
     fn at_console(sys: &Fake, who: &User) {
-        sys.on("/usr/bin/id -un", Ran::ok(&format!("{}\n", who.name)));
-        sys.on(
-            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-            Ran::ok(&format!("GroupMembership: {}\n", who.name)),
-        );
-        sys.on(
-            &format!(
-                "/usr/bin/dscl . -read /Users/{} UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
-                who.name
-            ),
-            Ran::ok(&format!(
-                "UniqueID: {}\nPrimaryGroupID: {}\nNFSHomeDirectory: {}\nUserShell: {}\n",
-                who.uid, who.gid, who.home, who.shell
-            )),
-        );
+        sys.logged_in(who);
         sys.stat_of(
             "/dev/console",
             Stat {
@@ -2761,8 +2916,6 @@ pub(crate) mod tests {
                 len: 0,
             },
         );
-        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
     }
 
     /// One Workstation pass as setup and the doctor build and run it
@@ -2818,6 +2971,67 @@ pub(crate) mod tests {
             "{:?}",
             desk.events
         );
+    }
+
+    /// One whole desktop pass (widgets, desktop and Dock, at the console) waits in this process
+    /// and reads each preference domain once per reading: no `sleep` child, one Dock relaunch
+    /// without a `launchctl print`, no command for the account or the Mac, no full flush; a
+    /// pass with nothing to change relaunches nothing. Before (05b421fb69) the same pass ran 2
+    /// `sleep` children, 85 exports, 35 full flushes, 3 `launchctl print`s and 5 context
+    /// commands among 187 runs, and the no-op pass 45 exports among 59.
+    #[test]
+    fn a_whole_desktop_pass_waits_in_process_and_reads_each_domain_once_per_reading() {
+        let who = user("alice", 501);
+        let mut selected = Selection::none();
+        for setting in [Setting::Widgets, Setting::Desktop, Setting::Dock] {
+            selected.set(setting, true);
+        }
+        let (mut sys, _desk) = desktop_of(&who, Desk::before());
+        sys.full_disk_access = Some(true);
+        at_console(&sys, &who);
+        let count =
+            |calls: &[String], what: &str| calls.iter().filter(|c| c.contains(what)).count();
+        for (changes, exports, runs) in [(true, 34, 120), (false, 18, 28)] {
+            let before = sys.calls().len();
+            let mut prepared = crate::init::prepare_workstation_selected(
+                &sys,
+                crate::init::WorkstationGroup::All,
+                selected,
+            )
+            .unwrap();
+            prepared.preference_changes(&sys).unwrap();
+            let run = prepared.run_recording(&sys, Mode::Apply).unwrap();
+            let expected = if changes {
+                Outcome::Changed
+            } else {
+                Outcome::Ok
+            };
+            assert!(
+                outcomes(&run)
+                    .iter()
+                    .all(|(_, outcome)| *outcome == expected),
+                "{:?}",
+                outcomes(&run)
+            );
+            let calls = &sys.calls()[before..];
+            assert_eq!(count(calls, "/bin/sleep"), 0, "{calls:?}");
+            assert_eq!(count(calls, "killall -u alice Dock"), usize::from(changes));
+            assert_eq!(count(calls, "launchctl print"), 0, "{calls:?}");
+            assert_eq!(count(calls, "durable-dir"), 0, "{calls:?}");
+            for context in [
+                "/usr/bin/id",
+                "/usr/bin/dscl",
+                "/usr/bin/uname",
+                "/usr/bin/sw_vers",
+            ] {
+                assert_eq!(count(calls, context), 0, "{calls:?}");
+            }
+            assert_eq!(count(calls, "identity"), 1, "{calls:?}");
+            let read =
+                count(calls, "defaults export") + count(calls, "defaults -currentHost export");
+            assert!(read <= exports, "{read} exports: {calls:?}");
+            assert!(calls.len() <= runs, "{} runs: {calls:?}", calls.len());
+        }
     }
 
     #[test]
@@ -3081,7 +3295,7 @@ pub(crate) mod tests {
         assert_eq!(desk.lock().unwrap().starting(), []);
         let icons = Target::user(WINDOW_MANAGER, "StandardHideDesktopIcons", &who);
         sys.run(&icons.write_cmd(&PValue::Bool(true))).unwrap();
-        defaults::relaunch(&sys, &who, "Dock").unwrap();
+        defaults::relaunch(&sys, &who, defaults::Session::Ask, "Dock").unwrap();
         let desk = desk.lock().unwrap();
         assert_eq!(
             desk.read(WINDOW_MANAGER, "StandardHideDesktopIcons"),

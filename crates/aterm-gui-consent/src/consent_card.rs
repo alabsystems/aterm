@@ -523,6 +523,8 @@ pub struct CardHost {
     pub need_logged: Option<Instant>,
     /// A kept need must not be decided again before this ([`NotDue::Settling`]).
     pub settle_retry_at: Option<Instant>,
+    /// The launch check's looks again at a verified grant it read off while settling.
+    pub settle_look: SettleLook,
     /// A `[privacy]` switch settled the card while its launch check was still owed; the host
     /// runs the check again once every switch is on ([`CardState::rearm_launch`]).
     pub launch_held: bool,
@@ -757,9 +759,13 @@ pub fn decide_need(
     }
 }
 
-/// The launch decision: runs once per process at the first park and never asks.
+/// The launch decision: runs once per process at the first park and never asks. A verified grant
+/// read off in a process younger than [`LAUNCH_SETTLE`] (`age`) is not concluded: an update's
+/// successor reads it off in its first second, before macOS attributes the process to aterm
+/// ([`SettleLook`] reads it again).
 pub fn decide_launch(
     facts: &CardFacts,
+    age: Duration,
     marker: Option<Marker>,
     record: &AccessRecord,
 ) -> LaunchVerdict {
@@ -784,10 +790,103 @@ pub fn decide_launch(
                 LaunchVerdict::Quiet(NotDue::Granted)
             }
         }
+        FdaState::Denied if record.verified_at.is_some() && age < LAUNCH_SETTLE => {
+            LaunchVerdict::Quiet(NotDue::Settling)
+        }
         FdaState::Denied if record.verified_at.is_some() => {
             LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified)
         }
         FdaState::Denied | FdaState::Unknown => LaunchVerdict::Quiet(NotDue::NoNeedYet),
+    }
+}
+
+/// The launch check's looks again at a verified grant it read off while the process settled
+/// ([`NotDue::Settling`]): once settled, then, if it still reads off, at the first focus gain
+/// after that. Each look reads the window's probe afresh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettleLook {
+    /// Nothing to look at again.
+    #[default]
+    Idle,
+    /// The settled look, at `at`.
+    Due { at: Instant },
+    /// A look's fresh read is out; `focus_after`: the settled look, so a grant still off is looked
+    /// at again at the next focus gain.
+    Reading { focus_after: bool },
+    /// Still off at the settled look: the next focus gain looks again.
+    AtFocus,
+}
+
+/// What a [`SettleLook`] read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleRead {
+    /// The grant reads held now: the launch read was the young process's.
+    Held,
+    /// The grant still reads off; `settled`: at the settled look, the first to say so.
+    StillOff { settled: bool },
+    /// The probe could not say.
+    Unread,
+}
+
+impl SettleLook {
+    /// A launch check that concluded `Settling` at process age `age`, at `now`: the settled look
+    /// waits out the rest of [`LAUNCH_SETTLE`] (at least a second).
+    pub fn after_launch(age: Duration, now: Instant) -> Self {
+        Self::Due {
+            at: now
+                + LAUNCH_SETTLE
+                    .saturating_sub(age)
+                    .max(Duration::from_secs(1)),
+        }
+    }
+
+    /// When the settled look is due, while it waits.
+    pub const fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Due { at } => Some(at),
+            _ => None,
+        }
+    }
+
+    /// Whether a fresh read is owed at `now` (the settled look's time came): the host reads the
+    /// probe afresh and the look waits for that read.
+    pub fn start(&mut self, now: Instant) -> bool {
+        match *self {
+            Self::Due { at } if now >= at => {
+                *self = Self::Reading { focus_after: true };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A focus gain, whose probe read is fresh: the look after a settled one waits for it.
+    pub const fn focus(&mut self) {
+        if matches!(self, Self::AtFocus) {
+            *self = Self::Reading { focus_after: false };
+        }
+    }
+
+    /// Whether a look waits for a read.
+    pub const fn reading(self) -> bool {
+        matches!(self, Self::Reading { .. })
+    }
+
+    /// The read a look waited for answered `fda`.
+    pub const fn read(&mut self, fda: FdaState) -> Option<SettleRead> {
+        let Self::Reading { focus_after } = *self else {
+            return None;
+        };
+        let (next, read) = match fda {
+            FdaState::Granted => (Self::Idle, SettleRead::Held),
+            FdaState::Denied if focus_after => {
+                (Self::AtFocus, SettleRead::StillOff { settled: true })
+            }
+            FdaState::Denied => (Self::Idle, SettleRead::StillOff { settled: false }),
+            FdaState::Unknown => (Self::Idle, SettleRead::Unread),
+        };
+        *self = next;
+        Some(read)
     }
 }
 
@@ -1575,17 +1674,73 @@ mod tests {
         );
     }
 
+    /// A grant read off while settling is looked at once settled, and, still off, once more at the
+    /// next focus gain; a look that reads it held ends the looks. Negative control: nothing is
+    /// read before the settled time, and a focus gain before the settled look reads nothing.
+    #[test]
+    fn a_grant_read_off_while_settling_is_looked_at_once_settled_then_at_focus() {
+        use super::{SettleLook, SettleRead};
+        let t0 = Instant::now();
+        let mut look = SettleLook::after_launch(Duration::from_secs(1), t0);
+        let at = t0 + LAUNCH_SETTLE - Duration::from_secs(1);
+        assert_eq!(look.deadline(), Some(at));
+        look.focus();
+        assert!(!look.start(at - Duration::from_secs(1)), "not before");
+        assert_eq!(
+            look.read(FdaState::Granted),
+            None,
+            "the control: no read owed"
+        );
+        assert!(look.start(at), "settled: read afresh");
+        assert!(!look.start(at), "once");
+        assert_eq!(look.deadline(), None);
+        assert_eq!(
+            look.read(FdaState::Denied),
+            Some(SettleRead::StillOff { settled: true })
+        );
+        assert!(!look.reading());
+        look.focus();
+        assert!(look.reading(), "the focus gain's read");
+        assert_eq!(
+            look.read(FdaState::Granted),
+            Some(SettleRead::Held),
+            "reads held now"
+        );
+        look.focus();
+        assert_eq!(look, SettleLook::Idle, "no more looks");
+
+        let mut look = SettleLook::after_launch(LAUNCH_SETTLE * 2, t0);
+        assert_eq!(look.deadline(), Some(t0 + Duration::from_secs(1)));
+        assert!(look.start(t0 + Duration::from_secs(1)));
+        assert_eq!(look.read(FdaState::Granted), Some(SettleRead::Held));
+        look.focus();
+        assert_eq!(look, SettleLook::Idle, "held: no focus look");
+
+        let mut look = SettleLook::after_launch(Duration::ZERO, t0);
+        assert!(look.start(t0 + LAUNCH_SETTLE));
+        let _ = look.read(FdaState::Denied);
+        look.focus();
+        assert_eq!(
+            look.read(FdaState::Denied),
+            Some(SettleRead::StillOff { settled: false }),
+            "still off"
+        );
+        look.focus();
+        assert_eq!(look, SettleLook::Idle, "two looks, no more");
+    }
+
     #[test]
     fn decide_launch_never_asks_and_confirms_only_an_opened_grant() {
         let none = AccessRecord::default();
         let denied = denied_release();
+        let settled = Duration::from_secs(120);
         assert_eq!(
-            decide_launch(&denied, None, &none),
+            decide_launch(&denied, settled, None, &none),
             LaunchVerdict::Quiet(NotDue::NoNeedYet),
             "a denied probe alone raises nothing"
         );
         assert_eq!(
-            decide_launch(&denied, Some(Marker::Opened), &none),
+            decide_launch(&denied, settled, Some(Marker::Opened), &none),
             LaunchVerdict::Quiet(NotDue::NoNeedYet),
             "opened-but-still-denied is not an answer, and not a question either"
         );
@@ -1594,7 +1749,7 @@ mod tests {
             ..denied_release()
         };
         assert_eq!(
-            decide_launch(&off, None, &none),
+            decide_launch(&off, settled, None, &none),
             LaunchVerdict::Quiet(NotDue::Off)
         );
         let headless = CardFacts {
@@ -1602,11 +1757,11 @@ mod tests {
             ..denied_release()
         };
         assert_eq!(
-            decide_launch(&headless, None, &none),
+            decide_launch(&headless, settled, None, &none),
             LaunchVerdict::Quiet(NotDue::Headless)
         );
         assert_eq!(
-            decide_launch(&denied, Some(Marker::NotNow), &none),
+            decide_launch(&denied, settled, Some(Marker::NotNow), &none),
             LaunchVerdict::Quiet(NotDue::Answered)
         );
         let granted = CardFacts {
@@ -1614,11 +1769,11 @@ mod tests {
             ..denied_release()
         };
         assert_eq!(
-            decide_launch(&granted, None, &none),
+            decide_launch(&granted, settled, None, &none),
             LaunchVerdict::Quiet(NotDue::Granted)
         );
         assert_eq!(
-            decide_launch(&granted, Some(Marker::Opened), &none),
+            decide_launch(&granted, settled, Some(Marker::Opened), &none),
             LaunchVerdict::Confirm,
             "the flip the owner started in an earlier process is acknowledged once"
         );
@@ -1627,7 +1782,7 @@ mod tests {
             ..none
         };
         assert_eq!(
-            decide_launch(&granted, None, &asked),
+            decide_launch(&granted, settled, None, &asked),
             LaunchVerdict::Confirm,
             "a grant after an ask is acknowledged whichever gesture made it"
         );
@@ -1637,25 +1792,40 @@ mod tests {
             ..none
         };
         assert_eq!(
-            decide_launch(&granted, None, &verified),
+            decide_launch(&granted, settled, None, &verified),
             LaunchVerdict::Quiet(NotDue::Held),
             "already verified: nothing to say again"
         );
         assert_eq!(
-            decide_launch(&granted, Some(Marker::NotNow), &none),
+            decide_launch(&granted, settled, Some(Marker::NotNow), &none),
             LaunchVerdict::Quiet(NotDue::Answered)
         );
         assert_eq!(
-            decide_launch(&denied, None, &verified),
+            decide_launch(&denied, settled, None, &verified),
             LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified),
             "quiet and LOGGED; the next ask's words say it regressed"
+        );
+        assert_eq!(
+            decide_launch(&denied, Duration::from_secs(1), None, &verified),
+            LaunchVerdict::Quiet(NotDue::Settling),
+            "an update's successor at its first second: read again once settled"
+        );
+        assert_eq!(
+            decide_launch(&denied, Duration::from_secs(1), None, &none),
+            LaunchVerdict::Quiet(NotDue::NoNeedYet),
+            "nothing verified: nothing to settle"
+        );
+        assert_eq!(
+            decide_launch(&granted, Duration::from_secs(1), None, &verified),
+            LaunchVerdict::Quiet(NotDue::Held),
+            "held is held at any age"
         );
         let unknown = CardFacts {
             fda: FdaState::Unknown,
             ..denied_release()
         };
         assert_eq!(
-            decide_launch(&unknown, None, &none),
+            decide_launch(&unknown, settled, None, &none),
             LaunchVerdict::Quiet(NotDue::NoNeedYet)
         );
         assert!(should_reassert(&asked, None, FdaState::Denied));

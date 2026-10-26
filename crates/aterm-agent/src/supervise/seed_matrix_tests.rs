@@ -6759,12 +6759,14 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
     };
     use crate::supervise::policy::turn_end::{RULE_LEFT, RULE_MODEL_FALLBACK};
     const WALL_LEFT: &str = "the wall left the screen or the worker worked";
-    const MARKS: [&str; 5] = [
+    // 0.106 wrote none of these; the done checks' note is v6's 5a (§14.5).
+    const MARKS: [&str; 6] = [
         " (short turns in a row: ",
         " (the open-items challenge was typed this job)",
         " (the wall's retries: ",
         " (the limit's try: ",
         " (in the limit's place: ",
+        " (done checks this Cruise run: ",
     ];
     let records = [
         RULE_POINT,

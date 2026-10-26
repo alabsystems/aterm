@@ -170,6 +170,35 @@ impl WindowLights {
 }
 
 impl App {
+    /// `aterm ctl chrome`'s `a11y` lines (a development build's): each window's Autopilot chip and
+    /// Messages band row nodes as its grid's accessibility tree is built for the adapter
+    /// ([`crate::a11y_tree::harness_node_lines`] over [`App::grid_a11y_tree`], the tree
+    /// `push_a11y_tree_with_plan` hands a terminal tab's window), so a check reads the node a
+    /// screen reader is handed, not the words beside it. A window with an overlay open, whose tree
+    /// is the overlay's, says none.
+    #[cfg(all(a11y_tree, any(test, debug_assertions)))]
+    pub(crate) fn harness_a11y_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (&wid, ws) in &self.windows {
+            if ws.overlay.is_some() {
+                continue;
+            }
+            let Some(update) = self.grid_a11y_tree(wid, None) else {
+                continue;
+            };
+            lines.extend(crate::a11y_tree::harness_node_lines(
+                wid.0,
+                &update,
+                |session| {
+                    self.pool
+                        .get(session)
+                        .map(|entry| entry.ctx.self_id.as_str().to_owned())
+                },
+            ));
+        }
+        lines
+    }
+
     /// Returns the `autopilot` lines for `aterm ctl chrome`, one per supervised pane.
     pub(crate) fn drawn_chip_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();

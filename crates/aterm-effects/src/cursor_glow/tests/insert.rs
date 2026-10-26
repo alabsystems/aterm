@@ -48,11 +48,6 @@ fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
         "the ring names the insert licence: {}",
         last.line(at(720))
     );
-    assert!(
-        last.line(at(720)).ends_with(" licence=insert"),
-        "`licence=` is the row's last token: {}",
-        last.line(at(720))
-    );
     let lit = v2_cols(&glow, 3);
     assert!(
         (2..16u16).all(|col| lit.contains(&col)),

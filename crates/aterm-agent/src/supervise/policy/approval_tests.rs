@@ -9044,3 +9044,180 @@ fn the_lab_boxes_are_answered_as_measured() {
         );
     }
 }
+
+/// A disk-free worker's context ([`ApprovalCtx::disk_worker`]) over `base`.
+fn disk_worker(base: ApprovalCtx) -> ApprovalCtx {
+    ApprovalCtx {
+        disk_worker: true,
+        ..base
+    }
+}
+
+/// `d` as [`RULE_DISK_WORKER`]'s decline: the refusal it amends, by index.
+fn fenced_out(d: &Decision) -> usize {
+    match d {
+        Decision::Decline {
+            rule_id,
+            refusal,
+            text,
+            ..
+        } => {
+            assert_eq!(*rule_id, RULE_DISK_WORKER, "{d:?}");
+            assert_eq!(text, DISK_WORKER_DECLINE, "{d:?}");
+            *refusal
+        }
+        _ => panic!("expected the disk-free worker's decline, got {d:?}"),
+    }
+}
+
+/// A DISK-FREE WORKER'S BOXES ARE ITS FENCE: at `safe` and at full power alike, a read is
+/// approved as for every session and `aterm harness disk` (any verb, by name or absolute path,
+/// piped only into reads) and a System State read (`aterm ctl … sys`) under [`RULE_DISK_WORKER`]; every other Bash command (an `rm`, a
+/// worktree's removal, a `kill`, a write by redirect or `tee`, an `aterm harness disk` joined to
+/// an `rm`) is declined with [`DISK_WORKER_DECLINE`] on the box's `No`. CONTROL: an `aterm` of
+/// another verb or by a relative path, and a read of a secret beside aterm's command, are
+/// declined; aterm's own command reads no secret under `~/Library`, which a `cat` does.
+#[test]
+fn a_disk_workers_bash_boxes_pass_only_reads_and_aterm_harness_disk() {
+    for (level, base) in [("safe", ctx()), ("all", full())] {
+        let worker = disk_worker(base);
+        for read in [
+            "ls -la ~/.cargo",
+            "du -sh /usr/share/man",
+            "aterm ctl @self status",
+        ] {
+            let d = on_screen(&bash_box(&[read], None), &worker);
+            assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{level}: {read}: {d:?}");
+        }
+        for ours in [
+            "aterm harness disk free ~/.cargo/registry/cache",
+            "aterm harness disk",
+            "aterm harness disk why",
+            "aterm harness disk free --dry-run ~/Library/Caches/pip ~/.npm/_cacache",
+            "/Applications/aterm.app/Contents/MacOS/aterm harness disk free ~/.cargo/git",
+            "aterm harness disk free ~/.cargo/registry/cache 2>&1 | tail -5",
+            "aterm harness disk && aterm harness disk free ~/.npm/_cacache",
+            "aterm ctl @self sys disk scope=aterm",
+            "aterm ctl @self sys procs scope=global top=16",
+            "aterm ctl sys why",
+        ] {
+            let rows = bash_box(&[ours], None);
+            let d = on_screen(&rows, &worker);
+            let (rule, choice, guard, subject, unproven) = approval(&d);
+            assert_eq!(rule, RULE_DISK_WORKER, "{level}: {ours}");
+            assert_eq!(*choice, Choice::Digit(1), "{level}: {ours}");
+            assert_eq!(unproven, None, "{level}: {ours}");
+            assert_eq!(subject, ours, "{level}");
+            assert_eq!(
+                guarded(guard, &rows),
+                [format!("   {ours}")],
+                "{level}: {ours}"
+            );
+        }
+        for theirs in [
+            "rm -rf ~/x",
+            "git worktree remove foo",
+            "git stash drop",
+            "kill 4242",
+            "mv ~/.cargo/registry /tmp/r",
+            "aterm harness disk free x; rm -rf y",
+            "aterm harness disk free x && git worktree remove foo",
+            "aterm harness disk free x > /tmp/freed.txt",
+            "aterm harness disk | tee /tmp/disk.txt",
+            "aterm harness disk free $(rm -rf ~/y)",
+            "aterm harness disk free ~/.npm/*",
+            "aterm harness accounts",
+            "./aterm harness disk free ~/.npm",
+            "env aterm harness disk free ~/.npm",
+            "aterm harness disk free ~/.npm; cat ~/.ssh/id_ed25519",
+            "cat ~/Library/Caches/pip/x",
+            "aterm ctl @self sys disk > /tmp/sys.txt",
+            "aterm ctl @self send hello",
+        ] {
+            let d = on_screen(&bash_box(&[theirs], None), &worker);
+            assert_eq!(fenced_out(&d), 1, "{level}: {theirs}: the `No`");
+        }
+    }
+}
+
+/// A disk-free worker's every other permission box is declined on its `No`: a file write, an
+/// edit, the rm circuit breaker its bypass rules would approve on scratch, and a box in a bypass
+/// session. CONTROL: under `approve = "none"` every box stays the owner's; the folder-trust
+/// dialog is decided as for every session.
+#[test]
+fn a_disk_workers_other_boxes_are_declined_on_their_no() {
+    let write = phase_fixtures::screen(phase_fixtures::BOX_WRITE_CREATE_2_1_309);
+    let edit = lines(CAP_EDIT);
+    for (name, rows) in [("write", &write), ("edit", &edit)] {
+        for (level, base) in [("safe", ctx()), ("all", full())] {
+            let d = on_screen(rows, &disk_worker(base));
+            assert_eq!(fenced_out(&d), 2, "{name} {level}: option 3 is its `No`");
+        }
+        let d = on_screen(rows, &disk_worker(none(ctx())));
+        assert!(reason(&d).contains("approve = \"none\""), "{name}: {d:?}");
+    }
+    let scratch = rm_box("S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"");
+    assert_eq!(
+        approved(&on_screen(&scratch, &bypass())),
+        Some(RULE_RM_BREAKER),
+        "an ordinary bypass session's breaker on scratch"
+    );
+    let d = on_screen(&scratch, &disk_worker(bypass()));
+    assert!(
+        matches!(
+            d,
+            Decision::Decline {
+                rule_id: RULE_DISK_WORKER,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    let d = on_screen(
+        &bash_box(&["aterm harness disk free ~/.npm"], None),
+        &disk_worker(bypass()),
+    );
+    assert!(
+        matches!(
+            d,
+            Decision::Decline {
+                rule_id: RULE_DISK_WORKER,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    let trust = lines(CAP_TRUST);
+    let worker = disk_worker(ctx());
+    assert_eq!(
+        on_screen(&trust, &worker),
+        on_screen(&trust, &ctx()),
+        "the trust dialog"
+    );
+}
+
+/// AN ORDINARY SESSION DECIDES AS BEFORE: its `rm` box is handed to a person at `safe` and
+/// pressed at full power, and `aterm harness disk free` is no read it approves. CONTROL: the
+/// same boxes of a disk-free worker are declined and approved under [`RULE_DISK_WORKER`].
+#[test]
+fn an_ordinary_sessions_rm_box_decides_as_before() {
+    let rm = bash_box(&["rm -rf ~/x"], None);
+    let d = on_screen(&rm, &ctx());
+    assert!(reason(&d).contains("not read-only"), "{d:?}");
+    assert_eq!(approved(&on_screen(&rm, &full())), Some(RULE_ALLOW_ONCE));
+    let ours = bash_box(&["aterm harness disk free ~/.npm/_cacache"], None);
+    assert!(reason(&on_screen(&ours, &ctx())).contains("aterm harness"));
+    let mut steps: Vec<super::super::trace::TraceStep> = Vec::new();
+    let reading = aterm_phase::read(Some("claude"), &rm, None);
+    let d = decide_traced(&reading, &rm, &disk_worker(ctx()), &mut steps);
+    assert_eq!(fenced_out(&d), 1);
+    let last = super::super::trace::deciding(&steps).expect("a deciding step");
+    assert_eq!(
+        (last.check, last.rule),
+        ("disk-worker", Some(RULE_DISK_WORKER))
+    );
+    assert_eq!(
+        approved(&on_screen(&ours, &disk_worker(ctx()))),
+        Some(RULE_DISK_WORKER)
+    );
+}

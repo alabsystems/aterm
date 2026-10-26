@@ -15,6 +15,7 @@ pub fn disk_reclaim_pass_model() -> Model {
             var measured = 0;
             var looked = 0;
             var demand = 0;
+            var projected = 0;
             var tier = 0;
             var stopped = 0;
             var intent = 0;
@@ -27,40 +28,52 @@ pub fn disk_reclaim_pass_model() -> Model {
             var released_at = 0;
             var past_target = 0;
             var whole_at_low = 0;
+            var ten_on_projection = 0;
 
             action MeasureOk when (looked == 0) { looked = 1; measured = 0; free = 3; }
             action MeasureLow when (looked == 0) { looked = 1; measured = 1; free = 2; }
             action MeasureShort when (looked == 0) { looked = 1; measured = 2; free = 1; }
             action MeasureEmergency when (looked == 0) { looked = 1; measured = 3; free = 0; }
             action Adopt when (looked == 1 && tier == 0 && demand == 0) { demand = 1; }
+            action Project when (looked == 1 && tier == 0 && projected == 0) { projected = 1; }
             action ReleaseReserve when (looked == 1 && tier == 0 && reserve == 1 && measured == 3) {
                 reserve = 0;
                 released_at = measured;
             }
-            action Admit1 when (looked == 1 && tier == 0 && (measured > 0 || demand == 1)) {
+            action Admit1 when (
+                looked == 1 && tier == 0 && (measured > 0 || demand == 1 || projected == 1)
+            ) {
                 tier = 1;
                 stopped = 0;
             }
             action Admit2 when (
-                looked == 1 && tier <= 1 && intent == 0 && (measured > 0 || demand == 1)
+                looked == 1 && tier <= 1 && intent == 0
+                    && (measured > 0 || demand == 1 || projected == 1)
             ) {
                 tier = 2;
                 stopped = 0;
                 held = 0;
             }
             action Admit3 when (
-                looked == 1 && tier <= 2 && intent == 0 && (measured > 1 || demand == 1)
+                looked == 1 && tier <= 2 && intent == 0
+                    && (measured > 1 || demand == 1 || projected == 1)
             ) {
                 tier = 3;
                 stopped = 0;
                 held = 0;
-                whole_at_low = if (measured <= 1 && demand == 0) { 1 } else { whole_at_low };
+                whole_at_low = if (measured <= 1 && demand == 0 && projected == 0) {
+                    1
+                } else {
+                    whole_at_low
+                };
             }
-            action Admit4 when (looked == 1 && tier <= 3 && intent == 0 && measured > 1) {
+            action Admit4 when (
+                looked == 1 && tier <= 3 && intent == 0 && (measured > 1 || projected == 1)
+            ) {
                 tier = 4;
                 stopped = 0;
                 held = 0;
-                recent_by = measured + 1;
+                recent_by = if (projected == 1) { 3 } else { measured + 1 };
             }
             action ReadBelowEmergency when (tier > 1 && stopped == 0 && intent == 0) { free = 0; }
             action ReadBelowFloor when (tier > 1 && stopped == 0 && intent == 0) { free = 1; }
@@ -95,7 +108,7 @@ pub fn disk_reclaim_pass_model() -> Model {
             }
             action AdmitRecentOnDemand when (
                 Buggy == 3 && looked == 1 && tier <= 3 && intent == 0 && demand == 1
-                    && measured <= 1
+                    && measured <= 1 && projected == 0
             ) {
                 tier = 4;
                 stopped = 0;
@@ -115,11 +128,28 @@ pub fn disk_reclaim_pass_model() -> Model {
             }
             action AdmitWholeAtLow when (
                 Buggy == 6 && looked == 1 && tier <= 2 && intent == 0 && measured == 1
-                    && demand == 0
+                    && demand == 0 && projected == 0
             ) {
                 tier = 3;
                 stopped = 0;
                 whole_at_low = 1;
+            }
+            action ReleaseOnProjection when (
+                Buggy == 7 && looked == 1 && tier == 0 && reserve == 1 && projected == 1
+                    && measured <= 2
+            ) {
+                reserve = 0;
+                released_at = measured;
+            }
+            action TenMinutesOnProjection when (
+                Buggy == 8 && looked == 1 && tier <= 3 && intent == 0 && projected == 1
+                    && measured <= 1
+            ) {
+                tier = 4;
+                stopped = 0;
+                held = 0;
+                recent_by = 3;
+                ten_on_projection = 1;
             }
 
             invariant NothingWithoutIntent: unjournalled == 0;
@@ -128,6 +158,7 @@ pub fn disk_reclaim_pass_model() -> Model {
             invariant ReserveOnlyMeasuredEmergency: reserve == 1 || released_at == 3;
             invariant StopsAtTarget: past_target == 0;
             invariant NoWholeAtLow: whole_at_low == 0;
+            invariant TenMinutesOnlyShort: ten_on_projection == 0;
             bound TierBox: tier <= 4;
             bound FreeBox: free <= 3;
         }

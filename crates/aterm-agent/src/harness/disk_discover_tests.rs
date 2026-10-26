@@ -1241,6 +1241,7 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
         room: None,
         table: Some(&table),
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -1363,6 +1364,7 @@ fn a_link_out_of_an_ended_sessions_scratchpad_never_gives_it_what_the_link_names
             floor_gib: 10,
             until_gib: 11,
             device: super::device_of(&noindex).expect("device"),
+            projected: None,
         },
         removable: true,
         blocked: None,
@@ -1982,4 +1984,103 @@ fn the_census_reads_whether_a_claude_code_is_on_its_stored_login() {
         assert!(!stored(&env), "{env:?}");
     }
     assert!(!stored(&[]), "not read");
+}
+
+/// [`survey_at`] with a projection standing ([`SurveyRoots::projected`]).
+fn survey_projected(
+    tmp: &Tmp,
+    roots: &Roots,
+    now: i64,
+    free: u64,
+    projected: crate::harness::disk::fill::Projection,
+) -> Report {
+    let d = discover(roots, Budget::SHIPPED);
+    let config = cfg(true);
+    let s = scan(
+        &SurveyRoots {
+            volume: Some(tmp.path().to_path_buf()),
+            found: d.found,
+            found_notes: d.notes,
+            home: roots.home.clone(),
+            claude_dirs: roots.claude_dirs.clone(),
+            claudes: roots.claudes.clone(),
+            claude_unread: roots.claude_unread.clone(),
+            mounts: Some(aterm_sysprobe::volumes::table()),
+            placing: roots.home.as_deref().and_then(super::placing_now),
+            projected: Some(projected),
+            ..SurveyRoots::default()
+        },
+        now,
+        Trigger::Tick,
+        config,
+        Some(free),
+    );
+    report(&s, config)
+}
+
+/// The night's incident (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2): at `low`, above the
+/// floor, a removed workspace's build cache two hours quiet waited out the day's window; under a
+/// projection it goes whole after the ten minutes every pressure tier holds, every other fence
+/// standing.
+#[test]
+fn under_a_projection_a_removed_workspaces_build_cache_goes_whole_inside_the_days_window() {
+    use crate::harness::disk::fill;
+    let tmp = Tmp::new("discover-build-cache-projected");
+    let home = mkdirs(&tmp.path().join("home"));
+    let now = now_after_write(0);
+    let gone = cache_build(&home, &home.join("aterm-wt/removed"), now - 2 * 3_600);
+    let just = cache_build(&home, &home.join("aterm-wt/just-removed"), now - 60);
+    mkdirs(&home.join("aterm-wt"));
+    let low = Config::default().warn_free_gib * GIB - GIB;
+    let floor = Config::default().auto_free_gib * GIB;
+    let p = fill::Projection::of(40_000_000, low, floor, None);
+
+    let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, low, cfg(true));
+    assert!(
+        whole_paths(&rep).is_empty(),
+        "at plain low the day's window keeps it: {:#?}",
+        rep.notes
+    );
+
+    let rep = survey_projected(&tmp, &roots_at(&tmp), now, low, p);
+    assert_eq!(whole_paths(&rep), vec![gone.clone()], "{:#?}", rep.notes);
+    let row = whole_row(&rep).expect("a whole row");
+    let Witness::OwnerGone { quiet_s, .. } = &row.witness else {
+        unreachable!("a whole row");
+    };
+    assert_eq!(*quiet_s, crate::harness::disk::PRESSURE_MIN_IDLE_S);
+    assert!(
+        row.witness.describe().contains("projected under the"),
+        "{}",
+        row.witness.describe()
+    );
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains(&just.display().to_string()) && n.contains("quiet window")),
+        "a cache written a minute ago keeps the ten minutes: {:#?}",
+        rep.notes
+    );
+
+    // NEGATIVE CONTROL: a scan that keeps the day's window under a projection takes nothing.
+    let rep = fill::fault::with(fill::fault::Fault::GoneQuietUnderProjection, || {
+        survey_projected(&tmp, &roots_at(&tmp), now, low, p)
+    });
+    assert!(whole_paths(&rep).is_empty(), "{:#?}", rep.rows);
+
+    let rep = survey_projected(&tmp, &roots_at(&tmp), now, low, p);
+    let mut journal = Vec::new();
+    apply_auto(&rep, None, &mut real(now), &mut || Some(low), &mut |step| {
+        if let Step::Removed(r, _) = step {
+            journal.push(r.path.clone());
+        }
+        true
+    })
+    .expect("pressed by the projection");
+    assert!(journal.contains(&gone), "{journal:?}");
+    assert!(!gone.exists(), "the removed workspace's cache went whole");
+    assert!(
+        just.join("debug/deps/liblay.rlib").is_file(),
+        "the fresh one stayed"
+    );
 }

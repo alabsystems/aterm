@@ -155,7 +155,7 @@ impl Item for NativeRepositories {
             let missing = repos::missing(sys, &self.user, &plan.repositories)
                 .map_err(Block::of(Wait::InTheWay))?;
             let ready = lookups_answer(sys, &self.user, &plan.token)
-                || (Git::keychain()
+                || (Git::keychain(sys)
                     .configured(sys, &self.user, &plan.account)?
                     .ready()
                     && credential_ready(sys, &self.user, &plan.account, &plan.token)?);
@@ -215,7 +215,13 @@ impl Item for NativeRepositories {
             current()?;
             if !credential_ready(sys, &self.user, &plan.account, &plan.token)? {
                 current()?;
-                Git::keychain().store(sys, Some(&self.user), GITHUB, &plan.account, &plan.token)?;
+                Git::keychain(sys).store(
+                    sys,
+                    Some(&self.user),
+                    GITHUB,
+                    &plan.account,
+                    &plan.token,
+                )?;
             }
         }
         let home = Path::new(&self.user.home);
@@ -422,7 +428,7 @@ fn credential_ready(
     account: &str,
     token: &Secret,
 ) -> Result<bool, String> {
-    Ok(Git::keychain()
+    Ok(Git::keychain(sys)
         .fill(sys, Some(user), GITHUB, account)?
         .is_some_and(|stored| stored.bytes() == token.bytes()))
 }
@@ -434,7 +440,7 @@ fn credential_ready(
 /// helper. A lookup git cannot run, or settings that answer some repositories otherwise, is no
 /// answer: the keychain path runs.
 pub(super) fn lookups_answer(sys: &dyn System, user: &User, token: &Secret) -> bool {
-    let git = Git::keychain();
+    let git = Git::keychain(sys);
     git.fill_as_configured(sys, Some(user), GITHUB)
         .is_ok_and(|answer| answer.is_some_and(|got| got.bytes() == token.bytes()))
         && git.uniform(sys, user).is_ok_and(|lookups| lookups.ready())
@@ -452,7 +458,7 @@ fn install_credentials(
     if lookups_answer(sys, user, token) {
         return Ok(());
     }
-    let git = Git::keychain();
+    let git = Git::keychain(sys);
     if !credential_ready(sys, user, account, token)? {
         current()?;
         git.store(sys, Some(user), GITHUB, account, token)?;

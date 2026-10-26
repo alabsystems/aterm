@@ -2,7 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::ai::connector::Cli;
+use crate::ai::connector::{Cli, Seam, Shared};
+
+const TEST_OVERLAY_SEAM: Seam = Seam::Overlay {
+    var: "TEST_OVERLAY_HOME",
+    shared: &[
+        Shared::Dir("sessions"),
+        Shared::File("history.jsonl"),
+        Shared::File("config.toml"),
+        Shared::File("AGENTS.override.md"),
+        Shared::File("AGENTS.md"),
+        Shared::Suffix(".sqlite"),
+    ],
+    markers: &[],
+};
 
 fn homes() -> (aterm_tempfile::TempDir, PathBuf, PathBuf) {
     let tmp = aterm_tempfile::Builder::new()
@@ -21,12 +34,9 @@ fn shared_names_become_links_to_the_default_home_and_a_second_call_makes_none() 
     std::fs::write(default_home.join("state_5.sqlite"), b"db").expect("db");
     std::fs::write(default_home.join("state_5.sqlite-wal"), b"wal").expect("wal");
     std::fs::write(default_home.join("auth.json"), b"{}").expect("login");
-    let seam = Cli::Codex.accounts().seam;
+    let seam = TEST_OVERLAY_SEAM;
     let first = ensure(seam, &overlay, &default_home).expect("ensure");
     assert!(first.drift.is_empty(), "{:?}", first.drift);
-    // `AGENTS.override.md` and `AGENTS.md` are linked before the default home has them: neither
-    // Codex 0.164.0 build warns of a link that leads nowhere
-    // (docs/measured/codex-overlay-writes-2026-10-24.md §7, §11).
     for name in [
         "sessions",
         "history.jsonl",
@@ -85,7 +95,7 @@ fn a_real_entry_or_a_foreign_link_is_left_and_reported_as_drift() {
     std::fs::write(overlay.join("history.jsonl"), b"own").expect("history");
     let elsewhere = tmp.path().join("elsewhere.toml");
     std::os::unix::fs::symlink(&elsewhere, overlay.join("config.toml")).expect("foreign link");
-    let got = ensure(Cli::Codex.accounts().seam, &overlay, &default_home).expect("ensure");
+    let got = ensure(TEST_OVERLAY_SEAM, &overlay, &default_home).expect("ensure");
     assert!(got.drift.contains(&Drift {
         name: "sessions".into(),
         is: Is::Dir
@@ -118,12 +128,8 @@ fn a_real_entry_or_a_foreign_link_is_left_and_reported_as_drift() {
 #[test]
 fn a_database_only_the_overlay_holds_is_no_drift() {
     let (_tmp, default_home, overlay) = homes();
-    let seam = Cli::Codex.accounts().seam;
+    let seam = TEST_OVERLAY_SEAM;
     ensure(seam, &overlay, &default_home).expect("ensure");
-    // The overlay's session ran before the default home made any database (the lab's §8);
-    // that it is drift once the default home makes one is
-    // `record_usage_reads_the_default_home_before_linking_overlays_so_startup_sqlite_never_drifts`'
-    // negative.
     std::fs::write(overlay.join("state_5.sqlite"), b"overlay's").expect("db");
     std::fs::write(overlay.join("state_5.sqlite-wal"), b"wal").expect("wal");
     assert_eq!(
@@ -136,7 +142,7 @@ fn a_database_only_the_overlay_holds_is_no_drift() {
 #[test]
 fn a_seam_that_is_no_overlay_makes_nothing() {
     let (_tmp, default_home, overlay) = homes();
-    for cli in [Cli::Claude, Cli::Grok] {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok] {
         let got = ensure(cli.accounts().seam, &overlay, &default_home).expect("ensure");
         assert_eq!(got, Ensured::default(), "{}", cli.id());
     }

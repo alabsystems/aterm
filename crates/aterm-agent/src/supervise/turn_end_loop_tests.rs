@@ -6,8 +6,9 @@ use crate::harness::login_latch::LoginLatches;
 use crate::harness::repo_work::{RepoRead, RepoWork};
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::turn_end::{
-    DONE_CHECK, FINISHED, LAND, LAND_NUDGE, REPO_UNREAD, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND,
-    RULE_LEFT, RULE_LOGIN, RULE_LOGIN_BACK, RULE_SUGGESTION, repo_work_suffix,
+    DONE_CHECK, FINISHED, LAND, LAND_NUDGE, REPO_UNREAD_OWN, RULE_CONTINUE, RULE_DONE_CHECK,
+    RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_LOGIN_BACK, RULE_SUGGESTION, done_check_words,
+    own_repo_work_suffix,
 };
 use std::sync::PoisonError;
 
@@ -193,7 +194,7 @@ fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
     assert!(
         lines.contains(&format!(
             "CONTINUED seq=102 rule={RULE_DONE_CHECK} {}",
-            clip(DONE_CHECK)
+            clip(&done_check_words(0))
         )),
         "{lines:#?}"
     );
@@ -203,8 +204,12 @@ fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
         .filter(|r| r.starts_with("turn "))
         .collect();
     assert!(
-        turns.len() >= 2 && turns.iter().all(|r| **r == continue_request(DONE_CHECK)),
-        "the check, and again: {:#?}",
+        turns.len() >= 2
+            && turns
+                .iter()
+                .enumerate()
+                .all(|(n, r)| **r == continue_request(&done_check_words(n))),
+        "the check, and again at the next angle: {:#?}",
         m.requests
     );
     let done: Vec<String> = journal_records(&journal)
@@ -241,7 +246,7 @@ fn a_check_answered_faster_than_any_read_is_judged_at_its_answer() {
         "✻ Baked for 0s · done 11:01 PM",
         "",
     ]);
-    let check_row = format!("❯ {DONE_CHECK}");
+    let check_row = format!("❯ {}", done_check_words(0));
     let answer_row = format!("⏺ {IDLE}");
     let answered = screen(&[
         &check_row,
@@ -279,7 +284,7 @@ fn a_check_answered_faster_than_any_read_is_judged_at_its_answer() {
         assert!(
             lines.contains(&format!(
                 "CONTINUED seq=102 rule={RULE_DONE_CHECK} {}",
-                clip(DONE_CHECK)
+                clip(&done_check_words(0))
             )),
             "{case}: {lines:#?}"
         );
@@ -319,13 +324,13 @@ impl IdleHost for TypedRecordHost {
     }
     fn last_turn(&self) -> Option<crate::harness::upgrade::LastTurn> {
         let (said, ended) = if self.typed.load(std::sync::atomic::Ordering::SeqCst) {
-            (DONE_CHECK, Duration::from_millis(41))
+            (done_check_words(0), Duration::from_millis(41))
         } else {
-            ("land the two branches", Duration::from_secs(6))
+            ("land the two branches".to_string(), Duration::from_secs(6))
         };
         Some(crate::harness::upgrade::LastTurn {
             opened: Some("prompt:fast".to_string()),
-            opened_said: Some(crate::supervise::approvals::words_hash(said)),
+            opened_said: Some(crate::supervise::approvals::words_hash(&said)),
             ended: Some(ended),
             opened_ms: Some(self.at_ms),
             ..Default::default()
@@ -385,7 +390,7 @@ fn the_record_tells_a_check_answered_faster_than_any_read() {
         assert!(
             lines.contains(&format!(
                 "CONTINUED seq=102 rule={RULE_DONE_CHECK} {}",
-                clip(DONE_CHECK)
+                clip(&done_check_words(0))
             )),
             "{case}: {lines:#?}"
         );
@@ -412,40 +417,51 @@ fn assert_reaction_awaited(m: &Mock, write: &str) {
     );
 }
 
+/// v6 §14.5 (5a): the worker's grey suggestion is typed over with Cruise's continuation as any act
+/// is typed (fenced on the judged screen, Enter fenced after it), never accepted with the accept
+/// key; an unfenced host types it with a guarded turn. NEGATIVE CONTROL: 2f's Accept arm of
+/// `continue_policy` back, the loop presses `right` and says `continue-suggestion@v1`.
 #[test]
-fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
+fn the_workers_suggestion_is_typed_over_with_the_continuation_never_accepted() {
     let mut m = Mock::new(vec![
         busy_screen(),
         suggesting("Stage 1 is in."),
-        suggesting("Stage 1 is in."),
+        typed_in("Stage 1 is in.", "keep going"),
         busy_screen(),
         ended(STOP),
     ]);
     m.gen_fence = true;
     m.sends_gen = true;
-    m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
     m.screen_cols.insert(2, 12);
     m.vanish_after = Some(2);
     let (lines, _) = watch_lines(&mut m, &hosted(30));
     assert!(
         lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
+            "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
         )),
         "{lines:#?}\n{:#?}",
         m.requests
     );
-    let keys: Vec<&String> = m.presses();
+    assert!(
+        !lines.iter().any(|l| l.contains(RULE_SUGGESTION)),
+        "{lines:#?}"
+    );
+    let writes: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| ["send ", "key "].iter().any(|v| r.starts_with(v)))
+        .collect();
     assert_eq!(
-        keys,
+        writes,
         [
-            "key if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ right",
-            "key if-gen=1.103 if=^❯\\x20keep\\x20going\\s*$ enter",
+            "send if-human=0 if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ -- keep going",
+            "key if-human=0 if-gen=1.103 if=^❯\\x20keep\\x20going\\s*$ enter",
         ],
         "{:#?}",
         m.requests
     );
-    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
-    assert_reaction_awaited(&m, "key if-gen=1.102");
 
     let mut m = Mock::new(vec![
         busy_screen(),
@@ -457,7 +473,7 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
     let (lines, _) = watch_lines(&mut m, &hosted(30));
     assert!(
         lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
+            "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
         )),
         "{lines:#?}"
     );
@@ -467,16 +483,16 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
 
 /// Claude Code 2.1.310 draws its grey suggestion's first glyph inverse, under the caret it draws
 /// itself, and the rest dim (the cells read in the real-Claude lab, 2026-10-24): the loop reads the
-/// glyph after the caret and accepts the suggestion, where it read the caret's cell as a person's
-/// draft and pressed Enter, which sends nothing. NEGATIVE CONTROL: the same caret over plain text
-/// is a draft, and nothing accepts it.
+/// glyph after the caret, reads a suggestion and types Cruise's continuation over it (v6 §14.5),
+/// where it read the caret's cell as a person's draft and pressed Enter, which sends nothing.
+/// NEGATIVE CONTROL: the same caret over plain text is a draft, and nothing is typed over it.
 #[test]
-fn a_suggestion_under_claude_codes_drawn_caret_is_accepted() {
+fn a_suggestion_under_claude_codes_drawn_caret_is_typed_over() {
     let caret = suggesting("Stage 1 is in.")
         .iter()
         .position(|row| row == "❯ keep going")
         .expect("caret row");
-    for (after, accepted) in [
+    for (after, typed_over) in [
         ("OK e 999999 111318 dim", true),
         ("OK e d0d0d0 111318 none", false),
     ] {
@@ -489,7 +505,8 @@ fn a_suggestion_under_claude_codes_drawn_caret_is_accepted() {
         ]);
         m.gen_fence = true;
         m.sends_gen = true;
-        m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
         m.screen_cols.insert(2, 12);
         m.vanish_after = Some(2);
         m.cells = [
@@ -505,128 +522,20 @@ fn a_suggestion_under_claude_codes_drawn_caret_is_accepted() {
             m.requests
         );
         assert_eq!(
-            lines.contains(&format!(
-                "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
-            )),
-            accepted,
-            "{after}: {lines:#?}\n{:#?}",
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("send ") && r.ends_with(" -- keep going")),
+            typed_over,
+            "{after}: the continuation typed over the suggestion, never over a draft: \
+             {lines:#?}\n{:#?}",
             m.requests
         );
-        assert_eq!(
-            m.presses().iter().any(|p| p.ends_with(" right")),
-            accepted,
-            "{after}: {:#?}",
+        assert!(
+            !m.presses().iter().any(|p| p.ends_with(" right")),
+            "{after}: no accept key: {:#?}",
             m.requests
         );
     }
-}
-
-#[test]
-fn a_torn_read_after_the_accept_key_is_read_again() {
-    let torn = {
-        let mut rows = suggesting("Stage 1 is in.");
-        let caret = rows
-            .iter()
-            .position(|row| row == "❯ keep going")
-            .expect("caret row");
-        rows[caret] = String::new();
-        rows
-    };
-    let accepting = |screens: Vec<Vec<String>>, filled_at: Option<usize>| {
-        let mut m = Mock::new(screens);
-        m.gen_fence = true;
-        m.sends_gen = true;
-        m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
-        m.idle_never = true;
-        if let Some(at) = filled_at {
-            m.screen_cols.insert(at, 12);
-        }
-        m.vanish_after = Some(2);
-        m
-    };
-    let mut m = accepting(
-        vec![
-            busy_screen(),
-            suggesting("Stage 1 is in."),
-            torn.clone(),
-            suggesting("Stage 1 is in."),
-            busy_screen(),
-            ended(STOP),
-        ],
-        Some(3),
-    );
-    let (lines, _) = watch_lines(&mut m, &hosted(30));
-    assert!(
-        lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
-        )),
-        "{lines:#?}\n{:#?}",
-        m.requests
-    );
-    assert_eq!(
-        m.presses(),
-        [
-            "key if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ right",
-            "key if-gen=1.104 if=^❯\\x20keep\\x20going\\s*$ enter",
-        ],
-        "{:#?}",
-        m.requests
-    );
-    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
-    let mut between: Vec<&str> = m
-        .requests
-        .iter()
-        .skip_while(|r| !(verb_of(r) == "key" && r.ends_with(" right")))
-        .skip(1)
-        .take_while(|r| !(verb_of(r) == "key" && r.ends_with(" enter")))
-        .filter_map(|r| {
-            if r.starts_with("await idle ") {
-                Some("settle")
-            } else if verb_of(r) == "text" {
-                Some("read")
-            } else {
-                None
-            }
-        })
-        .collect();
-    between.dedup();
-    assert_eq!(
-        between,
-        ["settle", "read", "settle", "read"],
-        "{:#?}",
-        m.requests
-    );
-
-    let (dir, path) = journal_file("te-accept-torn");
-    let mut m = accepting(
-        vec![
-            busy_screen(),
-            suggesting("Stage 1 is in."),
-            torn.clone(),
-            torn,
-        ],
-        None,
-    );
-    let opts = SuperviseOpts {
-        journal: Some(path.clone()),
-        ..hosted(30)
-    };
-    let (lines, _) = watch_lines(&mut m, &opts);
-    let (records, _) = journal_records(&path);
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(
-        m.presses(),
-        ["key if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ right"],
-        "{lines:#?}\n{:#?}",
-        m.requests
-    );
-    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
-    assert!(
-        records
-            .iter()
-            .any(|r| r.kind == "skipped" && r.seq == Some(102)),
-        "{records:#?}"
-    );
 }
 
 #[test]
@@ -2582,79 +2491,6 @@ fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
 }
 
 #[test]
-fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
-    let said = "Stage 1 is in.";
-    let world = |screens: Vec<Vec<String>>, filled: Option<usize>, sits: bool| {
-        let mut m = Mock::new(screens);
-        m.gen_fence = true;
-        m.sends_gen = true;
-        m.human_seq = Some(0);
-        m.help = FENCED_HELP.to_string();
-        if let Some(at) = filled {
-            m.screen_cols.insert(at, 12);
-        }
-        if sits {
-            m.key_gates = vec![(2, 1)];
-        }
-        m.vanish_after = Some(2);
-        m.exit_when = Some(|m| m.attention.is_some());
-        let (lines, _) = watch_lines(&mut m, &hosted(600));
-        let sends = m.requests.iter().filter(|r| r.starts_with("send ")).count();
-        let evidence = format!("{lines:#?}\n{:#?}", m.requests);
-        (m, lines, sends, evidence)
-    };
-
-    let (m, lines, sends, evidence) = world(
-        vec![
-            busy_screen(),
-            suggesting(said),
-            suggesting(said),
-            suggesting(said),
-            suggesting(said),
-            busy_screen(),
-            ended(STOP),
-        ],
-        Some(4),
-        false,
-    );
-    assert_eq!(sends, 0, "nothing typed behind the key: {evidence}");
-    let presses = m.presses();
-    assert!(
-        presses.len() == 2
-            && presses[0].ends_with(" right")
-            && presses[1].ends_with(" enter")
-            && presses[1].contains(" if-gen=1.105 "),
-        "the accept key, then Enter on the filled read: {evidence}"
-    );
-    assert!(
-        lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
-        )),
-        "{evidence}"
-    );
-
-    let (m, _, sends, evidence) = world(
-        vec![busy_screen(), suggesting(said), suggesting(said)],
-        None,
-        true,
-    );
-    assert_eq!(sends, 1, "its words typed once: {evidence}");
-    let pressed = m
-        .key_times
-        .iter()
-        .find(|(r, _)| r.ends_with(" right"))
-        .map(|(_, at)| *at);
-    let waited = m
-        .first_send_at
-        .zip(pressed)
-        .map(|(sent, right)| sent.saturating_duration_since(right));
-    assert!(
-        waited.is_some_and(|w| w >= turn_end_loop::ECHO_HANG),
-        "typed {waited:?} after the accept key: {evidence}"
-    );
-}
-
-#[test]
 fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_text() {
     let world = |unmoved: bool| {
         let mut shown = weekly_limited();
@@ -3318,8 +3154,9 @@ fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
         let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
         let mut heard = Heard::default();
         let typed = s
-            .type_text(&point, "keep going", RULE_CONTINUE, &mut heard)
-            .expect("the act");
+            .type_text_written(&point, "keep going", RULE_CONTINUE, &mut heard)
+            .expect("the act")
+            == crate::supervise::run::turn_end_loop::Written::Submitted;
         let held = s.input_unread(point.screen.seq, RULE_CONTINUE, &mut heard);
         drop(s);
         let evidence = format!("{:#?}\n{:#?}", heard.noted, m.requests);
@@ -3526,7 +3363,7 @@ fn the_windows_host_types_the_fenced_continuation_under_its_hand() {
 }
 
 #[test]
-fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
+fn the_windows_host_types_the_continuation_over_the_workers_suggestion_under_its_hand() {
     let run = |hand: bool| {
         let mut m = Mock::new(vec![
             busy_screen(),
@@ -3555,7 +3392,7 @@ fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
         });
         assert!(
             lines.contains(&format!(
-                "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
+                "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
             )),
             "{hand}: {lines:#?}\n{:#?}",
             m.requests
@@ -3576,17 +3413,13 @@ fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
             crate::harness::upgrade_drive::hand_give_back_here_request_as(HAND_HOLDER).as_str(),
         ]
     );
-    let accepted = run(false);
     assert_eq!(
-        accepted.first().map(String::as_str),
-        Some("key if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ right"),
-        "the accept key: {accepted:#?}"
-    );
-    assert!(
-        !accepted
-            .iter()
-            .any(|r| r.starts_with("lease ") || r.starts_with("send ")),
-        "{accepted:#?}"
+        run(false),
+        [
+            "send if-human=0 if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ -- keep going",
+            "key if-human=0 if-gen=1.103 if=^❯\\x20keep\\x20going\\s*$ enter",
+        ],
+        "no hand asked for"
     );
 }
 
@@ -3856,23 +3689,22 @@ fn a_refusals_episode_ends_at_a_taken_write_and_at_a_lifted_hold() {
 
 #[test]
 fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
-    let held = |screen: Vec<String>, key: &'static str| {
-        let mut m = Mock::new(vec![busy_screen(), screen]);
-        m.gen_fence = true;
-        m.sends_gen = true;
-        m.help = FENCED_HELP.to_string();
-        m.key_replies
-            .push_back(err("halted reason=owner origin=local"));
-        m.hold = "1";
-        m.hold_lifts_after = Some(2);
-        m.stall_sleep = Some(Duration::from_millis(20));
-        m.vanish_after = Some(1500);
-        m.exit_when = Some(match key {
-            "right" => |m: &Mock| m.presses().iter().filter(|p| p.ends_with(" right")).count() >= 2,
-            _ => |m: &Mock| m.presses().iter().filter(|p| p.ends_with(" enter")).count() >= 2,
-        });
-        m
-    };
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        typed_in("Stage 1 is in.", "also check the lexer"),
+    ]);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.help = FENCED_HELP.to_string();
+    m.key_replies
+        .push_back(err("halted reason=owner origin=local"));
+    m.hold = "1";
+    m.hold_lifts_after = Some(2);
+    m.stall_sleep = Some(Duration::from_millis(20));
+    m.vanish_after = Some(1500);
+    m.exit_when =
+        Some(|m: &Mock| m.presses().iter().filter(|p| p.ends_with(" enter")).count() >= 2);
+    m.cursor_col = Some(24);
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             answer_questions: false,
@@ -3881,20 +3713,6 @@ fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
         },
         ..auto(60)
     };
-    let mut m = held(suggesting("Stage 1 is in."), "right");
-    let _ = watch_lines(&mut m, &opts);
-    let rights: Vec<&String> = m
-        .presses()
-        .into_iter()
-        .filter(|p| p.ends_with(" right"))
-        .collect();
-    assert_eq!(rights.len(), 2, "{:#?}", m.requests);
-    assert_eq!(
-        rights[0],
-        "key if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ right"
-    );
-    let mut m = held(typed_in("Stage 1 is in.", "also check the lexer"), "enter");
-    m.cursor_col = Some(24);
     let _ = watch_lines(&mut m, &opts);
     let enters: Vec<&String> = m
         .presses()
@@ -10231,7 +10049,7 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
             .filter(|l| l.starts_with("REPO UNREAD seq="))
             .count()
     };
-    let suffix = repo_work_suffix(&dirty);
+    let suffix = own_repo_work_suffix(&dirty);
     assert!(
         suffix.contains("/Users//a/Developer/parser: 1 changed (src/lexer.rs)"),
         "{suffix}"
@@ -10243,7 +10061,10 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     );
     assert_eq!(
         turns.first(),
-        Some(&continue_request(&format!("{DONE_CHECK} {suffix}"))),
+        Some(&continue_request(&format!(
+            "{} {suffix}",
+            done_check_words(0)
+        ))),
         "the check with the repository's suffix: {lines:#?}"
     );
     assert!(asked >= 1, "the probe was asked at the claim");
@@ -10260,7 +10081,10 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     );
     assert_eq!(
         turns.first(),
-        Some(&continue_request(&format!("{DONE_CHECK} {REPO_UNREAD}"))),
+        Some(&continue_request(&format!(
+            "{} {REPO_UNREAD_OWN}",
+            done_check_words(0)
+        ))),
         "the check saying the repository could not be read: {lines:#?}"
     );
     assert!(asked >= 1, "the probe was asked at the claim");
@@ -10277,7 +10101,7 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     );
     assert_eq!(
         turns.first(),
-        Some(&continue_request(DONE_CHECK)),
+        Some(&continue_request(&done_check_words(0))),
         "the plain check: {lines:#?}"
     );
     assert!(asked >= 1, "the probe was asked at the claim");
@@ -10302,6 +10126,61 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         "{lines:#?}"
     );
 }
+/// A DISK-FREE WORKER'S REPOSITORY READS CLEAN BY ITS TASK RECORD
+/// (`Session::repo_asked`, `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4): at a
+/// done claim of a session whose trusted folder is the worker folder, the host's
+/// probe, which would read uncommitted work where the worker stands, is never
+/// asked, and the done check carries no repository suffix. NEGATIVE CONTROL:
+/// the same claim of a session trusted another folder asks the probe and
+/// carries the suffix of what it found.
+#[test]
+fn a_disk_workers_repository_reads_clean_without_asking_the_host() {
+    let (screens, dirty) = claim_over_work();
+    let suffix = own_repo_work_suffix(&dirty);
+    let run = |trusted: &str| {
+        let host = Arc::new(RepoHost::reads(vec![RepoRead::Found(dirty.clone())]));
+        let mut m = Mock::new(screens.clone());
+        m.trusted_cwd = Some(trusted.to_string());
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..auto(30)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let turns: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn "))
+            .cloned()
+            .collect();
+        (
+            turns,
+            lines,
+            host.asked.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    };
+    let (turns, lines, asked) =
+        run("/Users//a/Library/Application Support/aterm/harness/claude-harness/disk-worker");
+    assert_eq!(asked, 0, "the worker's probe is never asked: {lines:#?}");
+    assert_eq!(
+        turns.first(),
+        Some(&continue_request(&done_check_words(0))),
+        "the plain check: {lines:#?}"
+    );
+    let (turns, lines, asked) = run("/Users//a/Developer/parser");
+    assert!(asked >= 1, "another session's probe is asked: {lines:#?}");
+    assert_eq!(
+        turns.first(),
+        Some(&continue_request(&format!(
+            "{} {suffix}",
+            done_check_words(0)
+        ))),
+        "the check with the repository's suffix: {lines:#?}"
+    );
+}
+
 /// A host whose probe of the session's repository reads on ([`IdleHost::repo_work`]'s
 /// `None`) for its first `reading` asks, each moving the run's clock `step` on, then answers
 /// `found`; with `stop` given, every ask raises that stop and reads on, up to 64 asks.
@@ -10425,7 +10304,11 @@ fn a_probe_that_reads_on_keeps_the_loops_claim() {
             .collect();
         (renewals, turns, run.lines, host.asked.load(SeqCst))
     };
-    let check = continue_request(&format!("{DONE_CHECK} {}", repo_work_suffix(&dirty)));
+    let check = continue_request(&format!(
+        "{} {}",
+        done_check_words(0),
+        own_repo_work_suffix(&dirty)
+    ));
     let (at_once, turns, lines, asked) = run(0);
     assert!(asked >= 1, "the probe was asked at the claim: {lines:#?}");
     assert_eq!(turns.first(), Some(&check), "{lines:#?}");
@@ -12804,10 +12687,12 @@ fn a_picker_still_drawn_after_aterms_esc_gets_the_esc_again_after_its_pause() {
 /// HAND-OFF WAS DECIDED: no row was named at the picker (it got the method) or at the hand-off
 /// (its browser sign-in was told), then the accounts' news names the row while the hand-off sits
 /// unchanged on the screen. The news decides the hand-off again: one fenced Esc out of it, the
-/// sign-in withdrawn, and the host told the row's login ended once the dialog is gone. CONTROL:
-/// with no row named, the method's Enter alone, no Esc, and the sign-in told stands.
+/// sign-in withdrawn by that back-out, which its `CLEARED` line names, and the host told the
+/// row's login ended once the dialog is gone. CONTROL: with no row named, the method's Enter
+/// alone, no Esc, the sign-in told stands, and no line names a back-out.
 #[test]
 fn a_row_named_under_its_own_handoff_backs_out_of_it() {
+    use crate::supervise::policy::exception::LOGIN_BACKING_OUT;
     let mut login = rows(&[
         "⏺ Carrying on.",
         "  ⎿  Not logged in · Please run /login",
@@ -12883,6 +12768,10 @@ fn a_row_named_under_its_own_handoff_backs_out_of_it() {
         "the sign-in withdrawn at the news, before the Esc: {log}"
     );
     assert!(
+        cleared(&journal).is_some_and(|at| journal[at].ends_with(LOGIN_BACKING_OUT)),
+        "the sign-in told is cleared by the back-out, and says so (no method claimed unpicked): {log}"
+    );
+    assert!(
         !host.said("account:login-ended").is_empty(),
         "the host is told the row's login ended: {log}"
     );
@@ -12898,17 +12787,24 @@ fn a_row_named_under_its_own_handoff_backs_out_of_it() {
         cleared(&journal).is_none_or(|at| journal[at].starts_with("CLEARED seq=0 ")),
         "the sign-in told stands while the loop runs: {log}"
     );
+    assert!(
+        !journal.iter().any(|l| l.contains(LOGIN_BACKING_OUT)),
+        "nothing was backed out of, and no line says so: {log}"
+    );
 }
 
 /// THE PICKER OF THE `/login` ATERM TYPED, LEFT TO A PERSON (no method read), THE ROSTER NAMING
 /// THE LOGIN'S ROW ONLY AFTER: the accounts' news decides the picker again, as the box of a
 /// roster row's login, and it gets one fenced Esc, no method; the host is told the row's login
-/// ended once it is gone. Alike in both renderers' frames: the inline dialog under its `─` rule
-/// and the fullscreen renderer's bottom panel under its `▔` rule (measured on 2.1.310, which
-/// echoes no `❯ /login` above it), as it first opens with Claude Code's `/effort` hint in that
-/// rule and once the hint is gone. CONTROL: with no row named, no key at all.
+/// ended once it is gone, and the sign-in told is `CLEARED` by that back-out, which its line
+/// names. Alike in both renderers' frames: the inline dialog under its `─` rule and the
+/// fullscreen renderer's bottom panel under its `▔` rule (measured on 2.1.310, which echoes no
+/// `❯ /login` above it), as it first opens with Claude Code's `/effort` hint in that rule and
+/// once the hint is gone. CONTROL: with no row named, no key at all, and no line names a
+/// back-out.
 #[test]
 fn a_row_named_under_its_own_picker_backs_out_of_it() {
+    use crate::supervise::policy::exception::LOGIN_BACKED_OUT;
     use aterm_phase::prompt::fixtures as f;
     let mut login = rows(&[
         "⏺ Carrying on.",
@@ -12954,7 +12850,13 @@ fn a_row_named_under_its_own_picker_backs_out_of_it() {
             .filter(|r| r.starts_with("key "))
             .cloned()
             .collect();
-        (keys, host, log)
+        (keys, host, journal, log)
+    };
+    let cleared = |journal: &[String]| {
+        journal
+            .iter()
+            .find(|l| l.starts_with("CLEARED ") && l.contains(" exception=login "))
+            .cloned()
     };
     for (frame, screens) in [
         ("inline", (f::LOGIN_PICKER, f::LOGIN_INTERRUPTED)),
@@ -12973,7 +12875,7 @@ fn a_row_named_under_its_own_picker_backs_out_of_it() {
             ),
         ),
     ] {
-        let (keys, host, log) = run(
+        let (keys, host, journal, log) = run(
             &format!("te-picker-named-late-{frame}"),
             screens,
             Some("m7-a"),
@@ -12987,10 +12889,19 @@ fn a_row_named_under_its_own_picker_backs_out_of_it() {
             !host.said("account:login-ended").is_empty(),
             "{frame}: the host is told the row's login ended: {log}"
         );
-        let (keys, _, log) = run(&format!("te-picker-unnamed-late-{frame}"), screens, None);
+        assert!(
+            cleared(&journal).is_some_and(|l| l.ends_with(LOGIN_BACKED_OUT)),
+            "{frame}: the sign-in told is cleared by the back-out, and says so: {log}"
+        );
+        let (keys, _, journal, log) =
+            run(&format!("te-picker-unnamed-late-{frame}"), screens, None);
         assert!(
             keys.is_empty(),
             "{frame}: no key at a picker left to a person: {log}"
+        );
+        assert!(
+            cleared(&journal).is_none_or(|l| !l.contains(LOGIN_BACKED_OUT)),
+            "{frame}: nothing was backed out of, and no line says so: {log}"
         );
     }
 }
@@ -16449,6 +16360,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
                     retry: None,
                     said: s.turn_end.replies(),
                     said_reset_ms: s.carried().said_reset_ms,
+                    checks: s.turn_end.checks(),
                 },
                 s.turn_end.limit_try()
             )),
@@ -16703,7 +16615,13 @@ fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
     }
     let check = Some((
         Some(RULE_DONE_CHECK.to_string()),
-        Some(act_reason_after(Carried::streak(1), None)),
+        Some(act_reason_after(
+            Carried {
+                checks: 1,
+                ..Carried::streak(1)
+            },
+            None,
+        )),
     ));
     assert_eq!(
         got,
@@ -16910,7 +16828,16 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     );
     assert_eq!(act, (Some(RULE_DONE_CHECK), true, (None, Some(1))));
     let (_, _, reason, act_ms) = last_typed(&ledger).expect("the check's row");
-    assert_eq!(reason, act_reason_after(Carried::streak(1), Some(in_place)));
+    assert_eq!(
+        reason,
+        act_reason_after(
+            Carried {
+                checks: 1,
+                ..Carried::streak(1)
+            },
+            Some(in_place)
+        )
+    );
     let control = successor(&ledger, Autopilot::Cruise, act_ms);
     assert_eq!(
         control,
@@ -23965,7 +23892,10 @@ fn a_workers_done_check_goes_without_the_back_off() {
     let (m, lines) = run(working_task());
     assert!(
         lines.iter().any(|l| l.starts_with("CONTINUED ")
-            && l.ends_with(&format!("rule={RULE_DONE_CHECK} {}", clip(DONE_CHECK)))),
+            && l.ends_with(&format!(
+                "rule={RULE_DONE_CHECK} {}",
+                clip(&done_check_words(0))
+            ))),
         "{lines:#?}"
     );
     assert!(!lines.iter().any(|l| l.contains("back-off")), "{lines:#?}");

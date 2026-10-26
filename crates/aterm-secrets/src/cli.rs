@@ -787,7 +787,7 @@ mod unix {
                 let host = client::machine_named(&doc, &host)?;
                 if add {
                     doc.add_admin(&host).map_err(text_error)?;
-                    let done = client::admin_publish(&paths, &admin, &doc)?;
+                    let done = client::admin_publish_admin(&paths, &admin, &doc, &host)?;
                     Ok(published(&format!("added {host} to the admins"), &done))
                 } else {
                     let held = exposure(&doc, &host);
@@ -1601,7 +1601,30 @@ mod unix {
     }
 
     fn sync(paths: &Paths) -> crate::Result<ExitCode> {
-        match client::sync(paths, None)? {
+        let held = |served: Option<u64>| {
+            served.map_or("no vault".to_string(), |served| {
+                format!("seq {served}, older than this Mac's")
+            })
+        };
+        let mut outcome = client::sync(paths, None)?;
+        // A put-back writes no file here: files still unsettled are applied from the copy the
+        // source holds now. The first line says what the sync did, as before (a caller reads it).
+        let mut put_back = None;
+        if let SyncOutcome::PutBack { served, .. } = outcome
+            && !client::materialization_ready(paths)?
+        {
+            put_back = Some(served);
+            outcome = client::sync(paths, None)?;
+        }
+        let first_put_back = || {
+            if let Some(served) = put_back {
+                println!(
+                    "  the source held {}: put this Mac's copy back first",
+                    held(served)
+                );
+            }
+        };
+        match outcome {
             SyncOutcome::Applied { seq, report } => {
                 println!(
                     "applied seq {seq}: {} written, {} unchanged, {} removed, {} left in place, {} moved aside",
@@ -1611,6 +1634,7 @@ mod unix {
                     report.left.len(),
                     report.moved_aside.len()
                 );
+                first_put_back();
                 for (name, to) in &report.moved_aside {
                     println!("  {name}: the previous file was moved to {}", to.display());
                 }
@@ -1625,14 +1649,13 @@ mod unix {
             }
             SyncOutcome::Unchanged { seq } => {
                 println!("up to date at seq {seq}");
+                first_put_back();
                 Ok(ExitCode::SUCCESS)
             }
             SyncOutcome::PutBack { seq, served } => {
-                let held = served.map_or("no vault".to_string(), |served| {
-                    format!("seq {served}, older than this Mac's")
-                });
                 println!(
-                    "the source held {held}: put this Mac's copy back; up to date at seq {seq}"
+                    "the source held {}: put this Mac's copy back; up to date at seq {seq}",
+                    held(served)
                 );
                 Ok(ExitCode::SUCCESS)
             }
@@ -2180,7 +2203,7 @@ mod unix {
             }
             if code_only.contains(&request.recipient) {
                 held.push(request);
-            } else if names_asked(&waiting, &request.recipient).len() > 1 {
+            } else if client::names_asked(&waiting, &request.recipient).len() > 1 {
                 named.push(request);
             } else {
                 offered.push(request);
@@ -2225,18 +2248,6 @@ mod unix {
             }
         }
         Ok(())
-    }
-
-    /// The names the queue lists `key` under, sorted, each once.
-    fn names_asked<'a>(pending: &'a [client::Request], key: &str) -> Vec<&'a str> {
-        let mut hosts: Vec<&str> = pending
-            .iter()
-            .filter(|r| r.recipient == key)
-            .map(|r| r.host.as_str())
-            .collect();
-        hosts.sort_unstable();
-        hosts.dedup();
-        hosts
     }
 
     fn requests(paths: &Paths) -> crate::Result<ExitCode> {
@@ -2402,16 +2413,7 @@ mod unix {
         }
         let mut chosen = Vec::with_capacity(picked.len());
         for request in picked {
-            let hosts = names_asked(pending, &request.recipient);
-            if hosts.len() > 1 {
-                return Err(Error::new(format!(
-                    "code {} asks to join under {} names ({}), and anyone on the LAN can queue a key under a name of its choosing: approve it under the name its machine asked for with aterm secrets approve {} --name <host>",
-                    request.code,
-                    hosts.len(),
-                    hosts.join(", "),
-                    request.recipient
-                )));
-            }
+            client::one_name_asked(pending, request)?;
             chosen.push((request.recipient.clone(), request.host.clone()));
         }
         chosen.sort();

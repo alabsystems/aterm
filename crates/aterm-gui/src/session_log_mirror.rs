@@ -423,9 +423,12 @@ impl StoreMirror {
             return String::new();
         }
         let lead = if crate::fabric::fabric_mirror_facts().is_empty() {
-            " mirror=unserved"
+            format!(
+                " mirror={}",
+                aterm_types::fabric_grammar::MirrorState::Unserved.word()
+            )
         } else {
-            ""
+            String::new()
         };
         format!(
             "{lead} tails={} tombstones={}",

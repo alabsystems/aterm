@@ -61,7 +61,7 @@ fn the_painted_card_hit_tests_back_to_the_models_action() {
     let i = entries
         .iter()
         .position(|e| {
-            matches!(e, TabMenuEntry::Action { action, .. } if *action == MenuAction::CopySessionId)
+            matches!(e, TabMenuEntry::SessionAction { action, .. } if *action == MenuAction::CopySessionId)
         })
         .expect("the composed model always offers the session-id copy");
     assert!(
@@ -82,7 +82,7 @@ fn the_painted_card_hit_tests_back_to_the_models_action() {
         .expect("a live action row");
     assert_eq!(hit, i);
     match &entries[hit] {
-        TabMenuEntry::Action { action, .. } => {
+        TabMenuEntry::SessionAction { action, .. } => {
             assert_eq!(*action, MenuAction::CopySessionId);
         }
         other => panic!("expected an action row, got {other:?}"),

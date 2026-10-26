@@ -575,7 +575,10 @@ fn under_the_gate_the_vendors_browser_open_is_stopped_and_its_page_and_code_are_
     // No row, no browser here: the need leads with the once-ever setup (adopting the default
     // home's row), then this sign-in's code and page.
     let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
-    let adopt = Setup::Adopt(ADOPT_LABEL.to_owned());
+    let adopt = Setup::Adopt {
+        label: ADOPT_LABEL.to_owned(),
+        window: false,
+    };
     assert_eq!(
         *seen.texts.lock().unwrap(),
         [need_words(&adopt, url, Some("WMRT-8KQZ"))]
@@ -766,6 +769,115 @@ fn a_caller_that_does_not_wait_is_busy_while_another_signs_in() {
     );
 }
 
+/// Every setup for `label`, each with and without a window `accounts browser` opens here.
+fn every_setup(label: &str) -> Vec<Setup> {
+    let label = label.to_owned();
+    let mut all = vec![Setup::Window(label.clone()), Setup::Mailbox(label.clone())];
+    for window in [true, false] {
+        all.push(Setup::Email {
+            label: label.clone(),
+            window,
+        });
+        all.push(Setup::Adopt {
+            label: label.clone(),
+            window,
+        });
+    }
+    all
+}
+
+/// The need's first step after adopting the row or adding its email is one that works on this
+/// machine, in the order it runs. With a window `accounts browser` opens here (one installed, or
+/// the pinned one fetched first), the terminal's line runs `adopt-default`, then `accounts
+/// browser`, the mailbox the alternative. NEGATIVE CONTROL: with none (no window browser and the
+/// pinned fetch failed), it runs `adopt-default`, then puts the mailbox in the vault, and names
+/// `accounts browser` only after installing a browser, never as the next command; the email
+/// setup alike.
+#[test]
+fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
+    let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
+    let adopt = "run `aterm harness accounts adopt-default main --email <your x.ai email> --cli \
+                 grok`, ";
+    let window = needs_you_line(
+        &Setup::Adopt {
+            label: "main".to_owned(),
+            window: true,
+        },
+        url,
+        Some("WMRT-8KQZ"),
+    );
+    assert_eq!(
+        window,
+        format!(
+            "NEEDS YOU: once, so Grok Build signs in by itself from now on: {adopt}then run \
+             `aterm harness accounts browser main --cli grok` at this machine's desk and sign in \
+             there, or put that email's mailbox in the vault (ai-mailbox.toml); or approve this \
+             sign-in now: code WMRT-8KQZ at {url}"
+        )
+    );
+    let none = needs_you_line(
+        &Setup::Adopt {
+            label: "main".to_owned(),
+            window: false,
+        },
+        url,
+        Some("WMRT-8KQZ"),
+    );
+    assert_eq!(
+        none,
+        format!(
+            "NEEDS YOU: once, so Grok Build signs in by itself from now on: {adopt}then put that \
+             email's mailbox in the vault (ai-mailbox.toml), or install a Chromium that opens a \
+             window (Google Chrome for Testing or Chromium) and run `aterm harness accounts \
+             browser main --cli grok` at this machine's desk; or approve this sign-in now: code \
+             WMRT-8KQZ at {url}"
+        )
+    );
+    // The step after the first, in each: the window where it opens, else the mailbox.
+    let next = |line: &str| {
+        let after = line.split_once("then ").expect("a second step").1;
+        after
+            .split_once(',')
+            .map_or(after, |(step, _)| step)
+            .to_owned()
+    };
+    assert!(next(&window).starts_with("run `aterm harness accounts browser main"));
+    assert!(next(&none).starts_with("put that email's mailbox in the vault"));
+    assert!(
+        none.find("install a Chromium").expect("the alternative")
+            < none.find("accounts browser").expect("named after it"),
+        "{none}"
+    );
+    for window in [true, false] {
+        let email = needs_you_line(
+            &Setup::Email {
+                label: "work".to_owned(),
+                window,
+            },
+            url,
+            Some("WMRT-8KQZ"),
+        );
+        assert!(
+            email.starts_with(
+                "NEEDS YOU: once, so Grok Build signs in by itself from now on: add `email = \
+                 \"…\"` to work's row in Grok Build's roster, then "
+            ),
+            "{email}"
+        );
+        let step = next(&email);
+        assert_eq!(
+            step.starts_with("run `aterm harness accounts browser work --cli grok`"),
+            window,
+            "{email}"
+        );
+        assert_eq!(
+            step.starts_with("put that email's mailbox in the vault"),
+            !window,
+            "{email}"
+        );
+    }
+}
+
 /// The need leads with the once-ever setup in short words, then this sign-in's code and page,
 /// then the setup's exact command, within the attention cap: the whole page where it fits, else
 /// its host, else without the command, for the longest admissible label and code. For the label
@@ -804,22 +916,27 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
         )
     );
     assert!(
-        need_words(&Setup::Email("work".to_owned()), url, Some("WMRT-8KQZ"))
-            .starts_with("once: an email on work's grok row; or code WMRT-8KQZ at ")
+        need_words(
+            &Setup::Email {
+                label: "work".to_owned(),
+                window: true
+            },
+            url,
+            Some("WMRT-8KQZ")
+        )
+        .starts_with("once: an email on work's grok row; or code WMRT-8KQZ at ")
     );
-    let adopt = Setup::Adopt("default-home".to_owned());
+    let adopt = Setup::Adopt {
+        label: "default-home".to_owned(),
+        window: true,
+    };
     assert!(
         need_words(&adopt, url, Some("WMRT-8KQZ")).ends_with(
             "(aterm harness accounts adopt-default default-home --email <you> --cli grok)"
         ) && needs_you_line(&adopt, url, Some("WMRT-8KQZ"))
             .contains("run `aterm harness accounts adopt-default default-home --email")
     );
-    for setup in [
-        Setup::Window(ADOPT_LABEL.to_owned()),
-        Setup::Mailbox(ADOPT_LABEL.to_owned()),
-        Setup::Email(ADOPT_LABEL.to_owned()),
-        Setup::Adopt(ADOPT_LABEL.to_owned()),
-    ] {
+    for setup in every_setup(ADOPT_LABEL) {
         let text = need_words(&setup, url, Some("WMRT-8KQZ"));
         let at = text.find("WMRT-8KQZ").expect("the code");
         assert!(at + "WMRT-8KQZ".len() <= 69, "{setup:?}: {text}");
@@ -838,12 +955,7 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
     let widest = "a".repeat(64);
     assert!(super::super::accounts::admissible_label(&widest));
     let code = "ABCD-EFGH-IJKL-M";
-    for setup in [
-        Setup::Window(widest.clone()),
-        Setup::Mailbox(widest.clone()),
-        Setup::Email(widest.clone()),
-        Setup::Adopt(widest.clone()),
-    ] {
+    for setup in every_setup(&widest) {
         let text = need_words(&setup, &long, Some(code));
         assert!(
             text.len() <= cap && text.contains(&format!("code {code} at https://accounts.x.ai")),
@@ -1173,11 +1285,33 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
     assert_eq!(adopt_label(&dirs), ADOPT_LABEL);
     assert_eq!(adopt_label(&both), LEDGER_ACCOUNT, "`main` is listed");
     let mut ladder = Ladder::bare("none installed");
-    assert_eq!(ladder.setup(), Setup::Adopt(ADOPT_LABEL.to_owned()));
+    assert_eq!(
+        ladder.setup(),
+        Setup::Adopt {
+            label: ADOPT_LABEL.to_owned(),
+            window: false
+        }
+    );
+    ladder.window = true;
+    assert_eq!(
+        ladder.setup(),
+        Setup::Adopt {
+            label: ADOPT_LABEL.to_owned(),
+            window: true
+        },
+        "a window accounts browser opens here"
+    );
+    ladder.window = false;
     assert!(!ladder.ready());
     ladder.label = "work".to_owned();
     ladder.from = RowFrom::Active;
-    assert_eq!(ladder.setup(), Setup::Email("work".to_owned()));
+    assert_eq!(
+        ladder.setup(),
+        Setup::Email {
+            label: "work".to_owned(),
+            window: false
+        }
+    );
     assert!(
         ladder
             .words()
@@ -1195,7 +1329,7 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
     assert_eq!(
         ladder.setup(),
         Setup::Mailbox("work".to_owned()),
-        "no window browser: `accounts browser` would refuse"
+        "no window browser and none fetchable: `accounts browser` would refuse"
     );
     ladder.window = true;
     assert_eq!(ladder.setup(), Setup::Window("work".to_owned()));
@@ -1298,6 +1432,10 @@ fn a_refused_automatic_approval_ends_fail_closed() {
     assert!(
         refused(&ended, "the next launch from a terminal asks you"),
         "the end says the way out: {ended:?}"
+    );
+    assert!(
+        refused(&ended, &refused_way_out("main", true)),
+        "a window opens here, so it names `accounts browser`: {ended:?}"
     );
     assert_eq!(ended.exit(), EXIT_SIGNED_OUT);
     assert_eq!(rung.asked, 1);
@@ -1882,9 +2020,28 @@ fn the_live_rung_waits_for_the_machines_sign_in_lock() {
     )
     .unwrap();
     let store = Store::at_for(&state, Cli::Grok, &home);
-    let mut live = LiveAuto::new(Some(roster), Some(store.clone()), Some(home), clock());
+    let mut live = LiveAuto::new(
+        Some(roster),
+        Some(store.clone()),
+        Some(home.clone()),
+        clock(),
+    );
     let ladder = live.ladder(false, &|| false);
     assert_eq!(ladder.label, "main");
+    // Its window is what `accounts browser` does here: a desk that opens one, and one installed
+    // or the pinned one fetched, where no fetch of it failed (none has in this scratch home's
+    // cache).
+    assert_eq!(
+        ladder.window,
+        super::super::browser_window::window_route(Some(&home)).reachable()
+    );
+    if super::super::headless_fetch::Archive::host_window().is_some()
+        && std::env::var_os("XDG_CACHE_HOME").is_none()
+        && super::super::browser_window::no_window_desk().is_none()
+        && super::super::headless_fetch::curl_present()
+    {
+        assert!(ladder.window, "fetchable with no browser installed");
+    }
     let url = "https://accounts.x.ai/oauth2/device?client_id=a&client_id=b&user_code=WMRT-8KQZ";
     let mut approve = |finished: &'static dyn Fn() -> bool, within: Duration| -> Approval {
         let deadline = Instant::now() + within;
@@ -1949,5 +2106,38 @@ fn a_rung_that_ended_with_grok_is_not_named_approved() {
         ledger[0].starts_with("accounts.x.ai device exited-1; ")
             && ledger[0].ends_with("headless(grok ended while it ran) person(not asked)"),
         "{ledger:?}"
+    );
+}
+
+/// THE WAY OUT OF AN AUTOMATIC REFUSAL NAMES `accounts browser` AS THE COMMAND ONLY WHERE IT OPENS
+/// A WINDOW HERE, as the setup does: with a window, re-signing the row's profile in is that
+/// command; with none, it comes after installing a Chromium that opens a window. Both keep the
+/// approval at the next launch first.
+#[test]
+fn the_refusals_way_out_names_accounts_browser_only_where_it_opens_a_window() {
+    let window = refused_way_out("main", true);
+    let none = refused_way_out("main", false);
+    for text in [&window, &none] {
+        assert!(
+            text.starts_with(
+                "nothing was placed, and the next launch from a terminal asks you to approve its \
+                 code yourself (or "
+            ) && text.ends_with("`aterm harness accounts browser main --cli grok`)"),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        window,
+        "nothing was placed, and the next launch from a terminal asks you to approve its code \
+         yourself (or sign main's browser profile in again as its account: `aterm harness \
+         accounts browser main --cli grok`)"
+    );
+    assert!(!window.contains("install"), "{window}");
+    assert!(
+        none.contains(
+            "(or install a Chromium that opens a window (Google Chrome for Testing or \
+                       Chromium) and sign main's browser profile in again"
+        ),
+        "{none}"
     );
 }

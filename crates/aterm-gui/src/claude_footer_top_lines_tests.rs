@@ -285,27 +285,70 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
         reads(accent, SLAB)
     );
     let cells = &pane_cells(&app, wid)[PAD];
-    let mut letters = 0;
-    for c in &cells[button] {
-        if c.ch.is_alphabetic() {
-            letters += 1;
+    let mut track_letters = 0;
+    for (idx, c) in cells[button.clone()].iter().enumerate() {
+        if idx == 0 {
+            assert_eq!(c.bg, SLAB, "track cap sits on the slab");
+        } else if c.ch.is_alphabetic() {
+            track_letters += 1;
+            assert!(
+                reads(c.fg, c.bg) >= floor,
+                "{:?}: unselected `on` track letter {:.2} on its track",
+                c.ch,
+                reads(c.fg, c.bg)
+            );
+        }
+    }
+    assert_eq!(track_letters, 2, "the unselected `on` segment");
+    let mut thumb_letters = 0;
+    for c in &cells[switch.switch.clone()] {
+        if c.ch == '\u{2590}' || c.ch == '\u{258c}' {
+            assert!(
+                reads(c.fg, SLAB) >= floor,
+                "{:?}: an off-thumb cap {:.2} on the slab",
+                c.ch,
+                reads(c.fg, SLAB)
+            );
+        } else if c.ch != ' ' {
+            thumb_letters += 1;
             assert!(
                 reads(c.bg, SLAB) >= floor && reads(c.fg, c.bg) >= floor,
-                "{:?}: the pill {:.2} on the slab, its letter {:.2} on it",
+                "{:?}: the off thumb {:.2} on the slab, its glyph {:.2} on it",
                 c.ch,
                 reads(c.bg, SLAB),
                 reads(c.fg, c.bg)
             );
-        } else if c.ch != ' ' && c.bg == SLAB {
+        }
+    }
+    assert_eq!(thumb_letters, 4, "the `○ off` thumb");
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\n"),
+    );
+    refill(&mut app, wid);
+    let _ = pass(&mut app, wid);
+    let on_switch = switch_of(&app, wid, session).expect("codex-alab's lit switch");
+    assert_eq!(on_switch.face, HarnessSwitch::On);
+    let on_cells = &pane_cells(&app, wid)[PAD];
+    let cap = on_cells[on_switch.switch.clone()]
+        .iter()
+        .position(|c| c.ch == '\u{2590}')
+        .expect("lit pill cap");
+    for c in &on_cells[on_switch.switch.start + cap..on_switch.switch.end] {
+        if c.ch == '\u{2590}' || c.ch == '\u{258c}' {
             assert!(
                 reads(c.fg, SLAB) >= floor,
-                "{:?}: a cap {:.2} on the slab",
+                "{:?}: lit cap on the slab",
+                c.ch
+            );
+        } else if c.ch != ' ' {
+            assert!(
+                reads(c.bg, SLAB) >= floor && reads(c.fg, c.bg) >= floor,
+                "{:?}: lit accent thumb {:.2} on the slab",
                 c.ch,
-                reads(c.fg, SLAB)
+                reads(c.bg, SLAB)
             );
         }
     }
-    assert_eq!(letters, 2, "the button's `on`");
 }
 
 struct CopyGuard(String);
@@ -427,7 +470,9 @@ fn codex_gets_a_switch_only_as_codex_alab() {
                 assert_eq!(*cell, before[PAD][c], "{cols}: column {c} untinted");
             }
         }
-        let glyphs: Vec<&RenderCell> = after[PAD][switch.switch.clone()]
+        let slice = &after[PAD][switch.switch.clone()];
+        let cap = slice.iter().position(|c| c.ch == '\u{2590}');
+        let glyphs: Vec<&RenderCell> = slice[..cap.unwrap_or(slice.len())]
             .iter()
             .filter(|c| c.ch != ' ')
             .collect();
@@ -445,15 +490,20 @@ fn codex_gets_a_switch_only_as_codex_alab() {
                 c.ch
             );
         }
+        if let Some(cap) = cap {
+            let pill: String = slice[cap..].iter().map(|c| c.ch).collect();
+            assert_eq!(pill, "\u{2590} \u{25cf} on \u{258c}", "{cols}: lit thumb");
+        }
         let line = glass_chars(&app, wid, PAD);
         assert!(
             !line.contains(" codex "),
             "{cols}: codex-alab never reads the vendor's name: {line:?}"
         );
-        if cols >= 40 {
+        if cols >= 55 {
             assert!(
                 line.starts_with("      codex-alab ")
-                    && line.contains(" alab harness \u{25cf} on "),
+                    && line
+                        .contains(" alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} "),
                 "{cols}: {line:?}"
             );
             let ground = u32::from_be_bytes([0, slab.bg[0], slab.bg[1], slab.bg[2]]);
@@ -510,7 +560,11 @@ fn codex_gets_a_switch_only_as_codex_alab() {
         .find(|c| c.ch == '\u{25cf}')
         .expect("CONTROL: the lit state");
     let mark_fg = crate::chrome_band::band_colors(app.theme).accent;
-    assert_eq!(lit.fg, mark_fg, "CONTROL: bare, `●` in the accent");
+    assert_eq!(
+        (lit.bg, lit.fg),
+        (mark_fg, SLAB),
+        "CONTROL: bare, lit `● on` thumb wears the accent"
+    );
     let first = cells[switch.switch.clone()]
         .iter()
         .find(|c| c.ch != ' ')
@@ -1408,4 +1462,138 @@ fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
         .unwrap_or_else(|p| p.into_inner())
         .set_agent_reader_program_for_test(Some(aterm_phase::Program::Codex));
     assert_eq!(account(&app), "Codex CLI");
+}
+
+/// EVERY CLI HARNESS SHARES THE VERSIONED TWO-STATE SEGMENTED SWITCH: Claude Code, Antigravity,
+/// Muse Code and `codex-alab` all paint ` alab harness v0.1 ▐ ● on ▌ off ▌ ` when lit and
+/// ` alab harness v0.1 ▐ on ▐ ○ off ▌ ` when off, with identical narrow-column tiers, and when off
+/// neither segment wears the theme's active green accent.
+#[test]
+fn every_cli_harness_shares_the_versioned_segmented_switch_and_never_glows_green_when_off() {
+    let agy_rows = fixture_rows(include_str!(
+        "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
+    ));
+    let rule = "\u{2500}".repeat(120);
+    let muse_rows: Vec<String> = vec![
+        String::new(),
+        "  Muse Code 0.9.3".into(),
+        String::new(),
+        rule.clone(),
+        "\u{276F} ".into(),
+        rule,
+        "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review".into(),
+    ];
+    let default_theme = App::headless_for_test().theme;
+    let green_accent = crate::chrome_band::band_colors(default_theme).accent;
+    assert!(
+        green_accent[1] > 200 && green_accent[0] < 100,
+        "CONTROL: default theme's accent is bright green: {green_accent:?}"
+    );
+
+    for prog in ["claude", "agy", "muse", "codex"] {
+        let rows_count = if matches!(prog, "claude" | "agy") {
+            ROWS
+        } else {
+            24
+        };
+        let (mut app, wid, session) = pane_of(rows_count, 120, prog);
+        let _host = held(&mut app, session);
+        match prog {
+            "claude" => {
+                let ctx = app.pool.get(session).expect("session").ctx.clone();
+                let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                timeline.set_agent_reader_for_test(true);
+                assert!(timeline.set_claude_footer(PGID, None, Some(facts())));
+                drop(timeline);
+                feed(&app, session, &screen(&AT_REST));
+            }
+            "agy" => feed(&app, session, &agy_rows),
+            "muse" => {
+                drawer(&app, session, PGID, "muse", "0.9.3");
+                feed(&app, session, &muse_rows);
+            }
+            "codex" => {
+                set_proven(&app, session, true);
+                bytes(&app, session, codex_screen(120, Some(SLAB)).as_bytes());
+            }
+            _ => unreachable!(),
+        }
+        let settle = |app: &mut App| {
+            for _ in 0..2 {
+                refill(app, wid);
+                let _ = pass(app, wid);
+            }
+        };
+
+        settle(&mut app);
+        let on = switch_of(&app, wid, session).unwrap_or_else(|| panic!("{prog}: lit switch"));
+        assert_eq!(
+            (on.face, on.button.clone()),
+            (HarnessSwitch::On, None),
+            "{prog}"
+        );
+        let on_row = &app.windows[&wid].input_scratch.cells[on.frame_row];
+        let on_face: String = on_row[on.cols.clone()].iter().map(|c| c.ch).collect();
+        assert_eq!(
+            on_face, " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+            "{prog}: unified versioned segmented ON face"
+        );
+        let on_cap = on_row[on.switch.clone()]
+            .iter()
+            .position(|c| c.ch == '\u{2590}')
+            .expect("on thumb cap");
+        let on_thumb_bg = on_row[on.switch.start + on_cap + 1].bg;
+        let off_track_bg = on_row[on.switch.end + 1].bg;
+        assert_eq!(
+            on_thumb_bg, green_accent,
+            "{prog}: when ON, the `on` thumb wears the active accent"
+        );
+        assert_ne!(
+            off_track_bg, green_accent,
+            "{prog}: when ON, the `off` track segment is unselected, never active green"
+        );
+        assert!(
+            off_track_bg[1].abs_diff(off_track_bg[0]) <= 12,
+            "{prog}: unselected `off` track stays neutral: {off_track_bg:?}"
+        );
+
+        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+            crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+        );
+        settle(&mut app);
+        let off = switch_of(&app, wid, session).unwrap_or_else(|| panic!("{prog}: off switch"));
+        assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master), "{prog}");
+        let off_row = &app.windows[&wid].input_scratch.cells[off.frame_row];
+        let off_face: String = off_row[off.cols.clone()].iter().map(|c| c.ch).collect();
+        assert_eq!(
+            off_face, " alab harness v0.1 \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
+            "{prog}: unified versioned segmented OFF face"
+        );
+        assert_eq!(
+            on.cols.len(),
+            off.cols.len(),
+            "{prog}: ON and OFF faces occupy the exact same cell span"
+        );
+        for c in &off_row[off.cols.clone()] {
+            assert_ne!(
+                c.bg, green_accent,
+                "{prog}: when OFF, no cell background wears active green: {c:?}"
+            );
+            assert_ne!(
+                c.fg, green_accent,
+                "{prog}: when OFF, no cell foreground wears active green: {c:?}"
+            );
+            assert!(
+                c.bg[1].abs_diff(c.bg[0]) <= 12,
+                "{prog}: when OFF, every surface stays neutral (no green tint): {c:?}"
+            );
+        }
+        let btn = off.button.expect("off face's `on` segment");
+        let unselected_on_bg = off_row[btn.start + 2].bg;
+        let selected_off_bg = off_row[off.switch.start + 2].bg;
+        assert_ne!(
+            unselected_on_bg, selected_off_bg,
+            "{prog}: only `○ off` wears the selected thumb; `on` sits in the recessed track"
+        );
+    }
 }

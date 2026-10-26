@@ -63,8 +63,8 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
   tail             stream bus records as they land, until Ctrl-C
   --from <offset>  tail: replay from bus offset <offset> first
   --bodies         tail: print each record's text after its trust label
-  --filter <f>     tail: one subject pattern under `/f/<F>/` (`*` one segment, `>` the
-                   rest) instead of the whole fleet
+  --filter <f>     tail: one full subject pattern, `/f/<F>/…` (`*` one segment, `>`
+                   the rest), instead of the whole fleet
   brief            fold each session's mirrored log into a few lines (need, open work,
                    mail), newest session first, within --budget tokens (default 2000)
                    over the last --window records (default 65536); `@<sid>[@<node>]`

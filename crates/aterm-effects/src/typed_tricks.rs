@@ -321,7 +321,10 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
             head_chars += 1;
             continue;
         };
-        let cut = 1u128.checked_shl(u32::try_from(at).ok()?)?;
+        if at >= u128::BITS as usize {
+            return None;
+        }
+        let cut = 1u128 << (at as u32);
         match found.as_mut() {
             None => {
                 found = Some((

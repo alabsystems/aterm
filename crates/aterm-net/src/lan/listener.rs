@@ -139,6 +139,7 @@ impl Listener {
     /// attachments are refused. LAN interface binding and one-hop limits are
     /// established before listen, including the kernel's initial SYN-ACK.
     pub fn bind(local: SocketAddr, scope: Scope) -> io::Result<Self> {
+        crate::loopback::check(crate::loopback::Reach::Listen(local))?;
         if scope == Scope::Lan && !remote_supported(local) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

@@ -149,12 +149,8 @@ fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
         1,
         "…by the in-flight pool alone"
     );
-    let last = glow
-        .admission_log()
-        .last()
-        .map(|r| r.line(echo))
-        .expect("a ring row");
-    assert!(last.ends_with(" licence=inflight"), "{last}");
+    let last = glow.admission_log().last().expect("a ring row");
+    assert_eq!(last.licence, AdmissionRecord::LICENCE_IN_FLIGHT);
     assert!(
         v2_cols(&glow, 27).contains(&5),
         "its cell is lit in the echoing frame: {:?}",

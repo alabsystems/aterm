@@ -30,6 +30,7 @@ impl Multicast {
     /// Peers use the same port; zero is useful for isolated tests. Loopback is
     /// an explicit local/test policy and is never inferred as a LAN.
     pub fn bind(source: Ipv4Addr, group: Ipv4Addr, port: u16, scope: Scope) -> io::Result<Self> {
+        crate::loopback::check(crate::loopback::Reach::Listen((source, port).into()))?;
         if group.octets()[..2] != [239, 255] {
             return Err(refuse(
                 "discovery requires an administrative-local multicast group",

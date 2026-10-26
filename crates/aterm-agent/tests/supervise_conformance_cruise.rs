@@ -10,8 +10,8 @@ use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
     Composer, DONE_CHECK, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK, TurnEndAction,
-    TurnEndReading, TurnEndState, WaitKind, decide_turn_end, is_answer_rule, open_work_suffix,
-    repo_work_suffix,
+    TurnEndReading, TurnEndState, WaitKind, decide_turn_end, done_check_words, is_answer_rule,
+    open_work_suffix, own_repo_work_suffix,
 };
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_cruise_model;
@@ -179,13 +179,16 @@ fn verdict(a: &TurnEndAction) -> Verdict {
 /// open work the real state read in the claim's words (`open` 1) or the
 /// probe's finding (`open` 2), and no suffix with nothing left (`open` 0).
 fn defend_prompt(st: &State, real: &TurnEndState) -> String {
+    // The angle is the real state's count of the run's checks (v6 §14.5), which the model leaves
+    // to the policy's own tests.
+    let words = done_check_words(usize::from(real.checks()));
     match st["open"] {
-        0 => DONE_CHECK.to_string(),
+        0 => words,
         1 => format!(
-            "{DONE_CHECK} {}",
+            "{words} {}",
             open_work_suffix(real.open_items()).expect("the claim's open work")
         ),
-        _ => format!("{DONE_CHECK} {}", repo_work_suffix(&finding())),
+        _ => format!("{words} {}", own_repo_work_suffix(&finding())),
     }
 }
 

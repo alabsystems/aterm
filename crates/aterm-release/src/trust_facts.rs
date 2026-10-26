@@ -13,7 +13,7 @@ use aterm_digest::Sha256;
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 use crate::release::shell_word;
 
-pub const FACTS_MAGIC: &str = "aterm-trust facts 8";
+pub const FACTS_MAGIC: &str = "aterm-trust facts 9";
 
 pub const FACTS_END: &str = "end";
 
@@ -58,6 +58,11 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 pub const CHECK_CANCELLED: &str = "proof validation cancelled by the caller";
 
+/// Why a starved run stays undecided while its threads wait for a core, behind the host's work
+/// or the prover's own other threads, and what the Trust toolchain would need to offer for the
+/// lane to decide it then.
+const WALL_CLOCKS: &str = "the prover's clocks count wall time, and only `[trust] backstop` in the workspace root manifest sets them, for every run in the checkout, so the lane can neither count CPU time nor scale them by the share its threads get; while its threads wait for a core, behind the host's work or the prover's own other threads, only a prover whose clocks count CPU time, or that takes a backstop for one run, decides it (asked of the Trust toolchain in docs/DESIGN-adaptive-build-2026-10-24.md)";
+
 /// Raw verification metrics parsed from a single crate's `targo trust check` log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Measured {
@@ -87,9 +92,10 @@ pub struct Measured {
     pub backstops: Option<Vec<Backstop>>,
 }
 
-/// How a check ran: its CPU and wall time, the host's mean one-minute load while it ran and
-/// the host's cores. The prover's clocks are wall clocks, so a check that got too little CPU
-/// lapses more ([`Pace::starved`]).
+/// How a check ran: its CPU and wall time, the host's mean one-minute load while it ran, the
+/// host's cores, and how long its threads ran against how long they were runnable. The prover's
+/// clocks are wall clocks, so a check whose threads waited for a core lapses more
+/// ([`Pace::starved`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pace {
     pub cpu_ms: u64,
@@ -97,27 +103,54 @@ pub struct Pace {
     /// The mean one-minute load average, in hundredths; `None` when it could not be read.
     pub load: Option<u64>,
     pub cores: u64,
+    /// Its processes' threads, as the lane's reads of them saw them; `None` when unread.
+    pub threads: Option<Threads>,
+}
+
+/// How long a check's threads ran and how long they were runnable (running or waiting for a
+/// core), summed over its processes: the work each of the prover's clocks timed got
+/// `ran_ms / runnable_ms` of the time that clock counted, whatever kept its threads waiting,
+/// the host's other work or the check's own threads beyond the cores.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Threads {
+    pub ran_ms: u64,
+    pub runnable_ms: u64,
 }
 
 impl Pace {
-    /// `<cpu ms> <wall ms> <load in hundredths, or -> <cores>`: the lane's `.pace` mark and the
-    /// facts' field.
+    /// `<cpu ms> <wall ms> <load in hundredths, or -> <cores>`, then `<ran ms> <runnable ms>`
+    /// when its threads were read: the lane's `.pace` mark and the facts' field.
     #[must_use]
     pub fn text(&self) -> String {
-        format!(
+        let mut t = format!(
             "{} {} {} {}",
             self.cpu_ms,
             self.wall_ms,
             self.load.map_or_else(|| "-".into(), |l| l.to_string()),
             self.cores
-        )
+        );
+        if let Some(th) = self.threads {
+            t.push_str(&format!(" {} {}", th.ran_ms, th.runnable_ms));
+        }
+        t
     }
 
     /// Reads [`Pace::text`].
     #[must_use]
     pub fn parse(s: &str) -> Option<Pace> {
-        let [cpu, wall, load, cores] = s.split(' ').collect::<Vec<_>>()[..] else {
-            return None;
+        let (cpu, wall, load, cores, threads) = match s.split(' ').collect::<Vec<_>>()[..] {
+            [cpu, wall, load, cores] => (cpu, wall, load, cores, None),
+            [cpu, wall, load, cores, ran, runnable] => (
+                cpu,
+                wall,
+                load,
+                cores,
+                Some(Threads {
+                    ran_ms: ran.parse().ok()?,
+                    runnable_ms: runnable.parse().ok()?,
+                }),
+            ),
+            _ => return None,
         };
         Some(Pace {
             cpu_ms: cpu.parse().ok()?,
@@ -127,30 +160,69 @@ impl Pace {
                 l => Some(l.parse().ok()?),
             },
             cores: cores.parse().ok()?,
+            threads,
         })
     }
 
-    /// Starved: its CPU was under 0.8 of its wall time, or the load was above the cores.
+    /// Its threads' times, when a read found them runnable for any time.
+    fn share(&self) -> Option<&Threads> {
+        self.threads.as_ref().filter(|t| t.runnable_ms > 0)
+    }
+
+    /// Starved: its threads ran under 0.8 of the time they were runnable; where they were not
+    /// read, its CPU was under 0.8 of its wall time or the load was above the cores. The load
+    /// counts the check's own threads and work that yields to them, so it stands in only for
+    /// the share it cannot see.
     #[must_use]
     pub fn starved(&self) -> bool {
+        if let Some(t) = self.share() {
+            return t.ran_ms.saturating_mul(10) < t.runnable_ms.saturating_mul(8);
+        }
         (self.wall_ms > 0 && self.cpu_ms.saturating_mul(10) < self.wall_ms.saturating_mul(8))
             || self
                 .load
                 .is_some_and(|l| l > self.cores.saturating_mul(100))
     }
 
-    /// `CPU/wall 0.40, load 30.00 on 14 cores`.
+    /// What a run on the same host needs to be decided ([`Pace::starved`]).
+    #[must_use]
+    pub fn unstarved(&self) -> String {
+        if self.share().is_some() {
+            "threads that run at least 0.80 of the time they are runnable".to_string()
+        } else {
+            format!(
+                "CPU/wall at least 0.80 and a mean load of at most {} (its cores)",
+                self.cores
+            )
+        }
+    }
+
+    /// `CPU/wall 0.40, load 30.00 on 14 cores`, then `, threads ran 0.57 of their runnable
+    /// time, 11.86 of them runnable on average` when they were read; an average above the cores
+    /// says the check's own threads kept each other waiting.
     #[must_use]
     pub fn said(&self) -> String {
         let hundredths = |n: u64| format!("{}.{:02}", n / 100, n % 100);
-        let ratio = self
-            .cpu_ms
-            .saturating_mul(100)
-            .saturating_add(self.wall_ms / 2)
-            .checked_div(self.wall_ms)
-            .map_or_else(|| "?".to_string(), hundredths);
+        let ratio = |a: u64, b: u64| {
+            a.saturating_mul(100)
+                .saturating_add(b / 2)
+                .checked_div(b)
+                .map_or_else(|| "?".to_string(), hundredths)
+        };
         let load = self.load.map_or_else(|| "unread".to_string(), hundredths);
-        format!("CPU/wall {ratio}, load {load} on {} cores", self.cores)
+        let mut said = format!(
+            "CPU/wall {}, load {load} on {} cores",
+            ratio(self.cpu_ms, self.wall_ms),
+            self.cores
+        );
+        if let Some(t) = self.share() {
+            said.push_str(&format!(
+                ", threads ran {} of their runnable time, {} of them runnable on average",
+                ratio(t.ran_ms, t.runnable_ms),
+                ratio(t.runnable_ms, self.wall_ms)
+            ));
+        }
+        said
     }
 }
 
@@ -2451,6 +2523,8 @@ pub fn judge(
     let (mut total_proved, mut total_all, mut capbound_n) = (0u64, 0u64, 0usize);
     let mut unfinished_n = 0usize;
     let (mut by_trustd, mut by_clock) = (Vec::<String>::new(), Vec::<String>::new());
+    // What a run of the crates in `by_clock` needs to be decided ([`Pace::unstarved`]).
+    let mut clock_need: Option<String> = None;
     let (mut trustd_dirty, mut trustd_block) = (false, None::<(String, String)>);
     let mut ratchet_now: Option<String> = ratchet.map(str::to_string);
     let mut backstops_now: Option<String> = backstops.map(str::to_string);
@@ -2620,9 +2694,10 @@ pub fn judge(
         // nothing in it is the machine's.
         let run_withhold = if let Some(p) = starved.filter(|_| credit.n > 0) {
             Some(format!(
-                "the run was starved ({}), and {}, so a run that was not starved need not prove what it did; measure it again when the machine is quieter: {}",
+                "the run was starved ({}), and {}, so a run that was not starved need not prove what it did; measure it again in a run with {}: {}",
                 p.said(),
                 credit.said(),
+                p.unstarved(),
                 measure_again(facts, &[name])
             ))
         } else if m.backstops.is_none() && m.lapsed.saturating_add(m.rss) > 0 {
@@ -2740,11 +2815,13 @@ pub fn judge(
                 dash(),
             ]);
             by_clock.push(name.to_string());
+            clock_need.get_or_insert_with(|| pace.unstarved());
             skipped_what.push_str(&format!(" {name} (starved)"));
             notes.push(format!(
-                "BUDGET LAPSED: {name}: {proved} proved, floor {f}; in a starved run ({}), {} — undecided; measure it again when the machine is quieter: {}",
+                "BUDGET LAPSED: {name}: {proved} proved, floor {f}; in a starved run ({}), {} — undecided; a run with {} decides it ({}); {WALL_CLOCKS}",
                 pace.said(),
                 credit.said(),
+                pace.unstarved(),
                 measure_again(facts, &[name])
             ));
             continue;
@@ -3113,8 +3190,9 @@ pub fn judge(
         }
         if !by_clock.is_empty() {
             said.push(format!(
-                "in a starved run, what the machine can be credited with (each BUDGET LAPSED note says what) could cover the shortfall, so nothing was decided about: {}; measure them again when the machine is quieter: {}",
+                "in a starved run, what the machine can be credited with (each BUDGET LAPSED note says what) could cover the shortfall, so nothing was decided about: {}; a run with {} decides them ({}); while their threads wait for a core, behind the host's work or the prover's own other threads, only a prover whose clocks count CPU time does (each BUDGET LAPSED note says why)",
                 by_clock.join(" "),
+                clock_need.as_deref().unwrap_or_default(),
                 measure_again(facts, &by_clock.iter().map(String::as_str).collect::<Vec<_>>())
             ));
         }
@@ -5970,6 +6048,7 @@ mod tests {
         wall_ms: 1_843_000,
         load: Some(3000),
         cores: 14,
+        threads: None,
     };
 
     /// A quiet one: aterm-gpu's 1835 s of CPU in 1843 s at load 2 on 14 cores.
@@ -5978,6 +6057,7 @@ mod tests {
         wall_ms: 1_843_000,
         load: Some(200),
         cores: 14,
+        threads: None,
     };
 
     /// A real check's log and obligation record, trimmed: the report's Summary, Stop causes,
@@ -6154,11 +6234,12 @@ mod tests {
         let v = judged(STARVED, Some(&had), Update::RAISE);
         assert_eq!(row_of(&v, "aterm-gpu"), "NOT-VERIFIED(clock,<813,1)");
         assert_eq!((v.word, v.exit), ("COULD-NOT-RUN", 2));
+        let lapsed = note(&v, "BUDGET LAPSED: ");
         assert!(
-            note(&v, "BUDGET LAPSED: ").contains(&STARVED.said()),
-            "{}",
-            v.report
+            lapsed.contains(&STARVED.said()) && lapsed.contains(&STARVED.unstarved()),
+            "names the pace it had and the pace that decides it: {lapsed}"
         );
+        assert!(v.tail.contains(&STARVED.unstarved()), "{}", v.tail);
         assert_eq!((v.ratchet, v.backstops), (None, None), "no floor is raised");
 
         // A stop every run has earns nothing, starved or not.
@@ -6370,6 +6451,7 @@ mod tests {
             wall_ms,
             load,
             cores: 14,
+            threads: None,
         };
         assert!(!p(800, 1000, Some(1400)).starved());
         assert!(p(799, 1000, Some(100)).starved());
@@ -6383,9 +6465,63 @@ mod tests {
             p(1, 2, None).said(),
             "CPU/wall 0.50, load unread on 14 cores"
         );
-        for bad in ["", "-", "1 2 3", "1 2 x 4", "1 2 3 4 5"] {
+        for bad in [
+            "",
+            "-",
+            "1 2 3",
+            "1 2 x 4",
+            "1 2 3 4 5",
+            "1 2 3 4 5 x",
+            "1 2 3 4 5 6 7",
+        ] {
             assert_eq!(Pace::parse(bad), None, "{bad:?}");
         }
+    }
+
+    /// aterm-font under 20565c325 on this Mac (2026-10-25): 27905 s of CPU in 3861 s at a mean
+    /// load of 41.43 on 14 cores, most of it its own verifier's runnable threads.
+    #[test]
+    fn a_pace_whose_threads_were_read_is_starved_by_their_share_alone() {
+        let at = |load, threads| Pace {
+            cpu_ms: 27_904_710,
+            wall_ms: 3_861_090,
+            load: Some(load),
+            cores: 14,
+            threads,
+        };
+        let th = |ran_ms, runnable_ms| {
+            Some(Threads {
+                ran_ms,
+                runnable_ms,
+            })
+        };
+        let ran = at(4143, th(800, 1000));
+        assert!(
+            !ran.starved(),
+            "threads that ran are not starved by the load: {}",
+            ran.said()
+        );
+        assert!(
+            at(200, th(799, 1000)).starved(),
+            "threads that waited are, at any load"
+        );
+        // The negative control: the same run with its threads unread is judged by the load.
+        assert!(at(4143, None).starved());
+        assert!(!at(200, None).starved());
+        assert!(
+            at(4143, th(0, 0)).starved(),
+            "a read with no runnable time says nothing"
+        );
+        assert_eq!(Pace::parse(&ran.text()), Some(ran));
+        assert_eq!(Pace::parse("1 2 - 4 5 6").and_then(|p| p.threads), th(5, 6));
+        assert_ne!(ran.unstarved(), at(4143, None).unstarved());
+        // The lane's run of it at `--worker-threads 3` (2026-10-25), as its `.pace` mark says.
+        let lane = Pace::parse("25022638 3675162 4195 14 24965019 43582620").unwrap();
+        assert!(lane.starved());
+        assert_eq!(
+            lane.said(),
+            "CPU/wall 6.81, load 41.95 on 14 cores, threads ran 0.57 of their runnable time, 11.86 of them runnable on average"
+        );
     }
 
     #[test]

@@ -667,11 +667,60 @@ pub fn journal_line(line: &str) -> String {
     )
 }
 
-/// `journal [tag]`: the harness's own record of what it decided for the tab, and its ledger.
+/// The tab a verb's words name, `@<sid>`, taken out of `args` (the words after the tag): only
+/// their first word names one, so a later word (a capture's name or description) may start
+/// with `@`. `None` where the first word names none.
+/// # Errors
+/// A first word `@…` that is no session id.
+pub fn take_tab(args: &mut Vec<String>) -> Result<Option<String>, Fail> {
+    if !args.first().is_some_and(|w| w.starts_with('@')) {
+        return Ok(None);
+    }
+    let sid = args.remove(0).split_off(1);
+    let shaped = !sid.is_empty()
+        && sid.len() <= 64
+        && sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if shaped {
+        Ok(Some(sid))
+    } else {
+        Err(Fail::usage(format!("'@{sid}' names no session id")))
+    }
+}
+
+/// Whether the `ls` reply `ls` lists the tab `sid` (the third word of one of its rows, as
+/// [`sid`] reads the first).
+#[must_use]
+pub fn ls_lists(ls: &str, sid: &str) -> bool {
+    ls.lines().any(|l| l.split_whitespace().nth(2) == Some(sid))
+}
+
+/// The tab `named` if `door`'s lab lists it, else the first tab ([`sid`]) where none is named.
+/// # Errors
+/// The lab lists no tab `named`.
+fn named_or_first(door: &Door<'_>, named: Option<String>) -> Result<String, Fail> {
+    let Some(sid) = named else {
+        return Ok(sid(door));
+    };
+    if ls_lists(&door.out(&["ls"]), &sid) {
+        Ok(sid)
+    } else {
+        Err(Fail::usage(format!(
+            "lab '{}' lists no tab @{sid} ({} ls {0})",
+            door.run().tag,
+            crate::LAB
+        )))
+    }
+}
+
+/// `journal [tag] [@sid]`: the harness's own record of what it decided for the tab (the first
+/// tab, or the one named), and its ledger.
 pub fn cmd_journal(args: &[String]) -> Res {
-    let (run, _) = lab(args)?;
+    let (run, mut a) = lab(args)?;
+    let named = take_tab(&mut a)?;
     let door = Door::new(&run)?;
-    let sid = sid(&door);
+    let sid = named_or_first(&door, named)?;
     let f = run
         .state()
         .join("drive")
@@ -850,9 +899,19 @@ pub fn egress_text(run: &Run, minutes: &str) -> String {
     s
 }
 
-/// Format the one-line `# …` fixture header for this lab and the agent its tab runs.
+/// Format the one-line `# …` fixture header for this lab and the agent its active tab runs.
 #[must_use]
 pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
+    fixture_header_on(run, door, None, what)
+}
+
+/// [`fixture_header`] for the tab `tab` (`None`: the active tab): its size, and for Claude
+/// Code the launch that ran in it ([`launch_record`]).
+#[must_use]
+pub fn fixture_header_on(run: &Run, door: &Door<'_>, tab: Option<&str>, what: &str) -> String {
+    let at = tab.map(|sid| format!("@{sid}"));
+    let on =
+        |verb: &'static str| -> Vec<&str> { at.as_deref().into_iter().chain([verb]).collect() };
     let av = run
         .need_aterm()
         .ok()
@@ -875,7 +934,7 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
         })
         .unwrap_or_else(|| "?".into());
     let size = door
-        .out(&["dims"])
+        .out(&on("dims"))
         .lines()
         .find_map(|l| {
             let w: Vec<&str> = l.split_whitespace().collect();
@@ -918,16 +977,222 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
             run.codex_ver
         );
     }
-    let launcher = fs::read_to_string(run.run.join("claude.sh")).unwrap_or_default();
+    let sid = tab.map_or_else(|| active_sid(door), str::to_string);
+    let launcher = launch_record(run, &sid);
     let settings = scratch_text(&run.settings());
-    let stored = run.w.join("home/.claude/.credentials.json").exists();
-    let login = claude_login(&launcher, &settings, stored).phrase();
+    let creds = match claude_route(&launcher) {
+        ClaudeRoute::Stub => run.w.join("home/.claude/.credentials.json"),
+        ClaudeRoute::Default => {
+            launcher_value(&launcher, aterm_agent::harness::accounts::LOGIN_ENV)
+                .map_or_else(|| run.w.join("home/.claude"), std::path::PathBuf::from)
+                .join(".credentials.json")
+        }
+    };
+    let stored = crate::sys::scratch_read(&creds)
+        .ok()
+        .flatten()
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
     format!(
         "# claude-code {} · MEASURED {day}, `aterm ctl text` of a private headless aterm ({size}, aterm {av}) running the real \
-         Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, {login} and \
-         `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · {what}",
-        run.claude_ver
+         Claude Code, {} · {what}",
+        run.claude_ver,
+        claude_launch(&launcher, &settings, stored.as_deref())
     )
+}
+
+/// The active tab's session id ([`active_in`] of `ls`), empty when it lists none.
+#[must_use]
+pub fn active_sid(door: &Door<'_>) -> String {
+    active_in(&door.out(&["ls"])).unwrap_or_default()
+}
+
+/// The session id of the `ls` row marked `active=1` (its third word), the first.
+#[must_use]
+pub fn active_in(ls: &str) -> Option<String> {
+    ls.lines().find_map(|l| {
+        l.split_whitespace()
+            .any(|w| w == "active=1")
+            .then(|| l.split_whitespace().nth(2).map(str::to_string))
+            .flatten()
+    })
+}
+
+/// Where the launcher of what ran in tab `sid` is kept ([`record_launch`]).
+#[must_use]
+pub fn launch_path(run: &Run, sid: &str) -> std::path::PathBuf {
+    run.run.join(crate::lab::LAUNCHES).join(format!("{sid}.sh"))
+}
+
+/// Keep `launcher` as what ran in tab `sid`, for its captures' header ([`launch_record`]).
+/// # Errors
+/// The record could not be written.
+pub fn record_launch(run: &Run, sid: &str, launcher: &str) -> Result<(), Fail> {
+    let path = launch_path(run, sid);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)
+            .map_err(|e| Fail::die(format!("cannot make {}: {e}", dir.display())))?;
+    }
+    atomic_write(&path, launcher.as_bytes())
+        .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))
+}
+
+/// The launcher of what ran in tab `sid` ([`record_launch`]), else the lab's last Claude Code
+/// launch (`claude.sh`), else empty.
+#[must_use]
+pub fn launch_record(run: &Run, sid: &str) -> String {
+    let kept = (!sid.is_empty())
+        .then(|| fs::read_to_string(launch_path(run, sid)).ok())
+        .flatten();
+    kept.unwrap_or_else(|| fs::read_to_string(run.run.join("claude.sh")).unwrap_or_default())
+}
+
+/// Which way a Claude Code launch reached a model's API ([`claude_route`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeRoute {
+    /// The lab's own: `ANTHROPIC_BASE_URL` set to the local stub, `CLAUDE_CONFIG_DIR` scratch
+    /// ([`crate::lab::launcher`]). A lab that launched nothing reads so too.
+    Stub,
+    /// Claude Code's default route: no `ANTHROPIC_BASE_URL` set (the launcher unsets it, and
+    /// `CLAUDE_CONFIG_DIR` and the proxies), so it would reach Anthropic but for the jail.
+    Default,
+}
+
+/// The route of the launch `launcher` (a tab's `sh` script): the stub's where it sets
+/// `ANTHROPIC_BASE_URL`, or where there is no launcher; else the default route.
+#[must_use]
+pub fn claude_route(launcher: &str) -> ClaudeRoute {
+    if launcher.trim().is_empty() || launcher.contains("ANTHROPIC_BASE_URL=") {
+        ClaudeRoute::Stub
+    } else {
+        ClaudeRoute::Default
+    }
+}
+
+/// The value `launcher` gives `key` (`KEY=value` or `KEY='value'`), the first.
+#[must_use]
+pub fn launcher_value(launcher: &str, key: &str) -> Option<String> {
+    let at = format!("{key}=");
+    let start = launcher.match_indices(at.as_str()).find_map(|(i, _)| {
+        let before = launcher[..i].chars().next_back();
+        before
+            .is_none_or(|c| c.is_whitespace() || c == '\'')
+            .then_some(i + at.len())
+    })?;
+    let rest = &launcher[start..];
+    if let Some(quoted) = rest.strip_prefix('\'') {
+        quoted.split_once('\'').map(|(v, _)| v.to_string())
+    } else {
+        rest.split_whitespace().next().map(str::to_string)
+    }
+}
+
+/// Whether a `.credentials.json` holds a dead stored login: a `claudeAiOauth` whose tokens
+/// are empty and whose `expiresAt` is past (0), as the lab's dead-login world lays it.
+#[must_use]
+pub fn stored_login_dead(text: &str) -> bool {
+    J::parse(text)
+        .ok()
+        .and_then(|j| j.get("claudeAiOauth").cloned())
+        .is_some_and(|o| {
+            let empty = |k: &str| o.get(k).and_then(J::as_str).is_none_or(str::is_empty);
+            empty("accessToken")
+                && empty("refreshToken")
+                && o.get("expiresAt")
+                    .and_then(J::as_f64)
+                    .is_none_or(|t| t <= 0.0)
+        })
+}
+
+/// Where a default-route launch's stored login lives ([`Launched::stored`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginDir {
+    /// A scratch login directory the launcher names by `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+    /// ([`aterm_agent::harness::accounts::LOGIN_ENV`]).
+    SecureStorage,
+    /// The scratch HOME's own `.claude`.
+    ScratchClaude,
+}
+
+/// How Claude Code was launched in a tab, as its fixture header tells it ([`launched`],
+/// [`Self::sentence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Launched {
+    /// Its route ([`claude_route`]).
+    pub route: ClaudeRoute,
+    /// Its login ([`claude_login`]).
+    pub login: ClaudeLogin,
+    /// On the default route with a stored login: where that login lives, and whether it is
+    /// dead ([`stored_login_dead`]); `None` otherwise.
+    pub stored: Option<(LoginDir, bool)>,
+}
+
+/// How Claude Code was launched, from the tab's `launcher`, the scratch `settings` and the
+/// `.credentials.json` the launch reads (`stored`, its text where there is one).
+#[must_use]
+pub fn launched(launcher: &str, settings: &str, stored: Option<&str>) -> Launched {
+    let route = claude_route(launcher);
+    let login = claude_login(launcher, settings, stored.is_some());
+    let stored =
+        (route == ClaudeRoute::Default && login == ClaudeLogin::StoredCredentials).then(|| {
+            let dir =
+                if launcher_value(launcher, aterm_agent::harness::accounts::LOGIN_ENV).is_some() {
+                    LoginDir::SecureStorage
+                } else {
+                    LoginDir::ScratchClaude
+                };
+            (dir, stored.is_some_and(stored_login_dead))
+        });
+    Launched {
+        route,
+        login,
+        stored,
+    }
+}
+
+impl Launched {
+    /// The sentence a fixture header tells this launch by.
+    #[must_use]
+    pub fn sentence(self) -> String {
+        match self.route {
+            ClaudeRoute::Stub => format!(
+                "launched by path with a scratch `CLAUDE_CONFIG_DIR`, {} and \
+                 `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab)",
+                self.login.phrase()
+            ),
+            ClaudeRoute::Default => {
+                let how = match self.stored {
+                    Some((dir, dead)) => {
+                        let dir = match dir {
+                            LoginDir::SecureStorage => {
+                                "`CLAUDE_SECURESTORAGE_CONFIG_DIR` a scratch login dir"
+                            }
+                            LoginDir::ScratchClaude => "its scratch `.claude`",
+                        };
+                        let what = if dead {
+                            "a dead stored login"
+                        } else {
+                            "a stored login"
+                        };
+                        format!(
+                            "{dir} whose `.credentials.json` is {what}, no `apiKeyHelper` and no OAuth token"
+                        )
+                    }
+                    None => self.login.phrase().to_string(),
+                };
+                format!(
+                    "launched by path on its default route (no `CLAUDE_CONFIG_DIR`, no \
+                     `ANTHROPIC_BASE_URL` and no proxy: the lab's scratch HOME, {how}, every \
+                     connection but loopback denied by the lab's jail, crates/aterm-lab)"
+                )
+            }
+        }
+    }
+}
+
+/// How a fixture header says Claude Code was launched: [`launched`]'s [`Launched::sentence`].
+#[must_use]
+pub fn claude_launch(launcher: &str, settings: &str, stored: Option<&str>) -> String {
+    launched(launcher, settings, stored).sentence()
 }
 
 /// How the lab's Claude Code signs in ([`claude_login`]), each named in a fixture header by its
@@ -978,14 +1243,20 @@ pub fn claude_login(launcher: &str, settings: &str, stored: bool) -> ClaudeLogin
     }
 }
 
-/// `header [tag] "<what>"`.
+/// `header [tag] [@sid] "<what>"`: the active tab's, or the named one's.
 pub fn cmd_header(args: &[String]) -> Res {
-    let (run, a) = lab(args)?;
+    let (run, mut a) = lab(args)?;
+    let named = take_tab(&mut a)?;
+    let door = Door::new(&run)?;
+    let tab = named
+        .map(|sid| named_or_first(&door, Some(sid)))
+        .transpose()?;
     println!(
         "{}",
-        fixture_header(
+        fixture_header_on(
             &run,
-            &Door::new(&run)?,
+            &door,
+            tab.as_deref(),
             a.first().map_or("", String::as_str)
         )
     );
@@ -1031,8 +1302,24 @@ pub fn write_fixture_rows_in(
 
 /// Capture the current frame as a PNG next to the fixtures, or `None`.
 pub fn png(door: &Door<'_>, dir: &Path, full: &str) -> Option<std::path::PathBuf> {
+    png_on(door, None, dir, full)
+}
+
+/// [`png`] of tab `tab` (`None`: the active tab).
+pub fn png_on(
+    door: &Door<'_>,
+    tab: Option<&str>,
+    dir: &Path,
+    full: &str,
+) -> Option<std::path::PathBuf> {
     let name = format!("{full}.png");
-    let r = door.out(&["image", &name]);
+    let at = tab.map(|sid| format!("@{sid}"));
+    let args: Vec<&str> = at
+        .as_deref()
+        .into_iter()
+        .chain(["image", name.as_str()])
+        .collect();
+    let r = door.out(&args);
     let w: Vec<&str> = r.split_whitespace().collect();
     let src = (w.len() >= 4 && w[0] == "OK").then(|| w[3])?;
     let images = crate::paths::physical(Path::new(&door.run().sockdir)).join("images");
@@ -1045,7 +1332,8 @@ pub fn png(door: &Door<'_>, dir: &Path, full: &str) -> Option<std::path::PathBuf
         .map(|()| dst)
 }
 
-/// Capture the screen into `$LAB_STATE/captures/<agent>-<version>-<name>.txt` (and `.png`).
+/// Capture the active tab's screen into `$LAB_STATE/captures/<agent>-<version>-<name>.txt`
+/// (and `.png`).
 /// # Errors
 /// The screen could not be read, or the capture could not be written.
 pub fn capture(
@@ -1053,8 +1341,22 @@ pub fn capture(
     name: &str,
     what: &str,
 ) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), Fail> {
+    capture_on(run, None, name, what)
+}
+
+/// [`capture`] of tab `tab` (`None`: the active tab).
+/// # Errors
+/// As [`capture`].
+pub fn capture_on(
+    run: &Run,
+    tab: Option<&str>,
+    name: &str,
+    what: &str,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), Fail> {
     let door = Door::new(run)?;
-    let body = door.ctl(&["text"])?;
+    let at = tab.map(|sid| format!("@{sid}"));
+    let text: Vec<&str> = at.as_deref().into_iter().chain(["text"]).collect();
+    let body = door.ctl(&text)?;
     if body.code != 0 {
         return Err(Fail::die("ctl text failed"));
     }
@@ -1063,11 +1365,11 @@ pub fn capture(
     fs::create_dir_all(paths().state.join("captures")).map_err(|e| Fail::die(e.to_string()))?;
     let text = format!(
         "{}\n{}\n",
-        fixture_header(run, &door, what),
+        fixture_header_on(run, &door, tab, what),
         body.stdout.trim_end_matches('\n')
     );
     fs::write(&out, &text).map_err(|e| Fail::die(e.to_string()))?;
-    let png = png(&door, &paths().state.join("captures"), &full);
+    let png = png_on(&door, tab, &paths().state.join("captures"), &full);
     let host = aterm_uds::spawnfd::command("/bin/hostname")
         .arg("-s")
         .output()
@@ -1098,11 +1400,22 @@ fn pii_found(p: &crate::paths::Paths, host: &str, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `capture [tag] <name> "<what>"`: the screen as it is NOW, in the repo's fixture shape.
+/// `capture [tag] [@sid] <name> "<what>"`: the active tab's screen (or the named tab's) as it
+/// is NOW, in the repo's fixture shape.
 pub fn cmd_capture(args: &[String]) -> Res {
-    let (run, a) = lab(args)?;
+    let (run, mut a) = lab(args)?;
+    let named = take_tab(&mut a)?;
+    let tab = match named {
+        Some(sid) => Some(named_or_first(&Door::new(&run)?, Some(sid))?),
+        None => None,
+    };
     let name = a.first().ok_or_else(|| Fail::die("capture: need a name"))?;
-    capture(&run, name, a.get(1).map_or("", String::as_str))?;
+    capture_on(
+        &run,
+        tab.as_deref(),
+        name,
+        a.get(1).map_or("", String::as_str),
+    )?;
     Ok(0)
 }
 
@@ -1304,6 +1617,162 @@ mod tests {
         let phrases: std::collections::BTreeSet<&str> =
             all.iter().map(|login| login.phrase()).collect();
         assert_eq!(phrases.len(), all.len(), "each login a header tells apart");
+    }
+
+    /// Two tabs as a lab's `ls` lists them (measured 2026-10-25), the second one active.
+    const LS: &str = "0 0 s-514051f1c3c7e2adf6ba - alive /private/tmp/at.GQvN/proj meta=0 window=0 active=0 wfocus=1 program=zsh\n\
+                      0 1 s-0f4a5235f1fe789003c4 s-514051f1c3c7e2adf6ba alive /private/tmp meta=0 window=0 active=1 wfocus=1 program=zsh\n";
+
+    #[test]
+    fn a_verb_names_its_tab_by_sid_and_reads_the_active_one_otherwise() {
+        let words = |w: &[&str]| w.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let mut a = words(&["@s-0f4a5235f1fe789003c4", "name", "what"]);
+        assert_eq!(
+            take_tab(&mut a).unwrap().as_deref(),
+            Some("s-0f4a5235f1fe789003c4")
+        );
+        assert_eq!(a, words(&["name", "what"]), "the tab's word is taken out");
+        let mut a = words(&["name", "what"]);
+        assert_eq!(take_tab(&mut a).unwrap(), None, "no tab named");
+        assert_eq!(a.len(), 2);
+        for bad in [&["@"][..], &["@a b"], &["@../x", "name"]] {
+            assert!(take_tab(&mut words(bad)).is_err(), "{bad:?}");
+        }
+        for later in [
+            &["mention", "@ file picker"][..],
+            &["mention", "@mentions"],
+            &["@s-0f4a5235f1fe789003c4", "mention", "@mentions"],
+        ] {
+            let mut a = words(later);
+            let took = take_tab(&mut a).unwrap();
+            assert_eq!(
+                took.is_some(),
+                later[0].starts_with('@'),
+                "only the first word names a tab: {later:?}"
+            );
+            assert_eq!(
+                a.last().map(String::as_str),
+                later.last().copied(),
+                "a later `@` word is the verb's own: {later:?}"
+            );
+        }
+        assert!(ls_lists(LS, "s-0f4a5235f1fe789003c4"));
+        assert!(ls_lists(LS, "s-514051f1c3c7e2adf6ba"));
+        assert!(
+            !ls_lists(LS, "s-0f4a"),
+            "a prefix is no tab, nor is a parent column"
+        );
+        assert_eq!(active_in(LS).as_deref(), Some("s-0f4a5235f1fe789003c4"));
+        assert_eq!(
+            active_in(&LS.replace("active=1", "active=0")),
+            None,
+            "none active"
+        );
+    }
+
+    /// The lab's stub-route launcher ([`crate::lab::launcher`]) and Claude Code's default
+    /// route's (`claude-login-proof`), as each writes them.
+    const STUB: &str = "#!/bin/sh\nclear\nexec env PATH=\"/r/shim:$PATH\" CLAUDE_CONFIG_DIR=/r/scratch/home/.claude \
+                        ANTHROPIC_BASE_URL=http://127.0.0.1:57044 \\\n  HTTP_PROXY=http://127.0.0.1:57045 \\\n  /c/claude\n";
+    const DEFAULT: &str = "#!/bin/sh\nclear\nexec env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_BASE_URL -u HTTP_PROXY \\\n  \
+                           PATH=\"/r/shim:$PATH\" CLAUDE_SECURESTORAGE_CONFIG_DIR='/r/scratch/state/a b/lab-b' \
+                           DISABLE_AUTOUPDATER=1 \\\n  '/c/claude'\n";
+    const DEAD: &str =
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":[]}}"#;
+
+    #[test]
+    fn a_header_names_the_route_the_tab_was_launched_on() {
+        assert_eq!(claude_route(STUB), ClaudeRoute::Stub);
+        assert_eq!(claude_route(DEFAULT), ClaudeRoute::Default);
+        assert_eq!(claude_route(""), ClaudeRoute::Stub, "nothing launched");
+        assert_eq!(
+            launcher_value(DEFAULT, "CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+            Some("/r/scratch/state/a b/lab-b"),
+            "a quoted value whole"
+        );
+        assert_eq!(
+            launcher_value(STUB, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/r/scratch/home/.claude")
+        );
+        assert_eq!(
+            launcher_value(DEFAULT, "CLAUDE_CONFIG_DIR"),
+            None,
+            "`-u CLAUDE_CONFIG_DIR` gives it no value"
+        );
+        assert!(stored_login_dead(DEAD));
+        assert!(!stored_login_dead(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"r","expiresAt":1999999999999}}"#
+        ));
+        assert!(!stored_login_dead("{}"), "no stored login at all");
+        let none = r#"{"env": {}}"#;
+        let live = r#"{"claudeAiOauth":{"accessToken":"t","expiresAt":1999999999999}}"#;
+        let home = DEFAULT.replace(
+            " CLAUDE_SECURESTORAGE_CONFIG_DIR='/r/scratch/state/a b/lab-b'",
+            "",
+        );
+        let of = |route, login, stored| Launched {
+            route,
+            login,
+            stored,
+        };
+        let (stub, default, stored) = (
+            ClaudeRoute::Stub,
+            ClaudeRoute::Default,
+            ClaudeLogin::StoredCredentials,
+        );
+        let cases = [
+            ("the stub's route", STUB, Some(DEAD), of(stub, stored, None)),
+            (
+                "the default route, a dead login in a named dir",
+                DEFAULT,
+                Some(DEAD),
+                of(default, stored, Some((LoginDir::SecureStorage, true))),
+            ),
+            (
+                "the default route, a live login",
+                DEFAULT,
+                Some(live),
+                of(default, stored, Some((LoginDir::SecureStorage, false))),
+            ),
+            (
+                "the default route, the scratch HOME's own `.claude`",
+                home.as_str(),
+                Some(DEAD),
+                of(default, stored, Some((LoginDir::ScratchClaude, true))),
+            ),
+            (
+                "the default route, no stored login",
+                DEFAULT,
+                None,
+                of(default, ClaudeLogin::NoLogin, None),
+            ),
+        ];
+        let mut sentences = std::collections::BTreeSet::new();
+        for (case, launcher, creds, want) in cases {
+            let got = launched(launcher, none, creds);
+            assert_eq!(got, want, "{case}");
+            let sentence = claude_launch(launcher, none, creds);
+            assert_eq!(
+                sentence,
+                got.sentence(),
+                "{case}: the header's is the decision's"
+            );
+            for key in ["CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL"] {
+                assert!(sentence.contains(key), "{case}: names {key}");
+            }
+            assert_eq!(
+                sentence.contains(aterm_agent::harness::accounts::LOGIN_ENV),
+                got.stored
+                    .is_some_and(|(dir, _)| dir == LoginDir::SecureStorage),
+                "{case}: names the login dir's variable where the launch set it"
+            );
+            sentences.insert(sentence);
+        }
+        assert_eq!(
+            sentences.len(),
+            cases.len(),
+            "each launch a header tells apart"
+        );
     }
 
     #[test]

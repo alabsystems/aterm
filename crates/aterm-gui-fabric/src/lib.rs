@@ -11,7 +11,9 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use aterm_control::wire::pct_encode;
 use aterm_session::SessionId;
-use aterm_types::fabric_grammar::{KINDS, VERDICTS, is_principal, is_topic, via_ok};
+use aterm_types::fabric_grammar::{
+    KINDS, MirrorState, VERDICTS, is_principal, is_topic, parse_bus_offset, via_ok,
+};
 
 use aterm_gui_timing::now_ms;
 
@@ -2178,7 +2180,7 @@ enum HelloLog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MirrorReport {
-    state: &'static str,
+    state: MirrorState,
     reason: String,
 }
 
@@ -2756,7 +2758,7 @@ pub fn bridge_mirror_word() -> Option<bool> {
         Some(HelloLog::Auto) => link
             .mirror
             .as_ref()
-            .is_some_and(|m| m.state == "unretained")
+            .is_some_and(|m| m.state == MirrorState::Unretained)
             .then_some(false),
         Some(HelloLog::Off) | None => Some(false),
     }
@@ -2772,12 +2774,12 @@ pub fn fabric_mirror_facts() -> String {
         Some(HelloLog::Off) | None => return String::new(),
     };
     let state = link.mirror.as_ref().map_or_else(
-        || "starting".to_string(),
+        || MirrorState::Starting.word().to_string(),
         |m| {
             if m.reason.is_empty() {
-                m.state.to_string()
+                m.state.word().to_string()
             } else {
-                format!("{}:{}", m.state, m.reason)
+                format!("{}:{}", m.state.word(), m.reason)
             }
         },
     );
@@ -2788,13 +2790,8 @@ fn cmd_link_mirror<'a>(
     mut toks: impl Iterator<Item = &'a str>,
     generation: Option<BridgeGeneration>,
 ) -> String {
-    let state = match toks.next() {
-        Some("on") => "on",
-        Some("stopped") => "stopped",
-        Some("capped") => "capped",
-        Some("budget") => "budget",
-        Some("unretained") => "unretained",
-        _ => return LINK_USAGE.to_string(),
+    let Some(state) = toks.next().and_then(MirrorState::reported) else {
+        return LINK_USAGE.to_string();
     };
     let mut reason = String::new();
     for tok in toks {
@@ -3980,6 +3977,12 @@ pub fn cmd_hold_within_waking(
     let (Some(sid), Some(state)) = (toks.next(), toks.next()) else {
         return usage.to_string();
     };
+    if sid.starts_with('@') {
+        return format!(
+            "ERR usage: hold names its session by its bare sid, with no @: {}",
+            usage.trim_start_matches("ERR usage: ")
+        );
+    }
     let on = match state {
         "on" => true,
         "off" => false,
@@ -5540,9 +5543,9 @@ fn addressed_floor(inbox: &Inbox) -> Option<u64> {
 }
 
 const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say[:<topic>]> \
-                          kind=<ask|answer|task|report|note|ack|control> [re=<n>] [dl=<ms>] \
-                          [via=<p,...>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] \
-                          ([--] <text> | len=<n> + <n> raw bytes)\n";
+                          kind=<ask|answer|task|report|note|ack|control> [re=[@]<off>] \
+                          [dl=<ms>] [via=<p,...>] [key=<token>] [--wait[=<ms>]] \
+                          [--wait-ack[=<ms>]] ([--] <text> | len=<n> + <n> raw bytes)\n";
 
 const POST_LEN_USAGE: &str = "ERR usage: post len=<n> must be a byte count\n";
 
@@ -5616,9 +5619,9 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         } else if let Some(v) = kv(tok, "kind") {
             kind = Some(v.to_string());
         } else if let Some(v) = kv(tok, "re") {
-            match v.parse() {
-                Ok(n) => re = Some(n),
-                Err(_) => return POST_USAGE.to_string(),
+            match parse_bus_offset(v) {
+                Some(n) => re = Some(n),
+                None => return POST_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "dl") {
             match v.parse() {
@@ -5922,9 +5925,9 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
                 Err(_) => return USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "re") {
-            match v.parse() {
-                Ok(n) => re = Some(n),
-                Err(_) => return USAGE.to_string(),
+            match parse_bus_offset(v) {
+                Some(n) => re = Some(n),
+                None => return USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "kinds") {
             let list: Vec<String> = v.split(',').map(str::to_string).collect();
@@ -6720,6 +6723,38 @@ mod inbox_hold {
                 row.to.len()
             );
         }
+    }
+
+    /// `re=` takes a bus offset bare or as `inbox`, `cause=` and a brief's `head=` print it
+    /// (`@<off>`), as `aterm fabric post` does: both forms post the same reply, and `await inbox
+    /// re=` reads both.
+    #[test]
+    fn a_reply_names_its_offset_with_or_without_the_at_sign() {
+        let store = new_store();
+        let (_sid, ctx) = registered(&store);
+        assert_eq!(
+            cmd_post(&ctx, "to=@s-abc kind=note re=21 hi", None),
+            "OK 1\n"
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=@s-abc kind=note re=@21 hi", None),
+            "OK 2\n"
+        );
+        for bad in ["re=@", "re=@@21", "re=+5", "re=x"] {
+            assert_eq!(
+                cmd_post(&ctx, &format!("to=@s-abc kind=note {bad} hi"), None),
+                POST_USAGE,
+                "{bad}"
+            );
+        }
+        let res: Vec<Option<u64>> = ctx.fabric.lock().posts.iter().map(|r| r.re).collect();
+        assert_eq!(res, [Some(21), Some(21)]);
+        let (bare, at) = (
+            cmd_await_inbox(&ctx, &["re=7"], 0),
+            cmd_await_inbox(&ctx, &["re=@7"], 0),
+        );
+        assert!(!at.starts_with("ERR usage"), "{at}");
+        assert_eq!(at, bare);
     }
 
     #[test]
@@ -8458,6 +8493,30 @@ mod inbox_hold {
             assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
             assert_eq!(bridge_lost(&store, generation), 1);
             assert!(halt_refusal(&ctx, "turn").is_some());
+        });
+    }
+
+    #[test]
+    fn a_hold_naming_its_session_with_an_at_gets_the_bare_sid_form() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let bare = format!(
+                "ERR usage: hold names its session by its bare sid, with no @: {}",
+                HOLD_USAGE.trim_start_matches("ERR usage: ")
+            );
+            for issuer in [HoldIssuer::Owner, HoldIssuer::Bridge] {
+                for rest in [
+                    format!("@{sid} on"),
+                    format!("@{sid} off reason=x"),
+                    "@s-nope on".to_owned(),
+                    "@self on".to_owned(),
+                ] {
+                    assert_eq!(cmd_hold(&store, &rest, issuer), bare, "{issuer:?} {rest}");
+                }
+            }
+            assert_eq!(ctx.fabric.hold(), None, "nothing was held");
+            assert_eq!(owner_hold(&store, &format!("{sid} on")), "OK hold=1\n");
         });
     }
 

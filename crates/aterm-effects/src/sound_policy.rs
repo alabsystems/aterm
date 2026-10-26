@@ -196,7 +196,7 @@ pub struct TrailSoundPolicy {
     pub gain: Option<f32>,
     /// The window's cached tone-of-typing verdict, resolved by the host like gain.
     pub tone: crate::tone::Tone,
-    /// The `trail_sound_bed` knob (default on).
+    /// The `trail_sound_bed` knob (default off).
     pub bed: bool,
 }
 

@@ -116,6 +116,202 @@ fn explicit_aliases_and_optional_metadata_create_no_implied_requirements() {
 }
 
 #[test]
+fn typed_detail_references_report_missing_contacts_without_resolving_secrets() {
+    let mut snapshot = fixture();
+    put(
+        &mut snapshot,
+        "accounts",
+        "detail-account",
+        json!({"provider":"example","method":"email-link",
+            "details":{"phone":{"kind":"phone-ref","value":"missing-phone"}},
+            "source":{"email":{"kind":"email-ref","value":"missing-email"},
+                "secret":{"kind":"secret-ref","value":"private:entry"},
+                "origin":{"kind":"source-ref","value":"sheet:row"}}}),
+    );
+    let report = inspect(&snapshot);
+    for (field, collection, target) in [
+        ("details[phone]", "phones", "missing-phone"),
+        ("source[email]", "email-addresses", "missing-email"),
+    ] {
+        assert!(
+            report["issues"].as_array().unwrap().iter().any(|issue| {
+                issue["key"].as_str() == Some("detail-account")
+                    && issue["field"].as_str() == Some(field)
+                    && issue["code"].as_str() == Some("missing-reference")
+                    && issue["target"]["collection"].as_str() == Some(collection)
+                    && issue["target"]["key"].as_str() == Some(target)
+            }),
+            "missing diagnostic for {field}: {report:?}"
+        );
+    }
+    assert_eq!(report["issues"].as_array().unwrap().len(), 2);
+    assert_eq!(report["authority"].as_str(), Some("none"));
+    let text = aterm_json::to_string(&report).unwrap();
+    assert!(!text.contains("private:entry"));
+    assert!(!text.contains("sheet:row"));
+}
+
+#[test]
+fn typed_details_preserve_contact_refusals_for_every_root_collection() {
+    for (collection, value) in [
+        ("accounts", json!({"provider":"example","method":"phone"})),
+        ("mailboxes", json!({"name":"checked"})),
+        ("email-addresses", json!({"address":"checked@example.test"})),
+        ("phones", json!({"label":"checked"})),
+        ("machine-proposals", json!({"name":"m3"})),
+    ] {
+        let key = if collection == "machine-proposals" {
+            "01010101010101010101010101010101"
+        } else {
+            "checked"
+        };
+        for field in ["details", "source"] {
+            if field == "source" && collection != "accounts" {
+                continue;
+            }
+            for (kind, target_collection, id) in [
+                ("phone-ref", "phones", "sms"),
+                ("email-ref", "email-addresses", "alias"),
+            ] {
+                for qualified in [false, true] {
+                    for (state, code) in [
+                        (0, "missing-reference"),
+                        (1, "deleted-reference"),
+                        (2, "conflicted-reference"),
+                        (3, "stopped-reference"),
+                    ] {
+                        let mut snapshot = fixture();
+                        let mut value = value.clone();
+                        let reference = if qualified {
+                            format!("{target_collection}:{id}")
+                        } else {
+                            id.into()
+                        };
+                        value.as_object_mut().unwrap().insert(
+                            field.into(),
+                            json!({"contact":{"kind":kind,"value":reference}}),
+                        );
+                        put(&mut snapshot, collection, key, value);
+                        let target = (target_collection.into(), id.into());
+                        match state {
+                            0 => {
+                                snapshot.cells.remove(&target);
+                            }
+                            1 => {
+                                snapshot.cells.get_mut(&target).unwrap().candidates[0].value =
+                                    Value::Null;
+                            }
+                            2 => {
+                                snapshot.cells.get_mut(&target).unwrap().candidates.push(
+                                    Candidate {
+                                        operation: [99; 32],
+                                        value: Value::Null,
+                                    },
+                                );
+                            }
+                            3 => {
+                                snapshot.cells.get_mut(&target).unwrap().stopped = true;
+                            }
+                            _ => unreachable!(),
+                        }
+                        let before = snapshot.cells.clone();
+                        let report = inspect(&snapshot);
+                        assert_eq!(snapshot.cells, before);
+                        assert!(
+                            report["issues"].as_array().unwrap().iter().any(|issue| {
+                                issue["collection"].as_str() == Some(collection)
+                                    && issue["key"].as_str() == Some(key)
+                                    && issue["field"].as_str() == Some(&format!("{field}[contact]"))
+                                    && issue["code"].as_str() == Some(code)
+                                    && issue["target"]["collection"].as_str()
+                                        == Some(target_collection)
+                                    && issue["target"]["key"].as_str() == Some(id)
+                            }),
+                            "{collection} {field} {kind} {qualified} {state}: {report:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn contact_details_use_exact_namespaces_and_do_not_follow_other_details() {
+    let mut snapshot = fixture();
+    for (id, target) in [("one", "two"), ("two", "one")] {
+        put(
+            &mut snapshot,
+            "phones",
+            id,
+            json!({"details":{"related":{"kind":"phone-ref","value":target}}}),
+        );
+    }
+    assert!(codes(&inspect(&snapshot)).is_empty());
+    for (kind, reference) in [
+        ("phone-ref", "phones:sms"),
+        ("email-ref", "email-addresses:alias"),
+        ("phone-ref", "PHONES:sms"),
+        ("phone-ref", "email-addresses:sms"),
+        ("phone-ref", "other:sms"),
+        ("phone-ref", "phones:sms:extra"),
+    ] {
+        put(
+            &mut snapshot,
+            "accounts",
+            "checked",
+            json!({"provider":"example","method":"phone",
+                "details":{"contact":{"kind":kind,"value":reference}}}),
+        );
+        let report = inspect(&snapshot);
+        let issues = report["issues"].as_array().unwrap();
+        if reference == "phones:sms" || reference == "email-addresses:alias" {
+            assert!(issues.is_empty(), "{report:?}");
+        } else {
+            assert_eq!(issues.len(), 1, "{report:?}");
+            assert_eq!(
+                issues[0]["code"].as_str(),
+                Some("unsupported-contact-reference")
+            );
+            assert!(issues[0]["target"].is_null());
+            assert!(!aterm_json::to_string(&report).unwrap().contains(reference));
+        }
+    }
+}
+
+#[test]
+fn typed_detail_traversal_obeys_the_global_lookup_budget() {
+    let mut snapshot = empty();
+    let details = (0..64)
+        .map(|i| {
+            (
+                format!("p{i}"),
+                json!({"kind":"phone-ref","value":"missing"}),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for i in 0..600 {
+        put(
+            &mut snapshot,
+            "accounts",
+            &format!("a{i:04}"),
+            json!({"provider":"example","method":"phone","details":details}),
+        );
+    }
+    let report = inspect(&snapshot);
+    assert_eq!(report["truncated"].as_bool(), Some(true));
+    assert!(
+        report["limits_hit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("steps"))
+    );
+    assert!(report["inspected_objects"].as_u64().unwrap() < snapshot.cells.len() as u64);
+    assert!(report["issues"].as_array().unwrap().len() <= MAX_ISSUES);
+}
+
+#[test]
 fn exact_addresses_never_infer_aliases_or_fold_case_dots_and_tags() {
     let mut snapshot = fixture();
     for (id, address) in [
@@ -404,13 +600,74 @@ pub(crate) fn reference_transition(
             }
             8
         }
+        "DetailMissing" => {
+            put(
+                &mut snapshot,
+                "accounts",
+                "account",
+                json!({"provider":"example","method":"phone",
+                    "details":{"phone":{"kind":"phone-ref","value":"absent"}}}),
+            );
+            9
+        }
+        "DetailAlias" => {
+            put(
+                &mut snapshot,
+                "accounts",
+                "account",
+                json!({"provider":"example","method":"email-link",
+                    "source":{"email":{"kind":"email-ref","value":"email-addresses:alias"}}}),
+            );
+            put(
+                &mut snapshot,
+                "email-addresses",
+                "primary",
+                json!({"address":"Case+tag@example.test","alias_of":"alias"}),
+            );
+            10
+        }
+        "DetailClean" => {
+            put(
+                &mut snapshot,
+                "accounts",
+                "account",
+                json!({"provider":"example","method":"email-link",
+                    "details":{"phone":{"kind":"phone-ref","value":"phones:sms"},
+                        "email":{"kind":"email-ref","value":"alias"}},
+                    "source":{"email":{"kind":"email-ref","value":"email-addresses:primary"},
+                        "secret":{"kind":"secret-ref","value":"private:entry"},
+                        "origin":{"kind":"source-ref","value":"sheet:row"}}}),
+            );
+            11
+        }
+        "DetailSyntax" => {
+            put(
+                &mut snapshot,
+                "accounts",
+                "account",
+                json!({"provider":"example","method":"phone",
+                    "details":{"phone":{"kind":"phone-ref","value":"email-addresses:sms"}}}),
+            );
+            12
+        }
         _ => panic!("unknown reference action"),
     };
     let before = snapshot.cells.clone();
     let report = inspect(&snapshot);
     let mut next = state.clone();
     next.insert("scenario", scenario);
-    next.insert("warning", i64::from(!codes(&report).is_empty()));
+    let warning = if matches!(scenario, 9 | 10 | 12) {
+        report["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["collection"].as_str() == Some("accounts")
+                && issue["key"].as_str() == Some("account")
+                && issue["field"].as_str().is_some_and(|field| {
+                    field.starts_with("details[") || field.starts_with("source[")
+                })
+        })
+    } else {
+        !codes(&report).is_empty()
+    };
+    next.insert("warning", i64::from(warning));
     next.insert(
         "truncated",
         i64::from(report["truncated"].as_bool().unwrap()),
@@ -443,5 +700,21 @@ fn reference_diagnostics_conform_and_missing_checks_are_detected() {
         !model
             .successors("Cycle", &model.init_state())
             .contains(&unsafe_cycle)
+    );
+    let mut ignored_detail = reference_transition(&model.init_state(), "DetailMissing");
+    ignored_detail.insert("warning", 0);
+    assert!(!model.check_invariant("ReportDetailReferences", &ignored_detail));
+    assert!(
+        !model
+            .successors("DetailMissing", &model.init_state())
+            .contains(&ignored_detail)
+    );
+    let mut invented_requirement = reference_transition(&model.init_state(), "DetailClean");
+    invented_requirement.insert("warning", 1);
+    assert!(!model.check_invariant("NoInventedRequirement", &invented_requirement));
+    assert!(
+        !model
+            .successors("DetailClean", &model.init_state())
+            .contains(&invented_requirement)
     );
 }

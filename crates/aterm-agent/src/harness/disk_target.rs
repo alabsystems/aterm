@@ -85,6 +85,12 @@ pub const PROFILE_WALK_WALL: Duration = Duration::from_secs(10);
 /// A profile a compile wrote into within this many seconds (ten minutes) is never reclaimed, by either pass.
 pub const PRESSURE_MIN_IDLE_S: i64 = 10 * 60;
 
+/// The least idle time a profile's incremental cache needs under a projection that is not also a
+/// measured short (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2): an hour, the span of the
+/// projection's own hour rate, so a session paused between builds keeps its cache and its rebuild
+/// never reads as a fill aterm made.
+pub const PROJECTED_MIN_IDLE_S: i64 = 60 * 60;
+
 #[cfg(any(unix, windows))]
 const MAX_DELETE_DEPTH: usize = 256;
 
@@ -178,12 +184,15 @@ impl TargetDir {
             })
     }
 
-    /// The profiles the pressure pass may take ([`reclaim_lru`]), and each other recent one with why it is kept.
+    /// The profiles the pressure pass may take ([`reclaim_lru`]), each unwritten for at least
+    /// `min_idle_s` ([`PRESSURE_MIN_IDLE_S`], or [`PROJECTED_MIN_IDLE_S`] under a projection above
+    /// the floor), and each other recent one with why it is kept.
     #[must_use]
     pub fn pressure_candidates(
         &self,
         now: i64,
         threshold_days: i64,
+        min_idle_s: i64,
     ) -> (Vec<&Profile>, Vec<(&Profile, String)>) {
         let mut picks = Vec::new();
         let mut kept = Vec::new();
@@ -202,13 +211,13 @@ impl TargetDir {
                 continue;
             }
             let age = now.saturating_sub(last);
-            if age < PRESSURE_MIN_IDLE_S {
+            if age < min_idle_s.max(PRESSURE_MIN_IDLE_S) {
                 kept.push((
                     p,
                     format!(
                         "written into {} ago; no reclaim takes a profile built in the last {}",
                         human_age(age),
-                        human_age(PRESSURE_MIN_IDLE_S)
+                        human_age(min_idle_s.max(PRESSURE_MIN_IDLE_S))
                     ),
                 ));
                 continue;

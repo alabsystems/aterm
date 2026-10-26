@@ -820,10 +820,62 @@ now reads the launcher, the scratch settings and the scratch credentials file th
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-verbs-claude-login	contract	verbs::claude_login, verbs::ClaudeLogin::phrase, verbs::fixture_header	∀ launcher, settings, stored: claude_login(launcher, settings, stored) = ClaudeLogin::OAuthToken if launcher contains `CLAUDE_CODE_OAUTH_TOKEN`; else ApiKeyHelper if J::parse(settings) is an object whose `apiKeyHelper` is a string; else StoredCredentials if stored; else NoLogin. Settings that do not parse, or name `apiKeyHelper` as a non-string, are no helper. The four logins' phrases are distinct, and fixture_header names exactly claude_login(the tab's claude.sh, the run's scratch settings, whether home/.claude/.credentials.json exists).phrase().	verbs.rs::a_header_names_the_login_the_lab_launched_with	JSON parsing, substring search, an enum with &'static str phrases	1,3
+verbs-claude-login	contract	verbs::claude_login, verbs::ClaudeLogin::phrase, verbs::fixture_header	∀ launcher, settings, stored: claude_login(launcher, settings, stored) = ClaudeLogin::OAuthToken if launcher contains `CLAUDE_CODE_OAUTH_TOKEN`; else ApiKeyHelper if J::parse(settings) is an object whose `apiKeyHelper` is a string; else StoredCredentials if stored; else NoLogin. Settings that do not parse, or name `apiKeyHelper` as a non-string, are no helper. The four logins' phrases are distinct, and on the stub's route (§20, `verbs-claude-route`) fixture_header names exactly claude_login(the tab's launch record, the run's scratch settings, whether the credentials file its launch reads exists).phrase().	verbs.rs::a_header_names_the_login_the_lab_launched_with	JSON parsing, substring search, an enum with &'static str phrases	1,3
 ```
 
 ```tsv
 file	test	primary	also
 src/verbs.rs	a_header_names_the_login_the_lab_launched_with	verbs-claude-login	
+```
+
+## 20. Added 2026-10-25: `claude-login-proof`, and the tab a lab verb reads
+
+`claude-login-proof [tag]` reproduces the hand-run Claude Code 2.1.310 login E2E on a private
+headless instance built from this tree: the installed Claude Code on its default route (no
+`CLAUDE_CONFIG_DIR`, no `ANTHROPIC_BASE_URL`, no proxy) in a dead-login world the lab lays in its
+scratch HOME, four scenarios on two tabs (S1 a lost login a roster row names; S2 one no row names;
+S3 `aterm harness accounts add` naming S2's login while aterm's own picker stands; S3b a person's
+own `/login` in the same tab), a process watcher for `auth login` and browser or `open` launches
+for the whole run, and the lab down by its PIDs on every path but `--keep`. The judges below are
+pure functions of the evidence's text (the tab's journal and decision ledger, the acts its tape
+holds, the accounts' ledger, the window's `messages.log`, the instance's `aterm.log`, the egress
+and open recorders, the keychain tripwire, the jail's profile); the run prints one row each and
+exits 1 on any FAIL, under `--keep` too, judged there off the live scratch (no `left` row, the lab
+being up). The verb never presses a key in a `/login` picker: each key it sends is fenced on the
+composer's own row and pressed once (S1's and S2's prompts and their Enters, S3b's `/login` and
+its Enter), and the picker S3b opens is left standing until `down` closes the tab. S3's add lands
+within 15 s of one of the host's own looks at the roster (`add_wait`), so its next look is 45 s or
+more away and a back-out the add's wake brought is told from one that look brought. The hidden
+`--roster-by-hand` writes S3's row into the roster by hand, so no wake marker tells the host, the
+live negative control: S3 must FAIL on its look clause and the rest pass. Alongside, `journal`,
+`header` and `capture` take a tab (`@<sid>`), and the header names the route and login of the
+launch that ran in that tab. Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+login-proof-evidence	contract	claude_login_proof::{journal_of,decisions_of,act_line,acts_of,ledger_of,messages_of,log_times,looks_of,names,is_input,is_login_send,is_login_enter,is_fenced_esc}	journal_of(t) = [Said{t_ms: millis(r.t), line: r.line} | l ∈ lines(t), r = J::parse(l) with `t` (integer ms, or seconds with a fraction) and a string `line`], every other line skipped; decisions_of reads `ts`, `rule_id`, `decision` the same way; ledger_of reads `account`, `kind`, `why` (absent = ""); messages_of(t) = [Message{kind, t_ms, title} | l ∈ lines(t) whose tab-separated fields hold `kind=` and an integer `t=`], title "" when absent. log_times(log, n) = [round(1000 · words(l)[0] as seconds) | l ∈ lines(log) holding n whose first word reads as a number], and looks_of(log) = log_times(log, ROSTER_LOOK). act_line(t, ws) = show(t) ++ " " ++ join(" ", [w ∈ ws | w does not start with '@']), and acts_of(act_line(t, ws)) = [Act{t, line: that tail}]. names(line, label) ⇔ label is one maximal run of [A-Za-z0-9._-] in line. is_input(l) ⇔ words(l)[0] ∈ {key, send, paste, turn}; is_login_send(l) ⇔ l starts "send ", holds " if=" and ends " -- /login"; is_login_enter(l) ⇔ l starts "key ", ends " enter" and a word `if=…` holds "/login"; is_fenced_esc(l) ⇔ l starts "key ", ends " esc" and a word starts "if-human=".	-	1	-
+login-proof-s1	contract	claude_login_proof::judge_s1	judge_s1(journal, acts, ledger, label).verdict = Ok ⇔ some `WAITING ` record names label; no `TYPED `, `EXCEPTION ` or `ESCALATED ` record; no act is_input; and ledger holds (label, auth, why = signed-out), (label, login-ended, _) and (label, sign-in, why ∋ "no-route"); else Fail, each missing clause named in the evidence.	-	1	-
+login-proof-s2	contract	claude_login_proof::judge_s2	With I = the inputs of acts at or before `to` (S3's mark): judge_s2(journal, acts, messages, to).verdict = Ok ⇔ exactly one i ∈ I is_login_send, exactly one is_login_enter, and no other i ∈ I; exactly one `TYPED ` record at or before `to` holds " rule=" ++ RULE_LOGIN ++ " "; an `EXCEPTION ` record at or before `to` holds " kind=login " and " notice=" ++ LOGIN_CHOOSE.id; and a message went `posted` at or before `to` whose title starts LOGIN_CHOOSE.title.	-	1	-
+login-proof-s3	contract	claude_login_proof::judge_s3	With W = the inputs within [from, next] (the add, and S3b's start), e the first of W that is_fenced_esc, and L the least of looks at or after from: judge_s3((journal, decisions, acts), (ledger, messages, looks), label, (from, next)).verdict = Ok ⇔ e exists and |W| = 1; exactly one decision within [from, next] has rule RULE_LOGIN_BACK_OUT and decision `approved`; L exists and e.t < L (the back-out came before the host's own look at the roster, so the add's wake brought it); within [e.t, next] a `CLEARED ` record holds " exception=login " and ends policy::exception::LOGIN_BACKED_OUT, and a `WAITING ` record names label; no `TYPED ` record of RULE_LOGIN within [from, next]; ledger holds (label, sign-in, why ∋ "no-route"); and a message went `retired` within [e.t, next] whose title starts LOGIN_CHOOSE.title.	-	1	-
+login-proof-add	contract	claude_login_proof::add_wait	With T = the greatest of log_times(log, WAKE_ARMED) ++ looks_of(log) and φ = (now − T) mod HOST_LOOK_EVERY (in [0, 60 s)): add_wait(log, now) = None if T does not exist or φ ≤ S3_ADD_AFTER_LOOK (15 s); else Some(HOST_LOOK_EVERY − φ + LOOK_SETTLE), so the add lands LOOK_SETTLE past the host's next look.	-	1	-
+login-proof-s3b	contract	claude_login_proof::{judge_s3b,s3b_grace}	judge_s3b((journal, decisions, acts), messages, (from, to), (watched, grace)).verdict = Ok ⇔ no input within [from, to] (the person's Enter, and the watch's end); no decision within it is `approved` and one is `escalated`; no `TYPED ` record within it; no message went `posted` within it titled LOGIN_CHOOSE.title…; and watched ≥ grace. s3b_grace(cfg) = cfg.human_grace_s s + TurnEndTiming::default().take_within, read from the lab's own `aterm.toml`, so the watch the verb keeps (grace + 15 s) exceeds the supervisor's back-off however it is configured.	-	1	-
+login-proof-safety	contract	claude_login_proof::{judge_procs,judge_egress,judge_keychain,judge_owner,suspect}	suspect(c) = "auth login" if c holds " auth login"; else "open" if the basename of words(c)[0] ∈ {open, osascript} or c holds ".app/Contents/MacOS/"; else None. judge_procs(s, control, n) = Fail if s ≠ []; else Ok if control (the watcher saw its own jailed `auth login` control); else Unproven. judge_egress(sockets, egress) = Fail if a line of either holds "EXTERNAL"; else Ok if sockets has a line; else Unproven. judge_keychain(log) over S = the quoted `service="…"` of each line of log = Fail if some s ∈ S is in OWNER_ITEMS (`Claude Code`, `Claude Code-credentials`, the owner's un-suffixed items); else Unproven if S = []; else Ok. judge_owner(sb, homes) = Ok ⇔ homes ≠ [] ∧ ∀ h ∈ homes: sb holds `(deny file-write* (subpath "h"))`; else Fail.	-	1	-
+verbs-tab	contract	verbs::{take_tab,ls_lists,active_in,named_or_first,cmd_journal,cmd_header,cmd_capture}	take_tab(args) (the words after the tag) removes and returns args[0]'s tail when args[0] starts '@' and that tail is 1–64 chars of [A-Za-z0-9_-]; a tail of another shape is a usage error; an args[0] not starting '@' (or none) is Ok(None) and leaves args as they were, a later word starting '@' included. ls_lists(ls, sid) ⇔ some line has words[2] = sid. active_in(ls) = words[2] of the first line with a word `active=1`, else None. `journal`, `header` and `capture` read the tab take_tab names, refused when `ls` lists no such tab; with none named `journal` reads the first tab (`sid`) and `header` and `capture` the active one.	-	1	-
+verbs-claude-route	contract	verbs::{claude_route,launcher_value,stored_login_dead,launched,Launched::sentence,claude_launch,launch_record,record_launch,fixture_header_on}	claude_route(l) = Stub if trim(l) = "" or l holds "ANTHROPIC_BASE_URL="; else Default. launcher_value(l, k) = the value after the first `k=` that starts l or follows whitespace or a quote, up to the next quote when it opens with one, else to the next whitespace. stored_login_dead(t) ⇔ J::parse(t) has a `claudeAiOauth` whose `accessToken` and `refreshToken` are absent or "" and whose `expiresAt` is absent or ≤ 0. launched(l, settings, stored) = Launched{route: claude_route(l), login: claude_login(l, settings, stored ≠ None), stored: on Default with login StoredCredentials Some((SecureStorage if launcher_value(l, LOGIN_ENV) exists else ScratchClaude, stored_login_dead(stored))), else None}, and claude_launch(l, settings, stored) = launched(l, settings, stored).sentence(): on Stub the §19 sentence over the login's phrase(); on Default one naming the default route (no `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL` or proxy, the scratch HOME, the jail) and, where stored is Some, the login directory (naming LOGIN_ENV exactly when SecureStorage) and whether its login is dead; distinct Launched values the lab makes have distinct sentences. launch_record(run, sid) = the text record_launch kept for sid, else the lab's `claude.sh`, else ""; fixture_header_on reads the tab's dims and launch record and, on Default, the credentials under launcher_value(l, LOGIN_ENV) (else the scratch `.claude`).	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/claude_login_proof_tests.rs	the_evidence_reads_the_harness_records_it_is_kept_in	login-proof-evidence	
+src/claude_login_proof_tests.rs	s1_holds_on_a_roster_rows_wait_and_fails_on_a_login_typed_or_told	login-proof-s1	login-proof-evidence
+src/claude_login_proof_tests.rs	s2_holds_on_one_fenced_login_and_enter_and_fails_on_a_key_in_the_picker	login-proof-s2	login-proof-evidence
+src/claude_login_proof_tests.rs	s3_holds_on_the_back_out_before_the_hosts_look_and_fails_without_it	login-proof-s3	login-proof-evidence
+src/claude_login_proof_tests.rs	the_hosts_looks_at_the_roster_are_read_off_its_log_and_place_the_add	login-proof-add	login-proof-evidence
+src/claude_login_proof_tests.rs	s3b_holds_on_a_picker_left_alone_past_the_grace_and_fails_on_a_key_or_a_short_watch	login-proof-s3b	login-proof-evidence
+src/claude_login_proof_tests.rs	s3b_grace_is_the_supervisors_own_and_moves_with_it	login-proof-s3b	
+src/claude_login_proof_tests.rs	the_safety_judges_fail_on_a_sighting_an_external_socket_or_an_open_home	login-proof-safety	
+src/claude_login_proof_tests.rs	the_watcher_suspects_auth_login_and_opens_and_nothing_else	login-proof-safety	
+src/claude_login_proof_tests.rs	the_keychain_judge_fails_on_the_owners_own_items_and_proves_nothing_unasked	login-proof-safety	
+src/verbs.rs	a_verb_names_its_tab_by_sid_and_reads_the_active_one_otherwise	verbs-tab	
+src/verbs.rs	a_header_names_the_route_the_tab_was_launched_on	verbs-claude-route	verbs-claude-login
 ```

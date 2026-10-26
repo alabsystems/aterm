@@ -1170,6 +1170,56 @@ fn publish(app: &crate::App, session: u64, id: &str, plan: Option<PlanUsage>, re
     assert_eq!(tl.claude_footer_read_at(), Some(read));
 }
 
+/// A split tab whose least pane is shown in a twin listed before it (Open Active Session in New
+/// Window, then Move Tab to New Window on the split tab) keeps its other pane under that pane's
+/// own key, and the twin takes the shared pane: the request names two tabs, each under its own
+/// key and identity, so the reap credit's ledger keeps the split tab's counter with it. NEGATIVE
+/// CONTROL: each tab's least key taken before the dedup that gives the shared pane to the tab
+/// listed first leaves the split tab's pane under the twin's key, the two tabs one.
+#[test]
+fn a_twin_showing_a_split_tabs_least_pane_leaves_each_tab_its_key() {
+    let mut app = crate::App::headless_for_test();
+    let w0 = crate::WindowId(0);
+    let left = app.next_session_id;
+    app.push_stub_tab(w0, crate::stub_session(left));
+    let right = app.split_active_stub_tab(w0);
+    assert!(left < right, "the left pane's key is the tab's least");
+    assert!(
+        app.focus_pane_in(w0, crate::pane::FocusDir::Left)
+            || app.focus_pane_in(w0, crate::pane::FocusDir::Up)
+    );
+    app.frontmost_window = Some(w0);
+    let twin = app
+        .open_active_session_in_new_window_logical()
+        .expect("the twin's window");
+    app.frontmost_window = Some(w0);
+    let moved = app
+        .detach_active_tab_logical()
+        .expect("the split tab's window");
+    assert!(twin < moved, "the twin is listed first");
+    for (id, pooled) in &mut app.pool.sessions {
+        pooled.session.pid = 40_000 + i32::try_from(*id).expect("a session id");
+    }
+    let tab_id = |w| {
+        app.windows[&w]
+            .tab_set
+            .active_id()
+            .map(crate::tab_model::TabId::get)
+    };
+    let req = app.vitals_request(FOCUSED_PERIOD, false);
+    let roots: Vec<(u64, u64, Option<u64>)> =
+        req.tabs.iter().map(|t| (t.key, t.tab, t.tab_id)).collect();
+    assert_eq!(
+        roots,
+        [
+            (0, 0, tab_id(w0)),
+            (left, left, tab_id(twin)),
+            (right, right, tab_id(moved))
+        ],
+        "each tab under its own key and identity"
+    );
+}
+
 #[test]
 fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
     let mut app = crate::App::headless_for_test();

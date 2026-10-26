@@ -763,3 +763,58 @@ fn the_innermost_build_directory_decides_a_nested_profile_between_two_surveys() 
     assert!(kept(&rep).is_empty(), "{:?}", rep.notes);
     consistent(&rep);
 }
+
+/// A projection standing at `free` against the default floor, at 40 MB/s.
+fn projected_at(free: u64) -> fill::Projection {
+    fill::Projection::of(
+        40_000_000,
+        free,
+        Config::default().auto_free_gib * GIB,
+        None,
+    )
+}
+
+/// Under a projection above the floor tier 4 takes only profiles unwritten for an hour
+/// (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2); below the floor it is revision 1's ten
+/// minutes.
+#[test]
+fn under_a_projection_above_the_floor_a_recent_profile_waits_an_hour() {
+    let tmp = Tmp::new("pressure-projected-hour");
+    let (a, b, now) = three_recent(tmp.path());
+    last_used(&b.join("debug"), now - 30 * 60);
+    let low = Config::default().warn_free_gib * GIB - GIB;
+    let survey_projected = |free: u64| {
+        let roots = Roots {
+            volume: Some(tmp.path().to_path_buf()),
+            targets: vec![a.clone(), b.clone()],
+            projected: Some(projected_at(free)),
+            ..Roots::default()
+        };
+        let survey = scan(&roots, now, Trigger::Tick, Config::default(), Some(free));
+        report(&survey, Config::default())
+    };
+    let rep = survey_projected(low);
+    assert_eq!(
+        pressure_order(&rep),
+        vec![a.join("debug"), a.join("release")],
+        "the profile written half an hour ago is kept: {rep:?}"
+    );
+    assert!(
+        rep.notes.iter().any(|n| n.contains("in the last 1h")),
+        "{:#?}",
+        rep.notes
+    );
+    let (_, plain) = surveyed(&tmp, &[a.clone(), b.clone()], now, low);
+    assert!(pressure_order(&plain).is_empty(), "no tier 4 at plain low");
+    let rep = survey_projected(GIB);
+    assert_eq!(
+        pressure_order(&rep),
+        vec![a.join("debug"), a.join("release"), b.join("debug")],
+        "below the floor the ten minutes hold: {rep:?}"
+    );
+    // NEGATIVE CONTROL: a pass that keeps the ten minutes under a projection takes it.
+    let rep = fill::fault::with(fill::fault::Fault::TenMinutesOnProjection, || {
+        survey_projected(low)
+    });
+    assert!(pressure_order(&rep).contains(&b.join("debug")), "{rep:?}");
+}

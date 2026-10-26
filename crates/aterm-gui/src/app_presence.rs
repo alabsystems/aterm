@@ -830,6 +830,27 @@ impl App {
         }
     }
 
+    /// ATERM STOPPED TYPING INTO SESSION `session`, or no longer does (§14.3): `stopped` on its
+    /// glass ([`crate::harness_glass::on_stopped`]), and every surface that says it read again —
+    /// the chip's title where it is hovered, Settings ▸ Harness, the hover and the status item.
+    pub(crate) fn show_stopped(
+        &mut self,
+        session: u64,
+        stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    ) {
+        let hover_was = self.driven_by_aterm(session);
+        if !crate::harness_glass::on_stopped(self, session, stopped) {
+            return;
+        }
+        self.redraw_autopilot_title_readers(session);
+        self.harness_screen_moved();
+        if self.driven_by_aterm(session) == hover_was {
+            self.mark_status_dirty();
+        } else {
+            self.restamp_for_hover(session);
+        }
+    }
+
     /// A STALE HOLD GOES (§12.3.3 item 3).
     pub(crate) fn clear_land_held(&mut self, session: u64) {
         if let Some(entry) = self.pool.get(session) {
@@ -1243,15 +1264,14 @@ impl App {
             return None;
         }
         let glass = self.chip_glass(session);
-        let hold = self
-            .harness_glass
-            .get(&session)
-            .and_then(crate::harness_glass::SessionGlass::hold);
+        let own = self.harness_glass.get(&session);
+        let hold = own.and_then(crate::harness_glass::SessionGlass::hold);
         driven_words(
             crate::claude_lights::ChipFace::of(view, &glass),
             &glass,
             hold.as_ref(),
             false,
+            own.and_then(crate::harness_glass::SessionGlass::stopped),
         )
     }
 
@@ -1928,42 +1948,63 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
     if let Some(last) = lines.last_mut() {
         last.push_str(&ask.more_past(ask.others.len()));
     }
-    lines.push(format!("{} carries on meanwhile", ask.program.product()));
+    lines.push(aterm_agent::supervise::mode_words::report_words(
+        ask.program.product(),
+        false,
+    ));
     lines
 }
 
 /// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1). `landed_said`: the row these
 /// words end already says `landed` (the Overview's `task landed 17m`), so a landed chip says only
 /// `land` there; the tab's hover, which has no task words, passes `false` and keeps `land, landed`
-/// (§14.6).
+/// (§14.6). `stopped`: aterm stopped typing into it, said first under a face that carries a mode
+/// (§14.3: `land: stopped typing; not landed yet, 1 untracked file`, `cruise: stopped typing`).
 #[must_use]
 pub(crate) fn driven_words(
     face: crate::claude_lights::ChipFace,
     glass: &crate::claude_lights::ChipGlass,
     hold: Option<&crate::harness_glass::HeldGlass>,
     landed_said: bool,
+    stopped: Option<aterm_agent::harness::acts::HeldBy>,
 ) -> Option<String> {
     use crate::claude_lights::ChipFace;
+    let stop = stopped
+        .filter(|_| face.carries())
+        .map(|arm| crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Hover));
+    let mode = |mode: &str, why: Option<String>| match (&stop, why) {
+        (Some(stop), Some(why)) => format!("{mode}: {stop}; {why}"),
+        (Some(stop), None) => format!("{mode}: {stop}"),
+        (None, Some(why)) => format!("{mode}: {why}"),
+        (None, None) => mode.to_owned(),
+    };
     let words = match face {
-        ChipFace::Cruise => "cruise".to_owned(),
-        ChipFace::CruiseUntil => match glass.land_at {
-            Some(at) => match at.other_day {
+        ChipFace::Cruise => mode("cruise", None),
+        ChipFace::CruiseUntil => match (glass.land_at, &stop) {
+            (Some(at), Some(_)) => mode(
+                "cruise",
+                Some(match at.other_day {
+                    Some(day) => format!("lands {} {}", day.short(), at.clock.as_str()),
+                    None => format!("lands at {}", at.clock.as_str()),
+                }),
+            ),
+            (Some(at), None) => match at.other_day {
                 Some(day) => format!("cruise, lands {} {}", day.short(), at.clock.as_str()),
                 None => format!("cruise, lands at {}", at.clock.as_str()),
             },
-            None => "cruise".to_owned(),
+            (None, _) => mode("cruise", None),
         },
-        ChipFace::Land => match hold.and_then(|hold| {
-            crate::harness_glass::hold_words(
-                hold,
-                None,
-                crate::harness_glass::HoldForm::Hover,
-                None,
-            )
-        }) {
-            Some(why) => format!("land: {why}"),
-            None => "land".to_owned(),
-        },
+        ChipFace::Land => mode(
+            "land",
+            hold.and_then(|hold| {
+                crate::harness_glass::hold_words(
+                    hold,
+                    None,
+                    crate::harness_glass::HoldForm::Hover,
+                    None,
+                )
+            }),
+        ),
         ChipFace::Landed if landed_said => "land".to_owned(),
         ChipFace::Landed | ChipFace::Theirs => format!("land, {}", face.word()?),
         ChipFace::Off | ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {

@@ -1838,7 +1838,7 @@ pub(crate) struct StatusObserver {
     programs: program::ProgramResolver,
     pub(crate) inputs: crate::input_stall::InputWatches,
     footer_asked: std::collections::HashMap<u64, FooterAsk>,
-    rollout_asked: std::collections::HashMap<u64, Instant>,
+    rollout_asked: std::collections::HashMap<u64, crate::codex_rollout_tap::RolloutAsk>,
     pub(crate) slog_wakes: crate::session_log::Wakes,
     pub(crate) slog_memory: crate::session_log::MemorySweep,
     program_states: std::collections::HashMap<u64, crate::program_state::ProgramStateGate>,
@@ -2200,6 +2200,17 @@ impl StatusObserver {
                     .min()
             })
             .min();
+        let rollout_wake = self
+            .rollout_asked
+            .iter()
+            .filter(|(_, ask)| ask.owed)
+            .filter_map(|(id, ask)| {
+                let slot = self.sessions.get(id)?;
+                ask.at
+                    .checked_add(crate::codex_rollout_tap::RECHECK)
+                    .map(|at| at.max(slot.next_due))
+            })
+            .min();
         let owed = self
             .sessions
             .values()
@@ -2208,10 +2219,7 @@ impl StatusObserver {
                 slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
             })
             .min();
-        match (owed, agent_wake) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [owed, agent_wake, rollout_wake].into_iter().flatten().min()
     }
 
     /// Schedules a follow-up observation for `session` after the off-thread program resolver completes.
@@ -3641,6 +3649,10 @@ impl crate::App {
             )
         );
         let land = land_fields(held.filter(|_| claimed_here && under_land));
+        let land = format!(
+            "{land}{}",
+            stop_field(self.shown_stop(session).filter(|_| claimed_here))
+        );
         #[cfg(any(test, debug_assertions))]
         let end = self.end_status_fields(
             session,
@@ -3812,6 +3824,16 @@ pub(crate) fn land_fields(held: Option<aterm_agent::harness::acts::LandHeld>) ->
         held.nudges,
         held.since_ms
             .map_or_else(|| "-".to_string(), |ms| ms.div_euclid(1000).to_string())
+    )
+}
+
+/// Formats the `held` field for `status` output (§14.3): the arm that stopped the typing
+/// (`same-reply`, `no-work`), `-` where aterm types on. A reader that finds no `held=` (a build
+/// before it) reads it as unknown, never as `-`.
+pub(crate) fn stop_field(stopped: Option<aterm_agent::harness::acts::HeldBy>) -> String {
+    format!(
+        " held={}",
+        stopped.map_or("-", aterm_agent::harness::acts::HeldBy::word)
     )
 }
 

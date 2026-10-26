@@ -6,7 +6,6 @@
 //! (`docs/DESIGN-harness-goal-2026-10-24.md`).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use aterm_json::{Map, Value};
 
@@ -77,22 +76,16 @@ impl ClaudeGoal {
     }
 }
 
-/// codex-alab's goal store in its `$CODEX_HOME`: `thread_goals`, one row per thread.
-pub const CODEX_GOALS: &str = "goals_1.sqlite";
-
 /// Muse Code's goal store in a session's directory: `goals`, one row per session.
 pub const MUSE_GOALS: &str = "goals.db";
 
 /// Which agent's SQLite goal store a [`StoreGoal`] reads.
 ///
-/// Both keep one row per thread (codex-alab) or session (Muse Code) whose `objective` is the
-/// goal and whose `status` is `active` while the agent pursues it (`paused`, `blocked`,
-/// `usage_limited`, `budget_limited` and `complete` are not pursued); clearing the goal deletes
-/// the row.
+/// Muse Code keeps one row per session whose `objective` is the goal and whose `status` is
+/// `active` while the agent pursues it (`paused`, `blocked`, `usage_limited`, `budget_limited`
+/// and `complete` are not pursued); clearing the goal deletes the row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Store {
-    /// codex-alab's [`CODEX_GOALS`], keyed by the thread id its rollout names.
-    Codex,
     /// Muse Code's [`MUSE_GOALS`], keyed by the session id its session directory names.
     Muse,
 }
@@ -100,23 +93,8 @@ pub enum Store {
 /// The most bytes of an objective one read takes from a store, before [`shown`] cuts it.
 const STORE_TEXT_BYTES: usize = 4 * GOAL_BYTES;
 
-impl Store {
-    /// The query for `id`'s active goal, hex so no byte of it can break a row; `None` unless `id`
-    /// is a UUID (so no quote can be in it).
-    #[must_use]
-    pub fn query(self, id: &str) -> Option<String> {
-        let (table, key) = match self {
-            Self::Codex => ("thread_goals", "thread_id"),
-            Self::Muse => ("goals", "session_id"),
-        };
-        is_uuid(id).then(|| {
-            format!(
-                "SELECT hex(substr(CAST(objective AS BLOB), 1, {STORE_TEXT_BYTES})) FROM {table} \
-                 WHERE {key} = '{id}' AND status = 'active';"
-            )
-        })
-    }
-}
+/// Maximum byte size of a goal database or its write-ahead log read into memory.
+const GOAL_DB_MAX_BYTES: u64 = 64 << 20;
 
 /// Whether `id` is a UUID in its text form (`8-4-4-4-12` hex digits).
 #[must_use]
@@ -128,59 +106,10 @@ pub fn is_uuid(id: &str) -> bool {
         })
 }
 
-/// The goal a store's answer `out` names: its first row's hex decoded and [`shown`]; `None` for
-/// no row, or one that is not hex of UTF-8.
+/// Truncate `text` to [`STORE_TEXT_BYTES`] on a character boundary and format via [`shown`].
 #[must_use]
-pub fn objective_of(out: &str) -> Option<String> {
-    let hex = out.lines().map(str::trim).find(|l| !l.is_empty())?;
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let bytes: Option<Vec<u8>> = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-        .collect();
-    let bytes = bytes?;
-    // A cut at the read's byte bound may split the last character: keep what decodes.
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => text,
-        Err(e) if e.error_len().is_none() => std::str::from_utf8(&bytes[..e.valid_up_to()]).ok()?,
-        Err(_) => return None,
-    };
-    shown(text)
-}
-
-/// Apple's `sqlite3`, named absolutely (a platform binary): the one reader of an agent's goal
-/// store, READ ONLY.
-const SQLITE3: &str = aterm_uds::os_path!("sqlite3");
-
-/// How long one read may take: milliseconds, bounded for a wedged process.
-const STORE_WAIT: Duration = Duration::from_secs(5);
-
-/// One run of the reader over `target` (a private copy's path or an immutable URI,
-/// [`aterm_uds::foreign_db::read`]): `-readonly`, no `~/.sqliterc`, `-safe`, `-nofollow`, one
-/// row per line, no header.
-fn store_rows(target: &str, sql: &str) -> Option<String> {
-    let words = [
-        "-init",
-        "/dev/null",
-        "-readonly",
-        "-safe",
-        "-nofollow",
-        "-batch",
-        "-bail",
-        "-noheader",
-        "-list",
-        target,
-        sql,
-    ];
-    let args: Vec<&std::ffi::OsStr> = words.iter().map(std::ffi::OsStr::new).collect();
-    super::upgrade_drive::bounded_output(
-        Path::new(SQLITE3),
-        &args,
-        STORE_WAIT,
-        u64::try_from(2 * STORE_TEXT_BYTES + 64).unwrap_or(u64::MAX),
-    )
+pub fn objective_of(text: &str) -> Option<String> {
+    shown(super::truncate_bytes(text, STORE_TEXT_BYTES))
 }
 
 /// What identifies one file's content between two reads.
@@ -258,10 +187,31 @@ pub fn read_store(
     db: &Path,
     id: &str,
 ) -> Result<Option<String>, aterm_uds::foreign_db::Unread> {
-    let sql = store
-        .query(id)
-        .ok_or(aterm_uds::foreign_db::Unread::Failed)?;
-    aterm_uds::foreign_db::read(db, |target| store_rows(target, &sql)).map(|out| objective_of(&out))
+    if !is_uuid(id) {
+        return Err(aterm_uds::foreign_db::Unread::Failed);
+    }
+    let (table, key) = match store {
+        Store::Muse => ("goals", "session_id"),
+    };
+    aterm_uds::foreign_db::read_bytes(db, GOAL_DB_MAX_BYTES, |main, wal| {
+        let mut missing_col = false;
+        let matches = crate::harness::sqlite_read::scan_table(main, wal, table, |schema, row| {
+            let (Some(k_i), Some(obj_i), Some(st_i)) = (
+                schema.column_index(key),
+                schema.column_index("objective"),
+                schema.column_index("status"),
+            ) else {
+                missing_col = true;
+                return None;
+            };
+            if row.get(k_i)?.as_str() == Some(id) && row.get(st_i)?.as_str() == Some("active") {
+                Some(row.get(obj_i)?.to_list_field())
+            } else {
+                None
+            }
+        })?;
+        (!missing_col).then(|| matches.into_iter().next().and_then(|s| objective_of(&s)))
+    })
 }
 
 #[cfg(test)]

@@ -376,6 +376,9 @@ fn recovery_capability(
     native: &restore::NativeLeafRestore,
 ) -> Option<crate::native_app::RecoveryCapability> {
     match native.restore_tag.as_str() {
+        "about" if native.route.is_none() && native.uri.is_none() => {
+            Some(crate::native_app::RecoveryCapability::About)
+        }
         "system-state" if native.route.is_none() && native.uri.is_none() => {
             Some(crate::native_app::RecoveryCapability::SystemState)
         }
@@ -601,6 +604,7 @@ impl App {
         };
         let app = self.native_runtime.app(native.instance)?;
         match app.kind() {
+            crate::native_app::AppKind::About => Some(restore::NativeTabRestore::About),
             crate::native_app::AppKind::SystemState => Some(restore::NativeTabRestore::SystemState),
             crate::native_app::AppKind::Settings => {
                 let crate::native_app::AppViewState::Settings(state) =
@@ -620,7 +624,8 @@ impl App {
                         restore::NativeTabRestore::Markdown { uri }
                     }
                     crate::native_app::AppKind::Editor => restore::NativeTabRestore::Editor { uri },
-                    crate::native_app::AppKind::Settings
+                    crate::native_app::AppKind::About
+                    | crate::native_app::AppKind::Settings
                     | crate::native_app::AppKind::SystemState => unreachable!(),
                     crate::native_app::AppKind::Recovery => unreachable!(),
                 })
@@ -808,6 +813,10 @@ impl App {
                 }
                 let mut descriptor = match (app.kind(), state) {
                     (
+                        crate::native_app::AppKind::About,
+                        crate::native_app::AppViewState::About(_),
+                    ) => restore::NativeLeafRestore::about(),
+                    (
                         crate::native_app::AppKind::SystemState,
                         crate::native_app::AppViewState::SystemState(_),
                     ) => restore::NativeLeafRestore::system_state(),
@@ -836,7 +845,8 @@ impl App {
                     _ => return None,
                 };
                 match state {
-                    crate::native_app::AppViewState::SystemState(_) => {}
+                    crate::native_app::AppViewState::About(_)
+                    | crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
                         if carry_drafts {
                             descriptor.settings_drafts = settings.carried_field_drafts().carried;
@@ -911,7 +921,8 @@ impl App {
             return false;
         };
         match state {
-            crate::native_app::AppViewState::Settings(_)
+            crate::native_app::AppViewState::About(_)
+            | crate::native_app::AppViewState::Settings(_)
             | crate::native_app::AppViewState::SystemState(_) => true,
             crate::native_app::AppViewState::Markdown(markdown) => {
                 let Some(text) = document_text.as_deref() else {
@@ -2619,6 +2630,7 @@ impl App {
             window.layouts.clear();
             window.tabs = TabIndex::new(0, 0);
             window.front_content = None;
+            window.bind_trail_admission_source();
             window.active_terminal = None;
             window.window_focus = crate::front_content::WindowFocus::Host;
             old.tabs().to_vec()
@@ -3427,6 +3439,10 @@ impl App {
         let mark = self.restore_staging_mark(wid);
         let mut reads_harness = false;
         match descriptor.restore_tag.as_str() {
+            "about" => {
+                self.stage_about_tab(wid)
+                    .map_err(|why| format!("About could not be reopened: {why:?}"))?;
+            }
             "system-state" => {
                 self.stage_system_state_tab(wid)
                     .map_err(|why| format!("System State could not be reopened: {why:?}"))?;
@@ -3730,7 +3746,8 @@ impl App {
             crate::native_app::AppKind::Editor => {
                 crate::native_app::AppViewState::Editor(Box::default())
             }
-            crate::native_app::AppKind::Settings
+            crate::native_app::AppKind::About
+            | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
             | crate::native_app::AppKind::Recovery => {
                 return Err("restore descriptor is not a document app".to_string());
@@ -4074,6 +4091,10 @@ impl App {
         descriptor: &restore::NativeTabRestore,
     ) -> Option<crate::tab_model::TabId> {
         let result = match descriptor {
+            restore::NativeTabRestore::About => self
+                .open_about_tab_in_window(wid)
+                .then_some(())
+                .ok_or_else(|| "could not install About".to_string()),
             restore::NativeTabRestore::SystemState => self
                 .open_system_state_tab_in_window(wid)
                 .then_some(())

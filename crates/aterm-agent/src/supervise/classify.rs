@@ -267,6 +267,17 @@ pub fn classify_command(cmd: &str) -> Verdict {
 
 /// Classify `cmd`, permitting `python3 <path>` when `<path>` matches `python_allow`.
 pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
+    classify_command_except(cmd, python_allow, &|_| false)
+}
+
+/// [`classify_command_with`], with each segment `passed` holds left to its caller: that
+/// segment's command is not judged, while every scan of the whole line (its redirects, flags,
+/// assignments, substitutions, network reach and arithmetic) still is.
+pub(crate) fn classify_command_except<S: AsRef<str>>(
+    cmd: &str,
+    python_allow: &[S],
+    passed: &dyn Fn(&[String]) -> bool,
+) -> Verdict {
     let raw = cmd;
     let cmd = match prelex(cmd) {
         Ok(cmd) => cmd,
@@ -294,7 +305,12 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
     if let Some(reason) = argv_flag_hazard(&cmd) {
         return Verdict::no(reason);
     }
+    let mut left = false;
     for seg in &segments {
+        if passed(seg) {
+            left = true;
+            continue;
+        }
         if let Some(reason) = segment_head(seg, python_allow) {
             return Verdict::no(reason);
         }
@@ -304,7 +320,12 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
     }
     Verdict {
         read_only: true,
-        reason: "every segment read-only".to_string(),
+        reason: if left {
+            "every segment but its caller's read-only"
+        } else {
+            "every segment read-only"
+        }
+        .to_string(),
     }
 }
 
@@ -2420,14 +2441,28 @@ pub(crate) fn command_words(line: &str) -> Result<Vec<Vec<String>>, String> {
 }
 
 /// The words of `line` that may name a path a command reads, for the secret check.
+#[cfg(test)]
 pub(crate) fn path_operands(line: &str) -> Result<Vec<String>, String> {
+    path_operands_except(line, &|_| false)
+}
+
+/// [`path_operands`], where a segment `passed` holds, outside any substitution, names only its
+/// redirects' targets: its caller knows its command reads no file its words name.
+pub(crate) fn path_operands_except(
+    line: &str,
+    passed: &dyn Fn(&[String]) -> bool,
+) -> Result<Vec<String>, String> {
     let segments = program_words_nested(&strip_alarm_idiom(&prelex(line)?));
     let feeds_paths = segments.iter().flat_map(|(seg, _)| seg).any(|w| {
         program(w) == "xargs" || w == "-files0-from" || long_option_spells(w, "files0-from")
     });
     let mut out = Vec::new();
     for (seg, nested) in &segments {
-        segment_paths(seg, !nested && !feeds_paths, &mut out);
+        if !nested && passed(seg) {
+            redirect_paths(seg, &mut out);
+        } else {
+            segment_paths(seg, !nested && !feeds_paths, &mut out);
+        }
     }
     Ok(out)
 }
@@ -2447,7 +2482,9 @@ fn redirect_word(w: &str) -> Option<(&str, bool)> {
     ))
 }
 
-fn segment_paths(seg: &[String], exempt: bool, out: &mut Vec<String>) {
+/// The files `seg`'s redirects name, pushed onto `out` (a here-document's or here-string's text
+/// is none); which of `seg`'s words a redirect took, by index.
+fn redirect_paths(seg: &[String], out: &mut Vec<String>) -> Vec<bool> {
     let mut taken = vec![false; seg.len()];
     let mut k = 0;
     while k < seg.len() {
@@ -2467,6 +2504,11 @@ fn segment_paths(seg: &[String], exempt: bool, out: &mut Vec<String>) {
         }
         k += 1;
     }
+    taken
+}
+
+fn segment_paths(seg: &[String], exempt: bool, out: &mut Vec<String>) {
+    let taken = redirect_paths(seg, out);
     let words = |from: usize, to: usize| {
         (from..to)
             .filter(|k| !taken[*k])

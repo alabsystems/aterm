@@ -1021,7 +1021,7 @@ pub fn turn_tracker_model() -> Model {
     }
 }
 
-/// SESSION LOG JOURNAL VIEW: what a `log @<sid>` answered from the disk journal shows, over three seqs of one session's space: the session's open (seq 1), a run's under it (2) and a turn's under the run (3).
+/// SESSION LOG JOURNAL VIEW: what a `@<sid> log` answered from the disk journal shows, over three seqs of one session's space: the session's open (seq 1), a run's under it (2) and a turn's under the run (3).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_journal_model() -> Model {

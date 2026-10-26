@@ -44,6 +44,9 @@ pub struct WorkerCli {
     pub model_flag: &'static str,
     /// CLI flag that trusts the starting folder for this run alone ([`Fresh::trusted_here`]).
     pub trust_flag: Option<&'static str>,
+    /// CLI flag that names the permission mode a fresh start runs in
+    /// ([`Fresh::permission_mode`]), and the modes it takes; `None` for a CLI with no such flag.
+    pub permission_flag: Option<ModeFlag>,
     /// Environment pairs set on a fresh start and dropped first when tight on space.
     pub nicety: &'static [(&'static str, &'static str)],
     /// Starter environment variables naming directories that must be absolute when carried.
@@ -61,6 +64,21 @@ pub struct WorkerCli {
     /// ([`WorkerCli::signed_out`]); `None` for a CLI with no such hazard.
     login: Option<LoginGate>,
 }
+
+/// A CLI's flag naming the permission mode its run starts in ([`WorkerCli::permission_flag`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeFlag {
+    /// The flag, followed on the line by the mode.
+    pub flag: &'static str,
+    /// Every mode the flag takes, as the CLI spells it.
+    pub modes: &'static [&'static str],
+}
+
+/// Claude Code's `--permission-mode` and the modes a worker's line may name.
+pub const CLAUDE_PERMISSION_MODE: ModeFlag = ModeFlag {
+    flag: "--permission-mode",
+    modes: &["default", "acceptEdits", "plan", "bypassPermissions"],
+};
 
 /// Why a worker carrying an environment (its variables, then the user's home where known) must
 /// not start: a CLI's sign-in floor ([`grok::signed_out`]).
@@ -123,20 +141,27 @@ fn codex_flag_rides(name: &str, tokens: &[String]) -> bool {
         .any(|own| key == *own || key.strip_prefix(own).is_some_and(|r| r.starts_with('.')))
 }
 
-/// The `CODEX_HOME` a Codex starter's worker carries: the starter's own, where
-/// set; else, for a starter run under another `HOME` than `user`'s, that home's
-/// `.codex` (Codex's default), so the worker reads the starter's config and login.
+/// The `CODEX_HOME` and `CODEX_AUTH_PATH` a Codex starter's worker carries:
+/// the starter's own, where set; else, for a starter run under another `HOME`
+/// than `user`'s, that home's `.codex` (Codex's default), so the worker reads
+/// the starter's config and login.
 fn codex_home_env(args: &ProcArgs, user: &Path) -> Vec<(String, String)> {
     let env = super::codex_alab::HOME_ENV;
-    if let Some(home) = args.env_var(env).filter(|home| !home.is_empty()) {
-        return vec![(env.to_string(), home.to_string())];
+    let mut out = if let Some(home) = args.env_var(env).filter(|home| !home.is_empty()) {
+        vec![(env.to_string(), home.to_string())]
+    } else {
+        args.env_var("HOME")
+            .map(Path::new)
+            .filter(|home| home.is_absolute() && *home != user)
+            .and_then(|home| home.join(".codex").to_str().map(str::to_string))
+            .map(|codex| vec![(env.to_string(), codex)])
+            .unwrap_or_default()
+    };
+    let auth_env = super::codex_alab::AUTH_PATH_ENV;
+    if let Some(auth) = args.env_var(auth_env).filter(|auth| !auth.is_empty()) {
+        out.push((auth_env.to_string(), auth.to_string()));
     }
-    args.env_var("HOME")
-        .map(Path::new)
-        .filter(|home| home.is_absolute() && *home != user)
-        .and_then(|home| home.join(".codex").to_str().map(str::to_string))
-        .map(|codex| vec![(env.to_string(), codex)])
-        .unwrap_or_default()
+    out
 }
 
 /// Every worker harness `spawn` can start, one row per harness.
@@ -147,6 +172,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: None,
+        permission_flag: Some(CLAUDE_PERMISSION_MODE),
         nicety: &super::relaunch::CLAUDE_LAUNCH_ENV,
         dirs: &[super::accounts::HOME_ENV, super::accounts::HOMEDIR_ENV],
         launches: Launches::Claude,
@@ -160,8 +186,12 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: None,
+        permission_flag: None,
         nicety: &[],
-        dirs: &[super::codex_alab::HOME_ENV],
+        dirs: &[
+            super::codex_alab::HOME_ENV,
+            super::codex_alab::AUTH_PATH_ENV,
+        ],
         launches: Launches::Alab,
         homes: codex_home_env,
         flags: |argv| match super::codex_alab::kept_flags(argv, codex_flag_rides) {
@@ -179,6 +209,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_PROMPT_INTERACTIVE,
         model_flag: "--model",
         trust_flag: None,
+        permission_flag: None,
         nicety: &[],
         dirs: &[super::upgrade_agy::HOME_ENV],
         launches: Launches::Image {
@@ -194,6 +225,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: Some("--trust-workspace"),
+        permission_flag: None,
         nicety: &[],
         dirs: &[
             super::upgrade_muse::DATA_ENV,
@@ -218,6 +250,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: None,
+        permission_flag: None,
         nicety: &[grok::NO_SELF_UPDATE],
         dirs: &[grok::HOME_ENV],
         launches: Launches::Image {
@@ -542,6 +575,9 @@ pub struct Fresh<'a> {
     pub model: Option<&'a str>,
     /// Whether the shell stands in the folder its starter trusted for it.
     pub trusted_here: bool,
+    /// `--permission-mode`: the mode the CLI starts in, one its [`WorkerCli::permission_flag`]
+    /// takes, or `None` for the one its settings name.
+    pub permission_mode: Option<&'a str>,
 }
 
 /// Format the shell command line a worker runs at its first prompt, for the starter [`admit`]
@@ -549,8 +585,9 @@ pub struct Fresh<'a> {
 ///
 /// # Errors
 /// The line exceeds its budget, a carried directory is relative, the starter's argv holds a flag
-/// no table knows, `model` starts with `-`, or a variable [`Starter::unset`] removes is one its
-/// environment sets.
+/// no table knows, `model` starts with `-`, a permission mode is named for a CLI with no such
+/// flag or is none of the modes its flag takes, or a variable [`Starter::unset`] removes is one
+/// its environment sets.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -615,6 +652,24 @@ pub(super) fn line_of(
             cli.agent.product()
         ));
     }
+    let mode = match (fresh.permission_mode, cli.permission_flag) {
+        (None, _) => None,
+        (Some(mode), None) => {
+            return Err(format!(
+                "{} takes no permission mode on its command line, so its worker cannot start in \
+                 {mode:?}",
+                cli.agent.product()
+            ));
+        }
+        (Some(mode), Some(flag)) if !flag.modes.contains(&mode) => {
+            return Err(format!(
+                "the permission mode {mode:?} is none of {}'s ({})",
+                cli.agent.product(),
+                flag.modes.join(", ")
+            ));
+        }
+        (Some(mode), Some(flag)) => Some((flag.flag, mode)),
+    };
     let mut flags: Vec<String> = args.to_vec();
     if let Some(flag) = cli.trust_flag.filter(|_| fresh.trusted_here) {
         flags.push(flag.to_string());
@@ -622,6 +677,10 @@ pub(super) fn line_of(
     if let Some(model) = fresh.model {
         flags.push(cli.model_flag.to_string());
         flags.push(model.to_string());
+    }
+    if let Some((flag, mode)) = mode {
+        flags.push(flag.to_string());
+        flags.push(mode.to_string());
     }
     let both: Vec<(&str, &str)> = env
         .iter()

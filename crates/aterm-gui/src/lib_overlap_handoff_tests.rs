@@ -484,6 +484,256 @@ fn a_deferred_split_settings_close_replays_behind_the_front_tab() {
     assert_eq!(app.structural_invariant_violation(), None);
 }
 
+/// Focus every window and give `session` a failed command nobody has looked at.
+fn fail_unseen(app: &mut App, session: u64) {
+    for ws in app.windows.values_mut() {
+        ws.os_window_for_test = true;
+        ws.focused = true;
+    }
+    let term = app.pool.get(session).expect("a live session").term.clone();
+    crate::term_lock(&term).process(
+        b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\make\r\n\x1b]133;C\x1b\\\
+          \x1b]133;D;2\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\",
+    );
+    let t0 = std::time::Instant::now();
+    app.observe_session_statuses(t0);
+    app.observe_session_statuses(t0 + std::time::Duration::from_secs(1));
+    assert!(
+        unseen(app, session),
+        "PRECONDITION: a failure nobody has looked at"
+    );
+}
+
+fn unseen(app: &App, session: u64) -> bool {
+    app.session_status
+        .indicators(session)
+        .is_some_and(|bits| bits.status_attention)
+}
+
+/// The leaf of `wid`'s tab `tab` that shows `session`.
+fn leaf_of(
+    app: &App,
+    wid: WindowId,
+    tab: crate::tab_model::TabId,
+    session: u64,
+) -> crate::tab_model::ViewId {
+    app.windows[&wid]
+        .tab_set
+        .get(tab)
+        .expect("the tab")
+        .root
+        .leaves()
+        .into_iter()
+        .find(|view| {
+            app.view_store
+                .get(*view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                == Some(session)
+        })
+        .expect("the session's leaf")
+}
+
+#[test]
+fn a_deferred_pane_close_replays_behind_the_front_tab() {
+    let (pipe, sink) = crate::focus_report_tests::observer();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let closing = app.focused_session_id(wid).expect("tab A's pane");
+    let heir = app.split_active_stub_tab(wid);
+    let split = app.windows[&wid].tab_set.active_id().unwrap();
+    let closing_view = leaf_of(&app, wid, split, closing);
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session_with_sink(front, sink));
+    let front_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    crate::feed_session_for_test(&app, front, b"\x1b[?1004h");
+    fail_unseen(&mut app, heir);
+    let _ = crate::focus_report_tests::drain(pipe);
+    let cancelled = arm_outgoing_handoff(&mut app);
+
+    assert!(
+        app.close_session_by_id(closing).is_err(),
+        "the close waits for the handoff"
+    );
+    assert!(cancelled.try_recv().is_ok());
+    assert!(matches!(
+        app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
+        Some(crate::DeferredHandoffTeardown::Mutations(mutations))
+            if mutations.contains(&crate::DeferredHandoffMutation::CloseView {
+                window: wid,
+                tab: split,
+                view: closing_view,
+            })
+    ));
+    app.pending_update_handoff = None;
+
+    assert_eq!(
+        app.replay_deferred_handoff_view_close(wid, split, closing_view),
+        None
+    );
+    assert!(
+        app.view_store.get(closing_view).is_none() && app.pool.get(closing).is_none(),
+        "the replay closes the pane"
+    );
+    assert_eq!(
+        app.windows[&wid]
+            .tab_set
+            .get(split)
+            .map(|tab| tab.root.len()),
+        Some(1)
+    );
+    assert_eq!(
+        app.windows[&wid].tab_set.active_id(),
+        Some(front_tab),
+        "the replayed close leaves the person's front tab in front"
+    );
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    assert!(unseen(&app, heir), "the heir pane never came to the front");
+    assert_eq!(
+        crate::focus_report_tests::drain(pipe),
+        Vec::<u8>::new(),
+        "the person's program never heard it lost focus"
+    );
+    app.switch_tab_in(wid, 0);
+    assert_eq!(
+        crate::focus_report_tests::drain(pipe),
+        crate::focus_report_tests::FOCUS_OUT.to_vec(),
+        "control: a real switch away does blur it"
+    );
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
+#[test]
+fn a_replayed_close_of_a_tabs_last_pane_selects_no_neighbour() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let closing = app.focused_session_id(wid).expect("tab A's pane");
+    let closing_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    let closing_view = leaf_of(&app, wid, closing_tab, closing);
+    let neighbour = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(neighbour));
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(front));
+    let front_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    fail_unseen(&mut app, neighbour);
+
+    assert_eq!(
+        app.replay_deferred_handoff_view_close(wid, closing_tab, closing_view),
+        None
+    );
+    assert!(app.windows[&wid].tab_set.get(closing_tab).is_none());
+    assert!(app.pool.get(closing).is_none(), "the replay closes the tab");
+    assert_eq!(
+        app.windows[&wid].tab_set.active_id(),
+        Some(front_tab),
+        "the person's tab stays in front"
+    );
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    assert!(
+        unseen(&app, neighbour),
+        "the closed tab's neighbour never came to the front"
+    );
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
+#[test]
+fn a_replayed_terminal_leaf_close_in_a_mixed_tab_stays_behind() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let mixed = app.windows[&wid].tab_set.active_id().unwrap();
+    let (heir, _) = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+    let (closing, closing_view) =
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    app.switch_tab_in(wid, 0);
+    let front_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    let front = app.focused_session_id(wid).expect("the person's pane");
+    fail_unseen(&mut app, heir);
+
+    assert_eq!(
+        app.replay_deferred_handoff_view_close(wid, mixed, closing_view),
+        None
+    );
+    assert!(app.view_store.get(closing_view).is_none());
+    assert!(
+        app.pool.get(closing).is_none(),
+        "the replay closes the leaf"
+    );
+    assert_eq!(
+        app.windows[&wid]
+            .tab_set
+            .get(mixed)
+            .map(|tab| tab.root.len()),
+        Some(2)
+    );
+    assert_eq!(app.windows[&wid].tab_set.active_id(), Some(front_tab));
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    assert!(unseen(&app, heir), "the mixed tab never came to the front");
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
+#[test]
+fn a_confirmed_busy_pane_close_replays_behind_the_tab_the_person_is_on() {
+    use crate::app_window::CloseConfirm;
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    let wid = WindowId(0);
+    let busy = app.focused_session_id(wid).expect("tab A's pane");
+    let heir = app.split_active_stub_tab(wid);
+    let split = app.windows[&wid].tab_set.active_id().unwrap();
+    let busy_view = leaf_of(&app, wid, split, busy);
+    crate::feed_session_for_test(
+        &app,
+        busy,
+        b"\x1b]133;A\x07PS> \x1b]133;B\x07Start-Sleep 60\n\x1b]133;C\x07",
+    );
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(front));
+    let front_tab = app.windows[&wid].tab_set.active_id().unwrap();
+    fail_unseen(&mut app, heir);
+    let replay = crate::close_confirm::CloseReplay::Pane {
+        wid,
+        tab: split,
+        view: busy_view,
+    };
+
+    app.close_confirm = CloseConfirm::WireRefuseBusy;
+    assert_eq!(app.replay_confirmed_view_close(replay), None);
+    assert!(
+        app.pool.get(busy).is_some(),
+        "a replay that may not hang up a job still refuses"
+    );
+    assert_eq!(app.windows[&wid].tab_set.active_id(), Some(front_tab));
+
+    app.close_confirm = CloseConfirm::Programmatic;
+    assert_eq!(app.replay_confirmed_view_close(replay), None);
+    app.close_confirm = CloseConfirm::Interactive;
+    assert!(
+        app.pool.get(busy).is_none(),
+        "the answered question closes the busy pane without asking again"
+    );
+    assert_eq!(
+        app.windows[&wid].tab_set.active_id(),
+        Some(front_tab),
+        "the person's tab stays in front"
+    );
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    assert!(unseen(&app, heir), "the heir pane never came to the front");
+    let exit = {
+        let g = app.store.read().unwrap_or_else(|p| p.into_inner());
+        g.closed_logs()
+            .exits_since(0)
+            .rfind(|e| e.local_id == busy)
+            .map(|e| (e.reason, e.actor.as_wire().to_string()))
+    };
+    assert_eq!(
+        exit,
+        Some((crate::session_store::ExitReason::UiClose, "human".into())),
+        "the replay journals the person's close"
+    );
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
 #[test]
 fn pending_handoff_defers_every_tab_close_without_dropping_pty_ownership() {
     for closer in ["close_tab_at", "cmd-w", "control verb"] {
@@ -1199,6 +1449,116 @@ fn the_launch_reassert_posts_nothing_and_lights_the_menu_line_for_a_regression()
     });
     assert!(fda_entries(&app).is_empty(), "never an entry");
     assert!(app.access_steps.fda_regressed(), "the menu line names it");
+}
+
+/// A verified grant a young process read off (an update's successor) is read again once the
+/// process settled, from a fresh probe: held then, it ends there with no regression; still off,
+/// it is the card's need as any regression is, whose menu line says the update needs it
+/// re-allowed when another build verified it, and the next focus gain looks once more; a probe
+/// read made just before the settled look does not hold that look's back. Negative controls:
+/// before the settled time nothing is read; verified by this build, no update note.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_grant_a_young_process_read_off_is_read_again_once_settled() {
+    use super::consent_card::SettleLook;
+    use aterm_containment::ProbeGate;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+    static HELD: AtomicBool = AtomicBool::new(false);
+    static READS: AtomicU32 = AtomicU32::new(0);
+    fn fda(_gate: ProbeGate) -> FdaProbe {
+        READS.fetch_add(1, Ordering::SeqCst);
+        if HELD.load(Ordering::SeqCst) {
+            FdaProbe {
+                state: FdaState::Granted,
+                label: ProbeLabel::OpenOk,
+            }
+        } else {
+            FdaProbe {
+                state: FdaState::Denied,
+                label: ProbeLabel::OpenEperm,
+            }
+        }
+    }
+    let read = |app: &mut App, at: Instant| {
+        let start = Instant::now();
+        while app.consent_card_host.settle_look.reading() {
+            assert!(start.elapsed() < Duration::from_secs(60), "hang");
+            app.tick_macos_access_card(at);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let this_build = super::build_info::build_number().parse::<u64>().ok();
+    let other_build = Some(this_build.map_or(1, |build| build.wrapping_add(1)));
+    for (held, verified_build) in [
+        (true, other_build),
+        (false, this_build),
+        (false, other_build),
+    ] {
+        HELD.store(held, Ordering::SeqCst);
+        let mut app = access_card_windowed();
+        app.consent.set_fda_arm_for_test(fda);
+        app.consent_card.settle();
+        app.consent_card_host.record.verified_build = verified_build;
+        let t0 = Instant::now();
+        app.consent_card_host.settle_look = SettleLook::after_launch(Duration::from_secs(1), t0);
+        let at = app
+            .consent_card_host
+            .settle_look
+            .deadline()
+            .expect("the settled look waits");
+        assert!(
+            app.next_macos_access_card_deadline(t0)
+                .is_some_and(|wake| wake <= at),
+            "a park wakes for it"
+        );
+        let reads = READS.load(Ordering::SeqCst);
+        app.tick_macos_access_card(at - Duration::from_secs(1));
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            reads,
+            "the control: not before"
+        );
+        // A read made just before the look does not hold its fresh one back.
+        app.consent.hold_retry_floors_for_test();
+        app.tick_macos_access_card(at);
+        read(&mut app, at);
+        assert!(READS.load(Ordering::SeqCst) > reads, "read afresh");
+        if held {
+            assert_eq!(app.consent_card_host.settle_look, SettleLook::Idle);
+            assert_eq!(app.consent_card_host.kept_need, None, "no need");
+            assert!(!app.access_steps.fda_regressed());
+            continue;
+        }
+        assert_eq!(
+            app.consent_card_host.settle_look,
+            SettleLook::AtFocus,
+            "still off: the next focus gain looks again"
+        );
+        assert!(
+            app.consent_card_host.kept_need.is_some(),
+            "still off: a need, as any regression is (kept here: no event loop)"
+        );
+        // What the need's decision does with no event loop to post it: the regression.
+        app.note_fda_regression(true);
+        app.settle_access_steps(at);
+        let updated = verified_build != this_build;
+        assert_eq!(
+            app.system_state_menu_line().and_then(|line| line.note),
+            updated.then(|| crate::system_state_access::FDA_AFTER_UPDATE.to_owned()),
+            "the update note only when another build verified the grant"
+        );
+        HELD.store(true, Ordering::SeqCst);
+        app.consent.invalidate();
+        app.consent_card_host.settle_look.focus();
+        read(&mut app, at);
+        assert_eq!(
+            app.consent_card_host.settle_look,
+            SettleLook::Idle,
+            "reads held now"
+        );
+    }
 }
 
 /// Drive a due card through the park's tick at `now`: the question posts nothing and the card watches the probe for the grant.

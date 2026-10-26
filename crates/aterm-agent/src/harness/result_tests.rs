@@ -7,7 +7,7 @@ use super::*;
 use crate::supervise::ScratchDir;
 use crate::supervise::policy::turn_end::{
     DONE_CHECK, DONE_CHECK_MARKER_BEFORE, LAND, LAND_ANSWER, LAND_NUDGE, RETIRED_LAND_NUDGES,
-    RETIRED_LANDS, done_check_text,
+    RETIRED_LANDS, done_check_text, done_check_words,
 };
 
 const SESSION: &str = "0b2299fa-2e8d-447e-a9b8-082171298ccd";
@@ -286,7 +286,7 @@ fn a_done_check_with_the_standing_rules_is_the_check() {
             let current = done_check_text(rules, irreversible);
             for check in [
                 current.clone(),
-                current.replacen(DONE_CHECK, DONE_CHECK_MARKER_BEFORE, 1),
+                current.replacen(&done_check_words(0), DONE_CHECK_MARKER_BEFORE, 1),
             ] {
                 let mut rows = [
                     user("u-task", "Fix the parser."),
@@ -360,7 +360,7 @@ fn a_done_check_with_the_standing_rules_is_the_check() {
 #[test]
 fn a_legacy_done_check_still_recovers_the_workers_result() {
     let ruled = done_check_text(Some("leave unrelated files alone"), false).replacen(
-        DONE_CHECK,
+        &done_check_words(0),
         DONE_CHECK_MARKER_BEFORE,
         1,
     );

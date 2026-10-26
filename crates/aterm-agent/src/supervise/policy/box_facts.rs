@@ -117,6 +117,10 @@ impl ApprovalCtx {
         ctx.cwd_known = facts.cwd.is_some();
         ctx.set_trust_roots(&config.trust_roots, env.uid);
         ctx.trusted_cwd.clone_from(&facts.trusted_cwd);
+        ctx.disk_worker = facts
+            .trusted_cwd
+            .as_deref()
+            .is_some_and(crate::harness::disk::fence::is_worker_folder);
         ctx.worker_agent = facts.worker_agent;
         if config.withheld.rm_breaker {
             ctx.scratch_roots.clear();

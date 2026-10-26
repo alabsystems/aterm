@@ -52,13 +52,14 @@ impl Endian {
     }
 }
 
-/// Return the first offset at or after `pos` that is a multiple of `align`.
+/// Return the first offset at or after `pos` that is a multiple of `align`. Not `const`: Trust
+/// 0.11.0 refuses a contract on a `const fn`.
 #[cfg_attr(trust_verify, trust::requires(align == 1 || align == 2 || align == 4 || align == 8))]
 #[cfg_attr(trust_verify, trust::requires(pos <= 4294967296))]
 #[cfg_attr(trust_verify, trust::ensures(result >= pos && result - pos < align && result % align == 0))]
 #[inline]
 #[must_use]
-pub const fn pad_to(pos: usize, align: usize) -> usize {
+pub fn pad_to(pos: usize, align: usize) -> usize {
     let rem = pos % align;
     if rem == 0 { pos } else { pos + (align - rem) }
 }

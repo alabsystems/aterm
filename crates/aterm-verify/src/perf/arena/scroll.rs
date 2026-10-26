@@ -60,6 +60,56 @@ fn field(v: &Value, key: &str) -> String {
         .map_or_else(|| "?".into(), |f| format!("{f}"))
 }
 
+/// One window's frames as the house quotes latency: `n_present` and its p50/p95/p99 from
+/// `metrics percentiles`, then the render time's, so no `max_` stands alone. Present latency is
+/// output to present, and a scroll through the scrollback writes no output, so a window with no
+/// sample says so rather than quoting its empty percentiles as zeros.
+fn presents(pct: &Value) -> String {
+    let q = |n: &str, stem: &str| {
+        if pct.get(n).and_then(Value::as_f64) == Some(0.0) {
+            return format!("{n}=0");
+        }
+        format!(
+            "{n}={} {stem}_p50/p95/p99={}/{}/{}ms",
+            field(pct, n),
+            field(pct, &format!("{stem}_p50_ms")),
+            field(pct, &format!("{stem}_p95_ms")),
+            field(pct, &format!("{stem}_p99_ms"))
+        )
+    };
+    format!("{} {}", q("n_present", "present"), q("n_render", "render"))
+}
+
+/// How long a window has to draw the frame a scroll asked for: a hang detector, not a budget.
+const FRAME_HANG: Duration = Duration::from_secs(60);
+
+/// The window's `metrics percentiles` once a frame has rendered since its last reset, read every
+/// 20 ms for up to `hang`. The ctl `scroll` reply comes once the input is applied, before the
+/// frame it asks for is drawn, so a read straight after it can miss the jump's one frame.
+fn await_rendered(
+    hang: Duration,
+    mut read: impl FnMut() -> Result<Value, String>,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + hang;
+    loop {
+        let pct = read()?;
+        if pct
+            .get("n_render")
+            .and_then(Value::as_f64)
+            .is_some_and(|n| n >= 1.0)
+        {
+            return Ok(pct);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the window rendered no frame for the scroll within {}s",
+                hang.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 const CONFIG: &str = "scrollback_lines = 200000\nrestore_session = false\nbell_sound = false\n\n\
                       [update]\nenabled = false\n[packages]\nenabled = false\n";
 
@@ -138,22 +188,20 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let t0 = Instant::now();
     c(&["scroll", "top"])?;
     let jump_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let jump_pct = await_rendered(FRAME_HANG, || {
+        json(&c(&["metrics", "percentiles", "--json"])?)
+    })?;
     let shot = root.join("top.png");
     let _ = c(&["image", &shot.display().to_string()]);
-    let jump = json(&c(&["metrics", "--json"])?)?;
     group.retire()?;
 
     let scrub_row = format!(
-        "max_frame_gap={}ms slow_frames={} max_frame_render={}ms render_p99={}ms",
+        "{} max_frame_gap={}ms slow_frames={}",
+        presents(&scrub_pct),
         field(&scrub, "max_frame_gap_ms"),
-        field(&scrub, "slow_frames"),
-        field(&scrub, "max_frame_render_ms"),
-        field(&scrub_pct, "render_p99_ms")
+        field(&scrub, "slow_frames")
     );
-    let jump_row = format!(
-        "round-trip {jump_ms:.1}ms, first frame max_frame_render={}ms",
-        field(&jump, "max_frame_render_ms")
-    );
+    let jump_row = format!("round-trip {jump_ms:.1}ms, {}", presents(&jump_pct));
     eprintln!(
         "== ARENA-SCROLL (aterm side) ==\n  scrub sweep : {scrub_row}\n  jump-to-top : {jump_row}"
     );
@@ -207,6 +255,54 @@ mod tests {
                 .and_then(aterm_toml::Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn a_window_is_quoted_by_its_present_and_render_percentiles() {
+        let pct = json(
+            r#"{"n_present":250,"present_p50_ms":4.1,"present_p95_ms":6.25,"present_p99_ms":8,
+                "n_render":250,"render_p50_ms":0.5,"render_p95_ms":1,"render_p99_ms":1.44}"#,
+        )
+        .expect("percentiles");
+        assert_eq!(
+            presents(&pct),
+            "n_present=250 present_p50/p95/p99=4.1/6.25/8ms \
+             n_render=250 render_p50/p95/p99=0.5/1/1.44ms"
+        );
+        let scrolled = json(
+            r#"{"n_present":0,"present_p50_ms":0,"present_p95_ms":0,"present_p99_ms":0,
+                "n_render":178,"render_p50_ms":0.39,"render_p95_ms":0.46,"render_p99_ms":0.72}"#,
+        )
+        .expect("a scroll's percentiles");
+        assert_eq!(
+            presents(&scrolled),
+            "n_present=0 n_render=178 render_p50/p95/p99=0.39/0.46/0.72ms"
+        );
+        assert_eq!(
+            presents(&json("{}").expect("empty")),
+            "n_present=? present_p50/p95/p99=?/?/?ms n_render=? render_p50/p95/p99=?/?/?ms"
+        );
+    }
+
+    #[test]
+    fn the_jump_is_read_once_its_frame_has_rendered() {
+        let mut seen = [0.0, 0.0, 1.0].into_iter();
+        let mut reads = 0;
+        let pct = await_rendered(FRAME_HANG, || {
+            reads += 1;
+            json(&format!("{{\"n_render\":{}}}", seen.next().unwrap_or(2.0)))
+        })
+        .expect("the third read has the frame");
+        assert_eq!(
+            (reads, pct.get("n_render").and_then(Value::as_f64)),
+            (3, Some(1.0))
+        );
+        let e = await_rendered(Duration::ZERO, || json("{\"n_render\":0}"))
+            .expect_err("no frame by the wait");
+        assert!(e.contains("no frame") && e.ends_with("within 0s"), "{e}");
+        let e = await_rendered(Duration::ZERO, || Err("no socket".to_string()))
+            .expect_err("a failed read");
+        assert_eq!(e, "no socket");
     }
 
     #[test]

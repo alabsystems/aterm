@@ -8,11 +8,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+mod accessibility;
 mod complete_input;
 mod console_session;
 mod create_new;
 mod github_api;
 pub(crate) mod github_rest;
+#[cfg(target_os = "macos")]
+mod identity;
+#[cfg(target_os = "macos")]
+mod low_data;
 mod read_owned_file;
 mod relay;
 mod rename_noreplace;
@@ -515,6 +521,13 @@ pub trait System: Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Order directory-entry changes in `path` before every later write to its volume
+    /// ([`aterm_durable::ordered_dir`]): a barrier, not a full flush.
+    fn ordered_dir(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Remove a file or empty directory at `path` (succeeding if already absent).
     fn remove(&self, path: &Path) -> io::Result<()>;
 
@@ -572,6 +585,45 @@ pub trait System: Sync {
     fn pid_alive(&self, pid: u32) -> bool {
         let _ = pid;
         false
+    }
+
+    /// Pause this thread for `period`: a poll's wait, in this process, never a `sleep` child.
+    fn sleep(&self, period: Duration) {
+        std::thread::sleep(period);
+    }
+
+    /// The account this process runs as and the machine it runs on ([`Identity`]), read in
+    /// this process.
+    ///
+    /// # Errors
+    /// One line when the account database names no account for this uid, or a reading fails.
+    fn identity(&self) -> Result<Identity, String> {
+        Err("this system reads no account".into())
+    }
+
+    /// Whether the network this Mac uses now is in Low Data Mode, as macOS's network path
+    /// reads it, in this process; `None` when it cannot tell (no network path, or none read).
+    fn low_data_mode(&self) -> Option<bool> {
+        None
+    }
+
+    /// Whether the app macOS holds responsible for this process holds Accessibility, read in
+    /// this process with no prompt; `None` when it cannot be read here.
+    fn accessibility_trusted(&self) -> Option<bool> {
+        None
+    }
+
+    /// Ask macOS to show its Accessibility consent for the app it holds responsible for this
+    /// process (nothing when it holds it), answering the trust as it stands; `None` when it
+    /// cannot be asked here.
+    fn request_accessibility(&self) -> Option<bool> {
+        None
+    }
+
+    /// The name of the app macOS holds responsible for this process (aterm in aterm's tab,
+    /// Terminal under Terminal): the one a privacy grant this run needs goes to.
+    fn responsible_app(&self) -> Option<String> {
+        None
     }
 
     /// When `pid` started, in Unix seconds, as the kernel recorded it for any uid's process (what
@@ -734,6 +786,18 @@ pub trait System: Sync {
 }
 
 pub use crate::model::User;
+
+/// What [`System::identity`] reads: the account, as the account database names it, with
+/// whether it is an administrator (gid 80, or a member of the `admin` group), and the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// The account.
+    pub user: User,
+    /// The machine word `uname -m` prints (`arm64`).
+    pub arch: String,
+    /// macOS's product version (`27.0`).
+    pub os_version: String,
+}
 
 /// The live operating system.
 #[derive(Debug, Clone)]
@@ -1242,6 +1306,10 @@ impl System for Live {
         aterm_durable::durable_dir(path)
     }
 
+    fn ordered_dir(&self, path: &Path) -> io::Result<()> {
+        aterm_durable::ordered_dir(path)
+    }
+
     fn remove(&self, path: &Path) -> io::Result<()> {
         match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1379,6 +1447,64 @@ impl System for Live {
 
     fn pid_alive(&self, pid: u32) -> bool {
         aterm_uds::process::pid_alive(pid)
+    }
+
+    fn identity(&self) -> Result<Identity, String> {
+        #[cfg(target_os = "macos")]
+        {
+            identity::read(self.euid())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("the account is read on macOS alone".into())
+        }
+    }
+
+    fn low_data_mode(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            low_data::read(low_data::PATIENCE)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn accessibility_trusted(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            accessibility::trusted()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn request_accessibility(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            accessibility::request()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn responsible_app(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            i32::try_from(std::process::id())
+                .ok()
+                .and_then(aterm_containment::responsible_app)
+                .map(|app| app.display_name)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 
     fn process_started(&self, pid: u32) -> Option<u64> {
@@ -1738,7 +1864,21 @@ mod fake {
         pub terminal: bool,
         /// What [`System::agent_ancestor`] answers ([`Fake::root`]: none).
         pub agent: Option<&'static str>,
+        /// What [`System::identity`] answers ([`Fake::logged_in`]): none unless a test names
+        /// the account.
+        identity: Mutex<Option<super::Identity>>,
+        /// What a [`System::sleep`] does besides recording itself ([`Fake::on_sleep`]).
+        on_sleep: Mutex<Option<SleepHook>>,
+        /// What [`System::low_data_mode`] answers: unknown unless a test sets it.
+        pub low_data: Option<bool>,
+        /// What [`System::accessibility_trusted`] and [`System::request_accessibility`]
+        /// answer, one reading each, the last repeating ([`Fake::trusts`]): unknown when none.
+        trust: Mutex<Vec<bool>>,
+        /// What [`System::responsible_app`] answers.
+        pub responsible: Option<String>,
     }
+
+    type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
 
     #[derive(Clone)]
     enum Output {
@@ -2033,6 +2173,43 @@ mod fake {
             model: impl Fn(&Self, &Cmd) -> Option<Ran> + Send + Sync + 'static,
         ) -> &Self {
             *self.model.lock().unwrap() = Some(Arc::new(model));
+            self
+        }
+
+        /// Answer [`System::identity`] as `user`'s login on an arm64 Mac running macOS 27.0.
+        pub fn logged_in(&self, user: &User) -> &Self {
+            *self.identity.lock().unwrap() = Some(super::Identity {
+                user: user.clone(),
+                arch: "arm64".into(),
+                os_version: "27.0".into(),
+            });
+            self
+        }
+
+        /// Answer the Accessibility trust readings in turn, the last one for every later
+        /// reading.
+        pub fn trusts(&self, readings: &[bool]) -> &Self {
+            *self.trust.lock().unwrap() = readings.to_vec();
+            self
+        }
+
+        /// The next trust reading ([`Fake::trusts`]).
+        fn next_trust(&self) -> Option<bool> {
+            let mut trust = self.trust.lock().unwrap();
+            if trust.len() > 1 {
+                Some(trust.remove(0))
+            } else {
+                trust.first().copied()
+            }
+        }
+
+        /// Run `hook` at each [`System::sleep`], after it is recorded: a model whose time a
+        /// sleep moves on.
+        pub fn on_sleep(
+            &self,
+            hook: impl Fn(&Self, std::time::Duration) + Send + Sync + 'static,
+        ) -> &Self {
+            *self.on_sleep.lock().unwrap() = Some(Arc::new(hook));
             self
         }
 
@@ -2569,6 +2746,17 @@ mod fake {
             }
         }
 
+        fn ordered_dir(&self, path: &Path) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ordered-dir {}", path.display()));
+            match self.directory_flush_errors.lock().unwrap().get(path) {
+                Some(kind) => Err(io::Error::from(*kind)),
+                None => Ok(()),
+            }
+        }
+
         fn remove(&self, path: &Path) -> io::Result<()> {
             self.calls
                 .lock()
@@ -2811,6 +2999,50 @@ mod fake {
 
         fn pid_alive(&self, pid: u32) -> bool {
             self.alive.lock().unwrap().contains(&pid)
+        }
+
+        /// Recorded as `sleep <ms>ms`; no time passes unless [`Fake::on_sleep`] moves a model.
+        fn sleep(&self, period: std::time::Duration) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("sleep {}ms", period.as_millis()));
+            let hook = self.on_sleep.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(self, period);
+            }
+        }
+
+        /// Recorded as `ax-trusted`; answered as [`Fake::trusts`] scripts.
+        fn accessibility_trusted(&self) -> Option<bool> {
+            self.calls.lock().unwrap().push("ax-trusted".into());
+            self.next_trust()
+        }
+
+        /// Recorded as `ax-request`; answered as [`Fake::trusts`] scripts.
+        fn request_accessibility(&self) -> Option<bool> {
+            self.calls.lock().unwrap().push("ax-request".into());
+            self.next_trust()
+        }
+
+        fn responsible_app(&self) -> Option<String> {
+            self.responsible.clone()
+        }
+
+        /// Recorded as `low-data-mode`; answered as [`Fake::low_data`] says.
+        fn low_data_mode(&self) -> Option<bool> {
+            self.calls.lock().unwrap().push("low-data-mode".into());
+            self.low_data
+        }
+
+        /// Recorded as `identity`, the in-process reading; answered as [`Fake::logged_in`] set.
+        fn identity(&self) -> Result<super::Identity, String> {
+            self.calls.lock().unwrap().push("identity".into());
+            self.identity
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "no account scripted (Fake::logged_in)".into())
         }
 
         fn process_started(&self, pid: u32) -> Option<u64> {

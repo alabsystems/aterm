@@ -194,8 +194,10 @@ pub trait Desk {
 }
 
 /// The sessions `shown` that need the person, most pressing first by the
-/// need alone — a stuck need before a decide one, then the oldest, then tab
-/// order — each once, at its first place.
+/// need alone — a stuck need before a decide one, then, within a severity, a
+/// need that has stopped its agent before a report it carries on past
+/// ([`carries_on`]), then the oldest, then tab order — each once, at its first
+/// place.
 fn needing_order<V: Host>(table: &Table<V>, shown: &[Shown]) -> Vec<u64> {
     let mut needing: Vec<(Shown, &Slot<V>)> = Vec::new();
     for s in shown {
@@ -206,8 +208,24 @@ fn needing_order<V: Host>(table: &Table<V>, shown: &[Shown]) -> Vec<u64> {
             needing.push((*s, slot));
         }
     }
-    needing.sort_by_key(|(s, slot)| (rank(slot.severity()), slot.need_since, s.tab));
+    needing.sort_by_key(|(s, slot)| {
+        (
+            rank(slot.severity()),
+            carries_on(slot),
+            slot.need_since,
+            s.tab,
+        )
+    });
     needing.into_iter().map(|(s, _)| s.session).collect()
+}
+
+/// Whether `slot`'s need is a report its agent carries on past (a harness's
+/// `NEEDS YOU:`, published with no pill: [`super::NeedFact::show_pill`] false),
+/// which ranks after every need of its severity that has stopped an agent (an
+/// approval box no harness presses, a question, a frozen or stalled agent,
+/// another owner's ask): `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7.
+fn carries_on<V: Host>(slot: &Slot<V>) -> bool {
+    slot.need.as_ref().is_some_and(|need| !need.show_pill)
 }
 
 /// A need's rank: stuck first, then decide, then none.
@@ -220,9 +238,13 @@ const fn rank(severity: Option<NeedSeverity>) -> u8 {
 }
 
 /// Returns the next needing session after the needing `front`, else after `named`.
-/// A front report without a pill skips `named` if it would be next, so the
-/// pill's More action reaches the other needs. Returns `None` with fewer than
-/// two needs or when neither cursor is among them.
+/// Where `front` is a report without a pill (the pill names another tab's
+/// `named`), the walk goes on from `named` and passes the front report, so the
+/// pill's More action reaches the need after the pill's in [`needing_order`]
+/// (stopped work first, `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7),
+/// not the need after the report, which that order puts with the reports at the
+/// end; with only those two it gives the front report back. Returns `None` with
+/// fewer than two needs or when neither cursor is among them.
 #[must_use]
 pub fn next_need<V: Host>(
     table: &Table<V>,
@@ -235,24 +257,28 @@ pub fn next_need<V: Host>(
         return None;
     }
     let here = front.filter(|f| order.contains(f)).unwrap_or(named);
-    let at = order.iter().position(|s| *s == here)?;
-    let next = order[(at + 1) % order.len()];
-    let next = if next == named
-        && here != named
+    let front_report = here != named
         && table
             .slot(here)
             .and_then(|slot| slot.need.as_ref())
-            .is_some_and(|need| !need.show_pill)
-    {
-        order[(at + 2) % order.len()]
+            .is_some_and(|need| !need.show_pill);
+    let from = if front_report && order.contains(&named) {
+        named
     } else {
-        next
+        here
     };
-    Some(next)
+    let at = order.iter().position(|s| *s == from)?;
+    (1..order.len())
+        .map(|k| order[(at + k) % order.len()])
+        .find(|s| !(front_report && *s == here))
+        .or(Some(here))
 }
 
-/// Returns the most pressing session among `shown`. A repeated session ranks
-/// by its first occurrence but uses its active-tab location when one exists.
+/// Returns the most pressing session among `shown`: stuck before decide; within
+/// a severity a need that has stopped its agent before a report it carries on
+/// past ([`carries_on`]); then the front session, the oldest need and tab
+/// order. A repeated session ranks by its first occurrence but uses its
+/// active-tab location when one exists.
 #[must_use]
 pub fn pressing<V: Host>(
     table: &Table<V>,
@@ -276,6 +302,7 @@ pub fn pressing<V: Host>(
         .min_by_key(|(s, slot)| {
             (
                 rank(slot.severity()),
+                carries_on(slot),
                 Some(s.session) != front,
                 slot.need_since,
                 s.tab,

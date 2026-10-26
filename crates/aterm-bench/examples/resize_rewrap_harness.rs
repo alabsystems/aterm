@@ -23,7 +23,7 @@ const WARMUP: usize = 1;
 const DEEP_FILL_LINES: usize = 200_000;
 const DEEP_RING: usize = 10_000;
 const DEEP_RESIZES: usize = 2;
-const DEEP_ITERS: usize = 2;
+const DEEP_ITERS: usize = 5;
 
 /// Deterministic ~100-char wrapping lines.
 fn fill_corpus(lines: usize) -> Vec<u8> {
@@ -70,6 +70,34 @@ struct DeepPassStats {
     pump_total: f64,
     step_worst: f64,
     steps: usize,
+}
+
+/// The deep passes as the report gives them: each latency's worst over every pass, the median of
+/// the passes' worsts (a stall lands in one pass's worst, a step or resize made slower in every
+/// pass's), and the fastest pump.
+struct DeepSummary {
+    sync_worst: f64,
+    sync_worst_p50: f64,
+    pump_total: f64,
+    step_worst: f64,
+    step_worst_p50: f64,
+    steps: usize,
+}
+
+impl DeepSummary {
+    fn of(passes: &[DeepPassStats]) -> Self {
+        let each = |f: fn(&DeepPassStats) -> f64| passes.iter().map(f).collect::<Vec<f64>>();
+        let sync = each(|p| p.sync_worst);
+        let step = each(|p| p.step_worst);
+        Self {
+            sync_worst: worst(&sync),
+            sync_worst_p50: median(&sync),
+            pump_total: best(&each(|p| p.pump_total)),
+            step_worst: worst(&step),
+            step_worst_p50: median(&step),
+            steps: passes.last().map_or(0, |p| p.steps),
+        }
+    }
 }
 
 fn deep_pass(term: &mut Terminal) -> DeepPassStats {
@@ -159,6 +187,14 @@ fn converge_probe() -> (u64, usize) {
     (u64::from(max_width > 72), depth)
 }
 
+fn worst(samples: &[f64]) -> f64 {
+    samples.iter().copied().fold(0.0, f64::max)
+}
+
+fn best(samples: &[f64]) -> f64 {
+    samples.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
 fn median(samples: &[f64]) -> f64 {
     let mut v = samples.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -246,19 +282,21 @@ fn main() {
     }
     let mut ring_rates = Vec::with_capacity(N_ITERS);
     let mut tiered_rates = Vec::with_capacity(N_ITERS);
-    let mut ring_worst = 0.0f64;
-    let mut tiered_sync_worst = 0.0f64;
+    let mut ring_worsts = Vec::with_capacity(N_ITERS);
+    let mut tiered_sync_worsts = Vec::with_capacity(N_ITERS);
     for _ in 0..N_ITERS {
         let (rate, worst) = ring_pass(&mut ring_term);
         ring_rates.push(rate);
-        ring_worst = ring_worst.max(worst);
+        ring_worsts.push(worst);
         let (rate, worst) = tiered_pass(&mut tiered_term);
         tiered_rates.push(rate);
-        tiered_sync_worst = tiered_sync_worst.max(worst);
+        tiered_sync_worsts.push(worst);
     }
 
     let ring_med = median(&ring_rates);
     let tiered_med = median(&tiered_rates);
+    let ring_worst = worst(&ring_worsts);
+    let tiered_sync_worst = worst(&tiered_sync_worsts);
 
     let deep_mixed_corpus = fill_mixed_corpus(DEEP_FILL_LINES);
     let mut deep_mixed_term = deep_unlimited_term(&deep_mixed_corpus);
@@ -276,30 +314,14 @@ fn main() {
          (got {deep_wrap_depth})"
     );
 
-    let mut mixed = DeepPassStats {
-        sync_worst: 0.0,
-        pump_total: f64::INFINITY,
-        step_worst: 0.0,
-        steps: 0,
-    };
-    let mut wrapall = DeepPassStats {
-        sync_worst: 0.0,
-        pump_total: f64::INFINITY,
-        step_worst: 0.0,
-        steps: 0,
-    };
+    let mut mixed_passes = Vec::with_capacity(DEEP_ITERS);
+    let mut wrapall_passes = Vec::with_capacity(DEEP_ITERS);
     for _ in 0..DEEP_ITERS {
-        let s = deep_pass(&mut deep_mixed_term);
-        mixed.sync_worst = mixed.sync_worst.max(s.sync_worst);
-        mixed.pump_total = mixed.pump_total.min(s.pump_total);
-        mixed.step_worst = mixed.step_worst.max(s.step_worst);
-        mixed.steps = s.steps;
-        let s = deep_pass(&mut deep_wrap_term);
-        wrapall.sync_worst = wrapall.sync_worst.max(s.sync_worst);
-        wrapall.pump_total = wrapall.pump_total.min(s.pump_total);
-        wrapall.step_worst = wrapall.step_worst.max(s.step_worst);
-        wrapall.steps = s.steps;
+        mixed_passes.push(deep_pass(&mut deep_mixed_term));
+        wrapall_passes.push(deep_pass(&mut deep_wrap_term));
     }
+    let mixed = DeepSummary::of(&mixed_passes);
+    let wrapall = DeepSummary::of(&wrapall_passes);
     assert!(
         mixed.steps > 50 && wrapall.steps > 50,
         "reach: deep pumps must take many steps (mixed {}, wrapall {})",
@@ -332,20 +354,29 @@ fn main() {
     println!(
         "{{\"resize_ring_median_rps\":{ring_med:.3},\"resize_tiered_median_rps\":{tiered_med:.3},\
          \"resize_ring_worst_ms\":{:.3},\"resize_tiered_sync_worst_ms\":{:.3},\
+         \"resize_ring_worst_p50_ms\":{:.3},\"resize_tiered_sync_worst_p50_ms\":{:.3},\
          \"ring_lines\":{RING_LINES},\"tiered_fill_lines\":{TIERED_FILL_LINES},\
          \"tiered_depth\":{tiered_depth},\"n\":{N_ITERS},\"warmup\":{WARMUP},\
+         \"deep_n\":{DEEP_ITERS},\
          \"deep_mixed_depth\":{deep_mixed_depth},\"deep_mixed_pump_total_ms\":{:.3},\
          \"deep_mixed_step_worst_ms\":{:.3},\"deep_mixed_sync_worst_ms\":{:.3},\
+         \"deep_mixed_step_worst_p50_ms\":{:.3},\"deep_mixed_sync_worst_p50_ms\":{:.3},\
          \"deep_mixed_steps\":{},\"deep_wrapall_depth\":{deep_wrap_depth},\
          \"deep_wrapall_pump_total_ms\":{:.3},\"deep_wrapall_step_worst_ms\":{:.3},\
+         \"deep_wrapall_step_worst_p50_ms\":{:.3},\
          \"converge_stale_width\":{converge_stale},\"converge_history_lines\":{converge_depth}}}",
         ring_worst * 1e3,
         tiered_sync_worst * 1e3,
+        median(&ring_worsts) * 1e3,
+        median(&tiered_sync_worsts) * 1e3,
         mixed.pump_total * 1e3,
         mixed.step_worst * 1e3,
         mixed.sync_worst * 1e3,
+        mixed.step_worst_p50 * 1e3,
+        mixed.sync_worst_p50 * 1e3,
         mixed.steps,
         wrapall.pump_total * 1e3,
         wrapall.step_worst * 1e3,
+        wrapall.step_worst_p50 * 1e3,
     );
 }

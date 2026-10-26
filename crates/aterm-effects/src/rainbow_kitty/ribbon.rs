@@ -3526,8 +3526,8 @@ impl Ribbon {
         self.reseat_spaces(held_after, to);
         self.arrived = None;
         self.relocate = None;
+        let rewrap = self.take_rewrap_start(from, to);
         if re_wrapped {
-            let rewrap = self.take_rewrap_start(from, to);
             if let Some(rewrap) = rewrap
                 && let Some(end) = rewrap.start.checked_add(w)
                 && end < to.1

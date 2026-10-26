@@ -525,9 +525,16 @@ fn run_worker_launch(work: &Launch) {
         Some(aterm_agent::harness::agy_quota::Pick::Rotate { to, .. }) => Some(to.as_str()),
         _ => work.model.as_deref(),
     };
+    // A disk-free worker starts where every box is raised, whatever the owner's settings say,
+    // so its approval rule fences what it removes (the disk-free design's §8.4).
+    let disk_worker = work
+        .trusted_cwd
+        .as_deref()
+        .is_some_and(|cwd| aterm_agent::harness::disk::fence::is_worker_folder(Path::new(cwd)));
     let fresh = aterm_agent::harness::worker::Fresh {
         model,
         trusted_here: here,
+        permission_mode: disk_worker.then_some("default"),
     };
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
@@ -1132,11 +1139,45 @@ pub(crate) fn pooled_starter_in(
 /// `starter` onto `pool`'s login `pick` ([`pooled_starter`]): the variables
 /// [`aterm_agent::harness::relaunch::pool_args`] removes and its flags (Grok Build's own leader
 /// socket for a row of its own, in the home the starter carries, else `~/.grok` under the user's
-/// `home`), any prior seam variable replaced, and a row of its own's seam variable exported.
+/// `home`), any removed variables cleared from the carried environment, and the selected
+/// login seam exported or explicitly unset for the default row. Reapplication replaces the
+/// previous pool's removal list so a default row's unset cannot mask a later selected login.
 ///
 /// # Errors
 ///
 /// [`aterm_agent::harness::relaunch::pool_args`]' refusal.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkerEnvironment",
+        action = "Provider",
+        reason = "Select one of the four native provider fixtures."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkerEnvironment",
+        action = "Own",
+        reason = "Select the default login or a row with its own login path."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkerEnvironment",
+        action = "Carried",
+        reason = "Select clean, conflicting or previously pooled starter environments."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountWorkerEnvironment",
+        action = "Apply",
+        project = "aterm_gui::task_launch::tests::account_worker_env::model::environment_transition"
+    )
+)]
 pub(crate) fn pool_onto(
     mut starter: aterm_agent::harness::worker::Starter,
     pool: aterm_agent::harness::accounts::Cli,
@@ -1156,8 +1197,10 @@ pub(crate) fn pool_onto(
     if let Ok(flags) = starter.args.as_mut() {
         *flags = args.flags;
     }
+    starter
+        .env
+        .retain(|(name, _)| name != pick.var && !args.unset.contains(&name.as_str()));
     starter.unset = args.unset;
-    starter.env.retain(|(n, _)| n != pick.var);
     if let Some(value) = pick.value.clone() {
         starter.env.push((pick.var.to_string(), value));
     }

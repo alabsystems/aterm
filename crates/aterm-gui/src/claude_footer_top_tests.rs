@@ -484,7 +484,9 @@ fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     let at_rest = glass_chars(&app, wid, top);
     assert!(
         at_rest.starts_with("\u{2500}\u{2500}    claude \u{2500}")
-            && at_rest.contains("\u{2500} alab harness \u{25cf} on \u{2500}"),
+            && at_rest.contains(
+                "\u{2500} alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} \u{2500}"
+            ),
         "the lockup and the lit switch are on the top rule: {at_rest:?}"
     );
     for i in 0..30 {
@@ -775,7 +777,11 @@ fn the_switch_yields_its_cells_to_the_ghost() {
                 text.ends_with(&format!("\u{2500}\u{2500}{ghost_text}")),
                 "{len}: bare, the switch then the ghost: {text:?}"
             );
-            assert!(text.contains("\u{2590} on \u{258c}"), "{len}: {text:?}");
+            assert!(
+                text.contains("\u{2590} on \u{2590} \u{25cb} off \u{258c}")
+                    || text.contains("\u{2590} on \u{258c}"),
+                "{len}: {text:?}"
+            );
         }
         let unhosted = composed(run, None, None, GHOST);
         assert_eq!(unhosted.switch, None);
@@ -986,9 +992,9 @@ const SHOWS: &[Shown] = &[
         &[
             (108, "full s0"),
             (68, "full s0"),
-            (38, "full s0"),
-            (21, "icon s2"),
-            (14, "icon s2 compact"),
+            (38, "full s1"),
+            (21, "icon s3"),
+            (14, "icon s3 compact"),
         ],
     ),
     (
@@ -1019,9 +1025,9 @@ const SHOWS: &[Shown] = &[
         &[
             (104, "full s0"),
             (64, "full s0"),
-            (34, "full s1"),
-            (17, "icon s2"),
-            (10, "alone s2"),
+            (34, "full s2"),
+            (17, "icon s3"),
+            (10, "alone s3"),
         ],
     ),
     (
@@ -1053,8 +1059,8 @@ const SHOWS: &[Shown] = &[
             (120, "full s0"),
             (80, "full s0"),
             (50, "full s0"),
-            (33, "full s1"),
-            (26, "full s2"),
+            (33, "full s2"),
+            (26, "full s3"),
         ],
     ),
     (
@@ -1075,14 +1081,16 @@ const SHOWS: &[Shown] = &[
             (120, "full s0"),
             (80, "full s0"),
             (50, "full s0"),
-            (40, "full s0"),
-            (39, "full s1"),
-            (33, "full s1"),
-            (27, "full s2"),
-            (26, "icon s2"),
-            (16, "icon s2"),
-            (15, "icon s2 compact"),
-            (13, "alone s2"),
+            (49, "full s1"),
+            (42, "full s1"),
+            (41, "full s2"),
+            (37, "full s2"),
+            (36, "full s3"),
+            (27, "full s3"),
+            (26, "icon s3"),
+            (16, "icon s3"),
+            (15, "icon s3 compact"),
+            (13, "alone s3"),
         ],
     ),
     (
@@ -1092,10 +1100,11 @@ const SHOWS: &[Shown] = &[
             (120, "full s0"),
             (80, "full s0"),
             (50, "full s0"),
-            (48, "full s0"),
-            (47, "full s1"),
-            (39, "full s2"),
-            (33, "full s3"),
+            (49, "full s1"),
+            (42, "full s1"),
+            (41, "full s2"),
+            (37, "full s2"),
+            (36, "full s3"),
             (29, "full s3"),
             (28, "icon s3"),
             (26, "icon s3"),
@@ -1125,8 +1134,8 @@ const SHOWS: &[Shown] = &[
             (120, "full s0"),
             (80, "full s0"),
             (50, "full s0"),
-            (33, "full s0"),
-            (26, "full s1"),
+            (33, "full s2"),
+            (26, "full s3"),
         ],
     ),
     (
@@ -1136,7 +1145,7 @@ const SHOWS: &[Shown] = &[
             (120, "full s0"),
             (80, "full s0"),
             (50, "full s0"),
-            (33, "full s1"),
+            (33, "full s2"),
             (26, "full s3"),
         ],
     ),
@@ -1157,7 +1166,7 @@ const SHOWS: &[Shown] = &[
         &[
             (88, "full s0"),
             (48, "full s0"),
-            (18, "icon s2"),
+            (18, "icon s3"),
             (1, "nothing"),
         ],
     ),
@@ -1250,7 +1259,7 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     );
     assert_eq!(
         rung_name(vendor.map(|(r, _)| r)),
-        "full s2",
+        "full s3",
         "CONTROL: the vendor's ladder keeps a name at 26"
     );
     let (rungs, n) = ladder(Some(OFF), Some(CliMark::Agy.lockup_cells(Build::Vendor)));
@@ -1415,7 +1424,7 @@ fn the_mark_cell_survives_every_rung() {
     let lockup = CliMark::Claude.lockup_cells(Build::Vendor);
     let span = 14;
     let (rung, face) = lay_top(span, Some(LIT), Some(lockup)).expect("a rung");
-    assert_eq!(rung_name(Some(rung)), "icon s2 compact");
+    assert_eq!(rung_name(Some(rung)), "icon s3 compact");
     let face = face.expect("the switch");
     let mut line = vec!['\u{2500}'; span];
     let start = span - 1 - face.len;
@@ -1455,7 +1464,12 @@ fn flows(
         }
     };
     let first = switch.switch.start;
-    let last = switch.switch.end - 1;
+    let arc_end = (switch.switch.start..switch.switch.end)
+        .find(|&c| at(c).ch == '\u{2590}')
+        .unwrap_or(switch.switch.end);
+    let last = (switch.switch.start..arc_end)
+        .rfind(|&c| at(c).ch != ' ')
+        .expect("an arced glyph");
     let gap_last = switch.cols.start - 1;
     let tail = switch.cols.end;
     if at(gap_last).fg != tint_at(palette, 0.0) {
@@ -1522,7 +1536,7 @@ fn the_rule_flows_into_the_switch() {
         let bold = matches!(face, HarnessSwitch::On);
         for c in switch.switch.clone() {
             let cell = top.cells[c - top.col];
-            if cell.ch != ' ' {
+            if cell.ch != ' ' && cell.ch != '\u{2590}' && cell.ch != '\u{258c}' {
                 assert_eq!(cell.bold, bold, "{palette:?}: the switch's weight");
             }
         }
@@ -1532,19 +1546,28 @@ fn the_rule_flows_into_the_switch() {
     assert_eq!(
         layout(&cruise),
         layout(&off),
-        "Autopilot Off's switch is the lit one, `alab harness ● on`"
+        "Autopilot Off's switch is the lit segmented one, `alab harness ▐ ● on ▌ off ▌`"
     );
     let lockup = cruise.lockup.clone();
+    let cruise_sw = cruise.switch.clone().expect("Cruise's switch");
+    let pill_cols = {
+        let cap = (cruise_sw.switch.start..cruise_sw.cols.end)
+            .find(|&c| cruise.cells[c - cruise.col].ch == '\u{2590}')
+            .expect("pill cap");
+        cap..cruise_sw.cols.end
+    };
     for (k, (a, b)) in cruise.cells.iter().zip(&land.cells).enumerate() {
-        if lockup.contains(&(cruise.col + k)) || a.ch == ' ' {
+        let col = cruise.col + k;
+        if lockup.contains(&col) || pill_cols.contains(&col) || a.ch == ' ' {
             continue;
         }
         assert_ne!(a.fg, b.fg, "cell {k} {:?}: Cruise and Land apart", a.ch);
     }
     let switch = off.switch.clone().expect("Off's lit switch");
-    let glyphs: Vec<usize> = switch
-        .switch
-        .clone()
+    let cap = (switch.switch.start..switch.switch.end)
+        .find(|&c| off.cells[c - off.col].ch == '\u{2590}')
+        .expect("Off's pill cap");
+    let glyphs: Vec<usize> = (switch.switch.start..cap)
         .filter(|&c| off.cells[c - off.col].ch != ' ')
         .collect();
     let n = glyphs.len() - 1;
@@ -1555,6 +1578,15 @@ fn the_rule_flows_into_the_switch() {
             off.cells[c - off.col].fg,
             want,
             "Off glyph {k}: the moonbow"
+        );
+    }
+    let white_fill = brand_letter_fg(CardPalette::Off, 0.0, blank());
+    assert_eq!(off.cells[cap - off.col].fg, white_fill, "Off's left cap");
+    for c in (cap + 1)..(switch.switch.end - 1) {
+        assert_eq!(
+            off.cells[c - off.col].bg,
+            white_fill,
+            "Off's lit thumb wears moonbow white"
         );
     }
     let mut old = cruise.cells.clone();
@@ -2125,36 +2157,40 @@ fn the_bare_switch_reads_on_every_ground() {
                 HarnessSwitch::TurningOff,
             ] {
                 for hover in [false, true] {
-                    let paint = SwitchPaint {
-                        face,
-                        hover,
-                        version: None,
-                    };
-                    let f = switch_face(paint, 0).expect("the widest form");
-                    let mut seen: Vec<SwitchInk> = Vec::new();
-                    for &(ch, ink) in f.cells() {
-                        if ch == ' ' || seen.contains(&ink) {
-                            continue;
-                        }
-                        seen.push(ink);
-                        let c = switch_cell(ch, ink, paint, None, blank, accent);
-                        let what = format!(
-                            "{accent_name}'s accent on {ground_name}, {face:?}{}, {:?}'s {ch:?}",
-                            if hover { " hovered" } else { "" },
-                            f.text()
-                        );
-                        if ink == SwitchInk::Cap {
-                            let k = reads(c.fg, blank.bg);
-                            assert!(k >= 3.0, "{what}: the cap at {k:.2}:1");
-                        } else {
-                            let k = reads(c.fg, c.bg);
-                            assert!(k >= floor, "{what}: the letter at {k:.2}:1");
-                            if ink == SwitchInk::Button {
-                                let k = reads(c.bg, blank.bg);
-                                assert!(k >= 3.0, "{what}: the pill at {k:.2}:1");
+                    for version in [None, Some("0.1")] {
+                        let paint = SwitchPaint {
+                            face,
+                            hover,
+                            version,
+                        };
+                        let f = switch_face(paint, 0).expect("the widest form");
+                        let mut seen: Vec<SwitchInk> = Vec::new();
+                        for &(ch, ink) in f.cells() {
+                            if ch == ' ' || seen.contains(&ink) {
+                                continue;
                             }
+                            seen.push(ink);
+                            let c = switch_cell(ch, ink, paint, None, blank, accent);
+                            let what = format!(
+                                "{accent_name}'s accent on {ground_name}, {face:?}{}, {:?}'s {ch:?}",
+                                if hover { " hovered" } else { "" },
+                                f.text()
+                            );
+                            if ink.is_thumb_cap() {
+                                let k = reads(c.fg, blank.bg);
+                                assert!(k >= 3.0, "{what}: the cap at {k:.2}:1");
+                            } else if ink == SwitchInk::TrackCap {
+                                assert_eq!(c.bg, blank.bg, "{what}: track cap sits on the ground");
+                            } else {
+                                let k = reads(c.fg, c.bg);
+                                assert!(k >= floor, "{what}: the letter at {k:.2}:1");
+                                if ink.is_thumb() {
+                                    let k = reads(c.bg, blank.bg);
+                                    assert!(k >= 3.0, "{what}: the pill at {k:.2}:1");
+                                }
+                            }
+                            checked += 1;
                         }
-                        checked += 1;
                     }
                 }
             }

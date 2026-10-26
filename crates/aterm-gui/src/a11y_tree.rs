@@ -1379,6 +1379,48 @@ pub(crate) fn grid_tree(
     }
 }
 
+/// THE HARNESS'S NODES AS A SCREEN READER IS HANDED THEM (`aterm ctl chrome`'s `a11y` lines, a
+/// development build's): of `update`, window `window`'s tree as [`grid_tree`] builds it for the
+/// adapter, each Autopilot chip's node (`a11y window=<id> autopilot sid=<sid> role=<role>
+/// label="…" description="…"|-`, its session named by `sid_of`) and each Messages band row's
+/// (`a11y window=<id> band row=<0..2> role=<role> label="…" description="…"|-`), in the tree's
+/// order. Every other node is left out.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn harness_node_lines(
+    window: u64,
+    update: &TreeUpdate,
+    sid_of: impl Fn(u64) -> Option<String>,
+) -> Vec<String> {
+    let said = |node: &Node| {
+        let description = node
+            .description()
+            .map_or_else(|| "-".to_string(), |d| format!("{d:?}"));
+        format!(
+            "role={:?} label={:?} description={description}",
+            node.role(),
+            node.label().unwrap_or_default()
+        )
+    };
+    update
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            if let Some((session, HarnessChip::Autopilot)) = chip_for(*id) {
+                let sid = sid_of(session).unwrap_or_else(|| "-".to_string());
+                return Some(format!(
+                    "a11y window={window} autopilot sid={sid} {}",
+                    said(node)
+                ));
+            }
+            let row = ChromeMessage::from_node(*id)?.band_row_index()?;
+            Some(format!(
+                "a11y window={window} band row={row} {}",
+                said(node)
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2548,6 +2590,77 @@ mod tests {
         assert!(!spoken("\u{221e} cruise"));
         let bare = grid_tree(&snap, Some(GEOM), &GridFrame::default());
         assert!(bare.nodes.iter().all(|(id, _)| chip_for(*id).is_none()));
+    }
+
+    /// `chrome`'s `a11y` lines read the built tree's Autopilot chip and band row nodes, each its
+    /// role, label and description as the adapter is handed them, and nothing else: a Team chip, a
+    /// band's capsule and overflow, and the grid itself are left out.
+    #[test]
+    fn the_harness_node_lines_read_the_autopilot_chip_and_the_band_rows_off_the_built_tree() {
+        let snap = live_grid(3, 60, b"hi", Some((0, 2)));
+        let chip = |chip, label: &str, description: Option<&str>| GridChip {
+            session: 4,
+            chip,
+            label: label.to_string(),
+            description: description.map(str::to_string),
+            toggled: None,
+            row: 2,
+            col: 4,
+            width: 1,
+        };
+        let chips = [
+            chip(
+                HarnessChip::Autopilot,
+                "Autopilot: land.",
+                Some("Stopped typing: the same reply twice, with no work."),
+            ),
+            chip(
+                HarnessChip::Team,
+                "Worker of fmt",
+                Some("Goes to its manager."),
+            ),
+        ];
+        let messages = [
+            GridMessage {
+                alarm: true,
+                bar_row: Some(0),
+                detail: Some("Under Land it answered twice".to_string()),
+                capsules: vec![BandCapsule {
+                    label: "Show tab 3",
+                    col: 40,
+                    width: 10,
+                    index: 0,
+                }],
+                ..message(
+                    ChromeMessage::BandRow0,
+                    "aterm stopped typing in tab 3 \u{00b7} Open the tab",
+                )
+            },
+            message(ChromeMessage::BandOverflow, "2 more messages"),
+        ];
+        let update = grid_tree(
+            &snap,
+            Some(GEOM),
+            &GridFrame {
+                chips: &chips,
+                messages: &messages,
+                ..GridFrame::default()
+            },
+        );
+        let lines = harness_node_lines(2, &update, |session| {
+            (session == 4).then(|| "s-4".to_string())
+        });
+        assert_eq!(
+            lines,
+            [
+                "a11y window=2 band row=0 role=Alert label=\"aterm stopped typing in tab 3 \u{00b7} \
+                 Open the tab\" description=\"Under Land it answered twice\"",
+                "a11y window=2 autopilot sid=s-4 role=Button label=\"Autopilot: land.\" \
+                 description=\"Stopped typing: the same reply twice, with no work.\"",
+            ]
+        );
+        let bare = grid_tree(&snap, Some(GEOM), &GridFrame::default());
+        assert!(harness_node_lines(2, &bare, |_| None).is_empty());
     }
 
     /// A SUPERVISED CODEX SESSION'S ACCOUNT CHIP names the CLI and the account

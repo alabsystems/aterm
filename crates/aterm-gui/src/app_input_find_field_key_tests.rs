@@ -673,3 +673,135 @@ fn f3_and_shift_f3_step_the_matches_off_macos() {
         "Ctrl+F3 is not the field's"
     );
 }
+
+/// Open find on the front tab, start a query, run `close` (which must leave the front tab
+/// and its focused pane in place), then finish the query: every key must have reached
+/// the field, none the shell.
+fn find_survives(app: &mut App, case: &str, close: impl FnOnce(&mut App)) {
+    let wid = WindowId(0);
+    let front = app.focused_session_id(wid);
+    app.search_enter();
+    type_str(app, wid, "dep");
+    close(app);
+    assert_eq!(
+        app.focused_session_id(wid),
+        front,
+        "{case}: fixture keeps the front"
+    );
+    assert_eq!(
+        query(app, wid),
+        Some(("dep".to_string(), 3)),
+        "{case}: the find field and its query outlive a close behind them"
+    );
+    type_str(app, wid, "loy");
+    assert_eq!(
+        query(app, wid),
+        Some(("deploy".to_string(), 6)),
+        "{case}: the rest of the query reached the field"
+    );
+    app.on_key(wid, named(NamedKey::Enter));
+    assert!(app.windows[&wid].search.is_none(), "{case}: ⏎ accepted");
+    assert_eq!(
+        app.search_last_query, "deploy",
+        "{case}: ⏎ accepted the whole query"
+    );
+}
+
+#[test]
+fn a_close_behind_the_front_tab_keeps_its_find_field() {
+    let wid = WindowId(0);
+
+    let mut app = App::headless_for_test();
+    let background = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(background));
+    app.switch_tab_in(wid, 0);
+    find_survives(&mut app, "aterm ctl close of a background tab", |app| {
+        assert!(app.close_session_by_id(background).is_ok());
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            1,
+            "the background tab closed"
+        );
+    });
+
+    let mut app = App::headless_for_test();
+    let background = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(background));
+    app.switch_tab_in(wid, 0);
+    find_survives(&mut app, "a background tab's shell exiting", |app| {
+        assert!(app.exit_session_logical(background).is_empty());
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            1,
+            "the background tab closed"
+        );
+    });
+
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    app.switch_tab_in(wid, 0);
+    find_survives(&mut app, "aterm ctl settings close", |app| {
+        assert!(app.close_settings_tabs());
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            1,
+            "the Settings tab closed"
+        );
+    });
+
+    let mut app = App::headless_for_test();
+    let sibling = app.split_active_stub_tab(wid);
+    app.focus_pane(crate::pane::FocusDir::Left);
+    assert_eq!(
+        app.focused_session_id(wid),
+        Some(0),
+        "fixture: session 0 focused"
+    );
+    find_survives(&mut app, "a split sibling's shell exiting", |app| {
+        assert!(app.exit_session_logical(sibling).is_empty());
+        assert_eq!(
+            app.windows[&wid].layouts[0].sessions(),
+            vec![0],
+            "the split collapsed"
+        );
+    });
+}
+
+#[test]
+fn find_closes_with_the_content_it_searches() {
+    let wid = WindowId(0);
+    let open = |app: &mut App| {
+        app.search_enter();
+        type_str(app, wid, "dep");
+        assert!(app.windows[&wid].search.is_some(), "fixture: find is open");
+    };
+
+    let mut app = App::headless_for_test();
+    app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+    open(&mut app);
+    app.switch_tab_in(wid, 0);
+    assert!(
+        app.windows[&wid].search.is_none(),
+        "a tab switch closes find"
+    );
+
+    let mut app = App::headless_for_test();
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(front));
+    open(&mut app);
+    assert!(app.exit_session_logical(front).is_empty());
+    assert!(
+        app.windows[&wid].search.is_none(),
+        "the front tab's close closes find"
+    );
+
+    let mut app = App::headless_for_test();
+    let _ = app.split_active_stub_tab(wid);
+    open(&mut app);
+    app.focus_pane(crate::pane::FocusDir::Left);
+    assert_eq!(app.focused_session_id(wid), Some(0), "fixture: focus moved");
+    assert!(
+        app.windows[&wid].search.is_none(),
+        "a pane focus move closes find"
+    );
+}

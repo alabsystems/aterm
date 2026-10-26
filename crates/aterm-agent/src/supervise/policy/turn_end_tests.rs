@@ -205,28 +205,45 @@ fn is_escalate(a: &TurnEndAction, needle: &str) -> bool {
     matches!(a, TurnEndAction::Escalate { reason } if reason.contains(needle))
 }
 
+/// v6 §14.5 (5a): Claude Code's grey suggestion under Cruise is typed over with Cruise's whole
+/// continuation, never accepted bare (it carries none of the hunt's words and none of NEEDS YOU's);
+/// under Land a suggestion changes nothing. Negative control: 2f's Accept arm of
+/// `continue_policy` back accepts `keep going` under `continue-suggestion@v1` and fails the first
+/// assertion.
 #[test]
-fn the_workers_suggestion_is_accepted_once() {
+fn a_suggestion_under_cruise_is_typed_over_with_the_continuation_and_land_is_unchanged() {
     let now = t0();
-    let mut st = TurnEndState::default();
-    let mut r = idle("Done with stage 1.", Some(3 * MIN));
-    r.composer = Composer::Placeholder("keep going".to_string());
-    let a = act(&mut st, &r, now);
-    assert_eq!(
-        a,
-        TurnEndAction::Accept {
-            text: "keep going".to_string(),
-            rule_id: RULE_SUGGESTION
-        }
-    );
-    let again = TurnEndReading {
-        worked: None,
-        ..r.clone()
+    for suggestion in ["keep going", "Keep fixing forward!", "delete the branch"] {
+        let mut st = TurnEndState::default();
+        let mut r = idle("Done with stage 1.", Some(3 * MIN));
+        r.composer = Composer::Placeholder(suggestion.to_string());
+        let a = act(&mut st, &r, now);
+        assert_eq!(a, typed(RULE_CONTINUE), "{suggestion:?}");
+        let again = TurnEndReading {
+            worked: None,
+            ..r.clone()
+        };
+        assert!(
+            awaits(&decide_turn_end(&st, &again, &cfg(), now), now),
+            "{suggestion:?}: typed once, then the take awaited"
+        );
+    }
+    let land = |composer: Composer| {
+        let mut st = TurnEndState::default();
+        let r = TurnEndReading {
+            autopilot: Autopilot::Land,
+            composer,
+            ..idle("Done with stage 1.", Some(3 * MIN))
+        };
+        at(&mut st, &r, now)
     };
-    assert!(awaits(&decide_turn_end(&st, &again, &cfg(), now), now));
-    let mut st = TurnEndState::default();
-    r.composer = Composer::Placeholder("delete the branch".to_string());
-    assert_eq!(at(&mut st, &r, now), typed(RULE_CONTINUE));
+    let bare = land(Composer::Empty);
+    assert!(bare.rule_id().is_some_and(is_land_rule), "{bare:?}");
+    assert_eq!(
+        land(Composer::Placeholder("keep going".to_string())),
+        bare,
+        "Land types its own act over a suggestion, as over an empty composer"
+    );
 }
 
 #[test]
@@ -1238,7 +1255,8 @@ fn the_vendors_own_continuation_delivers_the_check_a_limit_cut_again() {
         let (cut_reply, cut_want) = if mode == Autopilot::Land {
             (DEFENSE, None)
         } else {
-            (done, Some(checked()))
+            // The cut check delivered by the vendor's continuation and answered: the next angle.
+            (done, Some(checked_at_angle(1)))
         };
         for (case, asked, reply, want) in [
             ("the act cut, its done reply", true, cut_reply, cut_want),
@@ -1372,7 +1390,7 @@ fn a_limits_end_types_no_keep_going_into_a_done_report() {
     };
     let done = "All done: the change is committed and pushed, and every suite passes.";
     let reversible = TurnEndAction::Type {
-        text: format!("{DONE_CHECK} {DONE_CHECK_REVERSIBLE}"),
+        text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
         rule_id: RULE_DONE_CHECK,
     };
     let held = no_continue();
@@ -1528,7 +1546,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
     };
     let done = "All done: the change is committed and pushed, and every suite passes.";
     let reversible = TurnEndAction::Type {
-        text: format!("{DONE_CHECK} {DONE_CHECK_REVERSIBLE}"),
+        text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
         rule_id: RULE_DONE_CHECK,
     };
     let ended =
@@ -2042,7 +2060,7 @@ fn a_limits_end_keeps_the_resume_on_codex_and_after_an_esc_and_the_budget() {
             }
         }
         let escalated = matches!(&last, TurnEndAction::Escalate { .. });
-        if escalated != capped || (!capped && last != checked()) {
+        if escalated != capped || (!capped && last != checked_at_angle(1)) {
             wrong.push(format!("capped {capped}: {last:?}"));
         }
     }
@@ -4553,7 +4571,7 @@ fn the_rules_ride_in_the_continuation() {
             done_check_text(Some(rules), false),
             done_check_text(Some(rules), true),
             act_words(
-                DONE_CHECK,
+                &done_check_words(5),
                 &[&open, DONE_CHECK_REVERSIBLE, NEEDS_ACK],
                 Some(rules),
             ),
@@ -4579,11 +4597,16 @@ fn the_rules_ride_in_the_continuation() {
     }
     let check = done_check_text(Some(words), false);
     assert!(
-        check.starts_with(&format!("{DONE_CHECK} (standing rules: word word "))
-            && check.ends_with(" word…)"),
+        check.starts_with(&format!(
+            "{} (standing rules: word word ",
+            done_check_words(0)
+        )) && check.ends_with(" word…)"),
         "{check}"
     );
-    assert_eq!(done_check_text(Some(&"x".repeat(800)), false), DONE_CHECK);
+    assert_eq!(
+        done_check_text(Some(&"x".repeat(800)), false),
+        done_check_words(0)
+    );
 }
 
 #[test]
@@ -5711,8 +5734,13 @@ fn a_persons_keystroke_holds_every_act_for_the_grace() {
 }
 
 fn checked() -> TurnEndAction {
+    checked_at_angle(0)
+}
+
+/// The done check at its `n`th claim of a Cruise run (from 0), bare: [`done_check_words`].
+fn checked_at_angle(n: usize) -> TurnEndAction {
     TurnEndAction::Type {
-        text: DONE_CHECK.to_string(),
+        text: done_check_words(n),
         rule_id: RULE_DONE_CHECK,
     }
 }
@@ -5815,6 +5843,8 @@ fn record_of(prompt: &str, age: Duration, ended: Option<Duration>) -> RecordTurn
 
 #[test]
 fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record() {
+    let check = done_check_words(0);
+    let check = check.as_str();
     const IDLE: &str = "Both branches have landed and no lander is running.";
     const LAND: &str = "land the two branches";
     let secs = Duration::from_secs;
@@ -5849,16 +5879,16 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
         assert!(!st.task_done(), "{st:?}");
     };
     let (mut st, sent) = checking(Some(LAND));
-    let answer = closing(IDLE, DONE_CHECK, Some(Duration::ZERO));
+    let answer = closing(IDLE, check, Some(Duration::ZERO));
     let a = at(&mut st, &answer, sent + fast);
     claimed(&st, &a, sent + fast);
     assert_eq!(
         decide_turn_end(&st, &answer, &cfg(), sent + 10 * 60 * MIN),
-        checked(),
-        "the check again once the back-off is past"
+        checked_at_angle(1),
+        "the check again, at the next angle, once the back-off is past"
     );
     let (mut st, sent) = checking(Some(LAND));
-    let a = at(&mut st, &closing(IDLE, DONE_CHECK, None), sent + fast);
+    let a = at(&mut st, &closing(IDLE, check, None), sent + fast);
     claimed(&st, &a, sent + fast);
     let by_record = |record: RecordTurn| TurnEndReading {
         record_turn: Some(record),
@@ -5866,18 +5896,18 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
     };
     let (mut st, sent) = checking(Some(LAND));
     let closed = record_of(
-        DONE_CHECK,
+        check,
         Duration::from_millis(500),
         Some(Duration::from_millis(41)),
     );
     let a = at(&mut st, &by_record(closed), sent + fast);
     claimed(&st, &a, sent + fast);
     let (mut st, sent) = checking(Some(LAND));
-    let open = record_of(DONE_CHECK, Duration::from_millis(500), None);
+    let open = record_of(check, Duration::from_millis(500), None);
     let a = at(&mut st, &by_record(open), sent + fast);
     assert!(awaits(&a, sent + fast), "{a:?}");
     let due = sent + fast + TurnEndTiming::default().take_within;
-    let closed = record_of(DONE_CHECK, due - sent, Some(Duration::from_millis(41)));
+    let closed = record_of(check, due - sent, Some(Duration::from_millis(41)));
     let a = at(&mut st, &by_record(closed), due);
     claimed(&st, &a, due);
     let mut st = TurnEndState::default();
@@ -5912,7 +5942,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
     untaken(
         &TurnEndReading {
             composer: Composer::Typed,
-            ..closing(IDLE, DONE_CHECK, None)
+            ..closing(IDLE, check, None)
         },
         Some(LAND),
     );
@@ -5926,24 +5956,24 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
         sent + fast + TurnEndTiming::default().take_within,
     );
     assert!(!st.task_done());
-    untaken(&closing(IDLE, DONE_CHECK, None), None);
+    untaken(&closing(IDLE, check, None), None);
     untaken(
         &by_record(record_of(
-            DONE_CHECK,
+            check,
             fast + RECORD_SLACK + secs(1),
             Some(Duration::from_millis(41)),
         )),
         None,
     );
-    untaken(&closing(IDLE, DONE_CHECK, None), Some(DONE_CHECK));
-    let (mut st, sent) = checking(Some(DONE_CHECK));
+    untaken(&closing(IDLE, check, None), Some(check));
+    let (mut st, sent) = checking(Some(check));
     let both = TurnEndReading {
         record_turn: Some(record_of(
-            DONE_CHECK,
+            check,
             Duration::from_millis(500),
             Some(Duration::from_millis(41)),
         )),
-        ..closing(IDLE, DONE_CHECK, None)
+        ..closing(IDLE, check, None)
     };
     let a = at(&mut st, &both, sent + fast);
     claimed(&st, &a, sent + fast);
@@ -5951,14 +5981,14 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
         &TurnEndReading {
             wall: Some(WallKind::Overloaded),
             wall_message: "API Error: 529 Overloaded.".to_string(),
-            ..closing(IDLE, DONE_CHECK, None)
+            ..closing(IDLE, check, None)
         },
         Some(LAND),
     );
     untaken(
         &TurnEndReading {
             interrupted: true,
-            ..closing(IDLE, DONE_CHECK, None)
+            ..closing(IDLE, check, None)
         },
         Some(LAND),
     );
@@ -5966,7 +5996,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
     st.park_off();
     let a = at(
         &mut st,
-        &closing(IDLE, DONE_CHECK, Some(Duration::ZERO)),
+        &closing(IDLE, check, Some(Duration::ZERO)),
         sent + fast,
     );
     assert!(awaits(&a, sent + fast), "{a:?}");
@@ -5980,7 +6010,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
     at(&mut st, &overloaded, sent + fast);
     let a = at(
         &mut st,
-        &closing(IDLE, DONE_CHECK, Some(Duration::ZERO)),
+        &closing(IDLE, check, Some(Duration::ZERO)),
         sent + fast + fast,
     );
     assert!(!st.task_done(), "a wall's answer: {a:?}");
@@ -6013,7 +6043,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
         st.seed_limit_conversation(Conversation::Named("B".to_owned()), None);
         let r = TurnEndReading {
             conversation,
-            ..closing(IDLE, DONE_CHECK, Some(Duration::ZERO))
+            ..closing(IDLE, check, Some(Duration::ZERO))
         };
         assert_eq!(st.answered_unseen(&r, sent + fast).is_some(), ours);
         st.observe(&r, sent + fast);
@@ -6768,14 +6798,17 @@ fn the_done_check_is_a_continuation_the_owner_can_limit() {
     ));
     assert_eq!(
         done_check_text(Some("never push to main"), false),
-        format!("{DONE_CHECK} (standing rules: never push to main)")
+        format!(
+            "{} (standing rules: never push to main)",
+            done_check_words(0)
+        )
     );
 }
 
 #[test]
 fn a_done_report_naming_an_irreversible_act_gets_the_check_with_the_reversible_clause() {
     let with_clause = TurnEndAction::Type {
-        text: format!("{DONE_CHECK} {DONE_CHECK_REVERSIBLE}"),
+        text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
         rule_id: RULE_DONE_CHECK,
     };
     let now = t0();
@@ -6793,7 +6826,10 @@ fn a_done_report_naming_an_irreversible_act_gets_the_check_with_the_reversible_c
     assert!(claimed_at(&st, &a), "{a:?}");
     assert_eq!(
         done_check_text(Some("never push to main"), true),
-        format!("{DONE_CHECK} {DONE_CHECK_REVERSIBLE} (standing rules: never push to main)")
+        format!(
+            "{} {DONE_CHECK_REVERSIBLE} (standing rules: never push to main)",
+            done_check_words(0)
+        )
     );
     let mut st = TurnEndState::default();
     act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
@@ -7764,7 +7800,9 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
     assert_eq!(waits, [1, 5, 15]);
     assert_eq!(
         exception_for(&st, &server_back, &cfg(), now),
-        Some(super::super::exception::Exception::repeats())
+        Some(super::super::exception::Exception::repeats(
+            crate::harness::acts::HeldBy::SameReply
+        ))
     );
     let off = SupervisorConfig {
         retry_api_errors: false,
@@ -7998,9 +8036,7 @@ fn a_walls_act_never_types_the_screens_words() {
                 while now < t + 6 * 60 * MIN {
                     let a = act(&mut st, &r, now);
                     let texts: Vec<&str> = match &a {
-                        TurnEndAction::Type { text, .. } | TurnEndAction::Accept { text, .. } => {
-                            vec![text.as_str()]
-                        }
+                        TurnEndAction::Type { text, .. } => vec![text.as_str()],
                         TurnEndAction::TypeCommand { command, .. } => vec![command.as_str()],
                         _ => vec![],
                     };
@@ -9311,7 +9347,7 @@ fn a_workers_check_and_answer_go_without_the_back_off() {
         let stop = first("Stage 1 landed.");
         if managed {
             assert!(
-                matches!(&check, TurnEndAction::Type { text, rule_id } if *rule_id == RULE_DONE_CHECK && text == DONE_CHECK),
+                matches!(&check, TurnEndAction::Type { text, rule_id } if *rule_id == RULE_DONE_CHECK && *text == done_check_words(0)),
                 "{check:?}"
             );
             assert!(
@@ -9393,7 +9429,7 @@ fn a_worker_that_asks_the_same_again_is_answered_once_more_then_held_until_it_ch
     assert_eq!(a, TurnEndAction::Nothing, "the second is held");
     assert_eq!(
         exception_for(&st, &r, &cfg(), t + 2 * QUICK),
-        Some(Exception::repeats()),
+        Some(Exception::repeats(crate::harness::acts::HeldBy::SameReply)),
         "the tab says so, and nothing escalates"
     );
     assert_eq!(
@@ -13770,7 +13806,7 @@ fn a_cruise_done_claim_gets_the_defend_prompt_never_nothing() {
             now += 3 * MIN;
             let r = idle(claim, Some(3 * MIN));
             let (a, then) = past_backoff(&mut st, &r, now);
-            assert_eq!(a, checked(), "{claim:?} round {round}");
+            assert_eq!(a, checked_at_angle(round), "{claim:?} round {round}");
             assert!(!st.task_done() && !st.landed(), "{claim:?} round {round}");
             assert_eq!(st.face(), TaskFace::Open);
             st.acted(&a, &r, then);
@@ -13965,15 +14001,15 @@ fn over_repo(r: TurnEndReading, repo: crate::harness::repo_work::RepoWork) -> Tu
 #[test]
 fn a_cruise_claim_over_repo_work_gets_the_check_with_the_repo_suffix() {
     let dirty = uncommitted_repo();
-    let suffix = repo_work_suffix(&dirty);
+    let suffix = own_repo_work_suffix(&dirty);
     for words in [
         "/Users//a/Developer/parser: 1 changed, 1 untracked (src/lexer.rs, notes.md)",
-        "commit, merge and push it to the remote main first",
+        "land what of it you made first, and leave what you did not make exactly as it is",
     ] {
         assert!(suffix.contains(words), "{words:?} in {suffix}");
     }
-    let with_repo = TurnEndAction::Type {
-        text: act_words(DONE_CHECK, &[&suffix], None),
+    let with_repo = |n: usize| TurnEndAction::Type {
+        text: act_words(&done_check_words(n), &[&suffix], None),
         rule_id: RULE_DONE_CHECK,
     };
     let claim = "Built, tested and landed the parser. All done; nothing left to do.";
@@ -13987,7 +14023,7 @@ fn a_cruise_claim_over_repo_work_gets_the_check_with_the_repo_suffix() {
         now += 3 * MIN;
         let r = over_repo(idle(claim, Some(3 * MIN)), dirty.clone());
         let (a, then) = past_backoff(&mut st, &r, now);
-        assert_eq!(a, with_repo, "round {round}");
+        assert_eq!(a, with_repo(round), "round {round}");
         assert!(!st.task_done(), "round {round}");
         st.acted(&a, &r, then);
         now = then;
@@ -13995,7 +14031,11 @@ fn a_cruise_claim_over_repo_work_gets_the_check_with_the_repo_suffix() {
     now += 3 * MIN;
     let r = idle(claim, Some(3 * MIN));
     let (a, then) = past_backoff(&mut st, &r, now);
-    assert_eq!(a, checked(), "a clean repository: the plain check");
+    assert_eq!(
+        a,
+        checked_at_angle(2),
+        "a clean repository: the plain check"
+    );
     assert!(!st.task_done());
     st.acted(&a, &r, then);
     let mut st = TurnEndState::default();
@@ -14013,7 +14053,7 @@ fn a_cruise_claim_over_repo_work_gets_the_check_with_the_repo_suffix() {
     assert_eq!(
         a,
         TurnEndAction::Type {
-            text: act_words(DONE_CHECK, &[&open_suffix, &suffix], None),
+            text: act_words(&done_check_words(0), &[&open_suffix, &suffix], None),
             rule_id: RULE_DONE_CHECK,
         }
     );
@@ -14274,7 +14314,7 @@ fn a_need_gets_the_act_and_its_ack_never_an_escalation() {
             Some(3 * MIN),
         )
     };
-    assert_eq!(at(&mut st, &r, now).rule_id(), Some(RULE_SUGGESTION));
+    assert_eq!(at(&mut st, &r, now), typed(RULE_CONTINUE));
     let mut st = TurnEndState::default();
     let r = idle(
         "Fixed the parser.\nNEEDS YOU: approval to force-push main",
@@ -14297,7 +14337,7 @@ fn a_need_gets_the_act_and_its_ack_never_an_escalation() {
         Some(3 * MIN),
     );
     let (a, _) = past_backoff(&mut st, &r, t0());
-    assert_eq!(a, acked(DONE_CHECK, RULE_DONE_CHECK));
+    assert_eq!(a, acked(&done_check_words(0), RULE_DONE_CHECK));
     let mut st = TurnEndState::default();
     act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
     let r = land(idle(
@@ -15347,7 +15387,7 @@ fn a_full_context_inside_the_done_check_gets_the_check_again_after_the_compactio
     assert_eq!(act(&mut st, &context(Some(5 * MIN)), now), compact);
     now += MIN;
     let again = TurnEndAction::Type {
-        text: DONE_CHECK.to_string(),
+        text: done_check_words(0),
         rule_id: RULE_COMPACT,
     };
     assert_eq!(act(&mut st, &compacted, now), again);
@@ -15424,7 +15464,9 @@ fn a_full_context_inside_the_done_check_gets_the_check_again_after_the_compactio
     st.acted(&a, &overloaded, now);
     now += 3 * MIN;
     let (a, _) = past_backoff(&mut st, &idle(reply, Some(3 * MIN)), now);
-    assert_eq!(a, checked(), "a first done report");
+    // The check the walls took was counted where it was typed (v6 §14.5): this claim asks the
+    // next angle.
+    assert_eq!(a, checked_at_angle(1), "a first done report");
 }
 
 fn renewable(r: &TurnEndReading, label: &str) -> TurnEndReading {
@@ -16896,6 +16938,11 @@ mod found {
 mod reader_measure {
     use super::*;
     include!("turn_end_reader_measure_tests.rs");
+}
+
+mod angles {
+    use super::*;
+    include!("turn_end_angles_tests.rs");
 }
 
 #[test]

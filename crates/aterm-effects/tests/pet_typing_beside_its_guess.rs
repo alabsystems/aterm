@@ -106,6 +106,11 @@ struct Knobs {
     /// this many ms into the take: aterm paints it once it has told the session is Claude
     /// Code's, a beat after the composer's first frame.
     chrome_from_ms: u64,
+    /// The host's chrome as the shipped host hands it over: the cells its last finished pass
+    /// painted (`aterm-gui`'s `PetChrome::held`), which that pass read off the frame before the
+    /// one the pet looks at. The frame a composer moves in, the pet reads its new rows with the
+    /// chrome still where the rows were; the next frame brings the chrome along.
+    chrome_lag: bool,
 }
 
 impl Knobs {
@@ -118,6 +123,7 @@ impl Knobs {
         rule_walled: false,
         line_walled: false,
         chrome_from_ms: 0,
+        chrome_lag: false,
     };
 }
 
@@ -163,6 +169,9 @@ struct Host {
     guesses: Vec<(u16, u16, u64)>,
     shots: Vec<Shot>,
     input: Option<(u64, RenderInput)>,
+    /// The chrome the last present painted, and the content sequence of the frame it painted
+    /// over, for [`Knobs::chrome_lag`].
+    painted: (Vec<PetRect>, Option<u64>),
 }
 
 impl Host {
@@ -188,6 +197,7 @@ impl Host {
             guesses: Vec::new(),
             shots: Vec::new(),
             input: None,
+            painted: (Vec::new(), None),
         }
     }
 
@@ -299,16 +309,22 @@ impl Host {
         if let Some((top, _)) = rules.filter(|_| self.knobs.line_walled) {
             chips.push(PetRect::new(top as f32 + 1.0, 0.0, 1.0, cols));
         }
+        let mut painted_over = Some(input.content_seq);
+        if self.knobs.chrome_lag {
+            (chips, painted_over) = std::mem::replace(&mut self.painted, (chips, painted_over));
+        }
         let reserve = match self.knobs.reserve {
             Reserve::Ink => PetReserve {
                 protected: &chips,
                 overlays: &[],
                 ink: &typed,
+                painted_over,
             },
             Reserve::Protected => PetReserve {
                 protected: &chips,
                 overlays: &typed,
                 ink: &[],
+                painted_over,
             },
         };
         self.owner
@@ -493,6 +509,25 @@ fn bracketed_composer_take() -> Vec<(u64, Rec)> {
 }
 
 fn bracketed_composer_typing(text: &str, rest: u64) -> Vec<(u64, Rec)> {
+    bracketed_composer_bursts(&[(text, rest)])
+}
+
+/// [`bracketed_composer_typing`] in bursts: each burst's text typed a key every 85 ms onto the
+/// draft so far, then its pause (ms) before the next.
+fn bracketed_composer_bursts(bursts: &[(&str, u64)]) -> Vec<(u64, Rec)> {
+    composer_bursts_under(
+        &[
+            " ▐▛███▜▌   Claude Code v2.1.305",
+            "▝▜█████▛▘  Opus 5.5 · API Usage Billing",
+            "  ▘▘ ▝▝    /private/tmp/lab/proj",
+        ],
+        bursts,
+    )
+}
+
+/// [`bracketed_composer_bursts`] under the screen's first four rows `above` (a launch card, a
+/// turn's spinner and tip) instead of the launch card.
+fn composer_bursts_under(above: &[&str], bursts: &[(&str, u64)]) -> Vec<(u64, Rec)> {
     const COLS: usize = 120;
     let rule = "─".repeat(COLS);
     let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
@@ -527,20 +562,24 @@ fn bracketed_composer_typing(text: &str, rest: u64) -> Vec<(u64, Rec)> {
     };
     let mut ev = Vec::new();
     let mut screen = String::from("\x1b[2J\x1b[H\x1b[?25l");
-    screen.push_str("\x1b[1;1H ▐▛███▜▌   Claude Code v2.1.305");
-    screen.push_str("\x1b[2;1H▝▜█████▛▘  Opus 5.5 · API Usage Billing");
-    screen.push_str("\x1b[3;1H  ▘▘ ▝▝    /private/tmp/lab/proj");
+    for (row, line) in above.iter().enumerate() {
+        screen.push_str(&format!("\x1b[{};1H{line}", row + 1));
+    }
     ev.push((0, Rec::Out(screen.into_bytes())));
     ev.push((10, Rec::Out(frame(""))));
     let mut t = 1_000;
-    for (n, ch) in text.chars().enumerate() {
-        ev.push((t, Rec::In(ch.to_string().into_bytes())));
-        let draft: String = text.chars().take(n + 1).collect();
-        ev.push((t + 15, Rec::Out(frame(&draft))));
-        t += 85;
-    }
-    if rest > 0 {
-        ev.push((t + rest, Rec::Out(Vec::new())));
+    let mut draft = String::new();
+    for &(text, rest) in bursts {
+        for ch in text.chars() {
+            ev.push((t, Rec::In(ch.to_string().into_bytes())));
+            draft.push(ch);
+            ev.push((t + 15, Rec::Out(frame(&draft))));
+            t += 85;
+        }
+        if rest > 0 {
+            t += rest;
+            ev.push((t, Rec::Out(Vec::new())));
+        }
     }
     ev
 }
@@ -2171,6 +2210,349 @@ fn the_sessions_first_trip_is_its_only_one() {
             assert!(
                 (row - f32::from(caret.0)).abs() < 0.5,
                 "{label}: at 3 s the cat rests at ({col:.1}, {row}), the caret at {caret:?}"
+            );
+        }
+    }
+}
+
+/// ONE SEAT FOR THE WHOLE LINE. In the long insert the cat is seated on the composer's footer,
+/// under the line the caret inserts into, from 10.6 s. With aterm's chips on the lower rule the
+/// footer has no head room under them, so the seat stops at their left edge as the caret runs on
+/// past it; the insert pushes its tail onto a new line (22.7 s), which opens room under the
+/// caret and beside it at the line's end. The cat keeps its seat on the footer for the whole
+/// line, and the wrap (27.3 s) is the line's only flight, as it is without the chips. Taken up
+/// to the room the growth opened, it flew there and back down at the wrap. Chips and harness,
+/// at 120 and 60 Hz, the echo as recorded and 150 ms late: one flight from 11 s to 29.5 s.
+///
+/// NEGATIVE CONTROL (as run before the fix): two, at 22.68 s up to row 57 and 27.34 s down to
+/// the footer (chips, 120 Hz).
+#[test]
+fn a_long_line_by_the_chips_costs_only_its_wrap() {
+    for brand in [false, true] {
+        for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+            let knobs = Knobs {
+                frame_ms,
+                echo_ms,
+                chips: true,
+                brand,
+                ..Knobs::SHIPPED
+            };
+            let span = (11_000 + echo_ms)..(29_500 + echo_ms);
+            let flew: Vec<_> = flights_of(replayed(3, knobs))
+                .into_iter()
+                .filter(|(at, ..)| span.contains(at))
+                .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
+                .collect();
+            assert!(
+                flew.len() == 1,
+                "harness {brand}, {frame_ms} ms a frame, echo +{echo_ms} ms: flights (ms, caret, \
+                 landing, caret) {flew:?}"
+            );
+        }
+    }
+}
+
+/// THE ESCORT'S TAIL SENDS NO ONE OUT. In the generating take the cat sits watching three
+/// deletions walk the caret back three cells (35.4 s to 37.1 s) and stands up 1.1 s after the
+/// last, with 0.3 s of the escort left. Its station is the rest's by then: it sets out along
+/// the top of the composer for the clean seat past the transcript's last line, and never toward
+/// the stand over the caret. Sent to that stand, it walked 1.8 cells left and turned back as the
+/// rest took over, with the caret still. At 120 and 60 Hz, the echo as recorded and 150 ms
+/// late, with the harness: from 37.9 s to 39.7 s the cat never goes back 0.5 cells from where
+/// it set out.
+///
+/// NEGATIVE CONTROL (as run before the fix): 1.8 cells back (6.7 to 4.9) at 120 Hz.
+#[test]
+fn the_escorts_tail_sends_no_one_back_to_its_stand() {
+    for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+        let knobs = Knobs {
+            frame_ms,
+            echo_ms,
+            chips: true,
+            brand: true,
+            ..Knobs::SHIPPED
+        };
+        let span = (37_900 + echo_ms)..(39_700 + echo_ms);
+        let cols: Vec<f32> = replayed(0, knobs)
+            .iter()
+            .filter(|s| span.contains(&s.ms) && s.frame.alpha > 0)
+            .filter(|s| s.frame.action != PetAction::Leap)
+            .map(|s| s.frame.col)
+            .collect();
+        let start = cols.first().copied().unwrap_or(0.0);
+        let least = cols.iter().copied().fold(start, f32::min);
+        assert!(
+            start - least < 0.5,
+            "{frame_ms} ms a frame, echo +{echo_ms} ms: back {:.2} cells from {start:.2}",
+            start - least
+        );
+    }
+}
+
+/// THE WRITING BRINGS THE STAND. After the long insert's wrap the cat lands half a cell past
+/// its stand on the footer, a stand the footer's words hold still while the caret runs toward
+/// it: the cat holds there and the stand comes to it. Eased back the half cell, it walked on
+/// with the caret a second later (a turn-back no caret move made). Plain, at 120 and 60 Hz, the
+/// echo as recorded and 150 ms late: from the wrap's landing for two seconds the cat never
+/// goes back 0.3 cells from where it came down.
+///
+/// NEGATIVE CONTROL (as run before the fix): 0.50 cells back (38.58 to 38.08) at 60 Hz with
+/// the echo 150 ms late.
+#[test]
+fn a_cat_ahead_of_the_writing_holds_where_it_came_down() {
+    for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+        let knobs = Knobs {
+            frame_ms,
+            echo_ms,
+            ..Knobs::SHIPPED
+        };
+        let shots = replayed(3, knobs);
+        let wrap = flights_of(shots)
+            .into_iter()
+            .filter(|(at, ..)| *at >= 26_000 + echo_ms)
+            .map(|(_, _, landed, _)| landed)
+            .next()
+            .expect("fixture: the wrap's flight");
+        let landed_at = shots
+            .iter()
+            .position(|s| s.frame.action == PetAction::Land && s.frame.col == wrap.col)
+            .expect("fixture: its landing");
+        let from = shots[landed_at].ms;
+        let back = shots[landed_at..]
+            .iter()
+            .take_while(|s| s.ms <= from + 2_000)
+            .filter(|s| s.frame.alpha > 0 && s.frame.action != PetAction::Leap)
+            .map(|s| wrap.col - s.frame.col)
+            .fold(0.0f32, f32::max);
+        assert!(
+            back < 0.3,
+            "{frame_ms} ms a frame, echo +{echo_ms} ms: back {back:.2} cells from the landing \
+             at {:.2} ({from} ms)",
+            wrap.col
+        );
+    }
+}
+
+/// A SEAT LOST TO THE WORDS IS LEFT ON FOOT. As the generating take's third turn begins
+/// (39.75 s) the cat's seat on top of the composer is covered by the turn's tip, and it flies to
+/// the clean ground beside the spinner's new line; at 40.9 s the line counts its first second
+/// over that seat. The cat walks along its own row past the words, and rests there until typing
+/// begins (46.3 s). Flown a row up instead, the turn cost two flights in 0.8 s. At 120 and 60 Hz,
+/// the echo as recorded and 150 ms late, with the harness: no flight between 40.5 s and 46 s.
+///
+/// NEGATIVE CONTROL (as run before the fix): a flight at 40.91 s from (12.4, 31.85) to
+/// (3.4, 30.85).
+#[test]
+fn a_seat_a_status_line_counts_over_is_left_on_foot() {
+    for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+        let knobs = Knobs {
+            frame_ms,
+            echo_ms,
+            chips: true,
+            brand: true,
+            ..Knobs::SHIPPED
+        };
+        let span = (40_500 + echo_ms)..(46_000 + echo_ms);
+        let flew: Vec<_> = flights_of(replayed(0, knobs))
+            .into_iter()
+            .filter(|(at, ..)| span.contains(at))
+            .map(|(at, from, landed, to)| (at, from, (landed.col, landed.row), to))
+            .collect();
+        assert!(
+            flew.is_empty(),
+            "{frame_ms} ms a frame, echo +{echo_ms} ms: flights (ms, caret, landing, caret) {flew:?}"
+        );
+    }
+}
+
+/// THE REST WHERE THE TYPING WALKS. With the harness on, the escort walks the top of the
+/// composer over the caret, and a cat at rest is seated there too, past the launch card's last
+/// line, where the top of the composer is clear: each pause in the writing sends it along the
+/// line to that seat, and each new burst finds it there, waiting for the caret or walking with
+/// it. Seated under the footer instead, it flew down at each pause and up at each burst. Three
+/// bursts with three-second pauses, at 120 and 60 Hz, the chrome as the host hands it a frame
+/// late: after the first burst's flight up onto the line, no flight.
+///
+/// NEGATIVE CONTROL (as run before the fix): a flight down under the footer at the first pause
+/// (3.7 s) and back up at the second burst (5.4 s).
+#[test]
+fn bursts_of_typing_by_a_hosted_composer_cost_no_flight_after_the_first() {
+    let window = Take {
+        name: "bursts",
+        src: "",
+        rows: 40,
+        cols: 120,
+    };
+    for frame_ms in [8u64, 16] {
+        let knobs = Knobs {
+            frame_ms,
+            chips: true,
+            brand: true,
+            chrome_lag: true,
+            ..Knobs::SHIPPED
+        };
+        let h = Host::replay_events(
+            &window,
+            knobs,
+            bracketed_composer_bursts(&[
+                ("in fact, i would", 3_000),
+                (" like the model", 3_000),
+                (" section hidden by default", 3_000),
+            ]),
+        );
+        let flights = flights_of(&h.shots);
+        let first_burst = flights
+            .iter()
+            .position(|(at, ..)| *at >= 1_000)
+            .unwrap_or(flights.len());
+        let after: Vec<_> = flights
+            .iter()
+            .skip(first_burst + 1)
+            .map(|(at, from, landed, to)| (*at, *from, (landed.col.round(), landed.row), *to))
+            .collect();
+        assert!(
+            after.is_empty(),
+            "{frame_ms} ms a frame: flights after the first burst's, (ms, caret, landing, caret) \
+             {after:?}"
+        );
+    }
+}
+
+/// THE LINE HOLDS THROUGH A PAUSE. Claude Code's turn lays its tip over the harness composer,
+/// two rows over its top rule, and the tip runs nearly the width of the pane: the top of the
+/// composer, the escort's ground over the caret, has no clean seat along it. Typed in bursts with
+/// two-second pauses, the cat goes up onto the line with the first burst and holds there through
+/// each pause, veiled over the tip, and walks on with the next burst. Flown under the footer as
+/// the escort ended, it flew back up at the next key: two flights each pause (the harness's
+/// first turn, 13.1 s and 13.9 s). A long pause still seats it clean, clear of every word: one
+/// flight once the hold runs out, and it rests whole. At 120 and 60 Hz, the chrome in time and a
+/// frame late.
+///
+/// NEGATIVE CONTROL (as run before the fix): flights down under the footer at each pause (3.7 s,
+/// 7.0 s) and up again at each burst (4.4 s, 7.6 s).
+#[test]
+fn a_pause_in_the_writing_costs_no_trip_off_the_line() {
+    let window = Take {
+        name: "tipped bursts",
+        src: "",
+        rows: 40,
+        cols: 120,
+    };
+    let tip: String =
+        "  \u{23bf}  Tip: Start with small features or bug fixes, tell Claude to propose \
+                       a plan, and verify its suggested edits before you accept them"
+            .chars()
+            .take(118)
+            .collect();
+    let events = || {
+        composer_bursts_under(
+            &[
+                "\u{273b} Churning\u{2026} (3s \u{b7} \u{2193} 12 tokens)",
+                "",
+                &tip,
+                "",
+            ],
+            &[
+                ("in fact, i would", 2_000),
+                (" like the model", 2_000),
+                (" section hidden", 8_000),
+            ],
+        )
+    };
+    let last_key = events()
+        .iter()
+        .filter(|(_, ev)| matches!(ev, Rec::In(_)))
+        .map(|(ms, _)| *ms)
+        .max()
+        .expect("fixture: keys");
+    for frame_ms in [8u64, 16] {
+        for chrome_lag in [false, true] {
+            let knobs = Knobs {
+                frame_ms,
+                chips: true,
+                brand: true,
+                chrome_lag,
+                ..Knobs::SHIPPED
+            };
+            let h = Host::replay_events(&window, knobs, events());
+            let flights: Vec<_> = flights_of(&h.shots)
+                .into_iter()
+                .filter(|(at, ..)| *at >= 1_000)
+                .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
+                .collect();
+            let writing: Vec<_> = flights.iter().filter(|f| f.0 <= last_key).collect();
+            assert!(
+                writing.len() == 1,
+                "{frame_ms} ms a frame, chrome late {chrome_lag}: flights while the writing \
+                 pauses and goes on, (ms, caret, landing, caret) {writing:?}"
+            );
+            let rested: Vec<_> = flights.iter().filter(|f| f.0 > last_key).collect();
+            let end = h.shots.last().expect("fixture: shots").frame;
+            assert!(
+                rested.len() == 1 && end.alpha == 255,
+                "{frame_ms} ms a frame, chrome late {chrome_lag}: after the long pause, flights \
+                 {rested:?}, resting at ({:.1}, {:.2}) alpha {}",
+                end.col,
+                end.row,
+                end.alpha
+            );
+        }
+    }
+}
+
+/// THE HOST'S CHROME RIDES ITS ROWS. The shipped host paints its chrome (the harness's line
+/// over the composer's upper rule, the chips on its lower rule) after the pet has looked at a
+/// frame, so the pet reads the chrome its last pass laid over the frame before
+/// ([`Knobs::chrome_lag`]). The frame Claude Code moves its composer in, that chrome lies where the
+/// rows were: in a window, a cat that rode down with the composer's rule was under the host's
+/// line, was moved off it, and leapt to a seat under the footer and back up as the next pass
+/// caught up (two leaps in 0.65 s of the harness's first turn). Carried with its rows, the late
+/// chrome draws the cat a host in time draws: the same body, pose and alpha on every present of
+/// every take, at 120 and 60 Hz, the echo as recorded and 150 ms late.
+///
+/// NEGATIVE CONTROL (as run before the fix): the generating take parts at 0.77 s, in the
+/// session's first bound (its landing aimed off the chrome a frame late); further on it hopped at
+/// 11.32 s where the host in time rides the composer down, and at 12.26 s the cat was moved off
+/// the stale line (`cursor-home`) and leapt.
+#[test]
+fn late_chrome_draws_the_cat_chrome_in_time_draws() {
+    let drawn = |s: &Shot| {
+        let f = s.frame;
+        (
+            s.ms,
+            f.action,
+            f.pose,
+            f.col,
+            f.row,
+            f.lift,
+            f.alpha,
+            f.facing_left,
+        )
+    };
+    for (take, shot_take) in TAKES.iter().enumerate() {
+        for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (16, 150)] {
+            let in_time = Knobs {
+                frame_ms,
+                echo_ms,
+                chips: true,
+                brand: true,
+                ..Knobs::SHIPPED
+            };
+            let late = Knobs {
+                chrome_lag: true,
+                ..in_time
+            };
+            let (a, b) = (replayed(take, in_time), replayed(take, late));
+            let parted = a
+                .iter()
+                .zip(b)
+                .find(|(x, y)| drawn(x) != drawn(y))
+                .map(|(x, y)| (drawn(x), x.reason, drawn(y), y.reason));
+            assert!(
+                parted.is_none() && a.len() == b.len(),
+                "{} at {frame_ms} ms a frame, echo +{echo_ms} ms: the late chrome parts the cat \
+                 from the chrome in time at (in time, late) {parted:?}",
+                shot_take.name
             );
         }
     }

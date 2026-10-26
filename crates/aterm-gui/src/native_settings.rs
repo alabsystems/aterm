@@ -1664,6 +1664,19 @@ pub(crate) struct SettingsViewState {
     /// Where the control a press found whole on the screen drawn ended there, which the bar of
     /// the status the press brings never covers ([`SettingsViewState::reveal_pressed`]).
     pressed_at: RefCell<Option<scroll::PressedAt>>,
+    /// Where this render stands a plain status's bar a press brought ([`StatusPlace`]).
+    status_place: Cell<StatusPlace>,
+    /// Whether this render's plain status's bar stands bare of its Undo, its words alone, where
+    /// no side of the list holds it with the Undo and nothing pressed moves; the Undo stays on
+    /// Cmd-Z and the command palette ([`settings_tree`]).
+    status_bare: Cell<bool>,
+    /// Whether the event being handled seated the list on its stops again
+    /// ([`SettingsViewState::drop_list_nudge`]): a press in it holds no place on the screen it
+    /// was pressed on (a Timer closed gives back the place its opening scrolled).
+    list_reseated: Cell<bool>,
+    /// How far down the window the page's list started in the render last built
+    /// ([`list_top_in`]): a press keeps it, so a page that moves its list moves its control.
+    laid_list_top: Cell<Option<f32>>,
     style_trial_undo: Option<(UiKey, Option<u64>)>,
     chosen_style_row: Option<UiKey>,
     cursor_style_note: RefCell<Option<(String, &'static str)>>,
@@ -1867,6 +1880,10 @@ impl SettingsViewState {
             list_carried: None,
             reveal_as: scroll::Reveal::Keep,
             pressed_at: RefCell::new(None),
+            status_place: Cell::new(StatusPlace::Rule),
+            status_bare: Cell::new(false),
+            laid_list_top: Cell::new(None),
+            list_reseated: Cell::new(false),
             style_trial_undo: None,
             chosen_style_row: None,
             cursor_style_note: RefCell::new(None),
@@ -4258,7 +4275,7 @@ impl SettingsApp {
         if !view.action_keeps_field_focus(action) {
             view.clear_field_edit();
         }
-        if let Some(key) = action
+        let pressed = action
             .strip_prefix("settings/set/")
             .or_else(|| action.strip_prefix("settings/reset/"))
             .or_else(|| {
@@ -4267,8 +4284,17 @@ impl SettingsApp {
                     .and_then(|choice| choice.rsplit_once('/'))
                     .map(|(key, _)| key)
             })
-        {
-            view.reveal_pressed(UiKey::new(format!("settings/control/{key}")));
+            .map(|key| UiKey::new(format!("settings/control/{key}")))
+            // A SEGMENT PRESSED IS A PRESS: its action is its own key. Never found, a segment
+            // pressed held no place and took no side for its status's bar, so the list moved it
+            // (Security's Universal Control, Leave as is, at 584x348 with 2x text: 68pt down).
+            .or_else(|| {
+                action
+                    .starts_with("settings/segment/")
+                    .then(|| UiKey::new(action))
+            });
+        if let Some(key) = pressed {
+            view.reveal_pressed(key);
         }
         if action == SEARCH_OPEN {
             view.begin_search_interaction();
@@ -8294,6 +8320,7 @@ impl SettingsApp {
             AppEvent::Action(invocation) => {
                 let pressed = UiKey::new(invocation.id.as_str());
                 let reveal_before = view.page_reveal.clone();
+                view.list_reseated.set(false);
                 let result = self.reduce_action(view, invocation, cx);
                 view.reveal_moved_focus(focus_before, true);
                 view.reveal_press(&pressed, reveal_before.as_ref());
@@ -11493,13 +11520,18 @@ fn settings_tree(
 ) -> UiTree {
     state.page_window.set(None);
     state.observe_semantic_font(cx.semantic_font.as_ref());
-    state.status_bar_most.set(None);
-    let _bars = BarsShared::open();
+    state.status_place.set(StatusPlace::Rule);
+    state.status_bare.set(false);
+    let bar_most_unsettled = || {
+        state.status_bar_most.set(None);
+        #[cfg(test)]
+        if STATUS_BAR_LEAST.with(Cell::get) {
+            state.status_bar_most.set(Some(0.0));
+        }
+    };
+    bar_most_unsettled();
+    let bars_weighed = BarsShared::open();
     let _words = StatusWordsShared::open();
-    #[cfg(test)]
-    if STATUS_BAR_LEAST.with(Cell::get) {
-        state.status_bar_most.set(Some(0.0));
-    }
     state.record_runtime_presentation(cx.motion, packages, update);
     let width = SettingsWidth::for_viewport(cx.viewport.width);
     let watch_status_height = config_watch_status_bar_height(state, cx.viewport);
@@ -11510,21 +11542,179 @@ fn settings_tree(
         cx.viewport,
         settings_text_scale().to_bits(),
     )));
-    let compact_status_docked =
+    let rule_docked =
         width == SettingsWidth::Compact && compact_status_dock_required(state, cx.viewport);
     let question_page = reset_all_question_takes_page(state, cx.viewport);
+    let build_page = || {
+        if question_page {
+            reset_all_question_page(state, cx.viewport)
+        } else {
+            page(state, update, packages, messages, harness, cx, width)
+        }
+    };
+    // NOTHING THE PERSON PRESSED MOVES: the bar of the status a press brought stands under the
+    // list where the list keeps the control there; else over the top of the list, away from the
+    // press; else in the compact toolbar ([`scroll::BarSide`]). The render that brings a status
+    // seats the page under its bar first and moves the bar only where that moved or covered the
+    // control: in a narrow window even the bar's least, one line of words, covered a switch
+    // pressed low on the list, which went up from under the pointer by what it covered
+    // (Security at 178x348 with 2x text: 60pt). A side taken for the press's first status
+    // ("Applying…") holds for the next where that still fits, so the bar does not hop.
+    // A bar a press stood over the list stays there for the press's next status though the
+    // window's rules would dock it, so it does not hop to the toolbar.
+    let stood_over = || {
+        state
+            .press_side()
+            .is_some_and(|(side, _, _)| side == scroll::BarSide::Over)
+    };
+    let weighing = !question_page
+        && state.plain_status()
+        && state.press_holds_place()
+        && (!rule_docked || stood_over());
+    let record = weighing.then(|| state.scroll_record.borrow().clone());
+    // The most the bar, `bare` of its Undo or not, may take over the top of the list: the room
+    // above the control, less a little clear where its least leaves that.
+    let band = |bare: bool| {
+        let room = state.press_band()?;
+        let was = state.status_bare.replace(bare);
+        let least = plain_bar_least(state, width, cx.viewport);
+        state.status_bare.set(was);
+        if least + BAND_CLEAR <= room + 0.01 {
+            Some(room - BAND_CLEAR)
+        } else {
+            (least <= room + 0.01).then_some(room)
+        }
+    };
+    let dock_holds = || {
+        width == SettingsWidth::Compact
+            && !keyboard_on_toolbar_search(state)
+            && !(state.page_chrome.get().toolbar_listed
+                && compact_toolbar_can_list(state, cx.viewport))
+            && {
+                let was = state.status_place.replace(StatusPlace::Dock);
+                bars_weighed.forget();
+                let holds = compact_dock_layout(
+                    state,
+                    cx.viewport,
+                    &DockActions::of(state),
+                    compact_dock_watcher(state),
+                    true,
+                    dock_plain_words(state),
+                )
+                .under
+                .is_none();
+                state.status_place.set(was);
+                bars_weighed.forget();
+                holds
+            }
+    };
+    let fits = |side: scroll::BarSide, bare: bool| match side {
+        scroll::BarSide::Under => true,
+        scroll::BarSide::Over => band(bare).is_some(),
+        scroll::BarSide::Dock => !bare && dock_holds(),
+    };
+    // How far down the window `page`'s list starts.
+    let list_top = |page: &UiNode| {
+        let header = if width == SettingsWidth::Compact {
+            compact_header_height(state, cx.viewport)
+        } else {
+            0.0
+        };
+        list_top_in(page).map(|top| header + top)
+    };
+    // Lay the page out again from the frame's record, the bar at `place`, `bare` or not.
+    let stand = |place: StatusPlace, bare: bool| {
+        state.status_place.set(place);
+        state.status_bare.set(bare);
+        state.scroll_record.replace(record.clone().flatten());
+        bar_most_unsettled();
+        bars_weighed.forget();
+    };
+    let mut built = None;
+    let side = weighing.then(|| {
+        let side = match state.press_side() {
+            Some((side, bare, true)) if fits(side, bare) => (side, bare),
+            Some((side, false, false)) if side != scroll::BarSide::Under && fits(side, false) => {
+                (side, false)
+            }
+            _ => {
+                let under = build_page();
+                if !state.press_moved(list_top(&under)) {
+                    built = Some(under);
+                    (scroll::BarSide::Under, false)
+                } else if band(false).is_some() {
+                    (scroll::BarSide::Over, false)
+                } else if dock_holds() {
+                    (scroll::BarSide::Dock, false)
+                } else {
+                    // A WINDOW NO SIDE OF WHOSE LIST HOLDS THE BAR WITH ITS UNDO stands it bare,
+                    // its words alone: under the list where the list keeps the control there,
+                    // else over the top of it. The switch went up from under the pointer by the
+                    // Undo's room (Security at 164x292 with 2x text: 34pt).
+                    stand(StatusPlace::Rule, true);
+                    let bare = build_page();
+                    if !state.press_moved(list_top(&bare)) {
+                        built = Some(bare);
+                        (scroll::BarSide::Under, true)
+                    } else if band(true).is_some() {
+                        (scroll::BarSide::Over, true)
+                    } else {
+                        stand(StatusPlace::Rule, false);
+                        (scroll::BarSide::Under, false)
+                    }
+                }
+            }
+        };
+        state.settle_press_side(side.0, side.1);
+        side
+    });
+    let (place, bare) = match side {
+        Some((scroll::BarSide::Over, bare)) => (StatusPlace::Over, bare),
+        Some((scroll::BarSide::Dock, _)) => (StatusPlace::Dock, false),
+        Some((scroll::BarSide::Under, bare)) => (StatusPlace::Rule, bare),
+        None => (StatusPlace::Rule, false),
+    };
+    let mut page = match built {
+        Some(page) => page,
+        None => {
+            if (place, bare) != (state.status_place.get(), state.status_bare.get())
+                || side.is_some()
+            {
+                stand(place, bare);
+            }
+            build_page()
+        }
+    };
+    let mut laid_top = list_top(&page);
+    let band = (place == StatusPlace::Over).then(|| band(bare)).flatten();
+    let over = band.and_then(|band| {
+        state.status_place.set(StatusPlace::Rule);
+        state.status_bar_most.set(Some(band));
+        let bar = feedback_bar(state, width, cx.viewport);
+        state.status_place.set(StatusPlace::Over);
+        let pressed = state.pressed_key()?;
+        lay_status_over_list(&mut page, bar?, &pressed).ok()
+    });
+    if place == StatusPlace::Over && over.is_none() {
+        // No list to stand over: the bar stands under the page after all.
+        state.settle_press_side(scroll::BarSide::Under, false);
+        stand(StatusPlace::Rule, false);
+        page = build_page();
+        laid_top = list_top(&page);
+    }
+    state.laid_list_top.set(laid_top);
+    let compact_status_docked = match state.status_place.get() {
+        StatusPlace::Rule => rule_docked,
+        StatusPlace::Over => false,
+        StatusPlace::Dock => true,
+    };
     state
         .presented_plain_dock
         .set(compact_status_docked && state.plain_status());
     let watch_status = (!compact_status_docked)
         .then(|| config_watch_status_bar(state, cx.viewport))
         .flatten();
-    let page = if question_page {
-        reset_all_question_page(state, cx.viewport)
-    } else {
-        page(state, update, packages, messages, harness, cx, width)
-    };
-    let feedback = (!compact_status_docked && !question_page)
+    let feedback = (!compact_status_docked && !question_page && over.is_none())
         .then(|| feedback_bar(state, width, cx.viewport))
         .flatten();
     let (body, root_feedback) = match width {
@@ -12490,7 +12680,7 @@ fn feedback_bar(
             bar.most_lines,
         )]),
     ];
-    if state.undo_offer().is_some() {
+    if state.undo_offer().is_some() && !state.status_bare.get() {
         children.push(
             UiNode::new(
                 "settings/undo",
@@ -12957,6 +13147,10 @@ fn feedback_bar_height(
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> f32 {
+    // A bar over the top of the list takes none of the page's room ([`StatusPlace::Over`]).
+    if state.status_place.get() == StatusPlace::Over && state.plain_status() {
+        return 0.0;
+    }
     let most = state.status_bar_most.get();
     weighed(
         |bars| &mut bars.heights,
@@ -13109,6 +13303,191 @@ fn words_broken(text: &str, width: f32) -> usize {
         .count()
 }
 
+/// The clear a status's bar over the top of a list keeps above the control a press found, where
+/// its least leaves that ([`scroll::BarSide::Over`]).
+const BAND_CLEAR: f32 = 4.0;
+
+/// Where a render stands a plain status's bar ([`settings_tree`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StatusPlace {
+    /// Where the window's rules put it: under the page, or docked in a compact toolbar.
+    #[default]
+    Rule,
+    /// Over the top of the list, away from the control a press found low on it
+    /// ([`scroll::BarSide::Over`]): the page lays its list out as under no bar.
+    Over,
+    /// Docked in the compact toolbar, where neither side of the list holds it
+    /// ([`scroll::BarSide::Dock`]).
+    Dock,
+}
+
+/// The least height a plain status's bar takes ([`plain_bar_layout`] with its words at their
+/// least).
+fn plain_bar_least(state: &SettingsViewState, width: SettingsWidth, viewport: LogicalRect) -> f32 {
+    let Some(feedback) = state.bar_feedback() else {
+        return 0.0;
+    };
+    let most = state.status_bar_most.replace(Some(0.0));
+    let least = plain_bar_layout(state, feedback, width, viewport).height;
+    state.status_bar_most.set(most);
+    least
+}
+
+/// The path of child indices from `node` to the list under it that holds control `key`, or to
+/// its first list.
+fn path_to_list(node: &UiNode, key: Option<&UiKey>) -> Option<Vec<usize>> {
+    fn holds(node: &UiNode, key: &UiKey) -> bool {
+        node.key == *key || node.children.iter().any(|child| holds(child, key))
+    }
+    fn walk(node: &UiNode, key: Option<&UiKey>, path: &mut Vec<usize>) -> bool {
+        for (index, child) in node.children.iter().enumerate() {
+            if key.is_some_and(|key| !holds(child, key)) {
+                continue;
+            }
+            path.push(index);
+            let list =
+                matches!(&child.content, UiContent::Group(spec) if spec.role == SemanticRole::List);
+            if list || walk(child, key, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    walk(node, key, &mut path).then_some(path)
+}
+
+/// How far down `page` its first list starts, as the page lays its children out: `None` where
+/// something over it takes no fixed height.
+fn list_top_in(page: &UiNode) -> Option<f32> {
+    let path = path_to_list(page, None)?;
+    let mut node = page;
+    let mut top = 0.0;
+    for &index in &path {
+        top += node.layout.padding.top;
+        if node.layout.flow == crate::native_ui::Flow::Column {
+            top -= node.layout.offset;
+            for sibling in &node.children[..index] {
+                let Length::Fixed(height) = sibling.layout.height else {
+                    return None;
+                };
+                top += height + node.layout.gap;
+            }
+        }
+        node = node.children.get(index)?;
+        top -= node.layout.outdent.top;
+    }
+    Some(top)
+}
+
+/// THE BAR OVER THE TOP OF THE LIST ([`SettingsViewState::press_band`]): `bar` takes the top of
+/// the list in `page` that holds control `pressed`, as tall as it is, across the page's width as
+/// a bar under the page stands. The list under it keeps every row where it was: it starts under
+/// the bar, scrolled on by the bar's height, so its room ends where it did and a row the bar
+/// covers is cut away under it, out of reach of the pointer and the keyboard as any row the
+/// list's edge cuts. `Err` where no list in `page` holds the control.
+fn lay_status_over_list(page: &mut UiNode, mut bar: UiNode, pressed: &UiKey) -> Result<(), ()> {
+    let Length::Fixed(band) = bar.layout.height else {
+        return Err(());
+    };
+    let mut path = path_to_list(page, Some(pressed)).ok_or(())?;
+    let node_at = |page: &UiNode, path: &[usize]| {
+        path.iter()
+            .try_fold(page, |node, index| node.children.get(*index))
+            .map(|node| node.key.clone())
+    };
+    let list_key = node_at(page, &path).ok_or(())?;
+    if path.len() > 1
+        && node_at(page, &path[..path.len() - 1])
+            .is_some_and(|parent| parent.as_str() == format!("{}/scroll", list_key.as_str()))
+    {
+        path.pop();
+    }
+    let direct = path.len() == 1;
+    let insets = page.layout.padding;
+    let (last, within) = path.split_last().ok_or(())?;
+    let parent = within
+        .iter()
+        .try_fold(&mut *page, |node, index| node.children.get_mut(*index))
+        .ok_or(())?;
+    let unit = parent.children.get_mut(*last).ok_or(())?;
+    let Length::Fixed(height) = unit.layout.height else {
+        return Err(());
+    };
+    if band >= height - 0.01 {
+        return Err(());
+    }
+    let mut unit = std::mem::replace(
+        unit,
+        UiNode::new(
+            "settings/status-over-list",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        ),
+    );
+    let shorten = |node: &mut UiNode| {
+        if let Length::Fixed(tall) = node.layout.height {
+            node.layout.height = Length::Fixed((tall - band).max(0.0));
+        }
+    };
+    shorten(&mut unit);
+    let list = if unit.key == list_key {
+        &mut unit
+    } else {
+        // The wrapper's list and its scroll thumb, both as tall as it.
+        unit.children.iter_mut().for_each(shorten);
+        unit.children
+            .iter_mut()
+            .find(|child| child.key == list_key)
+            .ok_or(())?
+    };
+    list.layout.offset += band;
+    if let Some(room) = list.room.as_mut() {
+        room.height = (room.height - band).max(0.0);
+    }
+    let gutter = unit.layout.outdent.right;
+    let (outdent, padding, reach) = if direct {
+        unit.layout.outdent = Insets::default();
+        (
+            Insets {
+                left: insets.left,
+                right: insets.right.max(gutter),
+                ..Insets::default()
+            },
+            Insets {
+                left: insets.left,
+                right: (insets.right - gutter).max(0.0),
+                ..Insets::default()
+            },
+            Insets {
+                left: insets.left,
+                right: (insets.right - gutter).max(0.0),
+                ..Insets::default()
+            },
+        )
+    } else {
+        (
+            std::mem::take(&mut unit.layout.outdent),
+            Insets::default(),
+            Insets::default(),
+        )
+    };
+    bar.layout = bar.layout.outdent(reach);
+    let width = unit.layout.width;
+    let slot = within
+        .iter()
+        .try_fold(&mut *page, |node, index| node.children.get_mut(*index))
+        .and_then(|parent| parent.children.get_mut(*last))
+        .ok_or(())?;
+    slot.layout = Layout::column()
+        .width(width)
+        .height(Length::Fixed(height))
+        .padding(padding)
+        .outdent(outdent);
+    slot.children = vec![bar, unit];
+    Ok(())
+}
+
 struct PlainBarLayout {
     words_width: f32,
     most_lines: usize,
@@ -13125,7 +13504,7 @@ fn plain_bar_layout(
     #[cfg(test)]
     crate::work_counts::bar_laid_out();
     let full = (viewport.width - settings_navigation_width(width) - 32.0).max(0.0);
-    let undo = state.undo_offer().is_some();
+    let undo = state.undo_offer().is_some() && !state.status_bare.get();
     let beside = if undo {
         (full - bar_undo_width() - 8.0).max(0.0)
     } else {
@@ -13173,7 +13552,18 @@ fn plain_bar_layout(
             words_width
         }
     };
+    // A BAR SHORTER THAN ITS UNDO UNDER ITS WORDS TAKES PUTS THE UNDO BESIDE THEM, where they
+    // still have the dock's least width there, their lines scrolling: a bar held over or under
+    // the control a press found never grows past the room it has for one more line under its
+    // words (Software Update at 234x292 with 2x text: the bar's 100pt covered the switch by 8pt,
+    // where 64pt with its Undo beside left it whole).
+    let under_fits = state
+        .status_bar_most
+        .get()
+        .is_none_or(|most| status_line_height() + 4.0 + scaled_control_height() <= most + 0.01);
+    let beside_holds = beside >= DOCK_WORDS_MIN * settings_text_scale() - 0.01;
     let undo_under = undo
+        && (under_fits || !beside_holds)
         && broken_words(feedback, set_at(beside, most_with(false)))
             > broken_words(feedback, set_at(full, most_with(true)));
     let words_width = if undo_under { full } else { beside };
@@ -13184,6 +13574,8 @@ fn plain_bar_layout(
         * status_line_height();
     let height = if undo_under {
         words + 4.0 + scaled_control_height()
+    } else if state.status_bare.get() {
+        words + 10.0
     } else {
         scaled_control_height().max(words + 10.0)
     };
@@ -13569,10 +13961,14 @@ fn compact_dock_laid(
                 > broken_words(words, (wide - 10.0).max(0.0))
         })
     };
+    // A dock that holds a press's status where neither side of the list does keeps its Undo
+    // beside words a word wider than their room hyphenates in ([`StatusPlace::Dock`]).
+    let hyphenates = state.status_place.get() == StatusPlace::Dock;
     let inline_actions = match actions {
         DockActions::None => Some(0.0),
-        DockActions::Undo => Some(dock_undo_width())
-            .filter(|width| *width <= beside + 0.01 && !breaks_more(room - width - 8.0, room)),
+        DockActions::Undo => Some(dock_undo_width()).filter(|width| {
+            *width <= beside + 0.01 && (hyphenates || !breaks_more(room - width - 8.0, room))
+        }),
         DockActions::Buttons(buttons) => match bar_button_fit(buttons, beside) {
             BarFit::Row { widths, .. } => {
                 Some(widths.iter().sum::<f32>() + 8.0 * buttons.len() as f32)
@@ -13655,6 +14051,11 @@ fn compact_status_dock_required(state: &SettingsViewState, viewport: LogicalRect
     if state.page_chrome.get().toolbar_listed && compact_toolbar_can_list(state, viewport) {
         return false;
     }
+    match state.status_place.get() {
+        StatusPlace::Over if state.plain_status() => return false,
+        StatusPlace::Dock if state.plain_status() => return true,
+        _ => {}
+    }
     let at = (
         viewport,
         state.status_bar_most.get(),
@@ -13719,6 +14120,11 @@ impl BarsShared {
     fn open() -> Self {
         BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::default())));
         Self
+    }
+
+    /// Forget what the render weighed so far: its bars are about to stand elsewhere.
+    fn forget(&self) {
+        BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::default())));
     }
 }
 
@@ -16613,6 +17019,9 @@ const PAGE_CHROMES_KEPT: usize = 64;
 struct ChromeInputs {
     content: u64,
     bars: (bool, bool),
+    /// Where the status's bar stands and whether bare of its Undo
+    /// ([`SettingsViewState::status_place`], [`SettingsViewState::status_bare`]).
+    place: (StatusPlace, bool),
     viewport: LogicalRect,
     appearance: crate::native_appearance::AppearancePreferences,
     terminal: (f32, f32),
@@ -16626,6 +17035,7 @@ impl ChromeInputs {
         Self {
             content: state.common.content_epoch,
             bars,
+            place: (state.status_place.get(), state.status_bare.get()),
             viewport: cx.viewport,
             appearance: crate::native_appearance::current_preferences(),
             terminal: (cx.terminal_font_px, cx.terminal_scale),
@@ -18719,11 +19129,17 @@ fn top_regular_choice_control_width(field: &EditField) -> f32 {
         .is_none()
         .then_some(field.placeholder.as_str())
         .filter(|placeholder| placeholder.trim_end().ends_with(" (default)"));
+    top_choice_words_width(field, painted_default)
+}
+
+/// The width a Top Settings choice takes for its choices' words and `painted`, the default's
+/// words where the control paints them ([`top_regular_choice_control_width`]).
+fn top_choice_words_width(field: &EditField, painted: Option<&str>) -> f32 {
     let widest = choices_for_field(field, &crate::app_config::ThemeCatalog::default())
         .unwrap_or_default()
         .iter()
         .map(String::as_str)
-        .chain(painted_default)
+        .chain(painted)
         .map(|option| {
             crate::native_ui::native_button_label_width(&setting_choice_label(field.key, option))
         })
@@ -18764,10 +19180,16 @@ fn top_setting_row(
         if let Some(control) = control
             && width != SettingsWidth::Compact
         {
-            control.layout.width = Length::Fixed(
-                top_regular_choice_control_width(field)
-                    .max(segmented_width_need(&projected).unwrap_or_default()),
-            );
+            // A SEGMENTED CHOICE PAINTS EACH CHOICE'S OWN WORDS, never the default's mark an
+            // unset closed choice paints, so it is weighed as though set and keeps its width
+            // whatever is chosen: weighed by the mark while unset, choosing a segment narrowed
+            // the segments and moved the one the person had just pressed (Top's Window
+            // appearance at 738x420: Dark, 1.4pt).
+            let weighed = match segmented_width_need(&projected) {
+                Some(need) => top_choice_words_width(field, None).max(need),
+                None => top_regular_choice_control_width(field),
+            };
+            control.layout.width = Length::Fixed(weighed);
         }
     }
     Some(TopRow {
@@ -19058,7 +19480,7 @@ fn theme_card_row(
         &worst,
         label_width.max(0.0),
         stacked,
-        false,
+        (false, true),
     );
     let detail = row_second_line(&placement, None, None, text_width);
     (with_row_detail(row, key, &detail, stacked), stacked)
@@ -19789,9 +20211,10 @@ fn top_card_row(
     }
     fit_row_button_words(&mut row, &name, text_width, stacked);
     let room = row_label_room(&row, stacked, text_width);
-    let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, false);
     let note = notes.then(|| row_footnote(state, key)).flatten();
     let note = note.as_deref();
+    let hold = name_holds_state((&name, &worst, room), timing, note, text_width);
+    let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, (false, hold));
     let detail = row_second_line(&placement, timing, note, text_width);
     let row = with_row_detail(row, key, &detail, stacked);
     let height = top_row_height(&row, row_width);
@@ -20233,9 +20656,35 @@ fn display_faces_head(
         .all(|word| crate::tray_raster::ui_text_width_for(face, word, px) <= beside);
     let room = if fits_beside { beside } else { text_width };
     let style = (SemanticRole::Heading, StyleRef::Quiet);
-    let reserved = wrapped_words_lines(&words(&worst), style, room).len();
-    let mut lines = wrapped_words_lines(&words(&tags), style, room);
-    lines.resize(reserved.max(lines.len()), String::new());
+    // Changed takes room in the caption's own lines, its last broken a word early where that
+    // holds it ([`row_name_lines_holding`]); else a line is kept for it.
+    let width = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
+    let said = |tags: &RowTags| {
+        tags.state
+            .iter()
+            .map(|tag| tag.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+    };
+    let held = lines_holding(
+        wrapped_words_lines(&CAPTION.to_ascii_uppercase(), style, room),
+        |line| width(&with_tags(line, &said(&worst))) <= room,
+        |line| width(line) <= room,
+    );
+    let lines = if held
+        .last()
+        .is_some_and(|last| width(&with_tags(last, &said(&worst))) <= room)
+    {
+        let mut lines = held;
+        if let Some(last) = lines.last_mut() {
+            *last = with_tags(last, &said(&tags));
+        }
+        lines
+    } else {
+        let reserved = wrapped_words_lines(&words(&worst), style, room).len();
+        let mut lines = wrapped_words_lines(&words(&tags), style, room);
+        lines.resize(reserved.max(lines.len()), String::new());
+        lines
+    };
     let caption_key = format!(
         "settings/group-heading/{}/display-faces",
         key_fragment(CAPTION)
@@ -29479,8 +29928,10 @@ fn seat_stacked_reset(row: &mut UiNode, name: &str, text_width: f32) {
     };
     let room = one_line_label_room(line, text_width);
     if pieces_fit(name, room, &row_label_width) {
-        let beside = row_name_lines(name, room).len();
-        let alone = row_name_lines(name, text_width).len();
+        // Weighed with the room its name keeps for Changed ([`row_name_lines_holding`]).
+        let changed = [CHANGED_WORD.to_string()];
+        let beside = row_name_lines_holding(name, &changed, room).len();
+        let alone = row_name_lines_holding(name, &changed, text_width).len();
         let cost = beside.saturating_sub(alone) as f32 * row_detail_line_height();
         if cost <= fixed_height(line) + row.layout.gap + 0.01 {
             return;
@@ -29660,7 +30111,22 @@ struct FinishedRow {
 
 impl FinishedRow {
     fn facts_fit_inline(&self) -> bool {
-        row_tag_fit(&self.name, &self.worst, self.label_room()).facts
+        row_tag_fit_held(
+            &self.name,
+            &self.worst,
+            self.label_room(),
+            self.holds_in_name(),
+        )
+        .facts
+    }
+
+    fn holds_in_name(&self) -> bool {
+        name_holds_state(
+            (&self.name, &self.worst, self.label_room()),
+            self.timing,
+            self.note.as_deref(),
+            self.text_width,
+        )
     }
 
     fn label_room(&self) -> f32 {
@@ -29680,7 +30146,7 @@ impl FinishedRow {
             &self.worst,
             self.label_room(),
             self.stacked,
-            below,
+            (below, self.holds_in_name()),
         );
         let mut chip_words = None;
         if let Some(color) = self.default_chip {
@@ -29862,8 +30328,15 @@ fn row_second_line(
             .chain(timing.map(str::to_string))
             .collect()
     };
-    let mut lines = fact_lines(&with_timing(&placement.below), px, text_width);
-    let reserved = fact_lines(&with_timing(&placement.worst_below), px, text_width).len();
+    let below = with_timing(&placement.below);
+    let worst = with_timing(&placement.worst_below);
+    // Laid out by the facts at worst alone, so the lines are the same whatever the row says.
+    if let Some(shared) = note.and_then(|note| facts_on_note(&below, &worst, note, px, text_width))
+    {
+        return shared;
+    }
+    let mut lines = fact_lines(&below, px, text_width);
+    let reserved = fact_lines(&worst, px, text_width).len();
     if lines.len() < reserved {
         lines.resize(reserved, String::new());
     }
@@ -29871,6 +30344,47 @@ fn row_second_line(
         lines.extend(wrapped_copy_lines(note, px, text_width));
     }
     lines
+}
+
+/// A ROW'S FACTS THAT MAY COME TAKE ROOM ON ITS NOTE'S FIRST LINE: the note wraps with that
+/// line as narrow as the facts it may say at worst (`worst`) leave it, and starts with the facts
+/// it says now (`below`), so the note's lines are the same whether they come or not and none
+/// reads as blank. A line kept apart for them read as blank while they were not said (Keyboard
+/// & Input's Predictive echo, a password fact only `always` says; Terminal's Searchable
+/// scrollback lines, Changed). `None` where the facts at worst take a line of their own or the
+/// note's first line would break inside a word.
+fn facts_on_note(
+    below: &[String],
+    worst: &[String],
+    note: &str,
+    px: f32,
+    width: f32,
+) -> Option<Vec<String>> {
+    let measure =
+        |text: &str| crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, text, px);
+    let lead = |facts: &[String]| {
+        let facts: Vec<&str> = facts
+            .iter()
+            .map(String::as_str)
+            .filter(|fact| !fact.trim().is_empty())
+            .collect();
+        (!facts.is_empty()).then(|| format!("{}{FACT_SEPARATOR}", facts.join(FACT_SEPARATOR)))
+    };
+    let room = width.max(48.0) - measure(&lead(worst)?);
+    if room < 48.0 {
+        return None;
+    }
+    let first = wrapped_copy_lines(note, px, room).into_iter().next()?;
+    let rest = note.trim_start().strip_prefix(first.as_str())?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut lines = vec![format!("{}{first}", lead(below).unwrap_or_default())];
+    let rest = rest.trim_start();
+    if !rest.is_empty() {
+        lines.extend(wrapped_copy_lines(rest, px, width));
+    }
+    Some(lines)
 }
 
 const COMPACT_INLINE_LABEL_MIN: f32 = 170.0;
@@ -30015,8 +30529,65 @@ fn row_label_width(text: &str) -> f32 {
     crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
+/// A setting's name on its row's label lines, broken so its last line holds `state` (the words
+/// its row says it is in at worst, "Changed") beside it where that is a word earlier: THE STATE
+/// TAKES ROOM IN THE NAME'S OWN LINES. Kept on a line of its own under a name that filled its
+/// last line, it reserved a line that read as blank while the setting was unchanged, the next
+/// line cut at the screen's end under it (Terminal's Searchable scrollback lines at 80x26 with
+/// 2x text: 58pt). Broken a word early, the name's last line holds the state when it comes and
+/// reads as a name set on two lines when it does not, and nothing moves either way.
+fn row_name_lines_holding(name: &str, state: &[String], label_width: f32) -> Vec<String> {
+    if state.is_empty() {
+        return row_name_lines(name, label_width);
+    }
+    lines_holding(
+        row_name_lines(name, label_width),
+        |line| row_label_fits(&with_tags(line, state), label_width),
+        |line| row_label_fits(line, label_width),
+    )
+}
+
+/// `lines` with as few words as it takes moved from the last onto a line of its own, so the last
+/// `holds` what may come beside it, each line still one that `fits`; `lines` as they are where
+/// the last holds it already or no break does.
+fn lines_holding(
+    mut lines: Vec<String>,
+    holds: impl Fn(&str) -> bool,
+    fits: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if lines.last().is_none_or(|last| holds(last)) {
+        return lines;
+    }
+    let Some(last) = lines.pop() else {
+        return lines;
+    };
+    let words: Vec<&str> = last.split_whitespace().collect();
+    let broken = (1..words.len()).rev().find_map(|split| {
+        let (head, tail) = (words[..split].join(" "), words[split..].join(" "));
+        (holds(&tail) && fits(&head)).then_some((head, tail))
+    });
+    match broken {
+        Some((head, tail)) => {
+            lines.push(head);
+            lines.push(tail);
+        }
+        None => lines.push(last),
+    }
+    lines
+}
+
 fn row_tag_fit(name: &str, worst: &RowTags, label_width: f32) -> RowTagFit {
-    let lines = row_name_lines(name, label_width);
+    row_tag_fit_held(name, worst, label_width, true)
+}
+
+/// [`row_tag_fit`], the name's last line broken to hold the state where `hold`
+/// ([`row_name_lines_holding`]); where a note takes the state instead, as it was set.
+fn row_tag_fit_held(name: &str, worst: &RowTags, label_width: f32, hold: bool) -> RowTagFit {
+    let lines = if hold {
+        row_name_lines_holding(name, &worst.state, label_width)
+    } else {
+        row_name_lines(name, label_width)
+    };
     let last = lines.last().map_or(name, String::as_str);
     let state =
         worst.state.is_empty() || row_label_fits(&with_tags(last, &worst.state), label_width);
@@ -30039,9 +30610,47 @@ fn place_row_tags(
     label_width: f32,
     facts_below: bool,
 ) -> RowTagPlacement {
-    let fit = row_tag_fit(name, worst, label_width);
+    place_row_tags_held(name, tags, worst, label_width, facts_below, true)
+}
+
+/// Whether a row's name keeps room for what it says at worst ([`row_name_lines_holding`]):
+/// not where its `note`'s first line takes it ([`facts_on_note`]), so the name stays as it is
+/// set.
+fn name_holds_state(
+    (name, worst, label_width): (&str, &RowTags, f32),
+    timing: Option<&str>,
+    note: Option<&str>,
+    text_width: f32,
+) -> bool {
+    let Some(note) = note else {
+        return true;
+    };
+    let placed = place_row_tags_held(name, worst, worst, label_width, false, false);
+    let below: Vec<String> = placed
+        .worst_below
+        .into_iter()
+        .chain(timing.map(str::to_string))
+        .collect();
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    below.is_empty() || facts_on_note(&below, &below, note, px, text_width).is_none()
+}
+
+/// [`place_row_tags`], the name broken to hold the state where `hold`, else as it was set.
+fn place_row_tags_held(
+    name: &str,
+    tags: &RowTags,
+    worst: &RowTags,
+    label_width: f32,
+    facts_below: bool,
+    hold: bool,
+) -> RowTagPlacement {
+    let fit = row_tag_fit_held(name, worst, label_width, hold);
     let facts_inline = fit.facts && !facts_below;
-    let mut lines = row_name_lines(name, label_width);
+    let mut lines = if fit.state && hold {
+        row_name_lines_holding(name, &worst.state, label_width)
+    } else {
+        row_name_lines(name, label_width)
+    };
     let pick = |tags: &RowTags, inline: bool| -> Vec<String> {
         let mut picked = Vec::new();
         if fit.state == inline {
@@ -30069,9 +30678,9 @@ fn lay_out_row_label(
     worst: &RowTags,
     label_width: f32,
     stacked: bool,
-    facts_below: bool,
+    (facts_below, hold): (bool, bool),
 ) -> RowTagPlacement {
-    let placement = place_row_tags(name, tags, worst, label_width, facts_below);
+    let placement = place_row_tags_held(name, tags, worst, label_width, facts_below, hold);
     set_row_label_lines(row, placement.lines.clone(), stacked);
     placement
 }
@@ -31193,10 +31802,14 @@ fn setting_row_parts(
         } else {
             ("", "")
         };
+        // Only Always says it, and Always is set in the file alone (the row offers Off and
+        // Adaptive), where the row's control changes with it: room kept for it while the value
+        // is another kept lines that read as blank (Keyboard & Input at 164x348 with 2x text:
+        // three lines under the segments).
         fact(
             visual.to_string(),
             semantic.to_string(),
-            Some("Can show a password"),
+            echo_always.then_some("Can show a password"),
         );
     }
     for note in &setting_effect.notes {
@@ -34648,7 +35261,7 @@ fn update_switches_fit_inline(state: &SettingsViewState, text_width: f32) -> boo
         .iter()
         .filter_map(|key| state.field_by_key(key))
         .all(|field| {
-            row_name_lines(field.label, room).len() == 1
+            row_name_lines_holding(field.label, &worst.state, room).len() == 1
                 && row_tag_fit(field.label, &worst, room).state
         })
 }
@@ -34714,7 +35327,7 @@ fn update_automatic_cards(
             &update_switch_tags(true),
             label_room,
             row_width == SettingsWidth::Compact,
-            false,
+            (false, true),
         );
         let detail = row_second_line(&placement, None, None, text_width);
         let mut row = with_row_detail(row, key, &detail, row_width == SettingsWidth::Compact);

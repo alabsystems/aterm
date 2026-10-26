@@ -5,6 +5,7 @@
 
 use std::sync::Mutex;
 
+use aterm_agent::harness::codex_tap::Refusal;
 use aterm_agent::harness::steps::{
     End, Judge, Step, StepBatch, StepEvent, StepMark, StepState, judge_wall,
 };
@@ -58,11 +59,60 @@ pub(crate) struct Applied {
     pub(crate) holds: usize,
 }
 
+/// Declares [`RolloutWord`] and [`RolloutWord::words`] from one variant list, so every word
+/// `status rollout=` can print is among those its help is held to.
+macro_rules! rollout_words {
+    ($($(#[$doc:meta])* $variant:ident => $word:literal,)*) => {
+        /// The word `status rollout=` prints for the last thing the session's rollout tap
+        /// said ([`TapAnswers`]): one of these, or a [`Refusal`]'s.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum RolloutWord {
+            $($(#[$doc])* $variant,)*
+            /// The tap bound nothing, and says why.
+            Refused(Refusal),
+        }
+
+        impl RolloutWord {
+            /// The word `status rollout=` prints.
+            pub(crate) const fn word(self) -> &'static str {
+                match self {
+                    $(RolloutWord::$variant => $word,)*
+                    RolloutWord::Refused(refusal) => refusal.word(),
+                }
+            }
+
+            /// Every word a [`RolloutWord`] can print, from the same lists as the enums.
+            #[cfg(test)]
+            pub(crate) fn words() -> impl Iterator<Item = &'static str> {
+                [$($word,)*]
+                    .into_iter()
+                    .chain(Refusal::ALL.iter().map(|refusal| refusal.word()))
+            }
+        }
+    };
+}
+
+rollout_words! {
+    /// The tap is bound: the rollout's rows reach the log.
+    Bound => "bound",
+    /// Nothing bound yet, and no refusal stands.
+    Unbound => "unbound",
+    /// The tap cannot be made for the target's thread.
+    NoThread => "no-thread",
+    /// The queued claim, target, run or sampled process image no longer matches.
+    Stale => "stale",
+    /// The sweep dropped a tap that answered ([`SessionLog::rollout_stopped`]).
+    Stopped => "stopped",
+}
+
+/// `status rollout=` while the tap was never asked for the session ([`SessionLog::rollout_fields`]).
+pub(crate) const ROLLOUT_NEVER_ASKED: &str = "-";
+
 /// WHAT THE ROLLOUT TAP ANSWERED (`status rollout= rollout_asks=`; session log 6D-3b's tap, its fence B5c): how many asks the session's rollout tap answered, each counted in a hold taken AFTER that ask's batch was applied (`crate::codex_rollout_tap`), and the last answer's word: `bound`, or why it bound nothing (a `codex_tap::Refusal`'s word, `unmeasured` among them; `stale` when the captured claim, record, run or sampled process image moved; `no-thread` if the tap cannot be made), or `stopped` once the sweep dropped the tap (the claimant gone from the front, the sweep off) until it asks again.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TapAnswers {
     asks: u64,
-    word: Option<&'static str>,
+    word: Option<RolloutWord>,
     /// The log's last seq when the count last moved: at or past every
     /// record the counted ask wrote, which the tap's tests read
     /// ([`SessionLog::rollout_counted_at`]).
@@ -72,7 +122,7 @@ pub(crate) struct TapAnswers {
 
 impl SessionLog {
     /// One ask the rollout tap answered, with its word ([`TapAnswers`]).
-    pub(crate) const fn rollout_answered(&mut self, word: &'static str) {
+    pub(crate) const fn rollout_answered(&mut self, word: RolloutWord) {
         self.rollout.asks = self.rollout.asks.saturating_add(1);
         self.rollout.word = Some(word);
         #[cfg(test)]
@@ -84,7 +134,7 @@ impl SessionLog {
     /// The sweep dropped the session's tap ([`TapAnswers`]): a session the tap answered says `stopped`, its count kept; one never asked stays `-`.
     pub(crate) const fn rollout_stopped(&mut self) {
         if self.rollout.word.is_some() {
-            self.rollout.word = Some("stopped");
+            self.rollout.word = Some(RolloutWord::Stopped);
         }
     }
 
@@ -98,7 +148,9 @@ impl SessionLog {
     pub(crate) fn rollout_fields(&self) -> String {
         format!(
             "rollout={} rollout_asks={}",
-            self.rollout.word.unwrap_or("-"),
+            self.rollout
+                .word
+                .map_or(ROLLOUT_NEVER_ASKED, RolloutWord::word),
             self.rollout.asks
         )
     }

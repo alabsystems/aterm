@@ -25,6 +25,9 @@ pub mod fleet_member;
 #[cfg(unix)]
 pub mod lan;
 
+/// The debug build's guard that keeps an isolated drive's fleet on the loopback.
+pub mod loopback;
+
 const MAX_HEX: usize = 4096;
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

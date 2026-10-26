@@ -857,6 +857,46 @@ impl PressCredits {
         if n > 0 { Some((keys, n)) } else { None }
     }
 
+    /// Unpaid cells of the live presses that were already occupied in `mask_at_park` at or before `at`.
+    #[inline]
+    pub(super) fn cells_at_park(&self, now: Instant, at: Instant, mask_at_park: u128) -> usize {
+        let mut total = 0usize;
+        let mut mask = self.occupied & mask_at_park;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, c, _)) = self.slots[i]
+                && t <= at
+                && self.payable(t, c, now)
+            {
+                total += usize::from(c);
+            }
+        }
+        total
+    }
+
+    /// Take every press banked after the park (`t > at` or absent from `mask_at_park`) out of the ring at its own index.
+    pub(super) fn split_off_for_park(&mut self, at: Instant, mask_at_park: u128) -> Self {
+        let mut later = Self {
+            head: self.head,
+            ..Self::default()
+        };
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let bit = 1u128 << i;
+            if let Some((t, _, _)) = self.slots[i]
+                && (t > at || (mask_at_park & bit) == 0)
+            {
+                later.slots[i] = self.slots[i].take();
+                self.occupied &= !bit;
+                later.occupied |= bit;
+            }
+        }
+        later
+    }
+
     /// Take every press banked after `at` out of the ring at its own index.
     pub(super) fn split_off_after(&mut self, at: Instant) -> Self {
         let mut later = Self {
@@ -1107,6 +1147,10 @@ pub(super) struct HeldPark {
     pub(super) landing_cell: Option<char>,
     /// The content witness carried this exact park's source row away.
     pub(super) content_followed: bool,
+    /// Occupied [`PressCredits`] slots when the park was held, distinguishing same-instant post-park presses.
+    pub(super) press_mask: u128,
+    /// Unreplayed `v2` [`rk::Event::Typed`] entries buffered when the park was held (`0` once that tick drained).
+    pub(super) v2_typed_before: usize,
 }
 
 impl HeldPark {
@@ -1631,7 +1675,6 @@ impl CursorGlow {
     pub fn note_return(&mut self, now: Instant) {
         self.note_return_keeping_hand(now);
         self.hand_row = None;
-        self.unowned_caret = None;
     }
 
     /// [`Self::note_return`] for an Enter into a foreground program's composer.
@@ -1644,6 +1687,7 @@ impl CursorGlow {
         if self.v2.engaged() {
             self.v2.on_event(rk::Event::Return, now);
         }
+        self.unowned_caret = None;
     }
 
     /// Record a Tab / scripted-gesture classifier boundary.
@@ -2343,7 +2387,11 @@ impl CursorGlow {
         let mut col = pane_col0;
         let cc_usize = usize::from(cc);
         while col < cc_usize {
-            if !blank(&self.row_cur, col) {
+            let cur_ch = at(&self.row_cur, col);
+            let left_border = col == pane_col0
+                && rk::is_box_border_glyph(cur_ch)
+                && at(&self.row_prev, col) == cur_ch;
+            if !blank(&self.row_cur, col) && !left_border {
                 return None;
             }
             col += 1;
@@ -2365,7 +2413,11 @@ impl CursorGlow {
             col += 1;
         }
         let mut word_col0 = origin;
-        while word_col0 > pane_col0 && !blank(&self.row_above_cur, word_col0 - 1) {
+        while word_col0 > pane_col0
+            && !blank(&self.row_above_cur, word_col0 - 1)
+            && !(word_col0 - 1 == pane_col0
+                && rk::is_box_border_glyph(at(&self.row_above_cur, word_col0 - 1)))
+        {
             word_col0 -= 1;
         }
         if word_col0 <= u16::MAX as usize {

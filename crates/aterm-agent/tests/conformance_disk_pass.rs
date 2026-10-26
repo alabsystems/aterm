@@ -85,6 +85,7 @@ fn gone(path: &str, last_used: i64) -> Row {
             floor_gib: 40,
             until_gib: 40,
             device: 1,
+            projected: None,
         },
     )
 }
@@ -135,11 +136,26 @@ fn recent(path: &str, last_used: i64) -> Row {
             floor_gib: 10,
             until_gib: 15,
             device: 1,
+            projected: None,
         },
     )
 }
 
+/// A projection standing at 2 MB/s, about 13.4 GiB over the horizon (§8.2).
+fn projection(free: u64) -> disk::fill::Projection {
+    let floor = Config::default().auto_free_gib * GIB_BYTES;
+    disk::fill::Projection::of(2_000_000, free, floor, None)
+}
+
 fn report_at(free: u64, demand: Option<u64>) -> Report {
+    report_projected(free, demand, None)
+}
+
+fn report_projected(
+    free: u64,
+    demand: Option<u64>,
+    projected: Option<disk::fill::Projection>,
+) -> Report {
     let config = Config::default();
     let rows = vec![
         gone("/h/cache/a/.cargo-build", NOW - 9 * 86_400),
@@ -155,6 +171,7 @@ fn report_at(free: u64, demand: Option<u64>) -> Report {
     survey.free_bytes = Some(free);
     survey.trigger = Trigger::Tick;
     survey.demand = demand;
+    survey.projected = projected;
     let mut rep = disk::report(&survey, config);
     rep.rows = rows;
     rep
@@ -187,10 +204,17 @@ fn step(m: &Model, s: &mut S, action: &str) -> Result<(), String> {
 }
 
 fn looked(m: &Model, measure: &str, demand: bool) -> Result<S, String> {
+    looked_projected(m, measure, demand, false)
+}
+
+fn looked_projected(m: &Model, measure: &str, demand: bool, projected: bool) -> Result<S, String> {
     let mut s = m.init_state();
     step(m, &mut s, measure)?;
     if demand {
         step(m, &mut s, "Adopt")?;
+    }
+    if projected {
+        step(m, &mut s, "Project")?;
     }
     Ok(s)
 }
@@ -443,9 +467,15 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
     ];
     let mut passes = 0;
     for (measure, free) in levels() {
-        for demand in [None, Some(need)] {
-            let rep = report_at(free, demand);
-            let start = looked(&m, measure, demand.is_some()).expect("the look");
+        for (demand, projected) in [
+            (None, None),
+            (Some(need), None),
+            (None, Some(projection(free))),
+            (Some(need), Some(projection(free))),
+        ] {
+            let rep = report_projected(free, demand, projected);
+            let start = looked_projected(&m, measure, demand.is_some(), projected.is_some())
+                .expect("the look");
             let plan = disk::pass_plan(&rep).unwrap_or_default();
             for tier in [
                 Tier::EndedOwners,
@@ -462,7 +492,8 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
                 assert_eq!(
                     planned,
                     admits,
-                    "{measure} demand={demand:?}: tier {} planned={planned}, the model admits={admits}",
+                    "{measure} demand={demand:?} projected={}: tier {} planned={planned}, the model admits={admits}",
+                    projected.is_some(),
                     tier.number()
                 );
             }
@@ -470,7 +501,10 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
                 let (done, events) = run(&rep, script);
                 let mut s = start.clone();
                 project(&m, &mut s, &plan, &events).unwrap_or_else(|why| {
-                    panic!("{measure} demand={demand:?} script={script:?}: {why}\n{events:#?}")
+                    panic!(
+                        "{measure} demand={demand:?} projected={} script={script:?}: {why}\n{events:#?}",
+                        projected.is_some()
+                    )
                 });
                 if let Some(done) = done {
                     passes += 1;
@@ -479,14 +513,42 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
                             .iter()
                             .all(|(r, _)| r.tier() != Some(Tier::RecentIncremental))
                             || measure == "MeasureShort"
-                            || measure == "MeasureEmergency",
-                        "{measure}: tier 4 above the floor"
+                            || measure == "MeasureEmergency"
+                            || projected.is_some(),
+                        "{measure}: tier 4 above the floor with no projection"
                     );
                 }
             }
         }
     }
-    assert!(passes >= 12, "the passes ran: {passes}");
+    assert!(passes >= 24, "the passes ran: {passes}");
+}
+
+#[test]
+fn under_a_projection_each_tier_stops_where_the_fill_no_longer_crosses() {
+    let (_, free) = levels()[1];
+    let p = projection(free);
+    let plan = disk::pass_plan(&report_projected(free, None, Some(p))).expect("pressed");
+    let c = Config::default();
+    let horizon = c.projected_target(&p);
+    assert_eq!(horizon, c.pressure_target_bytes() + p.need);
+    for planned in &plan {
+        let line = match planned.row.tier() {
+            Some(Tier::EndedOwners) => None,
+            Some(Tier::IdleIncremental | Tier::IdleWhole) => Some(c.idle_target_bytes(true)),
+            _ => Some(c.pressure_target_bytes()),
+        };
+        assert_eq!(
+            planned.target,
+            line.map(|l| l.max(horizon)),
+            "the line each tier stops at under pressure, raised to the horizon's: {planned:?}"
+        );
+    }
+    assert!(
+        plan.iter()
+            .any(|p| p.row.tier() == Some(Tier::RecentIncremental)),
+        "a projection at low runs tier 4"
+    );
 }
 
 #[test]
@@ -500,6 +562,7 @@ fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
     let state = tmp.join("state");
     let t = Config::default().thresholds(None);
     for (measure, free, level) in [
+        ("MeasureLow", 20 * GIB_BYTES, disk::Level::Low),
         ("MeasureShort", 6 * GIB_BYTES, disk::Level::Short),
         ("MeasureEmergency", 2 * GIB_BYTES, disk::Level::Emergency),
     ] {
@@ -508,7 +571,9 @@ fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
         std::fs::write(&reserve, vec![7u8; 4096]).expect("a small reserve");
         let moved = disk_reserve_look(&state, &reserve, level, Some(free), &t, NOW);
         let released = matches!(moved, ReserveMove::Released(_));
-        let mut s = looked(&m, measure, false).expect("the look");
+        // A projection is a forecast: the look that projects a crossing reads the reserve by its
+        // measured level alone, so the model's look projects too.
+        let mut s = looked_projected(&m, measure, false, true).expect("the look");
         assert_eq!(
             released,
             m.action_enabled("ReleaseReserve", &s),
@@ -563,6 +628,43 @@ fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
     projected(&real).expect("the real plan conforms");
     let caught = projected(&buggy).expect_err("the checker must reject tier 4 for a demand");
     assert!(caught.contains("Admit4"), "{caught}");
+}
+
+#[test]
+fn a_planner_that_takes_recent_caches_at_low_with_no_projection_is_rejected() {
+    let m = disk_reclaim_pass_model();
+    let (measure, free) = levels()[1];
+    let p = projection(free);
+    let real = disk::pass_plan(&report_projected(free, None, Some(p))).expect("pressed");
+    let events = |plan: &[Planned]| -> Vec<Event> {
+        plan.iter()
+            .filter(|p| !p.row.path.to_string_lossy().contains("refused"))
+            .flat_map(|p| {
+                let mut e = Vec::new();
+                if p.target.is_some() {
+                    e.push(Event::Read(free));
+                }
+                e.push(Event::Removing(p.row.path.clone(), p.row.tier()));
+                if matches!(p.row.tier(), Some(Tier::EndedOwners | Tier::IdleWhole)) {
+                    e.push(Event::Locked(p.row.path.clone(), p.row.path.clone()));
+                    e.push(Event::Deleting(p.row.path.clone(), p.row.path.clone()));
+                }
+                e.push(Event::Removed(p.row.path.clone(), p.row.tier()));
+                e
+            })
+            .collect()
+    };
+    let mut s = looked_projected(&m, measure, false, true).expect("the look");
+    project(&m, &mut s, &real, &events(&real)).expect("the projected plan conforms");
+    // NEGATIVE CONTROL: the same plan run at a look that projected nothing, as a planner that
+    // read `low` as pressure would run it.
+    let mut s = looked(&m, measure, false).expect("the look");
+    let caught = project(&m, &mut s, &real, &events(&real))
+        .expect_err("the checker must reject tiers 3 and 4 at low with no projection");
+    assert!(
+        caught.contains("Admit3") || caught.contains("Admit4"),
+        "{caught}"
+    );
 }
 
 #[test]

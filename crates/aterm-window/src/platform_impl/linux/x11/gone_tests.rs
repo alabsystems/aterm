@@ -76,7 +76,8 @@ fn a_lost_display_fails_each_call_and_ends_the_run_without_a_panic() {
 }
 
 /// The child's work: a window on `$DISPLAY`, its socket shut down, every call that asks the
-/// server something, then the event loop's run.
+/// server something (the monitors none, though the window cached them live), then the event
+/// loop's run.
 fn lose_the_display_under_a_window() {
     let mut event_loop = EventLoop::<()>::new_x11_any_thread().expect("an X11 loop on $DISPLAY");
     let PlatformActiveEventLoop::X(target) = &event_loop.window_target().p else {
@@ -87,6 +88,10 @@ fn lose_the_display_under_a_window() {
 
     assert!(window.outer_position().is_ok(), "the position, live");
     assert_eq!(window.inner_size(), PhysicalSize::new(800, 600), "the size, live");
+    assert!(!window.available_monitors().is_empty(), "the monitors, live");
+    assert!(window.primary_monitor().is_some(), "the primary monitor, live");
+    assert!(target.available_monitors().next().is_some(), "the loop's monitors, live");
+    let (monitor, scale) = (window.current_monitor(), window.scale_factor());
     assert!(!xconn.is_broken(), "the connection, live");
 
     let socket = xconn.xcb_connection().file_descriptor();
@@ -100,8 +105,12 @@ fn lose_the_display_under_a_window() {
     let _ = window.outer_size();
     let _ = window.is_maximized();
     let _ = window.is_minimized();
-    let _ = window.available_monitors();
-    let _ = window.primary_monitor();
+    assert!(window.available_monitors().is_empty(), "monitors of a display that has gone");
+    assert!(window.primary_monitor().is_none(), "a primary monitor of a display that has gone");
+    assert!(target.available_monitors().next().is_none(), "the loop's monitors, gone");
+    assert!(target.primary_monitor().is_none(), "the loop's primary monitor, gone");
+    assert_eq!(window.current_monitor(), monitor, "the window's monitor, the last reported");
+    assert_eq!(window.scale_factor(), scale, "the window's scale, the last reported");
     assert!(window.drag_window().is_err(), "a drag needs the pointer");
     window.set_title("gone");
     window.set_theme(Some(Theme::Dark));

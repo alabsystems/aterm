@@ -31,7 +31,7 @@ pub(crate) struct TrendSample {
     pub lane: &'static str,
     pub metric: String,
     pub value: f64,
-    /// LOWER is better (worst-latency metrics, e.g. the resize `*_worst_ms` fences).
+    /// LOWER is better (latency metrics, e.g. the resize lane's pump totals and worsts).
     pub inverted: bool,
     /// The figures of the operating point it was measured at.
     pub at: Vec<PointFigure>,
@@ -274,7 +274,8 @@ pub(crate) fn machine_id() -> MachineId {
     }
 }
 
-fn head_sha() -> String {
+/// HEAD's short `sha` as [`tree_label`] labels it.
+pub(crate) fn head_sha() -> String {
     let git = |args: &[&str]| {
         aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args(args)
@@ -289,6 +290,17 @@ fn head_sha() -> String {
     };
     let status = git(&["status", "--porcelain", "--untracked-files=no"]);
     tree_label(sha.trim(), status.as_deref())
+}
+
+/// The tree a run's rows name: `start`, read before its first lane built anything, made `+dirty`
+/// when the tree read as the rows are appended differs (a commit, a checkout or an edit while the
+/// lanes built and ran their harnesses).
+pub(crate) fn measured_tree(start: &str, end: &str) -> String {
+    if start == end || start == "unknown" || start.ends_with("+dirty") {
+        start.to_string()
+    } else {
+        format!("{start}+dirty")
+    }
 }
 
 const GOLDEN_REL: &str = "crates/aterm-verify/perf/golden/";
@@ -638,8 +650,8 @@ pub(crate) fn trend_rows(
 
 const TREND_HEADER: &str = "# aterm same-box perf trend ledger (E0, audit 5.6). Appended by every \
 GREEN `verify perf` run;\n# each metric must clear TREND_RATIO x the best of this box's last \
-TREND_WINDOW entries\n# (crates/aterm-verify/src/perf/trend.rs; *_worst_ms metrics are INVERTED — bounded \
-by best-MIN / TREND_RATIO).\n# The BOX column is a name from crates/aterm-verify/perf/golden/perf-boxes.tsv, \
+TREND_WINDOW entries\n# (crates/aterm-verify/src/perf/trend.rs; the resize lane's *_ms metrics are \
+INVERTED — bounded by best-MIN / TREND_RATIO).\n# The BOX column is a name from crates/aterm-verify/perf/golden/perf-boxes.tsv, \
 which is also where a\n# pre-W-1 hostname is claimed as the box it was measured on. NEVER edit a \
 box name here\n# to merge two machines — add the claim to perf-boxes.tsv, where the chip column \
 keeps it\n# honest. A row a re-record (`--record LANE`) wrote carries `rerecorded` in an eighth column:\n# that lane's new level is declared, and each of its metrics' windows starts there. A row \
@@ -655,8 +667,13 @@ pub(crate) fn may_append(lanes_ok: bool, judgment: &TrendJudgment, recorded: &[&
         && judgment.breaches.iter().all(|b| recorded.contains(&b.lane))
 }
 
-/// The trend sub-gate.
-pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&str]) -> LaneRun {
+/// The trend sub-gate. `tree` is [`head_sha`] read before the run's first lane.
+pub(crate) fn gate_trend(
+    samples: &[TrendSample],
+    lanes_ok: bool,
+    recorded: &[&str],
+    tree: &str,
+) -> LaneRun {
     let path = trend_path();
     let me = machine_id();
     let aliases = std::fs::read_to_string(boxes_path()).unwrap_or_default();
@@ -796,7 +813,7 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&s
         };
         text.push_str(&trend_rows(
             &utc_date(),
-            &head_sha(),
+            &measured_tree(tree, &head_sha()),
             &me,
             samples,
             recorded,
@@ -1277,6 +1294,23 @@ mod tests {
             "abc+dirty",
             "an unread status vouches nothing"
         );
+    }
+
+    #[test]
+    fn a_tree_that_changed_while_the_lanes_ran_is_dirty() {
+        assert_eq!(measured_tree("abc", "abc"), "abc");
+        assert_eq!(
+            measured_tree("abc", "abc+dirty"),
+            "abc+dirty",
+            "an edit mid-run"
+        );
+        assert_eq!(
+            measured_tree("abc+dirty", "abc"),
+            "abc+dirty",
+            "an edit built, then undone before the rows"
+        );
+        assert_eq!(measured_tree("abc", "def"), "abc+dirty", "a commit mid-run");
+        assert_eq!(measured_tree("unknown", "def"), "unknown");
     }
 
     #[test]

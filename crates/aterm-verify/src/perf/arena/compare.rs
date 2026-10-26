@@ -316,7 +316,7 @@ pub(crate) fn schedule(bench: &mut dyn Bench, plan: &Plan) -> Result<Comparison,
         *thermal_counts.entry(r.thermal).or_default() += 1;
     }
     let eligibility = Eligibility {
-        hardware: plan.chip.trim() == "Apple M4 Max",
+        hardware: super::rule_zero_hardware(&plan.chip),
         sample_count: plan.pairs >= MIN_PAIRS,
         thermal_available: thermal_counts[&Thermal::Unavailable] == 0,
         thermal_no_warning: thermal_counts[&Thermal::WarningOrUnrecognized] == 0,

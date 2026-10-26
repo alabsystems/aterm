@@ -573,41 +573,40 @@ impl App {
         Ok(line.trim_end().to_string())
     }
 
-    /// Places `ticket`'s newly created `tab` immediately to the right of its caller tab.
-    pub(crate) fn place_admitted_view(
-        &mut self,
+    /// The tab that stays in front of `wid` while `ticket`'s new view opens behind it, where
+    /// `front` was in front: by the askpass rule the view takes the front only while the
+    /// person is on its caller's tab in the front window. `None` (the view takes the front)
+    /// also when the ticket is gone.
+    pub(crate) fn admitted_view_kept_front(
+        &self,
         wid: WindowId,
-        tab: TabId,
         ticket: EditTicketId,
-        previously_active: Option<TabId>,
-    ) {
-        let Some(caller_tab) = self
+        front: Option<TabId>,
+    ) -> Option<TabId> {
+        let caller_tab = self.native_documents.edits.open.get(&ticket)?.caller_tab;
+        let takes_front = self.frontmost_window == Some(wid) && front == Some(caller_tab);
+        front.filter(|_| !takes_front)
+    }
+
+    /// Places `ticket`'s newly created `tab` immediately to the right of its caller tab, marks
+    /// it when it opened behind the person, and runs the window's one sync for the open.
+    pub(crate) fn place_admitted_view(&mut self, wid: WindowId, tab: TabId, ticket: EditTicketId) {
+        let caller_tab = self
             .native_documents
             .edits
             .open
             .get(&ticket)
-            .map(|entry| entry.caller_tab)
-        else {
-            return;
-        };
-        let front = self.frontmost_window == Some(wid);
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        if let Some(caller) = ws.tab_set.tabs().iter().position(|t| t.id == caller_tab) {
-            ws.tab_set.reorder(tab, caller + 1);
-        }
-        let keeps_focus = front && previously_active == Some(caller_tab);
-        if !keeps_focus
-            && let Some(previous) = previously_active
-            && ws.tab_set.switch_to(previous)
+            .map(|entry| entry.caller_tab);
+        if let Some(caller_tab) = caller_tab
+            && let Some(ws) = self.windows.get_mut(&wid)
         {
-            crate::app_tabs::align_terminal_projection_to_active(ws, &self.view_store);
-        }
-        let behind = ws.tab_set.active_id() != Some(tab);
-        ws.last_present = None;
-        if let Some(entry) = self.native_documents.edits.open.get_mut(&ticket) {
-            entry.attention = behind;
+            if let Some(caller) = ws.tab_set.tabs().iter().position(|t| t.id == caller_tab) {
+                ws.tab_set.reorder(tab, caller + 1);
+            }
+            let behind = ws.tab_set.active_id() != Some(tab);
+            if let Some(entry) = self.native_documents.edits.open.get_mut(&ticket) {
+                entry.attention = behind;
+            }
         }
         self.resync_active_or_window(wid);
         self.request_native_redraw(wid);
@@ -1800,6 +1799,40 @@ mod tests {
                 .contains(view(&second))
         );
         assert!(attention(&app, wid, placed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_that_opens_behind_never_tells_the_persons_program_it_lost_focus() {
+        use crate::focus_report_tests::{FOCUS_OUT, drain, observer};
+        let f = fixture("behind-focus", b"x\n");
+        let mut app = app();
+        let wid = WindowId(0);
+        let sid = caller(&mut app, wid);
+        let (pipe, sink) = observer();
+        let person = fresh_session(&mut app);
+        app.push_stub_tab(wid, crate::stub_session_with_sink(person, sink));
+        app.next_session_id = person + 1;
+        let person_tab = active_tab(&app, wid);
+        crate::feed_session_for_test(&app, person, b"\x1b[?1004h");
+        let _ = drain(pipe);
+
+        let (_, line) = edit(&mut app, sid, request(&f.uri, None));
+        let placed = tab_of(&app, wid, view(&ok(&line)));
+        assert_eq!(active_tab(&app, wid), person_tab, "the person's tab stays");
+        assert!(attention(&app, wid, placed), "opened behind, marked");
+        assert_eq!(
+            drain(pipe),
+            Vec::<u8>::new(),
+            "the person's program was never told it lost focus"
+        );
+
+        select(&mut app, wid, placed);
+        assert_eq!(
+            drain(pipe),
+            FOCUS_OUT.to_vec(),
+            "control: choosing the edit tab does blur it"
+        );
     }
 
     #[test]

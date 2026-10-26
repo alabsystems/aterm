@@ -68,6 +68,13 @@ pub(crate) fn open_step(timeline: &Mutex<SessionTimeline>, turn: Node, cls: &str
         .expect("a step opens")
 }
 
+/// A usage wall's reset as aterm reads it off a real notice ([`aterm_phase::notice_reset`],
+/// the screen reader's own grammar): what the wall's `detail=` holds, `14:05` for a 14:05 reset.
+fn usage_reset() -> String {
+    aterm_phase::notice_reset("Usage limit reached \u{b7} resets 14:05")
+        .expect("the notice names its reset")
+}
+
 /// Close `step` `ok`.
 fn close_step(timeline: &Mutex<SessionTimeline>, step: Node) {
     let mut g = timeline.lock().unwrap();
@@ -98,6 +105,24 @@ fn chrome(app: &mut App) -> crate::session_chrome::TabChromeExt {
     let wid = WindowId(0);
     let titles = app.tab_titles(wid);
     app.tab_chrome_ext(wid, &titles).swap_remove(0)
+}
+
+/// The cached session-0 template projected onto its current tab, without recomposing it.
+fn bound_cached_chrome(app: &App) -> crate::session_chrome::TabChromeExt {
+    use crate::session_chrome::{TabMenuEntry, TerminalMenuOrigin};
+
+    let mut ext = app.session_chrome[&0].ext.clone();
+    for entry in &ext.menu {
+        if let TabMenuEntry::SessionAction { origin, .. } | TabMenuEntry::RewindTo { origin, .. } =
+            entry
+        {
+            assert_eq!(*origin, None, "the shared template has no view owner");
+        }
+    }
+    let view = app.windows[&WindowId(0)].tab_set.active().unwrap().focus;
+    assert_eq!(app.focused_session_id(WindowId(0)), Some(0));
+    ext.bind_terminal_origin(TerminalMenuOrigin { view, session: 0 });
+    ext
 }
 
 /// The menu as it pops, mirrored (`chrome` verb words).
@@ -155,7 +180,7 @@ fn a_log_move_recomposes_the_tabs_clause_with_the_switch_on() {
     assert!(app.clause_moved(0), "the step moved the clause");
     app.follow_clause(0);
     assert!(!app.clause_moved(0), "one refresh took the move");
-    let ext = app.session_chrome[&0].ext.clone();
+    let ext = bound_cached_chrome(&app);
     assert!(tooltip(&ext).contains("\nnow: running shell"), "{ext:?}");
     assert!(
         menu_words(&ext)
@@ -287,7 +312,7 @@ fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
                         Fields::new()
                             .word(Key::Wall, "usage-session")
                             .expect("a wall")
-                            .tok(Key::Detail, "resets 14:05")
+                            .tok(Key::Detail, &usage_reset())
                             .expect("its reset"),
                     ),
                 now,
@@ -297,8 +322,8 @@ fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
     label(&app, Actor::Harness, "resuming", 60);
     let ext = chrome(&mut app);
     assert!(
-        tooltip(&ext).contains("\nnow: limit \u{b7} resets 14:05\n")
-            || tooltip(&ext).ends_with("\nnow: limit \u{b7} resets 14:05"),
+        tooltip(&ext).contains("\nnow: limit \u{b7} 14:05\n")
+            || tooltip(&ext).ends_with("\nnow: limit \u{b7} 14:05"),
         "{ext:?}"
     );
     assert!(!tooltip(&ext).contains("resuming"), "{ext:?}");
@@ -385,10 +410,10 @@ fn a_need_or_work_row_names_no_author() {
         Fields::new()
             .word(Key::Wall, "usage-session")
             .expect("a wall")
-            .tok(Key::Detail, "resets 14:05")
+            .tok(Key::Detail, &usage_reset())
             .expect("its reset"),
     );
-    no_author(&mut app, "limit \u{b7} resets 14:05");
+    no_author(&mut app, "limit \u{b7} 14:05");
 }
 
 /// Updating the clause adds no timeline row and leaves the tab label unchanged.
@@ -405,7 +430,7 @@ fn the_clause_moves_no_row_and_no_label() {
     app.follow_clause(0);
     assert_eq!(timeline.lock().unwrap().high_id(), high, "no timeline row");
     assert_eq!(app.tab_titles(wid), titles, "the label is the title");
-    let moved = app.session_chrome[&0].ext.clone();
+    let moved = bound_cached_chrome(&app);
     let rows = |ext: &crate::session_chrome::TabChromeExt| -> Vec<String> {
         menu_words(ext)
             .into_iter()
@@ -415,7 +440,7 @@ fn the_clause_moves_no_row_and_no_label() {
     assert_eq!(rows(&moved), rows(&quiet), "every other row is today's");
 }
 
-/// Open a `wall:usage-session` need (`resets 14:05`) under `turn`; the wall.
+/// Open a `wall:usage-session` need (its reset `14:05`, [`usage_reset`]) under `turn`; the wall.
 fn open_usage_wall(timeline: &Mutex<SessionTimeline>, turn: Node) -> Node {
     let mut g = timeline.lock().unwrap();
     let now = g.slog().now();
@@ -428,7 +453,7 @@ fn open_usage_wall(timeline: &Mutex<SessionTimeline>, turn: Node) -> Node {
                     Fields::new()
                         .word(Key::Wall, "usage-session")
                         .expect("a wall")
-                        .tok(Key::Detail, "resets 14:05")
+                        .tok(Key::Detail, &usage_reset())
                         .expect("its reset"),
                 ),
             now,
@@ -575,7 +600,7 @@ fn the_loops_limit_label_waits_under_the_open_wall_and_shows_once_it_closes() {
     );
     let ext = chrome(&mut app);
     assert!(
-        tooltip(&ext).contains("\nnow: limit \u{b7} resets 14:05"),
+        tooltip(&ext).contains("\nnow: limit \u{b7} 14:05"),
         "{ext:?}"
     );
     assert!(!tooltip(&ext).contains("resuming"), "{ext:?}");
@@ -586,7 +611,7 @@ fn the_loops_limit_label_waits_under_the_open_wall_and_shows_once_it_closes() {
     let menu = menu_words(&ext);
     assert!(
         menu.iter()
-            .any(|w| w.starts_with("now: limit \u{b7} resets 14:05")),
+            .any(|w| w.starts_with("now: limit \u{b7} 14:05")),
         "{menu:?}"
     );
     assert!(

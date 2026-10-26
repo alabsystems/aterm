@@ -273,20 +273,22 @@ fn renderer_binds_one_coord_list_everywhere() {
         (m.m_advance.round() as usize).max(1),
         "cell width must derive from the instantiated advance"
     );
+    // Its bold is the Bold its designer drew (`wght` 683 on its own `YAXS`), the face Settings
+    // names "SF Mono Bold", not `wght` 700 on the Regular's other axes.
     let bold = r
         .debug_vf_bold_coords()
         .expect("SFNSMono's wght axis reaches bold");
-    let wi = probe
-        .axes
-        .iter()
-        .position(|a| a.tag == WGHT_TAG)
-        .expect("wght");
-    let bold_w = clamp_axis(&probe.axes[wi], variation::BOLD_WGHT);
-    assert!((bold[wi].1 - bold_w).abs() < 1e-3, "bold wght = clamp(700)");
-    for (i, &(tag, v)) in bold.iter().enumerate() {
-        if i != wi {
-            assert_eq!((tag, v), coords[i], "non-wght axes identical in bold");
-        }
+    let designed = probe
+        .bold_coords
+        .as_deref()
+        .expect("SF Mono designs a Bold named instance");
+    assert_eq!(bold.len(), probe.axes.len(), "one value per axis in bold");
+    for ((tag, v), (axis, want)) in bold.iter().zip(probe.axes.iter().zip(designed)) {
+        assert_eq!(*tag, axis.tag);
+        assert!(
+            (v - want).abs() < 1e-3,
+            "bold draws SF Mono's Bold: {tag:#x} {v} vs {want}"
+        );
     }
 }
 

@@ -78,6 +78,13 @@ pub enum ErrorKind {
     /// gives, which nothing here tells apart. Asked again shortly, it may answer; it is no
     /// evidence that no vault is there.
     LocalNetworkPending,
+    /// A request that ran past its deadline: a long-poll the server still held, a lookup with
+    /// no answer, a slow network or a host that sleeps, which nothing here tells apart.
+    TimedOut,
+    /// A publish the vault refused before storing it: a version not newer than the one it holds
+    /// (another admin's publish came first), or another publish holding its store or path (a
+    /// server's 409). It cannot have landed.
+    NotStored,
 }
 
 impl Error {

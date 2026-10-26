@@ -281,6 +281,15 @@ pub(super) fn early_breaks(compiled: &crate::native_ui::CompiledUi) -> Vec<Strin
             if line.ends_with('-') || line.contains(FACT_SEPARATOR) {
                 continue;
             }
+            // A name breaks a word early where that is what lets its last line hold Changed
+            // ([`row_name_lines_holding`]).
+            let changed = |text: &str| format!("{text}{FACT_SEPARATOR}{CHANGED_WORD}");
+            if name.last().is_some_and(|(_, last, _)| last == next)
+                && row_label_width(&changed(next)) <= width + 0.01
+                && row_label_width(&changed(&format!("{line} {next}"))) > width + 0.01
+            {
+                continue;
+            }
             let Some((_, piece)) = line_pieces(next).into_iter().next() else {
                 continue;
             };
@@ -473,7 +482,12 @@ fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
                             continue;
                         }
                         rows += 1;
-                        let alone = row_name_lines(&name, row.rect.width).len();
+                        let alone = row_name_lines_holding(
+                            &name,
+                            &[CHANGED_WORD.to_string()],
+                            row.rect.width,
+                        )
+                        .len();
                         if lines.len() > alone + 1 {
                             faults.push(format!(
                                 "{scale}\u{d7} {width} {}: {name:?} on {} lines, {alone} alone: \

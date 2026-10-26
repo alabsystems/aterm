@@ -35,6 +35,7 @@ impl OperationId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum AppKind {
+    About,
     Settings,
     SystemState,
     Markdown,
@@ -45,6 +46,7 @@ pub(crate) enum AppKind {
 impl AppKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::About => "about",
             Self::Settings => "settings",
             Self::SystemState => "system-state",
             Self::Markdown => "markdown",
@@ -56,6 +58,7 @@ impl AppKind {
     /// Human-facing name, spelled as the apps' own tooltips spell it (`"Markdown · {uri}"`), so a tab's install-time tooltip never changes case on first refresh.
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
+            Self::About => "About aterm",
             Self::Settings => "Settings",
             Self::SystemState => "System State",
             Self::Markdown => "Markdown",
@@ -67,6 +70,7 @@ impl AppKind {
     /// The tab icon this app kind wears.
     pub(crate) const fn icon(self) -> AppIcon {
         match self {
+            Self::About => AppIcon::About,
             Self::Settings => AppIcon::Settings,
             Self::SystemState => AppIcon::Settings,
             Self::Markdown => AppIcon::Markdown,
@@ -153,6 +157,7 @@ impl CommonViewState {
 }
 
 pub(crate) enum AppViewState {
+    About(Box<crate::native_about::AboutViewState>),
     Settings(Box<crate::native_settings::SettingsViewState>),
     SystemState(Box<crate::system_state::SystemStateViewState>),
     Markdown(MarkdownViewState),
@@ -163,6 +168,7 @@ pub(crate) enum AppViewState {
 impl AppViewState {
     pub(crate) const fn kind(&self) -> AppKind {
         match self {
+            Self::About(_) => AppKind::About,
             Self::Settings(_) => AppKind::Settings,
             Self::SystemState(_) => AppKind::SystemState,
             Self::Markdown(_) => AppKind::Markdown,
@@ -173,6 +179,7 @@ impl AppViewState {
 
     pub(crate) fn common(&self) -> &CommonViewState {
         match self {
+            Self::About(view) => &view.common,
             Self::Settings(view) => &view.common,
             Self::SystemState(view) => &view.common,
             Self::Markdown(view) => &view.common,
@@ -190,6 +197,7 @@ impl AppViewState {
 
     pub(crate) fn common_mut(&mut self) -> &mut CommonViewState {
         match self {
+            Self::About(view) => &mut view.common,
             Self::Settings(view) => &mut view.common,
             Self::SystemState(view) => &mut view.common,
             Self::Markdown(view) => &mut view.common,
@@ -404,6 +412,7 @@ pub(crate) struct RecoveryPending {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryCapability {
+    About,
     SystemState,
     Settings {
         route: String,
@@ -439,6 +448,7 @@ pub(crate) struct RecoveryApp {
 }
 
 pub(crate) enum NativeApp {
+    About(Box<crate::native_about::AboutApp>),
     /// Boxed: the one Settings controller carries every page's projection and dwarfs the document apps, which are the many instances (as its view state is boxed in [`AppViewState::Settings`]).
     Settings(Box<crate::native_settings::SettingsApp>),
     SystemState(Box<crate::system_state::SystemStateApp>),
@@ -475,6 +485,7 @@ pub(crate) struct AppVTable {
 impl NativeApp {
     pub(crate) const fn vtable(&self) -> &'static AppVTable {
         match self {
+            Self::About(_) => &about_vtable::VTABLE,
             Self::Settings(_) => &settings_vtable::VTABLE,
             Self::SystemState(_) => &system_state_vtable::VTABLE,
             Self::Markdown(_) => &markdown_vtable::VTABLE,
@@ -489,7 +500,7 @@ impl NativeApp {
 
     pub(crate) const fn document_id(&self) -> Option<DocumentId> {
         match self {
-            Self::Settings(_) | Self::SystemState(_) => None,
+            Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
             Self::Markdown(app) => Some(app.document),
             Self::Editor(app) => Some(app.document),
             Self::Recovery(_) => None,
@@ -650,6 +661,7 @@ macro_rules! define_app_vtable {
     };
 }
 
+define_app_vtable!(about_vtable, About, About, AppKind::About, "about");
 define_app_vtable!(
     settings_vtable,
     Settings,
@@ -783,6 +795,7 @@ fn recovery_page_projection_at_scale(
         scale,
     );
     let capability = match &app.capability {
+        Some(RecoveryCapability::About) => "Retry reopens About aterm.",
         Some(RecoveryCapability::SystemState) => "Retry reopens System State.",
         Some(RecoveryCapability::Settings { .. }) => "Retry reopens this Settings page.",
         Some(RecoveryCapability::Document { .. }) => {
@@ -1353,6 +1366,7 @@ impl NativeAppModel for RecoveryApp {
 impl RecoveryApp {
     fn diagnostics_text(&self) -> String {
         let capability = match &self.capability {
+            Some(RecoveryCapability::About) => "about".to_string(),
             Some(RecoveryCapability::SystemState) => "system-state".to_string(),
             Some(RecoveryCapability::Settings { route }) => format!("settings-route={route}"),
             Some(RecoveryCapability::Document {
@@ -2714,7 +2728,8 @@ impl NativeRuntime {
             {
                 editor.config_watch_status.clone_from(&watch_status);
             }
-            AppViewState::SystemState(_)
+            AppViewState::About(_)
+            | AppViewState::SystemState(_)
             | AppViewState::Markdown(_)
             | AppViewState::Editor(_)
             | AppViewState::Recovery(_) => {}
@@ -2816,27 +2831,14 @@ impl NativeRuntime {
         changed
     }
 
-    /// One page tick ([`crate::system_state::SystemStateApp::tick`]): the page
-    /// is `shown` (the active view of some window), and its village walks when
-    /// a view in `seen` (every view someone can see, one in an unfocused split
-    /// pane included) drew it walking at its last render. A view nobody sees
-    /// never decides it, whatever size it last rendered at.
-    pub(crate) fn tick_system_state(&mut self, active: bool, shown: bool, seen: &[ViewId]) -> bool {
-        self.tick_system_state_at(std::time::Instant::now(), active, shown, seen)
-    }
-
-    /// Pause at a visibility event boundary without repainting or submitting.
-    pub(crate) fn pause_system_state_review(&mut self) {
-        self.update_system_state(|state| {
-            state.pause_review();
-            false
-        });
-    }
-
-    pub(crate) fn tick_system_state_at(
+    /// One page tick ([`crate::system_state::SystemStateApp::tick`]): a person is `present` at
+    /// this Mac, the page is `shown` (the active view of some window), and its village walks
+    /// when a view in `seen` (every view someone can see, one in an unfocused split pane
+    /// included) drew it walking at its last render. A view nobody sees never decides it,
+    /// whatever size it last rendered at.
+    pub(crate) fn tick_system_state(
         &mut self,
-        now: std::time::Instant,
-        active: bool,
+        present: bool,
         shown: bool,
         seen: &[ViewId],
     ) -> bool {
@@ -2844,7 +2846,7 @@ impl NativeRuntime {
             matches!(self.views.get(view), Some(AppViewState::SystemState(state))
                 if state.village_walks())
         });
-        self.update_system_state(|state| state.tick_at(now, active, shown, walks))
+        self.update_system_state(|state| state.tick(present, shown, walks))
     }
 
     pub(crate) fn offer_system_state(
@@ -2929,17 +2931,13 @@ impl NativeRuntime {
     }
 
     /// Note whose gesture System State handles next (a person's, or a control
-    /// client's), and permanently stop this startup offer's automatic Apply.
-    /// Only its label changes; the host dirties its views without retiring
-    /// the presented control that this same press will release on.
-    pub(crate) fn system_state_gesture(&mut self, by_person: bool) -> bool {
-        self.instances
-            .values_mut()
-            .find_map(|app| match app {
-                NativeApp::SystemState(state) => Some(state.gesture(by_person)),
-                _ => None,
-            })
-            .unwrap_or(false)
+    /// client's).
+    pub(crate) fn system_state_gesture(&mut self, by_person: bool) {
+        for app in self.instances.values_mut() {
+            if let NativeApp::SystemState(state) = app {
+                state.gesture(by_person);
+            }
+        }
     }
 
     pub(crate) fn document_id(&self, instance: AppInstanceId) -> Option<DocumentId> {
@@ -2961,7 +2959,8 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::SystemState(_)
+            NativeApp::About(_)
+            | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_) => None,
@@ -2991,7 +2990,8 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::SystemState(_)
+            NativeApp::About(_)
+            | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_) => None,
@@ -3011,7 +3011,8 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::SystemState(_)
+            NativeApp::About(_)
+            | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_) => None,
@@ -3031,7 +3032,8 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::SystemState(_)
+            NativeApp::About(_)
+            | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_) => None,
@@ -3171,7 +3173,8 @@ impl NativeRuntime {
                 {
                     &mut editor.config_watch_status
                 }
-                AppViewState::SystemState(_)
+                AppViewState::About(_)
+                | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
                 | AppViewState::Editor(_)
                 | AppViewState::Recovery(_) => {
@@ -3192,7 +3195,8 @@ impl NativeRuntime {
                     editor.common.presentation_revision =
                         editor.common.presentation_revision.saturating_add(1);
                 }
-                AppViewState::SystemState(_)
+                AppViewState::About(_)
+                | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
                 | AppViewState::Recovery(_) => {}
             }
@@ -3291,6 +3295,7 @@ impl NativeRuntime {
         match self.instances.get(&instance)? {
             NativeApp::Editor(editor) if editor.config_editor => editor.config_analysis.as_ref(),
             NativeApp::Settings(_)
+            | NativeApp::About(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
@@ -3311,6 +3316,7 @@ impl NativeRuntime {
         match self.instances.get(&instance)? {
             NativeApp::Editor(editor) => editor.config_assist(snapshot, caret),
             NativeApp::Settings(_)
+            | NativeApp::About(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Recovery(_) => None,
@@ -3430,7 +3436,10 @@ impl NativeRuntime {
                     editor.title.clone(),
                     editor.canonical_uri.clone(),
                 )),
-                NativeApp::Settings(_) | NativeApp::SystemState(_) | NativeApp::Recovery(_) => None,
+                NativeApp::About(_)
+                | NativeApp::Settings(_)
+                | NativeApp::SystemState(_)
+                | NativeApp::Recovery(_) => None,
             })
             .collect()
     }
@@ -3447,7 +3456,10 @@ impl NativeRuntime {
                 NativeApp::Editor(app) => {
                     Some((*instance, app.base_title.clone(), app.canonical_uri.clone()))
                 }
-                NativeApp::Settings(_) | NativeApp::SystemState(_) | NativeApp::Recovery(_) => None,
+                NativeApp::About(_)
+                | NativeApp::Settings(_)
+                | NativeApp::SystemState(_)
+                | NativeApp::Recovery(_) => None,
             })
             .collect::<Vec<_>>();
         let mut by_basename = BTreeMap::<String, Vec<(AppInstanceId, String)>>::new();
@@ -6732,6 +6744,7 @@ impl NativeAppModel for EditorApp {
             &crate::native_ui::editor_toolbar_items(toolbar),
             shell.command_bar_width,
             command_gap,
+            shell.command_row_cap,
         );
         let edit_header_row = view.edit_header.as_ref().map(|header| {
             let part = |key: &'static str,
@@ -7902,7 +7915,9 @@ mod markdown_reader_tests {
             let state = match kind {
                 AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
                 AppKind::Editor => AppViewState::Editor(Box::default()),
-                AppKind::Settings | AppKind::SystemState | AppKind::Recovery => unreachable!(),
+                AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
+                    unreachable!()
+                }
             };
             runtime.attach_view(view, instance, state).unwrap();
         }

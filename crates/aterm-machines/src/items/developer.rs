@@ -39,6 +39,26 @@ pub const LIST_BUDGET: Duration = Duration::from_secs(20 * 60);
 /// `softwareupdate -i` downloads about half a gigabyte and installs it.
 pub const INSTALL_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// How long a run waits for Apple's installer window ([`XCODE_SELECT`] `--install`) to finish
+/// once it is on screen: a person presses Install, and the download and install take minutes.
+pub const INSTALLER_PATIENCE: Duration = Duration::from_secs(30 * 60);
+
+/// How often that wait looks for the installed tools, in this process.
+const INSTALLER_TICK: Duration = Duration::from_secs(2);
+
+/// Why the tools wait while the network is in Low Data Mode.
+pub const LOW_DATA: &str = "Low Data Mode is on for this network, and the Command Line Tools \
+                            are about half a gigabyte to download: turn it off for this network \
+                            in System Settings > Network, or join another network, then run \
+                            `aterm init --only base.clt`";
+
+/// [`LOW_DATA`] when the network this Mac uses now is in Low Data Mode
+/// ([`System::low_data_mode`]); nothing when it is not, or cannot be told.
+#[must_use]
+pub fn low_data(sys: &dyn System) -> Option<&'static str> {
+    (sys.low_data_mode() == Some(true)).then_some(LOW_DATA)
+}
+
 /// The `[developer]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,10 +259,7 @@ impl CommandLineTools {
         }
         let labels = parse_labels(&listed);
         let Some(label) = pick(&labels) else {
-            return Err(format!(
-                "{} lists no Command Line Tools for Xcode, with the on-demand placeholder in place",
-                list.display()
-            ));
+            return Self::through_installer(sys, &list);
         };
         let install = Cmd::new(SOFTWAREUPDATE)
             .args(["-i", label.label.as_str()])
@@ -273,6 +290,48 @@ impl CommandLineTools {
             ));
         }
         Ok(())
+    }
+}
+
+impl CommandLineTools {
+    /// Where `softwareupdate` lists no tools (`list` read the catalog): Apple's own installer
+    /// window (`xcode-select --install`), which a person at this run's terminal presses Install
+    /// in, then a wait in this process for the installed tools, every [`INSTALLER_TICK`] for at
+    /// most [`INSTALLER_PATIENCE`], ended early by a stop.
+    fn through_installer(sys: &dyn System, list: &Cmd) -> Result<(), String> {
+        let open = Cmd::new(XCODE_SELECT).arg("--install");
+        let unlisted = format!(
+            "{} lists no Command Line Tools for Xcode, with the on-demand placeholder in place",
+            list.display()
+        );
+        run_ok(sys, &open).map_err(|why| format!("{unlisted}, and {why}"))?;
+        say(&format!(
+            "{unlisted}: Apple's installer is open on screen instead; press Install there \
+             (Ctrl-C stops waiting)"
+        ));
+        let ticks = INSTALLER_PATIENCE.as_millis() / INSTALLER_TICK.as_millis();
+        for _ in 0..ticks {
+            if installed(sys)? {
+                return Ok(());
+            }
+            if let Some(signal) = sys.stopped() {
+                return Err(format!(
+                    "stopped by signal {signal} while Apple's installer was open (`{}`); \
+                     the tools are not installed yet",
+                    open.display()
+                ));
+            }
+            sys.sleep(INSTALLER_TICK);
+        }
+        if installed(sys)? {
+            return Ok(());
+        }
+        Err(format!(
+            "{unlisted}, and Apple's installer (`{}`) did not install them within {} minutes: \
+             press Install in its window, then run `aterm init --only base.clt`",
+            open.display(),
+            INSTALLER_PATIENCE.as_secs() / 60
+        ))
     }
 }
 
@@ -314,6 +373,9 @@ impl Item for CommandLineTools {
             }
             (true, None) => Planned::Select,
             (false, _) => {
+                if let Some(why) = low_data(sys) {
+                    return Probe::Blocked { why: why.into() };
+                }
                 let probe = Cmd::new("/usr/bin/curl")
                     .args([
                         "--disable",
@@ -646,6 +708,139 @@ Software Update found the following new or updated software:\n\
             "the stops stay caught until the placeholder is gone: {calls:?}"
         );
         assert!(at("stop sent again").is_none(), "{calls:?}");
+    }
+
+    /// In Low Data Mode the probe plans nothing and reads nothing from Apple: the half-gigabyte
+    /// download waits, saying why; with Low Data Mode off (the negative control) it plans the
+    /// install.
+    #[test]
+    fn low_data_mode_holds_the_download_back_and_says_how_to_go_on() {
+        let items = expand(
+            &Table {
+                command_line_tools: Some(true),
+            },
+            &ctx(),
+        )
+        .unwrap();
+        let mut sys = Fake::root();
+        sys.low_data = Some(true);
+        sys.on("/usr/bin/xcode-select -p", none_selected());
+        assert_eq!(
+            items[0].probe(&sys, &ctx()),
+            Probe::Blocked {
+                why: LOW_DATA.into()
+            }
+        );
+        assert!(LOW_DATA.contains("`aterm init --only base.clt`"));
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|c| !c.contains("curl") && !c.contains("softwareupdate")),
+            "{:?}",
+            sys.calls()
+        );
+        for low_data in [Some(false), None] {
+            let mut sys = Fake::root();
+            sys.low_data = low_data;
+            sys.on("/usr/bin/xcode-select -p", none_selected())
+                .on(CURL, reachable());
+            assert!(
+                matches!(items[0].probe(&sys, &ctx()), Probe::Change { .. }),
+                "{low_data:?}"
+            );
+        }
+    }
+
+    /// Where `softwareupdate` lists no tools, Apple's installer window opens instead and the run
+    /// waits in this process (no `sleep` child) until the tools are there; no `sudo` is run
+    /// (the root half already runs as root). A stop ends the wait, and an installer that never
+    /// finishes is a failure that says what to press.
+    #[test]
+    fn an_unlisted_catalog_opens_apples_installer_and_waits_for_the_tools() {
+        let unlisted = || {
+            Ran::ok(
+                "Software Update Tool\n\nFinding available software\nNo new software available.\n",
+            )
+        };
+        let sys = Fake::root();
+        sys.on("/usr/sbin/softwareupdate -l", unlisted()).on(
+            "/usr/bin/xcode-select --install",
+            Ran::ok("xcode-select: note: install requested for command line developer tools\n"),
+        );
+        sys.on_sleep(|sys, _| {
+            if sys
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("sleep "))
+                .count()
+                == 3
+            {
+                sys.stat_of(CLT_GIT, git());
+            }
+        });
+        CommandLineTools::install(&sys).unwrap();
+        let calls = sys.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle)).unwrap();
+        assert!(
+            at("create /tmp/.com.apple.dt.CommandLineTools") < at("/usr/sbin/softwareupdate -l")
+        );
+        assert!(at("/usr/sbin/softwareupdate -l") < at("/usr/bin/xcode-select --install"));
+        assert!(at("/usr/bin/xcode-select --install") < at("sleep 2000ms"));
+        assert!(at("sleep 2000ms") < at("remove /tmp/.com.apple.dt.CommandLineTools"));
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("sleep ")).count(),
+            3,
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().all(|c| !c.contains("/bin/sleep")
+                && !c.contains("sudo")
+                && !c.starts_with("/usr/sbin/softwareupdate -i")),
+            "{calls:?}"
+        );
+
+        let mut stopped = Fake::root();
+        stopped.stop_after = Some(2);
+        stopped
+            .on("/usr/sbin/softwareupdate -l", unlisted())
+            .on("/usr/bin/xcode-select --install", Ran::ok(""));
+        let why = CommandLineTools::install(&stopped).unwrap_err();
+        assert!(
+            why.starts_with("stopped by signal 2 while Apple's installer"),
+            "{why}"
+        );
+
+        let never = Fake::root();
+        never
+            .on("/usr/sbin/softwareupdate -l", unlisted())
+            .on("/usr/bin/xcode-select --install", Ran::ok(""));
+        let why = CommandLineTools::install(&never).unwrap_err();
+        assert!(
+            why.contains("did not install them within 30 minutes"),
+            "{why}"
+        );
+        assert!(why.contains("`aterm init --only base.clt`"), "{why}");
+        let waits = never
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("sleep "))
+            .count();
+        assert_eq!(waits, 900, "every 2 s for 30 minutes");
+
+        let refused = Fake::root();
+        refused.on("/usr/sbin/softwareupdate -l", unlisted()).on(
+            "/usr/bin/xcode-select --install",
+            Ran::exit(
+                1,
+                "xcode-select: error: command line tools are already installed\n",
+            ),
+        );
+        let why = CommandLineTools::install(&refused).unwrap_err();
+        assert!(
+            why.contains("lists no Command Line Tools") && why.contains("already installed"),
+            "{why}"
+        );
+        assert!(refused.calls().iter().all(|c| !c.starts_with("sleep ")));
     }
 
     /// The placeholder is removed, then the stops are restored, then the one caught is sent again.

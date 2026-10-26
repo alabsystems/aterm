@@ -376,7 +376,8 @@ pub(super) struct TitleState {
     pub(super) icon: Arc<str>,
     /// Title stack for CSI 22/23 t, capped at `TITLE_STACK_MAX_DEPTH`.
     pub(super) stack: Vec<TitleStackEntry>,
-    /// Monotonic counter bumped each time a tab-label value changes (not on no-op re-sets): the window title, or the shell-reported cwd (OSC 7 / OSC 633 `P;Cwd=`) shown when no title is set.
+    /// Monotonic counter for window-title or stored shell-reported cwd path/host changes.
+    /// Cwd changes advance it even while an explicit title is set; identical cwd reports do not.
     pub(super) epoch: std::sync::atomic::AtomicU64,
 }
 

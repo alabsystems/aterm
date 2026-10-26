@@ -10,6 +10,9 @@ use aterm_containment::DevToolGrant;
 /// Minimum interval between focus-triggered re-reads while aterm is not on the list.
 pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(60);
 
+/// A read owed an approval or grant retries even when a worker could not start.
+const OWED_READ_RETRY: Duration = Duration::from_secs(1);
+
 /// What one reading asks of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -40,6 +43,15 @@ pub(crate) struct DevToolsWatch {
     handed_over: bool,
     /// Whether the next focus gain should re-read immediately after a Settings hand-over.
     read_on_return: bool,
+    /// Full Disk Access is held ([`Self::note_fda_granted`]): the list reads, so an `Unknown`
+    /// reading no longer means it cannot be read.
+    fda_granted: bool,
+    /// A grant or new approval owes a read until its current completion is observed.
+    read_owed: bool,
+    /// The approval whose fresh reading keeps the new-revision page's recent-open deferral.
+    read_revision: Option<u64>,
+    /// The last reading was `Unknown` while Full Disk Access was held: re-read as for `NotGranted`.
+    unknown_with_fda: bool,
     /// Whether a transition to `Granted` owes a macOS verdict refresh.
     refresh_owed: bool,
     /// Whether the current switch-on already requested a refresh.
@@ -69,7 +81,8 @@ impl DevToolsWatch {
         self.read_held
             || !self.read_once
             || self.read_on_return
-            || (self.awaiting_owner
+            || self.read_owed
+            || ((self.awaiting_owner || self.unknown_with_fda)
                 && self
                     .last_read
                     .is_none_or(|at| now.saturating_duration_since(at) >= REREAD_EVERY))
@@ -89,9 +102,46 @@ impl DevToolsWatch {
         self.read_held
     }
 
+    pub(crate) const fn owes_read(&self) -> bool {
+        self.read_held() || self.read_owed
+    }
+
+    /// Keep a refused dispatch or retired in-flight completion from spending this read.
+    pub(crate) fn read_deadline(&self, now: Instant) -> Option<Instant> {
+        self.read_owed
+            .then(|| self.last_read.map_or(now, |at| at + OWED_READ_RETRY))
+    }
+
+    /// A new approval must read this Mac now, even after the last one read Granted.
+    pub(crate) fn read_for_revision(&mut self, revision: u64) {
+        self.read_revision = Some(revision);
+        self.read_owed = true;
+        self.last_read = None;
+        self.forget_hand_over();
+    }
+
+    pub(crate) const fn reading_revision(&self) -> Option<u64> {
+        self.read_revision
+    }
+
+    pub(crate) fn take_reading_revision(&mut self) -> Option<u64> {
+        self.read_revision.take()
+    }
+
     /// Records that aterm opened the Developer Tools pane so the next focus gain re-reads.
     pub(crate) const fn note_handed_over(&mut self) {
         self.read_on_return = true;
+    }
+
+    /// Full Disk Access reads granted: the list can be read now, so one read is owed at once (the
+    /// window makes it without waiting for a focus gain), once per process, and stays owed until
+    /// a reading is observed. Unlike [`Self::note_handed_over`] it owes no verdict refresh:
+    /// nothing was handed over.
+    pub(crate) const fn note_fda_granted(&mut self) {
+        if !self.fda_granted {
+            self.fda_granted = true;
+            self.read_owed = true;
+        }
     }
 
     /// Resets the hand-over latch after an inconclusive helper attempt or a newly approved access
@@ -102,6 +152,11 @@ impl DevToolsWatch {
 
     /// What a completed reading asks for.
     pub(crate) fn observe(&mut self, grant: DevToolGrant, opened_this_revision: bool) -> Step {
+        // A panel's independent observation does not consume a new approval's slot read.
+        if self.read_revision.is_none() {
+            self.read_owed = false;
+        }
+        self.unknown_with_fda = grant == DevToolGrant::Unknown && self.fda_granted;
         match grant {
             DevToolGrant::Granted => {
                 if self.awaiting_owner {
@@ -167,8 +222,8 @@ impl DevToolsWatch {
 mod tests {
     use super::*;
 
-    /// Reads once at launch, re-reads only while `NotGranted`, and hands over once per approved
-    /// revision.
+    /// Reads once at launch, re-reads only while `NotGranted` (an `Unknown` reading, while Full
+    /// Disk Access is not held, reads nothing more), and hands over once per approved revision.
     #[test]
     fn the_watch_reads_at_launch_and_while_the_owner_is_wanted() {
         let t0 = Instant::now();
@@ -176,7 +231,10 @@ mod tests {
         assert!(watch.wants_read(t0), "the launch read");
         assert!(!watch.wants_read(t0), "one launch read, not one per focus");
         assert_eq!(watch.observe(DevToolGrant::Unknown, false), Step::Nothing);
-        assert!(!watch.wants_read(t0 + REREAD_EVERY * 9));
+        assert!(
+            !watch.wants_read(t0 + REREAD_EVERY * 9),
+            "no Full Disk Access: the list cannot be read, so it is not read again"
+        );
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
             Step::NotOn { hand_over: true }
@@ -212,6 +270,61 @@ mod tests {
             watch.observe(DevToolGrant::NotGranted, false),
             Step::NotOn { hand_over: false }
         );
+    }
+
+    /// Full Disk Access granted after an `Unknown` launch reading owes one read at once, with no
+    /// focus gain and no verdict refresh, until a reading is observed, and its `NotGranted` asks
+    /// for the page; a second grant owes none. Once it is held an `Unknown` reading is read again
+    /// at the cadence. Negative control: with no grant noted, the `Unknown` reading reads nothing
+    /// more.
+    #[test]
+    fn a_full_disk_access_grant_reads_the_list_once_at_once() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let mut watch = DevToolsWatch::default();
+        assert!(watch.wants_read(t0), "the launch read");
+        assert_eq!(watch.observe(DevToolGrant::Unknown, false), Step::Nothing);
+        assert!(
+            !watch.due(t1) && !watch.wants_read(t0 + REREAD_EVERY * 9),
+            "the control: no grant, no read"
+        );
+
+        let mut watch = DevToolsWatch::default();
+        assert!(watch.wants_read(t0), "the launch read");
+        assert_eq!(watch.observe(DevToolGrant::Unknown, false), Step::Nothing);
+        watch.note_fda_granted();
+        assert!(watch.due(t1), "owed at once");
+        assert!(watch.wants_read(t1), "the grant's read");
+        assert!(
+            watch.wants_read(t1),
+            "no reading came back (the probe could not read yet): still owed"
+        );
+        assert_eq!(
+            watch.observe(DevToolGrant::NotGranted, false),
+            Step::NotOn { hand_over: true },
+            "not on the list: the page is asked for"
+        );
+        assert!(
+            !watch.take_return_prime(false, DevToolGrant::NotGranted),
+            "nothing was handed over: no verdict refresh"
+        );
+        watch.note_fda_granted();
+        assert!(!watch.wants_read(t1), "one read: a second grant owes none");
+
+        let mut watch = DevToolsWatch::default();
+        assert!(watch.wants_read(t0));
+        let _ = watch.observe(DevToolGrant::Unknown, false);
+        watch.note_fda_granted();
+        assert!(watch.wants_read(t1));
+        assert_eq!(watch.observe(DevToolGrant::Unknown, false), Step::Nothing);
+        assert!(!watch.wants_read(t1 + REREAD_EVERY / 2), "the cadence");
+        assert!(
+            watch.wants_read(t1 + REREAD_EVERY),
+            "held, an unread list is read again"
+        );
+        assert_eq!(watch.observe(DevToolGrant::Granted, false), Step::Clear);
+        assert!(!watch.take_refresh(), "no switch-on was seen");
+        assert!(!watch.wants_read(t1 + REREAD_EVERY * 9), "on the list");
     }
 
     /// A held read is made once though the launch read was spent; `due` spends nothing. Negative

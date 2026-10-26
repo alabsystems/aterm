@@ -1221,12 +1221,9 @@ fn remedy_words(remedy: &Remedy) -> Option<String> {
     };
     let words = match remedy {
         Remedy::Command(command) => format!("fix: {}", act(command)),
-        Remedy::Repair => String::from("fix: aterm pkg repair"),
-        Remedy::Init { only } => format!("fix: aterm init --only {only}"),
-        Remedy::Develop => String::from("fix: aterm init --develop"),
-        Remedy::Provision { args } => format!("fix: targo --unverified verify provision {args}")
-            .trim_end()
-            .to_owned(),
+        Remedy::Repair | Remedy::Init { .. } | Remedy::Develop | Remedy::Provision { .. } => {
+            format!("fix: {}", remedy.command()?)
+        }
         Remedy::Person { how, .. } => format!("fix: {}", act(how)),
         Remedy::Network => String::from("the next pass, once online"),
         Remedy::None => return None,

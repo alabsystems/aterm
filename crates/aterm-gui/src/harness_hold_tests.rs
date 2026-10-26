@@ -327,6 +327,7 @@ fn row(
     hold: Option<HeldGlass>,
 ) -> HarnessSessionRow {
     HarnessSessionRow {
+        stopped: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -917,4 +918,220 @@ fn a_fixed_legs_words_and_the_tip_are_the_ones_beside_the_leg() {
     for leg in [HoldLeg::Needs, HoldLeg::Repo, HoldLeg::Open] {
         assert_eq!(leg.fixed_words(), None, "{leg:?} names what its reply held");
     }
+}
+
+/// Tab `sid`'s loop tells the exception standing at its point (`None`: its hold lifted).
+fn tell_stop(
+    app: &mut App,
+    sid: &str,
+    standing: Option<aterm_agent::supervise::policy::exception::Exception>,
+) {
+    app.note_harness_host(crate::harness_host::HostNote::ResumeException {
+        sid: sid.to_string(),
+        agent: aterm_phase::Program::Claude,
+        standing,
+    });
+}
+
+/// Session 0's chip title as its hover draws it under `view`, its spoken description, the
+/// Settings page's state line, the tab's hover, the worker row's tip and `status held=`.
+fn stop_surfaces(app: &mut App, view: crate::autopilot::AutopilotView) -> [String; 6] {
+    let chip = ChipGlass::default();
+    let title =
+        crate::claude_lights::title_parts(&app.harness_glass, &app.pool, 0, &(view, chip)).whole;
+    let (_, spoken) = app.autopilot_spoken(0, view, &chip);
+    if !app.harness_page_shown() {
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+    }
+    let instance = app
+        .native_runtime
+        .instance_by_kind(crate::native_app::AppKind::Settings)
+        .expect("the Settings controller");
+    let Some(crate::native_app::NativeApp::Settings(settings)) = app.native_runtime.app(instance)
+    else {
+        unreachable!("a Settings instance")
+    };
+    let line = settings.harness_snapshot().projection().sessions[0].state_line();
+    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
+    let tip = app.status_session_row(&handle).landing_tip;
+    [
+        title,
+        spoken.unwrap_or_default(),
+        line.unwrap_or_default(),
+        driven(app).unwrap_or_default(),
+        tip.unwrap_or_default(),
+        status(app, "held"),
+    ]
+}
+
+#[test]
+fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
+    use crate::autopilot::AutopilotView;
+    use crate::harness_glass::stop_words;
+    use aterm_agent::harness::acts::{HeldBy, STOPPED_TYPING};
+    use aterm_agent::supervise::policy::exception::Exception;
+    let sep = crate::native_ui::FACT_SEPARATOR;
+    for held_by in HeldBy::ALL {
+        for standing in [
+            Exception::repeats_land(held_by, None),
+            Exception::repeats(held_by),
+        ] {
+            let case = format!("{held_by:?} {:?}", standing.when);
+            let (mut app, sid, _host) = desk("land");
+            tell_hold(&mut app, &sid, Some(held()));
+            app.apply_harness_fact(
+                &sid,
+                crate::HarnessFact::Pause(Some(crate::PausePlan {
+                    at_unix: SINCE_S + 240,
+                    short: 2,
+                })),
+            );
+            let pause = app
+                .harness_glass
+                .get(&0)
+                .and_then(|g| g.pause)
+                .expect("CONTROL: the pause on the glass");
+            let before = stop_surfaces(&mut app, AutopilotView::Land);
+            let paused = pause.state_words(Some(crate::harness_glass::wall_today().1));
+            assert!(before[2].contains(&paused), "{case}: CONTROL: {before:#?}");
+            assert!(
+                before.iter().all(|s| !s.contains(STOPPED_TYPING)),
+                "{case}: CONTROL: {before:#?}"
+            );
+            assert_eq!(before[5], "-", "{case}");
+            tell_stop(&mut app, &sid, Some(standing));
+            let [title, spoken, line, hover, tip, field] =
+                stop_surfaces(&mut app, AutopilotView::Land);
+            assert!(
+                title.starts_with(&format!(
+                    "autopilot: land \u{2014} {}{sep}not landed yet",
+                    stop_words(held_by, HoldForm::Title)
+                )),
+                "{case}: {title}"
+            );
+            assert!(
+                !title.contains("last: "),
+                "{case}: the trail gives way: {title}"
+            );
+            assert!(
+                spoken.starts_with(&stop_words(held_by, HoldForm::Spoken)),
+                "{case}: {spoken}"
+            );
+            assert!(
+                line.starts_with(&format!(
+                    "{}{sep}not landed yet: ",
+                    stop_words(held_by, HoldForm::Line)
+                )),
+                "{case}: {line}"
+            );
+            assert!(
+                !line.contains(&paused),
+                "{case}: the lapsed pause goes: {line}"
+            );
+            assert!(
+                hover.starts_with(&format!(
+                    "driven by aterm (land: {}; not landed yet, ",
+                    stop_words(held_by, HoldForm::Hover)
+                )),
+                "{case}: {hover}"
+            );
+            assert!(
+                tip.starts_with(&format!(
+                    "{}{sep}not landed yet: ",
+                    stop_words(held_by, HoldForm::Tip)
+                )),
+                "{case}: {tip}"
+            );
+            assert_eq!(field, held_by.word(), "{case}");
+            tell_stop(&mut app, &sid, None);
+            let after = stop_surfaces(&mut app, AutopilotView::Land);
+            assert!(
+                after.iter().all(|s| !s.contains(STOPPED_TYPING)),
+                "{case}: the lift takes every stop word: {after:#?}"
+            );
+            assert_eq!(after[5], "-", "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
+    use crate::autopilot::{AutopilotView, mode_words};
+    use crate::harness_glass::stop_words;
+    use aterm_agent::harness::acts::{HeldBy, STOPPED_TYPING};
+    use aterm_agent::supervise::Autopilot;
+    use aterm_agent::supervise::policy::exception::Exception;
+    let (mut app, sid, _host) = desk("cruise");
+    let promise = mode_words(Autopilot::Cruise).chip;
+    let before = stop_surfaces(&mut app, AutopilotView::Cruise);
+    assert!(before[0].contains(promise), "CONTROL: {before:#?}");
+    tell_stop(&mut app, &sid, Some(Exception::repeats(HeldBy::SameReply)));
+    let [title, _, line, hover, _, field] = stop_surfaces(&mut app, AutopilotView::Cruise);
+    assert!(
+        title.starts_with(&format!(
+            "autopilot: cruise \u{2014} {}",
+            stop_words(HeldBy::SameReply, HoldForm::Title)
+        )),
+        "{title}"
+    );
+    assert!(!title.contains(promise), "{title}");
+    assert!(
+        line.starts_with(&stop_words(HeldBy::SameReply, HoldForm::Line)),
+        "{line}"
+    );
+    assert_eq!(
+        hover,
+        format!(
+            "driven by aterm (cruise: {})",
+            stop_words(HeldBy::SameReply, HoldForm::Hover)
+        )
+    );
+    assert_eq!(field, HeldBy::SameReply.word());
+    // A Cruise worker is never landing, and its row in the menu bar says the stop all the same.
+    {
+        use crate::status_item::{Glance, SessionRow, TaskRow, compose_status_menu, menu_lines};
+        const NOW: i64 = 1_800_000_000;
+        let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
+        let worker = SessionRow {
+            task: Some(TaskRow {
+                state: crate::task_record::TaskState::Working,
+                why: None,
+                from: "s-manager".to_string(),
+                entered: 7,
+                since_unix_ms: u64::try_from(NOW - 4 * 60).expect("positive") * 1000,
+                result_bytes: 0,
+                result_path: None,
+                seen: false,
+            }),
+            ..app.status_session_row(&handle)
+        };
+        assert!(!worker.landing, "CONTROL: Cruise does not land");
+        let manager = SessionRow {
+            id: 99,
+            sid: "s-manager".to_string(),
+            title: "lab-sweep".to_string(),
+            agent: "busy",
+            ..SessionRow::default()
+        };
+        let glance = Glance::build(
+            &[manager, worker],
+            &[],
+            None,
+            u64::try_from(NOW).expect("positive") * 1000,
+            None,
+        );
+        let lines = menu_lines(&compose_status_menu(&glance, NOW), &[]);
+        let tip = format!("tip=\"{}\"", stop_words(HeldBy::SameReply, HoldForm::Tip));
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(&tip)).count(),
+            1,
+            "the worker's row says the stop: {lines:#?}"
+        );
+    }
+    meta(&mut app, "set autopilot off");
+    let off = stop_surfaces(&mut app, AutopilotView::Off);
+    assert!(
+        off[..4].iter().all(|s| !s.contains(STOPPED_TYPING)),
+        "Off types nothing, so no stop is said: {off:#?}"
+    );
 }

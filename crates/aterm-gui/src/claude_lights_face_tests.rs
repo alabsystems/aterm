@@ -1356,6 +1356,7 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
             ("an unread hold and a need", Some(&fresh), Some(&need)),
         ] {
             let words = TitleWords {
+                stopped: None,
                 hold,
                 need: said_need,
             };
@@ -1476,6 +1477,7 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
                 trail,
                 Some(TODAY),
                 TitleWords {
+                    stopped: None,
                     hold: None,
                     need: Some(need),
                 },
@@ -1518,6 +1520,7 @@ fn a_held_landing_keeps_the_titles_four_lean_forms() {
         ..ChipGlass::default()
     };
     let words = TitleWords {
+        stopped: None,
         hold: Some(&hold),
         need: Some(&need),
     };

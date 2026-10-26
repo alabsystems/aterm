@@ -129,6 +129,8 @@ pub struct ActRequest<'a> {
 /// A parsed `open app ...` request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenAppRequest<'a> {
+    /// Focus or create the dedicated About native view.
+    About,
     /// Focus or create the System State native view.
     SystemState,
     /// Focus or create the Settings view at `route`.
@@ -267,16 +269,17 @@ pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
     })
 }
 
-/// Parse `open app` arguments (`system-state`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
+/// Parse `open app` arguments (`about`, `system-state`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
 pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     reject_line_break(rest, "open payload")?;
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <system-state|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <about|system-state|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
+        Some("about") if remainder(input).is_empty() => Ok(OpenAppRequest::About),
         Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
         Some("settings") => {
             let route = remainder(input);
@@ -302,7 +305,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         }
         Some(_) => Err(ParseError::UnknownApp),
         None => Err(ParseError::Usage(
-            "open app <system-state|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <about|system-state|settings [route]|markdown <uri>|editor <uri>>",
         )),
     }
 }
@@ -455,6 +458,9 @@ mod tests {
 
     #[test]
     fn open_request_is_parsed_but_not_canonicalized_or_authorized() {
+        assert_eq!(parse_open_app("app about"), Ok(OpenAppRequest::About));
+        assert!(parse_open_app("app about /extra").is_err());
+        assert!(parse_open_app("app about\nact app/v1").is_err());
         assert_eq!(
             parse_open_app("app system-state"),
             Ok(OpenAppRequest::SystemState)

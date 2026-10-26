@@ -21,6 +21,12 @@
 //! gone back or never elected, rather than running out. A host's look takes over what an ended
 //! host left of its sessions as it begins, before its pass (`ask::take_over`), and steps the lease
 //! after it, so a successor whose first pass runs past `ask::ADOPT_MS` keeps its session's pick.
+//!
+//! In the projected form (the design's §8.7, `World::projected`) the first host's looks are
+//! pressed by a crossing its fill ring projects (`ask::Ahead::projected`) at a free figure past its
+//! plain floor, where the plain walk reads the volume below it: the model's H reads the volume
+//! short there, the lease's floor stays the plain one, and the other host's look while the first
+//! host's projection record stands ends nothing, as the model's H holds the episode.
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -29,6 +35,7 @@ use aterm_agent::harness::disk::Level;
 use aterm_agent::harness::disk::ask::{
     self, Break, Done, Entry, HeldBy, HostId, Lease, Miss, Phase, Pick, Roster, Said, Seat,
 };
+use aterm_agent::harness::disk::fill::Projection;
 use aterm_models_harness::disk_free_ask_model;
 use aterm_spec::derive::Model;
 
@@ -50,6 +57,16 @@ const MARGIN: u64 = 5 * GIB;
 /// What the volume reads at each of the model's `free` places: below both floors, within the
 /// margin above L's, past it and below H's, within the margin above H's, past it.
 const PLACES: [u64; 5] = [20 * GIB, 34 * GIB, 40 * GIB, 50 * GIB, 60 * GIB];
+
+/// The volume's size, for a projection's horizon fill.
+const TOTAL: u64 = 1000 * GIB;
+
+/// The fill rate of the projected form ([`World::projected`]): 320 KiB/s, so from 50 GiB free the
+/// crossing of the first host's floor is 109 minutes away and a projected episode's windows keep
+/// their caps (`ask::DELIVER_MS`, `ask::ANSWER_MS`), and the projected walk's timings are the
+/// plain walk's. Whether a crossing lies within the horizon is the ring's (`disk::fill`), not the
+/// step's: the world says when the first host's ring projects.
+const RATE_BPS: u64 = 320 << 10;
 
 /// The model's place of `free` bytes free.
 fn place(free: u64) -> i64 {
@@ -167,6 +184,14 @@ struct World {
     held: Vec<&'static str>,
     /// The line each host's last look left owed one of its sessions (its board).
     owed: [Option<String>; 2],
+    /// The projected form: where the plain walk reads the volume at the model's place 2 (below
+    /// the first host's floor), this one reads it at 50 GiB, past that floor and within its
+    /// margin, with the first host's fill ring projecting a crossing of it
+    /// ([`World::projecting`]): its looks are pressed by the projection, and the model's H reads
+    /// the volume short ([`World::model_place`]).
+    projected: bool,
+    /// The first host's ring projects a crossing of its floor now.
+    projecting: bool,
     m: Model,
     s: S,
     /// The real steps taken, for a failure's dump.
@@ -304,10 +329,48 @@ impl World {
             seats: [vec![seat("s-a", 30), seat("s-b", 5)], vec![seat("s-c", 12)]],
             held: Vec::new(),
             owed: [None, None],
+            projected: false,
+            projecting: false,
             m,
             s,
             trail: Vec::new(),
         }
+    }
+
+    /// The projected form of the world ([`World::projected`]).
+    fn projected(name: &str) -> World {
+        World {
+            projected: true,
+            ..World::new(name)
+        }
+    }
+
+    /// The crossing host `h`'s ring projects at its look now: only the first host's, while it
+    /// projects.
+    fn crossing(&self, h: usize) -> Option<Projection> {
+        (h == 0 && self.projecting)
+            .then(|| Projection::of(RATE_BPS, self.free, FLOORS[0], Some(TOTAL)))
+    }
+
+    /// Whether the lease holds a projection record that stands at a look now: one refreshed within
+    /// `ask::COLD_HOLD_MS` by a host that runs (every look here is warm).
+    fn record_stands(&self) -> bool {
+        self.lease().entry(KEY).is_some_and(|e| {
+            e.projected.iter().any(|r| {
+                self.now.saturating_sub(r.at_ms) < ask::COLD_HOLD_MS
+                    && !self.dead.iter().any(|(h, _)| *h == r.host)
+            })
+        })
+    }
+
+    /// The model's place of the volume: the place of its free figure, but no more than the
+    /// model's 2 (H reading the volume short) where `held`: at the first host's look that
+    /// projects a crossing, and at any other look, or between looks, while a projection record
+    /// stands, which ends nothing. A look's own is judged as it begins, before its step drops or
+    /// closes anything.
+    fn model_place(&self, held: bool) -> i64 {
+        let at = place(self.free);
+        if held { at.min(2) } else { at }
     }
 
     fn fail(&self, why: String) -> String {
@@ -325,9 +388,14 @@ impl World {
         ask::read(&self.dir.0)
     }
 
-    /// The model's moves from where it holds free space to where the volume reads now.
+    /// The model's moves from where it holds free space to where the volume reads now, between
+    /// looks.
     fn follow(&mut self) -> Result<(), String> {
-        let to = place(self.free);
+        self.follow_to(self.model_place(self.record_stands()))
+    }
+
+    /// The model's moves from where it holds free space to place `to`.
+    fn follow_to(&mut self, to: i64) -> Result<(), String> {
         while self.s["free"] > to {
             self.fire("Drop")?;
         }
@@ -337,10 +405,21 @@ impl World {
         Ok(())
     }
 
-    /// The volume reads at the model's place `at`.
+    /// The volume reads at the model's place `at`: in the projected form, place 2 is read at
+    /// place 3's figure with the first host's ring projecting, and every other place projects
+    /// nothing.
     fn to(&mut self, at: usize) -> Result<(), String> {
-        self.free = PLACES[at];
-        self.trail.push(format!("free {} GiB", self.free / GIB));
+        self.projecting = self.projected && at == 2;
+        self.free = PLACES[if self.projecting { 3 } else { at }];
+        self.trail.push(format!(
+            "free {} GiB{}",
+            self.free / GIB,
+            if self.projecting {
+                ", host 0 projects"
+            } else {
+                ""
+            }
+        ));
         self.follow()
     }
 
@@ -534,8 +613,10 @@ impl World {
     }
 
     /// Host `h`'s look, after its pass: the real step under the lease's lock, projected. Each host
-    /// reads the volume short against its own floor, by its seat rule ([`World::roster`]). A look
-    /// that reads the asked session's rise is the model's `Frees` first, so the lease's step is
+    /// reads the volume short against its own floor, by its seat rule ([`World::roster`]); in the
+    /// projected form the first host's look is pressed by its ring's crossing as well
+    /// ([`World::crossing`]), and a pressed look the model opens on that opens nothing is refused.
+    /// A look that reads the asked session's rise is the model's `Frees` first, so the lease's step is
     /// checked against a model that knows space was freed. A look that reads the volume clear of
     /// its host's floor steps nothing where the window's look takes no lock (`ask::rests`: no
     /// episode open, no line of its host's to record). A host holding a line whose record was lost
@@ -567,6 +648,10 @@ impl World {
             self.fire("Frees")?;
         }
         let short = self.free < FLOORS[h];
+        // In the projected form the first host's look may be pressed by a crossing its ring
+        // projects, at a free figure past its floor.
+        let crossing = self.crossing(h);
+        let pressed = short || crossing.is_some();
         let lost = self.unrecorded[h].take();
         let reclaimed = std::mem::take(&mut self.pending[h]);
         let passing = !self.pending[1 - h].is_empty();
@@ -574,12 +659,19 @@ impl World {
             self.trail
                 .push(format!("host {h} looks while host {}'s pass runs", 1 - h));
         }
-        if !short && ask::rests(&self.lease(), KEY, lost.as_ref().map(|t| t.at)) {
+        if !pressed && ask::rests(&self.lease(), KEY, lost.as_ref().map(|t| t.at)) {
             self.trail.push(format!("host {h} look: rests"));
             self.unrecorded[h] = lost;
             return Ok(());
         }
         let mut before = self.lease().entry(KEY).cloned();
+        // The model's H reads the volume short at the first host's projecting look, and at the
+        // other host's while a projection record stands as it begins ([`World::model_place`]).
+        let held_short = if h == 0 {
+            crossing.is_some()
+        } else {
+            self.record_stands()
+        };
         let host = self.hosts[h].clone();
         let Rolled {
             barred,
@@ -600,7 +692,13 @@ impl World {
             now_ms: self.now,
             host: &host,
             key: KEY,
-            level: if short { Level::Short } else { Level::Ok },
+            level: if short {
+                Level::Short
+            } else if pressed {
+                Level::Low
+            } else {
+                Level::Ok
+            },
             free: self.free,
             floor: FLOORS[h],
             files_free: None,
@@ -614,6 +712,10 @@ impl World {
             reclaimed: &reclaimed,
             passing,
             alive: &alive,
+            ahead: ask::Ahead {
+                projected: crossing,
+                ..ask::Ahead::default()
+            },
         };
         let (recorded, said, after) = ask::transact(&self.dir.0, &ask::LOCK_LADDER, |l| {
             let recorded = lost.as_ref().map(|t| {
@@ -630,6 +732,7 @@ impl World {
             before = recorded;
         }
         self.trail.push(format!("host {h} look: {said:?}"));
+        self.follow_to(self.model_place(held_short))?;
         self.held_record(after.as_ref())?;
         self.owed[h] = match after.as_ref().map(|e| &e.phase) {
             Some(Phase::Owed { pick, .. }) if pick.host == host => Some(pick.sid.clone()),
@@ -807,7 +910,11 @@ impl World {
             Said::Freeing if self.s["done"] == 1 => {
                 Err(self.fail("the lease waits on a pass the model says is spent".to_owned()))
             }
-            Said::Settled | Said::Spent if short && self.m.action_enabled("Expire", &self.s) => {
+            Said::Quiet if pressed && self.m.action_enabled(open, &self.s) => Err(self.fail(
+                "a pressed look, aterm's freeing done and outside the cooldown, opened nothing"
+                    .to_owned(),
+            )),
+            Said::Settled | Said::Spent if pressed && self.m.action_enabled("Expire", &self.s) => {
                 Err(self.fail(
                     "the lease keeps parked an episode the model gives way to a new one".to_owned(),
                 ))
@@ -820,7 +927,8 @@ impl World {
             | Said::Owed { .. }
             | Said::Asked { .. }
             | Said::Settled
-            | Said::Spent => Ok(()),
+            | Said::Spent
+            | Said::WorkerRuns { .. } => Ok(()),
         };
         moved?;
         // A look that opened a round, or handed an asked line on to a new one, records what it
@@ -1180,6 +1288,139 @@ fn two_hosts_stepping_the_real_lease_take_only_the_models_steps() {
             w.trail
         );
     }
+}
+
+/// The scripted episode in the projected form ([`World::projected`]): wherever the plain script
+/// reads the volume below the first host's floor, this one reads it at 50 GiB, past that floor,
+/// and the first host's ring projects a crossing of it, so its looks are pressed by the
+/// projection and the model's H reads the volume short. The lease's floor stays the first host's
+/// plain one, and the second host's looks end nothing while the first's projection record stands.
+#[test]
+fn two_hosts_take_only_the_models_steps_where_a_projection_presses_the_first() {
+    let mut w = World::projected("scripted-projected");
+    scripted(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(w.s["phase"], 4, "the episode settled: {:?}", w.s);
+    assert_eq!(
+        w.trail
+            .iter()
+            .filter(|t| t.starts_with("host 0 look: Opened { done: Spent, projected: Some("))
+            .count(),
+        2,
+        "both episodes opened at the first host's projecting look: {:#?}",
+        w.trail
+    );
+    assert_eq!(
+        w.trail.iter().filter(|t| *t == "model End").count(),
+        1,
+        "{:#?}",
+        w.trail
+    );
+    let floor = w.lease().entry(KEY).and_then(|e| e.floor.clone());
+    assert_eq!(
+        floor.map(|f| (f.host, f.bytes)),
+        Some((w.hosts[0].clone(), FLOORS[0])),
+        "the floor the episode is held to is the first host's plain one"
+    );
+    for action in [
+        "OpenH",
+        "ElectA",
+        "ElectB",
+        "ElectC",
+        "KeepA",
+        "TypeA",
+        "TypeB",
+        "TypeC",
+        "HandOffOwed",
+        "HandOffAsked",
+        "OutAsked",
+        "End",
+        "Cools",
+        "Frees",
+        "Freed",
+    ] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
+/// The projected form's hold (the design's §8.7): the first host's projection opens an episode at
+/// 50 GiB free; the volume then reads 60 GiB, past both floors by the margin, and the first host's
+/// ring projects nothing more, but its record stands, so the second host's look there ends
+/// nothing, where the plain walk's would. The first host's own look drops its record and ends the
+/// episode. Opened again, an episode whose record no look refreshed for `ask::COLD_HOLD_MS` ends at
+/// the second host's look.
+fn projected_hold(w: &mut World) -> Result<(), String> {
+    w.spend(true)?;
+    w.to(2)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.to(4)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.to(2)?;
+    w.look(0)?;
+    w.to(4)?;
+    w.wait(ask::COLD_HOLD_MS)?;
+    w.look(1)?;
+    Ok(())
+}
+
+/// Each host's looks in `trail`, as `host <h> look: <word>`.
+fn looks(trail: &[String]) -> Vec<String> {
+    trail
+        .iter()
+        .filter(|t| t.starts_with("host ") && t.contains(" look: "))
+        .map(|t| t.split([' ', '{']).take(4).collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+#[test]
+fn a_standing_projection_record_holds_an_episode_the_plain_walk_would_end() {
+    let mut w = World::projected("projected-hold");
+    projected_hold(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        looks(&w.trail),
+        [
+            "host 0 look: Opened",
+            "host 1 look: Nominating",
+            "host 1 look: Nominating",
+            "host 0 look: Ended",
+            "host 0 look: Opened",
+            "host 1 look: Ended",
+        ],
+        "{:#?}",
+        w.trail
+    );
+}
+
+/// A look pressed by a projection: the first host's look at 50 GiB free, past its plain floor,
+/// its ring projecting a crossing of it (the model's H reading the volume short), with aterm's
+/// freeing done and outside the cooldown.
+fn projected_open(w: &mut World) -> Result<(), String> {
+    w.spend(true)?;
+    w.to(2)?;
+    w.look(0)
+}
+
+#[test]
+fn a_look_pressed_by_a_projection_above_its_floor_opens_an_episode() {
+    let mut w = World::projected("projected-open");
+    projected_open(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    assert!(w.trail.iter().any(|t| t == "model OpenH"), "{:#?}", w.trail);
+    let e = w.lease().entry(KEY).cloned().expect("the volume's entry");
+    assert_eq!(
+        e.floor.map(|f| f.bytes),
+        Some(FLOORS[0]),
+        "its floor is the plain one"
+    );
+    assert_eq!(
+        e.projected.iter().map(|r| r.floor).collect::<Vec<_>>(),
+        [FLOORS[0]],
+        "its projection is recorded apart"
+    );
 }
 
 /// A's line goes, and aterm's own passes on both hosts keep freeing space after it: the second
@@ -2799,4 +3040,82 @@ fn a_lease_that_settles_while_another_hosts_pass_runs_is_rejected() {
     })
     .expect_err("the checker must reject a settle on a running pass's space");
     assert!(caught.contains("`Freed` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a step that reads no crossing as pressure (`Fault::ProjectionIgnored`,
+/// revision 1) leaves closed an episode the first host's look, pressed by its projection above
+/// its floor with aterm's freeing done and outside the cooldown, opens, and the checker rejects
+/// that look.
+#[test]
+fn a_look_that_reads_no_crossing_as_pressure_is_rejected() {
+    let mut w = World::projected("projection-ignored");
+    let caught = ask::fault::with(ask::fault::Fault::ProjectionIgnored, || {
+        projected_open(&mut w)
+    })
+    .expect_err("the checker must reject a pressed look that opens nothing");
+    assert!(caught.contains("opened nothing"), "{caught}");
+    assert!(
+        caught.contains("host 0 look: Quiet"),
+        "the projected look read the volume quiet: {caught}"
+    );
+}
+
+/// NEGATIVE CONTROL: a look that ends an episode while a projection record stands
+/// (`Fault::EndWhileProjected`) lets the second host's look past both floors end the episode the
+/// first host's record still holds, and the checker rejects that end.
+#[test]
+fn a_look_that_ends_a_projected_episode_while_its_record_stands_is_rejected() {
+    let mut w = World::projected("end-while-projected");
+    let caught = ask::fault::with(ask::fault::Fault::EndWhileProjected, || {
+        projected_hold(&mut w)
+    })
+    .expect_err("the checker must reject an end while a projection record stands");
+    assert!(caught.contains("`End` is not enabled"), "{caught}");
+}
+
+#[test]
+fn fixed_seed_walks_where_a_projection_presses_the_first_host_take_only_the_models_steps() {
+    let mut reached = std::collections::BTreeSet::new();
+    for (seed, passes) in (1..=24u64).map(|s| (s, s % 2 == 0)) {
+        let mut w = World::projected("walk-projected");
+        walk(
+            &mut w,
+            seed.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            400,
+            passes,
+        )
+        .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        reached.extend(
+            w.trail
+                .iter()
+                .filter_map(|t| t.strip_prefix("model "))
+                .map(str::to_owned),
+        );
+        if w.trail
+            .iter()
+            .any(|t| t.starts_with("host 0 look: Opened { done: Spent, projected: Some("))
+        {
+            reached.insert("opened by a projection".to_owned());
+        }
+    }
+    for action in [
+        "OpenH",
+        "OpenL",
+        "RaiseH",
+        "ElectNone",
+        "TypeA",
+        "HandOffOwed",
+        "HandOffAsked",
+        "OutAsked",
+        "Frees",
+        "Freed",
+        "Expire",
+        "End",
+        "opened by a projection",
+    ] {
+        assert!(
+            reached.contains(action),
+            "no walk reached {action}: {reached:?}"
+        );
+    }
 }

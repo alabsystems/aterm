@@ -454,10 +454,10 @@ mod tests {
                     ) >= 4.5,
                     "{name} hovered Primary ink must meet WCAG-AA under High Contrast"
                 );
-                if colors.field_bg == colors.bar_bg {
+                if contrast(colors.field_bg, colors.bar_bg) < 3.0 {
                     let rule = colors.well_rule.unwrap_or_else(|| {
                         panic!(
-                            "{name}: well and band share a tone \
+                            "{name}: well and band stand under 3:1 \
                              with nothing drawn to separate them"
                         )
                     });
@@ -759,6 +759,19 @@ mod tests {
                 contrast(colors.caret, colors.field_bg) >= 4.5,
                 "{name} caret must meet WCAG-AA in the well"
             );
+            match colors.well_rule {
+                Some(rule) => assert!(
+                    contrast(colors.field_bg, colors.bar_bg) < 3.0
+                        && contrast(rule, colors.field_bg) >= 3.0
+                        && contrast(rule, colors.bar_bg) >= 3.0,
+                    "{name}: a well under 3:1 off the band draws an edge, 3:1 on the well and \
+                     on the band, only that one"
+                ),
+                None => assert!(
+                    contrast(colors.field_bg, colors.bar_bg) >= 3.0,
+                    "{name}: the well's fill alone is its edge only at 3:1"
+                ),
+            }
             assert!(
                 contrast(colors.capsule_hover_ink, colors.capsule_hover) >= 4.5,
                 "{name} hovered capsule label must meet WCAG-AA"

@@ -252,7 +252,7 @@ fn survey_forks(root: &Path, patch: &[PatchRow]) -> Vec<VendoredFork> {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("LICENSE") || name.starts_with("LICENCE") {
+                if is_licence_text(&name) {
                     fork.licenses.push(name);
                 }
             }
@@ -1479,6 +1479,8 @@ fn ob7_apache_modification_notices(
     let mut fails = 0;
     let mut scoped = Vec::new();
     let mut unverified = Vec::new();
+    // OB-6 judges a NOTICE it cannot read; here an unread one names no licence text.
+    let notice = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
     for fork in forks {
         if !apache_is_mandatory(&fork.license) {
             continue;
@@ -1529,6 +1531,25 @@ fn ob7_apache_modification_notices(
             if has_modification_notice(&text) {
                 continue;
             }
+            // An added licence text is kept as its holder wrote it: its notice is the NOTICE
+            // passage that names it by path, not a header in it.
+            if kind == "added" && is_licence_text(rel) {
+                if notice.contains(&format!("`{}/{rel}`", fork.rel)) {
+                    continue;
+                }
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-7] `{}/{rel}` is a licence text added relative to pristine `{} \
+                     {}`, and NOTICE does not name it. A licence text stays as its holder wrote \
+                     it, so its notice is NOTICE naming it by path; without that nothing says \
+                     aterm added it, and NOTICE's assertion that \"modified and added files carry \
+                     prominent notices\" is false. FIX: name `{}/{rel}` in NOTICE beside the code \
+                     it governs.",
+                    fork.rel, fork.name, fork.version, fork.rel
+                );
+                fails += 1;
+                continue;
+            }
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-7] `{}/{rel}` is {kind} relative to pristine `{} {}`, but its first \
@@ -1547,8 +1568,9 @@ fn ob7_apache_modification_notices(
         "    [OB-7] scope: forks where the Apache-2.0 arm is UNAVOIDABLE ({}). Dual `... OR MIT` \
          forks elect the MIT arm, which imposes no §4(b) duty. Modified files are detected by \
          a BYTE DIFF against the pristine registry copy — not by aterm's own markers — so a file \
-         edited without leaving a marker is still caught. A fork with no pristine copy available \
-         is reported UNVERIFIED, never passed.",
+         edited without leaving a marker is still caught. An added licence text (`LICENSE*`, \
+         `LICENCE*`) stays as its holder wrote it, and its notice is NOTICE naming it by path. A \
+         fork with no pristine copy available is reported UNVERIFIED, never passed.",
         if scoped.is_empty() {
             "none".to_string()
         } else {
@@ -1639,6 +1661,13 @@ fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
     modified.sort();
     added.sort();
     Some(Divergence { modified, added })
+}
+
+/// Is this fork-relative path a licence text: a file named `LICENSE*` or `LICENCE*`, as
+/// `[OB-5]` counts one?
+fn is_licence_text(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name.starts_with("LICENSE") || name.starts_with("LICENCE")
 }
 
 /// Does this file's header claim aterm changed it?
@@ -2150,6 +2179,48 @@ mod tests {
         std::fs::remove_dir_all(fixture.0.path().join("crates/aterm-absorbed")).unwrap();
         let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
+    }
+
+    /// An added licence text stays as its holder wrote it, so NOTICE naming it by path is its
+    /// notice. Unnamed, it fails; and the naming discharges neither an added file of another
+    /// kind nor an edited upstream licence.
+    #[test]
+    fn an_added_licence_text_takes_its_notice_from_notice() {
+        let plant = |tag: &str, rel: &str, notice: &str| {
+            let fixture = absorbed_fixture(tag, true);
+            let root = fixture.0.path();
+            std::fs::write(root.join(rel), "MIT License\n\nCopyright (c) 2022 Other\n").unwrap();
+            let path = root.join("NOTICE");
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str(notice);
+            std::fs::write(path, text).unwrap();
+            report(root)
+        };
+        let licence = "crates/aterm-absorbed/LICENSE-MIT-other";
+        let named = |rel: &str| format!("Its shadow is other's, MIT: see `{rel}`.\n");
+
+        let Attestation { ok, log, .. } = plant("licence-named", licence, &named(licence));
+        assert!(ok, "a licence text NOTICE names needs no header:\n{log}");
+
+        let Attestation { ok, log, .. } = plant("licence-unnamed", licence, "");
+        assert!(
+            !ok && log.contains(&format!("FAIL [OB-7] `{licence}` is a licence text added")),
+            "{log}"
+        );
+
+        let data = "crates/aterm-absorbed/other.tsv";
+        let Attestation { ok, log, .. } = plant("licence-not-data", data, &named(data));
+        assert!(
+            !ok && log.contains(&format!("FAIL [OB-7] `{data}` is added")),
+            "{log}"
+        );
+
+        let upstream = "crates/aterm-absorbed/LICENSE";
+        let Attestation { ok, log, .. } = plant("licence-edited", upstream, &named(upstream));
+        assert!(
+            !ok && log.contains(&format!("FAIL [OB-7] `{upstream}` is modified")),
+            "{log}"
+        );
     }
 
     #[test]

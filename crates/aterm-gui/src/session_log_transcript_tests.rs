@@ -720,6 +720,7 @@ fn set_rollout_claim(ctx: &crate::SessionCtx, target: &crate::self_claim::Rollou
                 draft_empty: None,
                 frame: None,
                 initializing: false,
+                goal: None,
             }),
             resume: Err("captured-no-resume"),
         }),
@@ -1036,6 +1037,33 @@ fn a_stopped_rollout_tap_says_stopped_and_keeps_its_count() {
     );
 }
 
+/// `help status` names exactly the words `rollout=` can print: every [`RolloutWord`] (its own
+/// and a tap refusal's, each enum and its word table one generated list, so a new word cannot
+/// reach `status` unenumerated) and [`ROLLOUT_NEVER_ASKED`].
+#[test]
+fn help_status_names_exactly_the_rollout_words_aterm_writes() {
+    use std::collections::BTreeSet;
+    let written: BTreeSet<&str> = RolloutWord::words().chain([ROLLOUT_NEVER_ASKED]).collect();
+    let help = aterm_types::control_verbs::spec("status")
+        .expect("the status verb")
+        .help_line();
+    let lists: Vec<&str> = help.split("rollout=<").skip(1).collect();
+    assert_eq!(lists.len(), 1, "help status names one rollout= vocabulary");
+    let named: BTreeSet<&str> = lists[0]
+        .split_once('>')
+        .expect("the vocabulary closes")
+        .0
+        .split('|')
+        .collect();
+    let unwritten: Vec<&&str> = named.difference(&written).collect();
+    let unnamed: Vec<&&str> = written.difference(&named).collect();
+    assert!(
+        unwritten.is_empty() && unnamed.is_empty(),
+        "help status names rollout words nothing writes {unwritten:?} and leaves out words \
+         aterm writes {unnamed:?}"
+    );
+}
+
 #[test]
 fn a_new_target_is_read_by_a_new_tap() {
     const NEXT: &str = "019a0000-0000-7000-8000-00000000000b";
@@ -1256,10 +1284,25 @@ fn the_rollout_tap_publishes_the_survey_facts_for_the_claimants_group_whatever_i
     };
     let (tl, _home, target, claim) =
         codex_rig("facts-tasked", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let sessions = target.home.join("alab").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("alab sessions dir");
+    std::fs::write(
+        sessions.join(format!("{}.json", target.pid)),
+        format!(
+            r#"{{"v":1,"pid":{},"sessionId":"{}","status":"busy","goal":"Ship native protocol"}}"#,
+            target.pid, target.thread
+        ),
+    )
+    .expect("session record with goal");
     let _ = host.ask(0xC0DE_0072, &claim.0, target, tasked);
     assert_eq!(
         survey(&tl).and_then(|s| s.task),
         Some("port the parser".into()),
         "a worker's task rides with the facts"
+    );
+    assert_eq!(
+        survey(&tl).and_then(|s| s.goal),
+        Some("Ship native protocol".into()),
+        "the session record's native goal rides with the facts"
     );
 }

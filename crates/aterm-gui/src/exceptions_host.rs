@@ -583,6 +583,55 @@ impl App {
                 );
                 aterm_log::info!("harness disk watch: the disk is out of its emergency");
             }
+            HostNote::DiskFilling {
+                needed,
+                projected_only,
+                free,
+                floor,
+                rate_bps,
+                eta_s,
+                said,
+            } => {
+                if needed {
+                    self.post_message(message_reporters::disk_filling(
+                        free,
+                        floor,
+                        rate_bps,
+                        eta_s,
+                        said.as_deref(),
+                    ));
+                } else {
+                    // An agent can act again: the alert goes, unresolved, as nothing came of it.
+                    self.messages
+                        .withdraw_key_prefix(message_reporters::DISK_FILLING_KEY, Instant::now());
+                }
+                if projected_only {
+                    self.except(&message_reporters::disk_filling_entry(
+                        free,
+                        floor,
+                        rate_bps,
+                        eta_s,
+                        said.as_deref(),
+                    ));
+                } else {
+                    self.except_end(message_reporters::DISK_FILLING_ENTRY_KEY);
+                }
+            }
+            HostNote::DiskFillingOver => {
+                self.messages.resolve_key_prefix(
+                    message_reporters::DISK_FILLING_KEY,
+                    aterm_messages::Outcome::Ok,
+                    Instant::now(),
+                );
+                let _ = self.messages.end_standing_quiet(
+                    message_reporters::DISK_FILLING_KEY,
+                    wall_stamp_now(),
+                    Instant::now(),
+                );
+                self.except_end(message_reporters::DISK_FILLING_ENTRY_KEY);
+            }
+            HostNote::DiskWorker { task, folder } => self.start_disk_worker(task, &folder),
+            HostNote::DiskWorkerExpired { sid } => self.disk_worker_expired(&sid),
             HostNote::ProgramCheckStuck { workers, limit } => {
                 self.post_message(message_reporters::program_check_stuck(workers, limit));
             }
@@ -616,6 +665,12 @@ impl App {
                 agent,
                 standing,
             } => {
+                // The stop is said whatever its urgency (§14.3): `resume_standing` keeps only
+                // Later exceptions, so the glass reads the arm here, and loses it as the loop
+                // lifts the hold (`standing: None`) or ends (`end_notes`).
+                if let Some(session) = self.local_session_of(&aterm_session::SessionId::new(&sid)) {
+                    self.show_stopped(session, standing.as_ref().and_then(|e| e.held));
+                }
                 match standing
                     .as_ref()
                     .filter(|exception| exception.when == Urgency::Now && !exception.escalated)

@@ -234,7 +234,12 @@ pub(super) fn self_claimed_plan(
     });
     let env: Vec<(&str, &str)> = home
         .into_iter()
-        .map(|value| ("CODEX_HOME", value))
+        .map(|value| (ca::HOME_ENV, value))
+        .chain(
+            st.codex_auth_path
+                .as_deref()
+                .map(|value| (ca::AUTH_PATH_ENV, value)),
+        )
         .collect();
     let line = upgrade::relaunch_line_env(
         dialect,
@@ -327,6 +332,7 @@ pub(super) fn self_claimed_after_exit(
         thread: resume.session.clone(),
         codex_home: home.to_string_lossy().into_owned(),
         codex_home_env: resume.codex_home.clone(),
+        codex_auth_path: resume.codex_auth_path.clone(),
         argv: snap.argv.clone(),
         cwd: resume.cwd.clone().unwrap_or_else(|| snap.cwd.clone()),
         twin: resume.argv[0].clone(),

@@ -92,6 +92,91 @@ pub fn via_ok(via: &str) -> bool {
         && via.split(',').all(is_principal)
 }
 
+/// A bus offset as an agent writes it: `<n>` or `@<n>`, the form `inbox`, `cause=` and a brief's
+/// `head=` print it in; digits only (`u64::from_str` would take `+5`).
+#[must_use]
+pub fn parse_bus_offset(v: &str) -> Option<u64> {
+    let digits = v.strip_prefix('@').unwrap_or(v);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Declares [`MirrorState`] and [`MirrorState::ALL`] from one variant list, so every word
+/// `fabric status mirror=` can print is one a reader of the words enumerates.
+macro_rules! mirror_states {
+    ($($(#[$doc:meta])* $variant:ident => $word:literal,)*) => {
+        /// The session log's bus mirror as `fabric status` says it (`mirror=<word>`).
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum MirrorState {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl MirrorState {
+            /// Every state, from the same list as the enum's.
+            pub const ALL: &'static [MirrorState] = &[$(MirrorState::$variant,)*];
+
+            /// The word `fabric status` prints after `mirror=`.
+            #[inline]
+            #[must_use]
+            pub const fn word(self) -> &'static str {
+                match self {
+                    $(MirrorState::$variant => $word,)*
+                }
+            }
+        }
+    };
+}
+
+mirror_states! {
+    /// The bridge asked for the mirror in its `hello` and has reported nothing since.
+    Starting => "starting",
+    /// Mirroring (`link mirror on`).
+    On => "on",
+    /// Stopped, with its `:<reason>` (`pin`, `endpoint`, `refused`).
+    Stopped => "stopped",
+    /// The bus holds as much of the mirror as it may (`capped:total`).
+    Capped => "capped",
+    /// The broker's retention window holds the next take back.
+    Budget => "budget",
+    /// An `auto` mirror over a broker that retains nothing.
+    Unretained => "unretained",
+    /// No bridge serves the logs this instance retains (with `tails=` and `tombstones=`).
+    Unserved => "unserved",
+}
+
+impl MirrorState {
+    /// The state a bridge reports as `link mirror <word>`: every one but the two the endpoint
+    /// says itself ([`Self::Starting`], [`Self::Unserved`]).
+    #[must_use]
+    pub fn reported(word: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|s| !matches!(s, Self::Starting | Self::Unserved))
+            .find(|s| s.word() == word)
+    }
+}
+
+/// The words a help text names after `mirror=`, whether as `<a|b>`, `a|b` or one word: the
+/// seam the tests holding `help fabric` and `aterm help fabric` to [`MirrorState`] read.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn mirror_words_named(text: &str) -> std::collections::BTreeSet<&str> {
+    text.split("mirror=")
+        .skip(1)
+        .flat_map(|after| {
+            let after = after.strip_prefix('<').unwrap_or(after);
+            let end = after
+                .find(|c: char| !c.is_ascii_lowercase() && c != '-' && c != '|')
+                .unwrap_or(after.len());
+            after[..end].split('|')
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
 /// Exit word sent before closing bridge lanes (`EVENT * bye <word>` / `link bye <word>`).
 /// Unannounced closes (crashes, `kill -9`) act like [`Bye::Handoff`]: nothing is withdrawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +221,49 @@ mod tests {
         }
         for other in ["", "Quit", "exit", "quit ", "handoff=1"] {
             assert_eq!(Bye::parse(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_bus_offset_is_digits_with_or_without_its_at_sign() {
+        assert_eq!(parse_bus_offset("21"), Some(21));
+        assert_eq!(parse_bus_offset("@21"), Some(21));
+        for bad in [
+            "",
+            "@",
+            "@@21",
+            "+5",
+            "@+5",
+            "-1",
+            "21 ",
+            "x",
+            "18446744073709551616",
+        ] {
+            assert_eq!(parse_bus_offset(bad), None, "{bad:?}");
+        }
+    }
+
+    /// `help fabric` names exactly the words `fabric status` prints after `mirror=`: every
+    /// [`MirrorState`], one generated list with its word table.
+    #[test]
+    fn help_fabric_names_exactly_the_mirror_words_fabric_status_prints() {
+        let help = crate::control_verbs::spec("fabric")
+            .expect("the fabric verb")
+            .help_line();
+        let named = mirror_words_named(&help);
+        let printed: std::collections::BTreeSet<&str> =
+            MirrorState::ALL.iter().map(|s| s.word()).collect();
+        assert_eq!(
+            named, printed,
+            "help fabric's mirror= words against MirrorState's"
+        );
+        for state in MirrorState::ALL {
+            let reported = MirrorState::reported(state.word());
+            assert_eq!(
+                reported.is_some(),
+                !matches!(state, MirrorState::Starting | MirrorState::Unserved),
+                "{state:?}"
+            );
         }
     }
 

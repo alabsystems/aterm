@@ -995,7 +995,7 @@ fn the_front_door_routes_doctor_here_and_its_help_to_the_diagnostics() {
     assert!(!crate::routes_to_doctor("show-config", &[]));
 }
 
-/// `base.clt` reads a C toolchain verdict, beside Command Line Tools git, as the install's to
+/// `base.clt` reads a C toolchain verdict, beside the git init runs, as the install's to
 /// fix only where the tools are missing: a refusing compiler is installed already, and one
 /// that did not answer is unknown.
 #[cfg(target_os = "macos")]
@@ -1533,10 +1533,10 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     );
 }
 
-/// `base.clt` plans the install wherever Command Line Tools git is missing, beside an
-/// Xcode.app compiler that builds or refuses too: the GitHub setup's clones run the tools' own
-/// git, and System State opens the install's tab for exactly that wait. A compiler that did
-/// not answer stays unknown.
+/// `base.clt` plans the install wherever the git init runs is missing (the tools', else
+/// Xcode's), beside a compiler that builds or refuses too: the GitHub setup's clones need it,
+/// and System State opens the install's tab for exactly that wait. A compiler that did not
+/// answer stays unknown.
 #[cfg(target_os = "macos")]
 #[test]
 fn base_clt_wants_the_tools_git_beside_an_xcode_compiler() {
@@ -1562,4 +1562,62 @@ fn base_clt_wants_the_tools_git_beside_an_xcode_compiler() {
         super::clt_found(&CcVerdict::Unanswered { driver }, false),
         Found::Unknown(_)
     ));
+}
+
+/// Every `aterm init` line this doctor prints for the base layer it composes, and the ones the
+/// crates it composes print for the Command Line Tools (aterm-uds's tool table, atpkg's C
+/// toolchain act), is one init takes over that base layer (`base.ai.accounts`, `base.clt`,
+/// `base`): each remedy rendered as a row's tail, then copied out of the text as a person
+/// would. A misspelt id is the negative control.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_init_line_doctor_prints_is_one_init_takes() {
+    use aterm_converge::{Explain, Item as _, Probe, Remedy};
+    let base = aterm_machines::init::Base {
+        items: vec![Box::new(super::AiAccountsItem)],
+        held: None,
+        clt: super::command_line_tools(),
+        targo: None,
+    };
+    assert!(base.clt.is_some(), "the test binary names itself");
+    let tail = |remedy: Remedy| {
+        let mut row = super::unmeasured("row", "family", None, String::new());
+        row.explain = Some(Explain {
+            why: String::new(),
+            remedy,
+        });
+        super::remedy(&row)
+    };
+    let texts = [
+        tail(
+            super::AiAccountsItem
+                .explain(&Probe::Blocked { why: String::new() })
+                .remedy,
+        ),
+        tail(aterm_machines::init_clt::place().remedy),
+        tail(Remedy::Init {
+            only: aterm_converge::Layer::Base.name().to_owned(),
+        }),
+        aterm_uds::host::tool("cc").remedy_on("darwin-arm64"),
+        atpkg::prereq::act().to_owned(),
+    ];
+    for text in &texts {
+        let lines = aterm_machines::init::init_lines(text);
+        assert!(!lines.is_empty(), "{text}");
+        for line in lines {
+            assert_eq!(
+                aterm_machines::init::refusal(&line, &base, &[]),
+                None,
+                "{line} (from {text})"
+            );
+        }
+    }
+    let misspelt = tail(Remedy::Init {
+        only: "base.ai.acounts".to_owned(),
+    });
+    let line = &aterm_machines::init::init_lines(&misspelt)[0];
+    assert!(
+        aterm_machines::init::refusal(line, &base, &[]).is_some(),
+        "{line}"
+    );
 }

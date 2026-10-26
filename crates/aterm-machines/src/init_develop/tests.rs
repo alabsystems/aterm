@@ -254,7 +254,10 @@ pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, st
             Ran::ok(status),
         ),
     ] {
-        sys.on(&checkout::git(alice, Some(path)).args(args).display(), ran);
+        sys.on(
+            &checkout::git(sys, alice, Some(path)).args(args).display(),
+            ran,
+        );
     }
 }
 
@@ -711,12 +714,14 @@ impl<'a> Bus<'a> {
     fn state(&self) -> (String, Option<String>, String) {
         let inner = self.inner();
         let branch = Live::new()
-            .run(&crate::checkout::git(&self.repos.who, Some(&inner)).args([
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "HEAD",
-            ]))
+            .run(
+                &crate::checkout::git(self.repos.live, &self.repos.who, Some(&inner)).args([
+                    "symbolic-ref",
+                    "--quiet",
+                    "--short",
+                    "HEAD",
+                ]),
+            )
             .unwrap();
         (
             self.repos.head(&inner),
@@ -799,7 +804,7 @@ fn a_submodule_head_git_cannot_read_is_never_updated() {
     ] {
         let (sys, alice) = alice_with(None);
         let path = Path::new("/Users//alice/aterm");
-        let git = checkout::git(&alice, Some(&path.join(SUBMODULE)));
+        let git = checkout::git(&sys, &alice, Some(&path.join(SUBMODULE)));
         let status = ["status", "--porcelain=v1", "-z", "--untracked-files=normal"];
         sys.on(&git.clone().args(status).display(), Ran::ok(""));
         let branch = ["symbolic-ref", "--quiet", "--short", "HEAD"];
@@ -987,7 +992,10 @@ fn a_conflicted_submodule_is_never_updated() {
     bus.repos
         .g(&bus.work, &["commit", "--quiet", "--all", "-m", "q"]);
     let merged = live
-        .run(&crate::checkout::git(&bus.repos.who, Some(&bus.work)).args(["merge", "side"]))
+        .run(
+            &crate::checkout::git(bus.repos.live, &bus.repos.who, Some(&bus.work))
+                .args(["merge", "side"]),
+        )
         .unwrap();
     assert!(!merged.success(), "{}", merged.describe());
     let status = bus
@@ -1209,7 +1217,10 @@ fn script_fetched(sys: &Fake, alice: &User, tip: &str) {
             Ran::ok(" 2222222222222222222222222222222222222222 vendor/astream (heads/main)\n"),
         ),
     ] {
-        sys.on(&checkout::git(alice, Some(path)).args(args).display(), ran);
+        sys.on(
+            &checkout::git(sys, alice, Some(path)).args(args).display(),
+            ran,
+        );
     }
 }
 

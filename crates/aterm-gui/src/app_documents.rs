@@ -4723,6 +4723,14 @@ impl App {
             });
         }
         let previously_active = self.windows.get(&wid).and_then(|ws| ws.tab_set.active_id());
+        // A view the person does not get in front goes in behind the tab in front with no
+        // switch and no sync, so their program is never told it lost focus for it.
+        let keep = match placement {
+            Placement::NewTabAfter { ticket } => {
+                self.admitted_view_kept_front(wid, ticket, previously_active)
+            }
+            Placement::FocusOrNewTab | Placement::NewTab => None,
+        };
 
         let title = granted
             .grant
@@ -4747,31 +4755,32 @@ impl App {
         let state = match kind {
             AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
             AppKind::Editor => AppViewState::Editor(Box::default()),
-            AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
+            AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
                 return Err("requested app is not a document app".to_string());
             }
         };
-        let install =
-            if let Some(instance) = self.native_runtime.instance_for_document(kind, document) {
-                self.install_native_tab(wid, instance, state, presentation)
-                    .map(|(tab, view)| (instance, tab, view))
-            } else {
-                let app = match kind {
-                    AppKind::Markdown => NativeApp::Markdown(MarkdownApp::new_with_uri(
-                        document,
-                        title,
-                        uri.to_string(),
-                        snapshot.text.as_ref(),
-                    )),
-                    AppKind::Editor => {
-                        NativeApp::Editor(EditorApp::new_with_uri(document, title, uri.to_string()))
-                    }
-                    AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
-                        return Err("requested app is not a document app".to_string());
-                    }
-                };
-                self.install_new_native_tab(wid, app, state, presentation)
+        let install = if let Some(instance) =
+            self.native_runtime.instance_for_document(kind, document)
+        {
+            self.install_native_tab_keeping(wid, instance, state, presentation, keep)
+                .map(|(tab, view)| (instance, tab, view))
+        } else {
+            let app = match kind {
+                AppKind::Markdown => NativeApp::Markdown(MarkdownApp::new_with_uri(
+                    document,
+                    title,
+                    uri.to_string(),
+                    snapshot.text.as_ref(),
+                )),
+                AppKind::Editor => {
+                    NativeApp::Editor(EditorApp::new_with_uri(document, title, uri.to_string()))
+                }
+                AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
+                    return Err("requested app is not a document app".to_string());
+                }
             };
+            self.install_new_native_tab_keeping(wid, app, state, presentation, keep)
+        };
         let (instance, tab, view) = install.map_err(|error| {
             aterm_log::warn!("could not install native document tab: {error:?}");
             "This document could not be reopened".to_string()
@@ -4806,10 +4815,11 @@ impl App {
         );
         self.refresh_disambiguated_document_titles();
         self.refresh_native_presentation(wid, instance, view);
-        self.resync_active_or_window(wid);
-        self.request_native_redraw(wid);
         if let Placement::NewTabAfter { ticket } = placement {
-            self.place_admitted_view(wid, tab, ticket, previously_active);
+            self.place_admitted_view(wid, tab, ticket);
+        } else {
+            self.resync_active_or_window(wid);
+            self.request_native_redraw(wid);
         }
         Ok(InstalledDocument {
             kind,
@@ -4869,7 +4879,7 @@ impl App {
                 state.buffer = Some(buffer);
                 Ok(())
             }
-            AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
+            AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
                 Err("requested app is not a document app".to_string())
             }
         }

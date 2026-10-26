@@ -1393,6 +1393,7 @@ pub(crate) fn palette_tray(
         ));
 
         let qy = card_y + ch;
+        let (rim, alpha) = crate::native_ui::resting_rim(&r);
         prims.push(DrawPrim::Stroke {
             x: card_x + cw * 1.5,
             y: qy + 2.0,
@@ -1400,7 +1401,7 @@ pub(crate) fn palette_tray(
             h: ch - 4.0,
             radius: ch * 0.28,
             width: 1.25,
-            color: rgba(r.separator, 0xCC),
+            color: rgba(rim, alpha),
         });
         let prompt = if state.query.is_empty() {
             "\u{203a} type to filter".to_string()
@@ -1625,6 +1626,7 @@ fn palette_filter_box(
         radius: PALETTE_ROW_RADIUS,
         fill: rgba(crate::native_ui::control_rest_fill_over(r.surface, r), 0xFF),
     });
+    let (rim, alpha) = crate::native_ui::resting_rim(r);
     prims.push(DrawPrim::Stroke {
         x: x + 0.5,
         y: y + 0.5,
@@ -1632,7 +1634,7 @@ fn palette_filter_box(
         h: (h - 1.0).max(0.0),
         radius: PALETTE_ROW_RADIUS,
         width: 1.0,
-        color: rgba(r.separator, 0xCC),
+        color: rgba(rim, alpha),
     });
     prims.push(DrawPrim::ClipPush {
         x,
@@ -3209,6 +3211,73 @@ mod tests {
                 enabled > 3 && disabled > 0,
                 "{enabled} enabled, {disabled} disabled"
             );
+        }
+    }
+
+    /// THE SEARCH FIELD'S RIM HOLDS 3:1 ON THE CARD (audit r17 CA1, r20 MC1): the field's fill is the card's own tone (or a few percent off it), so its rim is its only boundary and wears the control edge every Settings field wears, never the 1.5:1 separator, in a dark and two light themes, in the palette this platform draws and in the Fluent filter box.
+    #[test]
+    fn the_search_fields_rim_holds_three_to_one_on_the_card() {
+        use crate::native_appearance::contrast_ratio;
+        let github = Theme::from(&aterm_types::scheme::builtin("GitHub Light").expect("built-in"));
+        let g = fluent_geom();
+        for theme in [Theme::default(), light_theme(), github] {
+            let r = Roles::from_theme(theme);
+            let state = PaletteState::new();
+            let card = palette_layout(&state, &g).card;
+            let (card_x, card_y, card_w, _) = card;
+            let in_field = |prims: &[DrawPrim]| -> Vec<[u8; 4]> {
+                prims
+                    .iter()
+                    .filter_map(|prim| match *prim {
+                        DrawPrim::Stroke {
+                            x, y, w, h, color, ..
+                        } if x > card_x
+                            && w < card_w - 2.0
+                            && y > card_y
+                            && y + h <= card_y + 2.0 * g.ch + 0.5 =>
+                        {
+                            Some(color)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let mut filter_box = Vec::new();
+            palette_filter_box(
+                &mut filter_box,
+                &state,
+                &g,
+                &r,
+                card,
+                state.filtered().len(),
+            );
+            for (layout, prims) in [
+                (
+                    "this platform's palette",
+                    palette_tray(&state, &g, theme).prims,
+                ),
+                ("the Fluent filter box", filter_box),
+            ] {
+                let rims = in_field(&prims);
+                assert_eq!(rims.len(), 1, "{theme:?}, {layout}: the field's one rim");
+                let [red, green, blue, alpha] = rims[0];
+                let over = |ink: u8, ground: u8| {
+                    ((f32::from(ink) * f32::from(alpha)
+                        + f32::from(ground) * (255.0 - f32::from(alpha)))
+                        / 255.0)
+                        .round() as u8
+                };
+                let shown = [
+                    over(red, r.surface[0]),
+                    over(green, r.surface[1]),
+                    over(blue, r.surface[2]),
+                ];
+                let ratio = contrast_ratio(shown, r.surface);
+                assert!(
+                    ratio >= 3.0,
+                    "{theme:?}, {layout}: the rim is {ratio:.2}:1 on the card"
+                );
+            }
         }
     }
 

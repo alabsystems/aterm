@@ -395,8 +395,8 @@ const fn route(
     match center {
         Center::Granted => Route::Center,
         Center::Refused => Route::Withheld,
-        Center::Unasked if alerts && !asked => Route::Ask,
-        Center::Unasked => Route::Unasked,
+        Center::Unasked | Center::Provisional if alerts && !asked => Route::Ask,
+        Center::Unasked | Center::Provisional => Route::Unasked,
         Center::Absent if bundled => Route::Centerless,
         Center::Absent => Route::Osascript,
     }
@@ -1744,6 +1744,73 @@ mod tests {
         delivery.join().unwrap();
         *ASK.lock().unwrap() = None;
         assert_eq!(route, super::Route::Lapsed, "A resolved before delivery");
+    }
+
+    /// A stand-in macOS: the launch's quiet ask is made once (the next launch finds quiet delivery
+    /// granted) and is no dialog; nothing posts on quiet delivery, Notify Me on or off, until the
+    /// dialog Notify Me's first notice asks for is answered. Negative control: a bundle macOS
+    /// already lets post is asked nothing at launch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_launch_asks_quietly_once_and_only_notify_me_asks_for_banners() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        use super::{Route, route, way_for};
+        use crate::notice_center::{Center, NoticeCenter, Request, asks};
+
+        static SAID: Mutex<Center> = Mutex::new(Center::Unasked);
+        static QUIET: AtomicU32 = AtomicU32::new(0);
+        static DIALOGS: AtomicU32 = AtomicU32::new(0);
+        fn said() -> std::sync::MutexGuard<'static, Center> {
+            SAID.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        fn answer() -> Center {
+            *said()
+        }
+        fn prime(then: Box<dyn FnOnce() + Send>) {
+            if asks(answer(), Request::Provisional) {
+                QUIET.fetch_add(1, Ordering::SeqCst);
+                *said() = Center::Provisional;
+            }
+            then();
+        }
+        fn ask(then: Box<dyn FnOnce() + Send>) {
+            if asks(answer(), Request::Full) {
+                DIALOGS.fetch_add(1, Ordering::SeqCst);
+                *said() = Center::Granted;
+            }
+            then();
+        }
+        let asked = || (QUIET.load(Ordering::SeqCst), DIALOGS.load(Ordering::SeqCst));
+        let center = NoticeCenter::stand_in(answer, ask).priming(prime);
+        center.prime(Box::new(|| {}));
+        center.prime(Box::new(|| {}));
+        assert_eq!(asked(), (1, 0), "two launches: one quiet ask, no dialog");
+        assert_eq!(center.answer(), Center::Provisional);
+        for asked in [false, true] {
+            assert_eq!(
+                route(center.answer(), true, false, asked),
+                Route::Unasked,
+                "Notify Me off: nothing posts"
+            );
+        }
+        let first = AtomicBool::new(false);
+        assert_eq!(
+            way_for(center, true, true, &first, || true),
+            Route::Center,
+            "Notify Me's first notice asks, and posts on the yes"
+        );
+        assert_eq!(asked(), (1, 1), "the one dialog");
+
+        *said() = Center::Granted;
+        center.prime(Box::new(|| {}));
+        assert_eq!(
+            asked(),
+            (1, 1),
+            "the control: already allowed, nothing asked"
+        );
     }
 
     #[test]

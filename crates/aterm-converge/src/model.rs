@@ -212,6 +212,28 @@ pub enum Remedy {
     None,
 }
 
+impl Remedy {
+    /// The command that carries the remedy out, spelled once for every surface that prints
+    /// it: `aterm pkg repair`, `aterm init --only <only>`, `aterm init --develop`,
+    /// `targo --unverified verify provision <args>`, or the explicit door; `None` for a
+    /// person's act in System Settings, the next pass, or nothing.
+    #[must_use]
+    pub fn command(&self) -> Option<String> {
+        match self {
+            Self::Repair => Some("aterm pkg repair".to_owned()),
+            Self::Init { only } => Some(format!("aterm init --only {only}")),
+            Self::Develop => Some("aterm init --develop".to_owned()),
+            Self::Provision { args } => Some(
+                format!("targo --unverified verify provision {args}")
+                    .trim_end()
+                    .to_owned(),
+            ),
+            Self::Command(command) => Some(command.clone()),
+            Self::Person { .. } | Self::Network | Self::None => None,
+        }
+    }
+}
+
 /// Why an apply stood aside without changing anything and without failing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

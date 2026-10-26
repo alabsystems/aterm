@@ -32,7 +32,8 @@ struct P {
     unborn: bool,
     /// Its session; 0 for unread.
     session: u32,
-    /// Whether the kernel reaps its children for it (it ignores `SIGCHLD`).
+    /// Whether the kernel reaps its children for it (it ignores `SIGCHLD`), as the sweep reads
+    /// it: of every process, at every reading, whatever it has reaped.
     nocld: bool,
 }
 
@@ -99,10 +100,12 @@ impl P {
         }
     }
 
-    /// Started before the first step, though a later step first reads it.
+    /// Started before the first step, though a later step first reads it: its kernel start too
+    /// is older than every one the harness starts at its pid's tenfold.
     fn old(self) -> Self {
         Self {
             birth: Some(0),
+            start: u64::from(self.pid),
             ..self
         }
     }
@@ -257,8 +260,8 @@ fn a_process_older_than_the_last_step_counts_from_its_first_reading() {
     r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
     let old = |cpu| p(310, 300, cpu, 4_000).old();
     assert_eq!(r.step(&sweep(0, &[p(300, SHELL, 0, 0), old(9_000)])), 0);
-    assert!(!r.ledger.counted(310, Some(3_100), 1));
-    assert!(r.ledger.counted(310, Some(3_100), 2));
+    assert!(!r.ledger.counted(310, Some(310), 1));
+    assert!(r.ledger.counted(310, Some(310), 2));
     assert_eq!(missed(&r), 2, "what it ran since the last step is missed");
     assert_eq!(r.step(&sweep(0, &[p(300, SHELL, 0, 0), old(9_100)])), 100);
     assert_eq!(missed(&r), 2);
@@ -680,6 +683,36 @@ fn a_process_with_no_birth_read_is_dated_by_its_kernel_start() {
     assert_eq!(run(2_500), (0, 2), "older than one");
 }
 
+/// A process whose spawn straddled a reading (`targo` spawning `trustc`: its fork stamped 1 ms
+/// before the reading's wall clock, but still being created as the sweep listed, so that sweep
+/// read it no start) is first read at the next reading, older than that wall clock by its birth:
+/// its kernel start, newer than every one that sweep read, says nothing counted it, so it counts
+/// from its birth, unmarked; one older than a process that sweep read counts from its first
+/// reading, its work before missed. Live (2026-10-26), dated by its birth alone, the first read
+/// `tab_mc=≥1019 … unattributed_mc=1650` over a 591 ms window, its 1,039 ms lost. NEGATIVE
+/// CONTROL (by hand): dated by its birth where the host read one, the first reads (0, true) too.
+#[test]
+fn a_process_spawned_as_a_sweep_listed_counts_from_its_birth() {
+    let run = |start| {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+        r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+        let base = r.ledger.totals();
+        let spawned = P {
+            birth: Some(unix_ms(2_000 * MS) - 1),
+            ..p(310, 300, 1_039, 0).started(start)
+        };
+        r.step(&sweep(0, &[p(300, SHELL, 0, 0), spawned]));
+        (since(&r, &base, 1), missed(&r))
+    };
+    assert_eq!(
+        run(9_000),
+        ((1_039, false), 0),
+        "newer than every process the last sweep read"
+    );
+    assert_eq!(run(2_500), ((0, true), 3), "older than one");
+}
+
 /// A pid reused by a new process is a new member, never the old one's row.
 #[test]
 fn a_reused_pid_is_a_new_member() {
@@ -801,6 +834,33 @@ fn a_parent_the_kernel_reaped_for_passes_its_doubt_to_its_reaper() {
     assert_eq!(since(&r, &base, 1), (1_000, false));
 }
 
+/// A short-lived parent that ignores `SIGCHLD`, read once with nothing reaped yet (the sweep reads
+/// every process's flag), runs one batch of children the kernel reaps for it and exits, its
+/// waiting parent reaping it between two readings: that reaper's reaped growth holds the batch
+/// twice (2,010 ms for 1,010 run), so the window over the exits counts none of it past what is
+/// absorbed and is marked. NEGATIVE CONTROL (by hand): with the parent read as waiting, the window
+/// reads (1,800, false), the batch's 800 ms since its reading counted twice as exact.
+#[test]
+fn a_one_batch_parent_the_kernel_reaps_for_marks_its_reapers_window() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+    let read = r.step(&sweep(
+        0,
+        &[
+            p(300, SHELL, 0, 0),
+            p(310, 300, 10, 0).nocld(),
+            p(320, 310, 100, 0),
+            p(330, 310, 100, 0),
+        ],
+    ));
+    assert_eq!((read, missed(&r)), (210, 0));
+    let base = r.ledger.totals();
+    // 320 and 330 ran to 500 ms each, reaped for 310 (2,000 ms); 300 reaped 310.
+    r.step(&sweep(0, &[p(300, SHELL, 0, 10 + 2_000)]));
+    assert_eq!(since(&r, &base, 1), (0, true));
+    assert_eq!(owed(&r, 300), Some((0, 0)));
+}
+
 /// A tab's process that outlived its parent (an orphan launchd adopted) is in no parent chain to
 /// the tab, but it is in the session of the tab's shell, and every process in a session descends
 /// from its leader: it takes that tab, so its work counts there, and launchd's reap of it, which
@@ -826,9 +886,10 @@ fn an_orphan_in_a_tabs_session_keeps_the_tab() {
 /// own tab, which the host gives each pane to, leaves each tab its id: an id follows the host's
 /// identity for the tab, never a pane, so over a window across the share the split tab keeps its
 /// work from before it and the new tab takes none of it, only the shared pane's work since. When
-/// the split tab closes, the shared pane's processes count in the tab that still shows them.
-/// NEGATIVE CONTROL (by hand): ids by pane alone give the new tab the split tab's id, and it
-/// reads the split tab's 500 ms.
+/// the split tab closes, the shared pane's processes count in the tab that still shows them. The
+/// same holds where the shared pane is the split tab's least, its key then moving to its other
+/// pane's (the host's roots: `vitals_host_tests.rs`). NEGATIVE CONTROL (by hand): ids by pane
+/// alone give the new tab the split tab's id, and it reads the split tab's 500 ms.
 #[test]
 fn a_shared_pane_listed_first_takes_no_tabs_counter() {
     let root = |key, tab, shell, id| TabRoot {
@@ -864,6 +925,19 @@ fn a_shared_pane_listed_first_takes_no_tabs_counter() {
     let base = r.ledger.totals();
     r.step(&[p(ATERM, 1, 0, 0), p(207, ATERM, 400, 0)]);
     assert_eq!(since(&r, &base, 7), (300, false));
+
+    // The split tab's least pane, 5, shared into the twin listed first: the host gives pane 5 to
+    // the twin and the split tab its other pane's key, so the split tab keeps its counter under
+    // key 7 and the twin takes none of it, only pane 5's work since.
+    let mut r = Run::new();
+    r.tabs = vec![root(5, 5, 205, 10), root(7, 5, 207, 10)];
+    r.step(&panes(0, 0));
+    let base = r.ledger.totals();
+    r.step(&panes(500, 0));
+    r.tabs = vec![root(5, 5, 205, 20), root(7, 7, 207, 10)];
+    r.step(&panes(2_500, 100));
+    assert_eq!(since(&r, &base, 7), (600, false), "the split tab's");
+    assert_eq!(since(&r, &base, 5), (2_000, false), "the twin's, since");
 }
 
 /// A member reaped by a live process whose usage goes unread (root's `sudo -u me`) passes its
@@ -891,6 +965,42 @@ fn work_a_live_unread_process_reaped_waits_for_it_to_go() {
     let base = r.ledger.totals();
     r.step(&[p(ATERM, 1, 0, 0), p(SHELL, ATERM, 0, 1_000 + 455)]);
     assert_eq!(since(&r, &base, 1), (55, false));
+}
+
+/// The same work held under a member that ran `exec sudo -u me cmd` (300: its row kept, unread
+/// as root's), whose sudo's monitor (400) reaped the member: when the monitor exits while the
+/// sudo lives on, the work is held again at the sudo, as it would be at a process with no row,
+/// so the shell's own job meanwhile counts in full (1,000, not 600), and the sudo's exit leaves
+/// only its own 5 ms and the member's 50 ms tail (55, not 455). NEGATIVE CONTROL (by hand): held
+/// again only at a parent with no row, it goes uncertain to the shell instead, is taken out of
+/// the shell's job and then dropped, and the member's work counts twice at the sudo's exit.
+#[test]
+fn work_held_under_a_member_that_ran_sudo_waits_for_the_sudo() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+    let sudo = p(300, SHELL, 0, 0).root();
+    let monitor = p(400, 300, 0, 0).root();
+    assert_eq!(
+        r.step(&sweep(0, &[sudo, monitor, p(410, 400, 400, 0)])),
+        400
+    );
+    // 410 ran 50 ms more and the monitor reaped it; the monitor lives on.
+    r.step(&sweep(0, &[sudo, monitor]));
+    assert_eq!(missed(&r), 3, "its tail is held");
+    // The monitor exits; the sudo reaps it and lives on.
+    let base = r.ledger.totals();
+    r.step(&sweep(0, &[sudo]));
+    assert_eq!(since(&r, &base, 1), (0, false));
+    // The shell's own 1,000 ms job.
+    let shell = |child| [p(ATERM, 1, 0, 0), p(SHELL, ATERM, 0, child)];
+    let base = r.ledger.totals();
+    r.step(&[&shell(1_000)[..], &[sudo]].concat());
+    assert_eq!(since(&r, &base, 1), (1_000, false));
+    // The sudo exits; the shell reaps it (its 5 ms, and 410's 450).
+    let base = r.ledger.totals();
+    r.step(&shell(1_000 + 455));
+    assert_eq!(since(&r, &base, 1), (55, false));
+    assert_eq!(owed(&r, SHELL), Some((0, 0)));
 }
 
 /// A delegated job's figure reads its members' own CPU from a window's start to its end, so a

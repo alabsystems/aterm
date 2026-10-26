@@ -24,12 +24,8 @@ fn a_stalled_key_whose_echo_wraps_the_row_lights_the_last_column() {
         "the stalled fold is licensed: {:?}",
         tally.last_decline_reason
     );
-    let last = glow
-        .admission_log()
-        .last()
-        .map(|r| r.line(echo))
-        .expect("a ring row");
-    assert!(last.ends_with(" licence=inflight"), "{last}");
+    let last = glow.admission_log().last().expect("a ring row");
+    assert_eq!(last.licence, AdmissionRecord::LICENCE_IN_FLIGHT);
     assert!(
         v2_cols(&glow, 11).contains(&99),
         "the last column is lit on the echoing tick: {:?}",

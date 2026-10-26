@@ -3375,6 +3375,10 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
             (584.0, 391.0),
             (738.0, 430.0),
             (1_074.0, 443.0),
+            // Last screens that cut a switch at their top as rows hold Changed in their names.
+            (584.0, 685.0),
+            (738.0, 565.0),
+            (1_074.0, 451.0),
         ] {
             for last in [false, true] {
                 let mut lab = Lab::new("");
@@ -3552,6 +3556,10 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
             (584.0, 391.0),
             (738.0, 430.0),
             (1_074.0, 443.0),
+            // Last screens that cut a switch at their top as rows hold Changed in their names.
+            (584.0, 685.0),
+            (738.0, 565.0),
+            (1_074.0, 451.0),
         ] {
             for last in [false, true] {
                 let switches = |compiled: &crate::native_ui::CompiledUi| {
@@ -4752,8 +4760,9 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
 /// where the scroll settled on the 2× screen before the change back, with
 /// the stop that lists what that screen started with (a 2× screen past the
 /// 1× list's last kept its place too). So with the keyboard off the list (on
-/// the search field, on the sidebar row that opened the page) as with none,
-/// and the next frame at either size, nothing between, draws the same
+/// the search field; the sidebar row that opened the page takes the same
+/// path, as no stop lists either, and faults alike) as with none, and the
+/// next frame at either size, nothing between, draws the same
 /// screen: Home at 1564x180 drew its 2× screen from the stop it was at, and
 /// the next frame from the stop after, where the scroll it was asked for
 /// stood. On a list's last screen, which starts where the list's end puts
@@ -4794,7 +4803,7 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
     let moved = std::sync::atomic::AtomicUsize::new(0);
     let checked = std::sync::atomic::AtomicUsize::new(0);
     let faults = std::sync::Mutex::new(Vec::new());
-    let places = [None, Some("settings/search"), Some("settings/nav/themes")]
+    let places = [None, Some("settings/search")]
         .into_iter()
         .flat_map(|focus| {
             [
@@ -4829,30 +4838,42 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
             let _ = lab.compile(width, height);
             let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
             for top in 1..=limit {
+                set_scale(1.0);
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                lab.state_mut().common.last_focus = focus.map(UiKey::new);
+                let _ = lab.compile(width, height);
+                lab.state_mut().scroll_page_to(top);
+                lab.state_mut().page_reveal = None;
+                let _ = lab.compile(width, height);
+                let (one, shown, _, _) = place(&lab);
+                let at = shown.start;
+                // The scroll left as the 2× screen drew it, then settled on it: the second goes on
+                // from where the first ends, back on the 1× screen with no event since, so its 2×
+                // screen is the first one again, and the one lab serves both.
+                let mut first_two = None;
                 for settled in [false, true] {
-                    set_scale(1.0);
-                    let mut lab = Lab::new("");
-                    lab.state_mut().navigate(route);
-                    lab.state_mut().common.last_focus = focus.map(UiKey::new);
-                    let _ = lab.compile(width, height);
-                    lab.state_mut().scroll_page_to(top);
-                    lab.state_mut().page_reveal = None;
-                    let _ = lab.compile(width, height);
-                    let (one, shown, _, _) = place(&lab);
-                    let at = shown.start;
                     let context = format!(
                         "{route:?} {width}×{height} from stop {at}, keyboard {focus:?}, \
                          settled {settled}"
                     );
                     set_scale(2.0);
                     let at_two = lab.compile(width, height);
-                    if lab.compile(width, height) != at_two {
+                    let differs = match &first_two {
+                        Some(first) => (*first != at_two).then_some(
+                            "at 2× again, no event since, the screen is not the first 2× screen",
+                        ),
+                        None => (lab.compile(width, height) != at_two)
+                            .then_some("at 2× the next frame draws another screen"),
+                    };
+                    if let Some(fault) = differs {
                         faults
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(format!(
-                                "{context}: at 2× the next frame draws another screen"
-                            ));
+                            .push(format!("{context}: {fault}"));
+                    }
+                    if first_two.is_none() {
+                        first_two = Some(at_two);
                     }
                     if settled {
                         lab.state_mut().settle_page_scroll();
@@ -5377,14 +5398,15 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                         let docked = after
                             .semantic(&UiKey::new("settings/status-dock"))
                             .is_some();
-                        // A bar that stops over the switch just pressed, the switch where it
-                        // was, scrolls the rest of its words (`pressed_bottom`).
+                        // A bar held beside the switch just pressed, under the list or over
+                        // it, the switch where it was, scrolls the rest of its words
+                        // (`pressed_bottom`, `press_side`).
                         let held = after
                             .semantic(&UiKey::new("settings/feedback"))
                             .zip(was)
                             .is_some_and(|(bar, was)| {
                                 after.semantic(&pressed).map(|node| node.rect) == Some(was)
-                                    && bar.rect.y <= was.bottom() + status_line_height() + 0.5
+                                    && bar.rect.intersect(was).is_none_or(|both| both.height < 0.5)
                             });
                         let from_the_top =
                             bare(&feedback).starts_with(&bare(&read)) && !read.is_empty();
@@ -5636,7 +5658,7 @@ fn a_status_never_covers_the_switch_the_person_pressed() {
         let key = UiKey::new("settings/control/allow_osc52_query");
         let _ = lab.compile(178.0, 348.0);
         lab.dispatch(AppEvent::FocusChanged(Some(key.clone())));
-        let _ = lab.compile(178.0, 348.0);
+        let was = rect_of(&lab.compile(178.0, 348.0), key.as_str());
         lab.commit("settings/set/allow_osc52_query", None);
         let after = lab.compile(178.0, 348.0);
         let feedback = lab.state().feedback.clone().unwrap_or_default();
@@ -5647,14 +5669,15 @@ fn a_status_never_covers_the_switch_the_person_pressed() {
             .find(|node| node.key == key)
             .map(|node| (node.rect, node.clip));
         let bar = rect_of(&after, "settings/feedback");
-        assert!(
-            switch.is_some_and(|(rect, clip)| clip == rect && rect.bottom() <= bar.y + 0.5),
-            "the switch is whole over the bar: {switch:?}, bar {bar:?}"
+        assert_eq!(
+            switch,
+            Some((was, was)),
+            "the switch stays whole where it was pressed, beside the bar {bar:?}"
         );
         assert!(
-            switch.is_some_and(|(rect, _)| (rect.bottom() - bar.y).abs() < 0.5),
-            "the switch moves no further than the bar at its least covers it: {switch:?}, bar \
-             {bar:?}"
+            bar.bottom() <= was.y + 0.5,
+            "the bar stands over the list, away from the switch pressed low on it: {bar:?}, \
+             switch {was:?}"
         );
         let read = status_words(&after, "settings/status/visual");
         assert!(
@@ -5842,11 +5865,29 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
             let words = UiKey::new("settings/status/visual/words");
             let order = &pressed.focus_order;
             let at = |key: &UiKey| order.iter().position(|focus| focus == key);
+            // The words are the keyboard's stop where the bar stands: right after the switch
+            // under the list, right after the toolbar over it.
+            let over = rect_of(&pressed, "settings/feedback").bottom()
+                <= rect_of(&pressed, key.as_str()).y + 0.5;
+            let before = if over {
+                let toolbar = order
+                    .iter()
+                    .rposition(|focus| {
+                        ["settings/compact-navigation", "settings/search-open"]
+                            .contains(&focus.as_str())
+                    })
+                    .expect("the toolbar's stops");
+                order[toolbar].clone()
+            } else {
+                key.clone()
+            };
             assert_eq!(
                 at(&words),
-                at(&key).map(|switch| switch + 1),
-                "{context}: the words are the keyboard's next stop: {order:?}"
+                at(&before).map(|stop| stop + 1),
+                "{context}: the words are the keyboard's stop after {before:?}: {order:?}"
             );
+            lab.dispatch(AppEvent::FocusChanged(Some(before)));
+            let _ = lab.compile(178.0, 348.0);
             lab.dispatch(AppEvent::StepFocus(1));
             let _ = lab.compile(178.0, 348.0);
             assert!(
@@ -6669,20 +6710,65 @@ fn a_bar_held_over_a_press_keeps_its_room_when_the_list_scrolls() {
 /// up by what it covered: Software Update's at 178x348 with 1x text went up 73pt under a
 /// six-line bar, Security's at 178x348 with 2x text 156pt under a four-line one.
 #[test]
-fn a_status_bar_stops_over_the_control_the_person_pressed() {
-    at_each_text_scale(&[1.0, 2.0], "a bar over a pressed switch", |scale| {
-        let mut pressed = 0;
-        let mut held = 0;
-        let mut faults = Vec::new();
+fn a_row_with_a_note_says_changed_on_it_and_keeps_its_name_whole() {
+    // Terminal at 80x26 with 2x text: Searchable scrollback lines kept a blank line for Changed
+    // under its name and the note under that was cut at the screen's end, 58pt of blank. The note
+    // takes Changed on its first line, so the name stays on one line and that line shows.
+    at_each_text_scale(&[2.0], "changed on the note", |_| {
+        for written in [false, true] {
+            let source = if written {
+                "search_history_lines = 5000\n"
+            } else {
+                ""
+            };
+            let mut lab = Lab::new(source);
+            lab.state_mut().navigate(SettingsRoute::Terminal);
+            let screen = lab.compile(584.0, 376.0);
+            let painted = |prefix: &str| {
+                screen
+                    .paint
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with(prefix) && node.clip == node.rect)
+                    .filter_map(|node| match &node.content {
+                        UiContent::Text(spec) => Some(spec.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                painted("settings/label/search_history_lines/visual/line-"),
+                ["Searchable scrollback lines"],
+                "written: {written}"
+            );
+            let note = painted("settings/detail/search_history_lines/line-0");
+            let want = if written {
+                "Changed \u{b7} Find searches"
+            } else {
+                "Find searches"
+            };
+            assert!(
+                note.first().is_some_and(|line| line.starts_with(want)),
+                "written: {written}: the note's first line shows whole: {note:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn no_row_keeps_a_blank_line_for_what_it_may_say() {
+    // A ROW SAYS CHANGED, AND THE FACTS ONLY SOME VALUES BRING, IN ROOM IT DRAWS EITHER WAY: its
+    // name's last line broken a word early, or its note's first line, never a line kept empty
+    // (Terminal at 80x26 with 2x text: a 58pt blank under Searchable scrollback lines, the next
+    // line cut at the screen's end). Every screen of every page, at the standard sizes.
+    at_each_text_scale(&[1.0, 2.0], "no blank line", |scale| {
+        let mut blank = Vec::new();
+        let mut rows = 0;
         for (width, height) in [
-            (164.0, 348.0),
-            (178.0, 348.0),
-            (234.0, 348.0),
-            (178.0, 420.0),
-            (304.0, 348.0),
-            (444.0, 292.0),
             (584.0, 348.0),
+            (584.0, 376.0),
+            (744.0, 420.0),
             (1_074.0, 684.0),
+            (444.0, 292.0),
         ] {
             for route in SettingsRoute::ALL {
                 if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
@@ -6690,110 +6776,281 @@ fn a_status_bar_stops_over_the_control_the_person_pressed() {
                 }
                 let mut lab = Lab::new("");
                 lab.state_mut().navigate(route);
-                let mut found = None;
-                for _ in 0..8 {
-                    let before = lab.compile(width, height);
-                    found = before
-                        .paint
-                        .iter()
-                        .rfind(|node| {
-                            matches!(node.content, UiContent::Switch(_))
-                                && node.clip == node.rect
-                                && before
-                                    .semantic(&node.key)
-                                    .is_some_and(|live| live.rect == node.rect)
-                        })
-                        .map(|node| (node.key.clone(), node.rect));
-                    let last = lab
-                        .state()
-                        .scroll_shown()
-                        .is_none_or(|(plan, shown)| shown.end >= plan.len());
-                    if found.is_some() || last {
+                for _ in 0..30 {
+                    let compiled = lab.compile(width, height);
+                    for node in &compiled.paint {
+                        let key = node.key.as_str();
+                        let line = (key.starts_with("settings/detail/")
+                            || key.starts_with("settings/note/")
+                            || key.starts_with("settings/group-heading/"))
+                            && key.contains("/line-");
+                        rows += usize::from(line);
+                        let empty = match &node.content {
+                            UiContent::Group(_) => true,
+                            UiContent::Text(spec) => spec.text.trim().is_empty(),
+                            _ => false,
+                        };
+                        if line && empty && node.clip.height > 1.0 {
+                            blank.push(format!("{scale}x {width}x{height} {route:?} {key}"));
+                        }
+                    }
+                    let at = lab.state().scroll_shown().map(|(_, view)| view);
+                    lab.dispatch(AppEvent::ScrollPage(1));
+                    let _ = lab.compile(width, height);
+                    if lab.state().scroll_shown().map(|(_, view)| view) == at {
                         break;
                     }
-                    lab.dispatch(AppEvent::ScrollPage(1));
                 }
-                let Some((key, was)) = found else {
-                    continue;
-                };
-                let compiled = lab.compile(width, height);
-                let Some(crate::native_ui::SemanticValue::Bool(on)) =
-                    compiled.semantic(&key).map(|node| node.value.clone())
-                else {
-                    continue;
-                };
-                let setting = key
-                    .as_str()
-                    .trim_start_matches("settings/control/")
-                    .to_string();
-                lab.state_mut().common.last_focus = Some(key.clone());
-                let Some((patch, operation)) = lab.invoke(
-                    &format!("settings/set/{setting}"),
-                    Some(SemanticInput::Bool(!on)),
-                ) else {
-                    continue;
-                };
-                lab.carry(patch, operation);
-                let after = lab.compile(width, height);
-                let context = format!("{route:?} {width}x{height} at {scale}x {setting}");
-                let docked = after
-                    .semantic(&UiKey::new("settings/status-dock"))
-                    .is_some();
-                let Some(bar) = after
-                    .semantic(&UiKey::new("settings/feedback"))
-                    .map(|node| node.rect)
-                    .filter(|_| !docked)
-                else {
-                    continue;
-                };
-                pressed += 1;
-                let now = after
+            }
+        }
+        blank.sort();
+        blank.dedup();
+        assert!(
+            blank.is_empty(),
+            "{} lines kept blank:\n{}",
+            blank.len(),
+            blank.join("\n")
+        );
+        assert!(rows > 100, "the sweep draws rows' detail lines");
+    });
+}
+
+#[test]
+fn a_status_bar_keeps_its_undo_where_a_place_holds_it() {
+    // A BAR LEAVES ITS UNDO OUT ONLY WHERE NO PLACE HOLDS IT: where no side of the list holds the
+    // bar with its Undo under its words, the Undo goes beside them, their lines scrolling, or the
+    // compact toolbar docks it, a word too long for the dock hyphenating; the switch stays where
+    // it was pressed, the Undo stays a press away, and the bar stays where it first stood.
+    at_each_text_scale(&[2.0], "a bar keeps its Undo", |_| {
+        for (route, setting, width, height, docked) in [
+            (
+                SettingsRoute::SoftwareUpdate,
+                "update.enabled",
+                248.0,
+                292.0,
+                Some(false),
+            ),
+            (
+                SettingsRoute::SoftwareUpdate,
+                "update.enabled",
+                304.0,
+                236.0,
+                Some(true),
+            ),
+            // Over the list for "Applying…", it stays there for the landed status the window's
+            // rules would dock.
+            (
+                SettingsRoute::CursorMotion,
+                "cursor_blink",
+                290.0,
+                236.0,
+                None,
+            ),
+        ] {
+            let context = format!("{route:?} {width}x{height}");
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            let key = UiKey::new(format!("settings/control/{setting}"));
+            let mut was = None;
+            for _ in 0..8 {
+                let screen = lab.compile(width, height);
+                was = screen
                     .paint
                     .iter()
-                    .find(|node| node.key == key)
+                    .find(|node| node.key == key && node.clip == node.rect)
                     .map(|node| node.rect);
-                if now == Some(was) {
-                    if bar.y < was.bottom() - 0.5 {
-                        faults.push(format!("{context}: the bar {bar:?} covers {was:?}"));
+                if was.is_some() {
+                    break;
+                }
+                lab.dispatch(AppEvent::ScrollPage(1));
+            }
+            let was = was.unwrap_or_else(|| panic!("{context}: {setting} drawn whole"));
+            let on = matches!(
+                lab.compile(width, height)
+                    .semantic(&key)
+                    .map(|node| node.value.clone()),
+                Some(crate::native_ui::SemanticValue::Bool(true))
+            );
+            lab.state_mut().common.last_focus = Some(key.clone());
+            let (patch, operation) = lab
+                .invoke(
+                    &format!("settings/set/{setting}"),
+                    Some(SemanticInput::Bool(!on)),
+                )
+                .expect("writes");
+            let applying = lab.compile(width, height);
+            lab.carry(patch, operation);
+            let landed = lab.compile(width, height);
+            for (frame, after) in [("applying", &applying), ("landed", &landed)] {
+                assert_eq!(
+                    after
+                        .paint
+                        .iter()
+                        .find(|node| node.key == key)
+                        .map(|node| (node.rect, node.clip)),
+                    Some((was, was)),
+                    "{context} {frame}: the switch stays where it was pressed"
+                );
+            }
+            assert!(
+                lab.state().undo_offer().is_some()
+                    && landed.semantic(&UiKey::new("settings/undo")).is_some(),
+                "{context}: the status's Undo is a press away"
+            );
+            let docks = |after: &crate::native_ui::CompiledUi| {
+                after
+                    .semantic(&UiKey::new("settings/status-dock"))
+                    .is_some()
+            };
+            assert_eq!(
+                docks(&applying),
+                docks(&landed),
+                "{context}: the bar stays where it first stood"
+            );
+            if let Some(docked) = docked {
+                assert_eq!(
+                    docks(&landed),
+                    docked,
+                    "{context}: the status docks in the toolbar only where no side of the list \
+                     holds it"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
+    // NOTHING THE PERSON PRESSED MOVES: in every window of the sweep that found the switch moving
+    // (main 87 moves, then 24), and the windows past it where the bar's side, its Undo or the
+    // page's list decided it, the last switch a screen draws whole is pressed, a frame drawn
+    // while its write is in flight ("Applying…") and one after it lands; the switch is where it
+    // was on both, whole, and no status's bar covers it, whichever side of the list it takes. Past
+    // the first sweep the press is drawn again with no frame in flight too, so the side its
+    // landed status takes is weighed from the press's screen.
+    at_each_text_scale(&[1.0, 2.0], "a bar beside a pressed switch", |scale| {
+        let (mut pressed, mut over, mut held) = (0, 0, 0);
+        let mut faults = Vec::new();
+        for source in ["", "theme = \"GitHub Light\"\n"] {
+            for ((width, height), in_flight) in [
+                (164.0, 348.0),
+                (178.0, 348.0),
+                (192.0, 348.0),
+                (234.0, 348.0),
+                (178.0, 420.0),
+                (304.0, 348.0),
+                (444.0, 292.0),
+                (584.0, 236.0),
+                (584.0, 348.0),
+                (584.0, 376.0),
+                (738.0, 180.0),
+                (744.0, 420.0),
+                (1_074.0, 684.0),
+                // Where no side of the list holds the bar with its Undo, the dock does, the
+                // Undo beside the words does, its words alone do, or the page moved its list.
+                (164.0, 292.0),
+                (248.0, 292.0),
+                (290.0, 236.0),
+                (290.0, 520.0),
+            ]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, size)| {
+                let frames: &[bool] = if index < 13 { &[true] } else { &[true, false] };
+                frames.iter().map(move |applying| (size, *applying))
+            }) {
+                for route in SettingsRoute::ALL {
+                    if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+                        continue;
                     }
-                    if after
+                    let mut lab = Lab::new(source);
+                    lab.state_mut().navigate(route);
+                    let mut found = None;
+                    for _ in 0..8 {
+                        let before = lab.compile(width, height);
+                        found = before
+                            .paint
+                            .iter()
+                            .rfind(|node| {
+                                matches!(node.content, UiContent::Switch(_))
+                                    && node.clip == node.rect
+                                    && before
+                                        .semantic(&node.key)
+                                        .is_some_and(|live| live.rect == node.rect)
+                            })
+                            .map(|node| (node.key.clone(), node.rect));
+                        let last = lab
+                            .state()
+                            .scroll_shown()
+                            .is_none_or(|(plan, shown)| shown.end >= plan.len());
+                        if found.is_some() || last {
+                            break;
+                        }
+                        lab.dispatch(AppEvent::ScrollPage(1));
+                    }
+                    let Some((key, was)) = found else {
+                        continue;
+                    };
+                    let compiled = lab.compile(width, height);
+                    let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                        compiled.semantic(&key).map(|node| node.value.clone())
+                    else {
+                        continue;
+                    };
+                    let setting = key
+                        .as_str()
+                        .trim_start_matches("settings/control/")
+                        .to_string();
+                    lab.state_mut().common.last_focus = Some(key.clone());
+                    let Some((patch, operation)) = lab.invoke(
+                        &format!("settings/set/{setting}"),
+                        Some(SemanticInput::Bool(!on)),
+                    ) else {
+                        continue;
+                    };
+                    let context = format!(
+                        "{route:?} {width}x{height} at {scale}x{} {setting}",
+                        if source.is_empty() { "" } else { " light" }
+                    );
+                    let applying = in_flight.then(|| lab.compile(width, height));
+                    lab.carry(patch, operation);
+                    let landed = lab.compile(width, height);
+                    pressed += 1;
+                    let frames = applying
+                        .iter()
+                        .map(|applying| ("applying", applying))
+                        .chain([("landed", &landed)]);
+                    for (frame, after) in frames {
+                        let now = after
+                            .paint
+                            .iter()
+                            .find(|node| node.key == key)
+                            .map(|node| (node.rect, node.clip));
+                        let bar = after
+                            .semantic(&UiKey::new("settings/feedback"))
+                            .map(|node| node.rect);
+                        if now != Some((was, was)) {
+                            faults.push(format!(
+                                "{context} {frame}: moved from {was:?} to {now:?} beside the \
+                                 bar {bar:?}"
+                            ));
+                        } else if let Some(bar) = bar
+                            && bar.intersect(was).is_some_and(|both| both.height > 0.5)
+                        {
+                            faults
+                                .push(format!("{context} {frame}: the bar {bar:?} covers {was:?}"));
+                        }
+                    }
+                    if after_bar_over(&landed, was) {
+                        over += 1;
+                    }
+                    if landed
                         .paint
                         .iter()
                         .any(|node| node.key.as_str() == "settings/status/visual/thumb")
                     {
                         held += 1;
                     }
-                    continue;
-                }
-                let lines = after
-                    .paint
-                    .iter()
-                    .filter(|node| {
-                        node.key
-                            .as_str()
-                            .starts_with("settings/status/visual/line-")
-                            && node.clip.height >= node.rect.height - 0.5
-                    })
-                    .count();
-                let room_bottom = lab.state().scroll_plan().zip(now).and_then(|(plan, now)| {
-                    after
-                        .semantics
-                        .iter()
-                        .find(|node| {
-                            node.role == SemanticRole::List
-                                && node.key.as_str() != "settings/navigation/list"
-                                && node.rect.contains(now.x + 1.0, now.y + 1.0)
-                        })
-                        .map(|list| list.rect.y + plan.room())
-                });
-                let least_cut = room_bottom.is_some_and(|bottom| {
-                    now.is_some_and(|now| (was.y - now.y - (was.bottom() - bottom)).abs() < 0.5)
-                });
-                if lines > 1 || !least_cut {
-                    faults.push(format!(
-                        "{context}: moved from {was:?} to {now:?} under the bar {bar:?} \
-                         showing {lines} lines (the room ends at {room_bottom:?})"
-                    ));
                 }
             }
         }
@@ -6803,10 +7060,335 @@ fn a_status_bar_stops_over_the_control_the_person_pressed() {
             faults.len(),
             faults.join("\n")
         );
-        assert!(pressed > 20, "{pressed} presses under a bar");
+        assert!(pressed > 40, "{pressed} presses");
+        if scale > 1.5 {
+            assert!(
+                over > 0,
+                "some status's bar stands over the top of the list"
+            );
+            assert!(
+                held > 0,
+                "some bar holds its words in fewer lines, scrolling"
+            );
+        }
+    });
+}
+
+/// Whether `compiled`'s status bar stands over the list, above the control at `control`.
+fn after_bar_over(compiled: &crate::native_ui::CompiledUi, control: LogicalRect) -> bool {
+    compiled
+        .semantic(&UiKey::new("settings/status-dock"))
+        .is_none()
+        && compiled
+            .semantic(&UiKey::new("settings/feedback"))
+            .is_some_and(|bar| bar.rect.bottom() <= control.y + 0.5)
+}
+
+#[test]
+fn a_segment_pressed_stays_where_it_was_pressed() {
+    // NOTHING THE PERSON PRESSED MOVES, A SEGMENT AS A SWITCH: a segment chosen takes its
+    // segmented control's key, so the press that found it lost it, held no place for it and put
+    // no status's bar beside it; it went up under the bar (Appearance's Window appearance, Dark,
+    // at 192x348 with 2x text: from 264pt to 139pt) or down under the note the choice brought
+    // above it (Security's Universal Control, Leave as is, at 584x348 with 2x text: from 174pt to
+    // 242pt). And Top's choices narrowed once set away from their default, so the segment pressed
+    // moved sideways (Window appearance, Dark, at 738x420: 1.4pt). In every window of the
+    // switches' sweep, the last segment a screen draws whole that is not chosen is pressed, a
+    // frame drawn while its write is in flight and one after it lands: it is where it was on
+    // both, whole, and no status's bar covers it.
+    at_each_text_scale(&[1.0, 2.0], "a pressed segment stays", |scale| {
+        let (mut pressed, mut over) = (0, 0);
+        let mut faults = Vec::new();
+        for source in ["", "theme = \"GitHub Light\"\n"] {
+            for (width, height) in [
+                (164.0, 348.0),
+                (178.0, 348.0),
+                (192.0, 348.0),
+                (234.0, 348.0),
+                (178.0, 420.0),
+                (304.0, 348.0),
+                (444.0, 292.0),
+                (584.0, 236.0),
+                (584.0, 348.0),
+                (584.0, 376.0),
+                (738.0, 180.0),
+                (738.0, 420.0),
+                (1_074.0, 684.0),
+                (164.0, 292.0),
+                (248.0, 292.0),
+                (290.0, 236.0),
+                (290.0, 520.0),
+            ] {
+                for route in SettingsRoute::ALL {
+                    if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+                        continue;
+                    }
+                    let mut lab = Lab::new(source);
+                    lab.state_mut().navigate(route);
+                    let mut found = None;
+                    for _ in 0..8 {
+                        let before = lab.compile(width, height);
+                        found = before
+                            .paint
+                            .iter()
+                            .rfind(|node| {
+                                node.key.as_str().starts_with("settings/segment/")
+                                    && matches!(node.content, UiContent::Button(_))
+                                    && node.clip == node.rect
+                                    && before
+                                        .semantic(&node.key)
+                                        .is_some_and(|live| live.rect == node.rect)
+                            })
+                            .map(|node| (node.key.clone(), node.rect));
+                        let last = lab
+                            .state()
+                            .scroll_shown()
+                            .is_none_or(|(plan, shown)| shown.end >= plan.len());
+                        if found.is_some() || last {
+                            break;
+                        }
+                        lab.dispatch(AppEvent::ScrollPage(1));
+                    }
+                    let Some((key, was)) = found else {
+                        continue;
+                    };
+                    let Some((field, _)) = key
+                        .as_str()
+                        .trim_start_matches("settings/segment/")
+                        .rsplit_once('/')
+                    else {
+                        continue;
+                    };
+                    let chosen = UiKey::new(format!("settings/control/{field}"));
+                    lab.state_mut().common.last_focus = Some(key.clone());
+                    let Some((patch, operation)) = lab.invoke(key.as_str(), None) else {
+                        continue;
+                    };
+                    let context = format!(
+                        "{route:?} {width}x{height} at {scale}x{} {}",
+                        if source.is_empty() { "" } else { " light" },
+                        key.as_str()
+                    );
+                    let applying = lab.compile(width, height);
+                    lab.carry(patch, operation);
+                    let landed = lab.compile(width, height);
+                    pressed += 1;
+                    for (frame, after) in [("applying", &applying), ("landed", &landed)] {
+                        let now = after
+                            .paint
+                            .iter()
+                            .find(|node| node.key == chosen)
+                            .map(|node| (node.rect, node.clip));
+                        let bar = after
+                            .semantic(&UiKey::new("settings/feedback"))
+                            .map(|node| node.rect);
+                        if now != Some((was, was)) {
+                            faults.push(format!(
+                                "{context} {frame}: moved from {was:?} to {now:?} beside the \
+                                 bar {bar:?}"
+                            ));
+                        } else if let Some(bar) = bar
+                            && bar.intersect(was).is_some_and(|both| both.height > 0.5)
+                        {
+                            faults
+                                .push(format!("{context} {frame}: the bar {bar:?} covers {was:?}"));
+                        }
+                    }
+                    if after_bar_over(&landed, was) {
+                        over += 1;
+                    }
+                }
+            }
+        }
         assert!(
-            held > 0,
-            "some bar stops over its switch, its words scrolling"
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
         );
+        assert!(pressed > 20, "{pressed} presses");
+        if scale > 1.5 {
+            assert!(
+                over > 0,
+                "some segment's status stands over the top of the list"
+            );
+        }
+    });
+}
+
+#[test]
+fn the_person_moves_on_from_a_press_by_keyboard_or_page() {
+    // A PRESS HOLDS THE LIST ONLY UNTIL THE PERSON MOVES ON: after a switch is pressed and its
+    // status stands, Tab goes on to controls the list brings into view, and Page Down turns the
+    // page. Held past that, the list kept the switch where it was pressed, and the controls Tab
+    // went on to and the page Page Down turned to never came into view (Security at 584x348:
+    // after Allow programs to read the clipboard, the next switches).
+    at_each_text_scale(&[1.0, 2.0], "moving on from a press", |scale| {
+        let (mut steps, mut pages) = (0, 0);
+        let mut faults = Vec::new();
+        for (width, height) in [
+            (178.0, 348.0),
+            (304.0, 348.0),
+            (584.0, 348.0),
+            (738.0, 420.0),
+        ] {
+            for route in SettingsRoute::ALL {
+                if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+                    continue;
+                }
+                for paging in [false, true] {
+                    let mut lab = Lab::new("");
+                    lab.state_mut().navigate(route);
+                    let before = lab.compile(width, height);
+                    let Some(key) = before
+                        .paint
+                        .iter()
+                        .rfind(|node| {
+                            matches!(node.content, UiContent::Switch(_))
+                                && node.clip == node.rect
+                                && before.semantic(&node.key).is_some()
+                        })
+                        .map(|node| node.key.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                        before.semantic(&key).map(|node| node.value.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(setting) = key.as_str().strip_prefix("settings/control/") else {
+                        continue;
+                    };
+                    let context = format!("{route:?} {width}x{height} at {scale}x {setting}");
+                    lab.dispatch(AppEvent::FocusChanged(Some(key.clone())));
+                    let _ = lab.compile(width, height);
+                    let Some((patch, operation)) = lab.invoke(
+                        &format!("settings/set/{setting}"),
+                        Some(SemanticInput::Bool(!on)),
+                    ) else {
+                        continue;
+                    };
+                    lab.carry(patch, operation);
+                    let pressed = lab.compile(width, height);
+                    let y = |compiled: &crate::native_ui::CompiledUi| {
+                        compiled
+                            .paint
+                            .iter()
+                            .find(|node| node.key == key)
+                            .map(|node| node.rect.y)
+                    };
+                    if paging {
+                        let last = lab
+                            .state()
+                            .scroll_shown()
+                            .is_none_or(|(plan, shown)| shown.end >= plan.len());
+                        if last {
+                            continue;
+                        }
+                        lab.dispatch(AppEvent::ScrollPage(1));
+                        let turned = lab.compile(width, height);
+                        pages += 1;
+                        if y(&turned) == y(&pressed) {
+                            faults.push(format!("{context}: Page Down left the list as it was"));
+                        }
+                        continue;
+                    }
+                    for step in 0..4 {
+                        lab.dispatch(AppEvent::StepFocus(1));
+                        let after = lab.compile(width, height);
+                        let Some(focus) = lab.state().common.last_focus.clone() else {
+                            break;
+                        };
+                        if lab
+                            .state()
+                            .scroll_plan()
+                            .is_none_or(|plan| plan.stop_of(&focus).is_none())
+                        {
+                            continue;
+                        }
+                        steps += 1;
+                        let drawn = after
+                            .paint
+                            .iter()
+                            .find(|node| node.key == focus)
+                            .map(|node| (node.rect, node.clip));
+                        if !drawn
+                            .is_some_and(|(rect, clip)| clip.height >= rect.height.min(20.0) - 0.5)
+                        {
+                            faults.push(format!(
+                                "{context}: Tab {step} went to {} out of view: {drawn:?}",
+                                focus.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(steps > 20 && pages > 5, "{steps} Tabs, {pages} pages");
+    });
+}
+
+#[test]
+fn a_fact_no_choice_of_the_row_brings_keeps_no_room() {
+    // Predictive echo's "Can show a password" comes only with Always, which the file alone sets
+    // (the row offers Off and Adaptive), and its control changes with it; the room kept for it
+    // read as blank lines under the segments while the value was another (Keyboard & Input at
+    // 304x420 with 2x text: three lines). Unset, no line of the row is kept empty where Changed
+    // shares a line; written Always, the row says the fact.
+    at_each_text_scale(&[1.0, 2.0], "no room for an unchosen fact", |scale| {
+        let sizes: &[(f32, f32)] = if scale > 1.5 {
+            &[(304.0, 420.0)]
+        } else {
+            &[(164.0, 348.0), (234.0, 348.0)]
+        };
+        for &(width, height) in sizes {
+            for (source, said) in [("", false), ("predictive_echo = \"always\"\n", true)] {
+                let context = format!("{width}x{height} at {scale}x, said: {said}");
+                let mut lab = Lab::new(source);
+                lab.state_mut().navigate(SettingsRoute::KeyboardInput);
+                let mut seen = false;
+                let mut words = String::new();
+                for _ in 0..30 {
+                    let compiled = lab.compile(width, height);
+                    for node in &compiled.paint {
+                        let key = node.key.as_str();
+                        let line = (key.starts_with("settings/detail/predictive_echo/")
+                            || key.starts_with("settings/note/predictive_echo/"))
+                            && key.contains("/line-");
+                        if !line || node.clip.height <= 1.0 {
+                            continue;
+                        }
+                        seen = true;
+                        match &node.content {
+                            UiContent::Text(spec) => {
+                                words.push_str(&spec.text);
+                                words.push(' ');
+                            }
+                            _ => panic!("{context}: {key} is kept empty"),
+                        }
+                    }
+                    let at = lab.state().scroll_shown().map(|(_, view)| view);
+                    lab.dispatch(AppEvent::ScrollPage(1));
+                    let _ = lab.compile(width, height);
+                    if lab.state().scroll_shown().map(|(_, view)| view) == at {
+                        break;
+                    }
+                }
+                if said {
+                    assert!(seen, "{context}: the row's lines are drawn");
+                    assert!(
+                        words.replace("- ", "").contains("password"),
+                        "{context}: the row says it can show a password: {words:?}"
+                    );
+                }
+            }
+        }
     });
 }

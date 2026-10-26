@@ -368,11 +368,12 @@ const fn required(m: &Message) -> std::result::Result<(), &'static str> {
 }
 
 /// The header's length: the 16 bytes up to the fields' content, the fields (at most
-/// [`MAX_ARRAY_BYTES`]), and the padding to the body's 8-byte boundary.
+/// [`MAX_ARRAY_BYTES`]), and the padding to the body's 8-byte boundary. Not `const`: Trust
+/// 0.11.0 refuses a contract on a `const fn`.
 #[cfg_attr(trust_verify, trust::requires(fields <= 67108864))]
 #[cfg_attr(trust_verify, trust::ensures(result >= 16 && result % 8 == 0))]
 #[inline]
-const fn header_len(fields: usize) -> usize {
+fn header_len(fields: usize) -> usize {
     pad_to(16 + fields, 8)
 }
 

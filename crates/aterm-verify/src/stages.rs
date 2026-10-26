@@ -407,7 +407,7 @@ pub const OBJC_DRIVES: [ObjcDrive; 5] = [
         example: "objc_toolbar_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
-        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority — and the menu bar's real status item held This Mac as its glance counts it",
+        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority — and the menu bar's real status item held This Mac as its glance counts it, and listed a box that stopped its agent above an older report whose row's tip says its program carries on meanwhile",
     },
     ObjcDrive {
         package: "aterm-gui",
@@ -808,9 +808,9 @@ const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
 const MEASURE_NO_WINDOWS: &str = "ATERM_MEASURE_NO_WINDOWS";
 
 /// The named skip of the measuring rows `--no-windows` leaves out.
-const MEASURE_WINDOW_ROWS_SKIP: &str = "spin's window row (--no-windows: it opens a window on the \
-                                        desktop — fix: run without --no-windows when the desktop \
-                                        is free)";
+const MEASURE_WINDOW_ROWS_SKIP: &str = "spin's window rows (--no-windows: each opens a window on \
+                                        the desktop — fix: run without --no-windows when the \
+                                        desktop is free)";
 
 fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
     let label = format!("targo {}", args[1..].join(" "));

@@ -4604,7 +4604,7 @@ impl App {
                 SwitchPaint {
                     face,
                     hover,
-                    version: None,
+                    version: agent.and_then(aterm_phase::Program::harness_version),
                 }
             });
         let carried = supervised || (prog == aterm_phase::Program::Codex && self_proven);
@@ -4829,6 +4829,7 @@ impl App {
                         leaf.rect.size.width.round().max(1.0) as usize,
                     )
                 }));
+            ws.pet_chrome.painted_over(ws.input_scratch.content_seq);
             std::mem::take(&mut ws.claude_footer_lists)
         }) else {
             return;
@@ -5372,9 +5373,7 @@ impl App {
                 let harness_on = view.wears_glass(supervised).is_some() && !agy_switch_off;
                 let switch = crate::autopilot::HarnessSwitch::of(view).map(|face| {
                     let (face, hover) = ws.claude_lights.switch_shown(session, face);
-                    let version = (agent == Some(aterm_phase::Program::Agy))
-                        .then(|| aterm_phase::Program::Agy.harness_version())
-                        .flatten();
+                    let version = agent.and_then(aterm_phase::Program::harness_version);
                     SwitchPaint {
                         face,
                         hover,
@@ -6187,32 +6186,58 @@ enum SwitchInk {
     /// A glyph of the switch's words and state on a line that wears a theme
     /// ([`SwitchFace::on_arc`]).
     Arc(u8),
-    /// The switch's label (`alab harness`), and the face's blanks.
+    /// The switch's label (`alab harness v0.1`), and the face's blanks.
     Label,
-    /// The lit state, `● on`: the accent.
+    /// The ultra-narrow lit state, `● on`: the accent.
     Lit,
-    /// The state the switch is in when off, `○ off`.
-    Unlit,
-    /// A letter of the `on` button.
-    Button,
-    /// A cap of the button (`▐`, `▌`).
-    Cap,
+    /// A glyph of the selected `on` thumb (` ● on `).
+    OnThumb,
+    /// Outer cap of the selected `on` thumb (`▐`).
+    OnCap,
+    /// Inner seam cap from the selected `on` thumb into the recessed track (`▌`).
+    OnSeamCap,
+    /// A glyph of the selected `off` thumb (` ○ off `, or narrow ` on `): neutral slate, never accent.
+    OffThumb,
+    /// Outer cap of the selected `off` thumb (`▐`, `▌`).
+    OffCap,
+    /// Inner seam cap from the recessed track into the selected `off` thumb (`▐`).
+    OffSeamCap,
+    /// A glyph of the unselected segment (` off ` or ` on `) in the recessed track.
+    Track,
+    /// Outer cap of the recessed track (`▐`, `▌`).
+    TrackCap,
     /// `◐ turning on` or `◐ turning off`: the accent, quieted and floored to 4.5:1
     /// ([`turning_ink`]).
     Turning,
 }
 
-/// The cells a switch face may take: the widest, ` alab harness v0.1 ○ off ▐ on ▌ `.
-const SWITCH_FACE_MAX: usize = 34;
+impl SwitchInk {
+    #[cfg(test)]
+    const fn is_thumb_cap(self) -> bool {
+        matches!(
+            self,
+            Self::OnCap | Self::OnSeamCap | Self::OffCap | Self::OffSeamCap
+        )
+    }
+
+    #[cfg(test)]
+    const fn is_thumb(self) -> bool {
+        matches!(self, Self::OnThumb | Self::OffThumb)
+    }
+}
+
+/// The cells a switch face may take: the widest, ` alab harness v0.1 ▐ ● on ▌ off ▌ `, with
+/// headroom for multi-digit harness versions.
+const SWITCH_FACE_MAX: usize = 40;
 
 /// One harness switch face as laid ([`switch_face`]): its cells and where its parts lie in them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SwitchFace {
     cells: [(char, SwitchInk); SWITCH_FACE_MAX],
     len: usize,
-    /// The switch's own cells: its label and its state, a lit pill included.
+    /// The switch's selected state cells (with its label when contiguous on the left).
     switch: std::ops::Range<usize>,
-    /// The off face's `on` button ([`push_on_button`]).
+    /// The off face's `on` segment (`▐ on ` on the two-half switch, `▐ on ▌` at the narrowest).
     button: Option<std::ops::Range<usize>>,
 }
 
@@ -6237,16 +6262,15 @@ impl SwitchFace {
     }
 
     /// The face on a line that wears a theme ([`SwitchInk::Arc`], [`compose_top`]):
-    /// the arc runs through its words, a lit pill's caps and fill keeping their inks (the
-    /// accent, or the white line's white, [`switch_cell`]).
+    /// the arc runs through its words, while the segmented pill's caps, thumb and track keep their
+    /// inks (the accent, the white line's white, or neutral slate, [`switch_cell`]).
     fn on_arc(&mut self) {
-        let span = self.switch.clone();
         let arcs = |&(ch, ink): &(char, SwitchInk)| {
-            ch != ' ' && !matches!(ink, SwitchInk::Cap | SwitchInk::Button)
+            ch != ' ' && matches!(ink, SwitchInk::Label | SwitchInk::Lit | SwitchInk::Turning)
         };
-        let n = self.cells[span.clone()].iter().filter(|&c| arcs(c)).count();
+        let n = self.cells[..self.len].iter().filter(|&c| arcs(c)).count();
         let mut k = 0usize;
-        for cell in &mut self.cells[span] {
+        for cell in &mut self.cells[..self.len] {
             if !arcs(&*cell) {
                 continue;
             }
@@ -6284,38 +6308,51 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
     };
     match paint.face {
         HarnessSwitch::On => {
-            let words = [2, 1, 0].get(tier).copied()?;
+            let words = [2, 1, 0, 0].get(tier).copied()?;
             f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
-            // A versioned face draws its lit state as a pill: the switch's
-            // own state, so its cells are the switch's, never the off
-            // face's `on` button.
-            if paint.version.is_some() {
-                f.push("\u{2590}", SwitchInk::Cap);
-                f.push(" \u{25cf} on ", SwitchInk::Button);
-                f.push("\u{258c}", SwitchInk::Cap);
+            // Tiers 0..3 draw the two-state segmented `[ ● on | off ]` switch: only `● on` wears
+            // the lit thumb fill while `off` sits unselected in the recessed track. Tier 3 keeps
+            // `● on` down to 10-column panes.
+            if tier < 3 {
+                f.push("\u{2590}", SwitchInk::OnCap);
+                f.push(" \u{25cf} on ", SwitchInk::OnThumb);
+                f.push("\u{258c}", SwitchInk::OnSeamCap);
+                f.switch.end = f.len;
+                f.push(" off ", SwitchInk::Track);
+                f.push("\u{258c}", SwitchInk::TrackCap);
             } else {
                 f.push("\u{25cf} on", SwitchInk::Lit);
+                f.switch.end = f.len;
             }
-            f.switch.end = f.len;
             f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Off(_) => {
             let words = [2, 1, 0, 0].get(tier).copied()?;
             f.push(" ", SwitchInk::Label);
-            f.switch.start = f.len;
             label(&mut f, words);
+            // Tiers 0..3 draw the two-state segmented `[ on | ○ off ]` switch: `on` sits
+            // unselected in the muted track and only `○ off` wears a neutral slate thumb (never
+            // active green). Tier 3 keeps `▐ on ▌` in neutral slate down to 12-column panes.
             if tier < 3 {
-                f.push("\u{25cb} off", SwitchInk::Unlit);
+                let on_start = f.len;
+                f.push("\u{2590}", SwitchInk::TrackCap);
+                f.push(" on ", SwitchInk::Track);
+                f.button = Some(on_start..f.len);
+                f.switch.start = f.len;
+                f.push("\u{2590}", SwitchInk::OffSeamCap);
+                f.push(" \u{25cb} off ", SwitchInk::OffThumb);
+                f.push("\u{258c}", SwitchInk::OffCap);
                 f.switch.end = f.len;
-                f.push(" ", SwitchInk::Label);
             } else {
-                f.switch.end = f.len;
+                f.switch = f.len..f.len;
+                let on_start = f.len;
+                f.push("\u{2590}", SwitchInk::OffCap);
+                f.push(" on ", SwitchInk::OffThumb);
+                f.push("\u{258c}", SwitchInk::OffCap);
+                f.button = Some(on_start..f.len);
             }
-            let at = f.len;
-            push_on_button(&mut f);
-            f.button = Some(at..f.len);
             f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Turning | HarnessSwitch::TurningOff => {
@@ -6334,13 +6371,6 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
         }
     }
     Some(f)
-}
-
-/// The off switch's `on` button ([`switch_face`]).
-fn push_on_button(f: &mut SwitchFace) {
-    f.push("\u{2590}", SwitchInk::Cap);
-    f.push(" on ", SwitchInk::Button);
-    f.push("\u{258c}", SwitchInk::Cap);
 }
 
 /// The widest of `paint`'s faces that fits `room` cells with two of the rule's own on either
@@ -6365,9 +6395,10 @@ fn switch_cell(
     let accent = || legible_on(mark_fg, blank.bg);
     let quiet = || legible_on(mix(blank.fg, blank.bg, 0.3), blank.bg);
     let agent = || legible_on(mix(accent(), blank.fg, 0.35), blank.bg);
-    // On Autopilot Off's white line (`CardPalette::Off`) a lit pill wears the moonbow's white,
-    // as its words do; elsewhere a lit pill and an off face's `on` button wear the accent.
-    let pill = || match palette {
+    // On Autopilot Off's white line (`CardPalette::Off`) a lit `on` thumb wears the moonbow's
+    // white, as its words do; elsewhere a lit `on` thumb wears the accent, while an `off` thumb
+    // always wears neutral slate so an off switch never lights up in active green.
+    let on_pill = || match palette {
         Some(white @ aterm_effects::harness_card::CardPalette::Off)
             if paint.face == HarnessSwitch::On =>
         {
@@ -6375,13 +6406,31 @@ fn switch_cell(
         }
         _ => accent(),
     };
-    let fill = || {
-        let pill = pill();
+    let on_fill = || {
+        let pill = on_pill();
         if paint.hover {
             legible_on(mix(pill, blank.fg, 0.25), blank.bg)
         } else {
             pill
         }
+    };
+    let off_fill = || {
+        legible_on(
+            mix(blank.fg, blank.bg, if paint.hover { 0.3 } else { 0.45 }),
+            blank.bg,
+        )
+    };
+    let track_bg = || mix(blank.bg, blank.fg, if paint.hover { 0.18 } else { 0.12 });
+    let track_fg = || {
+        let bg = track_bg();
+        legible_on(
+            if paint.hover {
+                blank.fg
+            } else {
+                mix(blank.fg, bg, 0.35)
+            },
+            bg,
+        )
     };
     let on = paint.face.is_on();
     let mut cell = RenderCell { ch, ..blank };
@@ -6411,16 +6460,38 @@ fn switch_cell(
             cell.fg = accent();
             cell.bold = true;
         }
-        SwitchInk::Unlit => cell.fg = quiet(),
-        SwitchInk::Button => {
+        SwitchInk::OnThumb => {
             cell.fg = blank.bg;
-            cell.bg = fill();
+            cell.bg = on_fill();
             cell.bold = true;
-            if paint.hover && ch != ' ' {
+        }
+        SwitchInk::OnCap => cell.fg = on_fill(),
+        SwitchInk::OnSeamCap => {
+            cell.fg = on_fill();
+            cell.bg = track_bg();
+        }
+        SwitchInk::OffThumb => {
+            cell.fg = blank.bg;
+            cell.bg = off_fill();
+            cell.bold = true;
+            if paint.hover && ch != ' ' && ch != '\u{25cb}' {
                 cell.underline = aterm_core::terminal::UnderlineStyle::Single;
             }
         }
-        SwitchInk::Cap => cell.fg = fill(),
+        SwitchInk::OffCap => cell.fg = off_fill(),
+        SwitchInk::OffSeamCap => {
+            cell.fg = off_fill();
+            cell.bg = track_bg();
+        }
+        SwitchInk::Track => {
+            cell.fg = track_fg();
+            cell.bg = track_bg();
+            if paint.hover && ch != ' ' {
+                cell.bold = true;
+                cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+            }
+        }
+        SwitchInk::TrackCap => cell.fg = track_bg(),
         SwitchInk::Turning => cell.fg = turning_ink(accent(), blank.bg),
     }
     if paint.hover
@@ -7287,9 +7358,7 @@ pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> (String, O
     let paint = SwitchPaint {
         face: b.face,
         hover: false,
-        version: (b.program == aterm_phase::Program::Agy)
-            .then(|| b.program.harness_version())
-            .flatten(),
+        version: b.program.harness_version(),
     };
     let Some(face) = switch_face(paint, b.tier) else {
         return (String::new(), None);
@@ -7304,7 +7373,19 @@ pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> (String, O
             .collect::<Vec<_>>()
             .join(" ")
     };
-    (words(&face.switch), face.button.as_ref().map(words))
+    let switch = match &face.button {
+        Some(btn) if !face.switch.is_empty() => {
+            let lead = words(&(0..btn.start));
+            let state = words(&face.switch);
+            if lead.is_empty() {
+                state
+            } else {
+                format!("{lead} {state}")
+            }
+        }
+        _ => words(&face.switch),
+    };
+    (switch, face.button.as_ref().map(words))
 }
 
 /// Whether `row` is an agy tool-call header.
@@ -9035,9 +9116,10 @@ mod tests {
         assert_eq!(
             texts(paint(HarnessSwitch::On)),
             [
-                " alab harness \u{25cf} on ",
-                " alab \u{25cf} on ",
-                " \u{25cf} on "
+                " alab harness \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+                " alab \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+                " \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+                " \u{25cf} on ",
             ]
         );
         assert_eq!(
@@ -9047,9 +9129,10 @@ mod tests {
                 version: Some("0.1"),
             }),
             [
-                " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} ",
-                " alab \u{2590} \u{25cf} on \u{258c} ",
-                " \u{2590} \u{25cf} on \u{258c} "
+                " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+                " alab \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+                " \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
+                " \u{25cf} on ",
             ]
         );
         for off in [
@@ -9060,17 +9143,24 @@ mod tests {
             assert_eq!(
                 texts(p),
                 [
-                    " alab harness \u{25cb} off \u{2590} on \u{258c} ",
-                    " alab \u{25cb} off \u{2590} on \u{258c} ",
-                    " \u{25cb} off \u{2590} on \u{258c} ",
+                    " alab harness \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
+                    " alab \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
+                    " \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
                     " \u{2590} on \u{258c} ",
                 ],
                 "{off:?}"
             );
-            for f in faces(p) {
-                let button = f.button.clone().expect("every off form has its button");
+            for (tier, f) in faces(p).into_iter().enumerate() {
+                let button = f.button.clone().expect("every off form has its on segment");
                 let drawn: String = f.cells()[button].iter().map(|c| c.0).collect();
-                assert_eq!(drawn, "\u{2590} on \u{258c}");
+                assert_eq!(
+                    drawn,
+                    if tier < 3 {
+                        "\u{2590} on "
+                    } else {
+                        "\u{2590} on \u{258c}"
+                    }
+                );
             }
         }
         assert_eq!(
@@ -9129,8 +9219,9 @@ mod tests {
         }
     }
 
-    /// A versioned lit face's pill is the switch's own cells in every form, never the off face's
-    /// `on` button, and keeps its caps and fill on a themed line; every off form keeps its button.
+    /// A versioned lit face's pill is the switch's own cells in every segmented form, never the
+    /// off face's `on` button, and keeps its caps, thumb and muted `off` track on a themed line;
+    /// every off form keeps its `on` segment in neutral/recessed ink rather than active green.
     #[test]
     fn a_lit_pill_is_the_switchs_own_state_not_an_on_button() {
         use crate::autopilot::{HarnessSwitch, SwitchOff};
@@ -9144,10 +9235,14 @@ mod tests {
             .filter_map(|t| switch_face(paint(HarnessSwitch::On), t))
             .collect();
         let texts: Vec<String> = lit.iter().map(SwitchFace::text).collect();
-        assert_eq!(lit.len(), 3, "{texts:?}");
-        for f in &lit {
+        assert_eq!(lit.len(), 4, "{texts:?}");
+        for (tier, f) in lit.iter().enumerate() {
             let switch: String = f.cells()[f.switch.clone()].iter().map(|c| c.0).collect();
-            assert!(switch.ends_with(pill), "{:?}: {switch:?}", f.text());
+            if tier < 3 {
+                assert!(switch.ends_with(pill), "{:?}: {switch:?}", f.text());
+            } else {
+                assert_eq!(switch, "\u{25cf} on");
+            }
             assert_eq!(f.button, None, "{:?}", f.text());
         }
         let mut arced = lit[0].clone();
@@ -9161,13 +9256,28 @@ mod tests {
         assert_eq!(
             caps,
             [
-                SwitchInk::Cap,
-                SwitchInk::Button,
-                SwitchInk::Button,
-                SwitchInk::Button,
-                SwitchInk::Cap
+                SwitchInk::OnCap,
+                SwitchInk::OnThumb,
+                SwitchInk::OnThumb,
+                SwitchInk::OnThumb,
+                SwitchInk::OnSeamCap
             ],
-            "the pill keeps its inks on a themed line"
+            "the lit thumb keeps its inks on a themed line"
+        );
+        let tail: Vec<SwitchInk> = arced.cells()[arced.switch.end..]
+            .iter()
+            .filter(|c| c.0 != ' ')
+            .map(|c| c.1)
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                SwitchInk::Track,
+                SwitchInk::Track,
+                SwitchInk::Track,
+                SwitchInk::TrackCap
+            ],
+            "the unselected `off` segment stays on the recessed track"
         );
         assert_eq!(
             (words.first(), words.last()),
@@ -9175,11 +9285,30 @@ mod tests {
             "the arc runs through the words"
         );
         let off = paint(HarnessSwitch::Off(SwitchOff::Master));
-        for f in (0..SWITCH_TIERS).filter_map(|t| switch_face(off, t)) {
-            let button = f.button.clone().expect("CONTROL: every off form's button");
-            assert!(f.switch.end <= button.start, "CONTROL: {:?}", f.text());
-            let drawn: String = f.cells()[button].iter().map(|c| c.0).collect();
-            assert_eq!(drawn, "\u{2590} on \u{258c}");
+        for (tier, f) in (0..SWITCH_TIERS)
+            .filter_map(|t| switch_face(off, t))
+            .enumerate()
+        {
+            let button = f
+                .button
+                .clone()
+                .expect("CONTROL: every off form's on segment");
+            let drawn: String = f.cells()[button.clone()].iter().map(|c| c.0).collect();
+            if tier < 3 {
+                assert!(button.end <= f.switch.start, "CONTROL: {:?}", f.text());
+                assert_eq!(drawn, "\u{2590} on ");
+            } else {
+                assert!(f.switch.is_empty(), "CONTROL: {:?}", f.text());
+                assert_eq!(drawn, "\u{2590} on \u{258c}");
+            }
+            assert!(
+                f.cells().iter().all(|&(_, ink)| !matches!(
+                    ink,
+                    SwitchInk::OnThumb | SwitchInk::OnCap | SwitchInk::OnSeamCap | SwitchInk::Lit
+                )),
+                "off switch never uses active lit green inks: {:?}",
+                f.cells()
+            );
         }
     }
 
@@ -13107,7 +13236,8 @@ mod tests {
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 7]);
         assert!(
             top_rule.starts_with("\u{2500}\u{2500}    agy \u{2500}")
-                && top_rule.contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} "),
+                && top_rule
+                    .contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} "),
             "agy top rule has its lockup and the harness switch: {top_rule:?}"
         );
         assert!(
@@ -13300,7 +13430,8 @@ mod tests {
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 3]);
         assert!(
             top_rule.starts_with("\u{2500}\u{2500}    muse \u{2500}")
-                && top_rule.contains(" alab harness \u{25CF} on "),
+                && top_rule
+                    .contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} "),
             "muse top rule has its lockup and the harness switch: {top_rule:?}"
         );
         assert!(
@@ -13387,7 +13518,7 @@ mod tests {
             if *cols >= 32 {
                 assert!(
                     top.starts_with("\u{2500}\u{2500}    muse \u{2500}")
-                        && top.ends_with(" \u{25CF} on \u{2500}\u{2500}")
+                        && top.ends_with(" \u{25CF} on \u{258C} off \u{258C} \u{2500}\u{2500}")
                         && !top.contains("Voice"),
                     "{cols}: the lockup over the label, the switch at the right: {top:?}"
                 );
@@ -14129,11 +14260,7 @@ mod tests {
 
             let strip = strip(&app, wid);
             let expected_lockup = format!("\u{2500}\u{2500}    {prog} \u{2500}");
-            let expected_switch = if prog == "agy" {
-                " alab harness v0.1 \u{2590} \u{25CF} on \u{258C} "
-            } else {
-                " alab harness \u{25CF} on "
-            };
+            let expected_switch = " alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} ";
             let sid = app.pool.get(session).expect("session").ctx.self_id.clone();
             let chip_line = |app: &App| {
                 let head = format!("autopilot sid={} ", sid.as_str());
@@ -14260,7 +14387,7 @@ mod tests {
                     text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
                 assert!(
                     top_switch_off
-                        .contains(" alab harness v0.1 \u{25CB} off \u{2590} on \u{258C} ")
+                        .contains(" alab harness v0.1 \u{2590} on \u{2590} \u{25CB} off \u{258C} ")
                         && !top_switch_off.starts_with(&expected_lockup)
                         && !top_switch_off.contains("implement vision"),
                     "agy: toggled-off harness leaves only the off switch button on the top rule: {top_switch_off:?}"
@@ -14423,7 +14550,8 @@ mod tests {
         );
         let (claimed, text) = under(&mut app, Autopilot::Cruise);
         assert!(
-            text.contains("harness \u{25CF} on") && claimed.windows(2).any(|w| w[0] != w[1]),
+            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}")
+                && claimed.windows(2).any(|w| w[0] != w[1]),
             "claimed, tinted: {text:?}"
         );
         app.config.claude_footer = None;
@@ -14434,7 +14562,10 @@ mod tests {
         let blue = |c: [u8; 3]| c[0] <= c[1] && i32::from(c[2]) >= i32::from(c[0].max(c[1])) + 56;
 
         let (cruise, text) = under(&mut app, Autopilot::Cruise);
-        assert!(text.contains("harness \u{25CF} on"), "{text:?}");
+        assert!(
+            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"),
+            "{text:?}"
+        );
         assert!(cruise.len() > 60, "the run: {}", cruise.len());
         assert!(
             cruise.iter().copied().any(blue_violet),
@@ -14453,7 +14584,9 @@ mod tests {
         };
         assert!(
             text.starts_with("\u{2500}\u{2500}    claude \u{2500}")
-                && text.ends_with(" alab harness \u{25CF} on \u{2500}\u{2500}"),
+                && text.ends_with(
+                    " alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} \u{2500}\u{2500}"
+                ),
             "the lockup at the rule's left, the switch at its right: {text:?}"
         );
         let paint = |t: f32| {
@@ -14466,7 +14599,7 @@ mod tests {
         };
         let shown: Vec<[u8; 3]> = [paint(1.0), paint(1.0)]
             .into_iter()
-            .chain((0..86).map(|j| paint(1.0 - j as f32 / 85.0)))
+            .chain((0..71).map(|j| paint(1.0 - j as f32 / 70.0)))
             .chain([paint(1.0), paint(1.0)])
             .collect();
         assert_eq!(cruise, shown, "the palette backward over the gap");
@@ -14484,7 +14617,10 @@ mod tests {
         );
 
         let (land, text) = under(&mut app, Autopilot::Land);
-        assert!(text.contains("harness \u{25CF} on"), "{text:?}");
+        assert!(
+            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"),
+            "{text:?}"
+        );
         assert!(
             land.iter().copied().all(warm),
             "Land's rule is the sunset: {land:?}"
@@ -14492,7 +14628,8 @@ mod tests {
 
         let (off, text) = under(&mut app, Autopilot::Off);
         assert!(
-            text.contains(" alab harness \u{25CF} on ") && !text.contains("alab kitty"),
+            text.contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} ")
+                && !text.contains("alab kitty"),
             "Autopilot Off's switch says the harness is on, no wordmark: {text:?}"
         );
         for c in &off {
@@ -14504,7 +14641,7 @@ mod tests {
         assert!(!app.session_autopilot(session).2, "the claim is given back");
         let (released, text) = under(&mut app, Autopilot::Off);
         assert!(
-            text.contains("alab harness \u{25CF} on"),
+            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"),
             "no claim: {text:?}"
         );
         assert_eq!(released, off, "white with no claim");
@@ -14550,12 +14687,13 @@ mod tests {
             crate::term_lock(&term)
                 .process(b"\x1b]11;rgb:ff/ff/ff\x1b\\\x1b]10;rgb:20/20/20\x1b\\");
         }
-        let contrast = |c: [u8; 3]| {
+        let pair_contrast = |a: [u8; 3], b: [u8; 3]| {
             use aterm_effects::color_math::relative_luminance;
-            let y = relative_luminance(u32::from_be_bytes([0, c[0], c[1], c[2]]));
-            let paper = relative_luminance(0x00FF_FFFF);
-            (y.max(paper) + 0.05) / (y.min(paper) + 0.05)
+            let ya = relative_luminance(u32::from_be_bytes([0, a[0], a[1], a[2]]));
+            let yb = relative_luminance(u32::from_be_bytes([0, b[0], b[1], b[2]]));
+            (ya.max(yb) + 0.05) / (ya.min(yb) + 0.05)
         };
+        let contrast = |c: [u8; 3]| pair_contrast(c, [0xFF, 0xFF, 0xFF]);
         for word in [Autopilot::Cruise, Autopilot::Off] {
             let (_, text) = under(&mut app, word);
             let cells = &app.windows[&wid].input_scratch.cells[strip(&app, wid) + 5];
@@ -14565,7 +14703,9 @@ mod tests {
                     "Off wears no wordmark: {text:?}"
                 );
             }
-            let face: Vec<char> = "alab harness \u{25CF} on".chars().collect();
+            let face: Vec<char> = "alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"
+                .chars()
+                .collect();
             let at = (0..cells.len().saturating_sub(face.len()))
                 .find(|&k| {
                     cells[k..k + face.len()]
@@ -14574,7 +14714,8 @@ mod tests {
                         .eq(face.iter().copied())
                 })
                 .unwrap_or_else(|| panic!("{word:?}: the switch on paper: {text:?}"));
-            let letters: Vec<[u8; 3]> = cells[at..at + face.len()]
+            let label_len = "alab harness v0.1 ".chars().count();
+            let letters: Vec<[u8; 3]> = cells[at..at + label_len]
                 .iter()
                 .chain(&cells[6..12])
                 .filter(|c| c.ch != ' ')
@@ -14582,11 +14723,22 @@ mod tests {
                 .collect();
             assert_eq!(
                 letters.len(),
-                "alabharness\u{25CF}onclaude".chars().count(),
+                "alabharnessv0.1claude".chars().count(),
                 "{text:?}"
             );
             for c in &letters {
                 assert!(contrast(*c) >= 4.5, "{word:?}: {c:?} too pale on paper");
+            }
+            for cell in &cells[at + label_len..at + face.len()] {
+                if cell.ch != ' ' && cell.ch != '\u{2590}' && cell.ch != '\u{258C}' {
+                    assert!(
+                        pair_contrast(cell.fg, cell.bg) >= 4.5,
+                        "{word:?}: {:?} {:?} on {:?} too pale",
+                        cell.ch,
+                        cell.fg,
+                        cell.bg
+                    );
+                }
             }
         }
         let ink = [0x20, 0x20, 0x20];
@@ -14603,7 +14755,7 @@ mod tests {
         let (_, text) = under(&mut app, Autopilot::Off);
         assert!(
             !text.contains("alab kitty")
-                && text.contains(" alab harness \u{25CB} off \u{2590} on \u{258C} "),
+                && text.contains(" alab harness v0.1 \u{2590} on \u{2590} \u{25CB} off \u{258C} "),
             "master off: the bare off switch {text:?}"
         );
         host.shutdown_and_join();

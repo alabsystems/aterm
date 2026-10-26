@@ -1019,7 +1019,10 @@ fn an_api_errors_wall_held_after_its_notice_left_is_told_stalled_not_a_limit() {
     r.worked = None;
     let (a, told) = point(&mut st, &r, &cfg(), now + MIN);
     assert_eq!(a, TurnEndAction::Nothing);
-    assert_eq!(told, Some(Exception::repeats()));
+    assert_eq!(
+        told,
+        Some(Exception::repeats(crate::harness::acts::HeldBy::SameReply))
+    );
     let left = TurnEndReading {
         wall: None,
         wall_message: String::new(),
@@ -1029,7 +1032,7 @@ fn an_api_errors_wall_held_after_its_notice_left_is_told_stalled_not_a_limit() {
     assert_eq!(a, TurnEndAction::Nothing, "its track still holds");
     assert_eq!(
         told,
-        Some(Exception::repeats()),
+        Some(Exception::repeats(crate::harness::acts::HeldBy::SameReply)),
         "an API error's track is no limit"
     );
 }

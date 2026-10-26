@@ -15,8 +15,9 @@ mod native;
 mod repos;
 pub use native::InitialRepositoryInputs;
 
-/// Whether Command Line Tools git, which every clone runs, is installed: the initial
-/// repositories wait on it ([`crate::init_observe::Wait::CommandLineTools`]) until it is.
+/// Whether the git every clone runs ([`crate::items::github::installed_git`]: the Command Line
+/// Tools', else Xcode's) is installed: the initial repositories wait on it
+/// ([`crate::init_observe::Wait::CommandLineTools`]) until it is.
 #[must_use]
 pub fn git_installed(sys: &dyn System) -> bool {
     repos::git_installed(sys)
@@ -246,7 +247,7 @@ fn signed_in((value, _): crate::github_pages::Page) -> Result<String, GithubErro
 }
 
 fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>, String> {
-    let Some(token) = Git::keychain().fill(sys, Some(user), GITHUB, account)? else {
+    let Some(token) = Git::keychain(sys).fill(sys, Some(user), GITHUB, account)? else {
         return Ok(None);
     };
     Ok(match identity(sys, user, &token) {
@@ -255,18 +256,18 @@ fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>
     })
 }
 
+/// Why the GitHub bootstrap cannot start on a Mac without git.
+pub(crate) const NEEDS_GIT: &str = "GitHub bootstrap needs git, from Apple's Command Line Tools \
+                                    or Xcode (aterm init --only base.clt installs the tools)";
+
 fn readiness(
     sys: &dyn System,
     user: &User,
     config: &Github,
 ) -> Result<(Lookups, Option<Secret>), String> {
-    let git = Git::keychain();
+    let git = Git::keychain(sys);
     if !git.installed(sys) {
-        return Err(
-            "GitHub bootstrap needs Apple's Command Line Tools git (aterm init --only base.clt \
-             installs them)"
-                .into(),
-        );
+        return Err(NEEDS_GIT.into());
     }
     let helper = git.configured(sys, user, &config.account)?;
     Ok((helper, stored(sys, user, &config.account)?))
@@ -373,7 +374,7 @@ impl Item for Auth {
         if answered(sys, &self.user, &self.config)?.is_some() {
             return Ok(());
         }
-        let git = Git::keychain();
+        let git = Git::keychain(sys);
         let (helper, held) = readiness(sys, &self.user, &self.config)?;
         if held.is_none() {
             crate::port::no_core_dumps();

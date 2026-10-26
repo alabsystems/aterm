@@ -459,7 +459,8 @@ fn least_on_hue_path(rgb: u32, darken: bool, meets: impl Fn(u32) -> bool) -> u32
     };
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (rgb & 0x00FF_FFFF, end);
-    for i in 0..24 {
+    let mut i = 0;
+    while i < 24 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = path(mid);
         if mid_rgb == lo_rgb {
@@ -474,6 +475,7 @@ fn least_on_hue_path(rgb: u32, darken: bool, meets: impl Fn(u32) -> bool) -> u32
         if i >= 1 && lo_rgb == hi_rgb {
             break;
         }
+        i += 1;
     }
     hi_rgb
 }

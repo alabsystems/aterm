@@ -111,6 +111,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
         let fresh = Fresh {
             model: Some("m-1.5"),
             trusted_here: true,
+            permission_mode: None,
         };
         let line =
             line(cli, Dialect::Zsh, &starter, &fresh).unwrap_or_else(|e| panic!("{agent:?}: {e}"));
@@ -204,6 +205,7 @@ fn model_and_the_trust_are_each_clis_own() {
         let fresh = |model, trusted_here| Fresh {
             model,
             trusted_here,
+            permission_mode: None,
         };
         let named = line(cli, Dialect::Zsh, &plain, &fresh(Some("big-1"), false)).expect("a line");
         assert!(named.contains(" '--model' 'big-1' "), "{named}");
@@ -222,6 +224,44 @@ fn model_and_the_trust_are_each_clis_own() {
         }
         assert!(!all.contains("--skip-trust"), "{all}");
         assert!(!none.contains("--trust-workspace"), "{none}");
+    }
+}
+
+/// A PERMISSION MODE IS CLAUDE CODE'S `--permission-mode <m>` (the disk-free worker's
+/// `default`, `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4), after the model, and only a mode
+/// Claude Code takes. CONTROL: no mode named, no flag rides; a mode it does not take, and any
+/// mode for a CLI whose line has no such flag, start no worker.
+#[test]
+fn a_permission_mode_is_claude_codes_own_flag() {
+    let fresh = |mode| Fresh {
+        model: Some("big-1"),
+        permission_mode: mode,
+        ..Fresh::default()
+    };
+    let claude = row(Program::Claude);
+    for mode in CLAUDE_PERMISSION_MODE.modes {
+        let typed =
+            line(claude, Dialect::Zsh, &claude.plain(), &fresh(Some(mode))).expect("a line");
+        assert!(
+            typed.contains(&format!(" '--model' 'big-1' '--permission-mode' '{mode}' ")),
+            "{typed}"
+        );
+    }
+    let plain = line(claude, Dialect::Zsh, &claude.plain(), &fresh(None)).expect("a line");
+    assert!(!plain.contains("--permission-mode"), "{plain}");
+    for bad in ["auto", "Default", "--dangerously-skip-permissions", ""] {
+        let err = line(claude, Dialect::Zsh, &claude.plain(), &fresh(Some(bad)))
+            .expect_err("a mode Claude Code does not take");
+        assert!(err.contains("none of Claude Code's"), "{bad}: {err}");
+    }
+    for cli in WORKERS.iter().filter(|w| w.agent != Program::Claude) {
+        let err = line(cli, Dialect::Zsh, &cli.plain(), &fresh(Some("default")))
+            .expect_err("a CLI with no permission-mode flag");
+        assert!(
+            err.contains("takes no permission mode"),
+            "{:?}: {err}",
+            cli.agent
+        );
     }
 }
 
@@ -532,6 +572,30 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
         s.env,
         [("CODEX_HOME".to_string(), "/cx".to_string())],
         "its home, and no other variable"
+    );
+    let with_auth = starter_of(
+        cli,
+        Some(&alab),
+        &proc_args(
+            &argv,
+            &[
+                "CODEX_HOME=/cx",
+                "CODEX_AUTH_PATH=/u/accounts-codex/work/auth.json",
+            ],
+        ),
+        user,
+        || None,
+    )
+    .expect("a codex-alab starter with auth path");
+    assert_eq!(
+        with_auth.env,
+        [
+            ("CODEX_HOME".to_string(), "/cx".to_string()),
+            (
+                "CODEX_AUTH_PATH".to_string(),
+                "/u/accounts-codex/work/auth.json".to_string()
+            ),
+        ]
     );
     assert_eq!(
         s.args.clone().expect("its flags read"),

@@ -46,6 +46,20 @@ const LINE_PERCH_GAP: f32 = (2.0 - ART_ROWS) * 0.5;
 const _: () = assert!(LINE_PERCH_GAP > CLEARANCE);
 
 const SEAT_KEPT: f32 = 0.5;
+/// The last of the escort's [`SIT_AFTER`] (s) in which a cat off its stand on top of the host's
+/// line no longer sets out for it ([`PetBrain::escort_reaches`]).
+const ESCORT_TAIL: f32 = 0.5;
+/// How far past the words that took its seat a cat walks to rest
+/// ([`PetBrain::seat_lost_on_foot`]): room for a counter's next digit or two.
+const LOST_SEAT_ROOM: f32 = 2.0;
+/// How long the ground on top of the host's line must have held its words before a cat comes to
+/// rest there ([`PetBrain::rest_where_typing_walks`]).
+const WALK_SEAT_SETTLED: Duration = Duration::from_millis(1000);
+/// How long (s) after the writing's last key, or the caret's last beat, a cat on top of the host's
+/// line holds there rather than fly to a rest seat on another row ([`PetBrain::pause_hold`]): a
+/// pause in the writing shorter than this costs no trip.
+const PAUSE_HOLD: f32 = 3.0;
+const PAUSE_HOLD_DUR: Duration = Duration::from_millis(3000);
 /// How much further (cells, rows counted twice) from the stand than the nearest clean seat a
 /// seat the cat holds or rests in may lie and still be kept ([`PetBrain::console_station_on`]).
 const SEAT_KEEP_SLACK: f32 = 1.0;
@@ -461,8 +475,25 @@ pub(super) struct ConsoleLife {
     /// a jump along its row, keeps the seat only while it is as near as the nearest clean one.
     pub(super) rest_stand: std::cell::Cell<Option<(f32, f32)>>,
     pub(super) rest_seated: std::cell::Cell<bool>,
+    /// When the pause a cat on top of the host's line is holding through ends
+    /// ([`PetBrain::pause_hold`]): an edge the console offers, where the rest takes the station.
+    pause_hold_until: std::cell::Cell<Option<Instant>>,
+    /// Whether the station last given is the escort's stand on top of the host's line
+    /// ([`PetBrain::console_station`]): the letter veil a pause laid over the cat there lifts as
+    /// the writing walks it on ([`PetBrain::escort_over_the_line`]).
+    pub(super) line_escort: std::cell::Cell<bool>,
     row_sig: Vec<u64>,
     row_sig_prev: Vec<u64>,
+    /// The host's chrome as this frame's rows carry it ([`rebase_host_chrome`]), when the rows it
+    /// was painted on moved: kept between frames so a move allocates nothing.
+    chrome_rebased: Vec<PetRect>,
+    /// This frame's row signatures, read for [`rebase_host_chrome`] only on a frame whose rows
+    /// under the host's chrome changed.
+    chrome_rows: Vec<u64>,
+    /// Per row of [`Self::row_sig`], when its cells last changed ([`PetBrain::rows_settled`]).
+    row_changed: Vec<Option<Instant>>,
+    /// The frame row [`Self::row_sig`] starts at.
+    row_sig_first: usize,
     /// What [`Self::world`] and the row signatures were read from.
     reading: PetReading,
 }
@@ -472,6 +503,102 @@ impl Default for ConsoleLife {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// THE HOST'S CHROME RIDES ITS ROWS. The host paints its chrome into the frame after the pet has
+/// looked at it, so the chrome it reserves ([`PetReserve::protected`]: a harness's line over a
+/// composer's upper rule, the chips on its lower rule) is where its last pass painted it, over the
+/// frame the console read before this one (`prev`, the row signatures of that read). On the frame
+/// a program moves the rows (a transcript growing over a composer pushes it down, a draft that
+/// wraps grows it), the chrome still lies where the rows were: the console read a host's line
+/// over the transcript's last line and none over the composer's moved rule, so a cat that rode
+/// down with the composer was under the host's line, and hopped off it to a seat under the
+/// footer, and back up once the host's next pass caught up (a window's harness turn: two leaps in
+/// 0.65 s).
+///
+/// Each rect of the chrome goes where the rows it was painted over went: the smallest shift `k`
+/// for which its rows, with one row beside them, read now `k` rows on as they read then (a
+/// composer's two rules alike, their neighbours tell them apart). A rect whose rows read as they
+/// did with a neighbour stays; one whose rows match nowhere stays too, as the host left it.
+/// Writes the moved chrome into `out` and answers whether any rect moved; `rows` is scratch for
+/// this frame's signatures, read only when the rows under the chrome changed.
+fn rebase_host_chrome(
+    prev: &[u64],
+    input: &aterm_core::render::RenderInput,
+    pane: PetPane,
+    protected: &[PetRect],
+    rows: &mut Vec<u64>,
+    out: &mut Vec<PetRect>,
+) -> bool {
+    let n = prev.len();
+    let first = pane.row.min(input.cells.len());
+    if n == 0 || protected.is_empty() || input.cells.len() - first < n {
+        return false;
+    }
+    let sig_at = |r: usize| {
+        let row = input.cells[first + r].as_slice();
+        let start = pane.col.min(row.len());
+        let end = (pane.col + pane.cols).min(row.len());
+        row_signature(&row[start..end])
+    };
+    // The span of map rows a rect covers, and whether its rows and their neighbours read now as
+    // they did: the common frame (a spinner turning elsewhere) costs a few rows' signatures.
+    let span = |rect: &PetRect| -> Option<(usize, usize)> {
+        if !rect.valid() || rect.rows <= 0.0 {
+            return None;
+        }
+        let a = rect.row.floor().max(0.0) as usize;
+        let b = ((rect.row + rect.rows).ceil() as usize).min(n);
+        (a < b).then_some((a, b))
+    };
+    let mut changed = false;
+    for rect in protected {
+        if let Some((a, b)) = span(rect)
+            && (a.saturating_sub(1)..(b + 1).min(n)).any(|r| sig_at(r) != prev[r])
+        {
+            changed = true;
+            break;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    rows.clear();
+    rows.extend((0..n).map(sig_at));
+    let cur = rows.as_slice();
+    // Whether the rows [a, b) and a neighbour of theirs read now `k` rows on as they read then.
+    let moved = |a: usize, b: usize, k: isize| -> bool {
+        let at = |r: usize| r.checked_add_signed(k).filter(|&t| t < n);
+        let whole = (a..b).all(|r| at(r).is_some_and(|t| cur[t] == prev[r]));
+        let above = a
+            .checked_sub(1)
+            .is_some_and(|r| at(r).is_some_and(|t| cur[t] == prev[r]));
+        let below = b < n && at(b).is_some_and(|t| cur[t] == prev[b]);
+        whole && (above || below)
+    };
+    out.clear();
+    let mut any = false;
+    for rect in protected {
+        let shift = span(rect).and_then(|(a, b)| {
+            if moved(a, b, 0) {
+                return None;
+            }
+            (1..n as isize)
+                .flat_map(|k| [k, -k])
+                .find(|&k| moved(a, b, k))
+        });
+        match shift {
+            Some(k) => {
+                any = true;
+                out.push(PetRect {
+                    row: rect.row + k as f32,
+                    ..*rect
+                });
+            }
+            None => out.push(*rect),
+        }
+    }
+    any
 }
 
 #[inline]
@@ -555,8 +682,14 @@ impl ConsoleLife {
             rest_seat: std::cell::Cell::new(None),
             rest_stand: std::cell::Cell::new(None),
             rest_seated: std::cell::Cell::new(false),
+            pause_hold_until: std::cell::Cell::new(None),
+            line_escort: std::cell::Cell::new(false),
             row_sig: Vec::new(),
             row_sig_prev: Vec::new(),
+            chrome_rebased: Vec::new(),
+            chrome_rows: Vec::new(),
+            row_changed: Vec::new(),
+            row_sig_first: 0,
             reading: PetReading::new(),
         }
     }
@@ -763,6 +896,7 @@ impl PetBrain {
                 protected: exclusions,
                 overlays,
                 ink: &[],
+                painted_over: None,
             },
             PetFill::Unconsumed,
         );
@@ -822,7 +956,33 @@ impl PetBrain {
                 None => None,
             }
         };
-        world.observe_with_exclusions_near(input, facts, pane, reserve, held_center);
+        // THE HOST'S CHROME RIDES ITS ROWS ([`rebase_host_chrome`]): chrome painted over the
+        // frame this console read last, which the frame now read has moved on from.
+        let painted_over_last = matches!(
+            (prior_stamp, reserve.painted_over),
+            (Some(p), Some(seq))
+                if p.surface == facts.stamp.surface
+                    && p.content_seq == seq
+                    && facts.stamp.content_seq != seq
+        );
+        let rebased = painted_over_last
+            && rebase_host_chrome(
+                &self.console.row_sig,
+                input,
+                pane,
+                reserve.protected,
+                &mut self.console.chrome_rows,
+                &mut self.console.chrome_rebased,
+            );
+        let seen = PetReserve {
+            protected: if rebased {
+                &self.console.chrome_rebased
+            } else {
+                reserve.protected
+            },
+            ..reserve
+        };
+        world.observe_with_exclusions_near(input, facts, pane, seen, held_center);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
                 || prior_selection != world.selection_target()
@@ -900,6 +1060,7 @@ impl PetBrain {
         pane: PetPane,
         prior: Option<PetWorldStamp>,
     ) {
+        let now = self.last_now;
         let console = &mut self.console;
         let Some(stamp) = (match console.world.as_ref() {
             Some(w) => w.stamp(),
@@ -907,16 +1068,28 @@ impl PetBrain {
         }) else {
             console.row_sig.clear();
             console.row_sig_prev.clear();
+            console.row_changed.clear();
             return;
         };
         let first = pane.row.min(input.cells.len());
         let rows = pane.rows.min(input.cells.len() - first);
-        let same_grid =
-            matches!(prior, Some(p) if p.surface == stamp.surface) && console.row_sig.len() == rows;
+        let same_grid = matches!(prior, Some(p) if p.surface == stamp.surface)
+            && console.row_sig.len() == rows
+            && console.row_sig_first == first;
+        console.row_sig_first = first;
         let slice = &input.cells[first..first + rows];
+        // A grid read afresh is all new at once; read before the first tick, its rows take the
+        // first time known.
+        if let Some(now) = now
+            && console.row_changed.first().is_some_and(Option::is_none)
+        {
+            console.row_changed.fill(Some(now));
+        }
         if !same_grid {
             console.row_sig_prev.clear();
             console.row_sig.clear();
+            console.row_changed.clear();
+            console.row_changed.resize(rows, now);
             console.row_sig.reserve(rows);
             let mut i = 0;
             while i < slice.len() {
@@ -945,9 +1118,32 @@ impl PetBrain {
                 console.row_sig[..i].copy_from_slice(&console.row_sig_prev[..i]);
                 swapped = true;
             }
+            if console.row_sig_prev[i] != sig
+                && let Some(changed) = console.row_changed.get_mut(i)
+            {
+                *changed = now;
+            }
             console.row_sig[i] = sig;
             i += 1;
         }
+    }
+
+    /// Whether the map rows `rect` takes in `world` have held their cells for `settled` (a
+    /// spinner's line, a reply streaming in, a screen just drawn have not).
+    fn rows_settled(&self, world: &PetWorld, rect: PetRect, settled: Duration) -> bool {
+        let Some(now) = self.last_now else {
+            return false;
+        };
+        let top = world.coverage().row as f32;
+        let first = self.console.row_sig_first as f32;
+        let (a, b) = (
+            (rect.row + top - first).floor().max(0.0) as usize,
+            (rect.row + rect.rows + top - first).ceil().max(0.0) as usize,
+        );
+        self.console.row_changed.get(a..b).is_some_and(|rows| {
+            rows.iter()
+                .all(|at| at.is_some_and(|at| now.saturating_duration_since(at) >= settled))
+        })
     }
 
     pub(super) const fn content_ride(&self, rect: PetRect) -> Option<f32> {
@@ -2809,22 +3005,124 @@ impl PetBrain {
         width: f32,
     ) -> Option<(f32, f32)> {
         self.console.rest_seated.set(false);
+        self.console.pause_hold_until.set(None);
+        self.console.line_escort.set(false);
         if !self.console.presentable {
             return None;
         }
         let world = self.console.world.as_ref()?;
         world.stamp()?;
-        if self.console_escorting()
-            && let Some(over) = self.over_the_hosts_line(world, desired, sense_dims, width)
+        let escorting = self.console_escorting();
+        let over = self.over_the_hosts_line(world, desired, sense_dims, width);
+        if escorting
+            && let Some(over) = over
+            && self.escort_reaches(over)
         {
+            self.console.line_escort.set(true);
             return Some(
-                match self.console_station_on(world, over, sense_dims, width) {
+                match self.console_station_on(world, over, sense_dims, width, true) {
                     Some(s) => s,
                     None => over,
                 },
             );
         }
-        self.console_station_on(world, desired, sense_dims, width)
+        // The escort's station where no host's line is over its stand; the rest's otherwise (the
+        // writing paused, or the escort's tail, [`Self::escort_reaches`]), held on top of the line
+        // through a short pause.
+        let escort = escorting && over.is_none();
+        let hold = over.and_then(|(_, row)| self.pause_hold(row));
+        let kept = (self.console.rest_seat.get(), self.console.rest_stand.get());
+        let station = self.console_station_on(world, desired, sense_dims, width, escort);
+        if let (Some((row, until)), Some((_, seat_row))) = (hold, station)
+            && (seat_row - row).abs() >= 0.5
+        {
+            self.console.rest_seat.set(kept.0);
+            self.console.rest_stand.set(kept.1);
+            self.console.rest_seated.set(false);
+            self.console.pause_hold_until.set(Some(until));
+            return Some((self.col, row));
+        }
+        station
+    }
+
+    /// Whether the cat escorts the writing on top of the host's line ([`ConsoleLife::line_escort`]):
+    /// whole there, never dimmed for the turn's words it walks over (the owner, 2026-10-24: drawn
+    /// under that line, "I can't see it"), though a pause held it veiled over them
+    /// ([`Self::pause_hold`]).
+    #[inline]
+    pub(super) fn escort_over_the_line(&self) -> bool {
+        self.console.line_escort.get() && self.console_escorting()
+    }
+
+    /// THE LINE HOLDS THROUGH A PAUSE. A cat standing on top of the host's line (the escort's
+    /// ground over a harness composer's caret, [`Self::over_the_hosts_line`] on row `row`) when
+    /// the writing pauses keeps its place there, for [`PAUSE_HOLD`] from the last key or the
+    /// caret's last beat, rather than fly to a rest seat on another row: the words the top of the
+    /// line holds (a turn's tip) left it no clean seat along that ground, and the writing that
+    /// comes back finds the cat where it stood, its head veiled over the letters meanwhile. Flown
+    /// under the footer as the escort ended, it flew back up at the next key: the harness's first
+    /// turn leapt down and up again in 0.75 s as it paused between bursts of its next prompt. A
+    /// pause longer than the hold still seats the cat clean; an Enter ends the writing at once.
+    /// Answers the row held on and when the hold ends.
+    fn pause_hold(&self, row: f32) -> Option<(f32, Instant)> {
+        let now = self.last_now?;
+        if self.flight.is_some() || self.alpha <= 0.0 || (self.row - row).abs() >= 0.5 {
+            return None;
+        }
+        let typed = match (self.console.typed_at, self.console.typed_kind) {
+            (Some(at), Some(kind)) if kind != PetInputKind::Submit => {
+                PAUSE_HOLD_DUR.checked_sub(now.saturating_duration_since(at))
+            }
+            _ => None,
+        };
+        let beat = match self.rhythm_at {
+            Some(at) if self.watch_heat < WATCH_GATE => {
+                let left = PAUSE_HOLD - (self.clock - at) as f32;
+                (left > 0.0).then(|| Duration::from_secs_f32(left))
+            }
+            _ => None,
+        };
+        let left = match (typed, beat) {
+            (Some(a), Some(b)) => a.max(b),
+            (a, b) => a.or(b)?,
+        };
+        (!left.is_zero()).then(|| (row, now + left))
+    }
+
+    /// THE ESCORT'S TAIL SENDS NO ONE OUT. Once the writing stops, the escort holds the cat's
+    /// station on top of the host's line for [`SIT_AFTER`] more, then the rest takes it. In the
+    /// escort's tail ([`ESCORT_TAIL`]) a cat on that ground off its stand there (it sat watching a
+    /// deletion walk the caret back) sets out for the stand only while the escort lasts long
+    /// enough for it to get there at a walk ([`LAT_SPEED`]); otherwise its station is already the
+    /// rest's. Sent to the stand three
+    /// cells off with 0.3 s of the escort left, it walked there and turned back as the rest
+    /// took over: a turn-back no caret move made (the harness's generating take, 38.2 s).
+    fn escort_reaches(&self, stand: (f32, f32)) -> bool {
+        if self.flight.is_some() || (self.row - stand.1).abs() >= 0.5 {
+            return true;
+        }
+        // Before the escort's tail ([`ESCORT_TAIL`]) it runs to its stand however far it is (the
+        // writing is on, or pausing between keys); a cat already on its way there goes on.
+        let left = self.escort_left();
+        let gap = stand.0 - self.col;
+        left > ESCORT_TAIL
+            || gap.abs() <= ARRIVED
+            || (matches!(self.action, PetAction::Walk | PetAction::Run) && self.speed * gap > 0.0)
+            || gap.abs() * (1.0 / LAT_SPEED) <= left
+    }
+
+    /// How long (s) the escort lasts from now ([`Self::console_escorting`]): its [`SIT_AFTER`]
+    /// from the last key, or from the last rhythm of the caret while the watch is down.
+    fn escort_left(&self) -> f32 {
+        let typed = match (self.console.typed_at, self.last_now) {
+            (Some(at), Some(now)) => SIT_AFTER - now.saturating_duration_since(at).as_secs_f32(),
+            _ => 0.0,
+        };
+        let rhythm = match self.rhythm_at {
+            Some(at) if self.watch_heat < WATCH_GATE => SIT_AFTER - (self.clock - at) as f32,
+            _ => 0.0,
+        };
+        typed.max(rhythm)
     }
 
     /// THE HEAD LAW AT THE HOST'S LINE. A stand whose 1.7-row body reaches into a row the host
@@ -2936,10 +3234,10 @@ impl PetBrain {
         desired: (f32, f32),
         sense_dims: (u16, u16),
         width: f32,
+        escorting: bool,
     ) -> Option<(f32, f32)> {
         let body = Self::console_stand_rect(desired, sense_dims.0, width);
         let from = self.rest_reach_from(world, sense_dims.0, width);
-        let escorting = self.console_escorting();
         let walled = matches!(
             from,
             Some(from)
@@ -3063,7 +3361,24 @@ impl PetBrain {
         } else {
             None
         };
+        if !escorting
+            && let Some(seat) =
+                self.rest_where_typing_walks(world, desired, sense_dims, width, resting)
+        {
+            return Some(seat);
+        }
         let held_seat = self.console.rest_seat.get();
+        if let Some(seat) = self.seat_lost_on_foot(
+            world,
+            desired,
+            sense_dims.0,
+            width,
+            resting,
+            held_seat,
+            from,
+        ) {
+            return Some(seat);
+        }
         if let Some((col, row)) = resting
             && (row - desired.1).abs() < 0.5
             && !matches!(held_seat, Some((_, seat_row)) if (seat_row - desired.1).abs() >= 0.5)
@@ -3192,6 +3507,162 @@ impl PetBrain {
         }
         self.console.rest_seat.set(None);
         None
+    }
+
+    /// THE REST WHERE THE TYPING WALKS. Beside a composer whose upper rule is the host's line
+    /// ([`Self::over_the_hosts_line`]: the harness's lockup and switch), the escort walks the top
+    /// of the composer over the caret, and the cat at rest is seated where that walk starts: on
+    /// top of the line, at the nearest column whose head room is clear of words (past the end of
+    /// the transcript's last line), as far along the composer as the ground over the line runs
+    /// unwalled from the stand over the caret and the rest reach goes ([`REST_REACH`]). The first
+    /// key then finds the cat on the escort's ground: it waits there for the writing, or walks to
+    /// it. Seated on the nearest clean ground instead (under the footer, three rows from the
+    /// caret), it flew up to the line at each start of typing and down again at each pause.
+    ///
+    /// Only ground that has held its words for [`WALK_SEAT_SETTLED`] is taken: the line a spinner
+    /// turns on, or a screen still being drawn, would cover the seat as it counts on. A seat held
+    /// there, or rested in, is kept while it stays clean ([`SEAT_KEPT`]); it goes with the
+    /// composer, rows and all, and only a caret that jumps along its row takes the stand off it
+    /// ([`SEAT_KEEP_SLACK`]). Where the top of the line holds no such seat the ladder seats the
+    /// cat as before.
+    fn rest_where_typing_walks(
+        &self,
+        world: &PetWorld,
+        desired: (f32, f32),
+        sense_dims: (u16, u16),
+        width: f32,
+        resting: Option<(f32, f32)>,
+    ) -> Option<(f32, f32)> {
+        let (_, walk_row) = self.over_the_hosts_line(world, desired, sense_dims, width)?;
+        let rows = sense_dims.0;
+        let stand = Self::console_stand_rect((desired.0, walk_row), rows, width);
+        // A seat kept elsewhere stays kept: the cat is not sent across the composer by ground
+        // that has only now settled round a caret that has not moved.
+        let still = matches!(
+            self.console.rest_stand.get(),
+            Some((c, r)) if (r - desired.1).abs() < 0.5 && (c - desired.0).abs() < POUNCE_JUMP
+        );
+        if let Some(seat) = self.console.rest_seat.get()
+            && still
+            && (seat.1 - walk_row).abs() >= 0.5
+            && Self::console_keep_clear(
+                world,
+                seat,
+                rows,
+                width,
+                Self::console_stand_rect(desired, rows, width),
+                None,
+                true,
+            )
+            .is_some()
+        {
+            return None;
+        }
+        let along = |near: PetRect, reach: f32| {
+            world.nearest_clear_perch_along(near, CLEARANCE, reach, Some(stand))
+        };
+        let on_walk = |seat: &(f32, f32)| (seat.1 - walk_row).abs() < 0.5;
+        let kept = |seat: (f32, f32)| {
+            let held = Self::console_stand_rect(seat, rows, width);
+            ((held.col - stand.col).abs() <= REST_REACH)
+                .then(|| along(held, SEAT_KEPT))
+                .flatten()
+        };
+        let nearest = || {
+            self.rows_settled(world, stand, WALK_SEAT_SETTLED)
+                .then(|| along(stand, REST_REACH))
+                .flatten()
+        };
+        // The seat went down (or up) with the composer the caret is in: held on top of its line,
+        // it is the same seat on the line where it is now.
+        let (dr, jumped) = match self.console.rest_stand.get() {
+            Some((c, r)) => (desired.1 - r, (c - desired.0).abs() >= POUNCE_JUMP),
+            None => (0.0, false),
+        };
+        let held = self
+            .console
+            .rest_seat
+            .get()
+            .map(|(c, r)| (c, r + dr))
+            .filter(on_walk)
+            .and_then(kept)
+            .or_else(|| resting.filter(on_walk).and_then(kept));
+        // Where the ground over the line has not settled, the ladder chooses (and weighs a seat
+        // held against the stand the caret jumped to).
+        let next = match held {
+            Some(seat) if jumped => Self::seat_as_near(Some(seat), Some(nearest()?), stand),
+            Some(seat) => Some(seat),
+            None => nearest(),
+        }?;
+        let seat = (next.col, next.foot_row());
+        self.console.rest_seat.set(Some(seat));
+        self.console.rest_seated.set(true);
+        self.console.rest_stand.set(Some(desired));
+        Some(seat)
+    }
+
+    /// A SEAT LOST TO THE WORDS IS LEFT ON FOOT. A cat at rest whose seat the screen covers round
+    /// a caret that stays put (a status line counting on over it, a tip laid beside it) walks
+    /// along its own ground to the nearest clean seat there, within the rest reach and the ground
+    /// it can walk ([`PetWorld::nearest_clear_perch_along`]), before any seat on another row is
+    /// flown to: seated beside a spinner's new line as a turn began, the cat flew a row up when
+    /// the line counted its first second over it, the turn's second flight in under a second.
+    /// A caret that moved the stand takes the seat with it instead ([`SEAT_KEEP_SLACK`]).
+    #[allow(clippy::too_many_arguments)]
+    fn seat_lost_on_foot(
+        &self,
+        world: &PetWorld,
+        desired: (f32, f32),
+        rows: u16,
+        width: f32,
+        resting: Option<(f32, f32)>,
+        held_seat: Option<(f32, f32)>,
+        from: Option<PetRect>,
+    ) -> Option<(f32, f32)> {
+        let here = resting?;
+        let seat = held_seat?;
+        let still = matches!(
+            self.console.rest_stand.get(),
+            Some((c, r)) if (r - desired.1).abs() < 0.5 && (c - desired.0).abs() < POUNCE_JUMP
+        );
+        if !still
+            || (seat.0 - here.0).abs() > ARRIVED
+            || (seat.1 - here.1).abs() >= 0.5
+            || Self::console_keep_clear(
+                world,
+                seat,
+                rows,
+                width,
+                Self::console_stand_rect(desired, rows, width),
+                from,
+                false,
+            )
+            .is_some()
+        {
+            return None;
+        }
+        let body = Self::console_stand_rect(here, rows, width);
+        let next = world.nearest_clear_perch_along(body, CLEARANCE, REST_REACH, Some(body))?;
+        // Words that grew onto the seat grow on (a status line counting its seconds): the cat
+        // goes a little past them where the ground allows, not to the cell their end leaves.
+        let past = PetRect {
+            col: next.col + LOST_SEAT_ROOM * (next.col - body.col).signum(),
+            ..next
+        };
+        let next = if past.col >= 0.0
+            && world
+                .nearest_clear_perch_along(past, CLEARANCE, SEAT_KEPT, Some(body))
+                .is_some()
+        {
+            past
+        } else {
+            next
+        };
+        let seat = (next.col, next.foot_row());
+        self.console.rest_seat.set(Some(seat));
+        self.console.rest_seated.set(true);
+        self.console.rest_stand.set(Some(desired));
+        Some(seat)
     }
 
     /// `kept`, a seat held or rested in, while it lies no further from the stand `body` than
@@ -3991,6 +4462,7 @@ impl PetBrain {
         Self::offer_console_deadline(&mut earliest, floor, self.console.z.deadline());
         Self::offer_console_deadline(&mut earliest, floor, self.console.repair_until);
         Self::offer_console_deadline(&mut earliest, floor, self.console.failure_quiet_until);
+        Self::offer_console_deadline(&mut earliest, floor, self.console.pause_hold_until.get());
         let at = earliest?;
         Some(at.max(now + self.arm_floor()))
     }
@@ -4024,19 +4496,20 @@ impl PetBrain {
     /// that woke for each would have ticked, and offers the first of those ticks that would have
     /// changed anything ([`Self::console_motes_change_at`]): a hidden mote clear of the ink again,
     /// which the console then draws; a drawn mote the ink now covers; or a mote the brain drops
-    /// (its life spent, or a z over ink), which frees its slot for the next.
+    /// (its life spent, or a z or a pop over ink), which frees its slot for the next.
     ///
     /// A tick this skips would have drawn the frame before it, and kept the brain's motes, for two
     /// reasons. The console judges a mote's clearance at the pixel it draws at ([`mote_clears`]),
-    /// in a look its slices hold, so the verdict turns only at the mote's own edges, which the
-    /// walk visits. And the rest of the brain changes what it draws only at the edges
-    /// [`Self::next_change_secs`] offers, which bound the walk (`horizon`), or on the frames it
-    /// asks for ([`Self::needs_frames`]), when the host takes no offer: a beat counts as its
-    /// offer does, a still pose's hold offers its end, a glide lands on its last step, and a
-    /// rhythm run asks for frames. A skipped tick still changes how the brain's `f32` clocks sum,
-    /// so an edge can fall a little apart from where a host that ticked at every step meets it;
-    /// `a_dozing_pet_draws_what_a_dense_host_draws` holds a host at these offers to one that also
-    /// ticks every 2⁻⁸ s.
+    /// in a look its slices hold, so the verdict turns only at the mote's own edges, which the walk
+    /// visits; a pop has no slices and swells every frame, but a swelling box only meets more ink,
+    /// so a hidden pop clears it again only at a whole-pixel step of its centre. And the rest of
+    /// the brain changes what it draws only at the edges [`Self::next_change_secs`] offers, which
+    /// bound the walk (`horizon`), or on the frames it asks for ([`Self::needs_frames`]), when the
+    /// host takes no offer: a beat counts as its offer does, a still pose's hold offers its end, a
+    /// glide lands on its last step, and a rhythm run asks for frames. A skipped tick still changes
+    /// how the brain's `f32` clocks sum, so an edge can fall a little apart from where a host that
+    /// ticked at every step meets it; `a_dozing_pet_draws_what_a_dense_host_draws` holds a host at
+    /// these offers to one that also ticks every 2⁻⁸ s.
     pub(super) const fn hidden_mote_offer(&self, horizon: Option<f32>) -> Option<f32> {
         let limit = match horizon {
             Some(h) => h,
@@ -4047,7 +4520,7 @@ impl PetBrain {
         while i < PET_MOTES_MAX {
             if self.console_hid_mote(i)
                 && let Some(m) = self.motes[i]
-                && m.kind.rides_offer()
+                && m.kind.offers_hidden()
             {
                 next[i] = self.mote_own_edge(&m, 0.0);
             }
@@ -4097,7 +4570,7 @@ impl PetBrain {
         let mut i = 0;
         while i < PET_MOTES_MAX {
             if let Some(m) = self.motes[i]
-                && m.kind.rides_offer()
+                && m.kind.offers_hidden()
             {
                 let Some(sprite) = self.mote_sprite(&m, m.age(clock)) else {
                     return true;
@@ -10202,6 +10675,66 @@ mod tests {
             sweep.rehomed > 16,
             "keys move the pet's home: {}",
             sweep.rehomed
+        );
+    }
+
+    /// The rows [`DOZE_INK`] inks, as the host's ink probe reads them ([`PetBrain::sense_ink`]):
+    /// each row's first inked column and the column after its last.
+    const DOZE_INK_SPANS: [(u16, u16); 7] =
+        [(0, 9), (0, 2), (0, 9), (0, 2), (0, 9), (0, 2), (0, 1)];
+
+    /// A key that wakes a sleeper below scrollback costs its 60 Hz host no frame train while the
+    /// wake's stretch holds still. The stretch's reach eases out over [`STRETCH_LEAD`] on the
+    /// train, and its pose then holds to the hind leg's swap and the hand-off
+    /// ([`PetBrain::waking_moves`]); the z the wake pops rises into the ink, which hides it and
+    /// then drops it, and a hidden pop waits at the offer for the moment it could show again or
+    /// drop ([`PetMoteKind::offers_hidden`]). So the host sleeps from one offered edge to the
+    /// next, and a host that also ticks every [`DENSE`] draws the same ([`dense_case`]).
+    #[test]
+    fn a_wake_below_scrollback_trains_no_frames_while_its_stretch_holds() {
+        const FRAME: Duration = Duration::from_nanos(16_666_667);
+        let start = Instant::now();
+        let key = Duration::from_secs(1);
+        let keys = [(key, b"a".to_vec())];
+        let make = || {
+            let mut doze = Dozing::new(DOZE_INK, start, false);
+            doze.pet.sense_ink(0, &DOZE_INK_SPANS, None);
+            doze
+        };
+        dense_case(
+            "a key below scrollback",
+            &make,
+            &keys,
+            key + Duration::from_secs(6),
+            &mut Sweep::default(),
+        );
+        let mut doze = make();
+        let _ = doze.run(&keys, Schedule::Offered(FRAME), Some(key + 3 * FRAME));
+        assert!(
+            (0..PET_MOTES_MAX).any(|i| doze.pet.console_hid_mote(i)
+                && matches!(doze.pet.motes[i], Some(m) if m.kind == PetMoteKind::ZeePop)),
+            "fixture: the ink hides the pop the wake startles"
+        );
+        let mut doze = make();
+        let t0 = doze.now;
+        let run = doze.run(
+            &keys,
+            Schedule::Offered(FRAME),
+            Some(key + Duration::from_secs(2)),
+        );
+        let woke = t0 + key;
+        let held = (
+            woke + Duration::from_secs_f32(STRETCH_LEAD) + 2 * FRAME,
+            woke + Duration::from_secs_f32(WAKE_DUR - WAKE_HANDOFF),
+        );
+        let train: Vec<_> = run
+            .iter()
+            .filter(|d| d.at > held.0 && d.at < held.1 && !d.offered)
+            .map(|d| d.at - woke)
+            .collect();
+        assert!(
+            train.is_empty(),
+            "the held stretch rides the frame train at {train:?} after the key"
         );
     }
 

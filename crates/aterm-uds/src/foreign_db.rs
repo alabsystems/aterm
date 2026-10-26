@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Lock-free reads of another program's live SQLite database ([`read`](crate::foreign_db::read), [`immutable_uri`](crate::foreign_db::immutable_uri),
-//! [`Unread`](crate::foreign_db::Unread)).
+//! Lock-free reads of another program's live SQLite database ([`read`](crate::foreign_db::read), [`read_bytes`](crate::foreign_db::read_bytes),
+//! [`immutable_uri`](crate::foreign_db::immutable_uri), [`Unread`](crate::foreign_db::Unread)).
 
 use std::path::{Path, PathBuf};
 
@@ -214,6 +214,70 @@ pub fn read<T>(db: &Path, reader: impl FnOnce(&str) -> Option<T>) -> Result<T, U
     } else {
         reader(&immutable_uri(db))
     };
+    if look(db)? != before {
+        return Err(Unread::Changed);
+    }
+    answer.ok_or(Unread::Failed)
+}
+
+/// Read `from` into memory with plain reads (no lock of any kind), bounded by `max_bytes`.
+fn slurp_unlocked(from: &Path, was: &Identity, max_bytes: u64) -> Result<Vec<u8>, Unread> {
+    if !was.regular || was.len > max_bytes {
+        return Err(Unread::Failed);
+    }
+    let src = open_no_link(from).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Unread::Changed
+        } else {
+            Unread::Failed
+        }
+    })?;
+    let opened = src.metadata().map_err(|_| Unread::Failed)?;
+    if identity_of(&opened) != *was {
+        return Err(Unread::Changed);
+    }
+    let cap = usize::try_from(was.len).map_err(|_| Unread::Failed)?;
+    let limit = max_bytes.saturating_add(1);
+    let mut buf = Vec::with_capacity(cap);
+    use std::io::Read as _;
+    src.take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|_| Unread::Failed)?;
+    if u64::try_from(buf.len()).map_err(|_| Unread::Failed)? != was.len {
+        return Err(Unread::Changed);
+    }
+    Ok(buf)
+}
+
+/// READ `db` AND ITS OPTIONAL `-wal` INTO MEMORY WITH NO LOCK, COPY, OR SUBPROCESS.
+///
+/// # Errors
+/// [`Unread`]: no database file, a write under way, a change during the read, a file larger than
+/// `max_bytes`, or a reader that gave no answer.
+pub fn read_bytes<T>(
+    db: &Path,
+    max_bytes: u64,
+    reader: impl FnOnce(&[u8], Option<&[u8]>) -> Option<T>,
+) -> Result<T, Unread> {
+    let before = look(db)?;
+    let main_bytes = slurp_unlocked(db, &before.db, max_bytes)?;
+    let wal_bytes = match &before.wal {
+        Some(wal) => {
+            if !wal.regular {
+                return Err(Unread::Failed);
+            }
+            if wal.len > 0 {
+                Some(slurp_unlocked(&beside(db, "-wal"), wal, max_bytes)?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    if look(db)? != before {
+        return Err(Unread::Changed);
+    }
+    let answer = reader(&main_bytes, wal_bytes.as_deref());
     if look(db)? != before {
         return Err(Unread::Changed);
     }

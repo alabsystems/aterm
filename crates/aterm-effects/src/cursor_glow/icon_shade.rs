@@ -78,6 +78,27 @@ impl CursorGlow {
         self.word_icons_unshaded = true;
     }
 
+    #[inline]
+    pub(crate) fn note_word_icon_sprite_slice(&mut self, sprites: &[FreeSprite]) {
+        self.word_icons.clear();
+        self.word_icon_src.clear();
+        let mut i = 0;
+        while i < sprites.len() {
+            let s = &sprites[i];
+            i += 1;
+            if s.z == aterm_render::sprites::FreeZ::UnderText && !s.is_blank() {
+                let v = s.visible();
+                self.word_icons.push((v.x0, v.x1, v.y0, v.y1));
+                self.word_icon_src.push(IconSrc {
+                    art: Arc::clone(&s.art),
+                    dest: (s.x, s.x + i32::from(s.w), s.y, s.y + i32::from(s.h)),
+                    flip_x: s.flip_x,
+                });
+            }
+        }
+        self.word_icons_unshaded = true;
+    }
+
     /// The word icons the last word pass named, grid pixels `(x0, x1, y0, y1)`
     /// ([`Self::note_word_icon_sprites`]).
     #[cfg(any(test, debug_assertions))]

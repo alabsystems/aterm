@@ -28,13 +28,17 @@ const APP_BUNDLES: &[&str] = &[
     "Chromium.app/Contents/MacOS/Chromium",
 ];
 
-/// The executable inside a Chrome for Testing archive unpacked under the browser cache: in
-/// `chrome-<version>-<platform>/`, or straight under the cache, where its zip unpacks as is.
-const CACHE_BUILDS: &[&str] = &[
-    "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-    "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-    "chrome-linux64/chrome",
-];
+/// The executable inside a Chrome for Testing archive unpacked under the browser cache, for each
+/// platform the pin covers ([`aterm_uds::host::chrome::window_pinned_binary`]): in
+/// `chrome-<version>-<platform>/` (where [`fetch_window_browser`] places the pinned one), or
+/// straight under the cache, where its zip unpacks as is.
+fn cache_builds() -> Vec<PathBuf> {
+    use aterm_uds::host::chrome;
+    chrome::WINDOW_PINNED
+        .iter()
+        .map(|pin| chrome::window_pinned_binary(Path::new(""), pin.platform))
+        .collect()
+}
 
 /// The Chromium names a Linux desk finds on `PATH`.
 const LINUX_ON_PATH: &[&str] = &["chromium", "chromium-browser"];
@@ -88,11 +92,12 @@ pub fn find_window_browser_in(
             return Some(named);
         }
     }
+    let subs = cache_builds();
     for root in cache_roots {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
-        let unpacked = CACHE_BUILDS.iter().map(|sub| root.join(sub));
+        let unpacked = subs.iter().map(|sub| root.join(sub));
         let mut builds: Vec<(Vec<u64>, PathBuf)> = entries
             .filter_map(Result::ok)
             .filter_map(|e| {
@@ -104,7 +109,7 @@ pub fn find_window_browser_in(
         let versioned = builds
             .iter()
             .rev()
-            .flat_map(|(_, dir)| CACHE_BUILDS.iter().map(move |sub| dir.join(sub)));
+            .flat_map(|(_, dir)| subs.iter().map(move |sub| dir.join(sub)));
         if let Some(found) = versioned.chain(unpacked).find(|c| window_capable(c)) {
             return Some(found);
         }
@@ -145,11 +150,191 @@ pub fn find_window_browser(home: Option<&Path>) -> Option<PathBuf> {
     find_window_browser_in(&|name| std::env::var_os(name), &roots, &apps, on_path)
 }
 
+/// [`no_window_desk`] over its inputs: whether this is a Unix host, whether it is Linux, and
+/// `env` (`DISPLAY`, `WAYLAND_DISPLAY`).
+#[must_use]
+pub fn no_window_desk_in(
+    unix: bool,
+    linux: bool,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<&'static str> {
+    if !unix {
+        return Some("not run: a sign-in window opens on macOS and Linux only");
+    }
+    let shown = |name: &str| env(name).is_some_and(|v| !v.is_empty());
+    if linux && !shown("DISPLAY") && !shown("WAYLAND_DISPLAY") {
+        return Some(
+            "not run: this session has no display (no DISPLAY or WAYLAND_DISPLAY) to open the window on",
+        );
+    }
+    None
+}
+
+/// Why no sign-in window can open on this machine's desk, which `accounts browser` refuses on
+/// before anything else about the window and [`window_route`] reads first: a host that is neither
+/// macOS nor Linux, or a Linux session with no display (`DISPLAY`, `WAYLAND_DISPLAY`).
+#[must_use]
+pub fn no_window_desk() -> Option<&'static str> {
+    no_window_desk_in(cfg!(unix), cfg!(target_os = "linux"), &|name| {
+        std::env::var_os(name)
+    })
+}
+
+/// Whether `accounts browser` can open a window on this machine ([`window_route`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowRoute {
+    /// A Chromium that opens a window is installed ([`find_window_browser`]).
+    Found(PathBuf),
+    /// None is, and `accounts browser` fetches the pinned Chrome for Testing first
+    /// ([`fetch_window_browser`]): the pin covers this machine, a cache root is known, the
+    /// downloader is there ([`super::headless_fetch::curl_present`]), and no fetch of it has
+    /// failed there within [`super::headless_fetch::FAILURE_KEPT`]
+    /// ([`super::headless_fetch::last_failure`]).
+    Fetchable,
+    /// No window opens here, or none is installed and none would be fetched: why (no desk to
+    /// open one on, no pin for this machine, no cache root, no downloader, or the last fetch's
+    /// failure).
+    Unreachable(String),
+}
+
+impl WindowRoute {
+    /// Whether `accounts browser` would open a window here: one found, or one it fetches.
+    #[must_use]
+    pub fn reachable(&self) -> bool {
+        !matches!(self, WindowRoute::Unreachable(_))
+    }
+}
+
+/// [`window_route`] over its inputs: why no window opens on this desk (`desk`,
+/// [`no_window_desk`]), the window browser `found`, else this machine's pinned full build
+/// `archive`, the cache `root` it would be fetched into, and whether its downloader is there
+/// (`curl`).
+#[must_use]
+pub fn window_route_in(
+    desk: Option<&str>,
+    found: Option<PathBuf>,
+    archive: Option<&super::headless_fetch::Archive>,
+    root: Option<&Path>,
+    curl: bool,
+) -> WindowRoute {
+    if let Some(why) = desk {
+        return WindowRoute::Unreachable(why.to_owned());
+    }
+    if let Some(found) = found {
+        return WindowRoute::Found(found);
+    }
+    let Some(archive) = archive else {
+        return WindowRoute::Unreachable(
+            "the pin covers no Chrome for Testing build for this machine".to_owned(),
+        );
+    };
+    let Some(root) = root else {
+        return WindowRoute::Unreachable("no cache directory is known".to_owned());
+    };
+    if !curl {
+        return WindowRoute::Unreachable(format!(
+            "{}, which fetches the pinned Chrome for Testing, is not here",
+            super::headless_fetch::CURL
+        ));
+    }
+    match super::headless_fetch::last_failure(root, archive) {
+        Some(why) => WindowRoute::Unreachable(format!(
+            "the pinned Chrome for Testing's last fetch failed: {why}"
+        )),
+        None => WindowRoute::Fetchable,
+    }
+}
+
+/// Whether `accounts browser` can open a window on this machine: none where this desk opens no
+/// window ([`no_window_desk`]), else one installed ([`find_window_browser`]), else the pinned full
+/// Chrome for Testing it would fetch into the browser cache
+/// ([`super::headless_fetch::cache_root`]) with [`super::headless_fetch::CURL`], where no fetch
+/// of it has failed lately.
+#[must_use]
+pub fn window_route(home: Option<&Path>) -> WindowRoute {
+    window_route_in(
+        no_window_desk(),
+        find_window_browser(home),
+        super::headless_fetch::Archive::host_window().as_ref(),
+        super::headless_fetch::cache_root(home).as_deref(),
+        super::headless_fetch::curl_present(),
+    )
+}
+
+/// What a fetch ([`fetch_window_browser`]) says when its caller was stopped as the build was
+/// put in place: it stays there, where the next `accounts browser` finds it, and no window opens.
+pub const STOPPED_IN_PLACE: &str =
+    "it was stopped as the build was put in place, where the next run finds it";
+
+/// The archive [`fetch_window_browser`] fetches on this machine and the cache root it fetches
+/// it into: this machine's pinned full Chrome for Testing
+/// ([`super::headless_fetch::Archive::host_window`]) and the browser cache root
+/// ([`super::headless_fetch::cache_root`]).
+/// # Errors
+/// The pin covers no build for this machine, or no cache directory is known.
+pub fn window_fetch_plan(
+    home: Option<&Path>,
+) -> Result<(super::headless_fetch::Archive, PathBuf), String> {
+    let archive = super::headless_fetch::Archive::host_window().ok_or_else(|| {
+        "the pin covers no Chrome for Testing build for this machine; nothing was installed"
+            .to_owned()
+    })?;
+    let root = super::headless_fetch::cache_root(home)
+        .ok_or_else(|| "no cache directory is known; nothing was installed".to_owned())?;
+    Ok((archive, root))
+}
+
+/// Fetches this machine's pinned full Chrome for Testing into the browser cache root
+/// ([`window_fetch_plan`]), where [`find_window_browser`] then finds it
+/// ([`fetch_window_browser_into`]); its executable. `accounts browser` runs it where no window
+/// browser is found.
+/// # Errors
+/// The pin covers no build for this machine, no cache directory is known, or
+/// [`fetch_window_browser_into`]'s own.
+pub fn fetch_window_browser(
+    home: Option<&Path>,
+    fetch: &mut dyn super::headless_fetch::Fetch,
+    stopped: &dyn Fn() -> bool,
+) -> Result<PathBuf, String> {
+    let (archive, root) = window_fetch_plan(home)?;
+    fetch_window_browser_into(&root, &archive, fetch, stopped)
+}
+
+/// Installs `archive` into the cache `root` through `fetch` ([`super::headless_fetch::install`]:
+/// held to its size and sha256, nothing installed otherwise, a failure kept for
+/// [`window_route`]), ending once `stopped` says so, and returns its executable where it is a
+/// browser that opens a window ([`window_capable`]: never a headless shell).
+/// # Errors
+/// The install's own; the executable placed is no browser that opens a window; or `stopped`
+/// said so once the build was in place ([`STOPPED_IN_PLACE`]: the build stays, nothing opens).
+pub fn fetch_window_browser_into(
+    root: &Path,
+    archive: &super::headless_fetch::Archive,
+    fetch: &mut dyn super::headless_fetch::Fetch,
+    stopped: &dyn Fn() -> bool,
+) -> Result<PathBuf, String> {
+    let placed = super::headless_fetch::install(root, archive, fetch, stopped)?;
+    if !window_capable(&placed) {
+        return Err(format!(
+            "{} is no browser that opens a window",
+            placed.display()
+        ));
+    }
+    // A stop noted while the tree was renamed into place, after the install's last look.
+    if stopped() {
+        return Err(STOPPED_IN_PLACE.to_owned());
+    }
+    Ok(placed)
+}
+
 /// The browser's name for a person: `Google Chrome for Testing`, `Chromium`, else its file name.
 #[must_use]
 pub fn browser_name(browser: &Path) -> String {
     let text = browser.to_string_lossy();
-    if text.contains("Google Chrome for Testing") || text.ends_with("chrome-linux64/chrome") {
+    if text.contains("Google Chrome for Testing")
+        || text.ends_with("chrome-linux64/chrome")
+        || text.ends_with("chrome-linux-arm64/chrome")
+    {
         "Google Chrome for Testing".to_owned()
     } else if text.contains("Chromium") || text.contains("chromium") {
         "Chromium".to_owned()

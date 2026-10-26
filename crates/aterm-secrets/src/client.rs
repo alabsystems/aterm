@@ -80,6 +80,10 @@ impl Paths {
         self.dir.join("asking")
     }
 
+    fn answered_file(&self) -> PathBuf {
+        self.dir.join("answered")
+    }
+
     fn stuck_file(&self, pid: u32) -> PathBuf {
         self.dir.join(format!("{STUCK_PREFIX}{pid}"))
     }
@@ -745,9 +749,16 @@ struct State {
     failed: bool,
     manifest: Manifest,
     /// Entry name → digest of each value a pass is to write, saved before it writes and cleared
-    /// by its own save (a save that applies nothing keeps it), so the next apply still counts
-    /// the files a cut-short pass wrote as the vault's ([`materialize::apply_resuming`]).
+    /// by its own save (a save that applies nothing keeps it; an apply keeps the digests of
+    /// the entries it failed, whose write may have landed all the same), so the next apply
+    /// still counts the files a cut-short pass wrote as the vault's
+    /// ([`materialize::apply_resuming`]).
     pending: materialize::Pending,
+    /// The entries the last apply left this Mac's own (an unanchored ` if-absent` entry left in
+    /// place, a plain entry adopted): out of the manifest, so [`gaps`] looks at them apart, and
+    /// one whose file is gone since is a gap the next pass fills. `None` in a state no apply of
+    /// this record wrote (an older aterm's), until the next apply.
+    own: Option<BTreeSet<String>>,
 }
 
 fn load_state(paths: &Paths) -> crate::Result<State> {
@@ -808,6 +819,16 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
             .unwrap_or(false),
         manifest,
         pending: digests("pending"),
+        own: table
+            .get("own")
+            .and_then(aterm_toml::Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(aterm_toml::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            }),
     })
 }
 
@@ -846,6 +867,10 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
     }
     if state.failed {
         text.push_str("failed = true\n");
+    }
+    if let Some(own) = &state.own {
+        let names: Vec<String> = own.iter().map(|name| toml_str(name)).collect();
+        text.push_str(&format!("own = [{}]\n", names.join(", ")));
     }
     text.push_str("\n[manifest]\n");
     for (name, digest) in &state.manifest.files {
@@ -956,6 +981,13 @@ fn refused_now(state: &State) -> bool {
 /// # Errors
 /// The local records cannot be read or written, or the server could not be asked.
 pub fn read_verdict(paths: &Paths) -> crate::Result<bool> {
+    read_verdict_within(paths, Duration::MAX)
+}
+
+/// [`read_verdict`], its exchange with the source within `total` (a bounded wait's).
+/// # Errors
+/// As [`read_verdict`]'s, and a source that did not answer within `total`.
+pub fn read_verdict_within(paths: &Paths, total: Duration) -> crate::Result<bool> {
     let Some(config) = config(paths)? else {
         return Ok(false);
     };
@@ -975,7 +1007,7 @@ pub fn read_verdict(paths: &Paths) -> crate::Result<bool> {
     };
     let recipient = identity.recipient().to_bech32();
     let tag = join::proof_tag(&proof);
-    let refused = transport::list_verdicts(url)?
+    let refused = transport::list_verdicts_within(url, total)?
         .iter()
         .any(|(key, refused)| *key == recipient && *refused == tag);
     if refused && state.refused.as_deref() != Some(tag.as_str()) {
@@ -1393,8 +1425,11 @@ fn look_with(
                 match tries.get(url, wait) {
                     Ok(transport::Answer::Fetched(fetched)) => break fetched,
                     Ok(transport::Answer::Foreign(why)) => return Look::NoVault(why),
+                    // macOS refusing the `.local` name is the person's Don't Allow, an answer
+                    // no wait changes: only a hold is tried again.
                     Err(unheard)
                         if unheard.held
+                            && !refused_by_local_network(&unheard.why)
                             && tries
                                 .now()
                                 .saturating_duration_since(start)
@@ -1484,6 +1519,7 @@ fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) ->
 
 fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::Result<Report> {
     let resumed = std::mem::take(&mut state.pending);
+    let mut pended = materialize::Pending::new();
     let applied = materialize::apply_resuming(
         &paths.home,
         entries,
@@ -1491,6 +1527,7 @@ fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::
         &resumed,
         now(),
         &mut |held, pending| {
+            pended.clone_from(pending);
             if pending.is_empty() {
                 return Ok(());
             }
@@ -1502,6 +1539,8 @@ fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::
     );
     match applied {
         Ok((manifest, report)) => {
+            state.pending = landed(&paths.home, pended, &report.failed);
+            state.own = Some(own_entries(entries, &manifest, &report));
             state.manifest = manifest;
             Ok(report)
         }
@@ -1510,6 +1549,63 @@ fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::
             Err(error)
         }
     }
+}
+
+/// The digests a pass pended (`pended`) of the entries it `failed` whose file holds that value
+/// all the same: a write that failed after its rename (the directory's flush failing). Kept
+/// pending, the file counts as the vault's next pass, never adopted as this Mac's own. A failed
+/// write whose file does not hold it wrote nothing, so a file a person writes with that value
+/// later stays theirs.
+fn landed(
+    home: &Path,
+    mut pended: materialize::Pending,
+    failed: &[(String, String)],
+) -> materialize::Pending {
+    pended.retain(|name, digest| {
+        failed.iter().any(|(failed, _)| failed == name)
+            && materialize::holds_digest(home, name, digest)
+    });
+    pended
+}
+
+/// The entries an apply left this Mac's own that it would write once their file is gone
+/// ([`State::own`]): plain entries adopted, and ` if-absent` entries left whose anchors, all
+/// the way along, the vault wrote this pass (an anchor of this Mac's own, or one not looked
+/// at, leaves a gone file unfilled, so a file anchored to one is never named: it would be a
+/// gap no pass fills).
+fn own_entries(entries: &[Entry], manifest: &Manifest, report: &Report) -> BTreeSet<String> {
+    let by_name: BTreeMap<&str, &Entry> = entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect();
+    let vaults = |name: &str| {
+        manifest.files.contains_key(name) && !report.left.iter().any(|left| left == name)
+    };
+    let anchored_to_vaults = |entry: &Entry| {
+        let mut seen = BTreeSet::new();
+        let mut anchor = entry.anchor.as_deref();
+        while let Some(name) = anchor {
+            if !seen.insert(name) || !vaults(name) {
+                return false;
+            }
+            anchor = by_name
+                .get(name)
+                .and_then(|anchored| anchored.anchor.as_deref());
+        }
+        true
+    };
+    entries
+        .iter()
+        .filter(|entry| !manifest.files.contains_key(&entry.name))
+        .filter(|entry| {
+            if entry.if_absent {
+                report.left.contains(&entry.name) && anchored_to_vaults(entry)
+            } else {
+                report.unchanged.contains(&entry.name)
+            }
+        })
+        .map(|entry| entry.name.clone())
+        .collect()
 }
 
 fn names_of(report: &Report) -> Vec<String> {
@@ -1572,7 +1668,27 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
         && cache_intact(paths, state)
-        && changed_files(paths, state).is_empty()
+        && unsettled(paths, state).is_empty()
+}
+
+/// The files a pass would write again at the version `state` holds: [`changed_files`] and
+/// [`gaps`].
+fn unsettled(paths: &Paths, state: &State) -> BTreeSet<String> {
+    let mut unsettled = changed_files(paths, state);
+    unsettled.extend(gaps(paths, state));
+    unsettled
+}
+
+/// The entries [`State::own`] names whose file is gone since, where a pass would write it
+/// ([`materialize::is_gap`]): the vault fills a gap at the version it holds.
+fn gaps(paths: &Paths, state: &State) -> BTreeSet<String> {
+    state
+        .own
+        .iter()
+        .flatten()
+        .filter(|name| materialize::is_gap(&paths.home, name))
+        .cloned()
+        .collect()
 }
 
 /// The files `state`'s manifest names that are not as the vault wrote them (changed, missing or
@@ -1656,18 +1772,46 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     let config = configured(paths)?;
     let before = load_state(paths)?;
     let fetched = match (&config.source, wait) {
-        (Source::Url(_), Some(wait)) => {
-            let after = (before.membership != Stored::None
-                && !pin_gives_way(&config)
-                && source_bound(&config, &before)
-                && (!matches!(before.membership, Stored::In | Stored::Plain)
-                    || (!before.failed && before.pending.is_empty())))
-            .then_some(before.seq);
-            transport::fetch(&config.source, after, wait + Duration::from_secs(10))?
-        }
+        (Source::Url(_), Some(wait)) => transport::fetch(
+            &config.source,
+            long_poll_after(&config, &before),
+            wait + Duration::from_secs(10),
+        )?,
         _ => transport::fetch(&config.source, None, Duration::from_secs(30))?,
     };
     apply_fetched(paths, config, before, fetched)
+}
+
+/// [`sync`] as one try of a bounded wait (an approval's): a long-poll whose whole request ends
+/// within `total` ([`transport::fetch_within`]), as the server holds one for its own time, not
+/// the asker's; one that runs out of `total` heard nothing new ([`SyncOutcome::Unchanged`]).
+/// A vault at a path is read as [`sync`] reads it.
+pub fn sync_within(paths: &Paths, total: Duration) -> crate::Result<SyncOutcome> {
+    let config = configured(paths)?;
+    let before = load_state(paths)?;
+    let fetched = match &config.source {
+        Source::Url(url) => {
+            match transport::fetch_within(url, long_poll_after(&config, &before), total) {
+                Err(error) if error.kind() == crate::ErrorKind::TimedOut => {
+                    return Ok(SyncOutcome::Unchanged { seq: before.seq });
+                }
+                fetched => fetched?,
+            }
+        }
+        Source::Path(_) => transport::fetch(&config.source, None, Duration::from_secs(30))?,
+    };
+    apply_fetched(paths, config, before, fetched)
+}
+
+/// The seq a long-poll waits past (`?after=`): the one this Mac holds, once it is bound to
+/// the source and has nothing of that version left to write.
+fn long_poll_after(config: &Config, before: &State) -> Option<u64> {
+    (before.membership != Stored::None
+        && !pin_gives_way(config)
+        && source_bound(config, before)
+        && (!matches!(before.membership, Stored::In | Stored::Plain)
+            || (!before.failed && before.pending.is_empty())))
+    .then_some(before.seq)
 }
 
 /// [`sync`] of the envelope a join fetched and verified from the configured source already, in
@@ -1768,8 +1912,46 @@ fn apply_fetched(
         return Ok(SyncOutcome::Applied { seq: 0, report });
     };
     let held = floor(paths, &state, &config.name, &config);
-    let (envelope, pinned, verdict) =
-        envelope::verify_for_reader(&bytes, &config.name, &pin, &config.followed, held.as_ref())?;
+    let verified =
+        envelope::verify_for_reader(&bytes, &config.name, &pin, &config.followed, held.as_ref());
+    let (envelope, pinned, verdict) = match verified {
+        Ok(verified) => verified,
+        Err(error) => {
+            // The source went back to a version older than this Mac's (restored, or put back
+            // by a Mac that slept, maybe one signed before a rotation): a pass that did not
+            // long-poll hears it as a body, not a `204` naming the older seq, and puts this
+            // Mac's copy back as that one would. Its name and seq are read as the `204`'s are,
+            // unverified: what is put back is this Mac's own copy, verified under its pin
+            // ([`held_copy`]), which the server takes only as a newer version of its chain.
+            let older = match config.source {
+                Source::Url(_) if (state.seq, state.digest) == (before.seq, before.digest) => {
+                    envelope::parse(&bytes)
+                        .ok()
+                        .filter(|served| served.name == config.name && served.seq < state.seq)
+                        .map(|served| served.seq)
+                }
+                _ => None,
+            };
+            let Some((served, copy)) =
+                older.and_then(|served| Some((served, held_copy(paths, &config, &state)?)))
+            else {
+                return Err(error);
+            };
+            drop(lock);
+            transport::publish(&config.source, &copy).map_err(|failed| {
+                Error::new(format!(
+                    "{} holds seq {served} of {}, older than this machine's seq {}, and putting this machine's copy back failed: {failed}",
+                    place(&config.source),
+                    config.name,
+                    state.seq
+                ))
+            })?;
+            return Ok(SyncOutcome::PutBack {
+                seq: state.seq,
+                served: Some(served),
+            });
+        }
+    };
     state.heard = now();
     if let Pin::Replaced(_) = pinned {
         state.seq = 0;
@@ -1784,6 +1966,7 @@ fn apply_fetched(
     if verdict == Verdict::Unchanged
         && state.membership == Stored::In
         && source_bound(&config, &state)
+        && state.own.is_some()
         && files_intact(paths, &state)
     {
         save_state(paths, &state)?;
@@ -1824,12 +2007,6 @@ pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
         stop.store(true, Ordering::Relaxed);
         ended
     })
-}
-
-fn program_stamp() -> Option<(u64, u64, u64, i64)> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
-    Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
 }
 
 fn nap(stop: &AtomicBool, total: Duration) {
@@ -1947,9 +2124,10 @@ fn pass_line(
 type Repaired = Option<(([u8; 32], u64), BTreeSet<String>)>;
 
 /// Whether this pass repairs the files a version wrote, rather than long-polling: when they are
-/// not as written, once per version and set of such files. Another file changed since (or one
-/// put back that changed again with another) is repaired again; the same set is not, so a file
-/// a program on this Mac keeps rewriting is put back once, not every pass.
+/// not as written, or one an entry left this Mac's own is gone ([`unsettled`]), once per
+/// version and set of such files. Another file changed since (or one put back that changed
+/// again with another) is repaired again; the same set is not, so a file a program on this Mac
+/// keeps rewriting is put back once, not every pass.
 fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
     let Ok(state) = load_state(paths) else {
         return false;
@@ -1965,8 +2143,10 @@ fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
         *repaired = Some((version, BTreeSet::new()));
         return true;
     }
-    let changed = changed_files(paths, &state);
-    let due = !changed.is_empty()
+    // A state with no record of the entries this Mac holds as its own is applied once to
+    // write one, as the files are then not known to be settled.
+    let changed = unsettled(paths, &state);
+    let due = (!changed.is_empty() || state.own.is_none())
         && repaired
             .as_ref()
             .is_none_or(|(last, files)| *last != version || *files != changed);
@@ -1991,12 +2171,15 @@ fn subscriber_loop_until(
     let mut repaired = None;
     let mut last_error = String::new();
     let mut repeated = String::new();
-    let program = program_stamp();
+    // The path is read once, as it starts (`server::stamp_of`).
+    let exe = std::env::current_exe().ok();
+    let stamp = || exe.as_deref().and_then(crate::server::stamp_of);
+    let program = stamp();
     loop {
         if stop() {
             return Ok(());
         }
-        if program.is_some() && program_stamp() != program {
+        if crate::server::replaced(program, stamp()) {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
         }
@@ -2070,7 +2253,13 @@ fn subscriber_pass(paths: &Paths, repaired: &mut Repaired) -> crate::Result<(Con
         Source::Url(_) | Source::Path(_) => None,
     };
     match sync(paths, wait) {
-        Ok(outcome) => Ok((config, outcome)),
+        Ok(outcome) => {
+            // A put-back wrote no file here: the repair this pass was for is still due.
+            if matches!(outcome, SyncOutcome::PutBack { .. }) {
+                *repaired = before;
+            }
+            Ok((config, outcome))
+        }
         Err(error) => {
             *repaired = before;
             let _ = change_request(paths, &config, |state| {
@@ -2276,7 +2465,7 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
 }
 
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
-    let mut approver = Approver::default();
+    let mut approver = Approver::resumed(paths);
     if let Err(error) = clear_dead_stuck(paths) {
         log(&format!("could not clear old approver records: {error}"));
     }
@@ -2286,18 +2475,44 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
     }
 }
 
+/// What a judged approver pass read: the vault version, the requests, and those of them the vault
+/// answered as they stand ([`still_answered`]).
+type Listed = (
+    u64,
+    std::collections::BTreeSet<Judged>,
+    std::collections::BTreeSet<Answered>,
+);
+
+/// The requests in `pending` the vault answered as they stand ([`Answered`]). One whose time the
+/// server moved (a Mac let go that asks again as it asked before) drops out, which starts one
+/// pass; a request judged anew stays out, so its hourly re-asks start none, and neither do two
+/// requests under one key and name.
+fn still_answered(
+    pending: &[Request],
+    answered: &std::collections::BTreeSet<Answered>,
+) -> std::collections::BTreeSet<Answered> {
+    pending
+        .iter()
+        .filter_map(Answered::of)
+        .filter(|answer| answered.contains(answer))
+        .collect()
+}
+
 /// What the approver keeps from one pass to the next.
 #[derive(Default)]
 struct Approver {
     settled: Settled,
     checked: Option<ApprovalCheck>,
-    /// The vault version and the requests the last judged pass read.
-    listed: Option<(u64, std::collections::BTreeSet<Judged>)>,
+    /// What the last judged pass read ([`Listed`]).
+    listed: Option<Listed>,
     /// What [`write_asking`] last wrote.
     told: Option<Vec<Asking>>,
     /// Whether the last pass met a failure, other than a failure to read on a Mac last read as a
-    /// member, which leaves it as it was.
+    /// member, or a first refused publish ([`Approver::refused`]), which leave it as it was.
     failing: bool,
+    /// Whether the last pass's publish was refused before the vault stored it
+    /// ([`crate::ErrorKind::NotStored`]) and said nothing: one refused again is reported.
+    refused: bool,
     /// The failure this approver last reported, in its log and in [`approver_stuck`]'s record.
     reported: Option<String>,
     /// Whether this approver's record outlived a removal that failed, and waits for another.
@@ -2307,9 +2522,44 @@ struct Approver {
     unrecorded: bool,
     /// Whether the last pass that read this Mac's role found it no admin.
     member: bool,
+    /// The join requests the vault answered that are still queued ([`Answered`]), kept in
+    /// their record ([`write_answered`]) so an approver started again knows them too.
+    answered: std::collections::BTreeSet<Answered>,
+    /// Whether `answered` differs from its record, which a failed write left behind.
+    answered_unwritten: bool,
 }
 
 impl Approver {
+    /// An approver that knows the join requests its earlier runs found answered.
+    fn resumed(paths: &Paths) -> Approver {
+        Approver {
+            answered: read_answered(paths),
+            ..Approver::default()
+        }
+    }
+
+    /// Keep `answered` in its record when it changed, or when the last write failed.
+    fn keep_answered(
+        &mut self,
+        paths: &Paths,
+        log: &dyn Fn(&str),
+        answered: std::collections::BTreeSet<Answered>,
+    ) {
+        if self.answered == answered && !self.answered_unwritten {
+            return;
+        }
+        self.answered = answered;
+        self.answered_unwritten = match write_answered(paths, &self.answered) {
+            Ok(()) => false,
+            Err(error) => {
+                log(&format!(
+                    "could not record the join requests the vault answered: {error}"
+                ));
+                true
+            }
+        };
+    }
+
     /// Keep `asking` in the record an admin Mac's aterm reads ([`asking`]) when it changed.
     fn tell(&mut self, paths: &Paths, log: &dyn Fn(&str), asking: Vec<Asking>) {
         if self.told.as_ref() == Some(&asking) {
@@ -2352,11 +2602,13 @@ impl Approver {
             self.reported = Some(text);
         }
         self.failing = true;
+        self.refused = false;
     }
 
     /// Note a pass that met no failure, withdrawing a reported one with the line `said`.
     fn untroubled(&mut self, paths: &Paths, log: &dyn Fn(&str), said: &str) {
         self.failing = false;
+        self.refused = false;
         self.unrecorded = false;
         let withdrawn = self.reported.take().is_some();
         if withdrawn {
@@ -2480,22 +2732,31 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         Some(Approval::Open) => "as the vault is open",
         None => "by code",
     };
-    let listed = (seq, pending.iter().map(Judged::of).collect());
+    let judged: std::collections::BTreeSet<Judged> = pending.iter().map(Judged::of).collect();
+    let listed = (
+        seq,
+        judged.clone(),
+        still_answered(&pending, &approver.answered),
+    );
     let due =
         approval.is_some_and(|approval| approver.settled.due(&config, seq, &pending, approval));
-    // A request that came or went, or a version that let a Mac in, is read again too, so the
-    // record of the Macs an admin approves by hand follows the queue and the vault.
+    // A request that came or went, a version that let a Mac in, or a request the vault answered
+    // whose time moved (a Mac let go asking again) is read again too, so the record of the Macs
+    // an admin approves by hand follows the queue and the vault.
     if due || approver.listed.as_ref() != Some(&listed) {
         let mut publishing = false;
+        let mut answered = approver.answered.clone();
         let done = admin_open(paths).and_then(|admin| {
             if admin.config != config || admin.seq != seq {
                 return Err(Error::new("the vault changed while checking approval"));
             }
-            auto_approve_opened(paths, &admin, &mut publishing)
+            auto_approve_opened(paths, &admin, &mut publishing, &mut answered)
         });
         match done {
             Ok(mut done) => {
-                approver.listed = Some(listed);
+                approver.keep_answered(paths, log, answered);
+                // Read against the record this pass left, so the next pass rests.
+                approver.listed = Some((seq, judged, still_answered(&pending, &approver.answered)));
                 approver.tell(paths, log, std::mem::take(&mut done.asking));
                 if !done.approved.is_empty() {
                     log(&format!("approved {} {by}", done.approved.join(", ")));
@@ -2515,8 +2776,16 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
             }
             Err(error) => {
                 // A failed publish may still have landed (a reply lost after the server took
-                // it): say so from the first pass, unlike a failure to read.
-                approver.failing |= publishing;
+                // it): say so from the first pass, unlike a failure to read. One the vault
+                // refused before storing it met another admin's publish and cannot have landed:
+                // after a pass that did not fail it says nothing, leaves the approver as it was
+                // and reads that version again soon; refused again, it is reported.
+                let refused = error.kind() == crate::ErrorKind::NotStored;
+                if refused && !approver.refused && !approver.failing {
+                    approver.refused = true;
+                    return Duration::from_secs(2);
+                }
+                approver.failing |= publishing || refused;
                 approver.trouble(paths, log, format!("approving {by} failed: {error}"));
                 return Duration::from_secs(30);
             }
@@ -2608,15 +2877,20 @@ pub struct AutoApproved {
 /// Approve and publish all queued requests eligible under the vault's `[join]` policy.
 pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     let admin = admin_open(paths)?;
-    auto_approve_opened(paths, &admin, &mut false)
+    auto_approve_opened(paths, &admin, &mut false, &mut read_answered(paths))
 }
 
-/// [`auto_approve`] with `admin` opened; `publishing` is set once a publish is attempted, since a
-/// failed one may still have landed.
+/// [`auto_approve`] with `admin` opened; `publishing` is set once a publish is attempted that may
+/// have landed: any failed one but one the vault refused before storing it
+/// ([`crate::ErrorKind::NotStored`]). A request in `answered` from a key no longer in the vault
+/// is judged and left alone: no approval, no refusal, no ask. On success `answered` holds the
+/// requests the vault has answered now: those of keys in the vault (this pass's approvals
+/// included), and those it held before that are still queued.
 fn auto_approve_opened(
     paths: &Paths,
     admin: &Admin,
     publishing: &mut bool,
+    answered: &mut std::collections::BTreeSet<Answered>,
 ) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
     let policy = Approval::of(&admin.published_doc);
@@ -2636,7 +2910,17 @@ fn auto_approve_opened(
     let mut doc = admin.published_doc.clone();
     let mut admissions = Vec::new();
     let mut refusals = Vec::new();
+    let mut kept = std::collections::BTreeSet::new();
     for request in requests_for(&admin.config, None)? {
+        let answer = Answered::of(&request);
+        if members.contains(&request.recipient) {
+            kept.extend(answer);
+        } else if let Some(answer) = answer.filter(|answer| answered.contains(answer)) {
+            // Queued while its key was in the vault, and left so by a version that let it go.
+            kept.insert(answer);
+            done.judged.push(Judged::of(&request));
+            continue;
+        }
         let Some(approval) = policy.filter(|approval| approval.reads(&request)) else {
             if !members.contains(&request.recipient) {
                 done.asking.push(Asking::of(&request));
@@ -2660,6 +2944,7 @@ fn auto_approve_opened(
                 doc.add_machine(&host, &request.recipient)
                     .map_err(|e| Error::new(e.to_string()))?;
                 done.approved.push(host);
+                kept.extend(Answered::of(&request));
                 admissions.push((
                     request.recipient.clone(),
                     match approval {
@@ -2682,9 +2967,14 @@ fn auto_approve_opened(
         done.judged.push(judged);
     }
     if !done.approved.is_empty() {
-        *publishing = true;
-        done.seq = Some(publish_as(paths, admin, &doc, false, &admissions, false)?.seq);
+        let published = publish_as(paths, admin, &doc, false, &admissions, false);
+        // A version the vault refused before storing it (another admin's publish came first)
+        // cannot have landed; any other failed publish may have.
+        *publishing =
+            !matches!(&published, Err(error) if error.kind() == crate::ErrorKind::NotStored);
+        done.seq = Some(published?.seq);
     }
+    *answered = kept;
     // The joining Mac reads the verdict and asks its person again at once; one that is not
     // told still waits as before, so a verdict that does not arrive changes nothing.
     if let Source::Url(url) = &admin.config.source {
@@ -2720,9 +3010,121 @@ impl Asking {
 /// The most machines the record of those asking to join holds.
 const ASKING_MOST: usize = 64;
 
+/// A join request the vault answered: one queued while its key was in the vault. The server keeps
+/// a request until it expires, and a Mac in the vault asks no more, so after a version lets that
+/// key go the request still stands as it was: no new ask, and no Mac for a person to approve. A
+/// Mac that asks again is read anew once the server moves its request's time, which a changed
+/// request does at once and an unchanged one hourly ([`crate::server::JOIN_REFRESH_EVERY_SECS`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Answered {
+    recipient: String,
+    host: String,
+    at: u64,
+}
+
+impl Answered {
+    /// `request` as answered: none for one the server gave no time, which a later ask from the
+    /// same Mac could not be told apart from.
+    fn of(request: &Request) -> Option<Answered> {
+        Some(Answered {
+            recipient: request.recipient.clone(),
+            host: request.host.clone(),
+            at: request.at?,
+        })
+    }
+}
+
+/// The most join requests the record of answered ones holds.
+const ANSWERED_MOST: usize = 256;
+
+/// The join requests this admin Mac's approver found answered ([`Answered`]), as it last
+/// recorded them; empty where it recorded none.
+fn read_answered(paths: &Paths) -> std::collections::BTreeSet<Answered> {
+    let Ok(Some(bytes)) = fsx::read_private(&paths.answered_file(), 64 << 10) else {
+        return std::collections::BTreeSet::new();
+    };
+    String::from_utf8_lossy(bytes.as_slice())
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.splitn(3, '\t');
+            let (recipient, at, host) = (words.next()?, words.next()?, words.next()?);
+            (recipient.starts_with("age1") && !host.is_empty()).then_some(())?;
+            Some(Answered {
+                recipient: recipient.to_owned(),
+                host: host.to_owned(),
+                at: at.parse().ok()?,
+            })
+        })
+        .take(ANSWERED_MOST)
+        .collect()
+}
+
+/// Write `answered` where [`read_answered`] reads it: one `key<TAB>time<TAB>name` line each, the
+/// record gone when none stand.
+fn write_answered(
+    paths: &Paths,
+    answered: &std::collections::BTreeSet<Answered>,
+) -> crate::Result<()> {
+    let path = paths.answered_file();
+    if answered.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+        };
+    }
+    let text: String = answered
+        .iter()
+        .take(ANSWERED_MOST)
+        .map(|answered| {
+            let host: String = answered.host.chars().filter(|c| !c.is_control()).collect();
+            format!("{}\t{}\t{host}\n", answered.recipient, answered.at)
+        })
+        .collect();
+    fsx::ensure_private_dir(&paths.dir)?;
+    fsx::write_atomic(&path, text.as_bytes(), 0o600)
+}
+
+/// The head line of the record of those asking to join that names the approver process that
+/// wrote it ([`write_asking`]): `<pid>@<birth>`, its start as the kernel records it, so a later
+/// process given the same pid is not taken for it (`<pid>` alone where the start could not be
+/// read). A reader before it skips the line, which holds no tab.
+const ASKING_BY: &str = "# approver ";
+
+/// This process as the head of the record of those asking to join names it ([`ASKING_BY`]).
+fn approver_named() -> String {
+    let pid = std::process::id();
+    match i32::try_from(pid)
+        .ok()
+        .and_then(aterm_uds::process::read_birth)
+    {
+        Some(birth) => format!("{pid}@{}", birth.0),
+        None => pid.to_string(),
+    }
+}
+
+/// Whether the approver a record's head names (`<pid>@<birth>`, or `<pid>`) still runs: that pid
+/// with that start, or with only a pid named, that pid.
+fn approver_runs(named: &str) -> bool {
+    let (pid, birth) = named.split_once('@').unwrap_or((named, ""));
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    if birth.is_empty() {
+        return aterm_uds::process::pid_alive(pid);
+    }
+    let Ok(birth) = birth.parse::<u64>() else {
+        return false;
+    };
+    i32::try_from(pid)
+        .ok()
+        .and_then(aterm_uds::process::read_birth)
+        .is_some_and(|now| now.0 == birth)
+}
+
 /// Write `asking`, the machines an admin Mac's approver left for a person to approve, where this
-/// Mac's aterm reads them ([`asking`]): one `code<TAB>key<TAB>name` line each, the record gone
-/// when none ask.
+/// Mac's aterm reads them ([`asking`]): a head line naming this process ([`ASKING_BY`]), then one
+/// `code<TAB>key<TAB>name` line each, the record gone when none ask.
 fn write_asking(paths: &Paths, asking: &[Asking]) -> crate::Result<()> {
     let path = paths.asking_file();
     if asking.is_empty() {
@@ -2732,26 +3134,41 @@ fn write_asking(paths: &Paths, asking: &[Asking]) -> crate::Result<()> {
             Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
         };
     }
-    let text: String = asking
-        .iter()
-        .take(ASKING_MOST)
-        .map(|asking| {
+    let text: String = std::iter::once(format!("{ASKING_BY}{}\n", approver_named()))
+        .chain(asking.iter().take(ASKING_MOST).map(|asking| {
             let host: String = asking.host.chars().filter(|c| !c.is_control()).collect();
             format!("{}\t{}\t{host}\n", asking.code, asking.recipient)
-        })
+        }))
         .collect();
     fsx::ensure_private_dir(&paths.dir)?;
     fsx::write_atomic(&path, text.as_bytes(), 0o600)
 }
 
 /// The machines asking to join that this admin Mac's approver left for a person to approve, as
-/// it last recorded them: from the local record alone, empty where none ask or no approver runs.
+/// it last recorded them: from the local record alone, empty where none ask or no approver runs
+/// (the process the record names is gone: the subscriber turned off, stopped or killed, so
+/// nothing would keep the record current). A record that names no process (an approver before
+/// [`ASKING_BY`]) is read as it stands.
 pub fn asking(paths: &Paths) -> Vec<Asking> {
+    asking_with(paths, &approver_runs)
+}
+
+/// [`asking`], `runs` saying whether the approver the record's head names runs.
+fn asking_with(paths: &Paths, runs: &dyn Fn(&str) -> bool) -> Vec<Asking> {
     let Ok(Some(bytes)) = fsx::read_private(&paths.asking_file(), 64 << 10) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(bytes.as_slice())
+    let text = String::from_utf8_lossy(bytes.as_slice());
+    let by = text
         .lines()
+        .next()
+        .and_then(|head| head.strip_prefix(ASKING_BY));
+    if let Some(by) = by
+        && !runs(by)
+    {
+        return Vec::new();
+    }
+    text.lines()
         .filter_map(|line| {
             let mut words = line.splitn(3, '\t');
             let (code, recipient, host) = (words.next()?, words.next()?, words.next()?);
@@ -2771,7 +3188,8 @@ pub fn asking(paths: &Paths) -> Vec<Asking> {
 /// asked for (or the next free one), and publish: what an admin Mac's notice Approve does. The
 /// name the vault gave it.
 /// # Errors
-/// This Mac is no admin, no request from that key is waiting, or the publish failed.
+/// This Mac is no admin, no request from that key is waiting, the queue lists that key under
+/// more than one name ([`one_name_asked`]), or the publish failed.
 pub fn approve_request(paths: &Paths, recipient: &str) -> crate::Result<String> {
     let admin = admin_open(paths)?;
     let mut doc = admin.doc.clone();
@@ -2780,6 +3198,7 @@ pub fn approve_request(paths: &Paths, recipient: &str) -> crate::Result<String> 
         .iter()
         .find(|request| request.recipient == recipient)
         .ok_or_else(|| Error::new("that Mac no longer asks to join"))?;
+    one_name_asked(&pending, request)?;
     let host = free_name(&doc, &request.host);
     doc.add_machine(&host, recipient)
         .map_err(|e| Error::new(e.to_string()))?;
@@ -2852,8 +3271,12 @@ pub fn probe(url: &str, pin: &[u8; 32], total: Duration) -> crate::Result<ProbeO
 /// Allow), unlike a lookup nobody answered, which proves nothing.
 #[must_use]
 pub fn refused_by_local_network(error: &crate::Error) -> bool {
-    error.0.contains(aterm_http::LOCAL_NETWORK_REFUSED)
+    error.0.contains(LOCAL_NETWORK_REFUSED)
 }
+
+/// The words a failure carries when macOS's Local Network privacy refused this app a `.local`
+/// name ([`refused_by_local_network`]), as aterm-http names that refusal.
+pub const LOCAL_NETWORK_REFUSED: &str = aterm_http::LOCAL_NETWORK_REFUSED;
 
 /// [`probe`] of the vault at `url` (a `#<signer>` pin allowed) under its pin: the URL's own,
 /// else the key built in for the ALab vault's URL. A URL with neither is refused, since only a
@@ -3975,6 +4398,33 @@ pub fn admin_publish_approved(
     publish_as(paths, admin, doc, false, &admissions, false)
 }
 
+/// Publish `doc`, which names `host` an admin. In a vault whose Commons control entry `host` is
+/// outside, the publish carries this admin's approval of `host` ([`admin_publish_approved`]),
+/// which puts it in the entry's audience: an admin enrolls as a Commons member only from there,
+/// and removes a machine only once enrolled. Naming an admin again so brings in one an earlier
+/// aterm named without it.
+/// # Errors
+/// `host` is not in the vault, or the publish failed.
+pub fn admin_publish_admin(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    host: &str,
+) -> crate::Result<Published> {
+    let outside = admin_keys::control_descriptor(&admin.published_doc)?.is_some()
+        && matches!(doc.commons_audience(), Some(Audience::Hosts(hosts)) if !hosts.iter().any(|h| h == host));
+    if !outside {
+        return admin_publish(paths, admin, doc);
+    }
+    let recipient = doc
+        .machines()
+        .into_iter()
+        .find(|machine| machine.name == host)
+        .ok_or_else(|| Error::new(format!("no machine {host} in the vault")))?
+        .recipient;
+    admin_publish_approved(paths, admin, doc, &[recipient])
+}
+
 /// Publish `doc` signed by a newly rotated vault key endorsed by the current key.
 pub fn admin_rotate(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
     publish_as(paths, admin, doc, true, &[], false)
@@ -4478,6 +4928,38 @@ pub struct Request {
     pub at: Option<u64>,
     /// Its proof of the join password, if it sent one.
     pub proof: Option<String>,
+}
+
+/// The names the queue lists `key` under, sorted, each once.
+#[must_use]
+pub fn names_asked<'a>(pending: &'a [Request], key: &str) -> Vec<&'a str> {
+    let mut hosts: Vec<&str> = pending
+        .iter()
+        .filter(|r| r.recipient == key)
+        .map(|r| r.host.as_str())
+        .collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+/// Whether `request` may be approved by its code: the queue lists its key under one name. Anyone
+/// on the LAN can queue a key under a name of its choosing, so a key listed under two is approved
+/// only under the name its machine asked for, which an admin names (design §7).
+/// # Errors
+/// The queue lists the key under more than one name; the error names them and that command.
+pub fn one_name_asked(pending: &[Request], request: &Request) -> crate::Result<()> {
+    let hosts = names_asked(pending, &request.recipient);
+    if hosts.len() > 1 {
+        return Err(Error::new(format!(
+            "code {} asks to join under {} names ({}), and anyone on the LAN can queue a key under a name of its choosing: approve it under the name its machine asked for with aterm secrets approve {} --name <host>",
+            request.code,
+            hosts.len(),
+            hosts.join(", "),
+            request.recipient
+        )));
+    }
+    Ok(())
 }
 
 /// Pending join requests at the configured URL, excluding machines already in `doc`.
@@ -4993,6 +5475,35 @@ mod tests {
         );
         assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
         assert!(said.borrow().is_empty());
+    }
+
+    /// macOS refusing the vault's `.local` name (Don't Allow) ends a look at once, held, so the
+    /// row names the setting: no wait changes that answer. Negative control: trying a refusal
+    /// again, as a hold, takes the script's second answer.
+    #[test]
+    fn a_look_macos_refused_the_local_network_ends_at_once() {
+        let refused = format!(
+            "dns: alab-secrets.local: {}",
+            aterm_http::LOCAL_NETWORK_REFUSED
+        );
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |why: &str| said.borrow_mut().push(why.to_owned());
+        let mut tries = ScriptedTries::new(
+            transport::LOOK_CONNECT,
+            [unheard(&refused, true), served_vault()],
+        );
+        assert_eq!(
+            look_with(
+                &alab(),
+                HANG_DETECTOR,
+                Duration::from_secs(180),
+                &say,
+                &mut tries
+            ),
+            Look::Held(refused)
+        );
+        assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
+        assert!(said.borrow().is_empty(), "nothing waits on a refusal");
     }
 
     #[test]
@@ -6849,7 +7360,7 @@ mod tests {
         let before_a = body(&opened.config.source);
         let before_b = body(&current.source);
         let state = std::fs::read(admin.state_file()).expect("current state");
-        assert!(auto_approve_opened(&admin, &opened, &mut false).is_err());
+        assert!(auto_approve_opened(&admin, &opened, &mut false, &mut Default::default()).is_err());
         assert_eq!(body(&opened.config.source), before_a);
         assert_eq!(body(&current.source), before_b);
         assert_eq!(std::fs::read(admin.state_file()).unwrap(), state);
@@ -6888,8 +7399,8 @@ mod tests {
 
         let fresh = admin_open(&admin).expect("capture admitted first vault");
         join_pinned(&admin, &sources[1], "admin");
-        let rested =
-            auto_approve_opened(&admin, &fresh, &mut false).expect("no publication needed");
+        let rested = auto_approve_opened(&admin, &fresh, &mut false, &mut Default::default())
+            .expect("no publication needed");
         assert!(rested.approved.is_empty());
         assert_eq!(rested.seq, None);
         assert_eq!(
@@ -8026,7 +8537,292 @@ mod tests {
             }
         );
         assert!(served() == newest, "the newest copy is served");
+
+        // A pass that does not long-poll (a repair is due) hears an older copy as a signed body,
+        // not a `204` naming its seq: it puts the newest back all the same, and the repair it
+        // was for runs the pass after.
         server.stop();
+        let server = serve(&root.path().join("again"), &socket);
+        transport::publish(&source, &stale).expect("the stale copy is taken again");
+        let token = materialize::target_path(&member.home, "token").expect("target");
+        std::fs::remove_file(&token).expect("the token gone");
+        let mut repaired = None;
+        let (_, outcome) = subscriber_pass(&member, &mut repaired).expect("a repair pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 3,
+                served: Some(2)
+            }
+        );
+        assert!(served() == newest, "the newest copy is served again");
+        let (_, outcome) = subscriber_pass(&member, &mut repaired).expect("the repair");
+        assert!(
+            matches!(outcome, SyncOutcome::Applied { seq: 3, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read(&token).expect("the token"), b"inert-token");
+
+        // An older version signed before a rotation is put back over the same way: its seq is
+        // read as a `204`'s is, and what goes back is this Mac's copy under its new pin.
+        rotate(&admin);
+        assert!(matches!(
+            sync(&member, None).expect("the rotated version"),
+            SyncOutcome::Applied { seq: 4, .. }
+        ));
+        let rotated = std::fs::read(member.cache_file()).expect("the member's copy");
+        server.stop();
+        let server = serve(&root.path().join("rotated"), &socket);
+        transport::publish(&source, &stale).expect("the stale copy, signed before the rotation");
+        std::fs::remove_file(&token).expect("the token gone");
+        let mut repaired = None;
+        let (_, outcome) = subscriber_pass(&member, &mut repaired).expect("a repair pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 4,
+                served: Some(2)
+            }
+        );
+        assert!(served() == rotated, "the rotated copy is served");
+        let (_, outcome) = subscriber_pass(&member, &mut repaired).expect("the repair");
+        assert!(
+            matches!(outcome, SyncOutcome::Applied { seq: 4, .. }),
+            "{outcome:?}"
+        );
+        server.stop();
+    }
+
+    /// An approval's bounded wait ends at its own time: the server holds a long-poll for its
+    /// own (here a minute), which a try of [`sync_within`] does not outlast, and running out of
+    /// time is no news, not a failure. Negative control: [`sync`] with the same wait as its
+    /// long-poll fails once its own deadline (the wait plus 15 s) passes.
+    #[test]
+    fn a_bounded_wait_ends_at_its_own_time_whatever_the_server_holds() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, _, _, member) = a_vault_with_a_member(root.path(), &socket);
+        server.stop();
+        let holding = crate::server::start(
+            socket.try_clone().expect("a copy of the socket"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: root.path().join("store"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: Duration::from_secs(60),
+                keep_awake: false,
+            },
+        )
+        .expect("server starts");
+        let started = Instant::now();
+        let outcome = sync_within(&member, Duration::from_millis(300)).expect("no news");
+        let took = started.elapsed();
+        assert_eq!(outcome, SyncOutcome::Unchanged { seq: 2 });
+        assert!(
+            took < transport::FETCH_MARGIN,
+            "the wait ran past its own total: {took:?}"
+        );
+        holding.stop();
+    }
+
+    /// A file an entry left this Mac's own (a plain value adopted, an ` if-absent` file left in
+    /// place) is out of the manifest; deleted, it is a gap the vault fills at the version the
+    /// Mac holds, by an explicit sync and by the subscriber's repair. A file an anchored entry
+    /// left (its anchor this Mac's own) is no gap, so readiness never waits on it.
+    #[test]
+    fn a_gone_file_an_entry_left_this_macs_own_is_filled_again_at_the_same_version() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().expect("utf-8"), None, Some("admin")).expect("create");
+        let target = |name: &str| materialize::target_path(&admin.home, name).expect("target");
+        let (adopted, hosts) = (target("adopted"), target("~/.config/gh/hosts.yml"));
+        let (anchor, anchored) = (
+            target("~/.config/tool/config"),
+            target("~/.config/tool/key"),
+        );
+        let paired = target("~/.config/pair/b");
+        fsx::ensure_private_dir(&admin.home.join(".secrets")).expect("~/.secrets");
+        fsx::write_atomic(&adopted, b"inert-adopted", 0o600).expect("this Mac's value");
+        std::fs::create_dir_all(hosts.parent().expect("parent")).expect("dir");
+        fsx::write_atomic(&hosts, b"mine: {}\n", 0o600).expect("this Mac's hosts");
+        std::fs::create_dir_all(anchor.parent().expect("parent")).expect("dir");
+        fsx::write_atomic(&anchor, b"[mine]\n", 0o600).expect("this Mac's config");
+        std::fs::create_dir_all(paired.parent().expect("parent")).expect("dir");
+        fsx::write_atomic(&paired, b"mine\n", 0o600).expect("this Mac's half of a pair");
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "adopted", b"inert-adopted")
+            .expect("set");
+        for (name, value, anchored_to) in [
+            ("~/.config/gh/hosts.yml", &b"github.com: {}\n"[..], None),
+            ("~/.config/tool/config", b"[tool]\n", None),
+            (
+                "~/.config/tool/key",
+                b"inert-key",
+                Some("~/.config/tool/config"),
+            ),
+            ("~/.config/pair/a", b"inert-a", None),
+            ("~/.config/pair/b", b"inert-b", Some("~/.config/pair/a")),
+        ] {
+            doc.set_entry_with(&Audience::Everyone, name, value, true, anchored_to)
+                .expect("set");
+        }
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        sync(&admin, None).expect("sync");
+        let own = load_state(&admin).expect("state").own.expect("recorded");
+        assert_eq!(
+            own,
+            [
+                "adopted",
+                "~/.config/gh/hosts.yml",
+                "~/.config/pair/b",
+                "~/.config/tool/config"
+            ]
+            .map(String::from)
+            .into(),
+            "an entry anchored to this Mac's own file is not named; one anchored to the vault's is"
+        );
+        assert!(!anchored.exists(), "the anchored entry left no file");
+        assert!(materialization_ready(&admin).expect("ready"));
+        assert_eq!(
+            sync(&admin, None).expect("sync"),
+            SyncOutcome::Unchanged { seq: 2 }
+        );
+        let mut repaired = None;
+        assert!(!repair_due(&admin, &mut repaired), "nothing to repair");
+
+        std::fs::remove_file(&adopted).expect("gone");
+        std::fs::remove_file(&hosts).expect("gone");
+        std::fs::remove_file(&paired).expect("gone");
+        assert!(!materialization_ready(&admin).expect("ready"));
+        assert!(repair_due(&admin, &mut repaired), "the gaps are due");
+        assert!(!repair_due(&admin, &mut repaired), "once per version");
+        let SyncOutcome::Applied { seq: 2, report } = sync(&admin, None).expect("filled") else {
+            panic!("the gaps are filled at the version held");
+        };
+        assert_eq!(
+            report.written,
+            ["adopted", "~/.config/gh/hosts.yml", "~/.config/pair/b"].map(String::from)
+        );
+        assert_eq!(std::fs::read(&adopted).expect("filled"), b"inert-adopted");
+        assert_eq!(std::fs::read(&paired).expect("filled"), b"inert-b");
+        assert_eq!(std::fs::read(&hosts).expect("filled"), b"github.com: {}\n");
+        let state = load_state(&admin).expect("state");
+        assert!(
+            state.manifest.files.contains_key("adopted"),
+            "the vault's now"
+        );
+        assert_eq!(
+            state.own.expect("recorded"),
+            ["~/.config/tool/config".to_string()].into()
+        );
+        assert!(materialization_ready(&admin).expect("ready"));
+        assert_eq!(
+            sync(&admin, None).expect("sync"),
+            SyncOutcome::Unchanged { seq: 2 }
+        );
+
+        // A state an older aterm wrote has no such record: readiness does not wait on one,
+        // and the next sync, or the subscriber's next pass, applies once to write it.
+        let mut state = load_state(&admin).expect("state");
+        state.own = None;
+        save_state(&admin, &state).expect("state.toml");
+        assert!(materialization_ready(&admin).expect("ready"));
+        assert!(repair_due(&admin, &mut None), "applied once");
+        let SyncOutcome::Applied { seq: 2, report } = sync(&admin, None).expect("sync") else {
+            panic!("applied once at the version held");
+        };
+        assert!(quiet(&report), "nothing to write");
+        assert!(load_state(&admin).expect("state").own.is_some());
+        assert_eq!(
+            sync(&admin, None).expect("sync"),
+            SyncOutcome::Unchanged { seq: 2 }
+        );
+    }
+
+    /// A write that failed before it wrote anything keeps nothing pending ([`landed`]), so a file
+    /// a person writes with the same value later is theirs: adopted, and left by the vault's
+    /// unset.
+    #[test]
+    fn a_write_that_failed_before_it_wrote_leaves_a_later_identical_file_the_persons() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().expect("utf-8"), None, Some("admin")).expect("create");
+        let token = materialize::target_path(&admin.home, "~/.config/tool/token").expect("target");
+        let dir = token.parent().expect("parent").to_path_buf();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mode = |mode| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("mode");
+        };
+        let publish = |set: bool| {
+            let opened = admin_open(&admin).expect("open");
+            let mut doc = opened.doc.clone();
+            if set {
+                doc.set_entry(&Audience::Everyone, "~/.config/tool/token", b"inert-token")
+                    .expect("set");
+            } else {
+                doc.unset_entry(&Audience::Everyone, "~/.config/tool/token")
+                    .expect("unset");
+            }
+            admin_publish(&admin, &opened, &doc).expect("publish");
+        };
+
+        mode(0o500);
+        publish(true);
+        let _ = sync(&admin, None);
+        let state = load_state(&admin).expect("state");
+        assert!(state.failed, "the write failed");
+        assert!(state.pending.is_empty(), "{:?}", state.pending);
+        mode(0o700);
+        fsx::write_atomic(&token, b"inert-token", 0o600).expect("the person's own file");
+        sync(&admin, None).expect("sync");
+        let state = load_state(&admin).expect("state");
+        assert!(!state.failed);
+        assert!(
+            !state.manifest.files.contains_key("~/.config/tool/token"),
+            "adopted"
+        );
+        publish(false);
+        sync(&admin, None).expect("sync");
+        assert!(token.exists(), "the vault's unset leaves the person's file");
+    }
+
+    /// Of the digests a pass pended, those of entries it failed whose file holds the value stay:
+    /// a write that landed and then failed its directory's flush. Negative controls: an entry
+    /// that did not fail, and a failed one whose file holds another value or none.
+    #[test]
+    fn a_failed_entry_stays_pending_only_while_its_file_holds_the_value() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        let target = |name: &str| materialize::target_path(home, name).expect("target");
+        fsx::ensure_private_dir(&home.join(".secrets")).expect("~/.secrets");
+        let digest = materialize::digest_hex(b"inert-value");
+        for (name, held) in [
+            ("landed", Some(&b"inert-value"[..])),
+            ("other", Some(b"inert-other")),
+            ("absent", None),
+            ("written", Some(b"inert-value")),
+        ] {
+            if let Some(held) = held {
+                fsx::write_atomic(&target(name), held, 0o600).expect("file");
+            }
+        }
+        let pended: materialize::Pending = ["landed", "other", "absent", "written"]
+            .into_iter()
+            .map(|name| (name.to_string(), digest.clone()))
+            .collect();
+        let failed: Vec<(String, String)> = ["landed", "other", "absent"]
+            .into_iter()
+            .map(|name| (name.to_string(), "a reason".to_string()))
+            .collect();
+        assert_eq!(
+            landed(home, pended, &failed),
+            [("landed".to_string(), digest)].into()
+        );
     }
 }
 

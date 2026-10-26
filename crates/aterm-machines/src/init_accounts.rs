@@ -17,6 +17,7 @@ const STORE: &str = "Library/IdentityServices/Persistence/accounts.data";
 const GZIP: &str = aterm_uds::os_path!("gzip");
 const PLUTIL: &str = aterm_uds::os_path!("plutil");
 const OSASCRIPT: &str = aterm_uds::os_path!("osascript");
+const OPEN: &str = aterm_uds::os_path!("open");
 
 #[derive(Clone, Copy)]
 enum Service {
@@ -52,6 +53,55 @@ impl Service {
             Self::FaceTime => "com.apple.imservice.ids.FaceTime",
         }
     }
+
+    /// The app's bundle id, which `open -b` brings forward.
+    const fn bundle(self) -> &'static str {
+        match self {
+            Self::Messages => "com.apple.MobileSMS",
+            Self::FaceTime => "com.apple.FaceTime",
+        }
+    }
+
+    /// Where its Sign Out is, as a person finds it (English names).
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Messages => "Messages \u{25b8} Settings\u{2026} \u{25b8} iMessage",
+            Self::FaceTime => "FaceTime \u{25b8} Settings\u{2026} \u{25b8} General",
+        }
+    }
+}
+
+/// How often a run looks again, in this process: for Accessibility once macOS asked for it,
+/// and for the account to deregister once Sign Out was clicked.
+const POLL: Duration = Duration::from_millis(250);
+
+/// How long a run at a terminal waits for a person: to switch Accessibility on once macOS
+/// asked, and to click Sign Out by hand where it stays off.
+const PATIENCE: Duration = Duration::from_secs(2 * 60);
+
+/// How long the clicks and the deregistration that follows them may take.
+const SIGN_OUT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Why the sign-out waits while another macOS dialog this process started is up.
+const DIALOG_UP: &str = "another macOS dialog is still up: answer it, and the next pass signs \
+                         out (`aterm init --sign-out`)";
+
+/// Why it waits for macOS's Automation permission to control System Events.
+const AUTOMATION_OFF: &str = "macOS Automation permission to control System Events is off: \
+                              switch it on in System Settings \u{25b8} Privacy & Security \
+                              \u{25b8} Automation, then run `aterm init --sign-out`";
+
+/// The one Apple event that asks macOS's Automation question for System Events before any app
+/// opens. It has to reach System Events: AppleScript answers an application's `name`, `id`,
+/// `version` and `running` itself, sending nothing, so asking for one of those asks macOS
+/// nothing.
+const AUTOMATION_ASK: &str = "tell application id \"com.apple.systemevents\" to count processes";
+
+/// Whether this run asked macOS for Accessibility already, shared by its sign-out items: it
+/// asks once, and waits once.
+#[derive(Default)]
+struct Consent {
+    asked: Mutex<bool>,
 }
 
 struct SignOut {
@@ -61,6 +111,8 @@ struct SignOut {
     blocked: Mutex<Option<aterm_converge::StoodAside>>,
     /// Whether the last probe found the account signed in, for System State.
     reading: crate::init_observe::LastReading,
+    /// The run's one Accessibility request, shared with its other sign-out.
+    consent: std::sync::Arc<Consent>,
 }
 
 /// The two account items for each selected local user.
@@ -77,6 +129,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
 /// A selected user has no absolute home directory.
 pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
     let mut items: Vec<Box<dyn Item>> = Vec::new();
+    let consent = std::sync::Arc::new(Consent::default());
     for user in &ctx.users {
         if !Path::new(&user.home).is_absolute() {
             return Err("account sign-out needs an absolute user home".into());
@@ -93,6 +146,7 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
                 user: user.clone(),
                 blocked: Mutex::new(None),
                 reading: crate::init_observe::LastReading::default(),
+                consent: std::sync::Arc::clone(&consent),
             }));
         }
     }
@@ -138,24 +192,27 @@ impl Item for SignOut {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        if !accessibility_ready_for(sys, Some(&self.user), Some(deadline))? {
-            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(aterm_converge::StoodAside::Permission("macOS Accessibility permission for aterm is off; the sign-out runs once it is on".into()));
-            return Ok(());
-        }
-        // Driving System Events can raise macOS's Automation dialog: only one macOS
-        // dialog this process started is up at a time (System State design §6).
+        self.stand(None);
+        // macOS's Accessibility and Automation dialogs, and an app left open for the person's
+        // click, are each a dialog this process started: only one is up at a time (System
+        // State design §6), so the sign-out holds the one slot from its first question to its
+        // last click.
         let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
             aterm_types::macos_setup::DIALOG_WAIT,
         ) else {
-            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(aterm_converge::StoodAside::Waiting(
-                    "another macOS dialog is still up; account setup will retry automatically"
-                        .into(),
-                ));
+            self.stand(Some(aterm_converge::StoodAside::Waiting(DIALOG_UP.into())));
             return Ok(());
         };
+        if !self.accessible(sys)? {
+            return self.by_hand(sys);
+        }
+        if !self.automation(sys)? {
+            self.stand(Some(aterm_converge::StoodAside::Permission(
+                AUTOMATION_OFF.into(),
+            )));
+            return Ok(());
+        }
+        let deadline = Instant::now() + SIGN_OUT_DEADLINE;
         let labels = localized_labels(sys, &self.user, self.service, Some(deadline))?;
         let command = limited(
             signout_cmd(&self.user, self.service, &labels),
@@ -164,32 +221,30 @@ impl Item for SignOut {
         let ran = sys
             .run_complete_stdout(&command)
             .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
-        if ran.success() && ran.out().trim() == "permission-blocked" {
-            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(aterm_converge::StoodAside::Permission("macOS Automation permission to control System Events is off; the sign-out runs once it is on".into()));
-            return Ok(());
-        }
-        if !ran.success() || ran.out().trim() != "sign-out-requested" {
-            return Err(format!(
-                "{} account Settings controls were unavailable; sign-out remains unverified",
-                self.service.name()
-            ));
-        }
-        for attempt in 0..60 {
-            if !registered_until(sys, &self.user, self.service, Some(deadline))? {
+        match ran.out().trim() {
+            "permission-blocked" if ran.success() => {
+                self.stand(Some(aterm_converge::StoodAside::Permission(
+                    AUTOMATION_OFF.into(),
+                )));
                 return Ok(());
             }
-            if attempt != 59 {
-                let wait = limited(
-                    Cmd::new("/bin/sleep").arg("1").as_user(&self.user),
-                    Some(deadline),
-                )?;
-                let ran = sys
-                    .run(&wait)
-                    .map_err(|_| "could not await account deregistration".to_owned())?;
-                if !ran.success() {
-                    return Err("could not await account deregistration".into());
-                }
+            "not-frontmost" if ran.success() => {
+                return Err(format!(
+                    "{} left the front while it was being signed out, and nothing more was \
+                     clicked: run `aterm init --sign-out` again",
+                    self.service.name()
+                ));
             }
+            "sign-out-requested" if ran.success() => {}
+            _ => {
+                return Err(format!(
+                    "{} account Settings controls were unavailable; sign-out remains unverified",
+                    self.service.name()
+                ));
+            }
+        }
+        if self.deregistered(sys, SIGN_OUT_DEADLINE)? {
+            return Ok(());
         }
         Err("the account remains registered after Sign Out; verify its account settings".into())
     }
@@ -206,20 +261,158 @@ impl Item for SignOut {
     }
 }
 
+impl SignOut {
+    fn stand(&self, aside: Option<aterm_converge::StoodAside>) {
+        *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = aside;
+    }
+
+    /// Whether the app macOS holds responsible for this run holds Accessibility, which the
+    /// clicks need. A run at a terminal that finds it off asks macOS once for the run (its own
+    /// consent dialog), then reads it again every [`POLL`] in this process for at most
+    /// [`PATIENCE`], going on the moment it is on; a later sign-out of the same run does not ask
+    /// or wait again. Anywhere else (System State, which asks for it itself) nothing is asked.
+    fn accessible(&self, sys: &dyn System) -> Result<bool, String> {
+        if accessibility_ready(sys)? {
+            return Ok(true);
+        }
+        if !sys.has_tty() {
+            return Ok(false);
+        }
+        {
+            let mut asked = self
+                .consent
+                .asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *asked {
+                return Ok(false);
+            }
+            *asked = true;
+        }
+        say(&format!(
+            "signing out of {} clicks its Sign Out, which needs Accessibility for {}: switch it \
+             on in macOS's dialog (System Settings \u{25b8} Privacy & Security \u{25b8} \
+             Accessibility), and init goes on the moment it is on (Ctrl-C stops waiting)",
+            self.service.name(),
+            responsible(sys)
+        ));
+        if request_accessibility(sys)? {
+            return Ok(true);
+        }
+        for _ in 0..ticks(PATIENCE) {
+            if sys.stopped().is_some() {
+                return Ok(false);
+            }
+            sys.sleep(POLL);
+            if accessibility_ready(sys)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Where Accessibility stays off: at a terminal, the app comes forward and the person
+    /// clicks Sign Out themselves (aterm cannot open its Settings without Accessibility), and
+    /// the run reads the account every [`POLL`] for at most [`PATIENCE`], going on once it
+    /// deregisters. Otherwise, or once that wait ends, it stands aside naming the app the grant
+    /// goes to.
+    fn by_hand(&self, sys: &dyn System) -> Result<(), String> {
+        let refused = aterm_converge::StoodAside::Permission(format!(
+            "{} has no Accessibility, which clicking {}'s Sign Out needs: switch it on in System \
+             Settings \u{25b8} Privacy & Security \u{25b8} Accessibility, then run `aterm init \
+             --sign-out`",
+            responsible(sys),
+            self.service.name()
+        ));
+        if !sys.has_tty() {
+            self.stand(Some(refused));
+            return Ok(());
+        }
+        let open = Cmd::new(OPEN)
+            .args(["-b", self.service.bundle()])
+            .as_user(&self.user)
+            .in_session();
+        if !sys.run(&open).is_ok_and(|ran| ran.success()) {
+            self.stand(Some(refused));
+            return Ok(());
+        }
+        say(&format!(
+            "{} is open: choose {} and click Sign Out, and init goes on once it is signed out \
+             (Ctrl-C stops waiting)",
+            self.service.name(),
+            self.service.path()
+        ));
+        if self.deregistered(sys, PATIENCE)? {
+            return Ok(());
+        }
+        self.stand(Some(refused));
+        Ok(())
+    }
+
+    /// Ask macOS's Automation question for System Events once, before any app opens: `false`
+    /// when the person (or a standing answer) refused it.
+    fn automation(&self, sys: &dyn System) -> Result<bool, String> {
+        let ask = Cmd::new(OSASCRIPT)
+            .args(["-e", AUTOMATION_ASK])
+            .as_user(&self.user)
+            .in_session()
+            .budget(PATIENCE);
+        let ran = sys.run(&ask).map_err(|_| {
+            "could not ask for Automation permission to control System Events".to_owned()
+        })?;
+        if ran.success() {
+            return Ok(true);
+        }
+        if ran.err().contains("-1743") {
+            return Ok(false);
+        }
+        Err(format!(
+            "the Automation question for System Events did not answer: {}",
+            ran.describe()
+        ))
+    }
+
+    /// Whether the account deregistered within `patience`, read every [`POLL`] in this process;
+    /// a stop ends the wait.
+    fn deregistered(&self, sys: &dyn System, patience: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + patience;
+        for tick in 0..=ticks(patience) {
+            // Each reading keeps its own budget; the wait ends at its deadline or its last
+            // poll, whichever comes first, never in the middle of a reading.
+            if !registered(sys, &self.user, self.service)? {
+                return Ok(true);
+            }
+            if tick == ticks(patience) || Instant::now() >= deadline || sys.stopped().is_some() {
+                break;
+            }
+            sys.sleep(POLL);
+        }
+        Ok(false)
+    }
+}
+
+/// The polls in `patience`.
+fn ticks(patience: Duration) -> u128 {
+    patience.as_millis() / POLL.as_millis()
+}
+
+/// The app a grant this run needs goes to ([`System::responsible_app`]), else aterm.
+fn responsible(sys: &dyn System) -> String {
+    sys.responsible_app().unwrap_or_else(|| "aterm".to_owned())
+}
+
+/// One line on this run's terminal while it waits for a person. A terminal gone with its tab
+/// is no error.
+fn say(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 fn store_path(user: &User) -> PathBuf {
     Path::new(&user.home).join(STORE)
 }
 
 fn registered(sys: &dyn System, user: &User, service: Service) -> Result<bool, String> {
-    registered_until(sys, user, service, None)
-}
-
-fn registered_until(
-    sys: &dyn System,
-    user: &User,
-    service: Service,
-    deadline: Option<Instant>,
-) -> Result<bool, String> {
     let path = store_path(user);
     let persisted = match sys.stat(&path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
@@ -228,22 +421,16 @@ fn registered_until(
             return Err("persisted account store is not a regular file".into());
         }
         Ok(_) => {
-            let gzip = limited(
-                Cmd::new(GZIP).args(["-dc", "--"]).arg(path).as_user(user),
-                deadline,
-            )?;
+            let gzip = Cmd::new(GZIP).args(["-dc", "--"]).arg(path).as_user(user);
             let unpacked = sys
                 .run_complete_stdout(&gzip)
                 .map_err(|_| "cannot read the complete persisted account store".to_owned())?;
             if !unpacked.success() {
                 return Err("cannot decompress the persisted account store".into());
             }
-            let convert = limited(
-                Cmd::new(PLUTIL)
-                    .args(["-convert", "xml1", "-o", "-", "--", "-"])
-                    .as_user(user),
-                deadline,
-            )?;
+            let convert = Cmd::new(PLUTIL)
+                .args(["-convert", "xml1", "-o", "-", "--", "-"])
+                .as_user(user);
             let xml = sys
                 .run_complete_stdout_input(&convert, &unpacked.stdout)
                 .map_err(|_| "cannot decode the complete persisted account store".to_owned())?;
@@ -256,12 +443,9 @@ fn registered_until(
             persisted_registration(&entries, service)?
         }
     };
-    let cmd = limited(
-        Cmd::new("/usr/bin/defaults")
-            .args(["export", service.domain(), "-"])
-            .as_user(user),
-        deadline,
-    )?;
+    let cmd = Cmd::new("/usr/bin/defaults")
+        .args(["export", service.domain(), "-"])
+        .as_user(user);
     let ran = sys
         .run_complete_stdout(&cmd)
         .map_err(|_| "cannot read the complete account service preferences".to_owned())?;
@@ -326,9 +510,6 @@ fn persisted_registration(entries: &Entries, service: Service) -> Result<bool, S
     }
 }
 
-const AX_PREFLIGHT: &str = "ObjC.import('ApplicationServices'); $.AXIsProcessTrusted()";
-const AX_REQUEST: &str = "ObjC.import('Foundation'); ObjC.import('ApplicationServices'); $.AXIsProcessTrustedWithOptions($.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $.kAXTrustedCheckOptionPrompt))";
-
 /// Whether the shared account plan found a registration that needs sign-out.
 ///
 /// # Errors
@@ -356,55 +537,24 @@ pub fn accessibility_needed_selected(
         .any(|row| row.outcome == crate::model::Outcome::Planned))
 }
 
-/// Ask macOS to show its native Accessibility consent once for automatic setup.
+/// Ask macOS to show its native Accessibility consent once for automatic setup, in this
+/// process ([`System::request_accessibility`]), answering the trust as it stands.
 ///
 /// # Errors
-/// The bounded trust request could not run or returned an unknown result.
+/// The trust cannot be asked for here.
 pub fn request_accessibility(sys: &dyn System) -> Result<bool, String> {
-    let request = Cmd::new(OSASCRIPT)
-        .args(["-l", "JavaScript", "-e", AX_REQUEST])
-        .budget(Duration::from_secs(10));
-    let answer = sys.run_complete_stdout(&request).map_err(|_| {
-        "could not request Accessibility permission for account sign-out".to_owned()
-    })?;
-    if !answer.success() {
-        return Err("could not request Accessibility permission for account sign-out".into());
-    }
-    trust_answer(answer.out().trim())
+    sys.request_accessibility()
+        .ok_or_else(|| "could not request Accessibility permission for account sign-out".into())
 }
 
-/// Inspect Accessibility trust without requesting permission or opening an app.
+/// Inspect Accessibility trust without requesting permission or opening an app, in this
+/// process ([`System::accessibility_trusted`]).
 ///
 /// # Errors
-/// The OS trust query could not run or returned an unknown result.
+/// The trust cannot be read here.
 pub fn accessibility_ready(sys: &dyn System) -> Result<bool, String> {
-    accessibility_ready_for(sys, None, None)
-}
-
-fn accessibility_ready_for(
-    sys: &dyn System,
-    user: Option<&User>,
-    deadline: Option<Instant>,
-) -> Result<bool, String> {
-    let mut permission = Cmd::new(OSASCRIPT).args(["-l", "JavaScript", "-e", AX_PREFLIGHT]);
-    if let Some(user) = user {
-        permission = permission.as_user(user).in_session();
-    }
-    let answer = sys
-        .run_complete_stdout(&limited(permission, deadline)?)
-        .map_err(|_| "could not check Accessibility permission for account sign-out".to_owned())?;
-    if !answer.success() {
-        return Err("could not check Accessibility permission for account sign-out".into());
-    }
-    trust_answer(answer.out().trim())
-}
-
-fn trust_answer(answer: &str) -> Result<bool, String> {
-    match answer {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err("Accessibility trust query returned an unknown result".into()),
-    }
+    sys.accessibility_trusted()
+        .ok_or_else(|| "could not check Accessibility permission for account sign-out".into())
 }
 
 fn limited(cmd: Cmd, deadline: Option<Instant>) -> Result<Cmd, String> {
@@ -413,7 +563,7 @@ fn limited(cmd: Cmd, deadline: Option<Instant>) -> Result<Cmd, String> {
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err("account sign-out exceeded its one-minute deadline".into());
+        return Err("account sign-out ran out of its time".into());
     }
     let budget = cmd.budget.min(remaining);
     Ok(cmd.budget(budget))
@@ -533,40 +683,46 @@ on run argv
             set wasRunning to exists process appName
         end tell
         tell application appName to activate
+        -- Ready once its menu bar is there and it is in front: activation lands a moment after
+        -- `activate` returns, and the first click's frontmost check must not race it.
         set settingsReady to false
         repeat 120 times
             my checkDeadline(deadline)
             tell application "System Events"
                 if exists process appName then
                     tell process appName
-                        if exists menu bar 1 then set settingsReady to true
+                        if (exists menu bar 1) and frontmost then set settingsReady to true
                     end tell
                 end if
             end tell
             if settingsReady then exit repeat
             delay 0.1
         end repeat
-        if settingsReady is false then error "account Settings menu unavailable"
+        if settingsReady is false then
+            my mustBeFront(appName)
+            error "account Settings menu unavailable"
+        end if
         set priorSettings to my accountSettings(appName, paneNames)
         set closeSettings to priorSettings is missing value
         if priorSettings is missing value then
+            set settingsItem to missing value
             tell application "System Events"
                 tell process appName
-                    set openedByMenu to false
                     try
                         repeat with mi in menu items of menu 1 of menu bar item 2 of menu bar 1
                             try
                                 if (value of attribute "AXMenuItemCmdChar" of mi) is "," then
-                                    click mi
-                                    set openedByMenu to true
+                                    set settingsItem to mi
                                     exit repeat
                                 end if
                             end try
                         end repeat
                     end try
-                    if openedByMenu is false then keystroke "," using command down
                 end tell
             end tell
+            if settingsItem is missing value then error "account Settings menu item unavailable"
+            my mustBeFront(appName)
+            tell application "System Events" to click settingsItem
         end if
         repeat 120 times
             my checkDeadline(deadline)
@@ -577,6 +733,7 @@ on run argv
         if settingsWindow is missing value then error "account Settings window unavailable"
         set paneButton to my namedButton(settingsWindow, paneNames)
         if paneButton is missing value then error "account settings pane unavailable"
+        my mustBeFront(appName)
         tell application "System Events" to click paneButton
         set signOutButton to missing value
         repeat 120 times
@@ -586,6 +743,7 @@ on run argv
             delay 0.1
         end repeat
         if signOutButton is missing value then error "account Sign Out control unavailable"
+        my mustBeFront(appName)
         tell application "System Events" to click signOutButton
         set acknowledged to false
         repeat 120 times
@@ -594,6 +752,7 @@ on run argv
                 if exists sheet 1 of settingsWindow then
                     set confirmButton to my namedButton(sheet 1 of settingsWindow, signOutNames)
                     if confirmButton is not missing value then
+                        my mustBeFront(appName)
                         click confirmButton
                         set acknowledged to true
                     end if
@@ -607,11 +766,12 @@ on run argv
             delay 0.1
         end repeat
         if acknowledged is false then error "account Sign Out did not finish"
-        my closeOwnedSettings(settingsWindow, closeSettings)
+        my closeOwnedSettings(appName, settingsWindow, closeSettings)
     on error errorText number errorNumber
-        my closeOwnedSettings(settingsWindow, closeSettings)
+        my closeOwnedSettings(appName, settingsWindow, closeSettings)
         my restoreApplications(appName, wasRunning, priorApp)
         if errorNumber is -1743 or errorNumber is -25211 then return "permission-blocked"
+        if errorNumber is 1001 then return "not-frontmost"
         error "account sign-out controls unavailable"
     end try
     my restoreApplications(appName, wasRunning, priorApp)
@@ -622,6 +782,14 @@ end run
 on checkDeadline(deadline)
     if (current date) is greater than deadline then error "account Settings deadline expired"
 end checkDeadline
+
+-- Before every click: the app aterm drives is still in front, so a click never lands in a
+-- window the person brought forward meanwhile.
+on mustBeFront(appName)
+    tell application "System Events"
+        if not (frontmost of process appName) then error "not frontmost" number 1001
+    end tell
+end mustBeFront
 
 on restoreApplications(appName, wasRunning, priorApp)
     try
@@ -688,12 +856,12 @@ on existingButton(containerElement, buttonNames)
     return missing value
 end existingButton
 
-on closeOwnedSettings(settingsWindow, closeSettings)
+on closeOwnedSettings(appName, settingsWindow, closeSettings)
     if closeSettings and settingsWindow is not missing value then
         try
             with timeout of 2 seconds
             tell application "System Events"
-                if exists settingsWindow then
+                if (exists settingsWindow) and (frontmost of process appName) then
                     repeat with closeButton in buttons of settingsWindow
                         if subrole of closeButton is "AXCloseButton" then
                             click closeButton
@@ -725,8 +893,50 @@ mod tests {
             user,
             blocked: Mutex::new(None),
             reading: crate::init_observe::LastReading::default(),
+            consent: std::sync::Arc::default(),
         };
-        (Fake::root(), ctx, item)
+        let mut sys = Fake::root();
+        sys.responsible = Some("aterm".into());
+        (sys, ctx, item)
+    }
+
+    /// The runs a sign-out makes once Accessibility is on: the Automation question, the
+    /// labels, and the clicks answering `clicked`.
+    fn clicks(sys: &Fake, item: &SignOut, clicked: &str) {
+        sys.on(&automation_ask(item).display(), Ran::ok("System Events"));
+        let labels = Labels {
+            panes: vec!["iMessage".into()],
+            sign_out: vec!["Sign Out".into()],
+        };
+        sys.on(
+            &labels_cmd(&item.user, item.service).display(),
+            Ran::ok(r#"{"panes":["iMessage"],"sign_out":["Sign Out"]}"#),
+        );
+        sys.on(
+            &signout_cmd(&item.user, item.service, &labels).display(),
+            Ran::ok(clicked),
+        );
+    }
+
+    fn automation_ask(item: &SignOut) -> Cmd {
+        Cmd::new(OSASCRIPT)
+            .args(["-e", AUTOMATION_ASK])
+            .as_user(&item.user)
+            .in_session()
+            .budget(PATIENCE)
+    }
+
+    /// Signed in for the first `reads` readings of the account, signed out after.
+    fn signed_in_for(sys: &Fake, item: &SignOut, reads: usize) {
+        for _ in 0..reads {
+            store(sys, item, DISABLED);
+        }
+        store(sys, item, "<dict/>");
+        prefs(sys, item, EMPTY_PREFS);
+    }
+
+    fn count(sys: &Fake, call: &str) -> usize {
+        sys.calls().iter().filter(|c| c.as_str() == call).count()
     }
 
     fn prefs(sys: &Fake, item: &SignOut, body: &str) {
@@ -797,54 +1007,184 @@ mod tests {
         assert!(matches!(item.probe(&sys, &ctx), Probe::Unusable { .. }));
     }
 
+    /// Away from a terminal (System State, which asks for Accessibility itself) a sign-out
+    /// without it asks nothing, opens nothing and waits for nothing: it stands aside naming the
+    /// app the grant goes to.
     #[test]
     fn permission_refusal_does_not_launch_an_account_app() {
         let (sys, ctx, item) = fixture();
-        let cmd = Cmd::new(OSASCRIPT)
-            .args(["-l", "JavaScript", "-e", AX_PREFLIGHT])
-            .as_user(&item.user)
-            .in_session();
-        sys.on(&cmd.display(), Ran::ok("false"));
+        sys.trusts(&[false]);
         item.apply(&sys, &ctx)
             .expect("permission block is a structured outcome");
-        assert!(matches!(
+        let Some(aterm_converge::StoodAside::Permission(why)) = item.stood_aside() else {
+            panic!("{:?}", item.stood_aside());
+        };
+        assert!(why.starts_with("aterm has no Accessibility"), "{why}");
+        assert_eq!(sys.calls(), ["ax-trusted"]);
+    }
+
+    /// At a terminal, macOS is asked once and the trust read every 250 ms in this process: the
+    /// moment it flips the sign-out goes on in the same run, with no exit 77, no `sleep` child
+    /// and no keystroke; the deregistration that follows is read in this process too.
+    #[test]
+    fn trust_that_flips_while_init_waits_signs_out_in_the_same_run() {
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.trusts(&[false, false, false, false, true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 2);
+        let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0]);
+        assert_eq!(rows[0].stood_aside, None);
+        assert_eq!(count(&sys, "ax-request"), 1);
+        assert_eq!(count(&sys, "sleep 250ms"), 3 + 1, "{:?}", sys.calls());
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains("/bin/sleep") && !c.contains("keystroke")),
+            "{calls:?}"
+        );
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("ax-request") < at(AUTOMATION_ASK) && at(AUTOMATION_ASK) < at("Sign Out"));
+    }
+
+    /// Trust that never flips: after two minutes of reads (480, every 250 ms), the app comes
+    /// forward for the person's own Sign Out click, read for two minutes more; still signed in,
+    /// the row stands aside naming the app. The run's other sign-out neither asks nor waits for
+    /// Accessibility again.
+    #[test]
+    fn trust_that_never_flips_asks_for_the_click_then_names_the_app() {
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.responsible = Some("Terminal".into());
+        sys.trusts(&[false]);
+        let open = Cmd::new(OPEN)
+            .args(["-b", "com.apple.MobileSMS"])
+            .as_user(&item.user)
+            .in_session();
+        sys.on(&open.display(), Ran::ok(""));
+        store(&sys, &item, DISABLED);
+        prefs(&sys, &item, EMPTY_PREFS);
+        item.apply(&sys, &ctx).unwrap();
+        let Some(aterm_converge::StoodAside::Permission(why)) = item.stood_aside() else {
+            panic!("{:?}", item.stood_aside());
+        };
+        assert!(why.starts_with("Terminal has no Accessibility"), "{why}");
+        assert!(why.contains("`aterm init --sign-out`"), "{why}");
+        assert_eq!(count(&sys, "ax-request"), 1);
+        assert_eq!(count(&sys, &open.display()), 1);
+        assert_eq!(count(&sys, "sleep 250ms"), 480 + 480);
+        assert!(sys.calls().iter().all(|c| !c.contains(AUTOMATION_ASK)));
+
+        let other = SignOut {
+            service: Service::FaceTime,
+            user: item.user.clone(),
+            blocked: Mutex::new(None),
+            reading: crate::init_observe::LastReading::default(),
+            consent: std::sync::Arc::clone(&item.consent),
+        };
+        let facetime = Cmd::new(OPEN)
+            .args(["-b", "com.apple.FaceTime"])
+            .as_user(&item.user)
+            .in_session();
+        sys.on(&facetime.display(), Ran::ok(""));
+        sys.on(
+            &Cmd::new("/usr/bin/defaults")
+                .args(["export", Service::FaceTime.domain(), "-"])
+                .as_user(&item.user)
+                .display(),
+            Ran::ok("<dict><key>ActiveAccounts</key><array><string>a</string></array></dict>"),
+        );
+        let before = count(&sys, "sleep 250ms");
+        other.apply(&sys, &ctx).unwrap();
+        assert_eq!(count(&sys, "ax-request"), 1, "asked once for the run");
+        assert_eq!(
+            count(&sys, "sleep 250ms") - before,
+            480,
+            "the click's wait alone"
+        );
+
+        // The person clicks Sign Out by hand: the run goes on, signed out.
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.trusts(&[false]);
+        sys.on(&open.display(), Ran::ok(""));
+        signed_in_for(&sys, &item, 3);
+        item.apply(&sys, &ctx).unwrap();
+        assert_eq!(item.stood_aside(), None);
+    }
+
+    /// The app left the front before a click: the script clicks nothing more and the row fails
+    /// without reading for a deregistration it did not ask for.
+    #[test]
+    fn an_app_that_leaves_the_front_ends_the_clicks() {
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.trusts(&[true]);
+        clicks(&sys, &item, "not-frontmost");
+        let why = item.apply(&sys, &ctx).unwrap_err();
+        assert!(why.starts_with("Messages left the front"), "{why}");
+        assert!(
+            sys.calls().iter().all(|c| !c.contains("defaults")),
+            "{:?}",
+            sys.calls()
+        );
+    }
+
+    /// A refused Automation question stands aside before any app opens.
+    #[test]
+    fn a_refused_automation_question_opens_no_app() {
+        let (sys, ctx, item) = fixture();
+        sys.trusts(&[true]);
+        sys.on(
+            &automation_ask(&item).display(),
+            Ran::exit(
+                1,
+                "execution error: Not authorized to send Apple events to System Events. (-1743)",
+            ),
+        );
+        item.apply(&sys, &ctx).unwrap();
+        assert_eq!(
             item.stood_aside(),
-            Some(aterm_converge::StoodAside::Permission(_))
-        ));
-        assert_eq!(sys.calls().len(), 1);
+            Some(aterm_converge::StoodAside::Permission(
+                AUTOMATION_OFF.into()
+            ))
+        );
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|c| !c.contains("Sign Out") && !c.contains(OPEN))
+        );
     }
 
     #[test]
-    fn a_consent_request_is_bounded_and_waits_for_the_grant() {
-        for (answer, expected) in [
-            ("false", Some(false)),
-            ("true", Some(true)),
-            ("unknown", None),
+    fn a_consent_request_is_answered_in_this_process() {
+        for (readings, expected) in [
+            (Some(false), Some(false)),
+            (Some(true), Some(true)),
+            (None, None),
         ] {
             let sys = Fake::root();
-            let request = Cmd::new(OSASCRIPT)
-                .args(["-l", "JavaScript", "-e", AX_REQUEST])
-                .budget(Duration::from_secs(10));
-            sys.on(&request.display(), Ran::ok(answer));
+            if let Some(trusted) = readings {
+                sys.trusts(&[trusted]);
+            }
             assert_eq!(request_accessibility(&sys).ok(), expected);
-            assert_eq!(sys.calls(), vec![request.display()]);
+            assert_eq!(sys.calls(), ["ax-request"]);
         }
     }
 
     #[test]
     fn unsupported_localized_labels_refuse_before_launching_the_app() {
         let (sys, ctx, item) = fixture();
-        let preflight = Cmd::new(OSASCRIPT)
-            .args(["-l", "JavaScript", "-e", AX_PREFLIGHT])
-            .as_user(&item.user)
-            .in_session();
-        sys.on(&preflight.display(), Ran::ok("true"));
+        sys.trusts(&[true]);
+        sys.on(&automation_ask(&item).display(), Ran::ok("System Events"));
         sys.on(
             &labels_cmd(&item.user, item.service).display(),
             Ran::ok(r#"{"panes":[],"sign_out":[]}"#),
         );
         assert!(item.apply(&sys, &ctx).is_err());
-        assert_eq!(sys.calls().len(), 2);
+        assert_eq!(sys.calls().len(), 3, "{:?}", sys.calls());
         assert!(sys.calls().iter().all(|c| !c.contains("keystroke")));
     }
 
@@ -852,7 +1192,7 @@ mod tests {
     fn an_expired_shared_deadline_refuses_before_running_another_child() {
         let (sys, _ctx, item) = fixture();
         let expired = Instant::now() - Duration::from_secs(60);
-        assert!(registered_until(&sys, &item.user, item.service, Some(expired)).is_err());
+        assert!(localized_labels(&sys, &item.user, item.service, Some(expired)).is_err());
         assert!(sys.calls().is_empty());
     }
 
@@ -860,36 +1200,14 @@ mod tests {
     fn ui_exit_success_requires_removal_and_readback() {
         for removed in [false, true] {
             let (sys, ctx, item) = fixture();
-            store(&sys, &item, DISABLED);
+            sys.trusts(&[true]);
+            clicks(&sys, &item, "sign-out-requested");
             if removed {
+                signed_in_for(&sys, &item, 2);
+            } else {
                 store(&sys, &item, DISABLED);
-                store(&sys, &item, "<dict/>");
+                prefs(&sys, &item, EMPTY_PREFS);
             }
-            prefs(&sys, &item, EMPTY_PREFS);
-            let preflight = Cmd::new(OSASCRIPT)
-                .args(["-l", "JavaScript", "-e", AX_PREFLIGHT])
-                .as_user(&item.user)
-                .in_session();
-            sys.on(&preflight.display(), Ran::ok("true"));
-            let labels = Labels {
-                panes: vec!["iMessage".into()],
-                sign_out: vec!["Sign Out".into()],
-            };
-            sys.on(
-                &labels_cmd(&item.user, item.service).display(),
-                Ran::ok(r#"{"panes":["iMessage"],"sign_out":["Sign Out"]}"#),
-            );
-            sys.on(
-                &signout_cmd(&item.user, item.service, &labels).display(),
-                Ran::ok("sign-out-requested"),
-            );
-            sys.on(
-                &Cmd::new("/bin/sleep")
-                    .arg("1")
-                    .as_user(&item.user)
-                    .display(),
-                Ran::ok(""),
-            );
             let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
             assert_eq!(
                 rows[0].outcome,
@@ -900,6 +1218,7 @@ mod tests {
                 }
             );
             assert!(sys.calls().iter().all(|c| !c.contains("private-token")));
+            assert!(sys.calls().iter().all(|c| !c.contains("/bin/sleep")));
         }
     }
 
@@ -912,5 +1231,25 @@ mod tests {
         assert!(SIGN_OUT.contains("UI elements of containerElement"));
         assert!(SIGN_OUT.contains("description of elementRef as string"));
         assert!(SIGN_OUT.contains("AXMenuItemCmdChar"));
+    }
+
+    /// The script never types a key, and every click it makes for the sign-out comes right after
+    /// a look that the app is still in front.
+    #[test]
+    fn every_sign_out_click_follows_a_frontmost_check_and_nothing_is_typed() {
+        assert!(!SIGN_OUT.contains("keystroke"));
+        let lines: Vec<&str> = SIGN_OUT.lines().map(str::trim).collect();
+        let clicks: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                !line.starts_with("--") && line.contains("click ") && !line.contains("closeButton")
+            })
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(clicks.len(), 4, "{clicks:?}");
+        for at in clicks {
+            assert_eq!(lines[at - 1], "my mustBeFront(appName)", "{}", lines[at]);
+        }
     }
 }

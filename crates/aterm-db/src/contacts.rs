@@ -34,6 +34,10 @@ pub fn method(value: &str) -> bool {
 }
 /// A bounded map of explicitly classified extra information. Credential fields
 /// and payment instruments must be references to the secrets manager.
+/// In Commons reference diagnostics, `phone-ref` and `email-ref` identify local
+/// contact records by bare ID or exact `phones:ID` / `email-addresses:ID`.
+/// Other qualifications remain stored metadata but are reported as unsupported;
+/// `secret-ref` and `source-ref` are opaque to those diagnostics.
 pub fn validate_details(value: &Value) -> Result<()> {
     let object = value
         .as_object()

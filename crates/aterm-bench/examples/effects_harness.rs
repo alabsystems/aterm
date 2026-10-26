@@ -2074,6 +2074,13 @@ impl Scene {
                 continue;
             }
             r.num(format!("{s}_{what}_per_ginsn"), 1e9 / p50.max(1.0));
+            // The frames over all their instructions: the rate of a scene whose frames are two
+            // kinds by design, where the median frame sits on the edge between the kinds (the
+            // flowing card's 32 draws and 32 replays a run: its median is its costliest replay).
+            r.num(
+                format!("{s}_{what}_mean_per_ginsn"),
+                1e9 / mean(&v).max(1.0),
+            );
         }
         if clocked {
             let mut clock =

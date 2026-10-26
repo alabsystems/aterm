@@ -167,7 +167,9 @@ impl Terminal {
         Arc::clone(&self.title.window)
     }
 
-    /// Monotonic tab-label change epoch: bumped when the window title (OSC 0/2 or [`set_title`](Self::set_title)) or the shell-reported cwd (OSC 7 / OSC 633 `P;Cwd=`, shown for an unset title) changes value.
+    /// Monotonic change epoch for the window title (OSC 0/2 or [`set_title`](Self::set_title))
+    /// and stored shell-reported cwd path/host (OSC 7 / OSC 633 `P;Cwd=`).
+    /// Cwd changes advance it even while an explicit title is set; identical cwd reports do not.
     #[inline]
     #[must_use]
     pub fn title_epoch(&self) -> u64 {

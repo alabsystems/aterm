@@ -299,7 +299,8 @@ impl App {
                     crate::native_app::AppViewState::Settings(state) => {
                         state.replace_drawn_faces(drawn.clone())
                     }
-                    crate::native_app::AppViewState::Markdown(_)
+                    crate::native_app::AppViewState::About(_)
+                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
@@ -341,7 +342,8 @@ impl App {
                     crate::native_app::AppViewState::Settings(state) => {
                         state.replace_font_refusals(refusals.to_vec(), announce)
                     }
-                    crate::native_app::AppViewState::Markdown(_)
+                    crate::native_app::AppViewState::About(_)
+                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
@@ -382,7 +384,8 @@ impl App {
                     crate::native_app::AppViewState::Settings(state) => {
                         state.replace_font_families(std::sync::Arc::clone(families))
                     }
-                    crate::native_app::AppViewState::Markdown(_)
+                    crate::native_app::AppViewState::About(_)
+                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
@@ -567,7 +570,8 @@ impl App {
                         let armed = state.arm_consent_gestures(gestures);
                         state.replace_macos_access(access.clone()) || armed
                     }
-                    crate::native_app::AppViewState::Markdown(_)
+                    crate::native_app::AppViewState::About(_)
+                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,

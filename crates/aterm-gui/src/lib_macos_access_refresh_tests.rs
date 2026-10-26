@@ -23,6 +23,202 @@ fn granted() -> FdaProbe {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod fda_grant_history_tests {
+    use super::*;
+    use aterm_types::macos_setup::{Access, AccessOutcome, access_record};
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    struct History {
+        root: PathBuf,
+        writes: usize,
+        grants: usize,
+    }
+
+    thread_local! {
+        static HISTORY: RefCell<Option<History>> = const { RefCell::new(None) };
+    }
+
+    fn app(root: &Path, revision: u64, probe: FdaProbe) -> App {
+        HISTORY.with(|state| {
+            *state.borrow_mut() = Some(History {
+                root: root.to_owned(),
+                writes: 0,
+                grants: 0,
+            });
+        });
+        let mut app = App::headless_for_test();
+        app.consent = ConsentState::with_cached_probe_for_test(probe);
+        app.access_steps
+            .set_reach(crate::system_state_access::StepsReach {
+                record: |revision, access, outcome| {
+                    let root = HISTORY.with(|state| state.borrow().as_ref().unwrap().root.clone());
+                    let result = access_record::append(&root, revision, access, outcome);
+                    HISTORY.with(|state| state.borrow_mut().as_mut().unwrap().writes += 1);
+                    result
+                },
+                ..crate::system_state_access::StepsReach::INERT
+            });
+        app.set_system_state_handlers_for_test(crate::InitialSetupHandlers {
+            fda_granted: || {
+                HISTORY.with(|state| state.borrow_mut().as_mut().unwrap().grants += 1);
+            },
+            ..crate::InitialSetupHandlers::inert_for_test()
+        });
+        app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+            revision,
+            allowed: true,
+        }));
+        app
+    }
+
+    #[test]
+    fn fda_grant_history_failure_does_not_hold_verified_recovery() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = 8_410;
+        access_record::append(
+            root.path(),
+            revision - 1,
+            Access::DeveloperTools,
+            AccessOutcome::Declined,
+        )
+        .unwrap();
+        let record = root.path().join(access_record::FILE);
+        let retained = root.path().join("retained-access-record");
+        std::fs::rename(&record, &retained).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        let mut app = app(root.path(), revision, granted());
+        assert_eq!(app.access_revision(), Some(revision));
+        let now = Instant::now();
+
+        app.resolve_fda_need(true, now);
+        assert!(grant_recorded(&app), "the window verified its own grant");
+        let grants = HISTORY.with(|state| state.borrow().as_ref().unwrap().grants);
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().writes),
+            1
+        );
+        let retry = app
+            .next_access_step_deadline(now)
+            .expect("the history save is still owed");
+
+        // A later approval cannot retarget the completed outcome's pending save.
+        app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+            revision: revision + 1,
+            allowed: true,
+        }));
+        std::fs::remove_dir(&record).unwrap();
+        std::fs::rename(&retained, &record).unwrap();
+        app.settle_access_steps(retry);
+        assert_eq!(
+            access_record::latest(root.path(), revision, Access::FullDiskAccess),
+            Some(AccessOutcome::Granted)
+        );
+        assert_eq!(
+            access_record::latest(root.path(), revision + 1, Access::FullDiskAccess),
+            None
+        );
+        assert_eq!(
+            access_record::latest(root.path(), revision - 1, Access::DeveloperTools),
+            Some(AccessOutcome::Declined)
+        );
+        app.settle_access_steps(retry + Duration::from_secs(1));
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().writes),
+            2
+        );
+        assert_eq!(
+            grants, 1,
+            "verified FDA must notify deferred work before its separate history is writable"
+        );
+    }
+
+    #[test]
+    fn fda_grant_history_success_keeps_the_existing_append_wake() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = 8_430;
+        let mut app = app(root.path(), revision, granted());
+        let now = Instant::now();
+        app.resolve_fda_need(true, now);
+        app.resolve_fda_need(true, now);
+        assert!(grant_recorded(&app));
+        assert_eq!(
+            access_record::latest(root.path(), revision, Access::FullDiskAccess),
+            Some(AccessOutcome::Granted)
+        );
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().writes),
+            1
+        );
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().grants),
+            0
+        );
+        assert_eq!(app.next_access_step_deadline(now), None);
+    }
+
+    #[test]
+    fn fda_grant_history_recovery_requires_this_process_to_have_the_grant() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut unread = app(
+            root.path(),
+            8_420,
+            FdaProbe::refused(ProbeLabel::RefusedNoHome),
+        );
+        unread.headless = false;
+        assert!(unread.consent_card.begin_deciding(now));
+        assert!(unread.consent_card.on_decided(&Verdict::Offer, now));
+        unread.tick_macos_access_card(now);
+        assert_eq!(unread.consent_card.phase(), CardPhase::Settled);
+        assert!(!grant_recorded(&unread));
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().writes),
+            0
+        );
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().grants),
+            0
+        );
+
+        let mut revoked = app(root.path(), 8_422, denied());
+        revoked.headless = false;
+        assert!(revoked.consent_card.begin_deciding(now));
+        assert!(revoked.consent_card.on_decided(&Verdict::Offer, now));
+        revoked.tick_macos_access_card(now);
+        assert_eq!(
+            revoked.consent_card.phase(),
+            CardPhase::Watching { since: now }
+        );
+        assert!(!grant_recorded(&revoked));
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().writes),
+            0
+        );
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().grants),
+            0
+        );
+
+        let mut foreign = app(root.path(), 8_421, granted());
+        foreign
+            .consent
+            .set_responsible_for_test(|pids| pids.iter().map(|_| Ok(1)).collect());
+        foreign.resolve_fda_need(true, now);
+        assert!(!grant_recorded(&foreign));
+        assert!(access_record::read(root.path(), 8_421).is_empty());
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().writes),
+            0
+        );
+        assert_eq!(
+            HISTORY.with(|state| state.borrow().as_ref().unwrap().grants),
+            0
+        );
+    }
+}
+
 fn denied() -> FdaProbe {
     FdaProbe {
         state: FdaState::Denied,
@@ -638,6 +834,13 @@ fn a_grant_verified_on_another_mac_does_not_stop_the_new_macs_page() {
             page.then_some(Origin::Automatic),
             "{verified_here:?}"
         );
+        if page {
+            assert_eq!(
+                app.consent_card_host.settle_look,
+                crate::consent_card::SettleLook::Idle,
+                "the new Mac's page: no look again"
+            );
+        }
     }
 }
 
@@ -944,6 +1147,7 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
             fda: probe.state,
             dr,
         },
+        Duration::ZERO,
         marker,
         &record,
     );

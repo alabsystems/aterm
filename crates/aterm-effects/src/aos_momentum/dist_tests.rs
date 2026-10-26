@@ -36,12 +36,17 @@ impl Spread for Threads {
     }
 }
 
-/// Only the even jobs, on the caller's thread: the caller must run the rest in place.
-struct Evens;
+/// Only the even jobs, on the caller's thread: the caller must run the rest in place. Counts the
+/// jobs it skipped.
+#[derive(Default)]
+struct Evens {
+    skipped: AtomicU64,
+}
 
 impl Spread for Evens {
     fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
         (0..n).step_by(2).for_each(job);
+        self.skipped.fetch_add((n / 2) as u64, Ordering::Relaxed);
     }
 }
 
@@ -239,40 +244,32 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
 }
 
 /// `select_spread`, on threads or on a spread that skips jobs, selects as `select` does, and so
-/// does a serial finish at `CheckLevel::All` ([`serial_finish`]).
+/// does a serial finish at `CheckLevel::All`: the grid on threads; the plans file of [`six`] on
+/// the spread that skips (which runs the jobs it skips in place, on one thread) and serially,
+/// where the grid's 54 plans, judged twice over on one thread, took some 30 s in a debug build.
 #[test]
 fn select_spread_equals_select() {
     let ev = evaluator();
-    let local = local_grid();
-    for spread in [&Threads as &dyn Spread, &Evens] {
-        let s = ev
-            .select_spread(&mut GridProposer::new(), spread)
-            .expect("a winner");
-        same_selection(&s, local);
-    }
-    let (serial, _) = serial_finish(CheckLevel::All);
-    same_selection(serial, local);
-}
-
-/// The grid's honest claims, in slot order, finished serially at `check`, with the (slot, training
-/// ordinal) pairs the finish judged itself: run once a level. At `CheckLevel::All` every claim,
-/// made on the test pool's threads, is compared row by row with its serial judgment.
-fn serial_finish(check: CheckLevel) -> &'static (Selection, Vec<(u32, usize)>) {
-    static DOMINANCE: OnceLock<(Selection, Vec<(u32, usize)>)> = OnceLock::new();
-    static ALL: OnceLock<(Selection, Vec<(u32, usize)>)> = OnceLock::new();
-    let cell = match check {
-        CheckLevel::Dominance => &DOMINANCE,
-        CheckLevel::All => &ALL,
-    };
-    cell.get_or_init(|| {
-        let mut g = GridProposer::new();
-        let (s, judged) = distribute(evaluator(), &mut g, check, &grid_claim, &grid_slots())
-            .finish_noting(&Serial);
-        (
-            s.expect("every threaded row equals its serial judgment"),
-            judged,
-        )
-    })
+    let threaded = ev
+        .select_spread(&mut GridProposer::new(), &Threads)
+        .expect("a winner");
+    same_selection(&threaded, local_grid());
+    let text = plans_text(&six());
+    let local = ev
+        .select(&mut FileProposer::from_text(&text))
+        .expect("a winner");
+    let evens = Evens::default();
+    let skipping = ev
+        .select_spread(&mut FileProposer::from_text(&text), &evens)
+        .expect("a winner");
+    assert!(n(&evens.skipped) > 0, "the spread skips a job");
+    same_selection(&skipping, &local);
+    let slots: Vec<usize> = (0..six().len()).collect();
+    let mut file = FileProposer::from_text(&text);
+    let serial = distribute(ev, &mut file, CheckLevel::All, &six_claim, &slots)
+        .finish(&Serial)
+        .expect("every threaded row equals its serial judgment");
+    same_selection(&serial, &local);
 }
 
 /// `plan`'s honest claim, for a plan of the grid ([`grid_claims`]).
@@ -290,18 +287,35 @@ fn grid_slots() -> Vec<usize> {
 }
 
 /// `finish` with a spread that skips jobs runs the rest in place: the same selection and the
-/// same judgments as serial, at both check levels.
+/// same judgments as serial, at both check levels, the spread skipping jobs at each. Over the
+/// plans file of [`six`] (three admitted, three refused), whose finish judges a handful of claims
+/// where the grid's 54, judged four times over on one thread, took 30-45 s in a debug build.
 #[test]
 fn finish_with_a_skipping_spread_equals_serial() {
     let ev = evaluator();
+    let text = plans_text(&six());
+    let slots: Vec<usize> = (0..six().len()).collect();
+    let set = |v: &[(u32, usize)]| v.iter().copied().collect::<BTreeSet<_>>();
     for check in [CheckLevel::Dominance, CheckLevel::All] {
-        let (serial, judged_serial) = serial_finish(check);
-        let mut g = GridProposer::new();
-        let (skipped, judged_skipped) =
-            distribute(ev, &mut g, check, &grid_claim, &grid_slots()).finish_noting(&Evens);
-        same_selection(serial, &skipped.expect("a winner"));
-        let set = |v: &[(u32, usize)]| v.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(set(judged_serial), set(&judged_skipped), "{check:?}");
+        let finish = |spread: &dyn Spread| {
+            let mut file = FileProposer::from_text(&text);
+            let (s, judged) =
+                distribute(ev, &mut file, check, &six_claim, &slots).finish_noting(spread);
+            (s.expect("a winner"), judged)
+        };
+        let (serial, judged_serial) = finish(&Serial);
+        let evens = Evens::default();
+        let (skipped, judged_skipped) = finish(&evens);
+        assert!(
+            n(&evens.skipped) > 0,
+            "{check:?}: the spread skips a job, which the finish must run in place"
+        );
+        same_selection(&serial, &skipped);
+        assert_eq!(set(&judged_serial), set(&judged_skipped), "{check:?}");
+        assert!(
+            !judged_serial.is_empty(),
+            "{check:?}: the finish judges rows"
+        );
     }
 }
 

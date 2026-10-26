@@ -1922,14 +1922,27 @@ fn configured_settings_and_about_shortcuts_keep_the_receiving_window() {
             app.on_key(source, key(ElementState::Pressed, false));
 
             let opened = app.active_native_view(source).and_then(|(instance, view)| {
-                matches!(app.native_runtime.view_state(view), Some(AppViewState::Settings(state)) if state.route == route)
-                    .then_some((app.windows[&source].tab_set.active_id().unwrap(), instance, view))
+                let requested = match app.native_runtime.view_state(view) {
+                    Some(AppViewState::About(_)) => binding == "toggle_about",
+                    Some(AppViewState::Settings(state)) => {
+                        binding == "toggle_settings" && state.route == route
+                    }
+                    _ => false,
+                };
+                requested.then_some((
+                    app.windows[&source].tab_set.active_id().unwrap(),
+                    instance,
+                    view,
+                ))
             });
-            if opened.is_none() || previous.is_some_and(|previous| Some(previous) != opened) {
+            if opened.is_none()
+                || (binding == "toggle_settings"
+                    && previous.is_some_and(|previous| Some(previous) != opened))
+            {
                 failures.push(format!("{binding} existing={existing_settings}: did not open or reuse the receiving window's view"));
             }
             if app.windows[&source].tab_set.len()
-                != source_tabs.len() + usize::from(!existing_settings)
+                != source_tabs.len() + usize::from(binding == "toggle_about" || !existing_settings)
             {
                 failures.push(format!(
                     "{binding} existing={existing_settings}: wrong receiving window tab count"
@@ -1939,6 +1952,14 @@ fn configured_settings_and_about_shortcuts_keep_the_receiving_window() {
                 let retained = app.windows[&source].tab_set.get(tab.id).unwrap();
                 assert_eq!(retained.root, tab.root);
                 assert_eq!(retained.focus, tab.focus);
+            }
+            if binding == "toggle_about"
+                && let Some((_, _, settings_view)) = previous
+            {
+                assert_eq!(
+                    settings_state(&app, settings_view).0,
+                    SettingsRoute::Appearance
+                );
             }
             if settings_state(&app, front_view) != front_before
                 || topology(&app, front) != front_topology

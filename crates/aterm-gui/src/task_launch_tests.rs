@@ -4,6 +4,9 @@
 use super::*;
 use aterm_phase::Program;
 
+#[path = "account_worker_env_tests.rs"]
+mod account_worker_env;
+
 #[test]
 fn a_task_frame_is_at_most_64_kib() {
     assert_eq!(frame_len("0", "claude"), Ok(0));
@@ -698,15 +701,15 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
     };
     let pick = LoginEnv {
         label: "work".to_string(),
-        var: "CODEX_HOME",
-        value: Some("/c/work".to_string()),
+        var: "CODEX_AUTH_PATH",
+        value: Some("/c/work/auth.json".to_string()),
     };
     let onto = pool_onto(codex, Cli::Codex, &pick, home).expect("codex row");
     let cli = worker_cli(Program::Codex).expect("codex worker row");
     assert_eq!(
         line(cli, &onto, &Fresh::default()).expect("codex line"),
         concat!(
-            " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_HOME=/c/work'",
+            " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_AUTH_PATH=/c/work/auth.json'",
             " '/opt/twin/codex' '-c' 'x=1' -- \"$(command cat -- \"$ATERM_TASK_FILE\")\""
         )
     );
@@ -769,7 +772,7 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
     };
     let onto = pool_onto(grok(&[]), Cli::Grok, &main, home).expect("default row");
     assert_eq!(onto.args, Ok(words(&["-m", "grok-4"])));
-    assert_eq!(onto.unset, ["GROK_AUTH"]);
+    assert_eq!(onto.unset, ["GROK_AUTH_PATH", "GROK_AUTH"]);
     assert!(onto.env.is_empty(), "{:?}", onto.env);
     assert!(
         pool_onto(grok(&[("GROK_HOME", "rel")]), Cli::Grok, &work, home).is_err(),
@@ -1048,23 +1051,23 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         args: Ok(Vec::new()),
         unset: Vec::new(),
     };
-    let c1_str = c1.to_string_lossy().into_owned();
-    let c2_str = c2.to_string_lossy().into_owned();
+    let c1_auth = c1.join("auth.json").to_string_lossy().into_owned();
+    let c2_auth = c2.join("auth.json").to_string_lossy().into_owned();
 
     // 1. Manager running on pooled row `codex-1` spawns a child worker -> rotates to `codex-2`
-    //    with a single replaced `CODEX_HOME` entry.
+    //    with a single replaced `CODEX_AUTH_PATH` entry.
     let rotated = super::pooled_starter_in(
-        starter_on(&[("CODEX_HOME", &c1_str)]),
+        starter_on(&[("CODEX_AUTH_PATH", &c1_auth)]),
         Cli::Codex,
         &seat,
         &no_usage,
         1,
     )
     .expect("pooled launch");
-    assert_eq!(rotated.env, vec![("CODEX_HOME".to_string(), c2_str)]);
+    assert_eq!(rotated.env, vec![("CODEX_AUTH_PATH".to_string(), c2_auth)]);
 
     // 2. When `main` (default home, `dir = None`) is pinned, a starter carrying `codex-1` drops
-    //    `CODEX_HOME` completely so the child worker runs in the default home.
+    //    `CODEX_AUTH_PATH` completely so the child worker uses the default login.
     seat.store(Cli::Codex)
         .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
             s.active = Some("main".to_string());
@@ -1074,7 +1077,7 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         })
         .expect("pin main");
     let to_main = super::pooled_starter_in(
-        starter_on(&[("CODEX_HOME", &c1_str)]),
+        starter_on(&[("CODEX_AUTH_PATH", &c1_auth)]),
         Cli::Codex,
         &seat,
         &no_usage,
@@ -1085,7 +1088,7 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
 
     // 3. CONTROL: a custom scratch `CODEX_HOME` outside the bound roster, a non-default CLI home
     //    (`GROK_HOME`), or an explicit credential override (`CODEX_API_KEY`, with or without
-    //    `CODEX_HOME`) is left untouched without reading usage.
+    //    `CODEX_AUTH_PATH`) is left untouched without reading usage.
     let panic_read =
         |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("custom home must not read usage") };
     let custom_dir = root.join("custom-scratch-codex").display().to_string();
@@ -1094,7 +1097,10 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         super::pooled_starter_in(custom.clone(), Cli::Codex, &seat, &panic_read, 3),
         Ok(custom)
     );
-    let overridden = starter_on(&[("CODEX_HOME", &c1_str), ("CODEX_API_KEY", "sk-override")]);
+    let overridden = starter_on(&[
+        ("CODEX_AUTH_PATH", &c1_auth),
+        ("CODEX_API_KEY", "sk-override"),
+    ]);
     assert_eq!(
         super::pooled_starter_in(overridden.clone(), Cli::Codex, &seat, &panic_read, 4),
         Ok(overridden)
@@ -1115,6 +1121,19 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         super::pooled_starter_in(custom_grok.clone(), Cli::Grok, &seat, &panic_read, 6),
         Ok(custom_grok)
     );
+    for unpooled_auth in [
+        "auth.json",
+        "work/auth.json",
+        "/custom/outside/auth.json/",
+        "/custom/outside\n1/auth.json",
+    ] {
+        let unpooled = starter_on(&[("CODEX_AUTH_PATH", unpooled_auth)]);
+        assert_eq!(
+            super::pooled_starter_in(unpooled.clone(), Cli::Codex, &seat, &panic_read, 6),
+            Ok(unpooled),
+            "non-admitted CODEX_AUTH_PATH {unpooled_auth:?} must not misidentify as default row `main`"
+        );
+    }
 
     seat.store(Cli::Codex)
         .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
@@ -1135,7 +1154,7 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
     let held = super::pooled_starter_in(starter_on(&[]), Cli::Codex, &seat, &panic_read, 8);
     assert!(held.unwrap_err().contains("state.json"));
     let bound = super::pooled_starter_in(
-        starter_on(&[("CODEX_HOME", &c1_str)]),
+        starter_on(&[("CODEX_AUTH_PATH", &c1_auth)]),
         Cli::Codex,
         &seat,
         &panic_read,
@@ -1147,10 +1166,14 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         super::pooled_starter_in(outside.clone(), Cli::Codex, &seat, &panic_read, 9),
         Ok(outside)
     );
-    let orphan = seat.store(Cli::Codex).logins_dir().join("orphaned-renewal");
+    let orphan = seat
+        .store(Cli::Codex)
+        .logins_dir()
+        .join("orphaned-renewal")
+        .join("auth.json");
     let orphan_text = orphan.display().to_string();
     let owned = super::pooled_starter_in(
-        starter_on(&[("CODEX_HOME", &orphan_text)]),
+        starter_on(&[("CODEX_AUTH_PATH", &orphan_text)]),
         Cli::Codex,
         &seat,
         &panic_read,
@@ -1160,7 +1183,7 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
     std::fs::write(seat.store(Cli::Codex).logins_file(), "not JSON").unwrap();
     assert!(
         super::pooled_starter_in(
-            starter_on(&[("CODEX_HOME", &c1_str)]),
+            starter_on(&[("CODEX_AUTH_PATH", &c1_auth)]),
             Cli::Codex,
             &seat,
             &panic_read,
@@ -1173,4 +1196,65 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         super::pooled_starter_in(override_key.clone(), Cli::Codex, &seat, &panic_read, 11),
         Ok(override_key)
     );
+}
+
+#[test]
+fn a_relative_login_file_is_not_rotated_as_the_default_worker() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::Seat;
+    use aterm_agent::harness::worker::Starter;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("cfg");
+    std::fs::create_dir(&cfg).unwrap();
+    let seat = Seat {
+        config_dir: &cfg,
+        state: &tmp.path().join("state"),
+        home: tmp.path(),
+        now: 1_792_700_000,
+    };
+    for cli in [Cli::Codex, Cli::Grok] {
+        std::fs::write(
+            cfg.join(cli.accounts().roster_file),
+            "[[account]]\nlabel='main'\nclass='dedicated'\n",
+        )
+        .unwrap();
+        let store = seat.store(cli);
+        store
+            .transact_within(&accounts::LOCK_LADDER, seat.now, &mut None, |state| {
+                state.active = Some("main".into());
+                state.pinned = true;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let files = [
+            cfg.join(cli.accounts().roster_file),
+            store.state_file(),
+            store.logins_file(),
+            store.ledger_path(),
+            store.wake_path(),
+        ];
+        for broken in [false, true] {
+            if broken {
+                std::fs::write(&files[0], "[[broken").unwrap();
+                std::fs::write(store.state_file(), "not JSON").unwrap();
+            }
+            let before = files.each_ref().map(|path| std::fs::read(path).ok());
+            for value in ["auth.json", "./auth.json", "nested/auth.json"] {
+                let starter = Starter {
+                    exe: PathBuf::from("/opt/fixture"),
+                    env: vec![(cli.accounts().seam.var().into(), value.into())],
+                    args: Ok(Vec::new()),
+                    unset: Vec::new(),
+                };
+                let no_usage = |_, _: &Path, _| panic!("an unbound file must not poll pool usage");
+                let actual =
+                    super::pooled_starter_in(starter.clone(), cli, &seat, &no_usage, 0).unwrap();
+                assert_eq!(actual, starter, "{cli:?}: {value}, broken={broken}");
+            }
+            assert_eq!(
+                files.each_ref().map(|path| std::fs::read(path).ok()),
+                before
+            );
+        }
+    }
 }

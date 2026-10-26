@@ -31,7 +31,8 @@ pub(crate) enum FdaLaunch {
 
 /// WHETHER THE LAUNCH CHECK HANDS FULL DISK ACCESS OVER: the probe read the grant off on a
 /// Mac where aterm never verified it — the access card's launch verdict `NoNeedYet`, or
-/// `ReadsOffAfterVerified` beside a record verified on another Mac or for another bundle
+/// `ReadsOffAfterVerified` (or `Settling`: no young process's misread to wait out for a grant
+/// this Mac never held) beside a record verified on another Mac or for another bundle
 /// (`verified_here` is `Some(false)`: the record travels with a synced or migrated config
 /// directory; a record with no stamp keeps its word). Whose reading it was is not judged
 /// here: the hand-over brings nothing up from a window another app is responsible for
@@ -48,9 +49,24 @@ pub(crate) fn hands_over(
     fda == FdaState::Denied
         && match verdict {
             LaunchVerdict::Quiet(NotDue::NoNeedYet) => true,
-            LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified) => verified_here == Some(false),
+            LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified | NotDue::Settling) => {
+                verified_here == Some(false)
+            }
             _ => false,
         }
+}
+
+/// Whether the launch check looks at the grant again once this process settled
+/// (`consent_card::SettleLook`): a verified grant the young process read off
+/// (`NotDue::Settling`), unless the launch hands it over as a new Mac's ([`hands_over`]), whose
+/// page needs no look again. Pure.
+#[must_use]
+pub(crate) const fn looks_again(
+    verdict: &crate::consent_card::LaunchVerdict,
+    hand_over: bool,
+) -> bool {
+    use crate::consent_card::{LaunchVerdict, NotDue};
+    matches!(verdict, LaunchVerdict::Quiet(NotDue::Settling)) && !hand_over
 }
 
 impl FdaLaunch {
@@ -571,6 +587,33 @@ impl LaunchConsent {
 mod tests {
     use super::*;
     use crate::devtools_helper::{Closed, Refusal};
+
+    /// A grant verified on this Mac and read off in the process's first seconds is looked at
+    /// again once settled; one verified on another Mac is handed over as a new Mac's instead.
+    /// Negative controls: a settled process's off reading, and a handed-over one, look again at
+    /// nothing.
+    #[test]
+    fn only_a_young_processs_off_reading_of_a_grant_verified_here_is_looked_at_again() {
+        use crate::consent_card::{LaunchVerdict, NotDue};
+        let settling = LaunchVerdict::Quiet(NotDue::Settling);
+        let settled = LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified);
+        for (verified_here, looks) in [(Some(true), true), (None, true), (Some(false), false)] {
+            let hand_over = hands_over(FdaState::Denied, &settling, verified_here);
+            assert_eq!(hand_over, !looks, "{verified_here:?}");
+            assert_eq!(
+                looks_again(&settling, hand_over),
+                looks,
+                "{verified_here:?}"
+            );
+            assert!(
+                !looks_again(
+                    &settled,
+                    hands_over(FdaState::Denied, &settled, verified_here)
+                ),
+                "the control: settled, no look again ({verified_here:?})"
+            );
+        }
+    }
 
     fn facts() -> WarmupFacts {
         WarmupFacts {

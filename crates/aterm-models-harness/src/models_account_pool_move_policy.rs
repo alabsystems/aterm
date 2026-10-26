@@ -4,7 +4,8 @@
 use aterm_spec::derive::Model;
 
 /// A prepared relaunch line still requires current endpoint policy, generations
-/// and eligibility. Following an active account has the same admission check.
+/// and eligibility, with one current policy snapshot before preparation. Following
+/// an active account has the same admission check.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn account_pool_move_policy_model() -> Model {
@@ -15,7 +16,7 @@ pub fn account_pool_move_policy_model() -> Model {
             var phase = 0; var line = 0; var committed = 0;
             action AnotherProvider when (phase == 0 && provider <= 2 && case == 1) { provider = provider + 1; }
             action FollowActive when (phase == 0 && follows == 0) { follows = 1; }
-            action AnotherCase when (phase == 0 && provider == 1 && case <= 21) { case = case + 1; }
+            action AnotherCase when (phase == 0 && provider == 1 && case <= 23) { case = case + 1; }
             action Choose when (phase == 0) { phase = 1; }
             action Finish when (phase == 1) {
                 phase = 2;
@@ -32,12 +33,14 @@ pub fn account_pool_move_policy_model() -> Model {
                         || (case == 12 && Buggy == 12) || (case == 16 && Buggy == 16)
                         || (case == 17 && Buggy == 17) || (case == 18 && Buggy == 18)
                         || (case == 19 && Buggy == 23) || (case == 20 && Buggy == 24)
-                        || (case == 21 && Buggy == 25) || (case == 22 && Buggy == 26) {1} else {0};
+                        || (case == 21 && Buggy == 25) || (case == 22 && Buggy == 26)
+                        || (case == 23 && Buggy == 27) || (case == 24 && Buggy == 28) {1} else {0};
                 committed = if provider > 1 {0}
                     else if (case == 1 || case == 13 || case == 14 || case == 15) && follows == 0 {
                     if case == 1 && Buggy == 20 {0} else {1}
                 } else if case == 2 && Buggy == 19 {1}
-                    else if case == 1 && follows == 1 && Buggy == 21 {1} else {0};
+                    else if case == 1 && follows == 1 && Buggy == 21 {1}
+                    else if case == 23 && follows == 0 && Buggy == 29 {1} else {0};
             }
             invariant NoStaleLine: line == 0 || case == 1 || case == 13 || case == 14 || case == 15;
             invariant CurrentMovesAllowed: phase <= 1 || provider > 1

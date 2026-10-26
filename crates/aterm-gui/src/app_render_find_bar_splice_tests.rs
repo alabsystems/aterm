@@ -632,11 +632,17 @@ fn find_bar_floats_to_bottom_when_current_match_on_top() {
         cells[band.start].iter().any(|c| c.overline),
         "bottom-floated panel draws an overline seam on its top edge"
     );
+    let hit = app.windows[&wid]
+        .find_bar_hit
+        .as_ref()
+        .expect("panel geometry");
     assert!(
         band.clone().all(|row| cells[row]
             .iter()
-            .all(|c| c.underline == UnderlineStyle::None)),
-        "bottom-floated panel drops the underline seam"
+            .enumerate()
+            .filter(|(col, _)| row != hit.row || !hit.field_cols.contains(col))
+            .all(|(_, c)| c.underline == UnderlineStyle::None)),
+        "bottom-floated panel drops the underline seam (the query well's own edge is not one)"
     );
 }
 
@@ -2060,11 +2066,14 @@ fn the_top_panel_closes_on_a_rail_under_its_last_row() {
     assert_eq!(hit.band.start, 0, "the panel rides the top");
     let last = hit.band.end - 1;
     let input = &app.windows[&wid].input_scratch;
-    let underlined = hit
-        .band
-        .clone()
-        .flat_map(|row| input.cells[row].iter())
-        .any(|c| c.underline != aterm_core::terminal::UnderlineStyle::None);
+    // The query well's own edge (`find_bar::well_rule`) is the well's, not a rule across the band.
+    let underlined = hit.band.clone().any(|row| {
+        input.cells[row]
+            .iter()
+            .enumerate()
+            .filter(|(col, _)| row != hit.row || !hit.field_cols.contains(col))
+            .any(|(_, c)| c.underline != aterm_core::terminal::UnderlineStyle::None)
+    });
     let raster = input.chrome_raster(last);
     if rails {
         let raster = raster.expect("a rail on the band's last row");

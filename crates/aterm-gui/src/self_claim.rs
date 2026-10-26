@@ -571,6 +571,7 @@ mod tests {
             cwd: None,
             draft_empty: None,
             frame: None,
+            goal: None,
             initializing: false,
         })
     }
@@ -748,6 +749,7 @@ mod tests {
                 cwd: None,
                 draft_empty: None,
                 frame: None,
+                goal: None,
                 initializing: false,
             }))
         };

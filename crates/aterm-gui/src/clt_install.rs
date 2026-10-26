@@ -757,7 +757,8 @@ mod tests {
                 wid,
                 view,
                 AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("system-state/apply"),
+                    // A press on a group answers the offer.
+                    id: ActionId::new("system-state/group/1/leave"),
                     value: None,
                 }),
             )

@@ -540,5 +540,9 @@ mod end_tests;
 mod landed_words_tests;
 
 #[cfg(test)]
+#[path = "stopped_first_tests.rs"]
+mod stopped_first_tests;
+
+#[cfg(test)]
 #[path = "harness_task_reopen_tests.rs"]
 mod reopen_tests;

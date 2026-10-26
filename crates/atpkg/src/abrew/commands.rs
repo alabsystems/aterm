@@ -297,7 +297,7 @@ pub(super) fn cmd_search(api: &Api, rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn keg_abv(dir: &std::path::Path) -> String {
+pub(super) fn keg_abv(dir: &std::path::Path) -> String {
     let mut count = 0usize;
     let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -531,6 +531,30 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
     let aterm_json::Value::Object(map) = value else {
         return;
     };
+    // Brew's `to_hash` — what `info --json` prints — never carries
+    // these raw-API fields (analytics is its own opt-in report), and
+    // its bottle `files` holds only the bottle this machine would
+    // pour: brew's per-tag API file ships just that tag (or `all`).
+    for key in ["analytics", "executables", "generated_date", "variations"] {
+        map.remove(key);
+    }
+    if let Some(files) = map
+        .get_mut("bottle")
+        .and_then(|b| b.as_object_mut())
+        .and_then(|b| b.get_mut("stable"))
+        .and_then(|s| s.as_object_mut())
+        .and_then(|s| s.get_mut("files"))
+        .and_then(|f| f.as_object_mut())
+    {
+        let keep = super::machine::Machine::this()
+            .bottle_tags()
+            .into_iter()
+            .find(|t| files.contains_key(t))
+            .or_else(|| files.contains_key("all").then(|| "all".to_string()));
+        if let Some(keep) = keep {
+            files.retain(|tag, _| *tag == keep);
+        }
+    }
     let Some(name) = map
         .get("name")
         .and_then(aterm_json::Value::as_str)
@@ -630,10 +654,84 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
     map.insert("outdated".to_string(), aterm_json::Value::Bool(outdated));
 }
 
+/// Brew's `BundleVersion` for an installed cask: `CFBundleShortVersionString`
+/// and `CFBundleVersion` from the staged app's `Info.plist`, the short
+/// form with any trailing ` (<version>)` removed. Binary plists go
+/// through `plutil` exactly as brew's reader does.
+fn cask_bundle_versions(dir: &std::path::Path) -> (Option<String>, Option<String>) {
+    fn plist_string(xml: &str, key: &str) -> Option<String> {
+        let tag = format!("<key>{key}</key>");
+        let after = xml.find(&tag)? + tag.len();
+        let value = xml[after..].trim_start().strip_prefix("<string>")?;
+        let end = value.find("</string>")?;
+        let v = value[..end].trim();
+        (!v.is_empty() && v.len() <= 64).then(|| v.to_string())
+    }
+    let mut apps: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "app")
+                        && p.join("Contents/Info.plist").is_file()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    apps.sort();
+    let Some(app) = apps.first() else {
+        return (None, None);
+    };
+    let plist = app.join("Contents/Info.plist");
+    let Ok(bytes) = std::fs::read(&plist) else {
+        return (None, None);
+    };
+    let xml = if bytes.starts_with(b"bplist00") {
+        let Ok(out) = super::fetch::run_capture(
+            aterm_uds::os_path!("plutil"),
+            &[
+                "-convert",
+                "xml1",
+                "-o",
+                "-",
+                plist.to_str().unwrap_or_default(),
+            ],
+        ) else {
+            return (None, None);
+        };
+        if !out.status.success() {
+            return (None, None);
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut short = plist_string(&xml, "CFBundleShortVersionString");
+    let long = plist_string(&xml, "CFBundleVersion");
+    if let (Some(s), Some(v)) = (&short, &long)
+        && let Some(stripped) = s
+            .strip_suffix(&format!("({v})"))
+            .map(|p| p.trim_end().to_string())
+    {
+        short = Some(stripped);
+    }
+    (short, long)
+}
+
 fn enrich_cask_json(prefix: &Prefix, value: &mut aterm_json::Value) {
     let aterm_json::Value::Object(map) = value else {
         return;
     };
+    // As on the formula side, brew's cask `to_h` never carries these
+    // raw-API fields.
+    for key in [
+        "analytics",
+        "generated_date",
+        "supported_platforms",
+        "variations",
+    ] {
+        map.remove(key);
+    }
     let Some(token) = map
         .get("token")
         .and_then(aterm_json::Value::as_str)
@@ -649,9 +747,11 @@ fn enrich_cask_json(prefix: &Prefix, value: &mut aterm_json::Value) {
         .get("auto_updates")
         .and_then(aterm_json::Value::as_bool)
         .unwrap_or(false);
+    let mut bundle_versions = (None, None);
     let (installed, installed_time, outdated) = match prefix.installed_one(Kind::Cask, &token) {
         Some(inst) => {
             let dir = prefix.cask_dir(&token, &inst.version);
+            bundle_versions = cask_bundle_versions(&dir);
             let outdated = !auto_updates
                 && latest
                     .as_deref()
@@ -664,6 +764,18 @@ fn enrich_cask_json(prefix: &Prefix, value: &mut aterm_json::Value) {
         }
         None => (aterm_json::Value::Null, aterm_json::Value::Null, false),
     };
+    map.insert(
+        "bundle_short_version".to_string(),
+        bundle_versions
+            .0
+            .map_or(aterm_json::Value::Null, aterm_json::Value::String),
+    );
+    map.insert(
+        "bundle_version".to_string(),
+        bundle_versions
+            .1
+            .map_or(aterm_json::Value::Null, aterm_json::Value::String),
+    );
     map.insert("installed".to_string(), installed);
     map.insert("installed_time".to_string(), installed_time);
     map.insert("pinned".to_string(), aterm_json::Value::Bool(false));
@@ -1926,6 +2038,54 @@ pub(super) fn cmd_install(
             return failed(&error);
         }
     }
+    if opts.dry_run {
+        // Collect every plan first: a delegation anywhere hands the
+        // whole dry run to brew before a single summary line prints,
+        // and brew groups the requested formulae across the batch.
+        let mut tops = Vec::new();
+        let mut casks = Vec::new();
+        let mut failures = 0;
+        for name in &names {
+            let as_cask = if want_cask {
+                true
+            } else if want_formula {
+                false
+            } else {
+                api.formula(name).is_err()
+            };
+            if as_cask {
+                let c = match api.cask(name) {
+                    Ok(c) => c,
+                    Err(error) => return failed(&error),
+                };
+                match cask::install_with_deps(api, prefix, &c, true, opts.force, false, false) {
+                    Ok(_) => casks.push((c.token.clone(), cask::dry_dep_names(api, prefix, &c))),
+                    Err(install::InstallError::Failed(msg)) => {
+                        eprintln!("{msg}");
+                        failures += 1;
+                    }
+                    Err(error) => return from_install(prefix, args, Err(error)),
+                }
+            } else {
+                match install::dry_rows(api, prefix, name, &opts) {
+                    Ok((top, deps)) => {
+                        tops.push((Formula::short_name(name).to_string(), top, deps))
+                    }
+                    Err(install::InstallError::Failed(msg)) => {
+                        eprintln!("{msg}");
+                        failures += 1;
+                    }
+                    Err(error) => return from_install(prefix, args, Err(error)),
+                }
+            }
+        }
+        print_dry_sections(&tops, &casks);
+        return if failures == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     let mut landed = false;
     let mut failures = 0;
     for name in &names {
@@ -2002,6 +2162,123 @@ pub(super) fn cmd_install(
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Brew's `Formatter.version_changes` for dry-run rows: a fresh
+/// install shows just the new version, a replacement shows
+/// `old -> new`, columns aligned like the table printer.
+fn dry_change_lines(rows: &[install::DryRow]) -> Vec<String> {
+    let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    let old_width = rows
+        .iter()
+        .filter_map(|r| r.old_version.as_deref())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let sep = if rows.len() == 1 { " " } else { "  " };
+    rows.iter()
+        .map(|r| {
+            let versions = match &r.old_version {
+                Some(old) => format!("{old:old_width$} -> {}", r.new_version),
+                None => r.new_version.clone(),
+            };
+            format!("{:name_width$}{sep}{versions}", r.name)
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Prints brew's dry-run install summary: the requested formulae
+/// grouped install-then-upgrade, each top formula's dependency
+/// sections, then the casks with theirs. `tops` pairs each requested
+/// formula's display name with its `install::dry_rows` result;
+/// `casks` pairs each token with its uninstalled dependency names.
+fn print_dry_sections(
+    tops: &[(String, Option<install::DryRow>, Vec<install::DryRow>)],
+    casks: &[(String, Vec<String>)],
+) {
+    fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+        if n == 1 { one } else { many }
+    }
+    for upgrade in [false, true] {
+        let group: Vec<&install::DryRow> = tops
+            .iter()
+            .filter_map(|(_, top, _)| top.as_ref())
+            .filter(|r| r.old_version.is_some() == upgrade)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!(
+            "==> Would {} {} {}:",
+            if upgrade { "upgrade" } else { "install" },
+            group.len(),
+            plural(group.len(), "formula", "formulae")
+        );
+        let owned: Vec<install::DryRow> = group
+            .iter()
+            .map(|r| install::DryRow {
+                name: r.name.clone(),
+                old_version: r.old_version.clone(),
+                new_version: r.new_version.clone(),
+            })
+            .collect();
+        for line in dry_change_lines(&owned) {
+            println!("{line}");
+        }
+    }
+    for (display, _, deps) in tops {
+        for upgrade in [false, true] {
+            let group: Vec<install::DryRow> = deps
+                .iter()
+                .filter(|r| r.old_version.is_some() == upgrade)
+                .map(|r| install::DryRow {
+                    name: r.name.clone(),
+                    old_version: r.old_version.clone(),
+                    new_version: r.new_version.clone(),
+                })
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            println!(
+                "==> Would {} {} {} for {display}:",
+                if upgrade { "upgrade" } else { "install" },
+                group.len(),
+                plural(group.len(), "dependency", "dependencies")
+            );
+            for line in dry_change_lines(&group) {
+                println!("{line}");
+            }
+        }
+    }
+    if !casks.is_empty() {
+        println!(
+            "==> Would install {} {}:",
+            casks.len(),
+            plural(casks.len(), "cask", "casks")
+        );
+        println!(
+            "{}",
+            casks
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (token, deps) in casks {
+            if deps.is_empty() {
+                continue;
+            }
+            println!(
+                "==> Would install {} {} for {token}:",
+                deps.len(),
+                plural(deps.len(), "dependency", "dependencies")
+            );
+            println!("{}", deps.join(" "));
+        }
     }
 }
 
@@ -2173,6 +2450,61 @@ pub(super) fn cmd_reinstall(
     };
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
+    if opts.dry_run {
+        // Brew's reinstall has no dry run; abrew's extension reports
+        // through the same grouped summary as install.
+        let mut tops = Vec::new();
+        let mut casks = Vec::new();
+        let mut failures = 0;
+        for name in &names {
+            let short = Formula::short_name(name);
+            let cask_short = super::api::canonical_cask_token(short);
+            let as_cask = if want_cask {
+                true
+            } else if want_formula || prefix.installed_one(Kind::Formula, short).is_some() {
+                false
+            } else if prefix.installed_one(Kind::Cask, cask_short).is_some() {
+                true
+            } else {
+                api.formula(name).is_err() && api.cask(cask_short).is_ok()
+            };
+            if as_cask {
+                match api.cask(cask_short) {
+                    Ok(c) => {
+                        match cask::install_with_deps(api, prefix, &c, true, true, false, true) {
+                            Ok(_) => {
+                                casks.push((c.token.clone(), cask::dry_dep_names(api, prefix, &c)))
+                            }
+                            Err(install::InstallError::Failed(msg)) => {
+                                eprintln!("{msg}");
+                                failures += 1;
+                            }
+                            Err(error) => return from_install(prefix, args, Err(error)),
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        failures += 1;
+                    }
+                }
+            } else {
+                match install::dry_rows(api, prefix, short, &opts) {
+                    Ok((top, deps)) => tops.push((short.to_string(), top, deps)),
+                    Err(install::InstallError::Failed(msg)) => {
+                        eprintln!("{msg}");
+                        failures += 1;
+                    }
+                    Err(error) => return from_install(prefix, args, Err(error)),
+                }
+            }
+        }
+        print_dry_sections(&tops, &casks);
+        return if failures == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     let mut completed = false;
     let mut failures = 0;
     for name in &names {
@@ -4448,20 +4780,182 @@ fn dependency_tree(
     );
 }
 
+/// name → (runtime deps, build deps) for `uses` closure walks.
+type DepGraph = std::collections::BTreeMap<String, (Vec<String>, Vec<String>)>;
+
 pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let names = operands(rest);
     if names.is_empty() {
         return usage("uses needs a formula name");
     }
-    for name in names {
-        let short = Formula::short_name(&name);
-        let users = match install::dependents(api, prefix, short) {
-            Ok(users) => users,
-            Err(error) => return from_install(prefix, &[], Err(error)),
-        };
-        for u in users {
-            println!("{u}");
+    let installed_only = has_flag(rest, "--installed", "");
+    let missing_only = has_flag(rest, "--missing", "");
+    let recursive = has_flag(rest, "--recursive", "");
+    let include_build = has_flag(rest, "--include-build", "");
+    let want_formula = has_flag(rest, "--formula", "") || has_flag(rest, "--formulae", "");
+    let want_cask = has_flag(rest, "--cask", "") || has_flag(rest, "--casks", "");
+    let targets: Vec<String> = names
+        .iter()
+        .map(|n| Formula::short_name(n).to_string())
+        .collect();
+    let installed_f: std::collections::BTreeSet<String> = prefix
+        .installed(Kind::Formula)
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    let installed_c: std::collections::BTreeSet<String> = prefix
+        .installed(Kind::Cask)
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    // Brew warns (and continues with a placeholder) for a name no
+    // formula answers to; dependents of such a name are then an error.
+    let mut unknown = false;
+    for t in &targets {
+        if !installed_f.contains(t) && api.formula(t).is_err() {
+            eprintln!("Warning: No available formula with the name \"{t}\".");
+            unknown = true;
         }
+    }
+    // Rows are the candidate dependents. With --installed brew's
+    // formula side reads install-time runtime closures from tabs,
+    // which abrew receipts don't record; the declared closure over
+    // the current graph stands in (as it does for info --json).
+    let mut rows: Vec<super::api::DepRow> = Vec::new();
+    let mut formula_row_names: std::collections::BTreeSet<String> = Default::default();
+    if !want_cask {
+        if installed_only {
+            for name in &installed_f {
+                match api.formula(name) {
+                    Ok(f) => rows.push(super::api::DepRow {
+                        name: f.name,
+                        deps: f
+                            .dependencies
+                            .iter()
+                            .map(|d| Formula::short_name(d).to_string())
+                            .collect(),
+                        build_deps: f
+                            .build_dependencies
+                            .iter()
+                            .map(|d| Formula::short_name(d).to_string())
+                            .collect(),
+                    }),
+                    Err(error) => return failed(&error),
+                }
+            }
+        } else {
+            match api.deps_index(false) {
+                Ok(mut all) => rows.append(&mut all),
+                Err(error) => return failed(&error),
+            }
+        }
+        formula_row_names = rows.iter().map(|r| r.name.clone()).collect();
+    }
+    if !want_formula {
+        if installed_only {
+            for token in &installed_c {
+                match api.cask(token) {
+                    Ok(c) => rows.push(super::api::DepRow {
+                        name: c.token,
+                        deps: c
+                            .depends_formula
+                            .iter()
+                            .map(|d| Formula::short_name(d).to_string())
+                            .collect(),
+                        build_deps: Vec::new(),
+                    }),
+                    Err(error) => return failed(&error),
+                }
+            }
+        } else {
+            match api.deps_index(true) {
+                Ok(mut all) => rows.append(&mut all),
+                Err(error) => return failed(&error),
+            }
+        }
+    }
+    if missing_only {
+        rows.retain(|r| !installed_f.contains(&r.name) && !installed_c.contains(&r.name));
+    }
+    // The formula graph for recursive expansion, seeded from the
+    // formula rows already in hand and extended on demand (a
+    // dependency outside the row set still resolves through it).
+    let graph: std::cell::RefCell<DepGraph> = std::cell::RefCell::new(
+        rows.iter()
+            .filter(|r| formula_row_names.contains(&r.name))
+            .map(|r| (r.name.clone(), (r.deps.clone(), r.build_deps.clone())))
+            .collect(),
+    );
+    let graph_deps =
+        |graph: &std::cell::RefCell<DepGraph>, name: &str| -> (Vec<String>, Vec<String>) {
+            if let Some(hit) = graph.borrow().get(name) {
+                return hit.clone();
+            }
+            let entry = api
+                .formula(name)
+                .map(|f| {
+                    (
+                        f.dependencies
+                            .iter()
+                            .map(|d| Formula::short_name(d).to_string())
+                            .collect::<Vec<_>>(),
+                        f.build_dependencies
+                            .iter()
+                            .map(|d| Formula::short_name(d).to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap_or_default();
+            graph.borrow_mut().insert(name.to_string(), entry.clone());
+            entry
+        };
+    let closure_contains = |start: &[String], build: &[String], target: &str| -> bool {
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        let mut queue: Vec<String> = start.to_vec();
+        if include_build {
+            queue.extend(build.iter().cloned());
+        }
+        while let Some(cur) = queue.pop() {
+            if cur == target {
+                return true;
+            }
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            let (deps, build_deps) = graph_deps(&graph, &cur);
+            queue.extend(deps);
+            if include_build {
+                queue.extend(build_deps);
+            }
+        }
+        false
+    };
+    let mut hits: Vec<String> = rows
+        .into_iter()
+        .filter(|row| {
+            if targets.contains(&row.name) {
+                return false;
+            }
+            targets.iter().all(|t| {
+                let transitive = recursive || (installed_only && installed_f.contains(&row.name));
+                if transitive {
+                    closure_contains(&row.deps, &row.build_deps, t)
+                } else {
+                    row.deps.iter().any(|d| d == t)
+                        || (include_build && row.build_deps.iter().any(|d| d == t))
+                }
+            })
+        })
+        .map(|row| row.name)
+        .collect();
+    hits.sort();
+    hits.dedup();
+    for hit in &hits {
+        println!("{hit}");
+    }
+    if unknown && !hits.is_empty() {
+        eprintln!("Error: Missing formulae should not have dependents!");
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
@@ -6371,6 +6865,56 @@ mod tests {
         assert_eq!(disk_usage_readable(1_000_000), "1MB");
         assert_eq!(disk_usage_readable(1_050_000), "1.1MB");
         assert_eq!(disk_usage_readable(2_500_000_000), "2.5GB");
+    }
+
+    #[test]
+    fn cask_bundle_versions_read_the_staged_app_plist() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cask");
+        let contents = dir.join("Widget.app/Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            "<?xml version=\"1.0\"?><plist><dict>\
+             <key>CFBundleShortVersionString</key><string>2.5 (409)</string>\
+             <key>CFBundleVersion</key><string>409</string>\
+             </dict></plist>",
+        )
+        .unwrap();
+        // Brew strips the trailing " (<version>)" from the short form.
+        assert_eq!(
+            cask_bundle_versions(&dir),
+            (Some("2.5".to_string()), Some("409".to_string()))
+        );
+        assert_eq!(cask_bundle_versions(tmp.path()), (None, None));
+    }
+
+    #[test]
+    fn dry_change_lines_render_install_and_upgrade_rows() {
+        let fresh = |n: &str, v: &str| install::DryRow {
+            name: n.into(),
+            old_version: None,
+            new_version: v.into(),
+        };
+        // Oracle sample (brew install --dry-run): one space, name then
+        // the new version alone.
+        assert_eq!(
+            dry_change_lines(&[fresh("wget", "1.25.0_2")]),
+            ["wget 1.25.0_2"]
+        );
+        assert_eq!(
+            dry_change_lines(&[fresh("libpsl", "0.23.3")]),
+            ["libpsl 0.23.3"]
+        );
+        let upgraded = install::DryRow {
+            name: "ca-certificates".into(),
+            old_version: Some("2026-09-25_1".into()),
+            new_version: "2026-10-20".into(),
+        };
+        assert_eq!(
+            dry_change_lines(&[upgraded]),
+            ["ca-certificates 2026-09-25_1 -> 2026-10-20"]
+        );
     }
 
     #[test]

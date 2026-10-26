@@ -4219,6 +4219,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.turn_end.seed_short(seed.short);
             let ago = Duration::from_millis(u64::try_from(now_ms - seed.at_ms).unwrap_or(0));
             self.turn_end.seed_replies(seed.said, ago, self.fx.mono());
+            self.turn_end.seed_checks(seed.checks);
             let reset = seed.said_reset_ms.map(|ms| self.instant_of_ms(ms));
             self.turn_end.seed_replies_reset(reset);
             if seed.point && !seed.ran {

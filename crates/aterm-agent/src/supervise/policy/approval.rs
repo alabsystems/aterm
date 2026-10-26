@@ -22,10 +22,11 @@ use super::probe::{PolicyProbe, WorkerWrites};
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
 use super::shell_startup::ShellStartup;
 use super::trace::{NoTrace, Outcome, Trace, note};
+use crate::harness::disk::fence;
 use crate::harness::lights::Mode;
 use crate::supervise::classify::{
-    brace_expansion, classify_command_with, classify_except_rm, command_words, glob_match,
-    path_operands, plain_zsh_line, program, runs, unquoted_glob,
+    brace_expansion, classify_command_except, classify_command_with, classify_except_rm,
+    command_words, glob_match, path_operands_except, plain_zsh_line, program, runs, unquoted_glob,
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
@@ -75,6 +76,25 @@ pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
 pub const RULE_AUTOCOMPACT_OFFER: &str = "autocompact-offer@v1";
 /// Claude Code's auto-mode environment offer ([`auto_mode_setup`]).
 pub const RULE_AUTO_MODE_SETUP: &str = "auto-mode-setup@v1";
+/// A disk-free worker's fence ([`ApprovalCtx::disk_worker`], design
+/// `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4): a Bash box whose every command is a read or
+/// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
+/// it, and every other permission box the worker raises is declined under it with
+/// [`DISK_WORKER_DECLINE`].
+pub const RULE_DISK_WORKER: &str = "disk-worker@v1";
+
+/// What [`RULE_DISK_WORKER`] types into a disk-free worker's refusal.
+pub const DISK_WORKER_DECLINE: &str = "aterm's disk-free worker removes only through `aterm \
+                                       harness disk free`; keep it and name it in your report";
+
+/// The rules that approve a box as a read, whose approvals a disk-free worker's fence keeps
+/// ([`disk_fence`]).
+const READ_RULES: &[&str] = &[
+    RULE_READ_ONLY,
+    RULE_NO_RULE_READ_ONLY,
+    RULE_BREAKER_READ_ONLY,
+    RULE_READ_OUTSIDE_CWD,
+];
 
 /// A question dialog answered under the priority word `long-term` ([`QuestionPriority::LongTerm`]).
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
@@ -396,6 +416,10 @@ pub struct ApprovalCtx {
     pub login_method: Option<aterm_phase::LoginMethod>,
     pub trust_roots: Vec<ScratchRoot>,
     pub trusted_cwd: Option<PathBuf>,
+    /// The session is aterm's disk-free worker: its task record's trusted folder is the worker
+    /// folder ([`crate::harness::disk::fence::is_worker_folder`]), so its boxes are decided under
+    /// [`RULE_DISK_WORKER`]'s fence.
+    pub disk_worker: bool,
     pub worker_agent: Option<Program>,
     pub read_roots: Vec<ScratchRoot>,
     pub scratch_roots: Vec<ScratchRoot>,
@@ -463,6 +487,7 @@ impl ApprovalCtx {
             login_method: None,
             trust_roots: Vec::new(),
             trusted_cwd: None,
+            disk_worker: false,
             worker_agent: None,
             read_roots: Vec::new(),
             scratch_roots,
@@ -746,6 +771,109 @@ const fn draws_claude_boxes(program: Program) -> bool {
 }
 
 fn decide_box(
+    reading: &Reading,
+    rows: &[String],
+    ctx: &ApprovalCtx,
+    trace: &mut dyn Trace,
+) -> Decision {
+    let decided = decide_unfenced(reading, rows, ctx, trace);
+    if !ctx.disk_worker {
+        return decided;
+    }
+    let fenced = disk_fence(reading, ctx, decided.clone());
+    if fenced != decided {
+        note(trace, "disk-worker", fenced.rule_id(), || {
+            Outcome::Overruled(said(&fenced))
+        });
+    }
+    fenced
+}
+
+/// The tool boxes an agent raises for a call it makes: the boxes a disk-free worker's fence
+/// decides ([`disk_fence`]). A question, the folder-trust dialog, and the dialogs about the
+/// session (a usage limit, a model switch, the autocompact and auto-mode offers, an MCP server,
+/// a held message, one of no kind aterm reads) are left to their own rules.
+const fn fenced(kind: PromptKind) -> bool {
+    match kind {
+        PromptKind::Bash
+        | PromptKind::PowerShell
+        | PromptKind::Edit
+        | PromptKind::Write
+        | PromptKind::Overwrite
+        | PromptKind::Read
+        | PromptKind::Workflow
+        | PromptKind::Fetch
+        | PromptKind::NetworkRequest
+        | PromptKind::Browser
+        | PromptKind::Skill
+        | PromptKind::Monitor
+        | PromptKind::Tool
+        | PromptKind::PlanEnter
+        | PromptKind::PlanExit
+        | PromptKind::GoalProposal
+        | PromptKind::ComputerUse
+        | PromptKind::ReadOutsideSetting => true,
+        PromptKind::Trust
+        | PromptKind::Question
+        | PromptKind::HeldMessage
+        | PromptKind::UsageLimit
+        | PromptKind::ModelSwitch
+        | PromptKind::AutocompactOffer
+        | PromptKind::McpServer
+        | PromptKind::AutoModeSetup
+        | PromptKind::Other => false,
+    }
+}
+
+/// [`RULE_DISK_WORKER`]'s fence over `decided`, what the rules made of a disk-free worker's box:
+/// a tool box ([`fenced`]) keeps an approval as a read ([`READ_RULES`]) or of `aterm harness
+/// disk` ([`disk_verbs`]), and any other decision of one, an approval at full power or a hand-off
+/// to a person alike, becomes the decline [`DISK_WORKER_DECLINE`]. Under `approve = "none"` every
+/// box stays the owner's; a box the reader does not vouch for, or one with no `No` to amend, is
+/// handed to a person, as nothing is pressed on it.
+fn disk_fence(reading: &Reading, ctx: &ApprovalCtx, decided: Decision) -> Decision {
+    let Some(p) = reading.prompt.as_ref().filter(|p| fenced(p.kind)) else {
+        return decided;
+    };
+    if ctx.approve == Approve::None {
+        return decided;
+    }
+    if let Decision::Approve { rule_id, .. } = &decided
+        && (READ_RULES.contains(rule_id) || *rule_id == RULE_DISK_WORKER)
+    {
+        return decided;
+    }
+    let not_declined = |why: &str| {
+        Decision::escalate(format!(
+            "a disk-free worker's box, which its fence ({RULE_DISK_WORKER}) declines, was not \
+             declined: {why} ({})",
+            said(&decided)
+        ))
+    };
+    if !draws_claude_boxes(reading.program)
+        || reading.phase != Phase::Prompt
+        || !reading.phase_authoritative
+    {
+        return not_declined("no box the reader vouches for");
+    }
+    let what = if !p.command.is_empty() {
+        p.command.as_str()
+    } else if let Some(path) = p.path.as_deref() {
+        path
+    } else {
+        p.title.as_str()
+    };
+    let subject = format!("{} box: {what}", p.kind.name());
+    decline(
+        RULE_DISK_WORKER,
+        p,
+        DISK_WORKER_DECLINE.to_string(),
+        subject,
+    )
+    .unwrap_or_else(|not| not_declined(&not))
+}
+
+fn decide_unfenced(
     reading: &Reading,
     rows: &[String],
     ctx: &ApprovalCtx,
@@ -1280,7 +1408,13 @@ fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decisio
         return Decision::escalate("no box on the screen");
     };
     match prompt.kind {
-        PromptKind::Bash => bash(prompt, rows, ctx),
+        PromptKind::Bash => match bash(prompt, rows, ctx) {
+            Decision::Escalate { reason } if ctx.disk_worker => disk_verbs(prompt, rows, ctx)
+                .unwrap_or_else(|why| {
+                    Decision::escalate(format!("{reason}; nor {RULE_DISK_WORKER}'s: {why}"))
+                }),
+            decided => decided,
+        },
         PromptKind::Read => read_box(prompt, rows, ctx),
         PromptKind::Trust => trust_dialog(prompt, rows, ctx),
         kind => Decision::escalate(format!(
@@ -1583,6 +1717,74 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         )),
         Err(why) => Decision::escalate(why),
     }
+}
+
+/// [`RULE_DISK_WORKER`]'s approval of a disk-free worker's Bash box that [`bash`] did not prove:
+/// every command of every reading is a read the classifier proves, `aterm harness disk`
+/// ([`fence::runs_harness_disk`]) or a System State read (`aterm ctl … sys`,
+/// [`fence::runs_ctl_sys`]), under every other proof [`bash`] holds a read to (no vendor
+/// note but the no-rule one, no rm circuit breaker, no bypass session, this machine's shell, no
+/// socket, brace expansion, unshown blank or proof gap, git reads clear, and no secret read by a
+/// command other than aterm's).
+fn disk_verbs(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Result<Decision, String> {
+    if prompt.base_title().as_deref() != Some(aterm_phase::anchor!("box.bash")) {
+        return Err(format!(
+            "the box header is not a Bash header: {}",
+            prompt.title
+        ));
+    }
+    let first = prompt
+        .command_rows
+        .first()
+        .ok_or("a Bash box with no command row")?;
+    let first_row =
+        row_of(rows, prompt, first).ok_or("the command's first row is not on the screen")?;
+    no_option_above_the_question(prompt, rows)?;
+    if let Some(b) = prompt.rm_breaker() {
+        return Err(rm_breaker_label(&b));
+    }
+    match prompt.notes.as_slice() {
+        [] => {}
+        [note] if note == aterm_phase::anchor!("box.note_no_rule") => {}
+        [note, ..] => return Err(format!("the box carries a vendor note: {note}")),
+    }
+    if ctx.bypass_mode {
+        return Err("a box in a bypass session is a vendor circuit breaker".to_string());
+    }
+    if let Some(machine) = prompt.runs_on() {
+        return Err(format!(
+            "a command on {machine}: `aterm harness disk` frees this machine's disk"
+        ));
+    }
+    let (readings, subject) = command_readings(prompt, rows, false);
+    if readings.is_empty() {
+        return Err("a Bash box with no command".to_string());
+    }
+    let passed = |seg: &[String]| fence::runs_harness_disk(seg) || fence::runs_ctl_sys(seg);
+    network_free(&readings).and_then(|()| brace_free(&readings))?;
+    for line in &readings {
+        let v = classify_command_except(line, &ctx.python_allow, &passed);
+        if !v.read_only {
+            return Err(format!(
+                "neither a read nor `aterm harness disk` ({}): {}",
+                reading_name(line),
+                v.reason
+            ));
+        }
+    }
+    blanks_shown(&readings)?;
+    proof_gaps_clear(&readings)?;
+    shell_models_hold(&readings, None, ctx)?;
+    plain_under_zsh(&readings, ctx)?;
+    git_reads_clear(&readings, None, ctx)?;
+    secrets_free_except(&readings, &ctx.secrets, ctx.home.as_deref(), &passed)?;
+    Ok(Decision::Approve {
+        rule_id: RULE_DISK_WORKER,
+        choice: once_choice(prompt)?,
+        guard: row_guard(&rows[first_row]),
+        subject,
+        unproven: None,
+    })
 }
 
 const GLOB_SAFE: &[&str] = &[
@@ -2413,11 +2615,22 @@ fn secrets_free(
     secrets: &[SecretRule],
     home: Option<&Path>,
 ) -> Result<(), String> {
+    secrets_free_except(readings, secrets, home, &|_| false)
+}
+
+/// [`secrets_free`], the words of a command `passed` holds read as naming no file it reads
+/// ([`path_operands_except`]).
+fn secrets_free_except(
+    readings: &[String],
+    secrets: &[SecretRule],
+    home: Option<&Path>,
+    passed: &dyn Fn(&[String]) -> bool,
+) -> Result<(), String> {
     if secrets.is_empty() {
         return Ok(());
     }
     for line in readings {
-        let operands = path_operands(line)
+        let operands = path_operands_except(line, passed)
             .map_err(|why| format!("not read-only ({}): {why}", reading_name(line)))?;
         for op in &operands {
             let hit = operand_comps(op, home)

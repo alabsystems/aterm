@@ -790,7 +790,7 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
             HistoryExporter::start(dir.clone(), vec![(0, std::sync::Arc::clone(&term))], true)
                 .expect("the export starts");
         assert!(
-            export.await_caught_up(aterm_spec::wait::MUST_HAPPEN),
+            export.await_passed(aterm_spec::wait::MUST_HAPPEN),
             "{at}: its first pass finishes"
         );
         assert_eq!(
@@ -938,7 +938,7 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     let followed = std::sync::Arc::clone(&sessions.followed);
     let mut export =
         HistoryExporter::start(dir.clone(), sessions, true).expect("the export starts");
-    assert!(export.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
+    assert!(export.await_passed(aterm_spec::wait::MUST_HAPPEN));
     let (mut record, transferred) = prelaunched(31, ApplyMode::Immediate, FreezeSeed::Default);
     record.history_export = Some(export);
     record.dialled = Some(crate::DialledSuccessor {
@@ -1055,7 +1055,7 @@ fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
     let mut export =
         HistoryExporter::start(dir.clone(), vec![(0, std::sync::Arc::clone(&term))], true)
             .expect("the export starts");
-    assert!(export.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
+    assert!(export.await_passed(aterm_spec::wait::MUST_HAPPEN));
     let (mut record, transferred) = prelaunched(33, ApplyMode::Immediate, FreezeSeed::Default);
     record.history_export = Some(export);
     record.dialled = Some(crate::DialledSuccessor {

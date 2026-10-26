@@ -14,16 +14,17 @@ use crate::{App, Wake};
 /// System State's answer to the first-launch offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkstationSetupDecision {
-    /// Begin with this complete reviewed plan, after explicit Apply or thirty
-    /// seconds active and visible without interaction.
+    /// Begin with this plan: the page's own answer on its first tick with a person at this Mac
+    /// (no review, no countdown, no confirmation: design revision 4), or a press on the page.
     Begin(Plan),
-    /// The person pressed Cancel: the worker records it for good (design §3.3).
+    /// A Cancel: the worker records it for good (design §3.3). The page offers none since
+    /// revision 4; the worker's handling of the answer stays.
     Cancelled,
     /// The person closed the review that was shown, unanswered: not this launch. Nothing is
     /// recorded and nothing offers it again in this launch; the next launch offers it once more.
     Closed,
-    /// No window could show the review (none, or none focused), or the setup it reviews ended
-    /// meanwhile: the worker offers it again once one can.
+    /// No window could show the offer, or the setup it offers ended meanwhile: the worker offers
+    /// it again once one can.
     Unavailable,
 }
 
@@ -642,15 +643,14 @@ pub(crate) const fn eligible_launch_command(
 }
 
 impl App {
+    /// Show the offer in System State, focused or not: the page answers it by itself once a person
+    /// is at this Mac, so nothing waits for a window to come to the front.
     pub(crate) fn offer_workstation_setup(&mut self, request: Request) {
-        // A review of the groups the ALab signal adds waits in its tab, focused or not.
-        let widen = matches!(request.kind(), OfferKind::Widen { .. });
         if self.headless
-            || self
+            || !self
                 .windows
                 .values()
-                .all(|window| window.os_window.is_none())
-            || (!widen && !self.any_os_window_focused())
+                .any(|window| crate::has_os_window(window))
         {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
@@ -1021,12 +1021,14 @@ mod tests {
         assert_eq!(gate.take_press(u64::MAX), PagePress::Nobody);
     }
 
-    /// The page's automatic answer to the startup offer, end to end through the host, makes
-    /// the window's own admission (`AdmittedBy::Window`), even while a control client drives
-    /// another tab. A control client's actual page interaction stops the review's countdown;
-    /// its later explicit Apply admits the plan without a standing yes.
+    /// The page's own answer to the startup offer, end to end through the host, comes on the
+    /// first tick with a person at this Mac, as the offered plan stands, even after a control
+    /// client touched the page: a touch holds no answer since design revision 4. It makes the
+    /// window's own admission (`AdmittedBy::Window`) while a control client drives another tab;
+    /// a control client's touch on the page itself leaves the plan standing with no standing
+    /// yes for the access steps.
     #[test]
-    fn the_pages_automatic_answer_is_the_windows_own_admission() {
+    fn the_pages_own_answer_is_the_windows_own_admission() {
         for (elsewhere, on_page) in [(false, false), (true, false), (false, true)] {
             let mut app = App::headless_for_test();
             app.headless = false;
@@ -1035,8 +1037,6 @@ mod tests {
             app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
             let (send, receive) = std::sync::mpsc::channel();
             app.offer_system_state(Request::new(Plan::default(), send));
-            assert!(app.prepare_native_input_scratch(wid));
-            assert!(app.commit_glassless_native_frame(wid), "the offer on glass");
             if elsewhere {
                 app.with_gesture_source(true, |_| ());
             }
@@ -1045,43 +1045,20 @@ mod tests {
             }
             let start = Instant::now();
             app.tick_system_state(start);
-            app.tick_system_state(start + Duration::from_secs(30));
-            if on_page {
-                assert!(
-                    receive.try_recv().is_err(),
-                    "the controller stopped automatic Apply"
-                );
-                let (_, view) = app.active_native_view(wid).unwrap();
-                app.with_gesture_source(true, |app| {
-                    app.dispatch_native_view_event(
-                        wid,
-                        view,
-                        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                            id: crate::native_ui::ActionId::new("system-state/apply"),
-                            value: None,
-                        }),
-                    )
-                })
-                .unwrap();
-            }
             let mut answer = receive
                 .try_recv()
-                .expect("the untouched review expires; the touched review needs explicit Apply");
-            assert!(matches!(
+                .expect("the first tick with a person here answers the offer");
+            assert_eq!(
                 answer.decision,
-                WorkstationSetupDecision::Begin(_)
-            ));
-            let receipt = answer.receipt.take().expect("an Apply's receipt");
+                WorkstationSetupDecision::Begin(Plan::default())
+            );
+            let receipt = answer.receipt.take().expect("an answer's receipt");
             assert_eq!(
                 receipt.admission(),
-                if on_page {
-                    crate::system_state::Admission::Client
-                } else {
-                    crate::system_state::Admission::Automatic
-                }
+                crate::system_state::Admission::Automatic
             );
             receipt.accept();
-            app.tick_system_state(start + Duration::from_secs(31));
+            app.tick_system_state(start + Duration::from_secs(1));
             app.observe_initial_setup_permissions(policy(3, true));
             let admitted = app.admitted_access().map(|yes| (yes.revision(), yes.by()));
             if on_page {
@@ -1091,7 +1068,11 @@ mod tests {
                     "the plan stands"
                 );
             } else {
-                assert_eq!(admitted, Some((3, AdmittedBy::Window)));
+                assert_eq!(
+                    admitted,
+                    Some((3, AdmittedBy::Window)),
+                    "elsewhere {elsewhere}"
+                );
             }
         }
     }
@@ -1116,31 +1097,14 @@ mod tests {
         (app, request, receive)
     }
 
-    fn finish_stopped_startup_review(cancel: bool) {
+    #[test]
+    fn startup_review_withdrawal_cannot_release_an_earlier_local_stop() {
         let (mut app, request, receive) = stopped_startup_review();
-        if cancel {
-            let wid = crate::WindowId(0);
-            let (_, view) = app.active_native_view(wid).unwrap();
-            app.dispatch_native_view_event(
-                wid,
-                view,
-                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                    id: crate::native_ui::ActionId::new("system-state/cancel"),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        } else {
-            request.finish(WorkstationSetupDecision::Unavailable);
-            app.tick_system_state(Instant::now());
-        }
+        request.finish(WorkstationSetupDecision::Unavailable);
+        app.tick_system_state(Instant::now());
         assert_eq!(
             receive.try_recv().unwrap().decision,
-            if cancel {
-                WorkstationSetupDecision::Cancelled
-            } else {
-                WorkstationSetupDecision::Unavailable
-            }
+            WorkstationSetupDecision::Unavailable
         );
         assert!(!request.pending());
         // This is the unchanged policy from before Stop, read after the
@@ -1155,17 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_review_cancel_cannot_release_an_earlier_local_stop() {
-        finish_stopped_startup_review(true);
-    }
-
-    #[test]
-    fn startup_review_withdrawal_cannot_release_an_earlier_local_stop() {
-        finish_stopped_startup_review(false);
-    }
-
-    #[test]
-    fn startup_review_an_accepted_post_stop_apply_rearms_after_its_fresh_policy() {
+    fn startup_review_an_accepted_post_stop_press_rearms_after_its_fresh_policy() {
         let (mut app, _, receive) = stopped_startup_review();
         let wid = crate::WindowId(0);
         let (_, view) = app.active_native_view(wid).unwrap();
@@ -1175,7 +1129,7 @@ mod tests {
                 wid,
                 view,
                 crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                    id: crate::native_ui::ActionId::new("system-state/apply"),
+                    id: crate::native_ui::ActionId::new("system-state/group/1/leave"),
                     value: None,
                 }),
             )
@@ -1454,6 +1408,42 @@ mod tests {
         let seen = window_focus_gains();
         app.window_focus_event(crate::WindowId(0), true);
         assert!(window_focus_gains() > seen);
+    }
+
+    /// An offer that reaches a window nobody has focused is shown in System State at once, not
+    /// answered Unavailable for the worker to try again a minute later, and the page answers it
+    /// on the first tick with a person at this Mac.
+    #[test]
+    fn an_offer_to_an_unfocused_window_is_shown_and_answered_at_once() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.user_input_recent = |_| true;
+        let wid = crate::WindowId(0);
+        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+        app.window_focus_event(wid, false);
+        assert!(!app.any_os_window_focused());
+        let request = Request::new(Plan::default(), send);
+        app.offer_workstation_setup(request.clone());
+        assert!(receive.try_recv().is_err(), "not refused for want of focus");
+        assert!(app.workstation_setup.pending());
+        assert!(
+            app.native_runtime
+                .instance_by_kind(crate::native_app::AppKind::SystemState)
+                .is_some(),
+            "System State shows it"
+        );
+        app.tick_system_state(Instant::now());
+        let mut answer = receive
+            .try_recv()
+            .expect("the first tick with a person here answers it");
+        assert_eq!(
+            answer.decision,
+            WorkstationSetupDecision::Begin(Plan::default())
+        );
+        answer.receipt.take().unwrap().accept();
+        app.resolve_system_state_apply();
+        assert!(!request.pending());
     }
 
     #[test]

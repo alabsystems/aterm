@@ -8,10 +8,11 @@ use aterm_session::sink::SinkWriter;
 
 use super::{App, WindowId, pane, stub_session_with_sink, term_lock};
 
-const FOCUS_IN: &[u8] = b"\x1b[I";
-const FOCUS_OUT: &[u8] = b"\x1b[O";
+pub(crate) const FOCUS_IN: &[u8] = b"\x1b[I";
+pub(crate) const FOCUS_OUT: &[u8] = b"\x1b[O";
 
-fn observer() -> ([i32; 2], Arc<SinkWriter>) {
+/// A session sink whose writes land in the returned pipe's non-blocking read end.
+pub(crate) fn observer() -> ([i32; 2], Arc<SinkWriter>) {
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
@@ -23,7 +24,8 @@ fn observer() -> ([i32; 2], Arc<SinkWriter>) {
     (pipe, Arc::new(SinkWriter::new(pipe[1])))
 }
 
-fn drain(pipe: [i32; 2]) -> Vec<u8> {
+/// What the program behind `pipe`'s sink has been written since the last drain.
+pub(crate) fn drain(pipe: [i32; 2]) -> Vec<u8> {
     let mut bytes = [0u8; 64];
     let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
     if read <= 0 {

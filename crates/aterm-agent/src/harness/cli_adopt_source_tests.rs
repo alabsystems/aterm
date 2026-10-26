@@ -214,7 +214,10 @@ fn source_case(case: i64) -> (i64, i64, i64) {
             }
         }
     }
-    let granted = files[3..]
+    // The account store's state, logins and ledger: the wake marker a published adoption
+    // replaces (`wake_for_roster`, the last file) tells a running host of the row and grants
+    // nothing, while a refusal leaves it as it was with every other file (above).
+    let granted = files[3..6]
         .iter()
         .enumerate()
         .any(|(i, path)| std::fs::read(path).ok() != before[i + 3]);

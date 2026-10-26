@@ -570,14 +570,7 @@ mod tests {
         let console = |console_uid| {
             let mut sys = Fake::root();
             sys.euid = 501;
-            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-            sys.on(
-                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-                Ran::ok("GroupMembership: alice\n"),
-            );
-            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
-            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+            sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
             sys.stat_of(
                 "/dev/console",
                 Stat {

@@ -7,18 +7,25 @@
 # commit, never silently inside a results commit.
 
 [ghostty.tip]
-# The rolling nightly artifact — the exact channel mitchellh's 2026-07-06
-# benchmark charts describe. This pin includes the July IO-rework PRs
-# (#13209 2026-07-06, #13226, #13227, #13237 through 2026-07-07).
-commit = "2511abe3d (self-identified; full sha unresolved — tip dmg carries short id)"
+# The nightly channel — the exact channel mitchellh's 2026-07-06 benchmark
+# charts describe. This pin includes the July IO-rework PRs (#13209
+# 2026-07-06, #13226, #13227, #13237 through 2026-07-07).
+#
+# The artifact is the tip build's per-commit copy, not the rolling `tip`
+# release: that release's Ghostty.dmg is replaced on every green commit, so
+# by 2026-10-25 it was cec8b92f1 (sha256 7077720481b7…) and no longer
+# matched this pin. The per-commit copy at tip.files.ghostty.org is the same
+# file the tip release served on 2026-07-19 (it hashes to the pin), and it
+# does not move.
+commit = "2511abe3dd864013ef9a20c14c50e432f901f703"
 commit_date = "2026-07-19 (re-pin)"
-artifact = "https://github.com/ghostty-org/ghostty/releases/download/tip/Ghostty.dmg"
+artifact = "https://tip.files.ghostty.org/2511abe3dd864013ef9a20c14c50e432f901f703/Ghostty.dmg"
 artifact_sha256 = "63bab66d77d935f4316c355e09a804c6b19fe2213bbeef74c0e9642b5cdf6eb8"
 artifact_built = "2026-07-19 (downloaded)"
 # CFBundleShortVersionString inside the dmg — the tip build self-identifies
 # by commit, so verify this after mounting before any run:
 bundle_version = "2511abe3d"
-note = "Re-pin (new dmg + sha) whenever a D1-class re-measure is triggered; tip rebuilds on every green commit to main."
+note = "Re-pin (a newer commit's per-commit dmg + its sha) whenever a D1-class re-measure is triggered; tip rebuilds on every green commit to main."
 
 [ghostty.stable]
 version = "1.3.1"

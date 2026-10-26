@@ -133,6 +133,16 @@ use crate::{App, CloseOutcome, WindowId, pane, restore};
 
 #[test]
 fn recovery_authority_comes_only_from_typed_restore_fields() {
+    let mut about = restore::NativeLeafRestore::about();
+    assert!(matches!(
+        super::recovery_capability(&about),
+        Some(crate::native_app::RecoveryCapability::About)
+    ));
+    about.route = Some("/about".into());
+    assert!(super::recovery_capability(&about).is_none());
+    about.route = None;
+    about.uri = Some("file:///tmp/unrequested".into());
+    assert!(super::recovery_capability(&about).is_none());
     let valid =
         restore::NativeLeafRestore::document("markdown", "file:///tmp/Guide.md".to_string());
     assert!(matches!(
@@ -670,6 +680,155 @@ fn heterogeneous_active_tab_round_trips_by_recursive_index() {
         Some(crate::tab_model::View::Terminal(_))
     )));
     assert!(reopened.structural_invariants_ok());
+}
+
+#[test]
+fn about_and_legacy_settings_drafts_survive_split_restore_and_update_carry() {
+    use crate::native_app::{AppKind, AppViewState};
+
+    let wid = WindowId(0);
+    let draft = restore::SettingsDraftRestore {
+        key: "font_px".into(),
+        text: "19".into(),
+    };
+    let settings_snapshot = |app: &App, view| {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
+            panic!("legacy Settings keeps its own view");
+        };
+        (
+            state.route,
+            state.carried_field_drafts().carried,
+            state.common.last_focus.clone(),
+            state.common.focus_visible,
+        )
+    };
+
+    for zoomed in [false, true] {
+        let mut settings = restore::NativeLeafRestore::settings("/about".into());
+        settings.settings_drafts.push(draft.clone());
+        let root = split_of(
+            native_leaf(settings),
+            native_leaf(restore::NativeLeafRestore::about()),
+        );
+        let mut layout = window_of(vec![root.clone()]);
+        layout.restored_tabs[0].focused_path = vec![restore::RestoreBranch::Second];
+        layout.restored_tabs[0].zoomed = zoomed;
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new("font_px = 16\n".to_string())
+                .unwrap();
+        app.restore_into_window(wid, layout);
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        let tab_id = tab.id;
+        let leaves = tab.root.leaves();
+        let settings_view = leaves[0];
+        let about_view = leaves[1];
+        assert_eq!(tab.focus, about_view);
+        assert_eq!(tab.zoomed, zoomed);
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+        assert!(matches!(
+            app.native_runtime.view_state(about_view),
+            Some(AppViewState::About(_))
+        ));
+        let before = settings_snapshot(&app, settings_view);
+        assert_eq!(before.0, crate::native_settings::SettingsRoute::About);
+        assert_eq!(before.1, vec![draft.clone()]);
+        assert!(app.open_about_tab_in_window(wid));
+        assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab_id));
+        assert_eq!(
+            app.windows[&wid].tab_set.active().unwrap().focus,
+            about_view
+        );
+        assert_eq!(settings_snapshot(&app, settings_view), before);
+
+        let captured = app.capture_handoff_layout();
+        assert_eq!(captured.windows[0].restored_tabs[0].root, root);
+        assert_eq!(
+            captured.windows[0].restored_tabs[0].focused_path,
+            vec![restore::RestoreBranch::Second]
+        );
+        assert_eq!(captured.windows[0].restored_tabs[0].zoomed, zoomed);
+        let decoded = restore::RestoreManifest::from_toml(&captured.to_toml().unwrap()).unwrap();
+        let mut successor = App::headless_for_test();
+        successor.native_config_service =
+            crate::native_config_service::VersionedConfigService::new("font_px = 16\n".to_string())
+                .unwrap();
+        successor.restore_into_window(wid, decoded.windows.into_iter().next().unwrap());
+        let tab = successor.windows[&wid].tab_set.active().unwrap();
+        let leaves = tab.root.leaves();
+        assert_eq!(tab.focus, leaves[1]);
+        assert_eq!(tab.zoomed, zoomed);
+        assert_eq!(
+            settings_snapshot(&successor, leaves[0]).1,
+            vec![draft.clone()]
+        );
+        assert!(matches!(
+            successor.native_runtime.view_state(leaves[1]),
+            Some(AppViewState::About(_))
+        ));
+        assert!(successor.structural_invariants_ok());
+
+        app.close_focused_mixed_leaf(wid).unwrap();
+        assert!(app.view_store.get(about_view).is_none());
+        assert_eq!(settings_snapshot(&app, settings_view), before);
+        app.reopen_last_closed_view().unwrap();
+        let (instance, reopened_view) = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            app.native_runtime.app(instance).unwrap().kind(),
+            AppKind::About
+        );
+        assert_ne!(reopened_view, about_view);
+        assert_eq!(app.windows[&wid].tab_set.active().unwrap().root.len(), 2);
+        assert_eq!(settings_snapshot(&app, settings_view), before);
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[test]
+fn about_control_open_and_closed_tab_restore_keep_distinct_views_of_one_controller() {
+    use crate::native_app::{AppKind, AppViewState};
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    let settings = app.active_native_view(wid).unwrap();
+    let initial_tabs = app.windows[&wid].tab_set.len();
+    assert_eq!(
+        app.open_app(crate::app_control::parse_open("app about").unwrap())
+            .unwrap(),
+        "app about"
+    );
+    let original = app.active_native_view(wid).unwrap();
+    assert_eq!(
+        app.native_runtime.app(original.0).unwrap().kind(),
+        AppKind::About
+    );
+    assert_eq!(app.native_runtime.document_id(original.0), None);
+    assert_eq!(app.windows[&wid].tab_set.len(), initial_tabs + 1);
+    assert_eq!(
+        app.native_restore_descriptor(app.windows[&wid].tab_set.active().unwrap()),
+        Some(restore::NativeTabRestore::About)
+    );
+    assert!(app.open_about_tab());
+    assert_eq!(app.active_native_view(wid), Some(original));
+    assert_eq!(app.windows[&wid].tab_set.len(), initial_tabs + 1);
+
+    let (_, mirror) = app.stage_about_tab(wid).unwrap();
+    assert_ne!(mirror, original.1);
+    assert_eq!(app.active_native_view(wid).unwrap().0, original.0);
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.view_store.get(mirror).is_none());
+    app.reopen_last_closed_tab().unwrap();
+    let reopened = app.active_native_view(wid).unwrap();
+    assert_eq!(reopened.0, original.0);
+    assert_ne!(reopened.1, mirror);
+    assert_ne!(reopened.1, original.1);
+    assert!(app.view_store.get(original.1).is_some());
+    assert!(
+        matches!(app.native_runtime.view_state(settings.1), Some(AppViewState::Settings(state)) if state.route == crate::native_settings::SettingsRoute::TextFonts)
+    );
+    assert_eq!(app.pool.views(0), Some(1), "About never creates a PTY");
+    assert!(app.structural_invariants_ok());
 }
 
 #[test]
@@ -3656,6 +3815,7 @@ fn a_held_tabs_record_is_its_own_agents() {
                 ],
                 session: THREAD.into(),
                 codex_home: Some("/opt/agents/codex".into()),
+                codex_auth_path: None,
                 cwd: None,
             }),
             carried: None,

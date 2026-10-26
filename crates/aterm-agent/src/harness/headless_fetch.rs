@@ -1,20 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HARNESS FETCHES ITS OWN HEADLESS BROWSER. Where no headless browser is found
-//! ([`super::headless_oauth::find_headless_browser`]) and a headless sign-in waits on one alone
-//! (the Grok gate's automatic rung, `super::grok_signin::LiveAuto`), the pinned
-//! chrome-headless-shell is fetched into the cache root that finder reads
-//! ([`cache_root`]): the browser lane's own pin ([`aterm_uds::host::chrome`], one source for
-//! both), downloaded by [`CURL`] by its absolute path over https only, held to the pin's size
+//! THE HARNESS FETCHES ITS OWN BROWSERS. Two pinned builds of Chrome for Testing, one source
+//! for both ([`aterm_uds::host::chrome`]), each fetched into the cache root the finders read
+//! ([`cache_root`]) only where none is found:
+//! - the chrome-headless-shell ([`Archive::host`]), where no headless browser is found
+//!   ([`super::headless_oauth::find_headless_browser`]) and a headless sign-in waits on one alone
+//!   (the Grok gate's automatic rung, `super::grok_signin::LiveAuto`): the browser lane's own pin;
+//! - the full Chrome for Testing that opens a window ([`Archive::host_window`]), where no such
+//!   Chromium is found ([`super::browser_window::find_window_browser`]) and `aterm harness
+//!   accounts browser` would open one ([`super::browser_window::fetch_window_browser`]).
+//!
+//! Each is downloaded by [`CURL`] by its absolute path over https only, held to the pin's size
 //! and then its sha256, unpacked by atpkg's vetted extractor (each member beneath the tree,
 //! links only within it), and moved into place with one rename once its executable is there.
 //!
 //! Fail-closed: no network, a partial download, a size or sha256 other than the pin's, an
 //! archive that does not unpack or holds no executable installs nothing and says why; the
-//! scratch it fetched into goes with it. A stop (the caller's Ctrl-C, a hangup) ends the
-//! download within one poll, curl's process group killed, and installs nothing either
-//! ([`run_stoppable`]). Nothing here runs the browser.
+//! scratch it fetched into goes with it, and the cache root keeps one line saying why for that
+//! archive, read for [`FAILURE_KEPT`] or until a later install of it succeeds ([`last_failure`]).
+//! A stop (the caller's Ctrl-C,
+//! a hangup) ends the download within one poll, curl's process group killed, and installs
+//! nothing either ([`run_stoppable`]); a stop is no failure and is not kept. Nothing here runs
+//! the browser.
+//!
+//! Gatekeeper: neither curl nor the extractor sets `com.apple.quarantine`, and nothing here
+//! removes one, so what is placed carries no quarantine flag to strip, the headless shell and the
+//! full build alike. Chrome for Testing's macOS builds are not Developer ID signed: each Mach-O
+//! is ad hoc and linker-signed, and the bundle seals no resources, so `codesign --verify` of the
+//! app reports `code has no resources but signature indicates they must be present` on Google's
+//! own bytes as `/usr/bin/unzip` lays them too (measured on the 155.0.8059.84 mac-arm64 build,
+//! 2026-10-25). No signature check stands in for the pin: the archive's sha256 is what admits it.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -23,15 +39,34 @@ use std::time::{Duration, Instant, SystemTime};
 /// The downloader, by its absolute path (`DESIGN-init-system` S12).
 pub const CURL: &str = "/usr/bin/curl";
 
-/// The longest one fetch may take (`curl --max-time`): the archive is about 100 MB.
+/// The longest one fetch of the headless shell may take (`curl --max-time`): the archive is
+/// about 100 MB.
 pub const FETCH_WITHIN: Duration = Duration::from_secs(5 * 60);
 
-/// The most bytes an unpacked archive may hold: the pinned shell unpacks to about 250 MB.
+/// The longest one fetch of the full build may take (`curl --max-time`): the archive is about
+/// 200 MB.
+pub const WINDOW_FETCH_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+/// The most bytes an unpacked archive may hold: the pinned shell unpacks to about 250 MB and the
+/// full build to at most 418 MB.
 pub const UNPACKED_MAX: u64 = 1 << 30;
 
-/// The prefix of a fetch's scratch directory in the cache root (never `chrome-headless-shell-`,
-/// which the finder reads).
-const SCRATCH_PREFIX: &str = ".fetch-chrome-headless-shell-";
+/// The prefix of a fetch's scratch directory in the cache root (never `chrome-`, which the
+/// finders read; it covers the scratch an earlier build named `.fetch-chrome-headless-shell-`).
+const SCRATCH_PREFIX: &str = ".fetch-";
+
+/// The prefix of an archive's failure record in the cache root ([`last_failure`]): never
+/// [`SCRATCH_PREFIX`], whose stale entries are removed.
+const FAILED_PREFIX: &str = ".failed-";
+
+/// The most bytes of a reason a failure record keeps.
+const FAILED_WHY_MAX: usize = 240;
+
+/// How long a failure record is read ([`last_failure`]): a failed fetch says what the network or
+/// the cache was like then, and an older one no longer keeps `accounts browser` out of Grok
+/// Build's sign-in need, so one dropped connection does not leave the need on the mailbox for
+/// good. A later failure writes it anew.
+pub const FAILURE_KEPT: Duration = Duration::from_secs(60 * 60);
 
 /// A scratch left by a fetch that was killed is removed once it is this old.
 const STALE_SCRATCH: Duration = Duration::from_secs(60 * 60);
@@ -60,8 +95,8 @@ const PASSED: &[&str] = &[
 
 /// Downloads one archive: [`Curl`], or a test's stand-in.
 pub trait Fetch {
-    /// Downloads `url` into the new file `dest`, at most `bytes` long, ending at once (within a
-    /// poll) once `stopped` says the caller was asked to stop.
+    /// Downloads `url` into the new file `dest`, at most `bytes` long and within `within`,
+    /// ending at once (within a poll) once `stopped` says the caller was asked to stop.
     /// # Errors
     /// Why it did not finish (no network, a refusal, the time ran out, [`STOPPED`]).
     fn fetch(
@@ -69,12 +104,13 @@ pub trait Fetch {
         url: &str,
         dest: &Path,
         bytes: u64,
+        within: Duration,
         stopped: &dyn Fn() -> bool,
     ) -> Result<(), String>;
 }
 
-/// [`CURL`]: https only (redirects too), TLS 1.2 at least, no retry, at most the pin's size and
-/// [`FETCH_WITHIN`], stoppable ([`run_stoppable`]).
+/// [`CURL`]: https only (redirects too), TLS 1.2 at least, no retry, at most the archive's size
+/// and time ([`Archive::within`]), stoppable ([`run_stoppable`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Curl;
 
@@ -122,16 +158,14 @@ pub fn run_stoppable(
     }
 }
 
-/// What a curl exit means, in words.
-fn curl_words(code: Option<i32>) -> String {
+/// What a curl exit means, in words, for a fetch given `within`.
+fn curl_words(code: Option<i32>, within: Duration) -> String {
     match code {
+        Some(1) => "curl refused the URL's protocol (https only)".to_owned(),
         Some(6) => "the host could not be resolved (no network?)".to_owned(),
         Some(7) => "the host could not be reached (no network?)".to_owned(),
         Some(22) => "the server refused the download".to_owned(),
-        Some(28) => format!(
-            "it did not finish within {} min",
-            FETCH_WITHIN.as_secs() / 60
-        ),
+        Some(28) => format!("it did not finish within {} min", within.as_secs() / 60),
         Some(35 | 60) => "the TLS connection was refused".to_owned(),
         Some(63) => "it was larger than the pin".to_owned(),
         Some(code) => format!("curl exited {code}"),
@@ -145,6 +179,7 @@ impl Fetch for Curl {
         url: &str,
         dest: &Path,
         bytes: u64,
+        within: Duration,
         stopped: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let mut cmd = aterm_uds::spawnfd::command(CURL);
@@ -164,7 +199,7 @@ impl Fetch for Curl {
         .arg("--max-filesize")
         .arg(bytes.to_string())
         .arg("--max-time")
-        .arg(FETCH_WITHIN.as_secs().to_string())
+        .arg(within.as_secs().to_string())
         .arg("-o")
         .arg(dest)
         .arg("--")
@@ -175,9 +210,9 @@ impl Fetch for Curl {
                 cmd.env(name, value);
             }
         }
-        match run_stoppable(cmd, FETCH_WITHIN + Duration::from_secs(30), stopped)? {
+        match run_stoppable(cmd, within + Duration::from_secs(30), stopped)? {
             Some(0) => Ok(()),
-            code => Err(curl_words(code)),
+            code => Err(curl_words(code, within)),
         }
     }
 }
@@ -195,6 +230,8 @@ pub struct Archive {
     pub dir: String,
     /// Its executable, relative to that directory.
     pub binary: PathBuf,
+    /// The longest its download may take ([`Fetch::fetch`]).
+    pub within: Duration,
 }
 
 impl Archive {
@@ -212,6 +249,7 @@ impl Archive {
             bytes: pin.bytes,
             dir: format!("{}{DIR_SUFFIX}", lane.display()),
             binary: chrome::pinned_binary(Path::new(""), pin.platform),
+            within: FETCH_WITHIN,
         })
     }
 
@@ -219,6 +257,31 @@ impl Archive {
     #[must_use]
     pub fn host() -> Option<Archive> {
         Archive::pinned(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// The pinned full Chrome for Testing of `(os, arch)`, the build that opens a window
+    /// ([`aterm_uds::host::chrome::WINDOW_PINNED`]), where the pin covers it; placed as
+    /// `chrome-<version>-<platform>` with [`DIR_SUFFIX`], a versioned folder the window
+    /// browser's finder reads, beside any a person unzipped there and never in its place.
+    #[must_use]
+    pub fn window(os: &str, arch: &str) -> Option<Archive> {
+        use aterm_uds::host::chrome;
+        let pin = chrome::window_pin_for(os, arch)?;
+        let dir = chrome::window_pinned_dir(Path::new(""), pin.platform);
+        Some(Archive {
+            url: chrome::window_archive_url(pin.platform),
+            sha256: pin.sha256.to_owned(),
+            bytes: pin.bytes,
+            dir: format!("{}{DIR_SUFFIX}", dir.display()),
+            binary: chrome::window_pinned_binary(Path::new(""), pin.platform),
+            within: WINDOW_FETCH_WITHIN,
+        })
+    }
+
+    /// This host's pinned full Chrome for Testing ([`Archive::window`]).
+    #[must_use]
+    pub fn host_window() -> Option<Archive> {
+        Archive::window(std::env::consts::OS, std::env::consts::ARCH)
     }
 }
 
@@ -247,6 +310,21 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         hash.update(&buf[..n]);
     }
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether [`CURL`] is here to fetch with: a file (or a link to one) with an execute bit. A
+/// minimal Linux image may have none.
+#[must_use]
+pub fn curl_present() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(CURL).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Whether `path` is a regular file with an execute bit.
@@ -288,15 +366,74 @@ fn remove_stale_scratch(root: &Path) {
     }
 }
 
+/// Where `root` keeps why the last install of `archive` failed ([`last_failure`]).
+fn failure_path(root: &Path, archive: &Archive) -> PathBuf {
+    root.join(format!("{FAILED_PREFIX}{}", archive.dir))
+}
+
+/// Why the last install of `archive` into the cache `root` failed, where it did within
+/// [`FAILURE_KEPT`] (by its record's modification time) and no later install of it succeeded
+/// ([`install`]): one line, never a URL's query or a credential (it is the install's own error).
+/// A stop is not kept.
+#[must_use]
+pub fn last_failure(root: &Path, archive: &Archive) -> Option<String> {
+    last_failure_at(root, archive, SystemTime::now())
+}
+
+/// [`last_failure`] as of `now`: a record written more than [`FAILURE_KEPT`] before it is not
+/// read (nor one whose time cannot be read).
+fn last_failure_at(root: &Path, archive: &Archive, now: SystemTime) -> Option<String> {
+    let record = failure_path(root, archive);
+    let written = std::fs::metadata(&record).and_then(|m| m.modified()).ok()?;
+    if now.duration_since(written).unwrap_or(Duration::ZERO) > FAILURE_KEPT {
+        return None;
+    }
+    let text = std::fs::read_to_string(&record).ok()?;
+    let why = super::one_line(text.trim(), FAILED_WHY_MAX);
+    Some(if why.is_empty() {
+        "an earlier fetch failed".to_owned()
+    } else {
+        why
+    })
+}
+
 /// Installs `archive` into the cache `root` through `fetch` and returns its executable: at once
 /// where it is already in place; else downloaded into a fresh scratch in `root`, held to its
-/// size and sha256, unpacked there, and renamed into place once its executable is in the tree.
-/// `stopped` is asked before each step and through the download ([`Fetch::fetch`]).
+/// size and sha256, unpacked there, and renamed into place once its executable is in the tree,
+/// never over a tree another fetch placed meanwhile (that one is returned). `stopped` is asked
+/// before each step and through the download ([`Fetch::fetch`]). Once it is in place, an earlier
+/// failure's record is removed; a failure the caller's stop did not cause is kept in `root`
+/// ([`last_failure`]).
 /// # Errors
 /// Each says why and that nothing was installed: the root or scratch cannot be made, the download
 /// failed or was cut short, its size or sha256 is not the pin's, it does not unpack, it holds no
 /// executable, it cannot be put in place, or it was stopped ([`STOPPED`]).
 pub fn install(
+    root: &Path,
+    archive: &Archive,
+    fetch: &mut dyn Fetch,
+    stopped: &dyn Fn() -> bool,
+) -> Result<PathBuf, String> {
+    let placed = place(root, archive, fetch, stopped);
+    let record = failure_path(root, archive);
+    match &placed {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&record);
+        }
+        Err(why) if !stopped() => {
+            // Best effort: a root that cannot be made keeps no record either.
+            let _ = std::fs::write(
+                &record,
+                format!("{}\n", super::one_line(why, FAILED_WHY_MAX)),
+            );
+        }
+        Err(_) => {}
+    }
+    placed
+}
+
+/// [`install`] before its record.
+fn place(
     root: &Path,
     archive: &Archive,
     fetch: &mut dyn Fetch,
@@ -322,7 +459,7 @@ pub fn install(
         })?;
     let file = scratch.path().join("archive.zip");
     fetch
-        .fetch(&archive.url, &file, archive.bytes, stopped)
+        .fetch(&archive.url, &file, archive.bytes, archive.within, stopped)
         .map_err(|why| none(format!("the download failed: {why}")))?;
     if stopped() {
         return Err(none(format!("the download failed: {STOPPED}")));
@@ -366,14 +503,25 @@ pub fn install(
     if stopped() {
         return Err(none(STOPPED.to_owned()));
     }
-    if std::fs::symlink_metadata(&dest).is_ok() {
-        // A directory without the executable (a copy cut short by hand): set aside in the
-        // scratch, which goes with it, so the rename below lands on nothing.
-        let _ = std::fs::rename(&dest, scratch.path().join("replaced"));
+    // The rename lands only where nothing (or an empty directory) is: a tree another fetch
+    // placed meanwhile (`accounts browser` fetches before it takes the sign-in lock, so two
+    // terminals may) is never moved, since a browser may already run from it.
+    match std::fs::rename(&tree, &dest) {
+        Ok(()) => return Ok(binary),
+        // Another fetch placed the same pin first: its tree stays, this one goes with the scratch.
+        Err(_) if is_executable(&binary) => return Ok(binary),
+        Err(_) => {}
     }
+    // Something without the executable is there (a copy cut short by hand): set aside in the
+    // scratch, which goes with it, and the tree renamed in its place. Looked at once more first,
+    // so only a tree another fetch placed within these few calls can be set aside, and that one
+    // only where something broken was there before both.
+    if is_executable(&binary) {
+        return Ok(binary);
+    }
+    let _ = std::fs::rename(&dest, scratch.path().join("replaced"));
     match std::fs::rename(&tree, &dest) {
         Ok(()) => Ok(binary),
-        // Another fetch placed the same pin first.
         Err(_) if is_executable(&binary) => Ok(binary),
         Err(e) => Err(none(format!("{} cannot be placed: {e}", dest.display()))),
     }

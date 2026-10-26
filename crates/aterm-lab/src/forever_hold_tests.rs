@@ -227,6 +227,28 @@ fn each_repository_chain_says_its_own_count_alone() {
     assert!(matches!(legs(&stale, &cx(), L4), Verdict::Pass(_)));
 }
 
+/// A stopped tab's hover and state line lead with the stop (3a), the hold's words behind it: each
+/// leg is read past the stop, so a stopped land-c still says its own count alone.
+#[test]
+fn a_stopped_tabs_legs_are_read_past_its_stop() {
+    use aterm_agent::harness::acts::{FACT_SEPARATOR, HeldBy, stop_words};
+    let mut stopped = seen("repo", "1 untracked file", "x", false);
+    let hover = stop_words(HeldBy::SameReply, StopForm::Hover);
+    let line = stop_words(HeldBy::SameReply, StopForm::Line);
+    stopped.window.hover[1].1 =
+        format!("driven by aterm (land: {hover}; not landed yet, 1 untracked file)");
+    stopped.window.page[2].1 = format!(
+        "head=land-c: Window 2, tab 4\nstate={line}{FACT_SEPARATOR}not landed yet: 1 untracked \
+         file \u{b7} landing since 03:20"
+    );
+    let v = legs(&stopped, &cx(), L4);
+    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
+    assert!(
+        matches!(legs(&stopped, &cx(), L8), Verdict::Fail(_)),
+        "L8's count"
+    );
+}
+
 /// The line the first look read counts even when later reads draw the row with no state line.
 #[test]
 fn the_first_looks_state_line_counts_though_its_page_read_came_first() {

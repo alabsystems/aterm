@@ -284,7 +284,7 @@ pub struct SoundEvent {
     pub gain: f32,
     /// The host's inferred [`Tone`] of the typed line (the [`crate::tone`] classifier).
     pub tone: Tone,
-    /// Whether this gesture may feed the ambient bed (the host's `trail_sound_bed` setting, default on).
+    /// Whether this gesture may feed the ambient bed (the host's `trail_sound_bed` setting, default off).
     pub bed: bool,
     /// The glyph was shifted (a capital or shifted symbol): lifts this keystroke by [`SHIFT_GLYPH_LIFT`].
     pub shifted: bool,
@@ -1176,6 +1176,9 @@ struct Bed {
     energy: f32,
     level: f32,
     gain: f32,
+    out_lvl: f32,
+    hp_m: f32,
+    hp_s: f32,
     ph1: f32,
     ph2: f32,
     ph3: f32,
@@ -1199,6 +1202,9 @@ impl Bed {
         energy: 0.0,
         level: 0.0,
         gain: 0.0,
+        out_lvl: 0.0,
+        hp_m: 0.0,
+        hp_s: 0.0,
         ph1: 0.0,
         ph2: 0.0,
         ph3: 0.0,
@@ -1449,7 +1455,11 @@ impl TrailSynth {
             }
             i += 1;
         }
-        self.bed.level < 1e-3 && self.bed.energy < 1e-3 && self.dc_y_l == 0.0 && self.dc_y_r == 0.0
+        self.bed.level < 1e-3
+            && self.bed.energy < 1e-3
+            && self.bed.out_lvl < 1e-4
+            && self.dc_y_l == 0.0
+            && self.dc_y_r == 0.0
     }
 
     /// Number of live voices (test/diagnostic hook).
@@ -2803,6 +2813,9 @@ impl TrailSynth {
             }
             self.bed.level = 0.0;
             self.bed.energy = 0.0;
+            self.bed.out_lvl = 0.0;
+            self.bed.hp_m = 0.0;
+            self.bed.hp_s = 0.0;
             self.duck = 0.0;
             self.sing = 0.0;
             self.sing_hold = 0.0;
@@ -2823,8 +2836,18 @@ impl TrailSynth {
         } else {
             0.0
         };
-        let bed_on = self.bed.level >= 1e-4;
-        let bed_lvl = self.bed.level * self.bed.gain;
+        let bed_target = if self.bed.level >= 1e-4 {
+            self.bed.level * self.bed.gain
+        } else {
+            0.0
+        };
+        let bed_on = bed_target > 0.0 || self.bed.out_lvl >= 1e-5;
+        let bed_slew = if bed_on {
+            const INV_BED_OUT_TAU_S: f32 = -1.0 / 0.012;
+            1.0 - crate::color_math::exp_f32(dt * INV_BED_OUT_TAU_S)
+        } else {
+            0.0
+        };
         let bed_palette = if bed_on {
             Some(palette_for(self.bed_voice, self.bed_style))
         } else {
@@ -3026,7 +3049,8 @@ impl TrailSynth {
             active_len = write_idx;
 
             if let Some(palette) = bed_palette {
-                let (bl, br) = self.bed_sample_with(palette, dt, bed_lvl);
+                self.bed.out_lvl += (bed_target - self.bed.out_lvl) * bed_slew;
+                let (bl, br) = self.bed_sample_with(palette, dt, self.bed.out_lvl);
                 l += bl;
                 r += br;
             }
@@ -3055,6 +3079,11 @@ impl TrailSynth {
             out[f * 2] = soft_clip(yl);
             out[f * 2 + 1] = soft_clip(yr);
             f += 1;
+        }
+        if bed_target == 0.0 && self.bed.out_lvl < 1e-5 {
+            self.bed.out_lvl = 0.0;
+            self.bed.hp_m = 0.0;
+            self.bed.hp_s = 0.0;
         }
         if self.duck < 1e-4 {
             self.duck = 0.0;
@@ -3091,7 +3120,7 @@ impl TrailSynth {
     const fn tick_bed(&mut self, dt: f32) {
         let b = &mut self.bed;
         if b.energy > 0.0 {
-            let inv_tau_e = if b.energy < 0.02 { -5.0 } else { -1.0 / 0.7 };
+            let inv_tau_e = if b.energy < 0.02 { -5.0 } else { -1.0 / 0.32 };
             b.energy *= crate::color_math::exp_f32(dt * inv_tau_e);
         }
         let target = b.energy.min(1.0);
@@ -3101,7 +3130,7 @@ impl TrailSynth {
             } else if b.level < 0.02 {
                 -5.0
             } else {
-                -1.0 / 0.7
+                -1.0 / 0.32
             };
             b.level += (target - b.level) * (1.0 - crate::color_math::exp_f32(dt * inv_tau));
         }
@@ -3145,6 +3174,15 @@ impl TrailSynth {
         self.bed.lfo2 = (self.bed.lfo2 + 0.71 * dt).fract();
 
         let (m, side) = palette.bed_sample(self, dt, lvl);
+        if matches!(palette, PaletteKind::Mech | PaletteKind::Typewriter) {
+            return (0.0, 0.0);
+        }
+        const BED_HP_HZ: f32 = 220.0;
+        let k_hp = (BED_HP_HZ * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        self.bed.hp_m += k_hp * (m - self.bed.hp_m);
+        self.bed.hp_s += k_hp * (side - self.bed.hp_s);
+        let m = m - self.bed.hp_m;
+        let side = side - self.bed.hp_s;
         (m + side, m - side)
     }
 }
@@ -3340,11 +3378,11 @@ impl LumenPalette {
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
-        b.ph1 = (b.ph1 + 165.0 * dt).fract();
-        b.ph2 = (b.ph2 + 165.6 * dt).fract();
-        b.ph3 = (b.ph3 + 412.5 * dt).fract();
+        b.ph1 = (b.ph1 + 330.0 * dt).fract();
+        b.ph2 = (b.ph2 + 330.8 * dt).fract();
+        b.ph3 = (b.ph3 + 495.0 * dt).fract();
         let sm = sin01(b.ph1) + sin01(b.ph2) + (0.1 + 0.2 * u1) * sin01(b.ph3);
-        (sm * lvl * 0.024, sm * lvl * 0.005)
+        (sm * lvl * 0.015, sm * lvl * 0.004)
     }
 }
 
@@ -3460,12 +3498,12 @@ impl PhaserPalette {
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
-        b.ph1 = (b.ph1 + 196.0 * dt).fract();
-        b.ph2 = (b.ph2 + 196.8 * dt).fract();
+        b.ph1 = (b.ph1 + 392.0 * dt).fract();
+        b.ph2 = (b.ph2 + 393.0 * dt).fract();
         let sm = tri(b.ph1) + tri(b.ph2);
-        let k = ((400.0 + 500.0 * u1) * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        let k = ((520.0 + 480.0 * u1) * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (sm - b.lp1);
-        (b.lp1 * lvl * 0.05, 0.0)
+        (b.lp1 * lvl * 0.028, 0.0)
     }
 }
 
@@ -3855,12 +3893,12 @@ impl LaserPalette {
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
-        let k = (140.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        let k = (420.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (white - b.lp1);
         let ks = (1.3 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp2 += ks * (white - b.lp2);
         let swell = (1.0 + 40.0 * b.lp2).clamp(0.25, 2.2);
-        (b.lp1 * lvl * 0.5 * swell, 0.0)
+        (b.lp1 * lvl * 0.28 * swell, 0.0)
     }
 }
 
@@ -3951,13 +3989,13 @@ impl BeamPalette {
         let white = s.rnd() * 2.0 - 1.0;
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
-        let cut = 130.0 - 55.0 * b.droop;
-        let k = (cut.max(60.0) * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        let cut = 680.0 - 140.0 * b.droop;
+        let k = (cut.max(420.0) * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (white - b.lp1);
-        let k2 = (90.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        let k2 = (620.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp2 += k2 * (b.lp1 - b.lp2);
         let breathe = 0.75 + 0.25 * u1;
-        (b.lp2 * lvl * 0.5 * breathe, b.lp1 * lvl * 0.03)
+        (b.lp2 * lvl * 0.22 * breathe, b.lp1 * lvl * 0.025)
     }
 }
 
@@ -4268,11 +4306,11 @@ impl CometPalette {
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
-        b.ph1 = (b.ph1 + 110.0 * dt).fract();
-        b.ph2 = (b.ph2 + 110.5 * dt).fract();
-        b.ph3 = (b.ph3 + 165.0 * dt).fract();
+        b.ph1 = (b.ph1 + 330.0 * dt).fract();
+        b.ph2 = (b.ph2 + 330.7 * dt).fract();
+        b.ph3 = (b.ph3 + 440.0 * dt).fract();
         let sm = 0.5 * sin01(b.ph1) + 0.5 * sin01(b.ph2) + (0.08 + 0.12 * u1) * sin01(b.ph3);
-        (sm * lvl * 0.055, sm * lvl * 0.014)
+        (sm * lvl * 0.026, sm * lvl * 0.008)
     }
 }
 
@@ -4625,12 +4663,12 @@ impl MarimbaPalette {
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
-        b.ph1 = (b.ph1 + 130.8 * dt).fract();
-        b.ph2 = (b.ph2 + 196.2 * dt).fract();
+        b.ph1 = (b.ph1 + 261.6 * dt).fract();
+        b.ph2 = (b.ph2 + 392.4 * dt).fract();
         let sm = (0.6 + 0.4 * u1) * (sin01(b.ph1) + 0.7 * sin01(b.ph2));
-        let k = (600.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        let k = (750.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (sm - b.lp1);
-        (b.lp1 * lvl * 0.018, 0.0)
+        (b.lp1 * lvl * 0.011, 0.0)
     }
 }
 
@@ -4710,12 +4748,12 @@ impl FeltPalette {
 
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let b = &mut s.bed;
-        b.ph1 = (b.ph1 + 98.0 * dt).fract();
-        b.ph2 = (b.ph2 + 98.3 * dt).fract();
+        b.ph1 = (b.ph1 + 392.0 * dt).fract();
+        b.ph2 = (b.ph2 + 392.6 * dt).fract();
         let sm = sin01(b.ph1) + sin01(b.ph2);
-        let k = (400.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        let k = (650.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (sm - b.lp1);
-        (b.lp1 * lvl * 0.02, 0.0)
+        (b.lp1 * lvl * 0.010, 0.0)
     }
 }
 

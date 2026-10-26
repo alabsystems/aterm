@@ -16,7 +16,7 @@ const CAPTURED: i64 = 1_792_815_886;
 /// Its wall's reset, Oct 25 at 5:00 PM PDT.
 const RESET: i64 = 1_792_972_800;
 
-/// One point: its screen, its time from the loop's base, the turn it ended, when a person typed before it and whether their keys ended on an Enter over what they typed (the session's submit count one up), and the history above the screen the host serves.
+/// One point: its screen, its time from the loop's base, the turn it ended, when a person typed before it and whether their keys ended on an Enter over what they typed (the session's submit count one up), the history above the screen the host serves, and the session's input and submission counts the read carries where a recording gives them.
 struct R {
     rows: Vec<String>,
     at: i64,
@@ -24,6 +24,7 @@ struct R {
     typed: Option<i64>,
     entered: bool,
     above: Option<Vec<String>>,
+    counts: Option<(u64, u64)>,
 }
 
 fn r(rows: &[String], at: i64, worked: Option<u64>) -> R {
@@ -34,6 +35,7 @@ fn r(rows: &[String], at: i64, worked: Option<u64>) -> R {
         typed: None,
         entered: false,
         above: None,
+        counts: None,
     }
 }
 
@@ -188,7 +190,12 @@ impl<'a> Driver<'a> {
         let point = self.s.turn_of(Screen {
             rows: p.rows.clone(),
             seq: self.seq,
-            submits: (!self.uncounted).then_some(self.submits),
+            submits: match p.counts {
+                Some((_, submits)) => Some(submits),
+                None => (!self.uncounted).then_some(self.submits),
+            },
+            inputs_before: p.counts.map(|(inputs, _)| inputs),
+            inputs_after: p.counts.map(|(inputs, _)| inputs),
             ..Screen::default()
         });
         let a = self
@@ -386,7 +393,10 @@ fn a_wall_no_reader_names_is_typed_into_at_most_once_more_then_held_until_it_cha
             "{tag}: the same reply again holds every act: {out:#?}"
         );
         assert!(out[..3].iter().all(|o| o.told.is_none()), "{out:#?}");
-        let held = Some(format!("stalled {}", Exception::repeats().why));
+        let held = Some(format!(
+            "stalled {}",
+            Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+        ));
         assert!(
             out[3..].iter().all(|o| o.told == held),
             "{tag}: the tab's exception says so: {out:#?}"
@@ -454,7 +464,10 @@ fn api_frame(asks: &[Option<&str>]) -> Vec<String> {
 
 #[test]
 fn a_wall_no_reader_names_on_a_screen_drawn_the_same_each_time_is_held_all_the_same() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     assert_eq!(steady(1), steady(2), "the viewport repeats itself");
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("same-reply-steady-{autopilot:?}");
@@ -516,7 +529,10 @@ fn a_tab_already_looping_at_such_a_wall_gets_two_acts_at_most_from_a_loop_with_n
 
 #[test]
 fn a_wall_no_reader_names_behind_an_api_error_frame_is_retried_at_most_once_more_then_held() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("same-reply-api-frame-{autopilot:?}");
         let (dir, ledger) = ledger_at(&tag);
@@ -665,7 +681,10 @@ fn worded(answers: usize) -> Vec<String> {
 
 #[test]
 fn a_wall_no_reader_names_answered_after_a_long_spell_that_ran_no_tool_is_held_all_the_same() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let walls: [(&'static str, WallRows); 3] = [
         ("muse", |k| unnamed(&vec![None; k])),
         ("claude", |k| {
@@ -795,7 +814,10 @@ fn reader_of(program: &str) -> &'static dyn aterm_phase::ScreenReader {
 
 #[test]
 fn a_vendor_row_no_reader_names_is_typed_into_at_most_once_more_then_held() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let walls: [(&'static str, WallRows); 2] = [("claude", claude_wall), ("agy", agy_wall)];
     for (program, wall) in walls {
         let rows = |asks: &[Option<&str>]| vendor_walled(program, asks, wall);
@@ -903,7 +925,10 @@ fn claude_said(_: usize) -> Vec<String> {
 
 #[test]
 fn a_persons_new_prompt_row_lifts_a_claude_hold_only_where_a_point_saw_it_busy() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let rows = |asks: &[Option<&str>]| vendor_walled("claude", asks, claude_said);
     let reader = reader_of("claude");
     for asks in [&[None][..], &[None, None, Some("hi")]] {
@@ -1059,7 +1084,10 @@ fn own_turns(
 #[test]
 fn a_no_work_turn_the_program_opens_itself_counts_as_an_acts_answer() {
     use crate::supervise::policy::turn_end::NO_WORK_ACTS;
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("self-started-{autopilot:?}");
         let (bare, told) = own_turns(&tag, autopilot, None, 0, Some(3));
@@ -1140,7 +1168,10 @@ fn waiting_on_suite(acts: usize, events: usize, done: Option<&str>) -> Vec<Strin
 
 #[test]
 fn a_background_tasks_end_after_monitor_events_is_work() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::NoWork).why
+    ));
     // As claude-2.1.304-verbose-background-command-login-words.txt draws it, then as 2.1.268's notice builders draw a failure and a monitor's end; the control, in words.
     let ends = [
         "⏺ Background command \"Run the division suite\" completed (exit code 0)",
@@ -1210,7 +1241,10 @@ fn counting_down(asks: &[Option<&str>]) -> Vec<String> {
 
 #[test]
 fn a_wall_no_reader_names_counting_down_its_reset_is_the_same_reply() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     assert_ne!(counting_down(&[None]), counting_down(&[None, None])[..]);
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("same-reply-countdown-{autopilot:?}");
@@ -1894,7 +1928,10 @@ fn alternating(answers: usize) -> Vec<String> {
 
 #[test]
 fn a_wall_no_reader_names_in_two_wordings_by_turns_is_held_at_its_first_repeat() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     assert_ne!(alternating(1), unnamed(&[None]), "the second wording drawn");
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("same-reply-alternating-{autopilot:?}");
@@ -1945,7 +1982,10 @@ fn claude_ran_suite(_: usize) -> Vec<String> {
 
 #[test]
 fn a_529_first_met_as_a_continuations_answer_keeps_its_three_retries() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let walled = |k: usize| vendor_walled("claude", &vec![None; k], claude_529);
     let reader = aterm_phase::Program::Claude.reader();
     assert_eq!(
@@ -2102,7 +2142,10 @@ fn a_build_that_fails_the_same_after_collapsed_shell_commands_is_work_each_time(
 
 #[test]
 fn a_git_only_answer_that_says_the_same_is_work_each_time() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let reader = aterm_phase::Program::Claude.reader();
     // wait_bg17.out's measured row and 2.1.268's renderer's (its shell count leaves git commands out), then the shell count's.
     for group in [
@@ -2175,7 +2218,10 @@ fn paragraph_ends(paragraph: &'static str) -> impl Fn(usize) -> Vec<String> {
 
 #[test]
 fn a_reply_ending_in_a_git_clauses_words_said_the_same_is_held() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let reader = aterm_phase::Program::Claude.reader();
     for paragraph in [
         "  Waiting on PR #12",
@@ -2221,7 +2267,10 @@ fn landed_ends(row: fn(usize) -> String) -> impl Fn(usize) -> Vec<String> {
 
 #[test]
 fn a_reply_ending_in_its_commits_row_is_work_each_time() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let reader = aterm_phase::Program::Claude.reader();
     // Each answer's commit is its own; its sha is what a sentence lacks, wherever the row stands, alone or before a push.
     let commits: [fn(usize) -> String; 2] = [
@@ -2364,7 +2413,10 @@ fn rotating(answers: usize) -> Vec<String> {
 #[test]
 fn a_program_rotating_four_no_work_wordings_is_held_after_its_run_of_no_work_acts() {
     use crate::supervise::policy::turn_end::{NO_WORK_ACTS, REPLIES_KEPT};
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::NoWork).why
+    ));
     const { assert!(REPLIES_KEPT < 4, "four wordings outrun the replies kept") };
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("rotate-4-{autopilot:?}");
@@ -2456,7 +2508,10 @@ fn worked_unwatched(answers: usize) -> Vec<String> {
 #[test]
 fn a_loop_that_takes_over_after_work_no_loop_watched_starts_its_run_afresh() {
     use crate::supervise::policy::turn_end::NO_WORK_ACTS;
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::NoWork).why
+    ));
     let muse = aterm_phase::Program::Muse.reader();
     assert!(
         muse.turn_ran_tools(&worked_unwatched(0)),
@@ -2645,7 +2700,10 @@ fn viewed(rows: &[String], history: bool, at: i64, worked: Option<u64>) -> R {
 
 #[test]
 fn a_long_report_scrolled_over_its_calls_is_work_unless_its_whole_turn_shows_none() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     type Drawn = fn(bool) -> Box<dyn Fn(usize) -> Vec<String>>;
     let programs: [(&'static str, Drawn); 2] = [
         ("claude", |calls| Box::new(reported(calls))),
@@ -2725,7 +2783,10 @@ fn a_long_report_scrolled_over_its_calls_is_work_unless_its_whole_turn_shows_non
 
 #[test]
 fn keys_over_a_long_report_held_with_its_prompt_above_the_screen_lift_nothing() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     type Drawn = fn(bool) -> Box<dyn Fn(usize) -> Vec<String>>;
     let programs: [(&'static str, Drawn); 2] = [
         ("claude", |calls| Box::new(reported(calls))),
@@ -2950,7 +3011,10 @@ fn read_walls_of_four_classes_by_turns_are_held_past_the_run_and_a_walls_own_tri
 
 #[test]
 fn work_scrolled_above_a_529_keeps_the_retries_going() {
-    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let held = Some(format!(
+        "stalled {}",
+        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
+    ));
     let cut = |calls: bool| {
         move |k: usize| {
             vendor_walled("claude", &vec![None; k], |j| {
@@ -3638,4 +3702,51 @@ fn a_lead_agents_prompt_lets_one_act_go_only_above_claude_codes_reply_with_no_pe
              busy, lets one more act go, then held again; nothing else lifts it: {out:#?}"
         );
     }
+}
+
+#[test]
+fn the_journal_names_the_holds_arm_and_only_a_holds() {
+    use crate::harness::acts::HeldBy;
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, Some("@s-1".to_owned()));
+    let mut noted = Noted::default();
+    let told = [
+        (
+            Exception::repeats_land(HeldBy::SameReply, None),
+            Some(HeldBy::SameReply),
+        ),
+        (Exception::repeats(HeldBy::NoWork), Some(HeldBy::NoWork)),
+        (
+            Exception::limit_repeats(aterm_phase::Program::Claude, true),
+            None,
+        ),
+    ];
+    for (seq, (exception, held)) in (1..).zip(told) {
+        let head = format!(
+            "EXCEPTION seq={seq} kind={} when={}{} ",
+            exception.kind.word(),
+            exception.when.word(),
+            held.map_or_else(String::new, |arm| format!(" held={}", arm.word()))
+        );
+        s.exception_now = Some(exception);
+        s.sync_exception(seq, false, &mut noted);
+        let line = noted
+            .0
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("EXCEPTION "))
+            .unwrap_or_else(|| panic!("journaled: {:#?}", noted.0));
+        assert!(line.starts_with(&head), "{head:?} in {line:?}");
+    }
+    let lines: Vec<&String> = noted
+        .0
+        .iter()
+        .filter(|l| l.starts_with("EXCEPTION "))
+        .collect();
+    assert!(
+        lines[0].contains(" when=now held=same-reply "),
+        "{lines:#?}"
+    );
+    assert!(lines[1].contains(" when=later held=no-work "), "{lines:#?}");
+    assert!(!lines[2].contains(" held="), "{lines:#?}");
 }

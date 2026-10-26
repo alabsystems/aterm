@@ -173,8 +173,9 @@ fn kept_answer(root: &Path) -> Option<(LanAnswer, u64)> {
     Some((LanAnswer::of(value["answer"].as_str()?)?, sequence))
 }
 
-/// The later of this process's last answer and the one kept from earlier launches.
-fn last_answer() -> Option<LanAnswer> {
+/// The later of this process's last answer and the one kept from earlier launches: what a LAN
+/// look or the window's step last heard of macOS's Local Network switch ([`lan_answered`]).
+pub(super) fn last_answer() -> Option<LanAnswer> {
     let heard = HEARD.lock().ok().and_then(|heard| *heard);
     let kept = super::state_root().ok().and_then(|root| kept_answer(&root));
     latest([heard, kept])

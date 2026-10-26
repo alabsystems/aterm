@@ -2288,9 +2288,9 @@ impl Config {
         self.secure_keyboard_entry.unwrap_or(false)
     }
 
-    /// Ambient-bed on/off (`trail_sound_bed`, default on).
+    /// Ambient-bed on/off (`trail_sound_bed`, default off).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
-        self.trail_sound_bed.unwrap_or(true)
+        self.trail_sound_bed.unwrap_or(false)
     }
 
     /// Sing-along riff on/off (`trail_sound_riff`, default on).
@@ -9604,6 +9604,12 @@ mod w5_knob_tests {
         ] {
             assert_eq!(cfg(source).text_blending_or_default(), expected, "{source}");
         }
+        assert!(
+            !Config::default().trail_sound_bed_or_default(),
+            "ambient bed defaults off so typing notes carry no continuous drone"
+        );
+        assert!(cfg("trail_sound_bed = true").trail_sound_bed_or_default());
+        assert!(!cfg("trail_sound_bed = false").trail_sound_bed_or_default());
     }
 
     #[test]

@@ -27,14 +27,14 @@ pub mod trace;
 pub mod turn_end;
 
 pub use approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, Decision, DeclineStep,
-    QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
-    RULE_ANSWER_SHORT_TERM, RULE_BREAKER_READ_ONLY, RULE_DECLINE, RULE_LIMIT_RESET,
-    RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN, RULE_PROSE_LONG_TERM,
-    RULE_PROSE_SHORT_TERM, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER,
-    RULE_RM_BREAKER_WARN, RULE_TALL_BOX, RULE_TRUST_ANY, RULE_TRUST_DIALOG, SecretRule, buys,
-    decide, decide_screen, decide_traced, decline, decline_step, decline_text, default_secrets,
-    footer_mode, rm_breaker_label, roots_from_config,
+    Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, DISK_WORKER_DECLINE, Decision,
+    DeclineStep, QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
+    RULE_ANSWER_SHORT_TERM, RULE_BREAKER_READ_ONLY, RULE_DECLINE, RULE_DISK_WORKER,
+    RULE_LIMIT_RESET, RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN,
+    RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD,
+    RULE_RM_BREAKER, RULE_RM_BREAKER_WARN, RULE_TALL_BOX, RULE_TRUST_ANY, RULE_TRUST_DIALOG,
+    SecretRule, buys, decide, decide_screen, decide_traced, decline, decline_step, decline_text,
+    default_secrets, footer_mode, rm_breaker_label, roots_from_config,
 };
 pub use claude_settings::{AskKind, OwnerAsk};
 pub use git_config::{GitView, WorkerEnv};

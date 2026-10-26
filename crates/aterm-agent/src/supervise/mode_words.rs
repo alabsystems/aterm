@@ -64,6 +64,29 @@ pub const TIMED_CRUISE_RECORD: &str =
 pub const LANDED_WORDS: &str = "it said nothing is left, and no repository check found work left to land; the \
      harness types nothing more until someone else's turn";
 
+/// A `NEEDS YOU:` REPORT'S WORDS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.1, §14.7):
+/// what the tab's hover ends with and what the menu bar's report row says on hover, after the
+/// program's own name (`Program::product`: `Claude Code`, `Antigravity CLI`, `Muse Code`). The
+/// agent goes on past the report, unlike a box or a question that stops it.
+pub const CARRIES_ON: &str = "carries on meanwhile";
+
+/// …the menu bar's report row where that need is all that holds its Land session (the hold's one
+/// leg is its needs, §14.7), after the program's own name and `'s`.
+pub const LANDING_WAITS_ALONE: &str = "landing waits on this alone";
+
+/// A REPORT'S WORDS, ONE FUNCTION (§14.7): `<product> carries on meanwhile`, or, where the need
+/// alone holds its session's landing (`alone`), `<product>'s landing waits on this alone`. The
+/// window's hover and the menu bar's tip say them, and the forever lab judges the menu's tip
+/// against them.
+#[must_use]
+pub fn report_words(product: &str, alone: bool) -> String {
+    if alone {
+        format!("{product}'s {LANDING_WAITS_ALONE}")
+    } else {
+        format!("{product} {CARRIES_ON}")
+    }
+}
+
 /// `mode`'s sentences from [`MODE_WORDS`].
 #[must_use]
 pub const fn mode_words(mode: Autopilot) -> &'static ModeWords {

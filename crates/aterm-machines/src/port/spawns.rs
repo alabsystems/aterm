@@ -80,6 +80,24 @@ impl System for Spawns<'_> {
     fn durable_dir(&self, path: &Path) -> io::Result<()> {
         self.live.durable_dir(path)
     }
+    fn ordered_dir(&self, path: &Path) -> io::Result<()> {
+        self.live.ordered_dir(path)
+    }
+    fn identity(&self) -> Result<super::Identity, String> {
+        self.live.identity()
+    }
+    fn low_data_mode(&self) -> Option<bool> {
+        self.live.low_data_mode()
+    }
+    fn accessibility_trusted(&self) -> Option<bool> {
+        self.live.accessibility_trusted()
+    }
+    fn request_accessibility(&self) -> Option<bool> {
+        self.live.request_accessibility()
+    }
+    fn responsible_app(&self) -> Option<String> {
+        self.live.responsible_app()
+    }
     fn remove(&self, path: &Path) -> io::Result<()> {
         self.live.remove(path)
     }

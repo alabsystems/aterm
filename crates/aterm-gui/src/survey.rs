@@ -36,7 +36,7 @@ pub(crate) struct CodexSurvey {
     pub(crate) branch: Option<String>,
     /// Task prompt head from [`task_prompt_of_env`].
     pub(crate) task: Option<String>,
-    /// The thread's active goal, from codex-alab's own goal store ([`aterm_agent::harness::goal`]).
+    /// The thread's active goal, from codex-alab's live session record ([`aterm_agent::harness::self_claimed::read_record_goal`]).
     pub(crate) goal: Option<String>,
 }
 
@@ -464,11 +464,14 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
             timeline.program_shown(),
             need.needs_word(),
             // Where the need came from: the program's own report (a program-claim need) is a
-            // claim, said so in its own field.
-            if need.need.as_ref().is_some_and(|need| need.report.is_some()) {
-                "program"
-            } else {
-                "-"
+            // claim, said so in its own field; a harness's `NEEDS YOU:` report, which its agent
+            // carries on past, says `harness`, so a sibling's or a fleet peer's Needs you lists
+            // it after the work that has stopped (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+            // §14.7).
+            match need.need.as_ref() {
+                Some(need) if need.report.is_some() => "program",
+                Some(need) if need.harness.is_some() => "harness",
+                _ => "-",
             },
             need.hold_word(),
             need.need

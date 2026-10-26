@@ -109,25 +109,53 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
     }
 }
 
+/// The notice of `asking` again after its Approve was refused: the same key, so it replaces the
+/// notice the person pressed, with the refusal whole in its detail (the command it names
+/// among it, which one clipped line would cut off).
+pub(crate) fn refused(asking: &Asking, why: &str) -> Message {
+    notice(asking).sentence(format!("Approve did not let it in: {why}"))
+}
+
 /// Approve exactly `recipient`, off the event loop: an admin Mac's press of a notice's Approve.
-/// The notice ends once the approver's record no longer lists it; a refusal is logged and said
-/// in a record.
+/// The notice ends once the approver's record no longer lists it. A refusal is logged and said
+/// on each notice of that Mac ([`refused`]), or in a record once no notice of it is left.
 pub(crate) fn approve(recipient: String) -> bool {
     crate::qos::spawn_lane_thread(
         "aterm-secrets-approve",
         crate::qos::Role::Responsive,
         move || {
-            let approved = aterm_secrets::client::Paths::live()
-                .and_then(|paths| aterm_secrets::client::approve_request(&paths, &recipient));
+            let paths = aterm_secrets::client::Paths::live();
+            let approved = paths
+                .as_ref()
+                .map_err(ToString::to_string)
+                .and_then(|paths| {
+                    aterm_secrets::client::approve_request(paths, &recipient)
+                        .map_err(|error| error.to_string())
+                });
             match approved {
                 Ok(host) => aterm_log::info!("secrets vault: approved {host}"),
                 Err(error) => {
                     aterm_log::warn!("secrets vault: approving a Mac failed: {error}");
-                    crate::message_inbox::queue_message(
-                        Message::new(tags::PRIVACY, Severity::Warn, "Couldn't approve that Mac")
-                            .line(error.to_string())
+                    let notices: Vec<Asking> = paths
+                        .map(|paths| aterm_secrets::client::asking(&paths))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|asking| asking.recipient == recipient)
+                        .collect();
+                    if notices.is_empty() {
+                        crate::message_inbox::queue_message(
+                            Message::new(
+                                tags::PRIVACY,
+                                Severity::Warn,
+                                "Couldn't approve that Mac",
+                            )
+                            .sentence(&error)
                             .record(),
-                    );
+                        );
+                    }
+                    for asking in &notices {
+                        crate::message_inbox::queue_message(refused(asking, &error));
+                    }
                 }
             }
         },
@@ -187,6 +215,44 @@ mod tests {
         // CONTROL: another Mac's notice approves another key.
         let m32 = asking("m32", "WXYZ-WXYZ-WXYZ-WXYZ", "age1other");
         assert_ne!(notice.actions, super::notice(&m32).actions);
+    }
+
+    /// A refused Approve says why on the notice it replaces, whole: the refusal of a key the queue
+    /// lists under two names ends with the command that approves it, past one detail line's cap.
+    #[test]
+    fn a_refused_approve_says_why_whole_on_the_notice_it_replaces() {
+        let key = "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq";
+        let mc = asking("mc", "ABCD-EFGH-JKMN-PQRS", key);
+        let request = |host: &str| aterm_secrets::client::Request {
+            recipient: key.to_string(),
+            host: host.to_string(),
+            code: mc.code.clone(),
+            at: None,
+            proof: None,
+        };
+        let pending = [request("mc"), request(&"a-name-a-lan-host-chose".repeat(2))];
+        let why = aterm_secrets::client::one_name_asked(&pending, &pending[0])
+            .expect_err("a key listed under two names")
+            .to_string();
+        let command = format!("aterm secrets approve {key} --name <host>");
+        assert!(why.ends_with(&command), "{why}");
+        let shown = notice(&mc).normalized();
+        let said = refused(&mc, &why).normalized();
+        assert_eq!(said.key, shown.key, "it replaces the notice pressed");
+        assert_eq!(said.actions, shown.actions);
+        assert!(
+            matches!(said.need(), aterm_messages::need::Need::Now(ask) if ask.fault().is_none()),
+            "{:?}",
+            said.need()
+        );
+        // Negative control: the refusal as one detail line is clipped before its command.
+        let said = said.detail.join(" ");
+        assert!(
+            said.contains(&format!("Approve did not let it in: {why}")),
+            "{said}"
+        );
+        let clipped = notice(&mc).line(&why).normalized().detail.join(" ");
+        assert!(!clipped.contains(&command), "{clipped}");
     }
 
     #[test]

@@ -13,7 +13,80 @@ use super::*;
 #[path = "accounts_sync_new_label_tests.rs"]
 mod new_label_tests;
 
+#[cfg(test)]
+#[path = "accounts_source_presence_tests.rs"]
+mod source_presence;
+
 const NOW: i64 = 1_792_660_000;
+
+#[test]
+fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let member = csv_columns(cli)[0];
+        let alias = csv_columns(cli).last().unwrap();
+        let value = if cli == Cli::Kimi { "global" } else { "1" };
+        let region = if cli == Cli::Kimi {
+            "region='global'\n"
+        } else {
+            ""
+        };
+        let mut sources = vec![(
+            ACCOUNTS_CSV_FILE.to_owned(),
+            format!("email,computer,{member},{alias}\nnew@example.test,m16,{value},0\n"),
+            "ambiguous",
+        )];
+        for (fields, diagnostic) in [
+            ("machines=['m16', 17]", "`machines`"),
+            ("machines=['m16', 'unassigned']", "`machines`"),
+            ("machines=['m16']\nclass='sharedd'", "`class`"),
+            ("machines=['m16']\nclass=false", "`class`"),
+        ] {
+            sources.push((
+                if cli == Cli::Claude {
+                    FLEET_ROSTER_FILE.to_owned()
+                } else {
+                    cli_fleet_file(cli)
+                },
+                format!(
+                    "[[account]]\nlabel='valid'\nemail='valid@example.test'\nmachines=['m16']\n{region}\n\
+                     [[account]]\nlabel='invalid'\nemail='invalid@example.test'\n{region}{fields}\n"
+                ),
+                diagnostic,
+            ));
+        }
+        for (name, source, diagnostic) in sources {
+            let bed = Bed::new("malformed-source");
+            bed.secret(&name, &source);
+            let store = bed.seed_records(cli);
+            let paths = [
+                bed.roster(cli),
+                store.state_file(),
+                store.state_witness_file(),
+                store.logins_file(),
+                store.logins_witness_file(),
+                store.ledger_path(),
+                store.wake_path(),
+            ];
+            let before: Vec<_> = paths.iter().map(fs::read).collect();
+            let secrets = Bed::tree(&bed.secrets());
+            let result = if cli == Cli::Claude {
+                sync_accounts_for_init(&bed.home, &bed.state, &bed.roster(cli), NOW).map(|_| ())
+            } else {
+                bed.sync(cli, None).map(|_| ())
+            };
+            assert!(
+                result.is_err(),
+                "{cli:?}: malformed source was skipped or accepted: {result:?}"
+            );
+            assert!(result.unwrap_err().contains(diagnostic));
+            let after: Vec<_> = paths.iter().map(fs::read).collect();
+            for (before, after) in before.iter().zip(&after) {
+                assert_eq!(before.as_ref().ok(), after.as_ref().ok());
+            }
+            assert_eq!(Bed::tree(&bed.secrets()), secrets);
+        }
+    }
+}
 
 #[test]
 fn automatic_sync_refuses_a_new_label_with_retained_login_state() {
@@ -104,6 +177,55 @@ impl Bed {
     /// Opts this machine into `cli`'s pool the one way that does: a roster of its own.
     fn keep_roster(&self, cli: Cli) {
         fs::write(self.roster(cli), "").unwrap();
+    }
+
+    fn seed_records(&self, cli: Cli) -> accounts::Store {
+        fs::write(
+            self.roster(cli),
+            "[[account]]\nlabel='kept'\nclass='shared'\n",
+        )
+        .unwrap();
+        let store = accounts::Store::at_for(&self.state, cli, &self.home);
+        let mut state = accounts::State {
+            machine: "m16".into(),
+            active: Some("kept".into()),
+            pinned: true,
+            ..accounts::State::default()
+        };
+        state.accounts.insert(
+            "kept".into(),
+            accounts::Account {
+                auth: accounts::Auth::SignedOut,
+                auth_at: Some(NOW),
+                walls: BTreeMap::from([(
+                    "seven_day".into(),
+                    accounts::Wall {
+                        at: NOW,
+                        until: Some(NOW + 3600),
+                        by: "m16".into(),
+                        attempts: 1,
+                        cleared: false,
+                    },
+                )]),
+                ..accounts::Account::default()
+            },
+        );
+        store.save(&state).unwrap();
+        let mut logins = accounts::Logins::default();
+        logins.labels.insert(
+            "kept".into(),
+            accounts::Binding {
+                renewed_at: Some(NOW - 3600),
+                renewal_generation: 2,
+                ..accounts::Binding::default()
+            },
+        );
+        store.save_logins(&logins).unwrap();
+        store
+            .append(&[accounts::Event::new(NOW, accounts::Kind::Wall, "kept")])
+            .unwrap();
+        fs::write(store.wake_path(), b"retained wake").unwrap();
+        store
     }
 
     fn sync(&self, cli: Cli, source: Option<&str>) -> Result<CliSync, String> {

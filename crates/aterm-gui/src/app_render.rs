@@ -1230,6 +1230,7 @@ pub(crate) fn pet_console_exclusions(
         count,
         ink,
         typed,
+        painted_over: None,
     }
 }
 
@@ -1262,9 +1263,21 @@ pub(crate) struct PetExclusions {
     count: usize,
     ink: [aterm_effects::pet_world::PetRect; PET_INK_SLOTS],
     typed: usize,
+    /// The content sequence of the frame the host's chrome was painted over
+    /// (`crate::pet_chrome::PetChrome::held_painted_over`).
+    painted_over: Option<u64>,
 }
 
 impl PetExclusions {
+    /// The chrome is the host's last pass's, painted over the frame whose content sequence is
+    /// `seq` (`aterm_effects::pet_world::PetReserve::painted_over`).
+    pub(crate) fn painted_over(self, seq: Option<u64>) -> Self {
+        Self {
+            painted_over: seq,
+            ..self
+        }
+    }
+
     /// The find bar's bands and the Autopilot menu's card.
     pub(crate) fn overlays(&self) -> &[aterm_effects::pet_world::PetRect] {
         &self.rects[..self.overlays]
@@ -1286,6 +1299,7 @@ impl PetExclusions {
             protected: self.chrome(),
             overlays: self.overlays(),
             ink: self.ink(),
+            painted_over: self.painted_over,
         }
     }
 }
@@ -7838,7 +7852,7 @@ impl App {
             "none".to_string()
         };
         let comet_bed = &ws.fx.cursor().trail_scratch;
-        Ok(crate::cursor_glow::TrailStatus {
+        let line = crate::cursor_glow::TrailStatus {
             style_raw: self.config.cursor_trail_style_raw(),
             style: presentation.style.style,
             unknown: presentation.style.unknown,
@@ -7910,7 +7924,8 @@ impl App {
             comet_cells: comet_bed.len(),
             comet_alpha_max: comet_bed.iter().map(|cell| cell.alpha).max().unwrap_or(0),
         }
-        .line_v2(ws.fx.cursor().glow.v2_status()))
+        .line_v2(ws.fx.cursor().glow.v2_status());
+        Ok(format!("{line} {}", self.trail_target_fields()?))
     }
 
     fn cursor_frame_for_present(
@@ -11602,7 +11617,8 @@ impl App {
                     ws.search.is_some(),
                     ws.pet_chrome.held(),
                     ws.pet_chrome.held_overlays(),
-                );
+                )
+                .painted_over(ws.pet_chrome.held_painted_over());
                 // Refilled above by a damage-consuming fill (a chrome-row
                 // window's every frame), or the snapshot reused.
                 let observed = ws.fx.companion_mut().observe_console_filled(
@@ -15196,7 +15212,8 @@ impl App {
                 ws.search.is_some(),
                 ws.pet_chrome.held(),
                 ws.pet_chrome.held_overlays(),
-            );
+            )
+            .painted_over(ws.pet_chrome.held_painted_over());
             // Refilled this frame by a damage-consuming fill; one that
             // re-extracted no row keeps the reading.
             let observed = ws.fx.companion_mut().observe_console_filled(
@@ -16991,7 +17008,17 @@ impl App {
                         break;
                     }
                     if let Some(cell) = rowv.get_mut(col) {
-                        cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+                        // Over the edge a faint well draws (`find_bar::well_rule`, one line
+                        // across its cells in the control rim's grey), the composition is
+                        // marked a line heavier and in the words' own ink, so it still reads
+                        // apart from the settled text beside it.
+                        cell.underline = match cell.underline {
+                            aterm_core::terminal::UnderlineStyle::None => {
+                                aterm_core::terminal::UnderlineStyle::Single
+                            }
+                            _ => aterm_core::terminal::UnderlineStyle::Double,
+                        };
+                        cell.underline_color = None;
                     }
                 }
             }

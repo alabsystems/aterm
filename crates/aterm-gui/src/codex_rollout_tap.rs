@@ -10,16 +10,25 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::codex_facts::CodexFactsTail;
-use aterm_agent::harness::codex_tap::{RolloutTap, rollout_path};
+use aterm_agent::harness::codex_tap::{Refusal, RolloutTap, rollout_path};
 use aterm_agent::harness::footer::{FOLD_BUDGET, GitHeadRead, read_git_head};
 
 use crate::claude_footer::LogWake;
 use crate::self_claim::RolloutTarget;
-use crate::session_log::transcript::{Applied, Source, TapRun, apply_rollout_batch};
+use crate::session_log::transcript::{Applied, RolloutWord, Source, TapRun, apply_rollout_batch};
 use crate::session_timeline::SessionTimeline;
 
 /// Minimum interval between rollout reads while a `codex-alab` session is in front.
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
+
+/// Per-session rollout cadence state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RolloutAsk {
+    /// When the last rollout read was dispatched.
+    pub(crate) at: Instant,
+    /// Whether a sweep arrived before [`RECHECK`] elapsed and still owes a trailing read.
+    pub(crate) owed: bool,
+}
 
 /// Rollout action selected by the status sweep for one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +43,7 @@ pub(crate) enum Ask {
 
 /// Returns the next rollout [`Ask`] for `session` at `now`.
 pub(crate) fn due(
-    asked: &mut HashMap<u64, Instant>,
+    asked: &mut HashMap<u64, RolloutAsk>,
     session: u64,
     target: Option<RolloutTarget>,
     now: Instant,
@@ -46,13 +55,19 @@ pub(crate) fn due(
             Ask::Nothing
         };
     };
-    let due = asked
-        .get(&session)
-        .is_none_or(|at| now.saturating_duration_since(*at) >= RECHECK);
-    if !due {
+    if let Some(prior) = asked.get_mut(&session)
+        && now.saturating_duration_since(prior.at) < RECHECK
+    {
+        prior.owed = true;
         return Ask::Nothing;
     }
-    asked.insert(session, now);
+    asked.insert(
+        session,
+        RolloutAsk {
+            at: now,
+            owed: false,
+        },
+    );
     Ask::Read(target)
 }
 
@@ -214,15 +229,13 @@ struct Held {
     target: RolloutTarget,
     run: TapRun,
     tap: RolloutTap,
-    said: Option<&'static str>,
+    said: Option<Refusal>,
     /// The survey's reader of the same rollout, once its file is found ([`publish_facts`]).
     facts: Option<CodexFactsTail>,
     /// The claimant's worker task, read once.
     task: Option<String>,
     /// What [`publish_facts`] last published from it.
     shown: Option<crate::survey::CodexSurvey>,
-    /// The thread's active goal in codex-alab's goal store ([`aterm_agent::harness::goal`]).
-    goal: aterm_agent::harness::goal::StoreGoal,
 }
 
 /// The taps by session.
@@ -249,10 +262,16 @@ fn run(rx: &Receiver<Command>) {
 /// rollout until the sweep asks again.
 fn stop_tap(taps: &mut Taps, session: u64, timeline: Option<&Arc<Mutex<SessionTimeline>>>) {
     taps.remove(&session);
-    if let Some(timeline) = timeline {
+    let cleared = if let Some(timeline) = timeline {
         let mut timeline = timeline.lock().unwrap_or_else(PoisonError::into_inner);
-        timeline.clear_codex_survey();
+        let cleared = timeline.clear_codex_survey();
         timeline.slog_mut().rollout_stopped();
+        cleared
+    } else {
+        false
+    };
+    if cleared {
+        crate::claude_footer::post_changed(session);
     }
 }
 
@@ -262,11 +281,13 @@ fn drop_held(taps: &mut Taps, session: u64, ctx: Option<&crate::SessionCtx>) {
         .remove(&session)
         .is_some_and(|held| held.shown.is_some())
         && let Some(ctx) = ctx
-    {
-        ctx.timeline
+        && ctx
+            .timeline
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clear_codex_survey();
+            .clear_codex_survey()
+    {
+        crate::claude_footer::post_changed(session);
     }
 }
 
@@ -314,14 +335,14 @@ fn read_once_after(taps: &mut Taps, job: &Job, after_read: impl FnOnce()) -> Opt
     applied
 }
 
-/// [`read_once`]'s guarded arm, read and apply, and the answer's word:
-/// `bound`, the tap's refusal, `no-thread`, or `stale` when the queued
-/// claim, copied target, run or sampled process image no longer matches.
+/// [`read_once`]'s guarded arm, read and apply, and the answer ([`RolloutWord`]): bound, the
+/// tap's refusal, unbound, no thread, or stale when the queued claim, copied target, run or
+/// sampled process image no longer matches.
 fn read_on(
     taps: &mut Taps,
     job: &Job,
     after_read: impl FnOnce(),
-) -> (Option<Applied>, &'static str) {
+) -> (Option<Applied>, RolloutWord) {
     let read = || {
         let ctx = job.ctx.upgrade()?;
         let arm = {
@@ -337,7 +358,7 @@ fn read_on(
     };
     let Some((ctx, arm)) = read() else {
         drop_held(taps, job.session, job.ctx.upgrade().as_deref());
-        return (None, "stale");
+        return (None, RolloutWord::Stale);
     };
     if taps
         .get(&job.session)
@@ -349,7 +370,7 @@ fn read_on(
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(e) => {
             let Some(tap) = RolloutTap::new(&job.target.thread, &job.target.home) else {
-                return (None, "no-thread");
+                return (None, RolloutWord::NoThread);
             };
             e.insert(Held {
                 target: job.target.clone(),
@@ -359,7 +380,6 @@ fn read_on(
                 facts: None,
                 task: (job.image.task)(job.target.pid),
                 shown: None,
-                goal: aterm_agent::harness::goal::StoreGoal::default(),
             })
         }
     };
@@ -369,17 +389,21 @@ fn read_on(
     let running = (job.image.build)(job.target.pid);
     held.tap.arm(floor, arm.given, running.as_deref());
     let _ = held.tap.read(FOLD_BUDGET);
-    let refused = held.tap.refused().map(|r| r.word());
+    let refused = held.tap.refused();
     if refused != held.said {
         held.said = refused;
-        if let Some(word) = refused {
-            aterm_log::info!("codex rollout tap #{}: binds nothing: {word}", job.session);
+        if let Some(refusal) = refused {
+            aterm_log::info!(
+                "codex rollout tap #{}: binds nothing: {}",
+                job.session,
+                refusal.word()
+            );
         }
     }
     let word = match (held.tap.is_bound(), refused) {
-        (true, _) => "bound",
-        (false, Some(word)) => word,
-        (false, None) => "unbound",
+        (true, _) => RolloutWord::Bound,
+        (false, Some(refusal)) => RolloutWord::Refused(refusal),
+        (false, None) => RolloutWord::Unbound,
     };
     let batch = held.tap.take();
     let survey = read_facts(held, &job.target);
@@ -388,12 +412,12 @@ fn read_on(
         || (job.image.build)(job.target.pid) != running
     {
         drop_held(taps, job.session, Some(&ctx));
-        return (None, "stale");
+        return (None, RolloutWord::Stale);
     }
     let applied = apply_rollout_batch(&ctx, &job.target, job.run, &batch, held.tap.is_bound());
     if applied.disarm {
         drop_held(taps, job.session, Some(&ctx));
-        return (Some(applied), "stale");
+        return (Some(applied), RolloutWord::Stale);
     }
     if let Some(survey) = survey {
         publish_facts(&ctx, job, held, survey);
@@ -404,27 +428,30 @@ fn read_on(
 /// The survey's facts from `held`'s rollout, whatever build wrote it (the tap's steps are
 /// measured builds' only, these facts any codex's), when they differ from those last shown.
 fn read_facts(held: &mut Held, target: &RolloutTarget) -> Option<crate::survey::CodexSurvey> {
-    if held.facts.is_none() {
-        held.facts = Some(CodexFactsTail::new(rollout_path(
-            &target.home,
-            &target.thread,
-        )?));
+    if held.facts.is_none()
+        && let Some(path) = rollout_path(&target.home, &target.thread)
+    {
+        held.facts = Some(CodexFactsTail::new(path));
     }
-    let tail = held.facts.as_mut()?;
-    let _ = tail.read();
-    let facts = tail.facts();
+    let facts = match held.facts.as_mut() {
+        Some(tail) => {
+            let _ = tail.read();
+            tail.facts()
+        }
+        None => Default::default(),
+    };
     let branch = match facts.cwd.as_deref().map(read_git_head) {
         Some(GitHeadRead::Found(branch, _)) => Some(branch),
         _ => None,
     };
-    let goal = held
-        .goal
-        .read(
-            aterm_agent::harness::goal::Store::Codex,
-            &target.home.join(aterm_agent::harness::goal::CODEX_GOALS),
-            &target.thread,
-        )
-        .map(str::to_owned);
+    let goal = aterm_agent::harness::self_claimed::read_record_goal(
+        &target.home,
+        target.pid,
+        &target.thread,
+    );
+    if held.facts.is_none() && held.task.is_none() && goal.is_none() && held.shown.is_none() {
+        return None;
+    }
     let survey = crate::survey::CodexSurvey {
         facts,
         branch,
@@ -445,16 +472,18 @@ fn publish_facts(
     let Some(group) = (job.image.group)(job.target.pid) else {
         return;
     };
-    let Some(_claim) = crate::self_claim::hold_rollout(ctx, &job.target) else {
-        return;
+    let took = {
+        let Some(_claim) = crate::self_claim::hold_rollout(ctx, &job.target) else {
+            return;
+        };
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_codex_survey(group, survey.clone())
     };
-    let took = ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .set_codex_survey(group, survey.clone());
     if took {
         held.shown = Some(survey);
+        crate::claude_footer::post_changed(job.session);
     }
 }
 
@@ -490,7 +519,7 @@ impl Host {
         read_once_after(&mut self.0, &job, schedule.1)
     }
 
-    /// Runs one rollout read/apply pass and returns the answer token.
+    /// Runs one rollout read/apply pass and returns the answer's word.
     pub(crate) fn read_on(
         &mut self,
         session: u64,
@@ -499,9 +528,9 @@ impl Host {
         image: Image,
     ) -> &'static str {
         let Some(job) = Job::capture_job(session, ctx, target, &LogWake::default(), image) else {
-            return "stale";
+            return RolloutWord::Stale.word();
         };
-        read_on(&mut self.0, &job, || {}).1
+        read_on(&mut self.0, &job, || {}).1.word()
     }
 
     /// Stops `session`'s tap as the sweep's [`Ask::Stop`] does.
@@ -539,12 +568,14 @@ mod tests {
             due(&mut asked, 7, Some(target(THREAD)), at(0)),
             Ask::Read(target(THREAD))
         );
+        assert_eq!(asked.get(&7).map(|a| a.owed), Some(false));
         for ms in [1, 250, 999] {
             assert_eq!(
                 due(&mut asked, 7, Some(target(THREAD)), at(ms)),
                 Ask::Nothing,
                 "{ms}"
             );
+            assert_eq!(asked.get(&7).map(|a| a.owed), Some(true), "{ms}");
         }
         assert_eq!(
             due(&mut asked, 8, Some(target(THREAD)), at(500)),
@@ -554,6 +585,7 @@ mod tests {
             due(&mut asked, 7, Some(target(THREAD)), at(1_000)),
             Ask::Read(target(THREAD))
         );
+        assert_eq!(asked.get(&7).map(|a| a.owed), Some(false));
         assert_eq!(
             due(&mut asked, 7, Some(target(THREAD)), at(1_400)),
             Ask::Nothing

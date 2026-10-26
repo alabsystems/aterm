@@ -70,6 +70,7 @@ mod pet_rests_off_the_printed_line;
 mod pet_typing_beside_its_guess;
 mod phrase_pause_gaps;
 mod rainbow_kitty_v2_frame_cost;
+mod rainbow_pixel_continuity;
 mod relaid_composer_echo;
 mod review_real_bytes;
 mod revived_line_keeps_its_stops;

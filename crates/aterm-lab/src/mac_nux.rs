@@ -2041,7 +2041,11 @@ const LOCAL_VAULT_ENTRY: &str = "NUX_PROBE";
 /// The guest commands that make `vault-local`'s vault as a second identity (its own `$HOME`
 /// under `admin`): a server on 127.0.0.1 that advertises nothing, the vault (the lane's entry in
 /// `[everyone]`, a join password in `admin/password`) and its approver (`aterm secrets watch`);
-/// they print the vault's signer, which the joining Mac pins.
+/// they print the vault's signer, which the joining Mac pins. `password show` writes the join
+/// password only to a terminal, so the setup reads it as the person at one would, on the
+/// pseudo-terminal `expect` spawns it on (its line end's `\r` dropped; a terminal's EOF, which
+/// `script` with no input would type and the terminal echo as `^D`, never reaches it), and a
+/// line that is no one word (its refusal, which the terminal also carries) fails the setup.
 fn local_vault_setup(aterm: &str, admin: &str) -> String {
     let url = format!("http://127.0.0.1:{LOCAL_VAULT_PORT}/v1/{LOCAL_VAULT}");
     format!(
@@ -2050,7 +2054,9 @@ fn local_vault_setup(aterm: &str, admin: &str) -> String {
          n=0; until curl -s -o /dev/null --max-time 1 http://127.0.0.1:{LOCAL_VAULT_PORT}/; do \
          n=$((n+1)); [ $n -gt 600 ] && {{ echo 'the vault server did not answer within 60 s'; cat $A/serve.log; exit 1; }}; sleep 0.1; done; \
          {aterm} secrets create '{url}' --import $A/seed --no-agent --name nux-admin > $A/create.out 2>&1 || {{ cat $A/create.out; exit 1; }}; \
-         {aterm} secrets password show > $A/password 2>$A/password.err || {{ cat $A/password.err; exit 1; }}; \
+         expect -c 'set timeout 60; spawn -noecho {aterm} secrets password show; expect eof' > $A/password.tty 2>$A/password.err || {{ cat $A/password.err; exit 1; }}; \
+         tr -d '\\r' < $A/password.tty > $A/password; \
+         case \"$(cat $A/password)\" in ''|*' '*) echo 'password show printed no join password:'; cat $A/password.tty; exit 1;; esac; \
          ({aterm} secrets watch </dev/null >$A/watch.log 2>&1 &); \
          sed -n 's/.*add #\\([^ ]*\\) to the URL.*/\\1/p' $A/create.out"
     )

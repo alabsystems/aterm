@@ -77,19 +77,25 @@ fn every_pooled_cli_names_its_row_and_its_own_roster_store_and_seam() {
         ]
     );
     assert_eq!(
+        Cli::Codex.accounts().seam,
+        Seam::LoginFile {
+            var: "CODEX_AUTH_PATH",
+            file: "auth.json"
+        }
+    );
+    assert_eq!(
         Cli::Grok.accounts().seam,
         Seam::LoginFile {
             var: "GROK_AUTH_PATH",
             file: "auth.json"
         }
     );
-    for cli in [Cli::Codex, Cli::Kimi] {
-        let Seam::Overlay { var, shared, .. } = cli.accounts().seam else {
-            panic!("{} is an overlay home", cli.id());
-        };
-        assert_eq!(Some(var), cli.connector().home.var);
-        assert!(shared.contains(&Shared::Dir("sessions")), "{}", cli.id());
-    }
+    let cli = Cli::Kimi;
+    let Seam::Overlay { var, shared, .. } = cli.accounts().seam else {
+        panic!("{} is an overlay home", cli.id());
+    };
+    assert_eq!(Some(var), cli.connector().home.var);
+    assert!(shared.contains(&Shared::Dir("sessions")), "{}", cli.id());
 }
 
 #[test]

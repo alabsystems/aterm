@@ -228,6 +228,58 @@ impl Api {
         self.index_inner(casks, 86_400, true)
     }
 
+    /// Declared dependencies per index record, for reverse-dependency
+    /// queries (`uses`): short formula names this record depends on,
+    /// split runtime/build for formulae (casks declare formula
+    /// dependencies only). Variation-resolved like any other record.
+    pub fn deps_index(&self, casks: bool) -> Result<Vec<DepRow>, String> {
+        let (rel, file) = if casks {
+            ("cask.json", "cask-index.json")
+        } else {
+            ("formula.json", "formula-index.json")
+        };
+        let v = self.doc_with_freshness(rel, file, 86_400, true)?;
+        let machine = Machine::this();
+        let mut out = Vec::new();
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                let key = if casks { "token" } else { "name" };
+                let Some(name) = item.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let shorts = |deps: &[String]| -> Vec<String> {
+                    deps.iter()
+                        .map(|d| Formula::short_name(d).to_string())
+                        .collect()
+                };
+                let row = if casks {
+                    cask_record(item, name)
+                        .map(|c| DepRow {
+                            name: c.token,
+                            deps: shorts(&c.depends_formula),
+                            build_deps: Vec::new(),
+                        })
+                        .ok()
+                } else {
+                    formula_record(item, name, machine)
+                        .map(|f| DepRow {
+                            name: f.name,
+                            deps: shorts(&f.dependencies),
+                            build_deps: shorts(&f.build_dependencies),
+                        })
+                        .ok()
+                };
+                if let Some(row) = row {
+                    out.push(row);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Declared install options per formula from the raw index records.
     pub fn options_index(&self) -> Result<Vec<OptionsRow>, String> {
         let v = self.doc_with_freshness("formula.json", "formula-index.json", 86_400, true)?;
@@ -434,6 +486,13 @@ fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
         }
     }
     out
+}
+
+/// One [`Api::deps_index`] record.
+pub struct DepRow {
+    pub name: String,
+    pub deps: Vec<String>,
+    pub build_deps: Vec<String>,
 }
 
 pub struct OptionsRow {

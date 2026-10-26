@@ -243,6 +243,15 @@ pub struct Rates {
 /// The rates of a ring of bytes used, from its newest read bucket back.
 #[must_use]
 pub fn rates(ring: &BucketRing) -> Rates {
+    rates_within(ring, SPAN_SLACK)
+}
+
+/// [`rates`], each span's first read bucket allowed `slack` buckets after the span's start: a
+/// ring read once a minute (the disk watch's own, `aterm_agent::harness::disk::fill`) needs more
+/// than [`SPAN_SLACK`], and a ring of [`crate::ring::RING_BUCKETS`] plus `slack` holds the
+/// hour's span whole.
+#[must_use]
+pub fn rates_within(ring: &BucketRing, slack: i64) -> Rates {
     let Some((ke, ve)) = ring
         .iter()
         .rev()
@@ -256,7 +265,7 @@ pub fn rates(ring: &BucketRing) -> Rates {
             .iter()
             .filter(|&(k, _)| k >= from)
             .find_map(|(k, b)| b.value().map(|v| (k, v)))?;
-        (ks <= from + SPAN_SLACK && ks < ke).then(|| (ve - vs) / ((ke - ks) * BUCKET_S) as f64)
+        (ks <= from + slack && ks < ke).then(|| (ve - vs) / ((ke - ks) * BUCKET_S) as f64)
     };
     Rates {
         rate5: over(5),
@@ -269,9 +278,16 @@ pub fn rates(ring: &BucketRing) -> Rates {
 /// disk has been filling for [`FILLING_FOR_MS`], or at [`TTF_MAX_S`] and beyond.
 #[must_use]
 pub fn time_to_full(free: u64, rate60: Option<f64>, filling_for_ms: i64) -> Option<f64> {
-    let rate = rate60.filter(|r| *r > 0.0)?;
-    let secs = free as f64 / rate;
+    let secs = time_to_line(free, 0, rate60)?;
     (filling_for_ms >= FILLING_FOR_MS && secs < TTF_MAX_S).then_some(secs)
+}
+
+/// Seconds until `free` bytes fall to `line` at `rate` bytes a second of growth (`0` at or
+/// below it); `None` without a positive rate. [`time_to_full`] is its `line` 0.
+#[must_use]
+pub fn time_to_line(free: u64, line: u64, rate: Option<f64>) -> Option<f64> {
+    let rate = rate.filter(|r| *r > 0.0)?;
+    Some(free.saturating_sub(line) as f64 / rate)
 }
 
 /// The filling clause's facts ([`filling`]).
@@ -550,6 +566,43 @@ mod tests {
         let got = rates(&r);
         assert!((got.rate60.expect("slack") - 2e6).abs() < 1e-3, "{got:?}");
         assert_eq!(rates(&missing_ring(61, 2e6, 6..9)).rate60, None);
+    }
+
+    #[test]
+    fn a_ring_read_once_a_minute_reads_its_rates_within_a_wider_slack() {
+        let mut r = BucketRing::with_capacity(crate::ring::RING_BUCKETS + 12);
+        for i in 0..58 {
+            let at = i * 65_000 + 7_000;
+            let _ = r.push(T0 + at, Some(1e12 + 2e6 * (at / 1_000) as f64), false);
+        }
+        assert_eq!(
+            rates(&r).rate5,
+            None,
+            "a reading about a minute misses the 30 s slack"
+        );
+        let got = rates_within(&r, 12);
+        for rate in [got.rate5, got.rate10, got.rate60] {
+            let rate = rate.expect("covered");
+            assert!(
+                (rate - 2e6).abs() < 2e6 * 0.05,
+                "a bucket's offset only: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_to_line_is_time_to_full_above_a_line() {
+        let free = 36_000_000_000;
+        assert_eq!(time_to_line(free, 0, Some(1e7)), Some(3_600.0));
+        assert_eq!(time_to_line(free, 18_000_000_000, Some(1e7)), Some(1_800.0));
+        assert_eq!(
+            time_to_line(free, free + 1, Some(1e7)),
+            Some(0.0),
+            "below the line"
+        );
+        assert_eq!(time_to_line(free, 0, Some(0.0)), None);
+        assert_eq!(time_to_line(free, 0, Some(-1.0)), None);
+        assert_eq!(time_to_line(free, 0, None), None);
     }
 
     #[test]

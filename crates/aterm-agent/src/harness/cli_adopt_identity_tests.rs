@@ -79,12 +79,9 @@ fn run_case(case: i64) -> (i64, i64, i64) {
     let env = env_at(&tmp);
     let path = env.accounts_roster().unwrap();
     let store = env.accounts_store();
-    let files = [
-        store.state_file(),
-        store.logins_file(),
-        store.ledger_path(),
-        store.wake_path(),
-    ];
+    // The wake marker a published adoption replaces (`wake_for_roster`) tells a running host of
+    // the row and grants nothing, so it is no credential authority here.
+    let files = [store.state_file(), store.logins_file(), store.ledger_path()];
     let before = files.each_ref().map(|path| std::fs::read(path).ok());
     let held = RefCell::new(None);
     let after_probe = RefCell::new(None);

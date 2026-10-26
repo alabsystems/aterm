@@ -941,9 +941,8 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
+        // Nobody is at the screen yet, so the offer waits for its answer meanwhile.
         let mut app = App::headless_for_test();
-        // A person is at the screen, whose untouched countdown applies the review.
-        app.user_input_recent = |_| true;
         let wid = WindowId(0);
         let window = app.windows.get_mut(&wid).unwrap();
         window.rows = 24;
@@ -1023,28 +1022,20 @@ mod tests {
                 Some(key)
             );
         }
-        app.tick_system_state(start + Duration::from_secs(60));
-        if action == Action::ScrollIntoView {
-            assert!(
-                request.pending(),
-                "Show item must stop automatic Apply while retaining the offer"
-            );
-            assert!(receive.try_recv().is_err());
-            let apply = publish_vault_action(&mut app, wid, view, "system-state/apply", None);
-            app.on_native_accessibility_action(wid, apply);
-        }
-        let mut answer = receive.try_recv().expect("the review answers once");
+        assert!(request.pending(), "navigation answers nothing");
+        // A person comes to the screen: navigation held nothing (design revision 4).
+        app.user_input_recent = |_| true;
+        app.tick_system_state(start + Duration::from_secs(1));
+        let mut answer = receive
+            .try_recv()
+            .expect("the page answers once a person is here");
         assert_eq!(
             answer.decision,
             WorkstationSetupDecision::Begin(Plan::default())
         );
         assert_eq!(
             answer.receipt.as_ref().unwrap().admission(),
-            if action == Action::ScrollIntoView {
-                crate::system_state::Admission::Person
-            } else {
-                crate::system_state::Admission::Automatic
-            }
+            crate::system_state::Admission::Automatic
         );
         answer.receipt.take().unwrap().accept();
         app.resolve_system_state_apply();
@@ -1054,12 +1045,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_review_ax_show_item_stops_automatic_apply() {
+    fn startup_review_ax_show_item_moves_the_list_and_holds_no_answer() {
         startup_review_ax_navigation(Action::ScrollIntoView);
     }
 
     #[test]
-    fn startup_review_ax_focus_preserves_the_existing_countdown() {
+    fn startup_review_ax_focus_holds_no_answer() {
         startup_review_ax_navigation(Action::Focus);
     }
 
@@ -1566,17 +1557,8 @@ mod tests {
             for setting in Group::Input.settings() {
                 expected.selection.set(*setting, false);
             }
-            let apply = if by_offer {
-                assert!(
-                    APPLIED.with(|applied| applied.borrow().is_empty()),
-                    "the current offer's group press edits only its review draft"
-                );
-                let apply = publish_vault_action(&mut app, wid, view, "system-state/apply", None);
-                app.on_native_accessibility_action(wid, apply.clone());
-                Some(apply)
-            } else {
-                None
-            };
+            // The current offer's group press answers it at once, as a press on the page does
+            // with no offer up.
             assert_eq!(
                 APPLIED.with(|applied| std::mem::take(&mut *applied.borrow_mut())),
                 [expected.clone()],
@@ -1589,9 +1571,6 @@ mod tests {
                 ..crate::SetupStatus::default()
             });
             app.on_native_accessibility_action(wid, fresh);
-            if let Some(apply) = apply {
-                app.on_native_accessibility_action(wid, apply);
-            }
             assert!(
                 APPLIED.with(|applied| applied.borrow().is_empty()),
                 "a press already taken cannot submit a second time"

@@ -231,10 +231,14 @@ USAGE
                            per-obligation record (--obligations, the default;
                            --no-obligations keeps none, and then no floor is
                            set from a check a backstop stopped) and its pace
-                           (CPU/wall, load). A shortfall is put down to the
-                           machine only in a starved run (CPU/wall under 0.8,
-                           or load above the cores), and only for what a
-                           backstop stopped that the floor's run did not and
+                           (CPU/wall, load, and how long its threads ran and
+                           were runnable, where the process table says). A
+                           shortfall is put down to the machine only in a
+                           starved run (threads that ran under 0.8 of the
+                           time they were runnable; where they were not read,
+                           CPU/wall under 0.8, or load above the cores), and
+                           only for what a backstop stopped that the floor's
+                           run did not and
                            the proof checks cancelled beyond that run's count
                            (trust/backstops.tsv). No floor is set or raised
                            from a starved run the machine can be credited

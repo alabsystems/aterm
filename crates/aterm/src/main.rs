@@ -3039,6 +3039,13 @@ fn run_prepared_setup(
             if held_widen {
                 put_back_held_widen(revision);
             }
+            // A run can wait on a person past its Secrets stage for as long as they take, and a
+            // done Secrets stage is not run again: while the plan in force keeps the vault in
+            // sync ([`vault_sync_kept`]), the mend keeps a vault subscriber whose plist runs a
+            // copy that is gone (aterm.app moved since), or that this window owes the Mac, as
+            // after a finished setup. Its effects take the profile lock a pass holds, so it
+            // never acts beside the run's own Secrets stage.
+            (setup_io().mend_subscriber)();
             // One lock order, the setup slot before the automatic claim: never wait for the slot
             // holding the claim, or a person's choice, which holds the slot while it waits for
             // the claim, never gets it. The retry loop claims again once it holds the slot.
@@ -3126,7 +3133,7 @@ fn while_vault_sync_kept_with(
 fn finish_withheld_preferences() {
     report_withheld_preferences(
         finish_withheld_preferences_with(
-            aterm_cli::macos_doctor::finish_withheld_preferences_observed,
+            aterm_cli::macos_doctor::finish_withheld_preferences_observed_unless_stopped,
         ),
         |report, observation| {
             remember_initial_setup_rows(report, None, observation);
@@ -3181,19 +3188,22 @@ type WithheldReservation = (PreferenceReadings, InitialSetupBusy);
 
 #[cfg(target_os = "macos")]
 fn finish_withheld_preferences_with<T>(
-    follow_up: impl FnOnce(fn() -> WithheldReservation) -> T,
+    follow_up: impl FnOnce(fn() -> WithheldReservation, fn(u64) -> bool) -> T,
 ) -> T {
-    follow_up(|| {
-        let busy = wait_for_initial_setup_slot();
-        // Tuple fields drop in order: retire and refresh the widget reading
-        // before another operation can take the setup slot.
-        (
-            PreferenceReadings::begin(vec![aterm_types::macos_setup::Subject::Setting(
-                aterm_types::macos_setup::Setting::Widgets,
-            )]),
-            busy,
-        )
-    })
+    follow_up(
+        || {
+            let busy = wait_for_initial_setup_slot();
+            // Tuple fields drop in order: retire and refresh the widget reading
+            // before another operation can take the setup slot.
+            (
+                PreferenceReadings::begin(vec![aterm_types::macos_setup::Subject::Setting(
+                    aterm_types::macos_setup::Setting::Widgets,
+                )]),
+                busy,
+            )
+        },
+        setup_stop_requested,
+    )
 }
 
 /// The background setup worker of a window or a session. It reports to the log
@@ -3701,9 +3711,9 @@ impl SetupRetryHost for LiveSetupRetry {
         report_first_run_doctor_failure(&mut self.last_failure, why);
     }
     fn completed(&mut self) {
-        // From now no Secrets stage keeps the vault subscriber: while the plan in force keeps the
-        // vault in sync ([`vault_sync_kept`]), the mend keeps a stale or owed one, and System
-        // State's Secrets rows show the rest.
+        // While the plan in force keeps the vault in sync ([`vault_sync_kept`]), the mend keeps a
+        // stale or owed subscriber (started once per process: a run admitted at launch started
+        // it already), and System State's Secrets rows show the rest.
         (setup_io().mend_subscriber)();
     }
 }
@@ -7082,17 +7092,22 @@ fn initial_setup_report_rows(
     // A Restore reaches the page as what it did to each System State row, in the page's
     // own words (one calm line, and a row for each setting it could not put back), never
     // as the preference keys `aterm doctor` lists: those stay in the CLI's text.
-    if let Some(restore) = &report.restore {
-        return aterm_gui::restore_rows(&restore.outcome);
-    }
+    // An explicit page can also name a separate setup failure after that Restore.
+    let mut page = report.restore.as_ref().map_or_else(Vec::new, |restore| {
+        aterm_gui::restore_rows(&restore.outcome)
+    });
     let checked = report.action == aterm_cli::macos_doctor::Action::Check;
     // A pass, and a Check, reach the page the same way (design §3.6): a change that failed, or
     // could not be confirmed, by its row, a step that failed as a whole under the rows it
     // covers, and what a rollback put back in a Restore's words, never a stage's own name or an
     // item's own title (a preference key, a keyboard's ID); its other rows as they are.
-    let (mut page, rows) = match &report.page {
-        Some(page) => (aterm_gui::pass_rows(&page.outcome), page.rows.as_slice()),
-        None => (Vec::new(), report.rows.as_slice()),
+    let rows = match &report.page {
+        Some(part) => {
+            page.extend(aterm_gui::pass_rows(&part.outcome));
+            part.rows.as_slice()
+        }
+        None if report.restore.is_some() => &[],
+        None => report.rows.as_slice(),
     };
     if checked {
         for row in &mut page {
@@ -7110,8 +7125,9 @@ fn initial_setup_report_rows(
         // visible independently of the current plan's selected groups. A
         // setting back that loads at the next login (`LOGIN`) is no
         // failure and passes as itself.
-        let not_restored =
-            report.action == aterm_cli::macos_doctor::Action::Restore && row.status == "blocked";
+        let not_restored = report.restore.is_none()
+            && report.action == aterm_cli::macos_doctor::Action::Restore
+            && row.status == "blocked";
         aterm_gui::SetupStatusRow {
             name: if not_restored {
                 format!("Restore: {}", row.name)
@@ -8291,6 +8307,9 @@ mod initial_setup_result_tests {
     #[path = "withheld_restore_result_tests.rs"]
     mod withheld_restore_result_tests;
 
+    #[path = "withheld_stop_tests.rs"]
+    mod withheld_stop_tests;
+
     #[path = "startup_retry_wake_tests.rs"]
     mod startup_retry_wake_tests;
 
@@ -9133,6 +9152,8 @@ mod initial_setup_result_tests {
         startup_failures: Vec<String>,
         /// Follow-ups with Full Disk Access a recorded grant started.
         follow_ups: usize,
+        /// Starts of the vault subscriber's mend asked for.
+        mends: usize,
         /// What bringing a restored setup forward found.
         brought_forward: aterm_cli::macos_doctor::BroughtForward,
         /// Check again's looks at the LAN.
@@ -9182,6 +9203,7 @@ mod initial_setup_result_tests {
             startup_backoff_hold: false,
             startup_failures: Vec::new(),
             follow_ups: 0,
+            mends: 0,
             brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
             lan_probes: 0,
             startups: 0,
@@ -9285,7 +9307,7 @@ mod initial_setup_result_tests {
                 claim_rerun: Self::claim_rerun,
                 persist: Self::persist,
                 run: Self::run,
-                mend_subscriber: || {},
+                mend_subscriber: || change(|script| script.mends += 1),
                 put_back: |_| Ok(false),
                 start_follow_up: || change(|script| script.follow_ups += 1),
                 bring_forward: || Ok(script().brought_forward),
@@ -9514,6 +9536,25 @@ mod initial_setup_result_tests {
         let _io = TestIo::install();
         run_prepared_setup(PreparedSetup::Finished, None, StartupSent::default());
         assert_eq!(script().follow_ups, 1);
+        assert_eq!(script().mends, 1, "the vault subscriber's mend");
+    }
+
+    /// A launch that resumes an admitted run starts the vault subscriber's mend before the run:
+    /// the run may wait on a person past its done Secrets stage for as long as they take, which
+    /// would leave a subscriber whose program is gone dead meanwhile.
+    #[test]
+    fn a_launch_resuming_a_run_starts_the_vault_mend() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        let claim = StartupClaim::claim().unwrap().unwrap();
+        run_prepared_setup(
+            PreparedSetup::Authorized { claim, revision: 8 },
+            None,
+            StartupSent::default(),
+        );
+        assert_eq!(script().runs, [8]);
+        assert_eq!(script().mends, 1);
+        clear_setup_run(8);
     }
 
     /// Check again looks at the LAN before it reads the Local Network row, so the row reads what
@@ -11348,7 +11389,7 @@ mod initial_setup_result_tests {
                 }
             };
             let result = if follow_up {
-                finish_withheld_preferences_with(|reserve| {
+                finish_withheld_preferences_with(|reserve, _stopped| {
                     let _reserved = reserve();
                     effect()
                 })
@@ -11404,7 +11445,7 @@ mod initial_setup_result_tests {
             OBSERVE_QUEUE.lock().unwrap().running = true;
             let result = std::panic::catch_unwind(|| {
                 if follow_up {
-                    finish_withheld_preferences_with(|reserve| {
+                    finish_withheld_preferences_with(|reserve, _stopped| {
                         let _reserved = reserve();
                         panic!("injected follow-up panic");
                     });
@@ -11444,7 +11485,7 @@ mod initial_setup_result_tests {
         let generation = OBSERVED_ROWS.lock().unwrap().generation;
         // The CLI calls reserve only once it has found owed work and Full
         // Disk Access. Both earlier exits take this same unreserved path.
-        assert_eq!(finish_withheld_preferences_with(|_| None::<()>), None);
+        assert_eq!(finish_withheld_preferences_with(|_, _| None::<()>), None);
         assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(SETUP_ACTIVITY.lock().unwrap().epoch, epoch);
         let rows = OBSERVED_ROWS.lock().unwrap();

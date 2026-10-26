@@ -52,15 +52,26 @@ fn find_field_owns_the_preedit() {
         "the well displays the composition inline: {text:?}"
     );
     let run_col = hit.field_cols.start + 2 - hit.field_scroll;
+    // The well's own edge, where it draws one (`find_bar::well_rule`), is one line under every
+    // cell of it; the composition is marked apart from the settled text either way.
+    let edge = row[hit.field_cols.start + 1].underline;
     assert_eq!(
-        row[run_col].underline,
-        UnderlineStyle::Single,
-        "the composed char is underlined in the well"
+        row[hit.field_cols.start].underline, edge,
+        "settled query text wears the well's edge alone"
     );
     assert_eq!(
-        row[hit.field_cols.start].underline,
-        UnderlineStyle::None,
-        "settled query text is not underlined"
+        row[run_col].underline,
+        if edge == UnderlineStyle::None {
+            UnderlineStyle::Single
+        } else {
+            UnderlineStyle::Double
+        },
+        "the composed char is underlined in the well, apart from its edge"
+    );
+    assert_ne!(row[run_col].underline, edge, "the composition reads apart");
+    assert_eq!(
+        row[run_col].underline_color, None,
+        "the composition is marked in the words' own ink, not the edge's grey"
     );
     assert!(
         ws.last_ime_rect.is_some(),

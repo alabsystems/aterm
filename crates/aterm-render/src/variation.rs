@@ -29,6 +29,9 @@ pub struct VfProbe {
     pub axes: Vec<VfAxis>,
     /// Per-axis design-space coords of the `Regular` named instance.
     pub regular_coords: Option<Vec<f32>>,
+    /// Per-axis design-space coords of the `Bold` named instance (an italic file's `Bold
+    /// Italic`): the bold its designer drew, which a bold role draws ([`bold_role_coords`]).
+    pub bold_coords: Option<Vec<f32>>,
 }
 
 /// Clamp a requested design-space value onto `axis`.
@@ -131,9 +134,11 @@ pub fn probe_face(face: &aterm_font::Face<'_>) -> Option<VfProbe> {
         return None;
     }
     let regular_coords = regular_instance_coords(face, axes.len());
+    let bold_coords = bold_instance_coords(face, axes.len());
     Some(VfProbe {
         axes,
         regular_coords,
+        bold_coords,
     })
 }
 
@@ -145,6 +150,24 @@ fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Op
         name.eq_ignore_ascii_case("regular")
     })
     .or_else(|| instance_coords_named(face, axis_count, is_regular_weight_slant_name))
+}
+
+/// The design-space coords of the face's bold named instance from the raw `fvar`
+/// table: "Bold", else the italic of Bold ("Bold Italic", "Bold Oblique"), as SF
+/// Mono's italic file names it.
+fn bold_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Option<Vec<f32>> {
+    instance_coords_named(face, axis_count, |name| name.eq_ignore_ascii_case("bold")).or_else(
+        || {
+            instance_coords_named(face, axis_count, |name| {
+                name.get(..5)
+                    .filter(|head| head.eq_ignore_ascii_case("bold "))
+                    .is_some_and(|_| {
+                        let rest = name[5..].trim_start();
+                        rest.eq_ignore_ascii_case("italic") || rest.eq_ignore_ascii_case("oblique")
+                    })
+            })
+        },
+    )
 }
 
 /// Whether a named instance's subfamily `name` is the italic (or oblique) of
@@ -257,21 +280,51 @@ fn name_is(face: &aterm_font::Face<'_>, name_id: u16, wanted: impl Fn(&str) -> b
     })
 }
 
-/// The coords a face drawn in a bold role takes: `base` (its regular resolution
-/// under the user's requests) with `wght` at [`BOLD_WGHT`], or a weight class above
-/// `base` where that is heavier, clamped to the axis.
+/// How much heavier than the regular weight a bold role draws at least: a weight class.
+pub const BOLD_STEP: f32 = 100.0;
+
+/// The face's own Bold named instance ([`VfProbe::bold_coords`]) as a bold role over `base`
+/// (its regular resolution under the user's requests) draws it, where it is a weight class or
+/// more above `base`: on every axis but those the user's own requests set (`kept`, by tag),
+/// which keep `base`'s value. SF Mono's Bold is `wght` 683 on its own `YAXS`, the face its name
+/// table names "Bold"; `None` for a face that designs no Bold, or one too light over `base`.
 #[must_use]
-pub fn bold_role_coords(axes: &[VfAxis], base: &[f32]) -> Vec<f32> {
-    axes.iter()
-        .zip(base)
-        .map(|(axis, &value)| {
-            if axis.tag == WGHT_TAG {
-                clamp_axis(axis, BOLD_WGHT.max(value + 100.0))
-            } else {
-                value
-            }
+pub fn designed_bold_coords(probe: &VfProbe, base: &[f32], kept: &[u32]) -> Option<Vec<f32>> {
+    let axes = &probe.axes;
+    let w = axes.iter().position(|axis| axis.tag == WGHT_TAG)?;
+    let bold = probe.bold_coords.as_deref()?;
+    (bold.len() == axes.len() && base.len() == axes.len() && bold[w] + 1e-3 >= base[w] + BOLD_STEP)
+        .then(|| {
+            axes.iter()
+                .zip(bold.iter().zip(base))
+                .map(|(axis, (&designed, &asked))| {
+                    let users = axis.tag != WGHT_TAG && kept.contains(&axis.tag);
+                    clamp_axis(axis, if users { asked } else { designed })
+                })
+                .collect()
         })
-        .collect()
+}
+
+/// The coords a face drawn in a bold role takes from `base` (its regular resolution under the
+/// user's requests): its designed Bold where it has one ([`designed_bold_coords`]), else `base`
+/// with `wght` at [`BOLD_WGHT`], or a weight class above `base` where that is heavier, clamped
+/// to the axis.
+#[must_use]
+pub fn bold_role_coords(probe: &VfProbe, base: &[f32], kept: &[u32]) -> Vec<f32> {
+    designed_bold_coords(probe, base, kept).unwrap_or_else(|| {
+        probe
+            .axes
+            .iter()
+            .zip(base)
+            .map(|(axis, &value)| {
+                if axis.tag == WGHT_TAG {
+                    clamp_axis(axis, BOLD_WGHT.max(value + BOLD_STEP))
+                } else {
+                    value
+                }
+            })
+            .collect()
+    })
 }
 
 /// Coordinate-applied face metrics in device px, through aterm-font with every coord set.

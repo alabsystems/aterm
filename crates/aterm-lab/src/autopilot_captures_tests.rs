@@ -686,3 +686,42 @@ fn rules_are_found_bottom_first() {
     let text = format!("top\n{rule}\n> \n{rule}\n  ∞ autopilot\n");
     assert_eq!(rule_rows(&text), [3, 1]);
 }
+
+/// `controls prefs` of Settings ▸ Harness as same-land's held run read it: cruise-n's row and its
+/// state line on the list's screen, land-b's row laid out past its state line, a stopped row
+/// turned below the list, and one turned off it.
+const HARNESS_PAGE: &str = r#"state open=true landing=false pane=native-tab category=Harness selected=0 scroll=0
+ui key="settings/list/scroll" role=Group label="" value=- action=- state=- rect=1020.0,114.0,1804.0,426.0
+ui key="settings/list" role=List label="Harness" value=- action=- state=- rect=1020.0,114.0,1804.0,426.0
+ui key="harness/session/1" role=Group label="cruise-n: Tab 2 · Claude Code · supervised · autopilot cruise" value=- action=- state=- rect=1038.0,332.0,684.0,44.0
+ui key="harness/session/1/state" role=Status label="needs you: grant Screen Recording; carrying on" value=- action=- state=- rect=1038.0,398.0,684.0,18.0
+ui key="harness/session/2" role=Group label="land-b: Tab 3 · Claude Code · supervised · autopilot land" value=- action=- state=- rect=1038.0,444.0,684.0,44.0
+ui key="harness/session/3" role=Group label="same-land: Tab 7 · Claude Code · supervised · autopilot land" value=- action=- state=- rect=1038.0,500.0,684.0,44.0
+ui key="harness/session/3/state" role=Status label="stopped typing: the same reply twice, no work" value=- action=- state=- rect=1038.0,566.0,684.0,18.0
+ui key="harness/session/4" role=Group label="land-c: Tab 4 · Claude Code · supervised · autopilot land" value=- action=- state=- rect=1038.0,132.0,684.0,44.0 offscreen=true
+ui key="harness/session/4/state" role=Status label="stopped typing: the same reply twice, no work" value=- action=- state=- rect=1038.0,198.0,684.0,18.0"#;
+
+#[test]
+fn a_held_rows_state_line_is_shown_only_on_the_lists_screen() {
+    assert_eq!(
+        held_row_shown(HARNESS_PAGE, "cruise-n").as_deref(),
+        Some("needs you: grant Screen Recording; carrying on")
+    );
+    for (label, why) in [
+        ("land-b", "its state line is not laid out"),
+        ("same-land", "its state line is below the list"),
+        ("land-c", "its row is off the screen"),
+        ("land-d", "no row"),
+    ] {
+        assert_eq!(held_row_shown(HARNESS_PAGE, label), None, "{label}: {why}");
+    }
+    let turned = HARNESS_PAGE.replace(
+        "rect=1038.0,566.0,684.0,18.0",
+        "rect=1038.0,466.0,684.0,18.0",
+    );
+    assert_eq!(
+        held_row_shown(&turned, "same-land").as_deref(),
+        Some("stopped typing: the same reply twice, no work"),
+        "turned onto the list's screen"
+    );
+}

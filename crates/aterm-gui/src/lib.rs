@@ -109,6 +109,7 @@ mod act_barrier;
 mod active_handle_conformance;
 mod alert_keys;
 mod alt_screen_resync;
+mod app_about;
 mod app_colorscheme;
 mod app_config;
 mod app_input;
@@ -163,6 +164,7 @@ mod editor_carry_conformance;
 #[cfg(test)]
 mod host_exceptions_tests;
 mod ledger_key;
+mod native_about;
 #[cfg(all(test, target_os = "macos"))]
 mod nudge_conformance;
 mod os_appearance;
@@ -3522,6 +3524,14 @@ enum Wake {
         tab: tab_model::TabId,
         action: menu::MenuAction,
     },
+    /// A native session row carries the terminal leaf it described when popped.
+    #[cfg(target_os = "macos")]
+    TabMenuSessionAction {
+        window: WindowId,
+        tab: tab_model::TabId,
+        origin: session_chrome::TerminalMenuOrigin,
+        action: menu::MenuAction,
+    },
     #[cfg(target_os = "macos")]
     TabContextMenuOpening {
         window: WindowId,
@@ -3546,7 +3556,7 @@ enum Wake {
     TabMenuRewind {
         window: WindowId,
         tab: tab_model::TabId,
-        origin: session_chrome::RewindMenuOrigin,
+        origin: session_chrome::TerminalMenuOrigin,
         at_ms: u64,
     },
     #[cfg(target_os = "macos")]
@@ -7112,6 +7122,18 @@ impl WindowState {
             .filter(|mirror| mirror.session == session)
     }
 
+    fn bind_trail_admission_source(&mut self) {
+        let source = self.front_content.and_then(|front| {
+            front
+                .terminal_session()
+                .map(|session| crate::cursor_glow::AdmissionSource {
+                    view: front.view().get(),
+                    session,
+                })
+        });
+        self.fx.cursor_mut().glow.set_admission_source(source);
+    }
+
     fn present_card(&self) -> Option<&SettingsCard> {
         self.deck_fold
             .as_ref()
@@ -7825,7 +7847,7 @@ impl WindowState {
             _ => false,
         });
         let strip_shadow = (tab_set.len(), tab_set.active_index().unwrap_or(0));
-        WindowState {
+        let mut window = WindowState {
             os_window: None,
             #[cfg(test)]
             os_window_for_test: false,
@@ -8102,7 +8124,9 @@ impl WindowState {
             pending_close_attribution: None,
             wallpaper_scaled: None,
             wallpaper_ink_scratch: Vec::new(),
-        }
+        };
+        window.bind_trail_admission_source();
+        window
     }
 }
 
@@ -8197,12 +8221,17 @@ fn hands_off_keys(focused: bool, last_keystroke_at: Option<Instant>, now: Instan
             .is_none_or(|at| now.saturating_duration_since(at) >= AUTOMATIC_UPDATE_KEYSTROKE_GAP)
 }
 
-const fn os_window_focused(ws: &WindowState) -> bool {
+/// Whether this aterm window has a real OS surface (in a test, its stand-in for one).
+const fn has_os_window(ws: &WindowState) -> bool {
     #[cfg(test)]
     if ws.os_window_for_test {
-        return ws.focused;
+        return true;
     }
-    ws.focused && ws.os_window.is_some()
+    ws.os_window.is_some()
+}
+
+const fn os_window_focused(ws: &WindowState) -> bool {
+    ws.focused && has_os_window(ws)
 }
 
 /// True once the latest consumed PTY burst is old enough for automatic update admission.
@@ -10420,14 +10449,27 @@ impl App {
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
+        let now = Instant::now();
         let row = self.consent.devtools_cached(
             self.config.privacy_probe_gate(),
             self.config.privacy_observer_off(),
         );
         if row.pending() {
+            // A retired worker still owns the slot until its completion. Its wake
+            // owes the replacement read, even with no further focus change.
+            if self.devtools_watch.owes_read() && self.any_os_window_focused() {
+                self.read_devtools_list(now);
+            }
             return;
         }
         self.note_devtools_reading(&row);
+        if self.devtools_watch.reading_revision().is_some()
+            && (!self.config.privacy_probe_gate().permits() || self.config.privacy_observer_off())
+        {
+            self.devtools_watch.hold_read();
+            return;
+        }
+        let rearmed = self.devtools_watch.take_reading_revision();
         let opened = self.devtools_shown_this_revision();
         let step = self.devtools_watch.observe(row.grant(), opened);
         let list_read = row.list().label == aterm_containment::DevToolListLabel::Read;
@@ -10437,8 +10479,36 @@ impl App {
         {
             self.refresh_devtools_verdict();
         }
-        if self.apply_devtools_step(step) {
-            let _ = self.hand_devtools_to_owner(devtools_helper::Origin::Automatic);
+        let hand_over = if rearmed.is_some()
+            && rearmed != self.access_revision()
+            && step == devtools_watch::Step::Clear
+        {
+            // An independent OS fact may refresh the verdict, but a different
+            // approval has not received its own reading yet.
+            if self.devtools_watch.take_refresh() {
+                self.refresh_devtools_verdict();
+            }
+            false
+        } else {
+            self.apply_devtools_step(step)
+        };
+        if hand_over {
+            match rearmed {
+                Some(revision) if self.access_revision() == Some(revision) => {
+                    self.queue_rearmed_devtools_step(now);
+                    self.list_ahead_for_queued_devtools_step(now);
+                }
+                Some(_) if self.access_revision().is_none() => {
+                    // Stop holds gestures, not this observed fact. The same
+                    // approval returning may still owe its never-opened page.
+                    self.devtools_helper
+                        .queue(devtools_helper::Origin::Automatic, now);
+                }
+                None => {
+                    let _ = self.hand_devtools_to_owner(devtools_helper::Origin::Automatic);
+                }
+                Some(_) => {}
+            }
         }
     }
 
@@ -10485,7 +10555,13 @@ impl App {
         origin: devtools_helper::Origin,
         now: Instant,
     ) -> (devtools_helper::Reading, devtools_helper::Facts, bool) {
-        let reading = self.devtools_reading();
+        let reading = if !origin.owner_press() && self.devtools_watch.reading_revision().is_some() {
+            // Old Lane facts cannot admit a pane or a list-ahead run while
+            // the newly approved revision still owes its fresh slot reading.
+            devtools_helper::Reading::UNREAD
+        } else {
+            self.devtools_reading()
+        };
         let reach = self.devtools_helper.reach();
         let key = self.access_marks().devtools;
         let declined = !origin.owner_press()
@@ -10526,7 +10602,7 @@ impl App {
     /// then is often out. It waits a [`devtools_helper::PANEL_TICK`], by when the probe that read
     /// sent has answered, with the answer of any `spctl` run it `carried`, as the Full Disk
     /// Access step waits for its own reading (`App::look_for_fda_moment`).
-    fn hold_devtools_for_fda_reading(
+    fn hold_devtools_for_reading(
         &mut self,
         origin: devtools_helper::Origin,
         carried: Option<Result<(), String>>,
@@ -10556,6 +10632,28 @@ impl App {
             )
     }
 
+    /// The window's own Developer Tools step waits for its moment, queued before a revision
+    /// admitted it or brought back by one approved in this process: when admission would queue
+    /// it now and its list reads whole and empty, the `spctl` run its moment needs starts now
+    /// ([`devtools_helper::Lane::list_ahead`]), as for a step asked under an approved revision.
+    pub(crate) fn list_ahead_for_queued_devtools_step(&mut self, now: Instant) {
+        use devtools_helper::{Admit, Moment, Origin};
+        if !cfg!(target_os = "macos")
+            || !self.devtools_helper.windowed()
+            || self.devtools_helper.queued() != Some(Origin::Automatic)
+            || self.access_revision().is_none()
+        {
+            return;
+        }
+        let (_, facts, _) = self.devtools_admit_facts(Origin::Automatic, now);
+        if devtools_helper::admit(Origin::Automatic, Moment::Asked, &facts) == Admit::Queue
+            && facts.lists_terminal()
+        {
+            let wake = self.devtools_hand_over_wake();
+            self.devtools_helper.list_ahead(wake);
+        }
+    }
+
     fn devtools_hand_over_carrying(
         &mut self,
         origin: devtools_helper::Origin,
@@ -10578,13 +10676,31 @@ impl App {
             return HandOver::Queued;
         }
         let (reading, facts, fda_pending) = self.devtools_admit_facts(origin, now);
-        let answer = match devtools_helper::admit(origin, moment, &facts) {
+        let admitted = devtools_helper::admit(origin, moment, &facts);
+        // A `spctl` run made ahead of the moment serves the hand-over it was made for: whatever
+        // that hand-over comes to (a list read again since needs no run), it is spent, unless the
+        // hand-over is queued for a later moment.
+        let waiting_read = admitted == Admit::Refuse(devtools_helper::Refusal::Unknown)
+            && self.devtools_watch.reading_revision().is_some();
+        let listed_ahead = !matches!(admitted, Admit::Queue)
+            && !waiting_read
+            && self.devtools_helper.take_listed_ahead();
+        let answer = match admitted {
             Admit::Refuse(devtools_helper::Refusal::NoFullDiskAccess) if fda_pending => {
-                self.hold_devtools_for_fda_reading(origin, carried, now)
+                self.hold_devtools_for_reading(origin, carried, now)
+            }
+            Admit::Refuse(devtools_helper::Refusal::Unknown)
+                if self.devtools_watch.reading_revision().is_some() =>
+            {
+                self.hold_devtools_for_reading(origin, carried, now)
             }
             Admit::Refuse(why) => HandOver::Refused(why),
             Admit::Queue => {
                 self.devtools_helper.queue(origin, now);
+                if facts.lists_terminal() {
+                    let wake = self.devtools_hand_over_wake();
+                    self.devtools_helper.list_ahead(wake);
+                }
                 HandOver::Queued
             }
             Admit::PanelOnly => {
@@ -10610,6 +10726,9 @@ impl App {
             } if matches!(carried, Some(Ok(()))) => {
                 self.open_devtools_page(origin, carried, true, now)
             }
+            Admit::Hand {
+                list_terminal: true,
+            } if listed_ahead => self.open_devtools_page(origin, Some(Ok(())), true, now),
             Admit::Hand {
                 list_terminal: true,
             } => {
@@ -11234,7 +11353,7 @@ impl App {
     /// every switch is on again ([`Self::resume_held_launch_steps`]).
     pub(crate) fn read_devtools_list(&mut self, now: Instant) {
         let gate = self.config.privacy_probe_gate();
-        if !gate.permits() {
+        if !gate.permits() || self.config.privacy_observer_off() {
             if self.devtools_watch.due(now) {
                 self.devtools_watch.hold_read();
             }
@@ -11245,6 +11364,20 @@ impl App {
                 .consent
                 .devtools(gate, self.config.privacy_observer_off());
         }
+    }
+
+    /// Full Disk Access reads granted in this process: the Developer Tools list can be read now,
+    /// so it is read at once ([`devtools_watch::DevToolsWatch::note_fda_granted`], once per
+    /// process) rather than at the next launch or focus gain, and a `not_granted` asks for that
+    /// page in this process ([`Self::on_devtools_probe_ready`]). The slot's retry floor is
+    /// cleared: a read another reader made just before the grant would hold this one back.
+    fn read_devtools_list_after_fda(&mut self, now: Instant) {
+        if !cfg!(target_os = "macos") || self.headless {
+            return;
+        }
+        self.consent.refresh_devtools();
+        self.devtools_watch.note_fda_granted();
+        self.read_devtools_list(now);
     }
 
     fn devtools_launch_read_done(&mut self) -> bool {
@@ -12073,6 +12206,7 @@ impl App {
             ) {
                 self.devtools_helper
                     .note_fda(aterm_containment::consent::FdaState::Granted, now);
+                self.read_devtools_list_after_fda(now);
             } else {
                 self.note_macos_access_granted(now);
             }
@@ -12356,7 +12490,12 @@ impl App {
             devtools_helper::Admit::Refuse(devtools_helper::Refusal::NoFullDiskAccess)
                 if fda_pending =>
             {
-                self.hold_devtools_for_fda_reading(origin, Some(listed), now)
+                self.hold_devtools_for_reading(origin, Some(listed), now)
+            }
+            devtools_helper::Admit::Refuse(devtools_helper::Refusal::Unknown)
+                if self.devtools_watch.reading_revision().is_some() =>
+            {
+                self.hold_devtools_for_reading(origin, Some(listed), now)
             }
             devtools_helper::Admit::Refuse(why) => HandOver::Refused(why),
             _ if !moment => {
@@ -12400,8 +12539,17 @@ impl App {
         if !cfg!(target_os = "macos") {
             return None;
         }
+        let read = (self.devtools_helper.windowed()
+            && self.any_os_window_focused()
+            && self.config.privacy_probe_gate().permits()
+            && !self.config.privacy_observer_off())
+        .then(|| self.devtools_watch.read_deadline(now))
+        .flatten();
         self.devtools_helper
             .next_deadline(now, || self.any_os_window_focused())
+            .into_iter()
+            .chain(read)
+            .min()
     }
 
     fn on_debugger_probe_ready(&mut self) {
@@ -12483,6 +12631,7 @@ impl App {
             self.retract_macos_access_rows(false, now);
             return;
         }
+        self.tick_fda_settle_look(now);
         if let Some(id) = self.consent_card_message
             && self.messages.live(id).is_none()
         {
@@ -12632,12 +12781,12 @@ impl App {
             // Verified here: a later approval in this process brings no page back.
             self.note_fda_unverified_here(false);
             self.note_fda_regression(false);
-            if self.access_revision().is_some() {
-                self.record_access_step(
-                    aterm_types::macos_setup::Access::FullDiskAccess,
-                    aterm_types::macos_setup::AccessOutcome::Granted,
-                );
-            } else {
+            if !self.record_access_step(
+                aterm_types::macos_setup::Access::FullDiskAccess,
+                aterm_types::macos_setup::AccessOutcome::Granted,
+            ) {
+                // A failed history write must not withhold this verified grant.
+                // Successful writes already wake setup through the record watcher.
                 self.notify_initial_setup_fda_granted();
             }
             self.show_macos_access_granted(now);
@@ -12826,12 +12975,17 @@ impl App {
             return None;
         }
         let cap = self.consent_card.lifecycle_deadline();
-        if self.consent_card.phase() == consent_card::CardPhase::Settled {
-            return cap; // no deadline: a settled card owns no timer
-        }
-        match (cap, self.next_consent_probe_deadline(now)) {
-            (Some(cap), Some(refresh)) => Some(cap.min(refresh)),
-            (cap, refresh) => cap.or(refresh),
+        let card = if self.consent_card.phase() == consent_card::CardPhase::Settled {
+            cap // no deadline: a settled card owns no timer
+        } else {
+            match (cap, self.next_consent_probe_deadline(now)) {
+                (Some(cap), Some(refresh)) => Some(cap.min(refresh)),
+                (cap, refresh) => cap.or(refresh),
+            }
+        };
+        match (card, self.consent_card_host.settle_look.deadline()) {
+            (Some(card), Some(look)) => Some(card.min(look)),
+            (card, look) => card.or(look),
         }
     }
 
@@ -12868,7 +13022,11 @@ impl App {
         let now = Instant::now();
         match decision.why {
             consent_card::DecideWhy::Launch => {
-                let verdict = consent_card::decide_launch(&facts, decision.marker, &record);
+                let age = Duration::from_secs(
+                    consent_card::now_unix_secs()
+                        .saturating_sub(consent_card::process_started_at()),
+                );
+                let verdict = consent_card::decide_launch(&facts, age, decision.marker, &record);
                 match &verdict {
                     consent_card::LaunchVerdict::Confirm => aterm_log::info!(
                         "macOS access card: the grant the owner was asked for is held"
@@ -12883,6 +13041,7 @@ impl App {
                 }
                 let hand_over =
                     consent_launch::hands_over(panel.fda, &verdict, decision.verified_here);
+                let looks_again = consent_launch::looks_again(&verdict, hand_over);
                 // The same check with the card's Not now aside (the first approved
                 // revision spends it): whether a new approval in this process brings
                 // the page back (`App::rearm_access_steps`).
@@ -12891,6 +13050,7 @@ impl App {
                         offered: true,
                         ..facts
                     },
+                    age,
                     None,
                     &record,
                 );
@@ -12905,14 +13065,13 @@ impl App {
                         match why {
                             consent_card::NotDue::NoNeedYet
                             | consent_card::NotDue::ReadsOffAfterVerified => {}
-                            consent_card::NotDue::Held => {
-                                self.stamp_fda_verified_host();
-                                self.persist_macos_access_record(consent_card::AccessRecord {
-                                    verified_build: build_info::build_number().parse::<u64>().ok(),
-                                    ..consent_card::AccessRecord::default()
-                                });
-                                self.retract_macos_access_rows(true, now);
+                            consent_card::NotDue::Settling => {
+                                if looks_again {
+                                    self.consent_card_host.settle_look =
+                                        consent_card::SettleLook::after_launch(age, now);
+                                }
                             }
+                            consent_card::NotDue::Held => self.note_launch_fda_held(now),
                             consent_card::NotDue::Granted => {
                                 // A grant held but never asked for is recorded silently (no
                                 // check mark), so a later switch-off here is not taken for a
@@ -13011,11 +13170,89 @@ impl App {
         }
     }
 
+    /// The launch check (or its look again, [`Self::tick_fda_settle_look`]) found the verified
+    /// grant held: this Mac and build are stamped, and the card's rows end as fixed.
+    fn note_launch_fda_held(&mut self, now: Instant) {
+        self.stamp_fda_verified_host();
+        self.persist_macos_access_record(consent_card::AccessRecord {
+            verified_build: build_info::build_number().parse::<u64>().ok(),
+            ..consent_card::AccessRecord::default()
+        });
+        self.retract_macos_access_rows(true, now);
+    }
+
+    /// The launch check's looks again at a verified grant it read off while this process settled
+    /// ([`consent_card::SettleLook`]). Each reads the probe afresh: held, the launch read was the
+    /// young process's; still off at the settled look, the grant is a need as any regression is
+    /// (one menu-bar line, no page), whose note says the update needs it re-allowed when this
+    /// build is not the one that verified it (or this process is an update's successor); still
+    /// off at the focus look after it, only the log says so.
+    fn tick_fda_settle_look(&mut self, now: Instant) {
+        if self.consent_card_host.settle_look.start(now) {
+            self.consent.refresh_fda();
+        }
+        if !self.consent_card_host.settle_look.reading() {
+            return;
+        }
+        let panel = self.consent_panel_facts();
+        if panel.probe == aterm_containment::consent::ProbeLabel::Pending {
+            return;
+        }
+        let Some(read) = self.consent_card_host.settle_look.read(panel.fda) else {
+            return;
+        };
+        let which = match read {
+            consent_card::SettleRead::StillOff { settled: false } => "at focus",
+            _ => "once settled",
+        };
+        match read {
+            consent_card::SettleRead::Held => {
+                aterm_log::info!(
+                    "macOS access card: looked again {which} \u{2014} full disk access reads held now"
+                );
+                self.note_launch_fda_held(now);
+            }
+            consent_card::SettleRead::StillOff { settled } => {
+                let current = build_info::build_number().parse::<u64>().ok();
+                let after_update = self.handoff_successor
+                    || self
+                        .consent_card_host
+                        .record
+                        .verified_build
+                        .is_some_and(|verified| Some(verified) != current);
+                aterm_log::info!(
+                    "macOS access card: looked again {which} \u{2014} full disk access still off{}",
+                    if after_update {
+                        "; the update needs it re-allowed"
+                    } else {
+                        ""
+                    }
+                );
+                if settled {
+                    if after_update {
+                        self.note_fda_off_after_update();
+                    }
+                    // A need kept while settling keeps its own words (a dialog macOS showed).
+                    let cause = self
+                        .consent_card_host
+                        .kept_need
+                        .unwrap_or(consent_card::NeedCause::ProtectedRead { session: None });
+                    self.begin_fda_need_decision(cause, now);
+                }
+            }
+            consent_card::SettleRead::Unread => aterm_log::info!(
+                "macOS access card: looked again {which} \u{2014} the probe could not read full \
+                 disk access"
+            ),
+        }
+    }
+
     fn note_macos_access_granted(&mut self, now: Instant) {
         aterm_log::info!("macOS access card: full disk access observed granted");
         if self.consent.window_reads_own_grant() {
             self.devtools_helper
                 .note_fda(aterm_containment::consent::FdaState::Granted, now);
+            self.read_devtools_list_after_fda(now);
         }
         self.resolve_fda_need(true, now);
         self.consent_card.settle();
@@ -14120,7 +14357,6 @@ impl App {
     fn sync_window(&mut self, wid: WindowId) {
         self.settle_selection_gesture(wid);
         self.settle_hidden_button_owners(wid);
-        self.search_close_in(wid, false);
         self.edit_tabs_seen(wid);
         self.refresh_active_split_presentation(wid);
         let App {
@@ -14191,6 +14427,7 @@ impl App {
             ws.blink_reseed = true;
             ws.rain_hidden_band.clear();
         }
+        ws.bind_trail_admission_source();
         if !terminal_front {
             let now = Instant::now();
             ws.fx.decos_mut().freeze(now);
@@ -14221,6 +14458,13 @@ impl App {
             }
         } else {
             ws.predictor.reset();
+        }
+        // Find searches the front terminal, so it closes with it: a tab switch, a pane
+        // focus move or the front's own close. A sync that leaves the front as it was (a
+        // background tab or split sibling closing) keeps the open field, its query and
+        // any composition in it.
+        if front_changed || !terminal_front {
+            self.search_close_in(wid, false);
         }
         self.recompute_focus_reports();
         self.recompute_notify_suppress();
@@ -15575,6 +15819,7 @@ impl App {
             if cfg!(target_os = "macos") && !self.headless {
                 self.consent.invalidate();
                 let _ = self.consent_panel_facts();
+                self.consent_card_host.settle_look.focus();
                 self.consent.invalidate_debugger();
                 self.consent.invalidate_devtools();
                 self.devtools_helper.forget_opened();
@@ -18654,6 +18899,8 @@ impl App {
             Wake::ReadChrome { reply } => {
                 let mut lines = self.read_native_chrome();
                 lines.extend(self.drawn_chip_lines());
+                #[cfg(all(a11y_tree, any(test, debug_assertions)))]
+                lines.extend(self.harness_a11y_lines());
                 lines.extend(self.status_item_chrome_lines());
                 lines.push(self.presence_chrome_line());
                 let _ = reply.send(lines);
@@ -18780,6 +19027,15 @@ impl App {
                 action,
             } => {
                 self.dispatch_tab_menu_action(el, window, tab, action);
+            }
+            #[cfg(target_os = "macos")]
+            Wake::TabMenuSessionAction {
+                window,
+                tab,
+                origin,
+                action,
+            } => {
+                self.dispatch_tab_menu_session_action(window, tab, origin, action);
             }
             #[cfg(target_os = "macos")]
             Wake::TabContextMenuOpening { window } => {

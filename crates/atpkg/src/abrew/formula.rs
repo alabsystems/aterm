@@ -22,6 +22,8 @@ pub struct Formula {
     pub stable_sha256: String,
     /// Bottle files by tag (`arm64_tahoe`, `all`), sorted.
     pub bottle_files: Vec<Bottle>,
+    /// The bottle block's `rebuild` counter (the `.bottle.N.` in filenames).
+    pub bottle_rebuild: u64,
     /// Why no bottle of this formula pours natively whatever its cellar.
     pub pour_needs: Option<String>,
     /// `conflicts_with` names, evaluated against abrew's census at install.
@@ -333,6 +335,10 @@ impl Formula {
             stable_url: s(stable.and_then(|x| x.get("url"))),
             stable_sha256: s(stable.and_then(|x| x.get("checksum"))),
             bottle_files,
+            bottle_rebuild: v
+                .pointer("/bottle/stable/rebuild")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             pour_needs,
             conflicts,
             requirements: requirements.unwrap_or_default(),

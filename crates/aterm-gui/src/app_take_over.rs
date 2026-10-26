@@ -95,12 +95,17 @@ pub(crate) struct AgentsState {
 }
 
 /// One local need, ordered as the status item orders this aterm's needs
-/// (`status_item::Glance::build`): stuck before decide, then oldest first (since this aterm
+/// (`status_item::need_order`): stuck before decide; within a severity a need that has stopped
+/// its agent before a harness's report it carries on past
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7); then oldest first (since this aterm
 /// first saw it published, `Herald::need_since`; unknown age last), then by the tab's label,
 /// then the session's local id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct NeedStop {
     pub(crate) severity: aterm_types::needs::Severity,
+    /// It is a harness's `NEEDS YOU:` report ([`crate::needs::Need::harness`]), which its agent
+    /// carries on past: it comes after the needs of its severity that stopped their agents.
+    pub(crate) carries_on: bool,
     /// Since when it has stood, unix seconds; `i64::MAX` for unknown.
     pub(crate) since: i64,
     /// The tab's label ([`App::tab_label_of_session`], as ❯ names the row).
@@ -546,19 +551,20 @@ impl App {
     /// Every local need, read off each session's published verdict (never classified here),
     /// with its age and label as the status item's row has them ([`NeedStop`]).
     pub(crate) fn local_needs(&self) -> Vec<NeedStop> {
-        let needs: Vec<(u64, aterm_types::needs::Severity, u64)> = self
+        let needs: Vec<(u64, aterm_types::needs::Severity, bool, u64)> = self
             .pool
             .iter()
             .filter_map(|s| {
                 let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                 let need = tl.need().need.as_ref()?;
-                Some((s.id, need.word.severity(), need.key))
+                Some((s.id, need.word.severity(), need.harness.is_some(), need.key))
             })
             .collect();
         needs
             .into_iter()
-            .map(|(session, severity, key)| NeedStop {
+            .map(|(session, severity, carries_on, key)| NeedStop {
                 severity,
+                carries_on,
                 since: self.presence.herald.need_since(session).unwrap_or(i64::MAX),
                 label: self.tab_label_of_session(session),
                 session,
@@ -1452,7 +1458,7 @@ mod tests {
                 .position(|e| {
                     matches!(
                         e,
-                        crate::session_chrome::TabMenuEntry::Action {
+                        crate::session_chrome::TabMenuEntry::SessionAction {
                             action: MenuAction::TakeOver,
                             ..
                         }
@@ -1470,6 +1476,713 @@ mod tests {
                 "controller={controller}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn hand_back_menu_origin_case(change: &str) {
+        let (mut app, wid, source, source_ctx) = app_with_stub();
+        app.tab_strip_rows = 1;
+        let sibling = app.split_active_stub_tab(wid);
+        let sibling_ctx = app.pool.get(sibling).unwrap().ctx.clone();
+        crate::term_lock(app.pool.get(source).unwrap().live_term()).process(b"source terminal");
+        crate::term_lock(app.pool.get(sibling).unwrap().live_term()).process(b"sibling terminal");
+        assert!(app.take_over_session(source).is_ok());
+        assert!(app.take_over_session(sibling).is_ok());
+        assert_eq!(
+            source_ctx.fabric.holds().person(),
+            Some(crate::fabric::TAKEN_OVER)
+        );
+        assert_eq!(
+            sibling_ctx.fabric.holds().person(),
+            Some(crate::fabric::TAKEN_OVER)
+        );
+        assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+        assert_eq!(app.focused_session_id(wid), Some(source));
+        let tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let source_view = app.windows[&wid].tab_set.active().unwrap().focus;
+        assert!(app.open_active_tab_context_menu(wid));
+        let menu = app.windows[&wid].tab_menu.as_ref().unwrap();
+        assert_eq!(menu.tab, tab);
+        let hand_back = menu
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    crate::session_chrome::TabMenuEntry::SessionAction {
+                        action: MenuAction::HandBack,
+                        enabled: true,
+                        ..
+                    }
+                )
+            })
+            .expect("the source's held state offers Hand Back");
+        assert!(crate::tab_menu::is_selectable(&menu.entries[hand_back]));
+
+        match change {
+            "unchanged" => {}
+            "focus sibling" => {
+                assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Right));
+                assert!(app.view_store.contains(source_view));
+            }
+            "close source" => {
+                assert_eq!(app.close_active_tab_in(wid), None);
+                assert!(!app.view_store.contains(source_view));
+                assert!(app.pool.get(source).is_none());
+                assert!(app.begin_active_session_rename(wid));
+                assert!(app.rename_field_edit(
+                    wid,
+                    crate::app_search::SearchEdit::Insert("unsubmitted sibling draft".into())
+                ));
+                assert_eq!(
+                    app.windows[&wid].rename_edit.as_ref().unwrap().text,
+                    "unsubmitted sibling draft"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let expected_focus = if change == "unchanged" {
+            source
+        } else {
+            sibling
+        };
+        assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab));
+        assert_eq!(app.focused_session_id(wid), Some(expected_focus));
+        let retained_menu = app.windows[&wid]
+            .tab_menu
+            .as_ref()
+            .expect("the captured menu survives");
+        assert_eq!(retained_menu.tab, tab);
+        assert!(matches!(
+            retained_menu.entries[hand_back],
+            crate::session_chrome::TabMenuEntry::SessionAction {
+                action: MenuAction::HandBack,
+                enabled: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            sibling_ctx.fabric.holds().person(),
+            Some(crate::fabric::TAKEN_OVER)
+        );
+        let source_hold = source_ctx.fabric.holds().person().map(str::to_string);
+        let at = std::time::Instant::now();
+        if change == "close source" {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.fx.cursor_mut().glow.note_typed_cells(at, 1);
+            window.fx.cursor_mut().trail.note_typed(at);
+            assert!(window.fx.cursor().glow.move_licensed(at));
+            assert!(window.fx.cursor().trail.move_licensed(at));
+        }
+        let live = |app: &App| {
+            app.pool
+                .iter()
+                .map(|session| {
+                    let terminal = crate::term_lock(session.live_term());
+                    let metadata = session.ctx.meta.lock().unwrap();
+                    (
+                        session.id,
+                        (
+                            terminal.visible_content(),
+                            terminal.content_seq(),
+                            session.ctx.sink.input_epoch(),
+                            metadata.presentation_value("title"),
+                            metadata.presentation_value("role"),
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let live_before = live(&app);
+        let tabs = app.windows[&wid].tab_set.clone();
+        let front = app.windows[&wid].front_content;
+        let draft = app.windows[&wid].rename_edit.clone();
+        let focus_order = app.focus_order.clone();
+        let config = app.native_config_service.snapshot();
+
+        app.with_gesture_source(false, |app| app.activate_tab_menu_entry(wid, hand_back));
+
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "the chosen menu closes"
+        );
+        assert_eq!(
+            live(&app),
+            live_before,
+            "menu activation writes no terminal input or metadata"
+        );
+        assert_eq!(app.windows[&wid].tab_set, tabs);
+        assert_eq!(app.windows[&wid].front_content, front);
+        assert_eq!(app.windows[&wid].rename_edit, draft);
+        assert_eq!(app.frontmost_window, Some(wid));
+        assert_eq!(app.focus_order, focus_order);
+        assert_eq!(app.focused_session_id(wid), Some(expected_focus));
+        assert_eq!(
+            app.active_handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|session| session.id),
+            Some(expected_focus)
+        );
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+        if change == "close source" {
+            assert!(app.windows[&wid].fx.cursor().glow.move_licensed(at));
+            assert!(app.windows[&wid].fx.cursor().trail.move_licensed(at));
+            assert_eq!(
+                source_ctx.fabric.holds().person().map(str::to_string),
+                source_hold
+            );
+        }
+        let source_was_returned = source_ctx.fabric.holds().person().is_none();
+        let sibling_stays_held =
+            sibling_ctx.fabric.holds().person() == Some(crate::fabric::TAKEN_OVER);
+        assert!(
+            sibling_stays_held && (change == "close source" || source_was_returned),
+            "{change}: captured source returned={source_was_returned}, unrelated sibling still held={sibling_stays_held}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tab_menus_hand_back_returns_its_unchanged_source_session() {
+        hand_back_menu_origin_case("unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tab_menus_hand_back_does_not_retarget_a_focused_sibling() {
+        hand_back_menu_origin_case("focus sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tab_menus_hand_back_cancels_when_its_source_pane_closed() {
+        hand_back_menu_origin_case("close source");
+    }
+
+    #[cfg(unix)]
+    fn captured_session_row(
+        app: &App,
+        wid: WindowId,
+        action: MenuAction,
+    ) -> (usize, crate::session_chrome::TerminalMenuOrigin) {
+        let menu = app.windows[&wid]
+            .tab_menu
+            .as_ref()
+            .expect("the actual menu is open");
+        menu.entries
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry {
+                crate::session_chrome::TabMenuEntry::SessionAction {
+                    action: candidate,
+                    enabled: true,
+                    origin: Some(origin),
+                    ..
+                } if *candidate == action => Some((index, *origin)),
+                _ => None,
+            })
+            .expect("the enabled session action has its captured terminal owner")
+    }
+
+    #[test]
+    fn session_menu_editors_follow_the_supported_strip_setting() {
+        use crate::session_chrome::{TabMenuEntry, TerminalMenuOrigin};
+
+        let (mut app, wid, source, source_ctx) = app_with_stub();
+        assert_eq!(app.tab_strip_rows, 0);
+        assert!(!app.can_rename_session(wid));
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        let (tab_id, view, root) = (tab.id, tab.focus, tab.root.clone());
+        let origin = TerminalMenuOrigin {
+            view,
+            session: source,
+        };
+        let editor_rows = |entries: &[TabMenuEntry]| {
+            [MenuAction::RenameSession, MenuAction::SetRole].map(|wanted| {
+                entries.iter().find_map(|entry| match entry {
+                    TabMenuEntry::SessionAction {
+                        action,
+                        enabled,
+                        origin,
+                        ..
+                    } if *action == wanted => Some((*enabled, *origin)),
+                    _ => None,
+                })
+            })
+        };
+        let titles = app.tab_titles(wid);
+        let chrome = app.tab_chrome_ext(wid, &titles);
+        let index = app.windows[&wid].tab_set.active_index().unwrap();
+        assert_eq!(
+            editor_rows(&chrome[index].menu),
+            [Some((false, Some(origin))); 2],
+            "the cached source has no editor surface before the setting changes"
+        );
+        let input_epoch = source_ctx.sink.input_epoch();
+        let content = crate::term_lock(app.pool.get(source).unwrap().live_term()).visible_content();
+        let config = app.native_config_service.snapshot();
+
+        app.set_tab_strip_rows(1, Instant::now());
+
+        assert_eq!(app.tab_strip_rows, 1);
+        assert!(app.can_rename_session(wid));
+        assert!(app.open_active_tab_context_menu(wid));
+        let menu = app.windows[&wid].tab_menu.as_ref().unwrap();
+        assert_eq!(menu.tab, tab_id);
+        let actual = editor_rows(&menu.entries);
+        assert_eq!(app.windows[&wid].tab_set.active().unwrap().focus, view);
+        assert_eq!(app.windows[&wid].tab_set.active().unwrap().root, root);
+        assert_eq!(app.focused_session_id(wid), Some(source));
+        assert_eq!(app.frontmost_window, Some(wid));
+        assert_eq!(source_ctx.sink.input_epoch(), input_epoch);
+        assert_eq!(
+            crate::term_lock(app.pool.get(source).unwrap().live_term()).visible_content(),
+            content
+        );
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+        assert_eq!(
+            actual,
+            [Some((true, Some(origin))); 2],
+            "the actual card follows the newly available editor surface without another session event"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_menu_editors_keep_the_captured_pane_after_sibling_focus() {
+        for (action, field) in [
+            (MenuAction::RenameSession, MetaField::Title),
+            (MenuAction::SetRole, MetaField::Role),
+        ] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.tab_strip_rows = 1;
+            let source = app.next_session_id;
+            app.push_stub_tab(wid, crate::stub_session(source));
+            let source_ctx = app.pool.get(source).unwrap().ctx.clone();
+            let sibling = app.split_active_stub_tab(wid);
+            let sibling_ctx = app.pool.get(sibling).unwrap().ctx.clone();
+            crate::term_lock(app.pool.get(source).unwrap().live_term()).process(b"source text");
+            crate::term_lock(app.pool.get(sibling).unwrap().live_term()).process(b"sibling text");
+            assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+            let tab = app.windows[&wid].tab_set.active_id().unwrap();
+            let view = app.windows[&wid].tab_set.active().unwrap().focus;
+            assert!(app.open_active_tab_context_menu(wid));
+            let (row, origin) = captured_session_row(&app, wid, action);
+            assert_eq!((origin.view, origin.session), (view, source));
+            assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Right));
+            assert_eq!(app.focused_session_id(wid), Some(sibling));
+            let live = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|session| {
+                        let terminal = crate::term_lock(session.live_term());
+                        (
+                            session.id,
+                            (
+                                terminal.visible_content(),
+                                terminal.content_seq(),
+                                session.ctx.sink.input_epoch(),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = live(&app);
+            let root = app.windows[&wid].tab_set.active().unwrap().root.clone();
+            let config = app.native_config_service.snapshot();
+
+            app.activate_tab_menu_entry(wid, row);
+
+            assert!(app.windows[&wid].tab_menu.is_none());
+            let edit = app.windows[&wid]
+                .rename_edit
+                .as_ref()
+                .expect("the captured session's editor opens");
+            assert_eq!((edit.session, edit.tab, edit.field), (source, tab, field));
+            assert_eq!(app.windows[&wid].tab_set.active().unwrap().focus, view);
+            assert_eq!(app.focused_session_id(wid), Some(source));
+            assert!(app.rename_field_edit(
+                wid,
+                crate::app_search::SearchEdit::Insert("source edit".into())
+            ));
+            app.commit_session_rename(wid, source, "source edit");
+            assert_eq!(
+                source_ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .presentation_value(field.wire_name())
+                    .as_deref(),
+                Some("source edit")
+            );
+            assert!(
+                sibling_ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .presentation_value("title")
+                    .is_none()
+            );
+            assert!(
+                sibling_ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .presentation_value("role")
+                    .is_none()
+            );
+            assert_eq!(live(&app), before);
+            assert_eq!(app.windows[&wid].tab_set.active().unwrap().root, root);
+            assert_eq!(app.frontmost_window, Some(wid));
+            assert_eq!(
+                app.active_handle
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|session| session.id),
+                Some(source)
+            );
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert!(app.structural_invariants_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_menu_take_over_and_log_keep_the_captured_session() {
+        for action in [MenuAction::TakeOver, MenuAction::HarnessLog] {
+            let (mut app, wid, source, source_ctx) = app_with_stub();
+            app.tab_strip_rows = 1;
+            let sibling = app.split_active_stub_tab(wid);
+            let sibling_ctx = app.pool.get(sibling).unwrap().ctx.clone();
+            assert!(app.take_over_session(sibling).is_ok());
+            assert!(source_ctx.fabric.holds().person().is_none());
+            assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+            let tab = app.windows[&wid].tab_set.active_id().unwrap();
+            let source_view = app.windows[&wid].tab_set.active().unwrap().focus;
+            assert!(app.open_active_tab_context_menu(wid));
+            let (row, origin) = captured_session_row(&app, wid, action);
+            assert_eq!((origin.view, origin.session), (source_view, source));
+            assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Right));
+            assert_eq!(app.focused_session_id(wid), Some(sibling));
+            let live = |app: &App| {
+                app.pool
+                    .iter()
+                    .map(|session| {
+                        let terminal = crate::term_lock(session.live_term());
+                        (
+                            session.id,
+                            (
+                                terminal.visible_content(),
+                                terminal.content_seq(),
+                                session.ctx.sink.input_epoch(),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = live(&app);
+            let tabs = app.windows[&wid].tab_set.clone();
+            let front = app.windows[&wid].front_content;
+            let config = app.native_config_service.snapshot();
+
+            app.with_gesture_source(false, |app| app.activate_tab_menu_entry(wid, row));
+
+            assert!(app.windows[&wid].tab_menu.is_none());
+            match action {
+                MenuAction::TakeOver => {
+                    assert_eq!(
+                        source_ctx.fabric.holds().person(),
+                        Some(crate::fabric::TAKEN_OVER)
+                    );
+                    assert!(app.last_ledger_plan.is_none());
+                }
+                MenuAction::HarnessLog => {
+                    assert!(source_ctx.fabric.holds().person().is_none());
+                    assert_eq!(
+                        app.last_ledger_plan.as_ref().unwrap().sid,
+                        source_ctx.self_id.as_str()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                sibling_ctx.fabric.holds().person(),
+                Some(crate::fabric::TAKEN_OVER)
+            );
+            assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab));
+            assert_eq!(app.windows[&wid].tab_set, tabs);
+            assert_eq!(app.windows[&wid].front_content, front);
+            assert_eq!(app.focused_session_id(wid), Some(sibling));
+            assert_eq!(
+                app.active_handle
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|session| session.id),
+                Some(sibling)
+            );
+            assert_eq!(live(&app), before);
+            assert_eq!(app.frontmost_window, Some(wid));
+            assert_eq!(app.native_config_service.snapshot(), config);
+            assert!(app.structural_invariants_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_menu_rows_bind_each_shared_view_and_drop_a_closed_original() {
+        use crate::session_chrome::TabMenuEntry;
+
+        let (mut app, wid, source, source_ctx) = app_with_stub();
+        app.tab_strip_rows = 1;
+        let sibling = app.split_active_stub_tab(wid);
+        let sibling_ctx = app.pool.get(sibling).unwrap().ctx.clone();
+        crate::term_lock(app.pool.get(source).unwrap().live_term())
+            .process(b"\x1b]7;file://localhost/tmp/menu-source\x07");
+        crate::term_lock(app.pool.get(sibling).unwrap().live_term())
+            .process(b"\x1b]7;file://localhost/tmp/menu-sibling\x07");
+        assert!(app.take_over_session(source).is_ok());
+        assert!(app.take_over_session(sibling).is_ok());
+        assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+        let tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let source_view = app.windows[&wid].tab_set.active().unwrap().focus;
+        let mirror = app.open_active_session_in_new_window_logical().unwrap();
+        let mirror_view = app.windows[&mirror].tab_set.active().unwrap().focus;
+        assert_ne!(source_view, mirror_view);
+        assert_eq!(app.pool.views(source), Some(2));
+        app.window_focus_event(mirror, false);
+        app.window_focus_event(wid, true);
+        assert!(app.open_active_tab_context_menu(wid));
+        let (row, origin) = captured_session_row(&app, wid, MenuAction::HandBack);
+        assert_eq!((origin.view, origin.session), (source_view, source));
+        let source_index = app.windows[&wid].tab_set.active_index().unwrap();
+        assert_eq!(
+            app.terminal_menu_origin_index(wid, tab, origin),
+            Some(source_index)
+        );
+        let origins = |entries: &[TabMenuEntry]| {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    TabMenuEntry::SessionAction { origin, .. } => Some(*origin),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_titles = app.tab_titles(wid);
+        let source_ext = app.tab_chrome_ext(wid, &source_titles);
+        let source_owners = origins(&source_ext[source_index].menu);
+        assert!(!source_owners.is_empty());
+        assert!(source_owners.iter().all(|owner| *owner == Some(origin)));
+        let mirror_titles = app.tab_titles(mirror);
+        let mirror_ext = app.tab_chrome_ext(mirror, &mirror_titles);
+        let mirror_owners = origins(&mirror_ext[0].menu);
+        assert_eq!(mirror_owners.len(), source_owners.len());
+        assert!(mirror_owners.iter().all(|owner| {
+            owner.is_some_and(|owner| owner.view == mirror_view && owner.session == source)
+        }));
+        let cached = origins(&app.session_chrome[&source].ext.menu);
+        assert_eq!(cached.len(), source_owners.len());
+        assert!(cached.iter().all(Option::is_none));
+        let clipboard_rows = source_ext[source_index].menu.iter().filter(|entry| matches!(entry,
+            TabMenuEntry::SessionAction { action: MenuAction::CopySessionId | MenuAction::CopyCwd, enabled: true, origin: Some(owner), .. } if *owner == origin
+        )).count();
+        assert_eq!(
+            clipboard_rows, 2,
+            "both clipboard rows carry the captured target without executing a clipboard write"
+        );
+        assert_eq!(
+            app.session_id_text(origin.session).as_deref(),
+            Some(source_ctx.self_id.as_str())
+        );
+        assert_eq!(
+            app.session_cwd(origin.session).as_deref(),
+            Some("/tmp/menu-source")
+        );
+        assert_eq!(
+            app.session_cwd(sibling).as_deref(),
+            Some("/tmp/menu-sibling")
+        );
+        assert_ne!(
+            app.session_id_text(origin.session),
+            app.session_id_text(sibling)
+        );
+
+        assert_eq!(app.close_active_tab_in(wid), None);
+        assert!(!app.view_store.contains(source_view));
+        assert!(app.view_store.contains(mirror_view));
+        assert_eq!(app.pool.views(source), Some(1));
+        assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab));
+        assert_eq!(app.focused_session_id(wid), Some(sibling));
+        assert_eq!(app.terminal_menu_origin_index(wid, tab, origin), None);
+        for window in [wid, mirror] {
+            assert!(app.begin_active_session_rename(window));
+            assert!(app.rename_field_edit(
+                window,
+                crate::app_search::SearchEdit::Insert("unsubmitted shared-view draft".into())
+            ));
+        }
+        let at = std::time::Instant::now();
+        for window in app.windows.values_mut() {
+            window.fx.cursor_mut().glow.note_typed_cells(at, 1);
+            window.fx.cursor_mut().trail.note_typed(at);
+            assert!(window.fx.cursor().glow.move_licensed(at));
+            assert!(window.fx.cursor().trail.move_licensed(at));
+        }
+        let windows = |app: &App| {
+            app.windows
+                .iter()
+                .map(|(id, window)| {
+                    (
+                        *id,
+                        (
+                            window.tab_set.clone(),
+                            window.layouts.clone(),
+                            window.front_content,
+                            window.rename_edit.clone(),
+                            window.fx.cursor().glow.move_licensed(at),
+                            window.fx.cursor().trail.move_licensed(at),
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let sessions = |app: &App| {
+            app.pool
+                .iter()
+                .map(|session| {
+                    let terminal = crate::term_lock(session.live_term());
+                    let metadata = session.ctx.meta.lock().unwrap();
+                    (
+                        session.id,
+                        (
+                            app.pool.views(session.id),
+                            terminal.visible_content(),
+                            terminal.content_seq(),
+                            session.ctx.sink.input_epoch(),
+                            metadata.presentation_value("title"),
+                            metadata.presentation_value("role"),
+                            session.ctx.fabric.holds().person().map(str::to_string),
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before_windows = windows(&app);
+        let before_sessions = sessions(&app);
+        let focus_order = app.focus_order.clone();
+        let config = app.native_config_service.snapshot();
+
+        app.with_gesture_source(false, |app| app.activate_tab_menu_entry(wid, row));
+
+        assert!(app.windows[&wid].tab_menu.is_none());
+        assert_eq!(windows(&app), before_windows);
+        assert_eq!(sessions(&app), before_sessions);
+        assert_eq!(
+            source_ctx.fabric.holds().person(),
+            Some(crate::fabric::TAKEN_OVER)
+        );
+        assert_eq!(
+            sibling_ctx.fabric.holds().person(),
+            Some(crate::fabric::TAKEN_OVER)
+        );
+        assert_eq!(app.frontmost_window, Some(wid));
+        assert_eq!(app.focus_order, focus_order);
+        assert_eq!(
+            app.active_handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|session| session.id),
+            Some(sibling)
+        );
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_whole_tab_menu_close_still_targets_the_tab_after_its_original_pane_closed() {
+        use crate::session_chrome::TabMenuEntry;
+
+        let (mut app, wid, _source, _source_ctx) = app_with_stub();
+        app.tab_strip_rows = 1;
+        let sibling = app.split_active_stub_tab(wid);
+        assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+        let tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let source_view = app.windows[&wid].tab_set.active().unwrap().focus;
+        assert!(app.open_active_tab_context_menu(wid));
+        let menu = app.windows[&wid].tab_menu.as_ref().unwrap();
+        let close = menu
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    TabMenuEntry::Action {
+                        action: MenuAction::CloseTab,
+                        enabled: true,
+                        ..
+                    }
+                )
+            })
+            .expect("whole-tab Close is independent of a terminal owner");
+        assert!(crate::tab_menu::is_selectable(&menu.entries[close]));
+        assert_eq!(app.close_active_tab_in(wid), None);
+        assert!(!app.view_store.contains(source_view));
+        assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab));
+        assert_eq!(app.focused_session_id(wid), Some(sibling));
+        let retained = app.windows[&wid].tab_menu.as_ref().unwrap();
+        assert_eq!(retained.tab, tab);
+        assert!(matches!(
+            retained.entries[close],
+            TabMenuEntry::Action {
+                action: MenuAction::CloseTab,
+                enabled: true,
+                ..
+            }
+        ));
+        assert!(app.close_tab_menu(wid));
+        let terminal = app.pool.get(0).unwrap().live_term().clone();
+        let untouched = {
+            let term = crate::term_lock(&terminal);
+            (
+                term.visible_content(),
+                app.pool.get(0).unwrap().ctx.sink.input_epoch(),
+            )
+        };
+        let config = app.native_config_service.snapshot();
+
+        let index = app
+            .prepare_tab_menu_action(wid, tab, MenuAction::CloseTab)
+            .expect("the whole tab still exists after its original pane closed");
+        assert!(
+            !app.close_tab_at(wid, index),
+            "the other terminal tab keeps the window open"
+        );
+
+        assert!(app.windows[&wid].tab_set.get(tab).is_none());
+        assert!(app.pool.get(sibling).is_none());
+        assert_eq!(app.focused_session_id(wid), Some(0));
+        assert_eq!(app.frontmost_window, Some(wid));
+        assert_eq!(
+            {
+                let term = crate::term_lock(&terminal);
+                (
+                    term.visible_content(),
+                    app.pool.get(0).unwrap().ctx.sink.input_epoch(),
+                )
+            },
+            untouched
+        );
+        assert_eq!(app.native_config_service.snapshot(), config);
+        assert!(app.structural_invariants_ok());
     }
 
     #[test]
@@ -1984,6 +2697,7 @@ mod tests {
         use aterm_types::needs::{NeedWord, Severity};
         let stop = |word: NeedWord, since: i64, session: u64, key: u64| NeedStop {
             severity: word.severity(),
+            carries_on: false,
             since,
             label: String::new(),
             session,
@@ -2081,6 +2795,76 @@ mod tests {
         assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(listed[0]));
         assert_eq!(app.next_need(), Ok(()));
         assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(listed[1]));
+    }
+
+    /// STOPPED WORK FIRST (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): an hour-old
+    /// `NEEDS YOU:` report its agent carries on past comes after a box that has just stopped
+    /// another tab's agent, on ❯ and on Next That Needs You (⇧⌘J) alike, which starts where ❯
+    /// starts.
+    #[test]
+    fn next_need_starts_at_a_stopped_need_before_an_older_report() {
+        use aterm_types::needs::NeedWord;
+        let (mut app, wid, first, first_ctx) = app_with_stub();
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        let second_ctx = app.pool.get(second).expect("pooled").ctx.clone();
+        let report = crate::needs::HarnessAsk::told(
+            &["the release credential to sign 0.48.0".to_string()],
+            aterm_phase::Program::Claude,
+        );
+        assert!(report.is_some(), "a report");
+        for (ctx, key, harness) in [(&first_ctx, 1, report), (&second_ctx, 2, None)] {
+            let _ = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .set_need(crate::needs::Verdict {
+                    need: Some(crate::needs::Need {
+                        word: NeedWord::Ask,
+                        key,
+                        what: "approve?".to_string(),
+                        harness,
+                        report: None,
+                    }),
+                    ..crate::needs::Verdict::default()
+                });
+        }
+        let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
+        for (session, at) in [(first, now - 3 * 3600), (second, now - 120)] {
+            let handle = app
+                .store
+                .read()
+                .unwrap()
+                .by_local(session)
+                .cloned()
+                .expect("registered");
+            let row = app.status_session_row(&handle);
+            let _ = app.presence.herald.observe(session, Some(&row), at);
+        }
+        let stops = app.local_needs();
+        let stop = |s: u64| stops.iter().find(|n| n.session == s).cloned();
+        assert_eq!(
+            (
+                stop(first).map(|n| n.carries_on),
+                stop(second).map(|n| n.carries_on)
+            ),
+            (Some(true), Some(false)),
+            "the report carries on, the box stopped its agent"
+        );
+        assert!(
+            stop(first).map(|n| n.since) < stop(second).map(|n| n.since),
+            "control: the report is the older"
+        );
+        let listed = app.status_glance().local_need_sessions();
+        assert_eq!(
+            listed,
+            vec![second, first],
+            "❯ lists the stopped box before the older report"
+        );
+        assert_eq!(app.next_need(), Ok(()));
+        assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(second));
+        assert_eq!(app.next_need(), Ok(()));
+        assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(first));
     }
 
     #[test]

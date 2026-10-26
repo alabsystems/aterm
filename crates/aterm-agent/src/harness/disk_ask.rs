@@ -37,6 +37,19 @@
 //! - a settled or out episode gives way to a new one ([`COOLDOWN_MS`] after it parked and after
 //!   the volume's last line) at a look that reads the volume short, so a volume that stays near
 //!   its floor is still asked about, at most once a cooldown.
+//!
+//! Before the disk fills (the design's §8): a look whose fill ring projects a crossing of the
+//! floor within the horizon ([`Ahead::projected`]) reads the volume **pressed** as a short one
+//! does, so the episode opens while there is still time:
+//! - each projecting host records its projection ([`Entry::projected`]), and no look ends an
+//!   episode while a record stands, nor while its worker is claimed or running; floors stay plain
+//!   ([`Entry::floor`]);
+//! - a projected episode's windows are a third of the time its crossing leaves ([`window`]), and
+//!   a rise settles it only once the crossing is gone or its answer window ends;
+//! - when nobody can act, or the asked one did not free it in time, ONE dedicated worker is
+//!   claimed for the volume ([`worker_step`]): only the claiming host starts it, at most one an
+//!   episode and one a [`WORKER_COOLDOWN_MS`], and no line is typed while it works;
+//! - [`owner_needed`] says when only the owner can still act.
 
 use std::cmp::Ordering;
 use std::io;
@@ -48,6 +61,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::truncate_bytes;
 use super::super::usage::rfc3339_utc;
+use super::fill::Projection;
 use super::{Hog, Level, ROW_TEXT_CAP, human_bytes};
 
 /// The rule's name: its line, its ledger rows and the log say it.
@@ -113,6 +127,33 @@ pub const END_MARGIN: u64 = super::PRESSURE_MARGIN_GIB << 30;
 /// files between two looks, around the line, keeps one episode and does not end and open it
 /// look after look. The line is the same in every host, so no host's is recorded.
 pub const END_FILES_MARGIN: u64 = super::EMERGENCY_FILES_FREE;
+
+/// How long another host's projection record ([`Entry::projected`]) stands after its last
+/// projecting look, at the look of a host whose ring is cold ([`Ahead::cold`]) or while its host
+/// runs: a seamless update's successor reads no 10-minute rate for ten minutes and stands a
+/// projection ten minutes after that, so the episode, its pick and its worker wait for it.
+pub const COLD_HOLD_MS: i64 = 30 * 60_000;
+
+/// The least a projected episode's delivery or answer window is ([`window`]).
+pub const FLOOR_WINDOW_MS: i64 = 5 * 60_000;
+
+/// How long a disk worker runs from its start before it is over (`expired`): its host turns its
+/// Autopilot Off then, so nothing more is typed into it.
+pub const WORKER_MS: i64 = 40 * 60_000;
+
+/// How long a claimed worker's host has to say what its spawn did before the claim is `lost`.
+pub const SPAWN_MS: i64 = 2 * 60_000;
+
+/// No worker is claimed on a volume within this of its last claim, across episodes.
+pub const WORKER_COOLDOWN_MS: i64 = 6 * 3_600_000;
+
+/// The folder a disk worker starts in, under the harness state directory: its task record's
+/// trusted folder, by which the harness's approval rule knows a disk worker's boxes
+/// ([`super::fence::is_worker_folder`]).
+pub use super::fence::WORKER_FOLDER;
+
+/// The longest a worker's task is, in bytes ([`worker_task`]).
+pub const WORKER_TASK_CAP: usize = 4096;
 
 /// Lines an episode: the elected session's, then at most one other's.
 pub const MAX_ASKS: u32 = 2;
@@ -346,6 +387,52 @@ pub struct Look<'a> {
     pub passing: bool,
     /// Whether another host's process still runs ([`HostId::alive`]).
     pub alive: &'a dyn Fn(&HostId) -> bool,
+    /// What this host's fill ring projects, and the worker it can run (the design's §8).
+    pub ahead: Ahead<'a>,
+}
+
+/// What one host's look reads ahead of the volume, and of the worker it can run ([`Look::ahead`]).
+#[derive(Clone, Copy, Default)]
+pub struct Ahead<'a> {
+    /// The crossing this host's fill ring projects at the look's reading
+    /// ([`super::fill::Fill::crossing`]): the look reads the volume pressed though it is not
+    /// short. `None`: it projects none.
+    pub projected: Option<Projection>,
+    /// This host's ring has read no 10-minute rate yet ([`super::fill::Fill::cold`]): its look
+    /// cannot say a fill stopped, so another host's projection record stands at it for
+    /// [`COLD_HOLD_MS`] after that host ended.
+    pub cold: bool,
+    /// This host can start a disk worker ([`worker_step`]): its harness supervises Claude Code and
+    /// its state root is the owner's.
+    pub worker_ok: bool,
+    /// What this host's task records say of a session's task, for the worker it runs: `None`
+    /// where it has no record of it.
+    pub task: Option<&'a TaskRead<'a>>,
+    /// What the spawn this host's last worker claim asked for did, until a step records it.
+    pub spawned: Option<&'a Spawned>,
+}
+
+/// A host's read of its task records ([`Ahead::task`]): what one says of session `sid`.
+pub type TaskRead<'a> = dyn Fn(&str) -> Option<TaskSeen> + 'a;
+
+/// What a host's task record says of a worker's session ([`Ahead::task`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSeen {
+    /// It works on.
+    Working,
+    /// Its task is done or exited.
+    Ended,
+    /// It stalled, at what (a sign-in, an install, a shell).
+    Stalled(String),
+}
+
+/// What a worker spawn did ([`Ahead::spawned`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spawned {
+    /// When it answered (unix ms).
+    pub at_ms: i64,
+    /// The session it started, or why none started (`no-window`, `harness-off`, ...).
+    pub outcome: Result<String, String>,
 }
 
 /// A session the lease elected, on its host.
@@ -684,16 +771,139 @@ pub struct Entry {
     /// is short is never credited to the session asked. Kept only while an episode is open.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reclaimed: Vec<Reclaimed>,
+    /// Each host's projection, as its last projecting look read it (one a host, at most
+    /// [`MAX_NOMINEES`]): refreshed at each of its projecting looks and dropped at its first warm
+    /// look that projects nothing, or once it stands no more ([`Projected::stands`]). No look
+    /// ends the episode while one stands. Kept only while an episode is open.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub projected: Vec<Projected>,
+    /// The volume's disk worker ([`worker_step`]): claimed, running, or over this episode. Kept
+    /// across [`Entry::close`] while claimed or running; one an older or newer build wrote in a
+    /// shape this one cannot read is read as none, and the cooldown still stands.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "worker_or_none"
+    )]
+    pub worker: Option<Worker>,
+    /// The volume's last worker claim (unix ms), across episodes ([`WORKER_COOLDOWN_MS`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_worker_ms: Option<i64>,
+    /// When the lease first read a worker due that no host claimed (unix ms): [`SPAWN_MS`] later
+    /// no host can start one, which [`owner_needed`] reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_ms: Option<i64>,
 }
 
 impl Entry {
     fn close(&mut self) {
+        let worker = self.worker.take().filter(Worker::works);
+        #[cfg(any(test, debug_assertions))]
+        let worker = worker.filter(|_| !fault::armed(fault::Fault::ForgetWorkerAtClose));
         *self = Entry {
             key: std::mem::take(&mut self.key),
             last_ask_ms: self.last_ask_ms,
+            worker,
+            last_worker_ms: self.last_worker_ms,
             ..Entry::default()
         };
     }
+}
+
+/// One host's projection in an open episode ([`Entry::projected`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Projected {
+    pub host: HostId,
+    /// The fill rate, bytes a second.
+    pub rate_bps: u64,
+    /// Milliseconds from [`Self::at_ms`] until free space falls to [`Self::floor`].
+    pub eta_ms: i64,
+    /// The host's plain floor it was read against.
+    pub floor: u64,
+    /// The host's first projecting look of this record (unix ms).
+    pub since_ms: i64,
+    /// Its last (unix ms).
+    pub at_ms: i64,
+}
+
+impl Projected {
+    /// Whether this record holds the episode open at `look`: refreshed within [`COLD_HOLD_MS`],
+    /// and its host runs or the looking host's ring is cold, so a successor's first twenty
+    /// minutes keep what its predecessor projected.
+    fn stands(&self, look: &Look<'_>) -> bool {
+        look.now_ms.saturating_sub(self.at_ms) < COLD_HOLD_MS
+            && (self.host == *look.host || (look.alive)(&self.host) || look.ahead.cold)
+    }
+
+    /// Milliseconds its crossing leaves at `now_ms`.
+    fn left_ms(&self, now_ms: i64) -> i64 {
+        self.eta_ms
+            .saturating_sub(now_ms.saturating_sub(self.at_ms))
+            .max(0)
+    }
+}
+
+/// A volume's disk worker ([`Entry::worker`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worker {
+    /// The host that claimed it, or runs it now.
+    pub host: HostId,
+    /// When it was claimed (unix ms).
+    pub at_ms: i64,
+    pub state: WorkerState,
+    /// When a look of another host first read [`Self::host`] ended (unix ms): [`ADOPT_MS`] later
+    /// a claim is `lost` and a run `gone`, unless a host that runs its session took it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_ms: Option<i64>,
+}
+
+impl Worker {
+    /// Claimed or running: the rounds wait, no look ends the episode, and no other is claimed.
+    #[must_use]
+    pub const fn works(&self) -> bool {
+        matches!(
+            self.state,
+            WorkerState::Claimed | WorkerState::Running { .. }
+        )
+    }
+
+    /// The session it runs as, once started.
+    #[must_use]
+    pub fn sid(&self) -> Option<&str> {
+        match &self.state {
+            WorkerState::Claimed => None,
+            WorkerState::Running { sid, .. } => Some(sid),
+            WorkerState::Over { sid, .. } => sid.as_deref(),
+        }
+    }
+}
+
+/// Where a disk worker stands ([`Worker::state`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum WorkerState {
+    /// Its host asked its main thread to start it.
+    Claimed,
+    /// It runs as `sid` since `started_ms`; `free_at` the free figure then, `best_free` the most
+    /// read since.
+    Running {
+        sid: String,
+        started_ms: i64,
+        free_at: u64,
+        best_free: u64,
+    },
+    /// It is over (`why`: `finished`, `stalled:<what>`, `gone`, `expired`, `lost`,
+    /// `spawn:<reason>`) since `at_ms`; free space rose `rose` while it ran.
+    Over {
+        why: String,
+        sid: Option<String>,
+        at_ms: i64,
+        rose: u64,
+    },
+}
+
+/// [`Entry::worker`] as the lease holds it, or none where its shape is not this build's.
+fn worker_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Worker>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| aterm_json::from_value::<Worker>(v).ok()))
 }
 
 /// The machine-wide lease ([`LEASE_FILE`]).
@@ -773,9 +983,15 @@ pub enum Said {
     Cooldown {
         last_ms: i64,
     },
-    /// An episode opened.
+    /// An episode opened; `projected`: the crossing the opening look projected.
     Opened {
         done: Done,
+        projected: Option<Projection>,
+    },
+    /// The round's time is over, but the volume's disk worker is claimed or running
+    /// ([`Entry::worker`]): nobody is elected while it works.
+    WorkerRuns {
+        sid: Option<String>,
     },
     /// A round gathers nominees; `seat`: this host's.
     Nominating {
@@ -846,6 +1062,7 @@ impl Said {
             Said::Freeing => "freeing",
             Said::Cooldown { .. } => "cooldown",
             Said::Opened { .. } => "opened",
+            Said::WorkerRuns { .. } => "worker-runs",
             Said::Nominating { .. } => "nominating",
             Said::Elected { .. } => "elected",
             Said::Owed { .. } => "owed",
@@ -888,7 +1105,8 @@ impl Said {
             Said::Freed { sid, .. } => sid,
             Said::Nominating {
                 seat: Some(sid), ..
-            } => sid,
+            }
+            | Said::WorkerRuns { sid: Some(sid) } => sid,
             _ => "",
         }
     }
@@ -907,9 +1125,24 @@ impl Said {
                 rfc3339_utc(last_ms / 1000),
                 rfc3339_utc(last_ms.saturating_add(COOLDOWN_MS) / 1000)
             ),
-            Said::Opened { done } => format!(
+            Said::Opened {
+                done,
+                projected: None,
+            } => format!(
                 "below the floor and aterm's freeing is done ({}): one agent will be asked",
                 done.word()
+            ),
+            Said::Opened {
+                done,
+                projected: Some(p),
+            } => format!(
+                "{} and aterm's freeing is done ({}): one agent will be asked",
+                p.describe(),
+                done.word()
+            ),
+            Said::WorkerRuns { sid } => format!(
+                "aterm's disk worker{} is freeing space: no session is asked while it works",
+                sid.as_ref().map(|s| format!(" @{s}")).unwrap_or_default()
             ),
             Said::Nominating { until_ms, seat } => format!(
                 "gathering every host's nominee until {}{}",
@@ -1018,12 +1251,13 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     if look.level == Level::Unknown {
         return Said::Quiet;
     }
-    let below = look.level >= Level::Short;
+    let below = pressed(look);
     let entry = if below {
         lease.entry_mut(look.key)
     } else {
         match lease.entry_at(look.key) {
             Some(e) if e.episode_ms.is_some() => {
+                note_projected(e, look);
                 if ends(e, look) && !freed_by_pick(e, look) {
                     let asks = e.asks;
                     e.close();
@@ -1038,6 +1272,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
         hold(entry, look);
         note_held(entry, look);
         note_reclaimed(entry, look);
+        note_projected(entry, look);
     }
     let now = look.now_ms;
     match entry.phase.clone() {
@@ -1141,7 +1376,10 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             let passing = look.passing;
             #[cfg(any(test, debug_assertions))]
             let passing = passing && !fault::armed(fault::Fault::SettleWhilePassing);
-            if rose >= FREED_MIN && passing {
+            // While the look still projects a crossing, a rise settles nothing before the answer
+            // window ends: a GiB is seconds of a fast fill, and settling parks the episode.
+            let crossing = crossing(look).is_some() && now < until_ms;
+            if rose >= FREED_MIN && (passing || crossing) {
                 entry.phase = Phase::Asked {
                     pick: pick.clone(),
                     typed_ms,
@@ -1333,6 +1571,16 @@ pub fn take_over(lease: &mut Lease, r: &Roster<'_>) -> Vec<String> {
         }
         Phase::Idle | Phase::Nominating { .. } | Phase::Settled { .. } | Phase::Out { .. } => {}
     }
+    // A running worker whose host ended moves to the host that runs its session, as a pick does.
+    if let Some(w) = entry.worker.as_mut()
+        && let WorkerState::Running { sid, .. } = &w.state
+        && ended(&w.host)
+        && r.live.contains(sid)
+    {
+        took.push(sid.clone());
+        w.host = r.host.clone();
+        w.orphan_ms = None;
+    }
     let mut now_held: Vec<Held> = Vec::new();
     if let Phase::Nominating { nominees, .. } = &mut entry.phase {
         nominees.retain_mut(|n| {
@@ -1436,6 +1684,14 @@ fn ends(entry: &Entry, look: &Look<'_>) -> bool {
     if fault::armed(fault::Fault::EndAtOwnFloor) {
         return true;
     }
+    // A projection record that stands, or a worker that works, holds the episode open: the
+    // first is a host still reading a fill that crosses, the second the episode's own answer.
+    let projected = entry.projected.iter().any(|p| p.stands(look));
+    #[cfg(any(test, debug_assertions))]
+    let projected = projected && !fault::armed(fault::Fault::EndWhileProjected);
+    if projected || entry.worker.as_ref().is_some_and(Worker::works) {
+        return false;
+    }
     let (bytes, files) = (END_MARGIN, END_FILES_MARGIN);
     #[cfg(any(test, debug_assertions))]
     let (bytes, files) = if fault::armed(fault::Fault::EndAtHeldFloor) {
@@ -1480,7 +1736,7 @@ fn open(entry: &mut Entry, look: &Look<'_>) -> Said {
     entry.done = Some(done);
     entry.floor = Some(Floor {
         host: look.host.clone(),
-        bytes: look.floor,
+        bytes: floor_of(look),
     });
     entry.picks.clear();
     entry.released = 0;
@@ -1488,14 +1744,95 @@ fn open(entry: &mut Entry, look: &Look<'_>) -> Said {
     entry.asks = 0;
     entry.asked.clear();
     entry.held.clear();
+    entry.projected.clear();
+    // A worker over before this episode opened (one the line cooldown made due with none open)
+    // is no worker of this one: [`Entry::close`] drops such a record, and here none was closed.
+    // Kept, it barred this episode's own worker for good; the worker cooldown still stands.
+    entry.worker = entry.worker.take().filter(Worker::works);
     note_held(entry, look);
+    note_projected(entry, look);
     entry.phase = Phase::Nominating {
         until_ms: look.now_ms.saturating_add(NOMINATE_MS),
         nominees: Vec::new(),
         after: None,
     };
     nominate(entry, look);
-    Said::Opened { done }
+    Said::Opened {
+        done,
+        projected: crossing(look),
+    }
+}
+
+/// Whether `look` reads the volume pressed: short by its floor, or a crossing projected
+/// ([`Ahead::projected`]).
+#[must_use]
+pub fn pressed(look: &Look<'_>) -> bool {
+    look.level >= Level::Short || crossing(look).is_some()
+}
+
+/// The crossing `look` projects, as the step reads it.
+fn crossing(look: &Look<'_>) -> Option<Projection> {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::ProjectionIgnored) {
+        return None;
+    }
+    look.ahead.projected
+}
+
+/// The floor a look records ([`Entry::floor`]): its plain floor, never one a projection raised.
+fn floor_of(look: &Look<'_>) -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::ProjectionInFloor) {
+        return look
+            .floor
+            .saturating_add(crossing(look).map_or(0, |p| p.need));
+    }
+    look.floor
+}
+
+/// Record `look`'s projection in the open episode ([`Entry::projected`]) in place of its host's
+/// last, keeping when that host's projection began; drop its host's at a warm look that projects
+/// nothing, and every record that stands no more ([`Projected::stands`]). A host records one only
+/// once its ring is warm, so its own record is never one a cold look of it would drop.
+fn note_projected(entry: &mut Entry, look: &Look<'_>) {
+    let now = look.now_ms;
+    let since = entry
+        .projected
+        .iter()
+        .find(|p| p.host == *look.host)
+        .map(|p| p.since_ms);
+    entry
+        .projected
+        .retain(|p| p.host != *look.host && p.stands(look));
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::ProjectionInFloor) {
+        return;
+    }
+    if let Some(p) = crossing(look) {
+        entry.projected.push(Projected {
+            host: look.host.clone(),
+            rate_bps: p.rate_bps,
+            eta_ms: p.eta_ms,
+            floor: look.floor,
+            since_ms: since.unwrap_or(now),
+            at_ms: now,
+        });
+    }
+    let over = entry.projected.len().saturating_sub(MAX_NOMINEES);
+    entry.projected.drain(..over);
+}
+
+/// The window a step of `entry`'s episode has at `now_ms`: a third of the least time a standing
+/// crossing leaves ([`Entry::projected`]), at least [`FLOOR_WINDOW_MS`] and at most `cap`; `cap`
+/// with none recorded.
+fn window(entry: &Entry, now_ms: i64, cap: i64) -> i64 {
+    entry
+        .projected
+        .iter()
+        .filter(|p| now_ms.saturating_sub(p.at_ms) < COLD_HOLD_MS)
+        .map(|p| p.left_ms(now_ms))
+        .min()
+        .map_or(cap, |left| (left / 3).clamp(FLOOR_WINDOW_MS.min(cap), cap))
 }
 
 /// The floor `entry`'s open episode is held to on `look`: the one recorded for it while its host
@@ -1515,14 +1852,15 @@ fn held_to(entry: &Entry, look: &Look<'_>) -> u64 {
 /// as high. So the record, and the line, the owner's note and `harness disk why` that read it,
 /// say the floor the episode is held to, whether or not this look read the volume short.
 fn hold(entry: &mut Entry, look: &Look<'_>) {
+    let floor = floor_of(look);
     let kept = entry
         .floor
         .as_ref()
-        .is_some_and(|f| f.host != *look.host && f.bytes >= look.floor && (look.alive)(&f.host));
+        .is_some_and(|f| f.host != *look.host && f.bytes >= floor && (look.alive)(&f.host));
     if !kept {
         entry.floor = Some(Floor {
             host: look.host.clone(),
-            bytes: look.floor,
+            bytes: floor,
         });
     }
 }
@@ -1662,6 +2000,15 @@ fn held_why(entry: &Entry) -> Vec<HeldBy> {
 /// there is none and a session not yet picked is held ([`Said::Waiting`]); otherwise run out.
 fn elect(entry: &mut Entry, look: &Look<'_>, after: Option<Miss>) -> Said {
     let now = look.now_ms;
+    // No session is typed a line while the volume's worker works: it is the episode's answer.
+    let works = entry.worker.as_ref().filter(|w| w.works());
+    #[cfg(any(test, debug_assertions))]
+    let works = works.filter(|_| !fault::armed(fault::Fault::LineWhileWorker));
+    if let Some(w) = works {
+        return Said::WorkerRuns {
+            sid: w.sid().map(str::to_owned),
+        };
+    }
     let (best, seat) = match &entry.phase {
         Phase::Nominating { nominees, .. } => (
             nominees
@@ -1718,7 +2065,7 @@ fn elect(entry: &mut Entry, look: &Look<'_>, after: Option<Miss>) -> Said {
     entry.phase = Phase::Owed {
         pick: pick.clone(),
         elected_ms: now,
-        until_ms: now.saturating_add(DELIVER_MS),
+        until_ms: now.saturating_add(window(entry, now, DELIVER_MS)),
         orphan_ms: None,
     };
     Said::Elected { pick, held: n.held }
@@ -1858,7 +2205,7 @@ pub fn typed(
             entry.phase = Phase::Asked {
                 pick,
                 typed_ms: now_ms,
-                until_ms: now_ms.saturating_add(ANSWER_MS),
+                until_ms: now_ms.saturating_add(window(entry, now_ms, ANSWER_MS)),
                 free_at: free,
                 best_free: free,
             };
@@ -1927,7 +2274,7 @@ fn counted_late(entry: &mut Entry, host: &HostId, sid: &str, at_ms: i64, free: u
             sid: sid.to_owned(),
         },
         typed_ms: at_ms,
-        until_ms: at_ms.saturating_add(ANSWER_MS),
+        until_ms: at_ms.saturating_add(window(entry, at_ms, ANSWER_MS)),
         free_at: free,
         best_free: free,
     };
@@ -1980,7 +2327,9 @@ pub fn rests(lease: &Lease, key: &str, typed_ms: Option<i64>) -> bool {
     });
     #[cfg(any(test, debug_assertions))]
     let unrecorded = unrecorded && !fault::armed(fault::Fault::RestUnrecorded);
-    !open && !unrecorded
+    // A worker that works is stepped at every look, so its end is read whatever the volume reads.
+    let works = entry.is_some_and(|e| e.worker.as_ref().is_some_and(Worker::works));
+    !open && !unrecorded && !works
 }
 
 /// Host `host` found at its turn break that session `sid` may not be asked: the lease hands the
@@ -2116,6 +2465,415 @@ pub fn owner_line(entry: &Entry, now_ms: i64) -> Option<String> {
     }
 }
 
+/// What a worker step decided ([`worker_step`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerSaid {
+    /// This host claimed the volume's worker: it starts it now, once.
+    Claimed,
+    /// The worker this host started runs as `sid`.
+    Started { sid: String },
+    /// The worker is over (`why`, [`WorkerState::Over`]); free space rose `rose` while it ran.
+    /// `here`: it was this host's, which turns its Autopilot Off at `expired`.
+    Over {
+        sid: Option<String>,
+        why: String,
+        rose: u64,
+        here: bool,
+    },
+}
+
+impl WorkerSaid {
+    /// The ledger's word.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            WorkerSaid::Claimed => "worker",
+            WorkerSaid::Started { .. } => "worker-started",
+            WorkerSaid::Over { .. } => "worker-over",
+        }
+    }
+
+    /// One sentence a person reads.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            WorkerSaid::Claimed => "no agent could free the volume in time: aterm starts one \
+                                    dedicated disk worker"
+                .to_owned(),
+            WorkerSaid::Started { sid } => {
+                format!("aterm's disk worker runs as @{sid}; no session is asked while it works")
+            }
+            WorkerSaid::Over { sid, why, rose, .. } => format!(
+                "aterm's disk worker{} is over ({why}); free space rose {} while it ran",
+                sid.as_ref().map(|s| format!(" @{s}")).unwrap_or_default(),
+                human_bytes(*rose)
+            ),
+        }
+    }
+}
+
+/// After [`step`], under the same lock: move volume `look.key`'s disk worker on (a spawn's
+/// outcome, its task's end, its time, its host's end), or claim one where it is due
+/// ([`worker_due`]). Only the claiming host starts it ([`WorkerSaid::Claimed`]).
+#[must_use]
+pub fn worker_step(lease: &mut Lease, look: &Look<'_>) -> Option<WorkerSaid> {
+    if look.level == Level::Unknown {
+        return None;
+    }
+    let entry = lease.entry_at(look.key)?;
+    if entry.worker.as_ref().is_some_and(Worker::works) {
+        return worker_moves(entry, look);
+    }
+    if !wants_worker(entry, look) {
+        entry.due_ms = None;
+        return None;
+    }
+    if !look.ahead.worker_ok {
+        entry.due_ms.get_or_insert(look.now_ms);
+        return None;
+    }
+    entry.worker = Some(Worker {
+        host: look.host.clone(),
+        at_ms: look.now_ms,
+        state: WorkerState::Claimed,
+        orphan_ms: None,
+    });
+    entry.last_worker_ms = Some(look.now_ms);
+    entry.due_ms = None;
+    Some(WorkerSaid::Claimed)
+}
+
+/// Whether volume `entry`'s worker is due at `look` ([`worker_step`]), on a host that can start
+/// one ([`Ahead::worker_ok`]).
+#[must_use]
+pub fn worker_due(entry: &Entry, look: &Look<'_>) -> bool {
+    look.ahead.worker_ok && wants_worker(entry, look)
+}
+
+/// [`worker_due`] on any host: the look reads the volume pressed, aterm's freeing is done, no
+/// worker was claimed this episode nor within [`WORKER_COOLDOWN_MS`], and the lease reads one of:
+/// the episode is out; its round waits only on held sessions ([`waits`]); a round follows a pick
+/// that freed nothing or never took its line; it settled while a crossing is still projected;
+/// or no episode can open for the line cooldown.
+fn wants_worker(entry: &Entry, look: &Look<'_>) -> bool {
+    let now = look.now_ms;
+    let done = look.done.is_some();
+    #[cfg(any(test, debug_assertions))]
+    let done = done || fault::armed(fault::Fault::WorkerBeforeDone);
+    let none = entry.worker.is_none();
+    #[cfg(any(test, debug_assertions))]
+    let none = none
+        || (fault::armed(fault::Fault::WorkerTwice)
+            && !entry.worker.as_ref().is_some_and(Worker::works));
+    let cool = entry
+        .last_worker_ms
+        .is_some_and(|last| (0..WORKER_COOLDOWN_MS).contains(&now.saturating_sub(last)));
+    #[cfg(any(test, debug_assertions))]
+    let cool = cool && !fault::armed(fault::Fault::WorkerInCooldown);
+    if !pressed(look) || !done || !none || cool {
+        return false;
+    }
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::WorkerUndue) {
+        return true;
+    }
+    let line_cool = entry
+        .last_ask_ms
+        .is_some_and(|last| (0..COOLDOWN_MS).contains(&now.saturating_sub(last)));
+    match &entry.phase {
+        Phase::Out { .. } => true,
+        Phase::Nominating { after, .. } => {
+            waits(entry, now) || matches!(after, Some(Miss::NothingFreed | Miss::Undelivered))
+        }
+        Phase::Settled { .. } => crossing(look).is_some(),
+        Phase::Idle => entry.episode_ms.is_none() && line_cool,
+        Phase::Owed { .. } | Phase::Asked { .. } => false,
+    }
+}
+
+/// Move a claimed or running worker on at `look`.
+fn worker_moves(entry: &mut Entry, look: &Look<'_>) -> Option<WorkerSaid> {
+    let now = look.now_ms;
+    let w = entry.worker.as_mut()?;
+    if w.host != *look.host
+        && let WorkerState::Running { sid, .. } = &w.state
+        && look.live.contains(sid)
+        && !(look.alive)(&w.host)
+    {
+        // Its host ended and this one runs its session: a seamless update's successor.
+        w.host = look.host.clone();
+        w.orphan_ms = None;
+    }
+    let here = w.host == *look.host;
+    if !here {
+        if (look.alive)(&w.host) {
+            w.orphan_ms = None;
+            return None;
+        }
+        let at = *w.orphan_ms.get_or_insert(now);
+        if now.saturating_sub(at) < ADOPT_MS {
+            return None;
+        }
+        let why = if w.sid().is_some() { "gone" } else { "lost" };
+        return Some(worker_over(w, now, why.to_owned(), false));
+    }
+    match &mut w.state {
+        WorkerState::Claimed => {
+            if let Some(sp) = look.ahead.spawned.filter(|s| s.at_ms >= w.at_ms) {
+                return Some(match &sp.outcome {
+                    Ok(sid) => {
+                        w.state = WorkerState::Running {
+                            sid: sid.clone(),
+                            started_ms: sp.at_ms,
+                            free_at: look.free,
+                            best_free: look.free,
+                        };
+                        WorkerSaid::Started { sid: sid.clone() }
+                    }
+                    Err(why) => worker_over(w, now, format!("spawn:{why}"), true),
+                });
+            }
+            (now.saturating_sub(w.at_ms) >= SPAWN_MS)
+                .then(|| worker_over(w, now, "lost".to_owned(), true))
+        }
+        WorkerState::Running {
+            sid,
+            started_ms,
+            best_free,
+            ..
+        } => {
+            *best_free = (*best_free).max(look.free);
+            let seen = look.ahead.task.and_then(|task| task(sid));
+            let why = match seen {
+                Some(TaskSeen::Ended) => Some("finished".to_owned()),
+                Some(TaskSeen::Stalled(what)) => Some(format!("stalled:{what}")),
+                Some(TaskSeen::Working) | None => None,
+            }
+            .or_else(|| (!look.live.contains(sid)).then(|| "gone".to_owned()))
+            .or_else(|| {
+                (now.saturating_sub(*started_ms) >= WORKER_MS).then(|| "expired".to_owned())
+            });
+            why.map(|why| worker_over(w, now, why, true))
+        }
+        WorkerState::Over { .. } => None,
+    }
+}
+
+/// Worker `w` is over for `why` at `now`.
+fn worker_over(w: &mut Worker, now: i64, why: String, here: bool) -> WorkerSaid {
+    let (sid, rose) = match &w.state {
+        WorkerState::Running {
+            sid,
+            free_at,
+            best_free,
+            ..
+        } => (Some(sid.clone()), best_free.saturating_sub(*free_at)),
+        _ => (None, 0),
+    };
+    w.state = WorkerState::Over {
+        why: why.clone(),
+        sid: sid.clone(),
+        at_ms: now,
+        rose,
+    };
+    w.orphan_ms = None;
+    WorkerSaid::Over {
+        sid,
+        why,
+        rose,
+        here,
+    }
+}
+
+/// When the step in hand on `entry`'s volume ends at `now_ms`: a line owed or out (its answer
+/// window's end), a worker claimed or running (its run's end). `None`: none is in hand.
+fn in_hand_until(entry: &Entry, now_ms: i64) -> Option<i64> {
+    let line = match &entry.phase {
+        Phase::Owed { until_ms, .. } => {
+            Some(until_ms.saturating_add(window(entry, now_ms, ANSWER_MS)))
+        }
+        Phase::Asked { until_ms, .. } => Some(*until_ms),
+        _ => None,
+    };
+    let worker = entry.worker.as_ref().and_then(|w| match &w.state {
+        WorkerState::Claimed => Some(w.at_ms.saturating_add(SPAWN_MS + WORKER_MS)),
+        WorkerState::Running { started_ms, .. } => Some(started_ms.saturating_add(WORKER_MS)),
+        WorkerState::Over { .. } => None,
+    });
+    #[cfg(any(test, debug_assertions))]
+    let worker = worker.filter(|_| !fault::armed(fault::Fault::AlertWhileWorker));
+    line.max(worker)
+}
+
+/// Whether only the owner can still act on `look`'s volume now (the design's §8.5), `entry` its
+/// lease after the look's steps and `emergency` the free bytes below which writes fail: the look
+/// reads it pressed, aterm's freeing is done, and either nothing aterm runs can still act (no
+/// line owed or out, no worker claimed or running, none can start, and the episode is out or
+/// settled, or no episode can open for the line cooldown, or its round waits only on held
+/// sessions), or the step in hand ends after the fill reaches the emergency line.
+#[must_use]
+pub fn owner_needed(entry: Option<&Entry>, look: &Look<'_>, emergency: u64) -> bool {
+    let Some(e) = entry else {
+        return false;
+    };
+    if !pressed(look) || look.done.is_none() {
+        return false;
+    }
+    let now = look.now_ms;
+    if let Some(until) = in_hand_until(e, now) {
+        return crossing(look).is_some_and(|p| {
+            let left_s = look.free.saturating_sub(emergency) / p.rate_bps.max(1);
+            let left_ms = i64::try_from(left_s.saturating_mul(1_000)).unwrap_or(i64::MAX);
+            now.saturating_add(left_ms) < until
+        });
+    }
+    let can_start = e.worker.is_none()
+        && e.last_worker_ms
+            .is_none_or(|last| !(0..WORKER_COOLDOWN_MS).contains(&now.saturating_sub(last)))
+        && e.due_ms
+            .is_none_or(|due| now.saturating_sub(due) < SPAWN_MS);
+    if can_start && wants_worker(e, look) {
+        return false;
+    }
+    let line_cool = e
+        .last_ask_ms
+        .is_some_and(|last| (0..COOLDOWN_MS).contains(&now.saturating_sub(last)));
+    match &e.phase {
+        Phase::Out { .. } | Phase::Settled { .. } => true,
+        Phase::Idle => line_cool,
+        Phase::Nominating { .. } => waits(e, now),
+        Phase::Owed { .. } | Phase::Asked { .. } => false,
+    }
+}
+
+/// What a worker's task says of the volume ([`worker_task`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Brief<'a> {
+    /// The volume's mount point.
+    pub mount: &'a Path,
+    pub total: u64,
+    pub free: u64,
+    /// The floor the episode is held to.
+    pub floor: u64,
+    pub projected: Option<Projection>,
+    /// The free bytes at which the worker is done: the pass's projected target, or the floor
+    /// plus the margin the pass reclaims past it.
+    pub target: u64,
+    /// The largest holders the pass left ([`super::Report::hogs`], largest first).
+    pub holders: &'a [Hog],
+    /// What the owner's line says the ask came to ([`owner_line`]).
+    pub asked: Option<&'a str>,
+    /// `$HOME`, for `~/…`.
+    pub home: Option<&'a Path>,
+}
+
+/// The disk worker's task (the design's §8.4), in at most [`WORKER_TASK_CAP`] bytes of plain
+/// characters: what the volume reads and the target, what aterm did and kept, how to find what
+/// fills it without a look that raises a privacy dialog, to free only through `aterm harness disk
+/// free`, and the report it ends with.
+#[must_use]
+pub fn worker_task(b: &Brief<'_>) -> String {
+    let used = b.total.saturating_sub(b.free);
+    let pct = if b.total == 0 {
+        100
+    } else {
+        u64::try_from(u128::from(used) * 100 / u128::from(b.total)).unwrap_or(100)
+    };
+    let volume = plain(&b.mount.display().to_string())
+        .map_or_else(|| "The volume".to_owned(), |m| format!("The volume {m}"));
+    let state = match b.projected.map(|p| p.at(b.free, b.floor, Some(b.total))) {
+        Some(p) if b.free >= b.floor => format!(
+            "falling {}: at that rate it is under its {} floor in {}",
+            p.per_hour(),
+            human_bytes(b.floor),
+            p.eta_words()
+        ),
+        Some(p) => format!(
+            "below its {} floor and falling {}",
+            human_bytes(b.floor),
+            p.per_hour()
+        ),
+        None => format!("below its {} floor", human_bytes(b.floor)),
+    };
+    let target_mb = b.target >> 20;
+    let mut out = format!(
+        "aterm's disk-free worker. {volume} is {pct}% full, {} free, {state}. aterm's \
+         own cleanup has run every tier it may. Your job: find what is filling this volume and \
+         free only what regenerates, until `aterm ctl @self status` reads disk_free_mb= at least \
+         {target_mb}.",
+        human_bytes(b.free)
+    );
+    if let Some(asked) = b.asked.and_then(printable) {
+        out.push_str(&format!(" So far: {asked}."));
+    }
+    let kept: Vec<String> = b
+        .holders
+        .iter()
+        .take(4)
+        .map(|h| {
+            format!(
+                "{} {}",
+                shown_path(holder_path(h), b.home),
+                human_bytes(h.bytes)
+            )
+        })
+        .collect();
+    if !kept.is_empty() {
+        out.push_str(&format!(
+            " aterm kept these build directories (a session uses them, or a fence kept them); \
+             leave them: {}.",
+            kept.join("; ")
+        ));
+    }
+    out.push_str(
+        " To find what fills it: `aterm ctl @self sys disk scope=aterm` (every tab's folders and \
+         where processes write, with growth), `aterm ctl @self sys procs scope=global top=16` \
+         (who writes), `aterm harness disk` (what aterm could free and why it kept the rest), and \
+         `aterm harness disk free --dry-run` (what the tool caches under ~/Library/Caches, \
+         ~/.cache, ~/.cargo, ~/.npm and Xcode's DerivedData hold that may go, largest first). \
+         Never list, size or open a folder yourself under the home folder or ~/Library, \
+         Desktop, Documents, Downloads, Movies, Music, Pictures, iCloud Drive, /Volumes or \
+         another app's data: a look there can put a privacy dialog on the owner's screen. Free \
+         only with `aterm harness disk free <path>...` (it refuses what does not regenerate, \
+         and says why); every other removal is declined. Never ask a question: when unsure, keep it and name it. Never commit, push, \
+         or remove a worktree, branch or stash. End with one reply starting `Nothing left:` \
+         that names each path you freed and its size, then a line `disk-free filling: <what \
+         fills the volume>` and a line `disk-free owner-only: <what only the owner can free>`, \
+         and no NEEDS YOU line: aterm tells the owner. (rule disk-free@v1 worker)",
+    );
+    truncate_bytes(&out, WORKER_TASK_CAP).to_owned()
+}
+
+/// One `free-ask` row of a worker step on volume `key` ([`worker_step`]), at `now_s`, read with
+/// `free` bytes free, by host `host`.
+#[must_use]
+pub fn worker_row(now_s: i64, key: &str, said: &WorkerSaid, free: u64, host: &HostId) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now_s)));
+    let sid = match said {
+        WorkerSaid::Claimed => None,
+        WorkerSaid::Started { sid } => Some(sid.as_str()),
+        WorkerSaid::Over { sid, .. } => sid.as_deref(),
+    };
+    o.insert("sid".to_owned(), Value::from(sid.unwrap_or("").to_owned()));
+    o.insert("kind".to_owned(), Value::from(ROW_KIND.to_owned()));
+    o.insert("rule".to_owned(), Value::from(RULE_DISK_FREE.to_owned()));
+    o.insert("said".to_owned(), Value::from(said.word().to_owned()));
+    o.insert("volume".to_owned(), Value::from(key.to_owned()));
+    o.insert("free_bytes".to_owned(), Value::from(free));
+    o.insert("host_pid".to_owned(), Value::from(host.pid));
+    if let WorkerSaid::Over { why, rose, .. } = said {
+        o.insert("why".to_owned(), Value::from(why.clone()));
+        o.insert("rose_bytes".to_owned(), Value::from(*rose));
+    }
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(&said.describe(), ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| "{\"kind\":\"free-ask\",\"reason\":\"unserializable\"}".to_owned())
+}
+
 /// The guard on [`LOCK_FILE`]: its `Drop` releases by `LOCK_UN`.
 pub struct LeaseLock(std::fs::File);
 
@@ -2230,6 +2988,9 @@ pub struct Line<'a> {
     pub shared: bool,
     /// `$HOME`, for `~/…`.
     pub home: Option<&'a Path>,
+    /// The crossing the look projects ([`Ahead::projected`]): the line says the fill rate and
+    /// when it crosses [`Self::floor`] in place of "within … of its floor".
+    pub projected: Option<Projection>,
 }
 
 /// The harness's mark and whose fact the line is.
@@ -2257,7 +3018,9 @@ const HOLDER_PATH_CAP: usize = 56;
 /// the line leaves it ([`clip_within`]), or as "its volume", before it clips the holder: the
 /// holder is what the agent acts on, and the asked tab's own keeps its path and its mark. Only a
 /// line too long even then names the holder with its path clipped to the room left, so a line
-/// whose pass left a holder never says it names none, and every line keeps to the cap.
+/// whose pass left a holder never says it names none. A projected line ([`Line::projected`])
+/// still too long with the fill rate says its crossing without the rate, so every line keeps to
+/// the cap.
 #[must_use]
 pub fn line(l: &Line<'_>) -> String {
     line_within(l, LINE_CAP)
@@ -2276,17 +3039,51 @@ fn line_within(l: &Line<'_>, cap: usize) -> String {
         Done::CleanupOff => "aterm's own cleanup is off (`[disk] auto_free_gib`)",
         Done::Inodes => "aterm's cleanup frees bytes, not inodes",
     };
-    let below = match (l.done, l.emergency) {
-        (Done::Inodes, _) => "and out of inodes".to_owned(),
-        (_, true) => format!("below the {} writes need", human_bytes(l.floor)),
-        (_, false) if l.free < l.floor => format!("below its {} floor", human_bytes(l.floor)),
+    let projected = l.projected.map(|p| p.at(l.free, l.floor, Some(l.total)));
+    // `rate`: the projection's fill rate is said. A projected line still too long with it once
+    // the ladder below has given the volume's name way is said without it (`under its 47.0 GiB
+    // floor in ~13 min`, or below it `below its 47.0 GiB floor`), as long as revision 1's words:
+    // with it the fact runs about 40 characters past revision 1's.
+    let below = |rate: bool| match (l.done, l.emergency, projected) {
+        (Done::Inodes, _, _) => "and out of inodes".to_owned(),
+        (_, true, _) => format!("below the {} writes need", human_bytes(l.floor)),
+        (_, false, Some(p)) if l.free < l.floor && rate => format!(
+            "below its {} floor and falling {}",
+            human_bytes(l.floor),
+            p.per_hour()
+        ),
+        (_, false, Some(p)) if l.free >= l.floor && rate => format!(
+            "falling {}: at that rate it is under its {} floor in {}",
+            p.per_hour(),
+            human_bytes(l.floor),
+            p.eta_words()
+        ),
+        (_, false, Some(p)) if l.free >= l.floor => format!(
+            "under its {} floor in {}",
+            human_bytes(l.floor),
+            p.eta_words()
+        ),
+        (_, false, _) if l.free < l.floor => format!("below its {} floor", human_bytes(l.floor)),
         // The episode is held open until free space clears its floor by the margin.
-        (_, false) => format!(
+        (_, false, _) => format!(
             "within {} of its {} floor",
             human_bytes(END_MARGIN),
             human_bytes(l.floor)
         ),
     };
+    let rated = below(true);
+    let text = said_within(l, pct, &rated, why, cap);
+    let unrated = below(false);
+    if text.chars().count() > cap && unrated != rated {
+        return said_within(l, pct, &unrated, why, cap);
+    }
+    text
+}
+
+/// The `disk-free@v1` line [`line_within`] says in at most `cap` characters, its fact saying the
+/// volume `pct` full and `below`, and aterm done because `why`, with the largest holders the pass
+/// left that fit.
+fn said_within(l: &Line<'_>, pct: u64, below: &str, why: &str, cap: usize) -> String {
     let volume = plain(&l.mount.display().to_string()).unwrap_or_else(|| UNSAID_VOLUME.to_owned());
     let said_on = |volume: &str, named: &str| {
         format!(
@@ -2471,6 +3268,13 @@ fn plain(text: &str) -> Option<String> {
     .then(|| text.to_owned())
 }
 
+/// `text` when every character is printable ASCII or a space: aterm's own words (the owner's
+/// line names sessions, sizes and commands in backticks), refused whole if anything else got in.
+fn printable(text: &str) -> Option<String> {
+    (!text.trim().is_empty() && text.chars().all(|c| c.is_ascii_graphic() || c == ' '))
+        .then(|| text.to_owned())
+}
+
 fn clip(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= HOLDER_PATH_CAP {
@@ -2501,8 +3305,13 @@ pub fn row(now_s: i64, key: &str, said: &Said, level: Level, free: u64, host: &H
     o.insert("free_bytes".to_owned(), Value::from(free));
     o.insert("host_pid".to_owned(), Value::from(host.pid));
     match said {
-        Said::Opened { done } => {
+        Said::Opened { done, projected } => {
             o.insert("why".to_owned(), Value::from(done.word().to_owned()));
+            if let Some(p) = projected {
+                o.insert("projected".to_owned(), Value::from(true));
+                o.insert("rate_bps".to_owned(), Value::from(p.rate_bps));
+                o.insert("eta_s".to_owned(), Value::from(p.eta_ms / 1_000));
+            }
         }
         Said::Elected { pick, held } => {
             o.insert("held_bytes".to_owned(), Value::from(*held));
@@ -2772,6 +3581,62 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                     .join(", ")
             ));
         }
+        for p in &e.projected {
+            out.push(format!(
+                "  projected by host pid {}: falling {}/h, under its {} floor {} after {} (since \
+                 {}); no look ends the episode while it stands, to {}",
+                p.host.pid,
+                human_bytes(p.rate_bps.saturating_mul(3_600)),
+                human_bytes(p.floor),
+                aterm_vitals::words::duration_approx(p.eta_ms as f64 / 1_000.0),
+                at(p.at_ms),
+                at(p.since_ms),
+                at(p.at_ms.saturating_add(COLD_HOLD_MS))
+            ));
+        }
+        if let Some(w) = &e.worker {
+            out.push(match &w.state {
+                WorkerState::Claimed => format!(
+                    "  worker: claimed by host pid {} at {}; lost unless it starts by {}",
+                    w.host.pid,
+                    at(w.at_ms),
+                    at(w.at_ms.saturating_add(SPAWN_MS))
+                ),
+                WorkerState::Running {
+                    sid, started_ms, ..
+                } => format!(
+                    "  worker: @{sid} (host pid {}) runs since {}, until its task ends or {}; no \
+                     session is asked meanwhile",
+                    w.host.pid,
+                    at(*started_ms),
+                    at(started_ms.saturating_add(WORKER_MS))
+                ),
+                WorkerState::Over {
+                    why,
+                    sid,
+                    at_ms,
+                    rose,
+                } => format!(
+                    "  worker: {}over at {} ({why}); free space rose {} while it ran",
+                    sid.as_ref().map(|s| format!("@{s} ")).unwrap_or_default(),
+                    at(*at_ms),
+                    human_bytes(*rose)
+                ),
+            });
+        }
+        if let Some(last) = e.last_worker_ms {
+            out.push(
+                if (0..WORKER_COOLDOWN_MS).contains(&now_ms.saturating_sub(last)) {
+                    format!(
+                        "  last worker claimed {}, no new one before {}",
+                        at(last),
+                        at(last.saturating_add(WORKER_COOLDOWN_MS))
+                    )
+                } else {
+                    format!("  last worker claimed {}, worker cooldown over", at(last))
+                },
+            );
+        }
     }
     if rows.is_empty() {
         out.push("no free-ask rows in the disk ledger yet".to_owned());
@@ -2889,6 +3754,38 @@ pub mod fault {
         /// cleanup alone lifted the volume past its floor and margin, the ask's whole success,
         /// was never credited (no `freed` row, no owner's line saying it freed space).
         EndUncredited,
+        /// [`super::step`] reads no crossing as pressure ([`super::Ahead::projected`]), as
+        /// revision 1 did: a volume filling fast opens no episode until it is short.
+        ProjectionIgnored,
+        /// [`super::step`] ends an episode while a projection record stands
+        /// ([`super::Entry::projected`]): a host's look that projects nothing ends the episode
+        /// another host still reads a crossing in, or a successor's first look ends its
+        /// predecessor's.
+        EndWhileProjected,
+        /// [`super::step`] records the projected floor (the floor plus the horizon's fill) as the
+        /// episode's floor and keeps no projection record, as the first version did: the floor
+        /// shown is one the pass never reclaims below, and once the projection lapses its host's
+        /// look ends the episode on its own plain floor while another host reads the volume
+        /// short.
+        ProjectionInFloor,
+        /// [`super::worker_step`] claims a worker after one is over this episode.
+        WorkerTwice,
+        /// [`super::worker_step`] claims a worker at any pressed, done look, with a line owed or
+        /// out and the asked session still in its window.
+        WorkerUndue,
+        /// [`super::worker_step`] claims a worker while aterm's own passes may still free space.
+        WorkerBeforeDone,
+        /// [`super::worker_step`] claims a worker within [`super::WORKER_COOLDOWN_MS`] of the
+        /// volume's last.
+        WorkerInCooldown,
+        /// [`super::step`] elects a session while the volume's worker works.
+        LineWhileWorker,
+        /// [`super::Entry::close`] drops a worker that works: the next episode elects and types a
+        /// line while it runs.
+        ForgetWorkerAtClose,
+        /// [`super::owner_needed`] reads no worker in hand: the owner is alerted while the
+        /// worker works.
+        AlertWhileWorker,
     }
 
     thread_local! {
@@ -2918,3 +3815,11 @@ pub mod fault {
 #[cfg(test)]
 #[path = "disk_ask_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "disk_ask_worker_tests.rs"]
+mod worker_tests;
+
+#[cfg(test)]
+#[path = "disk_ask_projected_tests.rs"]
+mod projected_tests;

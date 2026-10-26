@@ -102,7 +102,17 @@ impl Item for CommandLineTools {
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
         match (self.found)(sys) {
             Found::Present(now) => Probe::Ok { now },
-            Found::Missing(from) if sys.has_tty() => Probe::Change {
+            Found::Missing(from) if !sys.has_tty() => Probe::Blocked {
+                why: format!("{from}; {NO_TTY}"),
+            },
+            // Asked before the password: the download waits for a network without Low Data
+            // Mode.
+            Found::Missing(from) if let Some(why) = crate::items::developer::low_data(sys) => {
+                Probe::Blocked {
+                    why: format!("{from}; {why}"),
+                }
+            }
+            Found::Missing(from) => Probe::Change {
                 from,
                 to: format!(
                     "installed as root by `{} machines here apply <baseline>` (one password \
@@ -111,9 +121,6 @@ impl Item for CommandLineTools {
                         .arg(self.aterm.as_os_str())
                         .display()
                 ),
-            },
-            Found::Missing(from) => Probe::Blocked {
-                why: format!("{from}; {NO_TTY}"),
             },
             Found::Refuses(why) => Probe::Blocked { why },
             Found::Unknown(why) => Probe::Unusable { why },
@@ -223,6 +230,11 @@ mod tests {
             .position(|call| call == &argv)
             .unwrap_or_else(|| panic!("the argv runs on the terminal: {calls:?}"));
         assert!(wrote < ran, "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|call| call.contains("sudo")).count(),
+            1,
+            "one password prompt: {calls:?}"
+        );
         assert!(
             calls
                 .iter()
@@ -234,6 +246,32 @@ mod tests {
             parsed.developer.and_then(|table| table.command_line_tools),
             Some(true)
         );
+    }
+
+    /// In Low Data Mode the item asks no password and runs nothing: the download waits, and
+    /// the row says how to go on; on a network without it the same Mac plans the install.
+    #[test]
+    fn low_data_mode_asks_no_password_and_says_how_to_go_on() {
+        let mut sys = Fake::default();
+        sys.tty = true;
+        sys.low_data = Some(true);
+        let item = item(Found::Missing("no developer directory".into()));
+        for mode in [Mode::Plan, Mode::Apply] {
+            let row = run(&sys, &item, mode);
+            assert_eq!(row.outcome, Outcome::Blocked, "{mode:?}: {row:?}");
+            let why = row.why.unwrap_or_default();
+            assert!(
+                why.starts_with("no developer directory; Low Data Mode is on"),
+                "{why}"
+            );
+        }
+        assert!(
+            sys.calls().iter().all(|call| !call.starts_with("tty ")),
+            "{:?}",
+            sys.calls()
+        );
+        sys.low_data = Some(false);
+        assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
     }
 
     #[test]

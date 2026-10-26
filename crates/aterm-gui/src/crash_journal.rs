@@ -3344,6 +3344,7 @@ pub(crate) mod tests {
                     ],
                     session: "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b".into(),
                     codex_home: None,
+                    codex_auth_path: None,
                     cwd: None,
                 }),
                 carried: None,

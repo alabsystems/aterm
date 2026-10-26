@@ -60,8 +60,8 @@ pub struct InitialSetupHandlers {
     /// subscriber, removes the record of the person's opt-out and reads the
     /// row again (design §3.3). Returns whether that worker started.
     pub sync_on: fn() -> bool,
-    /// The window verified its own Full Disk Access grant without an admitted
-    /// access revision to record it under. Refresh observations and finish any
+    /// The window verified its own Full Disk Access grant without durable
+    /// access history. Refresh observations and finish any
     /// previously owed preference work on a worker, without admitting prompts.
     pub fda_granted: fn(),
 }
@@ -222,10 +222,9 @@ const CHANGING_READS: u8 = 10;
 /// whenever its window regains focus (§3.6).
 pub(crate) const TOKEN_LOOK: Duration = Duration::from_secs(60);
 
-/// How recently a keyboard, mouse or trackpad must have been used for the first-launch
-/// countdown to advance ([`App::person_at_this_screen`]): twice the countdown, so a person who
-/// opened aterm and reads the review without touching anything still gets its automatic Apply.
-pub(crate) const COUNTDOWN_PRESENT_WITHIN: Duration = Duration::from_secs(60);
+/// How recently a keyboard, mouse or trackpad must have been used for the page to answer a
+/// setup offer by itself ([`App::person_at_this_screen`]): a person who just opened aterm has.
+pub(crate) const PERSON_PRESENT_WITHIN: Duration = Duration::from_secs(60);
 
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,7 +256,6 @@ pub(crate) struct Host {
     changing_reads: u8,
     next_tick: Option<Instant>,
     generation: u64,
-    offer_presented: bool,
     /// A review was shown in this process: a later one (an offer no window could show the first
     /// time, or the review of the groups the ALab signal adds) opens its tab behind the person's
     /// and waits there, never taking the tab they are in (design §6).
@@ -367,7 +365,7 @@ impl App {
         self.system_state_host.handlers = Some(handlers);
     }
 
-    /// A verified grant without a recordable revision still refreshes the rows
+    /// A verified grant without durable access history still refreshes the rows
     /// and lets the worker finish already-owed preferences. It admits no access step.
     pub(crate) fn notify_initial_setup_fda_granted(&self) {
         if let Some(handlers) = self.system_state_handlers() {
@@ -383,10 +381,9 @@ impl App {
         self.finish_system_state_shutdown_with(handlers);
     }
 
-    /// The first launch's review is up and unanswered: its headline is the page's one signal
-    /// meanwhile, so neither the menu line nor the tab's diamond says anything (§3.3, §3.6).
-    /// The review of the groups the ALab signal adds stills neither: its tab never takes focus,
-    /// and the plan in force, which it leaves as is, goes on saying what it needs (§3.5).
+    /// First-launch admission still waits: its headline is the page's one signal,
+    /// so the menu line and tab's diamond stay quiet (§3.3, §3.6). Wider scope
+    /// leaves the plan already in force reporting its existing needs (§3.5).
     pub(crate) fn system_state_review_pending(&self) -> bool {
         self.system_state_host
             .pending
@@ -530,8 +527,9 @@ impl App {
             self.hold_initial_setup_permissions();
         }
         self.refresh_system_state_tab_indicators();
-        self.system_state_host.offer_presented = false;
         self.system_state_host.action_refusal = None;
+        // The page answers the offer on its first tick with a person at this Mac: tick now.
+        self.system_state_host.next_tick = None;
         self.system_state_host.latest_status = SetupStatus::default();
         let views: Vec<_> = self
             .view_store
@@ -737,29 +735,7 @@ impl App {
             );
         if ours {
             let by_person = !self.person_gesture_refused();
-            if self.native_runtime.system_state_gesture(by_person) {
-                // Stopping changes only the stable-width Apply label. Dirty
-                // every copy, retaining its presented target through release.
-                let views = self
-                    .view_store
-                    .iter()
-                    .filter_map(|(view, link)| {
-                        matches!(link, crate::tab_model::View::Native(native)
-                            if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_))))
-                        .then_some(view)
-                    })
-                    .collect::<Vec<_>>();
-                for view in views {
-                    if let Ok((wid, _)) = self.locate_native_view(view) {
-                        self.invalidate_native_view_cache(
-                            wid,
-                            view,
-                            crate::native_app::DamageRegion::All,
-                        );
-                    }
-                }
-                self.request_redraw_system_state_windows();
-            }
+            self.native_runtime.system_state_gesture(by_person);
             // The permission gate's own evidence of whose gesture this is.
             self.note_system_state_touch();
         }
@@ -874,16 +850,16 @@ impl App {
         if self.system_state_access_step() != self.system_state_host.access_step {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
-        // `active` only advances the review's countdown, so the input and screen readings (an
-        // IOKit and a window server read on this thread) are made only while a review is offered.
-        let active = self.system_state_presented_active(instance)
-            && (self.system_state_host.pending.is_none() || self.person_at_this_screen());
+        // `present` only lets the page answer the offer by itself, so the input and screen
+        // readings (an IOKit and a window server read on this thread) are made only while an
+        // offer waits.
+        let present = self.system_state_host.pending.is_some() && self.person_at_this_screen();
         // The village walks only on a page someone can see, and only where a
         // view someone sees draws it.
         let seen = self.system_state_seen_views(instance);
-        let changed =
-            self.native_runtime
-                .tick_system_state_at(now, active, !shown.is_empty(), &seen);
+        let changed = self
+            .native_runtime
+            .tick_system_state(present, !shown.is_empty(), &seen);
         self.drain_system_state_actions();
         if !self.system_state_host.status_in_flight {
             self.system_state_host.next_status.get_or_insert(now);
@@ -895,10 +871,10 @@ impl App {
         }
     }
 
-    /// A dev scenario's first-launch review ([`crate::system_state::fixture_review`]): once a
+    /// A dev scenario's first-launch offer ([`crate::system_state::fixture_review`]): once a
     /// System State page is open, it is offered the plan a fresh launch offers, as a first
-    /// launch's window offers it but in a headless instance too, so a lab capture sees it; a
-    /// click then stops its countdown where the scenario says so. Its answer goes nowhere.
+    /// launch's window offers it but in a headless instance too, so a lab capture sees it. Its
+    /// answer goes nowhere.
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     fn offer_fixture_review(&mut self) {
         let Some(review) = self.system_state_host.fixture_review else {
@@ -916,8 +892,7 @@ impl App {
         permissions.set(aterm_types::macos_setup::Setting::Permissions, true);
         let permissions = Plan::from(permissions);
         match review {
-            crate::system_state::FixtureReview::Counting
-            | crate::system_state::FixtureReview::Stopped => {
+            crate::system_state::FixtureReview::Waiting => {
                 self.attach_system_state_offer(Request::unanswered(Plan::default()));
             }
             // The worker's look widens the review it offered once it hears the signal.
@@ -928,9 +903,6 @@ impl App {
             }
             crate::system_state::FixtureReview::Widen => self
                 .attach_system_state_offer(Request::unanswered_widen(Plan::default(), permissions)),
-        }
-        if review == crate::system_state::FixtureReview::Stopped {
-            self.native_runtime.system_state_gesture(true);
         }
     }
 
@@ -978,9 +950,6 @@ impl App {
     /// last front page withdraws it even while a hidden controller survives.
     pub(crate) fn publish_system_state_front(&mut self) {
         let front = self.system_state_frontmost();
-        if !front {
-            self.native_runtime.pause_system_state_review();
-        }
         aterm_types::macos_setup::set_system_state_front(front);
     }
 
@@ -1085,45 +1054,12 @@ impl App {
     }
 
     /// Whether a person is at this Mac's screen: a keyboard, mouse or trackpad was used within
-    /// [`COUNTDOWN_PRESENT_WITHIN`], and this login's screen is neither locked nor switched away
-    /// for another login. The first-launch countdown advances only then, so a window that opened
-    /// with nobody there (an update's relaunch, a launch from another Mac) never applies by
-    /// expiry.
+    /// [`PERSON_PRESENT_WITHIN`], and this login's screen is neither locked nor switched away
+    /// for another login. The page answers a setup offer by itself only then, so a window that
+    /// opened with nobody there (a launch from another Mac, a login with nobody at the screen)
+    /// changes nothing until a person comes (SAFE-1).
     fn person_at_this_screen(&self) -> bool {
-        (self.user_input_recent)(COUNTDOWN_PRESENT_WITHIN) && !(self.screen_away)()
-    }
-
-    /// Whether the page has been presented in a focused window and is still
-    /// in front there: only then can the first-launch countdown advance.
-    fn system_state_presented_active(
-        &mut self,
-        instance: crate::native_app::AppInstanceId,
-    ) -> bool {
-        if !self.system_state_frontmost() {
-            return false;
-        }
-        let active = self.system_state_host.offer_presented
-            || self.windows.iter().any(|(wid, window)| {
-                crate::os_window_focused(window)
-                    && window.overlay.is_none()
-                    && self
-                        .active_native_view(*wid)
-                        .is_some_and(|(current, view)| {
-                            current == instance
-                                && self.active_visible_leaf_plan(*wid).is_some_and(|plan| {
-                                    plan.leaf(view).is_some()
-                                        && self
-                                            .retained_native_leaf_artifact_from_plan(
-                                                *wid, view, true, &plan,
-                                            )
-                                            .is_some()
-                                })
-                        })
-            });
-        if active {
-            self.system_state_host.offer_presented = true;
-        }
-        active
+        (self.user_input_recent)(PERSON_PRESENT_WITHIN) && !(self.screen_away)()
     }
 
     /// Ask the worker for a fresh, prompt-free reading of every row for the
@@ -1287,30 +1223,6 @@ impl App {
         handlers: Option<InitialSetupHandlers>,
     ) {
         match action {
-            SystemStateAction::CancelReview => {
-                let _ = self.take_system_state_press();
-                let mut widen = false;
-                let mut launch = false;
-                if let Some(request) = self.system_state_host.pending.take() {
-                    widen = matches!(request.kind(), OfferKind::Widen { .. });
-                    // The model already answered Cancel, so its retained request no longer
-                    // reads pending. Keep the launch's calm projection across final close.
-                    launch = matches!(request.kind(), OfferKind::Launch);
-                    request.finish(WorkstationSetupDecision::Cancelled);
-                }
-                self.begin_system_state_action(false, false);
-                // The launch review's hold goes with it: a fresh read of the records, which
-                // keep the Cancel, decides. The widen's review held nothing.
-                if !widen {
-                    self.recheck_initial_setup_permissions();
-                }
-                self.finish_system_state_action(true, "Setup");
-                if launch {
-                    self.note_launch_review_closed();
-                } else {
-                    self.refresh_system_state_tab_indicators();
-                }
-            }
             // Stop changes no plan or status generation. It withdraws future
             // automatic gestures locally even when the durable run already
             // finished, and the worker keeps its ordinary durable Stop.
@@ -1363,6 +1275,11 @@ impl App {
                 else {
                     return;
                 };
+                // A fresh explicit delta belongs to the manual page once the worker withdrew
+                // its offer. A queued whole-offer answer still belongs to that ended Request.
+                if admission != Admission::Automatic && answer.changed.is_some() {
+                    self.resolve_withdrawn_system_state_offer(Instant::now());
+                }
                 // A run going now, or a plan still being admitted, stops for
                 // this one at its next step (§3.3): the worker does that as it
                 // takes the plan, so the window never sends a Stop that could

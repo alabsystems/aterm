@@ -17,7 +17,7 @@ use crate::perf::stats::{median, tail_summary};
 /// package cadence, and the audible bell off (this window is never the
 /// owner's terminal, so a BEL its shell rings must not play their alert
 /// sound; the key is read once with the rest and costs the start nothing).
-const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
+pub(crate) const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
                       [update]\nenabled = false\nauto_apply = false\n\
                       [packages]\nenabled = false\n";
 
@@ -1005,7 +1005,7 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     );
     eprintln!(
         "run class: {}",
-        if chip.contains("M4 Max") {
+        if super::rule_zero_hardware(&chip) {
             format!(
                 "rule-zero hardware eligible ('{chip}'); manual display/focus conditions still apply"
             )
@@ -1247,7 +1247,7 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
         "version": artifact.version,
         "sha256": artifact.sha256,
         "chip": chip,
-        "rule_zero_hardware_eligible": chip.contains("M4 Max"),
+        "rule_zero_hardware_eligible": super::rule_zero_hardware(chip),
         "backend_request": args.backend.name(),
         "actual_backend": samples.first().map(|s| s.backend.clone()),
         "warm": args.warm,

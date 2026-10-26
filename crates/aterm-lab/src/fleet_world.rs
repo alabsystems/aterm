@@ -171,7 +171,8 @@ pub struct World {
     pub keep: bool,
 }
 
-/// Returns the isolated environment variables for an instance world rooted at `root`.
+/// Returns the isolated environment variables for an instance world rooted at `root`, the
+/// loopback guard on ([`aterm_net::loopback`]).
 #[must_use]
 pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
     let p = crate::paths::paths();
@@ -194,6 +195,7 @@ pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
         ("LOGNAME".into(), p.user.clone()),
         ("LANG".into(), "en_US.UTF-8".into()),
         ("xcrun_nocache".into(), "1".into()),
+        (aterm_net::loopback::SEAM.into(), "1".into()),
     ];
     env.extend(crate::instance::seams());
     env

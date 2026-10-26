@@ -443,7 +443,8 @@ fn draft_join_policy_cannot_bypass_the_authenticated_password() {
     let mut admin = admin_open(&lab.paths).unwrap();
     let before = admin.seq();
     admin.doc.set_open(true).unwrap();
-    let done = auto_approve_opened(&lab.paths, &admin, &mut false).unwrap();
+    let done =
+        auto_approve_opened(&lab.paths, &admin, &mut false, &mut Default::default()).unwrap();
     assert!(done.approved.is_empty());
     assert_eq!(done.refused, [lab.peer_key()]);
     let after = admin_open(&lab.paths).unwrap();

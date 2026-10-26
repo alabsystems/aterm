@@ -854,11 +854,12 @@ impl FromData for Option<Offset32> {
     }
 }
 
-/// Clamps `val` to `min..=max`.
+/// Clamps `val` to `min..=max`. Not `const`: Trust 0.11.0 refuses a contract on a `const fn`
+/// (`contract_check_requires` is not yet stable as a const intrinsic).
 #[inline]
 #[cfg_attr(trust_verify, trust::requires(min <= max))]
 #[cfg_attr(trust_verify, trust::ensures(min <= result && result <= max))]
-pub const fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
+pub fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
     let upper = if val < max { val } else { max };
     if upper > min { upper } else { min }
 }

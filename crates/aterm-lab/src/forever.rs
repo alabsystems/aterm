@@ -408,7 +408,8 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
         | Mode::Cover
         | Mode::Cap
         | Mode::Resid
-        | Mode::Ladder => None,
+        | Mode::Ladder
+        | Mode::Angles => None,
     }
 }
 
@@ -528,6 +529,9 @@ pub enum Mode {
     /// W9, the agent ended and launched again by a person under its standing wall
     /// (`wall-relaunch`).
     WallRelaunch,
+    /// ANGLES, a new kind of work at each done claim (`angles`, v6 §14.5's 5a), under the short
+    /// back-off ladder at an eighth ([`ladder_env`]), as `ladder` runs.
+    Angles,
 }
 
 impl Mode {
@@ -547,6 +551,7 @@ impl Mode {
             "wall-unread" => Mode::WallUnread,
             "wall-cruise" => Mode::WallCruise,
             "wall-relaunch" => Mode::WallRelaunch,
+            "angles" => Mode::Angles,
             _ => return None,
         })
     }
@@ -569,7 +574,8 @@ impl Mode {
             | Mode::Cover
             | Mode::Cap
             | Mode::Resid
-            | Mode::Ladder => None,
+            | Mode::Ladder
+            | Mode::Angles => None,
         }
     }
 }
@@ -591,6 +597,10 @@ pub enum Repo {
     Unpushed,
     /// A commit on `main` pushed to `origin/wip`, which `origin/main` lacks.
     Unlanded,
+    /// Another session's work beside a clean `main` ([`angles::lay_others`]): a worktree on a
+    /// branch of its own, a branch holding a commit no remote has, and a stash entry. Angle 6
+    /// leaves every one as it is ([`angles::others_left`]).
+    Others,
 }
 
 impl Repo {
@@ -620,6 +630,10 @@ impl Repo {
                 &["1 commit not on origin/main"],
                 &["changed", "untracked", "stash", "unpushed"],
             ),
+            Repo::Others => (
+                &["1 stash"],
+                &["changed", "untracked", "unpushed", "not on"],
+            ),
         }
     }
 
@@ -631,6 +645,7 @@ impl Repo {
             Repo::Stashed => "a stash entry on main",
             Repo::Unpushed => "a commit no remote holds",
             Repo::Unlanded => "a commit pushed to origin/wip, not on origin/main",
+            Repo::Others => "another session's worktree, branch and stash",
         }
     }
 }
@@ -719,6 +734,8 @@ pub enum Chain {
     SameLand,
     /// HC (Cruise: one reply to every done check, held at its second answer).
     SameCruise,
+    /// ANGLES (Cruise: every reply its own real work and a done claim, each check another angle).
+    CruiseAngles,
 }
 
 /// The scenarios, by the names the report and the record use.
@@ -790,6 +807,9 @@ pub enum Scenario {
     HL,
     /// One reply to every done check under Cruise: held at its second answer, and said.
     HC,
+    /// A new kind of work at each done claim under Cruise ([`angles`]): six angles in turn, then
+    /// the first again, never held.
+    Angles,
 }
 
 impl Scenario {
@@ -843,6 +863,7 @@ impl Scenario {
             Scenario::Ladder => "LADDER",
             Scenario::HL => "HL",
             Scenario::HC => "HC",
+            Scenario::Angles => "ANGLES",
         }
     }
 
@@ -911,6 +932,9 @@ impl Scenario {
             Scenario::Ladder => "the back-off ladder doubled to its cap, each act at its due",
             Scenario::HL => "one defense to every Land act: held at its second answer, and said so",
             Scenario::HC => "one reply to every done check: held at its second answer, and said so",
+            Scenario::Angles => {
+                "six done claims after real work: six kinds of work asked in turn, never held"
+            }
         }
     }
 }
@@ -1008,6 +1032,10 @@ impl Chain {
     /// The relaunch's chain (`--mode wall-relaunch`, alone for W1's reason).
     pub const WALL_RELAUNCH: [Chain; 1] = [Chain::RelaunchWall];
 
+    /// The angles' chain (`--mode angles`, on a lab of its own: its replies hold the stub for
+    /// minutes each) and the Off control.
+    pub const ANGLES: [Chain; 2] = [Chain::CruiseAngles, Chain::Off];
+
     /// Every chain of every mode, each once: what `--chains` may name.
     #[must_use]
     pub fn every() -> Vec<Chain> {
@@ -1024,6 +1052,7 @@ impl Chain {
             .chain(Chain::WALL_UNREAD)
             .chain(Chain::WALL_CRUISE)
             .chain(Chain::WALL_RELAUNCH)
+            .chain(Chain::ANGLES)
         {
             if !v.contains(&c) {
                 v.push(c);
@@ -1047,6 +1076,7 @@ impl Chain {
             Mode::WallUnread => Chain::WALL_UNREAD.to_vec(),
             Mode::WallCruise => Chain::WALL_CRUISE.to_vec(),
             Mode::WallRelaunch => Chain::WALL_RELAUNCH.to_vec(),
+            Mode::Angles => Chain::ANGLES.to_vec(),
             Mode::Land | Mode::Cruise | Mode::Both => Chain::ALL
                 .into_iter()
                 .filter(|c| match c.autopilot() {
@@ -1159,6 +1189,7 @@ impl Chain {
             Chain::RedrawWall => WALL_REDRAW_LIMIT_MS,
             Chain::SwitchWall => WALL_SWITCH_LIMIT_MS,
             Chain::UnreadWall => WALL_UNREAD_LIMIT_MS,
+            Chain::CruiseAngles => angles::LIMIT_MS,
             _ => CHAIN_LIMIT_MS,
         }
     }
@@ -1212,6 +1243,7 @@ impl Chain {
             Chain::RelaunchWall => "relaunch-wall",
             Chain::SameLand => "same-land",
             Chain::SameCruise => "same-cruise",
+            Chain::CruiseAngles => "cruise-angles",
         }
     }
 
@@ -1236,7 +1268,8 @@ impl Chain {
             | Chain::Ladder
             | Chain::CruiseO
             | Chain::CruiseWall
-            | Chain::SameCruise => "cruise",
+            | Chain::SameCruise
+            | Chain::CruiseAngles => "cruise",
             Chain::Off | Chain::Mgr => "off",
             _ => "land",
         }
@@ -1284,6 +1317,7 @@ impl Chain {
             Chain::RelaunchWall => &[Scenario::W9],
             Chain::SameLand => &[Scenario::HL],
             Chain::SameCruise => &[Scenario::HC],
+            Chain::CruiseAngles => &[Scenario::Angles],
         }
     }
 
@@ -1297,6 +1331,7 @@ impl Chain {
             Chain::LandH => Repo::Unpushed,
             Chain::LandI => Repo::Unlanded,
             Chain::SameLand => Repo::Untracked,
+            Chain::CruiseAngles => Repo::Others,
             _ => Repo::Clean,
         }
     }
@@ -1384,6 +1419,37 @@ impl Chain {
     #[must_use]
     pub fn asks_as_person(self) -> bool {
         self == Chain::InstantPerson
+    }
+
+    /// How long the stub takes over its reply to the first prompt ([`Self::prompt`]), in ms: the
+    /// rule that answers it, or the spec's plain reply, its delay and its pace over each delta.
+    #[must_use]
+    pub fn first_reply_ms(self) -> i64 {
+        let spec = spec(&[self]);
+        let rule = crate::stub::scripted_reply(&spec, &[self.prompt()]);
+        let field = |k: &str| rule.and_then(|r| r.get(k)).or_else(|| spec.get(k));
+        let delay = field("delay_ms")
+            .and_then(J::as_i64)
+            .unwrap_or(REPLY_DELAY_MS);
+        let pace = field("pace_s").and_then(J::as_f64).unwrap_or(REPLY_PACE_S);
+        let text = rule.map_or(Some(WORK), |r| r.get("text").and_then(J::as_str));
+        let deltas = crate::stub::split_deltas(text.unwrap_or_default()).len();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            reason = "a pace of seconds over a reply's few hundred deltas"
+        )]
+        let paced = (pace * 1000.0 * deltas as f64) as i64;
+        delay.saturating_add(paced)
+    }
+
+    /// Whether the first prompt's reply is real work past the short-turn floor
+    /// (`turn_end::MIN_WORK`), so the first point closes no short turn (`cruise-angles`'): every
+    /// other chain's comes within seconds and closes one ([`p3_faults`]).
+    #[must_use]
+    pub fn first_reply_works(self) -> bool {
+        let floor = i64::try_from(turn_end::MIN_WORK.as_millis()).unwrap_or(i64::MAX);
+        self.first_reply_ms() >= floor
     }
 
     /// The first prompt (L13's a person's question; L15's the worker's task).
@@ -1566,6 +1632,12 @@ impl Chain {
             Chain::Ladder => vec![rule("", WORK)],
             Chain::SameLand => vec![rule(MARK, CLEAN), rule("", WORK)],
             Chain::SameCruise => vec![rule(MARK, CLEAN), rule("", DONE_CLAIM)],
+            Chain::CruiseAngles => angles::KEYS
+                .iter()
+                .zip(angles::REPLIES)
+                .map(|(key, reply)| long(key, reply))
+                .chain([long("", angles::FIRST)])
+                .collect(),
         }
     }
 
@@ -1764,6 +1836,16 @@ pub struct Seen {
     /// many requests of its conversation the stub read between the hold and the lift, read once
     /// the watch is over ([`lift_witness`]); `None` where it was not lifted.
     pub lift_stub: Option<usize>,
+    /// A same-reply chain's resume ask as `ctl messages tag=harness` printed it at each change
+    /// ([`surfaces::held::band_rows`]), and every read of it.
+    pub band: Vec<(i64, String)>,
+    pub band_reads: Vec<i64>,
+    /// When same-land's person began typing their turn into its held tab
+    /// ([`surfaces::held::person_due`], [`surfaces::held::person_typed`]): their first key is
+    /// already their turn (aterm journals `a person is typing`).
+    pub stop_person_ms: Option<i64>,
+    /// When that turn was sent (its Enter read back); `None` where the composer did not take it.
+    pub stop_person_sent_ms: Option<i64>,
     /// What the coverage chains' run did and read beside the records.
     pub cover: Cover,
     /// What the window showed of the tab ([`surfaces`]).
@@ -1851,6 +1933,9 @@ pub struct Cover {
     /// F3: the screen's last rows read once the first point after the prompt was journaled, and
     /// when.
     pub first_screen: Option<(i64, Vec<String>)>,
+    /// ANGLES: what of the other session's work ([`Repo::Others`]) no longer stands as laid, read
+    /// once the watch is over ([`angles::others_left`]; empty: all of it stands).
+    pub others_left: Option<Vec<String>>,
 }
 
 impl Cover {
@@ -2234,7 +2319,7 @@ pub fn quiet_after_landed_ms(seen: &Seen, t: i64, managed: bool) -> i64 {
 /// scenario also carries the hold's wants ([`surfaces::held::with_held`]).
 #[must_use]
 pub fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
-    let mut faults = chain_faults(seen, t0);
+    let mut faults = chain_faults(seen, t0, chain.first_reply_works());
     faults.extend(surfaces::held::stall_fault(chain, seen, t0));
     let verdicts = judge_scenarios(chain, seen, program, t0);
     if faults.is_empty() {
@@ -2314,6 +2399,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::F3 => cover::judge_tool_end(seen, land, t0),
             Scenario::Ladder => cover::judge_ladder(seen, LADDER_SCALE, t0),
             Scenario::HL | Scenario::HC => surfaces::held::judge_hold(chain, seen, t0),
+            Scenario::Angles => angles::judge(seen, t0),
         };
         let cx = surfaces::Ctx { chain, program, t0 };
         let v = surfaces::with_window(s, seen, &cx, v);
@@ -3324,7 +3410,7 @@ fn lost_after(seen: &Seen, t: i64, t0: i64) -> Option<String> {
     }
 }
 
-fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
+fn p3_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
     let from = seen.cover.person_ms.unwrap_or(t0);
     let streak = |r: &Row| -> Option<u32> {
         let (_, n) = r.reason.split_once("short turns in a row: ")?;
@@ -3352,7 +3438,7 @@ fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
                 && r.decision == "skipped"
                 && (r.ts - first.ts).abs() <= AT_DONE_MS
         });
-        let want = u32::from(!left);
+        let want = u32::from(!left && !first_works);
         if streak(first) != Some(want) {
             out.push(format!(
                 "the first point at +{} closed {} short turn(s), not {want} (P3: the ladder starts a step late): {}",
@@ -3368,9 +3454,10 @@ fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
 /// What fails every scenario of a chain, whatever each scenario's own judge says: an act typed
 /// before the due its back-off named ([`early_acts`]), an act typed twice with no point judged
 /// between ([`doubled_acts`]), a point before the first prompt or a first point that closed other
-/// than one short turn ([`p3_faults`]).
+/// than one short turn, none where the chain's first reply is real work (`first_works`,
+/// [`Chain::first_reply_works`]) ([`p3_faults`]).
 #[must_use]
-pub fn chain_faults(seen: &Seen, t0: i64) -> Vec<String> {
+pub fn chain_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
     let mut out = early_acts(seen, t0);
     let doubled = doubled_acts(seen, t0);
     if !doubled.is_empty() {
@@ -3378,7 +3465,7 @@ pub fn chain_faults(seen: &Seen, t0: i64) -> Vec<String> {
             "acts typed with no point judged between: {doubled:?}"
         ));
     }
-    out.extend(p3_faults(seen, t0));
+    out.extend(p3_faults(seen, t0, first_works));
     out
 }
 
@@ -3817,6 +3904,11 @@ pub(crate) fn launch_tab(
 }
 
 fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
+    git_out(home, dir, args).map(|_| ())
+}
+
+/// [`git`]'s run, its standard output on success.
+pub(crate) fn git_out(home: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = aterm_uds::spawnfd::command("/usr/bin/git")
         .args([
             "-c",
@@ -3840,7 +3932,7 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
         .output()
         .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
     if out.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         Err(format!(
             "git {}: {}",
@@ -3903,6 +3995,7 @@ pub fn lay_repo_at(
                 g(&["push", "-q", "origin", "main:wip"])?;
             }
         }
+        Repo::Others => angles::lay_others(&home, dir)?,
     }
     std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
@@ -4829,6 +4922,7 @@ fn status_words(door: &Door<'_>, sid: &str) -> String {
         "land_held",
         "land_nudges",
         "land_since",
+        "held",
     ]
     .iter()
     .map(|k| format!("{k}={}", word(&s, k).unwrap_or_else(|| "?".into())))
@@ -5853,6 +5947,11 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
         "task",
         on(door, &tab.sid, &["task"]).trim().to_string(),
     );
+    if tab.chain.same_reply() {
+        let band = surfaces::held::band_rows(&door.out(&["messages", "tag=harness"]), &tab.sid);
+        tab.seen.band_reads.push(now);
+        put(&mut tab.seen.band, "band", band);
+    }
     if tab.chain == Chain::Off && tab.seen.reply_ms.is_none() {
         let text = on(door, &tab.sid, &["text"]);
         if text.contains("All done") {
@@ -5941,7 +6040,16 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::LandI => {
             (nudge.is_some() && surfaces::held::watched_past(s, now)) || done_since(20_000)
         }
-        Chain::SameLand | Chain::SameCruise => {
+        // same-land is watched past its person's turn, until its band is gone or a minute passed.
+        Chain::SameLand => {
+            s.stop_person_ms.is_some_and(|p| {
+                now - p >= 60_000
+                    || s.band
+                        .last()
+                        .is_some_and(|(t, b)| *t > p && surfaces::held::stop_rows(b).is_empty())
+            }) || done_since(20_000)
+        }
+        Chain::SameCruise => {
             (s.all_acts().len() >= 2 && surfaces::held::watched_past(s, now)) || done_since(20_000)
         }
         Chain::InstantCruise => {
@@ -6049,7 +6157,10 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 && s.yield_after(acts[2].0, None, Some(NEED_C))
                     .event
                     .is_some_and(|(t, _)| now - t >= 10_000)
+                // N4's stand-in ask has been read where the window is (§14.7).
+                && (!s.window.read || s.window.stopped.is_some())
         }
+        Chain::CruiseAngles => angles::watched(s, now, tab.t0),
     }
 }
 
@@ -6177,6 +6288,32 @@ fn run_check(
             over: false,
         });
     }
+    let ask_sid = match (&desk, tabs.iter().find(|t| t.chain == Chain::CruiseN)) {
+        (Some(d), Some(cruise_n)) => {
+            let sid = spawn_tab(&door, &cruise_n.dir)?;
+            let r = on(
+                &door,
+                &sid,
+                &["meta", "set", "title", surfaces::stopped::ASK_TAB],
+            );
+            let w = surfaces::window_of(&door.out(&["ls"]), &sid).unwrap_or_default();
+            if w != d.chains_window {
+                return Err(could_not(&format!(
+                    "{}: spawned in window {w:?}, not the chains' window {}",
+                    surfaces::stopped::ASK_TAB,
+                    d.chains_window
+                )));
+            }
+            println!(
+                "  tab       {} @{sid}: a plain shell beside cruise-n, titled in window {w} ({}), \
+                 for N4's stand-in ask",
+                surfaces::stopped::ASK_TAB,
+                r.trim()
+            );
+            Some(sid)
+        }
+        _ => None,
+    };
     if let Some(d) = desk.as_mut()
         && let Some(i) = surfaces::front_of(&tabs.iter().map(|t| t.chain).collect::<Vec<_>>())
     {
@@ -6333,6 +6470,23 @@ fn run_check(
                     );
                 }
                 surfaces::held::look_step(&door, tab, front_label.as_deref());
+                surfaces::stopped::ask_step(&door, tab, ask_sid.as_deref());
+            }
+            if surfaces::held::person_due(tab.chain, &tab.seen, tab.t0, now) {
+                let began = now_ms();
+                let typed = person_turn(&door, &tab.sid, h.name(), surfaces::held::PERSON_TURN)?;
+                let sent = typed.as_ref().map(|(t, _)| *t);
+                surfaces::held::person_typed(&mut tab.seen, began, sent);
+                println!(
+                    "  [{}] +{} person  their turn into the held tab: \"{}\"{}",
+                    tab.chain.name(),
+                    at(tab.t0, began),
+                    surfaces::held::PERSON_TURN,
+                    sent.map_or_else(
+                        || " — the composer did not take it".to_string(),
+                        |t| format!(", sent at +{}", at(tab.t0, t))
+                    )
+                );
             }
             if let Some(ask) = tab.chain.asks()
                 && !tab.ask_tried
@@ -6413,6 +6567,10 @@ fn run_check(
                 }
                 tab.seen.cover.window_stub = window_witness(&run, tab);
                 tab.seen.cover.went_on_ms = went_on_witness(&run, tab);
+                if tab.chain.repo() == Repo::Others {
+                    tab.seen.cover.others_left =
+                        Some(angles::others_left(&run.w.join("home"), &tab.dir));
+                }
                 tab.seen.cover.owner_texts = owner_witness(&run, tab);
                 if let Some(texts) = &tab.seen.cover.owner_texts {
                     println!(
@@ -6565,7 +6723,7 @@ fn run_lab(
     if window {
         let r = Run::load(tag).ok();
         println!(
-            "forever: lab '{tag}' OPENED A WINDOW on this desk (instance pid {}): L13's person types through hwkey",
+            "forever: lab '{tag}' OPENED A WINDOW on this desk (instance pid {}): L13's person types through hwkey, same-land's hold is read off it",
             r.map_or(0, |r| r.instance_pid)
         );
     }
@@ -6596,7 +6754,7 @@ fn lab_opts(
     if mode == Mode::Cap {
         u.harness_keys = format!("{}\ncontinue_per_hour = {CAP_PER_HOUR}", u.harness_keys);
     }
-    if mode == Mode::Ladder {
+    if matches!(mode, Mode::Ladder | Mode::Angles) {
         u.instance_env = format!("{} {}", u.instance_env, ladder_env())
             .trim()
             .to_string();
@@ -6673,7 +6831,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let w = it.next().map(String::as_str);
                 mode = w.and_then(Mode::of).ok_or_else(|| {
                     usage(&format!(
-                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, resid or ladder, not {w:?}"
+                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, resid, ladder or angles, not {w:?}"
                     ))
                 })?;
             }
@@ -6727,12 +6885,13 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             asked
                 .chains(h)
                 .iter()
-                .any(|c| c.opening() == Opening::Person)
+                .any(|c| c.opening() == Opening::Person || *c == Chain::SameLand)
         })
     {
         return Err(usage(
-            "--window opens a window for a person's keys (hwkey): the run needs land-p (--mode cover, \
-             --chains land-p)",
+            "--window opens a window for a person's keys (hwkey) or for same-land's hold read off \
+             a real window (its chip's and its band's screen-reader nodes): the run needs land-p \
+             (--mode cover, --chains land-p) or same-land (--chains same-land)",
         ));
     }
     Ok(Some(asked))
@@ -6823,6 +6982,9 @@ pub mod walls;
 
 #[path = "forever_surfaces.rs"]
 pub mod surfaces;
+
+#[path = "forever_angles.rs"]
+pub mod angles;
 
 #[cfg(test)]
 #[path = "forever_tests.rs"]

@@ -255,13 +255,6 @@ pub(super) fn unmoved_since(screen: &Screen, at: u64, epoch: Option<u64>) -> boo
         .is_some_and(|now| Some(now.epoch) == epoch && now.seq <= at)
 }
 
-/// The text on the composer's caret row as `reader` reads it ([`typed_draft`]).
-fn caret_text(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
-    reader
-        .composer(rows)
-        .and_then(|(_, lines)| lines.into_iter().next())
-}
-
 /// A wall the host's measure of the API's reach answers ([`aterm_phase::ApiCause`]).
 const fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
     matches!(
@@ -1686,7 +1679,21 @@ impl<C: Ctl> Session<'_, C> {
     /// reads go on the host answers `None`, and between asks the loop renews its
     /// claim when due, so a probe however long lets no lease lapse; `None` once
     /// the loop is stopped, what the repository holds unknown.
+    ///
+    /// A disk-free worker's repository reads clean by its task record, unasked:
+    /// its trusted folder is the worker folder
+    /// ([`crate::harness::disk::fence::is_worker_folder`]), and nothing it does
+    /// is landed anywhere, so a `cd` into a checkout holding another session's
+    /// work neither holds it nor has Land nudge it to land that work
+    /// (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4, "Land for a worker").
     fn repo_asked(&mut self, host: &dyn IdleHost) -> Option<crate::harness::repo_work::RepoRead> {
+        if self
+            .trusted_cwd
+            .as_deref()
+            .is_some_and(crate::harness::disk::fence::is_worker_folder)
+        {
+            return Some(crate::harness::repo_work::RepoRead::Clean);
+        }
         loop {
             if let Some(found) = host.repo_work() {
                 return Some(found);
@@ -1717,6 +1724,7 @@ impl<C: Ctl> Session<'_, C> {
                 }),
             said: self.turn_end.replies(),
             said_reset_ms: self.turn_end.replies_reset().map(|t| self.unix_ms_of(t)),
+            checks: self.turn_end.checks(),
         }
     }
 
@@ -2514,7 +2522,8 @@ impl<C: Ctl> Session<'_, C> {
         self.say_wall_refused(review);
         self.say_sleep_unknown(seq, review);
         self.say_repo_unread(seq, review);
-        self.sync_exception(seq, review);
+        let backing_out = matches!(action, TurnEndAction::Cancel { .. });
+        self.sync_exception(seq, backing_out, review);
         self.task_edge(&point.screen, opts, review)?;
         if self.turn_end.exchange_at_wall() {
             self.ledger_left_at_wall(&point.screen, opts, seq);
@@ -2580,9 +2589,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.set_wait(*until, why.clone(), *wait);
                 return Ok(());
             }
-            TurnEndAction::Type { text, rule_id } | TurnEndAction::Accept { text, rule_id } => {
-                (one_turn(text), *rule_id)
-            }
+            TurnEndAction::Type { text, rule_id } => (one_turn(text), *rule_id),
             TurnEndAction::TypeCommand {
                 command, rule_id, ..
             } => (command.clone(), *rule_id),
@@ -2638,7 +2645,6 @@ impl<C: Ctl> Session<'_, C> {
         // Left: the text, any fact with it, stands in the composer unsent.
         let mut left = false;
         let typed = match &action {
-            TurnEndAction::Accept { .. } => self.accept_suggestion(point, &text, rule, review),
             TurnEndAction::Submit { .. } => self.submit_draft(point, &text, rule, review),
             _ => self
                 .type_text_written(point, &text, rule, review)
@@ -2682,11 +2688,24 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Publish any change in the standing exception ([`exception_for`]).
-    fn sync_exception(&mut self, seq: u64, review: &mut dyn Review) {
+    /// Publish any change in the standing exception ([`exception_for`]). `backing_out`: the
+    /// action the turn end carries out at this point is its Esc out of the `/login` it typed
+    /// ([`TurnEndAction::Cancel`], `login-back-out@v1`, at the browser hand-off or the dialog's
+    /// error), so a login exception that ends here ends by that back-out.
+    pub(super) fn sync_exception(&mut self, seq: u64, backing_out: bool, review: &mut dyn Review) {
+        use super::super::policy::exception::{LOGIN_BACKED_OUT, LOGIN_BACKING_OUT};
         self.stuck_over(seq, "the screen reached a point", review);
         let Some(now) = self.exception_now.clone() else {
-            self.exception_ended(seq, None, review);
+            let cause = self.exception_open.as_ref().and_then(|(open, since)| {
+                if open.kind != super::super::policy::outlook::ExceptionKind::Login {
+                    None
+                } else if self.turn_end.login_backed_out_since(*since) {
+                    Some(LOGIN_BACKED_OUT)
+                } else {
+                    backing_out.then_some(LOGIN_BACKING_OUT)
+                }
+            });
+            self.exception_ended(seq, cause, review);
             return;
         };
         match &self.exception_open {
@@ -2704,8 +2723,11 @@ impl<C: Ctl> Session<'_, C> {
             .notice
             .as_ref()
             .map_or_else(String::new, |n| format!(" notice={}", n.id));
+        let held = now
+            .held
+            .map_or_else(String::new, |arm| format!(" held={}", arm.word()));
         review.note(&format!(
-            "EXCEPTION seq={seq} kind={} when={}{notice} {} => {}",
+            "EXCEPTION seq={seq} kind={} when={}{held}{notice} {} => {}",
             now.kind.word(),
             now.when.word(),
             now.why,
@@ -3300,19 +3322,8 @@ impl<C: Ctl> Session<'_, C> {
             .is_some_and(|p| p.kind == aterm_phase::PromptKind::AutoModeSetup)
     }
 
-    /// Type and submit `text` via [`Self::type_fenced`] when supported ([`Self::type_guarded`]).
-    pub(super) fn type_text(
-        &mut self,
-        point: &Turn,
-        text: &str,
-        rule: &str,
-        review: &mut dyn Review,
-    ) -> Result<bool, Fail> {
-        self.type_text_written(point, text, rule, review)
-            .map(|written| written == Written::Submitted)
-    }
-
-    /// [`Self::type_text`], saying how far the text went, the guarded write's as well.
+    /// Type and submit `text` via [`Self::type_fenced`] when supported ([`Self::type_guarded`]),
+    /// saying how far the text went, the guarded write's as well.
     pub(super) fn type_text_written(
         &mut self,
         point: &Turn,
@@ -3678,118 +3689,6 @@ impl<C: Ctl> Session<'_, C> {
             Some(_) => {}
         }
         Ok(None)
-    }
-
-    /// THE ACCEPT KEY IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY A BUDGET ([`ECHO_HANG`]).
-    fn await_accept(&mut self, at: u64, text: &str) -> Result<Screen, Fail> {
-        let began = self.fx.mono();
-        self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
-        loop {
-            self.keep_hand()?;
-            self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
-            let mut now = self.screen()?;
-            if caret_row(self.reader(&now.rows), &now.rows).is_none() {
-                self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
-                now = self.screen()?;
-            }
-            let reader = self.reader(&now.rows);
-            let untaken = caret_text(reader, &now.rows).as_deref() == Some(text)
-                && !typed_draft(reader, &now);
-            let spent = self.fx.mono().saturating_duration_since(began);
-            if !untaken || spent >= ECHO_HANG {
-                return Ok(now);
-            }
-            let step = self.hand_step(ECHO_HANG - spent);
-            let moved = self.wait(&["seq", &now.seq.to_string()], step)?;
-            if matches!(moved, Wait::Unsupported) {
-                return Ok(now);
-            }
-        }
-    }
-
-    /// Accept and submit the worker's inline suggestion via fenced `right` and `enter` keys.
-    fn accept_suggestion(
-        &mut self,
-        point: &Turn,
-        text: &str,
-        rule: &str,
-        review: &mut dyn Review,
-    ) -> Result<bool, Fail> {
-        let seq = point.screen.seq;
-        let rows = &point.screen.rows;
-        if self.setup.types_under_hand {
-            return self.type_text(point, text, rule, review);
-        }
-        let (Some(generation), Some(caret)) = (
-            point.screen.generation.clone(),
-            caret_row(self.reader(rows), rows),
-        ) else {
-            return self.type_text(point, text, rule, review);
-        };
-        if !self.gen_fence_known()? {
-            return self.type_text(point, text, rule, review);
-        }
-        let Some((r, args)) =
-            self.press_fenced(&rows[caret], "right", &generation, (seq, rule), review)?
-        else {
-            return Ok(false);
-        };
-        if r.skipped_changed() {
-            review.note(&format!(
-                "SKIPPED seq={seq} rule={rule} the screen moved before the accept key"
-            ));
-            self.redecide_soon("the screen moved before the accept key");
-            return Ok(false);
-        }
-        if r.skipped() {
-            self.not_written(point, text, rule, &args, review)?;
-            return Ok(false);
-        }
-        let at = r.seq().unwrap_or(seq);
-        let now = self.await_accept(at, text)?;
-        let reader = self.reader(&now.rows);
-        let shows = caret_text(reader, &now.rows).as_deref() == Some(text);
-        let filled = shows && typed_draft(reader, &now) && reader.prompt(&now.rows).is_none();
-        let (generation, caret) = match (now.generation.clone(), caret_row(reader, &now.rows)) {
-            (Some(generation), Some(caret)) => (generation, caret),
-            (_, None) => {
-                review.note(&format!(
-                    "SKIPPED seq={seq} rule={rule} no composer after the accept key on two \
-                     settled reads; nothing more is pressed"
-                ));
-                return Ok(false);
-            }
-            (None, Some(_)) => {
-                review.note(&format!(
-                    "SKIPPED seq={seq} rule={rule} the read after the accept key carries no \
-                     generation to fence Enter on; nothing more is pressed"
-                ));
-                return Ok(false);
-            }
-        };
-        if !filled {
-            if !(shows && !typed_draft(reader, &now)) {
-                review.note(&format!(
-                    "SKIPPED seq={seq} rule={rule} the composer no longer shows the suggestion"
-                ));
-                return Ok(false);
-            }
-            let turn = self.turn_of(now);
-            return self.type_text(&turn, text, rule, review);
-        }
-        let Some((r, _)) =
-            self.press_fenced(&now.rows[caret], "enter", &generation, (seq, rule), review)?
-        else {
-            return Ok(false);
-        };
-        if r.skipped() {
-            review.note(&format!(
-                "SKIPPED seq={seq} rule={rule} the composer moved before Enter; the suggestion \
-                 stays filled"
-            ));
-            return Ok(false);
-        }
-        Ok(true)
     }
 }
 
@@ -4712,7 +4611,6 @@ pub(super) fn turn_end_outcome(action: &TurnEndAction, at: &dyn Fn(Instant) -> S
         ),
         TurnEndAction::Nothing
         | TurnEndAction::Type { .. }
-        | TurnEndAction::Accept { .. }
         | TurnEndAction::TypeCommand { .. }
         | TurnEndAction::Submit { .. }
         | TurnEndAction::Confirm { .. }

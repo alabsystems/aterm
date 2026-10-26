@@ -266,7 +266,6 @@ fn verdict(a: &TurnEndAction, st: &State) -> Verdict {
             }
             Verdict::Continue
         }
-        TurnEndAction::Accept { .. } => Verdict::Continue,
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_RETRY => Verdict::Retry,
         TurnEndAction::Submit { rule_id }
             if *rule_id == continue_rule(st) || *rule_id == RULE_API_RETRY =>

@@ -3,8 +3,8 @@
 
 //! The System State tab (`docs/DESIGN-system-state-2026-10-21.md` §3): what
 //! this Mac reads now beside what aterm wants, in five groups. A group's
-//! `Set up │ Leave as is` choice takes effect at once on the manual page;
-//! a first-launch offer keeps those choices in its review until Apply.
+//! `Set up │ Leave as is` choice takes effect at once. First launch admits
+//! its offer automatically at the first unblocked tick with a person present.
 
 mod paint;
 
@@ -12,7 +12,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
@@ -1089,17 +1088,14 @@ impl Said<'_> {
 /// The headline while rows are read: a Check going, or readings still to come.
 const CHECKING: &str = "Checking this Mac…";
 
-/// The headline while the first launch's review waits for Apply or Cancel (§3.3): the only
-/// signal it gives, since the tab is in front; no diamond, no menu line.
-pub(crate) const REVIEW_HEADLINE: &str = "Review this Mac's setup";
+/// The headline while the first launch's offer waits for the page's own answer, which it gives
+/// on its first tick with a person at this Mac (design revision 4: no review, no countdown, no
+/// confirmation): the only signal it gives; no diamond, no menu line.
+pub(crate) const STARTING_HEADLINE: &str = "Starting this Mac's setup";
 
 /// The headline while a newer aterm's setup is in force ([`SetupStatus::newer`]): calm, and the
 /// one line that says why the groups, Set up now and Restore are not this aterm's to press.
 pub(crate) const NEWER_HEADLINE: &str = "A newer aterm manages this Mac's setup";
-
-/// What the first launch's review says above its buttons, while it counts down and once a
-/// click stopped it (§3.3): one line at the narrowest window (46 columns).
-pub(crate) const REVIEW_NOTE: &str = "Apply sets up what is shown; Cancel changes nothing.";
 
 /// The headline while a setup run that did not finish as a whole waits for aterm to try it
 /// again by itself (§3.5), and no row waits.
@@ -1192,7 +1188,7 @@ pub(crate) const fn text_input_interacts(event: &TextInputEvent) -> bool {
 /// admission receipt to the worker (`InitialSetupApplyReceipt::admission`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// The first-run offer, applied after its uninterrupted visible countdown.
+    /// The first-run offer's automatic answer while a person is at this Mac.
     Automatic,
     /// A person pressed the page.
     Person,
@@ -1222,8 +1218,10 @@ enum Submission {
     /// Join: a group choice that also sends the vault address as typed and
     /// its password.
     Join,
-    /// The entire first-launch review, with its committed vault draft.
-    Review,
+    /// The launch's offer, answered by the page itself as the plan stands (design revision 4):
+    /// a provisional plan stays provisional, and a vault address or password being typed stays
+    /// a draft for Join, so no credential goes without a press.
+    Offer,
 }
 
 #[derive(Debug)]
@@ -1232,8 +1230,6 @@ pub(crate) enum SystemStateAction {
     /// a run is going, the worker stops it at its next step and runs this
     /// plan next (`InitialSetupHandlers::apply`).
     Apply(SetupAnswer, Admission),
-    /// End only the unanswered startup review; no setup records are changed.
-    CancelReview,
     /// Read every row again for this plan, prompt-free.
     Check(Plan),
     /// Put back the Mac preferences aterm saved.
@@ -1386,8 +1382,8 @@ fn row_view_for_source(
     row_view_as(subject, status, selection, vault_url, false)
 }
 
-/// [`row_view_for_source`], as the first launch's review shows it when `review` (§3.3): each row
-/// reads as what Apply will do, its value now and what it changes to. A row that would need a
+/// [`row_view_for_source`] before admission when `review` (§3.3): each row
+/// shows its current value and proposed change. A row that would need a
 /// person once setup runs reads as one that will change, with its probe's note alone and no
 /// button: nothing waits on the person until setup runs and asks them.
 fn row_view_as(
@@ -2689,6 +2685,9 @@ impl Password {
         password
     }
 
+    /// The typed password, emptying the field: the tests' read of what the
+    /// field still holds.
+    #[cfg(test)]
     fn take(&mut self) -> Option<SecretBytes> {
         self.forget_accepted();
         self.acceptance = None;
@@ -2708,58 +2707,6 @@ struct Awaiting {
     /// force, which the worker applies onto it ([`SetupAnswer::changed`]); `None`: the plan
     /// as sent.
     changed: Option<Selection>,
-}
-
-/// A first-launch offer counts only time spent active and visible. Once input
-/// stops it, this offer can be submitted only by its Apply button.
-struct StartupReview {
-    remaining: Duration,
-    last_active: Option<Instant>,
-    stopped: bool,
-}
-
-impl StartupReview {
-    fn new() -> Self {
-        Self {
-            remaining: Duration::from_secs(30),
-            last_active: None,
-            stopped: false,
-        }
-    }
-
-    fn seconds(&self) -> Option<u64> {
-        (!self.stopped)
-            .then(|| self.remaining.as_secs() + u64::from(self.remaining.subsec_nanos() != 0))
-    }
-
-    fn stop(&mut self) -> bool {
-        let changed = !self.stopped;
-        self.stopped = true;
-        self.last_active = None;
-        changed
-    }
-
-    /// The review shows a widened plan (§3.5): its count starts again at 30 seconds, unless a
-    /// touch stopped it for good.
-    fn restart(&mut self) {
-        if !self.stopped {
-            self.remaining = Duration::from_secs(30);
-            self.last_active = None;
-        }
-    }
-
-    fn tick(&mut self, now: Instant, active: bool) -> bool {
-        if self.stopped || !active {
-            self.last_active = None;
-            return false;
-        }
-        if let Some(previous) = self.last_active.replace(now) {
-            self.remaining = self
-                .remaining
-                .saturating_sub(now.saturating_duration_since(previous));
-        }
-        self.remaining.is_zero()
-    }
 }
 
 pub(crate) struct SystemStateApp {
@@ -2784,13 +2731,13 @@ pub(crate) struct SystemStateApp {
     vault_open: Option<bool>,
     status: SetupStatus,
     request: Option<Request>,
-    startup_review: Option<StartupReview>,
-    /// The launch's review shows the plan this Mac's ALab signal widened it to (§3.5).
+    /// The offer in `request` waits for the page's own answer, which the page gives on its
+    /// first tick with a person at this Mac ([`Self::tick`]): no review, no countdown and
+    /// no confirmation (design revision 4). Only a person at the Mac changes it (SAFE-1).
+    answer_waits: bool,
+    /// The launch's offer shows the plan this Mac's ALab signal widened it to while it waited
+    /// (§3.5).
     review_widened: bool,
-    /// The groups of the launch's review the person cancelled, while the worker's status does
-    /// not say the Cancel stands yet: a status that still names them is one read before the
-    /// worker kept it, and the page keeps every group at Leave as is meanwhile (§3.3).
-    cancel_sent: Option<Selection>,
     actions: VecDeque<SystemStateAction>,
     /// Whether the gesture being handled is a person's (not a control client's).
     by_person: bool,
@@ -2851,9 +2798,8 @@ impl SystemStateApp {
             vault_open: None,
             status: SetupStatus::default(),
             request: None,
-            startup_review: None,
+            answer_waits: false,
             review_widened: false,
-            cancel_sent: None,
             actions: VecDeque::new(),
             by_person: false,
             anim_ticks: 0,
@@ -2901,9 +2847,8 @@ impl SystemStateApp {
         self.password = Password::default();
         self.status = SetupStatus::default();
         self.request = Some(request);
-        self.startup_review = Some(StartupReview::new());
+        self.answer_waits = true;
         self.review_widened = false;
-        self.cancel_sent = None;
         true
     }
 
@@ -2916,10 +2861,10 @@ impl SystemStateApp {
                 .is_some_and(|request| matches!(request.kind(), OfferKind::Widen { .. }))
     }
 
-    /// The worker heard this Mac's ALab signal while the launch's review is up (§3.5): an
-    /// untouched draft widens to `widened` in place, its count starts again at 30 seconds
-    /// unless a touch stopped it, and the page says why ([`ALAB_ADDED_NOTE`]). A draft the
-    /// person edited stays theirs, as it is. Whether the page changed.
+    /// The worker heard this Mac's ALab signal while the launch's offer waits for its answer
+    /// (§3.5): the offer widens to `widened` in place, and the page says why
+    /// ([`ALAB_ADDED_NOTE`]); a vault address or password being typed stays as it is, unwidened.
+    /// Whether the page changed.
     fn widen_review(&mut self, widened: Plan) -> bool {
         if !self.reviewing()
             || self.reviewing_widen()
@@ -2932,9 +2877,6 @@ impl SystemStateApp {
         self.plan = widened.clone();
         self.submitted = widened;
         self.review_widened = true;
-        if let Some(review) = &mut self.startup_review {
-            review.restart();
-        }
         true
     }
 
@@ -2953,26 +2895,9 @@ impl SystemStateApp {
     /// nothing the page sent waits for the worker (and no offer is up); a
     /// vault address being typed stays as typed.
     pub(crate) fn publish(&mut self, status: SetupStatus) -> bool {
-        if status.busy {
-            self.pause_review();
-        }
         let mut changed = self.status != status;
-        // A status read before the worker kept the person's Cancel names the plan the review
-        // offered: the page keeps every group at Leave as is until one says the Cancel stands,
-        // or names another plan (a choice made meanwhile answered for the review).
-        let cancel_unheard = self.cancel_sent.is_some_and(|reviewed| {
-            !status.cancelled
-                && status
-                    .plan
-                    .as_ref()
-                    .is_none_or(|plan| plan.selection == reviewed)
-        });
-        if !cancel_unheard {
-            self.cancel_sent = None;
-        }
         if self.request.is_none()
             && self.awaiting.is_none()
-            && !cancel_unheard
             && let Some(plan) = &status.plan
         {
             if !self.plan_known || self.plan.selection != plan.selection {
@@ -3005,63 +2930,34 @@ impl SystemStateApp {
 
     /// Note whose gesture the next event is: the host stamps it before the
     /// reducer runs, from the App's gesture source.
-    pub(crate) fn gesture(&mut self, by_person: bool) -> bool {
+    pub(crate) const fn gesture(&mut self, by_person: bool) {
         self.by_person = by_person;
-        self.interact()
     }
 
+    /// Whether the offer up still waits for the page's own answer ([`Self::answer_waits`]).
     fn reviewing(&self) -> bool {
-        self.pending() && self.startup_review.is_some()
+        self.pending() && self.answer_waits
     }
 
-    fn interact(&mut self) -> bool {
-        self.reviewing()
-            && self
-                .startup_review
-                .as_mut()
-                .is_some_and(StartupReview::stop)
-    }
-
-    fn review_seconds(&self) -> Option<u64> {
-        self.startup_review
-            .as_ref()
-            .and_then(StartupReview::seconds)
-    }
-
-    /// Visibility can end between throttled ticks, including just before
-    /// sleep. Forget only that active sample; keep the remaining review time.
-    pub(crate) fn pause_review(&mut self) {
-        if let Some(review) = &mut self.startup_review {
-            review.last_active = None;
-        }
-    }
-
-    /// A withdrawn offer is let go. An untouched first-run review applies
-    /// after thirty seconds active and visible; while a setup run goes
-    /// and the page is `shown` (the visible view of a window), the village's
-    /// kitties walk a step. `walks` says whether a shown view's last render
-    /// showed a walking village ([`SystemStateViewState::village_walks`]).
-    /// `true` when the page changed: a page nobody sees, one Check again or
-    /// Restore keeps busy, or one whose shown views draw no walking village
-    /// owes no repaint for the walk.
-    #[cfg(test)]
-    pub(crate) fn tick(&mut self, active: bool, shown: bool, walks: bool) -> bool {
-        self.tick_at(Instant::now(), active, shown, walks)
-    }
-
-    pub(crate) fn tick_at(&mut self, now: Instant, active: bool, shown: bool, walks: bool) -> bool {
-        let before = (
-            self.request.is_some(),
-            self.status.busy,
-            self.review_seconds(),
-        );
+    /// A withdrawn offer is let go. An offer that waits for its answer is answered by the page
+    /// itself, as the plan stands, on the first tick a person is at this Mac (`present`: a
+    /// keyboard, mouse or trackpad used within the last minute, and the screen neither locked
+    /// nor switched away), focused, shown or not, whatever was clicked or typed meanwhile:
+    /// no review, no countdown, no confirmation (design revision 4); a status that says the page
+    /// is busy holds it until it is not. While a setup run goes and the page is `shown` (the
+    /// visible view of a window), the village's kitties walk a step. `walks` says whether a shown
+    /// view's last render showed a walking village ([`SystemStateViewState::village_walks`]).
+    /// `true` when the page changed: a page nobody sees, one Check again or Restore keeps busy,
+    /// or one whose shown views draw no walking village owes no repaint for the walk.
+    pub(crate) fn tick(&mut self, present: bool, shown: bool, walks: bool) -> bool {
+        let before = (self.request.is_some(), self.status.busy, self.reviewing());
         if self
             .request
             .as_ref()
             .is_some_and(|request| !request.pending())
         {
             self.request = None;
-            self.startup_review = None;
+            self.answer_waits = false;
             self.review_widened = false;
         }
         let widened = self
@@ -3069,26 +2965,14 @@ impl SystemStateApp {
             .as_ref()
             .and_then(Request::take_widened)
             .is_some_and(|widened| self.widen_review(widened));
-        if self.reviewing()
-            && self
-                .startup_review
-                .as_mut()
-                .is_some_and(|review| review.tick(now, active && shown && !self.status.busy))
-        {
-            self.apply(Admission::Automatic, Submission::Review, None);
+        if self.reviewing() && present && !self.status.busy {
+            self.apply(Admission::Automatic, Submission::Offer, None);
         }
         let walked = self.status.running() && shown && {
             self.anim_ticks = self.anim_ticks.wrapping_add(1);
             walks
         };
-        walked
-            || widened
-            || before
-                != (
-                    self.request.is_some(),
-                    self.status.busy,
-                    self.review_seconds(),
-                )
+        walked || widened || before != (self.request.is_some(), self.status.busy, self.reviewing())
     }
 
     pub(crate) fn pending(&self) -> bool {
@@ -3136,11 +3020,11 @@ impl SystemStateApp {
         )
     }
 
-    /// Whether `subject`'s row reads as what Apply, or Set up now, will do (§3.3): every row
-    /// while the first launch's review is up, or after it was closed unanswered (nothing was
-    /// approved, so nothing waits on anyone yet), and, in the review of the groups the ALab
-    /// signal adds (§3.5), the rows those groups add. A row the plan in force manages keeps its
-    /// real reading there, with its buttons and signals: that review's Apply changes none of it.
+    /// Whether `subject`'s row reads as what setup, or Set up now, will do (§3.3): every row
+    /// while the first launch's offer waits for its answer, or after it was closed unanswered
+    /// (nothing was approved, so nothing waits on anyone yet), and, in the offer of the groups
+    /// the ALab signal adds (§3.5), the rows those groups add. A row the plan in force manages
+    /// keeps its real reading there, with its buttons and signals: that offer changes none of it.
     fn reads_as_review(&self, subject: Subject) -> bool {
         if self.status.unanswered {
             return true;
@@ -3154,9 +3038,9 @@ impl SystemStateApp {
         }
     }
 
-    /// Whether the page's own signals are still (§3.3, §3.6): while the first launch's review is
-    /// up its headline is the one signal, on a tab in front, and a review closed unanswered
-    /// approved nothing. The review of the groups the ALab signal adds stills nothing: its tab
+    /// Whether the page's own signals are still (§3.3, §3.6): while the first launch's offer
+    /// waits for its answer its headline is the one signal, and an offer closed unanswered
+    /// approved nothing. The offer of the groups the ALab signal adds stills nothing: its tab
     /// never takes focus, and the plan in force goes on under it.
     pub(crate) fn signals_still(&self) -> bool {
         self.status.unanswered || (self.reviewing() && !self.reviewing_widen())
@@ -3201,9 +3085,9 @@ impl SystemStateApp {
             if self.status.busy {
                 return Headline::before_plan(&self.status);
             }
-            // The review of the groups the ALab signal adds says what the plan in force needs of
-            // a person, as its rows, the diamond and the menu line do; its own Apply is in the
-            // footer, so the headline offers no Set up now beside it.
+            // The offer of the groups the ALab signal adds says what the plan in force needs of
+            // a person, as its rows, the diamond and the menu line do; the offer applies by
+            // itself, so the headline offers no Set up now beside it.
             if self.reviewing_widen() && self.needs_attention() {
                 let plan = self.reviewed_plan();
                 return Headline {
@@ -3211,7 +3095,7 @@ impl SystemStateApp {
                     ..headline(&self.status, &self.reviewed_rows(), Some(&plan))
                 };
             }
-            return Headline::line(REVIEW_HEADLINE);
+            return Headline::line(STARTING_HEADLINE);
         }
         if !self.plan_known {
             return Headline::before_plan(&self.status);
@@ -3229,16 +3113,16 @@ impl SystemStateApp {
         headline(&status, &self.judged_rows(&in_force), Some(&in_force))
     }
 
-    /// A row read as what Apply will do offers no Open ([`Self::reads_as_review`]).
+    /// An unadmitted row offers no Open ([`Self::reads_as_review`]).
     pub(crate) fn can_open_access(&self, access: Access) -> bool {
         self.plan_known && self.reviewed_row(Subject::Access(access)).open == Some(access)
     }
 
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
     /// failed and the run no longer retries it (§3.5). Never while the page's signals are still
-    /// ([`Self::signals_still`]): the first launch's review, whose headline is the one signal on
-    /// a tab in front, or one closed unanswered, which approved nothing (§3.3). In the review of
-    /// the groups the ALab signal adds, the rows the plan in force manages say it as ever.
+    /// ([`Self::signals_still`]): first-launch admission still waits or its page closed
+    /// unanswered (§3.3). While wider scope awaits admission, the plan already in force
+    /// keeps its existing signals.
     pub(crate) fn needs_attention(&self) -> bool {
         if self.signals_still() {
             return false;
@@ -3265,8 +3149,8 @@ impl SystemStateApp {
     /// and leaves a draft where it is. `changed` is what the worker takes of the plan onto the
     /// plan in force ([`SetupAnswer::changed`]).
     fn apply(&mut self, admission: Admission, submission: Submission, changed: Option<Selection>) {
-        let review = submission == Submission::Review;
-        let with_vault = submission == Submission::Join || (review && self.vault_draft());
+        let offer = submission == Submission::Offer;
+        let with_vault = submission == Submission::Join;
         let mut plan = self.plan.clone();
         plan.vault_url = if with_vault {
             self.url.value().trim().to_owned()
@@ -3283,9 +3167,8 @@ impl SystemStateApp {
         self.status.busy = true;
         self.status.operation = None;
         self.stopping = false;
-        self.startup_review = None;
-        let widened = review && std::mem::take(&mut self.review_widened);
-        self.cancel_sent = None;
+        self.answer_waits = false;
+        let widened = offer && std::mem::take(&mut self.review_widened);
         self.awaiting = Some(Awaiting {
             plan: plan.clone(),
             password: password.as_ref().and(self.password.acceptance.clone()),
@@ -3296,11 +3179,7 @@ impl SystemStateApp {
                 decision: WorkstationSetupDecision::Begin(plan),
                 password,
                 receipt: None,
-                chosen: if review {
-                    admission != Admission::Automatic
-                } else {
-                    submission != Submission::AsItStands
-                },
+                chosen: !matches!(submission, Submission::AsItStands | Submission::Offer),
                 vault_typed: with_vault,
                 changed,
                 widened,
@@ -3325,7 +3204,7 @@ impl SystemStateApp {
         self.submitted = plan.clone();
         self.plan_known = true;
         self.request = None;
-        self.startup_review = None;
+        self.answer_waits = false;
         if let Some(password) = self
             .awaiting
             .take_if(|awaiting| awaiting.plan == plan)
@@ -3352,47 +3231,15 @@ impl SystemStateApp {
     }
 
     /// The host calls this only after the final view has actually detached.
-    /// Closing never cancels (§3.3): an unanswered review is closed for this
-    /// launch, nothing is recorded, and the next launch offers it again. What
-    /// the page sent is the worker's already.
+    /// Closing never cancels (§3.3): an offer still waiting for its answer is
+    /// closed for this launch, nothing is recorded, and the next launch offers
+    /// it again. What the page sent is the worker's already.
     pub(crate) fn closed(&mut self, _scope: CloseScope) {
         if let Some(request) = self.request.take() {
             request.finish(WorkstationSetupDecision::Closed);
         }
-        self.startup_review = None;
+        self.answer_waits = false;
         self.review_widened = false;
-    }
-
-    /// Cancel (§3.3). The launch's review: every group at Leave as is is the person's plan
-    /// now, which the worker records for good; a later group press sets up that group alone,
-    /// and Set up now applies the plan the review showed. The review of the groups the ALab
-    /// signal adds (§3.5): the plan in force stays as it is, the person's from now on.
-    fn cancel_review(&mut self) {
-        if !self.reviewing() {
-            return;
-        }
-        let widen = self.reviewing_widen();
-        if let Some(request) = self.request.take() {
-            request.finish_answer(SetupAnswer {
-                widened: self.review_widened,
-                ..WorkstationSetupDecision::Cancelled.into()
-            });
-        }
-        self.startup_review = None;
-        self.review_widened = false;
-        drop(self.password.take());
-        if !widen {
-            self.cancel_sent = Some(self.submitted.selection);
-            self.submitted = Plan {
-                selection: Selection::none(),
-                vault_url: self.submitted.vault_url.clone(),
-            };
-        }
-        self.plan = self.submitted.clone();
-        self.url = TextInputState::new(self.submitted.vault_url.clone());
-        self.plan_known = true;
-        self.publish(self.status.clone());
-        self.actions.push_back(SystemStateAction::CancelReview);
     }
 
     /// The plan the worker will run next: the one sent last, else the one it
@@ -3421,7 +3268,7 @@ impl SystemStateApp {
         (self.plan_known || self.status.newer()) && (!self.status.busy || self.status.queued)
     }
 
-    /// Whether Restore previous settings can start: nothing is busy, no review is up, and the
+    /// Whether Restore previous settings can start: nothing is busy, no offer waits, and the
     /// setup records are this aterm's to put back, not a newer aterm's (§3.4).
     fn can_restore(&self) -> bool {
         !self.status.busy && !self.reviewing() && !self.status.newer()
@@ -3443,6 +3290,18 @@ impl SystemStateApp {
         Some(changed)
     }
 
+    /// What a press takes onto the plan in force ([`SetupAnswer::changed`]): while the offer
+    /// waits for its answer, the press answers it with the plan the page shows, whole (`None`),
+    /// so the groups an offer of the ALab signal's widening adds go with the press; otherwise
+    /// the groups changed since the page last took the plan in force, `settings` among them.
+    fn press_changed(&self, settings: &[Setting]) -> Option<Selection> {
+        if self.reviewing() {
+            None
+        } else {
+            self.changed_with(settings)
+        }
+    }
+
     /// Set every bit of `group` to `on`, and submit the plan when that changes
     /// what the worker will run, or while the plan aterm chose by itself may still
     /// widen ([`Self::may_widen`]): a group choice makes the plan the person's, even
@@ -3454,11 +3313,10 @@ impl SystemStateApp {
         for setting in group.settings() {
             self.plan.selection.set(*setting, on);
         }
-        if self.reviewing() {
-            return;
-        }
+        // A press while the offer waits for its answer answers it, as the presser's choice: an
+        // offer still pending is one the plan may widen.
         if self.plan.selection != self.next_plan().selection || self.may_widen() {
-            let changed = self.changed_with(group.settings());
+            let changed = self.press_changed(group.settings());
             self.apply(
                 Admission::of_gesture(self.by_person),
                 Submission::Choice,
@@ -3571,7 +3429,6 @@ impl SystemStateApp {
 
     /// One pressed control of the page.
     fn act(&mut self, view: &mut SystemStateViewState, key: &str, value: Option<SemanticInput>) {
-        self.interact();
         if let Some(rest) = key.strip_prefix("system-state/group/") {
             let mut parts = rest.split('/');
             if let (Some(group), Some(choice)) = (
@@ -3599,14 +3456,6 @@ impl SystemStateApp {
             return;
         }
         match key {
-            "system-state/apply" if self.reviewing() && !self.status.busy => {
-                self.apply(
-                    Admission::of_gesture(self.by_person),
-                    Submission::Review,
-                    None,
-                );
-            }
-            "system-state/cancel" if self.reviewing() => self.cancel_review(),
             "system-state/stop" if self.status.running() && !self.stopping => {
                 // Asked once: the worker keeps it, so a run that has not
                 // shown up yet stops once it does.
@@ -3671,10 +3520,7 @@ impl SystemStateApp {
             "system-state/vault/join" if self.vault_editable() && self.plan_known => {
                 self.vault_open = Some(true);
                 self.plan.selection.set(Setting::Secrets, true);
-                if self.reviewing() {
-                    return;
-                }
-                let changed = self.changed_with(&[Setting::Secrets]);
+                let changed = self.press_changed(&[Setting::Secrets]);
                 self.apply(
                     Admission::of_gesture(self.by_person),
                     Submission::Join,
@@ -3757,30 +3603,18 @@ impl NativeAppModel for SystemStateApp {
         event: AppEvent,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
-        let interacted = match &event {
-            AppEvent::TextInput(event) => text_input_interacts(event),
-            AppEvent::Action(_)
-            | AppEvent::ScrollLines(_)
-            | AppEvent::ScrollAt { .. }
-            | AppEvent::ScrollPage(_)
-            | AppEvent::PressListPicture(_) => true,
-            #[cfg(any(a11y_tree, test))]
-            AppEvent::InsertText(_) | AppEvent::RevealControl(_) => true,
-            _ => false,
-        } && self.interact();
         // Scrolling and focus are this view's own; every other change is the
         // shared page's.
-        let shared = interacted
-            || !matches!(
-                event,
-                AppEvent::FocusChanged(_)
-                    | AppEvent::ScrollLines(_)
-                    | AppEvent::ScrollAt { .. }
-                    | AppEvent::ScrollPage(_)
-                    | AppEvent::PressListPicture(_)
-            );
+        let shared = !matches!(
+            event,
+            AppEvent::FocusChanged(_)
+                | AppEvent::ScrollLines(_)
+                | AppEvent::ScrollAt { .. }
+                | AppEvent::ScrollPage(_)
+                | AppEvent::PressListPicture(_)
+        );
         #[cfg(any(a11y_tree, test))]
-        let shared = interacted || (shared && !matches!(event, AppEvent::RevealControl(_)));
+        let shared = shared && !matches!(event, AppEvent::RevealControl(_));
         let handled = match event {
             AppEvent::FocusChanged(focus) => {
                 if let Some(key) = &focus {
@@ -3994,10 +3828,6 @@ impl<'a, 'b> Page<'a, 'b> {
             m,
             spans: Vec::new(),
         }
-    }
-
-    fn busy(&self) -> bool {
-        self.app.status.busy
     }
 
     fn tree(mut self) -> UiTree {
@@ -4598,9 +4428,6 @@ impl<'a, 'b> Page<'a, 'b> {
             self.app.can_check(),
             room,
         );
-        if self.app.reviewing() {
-            return self.review_footer(check, room);
-        }
         // A Restore waiting for another setup says so on its own button, which waits with it.
         let status = &self.app.status;
         let restore_waits = status.queued && status.operation == Some(SetupOperation::Restore);
@@ -4655,72 +4482,6 @@ impl<'a, 'b> Page<'a, 'b> {
                 .paint_only(),
                 restore.0,
             ]),
-            height,
-        )
-    }
-
-    /// The first launch's review footer (§3.3): one line saying what Apply and Cancel do, over
-    /// Check again, Cancel and Apply. Apply's face counts down (`Apply (30)`) until a click stops
-    /// it, in a footprint that stays put, its words centred; VoiceOver hears `Apply` alone, with,
-    /// while it counts, that it applies by itself in so many seconds. Returns the node and its
-    /// height.
-    fn review_footer(&self, check: (UiNode, f32, f32), room: f32) -> (UiNode, f32) {
-        let seconds = self.app.review_seconds();
-        let face = seconds.map_or_else(
-            || "Apply".to_owned(),
-            |seconds| format!("Apply ({seconds})"),
-        );
-        let cancel = self.fitted_button(
-            "system-state/cancel",
-            "Cancel".to_owned(),
-            None,
-            None,
-            StyleRef::Secondary,
-            true,
-            room,
-        );
-        let mut apply = self.fitted_button(
-            "system-state/apply",
-            "Apply".to_owned(),
-            Some(&face),
-            None,
-            StyleRef::Primary,
-            !self.busy(),
-            room,
-        );
-        // Pressing stops the countdown before release. Keep its painted
-        // target stable while the visible label changes to plain Apply.
-        apply.1 = self.m.button_w("Apply (30)").min(room).max(apply.1);
-        apply.0.layout.width = Length::Fixed(apply.1);
-        if let UiContent::Button(control) = &mut apply.0.content {
-            control.centred = true;
-            control.spec.description = seconds.map(|seconds| {
-                let unit = if seconds == 1 { "second" } else { "seconds" };
-                format!("Applies by itself in {seconds} {unit}")
-            });
-        }
-        let (buttons, buttons_h) = Self::button_rows(
-            "system-state/footer/buttons",
-            vec![check, cancel, apply],
-            room,
-        );
-        let (line, line_h) = crate::native_settings::wrapped_copy_node(
-            "system-state/footer/review",
-            REVIEW_NOTE,
-            SemanticRole::Text,
-            StyleRef::Secondary,
-            room,
-            self.m.line_h,
-            None,
-        );
-        let height = line_h + 4.0 + buttons_h;
-        (
-            UiNode::new(
-                "system-state/footer",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::column().gap(4.0).height(Length::Fixed(height)))
-            .children(vec![line, buttons]),
             height,
         )
     }
@@ -5814,38 +5575,28 @@ impl<'a, 'b> Page<'a, 'b> {
             ),
             help,
         ];
-        let join = !self.app.reviewing();
-        if join {
-            column.push(self.button(
-                "system-state/vault/join",
-                "Join".to_owned(),
-                None,
-                StyleRef::Secondary,
-                enabled && self.app.plan_known,
-            ));
-        }
-        let height = address_h
-            + password_h
-            + help_h
-            + m.control_h * if join { 3.0 } else { 2.0 }
-            + 4.0 * if join { 5.0 } else { 4.0 }
-            + 10.0;
+        column.push(self.button(
+            "system-state/vault/join",
+            "Join".to_owned(),
+            None,
+            StyleRef::Secondary,
+            enabled && self.app.plan_known,
+        ));
+        let height = address_h + password_h + help_h + m.control_h * 3.0 + 4.0 * 5.0 + 10.0;
         // Each field under its caption, 4pt apart (the column's gap).
         let url_top = top + disclose_h + address_h + 4.0;
         let password_top = url_top + m.control_h + 4.0 + password_h + 4.0;
         let join_top =
             top + disclose_h + address_h + password_h + help_h + m.control_h * 2.0 + 4.0 * 5.0;
-        let mut keys = vec![
+        let keys = vec![
             ("system-state/url".to_owned(), url_top, m.control_h),
             (
                 "system-state/password".to_owned(),
                 password_top,
                 m.control_h,
             ),
+            ("system-state/vault/join".to_owned(), join_top, m.control_h),
         ];
-        if join {
-            keys.push(("system-state/vault/join".to_owned(), join_top, m.control_h));
-        }
         out.push((
             UiNode::new(
                 "system-state/vault",
@@ -5966,8 +5717,9 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token: renew 
 /// `queued-choice`, `queued-restore`, `set-aside`, `set-aside-non-alab`, `startup-retry`,
 /// `restore-failed`, `setup-retried`, `failed-retrying`, `github-sign-in`, `vault-unreadable`,
 /// `join-refused`, `vault-not-joined`, `vault-held`, `newer`, `restoring`, the first launch's
-/// review, `review`, `review-stopped` and `review-widened` ([`fixture_review`]), `cancelled`
-/// and `review-closed` after it, the review of the groups the ALab signal adds, `widen-review`,
+/// offer waiting for a person at this Mac, `review` and `review-widened` ([`fixture_review`]), a
+/// `cancelled` an earlier aterm recorded and `review-closed`, the offer of the groups the ALab
+/// signal adds, `widen-review`,
 /// and Apple's Command Line Tools: `clt-password`, `clt-recovered`, `clt-installing` and `clt-missing`.
 /// Each draws only what the worker gives the page: the readings `init_observe` and the
 /// worker's probes make, and the rows a run, a Check or a Restore reports.
@@ -6712,10 +6464,10 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 _ => None,
             };
         }
-        "review" | "review-stopped" => {
-            // The first launch's review on a fresh signed Mac ([`fixture_review`]): every group
+        "review" => {
+            // The first launch's offer on a fresh signed Mac ([`fixture_review`]): every group
             // set up, most rows to change, and Full Disk Access and Debugger access, which a
-            // person grants once setup runs, read as what Apply changes.
+            // person grants once setup runs, read as what setup changes.
             status = fixture_status("fresh")?;
             let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
             fda.detail = Some(
@@ -6737,18 +6489,16 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     Some(status)
 }
 
-/// How a scenario shows a review (`review`, `review-stopped`, `review-widened`,
+/// How a scenario shows an offer still waiting for its answer (`review`, `review-widened`,
 /// `widen-review`): the page is offered the plan a launch offers, and draws the scenario's
-/// status under it, its countdown going or stopped by a click. Its answer goes nowhere, as
-/// every action of a scenario is inert. Debug and dev-seam builds only.
+/// status under it until a person is at this Mac (a headless instance has none). Its answer
+/// goes nowhere, as every action of a scenario is inert. Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FixtureReview {
-    /// The countdown goes (`Apply (30)`).
-    Counting,
-    /// A click stopped the countdown (`Apply`).
-    Stopped,
-    /// Offered Permissions alone, the review widens in place to the whole profile once the
+    /// The launch's offer waits for its answer.
+    Waiting,
+    /// Offered Permissions alone, the offer widens in place to the whole profile once the
     /// ALab signal is heard (§3.3).
     Widened,
     /// The review of the groups the ALab signal adds to a plan that set up Permissions alone
@@ -6760,8 +6510,7 @@ pub(crate) enum FixtureReview {
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_review(name: &str) -> Option<FixtureReview> {
     match name {
-        "review" => Some(FixtureReview::Counting),
-        "review-stopped" => Some(FixtureReview::Stopped),
+        "review" => Some(FixtureReview::Waiting),
         "review-widened" => Some(FixtureReview::Widened),
         "widen-review" => Some(FixtureReview::Widen),
         _ => None,

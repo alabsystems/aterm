@@ -320,8 +320,10 @@ impl Seen {
         if self.unit.is_blank() {
             return;
         }
-        let age =
-            u32::try_from(now.saturating_duration_since(self.born).as_millis()).unwrap_or(u32::MAX);
+        let age = now
+            .saturating_duration_since(self.born)
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
         let mut k = 0;
         while k < nb.len() {
             let Some(cols) = nb[k] else {
@@ -637,7 +639,7 @@ impl Witness {
             out.extend(run);
             score.missed = score
                 .missed
-                .saturating_add(u32::try_from(missed).unwrap_or(u32::MAX));
+                .saturating_add(missed.min(u32::MAX as usize) as u32);
             k += 1;
         }
         score
@@ -756,10 +758,8 @@ impl Witness {
         let mut evidence = false;
         let mut offsets = [(0usize, 0i16); 6];
         let mut n_off = 0usize;
-        if let Ok(dr) = i16::try_from(carry)
-            && dr > 0
-        {
-            offsets[n_off] = (RETURN_K, dr);
+        if carry > 0 && carry <= i16::MAX as u16 {
+            offsets[n_off] = (RETURN_K, carry as i16);
             n_off += 1;
         }
         if caret_carry != 0 {
@@ -1277,8 +1277,10 @@ impl Witness {
             s.row -= rows;
             if bottom > 0 && s.row.saturating_add(2) >= first_new {
                 let pend_ms = match last_walk {
-                    Some(t) => u32::try_from(t.saturating_duration_since(s.born).as_millis())
-                        .unwrap_or(u32::MAX),
+                    Some(t) => t
+                        .saturating_duration_since(s.born)
+                        .as_millis()
+                        .min(u32::MAX as u128) as u32,
                     None => 0,
                 };
                 let mut k = 0;

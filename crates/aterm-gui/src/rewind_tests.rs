@@ -2002,7 +2002,7 @@ fn a_tab_menu_rewind_row_does_not_retarget_a_sibling_after_focus_or_close() {
 #[cfg(unix)]
 #[test]
 fn a_tab_menu_rewind_owner_binds_each_shared_view_and_refuses_a_closed_original() {
-    use crate::session_chrome::{RewindMenuOrigin, TabMenuEntry};
+    use crate::session_chrome::{TabMenuEntry, TerminalMenuOrigin};
 
     let mut app = scripted_app();
     app.tab_strip_rows = 1;
@@ -2047,7 +2047,7 @@ fn a_tab_menu_rewind_owner_binds_each_shared_view_and_refuses_a_closed_original(
     let (origin, at_ms) = row(&source_ext[0].menu);
     assert_eq!(
         origin,
-        RewindMenuOrigin {
+        TerminalMenuOrigin {
             view: source_view,
             session: 0
         }
@@ -2057,7 +2057,7 @@ fn a_tab_menu_rewind_owner_binds_each_shared_view_and_refuses_a_closed_original(
     assert_eq!(
         row(&mirror_ext[0].menu),
         (
-            RewindMenuOrigin {
+            TerminalMenuOrigin {
                 view: mirror_view,
                 session: 0
             },

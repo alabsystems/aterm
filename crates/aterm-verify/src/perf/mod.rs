@@ -251,15 +251,15 @@ impl Lane {
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
             Lane::Cat => {
-                "macOS on the M4-class bench box (or --dev-smoke), targo (release build of \
+                "macOS on the M4 Max bench box (or --dev-smoke), targo (release build of \
                  aterm), curl"
             }
             Lane::Vte => {
-                "macOS on the M4-class bench box (or --dev-smoke), targo (release builds of aterm \
+                "macOS on the M4 Max bench box (or --dev-smoke), targo (release builds of aterm \
                  and vtebench), curl, git"
             }
             Lane::Scroll => {
-                "macOS on the M4-class bench box (or --dev-smoke), targo (release build of aterm)"
+                "macOS on the M4 Max bench box (or --dev-smoke), targo (release build of aterm)"
             }
             Lane::Fabric => {
                 "unix, targo (builds aterm and its fabric_bench bench: test, or opt-test with \
@@ -484,7 +484,7 @@ const OPTIONS: &[OptSpec] = &[
         flag: "--dev-smoke",
         value: None,
         lanes: BENCH_BOX_LANES,
-        help: "run off the M4-class bench box, labelled non-publishable",
+        help: "run off the M4 Max bench box, labelled non-publishable",
     },
     OptSpec {
         flag: "--dmg",
@@ -872,6 +872,7 @@ fn main(args: &[String]) -> ExitCode {
     }
     let names: Vec<&str> = cli.lanes.iter().map(|l| l.name()).collect();
     eprintln!("=== verify perf: {} ===", names.join(" "));
+    let tree = trend::head_sha();
 
     let mut ran: Vec<(Lane, LaneRun, f64)> = Vec::new();
     for lane in &cli.lanes {
@@ -957,7 +958,7 @@ fn main(args: &[String]) -> ExitCode {
             .flat_map(|r| r.samples.iter().map(|s| s.lane))
             .collect();
         trend_run = Some((
-            trend::gate_trend(&samples, lanes_ok, &recorded),
+            trend::gate_trend(&samples, lanes_ok, &recorded, &tree),
             started.elapsed().as_secs_f64(),
         ));
     }

@@ -165,6 +165,89 @@ pub fn plan(
     )
 }
 
+/// One row of a dry-run install plan: brew's `VersionChange` — the
+/// name, the installed version when replacing one, and the version
+/// that would be poured.
+#[derive(Clone)]
+pub(super) struct DryRow {
+    pub name: String,
+    pub old_version: Option<String>,
+    pub new_version: String,
+}
+
+/// Brew's already-installed notice for a named formula install
+/// (`Install::Check`): the up-to-date wording with its reinstall
+/// hint when the current keg is linked, the just-not-linked wording
+/// with its link hint otherwise. Printed on stderr, only the first
+/// line carrying the `Warning:` prefix.
+pub(super) fn warn_already_installed(prefix: &Prefix, inst: &Installed, version: &str) {
+    let full = prefix.specified_name(inst);
+    if is_linked(prefix, &inst.name, version) {
+        eprintln!("Warning: {full} {version} is already installed and up-to-date.");
+        eprintln!("To reinstall {version}, run:");
+        eprintln!("  brew reinstall {}", inst.name);
+    } else {
+        eprintln!("Warning: {full} {version} is already installed, it's just not linked.");
+        eprintln!("To link this version, run:");
+        eprintln!("  brew link {full}");
+    }
+}
+
+/// Plans and preflights a dry install of `name`, returning the
+/// requested formula's row (absent when already current, which is
+/// warned about exactly as a real install warns) and its dependency
+/// rows in plan order. Gating is identical to `install`: anything
+/// the native engine would delegate still delegates here, before the
+/// caller prints any summary.
+pub(super) fn dry_rows(
+    api: &Api,
+    prefix: &Prefix,
+    name: &str,
+    opts: &InstallOpts,
+) -> Result<(Option<DryRow>, Vec<DryRow>), InstallError> {
+    let planned = plan(api, prefix, name, opts)?;
+    for f in &planned {
+        preflight(prefix, f, opts, Machine::this())?;
+    }
+    let row = |f: &Formula| -> Option<DryRow> {
+        let new_version = keg_version(f);
+        match prefix.installed_one(Kind::Formula, &f.name) {
+            Some(inst)
+                if !opts.force
+                    && version_cmp(&inst.version, &new_version) != std::cmp::Ordering::Less =>
+            {
+                None
+            }
+            Some(inst) => Some(DryRow {
+                name: f.name.clone(),
+                old_version: (inst.version != new_version).then_some(inst.version),
+                new_version,
+            }),
+            None => Some(DryRow {
+                name: f.name.clone(),
+                old_version: None,
+                new_version,
+            }),
+        }
+    };
+    let mut rows: Vec<DryRow> = planned.iter().filter_map(row).collect();
+    let top = if rows
+        .last()
+        .is_some_and(|r| r.name == Formula::short_name(name))
+    {
+        rows.pop()
+    } else {
+        if !opts.quiet
+            && let Some(inst) = prefix.installed_one(Kind::Formula, Formula::short_name(name))
+        {
+            let version = inst.version.clone();
+            warn_already_installed(prefix, &inst, &version);
+        }
+        None
+    };
+    Ok((top, rows))
+}
+
 /// Resolves the full dependency closure for `fetch` regardless of
 /// installed state. Brew's `fetch --deps` expands build
 /// dependencies too (they are downloaded, never installed), so
@@ -297,6 +380,61 @@ pub(super) fn preflight_refusals(
     }
 }
 
+/// The tap a formula display names: `user/repo` from a qualified
+/// full name, else the core tap every API formula belongs to.
+fn tap_of(f: &Formula) -> String {
+    let parts: Vec<&str> = f.full_name.split('/').collect();
+    if parts.len() == 3 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        "homebrew/core".to_string()
+    }
+}
+
+/// Brew's specified form of a full name: official taps omitted.
+fn specified_of(full_name: &str) -> String {
+    full_name
+        .strip_prefix("homebrew/core/")
+        .or_else(|| full_name.strip_prefix("homebrew/cask/"))
+        .unwrap_or(full_name)
+        .to_string()
+}
+
+/// Each planned dependency's immediate parent within the plan, for
+/// brew's `Installing <parent> dependency: <dep>` headlines.
+fn dep_parents(planned: &[Formula], top: &str) -> BTreeMap<String, String> {
+    let by_name: BTreeMap<&str, &Formula> = planned.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut parents = BTreeMap::new();
+    let mut seen = BTreeSet::from([top.to_string()]);
+    let mut queue = vec![top.to_string()];
+    while let Some(cur) = queue.pop() {
+        if let Some(f) = by_name.get(cur.as_str()) {
+            for dep in &f.dependencies {
+                let dep = Formula::short_name(dep).to_string();
+                if by_name.contains_key(dep.as_str()) && seen.insert(dep.clone()) {
+                    parents.insert(dep.clone(), cur.clone());
+                    queue.push(dep);
+                }
+            }
+        }
+    }
+    parents
+}
+
+/// Brew's bottle filename: `<name>--<pkg_version>.<tag>.bottle[.N].tar.gz`.
+fn bottle_filename(f: &Formula, tag: &str) -> String {
+    let rebuild = if f.bottle_rebuild > 0 {
+        format!(".{}", f.bottle_rebuild)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}--{}.{tag}.bottle{rebuild}.tar.gz",
+        f.name,
+        keg_version(f)
+    )
+}
+
 /// Installs formula `name` and its missing dependencies, returning the installed version.
 pub fn install(
     api: &Api,
@@ -313,6 +451,44 @@ pub fn install(
     if !opts.dry_run {
         prefix.ensure()?;
     }
+    // Brew narrates a plain install: the tap-action headline, the
+    // dependency roll, and a headline per dependency. Upgrade and
+    // reinstall have their own banners at the command layer, and an
+    // already-current top is partitioned out before any of it (it
+    // only warns), so the narration runs only for a plain install
+    // whose top will actually pour.
+    let top_short = Formula::short_name(name).to_string();
+    let top = planned.iter().find(|f| f.name == top_short);
+    let top_current = !opts.force
+        && top.is_some_and(|f| {
+            prefix
+                .installed_one(Kind::Formula, &f.name)
+                .is_some_and(|inst| {
+                    version_cmp(&inst.version, &keg_version(f)) != std::cmp::Ordering::Less
+                })
+        });
+    let narrate = !opts.quiet
+        && !opts.dry_run
+        && !opts.upgrade
+        && !opts.reinstall
+        && !opts.as_dependency
+        && !top_current;
+    let parents = dep_parents(&planned, &top_short);
+    if narrate && let Some(f) = top {
+        println!("==> Installing {} from {}", f.name, tap_of(f));
+        let deps: Vec<String> = planned
+            .iter()
+            .filter(|d| d.name != top_short)
+            .map(|d| d.name.clone())
+            .collect();
+        if !deps.is_empty() {
+            println!(
+                "==> Installing dependencies for {}: {}",
+                specified_of(&f.full_name),
+                super::commands::to_sentence(&deps)
+            );
+        }
+    }
     let mut last = String::new();
     let mut installed_now: Vec<String> = Vec::new();
     let mut completed = false;
@@ -322,7 +498,7 @@ pub fn install(
         if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
             if !opts.force && version_cmp(&inst.version, &version) != std::cmp::Ordering::Less {
                 if !opts.quiet {
-                    eprintln!("Warning: {} {} is already installed", f.name, inst.version);
+                    warn_already_installed(prefix, &inst, &version);
                 }
                 last = inst.version;
                 continue;
@@ -334,7 +510,8 @@ pub fn install(
             };
         }
         if opts.dry_run {
-            println!("Would install {} {version}", f.name);
+            // The command layer prints brew's grouped dry-run summary
+            // from dry_rows; a dry install() itself stays silent.
         } else {
             let preserve = opts.upgrade || opts.reinstall;
             let on_request = if preserve {
@@ -343,16 +520,36 @@ pub fn install(
                 (!opts.as_dependency && f.name == Formula::short_name(name))
                     || prior.get(&f.name).copied().unwrap_or(false)
             };
-            match install_one(prefix, f, on_request, link, replacing) {
+            if narrate && f.name != top_short {
+                let parent = parents
+                    .get(&f.name)
+                    .map_or(top_short.as_str(), String::as_str);
+                println!("==> Installing {parent} dependency: {} ({version})", f.name);
+            }
+            match install_one(prefix, f, on_request, link, replacing, opts.quiet) {
                 Ok(()) => {
                     completed = true;
                     if !prior.contains_key(&f.name) {
                         installed_now.push(f.name.clone());
                     }
                     if !opts.quiet {
+                        if !f.caveats.trim().is_empty() {
+                            println!("==> Caveats");
+                            println!(
+                                "{}",
+                                f.caveats
+                                    .replace("$HOMEBREW_PREFIX", &prefix.root.to_string_lossy())
+                                    .replace("$HOMEBREW_CELLAR", &prefix.cellar().to_string_lossy())
+                                    .trim_end()
+                            );
+                        }
+                        let keg = prefix.keg(&f.name, &version);
+                        let shown = std::fs::canonicalize(&keg).unwrap_or_else(|_| keg.clone());
+                        let summary =
+                            format!("{}: {}", shown.display(), super::commands::keg_abv(&keg));
                         match super::install_badge() {
-                            Some(badge) => println!("{badge}  {}/{version}: installed", f.name),
-                            None => println!("{}/{version}: installed", f.name),
+                            Some(badge) => println!("{badge}  {summary}"),
+                            None => println!("{summary}"),
                         }
                     }
                 }
@@ -415,10 +612,18 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
             return;
         };
         for e in entries.flatten() {
+            let path = e.path();
             if e.file_type().is_ok_and(|t| t.is_symlink()) {
+                // A placeholder a relativization could not map (e.g.
+                // @@HOMEBREW_JAVA@@ with no openjdk dependency) must
+                // still delegate rather than pour a dangling link.
+                if let Ok(target) = std::fs::read_link(&path)
+                    && target.to_string_lossy().contains("@@HOMEBREW")
+                {
+                    out.push(format!("{} (placeholder symlink)", path.display()));
+                }
                 continue;
             }
-            let path = e.path();
             if e.file_type().is_ok_and(|t| t.is_dir()) {
                 walk(&path, out);
                 continue;
@@ -516,6 +721,232 @@ fn relocation_args(
     Ok(args)
 }
 
+/// The `@@HOMEBREW_*@@` placeholder → location pairs brew
+/// substitutes at pour time. `None` when the prefix path cannot be
+/// spelled into a file (a NUL byte), which delegates.
+fn placeholder_pairs(prefix: &Prefix, f: &Formula) -> Option<Vec<(&'static str, String)>> {
+    let root = prefix.root.to_string_lossy().into_owned();
+    let cellar = prefix.cellar().to_string_lossy().into_owned();
+    if root.contains('\0') || cellar.contains('\0') {
+        return None;
+    }
+    let java = f
+        .dependencies
+        .iter()
+        .map(|d| Formula::short_name(d))
+        .find(|d| *d == "openjdk" || d.starts_with("openjdk@"))
+        .map(|d| format!("{root}/opt/{d}/libexec/openjdk.jdk/Contents/Home"));
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("@@HOMEBREW_CELLAR@@", cellar),
+        ("@@HOMEBREW_REPOSITORY@@", root.clone()),
+        ("@@HOMEBREW_LIBRARY@@", format!("{root}/Library")),
+        ("@@HOMEBREW_PERL@@", format!("{root}/opt/perl/bin/perl")),
+        ("@@HOMEBREW_PREFIX@@", root),
+    ];
+    if let Some(java) = java {
+        pairs.push(("@@HOMEBREW_JAVA@@", java));
+    }
+    Some(pairs)
+}
+
+/// `to` expressed relative to the directory `from_dir` (both
+/// absolute), brew's `relative_path_from`.
+fn relative_path_from(from_dir: &Path, to: &Path) -> PathBuf {
+    use std::path::Component;
+    let from: Vec<_> = from_dir.components().collect();
+    let dest: Vec<_> = to.components().collect();
+    let mut common = 0;
+    while common < from.len()
+        && common < dest.len()
+        && from[common] == dest[common]
+        && matches!(from[common], Component::Normal(_) | Component::RootDir)
+    {
+        common += 1;
+    }
+    let mut out = PathBuf::new();
+    for part in &from[common..] {
+        if matches!(part, Component::Normal(_)) {
+            out.push("..");
+        }
+    }
+    for part in &dest[common..] {
+        out.push(part.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// Brew's `relativize_prefix_symlinks!`: an absolute symlink into
+/// the bottle's built prefix or cellar is rewritten relative to
+/// its parent, so it resolves wherever the keg lands. Relative
+/// links and absolute links outside the built locations are left
+/// alone. Runs against the staged payload but computes paths as
+/// they will sit at the keg's final location.
+fn relativize_prefix_symlinks(
+    prefix: &Prefix,
+    f: &Formula,
+    staged: &Path,
+    keg: &Path,
+) -> Result<(), InstallError> {
+    let root = prefix.root.to_string_lossy().into_owned();
+    let cellar = prefix.cellar().to_string_lossy().into_owned();
+    let mut built: Vec<(String, String)> = vec![
+        ("@@HOMEBREW_PREFIX@@".into(), "@@HOMEBREW_CELLAR@@".into()),
+        ("/opt/homebrew".into(), "/opt/homebrew/Cellar".into()),
+        ("/usr/local".into(), "/usr/local/Cellar".into()),
+        (
+            "/home/linuxbrew/.linuxbrew".into(),
+            "/home/linuxbrew/.linuxbrew/Cellar".into(),
+        ),
+    ];
+    if let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags())
+        && bottle.cellar.starts_with('/')
+        && let Some(parent) = Path::new(&bottle.cellar).parent()
+    {
+        built.push((parent.to_string_lossy().into_owned(), bottle.cellar.clone()));
+    }
+    built.retain(|(p, c)| *p != root && *c != cellar);
+    fn walk(
+        dir: &Path,
+        staged: &Path,
+        keg: &Path,
+        built: &[(String, String)],
+        root: &str,
+        cellar: &str,
+        failures: &mut Vec<String>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() && !kind.is_symlink() {
+                walk(&path, staged, keg, built, root, cellar, failures);
+                continue;
+            }
+            if !kind.is_symlink() {
+                continue;
+            }
+            let Ok(target) = std::fs::read_link(&path) else {
+                continue;
+            };
+            let target_str = target.to_string_lossy();
+            let mapped = built.iter().find_map(|(bp, bc)| {
+                target_str
+                    .strip_prefix(&format!("{bc}/"))
+                    .map(|rest| format!("{cellar}/{rest}"))
+                    .or_else(|| {
+                        target_str
+                            .strip_prefix(&format!("{bp}/"))
+                            .map(|rest| format!("{root}/{rest}"))
+                    })
+            });
+            let Some(new_abs) = mapped else { continue };
+            let Ok(rel_parent) = path.parent().unwrap_or(staged).strip_prefix(staged) else {
+                continue;
+            };
+            let final_parent = keg.join(rel_parent);
+            let new_target = relative_path_from(&final_parent, Path::new(&new_abs));
+            if let Err(error) = std::fs::remove_file(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|()| symlink_file(&new_target, &path))
+            {
+                failures.push(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    walk(staged, staged, keg, &built, &root, &cellar, &mut failures);
+    if let Some(first) = failures.first() {
+        return Err(InstallError::Failed(format!(
+            "abrew: {} bottle symlink could not be relativized ({first})",
+            f.name
+        )));
+    }
+    Ok(())
+}
+
+/// Brew's pour-time text pass (`replace_placeholders_with_locations`
+/// for text files): substitute the placeholders in every NUL-free
+/// regular file of the staged payload. Runs for every native
+/// bottle the Mach-O relocation pass does not already cover —
+/// `:any_skip_relocation` bottles still carry placeholders in
+/// their scripts and config files. Hardlinks share one rewrite.
+fn replace_text_placeholders(
+    prefix: &Prefix,
+    f: &Formula,
+    staged: &Path,
+) -> Result<(), InstallError> {
+    let Some(pairs) = placeholder_pairs(prefix, f) else {
+        return Err(InstallError::Unsupported(format!(
+            "{} bottle relocation needs Homebrew (prefix path is not spellable)",
+            f.name
+        )));
+    };
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = e.path();
+            if kind.is_dir() {
+                collect(&path, out);
+            } else if kind.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(staged, &mut files);
+    #[cfg(unix)]
+    let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
+    for path in files {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !seen.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
+            continue;
+        }
+        let mut text = bytes;
+        let mut changed = false;
+        for (old, new) in &pairs {
+            let replaced = replace_bytes(&text, old.as_bytes(), new.as_bytes());
+            if replaced != text {
+                changed = true;
+                text = replaced;
+            }
+        }
+        if changed {
+            let mode = meta.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            }
+            std::fs::write(&path, &text).map_err(|e| format!("abrew: {e}"))?;
+            let _ = std::fs::set_permissions(&path, mode);
+        }
+    }
+    Ok(())
+}
+
 /// Relocate a staged `:any` bottle payload from placeholder paths
 /// to this prefix, brew's two pour-time passes: install names / dylib ids /
 /// rpaths rewritten by `install_name_tool`, placeholders in NUL-free (text)
@@ -535,27 +966,9 @@ fn relocate_staged(
             f.name
         ))
     };
-    let root = prefix.root.to_string_lossy().into_owned();
-    let cellar = prefix.cellar().to_string_lossy().into_owned();
-    if root.contains('\0') || cellar.contains('\0') {
+    let Some(pairs) = placeholder_pairs(prefix, f) else {
         return Err(unsupported("prefix path is not spellable".into()));
-    }
-    let java = f
-        .dependencies
-        .iter()
-        .map(|d| Formula::short_name(d))
-        .find(|d| *d == "openjdk" || d.starts_with("openjdk@"))
-        .map(|d| format!("{root}/opt/{d}/libexec/openjdk.jdk/Contents/Home"));
-    let mut pairs: Vec<(&str, String)> = vec![
-        ("@@HOMEBREW_CELLAR@@", cellar.clone()),
-        ("@@HOMEBREW_REPOSITORY@@", root.clone()),
-        ("@@HOMEBREW_LIBRARY@@", format!("{root}/Library")),
-        ("@@HOMEBREW_PERL@@", format!("{root}/opt/perl/bin/perl")),
-        ("@@HOMEBREW_PREFIX@@", root.clone()),
-    ];
-    if let Some(java) = &java {
-        pairs.push(("@@HOMEBREW_JAVA@@", java.clone()));
-    }
+    };
     let relocate_name = |name: &str, pairs: &[(&str, String)]| -> Option<String> {
         for (old, new) in pairs {
             if let Some(rest) = name.strip_prefix(old) {
@@ -669,7 +1082,6 @@ fn relocate_staged(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     if needle.is_empty() {
         return haystack.to_vec();
@@ -728,19 +1140,31 @@ fn install_one(
     on_request: bool,
     link: bool,
     replace: ReplaceMode,
+    quiet: bool,
 ) -> Result<(), InstallError> {
     let version = keg_version(f);
     let keg = prefix.keg(&f.name, &version);
     let work =
         aterm_tempfile::TempDir::new_in(prefix.cellar()).map_err(|e| format!("abrew: {e}"))?;
-    let poured = pour_bottle(prefix, f, work.path())?;
+    let poured = pour_bottle(prefix, f, work.path(), quiet)?;
+    // Brew substitutes the @@HOMEBREW_*@@ placeholders in text files
+    // for EVERY bottle pour, `:any_skip_relocation` included (only
+    // linkage fixups are skipped there). The macOS `:any` path does
+    // text and Mach-O together in relocate_staged; every other
+    // native bottle gets the text pass here, and the leftover scan
+    // below still delegates any binary that carries a placeholder.
+    let any_cellar = f
+        .bottle_for(&Machine::this().bottle_tags())
+        .is_some_and(|b| b.cellar == ":any");
+    if !(cfg!(target_os = "macos") && any_cellar) {
+        replace_text_placeholders(prefix, f, &poured)?;
+    }
     #[cfg(target_os = "macos")]
-    if f.bottle_for(&Machine::this().bottle_tags())
-        .is_some_and(|b| b.cellar == ":any")
-    {
+    if any_cellar {
         let install_name_tool = super::machine::DeveloperDir::this().tool("install_name_tool");
         relocate_staged(prefix, f, &poured, install_name_tool.as_deref())?;
     }
+    relativize_prefix_symlinks(prefix, f, &poured, &keg)?;
     let leftovers = linkage_leftovers(&poured);
     if !leftovers.is_empty() {
         return Err(InstallError::Unsupported(format!(
@@ -1702,13 +2126,19 @@ pub fn remove_dangling_links(prefix: &Prefix, name: &str) -> Result<usize, Strin
     Ok(removed)
 }
 
-fn pour_bottle(prefix: &Prefix, f: &Formula, staging: &Path) -> Result<PathBuf, InstallError> {
+fn pour_bottle(
+    prefix: &Prefix,
+    f: &Formula,
+    staging: &Path,
+    quiet: bool,
+) -> Result<PathBuf, InstallError> {
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Err(InstallError::Unsupported(format!(
             "no bottle for {} on this platform",
             f.name
         )));
     };
+    let bottle_tag = bottle.tag.clone();
     let (url, sha) = (bottle.url, bottle.sha256);
     let version = keg_version(f);
     let dest = prefix
@@ -1726,6 +2156,9 @@ fn pour_bottle(prefix: &Prefix, f: &Formula, staging: &Path) -> Result<PathBuf, 
         fetch::curl_to_file(&url, &dest, &hrefs)?;
     }
     fetch::verify_digest_strict(&dest, &sha)?;
+    if !quiet {
+        println!("==> Pouring {}", bottle_filename(f, &bottle_tag));
+    }
     fetch::untar(&dest, staging)?;
     selected_bottle_payload(staging, &f.name, &version)
 }
@@ -1944,6 +2377,125 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::extract::fixtures::{gzip_bytes, tar_bytes};
+
+    #[test]
+    #[cfg(unix)]
+    fn prefix_symlinks_are_relativized_and_strays_still_delegate() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        let staged = tmp.path().join("staged");
+        std::fs::create_dir_all(staged.join("lib")).unwrap();
+        symlink_file(
+            Path::new("@@HOMEBREW_CELLAR@@/demo/1/lib/libdemo.dylib"),
+            &staged.join("lib/libdemo.1.dylib"),
+        )
+        .unwrap();
+        symlink_file(
+            Path::new("/opt/homebrew/opt/helper/bin/helper"),
+            &staged.join("lib/helper"),
+        )
+        .unwrap();
+        symlink_file(
+            Path::new("@@HOMEBREW_JAVA@@/bin/java"),
+            &staged.join("lib/java"),
+        )
+        .unwrap();
+        symlink_file(
+            Path::new("/usr/lib/libSystem.B.dylib"),
+            &staged.join("lib/sys"),
+        )
+        .unwrap();
+        let f = Formula {
+            name: "demo".to_string(),
+            ..Formula::default()
+        };
+        let keg = prefix.keg("demo", "1");
+        relativize_prefix_symlinks(&prefix, &f, &staged, &keg).unwrap();
+        // From <keg>/lib into the same directory: a bare name.
+        assert_eq!(
+            std::fs::read_link(staged.join("lib/libdemo.1.dylib")).unwrap(),
+            Path::new("libdemo.dylib")
+        );
+        // From <keg>/lib to <prefix>/opt/helper/bin/helper: four `..`.
+        assert_eq!(
+            std::fs::read_link(staged.join("lib/helper")).unwrap(),
+            Path::new("../../../../opt/helper/bin/helper")
+        );
+        // Unmapped system links are left alone; the java placeholder
+        // remains for the leftover scan to delegate.
+        assert_eq!(
+            std::fs::read_link(staged.join("lib/sys")).unwrap(),
+            Path::new("/usr/lib/libSystem.B.dylib")
+        );
+        let leftovers = linkage_leftovers(&staged);
+        assert_eq!(leftovers.len(), 1);
+        assert!(leftovers[0].contains("placeholder symlink"));
+    }
+
+    #[test]
+    fn text_placeholders_are_substituted_in_text_files_only() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        let staged = tmp.path().join("staged");
+        std::fs::create_dir_all(staged.join("etc/profile.d")).unwrap();
+        let script = staged.join("etc/profile.d/demo.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n. @@HOMEBREW_CELLAR@@/demo/1/etc/demo\n",
+        )
+        .unwrap();
+        let binary = staged.join("blob.bin");
+        let mut raw = b"@@HOMEBREW_PREFIX@@".to_vec();
+        raw.push(0);
+        std::fs::write(&binary, &raw).unwrap();
+        let f = Formula {
+            name: "demo".to_string(),
+            ..Formula::default()
+        };
+        replace_text_placeholders(&prefix, &f, &staged).unwrap();
+        let out = std::fs::read_to_string(&script).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "#!/bin/sh\n. {}/demo/1/etc/demo\n",
+                prefix.cellar().display()
+            )
+        );
+        // A NUL-bearing file is not text: left byte-identical for the
+        // leftover scan to delegate.
+        assert_eq!(std::fs::read(&binary).unwrap(), raw);
+    }
+
+    #[test]
+    fn bottle_filenames_and_dep_parents_match_brew_narration() {
+        let mut lz4 = Formula {
+            name: "lz4".to_string(),
+            version: "1.10.0".to_string(),
+            bottle_rebuild: 3,
+            ..Formula::default()
+        };
+        assert_eq!(
+            bottle_filename(&lz4, "arm64_golden_gate"),
+            "lz4--1.10.0.arm64_golden_gate.bottle.3.tar.gz"
+        );
+        lz4.bottle_rebuild = 0;
+        lz4.revision = 1;
+        assert_eq!(
+            bottle_filename(&lz4, "arm64_tahoe"),
+            "lz4--1.10.0_1.arm64_tahoe.bottle.tar.gz"
+        );
+        let mk = |name: &str, deps: &[&str]| Formula {
+            name: name.to_string(),
+            dependencies: deps.iter().map(ToString::to_string).collect(),
+            ..Formula::default()
+        };
+        let planned = vec![mk("leaf", &[]), mk("mid", &["leaf"]), mk("top", &["mid"])];
+        let parents = dep_parents(&planned, "top");
+        assert_eq!(parents.get("mid").map(String::as_str), Some("top"));
+        assert_eq!(parents.get("leaf").map(String::as_str), Some("mid"));
+        assert_eq!(specified_of("homebrew/core/zstd"), "zstd");
+        assert_eq!(tap_of(&mk("x", &[])), "homebrew/core");
+    }
 
     #[test]
     fn a_fetch_plan_keeps_installed_dependencies_and_their_descendants() {

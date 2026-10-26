@@ -69,6 +69,8 @@ USAGE:
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
                                                  report or reclaim stale build directories and caches
     aterm harness disk why [--json]              which agent session was asked to free disk space, and why
+    aterm harness disk free <path>... [--dry-run] [--json] | --dry-run [--json]
+                                                 remove caches tools rebuild or download again, fenced
     aterm harness ledger [@<sid>] [<n>] [--json] supervisor approval ledger for a session
     aterm harness ledger disk [<n>] [--json]     disk cleanup journal
     aterm harness ledger upgrade [<n>] [--json]  live upgrade ledger
@@ -81,7 +83,7 @@ USAGE:
                                                  create login directory and append roster row
     aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
                                                  enroll this machine's default login as a renewable row
-                                                 (`--cli codex` reads the email from its app server)
+                                                 (`--cli codex` reads the email from its auth.json)
     aterm harness accounts login <label>         run Claude Code's sign-in flow and record auth status
     aterm harness accounts browser <label> [--cli <id>]
                                                  open the row's own browser profile for a person to sign in once
@@ -118,7 +120,8 @@ OPTIONS:
     --sock <path>       limits, upgrade: control socket (default: resolved socket)
     --apply <class>     disk: safelist class to remove (`cargo-targets`, `claude-stale-versions`;
                         `atpkg-gc` and `claude-purge` are report-only and name the owning command)
-    --dry-run           upgrade: print each session's next step without typing or signalling
+    --dry-run           upgrade: print each session's next step without typing or signalling;
+                        disk free: say what would go and why not, removing nothing
                         (`disk --apply` and `upgrade models set` ignore it and still act)
     --status            upgrade: print recorded upgrades without sweeping
     --now               upgrade <sid>: move at first pause (still requires idle, empty draft,
@@ -180,8 +183,11 @@ launch runs this first (atpkg's `grok` twin, grok-alab), so nothing opens a page
     browser <label> --cli grok at this machine's desk and sign in there, or put <label>'s
     mailbox in the vault (ai-mailbox.toml); or approve this sign-in now: code <code> at <url>)
     and published on this session (attention `signin:grok`, which starts `once: sign <label> in
-    at the desk; or code <code> at <url>`). With no Chromium that opens a window installed, the
-    mailbox comes first. aterm opens no page on your desk: you open it and approve the code.
+    at the desk; or code <code> at <url>`). Where `accounts browser` opens no window here (a
+    Linux session with no display, or no Chromium that opens a window installed and the pinned
+    one not fetchable: no pin for the machine, no /usr/bin/curl, or a fetch that failed within
+    the hour; `accounts browser` fetches it otherwise), the mailbox comes first. aterm opens no
+    page on your desk: you open it and approve the code.
   - Once grok says it signed in, its login is written 0600 to `${GROK_HOME:-~/.grok}/auth.json`
     (one already there that is not refused is kept), the need comes down, and the accounts
     ledger (`ledger accounts --cli grok`) keeps the page's host, the flow, the outcome and what
@@ -293,6 +299,26 @@ ASKING AN AGENT (`rule disk-free@v1`):
   elections) no more agents are asked and the owner's disk line says so. The episode ends back at or above the floor; no new one opens within
   6 hours of the last line. `disk why` prints the lease and its recent decisions (the
   `free-ask` rows of `<state>/disk.jsonl`); `--json` prints the lease, then the rows.
+
+`disk free <path>...` is the one way aterm's disk-free worker removes anything. A path goes
+only when all of these hold:
+  - it lies strictly under a cache root tools rebuild or download again: `~/Library/Caches`
+    (not a `com.apple.*`, `com.aterm.*`, `aterm` or hidden child), `~/.cache` (not `aterm`),
+    `~/.cargo/registry`, `~/.cargo/git`, `~/.npm`, `~/Library/Developer/Xcode/DerivedData`;
+  - it is absolute, no symbolic link, and its real path is the path given (no component of it
+    is a link), and its root resolves inside the home folder;
+  - it is on its root's volume, the mount table was read whole, and no mount point lies at or
+    under it;
+  - no process of yours has a working directory, an executable or an open file under it;
+  - aterm's own grant is on (`disk.auto_free_gib` > 0), as for the window's pass.
+Each removal is journalled to `<state>/disk.jsonl` (`disk-free` rows) before it starts, and
+one the journal cannot record does not start; a row after it says the bytes it released.
+Each refusal prints one line with why. `--dry-run` says what would go and why not, whatever
+the grant, and removes and journals nothing; `--dry-run` with no path lists what the cache
+roots hold that may go, largest first (at most 24), so nothing under `~/Library` is listed or
+sized by hand. `--json` prints one object per path: `path`,
+`removed`, `bytes`, `bytes_partial`, `refused` (why not, or null), `dry_run`, `grant`. The
+exit status is 1 when any path was refused or failed, else 0.
 ";
 
 const HELP_TAP: &str = "\
@@ -431,9 +457,13 @@ VERBS:
     Renewals then approve the CLI's page in that profile headlessly. Refuses without a
     terminal on stdin, over SSH, while another sign-in holds the machine's sign-in lock or
     another browser or one of aterm's own sign-ins has the profile open, and for a row
-    without `email` (or a Kimi row without `region`). Needs a
-    Chromium that opens a window: Google Chrome for Testing or Chromium in /Applications or
-    ~/Applications, unzipped into aterm's browser cache, or named in $ATERM_BROWSER. It
+    without `email` (or a Kimi row without `region`). The window
+    is Google Chrome for Testing or Chromium from /Applications or ~/Applications, one
+    unzipped into aterm's browser cache, or one named in $ATERM_BROWSER; with none of those,
+    it first fetches the pinned Google Chrome for Testing (about 190 MB) into
+    aterm's browser cache with /usr/bin/curl over https, held to its pinned size and sha256
+    (Ctrl-C stops it; a download off the pin installs nothing, and a failed one is kept, so
+    Grok Build's sign-in need leads with the mailbox for an hour or until a fetch succeeds). It
     never opens your own browser or its profiles (a row's `browser` key names one of those,
     for Claude Code's at-the-desk renewals).
   - `accounts renew [--due | <label>...] [--on <host>,... | --here]`
@@ -470,9 +500,9 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
   - `accounts list|add|adopt-default|use|stats --cli <id>` take the forms above, with
     `--region` and `--flow` on `add` and `adopt-default`; `serve` is Claude Code's alone in
     this build, and its dashboard shows every pool. `stats --cli <id>` lists each row's
-    condition, login and usage (a Codex row's read through its app server in the row's own
-    home), and `stats --cli codex` reads the default home's newest rollouts' 5h and week
-    windows too.
+    condition, login and usage (a Codex row's read directly from OpenAI's usage API under the
+    row's `auth.json`), and `stats --cli codex` reads the default home's newest rollouts' 5h and
+    week windows too.
   - `accounts sync --cli <id> [<source>] [--machine <mN>] [--json]` adds this machine's rows
     of the CLI's fleet to its roster, each with a login directory of its own, and changes or
     removes no row the roster has. The fleet is the source named, else
@@ -490,7 +520,7 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     machine keeps. A new label with retained local login or account state is refused.
     Additions also yield to an ongoing sign-in; unchanged rosters can still sync.
   - `accounts renew <label>… [--due] --cli <id>` runs the CLI's own sign-in in a fresh
-    staging home (Codex's app server, or its `login --device-auth`; Grok's `login
+    staging home (Codex's native PKCE sign-in, or its `login --device-auth`; Grok's `login
     --device-auth` or `--oauth`; Kimi's `login --region <region>`), one machine-wide sign-in
     at a time. Its page must be https on the vendor's pinned hosts (kimi.ai or kimi.com by
     the row's region) and is approved in a headless browser under the email's own profile:
@@ -500,7 +530,7 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     (`unchecked`); another email is a wrong account and nothing live changes. The ledger
     keeps the host, flow and outcome, never the URL or code.
   - `accounts login <label> --cli <id>` runs that sign-in on this terminal for the person
-    to approve. A named Codex row is then checked by its own app server; a mismatch or
+    to approve. A named Codex row is then checked against its `auth.json` identity; a mismatch or
     unavailable identity keeps staging without changing the binding. Other unproved
     sign-ins retain `proved_by = \"unchecked\"`. Over SSH it opens no browser here and
     the CLI prints its URL for you to open, a browser flow whose page calls back to this
@@ -514,7 +544,7 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     events and the pasteboard denied, so it opens no browser on the desk and its background
     renewal runs there too.
   - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
-    next one (`next:`), once each row's usage was read in its own home (Codex's app server);
+    next one (`next:`), once each row's usage was read under its `auth.json`;
     `[harness] accounts = \"off\"` keeps only the pin, and a login kept in the OS keyring
     picks none. No running session of these CLIs is moved. Kimi's overlay home is measured on
     2.3.1 (a session one home wrote resumes in another; two signed-in logins not measured),
@@ -865,8 +895,8 @@ pub enum AccountsCmd {
     AdoptDefault {
         /// The label as typed.
         label: String,
-        /// `--email`: required, but for `--cli codex`, whose app server names the default
-        /// login's account (`account/read`, [`AccountsHost::codex_account`]).
+        /// `--email`: required, but for `--cli codex`, which reads the default login's
+        /// account from `auth.json` ([`AccountsHost::codex_account`]).
         email: Option<String>,
         /// Claude or Codex's reported email when the login address is an alias.
         identity_email: Option<String>,
@@ -999,6 +1029,16 @@ pub enum Cmd {
     /// ([`run_disk_why`]).
     DiskWhy {
         /// The lease and the rows verbatim.
+        json: bool,
+    },
+    /// `disk free <path>...`: the disk-free worker's one removal, fenced (`disk::free`,
+    /// [`run_disk_free`]).
+    DiskFree {
+        /// The paths to remove, as given.
+        paths: Vec<PathBuf>,
+        /// Say what would go and why not; remove and journal nothing.
+        dry_run: bool,
+        /// One JSON object per path.
         json: bool,
     },
     /// The newest rows of one ledger.
@@ -1468,6 +1508,23 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             }
             Cmd::DiskWhy { json }
         }
+        "disk" if rest.get(1) == Some(&"free") => {
+            if apply.is_some() {
+                return Err("disk free takes paths, --dry-run and --json, not --apply".to_string());
+            }
+            if rest.len() < 3 && !dry_run {
+                return Err(
+                    "disk free takes one path at least (`--dry-run` alone lists what each cache \
+                     root holds that may go)"
+                        .to_string(),
+                );
+            }
+            Cmd::DiskFree {
+                paths: rest[2..].iter().map(PathBuf::from).collect(),
+                dry_run,
+                json,
+            }
+        }
         "disk" => Cmd::Disk {
             targets: rest[1..].iter().map(PathBuf::from).collect(),
             apply,
@@ -1875,7 +1932,7 @@ fn accounts_of(
     if matches!(form, AccountsCmd::AdoptDefault { email: None, .. }) && cli != Cli::Codex {
         return Err(
             "accounts adopt-default needs --email <address>: the login it renews is checked \
-             against that address (Codex's alone is read from its app server)"
+             against that address (Codex's alone is read from its auth.json)"
                 .to_string(),
         );
     }
@@ -2981,6 +3038,7 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
             .and_then(|h| disk::discover::placing_of(h, &table)),
         mounts: Some(table),
         demand: None,
+        projected: None,
         idle_whole: targets.is_empty(),
         session_cwds: vec![env.cwd.clone()],
         session_cwd_unknown: None,
@@ -3360,6 +3418,8 @@ pub struct DiskLook<'a> {
     pub table: Option<&'a aterm_sysprobe::volumes::Table>,
     /// The need of an agent's wait the pass adopted ([`disk::Survey::demand`]).
     pub demand: Option<u64>,
+    /// The projection standing on the volume ([`disk::Survey::projected`]): pressure now.
+    pub projected: Option<disk::fill::Projection>,
     /// The working directory of every session of this instance, rostered or not: tier 3 never takes a build directory one of them works in.
     pub session_cwds: &'a [PathBuf],
     /// Why the working directory of some session of this instance is not known (on Windows a live tab that reported no absolute native one): while it stands tier 3 takes nothing.
@@ -3387,12 +3447,14 @@ pub fn disk_tick(
         room,
         table,
         demand,
+        projected,
         session_cwds,
         session_cwd_unknown,
         link_dirs,
     } = *look;
-    let admitted =
-        config.auto_free_gib > 0 && free.is_some() && (config.below_warn(free) || demand.is_some());
+    let admitted = config.auto_free_gib > 0
+        && free.is_some()
+        && (config.below_warn(free) || demand.is_some() || projected.is_some());
     if !admitted {
         return DiskTick::Plenty;
     }
@@ -3426,7 +3488,9 @@ pub fn disk_tick(
             .zip(table)
             .and_then(|(home, t)| disk::discover::placing_of(home, t)),
         demand,
-        idle_whole: config.idle_whole_on() && (config.below_auto_floor(free) || demand.is_some()),
+        projected,
+        idle_whole: config.idle_whole_on()
+            && (config.pressed(free, projected.as_ref()) || demand.is_some()),
         session_cwds: session_cwds.to_vec(),
         session_cwd_unknown: session_cwd_unknown.map(str::to_owned),
         link_dirs: link_dirs.to_vec(),
@@ -3663,6 +3727,121 @@ fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write)
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `disk free <path>...` ([`disk::free`]): the disk-free worker's one removal, its fences read
+/// against every process of this user and the mount table as they are now.
+fn run_disk_free(
+    env: &Env,
+    paths: &[PathBuf],
+    dry_run: bool,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let _quiet = aterm_sysprobe::quiet_errors();
+    let table = aterm_sysprobe::volumes::table();
+    let free = DiskFree {
+        paths,
+        dry_run,
+        json,
+    };
+    run_disk_free_with(
+        env,
+        &free,
+        &disk::discover::scan_processes,
+        &table,
+        out,
+        err,
+    )
+}
+
+/// What one `disk free` was asked ([`Cmd::DiskFree`]).
+struct DiskFree<'a> {
+    paths: &'a [PathBuf],
+    dry_run: bool,
+    json: bool,
+}
+
+/// [`run_disk_free`] with the processes (`processes`) and the mount table (`table`) it reads.
+fn run_disk_free_with(
+    env: &Env,
+    ask: &DiskFree<'_>,
+    processes: disk::discover::Processes<'_>,
+    table: &aterm_sysprobe::volumes::Table,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some(home) = env.home.as_deref() else {
+        let _ = writeln!(
+            err,
+            "aterm harness disk free: the home folder is unknown, so no cache root is placed and \
+             nothing is removed"
+        );
+        return ExitCode::from(1);
+    };
+    let reading = disk_config(env);
+    for note in &reading.notes {
+        let _ = writeln!(err, "aterm harness disk free: {note}");
+    }
+    let world = disk::free::World {
+        home,
+        processes,
+        mounts: Some(table),
+        config: reading.config,
+        now: env.now,
+        sid: &env.sid,
+    };
+    if ask.dry_run && !world.grant() {
+        let _ = writeln!(
+            err,
+            "aterm harness disk free: {}; without --dry-run every path is refused",
+            disk::free::GRANT_OFF
+        );
+    }
+    let mut sink = io::sink();
+    let mut journal = if ask.dry_run {
+        Journal::off()
+    } else {
+        let path = env.disk_ledger();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS);
+        let sid = (!env.sid.is_empty()).then_some(env.sid.as_str());
+        Journal::open(Some(&path), sid, &mut sink)
+    };
+    let outcomes = if ask.paths.is_empty() {
+        disk::free::survey(&world)
+    } else {
+        disk::free::run(ask.paths, ask.dry_run, &world, &mut |row| {
+            journal.append_raw(row, &mut io::sink())
+        })
+    };
+    for o in &outcomes {
+        if ask.json {
+            let value = o.to_json(ask.dry_run, world.grant());
+            let _ = writeln!(out, "{}", aterm_json::to_string(&value).unwrap_or_default());
+        } else {
+            let _ = writeln!(out, "{}", o.line());
+        }
+    }
+    let refused = outcomes.iter().filter(|o| o.refused()).count();
+    if !ask.json {
+        let went = outcomes.len() - refused;
+        let bytes: u64 = outcomes.iter().map(disk::free::Outcome::bytes).sum();
+        let _ = writeln!(
+            out,
+            "{} {} from {went} path(s); {refused} refused",
+            if ask.dry_run { "would free" } else { "freed" },
+            disk::human_bytes(bytes)
+        );
+    }
+    if refused > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Journal a poke ([`disk::poke`]) into `<state>/disk.jsonl`: what saw the disk full, the free figure measured on it and where that stands.
@@ -5024,7 +5203,7 @@ pub trait AccountsHost {
         None
     }
 
-    /// The email of the ChatGPT account Codex's login in `home` names (its app server's `account/read`, [`super::codex_app_login::read_account`]), used after terminal sign-in and by `adopt-default --cli codex` when no `--email` is given; `None` names none.
+    /// The email of the ChatGPT account Codex's login in `home` names (`<home>/auth.json`'s OAuth JWT claims, [`super::codex_app_login::read_account_email`]), used after terminal sign-in and by `adopt-default --cli codex` when no `--email` is given; `None` names none.
     fn codex_account(&self, home: &Path) -> Option<String> {
         let _ = home;
         None
@@ -5033,6 +5212,11 @@ pub trait AccountsHost {
     /// The Chromium `accounts browser` opens a row's profile in ([`super::browser_window::find_window_browser`]); `None` where none is installed.
     fn window_browser(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// Where [`AccountsHost::window_browser`] found none: the pinned full Chrome for Testing fetched into aterm's browser cache ([`super::browser_window::fetch_window_browser`]), held to its size and sha256, a download Ctrl-C (or another of [`WINDOW_END_SIGNALS`]) stops; its executable, or why nothing was installed. This host fetches nothing.
+    fn fetch_window_browser(&self) -> Result<PathBuf, String> {
+        Err("this host fetches no browser; nothing was installed".to_string())
     }
 
     /// `accounts browser` ([`run_accounts_browser`]): `profile` opened in `browser` at `url` in a window, waited for until the person presses Enter or Ctrl-C here (or another of [`WINDOW_END_SIGNALS`] arrives), quits the browser, or [`super::login_drive::HANG`] runs out ([`super::browser_window::run_window`]).
@@ -5162,14 +5346,7 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn codex_account(&self, home: &Path) -> Option<String> {
-        super::codex_app_login::run_app_server(
-            Cli::Codex,
-            home,
-            super::accounts_pool::USAGE_READ_WAIT,
-            super::codex_app_login::read_account,
-        )
-        .flatten()
-        .and_then(|account| account.email)
+        super::codex_app_login::read_account_email(home)
     }
 
     fn vendor_sign_in(&self, req: &super::login_drive::Request<'_>) -> super::login_drive::Drove {
@@ -5198,6 +5375,27 @@ impl AccountsHost for LiveAccounts {
     fn window_browser(&self) -> Option<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         super::browser_window::find_window_browser(home.as_deref())
+    }
+
+    fn fetch_window_browser(&self) -> Result<PathBuf, String> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let fetched = {
+            // Ctrl-C, a closed tab or a stop ends the download and installs nothing, never this
+            // process mid-rename.
+            let _held = WindowEnds::hold();
+            super::browser_window::fetch_window_browser(
+                home.as_deref(),
+                &mut super::headless_fetch::Curl,
+                &window_end_noted,
+            )
+        };
+        // Read once more with the hold dropped: an end noted after the fetch's last look is still
+        // set (only the next outermost hold clears it, and the window's hold would), and one
+        // after the drop meets the actions put back, which end this process.
+        match fetched {
+            Ok(_) if window_end_noted() => Err(super::browser_window::STOPPED_IN_PLACE.to_string()),
+            fetched => fetched,
+        }
     }
 
     fn open_window(
@@ -5750,16 +5948,7 @@ fn accounts_read_roster(env: &Env, err: &mut dyn Write) -> Option<(PathBuf, Rost
 }
 
 fn accounts_read_roster_for(cli: Cli, env: &Env, err: &mut dyn Write) -> Option<(PathBuf, Roster)> {
-    let Some(path) = env.accounts_roster_for(cli) else {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts: no config directory is known (neither $XDG_CONFIG_HOME nor \
-             $HOME is set), so there is no {} to read; name one with `--config \
-             <dir>/aterm.toml`",
-            cli.accounts().roster_file
-        );
-        return None;
-    };
+    let path = accounts_roster_path_for(cli, env, err)?;
     if let Some(store) = env.accounts_store_for(cli)
         && let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, &path)
     {
@@ -5776,6 +5965,20 @@ fn accounts_read_roster_for(cli: Cli, env: &Env, err: &mut dyn Write) -> Option<
             None
         }
     }
+}
+
+fn accounts_roster_path_for(cli: Cli, env: &Env, err: &mut dyn Write) -> Option<PathBuf> {
+    let Some(path) = env.accounts_roster_for(cli) else {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts: no config directory is known (neither $XDG_CONFIG_HOME nor \
+             $HOME is set), so there is no {} to read; name one with `--config \
+             <dir>/aterm.toml`",
+            cli.accounts().roster_file
+        );
+        return None;
+    };
+    Some(path)
 }
 
 fn accounts_refusal(path: &Path, why: &str) -> String {
@@ -6754,6 +6957,9 @@ fn run_accounts_add(
                      as it is: a login made under this name before is this account's again"
                 );
             }
+            if let Some(why) = &added.unwoken {
+                let _ = writeln!(err, "aterm harness accounts add: {why}");
+            }
             let verb = sign_in_verb(asked);
             let _ = writeln!(
                 out,
@@ -6784,6 +6990,8 @@ struct Added {
     dir_held_files: bool,
     /// The fleet files the row was listed in too, so the next sync keeps it.
     fleets: Vec<PathBuf>,
+    /// Why a running aterm was not woken for the new row ([`wake_for_roster`]), if it was not.
+    unwoken: Option<String>,
 }
 
 fn file_mode(path: &Path) -> Option<u32> {
@@ -6942,12 +7150,29 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
             dir.display()
         )
     })?;
+    let unwoken = wake_for_roster(&store);
     Ok(Added {
         roster: path,
         dir,
         listed_own,
         dir_held_files,
         fleets: fleets.into_iter().map(|(fleet, _)| fleet).collect(),
+        unwoken,
+    })
+}
+
+/// Wakes a running aterm's host for the roster this command has just written, as a sync wakes
+/// it ([`accounts::Store::touch_wake`]): a session waiting on a login hears of the new row at
+/// once, instead of at the host's next look at the roster's bytes, up to a minute later (which
+/// is how a row written by hand still reaches it). `Some(why)` when the marker could not be
+/// written: the roster stands, and that look still finds the row.
+fn wake_for_roster(store: &accounts::Store) -> Option<String> {
+    store.touch_wake().err().map(|why| {
+        format!(
+            "the roster is written, but the wake marker {} could not be replaced ({why}): a running \
+             aterm finds the new row at its next look, within a minute",
+            store.wake_path().display()
+        )
     })
 }
 
@@ -7092,6 +7317,65 @@ fn signin_guard(
     }
 }
 
+/// Recheck a captured row and login generation after taking the machine's
+/// sign-in lock, before creating a staging home or changing a browser profile.
+fn signin_policy_ready(
+    store: &accounts::Store,
+    policy: accounts::RenewalPolicy<'_>,
+    now: i64,
+    verb: &str,
+    err: &mut dyn Write,
+) -> bool {
+    match store.transact_renewal_within(&accounts::LOCK_LADDER, now, &mut None, policy, |_, _| {
+        Ok(Vec::new())
+    }) {
+        Ok(_) => true,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts {verb}: {}: {why}; nothing was run",
+                policy.row.label
+            );
+            false
+        }
+    }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInEpoch",
+        action = "Browser",
+        reason = "Native fixture selection between plain login and a browser window."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInEpoch",
+        action = "AnotherProvider",
+        reason = "Native fixture selection for the four browser providers."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInEpoch",
+        action = "AnotherCase",
+        reason = "Native fixture selection for changes before opening or during authentication."
+    )
+)]
+#[doc(hidden)]
+pub fn account_signin_epoch_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSignInEpoch",
+        action = "Run",
+        project = "aterm_agent::harness::cli::tests::signin_epoch::epoch_transition"
+    )
+)]
 fn run_accounts_login(
     env: &Env,
     host: &dyn AccountsHost,
@@ -7168,6 +7452,9 @@ fn run_accounts_login(
         row,
         logins: &logins,
     };
+    if !signin_policy_ready(&store, policy, env.now, "login", err) {
+        return ExitCode::from(1);
+    }
     let staging = match store.claim_staging_dir(label) {
         Ok(dir) => dir,
         Err(why) => {
@@ -7374,7 +7661,7 @@ fn run_accounts_adopt(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let done = (|| -> Result<PathBuf, String> {
+    let done = (|| -> Result<(PathBuf, Option<String>), String> {
         let path = env.accounts_roster_for(cli).ok_or_else(|| {
             format!(
                 "no config directory is known, so there is no {} to write; name one with \
@@ -7445,16 +7732,19 @@ fn run_accounts_adopt(
         })?;
         super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
             .map_err(|e| format!("{}: {e}; the roster is unchanged", write_to.display()))?;
-        Ok(path)
+        Ok((path, wake_for_roster(&store)))
     })();
     match done {
-        Ok(path) => {
+        Ok((path, unwoken)) => {
             let _ = writeln!(
                 out,
                 "listed `{}` (dedicated): this machine's own login, in {}",
                 row.label,
                 path.display()
             );
+            if let Some(why) = unwoken {
+                let _ = writeln!(err, "aterm harness accounts adopt-default: {why}");
+            }
             if cli == Cli::Claude {
                 let _ = writeln!(
                     out,
@@ -7952,6 +8242,47 @@ fn accounts_observe_signin(
 #[allow(dead_code)]
 fn signin_observation_environment() {}
 
+/// The scheduling image of a manual renewal. Later attempts still capture their
+/// own login generation and validate the original raw policy before authenticating.
+fn read_renewal_records(
+    cli: Cli,
+    store: &accounts::Store,
+    path: &Path,
+    now: i64,
+    recover_staging: bool,
+    err: &mut dyn Write,
+) -> Option<accounts::AccountRecords> {
+    let mut read = store.read_account_records(Some(path), now);
+    if recover_staging && read.is_ok() {
+        let _ = super::accounts_sync::recover_staging_renewals_for(cli, store, path, now);
+        // Even a failed staging publication may have admitted a pending receipt.
+        // Never schedule from the earlier image after the recovery pass ran.
+        read = store.read_account_records(Some(path), now);
+    }
+    match read {
+        Ok(records) => {
+            for note in &records.notes {
+                let _ = writeln!(err, "aterm harness accounts: {note}");
+            }
+            Some(records)
+        }
+        Err(accounts::RosterReadError::Roster(why)) => {
+            let _ = writeln!(err, "{}", accounts_refusal(path, &why));
+            None
+        }
+        Err(accounts::RosterReadError::Records(why)) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: account records cannot be read: {why} \
+                 (state: {}; bindings: {}); nothing was run",
+                store.state_file().display(),
+                store.logins_file().display(),
+            );
+            None
+        }
+    }
+}
+
 fn run_accounts_renew(
     env: &Env,
     host: &dyn AccountsHost,
@@ -7959,7 +8290,7 @@ fn run_accounts_renew(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let Some((path, _)) = accounts_read_roster(env, err) else {
+    let Some(path) = accounts_roster_path_for(Cli::Claude, env, err) else {
         return ExitCode::from(1);
     };
     let machines = match machines_to_renew(env, due, on) {
@@ -7971,30 +8302,23 @@ fn run_accounts_renew(
     };
     let store = env.accounts_store();
     let now = env.now;
-    if !signin_records_ready(&store, &path, now, "renew", err) {
-        return ExitCode::from(1);
-    }
-    if due && labels.is_empty() {
-        let _ = super::accounts_sync::recover_staging_renewals_for(Cli::Claude, &store, &path, now);
-    }
-    let Some((_, file_roster)) = accounts_read_roster(env, err) else {
+    let Some(records) = read_renewal_records(
+        Cli::Claude,
+        &store,
+        &path,
+        now,
+        due && labels.is_empty(),
+        err,
+    ) else {
         return ExitCode::from(1);
     };
-    let (logins, logins_note) = match store.load_logins(now) {
-        Ok(read) => read,
-        Err(why) => {
-            let _ = writeln!(
-                err,
-                "aterm harness accounts renew: {why}: {} is left as it is and nothing was run",
-                store.logins_file().display()
-            );
-            return ExitCode::from(1);
-        }
-    };
-    if let Some(note) = logins_note {
-        let _ = writeln!(err, "aterm harness accounts: {note}");
-    }
-    let roster = accounts::bound(&file_roster, &logins);
+    let accounts::AccountRecords {
+        raw_roster: file_roster,
+        roster,
+        logins,
+        state,
+        ..
+    } = records;
     let mut chosen: Vec<String> = Vec::new();
     for label in labels {
         match roster.row(label) {
@@ -8041,17 +8365,6 @@ fn run_accounts_renew(
                 && super::headless_oauth::has_browser_profile(&store.dir, label, em))
     };
     if due {
-        let (state, _) = match store.load(now) {
-            Ok(read) => read,
-            Err(why) => {
-                let _ = writeln!(
-                    err,
-                    "aterm harness accounts renew: {why}; due logins could not be determined, \
-                     so nothing was run"
-                );
-                return ExitCode::from(1);
-            }
-        };
         let enrolled = accounts::enrolled(&roster);
         let due_labels = accounts::renew_due(&roster, &logins, &state, &enrolled, now);
         for label in &due_labels {
@@ -8390,7 +8703,7 @@ fn sign_in_plan(
         return Err(Renewal::Failed);
     };
     // An overlay's shared entries are linked before the sign-in's child runs, so what the CLI
-    // makes there at its first start (Codex's databases, skills) is the default home's.
+    // makes there at its first start (such as shared skills or configuration) is the default home's.
     let seam = cli.accounts().seam;
     if let (crate::ai::connector::Seam::Overlay { .. }, Some(default_home)) =
         (seam, default_home.as_deref())
@@ -8448,7 +8761,7 @@ fn copy_new_private_file(src: &Path, dst: &Path) -> io::Result<bool> {
     }
 }
 
-/// Adopts any `Shared::Suffix` files (such as Codex's `state_*.sqlite`) created in a fresh sign-in `staging` home into `default_home` when missing there, removes the transient `staging` copies (and SQLite journal companions), and re-links `staging` via [`super::accounts_overlay::ensure`] so the new overlay never starts drifted.
+/// Adopts any `Shared::Suffix` files (such as database files) created in a fresh sign-in `staging` home into `default_home` when missing there, removes the transient `staging` copies (and SQLite journal companions), and re-links `staging` via [`super::accounts_overlay::ensure`] so the new overlay never starts drifted.
 fn reconcile_staging_overlay_suffixes(
     seam: crate::ai::connector::Seam,
     stores: &[&str],
@@ -9039,7 +9352,7 @@ fn run_accounts_renew_for(
         );
         return ExitCode::from(1);
     }
-    let Some((path, _)) = accounts_read_roster_for(cli, env, err) else {
+    let Some(path) = accounts_roster_path_for(cli, env, err) else {
         return ExitCode::from(1);
     };
     let Some(store) = env.accounts_store_for(cli) else {
@@ -9047,30 +9360,18 @@ fn run_accounts_renew_for(
         return ExitCode::from(1);
     };
     let now = env.now;
-    if !signin_records_ready(&store, &path, now, "renew", err) {
-        return ExitCode::from(1);
-    }
-    if due && labels.is_empty() {
-        let _ = super::accounts_sync::recover_staging_renewals_for(cli, &store, &path, now);
-    }
-    let Some((_, file_roster)) = accounts_read_roster_for(cli, env, err) else {
+    let Some(records) =
+        read_renewal_records(cli, &store, &path, now, due && labels.is_empty(), err)
+    else {
         return ExitCode::from(1);
     };
-    let (logins, logins_note) = match store.load_logins(now) {
-        Ok(read) => read,
-        Err(why) => {
-            let _ = writeln!(
-                err,
-                "aterm harness accounts renew: {why}: {} is left as it is and nothing was run",
-                store.logins_file().display()
-            );
-            return ExitCode::from(1);
-        }
-    };
-    if let Some(note) = logins_note {
-        let _ = writeln!(err, "aterm harness accounts: {note}");
-    }
-    let roster = accounts::bound(&file_roster, &logins);
+    let accounts::AccountRecords {
+        raw_roster: file_roster,
+        roster,
+        logins,
+        state,
+        ..
+    } = records;
     let mut chosen: Vec<String> = Vec::new();
     for label in labels {
         match roster.row(label) {
@@ -9099,17 +9400,6 @@ fn run_accounts_renew_for(
         }
     }
     if due {
-        let (state, _) = match store.load(now) {
-            Ok(read) => read,
-            Err(why) => {
-                let _ = writeln!(
-                    err,
-                    "aterm harness accounts renew: {why}; due logins could not be determined, \
-                     so nothing was run"
-                );
-                return ExitCode::from(1);
-            }
-        };
         let enrolled = accounts::enrolled_for(cli, &roster);
         let mut due_labels = accounts::renew_due(&roster, &logins, &state, &enrolled, now);
         due_labels.sort_by_key(|label| {
@@ -9321,7 +9611,7 @@ fn run_accounts_login_for(
     }
 }
 
-/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). From before the window until its record is written, the signals that would end this process only end the window ([`AccountsHost::hold_window_ends`]), and the profile carries [`super::browser_window::UNTIDIED_MARK`] until that pass has run, so a window whose pass never ran is made up by the next headless launch on the profile ([`super::browser_window::make_up_tidy`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
+/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`], else the pinned Chrome for Testing fetched first, before the sign-in lock is taken: [`AccountsHost::fetch_window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). From before the window until its record is written, the signals that would end this process only end the window ([`AccountsHost::hold_window_ends`]), and the profile carries [`super::browser_window::UNTIDIED_MARK`] until that pass has run, so a window whose pass never ran is made up by the next headless launch on the profile ([`super::browser_window::make_up_tidy`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
 fn run_accounts_browser(
     cli: Cli,
     env: &Env,
@@ -9329,6 +9619,34 @@ fn run_accounts_browser(
     label: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
+) -> ExitCode {
+    run_accounts_browser_with(
+        cli,
+        env,
+        host,
+        label,
+        out,
+        err,
+        super::browser_window::no_window_desk(),
+    )
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSignInEpoch",
+        action = "Run",
+        project = "aterm_agent::harness::cli::tests::signin_epoch::epoch_transition"
+    )
+)]
+fn run_accounts_browser_with(
+    cli: Cli,
+    env: &Env,
+    host: &dyn AccountsHost,
+    label: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    desk_refusal: Option<&str>,
 ) -> ExitCode {
     use super::browser_window::WindowEnd;
     let refuse = |err: &mut dyn Write, what: &str| {
@@ -9376,7 +9694,21 @@ fn run_accounts_browser(
     if !signin_records_ready(&store, &path, env.now, "browser", err) {
         return ExitCode::from(1);
     }
-    if let Some(why) = no_window_desk() {
+    let logins = match store.load_logins(env.now) {
+        Ok((logins, _)) => logins,
+        Err(why) => return refuse(err, &why),
+    };
+    let bound = accounts::bound(&file_roster, &logins);
+    let Some(bound_row) = bound.row(label) else {
+        return refuse(err, "the browser account is no longer listed");
+    };
+    let policy = accounts::RenewalPolicy {
+        roster_path: &path,
+        roster: &file_roster,
+        row: bound_row,
+        logins: &logins,
+    };
+    if let Some(why) = desk_refusal {
         return refuse(err, why);
     }
     if !host.stdin_is_terminal() {
@@ -9393,23 +9725,52 @@ fn run_accounts_browser(
              yours",
         );
     }
-    let Some(browser) = host.window_browser() else {
-        let cache = super::headless_oauth::browser_cache_roots(env.home.as_deref())
-            .into_iter()
-            .find(|root| root.extension().is_some_and(|e| e == "noindex"))
-            .map_or_else(
+    let browser = match host.window_browser() {
+        Some(browser) => browser,
+        None => {
+            let cache = super::headless_fetch::cache_root(env.home.as_deref()).map_or_else(
                 || "aterm's browser cache".to_string(),
                 |root| format!("{}/", root.display()),
             );
-        return refuse(
-            err,
-            &format!(
-                "no Chromium that opens a window is installed here: put Google Chrome for \
-                 Testing or Chromium in /Applications or ~/Applications, unzip a Chrome for \
-                 Testing archive into {cache} (as is, or in a `chrome-<version>-<platform>/` \
-                 folder), or name one in $ATERM_BROWSER"
-            ),
-        );
+            let size = super::headless_fetch::Archive::host_window()
+                .map(|archive| format!(" (about {} MB)", archive.bytes / 1_000_000))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "no Chromium that opens a window is installed here, so aterm fetches the pinned \
+                 Google Chrome for Testing {}{size} into {cache} first, held to its pinned size \
+                 and sha256 (Ctrl-C stops it)",
+                aterm_uds::host::chrome::PIN_VERSION
+            );
+            let _ = out.flush();
+            match host.fetch_window_browser() {
+                Ok(fetched) => {
+                    let _ = writeln!(out, "fetched: {}", fetched.display());
+                    fetched
+                }
+                Err(why) if why == super::browser_window::STOPPED_IN_PLACE => {
+                    return refuse(
+                        err,
+                        "stopped: the pinned Google Chrome for Testing was fetched and stays in \
+                         aterm's browser cache, where the next run finds it",
+                    );
+                }
+                Err(why) => {
+                    return refuse(
+                        err,
+                        &format!(
+                            "no Chromium that opens a window is installed here, and the pinned \
+                             Google Chrome for Testing was not fetched: {}. Run this again to \
+                             fetch it again, put Google Chrome for Testing or Chromium in \
+                             /Applications or ~/Applications, unzip a Chrome for Testing archive \
+                             into {cache} (as is, or in a `chrome-<version>-<platform>/` folder), \
+                             or name one in $ATERM_BROWSER",
+                            super::one_line(&why, 240)
+                        ),
+                    );
+                }
+            }
+        }
     };
     let _lock = match store.signin_within() {
         Ok(Some(lock)) => lock,
@@ -9421,6 +9782,9 @@ fn run_accounts_browser(
             );
         }
     };
+    if !signin_policy_ready(&store, policy, env.now, "browser", err) {
+        return ExitCode::from(1);
+    }
     let profile = super::headless_oauth::row_browser_profile(
         cli,
         &store.dir,
@@ -9510,7 +9874,7 @@ fn run_accounts_browser(
         // A mark left in place only makes the next launch's pass run again.
         let _ = super::browser_window::clear_untidied(&profile);
     }
-    let now = host.now();
+    let now = host.now().max(env.now);
     let state = match &tidied {
         Ok(t) => match t.session {
             Some(true) => "session-kept",
@@ -9521,8 +9885,23 @@ fn run_accounts_browser(
     };
     let event = accounts::Event::new(now, accounts::Kind::SignIn, label)
         .because(&format!("{site} window {} {state}", end.word()));
+    // Cleanup above is unconditional. A result for the old row must not unpark
+    // or otherwise become history for a replacement login under the same label.
+    let mut note = None;
     let recorded =
-        accounts_observe_signin(&store, &path, now, err, |_, _, _| Ok(vec![event])).is_ok();
+        store.transact_renewal_within(&accounts::LOCK_LADDER, now, &mut note, policy, |_, _| {
+            Ok(vec![event])
+        });
+    if let Some(note) = note {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
+    if let Err(why) = &recorded {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts browser: result was not recorded: {why}"
+        );
+    }
+    let recorded = recorded.is_ok();
     let flag = cli_flag(cli);
     let unrecorded = if recorded {
         ""
@@ -9571,6 +9950,9 @@ fn run_accounts_browser(
         "{label}: the window closed ({}); {dropped}; {said}{unrecorded}",
         end.word()
     );
+    if !recorded {
+        return ExitCode::from(1);
+    }
     if signed_in {
         let _ = writeln!(
             out,
@@ -9589,20 +9971,6 @@ fn run_accounts_browser(
         );
         ExitCode::from(1)
     }
-}
-
-/// Why no sign-in window can open on this machine's desk: a host that is neither macOS nor Linux, or a Linux session with no display (`DISPLAY`, `WAYLAND_DISPLAY`).
-fn no_window_desk() -> Option<&'static str> {
-    if !cfg!(unix) {
-        return Some("not run: a sign-in window opens on macOS and Linux only");
-    }
-    let shown = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-    if cfg!(target_os = "linux") && !shown("DISPLAY") && !shown("WAYLAND_DISPLAY") {
-        return Some(
-            "not run: this session has no display (no DISPLAY or WAYLAND_DISPLAY) to open the window on",
-        );
-    }
-    None
 }
 
 fn claude_profile_of(
@@ -9767,16 +10135,15 @@ pub fn run_accounts_of(
                     Some(email) => {
                         let _ = writeln!(
                             out,
-                            "{label}: Codex's app server names the default login's account \
-                                 as {email}"
+                            "{label}: Codex's default login names the account as {email}"
                         );
                         email
                     }
                     None => {
                         let _ = writeln!(
                             err,
-                            "aterm harness accounts adopt-default: {label}: Codex's app \
-                                 server named no ChatGPT account for the default login; pass \
+                            "aterm harness accounts adopt-default: {label}: Codex's default \
+                                 login named no ChatGPT account in auth.json; pass \
                                  --email <address>"
                         );
                         return ExitCode::from(1);
@@ -10302,6 +10669,11 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
             json,
         } => run_disk(env, targets, *apply, *json, out, err),
         Cmd::DiskWhy { json } => run_disk_why(env, *json, out, err),
+        Cmd::DiskFree {
+            paths,
+            dry_run,
+            json,
+        } => run_disk_free(env, paths, *dry_run, *json, out, err),
         Cmd::Ledger { file, count, json } => run_ledger(env, file, *count, *json, out, err),
         Cmd::Upgrade { sid, dry_run, json } => run_upgrade(env, sid, *dry_run, *json, out, err),
         Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),

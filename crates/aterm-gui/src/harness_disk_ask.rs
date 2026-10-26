@@ -118,6 +118,231 @@ pub(super) fn owner_said() -> Option<String> {
     OWNER.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
+/// What this process's last disk-worker spawn did, until a step records it
+/// ([`ask::Ahead::spawned`]).
+static SPAWNED: Mutex<Option<ask::Spawned>> = Mutex::new(None);
+
+/// The main thread's answer to [`HostNote::DiskWorker`]: the session it started, or why none
+/// started. The next disk look's step records it in the lease.
+pub(crate) fn worker_spawned(outcome: Result<String, String>) {
+    *SPAWNED.lock().unwrap_or_else(PoisonError::into_inner) = Some(ask::Spawned {
+        at_ms: now_ms(),
+        outcome,
+    });
+}
+
+impl crate::App {
+    /// Start the home volume's disk worker (`task`, in `folder`) the way Summarize starts its
+    /// worker: a Claude Code tab in the background under Autopilot Land, with no starting session
+    /// and no fact line, its trusted folder the worker folder, so the harness's disk-worker rule
+    /// fences its boxes. What the spawn did goes to the next disk look ([`worker_spawned`]).
+    pub(crate) fn start_disk_worker(&mut self, task: String, folder: &Path) {
+        let order = crate::task_launch::TaskOrder {
+            task: task.into_bytes(),
+            agent: Program::Claude,
+            model: None,
+            caller: None,
+            trusted_cwd: folder
+                .to_str()
+                .and_then(crate::spawn_folder::canonical_folder),
+            fact_line: false,
+            autopilot: aterm_agent::supervise::Autopilot::Land,
+        };
+        let booking = crate::control::control_media::SpawnBooking {
+            cwd: folder.to_str().map(str::to_string),
+            split: None,
+            raise: false,
+            admission: crate::tab_spawn::SpawnAdmission::Plain,
+        };
+        let plan = match self.resolve_spawn(crate::control::SpawnAim::Front, Some(order)) {
+            Ok(plan) => plan,
+            Err(why) => {
+                aterm_log::warn!("harness disk watch: the disk worker did not start: {why}");
+                worker_spawned(Err(spawn_word(&why)));
+                return;
+            }
+        };
+        self.book_spawn(
+            plan,
+            booking,
+            Box::new(|app, spawned| {
+                match spawned {
+                    Ok(spawned) => {
+                        let sid = app.start_spawned(spawned);
+                        aterm_log::info!("harness disk watch: the disk worker runs as @{sid}");
+                        worker_spawned(Ok(sid));
+                    }
+                    Err(why) => {
+                        aterm_log::warn!(
+                            "harness disk watch: the disk worker did not start: {why}"
+                        );
+                        worker_spawned(Err(spawn_word(&why)));
+                    }
+                }
+                app.mark_status_dirty();
+            }),
+        );
+    }
+
+    /// The disk worker `sid` ran out of its time ([`ask::WORKER_MS`]): its Autopilot goes Off,
+    /// written by aterm, so Land types nothing more into it.
+    pub(crate) fn disk_worker_expired(&mut self, sid: &str) {
+        let local = {
+            let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
+            store
+                .live_handles()
+                .find(|h| h.sid.as_str() == sid)
+                .map(|h| h.local_id)
+        };
+        let Some(local) = local else {
+            return;
+        };
+        self.write_autopilot_batch(
+            &[(local, Some(aterm_agent::supervise::Autopilot::Off), None)],
+            aterm_slog::Actor::Aterm,
+            None,
+        );
+        aterm_log::info!(
+            "harness disk watch: the disk worker @{sid} ran out of its time; its Autopilot is Off"
+        );
+    }
+}
+
+/// Why a spawn failed, as the lease's `spawn:<reason>` says it: its plain words, clipped.
+fn spawn_word(why: &str) -> String {
+    let plain: String = why
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut word = plain
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    word.truncate(48);
+    if word.is_empty() {
+        "unknown".to_owned()
+    } else {
+        word
+    }
+}
+
+/// Session `sid`'s task record, where `sid` is a live session of this process.
+fn task_record_of(store: &Store, sid: &str) -> Option<crate::task_record::TaskRecord> {
+    let handle = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        g.live_handles().find(|h| h.sid.as_str() == sid).cloned()
+    }?;
+    let t = handle
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    t.task().cloned()
+}
+
+/// What the last disk worker of this process reported, by volume key: its `disk-free filling:`
+/// and `disk-free owner-only:` lines ([`report_lines`]), which the owner's filling entry and
+/// alert show as its words.
+static WORKER_REPORT: Mutex<Option<(String, Vec<String>)>> = Mutex::new(None);
+
+/// The heads of the lines a disk worker's report ends with ([`ask::worker_task`]).
+const REPORT_HEADS: [&str; 2] = ["disk-free filling:", "disk-free owner-only:"];
+
+/// The longest a report line is shown, in characters.
+const REPORT_LINE_CAP: usize = 160;
+
+/// The largest result read for a worker's report.
+const REPORT_MAX_BYTES: u64 = 256 * 1024;
+
+/// The worker `sid`'s report lines, from its task record's result.
+fn worker_report(store: &Store, sid: &str) -> Vec<String> {
+    use std::io::Read as _;
+    let Some(path) = task_record_of(store, sid).and_then(|r| r.result_path) else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    let read =
+        std::fs::File::open(&path).and_then(|f| f.take(REPORT_MAX_BYTES).read_to_string(&mut text));
+    if let Err(e) = read {
+        aterm_log::debug!(
+            "harness disk watch: the disk worker's result {} could not be read ({e})",
+            path.display()
+        );
+        return Vec::new();
+    }
+    report_lines(&text)
+}
+
+/// The last line under each of [`REPORT_HEADS`] in `text`, read, not trusted: kept to plain
+/// characters (letters, digits, spaces and `/._-~+@:,=()'%`), its spaces collapsed, and clipped
+/// to [`REPORT_LINE_CAP`], so nothing planted in a result reaches the owner's glass as more than
+/// words.
+fn report_lines(text: &str) -> Vec<String> {
+    REPORT_HEADS
+        .iter()
+        .filter_map(|head| {
+            let said = text.lines().rev().find_map(|l| {
+                l.trim()
+                    .trim_start_matches(['-', '*', ' '])
+                    .strip_prefix(head)
+            })?;
+            let plain: String = said
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || " /._-~+@:,=()'%".contains(c) {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
+            let words: String = plain
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(REPORT_LINE_CAP)
+                .collect();
+            (!words.is_empty()).then(|| format!("{head} {words}"))
+        })
+        .collect()
+}
+
+/// The last [`HostNote::DiskFilling`] this process sent, so a look says it only when it changed.
+static FILLING: Mutex<Option<HostNote>> = Mutex::new(None);
+
+/// The folder a disk worker starts in, under the harness state `state`, made owner-only
+/// ([`ask::WORKER_FOLDER`]).
+fn worker_folder(state: &Path) -> Option<PathBuf> {
+    let dir = state.join(ask::WORKER_FOLDER);
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(dir)
+}
+
+/// What session `sid`'s task record says, for the disk worker this process runs
+/// ([`ask::Ahead::task`]): `None` where no live session of this process is `sid`, or it has no
+/// task record.
+fn task_seen(store: &Store, sid: &str) -> Option<ask::TaskSeen> {
+    let record = task_record_of(store, sid)?;
+    Some(match record.state {
+        TaskState::Working => ask::TaskSeen::Working,
+        TaskState::Done | TaskState::Exited => ask::TaskSeen::Ended,
+        TaskState::Stalled => ask::TaskSeen::Stalled(record.why.unwrap_or("stalled").to_owned()),
+    })
+}
+
 /// The unix ms now.
 fn now_ms() -> i64 {
     aterm_time::unix_millis()
@@ -220,7 +445,9 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     let host = ask::HostId::this();
     let now = now_ms();
     let reclaimed = passes_unrecorded(&key, &looked.reclaimed);
-    if look_rests(&state, &key, level) {
+    let floor_now = thresholds.short_below();
+    let (projected, cold) = super::disk_fill_ask(&key, reading.free, floor_now, reading.total);
+    if look_rests(&state, &key, level, projected.is_some()) {
         // At or above the floor with no episode open, and no line of this process's that the
         // lease has yet to record: nothing to step, no lock to take, and no line a pass's space
         // could be credited to.
@@ -241,16 +468,27 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             reading.free,
             &host,
         );
+        say_filling(&FILLING, note, None);
         return;
     }
-    let (spent, holders) = {
+    let (ran_out, free_after, holders) = {
         let b = crate::disk_board::SHELF.board_lock();
         let pass = b.last_pass.as_ref().filter(|p| p.key == reading.key);
         (
-            pass.is_some_and(|p| p.ran_out && thresholds.level(p.free_after, None) >= Level::Short),
+            pass.is_some_and(|p| p.ran_out),
+            pass.and_then(|p| p.free_after),
             pass.map(|p| p.left.clone()).unwrap_or_default(),
         )
     };
+    // Done when the last pass ran out and left the volume short, or with a crossing still
+    // projected from the free space it left: a pass that freed the horizon's fill succeeded.
+    let spent = ran_out
+        && (thresholds.level(free_after, None) >= Level::Short
+            || free_after.is_some_and(|f| {
+                super::disk_fill_ask(&key, f, floor_now, reading.total)
+                    .0
+                    .is_some()
+            }));
     let done = if looked.contended {
         None
     } else {
@@ -279,6 +517,11 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     // Read after the volume: a pass that freed space this look read has either been recorded by
     // its host's step, which it makes before it lets the lock go, or holds the lock still.
     let passing = looked.pass_lock.is_none() && another_pass_runs(&home);
+    let spawned = SPAWNED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let task = |sid: &str| task_seen(store, sid);
     let look = ask::Look {
         now_ms: now,
         host: &host,
@@ -297,6 +540,13 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         reclaimed: &reclaimed,
         passing,
         alive: &alive,
+        ahead: ask::Ahead {
+            projected,
+            cold,
+            worker_ok: true,
+            task: Some(&task),
+            spawned: spawned.as_ref(),
+        },
     };
     let unrecorded = typed_last(&key);
     let stepped = ask::transact(&state, &ask::LOCK_LADDER, |lease| {
@@ -304,9 +554,10 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             ask::typed_unrecorded(lease, &key, &host, &t.sid, t.at_ms, t.free);
         }
         let said = ask::step(lease, &look);
-        (said, lease.entry(&key).cloned())
+        let worker = ask::worker_step(lease, &look);
+        (said, worker, lease.entry(&key).cloned())
     });
-    let (said, entry) = match stepped {
+    let (said, worker, entry) = match stepped {
         Ok(Some(stepped)) => {
             passes_recorded(&key, &reclaimed);
             stepped
@@ -328,6 +579,37 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         }
     };
     journal(&state, now, &key, &said, level, reading.free, &host);
+    // The spawn's outcome is the lease's once no claim of this host's waits on it.
+    let claimed_here = entry
+        .as_ref()
+        .and_then(|e| e.worker.as_ref())
+        .is_some_and(|w| w.host == host && matches!(w.state, ask::WorkerState::Claimed));
+    if !claimed_here {
+        *SPAWNED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+    if let Some(w) = &worker {
+        worker_moved(&state, now, &key, w, &reading, &host, (note, store), || {
+            ask::worker_task(&ask::Brief {
+                mount: &reading.mount,
+                total: reading.total,
+                free: reading.free,
+                floor: entry
+                    .as_ref()
+                    .and_then(|e| e.floor.as_ref())
+                    .map_or(floor_now, |f| f.bytes),
+                projected,
+                target: floor_now
+                    .saturating_add(disk::PRESSURE_MARGIN_GIB << 30)
+                    .saturating_add(projected.map_or(0, |p| p.need)),
+                holders: &holders,
+                asked: entry
+                    .as_ref()
+                    .and_then(|e| ask::owner_line(e, now))
+                    .as_deref(),
+                home: Some(&home),
+            })
+        });
+    }
     let owed_here = entry.as_ref().and_then(|e| match &e.phase {
         ask::Phase::Owed { pick, .. } if pick.host == host => Some(pick.sid.clone()),
         _ => None,
@@ -357,6 +639,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             checkout: s.checkout.as_deref(),
             shared: s.shared,
             home: Some(&home),
+            projected,
         });
         Some((sid, text))
     });
@@ -378,6 +661,22 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     });
     let owner = entry.as_ref().and_then(|e| ask::owner_line(e, now));
     *OWNER.lock().unwrap_or_else(PoisonError::into_inner) = owner.clone();
+    // At a measured emergency `system.disk.full` is the owner's alert, as before.
+    let needed =
+        level != Level::Emergency && ask::owner_needed(entry.as_ref(), &look, thresholds.emergency);
+    say_filling(
+        &FILLING,
+        note,
+        (needed || (projected.is_some() && level < Level::Short)).then(|| HostNote::DiskFilling {
+            needed,
+            projected_only: projected.is_some() && level < Level::Short,
+            free: reading.free,
+            floor: floor_now,
+            rate_bps: projected.map(|p| p.rate_bps),
+            eta_s: projected.map(|p| p.eta_ms / 1_000),
+            said: filling_said(owner.as_deref(), entry.as_ref(), &report_for(&key)),
+        }),
+    );
     if out_raises_low(
         &said,
         level,
@@ -425,8 +724,123 @@ fn out_raises_low(said: &ask::Said, level: Level, floor: u64, done: Option<ask::
 /// there, and the lease holds the last line this process typed on it ([`ask::rests`] of
 /// [`typed_last`]). A line whose record a full disk kept from the lease, and whose episode another
 /// host then ended as the space came back, so steps the lease at this look, which records it.
-fn look_rests(state: &Path, key: &str, level: Level) -> bool {
-    level < Level::Short && ask::rests(&ask::read(state), key, typed_last(key).map(|t| t.at_ms))
+fn look_rests(state: &Path, key: &str, level: Level, projected: bool) -> bool {
+    level < Level::Short
+        && !projected
+        && ask::rests(&ask::read(state), key, typed_last(key).map(|t| t.at_ms))
+}
+
+/// Journal what a worker step decided, and act on it: a claim of this host's starts the worker
+/// on the main thread with the task `task` makes ([`HostNote::DiskWorker`]); a worker of this
+/// host's that ran out of its time has its Autopilot turned Off ([`HostNote::DiskWorkerExpired`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one look's figures, each read once by its caller"
+)]
+fn worker_moved(
+    state: &Path,
+    now_ms: i64,
+    key: &str,
+    said: &ask::WorkerSaid,
+    reading: &aterm_sysprobe::volumes::Reading,
+    host: &ask::HostId,
+    (note, store): (&NoteFn, &Store),
+    task: impl FnOnce() -> String,
+) {
+    aterm_log::info!(
+        "harness disk watch: {} {}: {}",
+        ask::RULE_DISK_FREE,
+        said.word(),
+        said.describe()
+    );
+    aterm_agent::harness::cli::disk_ask_journal(
+        state,
+        &[ask::worker_row(
+            now_ms / 1000,
+            key,
+            said,
+            reading.free,
+            host,
+        )],
+    );
+    match said {
+        ask::WorkerSaid::Claimed => match worker_folder(state) {
+            Some(folder) => note(HostNote::DiskWorker {
+                task: task(),
+                folder,
+            }),
+            None => worker_spawned(Err("no-folder".to_owned())),
+        },
+        ask::WorkerSaid::Over {
+            sid: Some(sid),
+            why,
+            here: true,
+            ..
+        } => {
+            let report = worker_report(store, sid);
+            if !report.is_empty() {
+                *WORKER_REPORT.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((key.to_owned(), report));
+            }
+            if why == "expired" {
+                note(HostNote::DiskWorkerExpired { sid: sid.clone() });
+            }
+        }
+        ask::WorkerSaid::Started { .. } | ask::WorkerSaid::Over { .. } => {}
+    }
+}
+
+/// What the owner's filling entry and alert say the asks and the worker did: the owner's line
+/// ([`ask::owner_line`]), the worker's state, then what its report said ([`report_lines`]).
+/// The last worker report of this process for volume `key` ([`WORKER_REPORT`]).
+fn report_for(key: &str) -> Vec<String> {
+    WORKER_REPORT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .filter(|(k, _)| k == key)
+        .map(|(_, lines)| lines.clone())
+        .unwrap_or_default()
+}
+
+fn filling_said(
+    owner: Option<&str>,
+    entry: Option<&ask::Entry>,
+    report: &[String],
+) -> Option<String> {
+    let worker = entry
+        .and_then(|e| e.worker.as_ref())
+        .map(|w| match &w.state {
+            ask::WorkerState::Claimed => "aterm is starting a disk worker".to_owned(),
+            ask::WorkerState::Running { sid, .. } => {
+                format!("aterm's disk worker @{sid} is freeing space")
+            }
+            ask::WorkerState::Over { why, rose, .. } => format!(
+                "aterm's disk worker is over ({why}; free space rose {})",
+                disk::human_bytes(*rose)
+            ),
+        });
+    let said: Vec<String> = owner
+        .map(str::to_owned)
+        .into_iter()
+        .chain(worker)
+        .chain(report.iter().map(|l| format!("its worker said {l}")))
+        .collect();
+    (!said.is_empty()).then(|| said.join("; "))
+}
+
+/// Send `told` (a [`HostNote::DiskFilling`]) when it differs from the last one sent (`last`,
+/// [`FILLING`]), or [`HostNote::DiskFillingOver`] once, when it is `None` after one.
+fn say_filling(last: &Mutex<Option<HostNote>>, note: &NoteFn, told: Option<HostNote>) {
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if *last == told {
+        return;
+    }
+    match &told {
+        Some(t) => note(t.clone()),
+        None => note(HostNote::DiskFillingOver),
+    }
+    *last = told;
 }
 
 /// Journal `said` when it moved the episode, or when its standing word changed here.
@@ -1411,9 +1825,11 @@ mod tests {
         at(&ask::Said::Freeing);
         at(&ask::Said::Opened {
             done: ask::Done::Spent,
+            projected: None,
         });
         at(&ask::Said::Opened {
             done: ask::Done::Spent,
+            projected: None,
         });
         at(&ask::Said::Settled);
         at(&ask::Said::Settled);
@@ -2282,6 +2698,7 @@ mod tests {
                 reclaimed: &[],
                 passing: false,
                 alive: &alive,
+                ahead: ask::Ahead::default(),
             };
             let said = ask::transact(state.path(), &ask::LOCK_LADDER, |l| ask::step(l, &look))
                 .expect("the lease is stepped")
@@ -2486,6 +2903,7 @@ mod tests {
                 reclaimed: &[],
                 passing: false,
                 alive: &alive,
+                ahead: ask::Ahead::default(),
             };
             let said = ask::transact(state.path(), &ask::LOCK_LADDER, |l| ask::step(l, &look))
                 .expect("the lease is stepped")
@@ -2631,6 +3049,7 @@ mod tests {
                 checkout: s.checkout.as_deref(),
                 shared: s.shared,
                 home: Some(Path::new("/u")),
+                projected: None,
             });
             (s.seat.held, s.shared, text)
         };
@@ -2955,6 +3374,7 @@ mod tests {
                 checkout,
                 shared: false,
                 home: Some(home),
+                projected: None,
             })
         };
         let wt = Path::new("/u/aterm/.claude/worktrees/v/crates/x");
@@ -3073,6 +3493,7 @@ mod tests {
                 checkout: checkout.as_deref(),
                 shared: false,
                 home: Some(home),
+                projected: None,
             });
             assert!(text.contains("~/aterm's builds 61.0 GiB"), "{text}");
             assert!(!text.contains("(this tab's)"), "{text}");
@@ -3345,8 +3766,11 @@ mod tests {
             start: String::new(),
         };
         let at = 1_000_000;
-        assert!(look_rests(state.path(), key, Level::Ok), "nothing to step");
-        assert!(!look_rests(state.path(), key, Level::Short), "short");
+        assert!(
+            look_rests(state.path(), key, Level::Ok, false),
+            "nothing to step"
+        );
+        assert!(!look_rests(state.path(), key, Level::Short, false), "short");
         TYPED.lock().unwrap_or_else(PoisonError::into_inner).insert(
             key.to_owned(),
             Typed {
@@ -3362,13 +3786,13 @@ mod tests {
         })
         .expect("written")
         .expect("locked");
-        let lacks = look_rests(state.path(), key, Level::Ok);
+        let lacks = look_rests(state.path(), key, Level::Ok, false);
         ask::transact(state.path(), &ask::LOCK_LADDER, |l| {
             ask::typed_unrecorded(l, key, &host, "s-a", at, 0)
         })
         .expect("written")
         .expect("locked");
-        let holds = look_rests(state.path(), key, Level::Ok);
+        let holds = look_rests(state.path(), key, Level::Ok, false);
         TYPED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -3382,5 +3806,114 @@ mod tests {
             Some(at),
             "its cooldown runs from the lost line"
         );
+    }
+
+    #[test]
+    fn a_filling_note_is_said_when_it_changes_and_its_end_once() {
+        let last = Mutex::new(None);
+        let told = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&told);
+        let note = move |n: HostNote| sink.lock().unwrap_or_else(PoisonError::into_inner).push(n);
+        let filling = |eta_s: i64, needed: bool| HostNote::DiskFilling {
+            needed,
+            projected_only: !needed,
+            free: 75 << 30,
+            floor: 47 << 30,
+            rate_bps: Some(39 << 20),
+            eta_s: Some(eta_s),
+            said: None,
+        };
+        say_filling(&last, &note, None);
+        assert!(
+            told.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "no end before a start"
+        );
+        say_filling(&last, &note, Some(filling(780, false)));
+        say_filling(&last, &note, Some(filling(780, false)));
+        say_filling(&last, &note, Some(filling(720, false)));
+        say_filling(&last, &note, Some(filling(720, true)));
+        say_filling(&last, &note, None);
+        say_filling(&last, &note, None);
+        let told = told.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(told.len(), 4, "{told:#?}");
+        assert!(matches!(
+            told[2],
+            HostNote::DiskFilling { needed: true, .. }
+        ));
+        assert_eq!(told[3], HostNote::DiskFillingOver);
+    }
+
+    #[test]
+    fn a_projected_look_never_rests() {
+        let state = aterm_tempfile::TempDir::new().expect("owned lease dir");
+        let key = "dev:rests-projected";
+        assert!(look_rests(state.path(), key, Level::Low, false));
+        assert!(
+            !look_rests(state.path(), key, Level::Low, true),
+            "a crossing projected steps the lease, so an episode opens before the floor"
+        );
+    }
+
+    #[test]
+    fn a_spawn_failure_is_said_as_one_plain_word() {
+        assert_eq!(
+            spawn_word("no window to host the session"),
+            "no-window-to-host-the-session"
+        );
+        assert_eq!(
+            spawn_word("`claude` not found: $PATH"),
+            "claude-not-found-path"
+        );
+        assert_eq!(spawn_word("\u{1b}[31m"), "31m");
+        assert_eq!(spawn_word("!!!"), "unknown");
+        assert!(spawn_word(&"x ".repeat(100)).len() <= 48);
+    }
+
+    #[test]
+    fn the_filling_line_says_the_ask_then_the_worker() {
+        let host = ask::HostId {
+            pid: 7,
+            start: "s".to_owned(),
+        };
+        let mut entry = ask::Entry::default();
+        assert_eq!(filling_said(None, Some(&entry), &[]), None);
+        assert_eq!(
+            filling_said(Some("asked @a"), None, &[]).as_deref(),
+            Some("asked @a")
+        );
+        entry.worker = Some(ask::Worker {
+            host,
+            at_ms: 0,
+            state: ask::WorkerState::Running {
+                sid: "s-w".to_owned(),
+                started_ms: 0,
+                free_at: 0,
+                best_free: 0,
+            },
+            orphan_ms: None,
+        });
+        assert_eq!(
+            filling_said(Some("asked @a"), Some(&entry), &[]).as_deref(),
+            Some("asked @a; aterm's disk worker @s-w is freeing space")
+        );
+        let report = report_lines(
+            "Nothing left: freed ~/Library/Caches/pip 3.1 GiB\n\
+             - disk-free filling: a Docker VM image in ~/Library/Containers grows 30 GiB/h\n\
+             disk-free owner-only: the VM image \u{1b}[31m`rm -rf ~`\n",
+        );
+        assert_eq!(
+            report,
+            [
+                "disk-free filling: a Docker VM image in ~/Library/Containers grows 30 GiB/h",
+                "disk-free owner-only: the VM image 31m rm -rf ~",
+            ]
+        );
+        assert!(
+            filling_said(None, None, &report)
+                .is_some_and(|s| s.starts_with("its worker said disk-free filling:"))
+        );
+        assert!(report_lines("no report here").is_empty());
     }
 }

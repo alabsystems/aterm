@@ -289,9 +289,19 @@ fn button_segs(c: &BandColors) -> Vec<Seg> {
         .collect()
 }
 
-/// The well's caret ink: on Windows ([`FIND_TOOLBAR`]) the band's accent, the colour of the well's focus line ([`WELL_ACCENT_LINE`]), floored to AA in the well, so caret and focus line are one mark in the user's accent where the caret was the terminal cursor's green whatever the accent; elsewhere, and under an OS-forced palette (whose well carries a border, not a focus line), the band's own caret ink ([`BandColors::caret`]).
+/// Whether the well closes on Windows' accent focus line ([`WELL_ACCENT_LINE`]): a theme's well, whose foot the line marks across its width at 3:1 off the band (the accent is floored there), so the line is the well's edge and no [`well_rule`] is drawn; under an OS-forced palette the well keeps the system's border instead.
+fn well_focus_line() -> bool {
+    WELL_ACCENT_LINE && chrome_band::forced_chrome().is_none()
+}
+
+/// The border the well draws ([`BandColors::well_rule`]: where its fill stands under 3:1 off the band), unless Windows' focus line is its edge ([`well_focus_line`]): an underline across the well's cells, a 1 px rim round the Fluent box.
+fn well_rule(c: &BandColors) -> Option<[u8; 3]> {
+    c.well_rule.filter(|_| !well_focus_line())
+}
+
+/// The well's caret ink: on Windows ([`FIND_TOOLBAR`]) the band's accent, the colour of the well's focus line ([`well_focus_line`]), floored to AA in the well, so caret and focus line are one mark in the user's accent where the caret was the terminal cursor's green whatever the accent; elsewhere, and under an OS-forced palette (whose well carries a border, not a focus line), the band's own caret ink ([`BandColors::caret`]).
 fn caret_ink(c: &BandColors) -> [u8; 3] {
-    if FIND_TOOLBAR && c.well_rule.is_none() {
+    if FIND_TOOLBAR && well_focus_line() {
         aterm_messages::ink::ensure_contrast(c.accent, c.field_bg, WELL_INK)
     } else {
         c.caret
@@ -423,8 +433,7 @@ pub(crate) fn find_bar_paint(
         FindSeam::BottomRail => {}
     }
 
-    let well_line =
-        (WELL_ACCENT_LINE && c.well_rule.is_none() && !field_cols.is_empty()).then_some(c.accent);
+    let well_line = (well_focus_line() && !field_cols.is_empty()).then_some(c.accent);
     FindBarPaint {
         rows,
         field_row,
@@ -569,7 +578,7 @@ fn paint_well(
     if last < chars.len() && cursor != last {
         row[field.end - 1] = chrome_band::cell(SCROLL_RIGHT, c.label, c.field_bg, false, false);
     }
-    if let Some(rule) = c.well_rule {
+    if let Some(rule) = well_rule(c) {
         for cell in &mut row[field] {
             cell.underline = aterm_core::terminal::UnderlineStyle::Single;
             cell.underline_color = Some(rule);
@@ -1152,7 +1161,7 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
             });
             prims.push(DrawPrim::ClipPop);
         }
-        if let Some(rule) = c.well_rule {
+        if let Some(rule) = well_rule(c) {
             prims.push(DrawPrim::Stroke {
                 x: bx + 0.5,
                 y: y0 + 0.5,
@@ -1857,11 +1866,24 @@ mod tests {
         assert_eq!(row[bad.field_cols.start].fg, c.warn, "bad regex ⇒ warn ink");
     }
 
-    /// The seam rides the content-facing edge and runs edge to edge.
+    /// The seam rides the content-facing edge and runs edge to edge. The query well's own edge
+    /// ([`well_rule`], the well's cells) is the well's, not a seam.
     #[test]
     fn seam_faces_the_content_and_is_unbroken() {
         use aterm_core::terminal::UnderlineStyle;
         let cols = 90;
+        let off_the_well = |p: &FindBarPaint| -> Vec<RenderCell> {
+            p.rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, row)| {
+                    row.iter()
+                        .enumerate()
+                        .filter(move |(col, _)| r != p.field_row || !p.field_cols.contains(col))
+                        .map(|(_, cell)| *cell)
+                })
+                .collect()
+        };
         let bottom = find_bar_paint(
             &view("q"),
             cols,
@@ -1874,10 +1896,8 @@ mod tests {
             "bottom panel → an unbroken overline on its top edge"
         );
         assert!(
-            bottom
-                .rows
+            off_the_well(&bottom)
                 .iter()
-                .flatten()
                 .all(|c| c.underline == UnderlineStyle::None),
             "bottom panel → no underline"
         );
@@ -1906,11 +1926,10 @@ mod tests {
             FindSeam::BottomRail,
         );
         assert!(
-            railed
-                .rows
-                .iter()
-                .flatten()
-                .all(|c| !c.overline && c.underline == UnderlineStyle::None),
+            railed.rows.iter().flatten().all(|c| !c.overline)
+                && off_the_well(&railed)
+                    .iter()
+                    .all(|c| c.underline == UnderlineStyle::None),
             "top panel with a rail → no cell rule at all: the rail is the splice's"
         );
         assert_eq!(
@@ -2026,24 +2045,39 @@ mod tests {
         }
     }
 
-    /// Under every stock Windows High-Contrast scheme the well's fill matches the band, so an unbroken border is stamped across the whole well instead.
+    /// THE QUERY WELL KEEPS A BOUNDARY: a theme's well stands only a step off the band (Default 1.4:1, GitHub Light's white well on its grey band 1.2:1), too faint to show where the field is, so off Windows an unbroken border is stamped across the whole well, as on every control's 3:1 edge, and on Windows the accent focus line marks its foot instead; under every stock Windows High-Contrast scheme the well's fill matches the band, and the border is stamped there too.
     #[test]
     fn the_query_well_keeps_a_boundary_under_a_forced_palette() {
         use aterm_core::terminal::UnderlineStyle;
         let cols = 90;
-        let plain = paint(&view("abc"), cols);
-        assert!(
-            plain.rows[plain.field_row][plain.field_cols.clone()]
-                .iter()
-                .all(|c| c.underline == UnderlineStyle::None),
-            "a theme-derived well is an inset already: no border"
-        );
-        let band = chrome_band::band_colors(Theme::default());
-        assert_eq!(
-            plain.well_line,
-            WELL_ACCENT_LINE.then_some(band.accent),
-            "the focus line is the band's accent, on Windows only"
-        );
+        let light = Theme::from(&aterm_types::scheme::builtin("GitHub Light").expect("built-in"));
+        for theme in [Theme::default(), light] {
+            let band = chrome_band::band_colors(theme);
+            assert!(
+                aterm_messages::ink::contrast(band.field_bg, band.bar_bg) < 3.0,
+                "{theme:?}: the fixture is only interesting because the well is faint"
+            );
+            let plain = find_bar_paint(&view("abc"), cols, FIND_BAR_ROWS, theme, FindSeam::Top);
+            let well = &plain.rows[plain.field_row][plain.field_cols.clone()];
+            if WELL_ACCENT_LINE {
+                assert!(
+                    well.iter().all(|c| c.underline == UnderlineStyle::None),
+                    "{theme:?}: the focus line is the well's edge on Windows"
+                );
+                assert_eq!(plain.well_line, Some(band.accent), "{theme:?}");
+            } else {
+                assert!(
+                    well.iter().all(|c| c.underline == UnderlineStyle::Single
+                        && c.underline_color == band.well_rule
+                        && band.well_rule.is_some()),
+                    "{theme:?}: a faint well carries an unbroken border, caret cell included"
+                );
+                assert_eq!(
+                    plain.well_line, None,
+                    "{theme:?}: no focus line off Windows"
+                );
+            }
+        }
 
         for (name, palette) in chrome_band::hc_fixtures::STOCK {
             chrome_band::hc_fixtures::with_forced(palette, || {

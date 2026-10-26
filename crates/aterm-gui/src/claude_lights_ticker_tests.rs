@@ -645,7 +645,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         ))
     );
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
-    assert_eq!(switch.label, "alab harness on");
+    assert_eq!(switch.label, "alab harness v0.1 on");
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::True));
     assert!(switch.description.is_some(), "{switch:?}");
     let drawn = app.windows[&wid]
@@ -664,7 +664,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         )
     );
     assert!(
-        row_text(&app, wid, drawn.frame_row)[..].contains("alab harness \u{25cf} on"),
+        row_text(&app, wid, drawn.frame_row)[..]
+            .contains("alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c}"),
         "the glass says what the node says"
     );
     assert_eq!(of(&chips, HarnessChip::Title), None, "{chips:?}");
@@ -708,7 +709,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     assert_eq!(autopilot(&app, session).1, AutopilotView::MasterOff);
     let chips = app.claude_chips_a11y(wid);
     let switch = of(&chips, HarnessChip::Switch).expect("the off switch");
-    assert_eq!(switch.label, "alab harness off");
+    assert_eq!(switch.label, "alab harness v0.1 off");
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
     let on = of(&chips, HarnessChip::SwitchOn).expect("the on button");
     assert_eq!(

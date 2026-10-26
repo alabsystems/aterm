@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! A configured Mac's secrets vault subscriber, mended at launch
-//! (docs/DESIGN-secrets-2026-10-20.md §7).
+//! (docs/DESIGN-secrets-2026-10-20.md §7), and an admin Mac's vault server job whose program
+//! is gone (`mend_server`).
 //!
 //! Joining is System State's Secrets vault row's. On a launch whose setup is finished, or
 //! that runs none, and every [`MEND_EVERY`] after, a configured Mac's subscriber is read off
@@ -450,6 +451,7 @@ pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) -> b
             move || {
                 let mut before: Option<Settled> = None;
                 loop {
+                    mend_server();
                     let settled = mend(&reach);
                     let line = settled.as_ref().map(settled_line);
                     if let Some(line) = &line
@@ -477,6 +479,30 @@ pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) -> b
     {
         let _ = config_path;
         false
+    }
+}
+
+/// The vault server's job, mended when the program it names is gone (an `aterm.app` moved or
+/// deleted, which launchd can then never start again): installed again from this aterm, where
+/// this aterm lasts, with the arguments it had (`aterm_secrets::service::repair_server`). Its
+/// own job, not the subscriber's: an admin Mac serves whatever System State's plan says of its
+/// sync. Logged; nothing is asked or posted.
+#[cfg(target_os = "macos")]
+fn mend_server() {
+    let Ok(paths) = Paths::live() else {
+        return;
+    };
+    match aterm_secrets::service::repair_server(
+        &paths.home,
+        &aterm_secrets::service::program_for_service,
+    ) {
+        Ok(Some(line)) => {
+            aterm_log::info!("secrets vault: the server's program was gone; {line}");
+        }
+        Ok(None) => {}
+        Err(error) => {
+            aterm_log::warn!("secrets vault: the server's job could not be repaired: {error}");
+        }
     }
 }
 

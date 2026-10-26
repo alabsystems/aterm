@@ -10,8 +10,8 @@ use std::time::Duration;
 use aterm_uds::spawnfd::{Stdio, command};
 
 use super::{
-    Aterm, COOLDOWN, Ghostty, Group, Halt, Inbox, Ledger, arena_dir, build_aterm, ghostty_tip,
-    live, macos_version, pins, preflight, without_aterm_env,
+    Aterm, COOLDOWN, Ghostty, Group, Halt, Inbox, Ledger, Scratch, arena_dir, build_aterm,
+    ghostty_tip, live, macos_version, pins, preflight, private, without_aterm_env,
 };
 use crate::perf::stats::median;
 use crate::perf::trend::utc_date;
@@ -114,8 +114,35 @@ pub(crate) const fn order(trial: u32) -> [Term; 2] {
     }
 }
 
+/// A private HOME and XDG tree under `root` for one aterm under test, its
+/// `aterm.toml` the start lane's (no restored session, no update or package
+/// lane, the bell off): the caller's config, accounts, fleet and sessions
+/// never reach the run, which runs shipping defaults (rule zero §4), and
+/// nothing it writes reaches them.
+pub(crate) fn private_root(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    let env = vec![
+        ("HOME", root.join("home")),
+        ("XDG_CONFIG_HOME", root.join("config")),
+        ("XDG_RUNTIME_DIR", root.join("runtime")),
+        ("XDG_CACHE_HOME", root.join("cache")),
+        ("XDG_STATE_HOME", root.join("state")),
+        ("XDG_DATA_HOME", root.join("data")),
+        ("TMPDIR", root.join("tmp")),
+    ];
+    let config = root.join("config/aterm");
+    for d in env.iter().map(|(_, d)| d).chain([&config]) {
+        std::fs::create_dir_all(d).map_err(|e| format!("could not create {}: {e}", d.display()))?;
+        private(d)?;
+    }
+    std::fs::write(config.join("aterm.toml"), super::start::CONFIG)
+        .map_err(|e| format!("could not write the config: {e}"))?;
+    Ok(env)
+}
+
 /// Launch `term` running `inner` (the in-terminal half's argv), wait for its
-/// report within `ceiling`, then stop the terminal by its own handle.
+/// report within `ceiling`, then stop the terminal by its own handle. aterm
+/// runs in a fresh [`private_root`] with its control socket beside the run's
+/// others.
 pub(crate) fn run_in(
     term: Term,
     aterm: &Aterm,
@@ -126,11 +153,18 @@ pub(crate) fn run_in(
     ceiling: Duration,
 ) -> Result<String, String> {
     let mut group = None;
+    let mut scratch = None;
     match term {
         Term::Aterm => {
+            let root = Scratch::new("arena-term")?;
+            let sockets = Scratch::sockets()?;
+            let env = private_root(root.path())?;
             let mut cmd = command(&aterm.bin);
             without_aterm_env(&mut cmd)
+                .envs(env)
                 .arg("--window")
+                .arg("--control-sock")
+                .arg(sockets.sock("t.sock")?)
                 .args(grid_args.0)
                 .arg("-e")
                 .args(inner)
@@ -138,6 +172,7 @@ pub(crate) fn run_in(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             group = Some(Group::spawn(&mut cmd)?);
+            scratch = Some((root, sockets));
         }
         Term::Ghostty => {
             live::opening(&ghostty.app);
@@ -162,6 +197,7 @@ pub(crate) fn run_in(
     if let Some(g) = group {
         g.retire()?;
     }
+    drop(scratch);
     live::stop_app(&ghostty.app);
     got
 }
@@ -310,6 +346,29 @@ mod tests {
     fn the_order_rotates_every_trial() {
         assert_eq!(order(1), [Term::Aterm, Term::Ghostty]);
         assert_eq!(order(2), [Term::Ghostty, Term::Aterm]);
+    }
+
+    #[test]
+    fn an_aterm_under_test_gets_a_private_home_and_xdg_tree_of_its_own() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = Scratch::new("arena-term-test").expect("scratch");
+        let env = private_root(root.path()).expect("private root");
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "TMPDIR",
+        ] {
+            let (_, dir) = env.iter().find(|(k, _)| *k == key).expect(key);
+            assert!(dir.starts_with(root.path()), "{key} {}", dir.display());
+            let mode = std::fs::metadata(dir).expect(key).permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{key}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("config/aterm/aterm.toml")).expect("config"),
+            super::super::start::CONFIG
+        );
     }
 
     #[test]

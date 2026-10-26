@@ -111,13 +111,16 @@ impl TerminalHandler<'_> {
         if path.is_some_and(|path| !reported_cwd_is_storable(path)) {
             return;
         }
-        if self.current_working_directory.as_deref() != path {
+        let host = host.filter(|_| path.is_some());
+        if self.current_working_directory.as_deref() != path
+            || self.shell.cwd_host.as_deref() != host
+        {
             self.title
                 .epoch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         *self.current_working_directory = path.map(String::from);
-        self.shell.cwd_host = host.filter(|_| path.is_some()).map(String::from);
+        self.shell.cwd_host = host.map(String::from);
         self.shell.cwd_reports = self.shell.cwd_reports.saturating_add(1);
         self.shell.cwd_carried = false;
     }
@@ -558,6 +561,109 @@ mod tests {
             term.title_epoch() > after_two,
             "title_epoch must increase when the cwd is cleared"
         );
+    }
+
+    fn assert_host_only_cwd_change_is_observable(report: &[u8], event: Option<&str>) {
+        let mut term = Terminal::new(4, 20);
+        term.process(b"\x1b]2;fixed title\x07source text\r\nkept row\x1b[2;5H");
+        let remote = b"\x1b]7;file://build-box.example/c/work\x07";
+        term.process(remote);
+        assert_eq!(term.current_working_directory(), Some("/c/work"));
+        assert_eq!(term.reported_cwd_host(), Some("build-box.example"));
+        assert_eq!(term.reported_cwd_seq(), Some(1));
+        assert_eq!(
+            term.take_osc_event(),
+            Some((7, "//build-box.example/c/work".into()))
+        );
+        assert_eq!(term.take_osc_event(), None);
+        let epoch = term.title_epoch();
+        term.process(remote);
+        assert_eq!(term.title_epoch(), epoch, "the same owner is a no-op");
+        assert_eq!(term.reported_cwd_seq(), Some(2));
+        assert_eq!(
+            term.take_osc_event(),
+            Some((7, "//build-box.example/c/work".into()))
+        );
+        term.process(b"\x1b]7;file://elsewhere/c/wo%00rk\x07");
+        assert_eq!(term.current_working_directory(), Some("/c/work"));
+        assert_eq!(term.reported_cwd_host(), Some("build-box.example"));
+        assert_eq!(
+            term.reported_cwd_seq(),
+            Some(2),
+            "the invalid report was refused"
+        );
+        assert_eq!(term.take_osc_event(), None);
+        assert_eq!(
+            term.title_epoch(),
+            epoch,
+            "a refusal moves no observer clock"
+        );
+        let grid = (
+            term.rows(),
+            term.cols(),
+            term.cursor(),
+            term.visible_content(),
+            term.content_seq(),
+        );
+
+        term.process(report);
+
+        assert_eq!(term.title(), "fixed title");
+        assert_eq!(term.current_working_directory(), Some("/c/work"));
+        assert_eq!(term.reported_cwd_host(), None, "the new report is local");
+        assert_eq!(term.reported_cwd_seq(), Some(3));
+        assert_eq!(term.take_osc_event(), event.map(|path| (7, path.into())));
+        assert_eq!(term.take_osc_event(), None);
+        let changed_epoch = term.title_epoch();
+        for (index, local) in [
+            "file:///c/work",
+            "file://localhost/c/work",
+            "file://LocalHost/c/work",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            term.process(format!("\x1b]7;{local}\x07").as_bytes());
+            assert_eq!(term.current_working_directory(), Some("/c/work"));
+            assert_eq!(term.reported_cwd_host(), None);
+            assert_eq!(term.reported_cwd_seq(), Some(4 + index as u64));
+            assert_eq!(term.take_osc_event(), Some((7, "/c/work".into())));
+            assert_eq!(term.take_osc_event(), None);
+            assert_eq!(
+                term.title_epoch(),
+                changed_epoch,
+                "normalized local owner unchanged"
+            );
+        }
+        assert_eq!(term.title(), "fixed title");
+        assert_eq!(
+            (
+                term.rows(),
+                term.cols(),
+                term.cursor(),
+                term.visible_content(),
+                term.content_seq()
+            ),
+            grid,
+            "CWD ownership changes neither grid, cursor nor content"
+        );
+        assert!(
+            changed_epoch > epoch,
+            "a new CWD host must be visible to title-epoch observers even when the raw path and title stay the same"
+        );
+    }
+
+    #[test]
+    fn title_epoch_observes_an_osc_7_host_change_with_the_same_path() {
+        assert_host_only_cwd_change_is_observable(
+            b"\x1b]7;file://localhost/c/work\x07",
+            Some("/c/work"),
+        );
+    }
+
+    #[test]
+    fn title_epoch_observes_an_osc_633_host_reset_with_the_same_path() {
+        assert_host_only_cwd_change_is_observable(b"\x1b]633;P;Cwd=/c/work\x07", None);
     }
 
     #[test]

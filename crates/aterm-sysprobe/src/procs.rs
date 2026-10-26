@@ -63,9 +63,9 @@ pub struct ProcessReading {
     /// Whether the kernel reaps its children for it (macOS `P_NOCLDWAIT`: it ignores `SIGCHLD`
     /// or set `SA_NOCLDWAIT`; a fork does not inherit it and an exec clears it), which then adds
     /// each child's time to its [`Self::child_cpu_ns`] twice (measured 2026-10-25: 400.4–401.6 ms
-    /// for a 200 ms child). Read, after the sweep's reads, for each process with reaped time and
-    /// for each whose usage goes unread that is the parent of one whose usage is read; `None`
-    /// otherwise, and off macOS.
+    /// for a 200 ms child). Read, after the sweep's reads, for every process, as each reading
+    /// finds it: nothing records it between two readings or after the process exits. `None`
+    /// where its record named another parent (a new process at the pid), and off macOS.
     pub reaps_unwaited: Option<bool>,
 }
 
@@ -444,26 +444,18 @@ pub(crate) mod imp {
     /// 749 records 96–115 µs (m22, 2026-10-25), as for births (the host's `BIRTHS_AT_ONCE`).
     const UNWAITED_AT_ONCE: usize = 12;
 
-    /// Reads [`ProcessReading::reaps_unwaited`] of each process whose reaped time is above 0
-    /// (only a reap moves it, and only one that ran with the flag set counts twice) and of each
-    /// whose usage goes unread that parents one whose usage is read (another user's `sudo`,
-    /// which may reap a member and pass its time up later): from its `kinfo_proc`, or from the
-    /// whole table past [`UNWAITED_AT_ONCE`]; one whose record names another parent is a new
-    /// process at the pid and stays unread. A zombie's came with its record.
+    /// Reads [`ProcessReading::reaps_unwaited`] of every live process (a zombie's came with its
+    /// record): of one that has reaped nothing yet too, since the kernel may reap its first
+    /// children for it and it may go before a reading shows their doubled time, and of one whose
+    /// usage goes unread (another user's `sudo`, which may reap a member and pass its time up
+    /// later). From the whole table, or from each one's `kinfo_proc` where the sweep holds no
+    /// more than [`UNWAITED_AT_ONCE`]; one whose record names another parent is a new process at
+    /// the pid and stays unread.
     fn read_unwaited(procs: &mut [ProcessReading]) {
-        let parents: std::collections::HashSet<u32> = procs
-            .iter()
-            .filter(|p| p.cpu_ns.is_some())
-            .map(|p| p.ppid)
-            .collect();
         let wanted: Vec<usize> = procs
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                p.reaps_unwaited.is_none()
-                    && (p.child_cpu_ns.is_some_and(|c| c > 0)
-                        || (p.cpu_ns.is_none() && p.pid > 1 && parents.contains(&p.pid)))
-            })
+            .filter(|(_, p)| p.reaps_unwaited.is_none())
             .map(|(i, _)| i)
             .collect();
         let table = (wanted.len() > UNWAITED_AT_ONCE)
@@ -1063,7 +1055,8 @@ mod tests {
 
     /// The spin stand-in's switch: [`spin_stand_in`] spins until it has run [`SPIN_NS`] of CPU;
     /// at `nested` it first runs and reaps one more spinner of its own, then says `ready` and
-    /// spins only on a byte.
+    /// spins only on a byte; at `nocld` and `ignore` it is [`nocld_stand_in`] and
+    /// [`ignore_stand_in`].
     #[cfg(target_os = "macos")]
     const SPIN_VAR: &str = "ATERM_SYSPROBE_SPIN";
 
@@ -1104,6 +1097,9 @@ mod tests {
         };
         if how == "nocld" {
             nocld_stand_in();
+        }
+        if how == "ignore" {
+            ignore_stand_in();
         }
         if how == "nested" {
             let status =
@@ -1190,6 +1186,50 @@ mod tests {
         let mut byte = [0; 1];
         let _ = std::io::stdin().read(&mut byte);
         std::process::exit(0);
+    }
+
+    /// [`spin_stand_in`] at `ignore`: ignores `SIGCHLD` and, having started and reaped nothing,
+    /// says `ready` and waits for a byte.
+    #[cfg(target_os = "macos")]
+    fn ignore_stand_in() -> ! {
+        use std::io::{Read as _, Write as _};
+        // SAFETY: sets one signal's disposition; this process starts no child.
+        let before = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        assert_ne!(before, libc::SIG_ERR, "SIGCHLD ignored");
+        println!("\nready");
+        std::io::stdout().flush().expect("the ready proof");
+        let mut byte = [0; 1];
+        let _ = std::io::stdin().read(&mut byte);
+        std::process::exit(0);
+    }
+
+    /// A PARENT THAT IGNORES `SIGCHLD` READS SO BEFORE ITS FIRST REAP (macOS, live): the kernel
+    /// may reap its first children for it, doubling their time, and it may go before any reading
+    /// shows that time, so the sweep reads the flag of a process that has reaped nothing too: a
+    /// stand-in that ignores `SIGCHLD` and has reaped nothing reads `Some(true)`. NEGATIVE
+    /// CONTROL: the zombie test's stand-in, which waits for its children, reads `Some(false)`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_parent_ignoring_sigchld_reads_so_before_its_first_reap() {
+        use std::io::Write as _;
+        let (mut child, saw) = stand_in(SPIN_STAND_IN, (SPIN_VAR, "ignore".as_ref()));
+        let pid = child.id();
+        saw("ready");
+        let row = processes()
+            .expect("a sweep")
+            .procs
+            .into_iter()
+            .find(|p| p.pid == pid)
+            .expect("the stand-in swept");
+        child
+            .stdin
+            .take()
+            .expect("its stdin")
+            .write_all(b"x")
+            .expect("the byte that ends it");
+        child.wait().expect("reaped");
+        assert_eq!(row.child_cpu_ns, Some(0), "it reaped nothing: {row:?}");
+        assert_eq!(row.reaps_unwaited, Some(true), "its row: {row:?}");
     }
 
     /// A PARENT THAT IGNORES `SIGCHLD` HAS ITS CHILD'S TIME ADDED TO ITS REAPED TIME TWICE, AND

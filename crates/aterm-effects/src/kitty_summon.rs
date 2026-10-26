@@ -131,10 +131,17 @@ impl TypedKittySummon {
             self.buf.drain(..split);
             return;
         }
-        if let Some((split, _)) = self.buf.char_indices().rev().nth(BUF_CAP - 1)
-            && split > 0
-        {
-            self.buf.drain(..split);
+        let bytes = self.buf.as_bytes();
+        let mut idx = bytes.len();
+        let mut chars = 0usize;
+        while idx > 0 && chars < BUF_CAP {
+            idx -= 1;
+            if (bytes[idx] & 0xC0) != 0x80 {
+                chars += 1;
+            }
+        }
+        if idx > 0 {
+            self.buf.drain(..idx);
         }
     }
 
@@ -210,20 +217,24 @@ impl TypedKittySummon {
     }
 
     fn trailing_scan_start(buf: &str, last: char) -> usize {
+        #[inline]
+        const fn is_ascii_tok(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+
         if buf.is_ascii() {
             let bytes = buf.as_bytes();
             if bytes.is_empty() {
                 return 0;
             }
-            let is_tok = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
             let mut k = bytes.len() - 1;
             while k > 0 {
                 let b = bytes[k - 1];
-                if is_tok(b) {
+                if is_ascii_tok(b) {
                     k -= 1;
                 } else if b == b'\'' || b == b'-' {
                     k -= 1;
-                    if k > 0 && is_tok(bytes[k - 1]) {
+                    if k > 0 && is_ascii_tok(bytes[k - 1]) {
                         k -= 1;
                     } else {
                         return k.saturating_sub(1);

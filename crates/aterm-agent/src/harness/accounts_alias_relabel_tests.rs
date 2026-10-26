@@ -76,6 +76,39 @@ fn fixture(case: i64) -> (Option<Roster>, FleetRoster, Option<&'static str>) {
     (Some(old), fleet, hint)
 }
 
+fn default_unlisted(built: &Roster, observed: Option<&str>) -> bool {
+    let desk = super::login_tests::Desk::new("m1");
+    let config = desk.config.join("aterm.toml");
+    fs::write(
+        &config,
+        "[fleet]\nmachine = \"m1\"\naccounts_source = \"https://example.test/fleet.csv\"\n",
+    )
+    .unwrap();
+    fs::write(desk.roster(), format_roster_toml(built).unwrap()).unwrap();
+    if let Some(email) = observed {
+        desk.default_login(email);
+    }
+    let rediscovery = std::sync::Mutex::new(Rediscovery::default());
+    let due = default_login_unlisted(
+        &desk.home,
+        &desk.state,
+        (&desk.roster(), &config),
+        super::login_tests::NOW,
+        &rediscovery,
+    );
+    assert_eq!(rediscovery.lock().unwrap().synced_for.is_some(), due);
+    if due {
+        assert!(!default_login_unlisted(
+            &desk.home,
+            &desk.state,
+            (&desk.roster(), &config),
+            super::login_tests::NOW,
+            &rediscovery,
+        ));
+    }
+    due
+}
+
 pub(crate) fn alias_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -85,11 +118,19 @@ pub(crate) fn alias_transition(
         next.insert("case", state["case"] + 1);
         return next;
     }
-    assert_eq!(action, "Build");
     let (old, fleet, hint) = fixture(state["case"]);
     let store = accounts::Store::at(Path::new("/tmp/aterm-alias-model"));
     let built = build_machine_roster(&fleet, "m1", &store, old.as_ref(), hint);
     Roster::parse(&format_roster_toml(&built).unwrap()).unwrap();
+    if action == "ChangedDefault" {
+        next.insert("phase", 2);
+        next.insert(
+            "unlisted",
+            i64::from(default_unlisted(&built, Some("different@example.test"))),
+        );
+        return next;
+    }
+    assert_eq!(action, "Build");
     let default = match built.row_for_login(None).unwrap().label.as_str() {
         "m1" => 1,
         "m1-2" => 2,
@@ -141,13 +182,16 @@ pub(crate) fn alias_transition(
     next.insert("relocation", relocation);
     next.insert("payload", i64::from(payload));
     next.insert("browser_safe", i64::from(browser_safe));
+    next.insert("unlisted", i64::from(default_unlisted(&built, hint)));
     next
 }
 
 #[test]
 fn alias_relabel_native_conforms_to_identity_and_move_model() {
     let model = aterm_models_harness::account_alias_relabel_model();
+    assert_eq!(model.mutant_dials(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    let (mut builds, mut changes) = (0, 0);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -157,9 +201,12 @@ fn alias_relabel_native_conforms_to_identity_and_move_model() {
                     "{}: {state:?} -> {next:?}",
                     action.name
                 );
+                builds += usize::from(action.name == "Build");
+                changes += usize::from(action.name == "ChangedDefault");
             }
         }
     }
+    assert_eq!((builds, changes), (12, 12));
     let accepted = alias_transition(&model.init_state(), "Build");
     for (field, bad_value, law) in [
         ("identity", 0, "IdentityBoundToLogin"),
@@ -168,11 +215,15 @@ fn alias_relabel_native_conforms_to_identity_and_move_model() {
         ("relocation", 1, "RelocationDecision"),
         ("payload", 0, "PayloadPreserved"),
         ("browser_safe", 0, "BrowserBoundToLogin"),
+        ("unlisted", 1, "NoNeedlessRediscovery"),
     ] {
         let mut bad = accepted.clone();
         bad.insert(field, bad_value);
         assert!(!model.check_invariant(law, &bad));
     }
+    let mut changed = alias_transition(&accepted, "ChangedDefault");
+    changed.insert("unlisted", 0);
+    assert!(!model.check_invariant("ChangedDefaultDetected", &changed));
 }
 
 #[test]

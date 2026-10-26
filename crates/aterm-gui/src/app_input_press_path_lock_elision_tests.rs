@@ -152,6 +152,155 @@ fn glow_tick(
     glow.spawns()
 }
 
+/// Admission history belongs to the views that produced it, not the tab or
+/// same-session mirror that happens to be front when the diagnostics are read.
+#[cfg(unix)]
+#[test]
+fn trail_admission_provenance_survives_tab_and_shared_session_view_changes() {
+    use std::time::Instant;
+
+    let (mut app, pipe, cfg) = rainbow_app();
+    let wid = WindowId(0);
+    let source = app.front_terminal(wid).unwrap().session;
+    let source_view = app.windows[&wid].tab_set.active().unwrap().focus;
+    let config = app.native_config_service.snapshot();
+    let field = |row: &str, key: &str, value: u64| {
+        let expected = format!("{key}={value}");
+        row.split_ascii_whitespace().any(|token| token == expected)
+    };
+    let check_target = |app: &App, owner: WindowId, view: crate::tab_model::ViewId, sid| {
+        let mut failures = Vec::new();
+        let rows = app.trail_admissions(Some(0)).unwrap();
+        let target = rows.iter().find(|row| row.starts_with("trail-target "));
+        let status = app.trail_status().unwrap();
+        for (key, value) in [("window", owner.0), ("view", view.get()), ("session", sid)] {
+            if !target.is_some_and(|row| field(row, key, value)) {
+                failures.push(format!("admission target lacks {key}={value}: {rows:?}"));
+            }
+            if !field(&status, key, value) {
+                failures.push(format!("standing target lacks {key}={value}"));
+            }
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.starts_with("admission "))
+                .count(),
+            0,
+            "the target row does not spend the requested admission limit"
+        );
+        failures
+    };
+    let mut failures = check_target(&app, wid, source_view, source);
+    app.on_key(wid, character_event('a', ElementState::Pressed));
+    app.on_key(wid, character_event('a', ElementState::Released));
+    assert_eq!(drain(pipe), b"a", "the actual key reaches A's sink");
+    term_lock(&app.front_terminal(wid).unwrap().term).process(b"a");
+    glow_tick(&mut app, &cfg, (0, 1), Instant::now());
+    let first = *app.windows[&wid]
+        .fx
+        .cursor()
+        .glow
+        .admission_log()
+        .last()
+        .unwrap();
+    assert_eq!(first.phase, crate::cursor_glow::AdmissionPhase::Licensed);
+    assert_eq!(first.licence, "key");
+    assert_eq!((first.origin, first.target), ((0, 0), (0, 1)));
+    assert!(first.seq > 0);
+
+    let sibling = app.next_session_id;
+    let sink = app.pool.get(source).unwrap().ctx.sink.clone();
+    app.push_stub_tab(wid, crate::stub_session_with_sink(sibling, sink));
+    let sibling_view = app.windows[&wid].tab_set.active().unwrap().focus;
+    assert_eq!(app.front_terminal(wid).unwrap().session, sibling);
+    assert_ne!(source_view, sibling_view);
+    assert_eq!(
+        app.windows[&wid]
+            .fx
+            .cursor()
+            .glow
+            .admission_log()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first],
+        "switching targets retains the actual historical admission"
+    );
+    failures.extend(check_target(&app, wid, sibling_view, sibling));
+    glow_tick(&mut app, &cfg, (0, 0), Instant::now());
+    app.on_key(wid, character_event('b', ElementState::Pressed));
+    app.on_key(wid, character_event('b', ElementState::Released));
+    assert_eq!(drain(pipe), b"b", "the actual key reaches B's sink");
+    term_lock(&app.front_terminal(wid).unwrap().term).process(b"b");
+    glow_tick(&mut app, &cfg, (0, 1), Instant::now());
+    let records = app.windows[&wid]
+        .fx
+        .cursor()
+        .glow
+        .admission_log()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0], first, "new input never rewrites old records");
+    assert_eq!(
+        records[1].phase,
+        crate::cursor_glow::AdmissionPhase::Licensed
+    );
+    assert!(records[1].seq > first.seq);
+    let rows = app.trail_admissions(Some(1)).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.starts_with("admission "))
+            .count(),
+        1
+    );
+    for (record, view, session) in [
+        (records[0], source_view, source),
+        (records[1], sibling_view, sibling),
+    ] {
+        let row = record.line(Instant::now());
+        if !field(&row, "source_view", view.get()) || !field(&row, "source_session", session) {
+            failures.push(format!(
+                "sequence {} lost its producing view/session: {row}",
+                record.seq
+            ));
+        }
+    }
+    app.switch_tab_in(wid, 0);
+    assert_eq!(app.front_terminal(wid).unwrap().session, source);
+    assert_eq!(
+        app.windows[&wid]
+            .fx
+            .cursor()
+            .glow
+            .admission_log()
+            .copied()
+            .collect::<Vec<_>>(),
+        records
+    );
+    failures.extend(check_target(&app, wid, source_view, source));
+
+    let mirror = app.open_active_session_in_new_window_logical().unwrap();
+    let mirror_view = app.windows[&mirror].tab_set.active().unwrap().focus;
+    assert_ne!(mirror_view, source_view);
+    assert_eq!(app.frontmost_window, Some(mirror));
+    assert_eq!(app.front_terminal(mirror).unwrap().session, source);
+    failures.extend(check_target(&app, mirror, mirror_view, source));
+    assert!(
+        app.windows[&mirror]
+            .fx
+            .cursor()
+            .glow
+            .admission_log()
+            .next()
+            .is_none()
+    );
+    assert!(app.structural_invariants_ok());
+    assert_eq!(app.native_config_service.snapshot(), config);
+    drop(app);
+    unsafe { libc::close(pipe) };
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A focus roundtrip and a status repaint leave ordinary input measurable.
 #[cfg(unix)]
 #[test]

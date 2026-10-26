@@ -11,7 +11,7 @@ use std::path::Path;
 use aterm_agent::supervise::journal::Word;
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
-    RULE_DONE_CHECK, RULE_LAND, RULE_SUGGESTION, TurnEndTiming,
+    RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, TurnEndTiming,
 };
 
 use crate::forever::{self, Chain, Repo};
@@ -37,10 +37,11 @@ pub enum Scene {
     /// Cruise's same-reply hold, the `cruise` chain's: a done claim, a done check, a defense, a
     /// done check, the same defense again: held (`kind=stalled`).
     SameReply,
-    /// Cruise over Claude Code's grey suggestion: a work reply after a tool call, its suggestion
-    /// accepted (`continue-suggestion@v1`); a done claim, the done check typed over the
-    /// suggestion it drew again; the defense, and the next point decided. 2.1.310 draws the
-    /// suggestion's first glyph inverse, under the caret it draws itself, and the rest dim.
+    /// Cruise over Claude Code's grey suggestion: a work reply after a tool call, Cruise's whole
+    /// continuation (`continue@v1`) typed over its suggestion, never the suggestion accepted bare
+    /// (v6 §14.5); a done claim, the done check typed over the suggestion it drew again; the
+    /// defense, and the next point decided. 2.1.310 draws the suggestion's first glyph inverse,
+    /// under the caret it draws itself, and the rest dim.
     Placeholder,
 }
 
@@ -194,13 +195,14 @@ pub const SUGGESTIONS_ON: &str = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
 /// (2.1.310): the conversation so far, then this as the last user message.
 pub const SUGGESTION_KEY: &str = "[SUGGESTION MODE:";
 
-/// The suggestion the stub drafts: a continuation the turn-end policy accepts bare
-/// (`turn_end::suggestion_allowed`).
+/// The suggestion the stub drafts: a continuation a build before v6's 5a accepted bare
+/// (`turn_end::suggestion_allowed`), which Cruise now types its own words over.
 pub const SUGGESTION: &str = "keep going";
 
 /// The placeholder scene's spec: the suggestion request answered with [`SUGGESTION`] at once;
-/// the done check with the clean defense; an accepted suggestion (or Cruise's own words, which
-/// hold it) with the done claim; the first prompt with a read of `readme` and the work reply,
+/// the done check with the clean defense; Cruise's continuation typed over the suggestion (whose
+/// words hold it, as an accepted suggestion's did) with the done claim; the first prompt with a
+/// read of `readme` and the work reply,
 /// so that its turn holds the two replies Claude Code drafts a suggestion after. (It drafts none
 /// after a reply that cost more than 10,000 tokens, which the stub counts from the request's
 /// size: the lean launch's requests stay well under.)
@@ -288,12 +290,12 @@ pub fn end_of(scene: Scene, lines: &[String]) -> Option<usize> {
             .iter()
             .position(|l| verb(l) == "EXCEPTION" && says(l, &stalled)),
         Scene::Placeholder => {
-            let accepted = lines
+            let continued = lines
                 .iter()
-                .position(|l| continued_rule(l) == Some(RULE_SUGGESTION))?;
-            let checked = accepted
+                .position(|l| continued_rule(l) == Some(RULE_CONTINUE))?;
+            let checked = continued
                 + 1
-                + lines[accepted + 1..]
+                + lines[continued + 1..]
                     .iter()
                     .position(|l| continued_rule(l) == Some(RULE_DONE_CHECK))?;
             lines[checked + 1..]
@@ -320,9 +322,10 @@ pub fn prepare(ctx: &Ctx, scene: Scene) -> Result<Launch, ScnErr> {
 
 /// Plays `scene` on a lab whose Claude Code shows its composer: types the first prompt and
 /// waits for the scene's end ([`end_of`]), then a moment more for the loop to settle on it.
-/// What the loop typed, the end's line and (for the placeholder) the composer the done check
-/// was typed over go into the summary; a scene that does not reach its end puts an `error`,
-/// which `tape promote` refuses.
+/// What the loop typed, the end's line and (for the placeholder) the composers its continuation
+/// and its done check were typed over go into the summary; a scene that does not reach its end,
+/// or a placeholder scene whose acts were not typed over the suggestion, puts an `error`, which
+/// `tape promote` refuses.
 /// # Errors
 /// Interrupted.
 pub fn play(ctx: &mut Ctx, scene: Scene) -> Result<(), ScnErr> {
@@ -368,33 +371,38 @@ pub fn play(ctx: &mut Ctx, scene: Scene) -> Result<(), ScnErr> {
     ctx.mark(&format!("scene end: {}", lines[at]), None);
     ctx.put("end", J::s(lines[at].as_str()));
     if scene == Scene::Placeholder {
-        let checked = journal.iter().skip(from).find_map(|(w, r)| {
-            let line = rec_s(r, "line");
-            (continued_rule(&line) == Some(RULE_DONE_CHECK)).then(|| {
-                let t = rec_t(r);
-                (
-                    if t > 0.0 { t } else { *w },
-                    continued_words(&line).to_string(),
-                )
-            })
-        });
-        let over = checked.and_then(|(t, words)| {
-            ctx.frames()
-                .iter()
-                .filter(|f| f.wall < t)
-                .filter_map(crate::record::Frame::comp)
-                .rfind(|c| !typing(c, &words))
-        });
-        if !over_suggestion(over.as_deref()) {
-            ctx.put(
-                "error",
-                format!(
-                    "{}: its done check was typed over {over:?}, not the suggestion {SUGGESTION:?}",
-                    scene.name()
-                ),
-            );
+        for (rule, what, key) in [
+            (RULE_CONTINUE, "continuation", "composer_at_continue"),
+            (RULE_DONE_CHECK, "done check", "composer_at_check"),
+        ] {
+            let typed = journal.iter().skip(from).find_map(|(w, r)| {
+                let line = rec_s(r, "line");
+                (continued_rule(&line) == Some(rule)).then(|| {
+                    let t = rec_t(r);
+                    (
+                        if t > 0.0 { t } else { *w },
+                        continued_words(&line).to_string(),
+                    )
+                })
+            });
+            let over = typed.and_then(|(t, words)| {
+                ctx.frames()
+                    .iter()
+                    .filter(|f| f.wall < t)
+                    .filter_map(crate::record::Frame::comp)
+                    .rfind(|c| !typing(c, &words))
+            });
+            if !over_suggestion(over.as_deref()) {
+                ctx.put(
+                    "error",
+                    format!(
+                        "{}: its {what} was typed over {over:?}, not the suggestion {SUGGESTION:?}",
+                        scene.name()
+                    ),
+                );
+            }
+            ctx.put(key, over.map_or(J::Null, J::s));
         }
-        ctx.put("composer_at_check", over.map_or(J::Null, J::s));
     }
     let settle = settle_after(scene.ends_quiet(), &lines[..at]);
     ctx.put("settle_s", J::Float(settle.as_secs_f64()));
@@ -441,7 +449,9 @@ const QUIET_MARGIN_S: u64 = 20;
 mod tests {
     use super::*;
     use aterm_agent::supervise::config::CONTINUE_TEXT;
-    use aterm_agent::supervise::policy::turn_end::{DONE_CHECK, suggestion_allowed};
+    use aterm_agent::supervise::policy::turn_end::{
+        DONE_CHECK, RULE_SUGGESTION, done_check_words, suggestion_allowed,
+    };
 
     fn reply<'a>(spec: &'a J, users: &[&str]) -> (&'a str, Option<&'a J>) {
         let users: Vec<String> = users.iter().map(|u| (*u).to_string()).collect();
@@ -473,15 +483,17 @@ mod tests {
         assert_eq!((text, tool), (SUGGESTION, None));
         assert!(
             suggestion_allowed(text),
-            "the policy accepts the suggestion bare"
+            "a build before 5a accepted the suggestion bare"
         );
         for typed in [SUGGESTION, CONTINUE_TEXT] {
             assert_eq!(reply(&spec, &[&prompt, typed]).0, forever::DONE_CLAIM);
         }
-        assert_eq!(
-            reply(&spec, &[&prompt, SUGGESTION, DONE_CHECK]).0,
-            forever::CLEAN
-        );
+        for check in [DONE_CHECK.to_string(), done_check_words(0)] {
+            assert_eq!(
+                reply(&spec, &[&prompt, CONTINUE_TEXT, &check]).0,
+                forever::CLEAN
+            );
+        }
     }
 
     #[test]
@@ -535,7 +547,7 @@ mod tests {
         }
         let placeheld = lines(&[
             "CONTINUED seq=30 rule=continue-done-check@v1 before the suggestion",
-            "CONTINUED seq=40 rule=continue-suggestion@v1 keep going",
+            "CONTINUED seq=40 rule=continue@v1 [aterm harness] Autopilot is Cruise: keep going.",
             "WAITING seq=41 4 short turn(s) in a row: 4 min back-off",
             "CONTINUED seq=55 rule=continue-done-check@v1 …",
             "NOTE seq=56 the reply is read",
@@ -544,6 +556,16 @@ mod tests {
         assert_eq!(end_of(Scene::Placeholder, &placeheld), Some(5));
         assert_eq!(end_of(Scene::Placeholder, &placeheld[..5]), None);
         assert_eq!(end_of(Scene::Placeholder, &placeheld[2..]), None);
+        let accepted = lines(&[
+            "CONTINUED seq=40 rule=continue-suggestion@v1 keep going",
+            "CONTINUED seq=55 rule=continue-done-check@v1 …",
+            "WAITING seq=60 3 short turn(s) in a row: 8 min back-off",
+        ]);
+        assert_eq!(
+            end_of(Scene::Placeholder, &accepted),
+            None,
+            "a suggestion accepted bare (2f's decision) is not the scene's end"
+        );
     }
 
     /// A landing or a hold runs on past its next rung: c5's landing, the second short turn, a
@@ -574,8 +596,8 @@ mod tests {
         assert_eq!(settle_after(true, &[]), s(15) + margin);
     }
 
-    /// The placeholder scene is kept only where its done check was typed over the stub's
-    /// suggestion. NEGATIVE CONTROLS: none read, a person's draft, the idle hint.
+    /// The placeholder scene is kept only where its continuation and its done check were typed
+    /// over the stub's suggestion. NEGATIVE CONTROLS: none read, a person's draft, the idle hint.
     #[test]
     fn the_done_check_is_kept_only_over_the_suggestion() {
         assert!(over_suggestion(Some(SUGGESTION)));
@@ -598,16 +620,17 @@ mod tests {
         assert_eq!(continued_rule("WAITING seq=9 rule=x@v1 overloaded"), None);
     }
 
-    /// The composer a done check was typed over is the last one before its typing began.
-    /// NEGATIVE CONTROL: the suggestion it replaced is not its typing.
+    /// The composer an act was typed over is the last one before its typing began. NEGATIVE
+    /// CONTROL: the suggestion it replaced is not its typing.
     #[test]
     fn a_composer_mid_act_is_the_acts_typing_and_the_suggestion_is_not() {
-        let words = DONE_CHECK;
-        let head: String = words.chars().take(5).collect();
-        assert!(typing(&head, words));
-        assert!(typing(words, words));
-        assert!(!typing(SUGGESTION, words));
-        assert!(!typing("", words));
+        for words in [done_check_words(0).as_str(), CONTINUE_TEXT] {
+            let head: String = words.chars().take(5).collect();
+            assert!(typing(&head, words));
+            assert!(typing(words, words));
+            assert!(!typing(SUGGESTION, words));
+            assert!(!typing("", words));
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ fn lines_grammar(signin: &SignIn, flow: Flow) -> (&'static Grammar, Completion, 
             completion,
             ..
         } => (grammar, *completion, &route.hosts),
-        Drive::AppServer => panic!("a line route"),
+        Drive::CodexPkce => panic!("a line route"),
     }
 }
 

@@ -3249,7 +3249,7 @@ fn replied_under_a_shell(reply: &str, fired_row: bool) -> Vec<String> {
 #[test]
 fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report() {
     use crate::supervise::policy::turn_end::{
-        DONE_CHECK, DONE_CHECK_REVERSIBLE, RULE_DONE_CHECK, RULE_LIMIT_RESUME,
+        DONE_CHECK_REVERSIBLE, RULE_DONE_CHECK, RULE_LIMIT_RESUME, done_check_words,
     };
     const RESET: i64 = 1_791_999_480;
     let done = "All done: the change is committed and pushed, and every suite passes.";
@@ -3363,7 +3363,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             (
                 done,
                 TurnEndAction::Type {
-                    text: DONE_CHECK.to_string(),
+                    text: done_check_words(0),
                     rule_id: RULE_DONE_CHECK,
                 },
                 false,
@@ -3371,7 +3371,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             (
                 "All done. Shall I delete the old release branches?",
                 TurnEndAction::Type {
-                    text: format!("{DONE_CHECK} {DONE_CHECK_REVERSIBLE}"),
+                    text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
                     rule_id: RULE_DONE_CHECK,
                 },
                 false,
@@ -3379,7 +3379,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             (
                 "All done.\nATERM-TASK-DONE",
                 TurnEndAction::Type {
-                    text: DONE_CHECK.to_string(),
+                    text: done_check_words(0),
                     rule_id: RULE_DONE_CHECK,
                 },
                 false,

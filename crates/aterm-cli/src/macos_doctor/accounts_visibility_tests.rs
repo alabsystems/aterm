@@ -49,21 +49,30 @@ pub(super) fn system_after_signout(
             len: 0,
         },
     );
+    sys.logged_in(&aterm_machines::model::User {
+        name: "alice".into(),
+        uid: 501,
+        gid: 20,
+        home: "/Users//alice".into(),
+        shell: "/bin/zsh".into(),
+        admin: true,
+    });
+    // Accessibility is on: the sign-out's clicks run.
+    sys.trusts(&[true]);
     let account = Arc::clone(account);
     sys.simulate(move |_, cmd| {
         let args: Vec<_> = cmd.args.iter().map(|arg| arg.to_str().unwrap()).collect();
         let answer = match cmd.program.to_str().unwrap() {
-            "/usr/bin/id" => "alice\n",
-            "/usr/bin/dscl" if args.contains(&"/Groups/admin") => {
-                "GroupMembership: alice\n"
-            }
-            "/usr/bin/dscl" => {
-                "UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"
-            }
-            "/usr/bin/uname" => "arm64\n",
-            "/usr/bin/sw_vers" => "27.0\n",
+            "/usr/bin/hidutil" => "Services:\n\nDevices:\n",
             "/usr/bin/defaults" => {
-                assert!(matches!(args.as_slice(), ["export", "com.apple.imservice.ids.iMessage" | "com.apple.imservice.ids.FaceTime", "-"]));
+                assert!(matches!(
+                    args.as_slice(),
+                    [
+                        "export",
+                        "com.apple.imservice.ids.iMessage" | "com.apple.imservice.ids.FaceTime",
+                        "-"
+                    ]
+                ));
                 if matches!(preflight, Some(Preflight::Unknown))
                     || (preflight.is_none() && account.unreadable)
                 {
@@ -75,6 +84,8 @@ pub(super) fn system_after_signout(
                     "<dict><key>ActiveAccounts</key><array/></dict>"
                 }
             }
+            // The Automation question for System Events, asked before any app opens.
+            "/usr/bin/osascript" if args.len() == 2 => "System Events",
             "/usr/bin/osascript" if args.first() == Some(&"-e") => {
                 assert!(["Messages", "FaceTime"].contains(&args[3]));
                 account.signouts.fetch_add(1, Ordering::SeqCst);
@@ -85,7 +96,6 @@ pub(super) fn system_after_signout(
             "/usr/bin/osascript" if args.get(4) == Some(&"--") => {
                 r#"{"panes":["iMessage"],"sign_out":["Sign Out"]}"#
             }
-            "/usr/bin/osascript" => "true",
             other => panic!("unexpected inert account tool: {other}"),
         };
         Some(Ran::ok(answer))

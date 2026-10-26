@@ -678,6 +678,7 @@ fn title_cx(chain: Chain, program: &'static str) -> Ctx<'static> {
 /// title is the others' negative control.
 #[test]
 fn every_chip_title_says_its_modes_sentence_from_mode_words() {
+    use aterm_agent::harness::acts::{HeldBy, StopForm, stop_words};
     use aterm_agent::supervise::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let title = |mode: &str, m: Autopilot| {
@@ -710,6 +711,29 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     let held = "autopilot: land \u{2014} not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} landing since 14:02 \u{b7} click: off";
     assert_eq!(title_says(held, "land"), TitleSays::Held);
     assert!(matches!(title_says(held, "cruise"), TitleSays::Wrong(_)));
+    // 3a: a stopped tab's title says the stop in the sentence's place, under Land or Cruise.
+    let stopped = |mode: &str, arm: HeldBy| {
+        format!(
+            "autopilot: {mode} \u{2014} {} \u{b7} not landed yet: 1 untracked file \u{b7} click: x",
+            stop_words(arm, StopForm::Title)
+        )
+    };
+    for arm in HeldBy::ALL {
+        for mode in ["land", "cruise"] {
+            assert_eq!(
+                title_says(&stopped(mode, arm), mode),
+                TitleSays::Stopped(arm)
+            );
+        }
+        assert!(matches!(
+            title_says(&stopped("off", arm), "off"),
+            TitleSays::Wrong(_)
+        ));
+        assert!(matches!(
+            title_says(&stopped("land", arm), "cruise"),
+            TitleSays::Wrong(_)
+        ));
+    }
     let unread = format!(
         "autopilot: land \u{2014} {} \u{b7} landing since 14:02",
         mode_words(Autopilot::Land).chip
@@ -757,6 +781,33 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         matches!(ok(&b, Chain::LandB, "claude"), Verdict::Pass(_)),
         "{:?}",
         ok(&b, Chain::LandB, "claude")
+    );
+    let stop = stopped("land", HeldBy::SameReply);
+    let s3a = title_seen(
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&stop))),
+    );
+    assert!(
+        matches!(ok(&s3a, Chain::LandB, "claude"), Verdict::Pass(_)),
+        "{:?}",
+        ok(&s3a, Chain::LandB, "claude")
+    );
+    let cruise_stop = stopped("cruise", HeldBy::SameReply);
+    let crossed = title_seen(
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+        Some(drawn_title("claude", "cruise", "\"∞\"", &qt(&cruise_stop))),
+    );
+    assert!(
+        matches!(ok(&crossed, Chain::LandB, "claude"), Verdict::Fail(_)),
+        "a cruise stop on a Land chain"
+    );
+    let stopped_early = title_seen(
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&stop))),
+        None,
+    );
+    assert!(
+        matches!(ok(&stopped_early, Chain::LandB, "claude"), Verdict::Fail(_)),
+        "a stop before its first prompt"
     );
     let early = title_seen(
         Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(held))),

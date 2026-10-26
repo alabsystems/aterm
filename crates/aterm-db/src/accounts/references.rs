@@ -242,6 +242,36 @@ impl<'a> Graph<'a> {
         }
     }
 
+    fn details(&mut self, object: &Key, field: &str, value: &Value) {
+        let Some(details) = value.get(field).and_then(Value::as_object) else {
+            return;
+        };
+        for (name, detail) in details {
+            let (kind, collection) = match detail.get("kind").and_then(Value::as_str) {
+                Some("phone-ref") => ("phone", "phones"),
+                Some("email-ref") => ("email", "email-addresses"),
+                // Secrets and source identifiers have no contact-table authority.
+                _ => continue,
+            };
+            if !self.step() {
+                break;
+            }
+            let field = format!("{field}[{name}]");
+            let Some(reference) = detail.get("value").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = match reference.split_once(':') {
+                None if crate::crypto::name(reference) => reference,
+                Some((prefix, id)) if prefix == collection && crate::crypto::name(id) => id,
+                _ => {
+                    self.issue(object, &field, "unsupported-contact-reference", None);
+                    continue;
+                }
+            };
+            let _ = self.identity(object, &field, kind, id);
+        }
+    }
+
     fn object(&mut self, key: &Key, value: &'a Value) {
         match key.0.as_str() {
             "email-addresses" => {
@@ -263,6 +293,12 @@ impl<'a> Graph<'a> {
             "mailboxes" => self.auth(key, value),
             _ => {}
         }
+        // Follow typed contact references only at the root inspection. A linked
+        // contact's details are inspected in its own turn, never recursively.
+        self.details(key, "details", value);
+        if key.0 == "accounts" {
+            self.details(key, "source", value);
+        }
     }
 }
 
@@ -283,6 +319,8 @@ fn evidence(cell: Option<&Cell>) -> Value {
 /// Inspect only observed local proposals. Missing optional metadata is not an
 /// error. Neither issue absence nor a named secret proves a usable login, a
 /// delivery route, provider support, machine assignment or spend authority.
+/// Typed phone/email details use exact local contact IDs; other qualifications
+/// are reported without echoing their value. Secret/source references stay opaque.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -344,6 +382,38 @@ fn evidence(cell: Option<&Cell>) -> Value {
     aterm_spec_anchor::refines(
         machine = "DbAccountReferences",
         action = "Limit",
+        project = "aterm_db::accounts::references::tests::reference_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAccountReferences",
+        action = "DetailMissing",
+        project = "aterm_db::accounts::references::tests::reference_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAccountReferences",
+        action = "DetailAlias",
+        project = "aterm_db::accounts::references::tests::reference_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAccountReferences",
+        action = "DetailClean",
+        project = "aterm_db::accounts::references::tests::reference_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAccountReferences",
+        action = "DetailSyntax",
         project = "aterm_db::accounts::references::tests::reference_transition"
     )
 )]

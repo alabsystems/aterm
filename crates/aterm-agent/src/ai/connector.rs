@@ -340,8 +340,7 @@ pub enum Shared {
     /// rename replaces the link and the overlay's next launch is refused as drift: kimi 2.3.1's
     /// `workspaces.json` is not one, its `mcp.json` is (an MCP server added, changed or removed
     /// in an overlay replaces that link), so the person's MCP setup follows every login. A CLI
-    /// that resolves the link before its rename keeps the link: both Codex 0.164.0 builds
-    /// rename a new `config.toml` over the default home's file.
+    /// that resolves the link before its rename keeps the link across atomic rewrites.
     File(&'static str),
     /// A file the person writes and the CLI only reads: linked once the default home has it,
     /// since the CLI warns of a link that leads nowhere (kimi 2.3.1 names a dangling
@@ -525,9 +524,10 @@ pub enum Drive {
         /// How the page hands the login back.
         completion: Completion,
     },
-    /// Codex's app server over JSON-RPC (`harness::codex_app_login`): the login's page and its
-    /// loopback callback named by `account/login/start`, the account by `account/read`.
-    AppServer,
+    /// Codex's native in-process PKCE loopback sign-in (`harness::codex_app_login`): listens on
+    /// `127.0.0.1:1455` (fallback `1457`), exchanges the authorization code over HTTPS and writes
+    /// `<staging>/auth.json` (`0600`) directly.
+    CodexPkce,
 }
 
 /// How a sign-in page hands the login back to the CLI.
@@ -624,25 +624,20 @@ pub const CLAUDE_ACCOUNTS: Accounts = Accounts {
 /// The hosts every Codex sign-in page is on: OpenAI's own sign-in, consent and device pages.
 const CODEX_HOSTS: &[&str] = &["auth.openai.com"];
 
-/// Codex's sign-in: the app server's browser login by default, its loopback callback on this
-/// machine (lab gate (d), codex-old 0.164.0: `account/login/start` answers a `loginId` and an
-/// `authUrl` on auth.openai.com whose `redirect_uri` is `http://127.0.0.1:1455/auth/callback`,
-/// and opens no browser), or `codex login --device-auth` where the row names `flow = "device"`
-/// (recorded on codex-old 0.164.0: the link and the code each on the line after its lead, the
-/// link always `https://auth.openai.com/codex/device`, so the page asks for the code). Its own
-/// `codex login` (a person's browser sign-in, `accounts login`) opens the default browser
-/// through LaunchServices whatever its `PATH` (codex 0.164.0-dev under an empty `PATH`: `starting
-/// browser login flow`, then `webbrowser::os: failed to get default browser, falling back to
-/// Safari` where the no-desk sandbox denied the lookup), so on macOS its child runs under
-/// [`crate::harness::login_drive::NO_DESK`] (`no_desk`); the app server, a renewal's route,
-/// answers `initialize`, `account/read` and `account/login/start` under it unchanged (0.164.0-dev,
-/// a scratch `CODEX_HOME`: a `loginId` and an `authUrl` on auth.openai.com, its loopback
-/// listening on 127.0.0.1:1455, nothing on its standard error).
+/// Codex's sign-in: the native in-process PKCE browser login by default (`harness::codex_app_login`,
+/// listening on `127.0.0.1:1455` / `1457` for `/auth/callback`, handing the `auth.openai.com`
+/// authorize URL to the approver without opening the OS browser, exchanging the code over HTTPS
+/// and writing `<staging>/auth.json` directly), or `codex login --device-auth` where the row names
+/// `flow = "device"` (recorded on codex-old 0.164.0: the link and the code each on the line after
+/// its lead, the link always `https://auth.openai.com/codex/device`, so the page asks for the
+/// code). Interactive `codex login` (`accounts login`) opens the default browser through
+/// LaunchServices whatever its `PATH`, so over SSH on macOS its child runs under
+/// [`crate::harness::login_drive::NO_DESK`] (`no_desk`).
 pub const CODEX_SIGNIN: SignIn = SignIn {
     routes: &[
         Route {
             flow: Flow::Browser,
-            drive: Drive::AppServer,
+            drive: Drive::CodexPkce,
             hosts: Hosts::Fixed(CODEX_HOSTS),
         },
         Route {
@@ -773,56 +768,17 @@ const CODEX_LIMIT_WORDS: &[&str] = &[
     "spend cap",
 ];
 
-/// Codex's pool: a whole `CODEX_HOME` per account, since Codex has no login-only variable,
-/// with everything but the login linked to `~/.codex` (lab gate (a), codex-old 0.164.0: its
-/// databases keep their `-wal` beside the linked file, a rollout lands in the linked
-/// `sessions`, and `exec resume <id>` in an overlay finds a rollout the default home wrote).
-/// Neither codex-old 0.164.0 nor codex-alab 0.164.0-dev replaces one of these links
-/// (`docs/measured/codex-overlay-writes-2026-10-24.md`, `exec` and TUI turns, resumes,
-/// `/rename`, a history trim, `mcp`, `features`, `archive`, `plugin` (codex-old) and a saved
-/// approval rule in an overlay). `config.toml`, the one shared file either rewrites by renaming
-/// a new copy over it, gets that copy at the default home's path, so its link stays. The rest
-/// is created through its link (`.sqlite-maintenance.lock` by codex-old), appended or written
-/// in place, or written inside a linked directory. `AGENTS.override.md` and `AGENTS.md`, the
-/// global instructions both builds read from the Codex home (the override first), are linked
-/// whether or not the default home has them: neither build warns of a link that leads nowhere,
-/// and each reads the file through it once the default home has it (the record's §7, §11).
-///
-/// An overlay that runs a session before the default home has made its databases makes six of
-/// its own, which `ensure` reports as drift once the default home makes them (the record's
-/// §8). The pool reads the default home's usage before it links or reads an overlay
-/// (`accounts_pool::record_usage`), a sign-in's staging home keeps no database of its own (one
-/// the default home lacks is moved there), and `launch_env` and `session_move` pass over a
-/// drifted row unless it is the pinned one. Left open: a launch under `accounts = "off"`
-/// (straight to the pin, no usage read), a roster with no default row, and a person's own
-/// `CODEX_HOME=<overlay>` run.
-///
-/// Each build records a thread's rollout under the path of the home that wrote it (the shared
-/// `state_5.sqlite`), and an `exec resume <id>` from the default home fails (`no rollout
-/// found`) once that path no longer resolves (the record's §12). So an overlay directory is
-/// never removed or renamed while a session it wrote may be resumed or moved.
+/// Codex's pool: `CODEX_AUTH_PATH` names the account's `auth.json` while `CODEX_HOME`
+/// (`~/.codex`: `config.toml`, `sessions`, `archived_sessions`, `history.jsonl`, `skills`,
+/// `rules`, `plugins`, `AGENTS.override.md`, `AGENTS.md` and `codex-alab`'s databases) stays
+/// shared across accounts. `codex-alab` reads and refreshes `auth.json` at `CODEX_AUTH_PATH`
+/// when set, falling back to `$CODEX_HOME/auth.json` for the default login, and preserves
+/// `CODEX_AUTH_PATH` in its self-claimed session record so crash relaunches stay on the same
+/// account without symlink overlays.
 pub const CODEX_ACCOUNTS: Accounts = Accounts {
-    seam: Seam::Overlay {
-        var: "CODEX_HOME",
-        shared: &[
-            Shared::Dir("sessions"),
-            Shared::Dir("archived_sessions"),
-            Shared::File("session_index.jsonl"),
-            Shared::File("history.jsonl"),
-            Shared::File("config.toml"),
-            Shared::File("AGENTS.override.md"),
-            Shared::File("AGENTS.md"),
-            Shared::Dir("prompts"),
-            Shared::Dir("rules"),
-            Shared::Dir("skills"),
-            Shared::Dir("plugins"),
-            Shared::Dir("shell_snapshots"),
-            Shared::Dir("thread-writer-locks"),
-            Shared::File("installation_id"),
-            Shared::File(".sqlite-maintenance.lock"),
-            Shared::Suffix(".sqlite"),
-        ],
-        markers: &[],
+    seam: Seam::LoginFile {
+        var: "CODEX_AUTH_PATH",
+        file: "auth.json",
     },
     roster_file: "accounts-codex.toml",
     default_home: ".codex",
@@ -838,7 +794,7 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
     sign_in_page: SignInPage::Fixed("https://auth.openai.com/log-in"),
     web_session_key: None,
     measured: true,
-    measured_on: Some("codex-old 0.164.0 and codex-alab 0.164.0-dev"),
+    measured_on: Some("codex-alab"),
     walls_measured_on: Some("codex rollouts' rate_limits"),
     signin: Some(CODEX_SIGNIN),
 };

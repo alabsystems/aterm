@@ -83,9 +83,14 @@ pub fn account_references_model() -> Model {
             action Duplicate when (scenario == 0) {scenario = 6; warning = if Buggy == 5 {0} else {1};}
             action Namespace when (scenario == 0) {scenario = 7; warning = if Buggy == 6 {0} else {1};}
             action Limit when (scenario == 0) {scenario = 8; warning = 1; truncated = if Buggy == 7 {0} else {1};}
+            action DetailMissing when (scenario == 0) {scenario = 9; warning = if Buggy == 10 {0} else {1};}
+            action DetailAlias when (scenario == 0) {scenario = 10; warning = if Buggy == 11 {0} else {1};}
+            action DetailClean when (scenario == 0) {scenario = 11; warning = if Buggy == 12 {1} else {0};}
+            action DetailSyntax when (scenario == 0) {scenario = 12; warning = if Buggy == 13 {0} else {1};}
             invariant ReportReferences: 2 > scenario || scenario > 7 || warning == 1;
-            invariant NoInventedRequirement: 1 > scenario || scenario > 1 || warning == 0;
-            invariant BoundedInspection: 8 > scenario || truncated == 1;
+            invariant ReportDetailReferences: 9 > scenario || scenario == 11 || scenario > 12 || warning == 1;
+            invariant NoInventedRequirement: ((1 > scenario || scenario > 1) && (11 > scenario || scenario > 11)) || warning == 0;
+            invariant BoundedInspection: 8 > scenario || scenario > 8 || truncated == 1;
             invariant NoEffects: effects == 0;
         }
     }
@@ -492,7 +497,8 @@ pub fn authority_custody_model() -> Model {
     }
 }
 
-/// A bounded source document is published atomically and retried exactly.
+/// A Commons source document is published atomically and retried exactly.
+/// Both import backends reject ambiguous source headers before writing records.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn import_atomic_model() -> Model {
@@ -502,6 +508,7 @@ pub fn import_atomic_model() -> Model {
             var phase = 0; var published = 0; var effects = 0; var stable = 1;
             action Reject when (phase == 0) {
                 phase = 1; published = if Buggy == 1 { 1 } else { 0 };
+                effects = if Buggy == 5 { 1 } else { 0 };
             }
             action Commit when (phase == 0) {
                 phase = 2; published = 1; effects = if Buggy == 2 { 0 } else { 1 };
@@ -511,6 +518,7 @@ pub fn import_atomic_model() -> Model {
                 stable = if Buggy == 4 { 0 } else { 1 };
             }
             invariant RejectBeforePublication: phase == 0 || phase > 1 || published == 0;
+            invariant RejectBeforeWrites: phase == 0 || phase > 1 || effects == 0;
             invariant AtomicSource: phase <= 1 || effects > 0;
             invariant OneEffect: effects <= 1;
             invariant OriginalReceipt: stable == 1;

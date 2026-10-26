@@ -363,8 +363,8 @@ fn a_discovered_list_says_it_was_found_on_this_mac() {
 }
 
 /// A `[fleet] accounts_source` naming a local file is synced from each time it changes: at the
-/// first upkeep pass that reads it (beside a roster an earlier sync made), then only once it is
-/// edited, and the row it gained appears. CONTROL: a pass with the file as it was syncs nothing.
+/// first upkeep pass that reads it (beside a roster an earlier sync made), then when edited,
+/// and the row it gained appears. CONTROL: a pass before revalidation syncs nothing.
 #[test]
 fn a_local_accounts_source_is_synced_again_each_time_it_changes() {
     let desk = Desk::new("m27");

@@ -29,7 +29,7 @@ pub struct BandInks {
     pub field_bg: [u8; 3],
     /// Text caret drawn in that well: the theme's cursor colour, contrast-floored against `field_bg` so it stays visible.
     pub caret: [u8; 3],
-    /// A drawn border for the well where its fill cannot carry the boundary on its own: `Some(ink)` exactly when `field_bg == bar_bg`.
+    /// A drawn border for the well where its fill cannot carry the boundary on its own: `Some(ink)` exactly when `field_bg` stands under [`WELL_EDGE_FLOOR`] off `bar_bg` ([`well_needs_edge`]).
     pub well_rule: Option<[u8; 3]>,
     /// The band's content-facing edge (the hairline over a find panel or a banner).
     pub seam: [u8; 3],
@@ -259,7 +259,7 @@ impl BandInks {
                 error,
                 field_bg,
                 caret: ensure_contrast(theme.cursor, field_bg, AA),
-                well_rule: (field_bg == bar_bg).then(|| ensure_contrast(theme.fg, field_bg, AA)),
+                well_rule: well_edge(field_bg, bar_bg, theme.fg),
                 seam: if t.border.is_some() {
                     t.seam_on(bar_bg)
                 } else {
@@ -315,7 +315,7 @@ impl BandInks {
             error: on_band,
             field_bg: hc.window,
             caret: in_well,
-            well_rule: (hc.window == hc.btn_face).then_some(in_well),
+            well_rule: well_needs_edge(hc.window, hc.btn_face).then_some(in_well),
             seam: on_band,
             accent: hc.highlight,
             meter: hc.highlight,
@@ -335,6 +335,39 @@ impl BandInks {
 
 /// The contrast floor applied on top of an OS-forced palette.
 pub(crate) const FORCED_INK_FLOOR: f64 = 3.0;
+
+/// The least contrast a text field's fill must stand off the ground it is inset in to be its
+/// boundary alone: the non-text floor (WCAG 1.4.11) every control's edge holds.
+pub const WELL_EDGE_FLOOR: f64 = 3.0;
+
+/// Whether a text field filled `fill` on `ground` must draw its edge: its fill stands under
+/// [`WELL_EDGE_FLOOR`] off the ground, so the fill alone does not show where the field is
+/// (the find bar's well in a theme's band, 1.2:1 in GitHub Light, a well the band's own tone).
+#[inline]
+#[must_use]
+pub fn well_needs_edge(fill: [u8; 3], ground: [u8; 3]) -> bool {
+    contrast(fill, ground) < WELL_EDGE_FLOOR
+}
+
+/// How far a field's edge starts from the theme's ink toward the field's fill before it is
+/// floored ([`well_edge`]): a separator's tone, where every resting control's rim starts.
+pub const WELL_EDGE_MIX: f32 = 0.70;
+
+/// The edge a text field filled `fill` on `ground` draws ([`well_needs_edge`]): the rim every
+/// resting control wears, a separator's tone of `ink` ([`WELL_EDGE_MIX`] of the way into the
+/// field) floored to [`WELL_EDGE_FLOOR`] on the field and on the ground it closes against, so
+/// it shows where the field ends without the weight of the words typed in it; none where the
+/// fill is its own edge.
+#[must_use]
+pub fn well_edge(fill: [u8; 3], ground: [u8; 3], ink: [u8; 3]) -> Option<[u8; 3]> {
+    well_needs_edge(fill, ground).then(|| {
+        [fill, ground]
+            .into_iter()
+            .fold(mix3(ink, fill, WELL_EDGE_MIX), |edge, backdrop| {
+                ensure_contrast(edge, backdrop, WELL_EDGE_FLOOR)
+            })
+    })
+}
 
 /// How far the lit Primary's fill moves from the resting accent toward the theme's ink (`mix3` `t`).
 pub const PRIMARY_HOVER_LIFT: f32 = 0.45;
@@ -1570,10 +1603,67 @@ mod tests {
             ..hc
         });
         assert!(contrast(hostile.value, hostile.bar_bg) >= FORCED_INK_FLOOR);
-        let inset = BandInks::forced(ForcedPalette {
+        let faint = BandInks::forced(ForcedPalette {
             window: [0x20, 0x20, 0x20],
             ..hc
         });
-        assert_eq!(inset.well_rule, None);
+        assert_eq!(
+            faint.well_rule,
+            Some(hc.window_text),
+            "a well 1.3:1 off the band shows no edge of its own"
+        );
+        let inset = BandInks::forced(ForcedPalette {
+            window: [0x80, 0x80, 0x80],
+            ..hc
+        });
+        assert_eq!(
+            inset.well_rule, None,
+            "a well 5:1 off the band is its own edge"
+        );
+    }
+
+    /// A WELL ITS FILL CANNOT SHOW DRAWS ITS EDGE: a theme's find-bar well stands only a step
+    /// off the band (Default 1.4:1, GitHub Light's white on its grey band 1.2:1), so it carries
+    /// [`BandInks::well_rule`], the rim every resting control wears: 3:1 on the well and on the
+    /// band it closes against, and lighter than the words typed in the well (the theme's ink drew
+    /// it at their weight, 12:1 on Default's well, a rule heavier than the band's own seam); a
+    /// well 3:1 off the band is its own edge.
+    #[test]
+    fn a_well_under_three_to_one_off_the_band_draws_its_edge() {
+        for (bg, fg) in [
+            ([0x11, 0x13, 0x18], [0xd6, 0xd7, 0xda]),
+            ([0xff, 0xff, 0xff], [0x1f, 0x23, 0x28]),
+        ] {
+            let c = BandInks::derive(ThemeInks { bg, fg, cursor: fg }, None, BarBase::Blend);
+            assert!(contrast(c.field_bg, c.bar_bg) < WELL_EDGE_FLOOR, "{bg:?}");
+            let rule = c.well_rule.expect("a faint well draws its edge");
+            for (ground, on) in [(c.field_bg, "the well"), (c.bar_bg, "the band")] {
+                assert!(
+                    contrast(rule, ground) >= WELL_EDGE_FLOOR,
+                    "{bg:?}: the edge on {on} is {:.2}:1",
+                    contrast(rule, ground)
+                );
+            }
+            assert!(
+                contrast(rule, c.field_bg) < contrast(fg, c.field_bg),
+                "{bg:?}: the edge is a rim, lighter than the words in the well"
+            );
+        }
+        let c = BandInks::derive(
+            ThemeInks {
+                bg: [0xff, 0xff, 0xff],
+                fg: [0, 0, 0],
+                cursor: [0, 0, 0],
+            },
+            None,
+            BarBase::Fixed {
+                light: [0x40, 0x40, 0x40],
+                dark: [0x40, 0x40, 0x40],
+            },
+        );
+        assert_eq!(
+            c.well_rule, None,
+            "a white well in a dark band is its own edge"
+        );
     }
 }

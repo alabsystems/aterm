@@ -135,36 +135,18 @@ fn the_usage_fold_keeps_the_goal_beside_its_spend() {
 }
 
 #[test]
-fn a_store_is_asked_only_for_a_uuids_active_goal_and_its_hex_is_decoded() {
-    let thread = "019a1b2c-3d4e-7f60-8a9b-0c1d2e3f4a5b";
-    let codex = Store::Codex.query(thread).expect("a uuid is asked for");
-    assert!(
-        codex.contains("FROM thread_goals WHERE thread_id = '019a1b2c-"),
-        "{codex}"
-    );
-    assert!(codex.contains("status = 'active'"), "{codex}");
-    let muse = Store::Muse.query(thread).expect("a uuid is asked for");
-    assert!(
-        muse.contains("FROM goals WHERE session_id = '019a1b2c-"),
-        "{muse}"
-    );
+fn a_store_validates_uuids_and_formats_bounded_objectives() {
+    let session = "019a1b2c-3d4e-7f60-8a9b-0c1d2e3f4a5b";
+    assert!(is_uuid(session));
     for bad in ["x' OR 1=1 --", "019a1b2c3d4e7f608a9b0c1d2e3f4a5b", ""] {
-        assert_eq!(Store::Codex.query(bad), None, "{bad:?} is no uuid");
+        assert!(!is_uuid(bad), "{bad:?} is no uuid");
     }
-    let hex = |s: &str| s.bytes().map(|b| format!("{b:02X}")).collect::<String>();
     assert_eq!(
-        objective_of(&format!("{}\n", hex("port the lexer\nto Rust"))),
+        objective_of("port the lexer\nto Rust"),
         Some("port the lexer to Rust".to_owned())
     );
     assert_eq!(objective_of(""), None, "no row");
-    assert_eq!(objective_of("\n"), None, "an empty objective");
-    assert_eq!(objective_of("ZZ"), None, "not hex");
-    let cut = &hex("caf\u{e9}")[..8];
-    assert_eq!(
-        objective_of(cut),
-        Some("caf".to_owned()),
-        "a split last character is dropped"
-    );
+    assert_eq!(objective_of("  \n\t "), None, "an empty objective");
 }
 
 /// A database laid as `schema` and `rows` say, with Apple's `/usr/bin/sqlite3`, WAL mode
@@ -185,14 +167,6 @@ fn store_db(dir: &std::path::Path, name: &str, schema: &str, rows: &str) -> std:
     db
 }
 
-/// codex-alab's `thread_goals`, as its `goals_1.sqlite` lays it (0.164).
-#[cfg(target_os = "macos")]
-const CODEX_SCHEMA: &str = "CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY NOT NULL, \
-    goal_id TEXT NOT NULL, objective TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN \
-    ('active','paused','blocked','usage_limited','budget_limited','complete')), token_budget \
-    INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0, time_used_seconds INTEGER NOT NULL DEFAULT \
-    0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);";
-
 /// Muse Code's `goals`, as its session's `goals.db` lays it (1.4.13).
 #[cfg(target_os = "macos")]
 const MUSE_SCHEMA: &str = "CREATE TABLE goals (session_id TEXT PRIMARY KEY, goal_id TEXT NOT \
@@ -205,7 +179,7 @@ const MUSE_SCHEMA: &str = "CREATE TABLE goals (session_id TEXT PRIMARY KEY, goal
 
 #[cfg(target_os = "macos")]
 #[test]
-fn codex_alab_and_muse_code_stores_name_only_an_active_goal() {
+fn muse_code_store_names_only_an_active_goal() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-goal-store-")
         .tempdir()
@@ -216,81 +190,64 @@ fn codex_alab_and_muse_code_stores_name_only_an_active_goal() {
         "019a0000-0000-7000-8000-00000000000b",
         "019a0000-0000-7000-8000-00000000000c",
     );
-    let codex = store_db(
-        &dir,
-        CODEX_GOALS,
-        CODEX_SCHEMA,
-        &format!(
-            "INSERT INTO thread_goals VALUES ('{a}','g1','ship the release | then rest','active',NULL,0,0,1,2); \
-             INSERT INTO thread_goals VALUES ('{b}','g2','paused work','paused',NULL,0,0,1,2); \
-             INSERT INTO thread_goals VALUES ('{c}','g3','done work','complete',NULL,0,0,1,2);"
-        ),
-    );
-    assert_eq!(
-        read_store(Store::Codex, &codex, a),
-        Ok(Some("ship the release | then rest".to_owned()))
-    );
-    assert_eq!(
-        read_store(Store::Codex, &codex, b),
-        Ok(None),
-        "a paused goal is not pursued"
-    );
-    assert_eq!(
-        read_store(Store::Codex, &codex, c),
-        Ok(None),
-        "a complete goal is over"
-    );
-    let missing = "019a0000-0000-7000-8000-0000000000ff";
-    assert_eq!(
-        read_store(Store::Codex, &codex, missing),
-        Ok(None),
-        "a cleared goal has no row"
-    );
     let muse = store_db(
         &dir,
         MUSE_GOALS,
         MUSE_SCHEMA,
         &format!(
             "INSERT INTO goals (session_id,goal_id,revision,objective,status,percent_complete,created_at_ms,updated_at_ms) \
-             VALUES ('{a}','g1','r1','tidy the parser','active',40,1,2); \
+             VALUES ('{a}','g1','r1','ship the release | then rest','active',40,1,2); \
              INSERT INTO goals (session_id,goal_id,revision,objective,status,percent_complete,created_at_ms,updated_at_ms) \
-             VALUES ('{b}','g2','r1','blocked work','blocked',10,1,2);"
+             VALUES ('{b}','g2','r1','blocked work','blocked',10,1,2); \
+             INSERT INTO goals (session_id,goal_id,revision,objective,status,percent_complete,created_at_ms,updated_at_ms) \
+             VALUES ('{c}','g3','r1','done work','complete',100,1,2);"
         ),
     );
     assert_eq!(
         read_store(Store::Muse, &muse, a),
-        Ok(Some("tidy the parser".to_owned()))
+        Ok(Some("ship the release | then rest".to_owned()))
     );
     assert_eq!(read_store(Store::Muse, &muse, b), Ok(None));
+    assert_eq!(read_store(Store::Muse, &muse, c), Ok(None));
+    let missing = "019a0000-0000-7000-8000-0000000000ff";
     assert_eq!(
-        read_store(Store::Codex, &dir.join("absent.sqlite"), a),
+        read_store(Store::Muse, &muse, missing),
+        Ok(None),
+        "a cleared goal has no row"
+    );
+    assert_eq!(
+        read_store(Store::Muse, &muse, "not-a-uuid"),
+        Err(aterm_uds::foreign_db::Unread::Failed)
+    );
+    assert_eq!(
+        read_store(Store::Muse, &dir.join("absent.sqlite"), a),
         Err(aterm_uds::foreign_db::Unread::Missing)
     );
 
     let mut held = StoreGoal::default();
     assert_eq!(
-        held.read(Store::Codex, &codex, a),
+        held.read(Store::Muse, &muse, a),
         Some("ship the release | then rest")
     );
     assert_eq!(
-        held.read(Store::Codex, &codex, b),
+        held.read(Store::Muse, &muse, b),
         None,
-        "another thread's read is its own"
+        "another session's read is its own"
     );
     assert_eq!(
-        held.read(Store::Codex, &dir.join("absent.sqlite"), a),
+        held.read(Store::Muse, &dir.join("absent.sqlite"), a),
         None,
         "no store, no goal"
     );
     assert_eq!(
-        held.read(Store::Codex, &codex, a),
+        held.read(Store::Muse, &muse, a),
         Some("ship the release | then rest")
     );
     let made = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command("/usr/bin/sqlite3")
-            .arg(&codex)
+            .arg(&muse)
             .arg(format!(
-                "UPDATE thread_goals SET status = 'complete' WHERE thread_id = '{a}'; \
+                "UPDATE goals SET status = 'complete' WHERE session_id = '{a}'; \
              PRAGMA wal_checkpoint(TRUNCATE);"
             )),
         std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
@@ -298,7 +255,7 @@ fn codex_alab_and_muse_code_stores_name_only_an_active_goal() {
     .unwrap_or_else(|e| panic!("sqlite3 within the hang detector: {e}"));
     assert!(made.status.success(), "{made:?}");
     assert_eq!(
-        held.read(Store::Codex, &codex, a),
+        held.read(Store::Muse, &muse, a),
         None,
         "the store moved: read again"
     );

@@ -593,9 +593,9 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
     let config_line = ungranted.unwrap_or(line);
     // A new key, a rotate's or a new fleet's (an aterm here may serve a fleet a leave just ended):
     // a member that joins next meets it.
-    let served = FleetSecret::new(&code.secret)
-        .map(|secret| serves_new_key(places, &secret))
-        .unwrap_or_default();
+    let unserved = FleetSecret::new(&code.secret)
+        .ok()
+        .and_then(|secret| serves_new_key(places, &secret));
     let mut out = format!(
         "aterm fleet init: this machine ({}, node {}) is the fleet's issuer{}\n",
         aterm_codec::tty::one_line(&code.host, 80),
@@ -609,10 +609,11 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
     out.push_str(&format!(
         "  key        {} (0600)\n  join code  {} (0600) — the fleet's secret: never printed, \
          as aterm exports screens\n  node key   {} (0600) — this machine's own: it proves \
-         which node it is\n{config_line}{served}",
+         which node it is\n{config_line}{}",
         places.state.join(KEY_FILE).display(),
         code_path.display(),
         places.state.join(NODE_KEY_FILE).display(),
+        unserved.as_deref().unwrap_or_default(),
     ));
     if !old_secret.is_empty() {
         out.push_str(&format!(
@@ -636,9 +637,14 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
          fleet join --code-file <file>    (or: aterm fleet join < <file>)\n  add --allow \
          content to let this fleet read that machine's tab titles, cwds, branches, prompts, \
          an agent's words and a shell's command line and rows: facts, the default, is \
-         programs, agent states, roles, task records and models alone\n{FOLLOWS} \
-         Members dial {}.\n",
-        member::host_port(&code.host, code.port)
+         programs, agent states, roles, task records and models alone\n{}\n",
+        follows(
+            unserved.as_deref(),
+            &format!(
+                " Members dial {}.",
+                member::host_port(&code.host, code.port)
+            )
+        )
     ));
     Ok(out)
 }
@@ -912,6 +918,16 @@ fn at_step(step: &str) {
 
 const FOLLOWS: &str = "An aterm running here follows [fleet] without a relaunch (`aterm ctl \
                        status` reads fleet=listening); one started later reads it at launch.";
+
+/// A report's closing words on an aterm here: [`FOLLOWS`], with `then` after it, unless the
+/// verb's own wait saw no listener serve the key it wrote (`unserved`, [`serves_new_key`]), whose
+/// line gives that cause and its remedy instead.
+fn follows(unserved: Option<&str>, then: &str) -> String {
+    match unserved {
+        Some(_) => then.trim_start().to_owned(),
+        None => format!("{FOLLOWS}{then}"),
+    }
+}
 
 fn issued_code(places: &Places, path: &Path) -> Result<JoinCode, Failure> {
     member::read_join_code(&places.state).map_err(|why| {
@@ -1258,7 +1274,8 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     );
     // The key a join wrote, where an aterm here may still serve another (one it replaced, or one a
     // leave just removed): a reader that comes next meets the new one.
-    out.push_str(&serves_new_key(places, &secret));
+    let unserved = serves_new_key(places, &secret);
+    out.push_str(unserved.as_deref().unwrap_or_default());
     if allow == FleetScope::Facts.word() {
         out.push_str(
             "  allow      facts: the fleet reads programs, agent states, roles, task records and \
@@ -1268,8 +1285,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     }
     out.push_str(&format!(
         "  issuer     {} at {issuer_at} recorded this machine as {} ({} peer{} in its book){}\n\
-         {FOLLOWS}\nOn a Mac, the local-network consent macOS asks for at aterm's first \
-         connection into the LAN covers the survey's reads too.\n",
+         {}\n",
         aterm_codec::tty::one_line(&joined.issuer.host, 80),
         member::host_port(&registration.host, registration.port),
         joined.peers,
@@ -1281,6 +1297,11 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
              has one (`aterm fleet init` there mints it, after an update if its aterm is \
              older; a join before then binds nothing)"
         },
+        follows(
+            unserved.as_deref(),
+            "\nOn a Mac, the local-network consent macOS asks for at aterm's first connection \
+             into the LAN covers the survey's reads too."
+        ),
     ));
     Ok(out)
 }
@@ -2283,14 +2304,15 @@ const PROBE_MAX: Duration = Duration::from_secs(1);
 /// Once a verb wrote `secret` as the key an aterm running here serves, wait, at most
 /// [`SERVES_NEW_KEY`], while its `[fleet] listen` place answers under another secret, or nothing
 /// listens there and an aterm runs here ([`aterm_runs_here`]) to bind it, so a reader or a join
-/// that comes next meets the new key; the line saying so where it still does. Nothing is waited
-/// for where anything else answers there, or nothing does and no aterm runs here.
-fn serves_new_key(places: &Places, secret: &FleetSecret) -> String {
+/// that comes next meets the new key; the line saying so where it still does, which the report's
+/// close then follows ([`follows`]). Nothing is waited for where anything else answers there, or
+/// nothing does and no aterm runs here.
+fn serves_new_key(places: &Places, secret: &FleetSecret) -> Option<String> {
     let table = ConfigFile::open(&places.config)
         .map_err(failed)
         .and_then(|config| fleet_table(text_of(&config)?).map_err(failed));
     let (Some(me), Ok(table)) = (own_identity(places), table) else {
-        return String::new();
+        return None;
     };
     let end = Instant::now() + SERVES_NEW_KEY;
     let mut runs = None;
@@ -2314,15 +2336,18 @@ fn serves_new_key(places: &Places, secret: &FleetSecret) -> String {
             {
                 format!(
                     "nothing listens on {at} {} s after the new key was written, though an aterm \
-                     runs here: `aterm ctl status` here reads why (fleet=refused:<why>, or off \
-                     where that aterm reads another aterm.toml)",
-                    SERVES_NEW_KEY.as_secs()
+                     runs here: `aterm ctl status` here reads fleet=off where that aterm reads \
+                     another aterm.toml than {}, whose [fleet] is off (one relaunched to read this \
+                     one listens; `aterm explain-config` in one of its tabs names the one it \
+                     reads), or fleet=refused:<why>, which names what keeps it from listening",
+                    SERVES_NEW_KEY.as_secs(),
+                    places.config.display()
                 )
             }
-            _ => return String::new(),
+            _ => return None,
         };
         if Instant::now() >= end {
-            return format!("  listener   {unserved}\n");
+            return Some(format!("  listener   {unserved}\n"));
         }
         std::thread::sleep(PROBE_MIN.min(end.saturating_duration_since(Instant::now())));
     }
@@ -2336,6 +2361,25 @@ type AtermHere = Box<dyn FnMut() -> bool>;
 thread_local! {
     static ATERM_HERE: std::cell::RefCell<Option<AtermHere>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this machine's own node proves itself at its `[fleet] listen` place under the key held
+/// within `within` ([`own_listener`]), as `peers`' header says it listens there.
+fn listens_here(places: &Places, within: Duration) -> bool {
+    let table = ConfigFile::open(&places.config)
+        .map_err(failed)
+        .and_then(|config| fleet_table(text_of(&config)?).map_err(failed));
+    let (Ok(secret), Some(me), Ok(table)) = (
+        aterm_net::fleet::read_key_file(&places.state),
+        own_identity(places),
+        table,
+    ) else {
+        return false;
+    };
+    matches!(
+        own_listener(&table, (&secret, Some(&me)), within),
+        Some(Ok(_))
+    )
 }
 
 /// Whether an aterm runs here, to serve `[fleet] listen` once it reads it: its control socket
@@ -3317,6 +3361,11 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
     if !args.is_empty() {
         return Err(Failure::Usage("leave takes nothing".to_owned()));
     }
+    leave_within(places, PEER_CHECK_WITHIN)
+}
+
+/// [`leave`], this machine's own listener given `within` to prove itself ([`listens_here`]).
+fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
     // Read before anything goes: once it has left, this machine reaches no Mac to hand a tab back,
     // and an issuer's fleet, which goes with it, takes no join again.
     let issues = in_state(places, CODE_FILE).unwrap_or(false);
@@ -3325,6 +3374,7 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
         "once it has left",
         (!issues).then_some("joins again"),
     );
+    let listening = listens_here(places, within);
     let mut out = String::new();
     let mut left = false;
     let mut issued = false;
@@ -3388,10 +3438,11 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
             "aterm fleet leave: this machine is in no fleet\n{out}"
         ));
     }
-    // A listener needs the key and `[fleet] listen` both. The issuer line goes only where this
-    // book still names an issuer: one a `peers rm` took out here still lists this machine.
+    // A listener needs the key and `[fleet] listen` both, and one stops only where it listened. The
+    // issuer line goes only where this book still names an issuer: one a `peers rm` took out here
+    // still lists this machine.
     let mut said: Vec<&str> = Vec::new();
-    if unkeyed && unlistened {
+    if unkeyed && unlistened && listening {
         said.push("An aterm running here stops listening within 2 s (it watches the key).");
     }
     if issued {

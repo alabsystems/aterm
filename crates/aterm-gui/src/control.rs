@@ -746,7 +746,8 @@ fn help_full_catalog() -> String {
 #   search <pat>         FIND in the scrollback (its newest search_history_lines lines)
 #
 # NATIVE TAB APPS (open in the front window; a document already open is focused):
-#   open app settings /about              About inside the Settings tab
+#   open app about                        the dedicated About tab
+#   open app settings /about              legacy About route inside Settings
 #   open app settings /updates            Software Update inside the Settings tab
 #   open app system-state                 System State: the setup plan and its progress
 #   open app markdown file:///abs/doc.md  read one bounded, local UTF-8 file

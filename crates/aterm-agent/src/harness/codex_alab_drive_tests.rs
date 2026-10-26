@@ -40,6 +40,7 @@ fn primary_copy(rig: &Rig, thread: &str) -> crate::harness::self_claimed::Copy {
         draft_empty: Some(true),
         frame: Some("idle".to_string()),
         initializing: false,
+        goal: None,
     };
     let live = ClaimedLive {
         exec_path: rig.twin.to_string_lossy().into_owned(),
@@ -651,6 +652,7 @@ impl Rig {
             ],
             session: T2.to_string(),
             codex_home,
+            codex_auth_path: None,
             cwd: Some("/w".to_string()),
         }
     }
@@ -830,6 +832,7 @@ fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
             cwd: Some(snap.cwd.clone()),
             draft_empty: None,
             frame: None,
+            goal: None,
             initializing: false,
         };
         let live = ClaimedLive {
@@ -1162,7 +1165,11 @@ fn an_overlay_run_names_the_lock_it_holds_through_its_linked_folder() {
     rig.kernel.exe = Some(exe.clone());
     let overlay = rig.dir.join("accounts-codex-work");
     crate::harness::accounts_overlay::ensure(
-        crate::ai::connector::CODEX_ACCOUNTS.seam,
+        crate::ai::connector::Seam::Overlay {
+            var: "CODEX_HOME",
+            shared: &[crate::ai::connector::Shared::Dir("thread-writer-locks")],
+            markers: &[],
+        },
         &overlay,
         &rig.home,
     )
@@ -1246,8 +1253,8 @@ fn a_pooled_codex_line_with_flags_starts_the_relaunch_found_as_ours() {
     };
     let work = LoginEnv {
         label: "work".to_string(),
-        var: "CODEX_HOME",
-        value: Some("/u/.aterm/accounts-codex/work".to_string()),
+        var: "CODEX_AUTH_PATH",
+        value: Some("/u/.aterm/accounts-codex/work/auth.json".to_string()),
     };
     let line = pool_line(&how, Cli::Codex, &work).expect("a row's line");
     let twin = rig.twin.to_string_lossy().into_owned();

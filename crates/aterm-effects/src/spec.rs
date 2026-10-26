@@ -236,10 +236,12 @@ impl SpecTable {
         if spec == WordEffectSpec::default() {
             return None;
         }
-        for i in 0..self.specs.len() {
+        let mut i = 0;
+        while i < self.specs.len() {
             if self.specs[i] == spec {
                 return Some(i as SpecId);
             }
+            i += 1;
         }
         if self.specs.len() >= usize::from(SpecId::MAX) {
             // defensive cap; unreachable for sane configs
@@ -261,10 +263,13 @@ impl SpecTable {
             }
             self.overrides.insert(form_hash(&base), id);
             let base_len = base.len();
-            for suf in ["'s", "\u{2019}s", "'", "\u{2019}"] {
+            const SUFFIXES: [&str; 4] = ["'s", "\u{2019}s", "'", "\u{2019}"];
+            let mut si = 0;
+            while si < SUFFIXES.len() {
                 base.truncate(base_len);
-                base.push_str(suf);
+                base.push_str(SUFFIXES[si]);
                 self.overrides.insert(form_hash(&base), id);
+                si += 1;
             }
         }
     }
@@ -284,11 +289,14 @@ impl SpecTable {
     /// Overlay another table onto this one.
     pub fn overlay(&mut self, other: SpecTable) {
         let mut remap = Vec::with_capacity(other.specs.len());
-        for spec in other.specs {
-            remap.push(self.intern_spec(spec));
+        let specs = other.specs.as_slice();
+        let mut i = 0;
+        while i < specs.len() {
+            remap.push(self.intern_spec(specs[i]));
+            i += 1;
         }
         for (form_hash, old_id) in other.overrides {
-            if let Some(new_id) = remap.get(usize::from(old_id)).copied().flatten() {
+            if let Some(Some(new_id)) = remap.get(usize::from(old_id)).copied() {
                 self.overrides.insert(form_hash, new_id);
             }
         }
@@ -482,11 +490,17 @@ pub fn build_custom(entries: &[RawCustomEntry]) -> (SpecTable, String) {
     let mut table = SpecTable::default();
     let mut spaced: Vec<&str> = Vec::new();
     let mut cjk: Vec<&str> = Vec::new();
-    for e in entries {
+    let mut ei = 0;
+    while ei < entries.len() {
+        let e = &entries[ei];
+        ei += 1;
         let spec = e.to_spec();
         let mut spec_id = None;
-        for w in &e.words {
-            let w = w.trim();
+        let words = e.words.as_slice();
+        let mut wi = 0;
+        while wi < words.len() {
+            let w = words[wi].trim();
+            wi += 1;
             if w.is_empty() {
                 continue;
             }
@@ -528,13 +542,15 @@ fn push_lexicon_entry(out: &mut String, lang: &str, forms: &[&str], is_cjk: bool
         out.push_str("cjk = true\n");
     }
     out.push_str("forms = [");
-    for (i, w) in forms.iter().enumerate() {
+    let mut i = 0;
+    while i < forms.len() {
         if i > 0 {
             out.push_str(", ");
         }
         out.push('"');
-        push_toml_basic_string_body(out, w);
+        push_toml_basic_string_body(out, forms[i]);
         out.push('"');
+        i += 1;
     }
     out.push_str("]\n");
 }

@@ -2255,9 +2255,7 @@ fn only_a_group_choice_or_join_makes_the_plan_the_choosers() {
     let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(Request::new(Plan::default(), send)));
-    let now = Instant::now();
-    app.tick_at(now, true, true, false);
-    app.tick_at(now + Duration::from_secs(30), true, true, false);
+    app.tick(true, true, false);
     assert!(!chosen(app.take_action()));
 }
 
@@ -2286,24 +2284,99 @@ fn an_accepted_plan_does_not_undo_a_choice_made_while_it_waited() {
     assert!(app.awaiting.is_none());
 }
 
+/// Design revision 4: the launch's offer is answered by the page itself, as the plan stands, on
+/// the first tick a person is at this Mac, shown or not; with nobody at the Mac it waits (SAFE-1).
+/// The answer is aterm's own, never a choice, and carries no typed vault.
 #[test]
-fn startup_review_waits_before_automatically_submitting() {
+fn the_offer_is_answered_on_the_first_tick_a_person_is_here_and_never_without_one() {
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(request.clone()));
-    app.tick(true, true, false);
-    assert!(
-        app.take_action().is_none(),
-        "the first visible tick starts the review, not its work"
-    );
+    for shown in [true, false, true] {
+        app.tick(false, shown, false);
+        assert!(app.take_action().is_none(), "nobody at this Mac");
+    }
     assert!(request.pending());
-    assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(app.headline().text, STARTING_HEADLINE);
+    app.tick(true, false, false);
+    let Some(SystemStateAction::Apply(answer, who)) = app.take_action() else {
+        panic!("the first tick with a person here answers the offer");
+    };
+    assert_eq!(who, Admission::Automatic);
+    assert!(!answer.chosen && !answer.vault_typed && answer.password.is_none());
+    assert_eq!(answer.changed, None, "the offered plan whole");
+    assert!(request.finish_answer(answer));
+    assert!(matches!(
+        receive
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .decision,
+        WorkstationSetupDecision::Begin(_)
+    ));
+    app.tick(true, true, false);
+    assert!(app.take_action().is_none(), "answered once");
+    assert!(receive.try_recv().is_err());
 }
 
+/// A status that says the page is busy holds the page's own answer until it is not.
 #[test]
-fn startup_review_group_changes_remain_unsubmitted_until_apply() {
-    let (send, receive) = mpsc::channel();
+fn the_pages_own_answer_waits_while_the_page_is_busy() {
+    let (send, _receive) = mpsc::channel();
+    let mut app = SystemStateApp::new(Plan::default());
+    assert!(app.offer(Request::new(Plan::default(), send)));
+    app.publish(SetupStatus {
+        busy: true,
+        ..SetupStatus::default()
+    });
+    app.tick(true, true, false);
+    assert!(app.take_action().is_none());
+    app.publish(SetupStatus::default());
+    app.tick(true, true, false);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Apply(_, Admission::Automatic))
+    ));
+}
+
+/// A scroll, a disclosure, typing or a caret move never holds the answer (design revision 4):
+/// there is no countdown for a touch to stop.
+#[test]
+fn interaction_never_holds_the_pages_own_answer() {
+    for event in [
+        AppEvent::ScrollLines(1),
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("system-state/row/secrets/disclose"),
+            value: None,
+        }),
+        AppEvent::TextInput(TextInputEvent::Commit("x".into())),
+        AppEvent::TextInput(TextInputEvent::Left { extend: false }),
+    ] {
+        let (send, _receive) = mpsc::channel();
+        let mut app = SystemStateApp::new(Plan::default());
+        assert!(app.offer(Request::new(Plan::default(), send)));
+        let (mut runtime, instance, view) = runtime_with_app(app);
+        runtime.system_state_gesture(true);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
+            )
+            .unwrap();
+        runtime.dispatch(instance, view, event).unwrap();
+        assert!(runtime.take_system_state_action().is_none());
+        runtime.tick_system_state(true, true, &[view]);
+        let (_, admission, password) = submitted(runtime.take_system_state_action());
+        assert_eq!(admission, Admission::Automatic);
+        assert!(password.is_none());
+    }
+}
+
+/// A group press while the offer waits answers it at once, as the presser's choice.
+#[test]
+fn a_group_press_while_the_offer_waits_answers_it_as_the_pressers_choice() {
+    let (send, _receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(request.clone()));
@@ -2318,241 +2391,85 @@ fn startup_review_group_changes_remain_unsubmitted_until_apply() {
             }),
         )
         .unwrap();
+    let Some(SystemStateAction::Apply(answer, admission)) = runtime.take_system_state_action()
+    else {
+        panic!("the press answers the offer");
+    };
+    assert_eq!(admission, Admission::Client);
+    assert!(answer.chosen);
+    let WorkstationSetupDecision::Begin(plan) = answer.decision else {
+        panic!("the plan begins");
+    };
+    assert!(!plan.selection.contains(Setting::Dock));
+    runtime.tick_system_state(true, true, &[view]);
     assert!(
         runtime.take_system_state_action().is_none(),
-        "a first-launch group change edits the review without starting setup"
+        "the press was the answer"
     );
-    let NativeApp::SystemState(page) = runtime.app(instance).unwrap() else {
-        unreachable!()
-    };
-    assert!(!page.reviewed_plan().selection.contains(Setting::Dock));
-    assert!(request.pending());
-    assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
 }
 
+/// Join while the offer waits answers it with the vault as typed and its password; the page's
+/// own answer never sends either, and leaves them for Join.
 #[test]
-fn startup_review_join_keeps_the_address_and_password_for_apply() {
-    let (send, receive) = mpsc::channel();
-    let request = Request::new(Plan::default(), send);
-    let mut app = SystemStateApp::new(Plan::default());
-    assert!(app.offer(request.clone()));
-    let (mut runtime, instance, view) = runtime_with_app(app);
-    for (key, value) in [
+fn only_join_sends_a_typed_vault_while_the_offer_waits() {
+    let typed = [
         (
             "system-state/url",
             Some("http://draft.local:7484/v1/review"),
         ),
         ("system-state/password", Some("synthetic-review-secret")),
-        ("system-state/vault/join", None),
-    ] {
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new(key),
-                    value: value.map(|value| SemanticInput::Text(value.into())),
-                }),
-            )
-            .unwrap();
-    }
-    assert!(
-        runtime.take_system_state_action().is_none(),
-        "Join in the startup review must not release credentials before Apply"
-    );
-    let NativeApp::SystemState(page) = runtime.app(instance).unwrap() else {
-        unreachable!()
-    };
-    assert_eq!(
-        page.reviewed_plan().vault_url,
-        "http://draft.local:7484/v1/review"
-    );
-    assert_eq!(page.password.text(), "synthetic-review-secret");
-    assert!(request.pending());
-    assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
-}
-
-#[test]
-fn startup_review_counts_only_active_visible_time_and_submits_once() {
-    let (send, receive) = mpsc::channel();
-    let request = Request::new(Plan::default(), send);
-    let mut app = SystemStateApp::new(Plan::default());
-    assert!(app.offer(request.clone()));
-    let start = Instant::now();
-    app.tick_at(start, false, true, false);
-    assert!(
-        app.take_action().is_none(),
-        "not until it is in an active window"
-    );
-    app.tick_at(start + Duration::from_secs(100), true, false, false);
-    assert!(app.take_action().is_none(), "a hidden page counts no time");
-    app.tick_at(start + Duration::from_secs(101), true, true, false);
-    app.tick_at(start + Duration::from_secs(111), true, true, false);
-    let view = SystemStateViewState::default();
-    assert_eq!(
-        compile(&app, &view, 900.0, 900.0)
-            .semantic(&UiKey::new("system-state/apply"))
-            .unwrap()
-            .description
-            .as_deref(),
-        Some("Applies by itself in 20 seconds")
-    );
-    app.publish(SetupStatus {
-        plan: Some(Plan::default()),
-        ..SetupStatus::default()
-    });
-    app.tick_at(start + Duration::from_secs(111), false, true, false);
-    app.tick_at(start + Duration::from_secs(1000), true, true, false);
-    app.tick_at(start + Duration::from_secs(1019), true, true, false);
-    assert!(
-        app.take_action().is_none(),
-        "focus and status never restart or consume paused time"
-    );
-    app.tick_at(start + Duration::from_secs(1020), true, true, false);
-    let Some(SystemStateAction::Apply(answer, who)) = app.take_action() else {
-        panic!("the offer applies");
-    };
-    assert_eq!(who, Admission::Automatic);
-    assert!(!answer.chosen && !answer.vault_typed && answer.password.is_none());
-    assert_eq!(
-        answer.changed, None,
-        "the full reviewed selection is applied"
-    );
-    assert!(request.finish_answer(answer));
-    assert!(matches!(
-        receive
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap()
-            .decision,
-        WorkstationSetupDecision::Begin(_)
-    ));
-    app.tick_at(start + Duration::from_secs(2000), true, true, false);
-    assert!(app.take_action().is_none());
-    assert!(receive.try_recv().is_err());
-}
-
-#[test]
-fn startup_review_pauses_when_busy_starts_and_ends_between_ticks() {
-    let (send, _receive) = mpsc::channel();
-    let mut app = SystemStateApp::new(Plan::default());
-    assert!(app.offer(Request::new(Plan::default(), send)));
-    let start = Instant::now();
-    app.tick_at(start, true, true, false);
-    app.tick_at(start + Duration::from_secs(10), true, true, false);
-    app.publish(SetupStatus {
-        busy: true,
-        ..SetupStatus::default()
-    });
-    app.publish(SetupStatus::default());
-    app.tick_at(start + Duration::from_secs(1000), true, true, false);
-    assert!(
-        app.take_action().is_none(),
-        "busy publications pause the review even without a busy tick"
-    );
-    assert_eq!(app.review_seconds(), Some(20));
-    app.tick_at(start + Duration::from_secs(1019), true, true, false);
-    assert!(app.take_action().is_none());
-    app.tick_at(start + Duration::from_secs(1020), true, true, false);
-    assert!(matches!(
-        app.take_action(),
-        Some(SystemStateAction::Apply(_, Admission::Automatic))
-    ));
-}
-
-#[test]
-fn startup_review_interaction_stops_automatic_apply_for_the_whole_offer() {
-    for event in [
-        AppEvent::ScrollLines(1),
-        AppEvent::Action(ActionInvocation {
-            id: ActionId::new("system-state/row/secrets/disclose"),
-            value: None,
-        }),
-        AppEvent::TextInput(TextInputEvent::Commit("x".into())),
-        AppEvent::TextInput(TextInputEvent::Left { extend: false }),
-    ] {
+    ];
+    for join in [false, true] {
         let (send, _receive) = mpsc::channel();
         let mut app = SystemStateApp::new(Plan::default());
         assert!(app.offer(Request::new(Plan::default(), send)));
         let (mut runtime, instance, view) = runtime_with_app(app);
-        let start = Instant::now();
-        runtime.tick_system_state_at(start, true, true, &[view]);
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
-            )
-            .unwrap();
-        runtime.dispatch(instance, view, event).unwrap();
-        runtime.tick_system_state_at(start + Duration::from_secs(60), true, true, &[view]);
-        runtime.publish_system_state(SetupStatus {
-            plan: Some(Plan::default()),
-            ..SetupStatus::default()
-        });
-        runtime.tick_system_state_at(start + Duration::from_secs(120), false, false, &[]);
-        runtime.tick_system_state_at(start + Duration::from_secs(180), true, true, &[view]);
-        assert!(runtime.take_system_state_action().is_none());
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("system-state/apply"),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let (_, admission, _) = submitted(runtime.take_system_state_action());
-        assert_eq!(admission, Admission::Client);
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("system-state/apply"),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        assert!(
-            runtime.take_system_state_action().is_none(),
-            "Apply is single-flight"
+        let keys = typed
+            .iter()
+            .copied()
+            .chain(join.then_some(("system-state/vault/join", None)));
+        for (key, value) in keys {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(key),
+                        value: value.map(|value| SemanticInput::Text(value.into())),
+                    }),
+                )
+                .unwrap();
+        }
+        runtime.tick_system_state(true, true, &[view]);
+        let Some(SystemStateAction::Apply(answer, _)) = runtime.take_system_state_action() else {
+            panic!("the offer is answered");
+        };
+        let WorkstationSetupDecision::Begin(plan) = &answer.decision else {
+            panic!("the plan begins");
+        };
+        assert_eq!(answer.vault_typed, join);
+        assert_eq!(
+            answer
+                .password
+                .is_some_and(|password| password.as_slice() == b"synthetic-review-secret"),
+            join
+        );
+        assert_eq!(
+            plan.vault_url == "http://draft.local:7484/v1/review",
+            join,
+            "join {join}"
+        );
+        assert_eq!(
+            page_app(&runtime, instance).password.text(),
+            "synthetic-review-secret",
+            "the field keeps the draft until the worker accepts it"
         );
     }
 }
 
+/// A reveal from VoiceOver moves only the view it came from.
 #[test]
-fn startup_review_focus_and_empty_preedit_do_not_stop_the_countdown() {
-    let (send, _receive) = mpsc::channel();
-    let mut app = SystemStateApp::new(Plan::default());
-    assert!(app.offer(Request::new(Plan::default(), send)));
-    let (mut runtime, instance, view) = runtime_with_app(app);
-    let start = Instant::now();
-    runtime.tick_system_state_at(start, true, true, &[view]);
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
-        )
-        .unwrap();
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::TextInput(TextInputEvent::Preedit {
-                text: String::new(),
-                selection: None,
-            }),
-        )
-        .unwrap();
-    runtime.tick_system_state_at(start + Duration::from_secs(30), true, true, &[view]);
-    let (_, admission, _) = submitted(runtime.take_system_state_action());
-    assert_eq!(admission, Admission::Automatic);
-}
-
-#[test]
-fn startup_review_ax_reveal_stops_the_shared_review_and_repaints_linked_views() {
+fn an_ax_reveal_moves_only_its_own_view() {
     let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(Request::new(Plan::default(), send)));
@@ -2561,7 +2478,6 @@ fn startup_review_ax_reveal_stops_the_shared_review_and_repaints_linked_views() 
     runtime
         .attach_view(second, instance, AppViewState::SystemState(Box::default()))
         .unwrap();
-    let views = [first, second];
     let viewport = LogicalRect::new(0.0, 0.0, 640.0, 480.0);
     let render = |runtime: &NativeRuntime, view| {
         runtime
@@ -2570,38 +2486,13 @@ fn startup_review_ax_reveal_stops_the_shared_review_and_repaints_linked_views() 
             .compile(viewport)
             .unwrap()
     };
-    let countdown = |runtime: &NativeRuntime, view| {
-        let compiled = render(runtime, view);
-        let apply = compiled
-            .semantic(&UiKey::new("system-state/apply"))
-            .unwrap();
-        apply.description.clone()
-    };
-    let before = views.map(|view| countdown(&runtime, view));
-    assert!(before.iter().all(Option::is_some));
-    let start = Instant::now();
-    runtime.tick_system_state_at(start, true, true, &views);
     let row = UiKey::new("system-state/row/repositories");
     assert!(render(&runtime, first).semantic(&row).unwrap().offscreen);
     let outcome = runtime
         .dispatch(instance, first, AppEvent::RevealControl(row.clone()))
         .unwrap();
-    assert!(
-        outcome
-            .effects
-            .iter()
-            .any(|effect| { matches!(effect, crate::native_app::AppEffect::RepaintInstance(_)) })
-    );
     assert!(!render(&runtime, first).semantic(&row).unwrap().offscreen);
-    let after = views.map(|view| countdown(&runtime, view));
-    assert_eq!(after, [None, None]);
-    runtime.tick_system_state_at(start + Duration::from_secs(60), true, true, &views);
-    assert!(runtime.take_system_state_action().is_none());
-
-    // Once the shared countdown is stopped, revealing only moves this view.
-    let outcome = runtime
-        .dispatch(instance, first, AppEvent::RevealControl(row))
-        .unwrap();
+    assert!(render(&runtime, second).semantic(&row).unwrap().offscreen);
     assert!(
         outcome
             .effects
@@ -2629,7 +2520,6 @@ fn closing_never_cancels_and_never_waits() {
         let request = Request::new(Plan::default(), send);
         let mut app = SystemStateApp::new(Plan::default());
         app.offer(request.clone());
-        act(&mut app, "system-state/group/1/leave");
         app.password
             .input(TextInputEvent::Commit("inert-password".into()));
         let (mut runtime, instance, view) = runtime_with_app(app);
@@ -2666,40 +2556,32 @@ fn page_app(
     app
 }
 
-/// The worker hears this Mac's ALab signal while the launch's review is up (§3.5): the untouched
-/// draft widens to the whole profile in place, the page says why, and the count starts again at
-/// 30 seconds, so the person always has 30 seconds with the plan that applies. The answer says
-/// the review showed the widened plan.
+/// The worker hears this Mac's ALab signal while the launch's offer still waits for its answer
+/// (§3.5; nobody at this Mac yet): the offer widens to the whole profile in place, the page says
+/// why, and the page's own answer, once a person is here, says it showed the widened plan.
 #[test]
-fn an_alab_signal_widens_an_untouched_review_in_place_and_counts_thirty_seconds_again() {
+fn an_alab_signal_widens_a_waiting_offer_in_place() {
     let (send, receive) = mpsc::channel();
     let narrow = permissions_only();
     let request = Request::new(narrow.clone(), send);
     let mut app = SystemStateApp::new(narrow.clone());
     assert!(app.offer(request.clone()));
     let (mut runtime, instance, view) = runtime_with_app(app);
-    let start = Instant::now();
-    runtime.tick_system_state_at(start, true, true, &[view]);
-    runtime.tick_system_state_at(start + Duration::from_secs(20), true, true, &[view]);
+    runtime.tick_system_state(false, true, &[view]);
     request.send_widened(Plan::default());
-    assert!(runtime.tick_system_state_at(start + Duration::from_secs(21), true, true, &[view]));
+    assert!(runtime.tick_system_state(false, true, &[view]));
     let app = page_app(&runtime, instance);
-    assert_eq!(app.plan, Plan::default(), "the draft widened in place");
+    assert_eq!(app.plan, Plan::default(), "the offer widened in place");
     assert!(
         app.notes(&app.reviewed_plan())
             .contains(&ALAB_ADDED_NOTE.to_owned()),
         "the page says why"
     );
-    assert_eq!(app.review_seconds(), Some(30), "the count starts again");
-    runtime.tick_system_state_at(start + Duration::from_secs(40), true, true, &[view]);
-    assert!(
-        runtime.take_system_state_action().is_none(),
-        "19 seconds of 30"
-    );
-    runtime.tick_system_state_at(start + Duration::from_secs(51), true, true, &[view]);
+    assert!(runtime.take_system_state_action().is_none());
+    runtime.tick_system_state(true, true, &[view]);
     let Some(SystemStateAction::Apply(answer, admission)) = runtime.take_system_state_action()
     else {
-        panic!("the untouched review applies");
+        panic!("the page answers the offer");
     };
     assert_eq!(admission, Admission::Automatic);
     assert_eq!(
@@ -2713,8 +2595,8 @@ fn an_alab_signal_widens_an_untouched_review_in_place_and_counts_thirty_seconds_
     drop(receive);
 }
 
-/// A draft the person edited stays theirs when the ALab signal comes: nothing widens, and the
-/// page says nothing about it (§3.5).
+/// A press answered the offer as the person's choice before the ALab signal came: nothing
+/// widens, and the page says nothing about it (§3.5).
 #[test]
 fn an_edited_review_stays_the_persons_when_the_alab_signal_comes() {
     let (send, _receive) = mpsc::channel();
@@ -2734,28 +2616,25 @@ fn an_edited_review_stays_the_persons_when_the_alab_signal_comes() {
     );
 }
 
-/// The review of the groups the ALab signal adds to aterm's provisional plan in force (§3.5):
-/// it shows the added groups at Set up and says why; left untouched and visible for 30 seconds
-/// it applies the widened plan as the window's own answer; Cancel leaves the plan in force as
-/// it is.
+/// The offer of the groups the ALab signal adds to aterm's provisional plan in force (§3.5):
+/// it shows the added groups at Set up and says why, and the page answers it with the widened
+/// plan as its own answer.
 #[test]
-fn a_review_of_the_groups_the_alab_signal_adds_applies_untouched_or_cancels_to_the_plan_in_force() {
+fn an_offer_of_the_groups_the_alab_signal_adds_is_answered_with_the_widened_plan() {
     let narrow = permissions_only();
     let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(narrow.clone());
-    assert!(app.offer(Request::widen(Plan::default(), narrow.clone(), send)));
+    assert!(app.offer(Request::widen(Plan::default(), narrow, send)));
     assert_eq!(app.plan, Plan::default(), "the added groups at Set up");
     assert!(
         app.notes(&app.reviewed_plan())
             .contains(&ALAB_ADDED_NOTE.to_owned())
     );
     let (mut runtime, _instance, view) = runtime_with_app(app);
-    let start = Instant::now();
-    runtime.tick_system_state_at(start, true, true, &[view]);
-    runtime.tick_system_state_at(start + Duration::from_secs(30), true, true, &[view]);
+    runtime.tick_system_state(true, true, &[view]);
     let Some(SystemStateAction::Apply(answer, admission)) = runtime.take_system_state_action()
     else {
-        panic!("the untouched review applies");
+        panic!("the page answers the offer");
     };
     assert_eq!(admission, Admission::Automatic);
     assert_eq!(
@@ -2766,64 +2645,62 @@ fn a_review_of_the_groups_the_alab_signal_adds_applies_untouched_or_cancels_to_t
             false
         )
     );
+}
 
-    let (send, receive) = mpsc::channel();
+/// A press on that offer while it waits answers it with the plan the page shows, whole: the
+/// pressed group as pressed and every other group the ALab signal added with it, not the pressed
+/// group alone taken onto the narrower plan in force.
+#[test]
+fn a_press_on_the_widened_offer_answers_it_with_the_whole_widened_plan() {
+    let narrow = permissions_only();
+    let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(narrow.clone());
-    assert!(app.offer(Request::widen(Plan::default(), narrow.clone(), send)));
-    act(&mut app, "system-state/cancel");
-    assert_eq!(
-        receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Cancelled
-    );
-    assert_eq!(
-        app.plan.selection, narrow.selection,
-        "the plan in force stays as it is"
+    assert!(app.offer(Request::widen(Plan::default(), narrow, send)));
+    let (mut runtime, instance, view) = runtime_with_app(app);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/group/2/leave"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let Some(SystemStateAction::Apply(answer, _)) = runtime.take_system_state_action() else {
+        panic!("the press answers the offer");
+    };
+    assert!(answer.chosen);
+    assert_eq!(answer.changed, None, "the plan as the page shows it");
+    let WorkstationSetupDecision::Begin(plan) = answer.decision else {
+        panic!("the plan begins");
+    };
+    assert!(!plan.selection.contains(Setting::Dock), "as pressed");
+    assert!(
+        plan.selection.contains(Setting::CapsLock) && plan.selection.contains(Setting::Spotlight),
+        "the other added groups go with it: {plan:?}"
     );
 }
 
-/// Cancel on the launch's review (§3.3): every group reads Leave as is at once, and a status read
-/// before the worker kept the Cancel never puts the offered plan back. Once the Cancel stands,
-/// the page says so in one calm line beside Set up now, and nothing lights: no Needs you, no
-/// diamond, no menu line.
+/// A Cancel an earlier aterm recorded (§3.3; the page offers none since design revision 4): every
+/// group reads Leave as is, the page says so in one calm line beside Set up now, and nothing
+/// lights: no Needs you, no diamond, no menu line.
 #[test]
-fn a_cancelled_review_leaves_every_group_as_is_with_one_calm_line_and_set_up_now() {
-    let (send, receive) = mpsc::channel();
+fn a_recorded_cancel_leaves_every_group_as_is_with_one_calm_line_and_set_up_now() {
     let mut app = SystemStateApp::new(Plan::default());
-    assert!(app.offer(Request::new(Plan::default(), send)));
-    act(&mut app, "system-state/cancel");
-    assert_eq!(
-        receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Cancelled
-    );
-    assert!(matches!(
-        app.take_action(),
-        Some(SystemStateAction::CancelReview)
-    ));
-    assert!(app.plan.selection.is_empty(), "every group at Leave as is");
-    let fda_needs_you = vec![reading(
-        Subject::Access(Access::FullDiskAccess),
-        Standing::NeedsYou,
-        Some("Off"),
-    )];
-    app.publish(SetupStatus {
-        plan: Some(Plan::default()),
-        observed: fda_needs_you.clone(),
-        ..SetupStatus::default()
-    });
-    assert!(
-        app.plan.selection.is_empty(),
-        "a status read before the Cancel was kept never puts the offer back"
-    );
-    let left = Plan::from(Selection::none());
     let cancelled = SetupStatus {
-        plan: Some(left),
+        plan: Some(Plan::from(Selection::none())),
         cancelled: true,
         finished: true,
-        observed: fda_needs_you,
+        observed: vec![reading(
+            Subject::Access(Access::FullDiskAccess),
+            Standing::NeedsYou,
+            Some("Off"),
+        )],
         ..SetupStatus::default()
     };
     app.publish(cancelled.clone());
-    assert!(app.plan.selection.is_empty());
+    assert!(app.plan.selection.is_empty(), "every group at Leave as is");
     assert_eq!(app.notes(&app.reviewed_plan()), [CANCELLED_NOTE.to_owned()]);
     let headline = app.headline();
     assert_eq!(headline.text, "Everything is left as is");
@@ -2835,7 +2712,7 @@ fn a_cancelled_review_leaves_every_group_as_is_with_one_calm_line_and_set_up_now
         "no menu line"
     );
     // Set up now: the plan as it stands, nothing of the page's own, which the worker takes onto
-    // the plan the review showed.
+    // the plan in force.
     app.gesture(true);
     act(&mut app, "system-state/headline/start");
     let Some(SystemStateAction::Apply(answer, admission)) = app.take_action() else {
@@ -2886,9 +2763,9 @@ fn a_cancel_after_a_restore_reads_as_any_cancel_beside_the_restores_line() {
     );
 }
 
-/// The person closed this launch's review unanswered (§3.3): the page shows the plan the review
-/// showed with Set up now, calm, with no countdown, and nothing it reads lights anything, since
-/// nobody approved its permission steps.
+/// This launch's offer was closed unanswered (§3.3): the page shows the plan the offer showed
+/// with Set up now, calm, and nothing it reads lights anything, since nothing approved its
+/// permission steps.
 #[test]
 fn a_review_closed_unanswered_reads_calm_with_set_up_now() {
     let mut app = SystemStateApp::new(Plan::default());
@@ -2907,7 +2784,6 @@ fn a_review_closed_unanswered_reads_calm_with_set_up_now() {
     let headline = app.headline();
     assert_eq!(headline.text, NOT_STARTED);
     assert!(headline.start && headline.open.is_none());
-    assert_eq!(app.review_seconds(), None, "no countdown");
     assert!(!app.needs_attention());
     assert_eq!(crate::system_state_access::menu_line(&status, false), None);
 }
@@ -5121,7 +4997,7 @@ fn every_scenarios_notes_are_sentences_in_the_pages_words() {
 }
 
 /// Every scenario the page's fixture seam draws.
-const SCENARIOS: [&str; 43] = [
+const SCENARIOS: [&str; 42] = [
     "checking",
     "running",
     "widened",
@@ -5163,7 +5039,6 @@ const SCENARIOS: [&str; 43] = [
     "newer",
     "restoring",
     "review",
-    "review-stopped",
     "cancelled",
 ];
 
@@ -6260,8 +6135,8 @@ fn an_unconfirmed_row_is_drawn_waiting_with_its_note() {
     assert_eq!(app.reviewed_row(repositories).chip, Some(Chip::InPlace));
 }
 
-/// The page offered the first launch's review of a fresh signed Mac (the `review` scenario):
-/// Full Disk Access and Debugger access read as needing a person once Permissions run.
+/// The first launch's offer of a fresh signed Mac waits for a person at this Mac (the `review`
+/// scenario): Full Disk Access and Debugger access read as needing a person once Permissions run.
 fn in_review() -> (
     SystemStateApp,
     mpsc::Receiver<crate::workstation_setup::SetupAnswer>,
@@ -6273,8 +6148,8 @@ fn in_review() -> (
     (app, receive)
 }
 
-/// While the first launch's review is up its headline is its one signal (design §3.3, §3.6):
-/// no attention diamond, and the headline says it is a review; once nothing is offered, the
+/// While the first launch's offer waits its headline is its one signal (design §3.3, §3.6):
+/// no attention diamond, and the headline says setup is starting; once nothing is offered, the
 /// same readings light the tab.
 #[test]
 fn the_review_headline_is_its_only_signal() {
@@ -6288,7 +6163,7 @@ fn the_review_headline_is_its_only_signal() {
     for status in [status_of("review"), failing] {
         let (mut app, _receive) = in_review();
         app.publish(status.clone());
-        assert_eq!(app.headline().text, REVIEW_HEADLINE);
+        assert_eq!(app.headline().text, STARTING_HEADLINE);
         assert!(!app.needs_attention());
         assert!(
             !app.presentation(&SystemStateViewState::default())
@@ -6304,9 +6179,9 @@ fn the_review_headline_is_its_only_signal() {
     }
 }
 
-/// During the review every row reads as what Apply does to it (design §3.3): a grant a person
-/// gives once setup runs reads `will change to`, with no `Needs you` and no button to open a
-/// pane nobody is asked to open yet.
+/// While the offer waits every row reads as what setup does to it (design §3.3): a grant a
+/// person gives once setup runs reads `will change to`, with no `Needs you` and no button to
+/// open a pane nobody is asked to open yet.
 #[test]
 fn review_rows_read_as_what_apply_will_do() {
     let (app, _receive) = in_review();
@@ -6340,101 +6215,6 @@ fn review_rows_read_as_what_apply_will_do() {
     let row = shown.reviewed_row(Subject::Access(Access::FullDiskAccess));
     assert_eq!(row.chip, Some(Chip::NeedsYou));
     assert_eq!(row.open, Some(Access::FullDiskAccess));
-}
-
-/// One line above the review's buttons says what each does, while Apply counts down and once
-/// a click stopped it (design §3.3).
-#[test]
-fn the_review_says_what_apply_and_cancel_do() {
-    let (mut app, _receive) = in_review();
-    for stopped in [false, true] {
-        if stopped {
-            assert!(app.gesture(true), "a click stops the countdown");
-        }
-        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
-        assert_eq!(
-            label(&compiled, "system-state/footer/review"),
-            REVIEW_NOTE,
-            "stopped {stopped}"
-        );
-        let said = compiled
-            .semantics
-            .iter()
-            .filter(|node| node.label == REVIEW_NOTE)
-            .count();
-        assert_eq!(said, 1, "stopped {stopped}");
-    }
-    let mut shown = SystemStateApp::new(Plan::default());
-    shown.publish(status_of("review"));
-    let compiled = compile(&shown, &SystemStateViewState::default(), 999.0, 1400.0);
-    assert!(
-        compiled
-            .semantic(&UiKey::new("system-state/footer/review"))
-            .is_none()
-    );
-}
-
-/// VoiceOver hears the review's button as `Apply`, its face's count aside: while it counts, its
-/// description says it applies by itself in so many seconds, and once stopped it has none.
-#[test]
-fn apply_tells_voiceover_it_applies_by_itself_only_while_counting() {
-    let (mut app, _receive) = in_review();
-    let counting = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
-    let apply = counting
-        .semantic(&UiKey::new("system-state/apply"))
-        .unwrap();
-    assert_eq!(apply.label, "Apply");
-    assert_eq!(
-        apply.description.as_deref(),
-        Some("Applies by itself in 30 seconds")
-    );
-    assert!(app.gesture(true));
-    let stopped = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
-    let apply = stopped.semantic(&UiKey::new("system-state/apply")).unwrap();
-    assert_eq!(apply.label, "Apply");
-    assert_eq!(apply.description, None);
-}
-
-/// Once a click stops the countdown, Apply keeps the footprint `Apply (30)` gave it, so
-/// nothing under the pointer moves, and paints its shorter face centred in it.
-#[test]
-fn a_stopped_apply_keeps_its_footprint_with_its_face_centred() {
-    let apply = |compiled: &CompiledUi| {
-        compiled
-            .paint
-            .iter()
-            .find(|node| node.key.as_str() == "system-state/apply")
-            .map(|node| {
-                let UiContent::Button(control) = &node.content else {
-                    panic!("Apply is a button");
-                };
-                (
-                    node.rect,
-                    control.centred,
-                    control.spec.visual_label.clone(),
-                )
-            })
-            .expect("Apply is painted")
-    };
-    let (mut app, _receive) = in_review();
-    let (counting, centred, face) = apply(&compile(
-        &app,
-        &SystemStateViewState::default(),
-        999.0,
-        1400.0,
-    ));
-    assert!(centred);
-    assert_eq!(face.as_deref(), Some("Apply (30)"));
-    assert!(app.gesture(true));
-    let (stopped, centred, face) = apply(&compile(
-        &app,
-        &SystemStateViewState::default(),
-        999.0,
-        1400.0,
-    ));
-    assert_eq!(face.as_deref(), Some("Apply"));
-    assert!(centred, "the shorter face sits in the middle of its button");
-    assert_eq!((stopped.x, stopped.width), (counting.x, counting.width));
 }
 
 /// A newer aterm's setup is said once, calmly, in the headline (design §3.2, §3.5): never a

@@ -448,7 +448,7 @@ fn workspace_of(manifest: &aterm_toml::Value) -> Option<Workspace> {
 /// The main worktree the aterm workspace at `root` belongs to, when it is a linked worktree.
 fn linked_worktree_of(sys: &dyn System, user: &User, root: &Path) -> Option<PathBuf> {
     let ran = sys
-        .run_complete_stdout(&checkout::git(user, Some(root)).args([
+        .run_complete_stdout(&checkout::git(sys, user, Some(root)).args([
             "rev-parse",
             "--path-format=relative",
             "--git-dir",
@@ -690,13 +690,13 @@ struct Needs {
 }
 
 impl Submodules {
-    fn git(&self) -> Cmd {
-        checkout::git(&self.user, Some(&self.path))
+    fn git(&self, sys: &dyn System) -> Cmd {
+        checkout::git(sys, &self.user, Some(&self.path))
     }
 
     fn read(&self, sys: &dyn System) -> Result<(Submodule, bool), String> {
         let recurse = sys
-            .run_complete_stdout(&self.git().args(["config", "--get", "submodule.recurse"]))
+            .run_complete_stdout(&self.git(sys).args(["config", "--get", "submodule.recurse"]))
             .map_err(|_| "cannot run git config in the checkout")?;
         let recurse = match recurse.status {
             Some(0) => String::from_utf8_lossy(&recurse.stdout).trim() == "true",
@@ -704,7 +704,7 @@ impl Submodules {
             _ => return Err("cannot read the checkout's submodule.recurse".into()),
         };
         let status = sys
-            .run_complete_stdout(&self.git().args(["submodule", "status", "--", SUBMODULE]))
+            .run_complete_stdout(&self.git(sys).args(["submodule", "status", "--", SUBMODULE]))
             .map_err(|_| "cannot run git submodule status in the checkout")?;
         let line = String::from_utf8_lossy(&status.stdout).into_owned();
         let state = if !status.success() || line.trim().is_empty() {
@@ -724,7 +724,7 @@ impl Submodules {
     /// A moved submodule is checked out again only when it merely lags the tree.
     fn moved_safely(&self, sys: &dyn System) -> Result<Option<String>, String> {
         let inner = self.path.join(SUBMODULE);
-        let git = checkout::git(&self.user, Some(&inner));
+        let git = checkout::git(sys, &self.user, Some(&inner));
         let status = sys
             .run_complete_stdout(&git.clone().args([
                 "status",
@@ -765,7 +765,7 @@ impl Submodules {
             return Err("cannot read vendor/astream's commit".into());
         }
         let recorded = sys
-            .run_complete_stdout(&self.git().args([
+            .run_complete_stdout(&self.git(sys).args([
                 "log",
                 "-1",
                 "--format=%H",
@@ -881,7 +881,7 @@ impl Item for Submodules {
             .ok_or("vendor/astream is gone from the checkout")?;
         if needs.recurse {
             let ran = sys
-                .run_complete_stdout(&self.git().args(["config", "submodule.recurse", "true"]))
+                .run_complete_stdout(&self.git(sys).args(["config", "submodule.recurse", "true"]))
                 .map_err(|_| "cannot run git config in the checkout")?;
             if !ran.success() {
                 return Err("git config submodule.recurse true failed".into());
@@ -891,7 +891,7 @@ impl Item for Submodules {
             let ran = sys
                 .run_complete_stdout(
                     &self
-                        .git()
+                        .git(sys)
                         .budget(LONG_BUDGET)
                         .args(checkout::NO_SIDE_RUNS)
                         .args([

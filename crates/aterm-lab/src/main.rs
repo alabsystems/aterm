@@ -40,6 +40,8 @@ mod band;
 #[cfg(target_os = "macos")]
 mod bus;
 #[cfg(target_os = "macos")]
+mod claude_login_proof;
+#[cfg(target_os = "macos")]
 mod clock;
 #[cfg(target_os = "macos")]
 mod codex;
@@ -342,15 +344,17 @@ usage: targo --unverified lab <command> [tag] [args]
                                  check prices.toml against Claude Code's embedded price catalog and Codex's model ids
   wait [tag] <regex> [secs]      wait until a screen row matches <regex> (default 60 s; `await match`); exit 1 if none did
   ps [tag]                       list pids for [tag], or for every lab with a run directory under $LAB_STATE/runs
-  journal [tag]                  print the harness journal and ledger
+  journal [tag] [@sid]           print the harness journal and ledger (the first tab's, or @sid's)
   watch [tag] [secs]             stream screen diffs and journal lines on one clock (default 30 s)
   stublog [tag] [N] | security [tag] | egress [tag] [MIN] | lsof [tag]
                                  the stub's log (last N lines, 40) | the keychain tripwire's log | egress witness, proxy
                                  refusals and sandbox denials (last MIN minutes, 30) | the lab's network sockets
-  capture [tag] <name> \"<what>\"  write $LAB_STATE/captures/<agent>-<version>-<name>.txt (+png)
+  capture [tag] [@sid] <name> \"<what>\"
+                                 write $LAB_STATE/captures/<agent>-<version>-<name>.txt (+png) of the active tab, or @sid
   catch [tag] <regex> <name> \"<what>\" [secs]
                                  capture a fixture the instant <regex> matches on screen (default 60 s)
-  header [tag] \"<what>\"          print the one-line `# ...` fixture header for [tag]
+  header [tag] [@sid] \"<what>\"   print the one-line `# ...` fixture header for [tag]'s active tab, or @sid, naming
+                                 the launch that ran there (the stub's route, or Claude Code's default route)
   footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]
                                  capture managed Claude Code footer screens across modes on a fresh lab
   halfdraw scan <cast> --program claude|agy|muse [--show N] [--event I]
@@ -363,6 +367,12 @@ usage: targo --unverified lab <command> [tag] [args]
                                  place a Muse Code lab's harness points against its sessions' runs (mid-reply, in the gate)
   probe [tag] [--replica]        run jail and replica-home isolation probes (--replica: replica home only)
   selftest [tag] [--keep]        end-to-end Claude Code proof (~25 s: turn, survey, harness, egress, tripwire, probes, twin)
+  claude-login-proof [tag] [--keep]
+                                 the real Claude Code's lost login on its default route, end to end (~5 min): a roster
+                                 row's lost login waits on aterm's sign-in (S1), one no row names gets /login (S2), the
+                                 row added by `accounts add` backs aterm out of its picker before the host's own look at
+                                 the roster (S3), a person's /login is left alone (S3b); no browser, no `auth login`, no
+                                 egress, no owner's keychain item; a verdict table, exit 1 on FAIL (--keep: judged live)
   nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
                                  force N (1-3) PTY displacements on real Claude Code and verify the repaint nudge (~2.5 min)
   restore [tag] quit|crash [--keep] [--hold] [--clear] [--land|--land-open]
@@ -373,13 +383,16 @@ usage: targo --unverified lab <command> [tag] [args]
                                  `step=done:taskless`; --land: the landed tab stays `task=landed` with
                                  `step=done:said-done`; --land-open: mid-work Land settles `step=done:landing` without
                                  typing Cruise nudges)
-  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
+  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|resid|ladder|angles] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
                                  - land / cruise / both: L1-L11, L16-L17, C1-C2, HL/HC (same-land, same-cruise), P4,
                                    N1-N4, Off control, plus Settings > Harness window & 20 s idle wake/render checks
                                    (--no-surfaces skips window checks); a chain aterm stops typing into is watched 60 s
-                                   past its hold, brought in front twice, and must say `stopped typing`
+                                   past its hold, brought in front twice, and must say `stopped typing` (the
+                                   chip or hover, the state line, `status held=`, the journal's `held=`), with
+                                   one `Stopped typing` Messages row only for Land over a repository leg, gone
+                                   once same-land's person types their turn
                                  - cover: L12 prose question, L13 person turn (task=theirs), L14/C3 P2 reads, P5, L15
                                    worker, C4, Off control
                                  - cap: continue_per_hour = 1 escalation and post-hour recovery (~72 min)
@@ -389,8 +402,11 @@ usage: targo --unverified lab <command> [tag] [args]
                                    each; wall-unread ~90 min)
                                  - wall-cruise / wall-relaunch: W8 Cruise at a wall, W9 a relaunch under a wall
                                  - resid / ladder: residual and backoff-ladder scenario slices
-                                 - --window (needs the land-p chain; refused under LAB_RESTORE=1): opens a real window and
-                                   types L13's person prompt via NSEvent `hwkey` (`human_seq=` verified)
+                                 - angles: cruise-angles, each done claim after real work asked another of the six kinds
+                                   of work in turn, never held past the sixth; the back-off ladder at an eighth (~30 min)
+                                 - --window (needs the land-p or same-land chain; refused under LAB_RESTORE=1): opens a real
+                                   window, types L13's person prompt via NSEvent `hwkey` (`human_seq=` verified), and reads
+                                   same-land's hold (its chip's and its band's screen-reader nodes) off it
   crash [tag] [--gap SECS] [--keep-tree]
                                  SIGKILL the lab's own aterm instance and relaunch it on the same state after SECS (default
                                  0; --keep-tree leaves its child processes, for PTY keeper testing; refused on windowed labs)
@@ -646,6 +662,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "ratelimits" => codex::cmd_ratelimits(args),
         "rollout" => codex::cmd_rollout(args),
         "codex-selftest" => codex_proof::cmd_codex_selftest(args),
+        "claude-login-proof" => claude_login_proof::cmd_claude_login_proof(args),
         "agy" => agy::cmd_agy(args),
         "agy-selftest" => agy_proof::cmd_agy_selftest(args),
         "agy-captures" => agy_captures::cmd_agy_captures(args),

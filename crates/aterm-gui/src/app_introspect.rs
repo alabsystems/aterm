@@ -2400,7 +2400,8 @@ fn observe_capture_pet_world(
         ws.search.is_some(),
         ws.pet_chrome.held(),
         ws.pet_chrome.held_overlays(),
-    );
+    )
+    .painted_over(ws.pet_chrome.held_painted_over());
     let observed = ws.fx.companion_mut().observe_console_reserved(
         input,
         &exact_focus.pet_world,
@@ -2721,6 +2722,22 @@ thread_local! {
 }
 
 impl App {
+    /// Identity of the global-front target selected by the trail readers.
+    pub(crate) fn trail_target_fields(&self) -> Result<String, String> {
+        let window = self.frontmost_window.ok_or("no focused window")?;
+        let state = self.windows.get(&window).ok_or("no focused window")?;
+        let view = state.front_content.map(|front| front.view().get());
+        let session = state
+            .front_content
+            .and_then(|front| front.terminal_session());
+        Ok(format!(
+            "selection=front window={} view={} session={}",
+            window.0,
+            view.map_or_else(|| "-".to_string(), |id| id.to_string()),
+            session.map_or_else(|| "-".to_string(), |id| id.to_string()),
+        ))
+    }
+
     /// The `trail` control-socket verb ([`crate::Wake::TrailAdmissions`]).
     pub(crate) fn trail_admissions(&self, count: Option<usize>) -> Result<Vec<String>, String> {
         let Some(ws) = self.frontmost_window.and_then(|wid| self.windows.get(&wid)) else {
@@ -2735,7 +2752,10 @@ impl App {
             .map(|record| record.line(now))
             .collect();
         let keep = count.unwrap_or(all.len()).min(all.len());
-        Ok(all[all.len() - keep..].to_vec())
+        let mut lines = Vec::with_capacity(keep + 1);
+        lines.push(format!("trail-target {}", self.trail_target_fields()?));
+        lines.extend_from_slice(&all[all.len() - keep..]);
+        Ok(lines)
     }
 
     /// Sample the selected terminal grid and all main-thread-owned presentation geometry as one event-turn record.
@@ -6425,14 +6445,48 @@ impl App {
         }
     }
 
+    fn read_about_controls(&self) -> Vec<String> {
+        let Some((wid, instance, view)) = self.front_about_view() else {
+            return vec!["state open=false pane=native-tab app=about".into()];
+        };
+        let compiled = self
+            .cached_native_ui(wid)
+            .filter(|frame| frame.stamp.instance == instance && frame.stamp.view == view)
+            .map(|frame| frame.compiled.clone())
+            .map_or_else(
+                || {
+                    self.native_ui_viewport_for(wid, view).and_then(|viewport| {
+                        self.compiled_native_ui_for(wid, instance, view, viewport)
+                    })
+                },
+                Ok,
+            );
+        let mut lines = vec!["state open=true pane=native-tab app=about".into()];
+        match compiled {
+            Ok(compiled) => {
+                let controls = compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| node.action.is_some())
+                    .count();
+                lines.push(format!(
+                    "native surface=native-tab app=about controls={controls} semantics={}",
+                    compiled.semantics.len()
+                ));
+                lines.extend(compiled.controls_lines());
+            }
+            Err(error) => lines.push(format!(
+                "native surface=native-tab app=about controls=0 semantics=0 error={error:?}"
+            )),
+        }
+        lines
+    }
+
     /// Read an auxiliary own-rendered surface's controls as human-readable text lines.
     pub(crate) fn read_aux_controls(&self, target: AuxTarget) -> Vec<String> {
         match target {
             AuxTarget::Prefs => self.read_native_settings_controls(None),
-            AuxTarget::About => self.read_native_settings_controls(Some((
-                "about",
-                crate::native_settings::SettingsRoute::About,
-            ))),
+            AuxTarget::About => self.read_about_controls(),
             AuxTarget::Menu => match self.front().and_then(|ws| ws.palette()) {
                 Some(p) => p.controls_lines(),
                 None => self
@@ -6476,11 +6530,10 @@ mod native_settings_compatibility_controls_tests {
     use crate::native_ui::UiKey;
 
     #[test]
-    fn about_and_update_aliases_emit_the_exact_retained_native_frame() {
-        for (target, route, retired_prefix) in [
-            (AuxTarget::About, SettingsRoute::About, "about "),
-            (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update "),
-        ] {
+    fn update_alias_emits_the_exact_retained_native_frame() {
+        {
+            let (target, route, retired_prefix) =
+                (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update ");
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
             assert!(app.open_settings_tab(route));
@@ -6697,10 +6750,9 @@ mod native_settings_compatibility_controls_tests {
 
     #[test]
     fn route_aliases_never_describe_a_matching_background_window() {
-        for (target, background_route, alias) in [
-            (AuxTarget::About, SettingsRoute::About, "about"),
-            (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update"),
-        ] {
+        {
+            let (target, background_route, alias) =
+                (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update");
             let mut app = App::headless_for_test();
             let background = WindowId(0);
             assert!(app.open_settings_tab(background_route));

@@ -20,6 +20,12 @@ mod report_read;
 #[path = "cli_upgrade_policy_tests.rs"]
 mod upgrade_policy;
 
+#[path = "cli_renewal_read_tests.rs"]
+mod renewal_read;
+
+#[path = "cli_signin_epoch_tests.rs"]
+mod signin_epoch;
+
 fn tmp_dir(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-harness-cli-{tag}-"))
@@ -1505,6 +1511,7 @@ fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
         reclaimed: &[],
         passing: false,
         alive: &alive,
+        ahead: ask::Ahead::default(),
     };
     let t = env.now * 1000;
     let mut rows = Vec::new();
@@ -1729,6 +1736,7 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         room: None,
         table: None,
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -1841,6 +1849,7 @@ fn tick_below_floor(
         room: None,
         table: None,
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -1917,6 +1926,7 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
         room: None,
         table: None,
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -2010,6 +2020,7 @@ fn the_disk_tick_removes_with_cloud_placeholders_exposed() {
         room: None,
         table: Some(&table),
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -2070,6 +2081,7 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
         room: None,
         table: None,
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -2161,6 +2173,7 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
         room: None,
         table: None,
         demand: None,
+        projected: None,
         session_cwds: &[],
         session_cwd_unknown: None,
         link_dirs: &[],
@@ -4178,6 +4191,12 @@ fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
 
     let (code, _, err) = acc_quiet(add("work-3", Class::Dedicated), &env);
     assert_eq!(code, exit(0), "{err}");
+    #[cfg(unix)]
+    let woken = {
+        let now = wake_id(&store);
+        assert_ne!(now, woken, "the add wakes a waiting host for its row");
+        now
+    };
     let fresh = store.login_dir("work-3").expect("a label");
     tty.login = Ok(3);
     tty.writes_home = false;
@@ -4228,6 +4247,50 @@ fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
 fn wake_id(store: &accounts::Store) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::metadata(store.wake_path()).ok().map(|m| m.ino())
+}
+
+/// Every command that writes the roster wakes a running aterm's host for it, as a sync does:
+/// the session waiting on a login hears of the row at once, not at the host's minute-long look.
+/// A refused write writes nothing and so wakes nobody.
+#[cfg(unix)]
+#[test]
+fn a_roster_write_wakes_a_waiting_host_and_a_refused_one_wakes_nobody() {
+    let tmp = tmp_dir("accounts-add-wakes");
+    let env = env_at(&tmp);
+    let store = env.accounts_store();
+    let (code, _, _) = acc_quiet(add("Work", Class::Dedicated), &env);
+    assert_eq!(code, exit(1));
+    assert_eq!(wake_id(&store), None, "a refused add wakes nobody");
+
+    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(err.is_empty(), "{err}");
+    let woken = wake_id(&store);
+    assert!(woken.is_some(), "the add wakes a waiting host");
+    let (code, _, _) = acc_quiet(add("work-2", Class::Shared), &env);
+    assert_eq!(code, exit(1));
+    assert_eq!(wake_id(&store), woken, "a listed label wakes nobody");
+    let (code, _, err) = acc_quiet(add("pool-a", Class::Shared), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert_ne!(wake_id(&store), woken, "each add wakes it again");
+
+    let other = tmp_dir("accounts-adopt-wakes");
+    let env = env_at(&other);
+    let store = env.accounts_store();
+    let adopt = |label: &str| AccountsCmd::AdoptDefault {
+        label: label.to_string(),
+        email: Some("owner@example.test".to_string()),
+        identity_email: None,
+        browser: None,
+    };
+    let (code, out, err) = acc_quiet(adopt("mine"), &env);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert!(err.is_empty(), "{err}");
+    let woken = wake_id(&store);
+    assert!(woken.is_some(), "adopt-default wakes a waiting host");
+    let (code, _, _) = acc_quiet(adopt("mine-2"), &env);
+    assert_eq!(code, exit(1), "the default login is listed already");
+    assert_eq!(wake_id(&store), woken, "and that refusal wakes nobody");
 }
 
 #[test]
@@ -7686,4 +7749,115 @@ fn signin_parses_for_grok_alone_and_wait_belongs_to_it() {
     let signin = help_page(HelpPage::Signin);
     assert!(signin.contains("Grok Build signs in by itself from now on"));
     assert!(signin.contains("aterm approves its page itself first, in a headless browser"));
+}
+
+#[test]
+fn disk_free_parses_its_paths_and_flags_and_is_on_the_disk_page() {
+    assert_eq!(
+        parse(&words("disk free /h/.npm/a /h/.cache/b --dry-run --json"))
+            .expect("parses")
+            .0,
+        Cmd::DiskFree {
+            paths: vec![PathBuf::from("/h/.npm/a"), PathBuf::from("/h/.cache/b")],
+            dry_run: true,
+            json: true,
+        }
+    );
+    assert_eq!(
+        parse(&words("disk free /h/.npm/a")).expect("parses").0,
+        Cmd::DiskFree {
+            paths: vec![PathBuf::from("/h/.npm/a")],
+            dry_run: false,
+            json: false,
+        }
+    );
+    for line in ["disk free", "disk free /x --apply cargo-targets"] {
+        assert!(parse(&words(line)).is_err(), "{line} should be refused");
+    }
+    assert_eq!(
+        parse(&words("disk free --dry-run")).expect("parses").0,
+        Cmd::DiskFree {
+            paths: Vec::new(),
+            dry_run: true,
+            json: false,
+        },
+        "a dry run with no path lists what the roots hold"
+    );
+    let page = help_page(HelpPage::Disk);
+    assert!(page.contains("aterm harness disk free <path>... [--dry-run] [--json]"));
+    assert!(page.contains("`disk free <path>...` is the one way"));
+}
+
+#[test]
+fn disk_free_removes_a_scratch_cache_journals_it_and_exits_nonzero_on_a_refusal() {
+    let tmp = tmp_dir("disk-free");
+    let mut env = env_at(&tmp);
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let home = std::fs::canonicalize(&home).expect("resolved home");
+    env.home = Some(home.clone());
+    let cache = home.join(".cache/some-tool");
+    std::fs::create_dir_all(&cache).expect("cache");
+    std::fs::write(cache.join("blob"), vec![1u8; 4096]).expect("blob");
+    let kept = home.join("Documents/notes");
+    std::fs::create_dir_all(&kept).expect("kept");
+    let nobody = |_: &[PathBuf], _: &[u32]| -> io::Result<aterm_uds::holders::PathScan> {
+        Ok(aterm_uds::holders::PathScan::default())
+    };
+    let table = aterm_sysprobe::volumes::Table {
+        complete: true,
+        ..aterm_sysprobe::volumes::Table::default()
+    };
+    let paths = [cache.clone(), kept.clone()];
+    let go = |dry_run: bool, json: bool| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ask = DiskFree {
+            paths: &paths,
+            dry_run,
+            json,
+        };
+        let code = run_disk_free_with(&env, &ask, &nobody, &table, &mut out, &mut err);
+        (
+            format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS),
+            String::from_utf8_lossy(&out).into_owned(),
+        )
+    };
+    let (ok, out) = go(true, false);
+    assert!(!ok, "a refusal exits nonzero: {out}");
+    assert!(
+        out.contains(&format!("would remove {}", cache.display())),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("refused {}", kept.display())),
+        "{out}"
+    );
+    assert!(cache.join("blob").is_file(), "a dry run removes nothing");
+    assert!(!env.disk_ledger().exists(), "a dry run journals nothing");
+
+    let (ok, out) = go(false, true);
+    assert!(!ok);
+    let objects: Vec<Value> = out
+        .lines()
+        .map(|l| aterm_json::from_str(l).expect("one object per line"))
+        .collect();
+    assert_eq!(objects.len(), 2, "{out}");
+    assert_eq!(objects[0]["removed"], Value::from(true));
+    assert_eq!(objects[0]["grant"], Value::from(true));
+    assert_eq!(objects[1]["removed"], Value::from(false));
+    assert!(
+        objects[1]["refused"]
+            .as_str()
+            .is_some_and(|w| w.contains("none of the cache roots"))
+    );
+    assert!(!cache.exists());
+    assert!(kept.is_dir());
+    let ledger = std::fs::read_to_string(env.disk_ledger()).expect("the ledger");
+    let actions: Vec<String> = ledger
+        .lines()
+        .map(|l| aterm_json::from_str::<Value>(l).expect("row"))
+        .filter(|r| r["kind"] == Value::from("disk-free"))
+        .map(|r| r["action"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(actions, ["removing", "removed", "refused"], "{ledger}");
 }

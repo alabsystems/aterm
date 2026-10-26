@@ -18,6 +18,9 @@ const COLS: u16 = 80;
 const TAP_BYTES: usize = 16 << 20;
 const SLICE: usize = 64 * 1024;
 const N_ITERS: usize = 9;
+/// Interleaved pass pairs behind the tail tap's ratio: a pass is about 35 ms, and with 9 pairs a
+/// scheduler stall at the quiet claim's load moved the median past the lane's 3% fence.
+const TAP_ITERS: usize = 49;
 const WARMUP: usize = 2;
 const PER_SAMPLE: usize = 64;
 
@@ -230,9 +233,9 @@ fn main() {
     let corpus = aterm_bench::throughput_corpus(TAP_BYTES);
 
     let mut tap_writer = tap_writer();
-    let mut ratios = Vec::with_capacity(N_ITERS);
-    let mut tapped = Vec::with_capacity(N_ITERS);
-    for i in 0..WARMUP + N_ITERS {
+    let mut ratios = Vec::with_capacity(TAP_ITERS);
+    let mut tapped = Vec::with_capacity(TAP_ITERS);
+    for i in 0..WARMUP + TAP_ITERS {
         let without = tap_pass(&corpus, None);
         let with = tap_pass(&corpus, Some(&mut tap_writer));
         if i >= WARMUP {
@@ -274,7 +277,8 @@ fn main() {
          \"kf_shell_us\":{:.3},\"kf_shell_capture_us\":{:.3},\"kf_tui_us\":{:.3},\
          \"kf_tui_capture_us\":{:.3},\"kf_bridge256_us\":{:.3},\"kf_bridge256_capture_us\":{:.3},\
          \"kf_bridge512_us\":{:.3},\"kf_bridge512_capture_us\":{:.3},\"recover_us\":{:.3},\
-         \"export_us_per_line\":{export:.4},\"n\":{N_ITERS},\"warmup\":{WARMUP}}}",
+         \"export_us_per_line\":{export:.4},\"n\":{N_ITERS},\"tap_n\":{TAP_ITERS},\
+         \"warmup\":{WARMUP}}}",
         1.0 / kf_shell,
         1.0 / kf_tui,
         1.0 / kf_256,

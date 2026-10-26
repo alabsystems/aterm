@@ -190,6 +190,8 @@ fn a_cross_row_park_sleeps_until_its_own_expiry() {
             landing_glyph: false,
             landing_cell: None,
             content_followed: false,
+            press_mask: u128::MAX,
+            v2_typed_before: 0,
         });
         let patience = if cross_row {
             Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S)

@@ -41,6 +41,7 @@ pub(super) fn fixture() -> HarnessState {
         words: "Automatic \u{b7} limited: approve: safe".to_string(),
         posture: HarnessPosture::On(Autopilot::Cruise),
         sessions: vec![HarnessSession {
+            stopped: None,
             local_id: 7,
             sid: "s-7".to_string(),
             title: "fix the build".to_string(),

@@ -13,6 +13,10 @@ use aterm_types::macos_setup::{
 
 #[cfg(test)]
 mod accounts_visibility_tests;
+#[cfg(any(test, debug_assertions))]
+mod follow_up_stop_test;
+#[cfg(any(test, debug_assertions))]
+pub use follow_up_stop_test::InitialSetupWithheldStopTest;
 mod initial;
 pub use initial::{
     BroughtForward, InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
@@ -119,8 +123,8 @@ pub struct Report {
     pub manual_steps: Vec<String>,
     /// Original per-key values retained for `--restore`.
     pub backup: PathBuf,
-    /// A Restore's outcome by System State row, for the page, whose notes name rows where
-    /// `rows` names each key; `None` for any other action.
+    /// A Restore's outcome by System State row, including one a setup pass finishes.
+    /// The page uses its row names where `rows` names each preference key.
     pub restore: Option<RestoreRows>,
     /// A pass's rows for the page (design §3.4, §3.6): what it did to the Mac settings in
     /// System State's row names, where `rows` names each preference key, keyboard and process
@@ -320,6 +324,13 @@ impl aterm_machines::init::Held for InitHold {
         // Only a whole profile admits automatic follow-up work. Merge its debt
         // before the Desktop lane runs, without spending retries or Restore state.
         record_withheld(&self.root, ids, &[], &[], ("", 0))
+    }
+
+    fn checkpoint(&self, settings: Selection) -> Result<(), String> {
+        if self.run.is_some() {
+            initial::record_applied(&self.root, settings)?;
+        }
+        Ok(())
     }
 
     fn verified(self: Box<Self>) -> Result<(), String> {
@@ -875,7 +886,7 @@ fn automatic_pass(
     let now = epoch_secs(now);
     let mut record = Automatic::load(root, revision)?;
     let owed = if host.full_disk_access() == Some(true) {
-        load_withheld(root).unwrap_or_default()
+        load_withheld(root)?
     } else {
         Withheld::default()
     };
@@ -971,16 +982,49 @@ fn mac_settings_retry_due(
     build: &str,
     now: u64,
 ) -> Result<Option<u64>, String> {
-    let record = Automatic::load(root, revision)?;
-    Ok(record
-        .failed
-        .iter()
-        .filter(|failed| {
-            failed.build == build && failed.tries == 1 && !record.settled.contains(&failed.item)
-        })
-        .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()))
-        .filter(|due| *due <= now)
-        .max())
+    let automatic = Automatic::load(root, revision).map(|record| {
+        record
+            .failed
+            .iter()
+            .filter(|failed| {
+                failed.build == build && failed.tries == 1 && !record.settled.contains(&failed.item)
+            })
+            .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()))
+            .filter(|due| *due <= now)
+            .max()
+    });
+    // A separate Full Disk Access follow-up can fail without an ordinary pass
+    // recording that attempt. Its scope includes approved debt from an earlier
+    // stage, even when this run queues only another group of Mac settings.
+    let withheld = (|| {
+        let record = load_withheld_reading_revision(root, || Ok(revision))?;
+        let Some(chosen) = initial::withheld_selection(root)? else {
+            return Ok(None);
+        };
+        Ok(record
+            .failed
+            .iter()
+            .filter(|failed| {
+                failed.build == build
+                    && failed.tries == 1
+                    && record.items.contains(&failed.item)
+                    && aterm_machines::init_preferences::setting_of(&failed.item)
+                        .is_some_and(|setting| chosen.contains(setting))
+            })
+            .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()))
+            .filter(|due| *due <= now)
+            .max())
+    })();
+    if initial::revision_at(root)? != revision {
+        return Ok(None);
+    }
+    // One unreadable cache must not hide a known deadline from the other, or
+    // create a deadline where neither record establishes one.
+    match (automatic, withheld) {
+        (Ok(a), Ok(b)) => Ok(a.max(b)),
+        (known @ Ok(Some(_)), Err(_)) | (Err(_), known @ Ok(Some(_))) => known,
+        (Err(why), _) | (_, Err(why)) => Err(why),
+    }
 }
 
 fn count_tries(failed: &mut Vec<Failed>, build: &str, now: u64, items: &[String]) {
@@ -1635,6 +1679,7 @@ impl Host for NativeHost {
         let answer = aterm_machines::init_activation::relaunch_reading(
             self.sys.as_ref(),
             &user,
+            aterm_machines::items::defaults::Session::Ask,
             name,
             &keys,
         );
@@ -2699,15 +2744,55 @@ fn follow_up_at(
     build: &str,
     now: std::time::SystemTime,
 ) -> Result<Option<Report>, String> {
+    follow_up_at_unless_stopped(root, host, build, now, |_| false)
+}
+
+fn follow_up_at_unless_stopped(
+    root: &Path,
+    host: &mut dyn Host,
+    build: &str,
+    now: std::time::SystemTime,
+    stopped: impl Fn(u64) -> bool,
+) -> Result<Option<Report>, String> {
     let restored = finish_waiting_restore(root, host)?;
-    let set = follow_up_setup_at(root, host, build, now)?;
-    Ok(match (restored, set) {
-        (Some(mut restored), Some(set)) => {
-            restored.rows.extend(set.rows);
-            Some(restored)
+    let began = std::time::Instant::now();
+    // The window's Stop is immediate; its durable save can still be queued
+    // behind this worker. Check the current run after taking profile.lock,
+    // while leaving the Restore above free to finish putting originals back.
+    let set = (|| {
+        if !load_withheld(root)?.items.is_empty() && stopped(initial::revision_at(root)?) {
+            Ok(None)
+        } else {
+            follow_up_setup_at(root, host, build, now)
         }
-        (restored, set) => restored.or(set),
-    })
+    })();
+    match (restored, set) {
+        (Some(mut restored), Err(detail)) => {
+            // Its waiting debt is already retired. Keep the completed Restore
+            // result alongside the separate setup failure, so the page cannot
+            // retain an old waiting result that no later follow-up can replace.
+            let elapsed_ms = Some(aterm_converge::millis(began.elapsed()));
+            restored.rows.push(Row {
+                name: "Setup".into(),
+                status: "error".into(),
+                detail,
+                elapsed_ms,
+            });
+            page(&mut restored).rows.push(Row {
+                name: "Setup".into(),
+                status: "unverified".into(),
+                detail: String::new(),
+                elapsed_ms,
+            });
+            Ok(Some(restored))
+        }
+        (None, Err(why)) => Err(why),
+        (Some(mut restored), Ok(Some(set))) => {
+            restored.rows.extend(set.rows);
+            Ok(Some(restored))
+        }
+        (restored, Ok(set)) => Ok(restored.or(set)),
+    }
 }
 
 fn follow_up_setup_at(
@@ -2791,6 +2876,15 @@ pub fn finish_withheld_preferences<S>(
 pub fn finish_withheld_preferences_observed<S>(
     reserve: impl FnMut() -> S,
 ) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
+    finish_withheld_preferences_observed_unless_stopped(reserve, |_| false)
+}
+
+/// The observed follow-up with the window's exact-run Stop check. Waiting Restore
+/// work remains independent of the deferred setup changes.
+pub fn finish_withheld_preferences_observed_unless_stopped<S>(
+    reserve: impl FnMut() -> S,
+    stopped: impl Fn(u64) -> bool,
+) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
     if aterm_types::dirs::runs_under_private_state_root() {
         return (InitialSetupObserved::new(Ok(None), None), None);
     }
@@ -2798,7 +2892,7 @@ pub fn finish_withheld_preferences_observed<S>(
         Ok(root) => root,
         Err(why) => return (InitialSetupObserved::new(Err(why), None), None),
     };
-    follow_up_finished_waiting_observed(
+    follow_up_finished_waiting_observed_unless_stopped(
         &root,
         reserve,
         || {
@@ -2808,6 +2902,7 @@ pub fn finish_withheld_preferences_observed<S>(
         &aterm_types::version::build_id(),
         std::time::SystemTime::now(),
         follow_up_lock_wait(),
+        stopped,
     )
 }
 
@@ -2865,13 +2960,34 @@ fn follow_up_finished_waiting<S, H: Host>(
     observed.result
 }
 
+#[cfg(test)]
 fn follow_up_finished_waiting_observed<S, H: Host>(
+    root: &Path,
+    reserve: impl FnMut() -> S,
+    host: impl FnOnce() -> Result<H, String>,
+    build: &str,
+    now: std::time::SystemTime,
+    wait: impl FnMut() -> bool,
+) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
+    follow_up_finished_waiting_observed_unless_stopped(
+        root,
+        reserve,
+        host,
+        build,
+        now,
+        wait,
+        |_| false,
+    )
+}
+
+fn follow_up_finished_waiting_observed_unless_stopped<S, H: Host>(
     root: &Path,
     mut reserve: impl FnMut() -> S,
     host: impl FnOnce() -> Result<H, String>,
     build: &str,
     now: std::time::SystemTime,
     mut wait: impl FnMut() -> bool,
+    stopped: impl Fn(u64) -> bool,
 ) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
     let (mut observation, mut reserved) = (None, None);
     let result = (|| {
@@ -2887,7 +3003,7 @@ fn follow_up_finished_waiting_observed<S, H: Host>(
             if let Some(lock) = HeldLock::try_take(root)? {
                 let report = follow_up_owed(root).and_then(|owed| {
                     if owed {
-                        follow_up_at(root, &mut host, build, now)
+                        follow_up_at_unless_stopped(root, &mut host, build, now, &stopped)
                     } else {
                         Ok(None)
                     }
@@ -3518,6 +3634,8 @@ mod tests {
     use super::*;
     use aterm_machines::port::Ran;
 
+    mod automatic_withheld_tests;
+    mod init_stage_outcomes_tests;
     mod restore_activation_tests;
     mod withheld_revision_tests;
 
@@ -3790,7 +3908,12 @@ mod tests {
             run_mutation(&mut self.host, root, Action::Apply)
         }
 
-        fn wait(&mut self, by: std::time::Duration) {
+        pub(super) fn with_build(mut self, build: &'static str) -> Self {
+            self.build = build;
+            self
+        }
+
+        pub(super) fn wait(&mut self, by: std::time::Duration) {
             self.now += by;
         }
 
@@ -3812,6 +3935,14 @@ mod tests {
         /// Notification Center never keeps a clear of its widget list (it is not up again in time).
         pub(super) fn notification_center_never_keeps(&mut self) {
             self.host.failing.push(nc_widgets());
+        }
+
+        pub(super) fn refuse_notification_center_restore(&mut self) {
+            self.host.refuses.push(nc_widgets());
+        }
+
+        pub(super) fn fail_next_relaunch(&mut self) {
+            self.host.fail_restart_once = true;
         }
 
         /// The person shows their desktop widgets again.
@@ -3895,6 +4026,9 @@ mod tests {
         fn answer(&self, cmd: &Cmd) -> Option<Ran>;
         /// Whether `pid` is alive.
         fn alive(&self, pid: u32) -> bool;
+        /// A wait of the code under test ([`System::sleep`]), which passes no time: what moves
+        /// the model on.
+        fn sleep(&self) {}
     }
 
     struct InertJournal(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
@@ -3937,6 +4071,15 @@ mod tests {
             }
             fn pid_alive(&self, pid: u32) -> bool {
                 self.model.as_ref().is_some_and(|model| model.alive(pid))
+            }
+            fn sleep(&self, period: std::time::Duration) {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("sleep {}ms", period.as_millis()));
+                if let Some(model) = &self.model {
+                    model.sleep();
+                }
             }
             fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
                 self.run(cmd).map(|ran| ran.status)
@@ -4618,7 +4761,7 @@ mod tests {
 
     /// A Dock under management: once relaunched it takes a second to start, then shows the
     /// pins it is given whatever was written. `defaults` reads and writes its one domain, and
-    /// `pgrep`, `launchctl print`, `killall` and `sleep` act on it.
+    /// `pgrep`, `launchctl print` and `killall` act on it, and each wait moves it on.
     #[derive(Default)]
     struct ManagedDock(std::sync::Mutex<ManagedState>);
 
@@ -4686,25 +4829,26 @@ mod tests {
                     dock.kills += 1;
                     Some(Ran::ok(""))
                 }
-                ("/bin/sleep", ["1"]) => {
-                    if let Some(left) = dock.starting.as_mut() {
-                        *left = left.saturating_sub(1);
-                        if *left == 0 {
-                            dock.starting = None;
-                            if !dock.keep_original {
-                                dock.prefs.retain(|(k, _)| k != "persistent-apps");
-                                dock.prefs.push(("persistent-apps".into(), managed_pins()));
-                            }
-                        }
-                    }
-                    Some(Ran::ok(""))
-                }
                 _ => None,
             }
         }
 
         fn alive(&self, pid: u32) -> bool {
             self.0.lock().unwrap().pid == pid
+        }
+
+        fn sleep(&self) {
+            let mut dock = self.0.lock().unwrap();
+            if let Some(left) = dock.starting.as_mut() {
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    dock.starting = None;
+                    if !dock.keep_original {
+                        dock.prefs.retain(|(k, _)| k != "persistent-apps");
+                        dock.prefs.push(("persistent-apps".into(), managed_pins()));
+                    }
+                }
+            }
         }
     }
 
@@ -7054,6 +7198,8 @@ mod tests {
     #[test]
     fn mac_settings_deadlines_name_only_unspent_current_run_and_build_attempts() {
         let root = aterm_tempfile::tempdir().unwrap();
+        initial::save_explicit_workstation_plan(root.path()).unwrap();
+        let revision = initial::revision_at(root.path()).unwrap();
         let failed = |item: &str, build: &str, tries, at| Failed {
             item: item.into(),
             build: build.into(),
@@ -7071,18 +7217,22 @@ mod tests {
                 failed("another-build", "other", 1, 4),
             ],
         }
-        .save(root.path(), 7)
+        .save(root.path(), revision)
         .unwrap();
         let due = |revision, build, now| {
             mac_settings_retry_due(root.path(), revision, build, now).unwrap()
         };
-        assert_eq!(due(7, BUILD, 599), None);
-        assert_eq!(due(7, BUILD, 600), Some(600));
-        assert_eq!(due(7, BUILD, 1_199), Some(600));
-        assert_eq!(due(7, BUILD, 1_200), Some(1_200));
-        assert_eq!(due(7, BUILD, 599), None, "a backward clock is not due");
-        assert_eq!(due(8, BUILD, 2_000), None, "another run");
-        assert_eq!(due(7, "absent-build", 2_000), None, "another build");
+        assert_eq!(due(revision, BUILD, 599), None);
+        assert_eq!(due(revision, BUILD, 600), Some(600));
+        assert_eq!(due(revision, BUILD, 1_199), Some(600));
+        assert_eq!(due(revision, BUILD, 1_200), Some(1_200));
+        assert_eq!(
+            due(revision, BUILD, 599),
+            None,
+            "a backward clock is not due"
+        );
+        assert_eq!(due(revision + 1, BUILD, 2_000), None, "another run");
+        assert_eq!(due(revision, "absent-build", 2_000), None, "another build");
     }
 
     #[test]

@@ -366,6 +366,8 @@ pub(crate) struct AlabRestore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_auth_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
 
@@ -375,6 +377,7 @@ impl AlabRestore {
             argv: resume.argv,
             session: resume.session,
             codex_home: resume.codex_home,
+            codex_auth_path: resume.codex_auth_path,
             cwd: resume.cwd,
         }
     }
@@ -384,6 +387,7 @@ impl AlabRestore {
             argv: self.argv,
             session: self.session,
             codex_home: self.codex_home,
+            codex_auth_path: self.codex_auth_path,
             cwd: self.cwd,
         }
     }
@@ -657,6 +661,11 @@ impl AgentRestore {
                     .as_deref()
                     .map(|home| ("CODEX_HOME", home))
                     .into_iter()
+                    .chain(
+                        alab.codex_auth_path
+                            .as_deref()
+                            .map(|auth| ("CODEX_AUTH_PATH", auth)),
+                    )
                     .collect(),
                 alab.argv
                     .iter()
@@ -904,6 +913,13 @@ pub(crate) struct NativeLeafRestore {
 }
 
 impl NativeLeafRestore {
+    pub(crate) fn about() -> Self {
+        let mut descriptor = Self::settings("/".into());
+        descriptor.restore_tag = "about".into();
+        descriptor.route = None;
+        descriptor
+    }
+
     pub(crate) fn system_state() -> Self {
         let mut descriptor = Self::settings("/".into());
         descriptor.restore_tag = "system-state".into();
@@ -999,6 +1015,8 @@ impl NativeLeafRestore {
             return Some("config-editor identity requires an Editor restore");
         }
         match self.restore_tag.as_str() {
+            "about" => (self.route.is_some() || self.uri.is_some())
+                .then_some("About has no document or Settings route"),
             "system-state" => (self.route.is_some() || self.uri.is_some())
                 .then_some("System State has no document or Settings route"),
             "settings" => self
@@ -1456,6 +1474,7 @@ impl PaneLayout {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeTabRestore {
+    About,
     #[serde(rename = "system-state")]
     SystemState,
     Settings {
@@ -1473,7 +1492,7 @@ impl NativeTabRestore {
     #[cfg(test)]
     pub(crate) fn document_uri(&self) -> Option<&str> {
         match self {
-            Self::Settings { .. } | Self::SystemState => None,
+            Self::About | Self::Settings { .. } | Self::SystemState => None,
             Self::Markdown { uri } | Self::Editor { uri } => Some(uri),
         }
     }
@@ -1486,7 +1505,7 @@ impl NativeTabRestore {
 
     fn shape_is_valid(&self) -> bool {
         match self {
-            Self::SystemState => true,
+            Self::About | Self::SystemState => true,
             Self::Settings { route } => {
                 !route.is_empty()
                     && route.len() <= MAX_SETTINGS_ROUTE_BYTES
@@ -1823,6 +1842,7 @@ impl RestoredTab {
 
     pub(crate) fn from_legacy_native(descriptor: &NativeTabRestore) -> Option<Self> {
         let native = match descriptor {
+            NativeTabRestore::About => NativeLeafRestore::about(),
             NativeTabRestore::SystemState => NativeLeafRestore::system_state(),
             NativeTabRestore::Settings { route } => NativeLeafRestore::settings(route.clone()),
             NativeTabRestore::Markdown { uri } => {
@@ -5122,6 +5142,44 @@ focused = true
     }
 
     #[test]
+    fn about_restore_descriptors_round_trip_without_document_or_settings_authority() {
+        let native = NativeLeafRestore::about();
+        assert_eq!(native.validation_error(), None);
+        let bytes = aterm_json::to_vec(&native).unwrap();
+        assert_eq!(
+            aterm_json::from_slice::<NativeLeafRestore>(&bytes).unwrap(),
+            native
+        );
+        let legacy = NativeTabRestore::About;
+        assert!(legacy.shape_is_valid());
+        assert_eq!(legacy.document_uri(), None);
+        let bytes = aterm_json::to_vec(&legacy).unwrap();
+        assert_eq!(
+            aterm_json::from_slice::<NativeTabRestore>(&bytes).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            RestoredTab::from_legacy_native(&legacy).unwrap().root,
+            RestoredSplitTree::leaf(RestoredView::Native(native.clone()))
+        );
+        for (route, uri) in [
+            (Some("/about".to_string()), None),
+            (None, Some("file:///tmp/unrequested".to_string())),
+        ] {
+            let mut invalid = native.clone();
+            invalid.route = route;
+            invalid.uri = uri;
+            assert!(invalid.validation_error().is_some());
+        }
+        let settings = NativeTabRestore::Settings {
+            route: "/about".into(),
+        };
+        assert!(legacy.joins_mirror(std::slice::from_ref(&settings)));
+        assert!(settings.joins_mirror(std::slice::from_ref(&legacy)));
+        assert!(!legacy.joins_mirror(std::slice::from_ref(&legacy)));
+    }
+
+    #[test]
     fn the_legacy_mirror_is_written_by_the_rule_the_parse_reads_it_by() {
         let settings = |route: &str| NativeTabRestore::Settings {
             route: route.to_string(),
@@ -6512,6 +6570,7 @@ metadata = "opaque=copy-me"
             ],
             session: SESSION.into(),
             codex_home: Some("/Users//me/lab codex/".into()),
+            codex_auth_path: Some("/Users//me/.aterm/accounts-codex/work/auth.json".into()),
             cwd: Some("/work".into()),
         };
         let alab = Snapshot {
@@ -6536,8 +6595,9 @@ metadata = "opaque=copy-me"
                 .expect("reads")
                 .resume_line(),
             Some(format!(
-                "CODEX_HOME='/Users//me/lab codex/' /Users//me/.aterm/agents/codex \
-                 --no-alt-screen resume {SESSION}"
+                "CODEX_HOME='/Users//me/lab codex/' \
+                 CODEX_AUTH_PATH=/Users//me/.aterm/accounts-codex/work/auth.json \
+                 /Users//me/.aterm/agents/codex --no-alt-screen resume {SESSION}"
             )),
             "the person's line is the validated one"
         );

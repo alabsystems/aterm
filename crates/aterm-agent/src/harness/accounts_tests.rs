@@ -8225,7 +8225,7 @@ fn each_seam_exports_its_own_variable_and_the_default_row_unsets_it() {
     );
     assert_eq!(
         login_env_for(Cli::Codex, &work),
-        ("CODEX_HOME", Some("/logins/work".to_owned()))
+        ("CODEX_AUTH_PATH", Some("/logins/work/auth.json".to_owned()))
     );
     assert_eq!(
         login_env_for(Cli::Kimi, &work),
@@ -8258,6 +8258,11 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/elsewhere/auth.json")]),
         ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/other.json")]),
         ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "auth.json")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "work/auth.json")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/auth.json/")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/auth.json/.")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work\n1/auth.json")]),
         ProcessLogin::of_env_for(
             Cli::Grok,
             [
@@ -8287,15 +8292,27 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     );
     assert!(!apart.default_home);
     let codex = Roster::parse_for(Cli::Codex, POOL_ROWS).expect("roster");
-    let overlay = ProcessLogin::of_env_for(Cli::Codex, [("CODEX_HOME", "/logins/work")]);
+    let auth_file =
+        ProcessLogin::of_env_for(Cli::Codex, [("CODEX_AUTH_PATH", "/logins/work/auth.json")]);
     assert!(
-        overlay.default_home,
-        "an overlay home is the seam, not another home"
+        auth_file.default_home,
+        "a login-file seam leaves the default home shared"
     );
-    assert_eq!(judged_label(&codex, &overlay), Some("work"));
+    assert_eq!(judged_label(&codex, &auth_file), Some("work"));
+    let apart_codex = ProcessLogin::of_env_for(
+        Cli::Codex,
+        [
+            ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+            ("CODEX_HOME", "/other"),
+        ],
+    );
+    assert!(!apart_codex.default_home);
     let shared_key = ProcessLogin::of_env_for(
         Cli::Codex,
-        [("CODEX_HOME", "/logins/work"), ("OPENAI_API_KEY", "k")],
+        [
+            ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+            ("OPENAI_API_KEY", "k"),
+        ],
     );
     assert_eq!(
         judged_label(&codex, &shared_key),
@@ -8303,9 +8320,28 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         "OPENAI_API_KEY is no Codex login: {shared_key:?}"
     );
     for own in ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
-        let keyed =
-            ProcessLogin::of_env_for(Cli::Codex, [("CODEX_HOME", "/logins/work"), (own, "k")]);
+        let keyed = ProcessLogin::of_env_for(
+            Cli::Codex,
+            [("CODEX_AUTH_PATH", "/logins/work/auth.json"), (own, "k")],
+        );
         assert_eq!(judged_label(&codex, &keyed), None, "{own}: {keyed:?}");
+    }
+    for malformed in [
+        "auth.json",
+        "work/auth.json",
+        "/logins/work/auth.json/",
+        "/logins/work/auth.json/.",
+        "/logins/work\n1/auth.json",
+        "/logins/work\u{2028}1/auth.json",
+    ] {
+        let who = ProcessLogin::of_env_for(Cli::Codex, [("CODEX_AUTH_PATH", malformed)]);
+        assert!(!who.stored_login, "{malformed:?}: {who:?}");
+        assert_eq!(
+            who.login.as_deref(),
+            Some(malformed),
+            "must never collapse to empty default login: {who:?}"
+        );
+        assert_eq!(judged_label(&codex, &who), None, "{malformed:?}: {who:?}");
     }
     let claude = [("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/logins/work")];
     assert_eq!(
@@ -8318,6 +8354,23 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         "another CLI's seam names no grok login"
     );
 }
+
+#[test]
+fn a_relative_login_file_never_names_the_default_account() {
+    for cli in [Cli::Codex, Cli::Grok] {
+        let roster = Roster::own();
+        let var = cli.accounts().seam.var();
+        for value in ["auth.json", "./auth.json", "nested/auth.json"] {
+            let who = ProcessLogin::of_env_for(cli, [(var, value)]);
+            assert_eq!(judged_label(&roster, &who), None, "{cli:?}: {value}");
+            assert!(!who.stored_login, "{cli:?}: {value}");
+            assert_eq!(who.login.as_deref(), Some(value), "retain the unbound path");
+        }
+    }
+}
+
+#[path = "accounts_login_attribution_tests.rs"]
+mod login_attribution;
 
 /// A KIMI CODE PROCESS IS JUDGED OFF ITS ROW BY WHAT KIMI 2.3.1 READS IN PLACE OF THE HOME'S
 /// LOGIN, AND BY NOTHING ELSE (`docs/measured/kimi-credentials-2026-10-24.md`): an environment

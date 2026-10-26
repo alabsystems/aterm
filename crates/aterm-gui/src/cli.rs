@@ -450,7 +450,7 @@ const STARTER_CONFIG: &str = concat!(
 #                                  #   ice chime | droplet | pew | zap | tick | crackle | mechanical | typewriter |
 #                                  #   marimba | felt (aliases: trail names, bell, raindrop, mech, thock, piano, clack)
 # tone_melody = true               # subtle on-device mood inflection from typed input (default ON)
-# trail_sound_bed = true           # continuous ambient bed texture behind notes (default ON)
+# trail_sound_bed = false          # continuous ambient bed texture behind notes (default OFF)
 # trail_sound_riff = true          # held-key sing-along song (default ON; false quiets song, keeps visuals)
 # bell_sound = true                # audible BEL beep (macOS NSBeep / Windows MessageBeep / X11 bell; default ON)
 

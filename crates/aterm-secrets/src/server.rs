@@ -82,7 +82,7 @@ pub const JOIN_CHANGE_GAP: Duration = Duration::from_secs(10);
 /// How often the log notes changes to one queued join request.
 const JOIN_NOTE_EVERY_SECS: u64 = 60 * 60;
 /// How long before an unchanged join re-post refreshes its queue time ([`JOIN_TTL_SECS`]).
-const JOIN_REFRESH_EVERY_SECS: u64 = 60 * 60;
+pub(crate) const JOIN_REFRESH_EVERY_SECS: u64 = 60 * 60;
 /// The most vaults one server holds.
 pub const MAX_VAULTS: usize = 64;
 /// The mDNS service type advertised.
@@ -139,18 +139,37 @@ pub fn serve(options: Options) -> crate::Result<()> {
             .as_ref()
             .map(|name| (name.clone(), running.addr.port())),
     );
-    let result = supervise(running, PROGRAM_EVERY, &program_stamp, &signalled);
+    let program = std::env::current_exe().ok();
+    let result = supervise(
+        running,
+        PROGRAM_EVERY,
+        &|| program.as_deref().and_then(stamp_of),
+        &signalled,
+    );
     drop(children);
     result
 }
 
 /// An executable as it is on disk.
-type Stamp = (u64, u64, u64, i64);
+pub(crate) type Stamp = (u64, u64, u64, i64);
 
-/// This process's executable as it is now (client.rs's subscriber watches the same).
-fn program_stamp() -> Option<Stamp> {
+/// Whether the program a service process started from (stamped `was`) was replaced on disk
+/// (`now`): another file at its path, which the service starts in its place once this process
+/// exits. A path that is gone (an `aterm.app` moved or deleted) is no replacement: nothing new
+/// waits there and launchd could not start the gone path, so the process keeps running from the
+/// file it holds open, and a repair moves the job (`crate::service::repair_server`, the GUI's
+/// subscriber mend).
+pub(crate) fn replaced(was: Option<Stamp>, now: Option<Stamp>) -> bool {
+    matches!((was, now), (Some(was), Some(now)) if was != now)
+}
+
+/// The file at `path` as it is on disk now. A service stamps the path its program started from,
+/// read once as it starts (client.rs's subscriber does the same): on Linux `current_exe` reads
+/// `/proc/self/exe`, which names `<path> (deleted)` once an update renames a new file over the
+/// path, so a read then would take the update for a program gone.
+pub(crate) fn stamp_of(path: &Path) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    let meta = std::fs::metadata(path).ok()?;
     Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
 }
 
@@ -168,7 +187,7 @@ fn supervise(
         }
         let stopping = if signalled.load(Ordering::SeqCst) {
             Some("stopped by a signal")
-        } else if program.is_some() && stamp() != program {
+        } else if replaced(program, stamp()) {
             Some("this program was replaced on disk; exiting so the service starts the new one")
         } else {
             None
@@ -270,6 +289,31 @@ pub fn start_with_join_change_gap(
             ..Tuning::default()
         },
     )
+}
+
+/// [`start_with_join_change_gap`] with no gap, its join queue kept by the clock `now`.
+#[cfg(test)]
+pub(crate) fn start_with_clock(
+    listener: std::net::TcpListener,
+    options: &Options,
+    now: fn() -> u64,
+) -> crate::Result<Running> {
+    launch(
+        listener,
+        options,
+        Tuning {
+            join_change_gap: Duration::ZERO,
+            now,
+            ..Tuning::default()
+        },
+    )
+}
+
+/// Post the join line `line` to vault `name` of `running` as from `peer`, as one over the network
+/// is posted: its reply's status.
+#[cfg(test)]
+pub(crate) fn post_join_as(running: &Running, name: &str, line: &str, peer: IpAddr) -> u16 {
+    post_join(&running.shared, name, line.as_bytes(), peer).status
 }
 
 /// [`start`] as a server on another Mac than its clients' ([`refuse_unheld`]).
@@ -4025,8 +4069,9 @@ mod tests {
 
     #[test]
     fn a_replaced_program_stops_the_server_and_ends_it_cleanly() {
-        assert!(program_stamp().is_some());
-        assert_eq!(program_stamp(), program_stamp());
+        let program = std::env::current_exe().expect("this test's program");
+        assert!(stamp_of(&program).is_some());
+        assert_eq!(stamp_of(&program), stamp_of(&program));
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(root.path(), 2 * HANG_DETECTOR));
         put(&running, &envelope(&OLD, 1)).expect("first");
@@ -4035,9 +4080,12 @@ mod tests {
         until_waiting(&running, 1);
         let shared = Arc::clone(&running.shared);
         let looks = AtomicUsize::new(0);
-        let stamp = || {
-            let look = looks.fetch_add(1, Ordering::SeqCst);
-            Some((1, if look < 3 { 1 } else { 2 }, 0, 0))
+        // The program as started, then its path gone a while (the app moved: no replacement,
+        // the server keeps serving), then another file there.
+        let stamp = || match looks.fetch_add(1, Ordering::SeqCst) {
+            0..3 => Some((1, 1, 0, 0)),
+            3..6 => None,
+            _ => Some((1, 2, 0, 0)),
         };
         supervise(
             running,
@@ -4046,7 +4094,10 @@ mod tests {
             &AtomicBool::new(false),
         )
         .expect("a clean exit");
-        assert!(looks.load(Ordering::SeqCst) >= 4);
+        assert!(
+            looks.load(Ordering::SeqCst) >= 7,
+            "served on while the path was gone"
+        );
         assert!(shared.stopping.load(Ordering::SeqCst));
         assert_eq!(
             waiter.join().expect("waiter").expect("ended"),
@@ -4055,6 +4106,38 @@ mod tests {
         until("every connection has closed", || {
             shared.active.load(Ordering::SeqCst) == 0
         });
+    }
+
+    /// Another file at the program's path is a replacement; a path gone, or a program never
+    /// stamped, is none.
+    #[test]
+    fn only_another_file_at_the_programs_path_replaces_it() {
+        let (one, two) = (Some((1, 1, 10, 0)), Some((1, 2, 10, 0)));
+        assert!(replaced(one, two));
+        assert!(replaced(one, Some((1, 1, 11, 0))), "rewritten in place");
+        assert!(!replaced(one, one));
+        assert!(!replaced(one, None), "moved or deleted");
+        assert!(!replaced(None, two), "never stamped");
+    }
+
+    /// The stamps of a path a service started from: an update renamed over it is a replacement
+    /// (on Linux too, where the running program's own link then names it deleted); the file moved
+    /// away is none.
+    #[test]
+    fn a_file_renamed_over_the_programs_path_replaces_it_and_one_moved_away_does_not() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("aterm");
+        std::fs::write(&path, b"one").expect("written");
+        let was = stamp_of(&path);
+        assert!(was.is_some());
+        let update = root.path().join("aterm.new");
+        std::fs::write(&update, b"two").expect("written");
+        std::fs::rename(&update, &path).expect("renamed over");
+        assert!(replaced(was, stamp_of(&path)), "an update in place");
+        let was = stamp_of(&path);
+        std::fs::rename(&path, root.path().join("moved")).expect("moved away");
+        assert_eq!(stamp_of(&path), None);
+        assert!(!replaced(was, stamp_of(&path)), "moved away");
     }
 
     #[test]

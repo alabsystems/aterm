@@ -528,8 +528,8 @@ impl OutputStreak {
                 } else {
                     Some([(
                         anchor_row as u16,
-                        u16::try_from(start).unwrap_or(u16::MAX),
-                        u16::try_from(end).unwrap_or(u16::MAX),
+                        start.min(u16::MAX as usize) as u16,
+                        end.min(u16::MAX as usize) as u16,
                     )])
                 }
             } else {
@@ -599,17 +599,21 @@ impl OutputStreak {
     }
 
     #[inline]
-    fn row_span_inked(observed: &[Vec<ObservedGlyph>], row: u16, from: i32, to: i32) -> bool {
+    const fn row_span_inked(observed: &[Vec<ObservedGlyph>], row: u16, from: i32, to: i32) -> bool {
         if to < 0 || from > to {
             return false;
         }
-        let Some(cells) = observed.get(usize::from(row)) else {
+        let r = row as usize;
+        if r >= observed.len() {
             return false;
-        };
-        let start = usize::try_from(from.max(0)).unwrap_or(usize::MAX);
-        let end = match usize::try_from(to) {
-            Ok(e) => e.saturating_add(1).min(cells.len()),
-            Err(_) => 0,
+        }
+        let cells = observed[r].as_slice();
+        let start = if from > 0 { from as usize } else { 0 };
+        let end_cand = (to as usize).saturating_add(1);
+        let end = if end_cand < cells.len() {
+            end_cand
+        } else {
+            cells.len()
         };
         if start >= end {
             return false;
@@ -624,11 +628,11 @@ impl OutputStreak {
         false
     }
 
-    fn retire_light_over_erased_ink(&mut self) {
+    const fn retire_light_over_erased_ink(&mut self) {
         if self.no_comets() && self.ribbon.is_none() {
             return;
         }
-        let observed = &self.observed_rows;
+        let observed = self.observed_rows.as_slice();
         let mut i = 0;
         while i < MAX_COMETS {
             if let Some(c) = self.comets[i]

@@ -216,7 +216,8 @@ fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
         .or_else(|| field("program"))
         .unwrap_or_else(|| crate::presence::short_sid(&sid));
     let agent = field("program_kind").as_deref() == Some("agent");
-    let claim = (field("needs_by").as_deref() == Some("program"))
+    let by = field("needs_by");
+    let claim = (by.as_deref() == Some("program"))
         .then(|| crate::needs::claim_words_of_row(word, field("agent").as_deref()))
         .flatten();
     let age_ms = match word {
@@ -233,6 +234,7 @@ fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
             label: crate::needs::fold_clip(&label, 40),
             age_ms,
             claim,
+            carries_on: by.as_deref() == Some("harness"),
         }),
         true,
     ))
@@ -412,6 +414,26 @@ mod tests {
             Some(CODEX_QUESTION_WORDS)
         );
         assert_eq!(claim("approval", "prompt", "-"), None, "CONTROL");
+    }
+
+    /// A need the row says is a harness's `NEEDS YOU:` report (`needs_by=harness`) carries on,
+    /// so Needs you lists it after the stopped work (§14.7); CONTROL: the same ask with
+    /// `needs_by=-` (another owner's direct ask, or an older aterm's row) and a program's own
+    /// report have stopped their agents.
+    #[test]
+    fn a_row_a_harness_reported_carries_on() {
+        let carries_on = |by: &str| {
+            parse_session_row(&format!(
+                "session local=3 sid=s-abc state=alive program=claude program_kind=agent \
+                 agent=busy agent_ms=4000 needs=ask needs_by={by} hold_by=-"
+            ))
+            .and_then(|(need, _)| need)
+            .expect("its need")
+            .carries_on
+        };
+        assert!(carries_on("harness"));
+        assert!(!carries_on("-"), "CONTROL: a direct ask");
+        assert!(!carries_on("program"), "CONTROL: the program's own report");
     }
 
     /// A scripted sibling over a real Unix socket serving AUTH and `survey

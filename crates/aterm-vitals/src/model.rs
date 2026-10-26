@@ -75,9 +75,9 @@ pub struct ProcSample {
     /// every whole reading (one with a sweep), `None` where unread.
     pub birth_ms: Option<i64>,
     /// Whether the kernel reaps its children for it (macOS `P_NOCLDWAIT`: it ignores `SIGCHLD`
-    /// or set `SA_NOCLDWAIT`), adding each child's time to its [`Self::child_cpu_ns`] twice; read
-    /// for one with reaped time and for one whose usage goes unread that parents one whose usage
-    /// is read, `None` otherwise and off macOS.
+    /// or set `SA_NOCLDWAIT`), adding each child's time to its [`Self::child_cpu_ns`] twice, as
+    /// the sweep read it for every process: nothing records it between two readings or after the
+    /// process exits. `None` where unread, and off macOS.
     pub reaps_unwaited: Option<bool>,
 }
 
@@ -380,7 +380,8 @@ impl VolumeSample {
 pub struct TabRoot {
     /// The host's stable key for it (its session id).
     pub key: u64,
-    /// Key of the tab this pane belongs to (the least key among its panes, or its own).
+    /// Key of the tab this pane belongs to (the least key among the panes the host lists in it,
+    /// a pane shown in two tabs listed in the first alone; or its own).
     pub tab: u64,
     /// The host's identity for that tab (its `TabId`: never reused while aterm runs, and kept
     /// when the tab moves to another window), which a pane shared into another tab does not

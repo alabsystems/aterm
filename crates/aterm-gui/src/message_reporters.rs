@@ -4007,6 +4007,101 @@ pub(crate) fn disk_freed_entry(bytes: u64, went: &[String]) -> Entry {
     entry.log_line(format!("disk-freed bytes={bytes} rows={}", went.len()))
 }
 
+/// The standing alert when only the owner can still act on a filling or short home volume.
+pub(crate) const DISK_FILLING_KEY: &str = "system.disk.filling";
+
+/// The exceptions entry while a crossing of the floor is projected (`Family::Disk`, `filling`).
+pub(crate) const DISK_FILLING_ENTRY_KEY: &str = "disk.filling";
+
+/// What a filling volume reads, in one clause: `under its 47.0 GiB floor in ~13 min at
+/// 130.8 GiB/h`, or below it.
+fn disk_fill_words(free: u64, floor: u64, rate_bps: Option<u64>, eta_s: Option<i64>) -> String {
+    let floor_words = aterm_agent::harness::disk::human_bytes(floor);
+    let rate = rate_bps.map(|r| {
+        format!(
+            "{}/h",
+            aterm_agent::harness::disk::human_bytes(r.saturating_mul(3_600))
+        )
+    });
+    match (rate, eta_s) {
+        (Some(rate), Some(eta)) if free >= floor => format!(
+            "under its {floor_words} floor in {} at {rate}",
+            aterm_vitals::words::duration_approx(eta as f64)
+        ),
+        (Some(rate), _) => format!("below its {floor_words} floor and falling {rate}"),
+        (None, _) => format!("below its {floor_words} floor"),
+    }
+}
+
+/// The alert when only the owner can still act on the home volume (the disk-free design's §8.5):
+/// aterm's cleanup is done, and no agent can act, or none can finish before it fills.
+pub(crate) fn disk_filling(
+    free: u64,
+    floor: u64,
+    rate_bps: Option<u64>,
+    eta_s: Option<i64>,
+    said: Option<&str>,
+) -> Message {
+    let why = StandingWhy::Spent {
+        tried: Reason::new("removed every build cache it may and asked its agents"),
+        reason: Reason::new(format!(
+            "the home volume is {}",
+            disk_fill_words(free, floor, rate_bps, eta_s)
+        )),
+    };
+    let then = Then::step("Free up space on the home volume").or_short("Free up disk space");
+    let cause_words = Why::from(why.clone()).words();
+    let message = Message::new(tags::SYSTEM, Severity::Error, "The disk is filling")
+        .line(then.words())
+        .line(cause_words)
+        .now(Ask::standing(why, then))
+        .line(format!(
+            "{} free. aterm harness disk why says what aterm, the asked sessions and its disk \
+             worker did.",
+            aterm_agent::harness::disk::human_bytes(free)
+        ));
+    match said {
+        Some(said) => message.line(said),
+        None => message,
+    }
+    .key(DISK_FILLING_KEY)
+}
+
+/// The exceptions entry while a crossing of the floor is projected and the volume is not short:
+/// a fact for later, with what the ask and the worker are doing.
+pub(crate) fn disk_filling_entry(
+    free: u64,
+    floor: u64,
+    rate_bps: Option<u64>,
+    eta_s: Option<i64>,
+    said: Option<&str>,
+) -> Entry {
+    let mut entry = Entry::new(
+        Family::Disk,
+        "",
+        "filling",
+        "The disk is filling",
+        Why::Spent {
+            tried: Reason::new("ran its cleanup on the fill's cadence and asked one agent"),
+            reason: Reason::new(format!(
+                "the home volume is {}",
+                disk_fill_words(free, floor, rate_bps, eta_s)
+            )),
+        },
+        Then::step("Read aterm harness disk why for what fills it"),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT);
+    if let Some(said) = said {
+        entry = entry.more(said);
+    }
+    entry.log_line(format!(
+        "disk-filling free={free} floor={floor} rate_bps={} eta_s={}",
+        rate_bps.unwrap_or(0),
+        eta_s.unwrap_or(-1)
+    ))
+}
+
 pub(crate) const DISK_FULL_KEY: &str = "system.disk.full";
 
 const DISK_FULL_SENTENCE: usize = 3;
@@ -5241,8 +5336,13 @@ pub(crate) fn notice_ask_key(sid: &str, notice: Option<&str>) -> String {
 pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -> Message {
     let clean = |line: &str| atpkg::progress::sanitize_for_tty(line, 240);
     let notice = exception.notice.as_ref();
-    let title = notice.map_or("Claude needs you", |n| n.title);
-    let short_title = notice.map_or(title, |n| n.short_title);
+    // A notice titles its own ask; a plain one its own title (`aterm stopped typing`, §14.3), so
+    // the default, which names Claude, is said only where neither does.
+    let (title, short_title) = match (notice, exception.title) {
+        (Some(n), _) => (n.title, n.short_title),
+        (None, Some(titled)) => titled,
+        (None, None) => ("Claude needs you", "Claude needs you"),
+    };
     let mut message = Message::new(
         tags::HARNESS,
         Severity::Warn,

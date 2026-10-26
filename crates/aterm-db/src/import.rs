@@ -35,6 +35,21 @@ struct Csv {
     rows: Vec<Vec<String>>,
     digest: [u8; 32],
 }
+impl Csv {
+    fn column(&self, name: &str) -> Result<Option<usize>> {
+        let mut matches = self
+            .headers
+            .iter()
+            .enumerate()
+            .filter(|(_, header)| header.trim().eq_ignore_ascii_case(name))
+            .map(|(index, _)| index);
+        let column = matches.next();
+        if matches.next().is_some() {
+            return Err(Error::new("CSV has ambiguous identity columns"));
+        }
+        Ok(column)
+    }
+}
 fn load(path: &Path) -> Result<Csv> {
     let mut bytes = Vec::new();
     File::open(path)?
@@ -154,22 +169,10 @@ fn object_id(domain: &[u8], parts: &[&[u8]]) -> String {
 /// headers stay in the source file; only their one-based coordinates travel.
 fn candidate_document(path: &Path) -> Result<Value> {
     let csv = load(path)?;
-    let column = |name: &str| {
-        let matches: Vec<_> = csv
-            .headers
-            .iter()
-            .enumerate()
-            .filter(|(_, header)| header.trim().eq_ignore_ascii_case(name))
-            .map(|(index, _)| index)
-            .collect();
-        match matches.as_slice() {
-            [] => Ok(None),
-            [one] => Ok(Some(*one)),
-            _ => Err(Error::new("CSV has ambiguous identity columns")),
-        }
-    };
-    let email_column = column("email")?.ok_or_else(|| Error::new("CSV has no email column"))?;
-    let machine_column = column("computer")?;
+    let email_column = csv
+        .column("email")?
+        .ok_or_else(|| Error::new("CSV has no email column"))?;
+    let machine_column = csv.column("computer")?;
     let mut rows = Vec::new();
     for (index, row) in csv.rows.iter().enumerate() {
         if row.iter().all(|cell| !nonempty(cell)) {
@@ -263,17 +266,21 @@ pub fn inspect(path: &Path) -> Result<Value> {
 /// other meaningful cells retain exact source coordinates for later classification.
 /// A start marker binds the caller's request to the exact file; chunk requests are
 /// deterministic, so restart resumes instead of duplicating partially saved work.
+/// Ambiguous identity headers are rejected before opening or changing the database.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbImportAtomic",
+        action = "Reject",
+        project = "aterm_db::import::commons::tests::atomic_transition"
+    )
+)]
 pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
     let csv = load(path)?;
     let email_col = csv
-        .headers
-        .iter()
-        .position(|h| h.trim().eq_ignore_ascii_case("email"))
+        .column("email")?
         .ok_or_else(|| Error::new("CSV has no email column"))?;
-    let label_col = csv
-        .headers
-        .iter()
-        .position(|h| h.trim().eq_ignore_ascii_case("computer"));
+    let label_col = csv.column("computer")?;
     let mut changes = BTreeMap::<(String, String), Change>::new();
     let (mut rejected, mut account_count, mut unresolved_cells) = (0usize, 0usize, 0usize);
     for (index, row) in csv.rows.iter().enumerate() {
@@ -426,6 +433,22 @@ mod tests {
         );
         for bad in ["a,\"not closed", "\"a\"trailing", "a\"b"] {
             assert!(parse(bad.as_bytes()).is_err());
+        }
+    }
+    #[test]
+    fn identity_columns_keep_source_positions_and_allow_no_machine_column() {
+        for (headers, email, machine) in [
+            (vec!["notes", " EMAIL ", "Computer", "notes"], 1, Some(2)),
+            (vec!["email", "google", "notes"], 0, None),
+            (vec!["computer", "email"], 1, Some(0)),
+        ] {
+            let csv = Csv {
+                headers: headers.into_iter().map(str::to_owned).collect(),
+                rows: Vec::new(),
+                digest: [0; 32],
+            };
+            assert_eq!(csv.column("email").unwrap(), Some(email));
+            assert_eq!(csv.column("computer").unwrap(), machine);
         }
     }
     #[test]

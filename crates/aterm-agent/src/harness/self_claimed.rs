@@ -40,6 +40,8 @@ pub struct Record {
     pub draft_empty: Option<bool>,
     /// TUI frame state (`working|idle|blocked|done|error`).
     pub frame: Option<String>,
+    /// Active goal published by `codex-alab` for the primary thread, sanitized for one-line display.
+    pub goal: Option<String>,
     /// Whether the record is in its pre-registration initializing frame.
     pub initializing: bool,
 }
@@ -98,6 +100,9 @@ pub fn parse(text: &str) -> Result<Record, Refusal> {
         cwd: opt_str("cwd")?,
         draft_empty: v.get("draftEmpty").and_then(Value::as_bool),
         frame: v.get("state").and_then(Value::as_str).map(str::to_owned),
+        goal: opt_str("goal")?
+            .as_deref()
+            .and_then(super::goal::objective_of),
         initializing: ["sessionId", "resumeArgv", "cwd", "state", "exit"]
             .iter()
             .all(|key| matches!(v.get(key), Some(Value::Null)))
@@ -122,13 +127,18 @@ fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
         exec_path: args.exec_path.clone(),
         image: aterm_sysprobe::process_path(pid),
         argv: args.argv.clone(),
-        codex_home: args.env_var("CODEX_HOME").map(str::to_owned),
+        codex_home: args.env_var(codex_alab::HOME_ENV).map(str::to_owned),
+        codex_auth_path: args.env_var(codex_alab::AUTH_PATH_ENV).map(str::to_owned),
         cwd: aterm_sysprobe::process_cwd(pid),
         twin: None,
         managed_launch: atpkg::store::resolve_configured()
             .and_then(|layout| atpkg::managed_launch::Hints::capture(&layout, &args)),
     };
-    let home = codex_home_of(live.codex_home.as_deref(), args.env_var("HOME"))?;
+    let home = codex_home_of(
+        live.codex_home.as_deref(),
+        live.cwd.as_deref(),
+        args.env_var("HOME"),
+    )?;
     Some((home, live))
 }
 
@@ -220,6 +230,8 @@ pub struct Live {
     pub argv: Vec<String>,
     /// `CODEX_HOME` environment variable at exec, if set.
     pub codex_home: Option<String>,
+    /// `CODEX_AUTH_PATH` environment variable at exec, if set.
+    pub codex_auth_path: Option<String>,
     /// Current working directory of the process.
     pub cwd: Option<PathBuf>,
     /// Managed `atpkg` Codex twin path (`<prefix>/agents/codex`), if configured.
@@ -237,6 +249,8 @@ pub struct Resume {
     pub session: String,
     /// `CODEX_HOME` directory for the relaunch, if non-default.
     pub codex_home: Option<String>,
+    /// `CODEX_AUTH_PATH` login file for the relaunch, if set.
+    pub codex_auth_path: Option<String>,
     /// Working directory for the relaunch.
     pub cwd: Option<String>,
 }
@@ -290,16 +304,45 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
         (Some(_), None) => return Err("cwd"),
         (_, running) => running.map(|p| p.to_string_lossy().into_owned()),
     };
+    let cwd = cwd.filter(|c| Path::new(c).is_absolute() && !c.chars().any(char::is_control));
     for (name, value) in &record.env {
-        if name != "CODEX_HOME" || live.codex_home.as_deref() != Some(value.as_str()) {
+        let matches_live = match name.as_str() {
+            codex_alab::HOME_ENV => live.codex_home.as_deref() == Some(value.as_str()),
+            codex_alab::AUTH_PATH_ENV => live.codex_auth_path.as_deref() == Some(value.as_str()),
+            _ => false,
+        };
+        if !matches_live {
             return Err("env");
+        }
+    }
+    if let Some(h) = live.codex_home.as_deref().filter(|s| !s.is_empty())
+        && (h
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            || (!Path::new(h).is_absolute() && cwd.is_none()))
+    {
+        return Err("home-path");
+    }
+    if let Some(auth) = live.codex_auth_path.as_deref().filter(|s| !s.is_empty()) {
+        let last_seg = auth
+            .rsplit(['/', std::path::MAIN_SEPARATOR])
+            .next()
+            .unwrap_or("");
+        if !Path::new(auth).is_absolute()
+            || matches!(last_seg, "" | "." | "..")
+            || auth
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return Err("auth-path");
         }
     }
     Ok(Resume {
         argv: argv.clone(),
         session: session.to_string(),
         codex_home: live.codex_home.clone(),
-        cwd: cwd.filter(|c| Path::new(c).is_absolute() && !c.chars().any(char::is_control)),
+        codex_auth_path: live.codex_auth_path.clone(),
+        cwd,
     })
 }
 
@@ -338,17 +381,21 @@ pub fn record_path(home: &Path, pid: u32) -> PathBuf {
         .join(format!("{pid}.json"))
 }
 
-/// The `$CODEX_HOME` a process started with `codex_home`/`home` uses:
-/// `CODEX_HOME`, else `$HOME/.codex`; canonical where it exists.
-fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    let dir = codex_home
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| {
-            home.map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|h| h.join(".codex"))
-        })?;
+/// The `$CODEX_HOME` a process started with `codex_home`/`home` in `cwd` uses:
+/// `CODEX_HOME` (resolved against `cwd` when relative), else `$HOME/.codex`; canonical where it exists.
+fn codex_home_of(
+    codex_home: Option<&str>,
+    cwd: Option<&Path>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    let dir = match codex_home.filter(|v| !v.is_empty()) {
+        Some(set) if Path::new(set).is_absolute() => PathBuf::from(set),
+        Some(relative) => cwd.filter(|c| c.is_absolute())?.join(relative),
+        None => home
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .map(|h| h.join(".codex"))?,
+    };
     Some(std::fs::canonicalize(&dir).unwrap_or(dir))
 }
 
@@ -402,13 +449,20 @@ pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume
         env: typed
             .codex_home
             .iter()
-            .map(|h| ("CODEX_HOME".to_string(), h.clone()))
+            .map(|h| (codex_alab::HOME_ENV.to_string(), h.clone()))
+            .chain(
+                typed
+                    .codex_auth_path
+                    .iter()
+                    .map(|p| (codex_alab::AUTH_PATH_ENV.to_string(), p.clone())),
+            )
             .collect(),
         status: None,
         exit: None,
         cwd: typed.cwd.clone(),
         draft_empty: None,
         frame: None,
+        goal: None,
         initializing: false,
     };
     validate(&record, pid, live)
@@ -480,6 +534,21 @@ fn read_record(path: &Path) -> Seen {
             Seen::Unreadable("record-too-large")
         }
         Err(_) => Seen::Unreadable("record-unreadable"),
+    }
+}
+
+/// Read the active goal published in `<home>/alab/sessions/<pid>.json` for live `pid` and `thread`.
+#[must_use]
+pub fn read_record_goal(home: &Path, pid: u32, thread: &str) -> Option<String> {
+    match read_record(&record_path(home, pid)) {
+        Seen::Present(record)
+            if record.pid == pid
+                && record.exit.is_none()
+                && record.session_id.as_deref() == Some(thread) =>
+        {
+            record.goal
+        }
+        _ => None,
     }
 }
 

@@ -7,6 +7,7 @@ pub mod build_cache;
 pub mod checkout;
 pub mod discovery;
 pub mod interrupt;
+pub mod lasting;
 pub mod layout;
 pub mod lease;
 pub mod named_lock;

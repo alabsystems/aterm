@@ -3,7 +3,7 @@
 
 //! A durable obligation to activate desktop preferences after their write.
 
-use crate::items::defaults::{Signalled, Target};
+use crate::items::defaults::{Session, Signalled, Target};
 use crate::model::{PValue, User};
 use crate::plist::Entries;
 use crate::port::{Cmd, System};
@@ -37,7 +37,10 @@ fn path(user: &User, family: &str) -> Result<PathBuf, String> {
         .join(format!("{family}.pending")))
 }
 
-fn parents(sys: &dyn System, user: &User, marker: &Path) -> Result<(), String> {
+/// Check every directory from the home down to `marker`'s: each that exists belongs to the
+/// user, is no link and is writable by no one else. Return those that do not exist yet, which
+/// [`begin`] creates, from the home down.
+fn parents(sys: &dyn System, user: &User, marker: &Path) -> Result<Vec<PathBuf>, String> {
     let home = Path::new(&user.home);
     let mut current = home.to_path_buf();
     let relative = marker
@@ -45,6 +48,7 @@ fn parents(sys: &dyn System, user: &User, marker: &Path) -> Result<(), String> {
         .ok_or("activation marker has no directory")?
         .strip_prefix(home)
         .map_err(|_| "activation marker is outside the account home")?;
+    let mut missing = Vec::new();
     for component in std::iter::once(None).chain(relative.components().map(Some)) {
         if let Some(component) = component {
             current.push(component);
@@ -52,7 +56,7 @@ fn parents(sys: &dyn System, user: &User, marker: &Path) -> Result<(), String> {
         match sys.stat(&current) {
             Ok(stat)
                 if stat.dir && !stat.symlink && stat.uid == user.uid && stat.mode & 0o022 == 0 => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(current.clone()),
             _ => {
                 return Err(
                     "activation state directory must belong to this user and contain no links"
@@ -61,7 +65,7 @@ fn parents(sys: &dyn System, user: &User, marker: &Path) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// Whether a previous write still needs its consumer relaunched.
@@ -89,25 +93,31 @@ pub fn pending(sys: &dyn System, user: &User, family: &str) -> Result<bool, Stri
     Ok(true)
 }
 
-/// Persist activation work before the first preference write.
+/// Persist activation work before the first preference write: the marker, then a barrier
+/// ([`System::ordered_dir`]) on each directory whose entries this call changed (the marker's
+/// own, and the parent of each directory it created), so the marker reaches the disk before
+/// any write after it. A marker already there was left by an earlier call whose barriers may
+/// not all have run (one failed, or the process died), so the whole chain is ordered again.
 /// # Errors
 /// The private marker cannot be safely written.
 pub fn begin(sys: &dyn System, user: &User, family: &str) -> Result<(), String> {
     let marker = path(user, family)?;
-    parents(sys, user, &marker)?;
-    pending(sys, user, family)?;
-    sys.create_dir_all(
-        marker
-            .parent()
-            .ok_or("activation marker has no directory")?,
-        0o700,
-    )
-    .map_err(|_| "cannot create the desktop activation state directory")?;
+    let created = parents(sys, user, &marker)?;
+    let earlier = pending(sys, user, family)?;
+    let directory = marker
+        .parent()
+        .ok_or("activation marker has no directory")?;
+    sys.create_dir_all(directory, 0o700)
+        .map_err(|_| "cannot create the desktop activation state directory")?;
     parents(sys, user, &marker)?;
     sys.write_user_file(user, &marker, RECORD, 0o600)
         .map_err(|_| "cannot persist pending desktop activation".to_owned())?;
-    for directory in marker.parent().into_iter().flat_map(Path::ancestors) {
-        sys.durable_dir(directory)
+    for changed in directory.ancestors().filter(|changed| {
+        earlier
+            || *changed == directory
+            || created.iter().any(|made| made.parent() == Some(*changed))
+    }) {
+        sys.ordered_dir(changed)
             .map_err(|_| "cannot persist the desktop activation directory entries".to_owned())?;
     }
     Ok(())
@@ -138,33 +148,45 @@ pub fn readers(domain: &str) -> &'static [&'static str] {
     }
 }
 
-/// How long [`relaunch_settled`] waits on what it relaunched, looking once a second: the
-/// one-minute hang detector, never a latency budget (a consumer that settles is done at
-/// once).
+/// How long [`relaunch_settled`] waits on what it relaunched: the one-minute hang detector,
+/// never a latency budget (a consumer that settles is done at once).
 const PATIENCE: Duration = Duration::from_secs(60);
-const POLLS: u32 = 60;
+
+/// How often [`relaunch_settled`] looks whether an old process exited: in this process
+/// ([`System::pid_alive`], [`System::sleep`]), with no child.
+const TICK: Duration = Duration::from_millis(20);
+
+/// The ticks between two looks at a consumer whose old processes are gone (its census and
+/// what it reads, which spawn): two equal looks this far apart (240 ms) under the same new
+/// process are what counts as still.
+const LOOK_EVERY: u32 = 12;
+
+/// The ticks [`PATIENCE`] holds.
+const TICKS: u32 = 3000;
 
 /// Where [`relaunch_settled`] is with one consumer.
 enum State<W> {
     /// Its answer.
     Done(Result<(), String>),
     /// Relaunched and not yet up: its old processes, what the last look saw under which
-    /// new ones, and what it waits for.
+    /// new ones, what it waits for, and the tick of its next look.
     Waiting {
         old: Vec<u32>,
         last: Option<(Vec<u32>, W)>,
         why: String,
+        next: u32,
     },
 }
 
-/// Relaunch each of `processes` that runs, once, in turn, and return once each is up again and past its start or the minute is out: for each, `Ok`, or why not, which says the activation remains pending (its durable marker, [`begin`], is cleared only after this).
+/// Relaunch each of `processes` that runs, once, in turn, in `session` ([`Session`]), and return once each is up again and past its start or the minute is out: for each, `Ok`, or why not, which says the activation remains pending (its durable marker, [`begin`], is cleared only after this).
 pub fn relaunch_settled<W: PartialEq>(
     sys: &dyn System,
     user: &User,
+    session: Session,
     processes: &[&str],
     look: impl Fn(&str) -> Result<W, String>,
 ) -> Vec<Result<(), String>> {
-    relaunched(sys, user, processes, look)
+    relaunched(sys, user, session, processes, look)
         .into_iter()
         .map(|answer| answer.map_err(|why| format!("{why}; activation remains pending")))
         .collect()
@@ -181,10 +203,11 @@ pub fn relaunch_settled<W: PartialEq>(
 pub fn relaunch_reading(
     sys: &dyn System,
     user: &User,
+    session: Session,
     process: &str,
     keys: &[Target],
 ) -> Result<(), String> {
-    relaunched(sys, user, &[process], |_| reading(sys, keys))
+    relaunched(sys, user, session, &[process], |_| reading(sys, keys))
         .pop()
         .unwrap_or(Ok(()))
 }
@@ -249,6 +272,7 @@ fn loaded(tiles: &PValue) -> bool {
 fn relaunched<W: PartialEq>(
     sys: &dyn System,
     user: &User,
+    session: Session,
     processes: &[&str],
     look: impl Fn(&str) -> Result<W, String>,
 ) -> Vec<Result<(), String>> {
@@ -257,7 +281,7 @@ fn relaunched<W: PartialEq>(
         .map(|&process| match census(sys, user, process) {
             Err(why) => State::Done(Err(why)),
             Ok(old) if old.is_empty() => State::Done(Ok(())),
-            Ok(old) => match crate::items::defaults::relaunch(sys, user, process) {
+            Ok(old) => match crate::items::defaults::relaunch(sys, user, session, process) {
                 Err(why) => State::Done(Err(why)),
                 // No login session: nothing was signalled and nothing starts again.
                 Ok(Signalled::NoSession) => State::Done(Ok(())),
@@ -267,16 +291,33 @@ fn relaunched<W: PartialEq>(
                     old,
                     last: None,
                     why: format!("{process} has not been looked at"),
+                    next: 0,
                 },
             },
         })
         .collect();
     let deadline = Instant::now() + PATIENCE;
-    for poll in 0..POLLS {
+    for tick in 0..TICKS {
         for (state, &process) in states.iter_mut().zip(processes) {
-            let State::Waiting { old, last, why } = state else {
+            let State::Waiting {
+                old,
+                last,
+                why,
+                next,
+            } = state
+            else {
                 continue;
             };
+            // An old process still running is looked at in this process, every tick.
+            if old.iter().any(|pid| sys.pid_alive(*pid)) {
+                *last = None;
+                *why = format!("the previous {process} process has not exited");
+                continue;
+            }
+            if tick < *next {
+                continue;
+            }
+            *next = tick + LOOK_EVERY;
             let now =
                 up(sys, user, process, old).and_then(|pids| look(process).map(|seen| (pids, seen)));
             let settled = match now {
@@ -299,15 +340,15 @@ fn relaunched<W: PartialEq>(
         let waiting = states
             .iter()
             .any(|state| matches!(state, State::Waiting { .. }));
-        if !waiting || poll + 1 == POLLS || Instant::now() >= deadline {
+        if !waiting || tick + 1 == TICKS || Instant::now() >= deadline {
             break;
         }
-        let sleep = Cmd::new("/bin/sleep").arg("1").as_user(user);
-        if !sys.run(&sleep).is_ok_and(|ran| ran.success()) {
+        sys.sleep(TICK);
+        if let Some(signal) = sys.stopped() {
             for (state, process) in states.iter_mut().zip(processes) {
                 if matches!(state, State::Waiting { .. }) {
                     *state = State::Done(Err(format!(
-                        "the wait for the relaunched {process} was interrupted"
+                        "the wait for the relaunched {process} was interrupted (signal {signal})"
                     )));
                 }
             }
@@ -459,35 +500,15 @@ mod tests {
             sys.alive(123);
             sys.on("/bin/launchctl print gui/501", Ran::ok(""));
             sys.on("alice@gui$ /usr/bin/killall -u alice Dock", Ran::ok(""));
-            sys.on(
-                "alice$ /bin/sleep 1",
-                if interrupted {
-                    Ran {
-                        status: Some(130),
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                    }
-                } else {
-                    Ran::ok("")
-                },
-            );
-            let answers = relaunch_settled(&sys, &who, &["Dock"], |_| Ok::<_, String>(()));
+            // A Ctrl-C the run caught reads at the first look after a sleep.
+            sys.stop_after = interrupted.then_some(0);
+            let answers =
+                relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| Ok::<_, String>(()));
             assert!(answers[0].is_err(), "{answers:?}");
             assert!(pending(&sys, &who, "dock").unwrap());
-            assert_eq!(
-                sys.calls()
-                    .iter()
-                    .filter(|call| call.contains("killall"))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                sys.calls()
-                    .iter()
-                    .filter(|call| call.contains("/bin/sleep"))
-                    .count(),
-                if interrupted { 1 } else { 59 }
-            );
+            assert_eq!(kills(&sys), 1);
+            assert_eq!(sleeps(&sys), if interrupted { 1 } else { TICKS - 1 });
+            assert_eq!(spawned_sleeps(&sys), 0);
         }
     }
 
@@ -511,7 +532,9 @@ mod tests {
                 ),
             );
             let mut answers =
-                relaunch_settled(&sys, &who, &["NotificationCenter"], |_| Ok::<_, String>(()));
+                relaunch_settled(&sys, &who, Session::Ask, &["NotificationCenter"], |_| {
+                    Ok::<_, String>(())
+                });
             let result = answers.remove(0);
             if output.is_none() {
                 result.unwrap();
@@ -533,7 +556,8 @@ mod tests {
         let census = "alice$ /usr/bin/pgrep -u 501 -x Dock";
         sys.on(census, Ran::ok("123\n"));
         sys.refuse_complete_stdout(census, "incomplete capture");
-        let answers = relaunch_settled(&sys, &who, &["Dock"], |_| Ok::<_, String>(()));
+        let answers =
+            relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| Ok::<_, String>(()));
         assert!(answers[0].is_err(), "{answers:?}");
         assert!(pending(&sys, &who, "dock").unwrap());
         assert!(sys.calls().iter().all(|call| !call.contains("killall")));
@@ -551,16 +575,15 @@ mod tests {
             sys.on(census, after);
             sys.on("/bin/launchctl print gui/501", Ran::ok(""));
             sys.on("alice@gui$ /usr/bin/killall -u alice Dock", Ran::ok(""));
-            sys.on("alice$ /bin/sleep 1", Ran::ok(""));
         };
         let sys = Fake::root();
         script(&sys, Ran::ok("124\n"));
         let reads = std::sync::Mutex::new(vec![1, 2, 2, 2]);
-        let answers = relaunch_settled(&sys, &who, &["Dock"], |_| {
+        let answers = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| {
             Ok::<_, String>(reads.lock().unwrap().remove(0))
         });
         assert_eq!(answers, [Ok(())]);
-        assert_eq!(sleeps(&sys), 2);
+        assert_eq!(sleeps(&sys), 2 * LOOK_EVERY);
         let sys = Fake::root();
         script(
             &sys,
@@ -570,30 +593,31 @@ mod tests {
                 stderr: Vec::new(),
             },
         );
-        let why = relaunch_settled(&sys, &who, &["Dock"], |_| Ok::<_, String>(()))
+        let why = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| Ok::<_, String>(()))
             .remove(0)
             .unwrap_err();
         assert!(why.contains("has not started again"), "{why}");
-        assert_eq!(sleeps(&sys), 59);
+        assert_eq!(sleeps(&sys), TICKS - 1);
         let sys = Fake::root();
         script(&sys, Ran::ok("124\n"));
         let count = std::sync::atomic::AtomicU32::new(0);
-        let why = relaunch_settled(&sys, &who, &["Dock"], |_| {
+        let why = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| {
             Ok::<_, String>(count.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
         })
         .remove(0)
         .unwrap_err();
         assert!(why.contains("Dock still rewrites what it reads"), "{why}");
-        assert_eq!(sleeps(&sys), 59);
+        assert_eq!(sleeps(&sys), TICKS - 1);
         assert_eq!(kills(&sys), 1);
         let sys = Fake::root();
         script(&sys, Ran::ok("124\n"));
         let looks = std::sync::Mutex::new(vec![Err("tiles"), Err("tiles"), Ok(()), Ok(())]);
-        let answers = relaunch_settled(&sys, &who, &["Dock"], |_| {
+        let answers = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| {
             looks.lock().unwrap().remove(0).map_err(str::to_owned)
         });
         assert_eq!(answers, [Ok(())]);
-        assert_eq!(sleeps(&sys), 3);
+        assert_eq!(sleeps(&sys), 3 * LOOK_EVERY);
+        assert_eq!(spawned_sleeps(&sys), 0);
     }
 
     /// A `killall` that exits 1 after the census saw the process (a refused kill, or a
@@ -612,12 +636,11 @@ mod tests {
                 "alice@gui$ /usr/bin/killall -u alice Dock",
                 Ran::exit(1, "kill -TERM 123: Operation not permitted"),
             );
-            sys.on("alice$ /bin/sleep 1", Ran::ok(""));
         };
         let sys = Fake::root();
         script(&sys);
         sys.alive(123);
-        let why = relaunch_settled(&sys, &who, &["Dock"], |_| Ok::<_, String>(()))
+        let why = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| Ok::<_, String>(()))
             .remove(0)
             .unwrap_err();
         assert!(
@@ -625,18 +648,18 @@ mod tests {
                 && why.ends_with("activation remains pending"),
             "{why}"
         );
-        assert_eq!(sleeps(&sys), 59);
+        assert_eq!(sleeps(&sys), TICKS - 1);
         assert_eq!(kills(&sys), 1);
 
         let sys = Fake::root();
         script(&sys);
         sys.on(census, Ran::ok("124\n"));
         let reads = std::sync::Mutex::new(vec![1, 2, 2]);
-        let answers = relaunch_settled(&sys, &who, &["Dock"], |_| {
+        let answers = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| {
             Ok::<_, String>(reads.lock().unwrap().remove(0))
         });
         assert_eq!(answers, [Ok(())]);
-        assert_eq!(sleeps(&sys), 2);
+        assert_eq!(sleeps(&sys), 2 * LOOK_EVERY);
         assert!(reads.lock().unwrap().is_empty());
     }
 
@@ -652,10 +675,11 @@ mod tests {
         sys.on(census, Ran::ok("125\n"));
         sys.on("/bin/launchctl print gui/501", Ran::ok(""));
         sys.on("alice@gui$ /usr/bin/killall -u alice Dock", Ran::ok(""));
-        sys.on("alice$ /bin/sleep 1", Ran::ok(""));
-        let answers = relaunch_settled(&sys, &who, &["Dock"], |_| Ok::<_, String>("pins"));
+        let answers = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| {
+            Ok::<_, String>("pins")
+        });
         assert_eq!(answers, [Ok(())]);
-        assert_eq!(sleeps(&sys), 2);
+        assert_eq!(sleeps(&sys), 2 * LOOK_EVERY);
     }
 
     /// Each consumer gets its own answer, and every one that was relaunched is waited on
@@ -680,9 +704,8 @@ mod tests {
             "alice@gui$ /usr/bin/killall -u alice NotificationCenter",
             Ran::exit(2, "injected"),
         );
-        sys.on("alice$ /bin/sleep 1", Ran::ok(""));
         let looked = std::sync::Mutex::new(Vec::new());
-        let answers = relaunch_settled(&sys, &who, &RELAUNCHED, |process| {
+        let answers = relaunch_settled(&sys, &who, Session::Ask, &RELAUNCHED, |process| {
             looked.lock().unwrap().push(process.to_owned());
             Ok::<_, String>(())
         });
@@ -698,10 +721,63 @@ mod tests {
             "{center}"
         );
         assert_eq!(*looked.lock().unwrap(), ["Dock", "Dock"]);
-        assert_eq!(sleeps(&sys), 1);
+        assert_eq!(sleeps(&sys), LOOK_EVERY);
     }
 
-    fn sleeps(sys: &Fake) -> usize {
+    /// While the old process runs, the wait looks at it in this process alone: each tick is
+    /// one in-process sleep, and neither a census nor a `sleep` child runs until it exited.
+    /// Negative control: the old wait spawned `/bin/sleep 1` per look and read the census each
+    /// time.
+    #[test]
+    fn an_old_process_still_running_is_waited_on_in_process_without_a_spawn() {
+        let who = user("alice", 501);
+        let census = "alice$ /usr/bin/pgrep -u 501 -x Dock";
+        let sys = Fake::root();
+        sys.on(census, Ran::ok("123\n"));
+        sys.on(census, Ran::ok("124\n"));
+        sys.alive(123);
+        sys.on("/bin/launchctl print gui/501", Ran::ok(""));
+        sys.on("alice@gui$ /usr/bin/killall -u alice Dock", Ran::ok(""));
+        let ticks = std::sync::atomic::AtomicU32::new(0);
+        sys.on_sleep(move |fake, period| {
+            assert_eq!(period, TICK);
+            if ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 3 {
+                fake.exited(123);
+            }
+        });
+        let answers = relaunch_settled(&sys, &who, Session::Ask, &["Dock"], |_| {
+            Ok::<_, String>("pins")
+        });
+        assert_eq!(answers, [Ok(())]);
+        let calls = sys.calls();
+        let killed = calls.iter().position(|c| c.contains("killall")).unwrap();
+        let looked = killed
+            + 1
+            + calls[killed + 1..]
+                .iter()
+                .position(|c| c == census)
+                .unwrap();
+        assert_eq!(
+            calls[killed + 1..looked],
+            ["sleep 20ms", "sleep 20ms", "sleep 20ms"],
+            "{calls:?}"
+        );
+        assert_eq!(spawned_sleeps(&sys), 0);
+        assert_eq!(kills(&sys), 1);
+    }
+
+    /// In-process sleeps ([`System::sleep`]).
+    fn sleeps(sys: &Fake) -> u32 {
+        let count = sys
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("sleep "))
+            .count();
+        u32::try_from(count).unwrap()
+    }
+
+    /// `sleep` children: none since the wait sleeps in this process.
+    fn spawned_sleeps(sys: &Fake) -> usize {
         sys.calls()
             .iter()
             .filter(|call| call.contains("/bin/sleep"))

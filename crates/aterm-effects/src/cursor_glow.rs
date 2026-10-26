@@ -263,6 +263,7 @@ pub struct CursorGlow {
     classic: crate::classic_wake::ClassicWake,
     sparks: Vec<Spark>,
     admission_log: AdmissionLog,
+    admission_source: Option<AdmissionSource>,
     spawns: u64,
     path_scratch: Vec<(i32, i32)>,
     particles: Vec<Particle>,
@@ -2145,6 +2146,9 @@ impl CursorGlow {
                     .tick_with_restored_rows(now, geom, &v2_cfg, &mut frame, witness_slice);
             } else {
                 self.v2.tick(now, geom, &v2_cfg, &mut frame);
+            }
+            if let Some(p) = self.held_park.as_mut() {
+                p.v2_typed_before = 0;
             }
             self.v2_caret = frame.caret;
             let rail_spans = self.v2.ribbon().rail_spans();

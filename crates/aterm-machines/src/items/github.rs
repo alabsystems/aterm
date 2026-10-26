@@ -7,7 +7,8 @@ use super::{Ctx, Item};
 use crate::model::{Probe, Read, User};
 use crate::port::{Cmd, System};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// The `[github]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -48,6 +49,38 @@ pub const GITHUB_FINGERPRINTS: [&str; 3] = [
 
 /// git from the Command Line Tools.
 pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
+
+/// Where `xcode-select -s` keeps the developer directory a person chose, which
+/// `xcode-select -p` prints.
+const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
+
+/// The developer directory `xcode-select -p` names with no choice made and Xcode installed.
+const XCODE_DEVELOPER: &str = "/Applications/Xcode.app/Contents/Developer";
+
+/// The git installed for the runs here, never `/usr/bin/git` (macOS's shim, which asks a person
+/// to install the Command Line Tools): the tools' own ([`CLT_GIT`]), else, on a Mac with Xcode
+/// and not the tools, the git of the developer directory `xcode-select -p` names (the one a
+/// person chose, else Xcode's). Read without a child process; `None` when neither is there.
+#[must_use]
+pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
+    let file = |path: &Path| sys.stat(path).is_ok_and(|stat| !stat.dir);
+    if file(Path::new(CLT_GIT)) {
+        return Some(CLT_GIT.into());
+    }
+    sys.read_link(Path::new(XCODE_SELECT_LINK))
+        .ok()
+        .filter(|dir| dir.is_absolute())
+        .into_iter()
+        .chain([PathBuf::from(XCODE_DEVELOPER)])
+        .map(|dir| dir.join("usr/bin/git"))
+        .find(|git| file(git))
+}
+
+/// [`installed_git`], or [`CLT_GIT`] where none is installed (each caller reads that first).
+#[must_use]
+pub fn git_program(sys: &dyn System) -> PathBuf {
+    installed_git(sys).unwrap_or_else(|| CLT_GIT.into())
+}
 
 /// For a test that runs the real [`CLT_GIT`], as the code it checks does: COULD NOT RUN
 /// on a host without it (a Mac before the Command Line Tools; any other unix, where
@@ -474,11 +507,13 @@ struct GitItem {
     value: String,
     /// `--add` to a multi-valued key (`insteadOf`) instead of replacing it.
     add: bool,
+    /// The git the last probe found ([`installed_git`]).
+    program: Mutex<PathBuf>,
 }
 
 impl GitItem {
     fn git(&self) -> Cmd {
-        Cmd::new(CLT_GIT)
+        Cmd::new(&*self.program.lock().unwrap_or_else(PoisonError::into_inner))
             .args(["config", "--global"])
             .as_user(&self.user)
     }
@@ -510,19 +545,17 @@ impl Item for GitItem {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        match sys.stat(Path::new(CLT_GIT)) {
-            Ok(s) if !s.dir => {}
-            _ => {
-                return Probe::Waits {
-                    on: CLT_ITEM.to_owned(),
-                    why: format!(
-                        "the Command Line Tools are not installed ({CLT_GIT} is missing), and \
-                         /usr/bin/git would ask a person to install them: set [developer] \
-                         command_line_tools = true"
-                    ),
-                };
-            }
-        }
+        let Some(program) = installed_git(sys) else {
+            return Probe::Waits {
+                on: CLT_ITEM.to_owned(),
+                why: format!(
+                    "the Command Line Tools are not installed ({CLT_GIT} is missing, and no \
+                     Xcode is selected), and /usr/bin/git would ask a person to install them: \
+                     set [developer] command_line_tools = true"
+                ),
+            };
+        };
+        *self.program.lock().unwrap_or_else(PoisonError::into_inner) = program;
         match self.read(sys) {
             Read::Value(values)
                 if values.contains(&self.value) && (self.add || values.len() == 1) =>
@@ -623,6 +656,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
                 key,
                 value,
                 add: false,
+                program: Mutex::new(CLT_GIT.into()),
             }));
         }
         if table.ssh_urls == Some(true) {
@@ -632,6 +666,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
                 key: SSH_URL_KEY,
                 value: HTTPS_PREFIX.to_owned(),
                 add: true,
+                program: Mutex::new(CLT_GIT.into()),
             }));
         }
     }
@@ -924,6 +959,49 @@ mod tests {
             "{:?}",
             sys.calls()
         );
+    }
+
+    #[test]
+    fn a_mac_with_xcode_and_not_the_command_line_tools_runs_the_git_xcode_select_names() {
+        let chosen = "/Applications/Xcode-beta.app/Contents/Developer/usr/bin/git";
+        let default = "/Applications/Xcode.app/Contents/Developer/usr/bin/git";
+        // Neither the tools nor Xcode: nothing to run, and git's settings wait.
+        let sys = Fake::root();
+        assert_eq!(installed_git(&sys), None);
+        assert!(matches!(
+            by_id("github.git-name@alice").probe(&sys, &ctx()),
+            Probe::Waits { .. }
+        ));
+        // Xcode at its usual place, no choice made: Xcode's git.
+        let sys = Fake::root();
+        sys.stat_of(default, FILE);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(default)));
+        // A developer directory a person chose with `xcode-select -s` wins over the default.
+        sys.link(
+            XCODE_SELECT_LINK,
+            "/Applications/Xcode-beta.app/Contents/Developer",
+        );
+        sys.stat_of(chosen, FILE);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(chosen)));
+        let get = format!("alice$ {chosen} config --global --get user.name");
+        sys.on(&get, Ran::exit(1, ""));
+        let item = by_id("github.git-name@alice");
+        assert!(
+            matches!(item.probe(&sys, &ctx()), Probe::Change { .. }),
+            "{:?}",
+            sys.calls()
+        );
+        let set = format!("alice$ {chosen} config --global user.name 'alice on lab-07'");
+        sys.on(&set, Ran::ok(""));
+        item.apply(&sys, &ctx()).unwrap();
+        assert!(sys.calls().contains(&set), "{:?}", sys.calls());
+        // The tools' own git, once installed, is the one every run takes.
+        sys.stat_of(CLT_GIT, FILE);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(CLT_GIT)));
+        // A directory where git should be is not a git.
+        let sys = Fake::root();
+        sys.stat_of(default, Stat { dir: true, ..FILE });
+        assert_eq!(installed_git(&sys), None);
     }
 
     #[test]

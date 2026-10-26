@@ -739,6 +739,25 @@ pub fn behind_a_link(home: &Path, name: &str) -> bool {
     linked(home, name, own_dir(home))
 }
 
+/// Whether entry `name`'s file under `home` holds the value of manifest digest `digest`.
+pub fn holds_digest(home: &Path, name: &str, digest: &str) -> bool {
+    target_path(home, name)
+        .ok()
+        .and_then(|target| fsx::read_private(&target, text::MAX_VALUE).ok().flatten())
+        .is_some_and(|bytes| digest_hex(bytes.as_slice()) == digest)
+}
+
+/// Whether entry `name`'s file under `home` is a gap a pass writes: missing, with no directory
+/// on its way that a pass refuses (a symlink, or one it does not own) ([`Places::reachable`]).
+pub fn is_gap(home: &Path, name: &str) -> bool {
+    let reachable = name
+        .strip_prefix("~/")
+        .is_none_or(|rel| refused_dir(home, rel, own_dir(home)).is_none());
+    reachable
+        && target_path(home, name)
+            .is_ok_and(|target| matches!(fsx::kind(&target), Ok(Kind::Missing)))
+}
+
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir) {

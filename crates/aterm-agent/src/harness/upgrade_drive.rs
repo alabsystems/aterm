@@ -1469,6 +1469,7 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
         .map_or(Probed::NoVersion, Probed::Version)
 }
 
+#[cfg_attr(not(all(test, unix)), allow(dead_code))]
 pub(super) fn bounded_output(
     program: &Path,
     args: &[&std::ffi::OsStr],
@@ -3353,6 +3354,7 @@ pub(super) struct St {
     pub(super) thread: String,
     pub(super) codex_home: String,
     pub(super) codex_home_env: Option<String>,
+    pub(super) codex_auth_path: Option<String>,
     pub(super) argv: Vec<String>,
     pub(super) cwd: String,
     pub(super) twin: String,
@@ -4234,6 +4236,9 @@ impl St {
         if let Some(home) = &self.codex_home_env {
             o.insert("codex_home_env".into(), Value::from(home.as_str()));
         }
+        if let Some(auth) = &self.codex_auth_path {
+            o.insert("codex_auth_path".into(), Value::from(auth.as_str()));
+        }
         if !self.muse_data.is_empty() {
             o.insert("muse_data".into(), Value::from(self.muse_data.as_str()));
         }
@@ -4502,6 +4507,10 @@ impl St {
             codex_home: s("codex_home"),
             codex_home_env: v
                 .get("codex_home_env")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            codex_auth_path: v
+                .get("codex_auth_path")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             argv: list("argv"),

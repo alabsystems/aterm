@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::store::{Layout, ToolName};
+use aterm_toolchain::lasting::temp_roots;
 
 /// The compile-time default-set roster the stubs cover before the first signed index resolves.
 pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
@@ -381,13 +382,6 @@ pub(crate) enum Durability {
     Bundle,
 }
 
-const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
-
-fn is_cache_dir(dir: &Path) -> bool {
-    crate::metadata_io::read_bounded_regular_utf8(&dir.join("CACHEDIR.TAG"), 4096)
-        .is_ok_and(|text| text.starts_with(CACHEDIR_TAG_SIGNATURE))
-}
-
 fn in_app_bundle(path: &Path) -> bool {
     let Some(macos) = path.parent() else {
         return false;
@@ -406,12 +400,7 @@ fn in_app_bundle(path: &Path) -> bool {
 /// The [`Durability`] of the atpkg at `atpkg`, with `temp_roots` the machine's temporary directories ([`temp_roots`]).
 #[must_use]
 pub(crate) fn durability(atpkg: &Path, temp_roots: &[PathBuf]) -> Durability {
-    let s = atpkg.to_string_lossy();
-    if s.contains("/AppTranslocation/")
-        || s.starts_with("/Volumes/")
-        || temp_roots.iter().any(|root| atpkg.starts_with(root))
-        || atpkg.ancestors().skip(1).any(is_cache_dir)
-    {
+    if aterm_toolchain::lasting::transient(atpkg, temp_roots) {
         return Durability::Transient;
     }
     if in_app_bundle(atpkg) {
@@ -421,27 +410,11 @@ pub(crate) fn durability(atpkg: &Path, temp_roots: &[PathBuf]) -> Durability {
     }
 }
 
-/// Whether the executable at `path` is not in a transient root ([`Durability::Transient`]).
+/// Whether the executable at `path` is not in a transient root ([`Durability::Transient`],
+/// [`aterm_toolchain::lasting`]).
 #[must_use]
 pub fn lasting(path: &Path) -> bool {
-    durability(path, &temp_roots()) != Durability::Transient
-}
-
-fn temp_roots() -> Vec<PathBuf> {
-    temp_roots_from(std::env::temp_dir())
-}
-
-fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for root in [temp_dir, PathBuf::from("/tmp"), PathBuf::from("/var/tmp")] {
-        if let Ok(real) = std::fs::canonicalize(&root) {
-            roots.push(real);
-        }
-        roots.push(root);
-    }
-    roots.retain(|root| root.is_absolute() && root.parent().is_some());
-    roots.dedup();
-    roots
+    aterm_toolchain::lasting::lasting(path)
 }
 
 /// Which atpkg a file laid now names.
@@ -739,6 +712,7 @@ pub fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_toolchain::lasting::{CACHEDIR_TAG_SIGNATURE, temp_roots_from};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 

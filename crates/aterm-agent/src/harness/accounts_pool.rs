@@ -8,7 +8,7 @@
 //! with the relaunch line a move writes ([`session_move`]). Claude Code's sessions keep the
 //! host's own flow (its transcripts and `/usage` reads); these read the pool's files (its
 //! roster as `logins.json` binds it, [`accounts::bound`]), the session's environment, the usage
-//! sample its caller read and, for Codex, its app server's own report of each row's usage.
+//! sample its caller read and, for Codex, OpenAI's `/wham/usage` endpoint for each row's login.
 
 use std::io;
 use std::path::Path;
@@ -93,8 +93,8 @@ impl Seat<'_> {
     }
 
     /// Whether `cli` keeps its login where no row's own login file is read (Codex's
-    /// `cli_auth_credentials_store` in its default home's `config.toml`, which every overlay
-    /// links: [`crate::ai::facts::codex_keyring`]).
+    /// `cli_auth_credentials_store` in its default home's `config.toml`, which every row's launch
+    /// reads directly: [`crate::ai::facts::codex_keyring`]).
     #[must_use]
     pub fn keyring_held(&self, cli: Cli) -> bool {
         cli == Cli::Codex
@@ -149,9 +149,9 @@ pub fn login_env(cli: Cli, row: &Row, home: &Path) -> io::Result<LoginEnv> {
     })
 }
 
-/// The home `row`'s login of `cli` runs in: its own directory (an overlay made ready by
-/// [`login_env`]), else the CLI's default home under `home`; `None` where its overlay cannot be
-/// used, or the seam is no home of its own.
+/// The directory `row`'s login of `cli` lives in: its own directory (an overlay made ready by
+/// [`login_env`], or a login directory/file seam's folder), else the CLI's default home under
+/// `home`; `None` where its overlay cannot be used.
 fn row_home(cli: Cli, row: &Row, home: &Path) -> Option<std::path::PathBuf> {
     match row.dir.as_deref().filter(|d| !d.is_empty()) {
         None => Some(home.join(cli.accounts().default_home)),
@@ -159,7 +159,7 @@ fn row_home(cli: Cli, row: &Row, home: &Path) -> Option<std::path::PathBuf> {
             login_env(cli, row, home).ok()?;
             Some(std::path::PathBuf::from(dir))
         }
-        Some(_) => None,
+        Some(dir) => Some(std::path::PathBuf::from(dir)),
     }
 }
 
@@ -489,16 +489,17 @@ fn poll_usage(
     ))
 }
 
-/// The product's [`ReadUsage`]: Codex's app server started in `home`, asked
-/// `account/rateLimits/read` within [`USAGE_READ_WAIT`], then ended
-/// ([`super::codex_app_login::run_app_server`], [`super::codex_app_login::read_usage`]); `None`
-/// for any other CLI, which has no usage report aterm reads.
+/// The product's [`ReadUsage`]: Codex's native `/wham/usage` read in `home` within
+/// [`USAGE_READ_WAIT`], refreshing `<home>/auth.json` in place when expired
+/// ([`super::codex_app_login::read_usage_in_home`]); `None` for any other CLI, which has no usage
+/// report aterm reads.
 #[must_use]
 pub fn live_usage(cli: Cli, home: &Path, now: i64) -> Option<Usage> {
-    super::codex_app_login::run_app_server(cli, home, USAGE_READ_WAIT, |server, deadline| {
-        super::codex_app_login::read_usage(server, deadline, now)
-    })
-    .flatten()
+    if cli != Cli::Codex {
+        return None;
+    }
+    let user_home = aterm_types::dirs::home_dir()?;
+    super::codex_app_login::read_usage_in_home(home, &user_home, USAGE_READ_WAIT, now)
 }
 
 /// The login a launch aterm makes of `cli` starts under ([`accounts::launch_row`] over the bound
@@ -748,7 +749,8 @@ pub struct Session<'a> {
     pub sample: Option<Sample>,
     /// Where it is.
     pub point: Point,
-    /// `accounts =` in `aterm.toml`.
+    /// The caller's `accounts =` snapshot from `aterm.toml`; a move requires it to
+    /// agree with the current file before preparing a command.
     pub mode: Mode,
     /// How its relaunch line is spelled.
     pub relaunch: PoolRelaunch<'a>,
@@ -778,8 +780,9 @@ impl Moved {
 /// mode, `off` included, before the advice is read. A turn end on the row's current login
 /// proves the rotation's unproven `active` ([`accounts::prove`]); a superseded login only
 /// contributes usage evidence. A move's line is written
-/// before anything is committed ([`StayWhy::NoLine`] where it cannot be). After preparing it,
-/// both endpoint rows and login generations are checked and advice is recomputed under the
+/// before anything is committed ([`StayWhy::NoLine`] where it cannot be). A stale caller's
+/// policy snapshot is refused before preparing a line. After preparation, both endpoint rows
+/// and login generations are checked and advice is recomputed under the
 /// account lock. A move that rotates then commits its rotation ([`accounts::begin_rotation`]), so the breaker counts it in that
 /// CLI's store alone. A CLI that keeps its login in the OS keyring stays
 /// ([`StayWhy::KeyringStore`]).
@@ -836,6 +839,9 @@ fn session_move_using(
     let state = &snapshot.state;
     let me = who.me(roster);
     let configured_mode = seat.mode();
+    if s.mode != configured_mode {
+        return Moved::stay(StayWhy::NothingDue);
+    }
     let enrolled = accounts::enrolled_for(s.cli, roster);
     let mut candidate_enrolled = enrolled.clone();
     let mut saw_line_failure = false;
@@ -935,7 +941,10 @@ fn finish_move(
             return Err("account policy or login changed while preparing a move".into());
         }
     }
-    if seat.keyring_held(session.cli) || seat.mode() != configured_mode {
+    if seat.keyring_held(session.cli)
+        || session.mode != configured_mode
+        || seat.mode() != configured_mode
+    {
         return Err("account routing changed while preparing a move".into());
     }
     let mut enrolled = accounts::enrolled_for(session.cli, &current.roster);

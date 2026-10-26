@@ -691,6 +691,11 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
 
 /// A tab's process counts only its growth between two readings that read its same start: the
 /// window's three readings are 0, 4 and 5 s, and claude (pid 1210) does 200 mc over the 5 s.
+/// Claude is the scene's newest process, and the reap ledger takes a process first read with a
+/// kernel start newer than every one the last sweep read for one born since (a spawn that
+/// sweep straddled), so a claude older than the window is given an older start than one that
+/// sweep read: the new one at its pid an older start than the first, and a base that reads no
+/// claude start a newer process (an `mdworker` gone by the next reading), as a Mac's does.
 #[test]
 fn a_tab_pid_reused_inside_the_window_counts_only_what_one_start_read() {
     let scene = spotlight_1032();
@@ -702,7 +707,7 @@ fn a_tab_pid_reused_inside_the_window_counts_only_what_one_start_read() {
     let f = facts_edited(&scene, |_, now| {
         for p in now.procs.iter_mut().flatten() {
             if p.pid == 1210 {
-                p.start = p.start.map(|s| s + 1);
+                p.start = p.start.map(|s| s - 1);
             }
         }
     });
@@ -716,6 +721,19 @@ fn a_tab_pid_reused_inside_the_window_counts_only_what_one_start_read() {
     for (missing_base, missing_now, tab) in [(true, false, 40), (false, true, 160), (true, true, 0)]
     {
         let f = facts_edited(&scene, |base, now| {
+            if missing_base {
+                let procs = base.procs.get_or_insert_with(Vec::new);
+                let mut newer = procs
+                    .iter()
+                    .find(|p| p.pid == 940)
+                    .cloned()
+                    .expect("Finder");
+                let claude = procs.iter().find(|p| p.pid == 1210).expect("claude");
+                (newer.pid, newer.name) = (1220, "mdworker".to_owned());
+                newer.start = claude.start.map(|s| s + 1_000);
+                newer.birth_ms = claude.birth_ms.map(|b| b + 1_000);
+                procs.push(newer);
+            }
             for (sample, missing) in [(base, missing_base), (now, missing_now)] {
                 if missing {
                     for p in sample.procs.iter_mut().flatten().filter(|p| p.pid == 1210) {

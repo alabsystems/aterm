@@ -252,6 +252,37 @@ fn a_fleet_need_names_its_tab_as_a_local_one_does() {
     assert_eq!(need_of("facts", "stalled", &[]).1, Some(5000));
 }
 
+/// A peer's harness report (`needs_by=harness`) carries on, at facts and content alike, so this
+/// Mac's Needs you lists it after the stopped work (§14.7); CONTROL: a direct ask (`-`) and a
+/// program's own report (`program`) have stopped their agents.
+#[test]
+fn a_peers_harness_report_carries_on_and_a_direct_ask_does_not() {
+    let carries_on = |level: &str, by: &str| {
+        let fields: Vec<(&str, &str)> = vec![
+            ("sid", "s-a"),
+            ("state", "alive"),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", "busy"),
+            ("agent_ms", "1000"),
+            ("needs", "ask"),
+            ("needs_by", by),
+        ];
+        let mut head = header("n1");
+        head[3].1 = level.to_string();
+        let json = format!("[{}]", peer("mac-1", &pairs(&head), &[fields.as_slice()]));
+        parse(&json, false, None, 1_000).expect("a survey").macs[0].needs[0].carries_on
+    };
+    for level in ["facts", "content"] {
+        assert!(carries_on(level, "harness"), "{level}");
+        assert!(!carries_on(level, "-"), "{level}: CONTROL, a direct ask");
+        assert!(
+            !carries_on(level, "program"),
+            "{level}: CONTROL, the program's own report"
+        );
+    }
+}
+
 #[test]
 fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
     let need_of = |level: &str, needs: &str, row: &[(&str, &str)]| {
@@ -834,6 +865,7 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
         age_ms: Some(1_000),
         what: None,
         claim: None,
+        carries_on: false,
     };
     FleetSlot {
         generation: 1,
@@ -1078,6 +1110,7 @@ fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
                 age_ms: Some(1_000),
                 what: None,
                 claim: None,
+                carries_on: false,
             })
             .into_iter()
             .collect(),

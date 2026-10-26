@@ -423,6 +423,122 @@ fn custody_bound(action: &str) -> bool {
 }
 
 #[test]
+fn an_admin_named_later_removes_a_machine_once_it_enrolls() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = ["m1", "m2", "m3"].map(|host| Paths::for_home(&root.path().join(host)));
+    let source = root.path().join("vault");
+    let created = create(&paths[0], source.to_str().unwrap(), None, Some("m1")).unwrap();
+    let pinned = format!("{}#{}", source.display(), created.signer);
+    // m2 and m3 come in as an open vault lets them: outside the control entry's audience.
+    for (machine, host) in paths[1..].iter().zip(["m2", "m3"]) {
+        let recipient = machine_identity(machine).unwrap().recipient().to_bech32();
+        let admin = admin_cached(&paths[0]).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine(host, &recipient).unwrap();
+        publish_as(
+            &paths[0],
+            &admin,
+            &doc,
+            false,
+            &[(recipient, AdmissionMethod::Open)],
+            false,
+        )
+        .unwrap();
+        join(
+            machine,
+            &JoinOptions {
+                source: pinned.clone(),
+                host: Some(host.into()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: crate::client::JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+    }
+    let in_audience = |host: &str| {
+        matches!(
+            admin_cached(&paths[0]).unwrap().published_doc.commons_audience(),
+            Some(Audience::Hosts(hosts)) if hosts.iter().any(|h| h == host)
+        )
+    };
+    let remove_m3 = || admin_revoke(&paths[1], &admin_open(&paths[1]).unwrap(), "m3", false);
+    // An earlier aterm named m2 an admin by a plain publish.
+    let admin = admin_cached(&paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.add_admin("m2").unwrap();
+    admin_publish(&paths[0], &admin, &doc).unwrap();
+    sync(&paths[1], None).unwrap();
+    assert!(
+        !in_audience("m2"),
+        "CONTROL: a plain publish leaves it outside"
+    );
+    let refused = remove_m3().err().unwrap().to_string();
+    assert!(
+        refused.contains("outside the vault's Commons control")
+            && refused.contains("remove it from m1,")
+            && refused.contains(&format!(
+                "aterm secrets admins add {} there",
+                join_code(&machine_identity(&paths[1]).unwrap().recipient())
+            )),
+        "{refused}"
+    );
+
+    // Naming it again from m1 brings it into the audience, so it holds the control entry...
+    let admin = admin_cached(&paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.add_admin("m2").unwrap();
+    admin_publish_admin(&paths[0], &admin, &doc, "m2").unwrap();
+    assert!(in_audience("m2"));
+    assert!(!in_audience("m3"), "only the admin named");
+    // Until m2 applies that version, it is told to.
+    let refused = remove_m3().err().unwrap().to_string();
+    assert!(
+        refused.contains("not yet applied the vault version"),
+        "{refused}"
+    );
+    sync(&paths[1], None).unwrap();
+    let peer = Bootstrap::required(&paths[1]).unwrap();
+    // ...though no roster names it yet.
+    let refused = remove_m3().err().unwrap().to_string();
+    assert!(
+        refused.contains("not yet an enrolled member") && refused.ends_with("remove it from m1"),
+        "{refused}"
+    );
+
+    // Enrolled by m1, with m1's journal, it removes m3.
+    let owner = Bootstrap::required(&paths[0]).unwrap();
+    let request = peer.request().unwrap();
+    let (mut pending, challenge) =
+        Pending::issue(&request, owner.trust().network, owner.trust().authority).unwrap();
+    let answer = peer.device().answer(&request, &challenge).unwrap();
+    let mut journal = Journal::open_existing(owner.journal_dir(), owner.trust()).unwrap();
+    admin_cached(&paths[0])
+        .unwrap()
+        .enroll_commons_member(&owner, &mut journal, pending.verify(&answer).unwrap())
+        .unwrap();
+    let mut held = Journal::open_existing(peer.journal_dir(), peer.trust()).unwrap();
+    for id in journal.inventory() {
+        held.ingest(journal.node(id).unwrap().bytes()).unwrap();
+    }
+    drop(held);
+    let revoked = remove_m3().unwrap();
+    assert!(revoked.retirement.is_some_and(|retired| retired.changed));
+    assert!(
+        !admin_cached(&paths[1])
+            .unwrap()
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.name == "m3")
+    );
+}
+
+#[test]
 fn retirement_publication_matches_real_failures_retries_and_preflight_refusals() {
     let model = aterm_models_db::retirement_publication_model();
     aterm_spec::interp::prove_and_catch(&model);

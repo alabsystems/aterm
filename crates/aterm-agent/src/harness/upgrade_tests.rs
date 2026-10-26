@@ -5571,3 +5571,33 @@ fn claudes_own_continuation_past_a_limit_row_ends_the_standing_limit() {
         (Some("u"), Some(RESET + 18_000))
     );
 }
+
+/// v6 §14.5 (5a): a prompt that opens with any angle's done check, bare or with its suffixes, v1's
+/// fixed check, or a harness note that carries the check after its facts ([`checking`]) is the done
+/// check's prompt to the transcript's reader. NEGATIVE CONTROL: v1 under a base that is not its
+/// prefix is not.
+#[test]
+fn every_angled_check_is_the_done_checks_prompt_in_the_transcript() {
+    use crate::supervise::policy::turn_end::{
+        DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, done_check_act, done_check_words,
+    };
+    let mut texts: Vec<String> = (0..DONE_ANGLES.len())
+        .flat_map(|n| {
+            [
+                done_check_words(n),
+                done_check_act(n, Some("never push to main"), true),
+            ]
+        })
+        .collect();
+    texts.push(DONE_CHECK_FIXED_BEFORE.to_string());
+    texts.push(checking(
+        &format!("{HARNESS_MARK} Relaunched: this session was restarted. {CARRY_ON}"),
+        false,
+    ));
+    for text in &texts {
+        assert!(is_done_check(text), "{text}");
+    }
+    let moved = DONE_CHECK_FIXED_BEFORE.replacen("done is never the end.", "never stop.", 1);
+    assert_ne!(moved, DONE_CHECK_FIXED_BEFORE);
+    assert!(!is_done_check(&moved), "{moved}");
+}

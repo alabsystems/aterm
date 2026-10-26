@@ -373,6 +373,81 @@ pub fn plist_program(text: &str) -> Option<PathBuf> {
     Some(PathBuf::from(out))
 }
 
+/// Every `<string>` of a plist's `ProgramArguments` array, its XML entities read back: the
+/// program [`plist_program`] names and its arguments, as [`plist_text`] writes them. `None`
+/// for a form it never writes.
+pub fn plist_argv(text: &str) -> Option<Vec<String>> {
+    let (_, after) = text.split_once("<key>ProgramArguments</key>")?;
+    let mut rest = after.trim_start().strip_prefix("<array>")?;
+    let mut argv = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with("</array>") {
+            return (!argv.is_empty()).then_some(argv);
+        }
+        let (escaped, tail) = rest.strip_prefix("<string>")?.split_once("</string>")?;
+        let mut word = String::with_capacity(escaped.len());
+        let mut left = escaped;
+        while let Some(at) = left.find('&') {
+            word.push_str(&left[..at]);
+            left = &left[at..];
+            let (entity, c) = [
+                ("&amp;", '&'),
+                ("&lt;", '<'),
+                ("&gt;", '>'),
+                ("&quot;", '"'),
+                ("&apos;", '\''),
+            ]
+            .into_iter()
+            .find(|(entity, _)| left.starts_with(entity))?;
+            word.push(c);
+            left = &left[entity.len()..];
+        }
+        word.push_str(left);
+        argv.push(word);
+        rest = tail;
+    }
+}
+
+/// Every word of a systemd unit's `ExecStart`, as [`systemd_unit`] writes them (each quoted by
+/// [`systemd_word`], one space apart): the program [`exec_program`] names and its arguments.
+/// `None` for a form it never writes.
+pub fn exec_argv(text: &str) -> Option<Vec<String>> {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let mut chars = line.chars();
+    let mut argv = Vec::new();
+    loop {
+        if chars.next()? != '"' {
+            return None;
+        }
+        let mut word = String::new();
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => match chars.next()? {
+                    c @ ('\\' | '"') => word.push(c),
+                    _ => return None,
+                },
+                c @ ('%' | '$') => {
+                    if chars.next()? != c {
+                        return None;
+                    }
+                    word.push(c);
+                }
+                c => word.push(c),
+            }
+        }
+        argv.push(word);
+        match chars.next() {
+            None => return Some(argv),
+            Some(' ') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
 /// [`unit_program`] of a systemd unit's text: its `ExecStart`'s first word, which
 /// [`systemd_word`] quoted (a program holds no control character, [`check_argv`]).
 pub fn exec_program(text: &str) -> Option<PathBuf> {
@@ -895,6 +970,55 @@ pub fn repair_subscriber(
     })
 }
 
+/// Repair the vault server's job when the program its unit file names is gone (its `aterm.app`
+/// moved or deleted, a disk image ejected), which launchd or systemd can then never start again:
+/// installed again running `program()`, with the arguments it had, so it serves the same vaults
+/// from the same address and store. `None` where nothing is repaired: no server job, one whose
+/// program is there (left as it is, running or not, wherever it is), one a person switched off
+/// (a plist's `Disabled` key), one in a shape `aterm secrets server on` never writes (no
+/// `secrets serve` after its program), or a home that is not this login's own, whose jobs
+/// launchd and systemd never read (as [`state`]). `program` is asked only for a repair.
+pub fn repair_server(
+    home: &Path,
+    program: &dyn Fn() -> crate::Result<PathBuf>,
+) -> crate::Result<Option<String>> {
+    if check_own_home(home).is_err() {
+        return Ok(None);
+    }
+    repair_server_with(
+        home,
+        &|path| std::fs::symlink_metadata(path).is_ok(),
+        |args| install_job(home, Job::Server, &program()?, args, false),
+    )
+}
+
+/// [`repair_server`], `exists` saying whether anything is at a path and `install` installing
+/// the job with these arguments.
+fn repair_server_with(
+    home: &Path,
+    exists: &dyn Fn(&Path) -> bool,
+    install: impl FnOnce(&[String]) -> crate::Result<String>,
+) -> crate::Result<Option<String>> {
+    let Ok(text) = std::fs::read_to_string(unit_file(home, Job::Server)) else {
+        return Ok(None);
+    };
+    let argv = if cfg!(target_os = "macos") {
+        plist_argv(&text).filter(|_| !text.contains("<key>Disabled</key>"))
+    } else {
+        exec_argv(&text)
+    };
+    let Some((held, args)) = argv.as_deref().and_then(<[String]>::split_first) else {
+        return Ok(None);
+    };
+    let serves = args
+        .get(..2)
+        .is_some_and(|words| words == ["secrets", "serve"]);
+    if !serves || exists(Path::new(held)) {
+        return Ok(None);
+    }
+    install(args).map(Some)
+}
+
 fn repair_subscriber_with(
     home: &Path,
     install: impl FnOnce() -> crate::Result<String>,
@@ -1181,6 +1305,109 @@ mod tests {
         ] {
             assert_eq!(plist_program(plist), None, "{plist}");
         }
+    }
+
+    #[test]
+    fn a_unit_names_back_its_whole_argv() {
+        let program = Path::new("/Applications/A&B <\"q'>.app/Contents/MacOS/aterm");
+        let args = [
+            "secrets".to_string(),
+            "serve".to_string(),
+            "--listen".to_string(),
+            "0.0.0.0:7484".to_string(),
+            "a&b <\"q'> 50%$".to_string(),
+            String::new(),
+        ];
+        let whole: Vec<String> = std::iter::once(program.to_string_lossy().into_owned())
+            .chain(args.iter().cloned())
+            .collect();
+        let plist = plist_text("l", program, &args, Path::new("/var/log/x.log"));
+        assert_eq!(plist_argv(&plist), Some(whole.clone()));
+        assert_eq!(
+            exec_argv(&systemd_unit("d", program, &args)),
+            Some(whole),
+            "systemd's words"
+        );
+        for unit in [
+            "ExecStart=\"/a\" watch",
+            "ExecStart=\"/a\"  \"b\"",
+            "ExecStart=\"/a\"\"b\"",
+            "ExecStart=\"/a",
+            "",
+        ] {
+            assert_eq!(exec_argv(unit), None, "{unit}");
+        }
+        for plist in [
+            "<key>ProgramArguments</key><array><string>/a</string>",
+            "<key>ProgramArguments</key><array></array>",
+            "<key>ProgramArguments</key><array><string>/a&nbsp;</string></array>",
+        ] {
+            assert_eq!(plist_argv(plist), None, "{plist}");
+        }
+    }
+
+    /// A server job whose program is gone is installed again with the arguments it had; one
+    /// whose program is there, one switched off, one in another shape and none at all are left.
+    #[test]
+    fn a_server_job_whose_program_is_gone_is_installed_again_as_it_was() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        let gone = Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
+        let args: Vec<String> = ["secrets", "serve", "--listen", "0.0.0.0:7484"]
+            .map(String::from)
+            .into();
+        let write = |text: String| {
+            let unit = unit_file(home, Job::Server);
+            std::fs::create_dir_all(unit.parent().expect("parent")).expect("dir");
+            std::fs::write(&unit, text).expect("unit");
+        };
+        let unit_text = |program: &Path, args: &[String]| {
+            if cfg!(target_os = "macos") {
+                plist_text(
+                    Job::Server.label(),
+                    program,
+                    args,
+                    &log_path(home, Job::Server),
+                )
+            } else {
+                systemd_unit(Job::Server.description(), program, args)
+            }
+        };
+        let repair = |exists: bool| {
+            let mut installed = None;
+            let line = repair_server_with(home, &|path| exists && path == gone, |args| {
+                installed = Some(args.to_vec());
+                Ok("installed".to_string())
+            })
+            .expect("read");
+            (line, installed)
+        };
+        assert_eq!(repair(false), (None, None), "no server job");
+        write(unit_text(gone, &args));
+        assert_eq!(
+            repair(false),
+            (Some("installed".to_string()), Some(args.clone())),
+            "the program gone"
+        );
+        assert_eq!(repair(true), (None, None), "the program there");
+        let watch = ["secrets".to_string(), "watch".to_string()];
+        write(unit_text(gone, &watch));
+        assert_eq!(repair(false), (None, None), "not a server's arguments");
+        if cfg!(target_os = "macos") {
+            let off = unit_text(gone, &args).replace(
+                "<key>RunAtLoad</key>",
+                "<key>Disabled</key>\n\t<true/>\n\t<key>RunAtLoad</key>",
+            );
+            write(off);
+            assert_eq!(repair(false), (None, None), "switched off");
+        }
+        // A home not this login's own (this scratch one) is never repaired, nor its program
+        // asked: launchd and systemd never read its jobs.
+        write(unit_text(gone, &args));
+        assert_eq!(
+            repair_server(home, &|| panic!("a program asked for")).expect("no error"),
+            None
+        );
     }
 
     fn assert_subscriber_decision_held(home: &Path) {

@@ -153,10 +153,9 @@ fn observe_read(cli: Cli, case: i64, policy_only: bool) -> (i64, [bool; 4]) {
         match result {
             Ok(Some(env)) => {
                 assert_eq!(env.label, "work");
-                let expected = if cli == Cli::Grok {
-                    staging.join("auth.json")
-                } else {
-                    staging.clone()
+                let expected = match cli.accounts().seam {
+                    crate::ai::connector::Seam::LoginFile { file, .. } => staging.join(file),
+                    _ => staging.clone(),
                 };
                 assert_eq!(env.value.as_deref(), expected.to_str());
                 2

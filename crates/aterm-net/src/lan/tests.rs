@@ -422,3 +422,55 @@ fn lan_policy_model_conforms_and_catches_a_private_address_bypass() {
     assert!(!model.successors("Routed", &state).contains(&bad));
     assert!(!model.check_invariant("OnlyVerifiedLink", &bad));
 }
+
+#[test]
+fn the_loopback_guard_refuses_a_lan_dial_listen_and_join_and_keeps_the_loopback() {
+    use crate::loopback::forced;
+    use std::net::Ipv4Addr;
+    let documentation = Ipv4Addr::new(192, 0, 2, 1);
+    for on in [true, false] {
+        let refusals = forced(on, || {
+            [
+                (
+                    "dial",
+                    Connection::connect(
+                        (documentation, 7100).into(),
+                        Scope::Lan,
+                        Duration::from_secs(60),
+                    )
+                    .err(),
+                ),
+                (
+                    "listen",
+                    Listener::bind((documentation, 0).into(), Scope::Lan).err(),
+                ),
+                (
+                    "multicast",
+                    Multicast::bind(documentation, Ipv4Addr::new(239, 255, 0, 1), 0, Scope::Lan)
+                        .err(),
+                ),
+            ]
+        });
+        for (what, refused) in refusals {
+            let refused = refused.unwrap_or_else(|| panic!("{what}: no LAN at 192.0.2.1"));
+            let said = refused.to_string();
+            assert_eq!(
+                said.starts_with("ATERM_DEBUG_LOOPBACK_ONLY=1 refuses ")
+                    && said.contains("192.0.2.1"),
+                on,
+                "{what} (guard {on}): {said}"
+            );
+        }
+    }
+    let local = TcpListener::bind("127.0.0.1:0").unwrap();
+    forced(true, || {
+        Connection::connect(
+            local.local_addr().unwrap(),
+            Scope::Loopback,
+            Duration::from_secs(60),
+        )
+        .expect("a loopback dial under the guard");
+        Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback)
+            .expect("a loopback listener under the guard");
+    });
+}

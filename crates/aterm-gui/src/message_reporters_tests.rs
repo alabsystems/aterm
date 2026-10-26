@@ -926,6 +926,8 @@ fn every_reporter_message() -> Vec<Message> {
                 nav: None,
             },
             &Exception {
+                held: None,
+                title: None,
                 kind: ExceptionKind::Login,
                 when: Urgency::Now,
                 why: "Its login is gone, and the roster has no other account to move it to."
@@ -936,6 +938,16 @@ fn every_reporter_message() -> Vec<Message> {
                 notice: None,
             },
         ));
+        for held in aterm_agent::harness::acts::HeldBy::ALL {
+            all.push(resume_ask(
+                "s-0123456789abcdef",
+                &UpgradeSpot {
+                    place: place.to_string(),
+                    nav: None,
+                },
+                &Exception::repeats_land(held, None),
+            ));
+        }
         for text in aterm_agent::supervise::policy::notice::ALL {
             all.push(resume_ask(
                 "s-0123456789abcdef",

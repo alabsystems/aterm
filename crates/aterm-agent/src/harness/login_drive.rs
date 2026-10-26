@@ -295,7 +295,7 @@ pub fn child_args(route: &Route, region: Option<Region>) -> Vec<String> {
             }
             out
         }
-        Drive::AppServer => vec!["app-server".to_owned()],
+        Drive::CodexPkce => vec!["login".to_owned()],
     }
 }
 
@@ -533,7 +533,7 @@ pub enum Outcome {
     /// The approver stopped on the vendor's sign-in page, which the row's browser profile is
     /// signed out of, and it was ended.
     NeedsSignIn(String),
-    /// The CLI said its sign-in failed (Codex's `account/login/completed` without success).
+    /// Sign-in completed without succeeding (provider OAuth error, missing authorization code, or CLI failure).
     Failed,
     /// [`HANG`] ran out, and it was ended.
     Hung,
@@ -819,9 +819,6 @@ impl Request<'_> {
     }
 }
 
-/// How long a Codex app server is waited for to exit once its standard input closed.
-const APP_SERVER_GRACE: Duration = Duration::from_secs(5);
-
 /// The macOS sandbox a [`SignIn::no_desk`] CLI's sign-in child runs under ([`NO_DESK`]).
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -932,6 +929,23 @@ pub fn sign_in_with(
     let Some(signin) = req.signin() else {
         return not_run("this CLI has no sign-in in this build".to_owned());
     };
+    let Drive::Lines {
+        grammar,
+        completion,
+        ..
+    } = &req.route.drive
+    else {
+        let deadline = Instant::now()
+            .checked_add(hang)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+        return super::codex_app_login::login_in_home(
+            req.staging,
+            approver,
+            req.hosts,
+            req.row.email.as_deref(),
+            deadline,
+        );
+    };
     let sandbox = if signin.no_desk.contains(&std::env::consts::OS) {
         let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
             return not_run(format!(
@@ -974,76 +988,22 @@ pub fn sign_in_with(
     };
     let env = child_env(req.cli, signin, req.staging, &path, var);
     let email = req.row.email.as_deref();
-    match &req.route.drive {
-        Drive::Lines {
+    let args = child_args(req.route, req.row.vendor.region);
+    drive(
+        &Spec {
+            program,
+            lead,
+            args: &args,
+            env: &env,
+            cwd: req.staging,
             grammar,
-            completion,
-            ..
-        } => {
-            let args = child_args(req.route, req.row.vendor.region);
-            drive(
-                &Spec {
-                    program,
-                    lead,
-                    args: &args,
-                    env: &env,
-                    cwd: req.staging,
-                    grammar,
-                    completion: *completion,
-                    hosts: req.hosts,
-                    email,
-                    hang,
-                },
-                approver,
-            )
-        }
-        Drive::AppServer => {
-            use aterm_uds::spawnfd::Stdio;
-            let mut cmd = aterm_uds::spawnfd::command(program);
-            cmd.args(lead)
-                .args(child_args(req.route, None))
-                .env_clear()
-                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_os_str())))
-                .current_dir(req.staging)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            #[cfg(unix)]
-            cmd.process_group(0);
-            let mut child = match cmd.spawn() {
-                Ok(child) => child,
-                Err(e) => return not_run(format!("it will not run: {e}")),
-            };
-            let (Some(from), Some(to)) = (child.stdout.take(), child.stdin.take()) else {
-                end(&mut child);
-                return not_run("its streams were not opened".to_owned());
-            };
-            let drove = super::codex_app_login::login(
-                super::codex_app_login::AppServer {
-                    from: Box::new(from),
-                    to: Box::new(to),
-                },
-                approver,
-                req.hosts,
-                email,
-                Instant::now() + hang,
-            );
-            let closed_at = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if closed_at.elapsed() < APP_SERVER_GRACE => {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    _ => {
-                        end(&mut child);
-                        break;
-                    }
-                }
-            }
-            drove
-        }
-    }
+            completion: *completion,
+            hosts: req.hosts,
+            email,
+            hang,
+        },
+        approver,
+    )
 }
 
 /// `req`'s sign-in on this machine: the CLI's own binary ([`program_of`]), under
@@ -1077,13 +1037,13 @@ pub fn sign_in_live(
 pub type LoginPath = Option<aterm_tempfile::TempDir>;
 
 /// Whether `route`'s page hands the login back on a loopback callback on the machine the CLI
-/// runs on (a [`Completion::Loopback`] route, and Codex's app server, whose `redirect_uri` is
-/// `http://127.0.0.1:1455/…`): a browser on another machine cannot finish it.
+/// runs on (a [`Completion::Loopback`] route, and Codex's native PKCE browser route, whose
+/// `redirect_uri` is `http://127.0.0.1:1455/…`): a browser on another machine cannot finish it.
 #[must_use]
 pub fn calls_back_here(route: &Route) -> bool {
     match &route.drive {
         Drive::Lines { completion, .. } => *completion == Completion::Loopback,
-        Drive::AppServer => true,
+        Drive::CodexPkce => true,
     }
 }
 
@@ -1197,7 +1157,7 @@ pub fn off_this_desk(
 /// this machine's desk over SSH (`over_ssh`) as [`off_this_desk`] says, its environment
 /// [`child_env`]'s with the `PATH` that gives; a route that calls back to this machine runs as
 /// the CLI's device route there ([`login_route`]). A Codex browser route runs `codex login`,
-/// the app server being the harness's alone.
+/// the native PKCE loopback driver being the harness's alone.
 /// # Errors
 /// Over SSH, the route calls back here and the CLI has no device route ([`login_route`]), or
 /// [`off_this_desk`] refuses (a no-desk CLI's sandbox is missing or cannot run here, or no
@@ -1211,7 +1171,7 @@ pub fn login_command(
     let route = login_route(req, over_ssh)?;
     let signin = req.signin();
     let args: Vec<OsString> = match route.drive {
-        Drive::AppServer => vec![OsString::from("login")],
+        Drive::CodexPkce => vec![OsString::from("login")],
         Drive::Lines { .. } => child_args(route, req.row.vendor.region)
             .into_iter()
             .map(OsString::from)

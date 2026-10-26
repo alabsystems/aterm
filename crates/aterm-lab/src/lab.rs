@@ -423,6 +423,10 @@ const BIN: &str = "bin/aterm-lab";
 /// Written beside [`BIN`] once a program started from it showed it ran.
 const BIN_RAN: &str = "bin/ran";
 
+/// The run directory's record of what was launched in each tab, `<sid>.sh`
+/// ([`crate::verbs::record_launch`]): `down` keeps it in its logs, then removes it.
+pub const LAUNCHES: &str = "launch";
+
 /// Written in `relay/` once the relay copied there showed it ran.
 const RELAY_RAN: &str = "relay/ran";
 
@@ -599,7 +603,8 @@ fn sweep_copies(
 }
 
 /// The end of `down`, once its logs are kept: the copies that may go, the scratch among them
-/// ([`sweep_copies`]), the run directory's own files, then the directory.
+/// ([`sweep_copies`]), the run directory's own files and its tabs' launch records
+/// ([`crate::verbs::record_launch`], which `down` keeps in its logs), then the directory.
 fn clear_run_dir(
     run_dir: &Path,
     relay_ran: bool,
@@ -629,6 +634,7 @@ fn clear_run_dir(
             }
         }
     }
+    let _ = fs::remove_dir_all(run_dir.join(LAUNCHES));
     let _ = fs::remove_dir(run_dir);
 }
 
@@ -1794,6 +1800,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         let _ = fs::write(keep.join("security.log"), masked);
     }
     keep_tree(&r.state().join("drive"), &keep.join("drive"));
+    keep_tree(&r.run.join(LAUNCHES), &keep.join(LAUNCHES));
     crate::clock::keep(&r, &keep.join("clock"));
     keep_tree(&r.state().join("logs"), &keep.join("state-logs"));
     if keep_dumps {
@@ -2093,10 +2100,15 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
         crate::verbs::settings_merge(run, &J::obj([("apiKeyHelper", J::Null)]))?;
     }
     let script = run.run.join("claude.sh");
-    atomic_write(&script, launcher(run, l).as_bytes())
+    let text = launcher(run, l);
+    atomic_write(&script, text.as_bytes())
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", script.display())))?;
     let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
     let door = Door::new(run)?;
+    let sid = crate::verbs::active_sid(&door);
+    if !sid.is_empty() {
+        crate::verbs::record_launch(run, &sid, &text)?;
+    }
     let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
     let sent = door.ctl(&["send", &line])?;
     if sent.code != 0 {
@@ -3286,6 +3298,23 @@ mod tests {
             }
             assert!(!run.run.exists(), "{what}: the later down finished");
         }
+    }
+
+    /// The tabs' launch records (`launch/<sid>.sh`), which `down` keeps in its logs first, go
+    /// with the run directory: a lab that launched Claude Code leaves nothing of its run behind.
+    #[test]
+    fn a_down_removes_the_tabs_launch_records_with_the_run() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (run, made) = torn_down(root.path(), true, false);
+        let record = run.run.join(LAUNCHES).join("s-c99d4225e7307a6cc1f4.sh");
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(
+            &record,
+            "#!/bin/sh\nexec env -u CLAUDE_CONFIG_DIR /c/claude\n",
+        )
+        .unwrap();
+        clear_run_dir(&run.run, false, false, &run.tag, made);
+        assert!(!run.run.exists(), "the run directory went whole");
     }
 
     /// A clone held in the scratch that never showed it ran keeps the scratch and `env.sh` past any

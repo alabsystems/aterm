@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::acts::HoldLeg;
+use aterm_agent::harness::acts::{HeldBy, HoldLeg};
 use aterm_agent::harness::footer::text_width;
 use aterm_agent::supervise::policy::turn_end::RULE_LAND;
 
@@ -105,7 +105,8 @@ pub enum Scene {
     Landed,
     /// Autopilot Off.
     Off,
-    /// Land held by the same reply, said (`same-land`, once 3a says the stop).
+    /// Land held by the same reply, the stop said (`same-land`, 3a): its rest and hovered title,
+    /// and beside them the Overview and Settings ▸ Harness ([`Shots::held_extras`]).
     SameLand,
     /// codex-alab under Cruise, at rest after a turn.
     Cruise,
@@ -183,13 +184,6 @@ pub enum Plan {
     Skip(&'static str),
 }
 
-/// Why `same-land` is a skip. 2a brought its chain into the forever lab, and until 3a it runs
-/// land-c's scene word for word (§14.2.1's departures), so the stop words 3a adds are what it
-/// would show.
-pub const SAME_LAND_WAITS: &str = "UNOBSERVED until 3a (§14.3, a stopped Autopilot says so) is \
-    on main: this tree says no stop, and the forever lab's same-land chain runs land-c's scene \
-    until then, so it shows nothing land-repo does not";
-
 /// Why codex-alab's holds are skips: it rebuilds no Land hold from its own acts until A3.
 pub const A3_WAITS: &str = "UNOBSERVED until A3 (§14.14, codex-alab's Land hold rebuilt from \
     its own acts, deferred to the round after 8b): codex-alab keeps nudging and holds no landing, \
@@ -201,7 +195,7 @@ const SUPERVISED: [(Scene, Plan); 6] = [
     (Scene::LandRepo, Plan::Chain(Chain::LandC)),
     (Scene::Landed, Plan::Chain(Chain::LandA)),
     (Scene::Off, Plan::Chain(Chain::Off)),
-    (Scene::SameLand, Plan::Skip(SAME_LAND_WAITS)),
+    (Scene::SameLand, Plan::Chain(Chain::SameLand)),
 ];
 
 const CODEX_ALAB: [(Scene, Plan); 8] = [
@@ -667,10 +661,11 @@ Autopilot's scenes on every harness, side by side (design §14.2's 2b), on one p
 instance per harness and look, launched in that look (its aterm.toml's theme), so every program
 starts on the ground it is shot on. Claude Code, agy and Muse Code run the forever lab's
 chains against its stub: cruise-needs (cruise-n's two needs), land-open (land-b's open hold),
-land-repo (land-c's repository hold), landed (land-a's landing) and off; same-land is a named skip
-until 3a. codex-alab runs codex-alab-proof's legs against its fake model: cruise, land, landed, off
-and need; its holds are named skips until A3. codex-alab needs the package codex-alab-proof would
-pick.
+land-repo (land-c's repository hold), landed (land-a's landing), off, and same-land (the
+same-reply hold, the stop said: beside its shots the Overview, Settings ▸ Harness and the
+Messages rows it raised). codex-alab runs codex-alab-proof's legs against its fake model: cruise,
+land, landed, off and need; its holds are named skips until A3. codex-alab needs the package
+codex-alab-proof would pick.
 
 After each scene settles it takes an image at rest (<harness>-<scene>-<look>-<scale>x-rest.png),
 then points at the chip and takes its hovered title (…-title.png, the rule's band beside it as
@@ -1194,6 +1189,9 @@ fn agent_lab(
             }
             if tab.done {
                 rows.extend(shots.scene(&door, tab.scene, &tab.sid, chain.name())?);
+                if tab.scene == Scene::SameLand {
+                    shots.held_extras(&door, &tab.sid, chain.name())?;
+                }
             }
         }
         stop::sleep(Duration::from_secs(2))?;
@@ -1211,12 +1209,14 @@ fn agent_settled(door: &Door<'_>, scene: Scene, sid: &str, chain: Chain) -> bool
         Scene::CruiseNeeds => idle && w("needs_n") == "2",
         Scene::LandOpen => idle && held(HoldLeg::Open),
         Scene::LandRepo => idle && held(HoldLeg::Repo),
+        // Stopped: the same-reply hold standing (3a's `status held=`).
+        Scene::SameLand => idle && w("held") == HeldBy::SameReply.word(),
         Scene::Landed => w("task") == "landed",
         Scene::Off => {
             idle && w("autopilot") == chain.autopilot()
                 && forever::on(door, sid, &["text"]).contains(forever::DONE_CLAIM)
         }
-        Scene::SameLand | Scene::Cruise | Scene::Land | Scene::Need => false,
+        Scene::Cruise | Scene::Land | Scene::Need => false,
     }
 }
 
@@ -1821,6 +1821,127 @@ impl Shots<'_> {
         Ok(rows)
     }
 
+    /// THE STOP BESIDE ITS TAB (3a): with same-land's tab in front, the Overview
+    /// (`…-overview.png`) and Settings ▸ Harness turned to same-land's row (`…-page.png`), each
+    /// opened on the front window, shot with `image` once it shows the session ([`HELD_HANG`] the
+    /// hang detector of each wait) and closed again, and `…-held.txt` with what they, the tab's
+    /// hover and `ctl messages tag=harness` read: the stop's words on every surface a person reads
+    /// it on. A surface that never showed the session is NOT CAPTURED by name; a sidecar that cannot
+    /// be written fails the run.
+    fn held_extras(&self, lab: &dyn Lab, sid: &str, label: &str) -> Result<(), Fail> {
+        let (who, look, scale) = (self.who, self.look, self.a.scale);
+        let name = |tail: &str| {
+            format!(
+                "{}-{}-{}-{scale}x{tail}",
+                who.name(),
+                Scene::SameLand.name(),
+                look.name()
+            )
+        };
+        let mut said = vec![format!(
+            "# {}: {} on {}, {}; sid={sid}; at {}",
+            name("-held.txt"),
+            Scene::SameLand.what(),
+            self.head,
+            look.theme(),
+            crate::util::now_ms()
+        )];
+        let chrome = lab.said(&["chrome"]);
+        let strip = forever::surfaces::strip_tabs(&chrome);
+        let hover = strip
+            .iter()
+            .find(|t| t.label == label)
+            .and_then(forever::surfaces::StripTab::driven)
+            .unwrap_or_else(|| "-".into());
+        said.push(format!("## the tab's hover\n{hover}"));
+        said.push(format!(
+            "## what a screen reader is handed (`chrome`'s `a11y` lines)\n{}",
+            forever::surfaces::ax_of(&chrome, sid)
+        ));
+        let overview = name("-overview.png");
+        let opened = lab.said(&["open", "overview"]);
+        let listed = |read: &str| {
+            read.lines().any(|l| {
+                l.starts_with("overview chip ") && forever::word(l, "sid").as_deref() == Some(sid)
+            })
+        };
+        let kept = if crate::wait_until(HELD_HANG, || listed(&lab.said(&["controls", "overview"])))
+        {
+            self.shoot_front(lab, &overview)
+        } else {
+            Err(format!(
+                "`controls overview` listed no @{sid} within {} s",
+                HELD_HANG.as_secs()
+            ))
+        };
+        said.push(self.extra_said(
+            "overview",
+            &opened,
+            &kept,
+            &lab.said(&["controls", "overview"]),
+        ));
+        let _ = lab.said(&["open", "overview", "close"]);
+        let _ = raise(lab, label);
+        let page = name("-page.png");
+        let opened = lab.said(&["open", "app", "settings", "/harness"]);
+        let kept = turn_to_row(lab, label).and_then(|_| self.shoot_front(lab, &page));
+        said.push(self.extra_said("prefs", &opened, &kept, &lab.said(&["controls", "prefs"])));
+        let _ = lab.said(&["pointer", "leave"]);
+        let _ = lab.said(&["open", "prefs", "close"]);
+        let _ = raise(lab, label);
+        said.push(format!(
+            "## ctl messages tag=harness\n{}",
+            lab.said(&["messages", "tag=harness"]).trim_end()
+        ));
+        let p = self.out.join(name("-held.txt"));
+        crate::sys::put(
+            &p,
+            0o644,
+            &crate::sys::PutSrc::Bytes(format!("{}\n", said.join("\n")).as_bytes()),
+        )
+        .map_err(|e| Fail::exit(3, format!("cannot write {}: {e}", p.display())))
+    }
+
+    /// One extra's part of `…-held.txt`, and its line on the run's output: what opening it said,
+    /// the png kept (or why none was) and what `controls <target>` read.
+    fn extra_said(
+        &self,
+        target: &str,
+        opened: &str,
+        kept: &Result<String, String>,
+        read: &str,
+    ) -> String {
+        let kept = kept
+            .as_ref()
+            .map_or_else(|why| format!("{NOT_CAPTURED}{why}"), Clone::clone);
+        println!(
+            "  {} same-land ({}): {target} {kept}",
+            self.who.name(),
+            self.look.name()
+        );
+        format!(
+            "## {target}: {} -> {kept}\n{}",
+            opened.trim(),
+            read.trim_end()
+        )
+    }
+
+    /// `image` of the front window, moved to `<out>/<file>`: the file, or why none was kept.
+    fn shoot_front(&self, lab: &dyn Lab, file: &str) -> Result<String, String> {
+        let r = lab.said(&["image", file]);
+        let w: Vec<&str> = r.split_whitespace().collect();
+        let src = (w.len() >= 4 && w[0] == "OK")
+            .then(|| PathBuf::from(w[3]))
+            .ok_or_else(|| format!("`image` said {:?}", r.trim()))?;
+        if crate::paths::physical(&src) != lab.images().join(file) {
+            return Err(format!("`image` wrote {} elsewhere", src.display()));
+        }
+        crate::sys::put(&self.out.join(file), 0o644, &crate::sys::PutSrc::File(&src))
+            .map_err(|e| format!("cannot keep {}: {e}", src.display()))?;
+        let _ = std::fs::remove_file(&src);
+        Ok(file.to_string())
+    }
+
     /// `image` of the window showing `sid`, moved to `<out>/<file>`: its frame.
     fn shoot(&self, lab: &dyn Lab, sid: &str, file: &str) -> Option<Frame> {
         let r = on(lab, sid, &["image", file]);
@@ -2007,6 +2128,106 @@ fn drawn_of(line: &str) -> Option<String> {
 
 /// The tab labelled `label` brought to the front of its window: what `tab` said, or why it is not
 /// in front (no such tab in the strip, `tab` refused, or the strip not selecting it after).
+/// How long each of the held scene's extras waits for what it shows: a hang detector, never a
+/// budget ([`Shots::held_extras`]).
+const HELD_HANG: Duration = Duration::from_secs(60);
+
+/// How many steps of the wheel Settings ▸ Harness's list may take to bring a row on its screen.
+const PAGE_STEPS: usize = 60;
+
+/// `rect=x,y,w,h` of a `controls` line.
+fn rect_of(line: &str) -> Option<[f64; 4]> {
+    let v: Vec<f64> = forever::word(line, "rect")?
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    v.try_into().ok()
+}
+
+/// TAB `label`'S STATE LINE ON SETTINGS ▸ HARNESS'S SCREEN, from `controls prefs`: its session row
+/// (`harness/session/<n>`, labelled `<label>: …`) and that row's `/state` line laid out, neither
+/// `offscreen=true`, and the state line inside `settings/list`'s rect. The state line's words, or
+/// `None` while the list has not brought them there.
+#[must_use]
+pub fn held_row_shown(controls: &str, label: &str) -> Option<String> {
+    let rows: Vec<(String, &str)> = controls
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            Some((forever::surfaces::quoted(l, "key")?, l))
+        })
+        .collect();
+    let head = format!("{label}: ");
+    let (key, _) = rows.iter().find(|(k, l)| {
+        k.strip_prefix("harness/session/")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            && forever::surfaces::quoted(l, "label").is_some_and(|v| v.starts_with(&head))
+            && forever::word(l, "offscreen").as_deref() != Some("true")
+    })?;
+    let state = format!("{key}/state");
+    let (_, line) = rows.iter().find(|(k, _)| *k == state)?;
+    let [_, y, _, h] = rect_of(line)?;
+    let [_, ly, _, lh] = rect_of(rows.iter().find(|(k, _)| k == "settings/list")?.1)?;
+    (forever::word(line, "offscreen").as_deref() != Some("true") && y >= ly && y + h <= ly + lh)
+        .then(|| forever::surfaces::quoted(line, "label").unwrap_or_default())
+}
+
+/// TURNS SETTINGS ▸ HARNESS, open on the front window, TO TAB `label`'S ROW: the wheel over its
+/// list turned to the top, then down a step at a time, as a person scrolls, until the row's state
+/// line is on the list's screen ([`held_row_shown`]). Each turn waits for the list to move
+/// ([`HELD_HANG`]); a step that does not move it is the list's end. The state line, or why it was
+/// not brought there.
+fn turn_to_row(lab: &dyn Lab, label: &str) -> Result<String, String> {
+    let controls = || lab.said(&["controls", "prefs"]);
+    let scroll = |read: &str| forever::word(read, "scroll");
+    let mut read = String::new();
+    if !crate::wait_until(HELD_HANG, || {
+        read = controls();
+        read.contains("key=\"settings/page/harness\"")
+    }) {
+        return Err(format!(
+            "Settings \u{25b8} Harness was not on the front window within {} s",
+            HELD_HANG.as_secs()
+        ));
+    }
+    let (x, y) = forever::surfaces::list_middle(&read)
+        .ok_or("the page drew no list to turn the wheel over")?;
+    let xy = format!("xy={x},{y}");
+    let turn = |dy: &str| {
+        let r = lab.said(&["pointer", "wheel", dy, &xy]);
+        if r.starts_with("OK") {
+            Ok(())
+        } else {
+            Err(format!("the wheel refused: {}", r.trim()))
+        }
+    };
+    turn("dy=-10000")?;
+    if !crate::wait_until(HELD_HANG, || scroll(&controls()).as_deref() == Some("0")) {
+        return Err(format!(
+            "the list did not come to its top within {} s",
+            HELD_HANG.as_secs()
+        ));
+    }
+    for _ in 0..PAGE_STEPS {
+        read = controls();
+        if let Some(line) = held_row_shown(&read, label) {
+            return Ok(line);
+        }
+        let before = scroll(&read);
+        turn("dy=1")?;
+        if !crate::wait_until(HELD_HANG, || scroll(&controls()) != before) {
+            return Err(format!(
+                "the list's end at scroll={}, and no {label} row with its state line on its screen",
+                before.as_deref().unwrap_or("?")
+            ));
+        }
+    }
+    Err(format!(
+        "{PAGE_STEPS} steps of the wheel brought no {label} row with its state line on its screen"
+    ))
+}
+
 fn raise(lab: &dyn Lab, label: &str) -> Result<String, String> {
     let strip = forever::surfaces::strip_tabs(&lab.said(&["chrome"]));
     let Some(at) = strip.iter().find(|t| t.label == label).map(|t| t.index) else {

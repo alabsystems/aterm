@@ -40,7 +40,7 @@ mod macos {
 
     use super::{FINDING, HUNG, NOT_RUN, PASS};
     use crate::app_tabs::NativeTabCommand;
-    use crate::session_chrome::{RewindMenuOrigin, TabChromeExt, TabMenuEntry};
+    use crate::session_chrome::{TabChromeExt, TabMenuEntry, TerminalMenuOrigin};
     use crate::tab_bar::TabStripMetadata;
     use crate::tab_model::{TabConnRole, TabIconKind, TabId, ViewId};
     use crate::{Wake, WindowId, toolbar};
@@ -384,7 +384,7 @@ mod macos {
                     TabMenuEntry::Separator,
                     TabMenuEntry::Action {
                         label: "Close Tab".to_owned(),
-                        action: crate::menu::MenuAction::About,
+                        action: crate::menu::MenuAction::CloseTab,
                         enabled: true,
                     },
                 ],
@@ -419,7 +419,8 @@ mod macos {
         window: Option<Window>,
         wakes: Vec<String>,
         native_wakes: Vec<(WindowId, NativeTabCommand)>,
-        rewind_wakes: Vec<(WindowId, TabId, RewindMenuOrigin, u64)>,
+        rewind_wakes: Vec<(WindowId, TabId, TerminalMenuOrigin, u64)>,
+        session_wakes: Vec<(WindowId, TabId, TerminalMenuOrigin, crate::menu::MenuAction)>,
         blocked: Option<String>,
     }
 
@@ -428,6 +429,7 @@ mod macos {
             self.wakes.clear();
             self.native_wakes.clear();
             self.rewind_wakes.clear();
+            self.session_wakes.clear();
         }
     }
 
@@ -439,6 +441,14 @@ mod macos {
             Wake::TabCmd { action, .. } => format!("TabCmd({action:?})"),
             Wake::TabContextMenuOpening { .. } => "TabContextMenuOpening".to_owned(),
             Wake::TabMenuAction { action, .. } => format!("TabMenuAction({action:?})"),
+            Wake::TabMenuSessionAction {
+                window,
+                tab,
+                origin,
+                action,
+            } => {
+                format!("TabMenuSessionAction({window:?},{tab:?},{origin:?},{action:?})")
+            }
             Wake::TabMenuRewind {
                 window,
                 tab,
@@ -494,6 +504,15 @@ mod macos {
             } = &w
             {
                 self.rewind_wakes.push((*window, *tab, *origin, *at_ms));
+            }
+            if let Wake::TabMenuSessionAction {
+                window,
+                tab,
+                origin,
+                action,
+            } = &w
+            {
+                self.session_wakes.push((*window, *tab, *origin, *action));
             }
             if let Some(s) = show_wake(&w) {
                 self.wakes.push(s);
@@ -832,15 +851,73 @@ mod macos {
         };
         let items = crate::status_item::items_on_the_bar(&item);
         drop(item);
-        for (title, enabled) in items.iter().filter(|(t, _)| t.starts_with("This Mac")) {
-            println!("  --  {title:?} enabled={enabled}");
+        for i in items.iter().filter(|i| i.title.starts_with("This Mac")) {
+            println!("  --  {:?} enabled={}", i.title, i.enabled);
         }
         cx.check(
-            items.iter().filter(|(t, on)| *t == want && !on).count() == 1,
+            items
+                .iter()
+                .filter(|i| i.title == want && !i.enabled)
+                .count()
+                == 1,
             format!(
                 "the real status item's NSMenu holds {want:?} once, greyed ({} items)",
                 items.len()
             ),
+        );
+    }
+
+    /// Stage 12: a real `NSStatusItem` carrying a box beside an older report
+    /// ([`crate::status_item::a_box_beside_an_older_report`]), its menu repainted by its own
+    /// delegate as a person's open repaints it, and Needs you read back off AppKit's items: the
+    /// box that stopped its agent above the three-hour-old report its agent carries on past (STOPPED
+    /// WORK FIRST, §14.7 of `docs/DESIGN-harness-autopilot-2026-10-15.md`), the report's
+    /// `-toolTip` its program carrying on meanwhile in the words the glance makes
+    /// ([`aterm_agent::supervise::mode_words::report_words`]), and the box's none. The item leaves
+    /// the bar when the stage ends.
+    fn stopped_first_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
+        let now_ms = aterm_time::unix_millis().unwrap_or(0);
+        let now_unix = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+        let rows = crate::status_item::a_box_beside_an_older_report(now_unix);
+        let glance = crate::status_item::Glance::build(&rows, &[], None, now_ms, None);
+        let Some(item) = crate::status_item::install(proxy, &glance) else {
+            cx.check(false, "the status bar gave the drive no item".to_owned());
+            return;
+        };
+        let items = crate::status_item::items_on_the_bar(&item);
+        drop(item);
+        let needs: Vec<_> = items
+            .iter()
+            .filter(|i| i.title.starts_with('\u{25c7}'))
+            .collect();
+        for i in &needs {
+            println!("  --  {:?} enabled={} tip={:?}", i.title, i.enabled, i.tip);
+        }
+        let at = |label: &str| {
+            let head = format!("\u{25c7} {label} \u{2014}");
+            needs.iter().position(|i| i.title.starts_with(&head))
+        };
+        let (approval, report) = (at("build"), at("proj-api"));
+        cx.check(
+            matches!((approval, report), (Some(b), Some(r)) if b < r),
+            format!(
+                "Needs you lists the box that stopped its agent above the older report (box at {approval:?}, report at {report:?} of {} rows)",
+                needs.len()
+            ),
+        );
+        let want = aterm_agent::supervise::mode_words::report_words(
+            aterm_phase::Program::Claude.product(),
+            false,
+        );
+        let tip = report.and_then(|r| needs[r].tip.clone());
+        cx.check(
+            tip.as_deref() == Some(want.as_str()),
+            format!("the report row's -toolTip is {want:?} (got {tip:?})"),
+        );
+        let box_tip = approval.and_then(|b| needs[b].tip.clone());
+        cx.check(
+            box_tip.is_none(),
+            format!("the box's row carries no -toolTip (got {box_tip:?})"),
         );
     }
 
@@ -873,6 +950,7 @@ mod macos {
             wakes: Vec::new(),
             native_wakes: Vec::new(),
             rewind_wakes: Vec::new(),
+            session_wakes: Vec::new(),
             blocked: None,
         };
         let start = Instant::now();
@@ -1431,11 +1509,11 @@ mod macos {
 
         if pop_site_replaced {
             println!("\n-- stage 5b: Rewind callbacks retain their popped row's owner");
-            let original = RewindMenuOrigin {
+            let original = TerminalMenuOrigin {
                 view: ViewId::from_stored(701),
                 session: 71,
             };
-            let rebound = RewindMenuOrigin {
+            let rebound = TerminalMenuOrigin {
                 view: ViewId::from_stored(902),
                 session: 92,
             };
@@ -1564,6 +1642,196 @@ mod macos {
                         .collect::<Vec<_>>()
                 };
                 cx.check(d.rewind_wakes == expected, format!("{label}: Rewind callback keeps window/tab/view/session/time; expected {expected:?}, saw {:?}", d.rewind_wakes));
+            }
+            apply(&handle, &m3);
+            LAST_POPPED_MENU.with(|slot| *slot.borrow_mut() = None);
+        }
+
+        if pop_site_replaced {
+            use crate::menu::MenuAction;
+            println!("\n-- stage 5c: session callbacks retain their popped row's owner and action");
+            let original = TerminalMenuOrigin {
+                view: ViewId::from_stored(1101),
+                session: 111,
+            };
+            let rebound = TerminalMenuOrigin {
+                view: ViewId::from_stored(2202),
+                session: 222,
+            };
+            let rebound_tab = TabId::from_stored(202);
+            let mut sender = None;
+            let mut previous_receivers = Vec::new();
+            for (label, tab, owner, action, pop, item_index, accepted) in [
+                (
+                    "original session pop",
+                    m3.ids[1],
+                    original,
+                    MenuAction::HandBack,
+                    true,
+                    3,
+                    true,
+                ),
+                (
+                    "session rebind without pop",
+                    rebound_tab,
+                    rebound,
+                    MenuAction::TakeOver,
+                    false,
+                    3,
+                    true,
+                ),
+                (
+                    "fresh session pop",
+                    rebound_tab,
+                    rebound,
+                    MenuAction::TakeOver,
+                    true,
+                    3,
+                    true,
+                ),
+                (
+                    "unbound session row",
+                    rebound_tab,
+                    rebound,
+                    MenuAction::TakeOver,
+                    true,
+                    1,
+                    false,
+                ),
+                (
+                    "disabled session row",
+                    rebound_tab,
+                    rebound,
+                    MenuAction::TakeOver,
+                    true,
+                    2,
+                    false,
+                ),
+            ] {
+                let mut fixture = model(3);
+                fixture.ids[1] = tab;
+                fixture.ext[1].menu = vec![
+                    TabMenuEntry::Header("session commands".to_owned()),
+                    TabMenuEntry::SessionAction {
+                        label: "Unbound Copy Session ID".to_owned(),
+                        action: MenuAction::CopySessionId,
+                        enabled: true,
+                        origin: None,
+                    },
+                    TabMenuEntry::SessionAction {
+                        label: "Disabled Rename Session".to_owned(),
+                        action: MenuAction::RenameSession,
+                        enabled: false,
+                        origin: Some(owner),
+                    },
+                    TabMenuEntry::SessionAction {
+                        label: label.to_owned(),
+                        action,
+                        enabled: true,
+                        origin: Some(owner),
+                    },
+                ];
+                apply(&handle, &fixture);
+                // SAFETY: the strip is live; updates can replace chip receivers.
+                let receivers = unsafe { chips(strip) };
+                cx.check(
+                    receivers.len() == 3,
+                    format!("{label}: three chip receivers remain"),
+                );
+                if receivers.len() != 3 {
+                    break;
+                }
+                if !pop {
+                    let reused = receivers == previous_receivers;
+                    cx.check(
+                        reused,
+                        "Session row rebinding retains the same chip receivers".to_owned(),
+                    );
+                    if !reused {
+                        continue;
+                    }
+                }
+                if pop {
+                    let before = pops();
+                    d.clear_wakes();
+                    // SAFETY: the chip and its window are live; the installed stub
+                    // records the real menu without entering modal tracking.
+                    unsafe {
+                        let bounds = s_rect(receivers[1], sel!(bounds));
+                        let point = s_point_point_id(
+                            receivers[1],
+                            sel!(convertPoint:toView:),
+                            CGPoint {
+                                x: bounds.size.width * 0.35,
+                                y: bounds.size.height * 0.5,
+                            },
+                            Id::NIL,
+                        );
+                        s_v_id(
+                            receivers[1],
+                            sel!(rightMouseDown:),
+                            mouse_event(RIGHT_DOWN, point, 0, win_no, 1),
+                        );
+                    }
+                    pump(&mut d, &mut el, 120);
+                    let popped = pops() > before
+                        && d.wakes.iter().any(|wake| wake == "TabContextMenuOpening");
+                    cx.check(
+                        popped,
+                        format!("{label}: the actual chip built and popped its session menu"),
+                    );
+                    sender = if popped {
+                        LAST_POPPED_MENU.with(|slot| {
+                            let menu = slot.borrow();
+                            let menu = menu.as_ref()?;
+                            // SAFETY: the captured menu is retained. Bounds are checked;
+                            // itemAtIndex: takes NSInteger and its +0 child is retained.
+                            unsafe {
+                                if s_isize(menu.id(), sel!(numberOfItems)) <= item_index {
+                                    return None;
+                                }
+                                let item_at: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id =
+                                    checked_msg();
+                                aterm_objc::Obj::retain(item_at(
+                                    menu.id(),
+                                    sel!(itemAtIndex:),
+                                    item_index,
+                                ))
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                }
+                previous_receivers = receivers.clone();
+                let Some(item) = sender.as_ref() else {
+                    cx.check(
+                        false,
+                        format!("{label}: the actual session menu item is retained"),
+                    );
+                    continue;
+                };
+                // SAFETY: this is the retained actual NSMenuItem's BOOL accessor.
+                cx.check(
+                    unsafe { s_bool(item.id(), sel!(isEnabled)) } == accepted,
+                    format!("{label}: the native item has the expected enabled state {accepted}"),
+                );
+                d.clear_wakes();
+                // SAFETY: the receiver is live and the real item is retained across the
+                // swallowed pop, including when directly forcing a disabled callback.
+                unsafe {
+                    s_v_id(receivers[1], sel!(tabMenuSessionAction:), item.id());
+                }
+                pump(&mut d, &mut el, 120);
+                let expected = if !accepted {
+                    Vec::new()
+                } else if !pop {
+                    vec![(strip_window, m3.ids[1], original, MenuAction::HandBack)]
+                } else {
+                    vec![(strip_window, tab, owner, action)]
+                };
+                cx.check(d.session_wakes == expected,
+                    format!("{label}: callback keeps window/tab/view/session/action; expected {expected:?}, saw {:?}", d.session_wakes));
             }
             apply(&handle, &m3);
             LAST_POPPED_MENU.with(|slot| *slot.borrow_mut() = None);
@@ -1934,6 +2202,7 @@ mod macos {
         }
         let mut m = model(4);
         for kind in [
+            TabIconKind::About,
             TabIconKind::Settings,
             TabIconKind::Markdown,
             TabIconKind::Editor,
@@ -2076,6 +2345,7 @@ mod macos {
         let groups: [&[&str]; 8] = [
             &["tabs=1", "tabs=2", "tabs=3", "tabs=5", "tabs=8"],
             &[
+                "icon=About",
                 "icon=Settings",
                 "icon=Markdown",
                 "icon=Editor",
@@ -2185,6 +2455,11 @@ mod macos {
 
         println!("\n-- stage 11: the menu bar's This Mac row, off the real status item's NSMenu");
         this_mac_on_the_bar(&mut cx, &proxy);
+
+        println!(
+            "\n-- stage 12: the menu bar's Needs you, stopped work first, off the real NSMenu"
+        );
+        stopped_first_on_the_bar(&mut cx, &proxy);
 
         drop(handle);
         drop(d.window.take());

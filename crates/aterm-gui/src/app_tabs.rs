@@ -1067,6 +1067,20 @@ impl App {
         state: crate::native_app::AppViewState,
         presentation: crate::tab_model::TabPresentation,
     ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), NativeTabInstallError> {
+        self.install_native_tab_keeping(wid, instance, state, presentation, None)
+    }
+
+    /// [`Self::install_native_tab`], except that where `keep` is given and stands in `wid`
+    /// the new tab is appended behind it: `keep` stays the active tab and nothing syncs, so
+    /// the caller owes the window its one sync.
+    pub(crate) fn install_native_tab_keeping(
+        &mut self,
+        wid: WindowId,
+        instance: crate::tab_model::AppInstanceId,
+        state: crate::native_app::AppViewState,
+        presentation: crate::tab_model::TabPresentation,
+        keep: Option<crate::tab_model::TabId>,
+    ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), NativeTabInstallError> {
         if !self.windows.contains_key(&wid) {
             return Err(NativeTabInstallError::UnknownWindow);
         }
@@ -1094,10 +1108,19 @@ impl App {
             self.view_store.remove(view);
             return Err(NativeTabInstallError::UnknownWindow);
         };
+        let keep = keep.filter(|keep| ws.tab_set.get(*keep).is_some());
         if ws.tab_set.push(tab).is_err() {
             self.native_runtime.remove_view(view);
             self.view_store.remove(view);
             return Err(NativeTabInstallError::DuplicateTab);
+        }
+        // A push makes the new tab active: the kept tab goes back before anything syncs.
+        if let Some(keep) = keep {
+            let kept = ws.tab_set.switch_to(keep);
+            debug_assert!(kept);
+            align_terminal_projection_to_active(ws, &self.view_store);
+            debug_assert!(ws.tab_set.invariant_holds(&self.view_store));
+            return Ok((tab_id, view));
         }
         let switched = ws.tab_set.switch_to(tab_id);
         debug_assert!(switched);
@@ -1121,6 +1144,25 @@ impl App {
         ),
         NativeTabInstallError,
     > {
+        self.install_new_native_tab_keeping(wid, app, state, presentation, None)
+    }
+
+    /// [`Self::install_new_native_tab`] with [`Self::install_native_tab_keeping`]'s `keep`.
+    pub(crate) fn install_new_native_tab_keeping(
+        &mut self,
+        wid: WindowId,
+        app: crate::native_app::NativeApp,
+        state: crate::native_app::AppViewState,
+        presentation: crate::tab_model::TabPresentation,
+        keep: Option<crate::tab_model::TabId>,
+    ) -> Result<
+        (
+            crate::tab_model::AppInstanceId,
+            crate::tab_model::TabId,
+            crate::tab_model::ViewId,
+        ),
+        NativeTabInstallError,
+    > {
         if !self.windows.contains_key(&wid) {
             return Err(NativeTabInstallError::UnknownWindow);
         }
@@ -1128,7 +1170,7 @@ impl App {
             .native_runtime
             .insert_instance(app)
             .map_err(NativeTabInstallError::Runtime)?;
-        match self.install_native_tab(wid, instance, state, presentation) {
+        match self.install_native_tab_keeping(wid, instance, state, presentation, keep) {
             Ok((tab, view)) => Ok((instance, tab, view)),
             Err(error) => {
                 self.native_runtime.remove_instance(instance);
@@ -1459,7 +1501,7 @@ impl App {
             self.session_chrome.retain(|sid, _| live.contains(sid));
         }
         let tabs: Vec<(
-            Option<crate::session_chrome::RewindMenuOrigin>,
+            Option<crate::session_chrome::TerminalMenuOrigin>,
             Option<String>,
         )> = self.windows.get(&wid).map_or_else(Vec::new, |ws| {
             ws.tab_set
@@ -1471,7 +1513,7 @@ impl App {
                         .get(tab.focus)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
-                        .map(|session| crate::session_chrome::RewindMenuOrigin {
+                        .map(|session| crate::session_chrome::TerminalMenuOrigin {
                             view: tab.focus,
                             session,
                         });
@@ -1493,7 +1535,7 @@ impl App {
                     let label = titles.get(i).map_or("", String::as_str);
                     let mut ext =
                         self.composed_session_chrome(wid, origin.session, label, &mut edges);
-                    ext.bind_rewind_origin(*origin);
+                    ext.bind_terminal_origin(*origin);
                     ext
                 }
                 None => crate::session_chrome::TabChromeExt {
@@ -1670,9 +1712,11 @@ impl App {
         };
         let now = crate::turn_ledger::now_ms();
         let clause = self.chrome_clause_read(retry_window, session, &ctx.timeline, now);
+        let can_rename = self.can_rename_session(retry_window);
         if let Some(c) = self.session_chrome.get(&session)
             && c.high_id == high_id
             && c.label == label
+            && c.can_rename == can_rename
             && c.activity_revision == activity_revision
             && c.connections_revision == connections_revision
             && c.upgrade_revision == upgrade_revision
@@ -1733,7 +1777,6 @@ impl App {
             )
         };
         let goal_term = crate::claude_footer::goal_term(goal.as_deref());
-        let can_rename = self.can_rename_session(retry_window);
         let upgrade = sid.as_ref().and_then(|sid| {
             self.upgrade_view
                 .menu_for(sid.as_str(), crate::upgrade_host::now_s())
@@ -1768,6 +1811,7 @@ impl App {
             chrome::CachedChrome {
                 high_id,
                 label: label.to_string(),
+                can_rename,
                 activity_revision,
                 connections_revision,
                 upgrade_revision,
@@ -2216,7 +2260,11 @@ impl App {
                 .expect("moved tab id is process-unique");
             align_terminal_projection_to_active(ws, &self.view_store);
         }
-        self.frontmost_window = Some(wid_b);
+        // `frontmost_window` is left to the OS: B's `Focused(true)` moves it
+        // (`window_focus_event`). A destination that never takes focus (a minimized
+        // window on macOS, any window on Wayland) leaves the front on the window that
+        // still holds the keyboard, so a menu key equivalent (⌘V, ⌘W, ⌘C) and a bare
+        // ctl verb never act on a window the person cannot see.
         // A mixed tab has no `layouts` projection, but its terminal leaves still
         // carry the source window's grid.
         self.resize_panes(wid_b);
@@ -2227,9 +2275,9 @@ impl App {
             self.sync_window(wid_a);
         }
         self.sync_active_session();
-        if let Some(w) = self.windows.get(&wid_b).and_then(|ws| ws.os_window.clone()) {
-            w.focus_window();
-        }
+        // `raise_window`, not a bare `focus_window`: macOS ignores focus for a
+        // minimized window, so the raise un-minimizes it first.
+        self.raise_window(wid_b);
         debug_assert!(
             self.structural_invariants_ok(),
             "window/session structural invariants violated after \
@@ -2610,9 +2658,19 @@ impl App {
             .and_then(crate::harness_glass::SessionGlass::end);
         let landed = self.chip_face_landed(h.local_id);
         let hold = self.shown_hold(h.local_id);
-        let landing_tip = hold.and_then(|hold| {
+        let held_tip = hold.and_then(|hold| {
             crate::harness_glass::hold_words(&hold, None, crate::harness_glass::HoldForm::Tip, None)
         });
+        let stop_tip = self
+            .shown_stop(h.local_id)
+            .map(|arm| crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Tip));
+        let landing_tip = match (stop_tip, held_tip) {
+            (Some(stop), Some(held)) => {
+                Some(format!("{stop}{}{held}", crate::native_ui::FACT_SEPARATOR))
+            }
+            (stop, held) => stop.or(held),
+        };
+        let need_alone = hold.is_some_and(crate::harness_glass::HeldGlass::need_alone);
         let (verdict, agent, program, task, told) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -2664,6 +2722,7 @@ impl App {
             landed,
             landing: hold.is_some(),
             landing_tip,
+            need_alone,
             place: None,
         }
     }
@@ -3160,8 +3219,25 @@ impl App {
             crate::sibling_scan::request_scan(proxy.clone());
             self.start_fleet_glance();
             #[cfg(target_os = "macos")]
-            self.learn_notice_voice();
+            self.prime_notices();
         }
+    }
+
+    /// The first window's launch asks macOS, where it was never asked, to let aterm post
+    /// quietly (no dialog, Notification Center only, and aterm posts nothing on it), so turning
+    /// Notify Me on later is the only dialog; then the status item learns whose voice notices
+    /// have.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prime_notices(&self) {
+        let proxy = self.proxy.clone();
+        let center = self.notice_center;
+        center.prime(Box::new(move || {
+            if let Some(proxy) = proxy {
+                crate::notify::learn_voice(center, move || {
+                    let _ = proxy.send_event(crate::Wake::NoticeVoice);
+                });
+            }
+        }));
     }
 
     /// The drawn glance a click's `pick` was painted from — the one the menu's last open was painted from ([`Self::note_status_painted`]), else one of the last two handed over — or `None`.
@@ -4479,120 +4555,129 @@ impl App {
         closes_window.then_some(window)
     }
 
-    /// Replay a pre-rollback focused-view close against stable identities.
+    /// Replay a pre-rollback focused-view close (or a confirmed close question's pane close)
+    /// against stable identities, from behind: the window's front tab stays in front and
+    /// every tab keeps its focused leaf (a closed leaf's heir takes its place), with no sync
+    /// of another tab, except that a native leaf whose close asks first (its recovery
+    /// palette) brings its tab forward, focused on that leaf.
     pub(crate) fn replay_deferred_handoff_view_close(
         &mut self,
         window: WindowId,
         tab: crate::tab_model::TabId,
         view: crate::tab_model::ViewId,
     ) -> Option<WindowId> {
-        let (previous_active, previous_focus) = {
-            let state = self.windows.get(&window)?;
-            let target = state.tab_set.get(tab)?;
+        let mixed = {
+            let target = self.windows.get(&window)?.tab_set.get(tab)?;
             if !target.root.contains(view) {
                 return None;
             }
-            (state.tab_set.active_id(), target.focus)
+            !is_terminal_tab(target, &self.view_store)
         };
         // A native leaf has no job to ask about: it closes as it would have, from behind.
-        if matches!(
-            self.view_store.get(view),
-            Some(crate::tab_model::View::Native(_))
-        ) {
-            let last = self.windows.get(&window).is_some_and(|state| {
-                state.tab_set.len() == 1
-                    && state
-                        .tab_set
-                        .get(tab)
-                        .is_some_and(|target| target.root.len() == 1)
-            });
-            return self
-                .close_view_keeping_front(window, tab, view)
-                .is_ok()
-                .then_some(window)
-                .filter(|_| last);
-        }
-
-        if let Some(state) = self.windows.get_mut(&window) {
-            state.tab_set.switch_to(tab);
-            let target_index = state
-                .tab_set
-                .tabs()
-                .iter()
-                .position(|candidate| candidate.id == tab);
-            if let Some(target_index) = target_index
-                && let Some(target) = state.tab_set.tab_at_mut(target_index)
-            {
-                let _ = target.set_focus(view);
+        let session = match self.view_store.get(view).copied() {
+            Some(crate::tab_model::View::Native(_)) => {
+                let last = self.windows.get(&window).is_some_and(|state| {
+                    state.tab_set.len() == 1
+                        && state
+                            .tab_set
+                            .get(tab)
+                            .is_some_and(|target| target.root.len() == 1)
+                });
+                return self
+                    .close_view_keeping_front(window, tab, view)
+                    .is_ok()
+                    .then_some(window)
+                    .filter(|_| last);
             }
-            align_terminal_projection_to_active(state, &self.view_store);
+            Some(crate::tab_model::View::Terminal(terminal)) => terminal.session,
+            None => return None,
+        };
+        // A terminal leaf closes from behind too, asking first where ⌘W on it would ask (a
+        // confirmed question replays under `CloseConfirm::Programmatic`, which asks nothing).
+        let _closing = session_store::CloseAttribution::enter(
+            session_store::ExitReason::UiClose,
+            session_store::ExitActor::Human,
+        );
+        if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
+            crate::DeferredHandoffMutation::CloseView { window, tab, view },
+        )) {
+            return None;
         }
-        if let Some(session) = self
-            .view_store
-            .get(view)
-            .copied()
-            .and_then(crate::tab_model::View::terminal_session)
-            && let Some(tree) = self.active_tree_mut(window)
+        if !mixed {
+            return self.close_terminal_pane_from_behind(window, tab, view, session);
+        }
+        let busy = self.pane_close_hangs_up_a_job(session);
+        let replay = crate::close_confirm::CloseReplay::Pane {
+            wid: window,
+            tab,
+            view,
+        };
+        if self.view_close_allowed(window, busy, replay) {
+            let _ = self.close_view_keeping_front(window, tab, view);
+        }
+        None
+    }
+
+    /// Close `view`, the pane showing `session` in all-terminal tab `tab` of `window`, as ⌘W
+    /// closes it (the whole tab when it is the tab's one pane), by its pane rather than by
+    /// focus. Neither the window's front tab nor any tab's focus moves for it, so the close's
+    /// one sync finds the tab and leaf that were in front still there. Returns `window` when
+    /// the pane was the window's last.
+    fn close_terminal_pane_from_behind(
+        &mut self,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+        view: crate::tab_model::ViewId,
+        session: u64,
+    ) -> Option<WindowId> {
+        let (index, exits_window, siblings) = self.windows.get(&window).and_then(|state| {
+            let index = terminal_projection_index(&state.tab_set, &self.view_store, tab)?;
+            let tree = state
+                .layouts
+                .get(index)
+                .filter(|tree| tree.contains(session))?;
+            Some((
+                index,
+                state.tab_set.len() <= 1 && tree.len() <= 1,
+                tree.len() > 1,
+            ))
+        })?;
+        if !self.window_exit_close_allowed(window, exits_window) {
+            return None;
+        }
+        if !exits_window {
+            let busy = self.pane_close_hangs_up_a_job(session);
+            let replay = if siblings {
+                crate::close_confirm::CloseReplay::Pane {
+                    wid: window,
+                    tab,
+                    view,
+                }
+            } else {
+                crate::close_confirm::CloseReplay::Tab { wid: window, tab }
+            };
+            if !self.view_close_allowed(window, busy, replay) {
+                return None;
+            }
+        }
+        let recovery = self.closed_view_record_for(window, tab, view);
+        let outcome = self
+            .windows
+            .get_mut(&window)
+            .and_then(|state| state.layouts.get_mut(index))
+            .map(|tree| tree.close_pane(session))?;
+        let collapsed = matches!(outcome, pane::CloseOutcome::Collapsed { .. });
+        let closes_window = self.apply_close_outcome(window, index, outcome);
+        if collapsed
+            && self.view_store.get(view).is_none()
+            && let Some(recovery) = recovery
         {
-            let _ = tree.set_focus(session);
+            self.retain_closed_view(recovery);
         }
-        self.resync_active_or_window(window);
-
-        let closes_window = self.close_active_tab_in(window);
-        let blocked_recovery_owns_focus = self.windows.get(&window).is_some_and(|state| {
-            state
-                .tab_set
-                .get(tab)
-                .is_some_and(|target| target.root.contains(view))
-                && state
-                    .palette()
-                    .is_some_and(|palette| palette.is_native_close_recovery_for(window, view))
-        });
-        if closes_window.is_none() && !blocked_recovery_owns_focus {
-            if let Some(state) = self.windows.get_mut(&window) {
-                let target_index = state
-                    .tab_set
-                    .tabs()
-                    .iter()
-                    .position(|candidate| candidate.id == tab);
-                if let Some(target_index) = target_index
-                    && let Some(target) = state.tab_set.tab_at_mut(target_index)
-                {
-                    let _ = target.set_focus(previous_focus);
-                }
-            }
-            // The target is still in front: its pane tree takes the restored focus too, or
-            // the tree keeps the closed pane's heir and a later Cmd-W closes that pane.
-            if let Some(session) = self
-                .windows
-                .get(&window)
-                .and_then(|state| state.tab_set.active())
-                .filter(|active| active.id == tab)
-                .and_then(|target| self.view_store.get(target.focus).copied())
-                .and_then(crate::tab_model::View::terminal_session)
-                && let Some(tree) = self.active_tree_mut(window)
-            {
-                let _ = tree.set_focus(session);
-            }
-            if let Some(state) = self.windows.get_mut(&window) {
-                if let Some(previous_active) = previous_active {
-                    state.tab_set.switch_to(previous_active);
-                }
-                align_terminal_projection_to_active(state, &self.view_store);
-            }
-            if let Some(session) = self
-                .windows
-                .get(&window)
-                .and_then(|state| state.tab_set.active())
-                .and_then(|tab| self.view_store.get(tab.focus).copied())
-                .and_then(crate::tab_model::View::terminal_session)
-                && let Some(tree) = self.active_tree_mut(window)
-            {
-                let _ = tree.set_focus(session);
-            }
-            self.resync_active_or_window(window);
+        if closes_window {
+            self.stash_deferred_close_attribution(window);
         }
-        closes_window
+        closes_window.then_some(window)
     }
 
     /// Resolve one deferred whole-tab close by stable identity so intervening tab selection/reordering cannot redirect it to a different tab.
@@ -5685,7 +5770,7 @@ impl App {
                 .get(tab.focus)
                 .copied()
                 .and_then(crate::tab_model::View::terminal_session)
-                .map(|session| crate::session_chrome::RewindMenuOrigin {
+                .map(|session| crate::session_chrome::TerminalMenuOrigin {
                     view: tab.focus,
                     session,
                 })
@@ -5695,7 +5780,7 @@ impl App {
         let titles = self.tab_titles(wid);
         let label = crate::chrome_label::capped_label(titles.get(index).map_or("", String::as_str));
         let mut ext = self.composed_session_chrome(wid, origin.session, &label, &mut None);
-        ext.bind_rewind_origin(origin);
+        ext.bind_terminal_origin(origin);
         crate::session_chrome::menu_shown_at(&ext.menu, crate::turn_ledger::now_ms())
     }
 
@@ -5806,6 +5891,18 @@ impl App {
 
     /// Activate entry `i` of the open menu on `wid` and dismiss the card.
     pub(crate) fn activate_tab_menu_entry(&mut self, wid: WindowId, i: usize) {
+        let session_action = self.windows.get(&wid).and_then(|ws| {
+            let menu = ws.tab_menu.as_ref()?;
+            match menu.entries.get(i)? {
+                crate::session_chrome::TabMenuEntry::SessionAction {
+                    action,
+                    enabled: true,
+                    origin: Some(origin),
+                    ..
+                } => Some((menu.tab, *origin, *action)),
+                _ => None,
+            }
+        });
         let upgrade = self.windows.get(&wid).and_then(|ws| {
             let menu = ws.tab_menu.as_ref()?;
             match menu.entries.get(i)? {
@@ -5850,6 +5947,10 @@ impl App {
             }
         });
         self.close_tab_menu(wid);
+        if let Some((tab, origin, action)) = session_action {
+            self.dispatch_tab_menu_session_action(wid, tab, origin, action);
+            return;
+        }
         if let Some((tab, origin, at_ms)) = rewind_row {
             self.dispatch_tab_menu_rewind(wid, tab, origin, at_ms);
             return;
@@ -5859,27 +5960,6 @@ impl App {
         }
         if let Some((tab, peer_sid, verb)) = session_row {
             self.dispatch_tab_menu_connection(wid, tab, &peer_sid, verb);
-            return;
-        }
-        if let Some((tab, action)) = chosen
-            && matches!(
-                action,
-                crate::menu::MenuAction::TakeOver | crate::menu::MenuAction::HandBack
-            )
-        {
-            let session = self
-                .tab_index_for_id(wid, tab)
-                .and_then(|index| self.tab_terminal_session(wid, index));
-            if let Some(session) = session {
-                let done = if action == crate::menu::MenuAction::TakeOver {
-                    self.take_over_session(session)
-                } else {
-                    self.hand_back_session(session)
-                };
-                if let Err(why) = done {
-                    aterm_log::info!("tab menu {action:?}: {why}");
-                }
-            }
             return;
         }
         if let Some((tab, action)) = chosen
@@ -9096,6 +9176,9 @@ mod session_chrome_app_tests {
             ext[0].menu.iter().find_map(|e| match e {
                 TabMenuEntry::Action {
                     action, enabled, ..
+                }
+                | TabMenuEntry::SessionAction {
+                    action, enabled, ..
                 } if *action == a => Some(*enabled),
                 _ => None,
             })
@@ -9234,20 +9317,20 @@ mod session_chrome_app_tests {
         app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
         let popped = app.windows[&wid].tab_set.tabs()[1].id;
         let popped_sid = app
-            .tab_session_id_text(wid, 1)
-            .expect("clicked tab has a registered session");
+            .tab_terminal_session(wid, 1)
+            .expect("clicked tab has a terminal session");
         app.move_tab(wid, 0, 2);
         let index = app
             .tab_index_for_id(wid, popped)
             .expect("the clicked tab still exists");
         assert_eq!(index, 0, "the clicked tab moved from position 1 to 0");
         assert_eq!(
-            app.tab_session_id_text(wid, index),
-            Some(popped_sid.clone()),
+            app.tab_terminal_session(wid, index),
+            Some(popped_sid),
             "the action lands on the SAME session the menu was popped on"
         );
         assert_ne!(
-            app.tab_session_id_text(wid, 1),
+            app.tab_terminal_session(wid, 1),
             Some(popped_sid),
             "the clicked position was inherited by another session"
         );
@@ -9409,11 +9492,11 @@ mod session_chrome_app_tests {
         app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
         app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
         let popped = app.windows[&wid].tab_set.tabs()[1].id;
-        let neighbor_sid = app.tab_session_id_text(wid, 2);
+        let neighbor_sid = app.tab_terminal_session(wid, 2);
         assert!(!app.close_tab_at(wid, 1), "two tabs survive the close");
         assert_eq!(app.windows[&wid].tab_set.len(), 2, "clicked tab is gone");
         assert_eq!(
-            app.tab_session_id_text(wid, 1),
+            app.tab_terminal_session(wid, 1),
             neighbor_sid,
             "the frozen index re-binds to the neighbor — the trap"
         );
@@ -10657,11 +10740,17 @@ mod status_glance_tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn only_turning_notify_me_on_asks_macos() {
-        use crate::notice_center::take_asks;
+        use crate::notice_center::{take_asks, take_primes};
         use crate::status_item::StatusAction;
         let mut app = App::headless_for_test();
         assert!(!app.config.desktop_alerts_or_default(), "off by default");
         let _ = take_asks();
+        app.prime_notices();
+        assert_eq!(
+            (take_primes(), take_asks()),
+            (1, 0),
+            "the launch asks quietly, never the dialog"
+        );
         app.dispatch_status_action(StatusAction::ToggleNotify);
         assert!(app.config.desktop_alerts_or_default(), "on");
         assert_eq!(take_asks(), 1, "turning it on asks");

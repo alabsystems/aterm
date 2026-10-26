@@ -3869,6 +3869,106 @@ fn a_dial_refused_as_busy_past_a_dead_address_names_the_busy_one() {
     assert!(!ends_the_seat(&why, deadline, Instant::now()));
 }
 
+static GUARD_ASKED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[test]
+fn the_loopback_guard_skips_what_leaves_the_loopback_before_its_connect_or_lookup() {
+    let asked: Resolver = |name, _| {
+        GUARD_ASKED.lock().unwrap().push(name.to_owned());
+        Vec::new()
+    };
+    // The stub `attempt` is the only dial: no address here reaches a socket.
+    let walk_as = |on: bool, host: &str, addr: Option<IpAddr>, answers: bool| {
+        GUARD_ASKED.lock().unwrap().clear();
+        let mut dialled = Vec::new();
+        let walked = crate::loopback::forced(on, || {
+            walk(
+                (host, addr, 7100),
+                (Instant::now() + HANG, HANG),
+                (&[], asked),
+                |to| {
+                    dialled.push(to);
+                    if answers {
+                        AtAddr::Reached(())
+                    } else {
+                        AtAddr::Passed(Unreached::Connect(
+                            to,
+                            io::ErrorKind::ConnectionRefused.into(),
+                        ))
+                    }
+                },
+            )
+        });
+        let mut names = std::mem::take(&mut *GUARD_ASKED.lock().unwrap());
+        names.sort();
+        (walked, dialled, names)
+    };
+    let guard = |walked: &Result<(), Unreached>, place: &str| {
+        matches!(walked, Err(Unreached::Local(said))
+            if said.starts_with("ATERM_DEBUG_LOOPBACK_ONLY=1 refuses ") && said.contains(place))
+    };
+    let documentation = IpAddr::from([192, 0, 2, 1]);
+    for on in [true, false] {
+        let (walked, dialled, names) = walk_as(on, "192.0.2.1", Some(documentation), true);
+        assert!(
+            matches!(walked, Err(Unreached::NotFleet(_))),
+            "past the fleet's kind, guard {on}: {walked:?}"
+        );
+        assert!(
+            dialled.is_empty() && names.is_empty(),
+            "{dialled:?} {names:?}"
+        );
+    }
+    let private = IpAddr::from([10, 0, 0, 1]);
+    let (walked, dialled, names) = walk_as(true, "10.0.0.1", Some(private), true);
+    assert!(guard(&walked, "a dial of 10.0.0.1:7100"), "{walked:?}");
+    assert!(
+        dialled.is_empty() && names.is_empty(),
+        "{dialled:?} {names:?}"
+    );
+    let (walked, dialled, _) = walk_as(false, "10.0.0.1", Some(private), true);
+    assert!(walked.is_ok(), "the control: {walked:?}");
+    assert_eq!(dialled, [SocketAddr::new(private, 7100)]);
+    for (host, unguarded) in [
+        ("guard-peer.invalid", vec!["guard-peer.invalid"]),
+        ("guard-mac", vec!["guard-mac", "guard-mac.local"]),
+    ] {
+        let (walked, dialled, names) = walk_as(true, host, None, true);
+        assert!(
+            guard(&walked, &format!("a lookup of {host:?}")),
+            "{walked:?}"
+        );
+        assert!(dialled.is_empty() && names.is_empty(), "{host}: {names:?}");
+        let (walked, _, names) = walk_as(false, host, None, true);
+        assert!(matches!(walked, Err(Unreached::Resolve(_))), "{walked:?}");
+        assert_eq!(names, unguarded, "the control: {host}");
+    }
+    let loopback = IpAddr::from([127, 0, 0, 1]);
+    let (walked, dialled, names) = walk_as(true, "guard-mac", Some(loopback), false);
+    assert!(
+        matches!(walked, Err(Unreached::Connect(at, _)) if at == SocketAddr::new(loopback, 7100)),
+        "the loopback's answer stands over the lookup the guard skipped: {walked:?}"
+    );
+    assert!(
+        dialled.len() == 1 && names.is_empty(),
+        "{dialled:?} {names:?}"
+    );
+    let (_, _, names) = walk_as(false, "guard-mac", Some(loopback), false);
+    assert_eq!(names, ["guard-mac", "guard-mac.local"], "the control");
+    let (walked, _, names) = walk_as(true, "localhost", None, true);
+    assert!(matches!(walked, Err(Unreached::Resolve(_))), "{walked:?}");
+    assert_eq!(
+        names,
+        ["localhost"],
+        "no multicast-DNS twin under the guard"
+    );
+    let (_, _, names) = walk_as(false, "localhost", None, true);
+    assert_eq!(names, ["localhost", "localhost.local"], "the control");
+    let (walked, dialled, _) = walk_as(true, "127.0.0.1", Some(loopback), true);
+    assert!(walked.is_ok(), "{walked:?}");
+    assert_eq!(dialled, [SocketAddr::new(loopback, 7100)]);
+}
+
 #[test]
 fn a_book_the_deadline_cut_short_is_the_issuers_row() {
     const WITHIN: Duration = Duration::from_secs(1);

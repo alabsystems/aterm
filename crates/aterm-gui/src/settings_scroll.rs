@@ -189,6 +189,9 @@ pub(super) struct ScrollPlan {
     gap: f32,
     seated: Option<Seat>,
     segments: Shared<(UiKey, UiKey)>,
+    /// Each segmented control's segments in order, the chosen one under the control's key
+    /// ([`Self::segment_place`]).
+    segment_sets: Shared<Vec<UiKey>>,
     foot: ListFoot,
 }
 
@@ -549,11 +552,14 @@ impl ScrollPlan {
     }
 
     fn control_span(&self, index: usize, key: &UiKey) -> Option<(f32, f32)> {
+        // The control's own span, else its segmented control's: a segment on a line of its own
+        // took the span of the chosen one where that came first.
+        let spans = self.spans.get(index)?;
         let control = self.resolve(key);
-        self.spans
-            .get(index)?
+        spans
             .iter()
-            .find(|(span, _, _)| span == key || span == control)
+            .find(|(span, _, _)| span == key)
+            .or_else(|| spans.iter().find(|(span, _, _)| span == control))
             .map(|(_, top, height)| (*top, top + height))
     }
 
@@ -793,12 +799,18 @@ impl ScrollPlan {
         // the screen's first stop (Cursor & Motion at 738x418 under a status's bar: 32pt of
         // Effect policy's card, Serious Mode's row cut away). It is given up as well.
         let blank = caption.is_none() && self.draws_nothing_from(start, flush);
+        // A filler whose control its seat cuts, so the list draws that control as a picture at
+        // its top or not at all, is given up too: a band of card over the screen's first stop
+        // held the switch's sliver and the note under it (Security at 584x376: Secure Keyboard
+        // Entry's switch, 4pt of it).
+        let veiled = caption.is_none() && self.veils_controls_from(start, flush);
         let group = self.groups[start].is_some();
         let cut = group && matches!(caption, Some(caption) if !caption.kept);
         let kept = group && matches!(caption, Some(caption) if caption.kept);
         let headed = start < top
             && (kept
                 || blank
+                || veiled
                 || cut
                     && self.span(start + 1..n) + 0.5 >= self.span(start..n) - self.lead_of(start));
         let (offset, caption) = if headed {
@@ -885,6 +897,38 @@ impl ScrollPlan {
             })
     }
 
+    /// Whether a screen that starts `offset` into stop `index` cuts a control of it at its top so
+    /// the list does not draw it (a sliver of it, or its name cut through), while words of the
+    /// stop under it still show: a band of card holding them without the control they belong to
+    /// ([`Self::last_screen`]).
+    fn veils_controls_from(&self, index: usize, offset: f32) -> bool {
+        let top = self.stop_top(index, index);
+        let parts = &self.drawn_bands[index];
+        let controls = self.control_rows.get(index).map_or(&[][..], Vec::as_slice);
+        // Words cut through: a whole band no control row of the stop draws.
+        let name_cut = parts.iter().any(|part| {
+            part.whole
+                && top + part.top < offset - 0.5
+                && top + part.bottom > offset + 0.5
+                && !controls.iter().any(|(_, at, height)| {
+                    (part.top - at).abs() < 0.5 && (part.bottom - (at + height)).abs() < 0.5
+                })
+        });
+        let Some(veiled) = self.control_rows.get(index).and_then(|rows| {
+            rows.iter()
+                .filter(|(_, at, height)| {
+                    top + at < offset - 0.5 && (name_cut || top + at + height - offset < PEEK_MIN)
+                })
+                .map(|(_, at, height)| top + at + height)
+                .reduce(f32::max)
+        }) else {
+            return false;
+        };
+        parts
+            .iter()
+            .any(|part| part.whole && top + part.top >= veiled.max(offset) - 0.5)
+    }
+
     /// How many of the list's stops the screen that starts with each cuts.
     pub(super) fn cut_stops(&self) -> usize {
         (0..self.len()).filter(|&stop| self.cuts(stop)).count()
@@ -927,26 +971,58 @@ impl ScrollPlan {
 
     /// Record the segmented controls in `node`, a stop just added ([`UiNode::segmented`]).
     pub(super) fn add_segments(&mut self, node: &UiNode) {
-        fn walk(node: &UiNode, out: &mut Vec<(UiKey, UiKey)>) {
+        fn walk(node: &UiNode, out: &mut Vec<(UiKey, UiKey)>, sets: &mut Vec<Vec<UiKey>>) {
             if node.paint_only {
                 return;
             }
             if node.segmented {
                 if let Some(control) = segmented_control_key(node) {
+                    let segments: Vec<UiKey> = crate::native_ui::segments_of(&node.children)
+                        .into_iter()
+                        .map(|(segment, _)| segment)
+                        .collect();
                     out.extend(
-                        crate::native_ui::segments_of(&node.children)
-                            .into_iter()
-                            .filter(|(segment, _)| *segment != control)
-                            .map(|(segment, _)| (segment, control.clone())),
+                        segments
+                            .iter()
+                            .filter(|segment| **segment != control)
+                            .map(|segment| (segment.clone(), control.clone())),
                     );
+                    sets.push(segments);
                 }
                 return;
             }
             for child in &node.children {
-                walk(child, out);
+                walk(child, out, sets);
             }
         }
-        walk(node, std::sync::Arc::make_mut(&mut self.segments));
+        walk(
+            node,
+            std::sync::Arc::make_mut(&mut self.segments),
+            std::sync::Arc::make_mut(&mut self.segment_sets),
+        );
+    }
+
+    /// Where segment `key` stands among its segmented control's segments: the control's key
+    /// ([`Self::resolve`]) and the segment's place from the first. A segment is drawn under the
+    /// control's key once chosen, so the key a press found is gone from the list the press
+    /// brings; its place is not ([`PressedAt::key_in`]).
+    pub(super) fn segment_place(&self, key: &UiKey) -> Option<(UiKey, usize)> {
+        let control = self.resolve(key);
+        self.segment_sets
+            .iter()
+            .find(|set| set.contains(control))?
+            .iter()
+            .position(|segment| segment == key)
+            .map(|at| (control.clone(), at))
+    }
+
+    /// The key of the segment at place `at` of the segmented control `control` names
+    /// ([`Self::segment_place`]).
+    pub(super) fn segment_at(&self, control: &UiKey, at: usize) -> Option<&UiKey> {
+        self.segment_sets
+            .iter()
+            .find(|set| set.contains(control))?
+            .get(at)
     }
 
     /// The control `key` is to the list.
@@ -1773,6 +1849,56 @@ impl ScrollPlan {
         })
     }
 
+    /// THE SEAT THAT HOLDS A PRESSED CONTROL WHERE IT WAS PRESSED: the screen, from the stops
+    /// at and above `top` (then below), that draws stop `index`'s control span `(from, to)`
+    /// whole with its top `at` down the list. `None` where the list has no such seat (its end
+    /// reached, or the control no longer fitting there whole).
+    pub(super) fn seat_holding(
+        &self,
+        index: usize,
+        top: usize,
+        (from, to): (f32, f32),
+        at: f32,
+    ) -> Option<(usize, Option<Seat>)> {
+        if self.foot == ListFoot::Whole
+            || index >= self.len()
+            || at + from.min(0.0) < -0.01
+            || at + (to - from) > self.room + 0.01
+        {
+            return None;
+        }
+        let limit = self.limit();
+        let near = top.min(limit).min(index);
+        let candidates = (0..=near).rev().chain(near + 1..=limit.min(index));
+        for start in candidates {
+            let natural = self.stop_screen(start);
+            if natural.whole || natural.drawn.start > index {
+                continue;
+            }
+            let now = self.stop_top(natural.drawn.start, index) - natural.offset + from;
+            let nudge = now - at;
+            let holds = |screen: &Screen| {
+                self.live_band(screen, index)
+                    .is_some_and(|(then, floor, live)| {
+                        (then + from - at).abs() < 0.5
+                            && then + from >= floor - 0.01
+                            && then + to <= live + 0.01
+                    })
+            };
+            if nudge.abs() < 0.01 {
+                if holds(&natural) {
+                    return Some((start, None));
+                }
+                continue;
+            }
+            let seat = Seat::nudged(start, nudge);
+            if self.seat_fits(seat) && holds(&self.nudged(natural, nudge, false)) {
+                return Some((start, Some(seat)));
+            }
+        }
+        None
+    }
+
     /// Nudge from its seat taken by a press on stop `index`'s controls from `top`.
     #[cfg(test)]
     pub(super) fn press_nudge(&self, index: usize, top: usize) -> Option<f32> {
@@ -1990,6 +2116,55 @@ pub(super) struct PressedAt {
     bottom: f32,
     before: Option<String>,
     status: Option<String>,
+    /// Whether `status` came while a write was in flight ("Applying…"): the press's own write,
+    /// whose outcome the press takes for its status when it lands.
+    awaits: bool,
+    /// Where the control began, down from the list's top: a status's bar over the list's top
+    /// ends above it ([`SettingsViewState::press_band`]).
+    top: f32,
+    /// Where the bar of the status the press brought stands ([`BarSide`]), whether it stands
+    /// there bare of its Undo, and the status it was weighed for, once a render weighed it
+    /// ([`SettingsViewState::press_side`]).
+    side: Option<(BarSide, bool, Option<String>)>,
+    /// Whether the bar may no longer stand over the top of the list: the person scrolled the
+    /// list, or the keyboard went to a control there ([`SettingsViewState::press_band`]).
+    band_gone: bool,
+    /// Whether the person scrolled the list since: the place the press found is then no
+    /// screen's to hold ([`SettingsViewState::seat_scroll`]).
+    scrolled: bool,
+    /// How far down the window the list started on that screen
+    /// ([`SettingsViewState::laid_list_top`]).
+    list_top: Option<f32>,
+    /// Where the control stood among its segmented control's segments, where it is one
+    /// ([`ScrollPlan::segment_place`], [`Self::key_in`]).
+    segment: Option<(UiKey, usize)>,
+}
+
+impl PressedAt {
+    /// The key the control the press found is drawn under in `plan`: a segment the press chose
+    /// takes its segmented control's key, so it is found by its place. Followed by the key it
+    /// had, the segment the person pressed was lost to the list the press brought, which then
+    /// moved it and stood a status's bar over it (Appearance's Window appearance, Dark, at
+    /// 192x348 with 2x text: from 264pt to 139pt, under the bar).
+    fn key_in(&self, plan: &ScrollPlan) -> UiKey {
+        self.segment
+            .as_ref()
+            .and_then(|(control, at)| plan.segment_at(control, *at))
+            .unwrap_or(&self.key)
+            .clone()
+    }
+}
+
+/// WHERE THE BAR OF A STATUS A PRESS BROUGHT STANDS, so it never moves or covers the control
+/// pressed ([`SettingsViewState::press_side`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BarSide {
+    /// Under the list, where the list keeps the control where it was.
+    Under,
+    /// Over the top of the list, above the control.
+    Over,
+    /// In the compact toolbar, where neither side of the list holds it.
+    Dock,
 }
 
 /// What a page's reveal ([`SettingsViewState::page_reveal`]) is.
@@ -2567,6 +2742,17 @@ impl SettingsViewState {
                 }
             }
         }
+        // A PRESSED CONTROL STAYS WHERE IT WAS PRESSED: where what the press brought changed the
+        // stops above it or around it (a row's note, a card's padding chosen by its tallest
+        // row) and the seat left the control elsewhere, the screen that draws it whole where it
+        // was pressed holds it there; what the press brought below comes into view as the list
+        // stands. A press that turned Supervise coding agents off brought its rows' notes, the
+        // card re-padded, and the switch went 10pt down under the pointer (Harness at 744x420
+        // with 2x text).
+        if let Some((held_top, seat)) = self.press_hold(plan, top) {
+            top = held_top;
+            plan.seated = seat;
+        }
         let left = focus.map(|key| {
             let now = Left::on(plan, key, top);
             let record = self.scroll_record.borrow();
@@ -2788,6 +2974,13 @@ impl SettingsViewState {
             record.place = None;
             record.left = None;
         }
+        // The person scrolled: a status's bar over the list's top would cover what scrolls under
+        // it, so it stands under the list from now on, and the press's place is no screen's.
+        if let Some(at) = self.pressed_at.borrow_mut().as_mut() {
+            at.band_gone = true;
+            at.scrolled = true;
+        }
+        self.list_reseated.set(true);
     }
 
     fn listed_on_page(&self, key: &UiKey) -> bool {
@@ -3046,21 +3239,33 @@ impl SettingsViewState {
 
     /// Keep control `key` in view at the next render, where the screen drawn showed it whole.
     pub(super) fn reveal_pressed(&mut self, key: UiKey) {
-        let at = self.drawn_bottom(&key).map(|bottom| PressedAt {
+        let segment = self
+            .scroll_record
+            .borrow()
+            .as_ref()
+            .and_then(|record| record.place().0.segment_place(&key));
+        let at = self.drawn_span(&key).map(|(top, bottom)| PressedAt {
             context: self.scroll_context(),
             key: key.clone(),
             bottom,
             before: self.bar_feedback().cloned(),
             status: None,
+            awaits: false,
+            top,
+            side: None,
+            band_gone: self.list_reseated.get(),
+            scrolled: self.list_reseated.get(),
+            list_top: self.laid_list_top.get(),
+            segment,
         });
         self.pressed_at.replace(at);
         self.page_reveal = Some(key);
         self.reveal_as = Reveal::Pressed;
     }
 
-    /// Where control `key` ends, down from the list's top, on the screen last drawn, where that
-    /// screen showed it whole in the list's room.
-    fn drawn_bottom(&self, key: &UiKey) -> Option<f32> {
+    /// Where control `key` begins and ends, down from the list's top, on the screen last drawn,
+    /// where that screen showed it whole in the list's room.
+    fn drawn_span(&self, key: &UiKey) -> Option<(f32, f32)> {
         let record = self.scroll_record.borrow();
         let record = record.as_ref().filter(|record| record.unscrolled(self))?;
         let (plan, top) = record.place();
@@ -3071,7 +3276,146 @@ impl SettingsViewState {
             return None;
         }
         let at = plan.stop_top(screen.drawn.start, index) - screen.offset;
-        (at + from >= -0.01 && at + to <= plan.room + 0.01).then_some(at + to)
+        (at + from >= -0.01 && at + to <= plan.room + 0.01).then_some((at + from, at + to))
+    }
+
+    /// THE BAR OF A STATUS A PRESS BROUGHT TAKES THE SIDE OF THE LIST AWAY FROM THE PRESS: the
+    /// room over the top of the press's list, down to the control, while the bar may stand
+    /// there. That is while the press holds ([`Self::pressed_bottom`]) on the screen it was
+    /// pressed on, and the keyboard is on no other control of the list that room covers.
+    pub(super) fn press_band(&self) -> Option<f32> {
+        self.pressed_bottom()?;
+        let mut held = self.pressed_at.borrow_mut();
+        let at = held
+            .as_mut()
+            .filter(|at| !at.band_gone && self.press_stands(at))?;
+        let band = at.top;
+        let record = self.scroll_record.borrow();
+        let record = record.as_ref().filter(|record| record.unscrolled(self))?;
+        let (plan, top) = record.place();
+        let pressed = at.key_in(plan);
+        let covered = self
+            .common
+            .last_focus
+            .as_ref()
+            .filter(|focus| **focus != at.key && **focus != pressed)
+            .and_then(|focus| {
+                let index = plan.stop_holding(focus).or_else(|| plan.stop_of(focus))?;
+                let (from, _) = plan.control_span(index, focus)?;
+                let screen = plan.screen(top.min(plan.limit()));
+                screen.drawn.contains(&index).then(|| {
+                    plan.stop_top(screen.drawn.start, index) - screen.offset + from < band - 0.01
+                })
+            })
+            .unwrap_or(false);
+        if covered {
+            at.band_gone = true;
+            return None;
+        }
+        Some(band)
+    }
+
+    /// Whether a press holds the list on the screen it was pressed on, the status it brought
+    /// standing ([`Self::pressed_bottom`]): its bar then takes the side that moves nothing
+    /// ([`Self::press_side`]).
+    pub(super) fn press_holds_place(&self) -> bool {
+        self.pressed_bottom().is_some()
+            && self
+                .pressed_at
+                .borrow()
+                .as_ref()
+                .is_some_and(|at| self.press_stands(at) && at.status.is_some())
+    }
+
+    /// THE PERSON MOVES ON FROM A PRESS: a press holds the list where it found its control only
+    /// while the person has not scrolled the list since and the list still reveals what the
+    /// press found, no page turned, no control the keyboard went on to, nothing else asked into
+    /// view. Held past that, the list kept the switch pressed where it was and the controls Tab
+    /// went on to, and the page Page Down turned to, never came into view (Security at 584x348:
+    /// after Allow programs to read the clipboard, the next switches).
+    fn press_stands(&self, at: &PressedAt) -> bool {
+        !at.scrolled
+            && self.reveal_as == Reveal::Pressed
+            && self.page_reveal.as_ref().is_some_and(|reveal| {
+                *reveal == at.key
+                    || at
+                        .segment
+                        .as_ref()
+                        .is_some_and(|(control, _)| reveal == control)
+            })
+    }
+
+    /// The key the control the press holding the list found is drawn under on the screen last
+    /// seated ([`Self::reveal_pressed`], [`PressedAt::key_in`]).
+    pub(super) fn pressed_key(&self) -> Option<UiKey> {
+        let held = self.pressed_at.borrow();
+        let at = held.as_ref()?;
+        let record = self.scroll_record.borrow();
+        Some(
+            record
+                .as_ref()
+                .map_or_else(|| at.key.clone(), |record| at.key_in(record.place().0)),
+        )
+    }
+
+    /// Where a render put the bar of the status a press brought ([`BarSide`]), whether bare of
+    /// its Undo, and whether it weighed it for the status standing now.
+    pub(super) fn press_side(&self) -> Option<(BarSide, bool, bool)> {
+        let status = self.bar_feedback();
+        self.pressed_at.borrow().as_ref().and_then(|at| {
+            at.side
+                .as_ref()
+                .map(|(side, bare, weighed)| (*side, *bare, weighed.as_ref() == status))
+        })
+    }
+
+    /// Put the bar of the status standing now, which a press brought, at `side`, `bare` of its
+    /// Undo or not.
+    pub(super) fn settle_press_side(&self, side: BarSide, bare: bool) {
+        let status = self.bar_feedback().cloned();
+        if let Some(at) = self.pressed_at.borrow_mut().as_mut() {
+            at.side = Some((side, bare, status));
+        }
+    }
+
+    /// The seat that holds the control a press found where the press found it, where `top` (with
+    /// `plan`'s seat) draws it elsewhere ([`ScrollPlan::seat_holding`]): while the press holds and
+    /// nothing has scrolled the list since.
+    fn press_hold(&self, plan: &ScrollPlan, top: usize) -> Option<(usize, Option<Seat>)> {
+        self.pressed_bottom()?;
+        let (key, at) = self
+            .pressed_at
+            .borrow()
+            .as_ref()
+            .filter(|at| self.press_stands(at))
+            .map(|at| (at.key_in(plan), at.top))?;
+        let key = &key;
+        let index = plan.stop_holding(key).or_else(|| plan.stop_of(key))?;
+        let span = plan.control_span(index, key)?;
+        let screen = plan.screen(top.min(plan.limit()));
+        let now = plan
+            .live_band(&screen, index)
+            .map(|(then, _, _)| then + span.0);
+        if now.is_some_and(|now| (now - at).abs() < 0.5) {
+            return None;
+        }
+        plan.seat_holding(index, top, span, at)
+    }
+
+    /// Whether the screen last seated, its list starting `list_top` down the window, moved the
+    /// control a press found, or does not show it whole in the room the list has
+    /// ([`Self::press_band`]).
+    pub(super) fn press_moved(&self, list_top: Option<f32>) -> bool {
+        let held = self.pressed_at.borrow().clone();
+        held.is_some_and(|at| {
+            let key = self.pressed_key().unwrap_or_else(|| at.key.clone());
+            at.list_top
+                .zip(list_top)
+                .is_some_and(|(was, now)| (was - now).abs() > 0.5)
+                || self
+                    .drawn_span(&key)
+                    .is_none_or(|(_, bottom)| (bottom - at.bottom).abs() > 0.5)
+        })
     }
 
     /// Handle a pointer press on a control preview picture in the list strip.
@@ -3315,21 +3659,31 @@ impl SettingsViewState {
     /// that came with it stands on that list, so the bar keeps the room it took when it came.
     /// Let go when a scroll ended the press, the bar grew back over the list to show every word
     /// (Software Update at 178x348: from 98pt to 186pt of the page's 268pt).
+    ///
+    /// THE PRESS'S STATUS IS ITS WRITE'S, PENDING AND LANDED: a status that came while a write
+    /// was in flight ("Applying…") gives way to the write's outcome as the same press's. Let go
+    /// there, the outcome's bar grew back over the list in full and moved the switch the person
+    /// had just pressed (AI at 164x348 with 2x text: 264pt, to 184pt under "Applying…", then to
+    /// 120pt under "Look for AI CLI problems turned off").
     fn pressed_bottom(&self) -> Option<f32> {
         let mut held = self.pressed_at.borrow_mut();
         let at = held.as_mut()?;
         let status = self.bar_feedback();
+        let landed = at.awaits && status.is_some();
         let gone = at.context != self.scroll_context()
             || match (&at.status, status) {
-                (Some(came), now) => now != Some(came),
+                (Some(came), now) => now != Some(came) && !landed,
                 (None, _) => false,
             };
         if gone {
             *held = None;
             return None;
         }
-        if at.status.is_none() && status != at.before.as_ref() {
+        if (at.status.is_none() && status != at.before.as_ref())
+            || (landed && status != at.status.as_ref())
+        {
             at.status = status.cloned();
+            at.awaits = !self.pending.is_empty();
         }
         let pressing =
             self.reveal_as == Reveal::Pressed && self.page_reveal.as_ref() == Some(&at.key);

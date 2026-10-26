@@ -28,9 +28,10 @@ key-text `SmolStr`. Its `dpi` module is derived from dpi 0.1.2
 `CursorIcon` from cursor-icon 1.2.0 by Kirill Chibisov (MIT OR Apache-2.0 OR
 Zlib, used under Apache-2.0). Its `src/frame_shadow.rs` (the shadow margin
 around a client-decorated Wayland window) is derived from sctk-adwaita 0.10.1
-by Bartłomiej Maryńczak, MIT, and stays MIT: see
-`crates/aterm-window/LICENSE-MIT-sctk-adwaita`. Modified and added files carry
-prominent notices.
+by Bartłomiej Maryńczak, MIT, and stays MIT: its licence is sctk-adwaita's
+own text, which aterm added unchanged as
+`crates/aterm-window/LICENSE-MIT-sctk-adwaita`. Other modified and added files
+carry prominent notices.
 
 `crates/aterm-lz4/` is a modified, block-mode-only subset derived from
 lz4_flex 0.11.5 by Pascal Seitz and contributors. Its upstream-derived files

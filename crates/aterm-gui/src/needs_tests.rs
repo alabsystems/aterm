@@ -2083,11 +2083,26 @@ fn two_grok_auth_walls_give_one_need() {
     // still the code within the row, for every setup of the label `adopt-default` gives.
     {
         use aterm_agent::harness::grok_signin::{ADOPT_LABEL, Setup, need_words};
+        let label = || ADOPT_LABEL.to_owned();
         for setup in [
-            Setup::Window(ADOPT_LABEL.to_owned()),
-            Setup::Mailbox(ADOPT_LABEL.to_owned()),
-            Setup::Email(ADOPT_LABEL.to_owned()),
-            Setup::Adopt(ADOPT_LABEL.to_owned()),
+            Setup::Window(label()),
+            Setup::Mailbox(label()),
+            Setup::Email {
+                label: label(),
+                window: true,
+            },
+            Setup::Email {
+                label: label(),
+                window: false,
+            },
+            Setup::Adopt {
+                label: label(),
+                window: true,
+            },
+            Setup::Adopt {
+                label: label(),
+                window: false,
+            },
         ] {
             let leader = NeedFacts {
                 attention: vec![entry(

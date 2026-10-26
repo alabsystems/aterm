@@ -1917,6 +1917,29 @@ pub(crate) enum HostNote {
     },
     /// The volume is back above the emergency line: the alert ends.
     DiskFullOver,
+    /// The home volume is filling (the design's §8.5): a crossing of its `floor` is projected at
+    /// `rate_bps` in `eta_s`, or it is short, and `needed`: only its owner can still act now
+    /// ([`aterm_agent::harness::disk::ask::owner_needed`]). `projected_only`: a crossing is
+    /// projected and the volume is not short, which the `disk.filling` entry says. `said`: what
+    /// the asks and the worker did.
+    DiskFilling {
+        needed: bool,
+        projected_only: bool,
+        free: u64,
+        floor: u64,
+        rate_bps: Option<u64>,
+        eta_s: Option<i64>,
+        said: Option<String>,
+    },
+    /// No crossing is projected and the owner is not needed: the entry and the alert end.
+    DiskFillingOver,
+    /// Start the home volume's disk worker on the main thread with `task`, in `folder`
+    /// ([`aterm_agent::harness::disk::ask::worker_step`]); what the spawn did goes back to the
+    /// next disk look.
+    DiskWorker { task: String, folder: PathBuf },
+    /// The disk worker `sid` ran out of its time: its Autopilot goes Off, so Land types nothing
+    /// more into it.
+    DiskWorkerExpired { sid: String },
     /// macOS's program check is stuck ([`crate::program_check_watch`]).
     ProgramCheckStuck { workers: u64, limit: Option<u64> },
     /// The program check is not stuck.
@@ -16500,6 +16523,11 @@ fn disk_look_pass(
     let room = stats.as_ref().map(|r| disk_room_after(&state, r, now));
     let thresholds = reading.thresholds_with(total, room);
     let level = thresholds.level(free, stats.as_ref().and_then(|s| s.files_free));
+    // The fill ring reads every look, whatever the pass then does: a projection that stands
+    // presses the pass as a short volume does (the design's §8.2).
+    let projected = stats
+        .as_ref()
+        .and_then(|r| disk_fill_observe(r, now, thresholds.short_below()));
     let private = disk_private(&home);
     looked.thresholds = Some(thresholds);
     looked.private = private.is_some();
@@ -16537,6 +16565,15 @@ fn disk_look_pass(
             moved => {
                 if let aterm_agent::harness::cli::ReserveMove::Released(bytes) = &moved {
                     disk_reclaimed(looked, *bytes);
+                    if let Some(r) = stats.as_ref() {
+                        disk_fill_credit(
+                            &r.key.spelled(),
+                            *bytes,
+                            free,
+                            measure().map(|s| s.free),
+                            Duration::ZERO,
+                        );
+                    }
                 }
                 aterm_log::info!(
                     "harness disk watch: reserve {moved:?} at {}",
@@ -16573,7 +16610,7 @@ fn disk_look_pass(
     if let Some(line) = disk_private_said(&DISK_PRIVATE_SAID, line) {
         aterm_log::info!("{line}");
     }
-    if (!config.below_warn(free) && demand.is_none())
+    if (!config.below_warn(free) && demand.is_none() && projected.is_none())
         || config.auto_free_gib == 0
         || private.is_some()
     {
@@ -16611,13 +16648,20 @@ fn disk_look_pass(
         return;
     }
     let started = Instant::now();
+    // A pressing projection runs passes on a short volume's cadence: at once when it first
+    // stands, then every `DISK_PASS_EVERY`.
+    let pass_level = if projected.is_some() && level < Level::Short {
+        Level::Short
+    } else {
+        level
+    };
     let due = demand.is_some()
         || disk_pass_due(
             &mut DISK_LAST_PASS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             started,
-            level,
+            pass_level,
             free,
             poked,
             room.unwrap_or(0),
@@ -16671,7 +16715,9 @@ fn disk_look_pass(
     let placing = aterm_agent::harness::disk::discover::placing_of(&home, &table);
     let demand_cwds: Vec<std::path::PathBuf> = adopted.map(|(_, cwds)| cwds).unwrap_or_default();
     let demand_only = sids.is_empty();
-    if sids.is_empty() && demand.is_none() {
+    // A pressing projection runs the disk pass, whose fences (no lock, no process under it, its
+    // owner gone under the locks) are the pass's, never the sweep's shorter window.
+    if sids.is_empty() && demand.is_none() && projected.is_none() {
         let gone_after = if short {
             atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE
         } else {
@@ -16692,6 +16738,15 @@ fn disk_look_pass(
         let (freed, went) = disk_swept(&swept, &sized);
         disk_reclaimed(looked, freed);
         let after = measure();
+        if let Some(key) = home_key.as_ref() {
+            disk_fill_credit(
+                &key.spelled(),
+                freed,
+                free,
+                after.as_ref().map(|s| s.free),
+                started.elapsed(),
+            );
+        }
         if !swept.is_empty() {
             aterm_log::info!(
                 "harness disk watch: {} ({} GiB free against a {} GiB warning and a {} GiB \
@@ -16803,6 +16858,7 @@ fn disk_look_pass(
         room,
         table: Some(&table),
         demand,
+        projected,
         session_cwds: &DISK_ALL_CWDS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -16870,6 +16926,9 @@ fn disk_look_pass(
         aterm_agent::harness::cli::DiskTick::Plenty => 0,
     };
     disk_reclaimed(looked, freed_bytes);
+    if let Some(key) = home_key.as_ref() {
+        disk_fill_credit(&key.spelled(), freed_bytes, free, after, started.elapsed());
+    }
     let went: Vec<String> = match &tick {
         aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => {
             let mut rows: Vec<(u64, String)> = done
@@ -16892,7 +16951,7 @@ fn disk_look_pass(
         }
         aterm_agent::harness::cli::DiskTick::Plenty => Vec::new(),
     };
-    if freed && (short || took_whole) {
+    if freed && (short || took_whole || projected.is_some()) {
         let (bytes, went) = disk_episode_freed(board, freed_bytes, &went);
         note(HostNote::DiskFreed { bytes, went });
     }
@@ -16929,7 +16988,7 @@ fn disk_look_pass(
         !freed
             && (level_after == Level::Emergency
                 || (level_after == Level::Unknown && level == Level::Emergency)),
-        level,
+        pass_level,
         freed,
     );
     let tiers: Vec<u8> = match &tick {
@@ -17395,6 +17454,87 @@ fn disk_room_after(state: &Path, reading: &aterm_sysprobe::volumes::Reading, now
         aterm_log::warn!("harness disk watch: the room file could not be written: {e}");
     }
     room
+}
+
+/// Each volume's fill ring, by its spelled key (`aterm_agent::harness::disk::fill`): this
+/// process's own readings, one a look, net of what its passes freed. Not kept across a relaunch.
+static DISK_FILLS: Mutex<Vec<(String, aterm_agent::harness::disk::fill::Fill)>> =
+    Mutex::new(Vec::new());
+
+/// The most volumes [`DISK_FILLS`] keeps: the look reads the home volume alone.
+const DISK_FILLS_MAX: usize = 8;
+
+/// Run `f` on volume `key`'s fill ring, made where there is none.
+fn disk_fill<T>(key: &str, f: impl FnOnce(&mut aterm_agent::harness::disk::fill::Fill) -> T) -> T {
+    let mut fills = DISK_FILLS.lock().unwrap_or_else(PoisonError::into_inner);
+    let at = match fills.iter().position(|(k, _)| k == key) {
+        Some(at) => at,
+        None => {
+            if fills.len() >= DISK_FILLS_MAX {
+                fills.remove(0);
+            }
+            fills.push((
+                key.to_owned(),
+                aterm_agent::harness::disk::fill::Fill::new(),
+            ));
+            fills.len() - 1
+        }
+    };
+    f(&mut fills[at].1)
+}
+
+/// Feed one look's `reading` to its volume's fill ring at `now` (unix seconds), against `floor`
+/// (`Thresholds::short_below`): the projection that presses the pass now, if one stands.
+fn disk_fill_observe(
+    reading: &aterm_sysprobe::volumes::Reading,
+    now: i64,
+    floor: u64,
+) -> Option<aterm_agent::harness::disk::fill::Projection> {
+    disk_fill(&reading.key.spelled(), |fill| {
+        fill.observe(
+            now.saturating_mul(1_000),
+            reading.free,
+            Some(reading.total),
+            floor,
+        )
+    })
+}
+
+/// Credit volume `key`'s fill ring with what this process freed there (`counted` by its removers,
+/// free space reading `before` and `after` across `took`), as free space measured it.
+fn disk_fill_credit(
+    key: &str,
+    counted: u64,
+    before: Option<u64>,
+    after: Option<u64>,
+    took: Duration,
+) {
+    if counted == 0 {
+        return;
+    }
+    let (Some(before), Some(after)) = (before, after) else {
+        return;
+    };
+    let pass_ms = i64::try_from(took.as_millis()).unwrap_or(i64::MAX);
+    disk_fill(key, |fill| fill.credit(counted, before, after, pass_ms));
+}
+
+/// What volume `key`'s fill ring reads for the ask at `free` bytes against `floor` on a volume of
+/// `total`: the crossing it projects ([`aterm_agent::harness::disk::fill::Fill::crossing`]), and
+/// whether the ring is cold.
+pub(crate) fn disk_fill_ask(
+    key: &str,
+    free: u64,
+    floor: u64,
+    total: u64,
+) -> (Option<aterm_agent::harness::disk::fill::Projection>, bool) {
+    let fills = DISK_FILLS.lock().unwrap_or_else(PoisonError::into_inner);
+    fills
+        .iter()
+        .find(|(k, _)| k == key)
+        .map_or((None, true), |(_, fill)| {
+            (fill.crossing(free, floor, Some(total)), fill.cold())
+        })
 }
 
 const DISK_PASS_EVERY: Duration = Duration::from_secs(10 * 60);
@@ -18173,11 +18313,14 @@ impl RosterPrint {
 /// The activation thread's loop over `wait` until the host shuts down. `wait` is the parked
 /// [`ActivationWake::wait`]: `true` for a newer build, `false` for the fallback or a pulled
 /// trigger. A roster file that reads otherwise after a wait than at the last look that read it
-/// (a row named, changed or dropped there: by hand or by `aterm harness accounts add`) is
-/// news of the accounts ([`Switches::accounts_news`]), which no store transaction wakes the
-/// host for: a session's loop then decides again what it holds, as the dialog of its own
-/// `/login` over a login a row now names, which it backs out of. While the host reads no roster
-/// ([`RosterPrint::of`]) the file is not opened, and the last look that read it stands.
+/// (a row named, changed or dropped there) is news of the accounts
+/// ([`Switches::accounts_news`]): a session's loop then decides again what it holds, as the
+/// dialog of its own `/login` over a login a row now names, which it backs out of. That look
+/// is how a row written by hand arrives, within [`WAKE_FALLBACK`]; `aterm harness accounts
+/// add`, `adopt-default` and a sync also replace the accounts store's wake marker once they
+/// write the roster, whose listener ([`HostHandle::note_accounts`]) tells the news at once.
+/// While the host reads no roster ([`RosterPrint::of`]) the file is not opened, and the last
+/// look that read it stands.
 fn activation_loop(host: &HostHandle, mut wait: impl FnMut() -> bool) {
     let mut roster = RosterPrint::of(host);
     accounts_look(

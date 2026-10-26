@@ -5,6 +5,75 @@ use super::*;
 use std::cell::{Cell, RefCell};
 
 #[test]
+fn session_move_refuses_policy_already_stale_before_preparation() {
+    for follows in [false, true] {
+        for (observed, configured) in
+            [Mode::Early, Mode::Wall, Mode::Off]
+                .into_iter()
+                .flat_map(|observed| {
+                    [Mode::Early, Mode::Wall, Mode::Off].map(|configured| (observed, configured))
+                })
+        {
+            let cli = Cli::Codex;
+            let world = World::new("move-stale-policy");
+            world.two(cli);
+            world.on_main(cli, &[]);
+            let store = world.seat().store(cli);
+            if follows {
+                store
+                    .transact(NOW, &mut None, |state| {
+                        state.active = Some("work".into());
+                        state.proven = true;
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+            }
+            std::fs::write(
+                world.cfg.join("aterm.toml"),
+                format!("[harness]\naccounts = '{}'\n", configured.as_str()),
+            )
+            .unwrap();
+            let before = world.load(cli);
+            let prepared = Cell::new(false);
+            let mut s = session(cli, Supervisor::Aterm, observed, Path::new("/opt/provider"));
+            s.point = Point::Wall {
+                window: "five_hour".into(),
+                at: Some(NOW - MIN),
+            };
+            let result = super::super::session_move_using(&world.seat(), &s, |_| {
+                prepared.set(true);
+                Some("prepared stale-policy command".into())
+            });
+            let after = world.load(cli);
+            assert!(after.accounts["main"].sample.is_some());
+            if observed != configured || observed == Mode::Off {
+                let why = if observed == configured {
+                    StayWhy::Off
+                } else {
+                    StayWhy::NothingDue
+                };
+                assert_eq!(
+                    result,
+                    Moved::stay(why),
+                    "observed={observed:?}, configured={configured:?}, follows={follows}"
+                );
+                assert!(!prepared.get());
+                assert_eq!(after.active, before.active);
+                assert_eq!(after.rotations, before.rotations);
+            } else {
+                assert!(
+                    result.line.is_some(),
+                    "current policy permits the wall move"
+                );
+                assert!(prepared.get());
+                assert_eq!(after.active.as_deref(), Some("work"));
+                assert_eq!(after.rotations.len(), usize::from(!follows));
+            }
+        }
+    }
+}
+
+#[test]
 fn prepared_session_move_refuses_a_target_renewed_in_the_same_directory() {
     let cli = Cli::Codex;
     for follows in [false, true] {
@@ -145,6 +214,14 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         Mode::Early,
         Path::new("/opt/provider"),
     );
+    if matches!(case, 23 | 24) {
+        let mode = if case == 23 { "off" } else { "wall" };
+        std::fs::write(
+            world.cfg.join("aterm.toml"),
+            format!("[harness]\naccounts = '{mode}'\n"),
+        )
+        .unwrap();
+    }
     if cli != Cli::Codex {
         let result = super::super::session_move_using(&world.seat(), &s, |_| {
             panic!("unmeasured running-session moves must not prepare a relaunch")
@@ -256,11 +333,15 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
                 "[harness]\naccounts = 'off'\n",
             )
             .unwrap(),
-            20 => std::fs::write(
-                world.home.join(".codex/config.toml"),
-                "cli_auth_credentials_store = 'keyring'\n",
-            )
-            .unwrap(),
+            20 => {
+                let codex_dir = world.home.join(".codex");
+                std::fs::create_dir_all(&codex_dir).unwrap();
+                std::fs::write(
+                    codex_dir.join("config.toml"),
+                    "cli_auth_credentials_store = 'keyring'\n",
+                )
+                .unwrap();
+            }
             21 => {
                 store
                     .transact_logins(NOW, &mut None, |_, logins| {
@@ -299,10 +380,15 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         Some(line)
     });
     drop(held);
-    let after = after.into_inner().unwrap_or_else(|| {
-        panic!("{cli:?}, follows={follows}, case={case}: no prepared command: {result:?}")
-    });
-    if result.line.is_none() {
+    let after = after.into_inner();
+    assert_eq!(
+        after.is_none(),
+        matches!(case, 23 | 24),
+        "{cli:?}, follows={follows}, case={case}: unexpected prepare state: {result:?}"
+    );
+    if result.line.is_none()
+        && let Some(after) = after
+    {
         assert_eq!(
             files.each_ref().map(|path| std::fs::read(path).ok()),
             after,
@@ -351,7 +437,7 @@ pub(crate) fn move_transition(
 #[test]
 fn session_move_policy_conforms_for_rotation_and_following() {
     let model = aterm_models_harness::account_pool_move_policy_model();
-    assert_eq!(model.mutant_dials(), (1..=26).collect::<Vec<_>>());
+    assert_eq!(model.mutant_dials(), (1..=29).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let mut checked = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
@@ -367,11 +453,21 @@ fn session_move_policy_conforms_for_rotation_and_following() {
             }
         }
     }
-    assert_eq!(checked, 2 * 22 + 2 * 2);
+    assert_eq!(checked, 2 * 24 + 2 * 2);
     let mut stale = model.init_state();
     stale.insert("case", 3);
     stale.insert("phase", 1);
     let mut stale = move_transition(&stale, "Finish");
     stale.insert("line", 1);
     assert!(!model.check_invariant("NoStaleLine", &stale));
+    for case in [23, 24] {
+        let mut initial = model.init_state();
+        initial.insert("case", case);
+        initial.insert("phase", 1);
+        let mut bad = move_transition(&initial, "Finish");
+        bad.insert("line", 1);
+        assert!(!model.check_invariant("NoStaleLine", &bad));
+        bad.insert("committed", 1);
+        assert!(!model.check_invariant("RefusalChangesNoRotation", &bad));
+    }
 }

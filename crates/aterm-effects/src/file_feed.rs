@@ -88,12 +88,13 @@ pub const MAX_SPARKLE_LEXICON_BYTES: usize = 256 * 1024;
 
 #[inline]
 fn limit_plus_sentinel(max_bytes: usize) -> io::Result<usize> {
-    max_bytes.checked_add(1).ok_or_else(|| {
-        io::Error::new(
+    let Some(limit) = max_bytes.checked_add(1) else {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "visual-feed byte limit cannot be represented",
-        )
-    })
+        ));
+    };
+    Ok(limit)
 }
 
 #[inline]
@@ -172,12 +173,15 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
 
 #[inline]
 fn check_observed_size(observed_len: u64, max_bytes: usize) -> io::Result<usize> {
-    if observed_len > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+    let max_u64 = if usize::BITS > u64::BITS && max_bytes > u64::MAX as usize {
+        u64::MAX
+    } else {
+        max_bytes as u64
+    };
+    if observed_len > max_u64 {
         return Err(too_large(max_bytes));
     }
-    Ok(usize::try_from(observed_len)
-        .unwrap_or(max_bytes)
-        .min(max_bytes))
+    Ok(observed_len as usize)
 }
 
 /// Read a same-handle regular file into a byte vector bounded by `max_bytes`.
@@ -186,12 +190,12 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Ve
     let reserve_len = check_observed_size(observed_len, max_bytes)?;
     let read_limit = limit_plus_sentinel(max_bytes)?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(reserve_len).map_err(|error| {
-        io::Error::new(
+    if let Err(error) = bytes.try_reserve_exact(reserve_len) {
+        return Err(io::Error::new(
             io::ErrorKind::OutOfMemory,
             format!("visual-feed allocation refused: {error}"),
-        )
-    })?;
+        ));
+    }
     file.take(read_limit as u64).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(too_large(max_bytes));
@@ -201,12 +205,13 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Ve
 
 /// Read a bounded visual-feed file and require complete UTF-8.
 pub fn read_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<String> {
-    String::from_utf8(read_bounded_regular_file(path, max_bytes)?).map_err(|error| {
-        io::Error::new(
+    match String::from_utf8(read_bounded_regular_file(path, max_bytes)?) {
+        Ok(s) => Ok(s),
+        Err(error) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("visual-feed file is not UTF-8: {error}"),
-        )
-    })
+        )),
+    }
 }
 
 /// Delimit and fold in the byte count, so the result fingerprints content, not hasher state.

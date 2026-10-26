@@ -839,9 +839,9 @@ pub(crate) struct BorderSwitch {
     pub(crate) term_row: usize,
     /// Every cell a press acts on: the whole face, its blanks included.
     pub(crate) cols: std::ops::Range<usize>,
-    /// The switch's own cells, its label and its state (`alab harness ○ off`).
+    /// The switch's selected state cells (`alab harness v0.1 ▐ ● on ▌` when lit, `▐ ○ off ▌` when off).
     pub(crate) switch: std::ops::Range<usize>,
-    /// The `on` button's cells, on an off switch.
+    /// The `on` segment's cells, on an off switch.
     pub(crate) button: Option<std::ops::Range<usize>>,
     pub(crate) session: u64,
     /// What the switch said.
@@ -903,10 +903,7 @@ impl TitleReading {
         &mut self,
         generation: u64,
         built: (AutopilotView, ChipGlass),
-        read_words: impl FnOnce() -> (
-            Option<crate::harness_glass::HeldGlass>,
-            Option<crate::needs::HarnessAsk>,
-        ),
+        read_words: impl FnOnce() -> ReadWords,
         read_trail: impl FnOnce(bool) -> (String, Option<i64>),
     ) -> bool {
         if self.generation == generation && self.built == built {
@@ -936,13 +933,10 @@ pub(crate) struct TitleParts {
 /// ([`TitleReading::refresh`] and its first build) and `chrome`'s `title=` ([`title_parts`]).
 fn compose_title(
     built: &(AutopilotView, ChipGlass),
-    read_words: impl FnOnce() -> (
-        Option<crate::harness_glass::HeldGlass>,
-        Option<crate::needs::HarnessAsk>,
-    ),
+    read_words: impl FnOnce() -> ReadWords,
     read_trail: impl FnOnce(bool) -> (String, Option<i64>),
 ) -> TitleParts {
-    let (hold, need) = read_words();
+    let (hold, need, stopped) = read_words();
     let (trail, today) = read_trail(title_stamped(&built.1) || hold.is_some());
     let (whole, short) = autopilot_title(
         built.0,
@@ -952,6 +946,7 @@ fn compose_title(
         TitleWords {
             hold: hold.as_ref(),
             need: need.as_ref(),
+            stopped,
         },
     );
     TitleParts {
@@ -2295,6 +2290,16 @@ fn light_face(
 }
 
 impl ChipFace {
+    /// Whether the harness types under this face (`∞`, `∞ ⤓18:00`, `⤓ land`): the faces a stop is
+    /// said on (§14.3), never an Off, landed or quiet one.
+    #[must_use]
+    pub(crate) const fn carries(self) -> bool {
+        matches!(
+            self,
+            ChipFace::Cruise | ChipFace::CruiseUntil | ChipFace::Land
+        )
+    }
+
     /// Every face, in order.
     #[cfg(test)]
     pub(crate) const ALL: [ChipFace; 9] = [
@@ -2438,6 +2443,25 @@ impl ChipFace {
     ) -> Option<std::borrow::Cow<'static, str>> {
         use crate::autopilot::mode_words;
         use aterm_agent::supervise::Autopilot;
+        if let Some(stopped) = words.stop_under(self) {
+            let stop =
+                crate::harness_glass::stop_words(stopped, crate::harness_glass::HoldForm::Title);
+            let held = words
+                .hold
+                .filter(|_| self == ChipFace::Land)
+                .and_then(|hold| {
+                    crate::harness_glass::hold_words(
+                        hold,
+                        words.need,
+                        crate::harness_glass::HoldForm::Title,
+                        today,
+                    )
+                });
+            return Some(match held {
+                Some(held) => format!("{stop}{}{held}", crate::native_ui::FACT_SEPARATOR).into(),
+                None => stop.into(),
+            });
+        }
         let fixed = match self {
             ChipFace::Cruise => mode_words(Autopilot::Cruise).chip,
             ChipFace::CruiseUntil => crate::autopilot::TIMED_CRUISE_CHIP,
@@ -2541,7 +2565,17 @@ pub(crate) struct TitleWords<'a> {
     pub(crate) hold: Option<&'a crate::harness_glass::HeldGlass>,
     /// The session's need, where the published one is a harness's own ask.
     pub(crate) need: Option<&'a crate::needs::HarnessAsk>,
+    /// The arm that stopped the typing, as the loop told it, whatever the face (§14.3).
+    pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
 }
+
+/// What a title reads of a session beside its glass, copied out: Land's hold, the need and the
+/// stop ([`TitleWords`]).
+pub(crate) type ReadWords = (
+    Option<crate::harness_glass::HeldGlass>,
+    Option<crate::needs::HarnessAsk>,
+    Option<aterm_agent::harness::acts::HeldBy>,
+);
 
 impl<'a> TitleWords<'a> {
     /// The need said on its own part of the title (`· needs you: …; carrying on`).
@@ -2563,6 +2597,14 @@ impl<'a> TitleWords<'a> {
     pub(crate) fn hold_under(self, face: ChipFace) -> Option<&'a crate::harness_glass::HeldGlass> {
         self.hold.filter(|_| face == ChipFace::Land)
     }
+
+    /// The stop `face` says (§14.3): under a face the harness types under alone
+    /// ([`ChipFace::carries`]). While it stands it takes the place of the mode's own promise, and
+    /// the lapsed pause and the trail are not said.
+    #[must_use]
+    pub(crate) fn stop_under(self, face: ChipFace) -> Option<aterm_agent::harness::acts::HeldBy> {
+        self.stopped.filter(|_| face.carries())
+    }
 }
 
 /// The words a title reads of session `session` ([`TitleWords`]), copied out.
@@ -2570,14 +2612,15 @@ fn title_words_of(
     glass: &std::collections::HashMap<u64, crate::harness_glass::SessionGlass>,
     pool: &crate::SessionPool,
     session: u64,
-) -> (
-    Option<crate::harness_glass::HeldGlass>,
-    Option<crate::needs::HarnessAsk>,
-) {
-    let hold = glass
-        .get(&session)
-        .and_then(crate::harness_glass::SessionGlass::hold);
-    (hold, with_harness_ask(pool, session, |need| need.cloned()))
+) -> ReadWords {
+    let own = glass.get(&session);
+    let hold = own.and_then(crate::harness_glass::SessionGlass::hold);
+    let stopped = own.and_then(crate::harness_glass::SessionGlass::stopped);
+    (
+        hold,
+        with_harness_ask(pool, session, |need| need.cloned()),
+        stopped,
+    )
 }
 
 /// Session `session`'s published need where it is a harness's ask.
@@ -2622,7 +2665,12 @@ pub(crate) fn autopilot_title(
     let click = face.click(glass);
     const PAUSE_LEAD: &str = " \u{b7} ";
     let need = words.need_under(face).map(crate::harness_glass::need_title);
-    let pause = glass.pause.map(|p| p.title_words(today));
+    let stopped = words.stop_under(face).is_some();
+    let pause = glass
+        .pause
+        .filter(|_| !stopped)
+        .map(|p| p.title_words(today));
+    let trail = if stopped { "" } else { trail };
     let mut whole = String::with_capacity(
         phrase.len()
             + explanation
@@ -4281,7 +4329,11 @@ pub(crate) fn autopilot_description(
     today: Option<i64>,
     last: Option<String>,
 ) -> Option<String> {
+    let stopped = words.stop_under(face);
     let parts: Vec<String> = [
+        stopped.map(|arm| {
+            crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Spoken)
+        }),
         words.hold_under(face).and_then(|hold| {
             crate::harness_glass::hold_words(
                 hold,
@@ -4293,8 +4345,11 @@ pub(crate) fn autopilot_description(
         words
             .need_under(face)
             .map(crate::harness_glass::need_spoken),
-        glass.pause.map(|p| p.spoken(today)),
-        last,
+        glass
+            .pause
+            .filter(|_| stopped.is_none())
+            .map(|p| p.spoken(today)),
+        last.filter(|_| stopped.is_none()),
     ]
     .into_iter()
     .flatten()
@@ -4312,13 +4367,13 @@ impl App {
         glass: &ChipGlass,
     ) -> (String, Option<String>) {
         let face = ChipFace::of(view, glass);
-        let hold = self
-            .harness_glass
-            .get(&session)
-            .and_then(crate::harness_glass::SessionGlass::hold);
+        let own = self.harness_glass.get(&session);
+        let hold = own.and_then(crate::harness_glass::SessionGlass::hold);
+        let stopped = own.and_then(crate::harness_glass::SessionGlass::stopped);
         let held = TitleWords {
             hold: hold.as_ref(),
             need: None,
+            stopped: None,
         }
         .hold_under(face)
         .is_some();
@@ -4329,6 +4384,7 @@ impl App {
             let words = TitleWords {
                 hold: hold.as_ref(),
                 need,
+                stopped,
             };
             autopilot_description(face, glass, words, today, last)
         });

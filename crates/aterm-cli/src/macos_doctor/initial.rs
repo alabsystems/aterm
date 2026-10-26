@@ -48,6 +48,14 @@ mod repositories;
 #[cfg(test)]
 mod vault_sync_tests;
 
+#[cfg(test)]
+pub(super) fn resume_native_accounts_after_init_for_test(
+    root: &Path,
+    account: &std::sync::Arc<crate::macos_doctor::accounts_visibility_tests::Account>,
+) -> Result<Option<Report>, String> {
+    tests::resume_native_accounts_after_init_for_test(root, account)
+}
+
 /// One independently retried part of a setup run. The discriminant is the bit
 /// the progress record stores, so a stored bit keeps its meaning across versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1214,6 +1222,116 @@ fn in_plan_vault(plan: &Plan, configured: Result<Option<ConfiguredVault>, String
         Ok(None) => false,
         Err(_) => true,
     }
+}
+
+/// Whether this process let a probe of the ALab vault nobody answered through to the join, to
+/// wait for macOS's Local Network answer ([`unjoined_alab_row`]).
+static UNANSWERED_PROBE_JOINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The row System State's Secrets stage stops at for a plan that names the ALab vault this Mac
+/// has not joined, from what the probe of its address heard (`here`) and what a LAN look last
+/// heard of macOS's Local Network switch (`lan`, [`access::last_answer`]); `None` lets the join
+/// go ahead (design §3.3).
+///
+/// A server that holds no ALab vault leaves the row waiting for a change of network, the next
+/// launch, a new plan or Check again. A probe nobody answered is asked again after the Secrets
+/// retry pause, except the first in this process (`joined`, set here) while no look has heard
+/// how the switch stands: macOS may be holding the probe's lookup until the person answers its
+/// question, so that join goes ahead and its own look waits for the answer (`init_secrets`'
+/// patient look, spent once per process too), and the Mac joins within seconds of Allow, not a
+/// retry pause later. Once a look heard the switch, waiting for the person cannot help: the
+/// network or the vault failed with it on, or the person turned it off. The record keeps an
+/// answer from earlier launches, and an asked question from one long answered, so only the
+/// first probe of a process waits for it.
+fn unjoined_alab_row(
+    here: scope::VaultHere,
+    lan: Option<access::LanAnswer>,
+    joined: &std::sync::atomic::AtomicBool,
+) -> Option<Row> {
+    use access::LanAnswer;
+    let status = match here {
+        scope::VaultHere::Absent => WAITING,
+        scope::VaultHere::Unreached => {
+            let heard = matches!(lan, Some(LanAnswer::Reached | LanAnswer::Refused));
+            if !heard && !joined.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            UNREACHED
+        }
+        scope::VaultHere::Found | scope::VaultHere::Unasked => return None,
+    };
+    Some(Row {
+        name: Stage::Secrets.name().into(),
+        status: status.into(),
+        detail: here.note()?.into(),
+        elapsed_ms: None,
+    })
+}
+
+/// [`secrets_rows`] of the join a probe nobody answered let through ([`unjoined_alab_row`]): a
+/// row its look stood aside on reads as the probe's own row would have for what the look heard,
+/// with the look's words. A vault that did not answer it either is [`UNREACHED`], so the pass
+/// parks and the Secrets retry pause asks again; a server there holding no vault is [`WAITING`]
+/// for a change ([`aterm_machines::init_secrets::NO_VAULT_NOW`]).
+fn unanswered_join_rows(reports: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
+    let parked: Vec<Option<&'static str>> = reports
+        .iter()
+        .map(|report| match &report.stood_aside {
+            Some(aterm_converge::StoodAside::Offline(why))
+                if report.outcome == aterm_machines::model::Outcome::Blocked =>
+            {
+                Some(
+                    if why.starts_with(aterm_machines::init_secrets::NO_VAULT_NOW) {
+                        WAITING
+                    } else {
+                        UNREACHED
+                    },
+                )
+            }
+            _ => None,
+        })
+        .collect();
+    secrets_rows(reports)
+        .into_iter()
+        .zip(parked)
+        .map(|(row, parked)| match parked {
+            Some(status) => Row {
+                status: status.into(),
+                ..row
+            },
+            None => row,
+        })
+        .collect()
+}
+
+/// What the join a probe nobody answered let through ([`unjoined_alab_row`]) heard of macOS's
+/// Local Network switch, kept for the Local Network row and later launches
+/// ([`access::lan_answered`]) as the probe would have kept it. A join made, or waiting for an admin
+/// Mac, and a server there holding no vault are a reach; macOS refusing the vault's `.local` name
+/// is the person's Don't Allow; a look nothing answered says nothing of the switch.
+fn join_lan_answer(reports: &[aterm_machines::model::ItemReport]) -> Option<access::LanAnswer> {
+    use access::LanAnswer::{Reached, Refused};
+    use aterm_converge::StoodAside;
+    use aterm_machines::model::Outcome;
+    reports
+        .iter()
+        .find_map(|report| match (report.outcome, &report.stood_aside) {
+            (Outcome::Changed, None) | (Outcome::Blocked, Some(StoodAside::Waiting(_))) => {
+                Some(Reached)
+            }
+            (Outcome::Blocked, Some(StoodAside::Offline(why))) => {
+                if why.starts_with(aterm_machines::init_secrets::NO_VAULT_NOW) {
+                    Some(Reached)
+                } else {
+                    aterm_secrets::client::refused_by_local_network(&aterm_secrets::Error::new(
+                        why.as_str(),
+                    ))
+                    .then_some(Refused)
+                }
+            }
+            _ => None,
+        })
 }
 
 /// The plan in force as offered and shown: the `saved` one (or every group, before any is saved)
@@ -4198,7 +4316,7 @@ pub struct InitialSetupParkMark {
     /// The run whose Repositories stage is unfinished: the Command Line Tools arriving may end
     /// its wait ([`InitialSetupParkMark::facts_changed_since`]).
     developer_tools_run: Option<u64>,
-    /// Whether Command Line Tools git is installed, read for [`Self::developer_tools_run`]
+    /// Whether the git every clone runs is installed, read for [`Self::developer_tools_run`]
     /// ([`InitialSetupParkMark::with_developer_tools`]).
     developer_tools: Option<bool>,
     retry_due: Option<u64>,
@@ -5117,27 +5235,19 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
                 "another macOS dialog is still up; the join waits for it".into(),
             )]);
         };
-        // The ALab vault's own address, not joined yet: when the probe hears no ALab vault
-        // on this network, the row says what it heard (design §3.3). One that holds none
-        // waits for a change of network, the next launch, a new plan or Check again; one
-        // that did not answer is asked again after the Secrets retry pause.
+        // The ALab vault's own address, not joined yet: the probe's answer decides whether the
+        // join goes ahead ([`unjoined_alab_row`]).
+        let mut unanswered = false;
         if plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL
             && !in_plan_vault(plan, live_configured_vault())
         {
             let here = scope::probe_vault();
-            if let Some(note) = here.note() {
-                let status = if here == scope::VaultHere::Unreached {
-                    UNREACHED
-                } else {
-                    WAITING
-                };
-                return Ok(vec![Row {
-                    name: Stage::Secrets.name().into(),
-                    status: status.into(),
-                    detail: note.into(),
-                    elapsed_ms: None,
-                }]);
+            if let Some(row) =
+                unjoined_alab_row(here, access::last_answer(), &UNANSWERED_PROBE_JOINED)
+            {
+                return Ok(vec![row]);
             }
+            unanswered = here == scope::VaultHere::Unreached;
         }
         let ops = aterm_machines::init_secrets::unattended(&ctx)?;
         aterm_machines::init::run_initial_secrets(
@@ -5149,7 +5259,15 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
             password,
             APPROVAL_WAIT,
         )
-        .map(secrets_rows)
+        .map(|reports| {
+            if !unanswered {
+                return secrets_rows(reports);
+            }
+            if let Some(answer) = join_lan_answer(&reports) {
+                access::lan_answered(answer);
+            }
+            unanswered_join_rows(reports)
+        })
     }
 
     fn secrets_pace(&mut self) -> Option<Pace> {
@@ -5613,7 +5731,16 @@ fn execute_pass(
         Ok(Some(follow_up)) => {
             let at = report.rows.len();
             report.rows.extend(follow_up.rows);
-            if let Some(page) = follow_up.page {
+            let page = if let Some(restore) = follow_up.restore {
+                // The pass keeps the put-back's outcome separately from its
+                // raw keys and reader rows, which belong only in CLI output.
+                // Even an empty page stands for that raw range.
+                report.restore = Some(restore);
+                Some(follow_up.page.unwrap_or_default())
+            } else {
+                follow_up.page
+            };
+            if let Some(page) = page {
                 pages.push((at..report.rows.len(), page));
             }
         }
@@ -5802,6 +5929,9 @@ fn execute_initial_for_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod deferred_mac_deadline_tests;
+    mod embedded_restore_tests;
 
     type StageReading = (bool, Vec<Setting>, Vec<Subject>);
 
@@ -7244,6 +7374,29 @@ mod tests {
         let mut startup = InitialSetupAuthorization::capture_at(root).unwrap();
         let offered = startup.offer_reading(root, || Ok(None)).unwrap();
         startup.persist_at(root, &offered).result.unwrap()
+    }
+
+    pub(super) fn resume_native_accounts_after_init_for_test(
+        root: &Path,
+        account: &std::sync::Arc<crate::macos_doctor::accounts_visibility_tests::Account>,
+    ) -> Result<Option<Report>, String> {
+        use crate::macos_doctor::accounts_visibility_tests::system;
+
+        let Some(revision) = launch_startup(root) else {
+            return Ok(None);
+        };
+        let mut host = Fake {
+            native_accounts: Some((
+                system(None, account),
+                NativeHost::over(
+                    Box::new(system(None, account)),
+                    Box::new(aterm_machines::init::prepare_workstation_selected),
+                ),
+            )),
+            ..Fake::default()
+        };
+        execute_initial_for_revision(&mut host, root, revision, &mut None, SetupHooks::NONE)
+            .map(|pass| pass.map(|(report, _)| report))
     }
 
     /// A person's Cancel of the first-launch review holds until they ask again (System State
@@ -13354,6 +13507,214 @@ mod tests {
             host.calls
         );
         assert!(finished_at(root.path()).unwrap());
+    }
+
+    /// The ALab vault's probe stops an unjoined Mac's Secrets stage at what it heard, except the
+    /// first probe nobody answered in a process while no look has heard how macOS's Local Network
+    /// switch stands (no answer, or a question asked): that join goes ahead and its own look
+    /// waits for the answer. A later one, or one after a look heard the switch, stops unreached.
+    /// Negative controls: stopping at every probe nobody answered, as before, fails the untold
+    /// and asked first tries; letting every one through fails the second.
+    #[test]
+    fn only_a_first_unanswered_alab_probe_lets_the_join_wait_for_the_local_network_answer() {
+        use access::LanAnswer::{Asked, Reached, Refused};
+        use scope::VaultHere;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stops = |here, lan, joined: &AtomicBool| {
+            unjoined_alab_row(here, lan, joined).map(|row| (row.name, row.status, row.detail))
+        };
+        let row = |status: &str, detail: &str| {
+            Some((
+                Stage::Secrets.name().to_owned(),
+                status.to_owned(),
+                detail.to_owned(),
+            ))
+        };
+        let unreached = row(UNREACHED, scope::NOT_REACHED);
+        for lan in [None, Some(Asked)] {
+            let joined = AtomicBool::new(false);
+            assert_eq!(stops(VaultHere::Unreached, lan, &joined), None, "{lan:?}");
+            assert!(joined.load(Ordering::Relaxed));
+            assert_eq!(
+                stops(VaultHere::Unreached, lan, &joined),
+                unreached,
+                "{lan:?}"
+            );
+        }
+        for lan in [Some(Reached), Some(Refused)] {
+            let joined = AtomicBool::new(false);
+            assert_eq!(
+                stops(VaultHere::Unreached, lan, &joined),
+                unreached,
+                "{lan:?}"
+            );
+            assert!(!joined.load(Ordering::Relaxed), "{lan:?}: no join waited");
+        }
+        for lan in [None, Some(Asked), Some(Reached), Some(Refused)] {
+            let joined = AtomicBool::new(false);
+            assert_eq!(
+                stops(VaultHere::Absent, lan, &joined),
+                row(WAITING, scope::NO_VAULT),
+                "{lan:?}"
+            );
+            assert_eq!(stops(VaultHere::Found, lan, &joined), None, "{lan:?}");
+            assert_eq!(stops(VaultHere::Unasked, lan, &joined), None, "{lan:?}");
+            assert!(!joined.load(Ordering::Relaxed), "{lan:?}");
+        }
+    }
+
+    /// The join a probe nobody answered let through parks as the probe's own row would have:
+    /// a row stood aside because the vault did not answer is unreached, and one whose look heard
+    /// a server with no vault waits, each with the look's words, so the pass parks; any other row
+    /// is as [`secrets_rows`] has it. Negative control: the plain rows leave it blocked, which
+    /// retries the pass every minute.
+    #[test]
+    fn a_join_an_unanswered_probe_let_through_parks_where_the_vault_does_not_answer() {
+        use aterm_converge::StoodAside;
+        use aterm_machines::model::{Effect, ItemReport, Outcome};
+        let item = |outcome: Outcome, stood_aside: Option<StoodAside>, why: &str| ItemReport {
+            id: "secrets.vault".into(),
+            family: "secrets".into(),
+            title: "vault".into(),
+            outcome,
+            from: None,
+            to: None,
+            why: Some(why.to_owned()),
+            revert: None,
+            effect: Effect::Now,
+            detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside,
+            essential: false,
+            elapsed_ms: None,
+        };
+        let offline = "the vault does not answer, so nothing was changed: no route";
+        let no_vault = format!(
+            "{}: a login page",
+            aterm_machines::init_secrets::NO_VAULT_NOW
+        );
+        let reports = vec![
+            item(
+                Outcome::Blocked,
+                Some(StoodAside::Offline(offline.into())),
+                offline,
+            ),
+            item(
+                Outcome::Blocked,
+                Some(StoodAside::Waiting("an admin Mac".into())),
+                "approve",
+            ),
+            item(Outcome::Changed, None, "joined"),
+            item(
+                Outcome::Blocked,
+                Some(StoodAside::Offline(no_vault.clone())),
+                &no_vault,
+            ),
+        ];
+        let seen = |rows: Vec<Row>| {
+            rows.into_iter()
+                .map(|row| (row.name, row.status, row.detail))
+                .collect::<Vec<_>>()
+        };
+        let secrets = Stage::Secrets.name().to_owned();
+        assert_eq!(
+            seen(unanswered_join_rows(reports.clone())),
+            [
+                (secrets.clone(), UNREACHED.to_owned(), offline.to_owned()),
+                (secrets.clone(), WAITING.to_owned(), "approve".to_owned()),
+                (secrets.clone(), "applied".to_owned(), "joined".to_owned()),
+                (secrets.clone(), WAITING.to_owned(), no_vault.clone()),
+            ]
+        );
+        assert_eq!(
+            SetupNext::of(&unanswered_join_rows(reports.clone())[..1]),
+            SetupNext::Park
+        );
+        assert_eq!(SetupNext::of(&secrets_rows(reports)[..1]), SetupNext::Retry);
+    }
+
+    /// The join a probe nobody answered let through keeps what its look heard of macOS's Local
+    /// Network switch, as the probe would have: a join made or waiting for an admin Mac, or a
+    /// server there with no vault, reads the switch on; macOS refusing the vault's `.local` name
+    /// reads it off; a look nothing answered leaves it untold, so a laptop away from the vault's
+    /// LAN never reads on. Negative controls: keeping nothing leaves the joined Mac's row untold;
+    /// reading every stand-aside as a reach fails the unanswered case.
+    #[test]
+    fn a_join_an_unanswered_probe_let_through_keeps_what_its_look_heard_of_the_lan() {
+        use access::{Lan, LanAnswer};
+        use aterm_converge::StoodAside;
+        use aterm_machines::model::{Effect, ItemReport, Outcome};
+        let item = |outcome: Outcome, stood_aside: Option<StoodAside>| ItemReport {
+            id: "secrets.vault".into(),
+            family: "secrets".into(),
+            title: "vault".into(),
+            outcome,
+            from: None,
+            to: None,
+            why: stood_aside.as_ref().map(|aside| aside.why().to_owned()),
+            revert: None,
+            effect: Effect::Now,
+            detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside,
+            essential: false,
+            elapsed_ms: None,
+        };
+        let refused = format!(
+            "the vault does not answer, so nothing was changed: fetching \
+             http://alab-secrets.local:7484/v1/alab: {}",
+            aterm_secrets::client::LOCAL_NETWORK_REFUSED
+        );
+        let cases = [
+            (
+                item(Outcome::Changed, None),
+                Some(LanAnswer::Reached),
+                Lan::On,
+            ),
+            (
+                item(
+                    Outcome::Blocked,
+                    Some(StoodAside::Waiting("an admin Mac approves it".into())),
+                ),
+                Some(LanAnswer::Reached),
+                Lan::On,
+            ),
+            (
+                item(
+                    Outcome::Blocked,
+                    Some(StoodAside::Offline(format!(
+                        "{}: a login page",
+                        aterm_machines::init_secrets::NO_VAULT_NOW
+                    ))),
+                ),
+                Some(LanAnswer::Reached),
+                Lan::On,
+            ),
+            (
+                item(Outcome::Blocked, Some(StoodAside::Offline(refused))),
+                Some(LanAnswer::Refused),
+                Lan::Off,
+            ),
+            (
+                item(
+                    Outcome::Blocked,
+                    Some(StoodAside::Offline(
+                        "the vault does not answer, so nothing was changed: no route".into(),
+                    )),
+                ),
+                None,
+                Lan::Untold,
+            ),
+        ];
+        for (report, answer, lan) in cases {
+            let heard = join_lan_answer(std::slice::from_ref(&report));
+            assert_eq!(heard, answer, "{report:?}");
+            assert_eq!(Lan::of(heard, &[]), lan, "{report:?}");
+        }
     }
 
     /// A Mac where aterm saved no plan and the vault's `source.toml` cannot be read (a

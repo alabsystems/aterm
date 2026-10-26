@@ -239,6 +239,7 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
         format!("--window-height={grid_rows}"),
     ];
     let max_secs_s = max_secs.to_string();
+    let (rows_s, cols_s) = (grid_rows.to_string(), cols.to_string());
     let mut counted: Vec<(Term, BTreeMap<String, Vec<f64>>)> = Vec::new();
     for i in 1..=trials {
         for term in order(i) {
@@ -251,6 +252,8 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
                     &bench_dir,
                     &prefix,
                     Path::new(&max_secs_s),
+                    Path::new(&rows_s),
+                    Path::new(&cols_s),
                     inbox.path(),
                 ],
             )?;

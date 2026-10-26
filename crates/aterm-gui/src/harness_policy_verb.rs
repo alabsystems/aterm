@@ -5,7 +5,8 @@
 
 use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
 use aterm_agent::supervise::policy::turn_end::{
-    continuation_text, done_check_text, land_answer_text, land_nudge_text, land_text,
+    DONE_ANGLES, DONE_TAIL, continuation_text, done_check_text, land_answer_text, land_nudge_text,
+    land_text,
 };
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_phase::Program;
@@ -73,22 +74,29 @@ pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String
     }
 }
 
-/// The additive text keys after `questions=`, in their wire order.
-pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
+/// The additive text keys after `questions=`, in their wire order. `done_check_angles` and
+/// `done_check_tail` came with v6's 5a, after the rest: a reader keys on names, and one that
+/// meets a reply without them keeps `done_check_text` whole (the tests' `done_checks_of`, the
+/// downgrade parse such a reader writes).
+pub(crate) const ACT_TEXT_KEYS: [&str; 8] = [
     "done_check_text",
     "land_text",
     "land_nudge_text",
     "land_answer_text",
     "needs_hint_text",
     "needs_ack_text",
+    "done_check_angles",
+    "done_check_tail",
 ];
 
 /// Autopilot Cruise / Land's fixed words as aterm's own loop types them for a session whose
 /// standing rules read `rules`, keyed by [`ACT_TEXT_KEYS`]: the four whole acts through the
-/// turn-end policy's own composers (the rules after the words), the two suffixes bare.
+/// turn-end policy's own composers (the rules after the words; the done check is its first
+/// angle's whole act), the two suffixes bare, then Cruise's six angles in order, one to a line,
+/// and the words that follow each, bare.
 #[must_use]
-pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
-    let [done_check, land, nudge, answer, hint, ack] = ACT_TEXT_KEYS;
+pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 8] {
+    let [done_check, land, nudge, answer, hint, ack, angles, tail] = ACT_TEXT_KEYS;
     [
         (done_check, done_check_text(rules, false)),
         (land, land_text(rules)),
@@ -96,6 +104,8 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
         (answer, land_answer_text(rules)),
         (hint, NEEDS_HINT.to_string()),
         (ack, NEEDS_ACK.to_string()),
+        (angles, DONE_ANGLES.join("\n")),
+        (tail, DONE_TAIL.to_string()),
     ]
 }
 
@@ -468,6 +478,34 @@ mod tests {
         assert!(text.ends_with("never force-push)"), "{text}");
     }
 
+    /// A READER'S DONE CHECKS FROM THE REPLY `line`: the acts its rotation types at each claim in
+    /// turn, as aterm's own loop types them. Each is `done_check_text` with its first angle given
+    /// way to the claim's (the base before it and the tail and standing rules after it kept). A
+    /// reply from a build before v6's 5a carries no `done_check_angles=`, or one whose first angle
+    /// `done_check_text` does not hold: then the one fixed text, whole, at every claim (the
+    /// downgrade). `None` where the reply holds no `done_check_text=` at all.
+    fn done_checks_of(line: &str) -> Option<Vec<String>> {
+        let field = |key: &str| {
+            line.trim_end()
+                .split(' ')
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+                .filter(|v| *v != "-")
+                .map(aterm_control::wire::pct_decode)
+        };
+        let whole = field("done_check_text")?;
+        let angles = field("done_check_angles").unwrap_or_default();
+        let angles: Vec<&str> = angles.lines().filter(|a| !a.is_empty()).collect();
+        let Some((before, after)) = angles.first().and_then(|first| whole.split_once(first)) else {
+            return Some(vec![whole]);
+        };
+        Some(
+            angles
+                .iter()
+                .map(|angle| format!("{before}{angle}{after}"))
+                .collect(),
+        )
+    }
+
     fn act_texts_of(line: &str) -> Vec<(&'static str, String)> {
         ACT_TEXT_KEYS
             .iter()
@@ -480,19 +518,23 @@ mod tests {
     }
 
     #[test]
-    fn the_six_texts_are_the_loops_own_words_composed_as_it_composes_them() {
-        use aterm_agent::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_ANSWER, LAND_NUDGE};
+    fn the_texts_are_the_loops_own_words_composed_as_it_composes_them() {
+        use aterm_agent::supervise::policy::turn_end::{
+            LAND, LAND_ANSWER, LAND_NUDGE, done_check_words,
+        };
         let cfg = SupervisorConfig::default();
         let bare = act_texts_of(&reply(&facts(cfg.clone()), None, true));
         assert_eq!(
             bare,
             [
-                ("done_check_text", DONE_CHECK.to_string()),
+                ("done_check_text", done_check_words(0)),
                 ("land_text", LAND.to_string()),
                 ("land_nudge_text", LAND_NUDGE.to_string()),
                 ("land_answer_text", LAND_ANSWER.to_string()),
                 ("needs_hint_text", NEEDS_HINT.to_string()),
                 ("needs_ack_text", NEEDS_ACK.to_string()),
+                ("done_check_angles", DONE_ANGLES.join("\n")),
+                ("done_check_tail", DONE_TAIL.to_string()),
             ]
         );
         let rules = "never force-push";
@@ -503,7 +545,10 @@ mod tests {
         assert_eq!(ruled[2].1, land_nudge_text(Some(rules)));
         assert_eq!(ruled[3].1, land_answer_text(Some(rules)));
         for ((key, with), (_, without)) in ruled.iter().zip(&bare) {
-            let suffix = matches!(*key, "needs_hint_text" | "needs_ack_text");
+            let suffix = matches!(
+                *key,
+                "needs_hint_text" | "needs_ack_text" | "done_check_angles" | "done_check_tail"
+            );
             assert_eq!(with.contains(rules), !suffix, "{key}: {with}");
             if suffix {
                 assert_eq!(with, without, "{key}");
@@ -517,6 +562,73 @@ mod tests {
             ACT_TEXT_KEYS.iter().all(|k| field(&edge, k).is_none()),
             "{edge}"
         );
+    }
+
+    /// THE ANGLES ROUND-TRIP: a reader of the reply rebuilds each of the six done checks the loop
+    /// types in turn, the standing rules after each, from `done_check_text`, `done_check_angles`
+    /// and `done_check_tail`; and `done_check_text` stays one whole act, the first angle's.
+    /// NEGATIVE CONTROL: main's reply, which has neither new key, reads as its one fixed text at
+    /// every claim (the downgrade), and so does a reply whose angles `done_check_text` does not
+    /// hold.
+    #[test]
+    fn the_angles_round_trip_and_a_reply_without_them_reads_as_one_text() {
+        use aterm_agent::supervise::policy::turn_end::{
+            DONE_CHECK, DONE_CHECK_FIXED_BEFORE, done_check_act,
+        };
+        let cfg = SupervisorConfig::default();
+        let rules = "never force-push";
+        let line = reply(&facts(cfg), Some(rules), true);
+        let raw = field(&line, "done_check_angles").expect("the angles");
+        assert!(!raw.contains('\n'), "one line on the wire: {raw}");
+        let angles = aterm_control::wire::pct_decode(&raw);
+        assert_eq!(angles.lines().collect::<Vec<_>>(), DONE_ANGLES);
+        assert_eq!(
+            field(&line, "done_check_tail").map(|t| aterm_control::wire::pct_decode(&t)),
+            Some(DONE_TAIL.to_string())
+        );
+        let checks = done_checks_of(&line).expect("a done check");
+        let typed: Vec<String> = (0..DONE_ANGLES.len())
+            .map(|n| done_check_act(n, Some(rules), false))
+            .collect();
+        assert_eq!(checks, typed);
+        assert_eq!(checks[0], done_check_text(Some(rules), false));
+        for (check, angle) in checks.iter().zip(DONE_ANGLES) {
+            assert!(check.starts_with(DONE_CHECK), "{check}");
+            assert!(
+                check.contains(angle) && check.contains(DONE_TAIL),
+                "{check}"
+            );
+            assert!(check.ends_with(&format!("{rules})")), "{check}");
+        }
+        let mains: String = line
+            .trim_end()
+            .split(' ')
+            .filter(|kv| {
+                !kv.starts_with("done_check_angles=") && !kv.starts_with("done_check_tail=")
+            })
+            .map(|kv| match kv.strip_prefix("done_check_text=") {
+                Some(_) => format!(
+                    "done_check_text={}",
+                    crate::control::pct_encode(DONE_CHECK_FIXED_BEFORE)
+                ),
+                None => kv.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(field(&mains, "done_check_angles").is_none(), "{mains}");
+        assert_eq!(
+            done_checks_of(&mains),
+            Some(vec![DONE_CHECK_FIXED_BEFORE.to_string()])
+        );
+        let foreign = format!(
+            "{mains} done_check_angles={}",
+            crate::control::pct_encode("Another angle.\nAnd another.")
+        );
+        assert_eq!(
+            done_checks_of(&foreign),
+            Some(vec![DONE_CHECK_FIXED_BEFORE.to_string()])
+        );
+        assert_eq!(done_checks_of("OK effective=on"), None);
     }
 
     #[test]

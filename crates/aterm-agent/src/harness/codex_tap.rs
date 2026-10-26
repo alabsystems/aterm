@@ -19,31 +19,44 @@ const SESSION_META: &str = aterm_phase::anchor!("rollout.session_meta");
 const KEY_ID: &str = aterm_phase::anchor!("rollout.id");
 const KEY_CLI_VERSION: &str = aterm_phase::anchor!("rollout.cli_version");
 
-/// Why a tap bound nothing, in one word ([`Self::word`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Refusal {
+/// Declares [`Refusal`], its word table and [`Refusal::ALL`] from one variant list, so a
+/// refusal the tap can produce is always among those a reader of the words enumerates.
+macro_rules! refusals {
+    ($($(#[$doc:meta])* $variant:ident => $word:literal,)*) => {
+        /// Why a tap bound nothing, in one word ([`Self::word`]).
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Refusal {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl Refusal {
+            /// Every refusal, so a reader of the words (`status rollout=`'s help) reads them
+            /// from here; the same list as the enum's, so it cannot miss one.
+            pub const ALL: &'static [Refusal] = &[$(Refusal::$variant,)*];
+
+            /// The refusal's word.
+            #[must_use]
+            pub const fn word(self) -> &'static str {
+                match self {
+                    $(Refusal::$variant => $word,)*
+                }
+            }
+        }
+    };
+}
+
+refusals! {
     /// No rollout of the thread under the home (yet).
-    NoRollout,
+    NoRollout => "no-rollout",
     /// The rollout's first row is not written whole yet, or runs past the read's bound.
-    NoMeta,
+    NoMeta => "no-meta",
     /// The rollout's first row is no `session_meta` of the thread (final).
-    OtherThread,
+    OtherThread => "other-thread",
     /// The build its `session_meta` names is not one [`CODEX_MEASURED_BUILDS`] holds (final).
-    Unmeasured,
+    Unmeasured => "unmeasured",
 }
 
 impl Refusal {
-    /// The refusal's word.
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            Refusal::NoRollout => "no-rollout",
-            Refusal::NoMeta => "no-meta",
-            Refusal::OtherThread => "other-thread",
-            Refusal::Unmeasured => "unmeasured",
-        }
-    }
-
     /// Whether the refusal stands for the tap's life.
     #[must_use]
     pub const fn is_final(self) -> bool {

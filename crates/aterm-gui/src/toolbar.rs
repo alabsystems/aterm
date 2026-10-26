@@ -791,7 +791,7 @@ mod macos {
     use crate::app_tabs::{NativeTabCommand, TabStripOrigin};
     use crate::appkit::{self, consts};
     use crate::menu::MenuAction;
-    use crate::session_chrome::{ConnVerb, RewindMenuOrigin, TabChromeExt, TabMenuEntry};
+    use crate::session_chrome::{ConnVerb, TabChromeExt, TabMenuEntry, TerminalMenuOrigin};
     use crate::tab_bar::{
         TAB_ICON_DESIGN_SIZE, TAB_ICON_NATIVE_SIZE, TAB_STATUS_KINDS, TabConnRole,
         TabIconPrimitive, TabStatusKind, TabStripMetadata, native_tab_content_layout,
@@ -1896,6 +1896,9 @@ mod macos {
         /// rendered as an `NSMenu` per pop and read back by [`read_tab_menus`] for the
         /// `chrome` mirror.
         menu_entries: RefCell<Vec<TabMenuEntry>>,
+        /// Session rows, including disabled and unbound entries, captured only at pop.
+        /// `tabMenuSessionAction:` indexes this snapshot rather than current chrome.
+        menu_session_actions: RefCell<Vec<(Option<TerminalMenuOrigin>, MenuAction, bool)>>,
         /// The connection rows of the open menu's pop-time snapshot, in order; a
         /// `tabMenuConnection:` click decodes its `tag` as an index into this.
         menu_conn: RefCell<Vec<(aterm_session::SessionId, ConnVerb)>>,
@@ -1903,7 +1906,7 @@ mod macos {
         /// a `tabMenuUpgrade:` click decodes its `tag` against it.
         menu_upgrade: RefCell<Vec<(String, String, aterm_messages::UpgradeWord)>>,
         /// The Rewind rows' captured terminal and instant; a `tabMenuRewind:` click decodes its `tag` against this pop-time snapshot.
-        menu_rewind: RefCell<Vec<(Option<RewindMenuOrigin>, u64)>>,
+        menu_rewind: RefCell<Vec<(Option<TerminalMenuOrigin>, u64)>>,
     }
 
     aterm_objc::declare_class! {
@@ -2149,6 +2152,28 @@ mod macos {
                         action,
                     });
                 }
+            }
+
+            /// Dispatch an enabled session row against the owner captured when popped.
+            @sel(tabMenuSessionAction:)
+            fn tab_menu_session_action(&self, sender: Id) {
+                if sender.is_null() {
+                    return;
+                }
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed; its tag is NSInteger.
+                let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                let Ok(index) = usize::try_from(tag) else { return };
+                let ivars = self.ivars();
+                let Some((Some(origin), action, true)) = ivars.menu_session_actions.borrow().get(index).copied() else {
+                    return;
+                };
+                let Some(tab) = ivars.menu_tab.get() else { return };
+                let _ = ivars.proxy.send_event(Wake::TabMenuSessionAction {
+                    window: ivars.window,
+                    tab,
+                    origin,
+                    action,
+                });
             }
 
             /// Dispatch a per-peer connection action indexed by the sender's tag.
@@ -2476,6 +2501,7 @@ mod macos {
                 title: RefCell::new(title.to_string()),
                 tooltip: RefCell::new(tooltip.map(str::to_string)),
                 menu_entries: RefCell::new(Vec::new()),
+                menu_session_actions: RefCell::new(Vec::new()),
                 menu_conn: RefCell::new(Vec::new()),
                 menu_upgrade: RefCell::new(Vec::new()),
                 menu_rewind: RefCell::new(Vec::new()),
@@ -2854,6 +2880,19 @@ mod macos {
                 return;
             }
             self.ivars().menu_tab.set(Some(self.tab_id()));
+            *self.ivars().menu_session_actions.borrow_mut() = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    TabMenuEntry::SessionAction {
+                        origin,
+                        action,
+                        enabled,
+                        ..
+                    } => Some((*origin, *action, *enabled)),
+                    _ => None,
+                })
+                .collect();
+            let mut session_action_index: isize = 0;
             *self.ivars().menu_conn.borrow_mut() = entries
                 .iter()
                 .filter_map(|e| match e {
@@ -2932,6 +2971,26 @@ mod macos {
                             };
                             appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
                             appkit::send_v_bool(item.id(), sel!(setEnabled:), *enabled);
+                            appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
+                            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+                        }
+                        TabMenuEntry::SessionAction {
+                            label,
+                            enabled,
+                            origin,
+                            ..
+                        } => {
+                            let tag = session_action_index;
+                            session_action_index += 1;
+                            let Some(item) = item_with(label, sel!(tabMenuSessionAction:)) else {
+                                continue;
+                            };
+                            appkit::send_v_isize(item.id(), sel!(setTag:), tag);
+                            appkit::send_v_bool(
+                                item.id(),
+                                sel!(setEnabled:),
+                                *enabled && origin.is_some(),
+                            );
                             appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
@@ -4289,6 +4348,7 @@ mod macos {
                 ),
                 (TabView::class(), sel!(closeTab:), "v@:@".into()),
                 (TabView::class(), sel!(tabMenuAction:), "v@:@".into()),
+                (TabView::class(), sel!(tabMenuSessionAction:), "v@:@".into()),
                 (TabView::class(), sel!(tabMenuConnection:), "v@:@".into()),
                 (TabView::class(), sel!(dealloc), "v@:".into()),
                 (

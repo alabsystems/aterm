@@ -281,6 +281,103 @@ fn a_real_return_and_natural_wrap_keep_their_immediate_row_move() {
 }
 
 #[test]
+fn a_submitted_composer_owns_the_next_echo_after_a_generic_boundary() {
+    use aterm_effects::cursor_glow::{AdmissionPhase, AdmissionRecord};
+    use aterm_effects::rainbow_kitty::TypedClass;
+
+    let mut h = Host::new();
+    h.program(b"\x1b[?1049h\x1b[21;3Hseed");
+    assert!(h.term.is_alternate_screen());
+    assert_eq!((h.term.cursor().row, h.term.cursor().col), (20, 6));
+    h.glow.clear_typed(h.now);
+    h.now += Duration::from_millis(90);
+    h.glow.note_return_keeping_hand(h.now);
+    h.program(b"\x1b[21;1H\x1b[2K  ");
+    assert_eq!((h.term.cursor().row, h.term.cursor().col), (20, 2));
+    let submitted = h
+        .glow
+        .admission_log()
+        .last()
+        .copied()
+        .expect("the submit reset was judged");
+    assert_eq!(
+        (
+            submitted.phase,
+            submitted.licence,
+            submitted.origin,
+            submitted.target
+        ),
+        (
+            AdmissionPhase::Licensed,
+            AdmissionRecord::LICENCE_KEY,
+            (20, 6),
+            (20, 2)
+        ),
+        "the alternate-screen Return licenses the actual composer reset"
+    );
+    h.idle(500);
+    let before = h.glow.admission_tally();
+    h.program(b"\x1b7\x1b[19;1Hs\x1b8");
+    h.program(b"\x1b7\x1b[19;2Ht\x1b8");
+    assert!(h.live(18).is_empty(), "keyless response output stays dark");
+    assert_eq!(h.glow.admission_tally().licensed, before.licensed);
+    assert_eq!((h.term.cursor().row, h.term.cursor().col), (20, 2));
+
+    h.now += Duration::from_millis(90);
+    h.glow
+        .note_typed_expected(h.now, 1, false, TypedClass::Glyph, 'i');
+    let forgotten = h.glow.in_flight_tally().forgotten;
+    for (column, glyph) in [(3, 'x'), (4, 'i')] {
+        h.program(format!("\x1b7\x1b[19;{column}H{glyph}\x1b8").as_bytes());
+        assert!(
+            h.glow.admission_log().any(|record| {
+                record.origin == (18, column - 1)
+                    && record.target == (18, column)
+                    && record.reason == CursorGlow::DECLINE_PROGRAM_ROW
+            }),
+            "a foreign-row {glyph:?} cannot claim the pending composer key"
+        );
+        assert!(h.live(18).is_empty());
+        assert_eq!(h.glow.admission_tally().licensed, before.licensed);
+        assert_eq!(h.glow.in_flight_tally().forgotten, forgotten);
+        assert_eq!(h.glow.in_flight_tally().credits, 1);
+        assert_eq!((h.term.cursor().row, h.term.cursor().col), (20, 2));
+    }
+
+    h.program(b"i");
+    for (glyph, class) in [(b' ', TypedClass::Space), (b'j', TypedClass::Glyph)] {
+        h.now += Duration::from_millis(90);
+        h.glow
+            .note_typed_expected(h.now, 1, false, class, char::from(glyph));
+        h.program(&[glyph]);
+    }
+    assert_eq!((h.term.cursor().row, h.term.cursor().col), (20, 5));
+    let mut row = Vec::new();
+    h.term.row_cols_into(20, &mut row);
+    assert_eq!(&row[2..5], &['i', ' ', 'j']);
+    assert!(h.live(18).is_empty(), "the response row never receives ink");
+    let refused: Vec<_> = h
+        .glow
+        .admission_log()
+        .filter(|record| {
+            record.seq > submitted.seq
+                && record.origin.0 == 20
+                && record.phase == AdmissionPhase::Declined
+        })
+        .map(|record| (record.phase, record.reason, record.origin, record.target))
+        .collect();
+    assert_eq!(
+        (
+            h.live(20),
+            h.glow.admission_tally().licensed - before.licensed,
+            refused
+        ),
+        (vec![2, 3, 4], 3, Vec::new()),
+        "a classified submit must release the prior generic boundary's doubt for its own glyph, space and following glyph"
+    );
+}
+
+#[test]
 fn a_coalesced_pair_across_the_pending_margin_wrap_lights_both_glyphs() {
     let mut h = Host::new();
     h.program(b"\x1b[21;79H");

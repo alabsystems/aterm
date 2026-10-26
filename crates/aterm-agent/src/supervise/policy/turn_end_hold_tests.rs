@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use crate::harness::acts::{HoldLeg, LandHeld, OpenWord, TaskFace};
+use crate::harness::acts::{HeldBy, HoldLeg, LandHeld, OpenWord, TaskFace};
 use crate::harness::repo_work::RepoWork;
+use crate::supervise::policy::exception::{Exception, Urgency, exception_for};
+use crate::supervise::policy::outlook::ExceptionKind;
 use crate::supervise::policy::turn_end::HoldStart;
 
 const WORK: &str = "Implemented the parser module and its unit tests in this turn.";
@@ -706,5 +708,312 @@ fn someone_elses_turn_seen_only_at_its_end_drops_the_legs() {
     assert!(
         again.read && again.holds(HoldLeg::Open) && again.nudges == 1,
         "{again:?}"
+    );
+}
+
+/// A HOLD'S FIRST ACT under `mode`: the session at its first point, its work done, the act typed and ledgered.
+fn begun_under(mode: Autopilot, managed: bool) -> (TurnEndState, Instant) {
+    let now = t0();
+    let mut st = TurnEndState::default();
+    st.set_managed(managed);
+    st.face_start();
+    let a = act(&mut st, &under(mode, idle(WORK, Some(3 * MIN))), now);
+    let rule = a
+        .rule_id()
+        .unwrap_or_else(|| panic!("{mode:?}: an act: {a:?}"));
+    st.ledgered(rule, SINCE_MS);
+    (st, now)
+}
+
+/// Each act answered quickly with no work by `answer(k)` under `mode`, until the point holds: the answers it took, the exception it stands under and the hold's arm.
+fn held_after(
+    mode: Autopilot,
+    managed: bool,
+    repo: Option<RepoWork>,
+    answer: impl Fn(usize) -> String,
+) -> (usize, Option<Exception>, Option<HeldBy>) {
+    const QUICK: Duration = Duration::from_secs(30);
+    let (mut st, mut now) = begun_under(mode, managed);
+    for k in 0..4 * NO_WORK_ACTS {
+        now += 2 * MIN;
+        st.took();
+        let mut r = under(
+            mode,
+            TurnEndReading {
+                repo: crate::harness::repo_work::RepoRead::of_found(repo.clone()),
+                ..idle(&answer(k), Some(QUICK))
+            },
+        );
+        loop {
+            match act(&mut st, &r, now) {
+                TurnEndAction::Nothing => {
+                    return (k + 1, exception_for(&st, &r, &cfg(), now), st.held_by());
+                }
+                // The back-off waited out, the same screen read again at its end.
+                TurnEndAction::WaitUntil { until, .. } => {
+                    now = until;
+                    r.worked = None;
+                }
+                a => {
+                    let rule = a.rule_id().unwrap_or_else(|| panic!("{mode:?}: {a:?}"));
+                    st.ledgered(rule, SINCE_MS + 60_000 * i64::try_from(k + 1).unwrap_or(0));
+                    break;
+                }
+            }
+        }
+    }
+    panic!("{mode:?}: never held");
+}
+
+/// One case of the loud hold: its name, mode, answer, repository finding, whether a manager
+/// waits on it, and the exception its hold raises.
+type HoldCase = (
+    &'static str,
+    Autopilot,
+    String,
+    Option<RepoWork>,
+    bool,
+    Exception,
+);
+
+#[test]
+fn the_one_loud_hold_is_lands_with_repository_work_in_a_session_no_manager_waits_on() {
+    use crate::harness::acts::HeldBy::SameReply;
+    let repo = found(0, 1, 0, 0, 0);
+    let rows: [HoldCase; 6] = [
+        (
+            "land, a Repo leg",
+            Autopilot::Land,
+            CLEAN.to_string(),
+            Some(repo.clone()),
+            false,
+            Exception::repeats_land(SameReply, Some(&repo)),
+        ),
+        (
+            "land, an Open leg and a Repo leg",
+            Autopilot::Land,
+            open_defense(),
+            Some(repo.clone()),
+            false,
+            Exception::repeats_land(SameReply, Some(&repo)),
+        ),
+        (
+            "land, an Open leg alone",
+            Autopilot::Land,
+            open_defense(),
+            None,
+            false,
+            Exception::repeats(SameReply),
+        ),
+        (
+            "land, a Needs leg alone",
+            Autopilot::Land,
+            needs_defense(),
+            None,
+            false,
+            Exception::repeats(SameReply),
+        ),
+        (
+            "land, a Repo leg, a managed worker",
+            Autopilot::Land,
+            CLEAN.to_string(),
+            Some(repo.clone()),
+            true,
+            Exception::repeats(SameReply),
+        ),
+        (
+            "cruise, repository work",
+            Autopilot::Cruise,
+            CLEAN.to_string(),
+            Some(repo.clone()),
+            false,
+            Exception::repeats(SameReply),
+        ),
+    ];
+    for (case, mode, said, repo, managed, want) in rows {
+        let (answers, told, held) = held_after(mode, managed, repo, |_| said.clone());
+        assert_eq!(answers, 2, "{case}: held at the second same answer");
+        assert_eq!(held, Some(SameReply), "{case}");
+        assert_eq!(told.as_ref(), Some(&want), "{case}");
+    }
+    let loud = Exception::repeats_land(SameReply, Some(&repo));
+    assert_eq!(
+        (loud.kind, loud.when, loud.held, loud.title),
+        (
+            ExceptionKind::Stalled,
+            Urgency::Now,
+            Some(SameReply),
+            Some(("aterm stopped typing", "Stopped typing"))
+        )
+    );
+    assert!(
+        loud.why
+            .contains(&crate::supervise::policy::turn_end::repo_finding(&repo)),
+        "its why names the repository's finding: {loud:?}"
+    );
+    let quiet = Exception::repeats(SameReply);
+    assert_eq!((quiet.when, quiet.title), (Urgency::Later, None));
+}
+
+/// A LAND HOLD AT A SPENT API WALL IS THE WALL'S (limit 3 of §14.0): Land's nudge read the Repo
+/// leg, then a retryable API error answered each of aterm's tries the same until they were spent,
+/// which holds at the wall's reply (`Kept::holds`). That hold is told Later at the wall, and stays
+/// Later once the wall's notice leaves the screen: no band says the agent gave the same reply
+/// twice, and the repository's work is not what stopped it. (The same Land run with no wall is
+/// `Urgency::Now`: the one loud hold above.)
+#[test]
+fn a_spent_api_walls_hold_under_land_with_repository_work_stays_a_fact_for_later() {
+    let repo = found(0, 1, 0, 0, 0);
+    let on_repo = |r: TurnEndReading| {
+        land(TurnEndReading {
+            repo: crate::harness::repo_work::RepoRead::of_found(Some(repo.clone())),
+            ..r
+        })
+    };
+    let (mut st, mut now) = begun_under(Autopilot::Land, false);
+    now += 2 * MIN;
+    st.took();
+    let mut r = on_repo(idle(CLEAN, Some(Duration::from_secs(30))));
+    let nudged = loop {
+        match act(&mut st, &r, now) {
+            TurnEndAction::WaitUntil { until, .. } => {
+                now = until;
+                r.worked = None;
+            }
+            a => break a,
+        }
+    };
+    assert_eq!(
+        nudged.rule_id(),
+        Some(RULE_LAND_NUDGE),
+        "Land's nudge at the first answer: {nudged:?}"
+    );
+    st.ledgered(RULE_LAND_NUDGE, SINCE_MS + 60_000);
+    assert!(
+        st.land_held()
+            .is_some_and(|hold| hold.read && hold.holds(HoldLeg::Repo)),
+        "the nudge read the Repo leg: {:?}",
+        st.land_held()
+    );
+    let kind = WallKind::ApiError {
+        code: Some(500),
+        retryable: true,
+        cause: aterm_phase::ApiCause::Server,
+    };
+    let mut w = on_repo(walled(
+        kind,
+        "API Error: 500 Internal server error",
+        Some(Duration::from_secs(4)),
+    ));
+    let mut retries = Vec::new();
+    loop {
+        assert!(retries.len() <= 12, "the wall's tries end: {retries:?}");
+        now += Duration::from_secs(5);
+        match act(&mut st, &w, now) {
+            TurnEndAction::WaitUntil { until, .. } => {
+                now = until;
+                w.worked = None;
+            }
+            TurnEndAction::Nothing => break,
+            a => {
+                retries.push(a.rule_id().unwrap_or("?"));
+                w.worked = Some(Duration::from_secs(4));
+            }
+        }
+    }
+    assert!(
+        !retries.is_empty() && retries.iter().all(|rule| *rule == "api-retry@v1"),
+        "aterm retried the wall until its tries were spent: {retries:?}"
+    );
+    assert_eq!(st.held_by(), Some(HeldBy::SameReply));
+    w.worked = None;
+    now += MIN;
+    st.observe(&w, now);
+    assert_eq!(
+        exception_for(&st, &w, &cfg(), now),
+        Some(Exception::repeats(HeldBy::SameReply)),
+        "at the wall"
+    );
+    let left = TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        ..w.clone()
+    };
+    now += MIN;
+    st.observe(&left, now);
+    assert_eq!(
+        exception_for(&st, &left, &cfg(), now),
+        Some(Exception::repeats(HeldBy::SameReply)),
+        "once the wall's notice left the screen, the wall's hold is still a fact for later"
+    );
+}
+
+#[test]
+fn six_no_work_answers_each_worded_its_own_way_hold_as_no_work() {
+    use crate::harness::acts::HeldBy::NoWork;
+    let worded = |k: usize| {
+        let case = char::from(b'a' + u8::try_from(k % 26).unwrap_or(0));
+        format!("Nothing left: the parser is committed and pushed, case {case}.")
+    };
+    let repo = found(0, 1, 0, 0, 0);
+    for (mode, repo, want) in [
+        (Autopilot::Cruise, None, Exception::repeats(NoWork)),
+        (
+            Autopilot::Land,
+            Some(repo.clone()),
+            Exception::repeats_land(NoWork, Some(&repo)),
+        ),
+    ] {
+        let (answers, told, held) = held_after(mode, false, repo, worded);
+        assert_eq!(answers, NO_WORK_ACTS, "{mode:?}");
+        assert_eq!(held, Some(NoWork), "{mode:?}");
+        assert_eq!(told, Some(want), "{mode:?}");
+    }
+    // Each exception says its own arm, in the arm's one wording (`HeldBy::answered`): no
+    // no-work hold is told as the same reply, quiet or loud.
+    let quiet = Exception::repeats;
+    let loud = |held: HeldBy| Exception::repeats_land(held, Some(&repo));
+    assert_ne!(quiet(NoWork).why, quiet(HeldBy::SameReply).why);
+    assert_ne!(loud(NoWork).why, loud(HeldBy::SameReply).why);
+    for held in HeldBy::ALL {
+        assert!(loud(held).why.contains(&held.answered()), "{held:?}");
+    }
+    assert!(quiet(NoWork).why.contains(&NoWork.answered()));
+    assert_ne!(quiet(NoWork).clears, quiet(HeldBy::SameReply).clears);
+}
+
+#[test]
+fn a_switch_to_land_over_a_standing_hold_types_nothing_and_off_then_land_types_lands_act() {
+    let (mut st, mut now) = begun_under(Autopilot::Cruise, false);
+    let r = |worked| under(Autopilot::Cruise, idle(CLEAN, worked));
+    while st.held_by().is_none() {
+        assert!(now < t0() + 60 * MIN, "held under Cruise within the hour");
+        now += 2 * MIN;
+        st.took();
+        if let TurnEndAction::WaitUntil { until, .. } =
+            act(&mut st, &r(Some(Duration::from_secs(30))), now)
+        {
+            now = until;
+            act(&mut st, &r(None), now);
+        }
+    }
+    assert_eq!(act(&mut st, &r(None), now + MIN), TurnEndAction::Nothing);
+    let switched = land(idle(CLEAN, None));
+    assert_eq!(
+        act(&mut st, &switched, now + 2 * MIN),
+        TurnEndAction::Nothing,
+        "a switch to Land restarts no typing"
+    );
+    st.park_off();
+    assert_eq!(st.held_by(), None, "Off's park clears the replies");
+    // The short turns' back-off stands across the park; the act at its end is Land's own.
+    let typed = match act(&mut st, &switched, now + 3 * MIN) {
+        TurnEndAction::WaitUntil { until, .. } => act(&mut st, &switched, until),
+        a => a,
+    };
+    assert_eq!(
+        typed,
+        land_instruction(),
+        "Off, then Land, types Land's act"
     );
 }

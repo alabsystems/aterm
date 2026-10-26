@@ -80,6 +80,12 @@ pub struct Window {
     /// A same-reply chain's looks in front past its hold ([`held::look_step`]): each its
     /// `autopilot` line, title and all (`-` where its label was not in the strip).
     pub held: Vec<(i64, String)>,
+    /// What a screen reader is handed at each of those looks, one per [`Self::held`] entry at its
+    /// time: `sid`'s Autopilot chip node and the window's Messages band row nodes ([`ax_of`]).
+    pub held_ax: Vec<(i64, String)>,
+    /// `cruise-n`'s stand-in ask beside its N4 report ([`stopped::ask_step`]): what Needs you and
+    /// `presence pressing=` showed of the two ([`stopped::Read::line`]).
+    pub stopped: Option<(i64, String)>,
 }
 
 impl Window {
@@ -752,6 +758,28 @@ pub fn chip_of(chrome: &str, sid: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// THE SCREEN READER'S HARNESS NODES in a `chrome` read (a development build's `a11y` lines,
+/// §14.3's windowed read): `sid`'s Autopilot chip node and every Messages band row node, as the
+/// window's accessibility tree is built for the adapter, one a line without the `a11y ` head;
+/// `-` where `chrome` printed none.
+#[must_use]
+pub fn ax_of(chrome: &str, sid: &str) -> String {
+    let chip = format!("autopilot sid={sid} ");
+    let nodes: Vec<&str> = chrome
+        .lines()
+        .filter_map(|l| l.strip_prefix("a11y "))
+        .filter(|l| {
+            l.split_once(' ')
+                .is_some_and(|(_, node)| node.starts_with(&chip) || node.starts_with("band row="))
+        })
+        .collect();
+    if nodes.is_empty() {
+        "-".to_string()
+    } else {
+        nodes.join("\n")
+    }
+}
+
 /// An `autopilot` line's ` title=` field split off it (a development build's, §12.5.4's 5d): the
 /// line without it, and the title (`Some("-")` where it printed `title=-`, `None` where it printed
 /// no such field: a release build's, or one before 5d).
@@ -1244,6 +1272,11 @@ pub const WANTS: &[Want] = &[
         name: "(c), never (b), on a row one level in under its row (indent=1)",
         judge: |s, c| n_further(s, c, 3),
     },
+    Want {
+        under: Under::Scenario(Scenario::N4),
+        name: stopped::WANT,
+        judge: stopped::first,
+    },
 ];
 
 /// Folds applicable [`WANTS`] assertions into scenario `s`'s record verdict `v`.
@@ -1283,8 +1316,9 @@ fn compose(a: Verdict, name: &str, b: Verdict) -> Verdict {
     }
 }
 
-/// The faces a chain's chip may wear at `t`.
-fn faces_at(chain: Chain, done: Option<i64>, t: i64) -> Vec<&'static str> {
+/// The faces a chain's chip may wear at `t`: same-land's also `theirs` from its person's turn
+/// (`person`) on, the exchange that turn opened being theirs.
+fn faces_at(chain: Chain, done: Option<i64>, person: Option<i64>, t: i64) -> Vec<&'static str> {
     match chain.autopilot() {
         "cruise" => vec!["cruise"],
         "off" => vec!["off"],
@@ -1294,7 +1328,7 @@ fn faces_at(chain: Chain, done: Option<i64>, t: i64) -> Vec<&'static str> {
                 Some(d) if t >= d - 10_000 => vec!["land", "landed"],
                 _ => vec!["land"],
             };
-            if chain == Chain::LandP {
+            if chain == Chain::LandP || chain == Chain::SameLand && person.is_some_and(|p| t >= p) {
                 v.push("theirs");
             }
             v
@@ -1320,7 +1354,7 @@ fn chip_faces(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let mut bad = Vec::new();
     for (t, l) in &lines {
         let c = chip(l);
-        let allowed = faces_at(cx.chain, done, *t);
+        let allowed = faces_at(cx.chain, done, seen.stop_person_ms, *t);
         if !allowed.contains(&c.face.as_str()) {
             bad.push(format!(
                 "+{} face={} (wanted {allowed:?})",
@@ -1765,6 +1799,9 @@ pub enum TitleSays {
     Sentence,
     /// Under Land, a READ hold's words in the sentence's place (`not landed yet: …`, §12.4.12).
     Held,
+    /// Under Land or Cruise, the stop in the sentence's place (§14.3: `stopped typing: …`, 3a's
+    /// [`stop_words`](aterm_agent::harness::acts::stop_words) for the arm it names).
+    Stopped(aterm_agent::harness::acts::HeldBy),
     /// A face past Land's own (`land, landed`, `land, quiet`): no mode sentence to say. It holds
     /// the `face=` that says it (`landed`, `theirs`). A landed title says
     /// [`LANDED_WORDS`](aterm_agent::supervise::mode_words::LANDED_WORDS) whole (§14.9, 9a).
@@ -1813,6 +1850,19 @@ pub fn title_says(t: &str, mode: &str) -> TitleSays {
     }
     if m == Autopilot::Land && rest.starts_with("not landed yet: ") && !rest.contains(sentence) {
         return TitleSays::Held;
+    }
+    if matches!(m, Autopilot::Land | Autopilot::Cruise)
+        && let Some(arm) = aterm_agent::harness::acts::HeldBy::ALL
+            .into_iter()
+            .find(|arm| {
+                rest.starts_with(&aterm_agent::harness::acts::stop_words(
+                    *arm,
+                    aterm_agent::harness::acts::StopForm::Title,
+                ))
+            })
+        && !rest.contains(sentence)
+    {
+        return TitleSays::Stopped(arm);
     }
     TitleSays::Wrong(format!("its sentence is not {sentence:?}"))
 }
@@ -1893,12 +1943,19 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
                 observed += 1;
                 said.push(format!("{at_t} {}", one_line(title, 160)));
             }
-            TitleSays::Held | TitleSays::Past(_) if *place == "opening" && !spawned_opening => bad
-                .push(format!(
+            TitleSays::Held | TitleSays::Past(_) | TitleSays::Stopped(_)
+                if *place == "opening" && !spawned_opening =>
+            {
+                bad.push(format!(
                     "{at_t}: before its first prompt, not its mode's sentence: {}",
                     one_line(title, 200)
-                )),
+                ));
+            }
             TitleSays::Held if c.face == "land" => {
+                observed += usize::from(spawned_opening);
+                said.push(format!("{at_t} {}", one_line(title, 160)));
+            }
+            TitleSays::Stopped(_) if c.face == mode => {
                 observed += usize::from(spawned_opening);
                 said.push(format!("{at_t} {}", one_line(title, 160)));
             }
@@ -1906,7 +1963,7 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
                 observed += usize::from(spawned_opening);
                 said.push(format!("{at_t} {}", one_line(title, 160)));
             }
-            TitleSays::Held | TitleSays::Past(_) => bad.push(format!(
+            TitleSays::Held | TitleSays::Past(_) | TitleSays::Stopped(_) => bad.push(format!(
                 "{at_t}: not the words of its chip's face={}: {}",
                 c.face,
                 one_line(title, 200)
@@ -3681,6 +3738,9 @@ pub mod hold;
 
 #[path = "forever_held.rs"]
 pub mod held;
+
+#[path = "forever_stopped.rs"]
+pub mod stopped;
 
 #[cfg(test)]
 #[path = "forever_surfaces_tests.rs"]

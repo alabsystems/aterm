@@ -166,8 +166,12 @@ impl App {
                             None,
                         )
                     });
+                let stopped = self
+                    .harness_glass
+                    .get(&h.local_id)
+                    .and_then(crate::harness_glass::SessionGlass::stopped);
                 (
-                    crate::app_presence::driven_words(face, &glass, None, landed),
+                    crate::app_presence::driven_words(face, &glass, None, landed, stopped),
                     held,
                 )
             });

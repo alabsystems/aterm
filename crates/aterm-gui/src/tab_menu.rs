@@ -129,6 +129,7 @@ fn entry_text(entry: &TabMenuEntry) -> &str {
         TabMenuEntry::Event { words, .. } | TabMenuEntry::RewindTo { words, .. } => words,
         TabMenuEntry::Separator => "",
         TabMenuEntry::Action { label, .. } => label,
+        TabMenuEntry::SessionAction { label, .. } => label,
         TabMenuEntry::ConnectionAction { label, .. } => label,
         TabMenuEntry::Upgrade { label, .. } => label,
     }
@@ -140,6 +141,11 @@ pub(crate) const fn is_selectable(entry: &TabMenuEntry) -> bool {
     matches!(
         entry,
         TabMenuEntry::Action { enabled: true, .. }
+            | TabMenuEntry::SessionAction {
+                enabled: true,
+                origin: Some(_),
+                ..
+            }
             | TabMenuEntry::ConnectionAction { enabled: true, .. }
             | TabMenuEntry::Upgrade { .. }
             | TabMenuEntry::RewindTo {
@@ -405,9 +411,12 @@ pub(crate) fn paint(
         let (fg, bold) = match entry {
             TabMenuEntry::Header(_) | TabMenuEntry::Event { .. } => (c.band.label, false),
             TabMenuEntry::Action { enabled: false, .. }
+            | TabMenuEntry::SessionAction { enabled: false, .. }
+            | TabMenuEntry::SessionAction { origin: None, .. }
             | TabMenuEntry::ConnectionAction { enabled: false, .. }
             | TabMenuEntry::RewindTo { origin: None, .. } => (c.disabled, false),
             TabMenuEntry::Action { .. }
+            | TabMenuEntry::SessionAction { .. }
             | TabMenuEntry::ConnectionAction { .. }
             | TabMenuEntry::Upgrade { .. }
             | TabMenuEntry::RewindTo { .. }
@@ -416,6 +425,7 @@ pub(crate) fn paint(
                 (c.sel_fg, true)
             }
             TabMenuEntry::Action { .. }
+            | TabMenuEntry::SessionAction { .. }
             | TabMenuEntry::ConnectionAction { .. }
             | TabMenuEntry::Upgrade { .. }
             | TabMenuEntry::RewindTo { .. } => (c.band.value, false),
@@ -480,6 +490,14 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
             TabMenuEntry::Separator => 1u8.hash(&mut h),
             TabMenuEntry::Action { label, enabled, .. } => {
                 (2u8, label.as_str(), *enabled).hash(&mut h);
+            }
+            TabMenuEntry::SessionAction {
+                label,
+                enabled,
+                origin,
+                ..
+            } => {
+                (7u8, label.as_str(), *enabled, *origin).hash(&mut h);
             }
             TabMenuEntry::ConnectionAction {
                 label,

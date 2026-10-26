@@ -1152,7 +1152,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     let record = status(&app);
     assert!(
         record.contains(
-            " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- \
+            " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- end=- end_seen=- \
              end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
              turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
         ),
@@ -1307,7 +1307,7 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     let record = status(&app);
     assert!(
         record.contains(&format!(
-            " task=- pause={AT} land_held=- land_nudges=- land_since=- end=- end_seen=- end_cheered=- \
+            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- end=- end_seen=- end_cheered=- \
              goal=- task_state=- task_rev=0 log_seq="
         )),
         "{record}"
@@ -1690,7 +1690,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              idle_ready_min waits waits_ready supervisor supervisor_proven autopilot \
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
-             resizes flaps land_at task pause land_held land_nudges land_since end end_seen \
+             resizes flaps land_at task pause land_held land_nudges land_since held end end_seen \
              end_cheered goal task_state task_rev \
              log_seq log_ep run turn step need need_since_ms rollout rollout_asks editing bells \
              bells_sounded last_bell gen seq hash"
@@ -2611,7 +2611,7 @@ fn the_status_record_carries_the_task_record() {
     let none = app.session_status_record(0).expect("live session");
     assert!(
         none.contains(
-            " pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- end_cheered=- \
+            " pause=- land_held=- land_nudges=- land_since=- held=- end=- end_seen=- end_cheered=- \
              goal=- task_state=- task_rev=0 log_seq="
         ),
         "{none}"
@@ -2622,7 +2622,7 @@ fn the_status_record_carries_the_task_record() {
     let record = app.session_status_record(0).expect("live session");
     assert!(
         record.contains(
-            " task=- pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- end_cheered=- \
+            " task=- pause=- land_held=- land_nudges=- land_since=- held=- end=- end_seen=- end_cheered=- \
              goal=- task_state=done task_rev=2 log_seq="
         ),
         "{record}"

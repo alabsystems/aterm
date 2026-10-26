@@ -118,6 +118,7 @@ impl<'a> At<'a> {
                 reclaimed: &self.reclaimed,
                 passing: self.passing,
                 alive: &alive,
+                ahead: Ahead::default(),
             },
         )
     }
@@ -683,7 +684,10 @@ fn the_line_goes_once_then_free_space_rising_settles_the_episode_and_rising_past
     assert!(
         matches!(
             two.step(&mut lease, t + COOLDOWN_MS),
-            Said::Opened { done: Done::Spent }
+            Said::Opened {
+                done: Done::Spent,
+                projected: None
+            }
         ),
         "the cooldown is over"
     );
@@ -1209,7 +1213,10 @@ fn an_episode_parked_out_or_settled_gives_way_to_a_new_one_after_the_cooldown() 
     );
     assert_eq!(
         one.step(&mut lease, now),
-        Said::Opened { done: Done::Spent },
+        Said::Opened {
+            done: Done::Spent,
+            projected: None
+        },
         "the parked episode gives way to a new one"
     );
     assert_eq!(
@@ -1242,7 +1249,13 @@ fn an_episode_parked_out_or_settled_gives_way_to_a_new_one_after_the_cooldown() 
         "within the cooldown of its line it stays settled"
     );
     let said = one.step(&mut lease, t + 60_000 + COOLDOWN_MS);
-    assert_eq!(said, Said::Opened { done: Done::Spent });
+    assert_eq!(
+        said,
+        Said::Opened {
+            done: Done::Spent,
+            projected: None
+        }
+    );
     let e = lease.entry(KEY).expect("entry");
     assert!(
         e.picks.is_empty() && e.asks == 0 && e.last_ask_ms == Some(t),
@@ -2930,6 +2943,7 @@ fn the_line_names_the_volume_the_holders_and_the_rule_within_its_cap() {
         checkout: Some(Path::new("/Users//u/aterm")),
         shared: false,
         home: Some(Path::new("/Users//u")),
+        projected: None,
     });
     assert!(text.starts_with("[aterm harness] aterm: "), "{text}");
     assert!(text.ends_with("(rule disk-free@v1)"), "{text}");
@@ -2960,6 +2974,7 @@ fn a_line_owed_while_the_episode_is_held_past_its_floor_says_how_near_it_is() {
         checkout: None,
         shared: false,
         home: None,
+        projected: None,
     });
     assert!(
         text.contains("50.0 GiB free, within 5.0 GiB of its 48.0 GiB floor"),
@@ -2987,6 +3002,7 @@ fn a_holder_path_with_any_character_beyond_the_plain_ones_is_not_said() {
         checkout: None,
         shared: false,
         home: Some(Path::new("/Users//u")),
+        projected: None,
     });
     assert!(!text.contains("rm -rf"), "{text}");
     assert!(text.contains("a build directory's builds 50"), "{text}");
@@ -3008,6 +3024,7 @@ fn a_long_holder_path_is_clipped_and_holders_drop_before_the_line_passes_its_cap
         checkout: None,
         shared: false,
         home: Some(Path::new("/Users//u")),
+        projected: None,
     });
     assert!(text.contains('…'), "{text}");
     assert!(text.chars().count() <= LINE_CAP, "{}", text.chars().count());
@@ -3034,6 +3051,7 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
             checkout: Some(Path::new(own)),
             shared: false,
             home: Some(Path::new(home)),
+            projected: None,
         })
     };
     // The asked tab's own worktree, nested in a checkout under a long name, on the common
@@ -3104,6 +3122,7 @@ fn a_holder_too_long_to_say_whole_is_named_clipped_never_said_to_be_none() {
                 checkout: Some(Path::new(own)),
                 shared: false,
                 home: Some(Path::new(home)),
+                projected: None,
             },
             cap,
         )
@@ -3179,6 +3198,7 @@ fn a_volume_mounted_at_a_long_path_gives_way_to_the_asked_tabs_own_build() {
             checkout: Some(Path::new(&alpha)),
             shared: false,
             home: Some(Path::new(mount)),
+            projected: None,
         })
     };
     let holders = [
@@ -3238,6 +3258,7 @@ fn a_holder_of_a_checkout_another_session_works_in_is_marked_shared_within_the_c
             checkout: Some(Path::new(own)),
             shared,
             home: Some(home),
+            projected: None,
         })
     };
     let alone = at("/System/Volumes/Data", &holders, "/Users//u/aterm", false);
@@ -3314,6 +3335,7 @@ fn a_holder_of_a_checkout_another_session_works_in_is_marked_shared_within_the_c
                 checkout: Some(Path::new(own)),
                 shared: true,
                 home: Some(home),
+                projected: None,
             },
             cap,
         )

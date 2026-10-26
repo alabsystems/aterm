@@ -95,6 +95,10 @@ pub(crate) const RETIRED_KEYS: [&str; 8] = [
     "privacy.secrets.not-synced",
 ];
 
+/// The menu line's note under a verified Full Disk Access grant an update left off
+/// ([`App::note_fda_off_after_update`]).
+pub(crate) const FDA_AFTER_UPDATE: &str = "The update needs Full Disk Access re-allowed.";
+
 /// The vault join's waiting entry, which carries the approval code an admin Mac needs: it ends
 /// only once a status has read the Secrets row.
 pub(crate) const JOIN_PENDING_KEY: &str = "privacy.secrets.join-pending";
@@ -189,6 +193,9 @@ pub(crate) struct AccessSteps {
     /// unless the approved revision's Full Disk Access step is declined
     /// ([`App::fda_declined_in_revision`]).
     fda_regressed: bool,
+    /// The regressed grant reads off in a build newer than the one that verified it
+    /// ([`App::note_fda_off_after_update`]): the menu line says the update needs it re-allowed.
+    fda_after_update: bool,
     /// Whether the window's own Full Disk Access step is declined under the
     /// marker key it was read for (the approved revision's): read once per key,
     /// and again after a decline this process notes.
@@ -211,6 +218,9 @@ pub(crate) struct AccessSteps {
     /// The approved access revision this process last saw: another one is a new
     /// approval in this process ([`App::rearm_access_steps`]).
     seen_revision: Option<u64>,
+    /// No revision stood at a look since the last one that saw it: a revision standing again
+    /// admits a Developer Tools step queued meanwhile ([`App::rearm_access_steps`]).
+    revision_lapsed: bool,
     /// The launch check found Full Disk Access off on a Mac where aterm never
     /// verified it, and no grant was verified here since
     /// ([`App::note_fda_unverified_here`]): a new approval brings the window's
@@ -260,6 +270,7 @@ impl AccessSteps {
             pane_act: None,
             pane_until: None,
             fda_regressed: false,
+            fda_after_update: false,
             fda_declined: None,
             dialog: None,
             line: None,
@@ -268,6 +279,7 @@ impl AccessSteps {
             join_pending_retired: false,
             warmup_gate: None,
             seen_revision: None,
+            revision_lapsed: false,
             fda_unverified_here: false,
         }
     }
@@ -840,7 +852,12 @@ impl App {
         let line = if self.system_state_review_pending() {
             None
         } else {
-            menu_line(status, regressed)
+            menu_line(status, regressed).map(|mut line| {
+                if regressed && self.access_steps.fda_after_update && line.note.is_none() {
+                    line.note = Some(FDA_AFTER_UPDATE.to_owned());
+                }
+                line
+            })
         };
         let secrets_read = status.plan.as_ref().is_some_and(|plan| {
             plan.selection.contains(Setting::Secrets)
@@ -909,13 +926,13 @@ impl App {
 
     /// Record `outcome` for `access` under the approved revision; nothing
     /// without one, and no repeated line while that row's outcome is unchanged.
-    pub(crate) fn record_access_step(&mut self, access: Access, outcome: AccessOutcome) {
-        if let Some(revision) = self.access_revision() {
-            self.record_access_at(revision, access, outcome);
-        }
+    /// Returns whether that outcome is durable.
+    pub(crate) fn record_access_step(&mut self, access: Access, outcome: AccessOutcome) -> bool {
+        self.access_revision()
+            .is_some_and(|revision| self.record_access_at(revision, access, outcome))
     }
 
-    fn record_access_at(&mut self, revision: u64, access: Access, outcome: AccessOutcome) {
+    fn record_access_at(&mut self, revision: u64, access: Access, outcome: AccessOutcome) -> bool {
         let index = self
             .access_steps
             .recorded
@@ -924,7 +941,7 @@ impl App {
         let index = if let Some(index) = index {
             let last = &mut self.access_steps.recorded[index];
             if last.outcome == outcome {
-                return;
+                return last.retry_at.is_none();
             }
             last.outcome = outcome;
             last.retry_at = None;
@@ -943,6 +960,7 @@ impl App {
         if (access, outcome) == (Access::FullDiskAccess, AccessOutcome::Declined) {
             self.fda_decline_noted();
         }
+        self.access_steps.recorded[index].retry_at.is_none()
     }
 
     fn retry_access_records(&mut self, now: Instant) {
@@ -977,12 +995,25 @@ impl App {
     /// A verified Full Disk Access grant reads off (`true`), or that ended: the
     /// menu line follows. It never opens a page by itself (§3.6).
     pub(crate) fn note_fda_regression(&mut self, regressed: bool) {
+        if !regressed {
+            self.access_steps.fda_after_update = false;
+        }
         if self.access_steps.fda_regressed != regressed {
             self.access_steps.fda_regressed = regressed;
             aterm_log::info!(
                 "system state: a verified Full Disk Access grant {}",
                 if regressed { "reads off" } else { "is settled" }
             );
+            self.refresh_system_state_menu_line();
+        }
+    }
+
+    /// A verified Full Disk Access grant still reads off once this process settled, in a build
+    /// newer than the one that verified it: a regression the menu line names says, under it,
+    /// that the update needs it re-allowed ([`FDA_AFTER_UPDATE`]), until the regression ends.
+    pub(crate) fn note_fda_off_after_update(&mut self) {
+        if !self.access_steps.fda_after_update {
+            self.access_steps.fda_after_update = true;
             self.refresh_system_state_menu_line();
         }
     }
@@ -1275,19 +1306,29 @@ impl App {
     /// the step moment (design §6). The debugger step comes back by the window's own admission
     /// (`DebuggerStepQueue::unpark`), and Local Network is per revision already. The first
     /// revision this process sees is the launch path's, and the same revision coming back
-    /// changes nothing. While a `[privacy]` switch is off nothing is queued and the revision is
-    /// not taken as seen, so one approved meanwhile asks once every switch is on.
+    /// changes nothing, except that a Developer Tools step queued while no revision stood starts
+    /// its `spctl` run then ([`Self::list_ahead_for_queued_devtools_step`]). While a `[privacy]`
+    /// switch is off nothing is queued and the revision is not taken as seen, so one approved
+    /// meanwhile asks once every switch is on.
     pub(crate) fn rearm_access_steps(&mut self, now: Instant) {
         let Some(revision) = self.access_revision() else {
+            self.access_steps.revision_lapsed = true;
             return;
         };
         if !self.access_steps_allowed() {
             return;
         }
+        let lapsed = std::mem::take(&mut self.access_steps.revision_lapsed);
         let Some(seen) = self.access_steps.seen_revision.replace(revision) else {
+            // A step asked before any revision stood waits for this one at its moment.
+            self.list_ahead_for_queued_devtools_step(now);
             return;
         };
         if seen == revision {
+            if lapsed {
+                // The same revision back: a step asked while none stood waits for it.
+                self.list_ahead_for_queued_devtools_step(now);
+            }
             return;
         }
         aterm_log::info!(
@@ -1295,6 +1336,7 @@ impl App {
         );
         self.rearm_fda_step(now);
         self.rearm_devtools_step(now);
+        self.list_ahead_for_queued_devtools_step(now);
     }
 
     /// A `[privacy]` switch on again runs what it held at launch (design §4): a switch off is a
@@ -1308,13 +1350,13 @@ impl App {
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
-        if self.config.privacy_probe_gate().permits() {
+        if self.config.privacy_probe_gate().permits() && !self.config.privacy_observer_off() {
             // A read whose completion landed after a switch went off was spent on
             // nothing (the launch read among them): it is owed again.
             if self.devtools_helper.forget_switched_off_reading() {
                 self.devtools_watch.hold_read();
             }
-            if self.devtools_watch.read_held() && self.any_os_window_focused() {
+            if self.devtools_watch.owes_read() && self.any_os_window_focused() {
                 self.read_devtools_list(now);
             }
         }
@@ -1370,19 +1412,25 @@ impl App {
             .set_fda(crate::consent_launch::FdaLaunch::Waiting);
     }
 
-    /// The window's own Developer Tools page for a new access revision: the watch's
-    /// once-per-process latch is let go, and a reading that already says `not_granted` queues
-    /// the page now unless aterm opened it for this revision. It is judged whole at the step
-    /// moment (`App::devtools_hand_over`), behind any Full Disk Access page, and a page aterm
-    /// brought up within [`atpkg::devtools::REOPEN_AFTER_S`] defers it.
+    /// A new access approval owes a fresh Developer Tools reading even when
+    /// the preceding approval read Granted. Its current completion queues
+    /// the page through [`Self::queue_rearmed_devtools_step`].
     fn rearm_devtools_step(&mut self, now: Instant) {
         if !cfg!(target_os = "macos") || !self.devtools_helper.windowed() {
             return;
         }
-        self.devtools_watch.forget_hand_over();
-        if self.devtools_reading().grant != aterm_containment::DevToolGrant::NotGranted {
-            return;
+        if let Some(revision) = self.access_revision() {
+            self.devtools_watch.read_for_revision(revision);
+            self.consent.refresh_devtools();
+            if self.any_os_window_focused() {
+                self.read_devtools_list(now);
+            }
         }
+    }
+
+    /// A fresh new-approval read said NotGranted: preserve the revision's
+    /// once-only page and defer behind a page already brought up recently.
+    pub(crate) fn queue_rearmed_devtools_step(&mut self, now: Instant) {
         if self.devtools_shown_this_revision() {
             return;
         }

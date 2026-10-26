@@ -104,24 +104,30 @@ pub fn simhash_ctx_reference(
     votes.fill(0);
     cast_vote(votes, form_hash, FORM_WEIGHT);
     let mut pos = end;
-    for w in CTX_WEIGHTS {
+    let mut wi = 0;
+    while wi < CTX_WEIGHTS.len() {
         let Some((s, e)) = token_right(chars, pos) else {
             break;
         };
         pos = e;
-        vote_token(&chars[s..e], w, votes, tok, folded);
+        vote_token(&chars[s..e], CTX_WEIGHTS[wi], votes, tok, folded);
+        wi += 1;
     }
     let mut pos = start;
-    for w in CTX_WEIGHTS {
+    let mut wi = 0;
+    while wi < CTX_WEIGHTS.len() {
         let Some((s, e)) = token_left(chars, pos) else {
             break;
         };
         pos = s;
-        vote_token(&chars[s..e], w, votes, tok, folded);
+        vote_token(&chars[s..e], CTX_WEIGHTS[wi], votes, tok, folded);
+        wi += 1;
     }
     let mut fp = 0u64;
-    for (i, v) in votes.iter().enumerate() {
-        fp |= u64::from(*v >= 0) << i;
+    let mut i = 0;
+    while i < 64 {
+        fp |= u64::from(votes[i] >= 0) << i;
+        i += 1;
     }
     fp
 }
@@ -161,7 +167,9 @@ fn vote_token(
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
     let mut h = aterm_hash::FNV64_OFFSET;
     let mut ascii_ok = true;
-    for (i, &c) in tok_chars.iter().enumerate() {
+    let mut i = 0;
+    while i < tok_chars.len() {
+        let c = tok_chars[i];
         if c.is_ascii_alphabetic() {
             h = aterm_hash::fnv_mix_u64(h, u64::from(c.to_ascii_lowercase() as u8));
         } else if c.is_ascii() {
@@ -183,6 +191,7 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
             ascii_ok = false;
             break;
         }
+        i += 1;
     }
     if ascii_ok {
         return if tok_chars.len() >= 2 {
@@ -192,7 +201,11 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
         };
     }
     tok.clear();
-    tok.extend(tok_chars.iter().copied());
+    let mut ci = 0;
+    while ci < tok_chars.len() {
+        tok.push(tok_chars[ci]);
+        ci += 1;
+    }
     fold_into(tok, folded);
     let mut len = 0usize;
     let mut h = aterm_hash::FNV64_OFFSET;

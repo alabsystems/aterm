@@ -398,7 +398,7 @@ and discovery
 A terminal tab's tooltip and context menu add one
 .B now:
 line saying what its session log says the session is doing
-.RB ( "now: running shell" ", " "now: approval \(pc bash" ", " "now: limit \(pc resets 14:05" );
+.RB ( "now: running shell" ", " "now: approval \(pc bash" ", " "now: limit \(pc 14:05" );
 while the tab needs you, that comes first, and a label another program set with
 .B mark
 never shows there.
@@ -483,13 +483,17 @@ turns it off): each session's log as
 segments, 0600 in a 0700 folder, the oldest deleted first to keep it near
 64 MiB and 2048 files (files a running instance is still writing can hold it
 above that), so
-.B aterm ctl log @<sid>
-answers for a session from an earlier run. It keeps each command's first word
-as typed (so a secret typed at a prompt and run is kept too), the session's
-folder, its meta values (an attention text only as a fingerprint) and mail's
-senders and recipients; never a command's arguments, an OSC title, a mail's
-body or an agent's transcript text. Off, nothing is created there, and
-nothing already there is deleted.
+.B aterm ctl @<sid> log
+and
+.B aterm ctl @<sid> brief
+answer for a session from an earlier run. It keeps each command's program name
+(a secret typed at a prompt and run is kept as that name too; the wrapper's
+own name when the wrapper's flags are not known) and, for a listed tool, one
+known subcommand word, the session's folder, its meta values (an attention
+text only as a fingerprint) and mail's senders and recipients; never a
+command's other arguments, an OSC title, a mail's body or an agent's
+transcript text. Off, nothing is created there, and nothing already there is
+deleted.
 .SH EXAMPLES
 .nf
 aterm                                  # an interactive shell

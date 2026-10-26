@@ -1021,6 +1021,7 @@ mod tests {
             ],
             session: thread.to_string(),
             codex_home: None,
+            codex_auth_path: None,
             cwd: Some("/w".to_string()),
         };
         let copy = |thread: &str| self_claimed::Copy {
@@ -1449,6 +1450,7 @@ mod tests {
                     argv: vec!["/opt/codex/bin/codex".to_string()],
                     session: "0badf00d-1111-2222-3333-444455556666".to_string(),
                     codex_home: None,
+                    codex_auth_path: None,
                     cwd: None,
                 }),
             });

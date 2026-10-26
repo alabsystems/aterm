@@ -82,7 +82,7 @@ pub enum Reading {
 /// waiting row's note gives (design §3.3), never the engine's line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// Command Line Tools git, which every clone runs, is not installed.
+    /// The git every clone runs (the Command Line Tools', else Xcode's) is not installed.
     CommandLineTools,
     /// aterm's GitHub settings (`~/.config/aterm/init.toml`) cannot be used.
     Settings,

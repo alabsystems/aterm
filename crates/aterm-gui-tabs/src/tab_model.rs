@@ -1305,6 +1305,7 @@ impl TabIndicators {
 /// Closed icon identity for first-party, non-terminal tab applications.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TabIconKind {
+    About,
     Settings,
     Markdown,
     Editor,
@@ -1317,6 +1318,7 @@ impl TabIconKind {
     #[inline]
     pub const fn semantic_name(self) -> &'static str {
         match self {
+            Self::About => "about",
             Self::Settings => "settings",
             Self::Markdown => "markdown",
             Self::Editor => "editor",
@@ -1329,6 +1331,7 @@ impl TabIconKind {
     #[inline]
     pub const fn display_name(self) -> &'static str {
         match self {
+            Self::About => "About aterm",
             Self::Settings => "Settings",
             Self::Markdown => "Markdown viewer",
             Self::Editor => "Editor",

@@ -7,8 +7,9 @@
 //! environment variable, installs a hook or an allocator, or re-executes
 //! itself; each file's scratch directories carry a prefix of its own
 //! (`aterm-footer-model-`, `aterm-conformance-disk-`,
-//! `aterm-conformance-diskask-`), so no two files share
-//! one; and the checker tier's `ty` spawns (`validate_transition_tiered`,
+//! `aterm-conformance-diskask-`, `aterm-conformance-diskworker-`,
+//! `aterm-conformance-diskhold-`), so no two
+//! files share one; and the checker tier's `ty` spawns (`validate_transition_tiered`,
 //! built with aterm-spec's `checkers` feature only) take a scratch directory
 //! per call and share nothing else, so they run concurrently with every other
 //! `ty`.
@@ -24,7 +25,9 @@ aterm_durable::plain_durable_flushes_in_tests!();
 mod common;
 mod conformance_account_key;
 mod conformance_disk_free_ask;
+mod conformance_disk_free_worker;
 mod conformance_disk_pass;
+mod conformance_disk_projected_hold;
 mod conformance_footer_model;
 mod conformance_login_wall;
 mod conformance_occupancy;

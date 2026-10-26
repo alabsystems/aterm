@@ -28,6 +28,11 @@ pub(crate) struct PetChrome {
     read: std::cell::Cell<bool>,
     /// Whether [`PetChrome::begin`] opened the pass a commit would end.
     begun: bool,
+    /// The content sequence of the frame the chrome in `held` was painted over, and of the one
+    /// this pass paints over ([`PetChrome::painted_over`]): the pet reads `held` over the next
+    /// frame, and carries it with the rows it was painted on where they have moved since.
+    held_over: Option<u64>,
+    next_over: Option<u64>,
 }
 
 impl PetChrome {
@@ -49,6 +54,18 @@ impl PetChrome {
         self.next_overlays.clear();
         self.pane = pane;
         self.begun = true;
+        self.next_over = None;
+    }
+
+    /// This pass paints over the frame whose content sequence is `seq` (`RenderInput::content_seq`).
+    pub(crate) fn painted_over(&mut self, seq: u64) {
+        self.next_over = Some(seq);
+    }
+
+    /// The content sequence of the frame the chrome [`PetChrome::held`] gives was painted over
+    /// (`aterm_effects::pet_world::PetReserve::painted_over`).
+    pub(crate) fn held_painted_over(&self) -> Option<u64> {
+        self.held_over
     }
 
     /// A splice painted `cols` cells from frame cell `(row, col)` down `rows` rows: the part inside the focused pane, pane-local.
@@ -105,6 +122,7 @@ impl PetChrome {
             return false;
         }
         let moved = self.next != self.held || self.next_overlays != self.held_overlays;
+        self.held_over = self.next_over;
         if moved {
             std::mem::swap(&mut self.next, &mut self.held);
             std::mem::swap(&mut self.next_overlays, &mut self.held_overlays);
@@ -190,6 +208,38 @@ mod tests {
         chrome.note(28, 0, 1, 100);
         assert!(chrome.commit(), "the menu closed: owed again");
         assert!(chrome.held_overlays().is_empty());
+    }
+
+    /// THE HELD CHROME NAMES THE FRAME IT WAS PAINTED OVER: the pet reads it over the next
+    /// frame and carries it with the rows it was painted on where they moved since
+    /// (`aterm_effects::pet_world::PetReserve::painted_over`). A pass that paints the same cells
+    /// over a newer frame names the newer frame; one that names none leaves none; a commit with
+    /// no pass begun keeps the frame with the cells.
+    #[test]
+    fn the_held_chrome_names_the_frame_it_was_painted_over() {
+        let pane = Some((0, 0, 30, 80));
+        let mut chrome = PetChrome::default();
+        assert_eq!(chrome.held_painted_over(), None);
+        chrome.begin(pane);
+        chrome.painted_over(7);
+        chrome.note(28, 2, 1, 6);
+        let _ = chrome.commit();
+        assert_eq!(chrome.held_painted_over(), Some(7));
+        chrome.begin(pane);
+        chrome.painted_over(8);
+        chrome.note(28, 2, 1, 6);
+        assert!(!chrome.commit(), "the same cells: nothing owed");
+        assert_eq!(chrome.held_painted_over(), Some(8), "over the newer frame");
+        assert!(!chrome.commit());
+        assert_eq!(chrome.held_painted_over(), Some(8), "no pass begun");
+        chrome.begin(pane);
+        chrome.note(28, 2, 1, 6);
+        let _ = chrome.commit();
+        assert_eq!(
+            chrome.held_painted_over(),
+            None,
+            "a pass that named no frame"
+        );
     }
 
     /// A COMMIT WITH NO PASS BEGUN KEEPS WHAT IS HELD (the capture routes

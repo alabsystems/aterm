@@ -223,11 +223,17 @@ impl Target {
 
     /// What the host holds under the key.
     pub fn read(&self, sys: &dyn System) -> Read<PValue> {
-        match self.entries(sys) {
-            Err(why) => Read::Unusable(why),
-            Ok(entries) => match entries.into_iter().find(|(k, _)| *k == self.key) {
+        self.read_in(&self.entries(sys))
+    }
+
+    /// What `entries`, a reading of the key's domain ([`Target::entries`]), holds under the key.
+    #[must_use]
+    pub fn read_in(&self, entries: &Result<Entries, String>) -> Read<PValue> {
+        match entries {
+            Err(why) => Read::Unusable(why.clone()),
+            Ok(entries) => match entries.iter().find(|(k, _)| *k == self.key) {
                 None => Read::Absent,
-                Some((_, Ok(v))) => Read::Value(v),
+                Some((_, Ok(v))) => Read::Value(v.clone()),
                 Some((_, Err(why))) => Read::Unusable(format!("{}: {why}", self.describe())),
             },
         }
@@ -242,6 +248,31 @@ impl Target {
             ""
         };
         format!("{host}{} {}", self.domain, self.key)
+    }
+}
+
+/// One reading of several keys: each domain read once per scope and account ([`Target::entries`])
+/// and each key answered from that, as [`Target::read`] answers it. A reading of one moment: a
+/// later reading (a read-back, a check that nothing changed since a snapshot) takes a new one.
+#[derive(Debug, Default)]
+pub struct Exports(Vec<(Target, Result<Entries, String>)>);
+
+impl Exports {
+    /// What the host holds under `target`'s key, its domain read at the first key asked of it.
+    pub fn read(&mut self, sys: &dyn System, target: &Target) -> Read<PValue> {
+        let at = self
+            .0
+            .iter()
+            .position(|(seen, _)| {
+                seen.domain == target.domain
+                    && seen.scope == target.scope
+                    && seen.user == target.user
+            })
+            .unwrap_or_else(|| {
+                self.0.push((target.clone(), target.entries(sys)));
+                self.0.len() - 1
+            });
+        target.read_in(&self.0[at].1)
     }
 }
 
@@ -561,11 +592,18 @@ impl Activation for Relaunch {
         )))
     }
 
-    fn activate(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
+    fn activate(&self, sys: &dyn System, ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
         let owed = std::mem::take(&mut *self.owed.lock().unwrap_or_else(PoisonError::into_inner));
         let keys: Vec<Target> = owed.iter().map(|(_, target)| target.clone()).collect();
+        let session = Session::of(&self.user, ctx);
         Ok(
-            match crate::init_activation::relaunch_reading(sys, &self.user, &self.process, &keys) {
+            match crate::init_activation::relaunch_reading(
+                sys,
+                &self.user,
+                session,
+                &self.process,
+                &keys,
+            ) {
                 Ok(()) => Vec::new(),
                 Err(why) => owed.into_iter().map(|(id, _)| (id, why.clone())).collect(),
             },
@@ -739,20 +777,53 @@ pub enum Signalled {
     NoSession,
 }
 
-/// Relaunch `process` in `user`'s login session, if there is one, saying what was
+/// Whether a user's login session is known before a relaunch ([`relaunch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    /// The user owns this Mac's console in the run's context ([`Ctx::console`]): their login
+    /// session runs, and nothing asks.
+    AtConsole,
+    /// `launchctl print gui/<uid>` says whether there is one.
+    Ask,
+}
+
+impl Session {
+    /// [`Session::AtConsole`] when `ctx`'s console account is `user`, else [`Session::Ask`].
+    #[must_use]
+    pub fn of(user: &User, ctx: &Ctx) -> Self {
+        if ctx
+            .console
+            .as_ref()
+            .is_some_and(|console| console.uid == user.uid)
+        {
+            Self::AtConsole
+        } else {
+            Self::Ask
+        }
+    }
+}
+
+/// Relaunch `process` in `user`'s login session, if there is one (`session`), saying what was
 /// signalled.
 ///
 /// # Errors
 /// One line when the session check or the relaunch did not work.
-pub fn relaunch(sys: &dyn System, user: &User, process: &str) -> Result<Signalled, String> {
-    let session = Cmd::new(LAUNCHCTL)
-        .arg("print")
-        .arg(format!("gui/{}", user.uid));
-    match sys.run(&session) {
-        Ok(ran) if ran.success() => {}
-        Ok(ran) if ran.status == Some(NO_SESSION) => return Ok(Signalled::NoSession),
-        Ok(ran) => return Err(format!("{}: {}", session.display(), ran.describe())),
-        Err(e) => return Err(format!("{}: {e}", session.display())),
+pub fn relaunch(
+    sys: &dyn System,
+    user: &User,
+    session: Session,
+    process: &str,
+) -> Result<Signalled, String> {
+    if session == Session::Ask {
+        let ask = Cmd::new(LAUNCHCTL)
+            .arg("print")
+            .arg(format!("gui/{}", user.uid));
+        match sys.run(&ask) {
+            Ok(ran) if ran.success() => {}
+            Ok(ran) if ran.status == Some(NO_SESSION) => return Ok(Signalled::NoSession),
+            Ok(ran) => return Err(format!("{}: {}", ask.display(), ran.describe())),
+            Err(e) => return Err(format!("{}: {e}", ask.display())),
+        }
     }
     let kill = Cmd::new(KILLALL)
         .args(["-u", user.name.as_str(), process])

@@ -191,7 +191,8 @@ impl FleetRoster {
     /// Parse `fleet-accounts.toml` text back into a [`FleetRoster`].
     /// # Errors
     /// Returns a human-readable error if the TOML is invalid, `account` is not an array of tables,
-    /// or any row is missing required fields or carries a refused label or email.
+    /// or any row is missing required fields, carries a refused label or email, has a
+    /// malformed machine assignment, or names an invalid explicit class.
     pub fn from_toml(text: &str, source: &str) -> Result<Self, String> {
         Self::from_toml_for(Cli::Claude, text, source)
     }
@@ -239,30 +240,7 @@ impl FleetRoster {
                     idx + 1
                 ));
             }
-            let machines: Vec<String> = match row.get("machines") {
-                Some(aterm_toml::Value::Array(arr)) => arr
-                    .iter()
-                    .filter_map(aterm_toml::Value::as_str)
-                    .filter_map(normalize_machine_id)
-                    .collect(),
-                Some(aterm_toml::Value::String(s)) => normalize_machine_id(s).into_iter().collect(),
-                _ => Vec::new(),
-            };
-            if machines.is_empty() {
-                return Err(format!(
-                    "fleet roster row {} ({label}): missing `machines`",
-                    idx + 1
-                ));
-            }
-            let class = row
-                .get("class")
-                .and_then(aterm_toml::Value::as_str)
-                .and_then(Class::parse)
-                .unwrap_or(if machines.len() > 1 {
-                    Class::Shared
-                } else {
-                    Class::Dedicated
-                });
+            let (machines, class) = fleet_assignment(row, idx + 1, &label)?;
             let browser = row
                 .get("browser")
                 .and_then(aterm_toml::Value::as_str)
@@ -285,6 +263,112 @@ impl FleetRoster {
             accounts,
         })
     }
+}
+
+// An explicit assignment is admitted whole. Normalize before stable deduplication:
+// repeated spellings of one host cannot change its inferred contention class.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Missing",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "InvalidMachine",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "WrongType",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "InvalidClass",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Scalar",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Distinct",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Duplicate",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Override",
+        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
+    )
+)]
+fn fleet_assignment(
+    row: &aterm_toml::Table,
+    n: usize,
+    label: &str,
+) -> Result<(Vec<String>, Class), String> {
+    let values = match row.get("machines") {
+        Some(aterm_toml::Value::Array(values)) if !values.is_empty() => values.as_slice(),
+        Some(value @ aterm_toml::Value::String(_)) => std::slice::from_ref(value),
+        _ => {
+            return Err(format!(
+                "fleet roster row {n} ({label}): `machines` must be a machine name or a nonempty array of machine names"
+            ));
+        }
+    };
+    let mut seen = BTreeSet::new();
+    let mut machines = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let machine = value
+            .as_str()
+            .and_then(normalize_machine_id)
+            .ok_or_else(|| {
+                format!(
+                    "fleet roster row {n} ({label}): `machines` entry {} must be a recognized machine name",
+                    index + 1
+                )
+            })?;
+        if seen.insert(machine.clone()) {
+            machines.push(machine);
+        }
+    }
+    let class = match row.get("class") {
+        None if machines.len() > 1 => Class::Shared,
+        None => Class::Dedicated,
+        Some(value) => value.as_str().and_then(Class::parse).ok_or_else(|| {
+            format!("fleet roster row {n} ({label}): `class` must be `dedicated` or `shared`")
+        })?,
+    };
+    Ok((machines, class))
 }
 
 /// The vendor keys of `cli`'s fleet roster row `n` ([`FleetRoster::from_toml_for`]).
@@ -433,6 +517,7 @@ fn machines_from_email_hint(email: &str) -> Vec<String> {
 }
 
 fn csv_records(mut text: &str) -> impl Iterator<Item = Result<&str, &'static str>> {
+    text = text.strip_prefix('\u{feff}').unwrap_or(text);
     std::iter::from_fn(move || {
         let input = text;
         if input.is_empty() {
@@ -529,8 +614,10 @@ fn notes_disqualify(notes: &str) -> bool {
 
 /// Parse the accounting CSV into a [`FleetRoster`].
 /// # Errors
-/// Returns an error if the CSV has no header row, no `email` / `claude` columns, or malformed
-/// quoting. LF and CRLF separate records only outside quotes.
+/// Returns an error if the CSV has no header row, missing or ambiguous identity/membership
+/// columns, an ambiguous required machine-layout marker, or malformed quoting.
+/// Invalid generated account labels and exhaustion of their disambiguating suffixes also fail.
+/// LF and CRLF separate records only outside quotes.
 pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster, String> {
     parse_sheet(csv_text, source, Cli::Claude).map(|(fleet, _)| fleet)
 }
@@ -580,21 +667,33 @@ pub fn parse_accounting_csv_for(
     parse_sheet(csv_text, source, cli).map(|(roster, held)| CliFleet { cli, roster, held })
 }
 
-/// Whether the sheet's header names `cli`'s column ([`csv_columns`]).
+/// Whether the sheet's header names `cli`'s column ([`csv_columns`]). Duplicate names still
+/// count as present, so the selected source reaches the parser's explicit refusal.
 #[must_use]
 pub fn csv_names_column(cli: Cli, csv_text: &str) -> bool {
     csv_records(csv_text)
         .next()
         .and_then(Result::ok)
-        .is_some_and(|header| member_column(cli, &parse_csv_line(header)).is_some())
+        .is_some_and(|header| !matches!(member_column(cli, &parse_csv_line(header)), Ok(None)))
 }
 
-fn member_column(cli: Cli, header: &[String]) -> Option<usize> {
-    header.iter().position(|h| {
-        csv_columns(cli)
+fn unique_column(header: &[String], names: &[&str]) -> Result<Option<usize>, ()> {
+    let mut matches = header.iter().enumerate().filter_map(|(index, h)| {
+        names
             .iter()
             .any(|word| h.trim().eq_ignore_ascii_case(word))
-    })
+            .then_some(index)
+    });
+    let first = matches.next();
+    if matches.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
+fn member_column(cli: Cli, header: &[String]) -> Result<Option<usize>, ()> {
+    unique_column(header, csv_columns(cli))
 }
 
 /// What a row's cell in a CLI's column says of its membership ([`parse_sheet`]).
@@ -659,6 +758,62 @@ fn notes_disqualify_for(cli: Cli, notes: &str) -> bool {
 
 /// The one reading of the accounting sheet, for `cli`'s column ([`parse_accounting_csv`],
 /// [`parse_accounting_csv_for`]): its rows, and the rows it held ([`CliFleet::held`]).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "Unique",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "DuplicateEmail",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "DuplicateMember",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "MissingEmail",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "MissingMember",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "DuplicateAnchor",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSheetColumns",
+        action = "MultiMachine",
+        project = "aterm_agent::harness::accounts_sync::sheet_columns_tests::sheet_transition"
+    )
+)]
 fn parse_sheet(
     csv_text: &str,
     source: &str,
@@ -671,17 +826,22 @@ fn parse_sheet(
         .map_err(|why| format!("CSV at {source}: {why}"))?
         .ok_or_else(|| format!("CSV at {source} is empty"))?;
     let header = parse_csv_line(header_line);
-    let email_col = header
-        .iter()
-        .position(|h| h.trim().eq_ignore_ascii_case("email"))
+    let email_col = unique_column(&header, &["email"])
+        .map_err(|()| format!("CSV at {source} has ambiguous `email` columns"))?
         .ok_or_else(|| format!("CSV at {source} has no `email` column"))?;
-    let member_col = member_column(cli, &header).ok_or_else(|| {
-        format!(
-            "CSV at {source} has no `{}` column",
-            csv_columns(cli).first().copied().unwrap_or("claude")
-        )
-    })?;
-    let claude_col = member_column(Cli::Claude, &header).unwrap_or(member_col);
+    let member_col = member_column(cli, &header)
+        .map_err(|()| {
+            format!(
+                "CSV at {source} has ambiguous `{}` membership columns",
+                cli.id()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "CSV at {source} has no `{}` column",
+                csv_columns(cli).first().copied().unwrap_or("claude")
+            )
+        })?;
     let mut computer_cols: Vec<usize> = header
         .iter()
         .enumerate()
@@ -689,13 +849,27 @@ fn parse_sheet(
         .map(|(i, _)| i)
         .collect();
     if let Some(&first_comp) = computer_cols.first()
-        && first_comp + 1 < claude_col
         && header
             .get(first_comp + 1)
             .is_some_and(|h| h.trim().is_empty())
         && !computer_cols.contains(&(first_comp + 1))
     {
-        computer_cols.push(first_comp + 1);
+        let candidate = first_comp + 1;
+        let last_claude = header
+            .iter()
+            .rposition(|h| h.trim().eq_ignore_ascii_case("claude"));
+        let within_machines = match last_claude {
+            Some(last) if candidate < last => member_column(Cli::Claude, &header)
+                .map_err(|()| {
+                    format!("CSV at {source} has ambiguous `claude` columns for its machine layout")
+                })?
+                .is_some(),
+            Some(_) => false,
+            None => candidate < member_col,
+        };
+        if within_machines {
+            computer_cols.push(candidate);
+        }
     }
     let notes_start = header
         .iter()
@@ -1468,7 +1642,7 @@ impl FleetOrigin {
 /// [`FleetOrigin`] of the roster at `roster`, for `home` and the config file `config`.
 #[must_use]
 pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -> FleetOrigin {
-    let beside = fleet_file_beside(roster).filter(|fleet| fleet.is_file());
+    let beside = fleet_file_beside(roster).filter(|fleet| source_entry_present(fleet));
     let beside_opt_in = beside.as_deref().and_then(fleet_file_opt_in);
     let beside_opts_in = beside_opt_in.is_some_and(OptIn::opts_in_by_file);
     if !beside_opts_in && let Some(source) = config.and_then(source_key) {
@@ -1478,7 +1652,7 @@ pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -
     if let Some(vault) = secrets
         .as_ref()
         .map(|secrets| secrets.join(FLEET_ROSTER_FILE))
-        .filter(|vault| vault.is_file())
+        .filter(|vault| source_entry_present(vault))
     {
         let read = read_local_source_text(&vault).ok().and_then(|text| {
             let fleet = FleetRoster::from_toml(&text, &vault.display().to_string()).ok()?;
@@ -1501,7 +1675,7 @@ pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -
     }
     if let Some(sheet) = secrets
         .map(|secrets| secrets.join(ACCOUNTS_CSV_FILE))
-        .filter(|sheet| sheet.is_file())
+        .filter(|sheet| source_entry_present(sheet))
     {
         return FleetOrigin::Vault(sheet);
     }
@@ -1514,11 +1688,13 @@ pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -
     }
 }
 
-/// Whether a fleet roster file stands beside `roster` without opting in ([`configured_source`]).
+/// Whether a fleet roster entry stands beside `roster` without a readable opt-in
+/// ([`configured_source`]). An unusable entry stays visible but grants no opt-in.
 #[must_use]
 pub fn fleet_file_ignored(roster: &Path) -> bool {
     fleet_file_beside(roster).is_some_and(|fleet| {
-        fleet.is_file() && !fleet_file_opt_in(&fleet).is_some_and(OptIn::opts_in_by_file)
+        source_entry_present(&fleet)
+            && !fleet_file_opt_in(&fleet).is_some_and(OptIn::opts_in_by_file)
     })
 }
 
@@ -1593,6 +1769,8 @@ fn load_fleet_source_with(
     source: Option<&str>,
     fetch: &Fetch<'_>,
 ) -> Result<(FleetRoster, OptIn), String> {
+    let normalized = source_env(env)?;
+    let env = &normalized;
     let (chosen, opt_in) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), OptIn::Named),
         None => configured_source(env.config.as_deref(), env.accounts_roster().as_deref())
@@ -1605,7 +1783,10 @@ fn load_fleet_source_with(
             })
             .ok_or_else(|| NO_SOURCE.to_owned())?,
     };
-    let raw = fetch(env, &chosen)?;
+    let configured = (opt_in == OptIn::Key)
+        .then(|| configured_source_env(env))
+        .transpose()?;
+    let raw = fetch(configured.as_ref().unwrap_or(env), &chosen)?;
     let toml = chosen.ends_with(".toml")
         || raw.trim_start().starts_with('#')
         || raw.contains("[[account]]");
@@ -2089,7 +2270,11 @@ fn decode_source_text(bytes: Vec<u8>, source: &str) -> Result<String, String> {
 }
 
 fn read_local_source_text(path: &Path) -> io::Result<String> {
-    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)?;
+    read_local_source_text_with(path, astream_sys::Links::Refuse)
+}
+
+fn read_local_source_text_with(path: &Path, links: astream_sys::Links) -> io::Result<String> {
+    let file = astream_sys::open_nonblocking(path, links)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -2110,12 +2295,184 @@ fn read_local_source_text(path: &Path) -> io::Result<String> {
         .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
+// Source selection may skip an absent entry, never an unreadable one. When an
+// ancestor is missing, distinguish a normal absent directory from a dangling
+// link or a non-directory obstruction. This probe grants no read/write authority;
+// the bounded reader and publication snapshots still judge what they open.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePresence",
+        action = "Primary",
+        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePresence",
+        action = "Fallback",
+        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePresence",
+        action = "PrimaryUnavailable",
+        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePresence",
+        action = "FallbackUnavailable",
+        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+    )
+)]
+fn source_entry_present(path: &Path) -> bool {
+    let mut at = path;
+    loop {
+        match fs::symlink_metadata(at) {
+            Ok(_) if at == path => return true,
+            Ok(_) => return fs::metadata(at).map_or(true, |meta| !meta.is_dir()),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = at.parent() else {
+                    return false;
+                };
+                at = parent;
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+fn has_fleet_source(dir: &Path) -> bool {
+    [FLEET_ROSTER_FILE, ACCOUNTS_CSV_FILE]
+        .into_iter()
+        .any(|name| source_entry_present(&dir.join(name)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FetchPlan {
     Http(String),
     File(PathBuf),
 }
 
+/// Resolve from captured context only. A drive-relative Windows path must not consult
+/// the process's per-drive current directory, and an unknown base grants no fallback.
+fn source_path(base: &Path, path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::Prefix(_)))
+    {
+        return Err(format!(
+            "account source path {} is drive-relative; name an absolute path",
+            path.display()
+        ));
+    }
+    if !base.is_absolute() {
+        return Err("a relative account source needs a captured absolute directory".to_owned());
+    }
+    let resolved = base.join(path);
+    if !resolved.is_absolute() {
+        return Err(format!(
+            "account source path {} has no captured root",
+            path.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Resolve a relative config path against the same captured directory used by source reads.
+/// The caller uses this environment for both source selection and roster publication.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "NoConfigFile",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
+fn source_env(env: &Env) -> Result<Env, String> {
+    let mut resolved = env.clone();
+    resolved.config = env
+        .config
+        .as_deref()
+        .map(|path| {
+            if path.file_name().is_none() {
+                Err("an account sync config path must name a file".to_owned())
+            } else {
+                source_path(&env.cwd, path)
+            }
+        })
+        .transpose()?;
+    Ok(resolved)
+}
+
+fn configured_source_env(env: &Env) -> Result<Env, String> {
+    let mut resolved = source_env(env)?;
+    resolved.cwd = resolved
+        .config
+        .as_deref()
+        .and_then(Path::parent)
+        .ok_or("a configured account source needs a config directory")?
+        .to_path_buf();
+    Ok(resolved)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "Explicit",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "Configured",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "Absolute",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "Home",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "NoBase",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourcePath",
+        action = "NoHome",
+        project = "aterm_agent::harness::accounts_sync::source_path_tests::path_transition"
+    )
+)]
 fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
     if source.starts_with(RCLONE_PREFIX) {
         return Err(format!(
@@ -2127,10 +2484,24 @@ fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
     if source.starts_with("http://") || source.starts_with("https://") {
         return Ok(FetchPlan::Http(normalize_google_sheet_url(source)));
     }
-    Ok(match (source.strip_prefix("~/"), env.home.as_deref()) {
-        (Some(rest), Some(home)) => FetchPlan::File(home.join(rest)),
-        _ => FetchPlan::File(PathBuf::from(source)),
-    })
+    let path = if let Some(rest) = source.strip_prefix("~/") {
+        let home = env
+            .home
+            .as_deref()
+            .filter(|home| home.is_absolute())
+            .ok_or("a home-relative account source needs a captured absolute home")?;
+        let relative = Path::new(rest.trim_start_matches(std::path::is_separator));
+        if relative
+            .components()
+            .any(|part| matches!(part, std::path::Component::Prefix(_)))
+        {
+            return Err("a home-relative account source cannot name a drive prefix".to_owned());
+        }
+        source_path(home, relative)?
+    } else {
+        source_path(&env.cwd, Path::new(source))?
+    };
+    Ok(FetchPlan::File(path))
 }
 
 type RunFetcher =
@@ -2169,16 +2540,11 @@ fn fetch_source_text(env: &Env, source: &str) -> Result<String, String> {
 fn fetch_source_text_with(env: &Env, source: &str, run: &RunFetcher) -> Result<String, String> {
     match fetch_plan(env, source)? {
         FetchPlan::Http(url) => fetch_http(&url, run),
-        FetchPlan::File(path) => {
-            let mut bytes = Vec::new();
-            fs::File::open(&path)
-                .and_then(|file| {
-                    file.take((SOURCE_TEXT_MAX_BYTES + 1) as u64)
-                        .read_to_end(&mut bytes)
-                })
-                .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-            decode_source_text(bytes, source)
-        }
+        // An explicit source keeps ordinary path semantics, including final symlinks.
+        // Refuse non-regular descriptors before reading; on Unix the nonblocking open also
+        // prevents a FIFO from waiting for a writer.
+        FetchPlan::File(path) => read_local_source_text_with(&path, astream_sys::Links::Follow)
+            .map_err(|e| format!("could not read {}: {e}", path.display())),
     }
 }
 
@@ -2632,6 +2998,8 @@ fn sync_accounts_with(
     machine_override: Option<&str>,
     how: &SyncHow<'_>,
 ) -> Result<SyncReport, String> {
+    let normalized = source_env(env)?;
+    let env = &normalized;
     let roster_path = env
         .accounts_roster()
         .ok_or("no config directory is known (set HOME or XDG_CONFIG_HOME)")?;
@@ -2974,8 +3342,8 @@ pub(super) fn list_in_local_fleet(
 
 static AUTO_SYNC_COOLDOWN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
-/// How often a window's upkeep reads this machine's logins and transcripts again for accounts a
-/// fleet discovery made does not list yet ([`init_sync_needed`]).
+/// How often upkeep rediscovers local accounts and revalidates configured local sources whose
+/// metadata is unchanged ([`init_sync_needed`], [`key_file_changed`]).
 const REDISCOVER_EVERY: Duration = Duration::from_secs(15 * 60);
 
 /// How long a window's upkeep waits before it syncs again for the same default login the roster
@@ -2991,9 +3359,9 @@ struct Rediscovery {
     /// The default login's email it last synced for because the roster's default row was another
     /// account, and when.
     synced_for: Option<(String, Instant)>,
-    /// The local file `[fleet] accounts_source` names and its modification time, as last synced
-    /// from ([`key_file_changed`]).
-    key_seen: Option<(PathBuf, std::time::SystemTime)>,
+    /// The local source observation last scheduled for an attempt, whether it succeeded or
+    /// failed. Even an unchanged observation is retried after `REDISCOVER_EVERY`.
+    key_attempt: Option<LocalSourceAttempt>,
     /// The addresses a fleet discovery made lists only for a credential, and when they were
     /// read ([`unclaimed_emails`]).
     unclaimed: Option<(Instant, BTreeSet<String>)>,
@@ -3002,7 +3370,7 @@ struct Rediscovery {
 static REDISCOVERY: std::sync::Mutex<Rediscovery> = std::sync::Mutex::new(Rediscovery {
     read_at: None,
     synced_for: None,
-    key_seen: None,
+    key_attempt: None,
     unclaimed: None,
 });
 
@@ -3027,6 +3395,15 @@ fn rediscover_due(rediscovery: &std::sync::Mutex<Rediscovery>) -> bool {
 /// on the default login changed it): at once for an email the upkeep has not synced for, else
 /// once per [`UNLISTED_RETRY`]. Only a roster a configured source writes is synced
 /// ([`configured_source`]); one written by hand stays as written.
+/// The profile names the provider identity, which may differ from its login alias.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAliasRelabel",
+        action = "ChangedDefault",
+        project = "aterm_agent::harness::accounts_sync::alias_relabel_tests::alias_transition"
+    )
+)]
 fn default_login_unlisted(
     home: &Path,
     state_dir: &Path,
@@ -3048,7 +3425,7 @@ fn default_login_unlisted(
     };
     if roster
         .row_for_login(None)
-        .and_then(|row| row.email.as_deref())
+        .and_then(Row::expected_identity_email)
         .is_some_and(|held| accounts::email_matches(held, &email))
     {
         return false;
@@ -3126,7 +3503,7 @@ struct UpkeepEffects<'a> {
     spawn_vault: &'a SpawnRenewal,
     /// What the configured mailbox offers a row's sign-in ([`ladder_mailbox_live`]).
     mailbox: &'a LadderMailbox,
-    /// Where each automatic sign-in's one line goes ([`log_sign_in`]).
+    /// Where automatic sign-ins and source refresh refusals go ([`log_sign_in`]).
     log: SignInLog,
     /// One run of `claude auth login` for a route, where it is not the live one
     /// ([`spawn_row_renewal`]).
@@ -3321,9 +3698,12 @@ fn upkeep_claude(
     fx: &UpkeepEffects<'_>,
 ) -> Upkept {
     let config = config_beside(roster_path);
-    if step.syncs() && sync_called_for(home, state_dir, (roster_path, &config), now, fx.rediscovery)
+    if step.syncs()
+        && sync_called_for(home, state_dir, (roster_path, &config), now, fx.rediscovery)
+        && let Err(why) =
+            sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch)
     {
-        let _ = sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch);
+        (fx.log)(&format!("accounts sync: {why}"));
     }
     // A saved explicit choice is independent of automatic fleet-source admission.
     let pending = step
@@ -3374,13 +3754,13 @@ fn sign_ins_on(config: &Path) -> bool {
 }
 
 /// THE ONE RULE OF WHEN A PERIODIC CALLER SYNCS a roster that stands (a window's upkeep, the
-/// setup pass's [`resync_for_setup`]): when something it is made from changed. That is
+/// setup pass's [`resync_for_setup`]): when its inputs changed or need revalidation. That is
 /// `~/.secrets` holding a fleet, a sheet or a mailbox where no source is configured yet; a vault
 /// fleet or sheet the fleet file does not match, or accounts this machine's own logins show that
 /// a fleet discovery made does not list ([`init_sync_needed`], read every [`REDISCOVER_EVERY`]);
 /// the default login holding an account the roster's default row is not
 /// ([`default_login_unlisted`]); or a `[fleet] accounts_source` that is a local file this process
-/// has not synced from as it stands ([`key_file_changed`]). A sync that runs and finds nothing new
+/// needs to read again ([`key_file_changed`]). A sync that runs and finds nothing new
 /// writes nothing ([`persist_accounts_sync`]).
 fn sync_called_for(
     home: &Path,
@@ -3394,15 +3774,25 @@ fn sync_called_for(
     }
     let secrets = home.join(".secrets");
     let configured = configured_source(Some(config), Some(roster_path));
+    // A mode change invalidates this process's observation. Returning to the same path
+    // must not inherit the timer from a source which stopped being authoritative.
+    let key_changed = if matches!(configured, Some(FleetSource::Key(_))) {
+        key_file_changed(home, state_dir, config, now, rediscovery)
+    } else {
+        rediscovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .key_attempt = None;
+        false
+    };
     let unconfigured_with_secrets = configured.is_none()
-        && ([
-            FLEET_ROSTER_FILE,
-            ACCOUNTS_CSV_FILE,
-            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-            super::headless_oauth::MAILBOX_TOML_FILE,
-        ]
-        .into_iter()
-        .any(|name| secrets.join(name).is_file())
+        && (has_fleet_source(&secrets)
+            || [
+                super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+                super::headless_oauth::MAILBOX_TOML_FILE,
+            ]
+            .into_iter()
+            .any(|name| secrets.join(name).is_file())
             || (secrets.is_dir()
                 && super::headless_oauth::discover_mailbox_config_files(
                     Some(home),
@@ -3423,14 +3813,13 @@ fn sync_called_for(
             rediscover_due(rediscovery),
         )
         || default_login_unlisted(home, state_dir, (roster_path, config), now, rediscovery)
-        || matches!(configured, Some(FleetSource::Key(_)))
-            && key_file_changed(home, state_dir, config, now, rediscovery)
+        || key_changed
 }
 
-/// Whether `[fleet] accounts_source` names a local file this process has not synced from as it
-/// stands now (its modification time is not the one last seen): at the first read of a file that
-/// is there, then each time it changes. A URL is read only when the roster is missing or a person
-/// syncs.
+/// Whether a configured local source needs an attempt: on its first observation, changed
+/// metadata (including unavailable metadata), or after `REDISCOVER_EVERY`. Metadata is only a
+/// scheduling hint: unchanged metadata cannot suppress failed reads or same-stamp edits forever.
+/// A URL is read only when the roster is missing or another existing trigger calls for a sync.
 fn key_file_changed(
     home: &Path,
     state_dir: &Path,
@@ -3438,26 +3827,88 @@ fn key_file_changed(
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
 ) -> bool {
-    let Some(source) = source_key(config) else {
-        return false;
-    };
-    let Ok(FetchPlan::File(path)) = fetch_plan(&quiet_env(home, state_dir, config, now), &source)
-    else {
-        return false;
-    };
-    let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) else {
-        return false;
-    };
-    let seen = (path, modified);
+    let configured = configured_source_env(&quiet_env(home, state_dir, config, now)).ok();
+    let path = configured.as_ref().and_then(|env| {
+        let source = source_key(env.config.as_deref()?)?;
+        match fetch_plan(env, &source) {
+            Ok(FetchPlan::File(path)) => Some(path),
+            _ => None,
+        }
+    });
+    let version = path.map(|path| {
+        let stamp = fs::metadata(&path)
+            .and_then(|meta| meta.modified().map(|modified| (modified, meta.len())))
+            .ok();
+        (path, stamp)
+    });
     let mut held = rediscovery
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if held.key_seen.as_ref() == Some(&seen) {
+    if let Some(version) = version {
+        schedule_local_source(&mut held.key_attempt, version, Instant::now())
+    } else {
+        held.key_attempt = None;
+        false
+    }
+}
+
+type LocalSourceVersion = (PathBuf, Option<(std::time::SystemTime, u64)>);
+
+#[derive(Debug)]
+struct LocalSourceAttempt {
+    version: LocalSourceVersion,
+    at: Instant,
+}
+
+/// Record attempts, never success. Quiet polls keep the deadline anchored to the last attempt.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSourceRefresh",
+        action = "Poll",
+        project = "aterm_agent::harness::accounts_sync::source_refresh_tests::refresh_transition"
+    )
+)]
+fn schedule_local_source(
+    last: &mut Option<LocalSourceAttempt>,
+    version: LocalSourceVersion,
+    now: Instant,
+) -> bool {
+    if last.as_ref().is_some_and(|last| {
+        last.version == version && now.saturating_duration_since(last.at) < REDISCOVER_EVERY
+    }) {
         return false;
     }
-    held.key_seen = Some(seen);
+    *last = Some(LocalSourceAttempt { version, at: now });
     true
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSourceRefresh",
+        action = "Edit",
+        reason = "An external writer changes the source observation between polls."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSourceRefresh",
+        action = "Disappear",
+        reason = "The environment makes source metadata unavailable between polls."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSourceRefresh",
+        action = "Elapse",
+        reason = "The environment advances monotonic time independently of polling."
+    )
+)]
+#[doc(hidden)]
+pub fn account_source_refresh_environment() {}
 
 fn config_beside(roster: &Path) -> PathBuf {
     roster
@@ -3524,6 +3975,7 @@ fn sync_if_missing(
 }
 
 /// Whether a fleet accounts source is configured or discoverable for [`sync_accounts_for_init`].
+/// An unusable expected source also returns true so setup can report its read error.
 #[must_use]
 pub fn has_init_accounts_source(
     home: &Path,
@@ -3539,21 +3991,20 @@ pub fn has_init_accounts_source(
         return true;
     }
     let secrets = home.join(".secrets");
-    if [
-        FLEET_ROSTER_FILE,
-        "ai-accounts.csv",
-        super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-        super::headless_oauth::MAILBOX_TOML_FILE,
-    ]
-    .into_iter()
-    .any(|name| secrets.join(name).is_file())
+    if has_fleet_source(&secrets)
+        || [
+            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            super::headless_oauth::MAILBOX_TOML_FILE,
+        ]
+        .into_iter()
+        .any(|name| secrets.join(name).is_file())
     {
         return true;
     }
     if Roster::load(roster_path).is_ok_and(|r| !r.rows.is_empty())
         && roster_path
             .parent()
-            .is_some_and(|p| p.join(FLEET_ROSTER_FILE).is_file())
+            .is_some_and(|p| source_entry_present(&p.join(FLEET_ROSTER_FILE)))
     {
         return true;
     }
@@ -3596,6 +4047,7 @@ pub fn has_init_accounts_source(
 /// Whether `~/.secrets/` holds an updated fleet or accounting sheet not yet converged into
 /// `roster_path`, or, for a fleet discovery made ([`fleet_takes_discovered`]), local discovery
 /// (a mailbox file's accounts among what it reads) finds an account the fleet does not list yet.
+/// An unreadable or invalid selected source also needs a sync attempt to report its refusal.
 #[must_use]
 pub fn needs_init_accounts_sync(
     home: &Path,
@@ -3623,29 +4075,39 @@ fn init_sync_needed(
         return false;
     }
     let secrets_fleet = secrets.join(FLEET_ROSTER_FILE);
-    if secrets_fleet.is_file() && fs::read(&secrets_fleet).ok() != fs::read(&fb).ok() {
-        return true;
+    let has_secrets_fleet = source_entry_present(&secrets_fleet);
+    if has_secrets_fleet {
+        match (
+            read_local_source_text(&secrets_fleet),
+            read_local_source_text(&fb),
+        ) {
+            (Ok(source), Ok(kept)) if source == kept => {}
+            _ => return true,
+        }
     }
     let Ok(existing_text) = read_local_source_text(&fb) else {
-        return false;
+        return true;
     };
     let Ok(existing_fleet) = FleetRoster::from_toml(&existing_text, "fleet-accounts.toml") else {
-        return false;
+        return true;
     };
     let opt_in = opt_in_of(&existing_text);
     let secrets_csv = secrets.join("ai-accounts.csv");
-    if !secrets_fleet.is_file()
-        && secrets_csv.is_file()
-        && let Ok(csv_text) = read_local_source_text(&secrets_csv)
-        && let Ok(csv_fleet) = parse_accounting_csv(&csv_text, "ai-accounts.csv")
-        && csv_fleet.accounts.iter().any(|acct| {
+    if !has_secrets_fleet && source_entry_present(&secrets_csv) {
+        let Ok(csv_text) = read_local_source_text(&secrets_csv) else {
+            return true;
+        };
+        let Ok(csv_fleet) = parse_accounting_csv(&csv_text, "ai-accounts.csv") else {
+            return true;
+        };
+        if csv_fleet.accounts.iter().any(|acct| {
             !existing_fleet
                 .accounts
                 .iter()
                 .any(|a| accounts::email_matches(&a.email, &acct.email))
-        })
-    {
-        return true;
+        }) {
+            return true;
+        }
     }
     // Discovery's accounts are added only to a fleet discovery made: a fleet from a vault, a
     // sheet or a URL stays as its source wrote it, and a person's list as they wrote it.
@@ -3868,7 +4330,7 @@ fn sync_accounts_for_init_with(
         [FLEET_ROSTER_FILE, "ai-accounts.csv"]
             .into_iter()
             .map(|name| secrets.join(name))
-            .find(|p| p.is_file())
+            .find(|p| source_entry_present(p))
             .map(|p| p.to_string_lossy().into_owned())
     };
     let mut captured_fleet = None;
@@ -3892,7 +4354,7 @@ fn sync_accounts_for_init_with(
             fleet_snapshots.push(snapshot);
         }
         None
-    } else if fleet_path.is_file() {
+    } else if source_entry_present(&fleet_path) {
         let source = fleet_path.to_string_lossy().into_owned();
         let (text, snapshot) = capture_init_fleet(&env, &fleet_path, false, false)?;
         captured_fleet = Some((source.clone(), text));
@@ -3930,7 +4392,7 @@ fn sync_accounts_for_init_with(
     };
     let secrets_dir = home.join(".secrets");
     let secrets_fleet = secrets_dir.join(FLEET_ROSTER_FILE);
-    if secrets_dir.is_dir() && !secrets_fleet.exists() {
+    if secrets_dir.is_dir() && !source_entry_present(&secrets_fleet) {
         fleet_snapshots.push(FleetSnapshot {
             path: secrets_fleet,
             bytes: None,
@@ -3968,7 +4430,7 @@ fn sync_accounts_for_init_with(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resync {
     /// Claude Code's sync ran: the roster was missing (at most once per 10 minutes) or something
-    /// it is made from changed ([`sync_called_for`]).
+    /// it is made from changed or was due for revalidation ([`sync_called_for`]).
     pub synced: bool,
     /// Why the sync failed. Recovery may have completed a previous commit before this
     /// attempt refused its source or encountered another publication error.
@@ -3985,7 +4447,7 @@ pub struct Resync {
 }
 
 /// THE SETUP PASS'S RESYNC (`aterm`'s first-run setup runs it every pass it retries): Claude
-/// Code's sync only where the roster is missing or something it is made from changed
+/// Code's sync where the roster is missing or its inputs changed or need revalidation
 /// ([`sync_called_for`], the rule a window's upkeep keeps), each other CLI's (which writes only
 /// the rows it adds), and, where the sync leaves rows with no login made here, `sign_in` allows
 /// (an instance that keeps this account's own fleet accounts) and the config does not turn
@@ -4149,9 +4611,9 @@ fn load_cli_fleet(
             let read = |path: &Path| {
                 read_local_source_text(path).map_err(|why| format!("{}: {why}", path.display()))
             };
-            if toml.is_file() {
+            if source_entry_present(&toml) {
                 (toml.display().to_string(), read(&toml)?)
-            } else if csv.is_file() {
+            } else if source_entry_present(&csv) {
                 let text = read(&csv)?;
                 if !csv_names_column(cli, &text) {
                     return Ok(None);
@@ -4416,6 +4878,14 @@ fn run_cli_accounts_sync_with(
 ) -> ExitCode {
     let flag = format!("--cli {}", cli.id());
     let product = cli.connector().product;
+    let normalized = match source_env(env) {
+        Ok(env) => env,
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts sync {flag}: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = &normalized;
     let (Some(config), Some(home)) = (env.config.as_deref(), env.home.as_deref()) else {
         let _ = writeln!(
             err,
@@ -4424,12 +4894,15 @@ fn run_cli_accounts_sync_with(
         );
         return ExitCode::FAILURE;
     };
+    // The pool helper reconstructs a home-based environment for background upkeep.
+    // An explicit CLI fetch keeps the session context captured by this invocation.
+    let fetch_in_session = |_: &Env, source: &str| fetch(env, source);
     let synced = sync_cli_with(
         cli,
         (home, &env.state, config),
         (source, machine_override),
         env.now,
-        (fetch, &sync_lock_ladder()),
+        (&fetch_in_session, &sync_lock_ladder()),
     );
     let file = cli.accounts().roster_file;
     let synced = match synced {
@@ -13040,9 +13513,25 @@ mod login_tests;
 mod resync_tests;
 
 #[cfg(test)]
+#[path = "accounts_source_refresh_tests.rs"]
+mod source_refresh_tests;
+
+#[cfg(test)]
+#[path = "accounts_source_path_tests.rs"]
+mod source_path_tests;
+
+#[cfg(test)]
 #[path = "accounts_sync_ladder_tests.rs"]
 mod ladder_tests;
 
 #[cfg(test)]
 #[path = "accounts_request_admission_tests.rs"]
 mod request_admission_tests;
+
+#[cfg(test)]
+#[path = "accounts_sheet_columns_tests.rs"]
+mod sheet_columns_tests;
+
+#[cfg(test)]
+#[path = "accounts_fleet_assignment_tests.rs"]
+mod fleet_assignment_tests;

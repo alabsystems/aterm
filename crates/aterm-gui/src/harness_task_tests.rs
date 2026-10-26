@@ -1060,6 +1060,7 @@ fn a_proven_self_claims_landing_marks_its_workers_task_done_with_its_rollout_rep
                         cwd: None,
                         draft_empty: None,
                         frame: None,
+                        goal: None,
                         initializing: false,
                     },
                 ),

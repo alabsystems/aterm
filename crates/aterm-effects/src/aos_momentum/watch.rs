@@ -118,19 +118,17 @@ impl Segment {
         }
         let verdict = contract.judge(&schema, log.inputs(), &run);
         out.judged = Judged::from(&verdict);
-        if out.judged.failed() {
-            out.fault = retired
-                .checkpoint
-                .encode()
-                .ok()
-                .zip(log.encode(&schema).ok())
-                .map(|(checkpoint, encoded)| MomentumTrace {
-                    identity: identity.clone(),
-                    checkpoint,
-                    log: encoded,
-                    head_state: run.state_digest,
-                    head_chain: run.observation_chain,
-                });
+        if out.judged.failed()
+            && let (Ok(checkpoint), Ok(encoded)) =
+                (retired.checkpoint.encode(), log.encode(&schema))
+        {
+            out.fault = Some(MomentumTrace {
+                identity: identity.clone(),
+                checkpoint,
+                log: encoded,
+                head_state: run.state_digest,
+                head_chain: run.observation_chain,
+            });
         }
         out
     }

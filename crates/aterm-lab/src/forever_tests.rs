@@ -3,6 +3,7 @@
 
 //! Tests for `lab forever` stub scripts, request readers, and scenario judge.
 
+use aterm_agent::harness::acts::HeldBy;
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::approvals::LEFT_REASON;
 use aterm_agent::supervise::config::CONTINUE_TEXT;
@@ -12,6 +13,7 @@ use aterm_agent::supervise::policy::turn_end::{
     clean_defense, open_work_suffix, repo_work_suffix, says_done,
 };
 
+use super::surfaces::held::tests::three_a_said;
 use super::*;
 use crate::stub::{gemini::gemini_users, message_users, responses_users};
 
@@ -682,7 +684,7 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 39);
+    assert_eq!(Chain::every().len(), 40);
     assert!(
         Chain::every()
             .iter()
@@ -1119,6 +1121,19 @@ fn the_words_are_read() {
             .unwrap()
             .window
     );
+    let read_off = parse_args(&v(&[
+        "--harness",
+        "claude",
+        "--mode",
+        "both",
+        "--chains",
+        "same-land",
+        "--window",
+    ]))
+    .unwrap()
+    .unwrap();
+    assert!(read_off.window, "same-land's hold read off a real window");
+    assert!(read_off.chains(Harness::Claude).contains(&Chain::SameLand));
     for bad in [
         &[
             "--harness",
@@ -1129,7 +1144,15 @@ fn the_words_are_read() {
             "land-q",
             "--window",
         ][..],
-        &["--harness", "claude", "--mode", "land", "--window"],
+        &[
+            "--harness",
+            "claude",
+            "--mode",
+            "land",
+            "--chains",
+            "land-c",
+            "--window",
+        ],
         &["--harness", "muse", "--mode", "wall", "--window"],
     ] {
         let f = parse_args(&v(bad)).err();
@@ -1439,6 +1462,7 @@ fn repo_suffix(repo: Repo) -> String {
         Repo::Stashed => RepoWork::of_git(r, "", "WIP on main: 1a2b lab\n", 0, 0, "origin/main"),
         Repo::Unpushed => RepoWork::of_git(r, "", "", 1, 1, "origin/main"),
         Repo::Unlanded => RepoWork::of_git(r, "", "", 0, 1, "origin/main"),
+        Repo::Others => RepoWork::of_git(r, "", "On main: another\n", 0, 0, "origin/main"),
     };
     repo_work_suffix(&work.expect("work found"))
 }
@@ -1935,6 +1959,10 @@ fn instant_landed() -> Seen {
             new_turns: 0,
         }),
         lift_stub: None,
+        band: Vec::new(),
+        band_reads: Vec::new(),
+        stop_person_ms: None,
+        stop_person_sent_ms: None,
     }
 }
 
@@ -2664,6 +2692,23 @@ fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
     let headless = lab_opts(restored, Mode::Cover, true, (false, false)).expect("the seam alone");
     assert!(!headless.window && headless.restore && !headless.lifeline);
     assert!(!headless.instance_env.contains(PERSON_SEAM));
+}
+
+/// `ladder` and `angles` run their aterm under the back-off ladder's seam at an eighth, and no other
+/// mode does: `angles`' sixth check would come past +79 min on the shipped ladder. NEGATIVE
+/// CONTROL: `cruise`, whose same reply is held by its second answer, keeps the shipped ladder.
+#[test]
+fn the_ladder_and_angles_modes_alone_run_the_ladder_at_an_eighth() {
+    for (mode, scaled) in [
+        (Mode::Ladder, true),
+        (Mode::Angles, true),
+        (Mode::Cruise, false),
+        (Mode::Cover, false),
+    ] {
+        let u =
+            lab_opts(crate::lab::UpOpts::default(), mode, false, (false, false)).expect("headless");
+        assert_eq!(u.instance_env.contains(&ladder_env()), scaled, "{mode:?}");
+    }
 }
 
 #[test]
@@ -3583,7 +3628,39 @@ fn a_point_before_the_first_prompt_or_a_late_ladder_fails_the_chain() {
     let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L5);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("closed 2 short turn(s), not 1"), "{why}");
-    assert!(chain_faults(&landed_a(), T0).is_empty());
+    assert!(chain_faults(&landed_a(), T0, false).is_empty());
+}
+
+/// A first reply that is real work past the floor closes no short turn, and P3 wants none: only
+/// `cruise-angles` scripts one, and every other chain's first reply comes within seconds.
+/// NEGATIVE CONTROLS: the same record judged as a quick first reply's fails, and a first point
+/// that closed one short turn after real work fails.
+#[test]
+fn a_first_reply_of_real_work_closes_no_short_turn() {
+    let works: Vec<Chain> = Chain::every()
+        .into_iter()
+        .filter(|c| c.first_reply_works())
+        .collect();
+    assert_eq!(works, [Chain::CruiseAngles]);
+    assert!(Chain::CruiseAngles.first_reply_ms() >= 140_000);
+    assert!(Chain::LandA.first_reply_ms() < 10_000);
+    let mut s = landed_a();
+    s.ledger[0] = point(5_000, 0);
+    assert!(chain_faults(&s, T0, true).is_empty());
+    let quick = chain_faults(&s, T0, false);
+    assert!(
+        quick
+            .iter()
+            .any(|f| f.contains("closed 0 short turn(s), not 1")),
+        "{quick:?}"
+    );
+    let worked = chain_faults(&landed_a(), T0, true);
+    assert!(
+        worked
+            .iter()
+            .any(|f| f.contains("closed 1 short turn(s), not 0")),
+        "{worked:?}"
+    );
 }
 
 #[test]
@@ -4479,10 +4556,34 @@ fn seen_cruise_n() -> Seen {
                 ),
             ],
             opening: opened("claude", "cruise"),
+            stopped: Some(j(868_000, &stopped_read(Some("Claude Code"), true))),
             ..window("cruise-n")
         },
         ..Seen::default()
     }
+}
+
+/// N4's stand-in ask beside its report as [`surfaces::stopped::ask_step`] keeps it (§14.7): on a
+/// 7a build (`first`) the ask's row above the report's and pressed, the report's row carrying
+/// `product`'s tip; on main before it the older report above, pressed, with no tip.
+fn stopped_read(product: Option<&str>, first: bool) -> String {
+    let ask = format!(
+        "◇ {} — approve the stand-in request · 1s",
+        surfaces::stopped::ASK_TAB
+    );
+    let report = format!("◇ cruise-n — {NEED_A} · 3s");
+    let read = surfaces::stopped::Read {
+        rows: if first {
+            vec![ask, report]
+        } else {
+            vec![report, ask]
+        },
+        ask: Some(usize::from(!first)),
+        report: Some(usize::from(first)),
+        tip: product.map(|p| aterm_agent::supervise::mode_words::report_words(p, false)),
+        pressing: if first { "@s-ask" } else { "@s-cn" }.into(),
+    };
+    format!("{} cleared=yes", read.line("s-ask", "s-cn"))
 }
 
 #[test]
@@ -4521,6 +4622,23 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
             ("N3", "PASS"),
             ("N4", "FAIL")
         ]
+    );
+    let mut s = seen_cruise_n();
+    s.window.stopped = Some(j(868_000, &stopped_read(None, false)));
+    assert_eq!(
+        verdicts(Chain::CruiseN, &s, "claude"),
+        [
+            ("N1", "PASS"),
+            ("N2", "PASS"),
+            ("N3", "PASS"),
+            ("N4", "FAIL")
+        ],
+        "main's read before 7a fails N4's stopped-first want alone"
+    );
+    s.window.stopped = None;
+    assert_eq!(
+        one(Chain::CruiseN, &s, "claude", Scenario::N4).0,
+        "UNOBSERVED"
     );
     let n = |s: &Seen, k| surfaces::judge_needs_step(s, T0, k).word();
     let good = seen_cruise_n();
@@ -6876,8 +6994,15 @@ fn cruise_held(line: &str) -> Seen {
 /// title and all): the mode's own promise, no stop word.
 const CRUISE_ON_MAIN: &str = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=\"Last: kept going at 11:48.\" title=\"autopilot: cruise — keeps going for ever, finding more to do · last: ↻ kept going 11:48, ↻ kept going 11:44 · click: land · right-click: more\"";
 
-/// The same chip as §14.3 words it once 3a says the stop.
-const CRUISE_SAID: &str = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=\"Stopped typing: the same reply twice, with no work. It types again at your turn, or once the agent works.\" title=\"autopilot: cruise — stopped typing: the same reply twice, no work; types again at your turn or once the agent works · click: land · right-click: more\"";
+/// The same chip as §14.3 words it once 3a says the stop: description and title led by it
+/// ([`surfaces::held::stop_heads`]).
+fn cruise_said() -> String {
+    let [spoken, titled, _] = surfaces::held::stop_heads("cruise", HeldBy::SameReply);
+    format!(
+        "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" \
+         description=\"{spoken}\" title=\"{titled} · click: land · right-click: more\""
+    )
+}
 
 /// 2a's negative control first (§14.2's Proof): main's watch ended the cruise chain at its second
 /// done check, before the hold, and C2 passed while aterm had stopped typing for good. Watched a
@@ -6911,13 +7036,25 @@ fn the_cruise_chain_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
     );
     let (w, why) = one(
         Chain::Cruise,
-        &cruise_held(CRUISE_SAID),
+        &cruise_held(&cruise_said()),
         "claude",
         Scenario::C2,
     );
-    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert_eq!(w, "FAIL", "said, but main's journal names no arm: {why}");
     assert!(
-        !why.contains("HELD, NOT SAID") && why.contains("SKIPPED until 3a is on main"),
+        !why.contains("HELD, NOT SAID") && why.contains("held=(none)"),
+        "{why}"
+    );
+    let (w, why) = one(
+        Chain::Cruise,
+        &three_a_said(cruise_held(&cruise_said()), Chain::Cruise),
+        "claude",
+        Scenario::C2,
+    );
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("journaled when=later held=same-reply")
+            && why.contains("no `Stopped typing` row"),
         "{why}"
     );
 }
@@ -6939,9 +7076,10 @@ fn nudged_held(suffix: &str) -> Seen {
 }
 
 /// A land chain's nudge whose yield was held passes its records' want (the nudge named what is
-/// left; the hold is the decision), and the hold's wants follow: under `--no-surfaces` a named
-/// skip, and 3a's fields UNOBSERVED. Its watch ends a minute past the hold, or past the `WAITING`
-/// where none came, where main's ended 3 s past that `WAITING` and never past a hold.
+/// left; the hold is the decision), and the hold's wants follow: under `--no-surfaces` what it
+/// says is a named skip, and 3a's fields fail on `b42ae72fc3`'s journal and pass on 3a's. Its
+/// watch ends a minute past the hold, or past the `WAITING` where none came, where main's ended
+/// 3 s past that `WAITING` and never past a hold.
 #[test]
 fn a_held_nudge_is_its_points_decision_and_the_watch_runs_past_it() {
     for (c, id) in REPO_CHAINS.into_iter().chain([(Chain::LandB, "L2")]) {
@@ -6951,11 +7089,23 @@ fn a_held_nudge_is_its_points_decision_and_the_watch_runs_past_it() {
             repo_suffix(c.repo())
         };
         let (w, why) = one(c, &nudged_held(&suffix), "claude", c.scenarios()[0]);
-        assert_eq!(w, "UNOBSERVED", "{id}: {why}");
+        assert_eq!(w, "FAIL", "{id}: {why}");
         assert!(
             why.contains("+373.6 s HELD EXCEPTION seq=3 kind=stalled")
                 && why.contains("SKIPPED (--no-surfaces)")
-                && why.contains("SKIPPED until 3a is on main"),
+                && why.contains("held=(none)"),
+            "{id}: {why}"
+        );
+        let (w, why) = one(
+            c,
+            &three_a_said(nudged_held(&suffix), c),
+            "claude",
+            c.scenarios()[0],
+        );
+        assert_eq!(w, "PASS", "{id}: {why}");
+        let when = if c == Chain::LandB { "later" } else { "now" };
+        assert!(
+            why.contains(&format!("journaled when={when} held=same-reply")),
             "{id}: {why}"
         );
         assert!(!why.contains("no WAITING decided"), "{id}: {why}");
@@ -6999,19 +7149,64 @@ fn a_hold_fails_every_scenario_of_a_chain_that_scripts_no_same_reply() {
 /// HL and HC run in the measured pass, each to a minute past its second act's point.
 #[test]
 fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
-    let mut s = nudged_held(&repo_suffix(Repo::Untracked));
-    assert!(!finished(&tab_of(Chain::SameLand, s.clone()), T0 + 433_599));
-    assert!(finished(&tab_of(Chain::SameLand, s.clone()), T0 + 433_600));
-    s.journal.truncate(2);
-    assert!(!finished(&tab_of(Chain::SameLand, s), T0 + 900_000));
+    let held = three_a_said(nudged_held(&repo_suffix(Repo::Untracked)), Chain::SameLand);
+    assert!(!finished(
+        &tab_of(Chain::SameCruise, held.clone()),
+        T0 + 433_599
+    ));
+    assert!(finished(
+        &tab_of(Chain::SameCruise, held.clone()),
+        T0 + 433_600
+    ));
+    // same-land runs on past its person's turn: a minute, or until its row is read gone.
+    assert!(
+        !finished(&tab_of(Chain::SameLand, held.clone()), T0 + 900_000),
+        "no person's turn yet"
+    );
+    let p = T0 + 434_000;
+    let mut typed = held.clone();
+    typed.stop_person_ms = Some(p);
+    assert!(!finished(
+        &tab_of(Chain::SameLand, typed.clone()),
+        p + 59_999
+    ));
+    assert!(finished(
+        &tab_of(Chain::SameLand, typed.clone()),
+        p + 60_000
+    ));
+    let withdrawn = typed.band[0].1.replace("state=live", "state=withdrawn");
+    let mut gone = typed.clone();
+    gone.journal.push((
+        p + 400,
+        "CLEARED seq=4 exception=stalled after=60s a different reply, someone's turn, or the agent \
+         working"
+            .into(),
+    ));
+    gone.band.push((p + 2_000, withdrawn));
+    gone.band_reads.push(p + 2_000);
+    gone.end_ms = p + 2_000;
+    assert!(finished(&tab_of(Chain::SameLand, gone.clone()), p + 2_000));
+    let mut cold = typed;
+    cold.journal.truncate(2);
+    cold.stop_person_ms = None;
+    assert!(!finished(&tab_of(Chain::SameCruise, cold), T0 + 900_000));
     let (w, why) = one(
         Chain::SameLand,
         &nudged_held(&repo_suffix(Repo::Untracked)),
         "claude",
         Scenario::HL,
     );
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(why.contains("held at +373.6 s") && why.contains("one `Stopped typing` row"));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("held at +373.6 s") && why.contains("held=(none)"),
+        "{why}"
+    );
+    let (w, why) = one(Chain::SameLand, &gone, "claude", Scenario::HL);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("one `Stopped typing` row") && why.contains("the row gone by +436.0 s"),
+        "{why}"
+    );
     let (w, why) = one(
         Chain::SameCruise,
         &cruise_held(CRUISE_ON_MAIN),
@@ -7020,7 +7215,7 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
     );
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("HELD, NOT SAID"), "{why}");
-    assert!(why.contains("no `Stopped typing` row"), "{why}");
+    assert!(why.contains("held=(none)"), "{why}");
     assert!(Chain::of_mode(Mode::Both).contains(&Chain::SameLand));
     assert!(surfaces::TITLED.contains(&Chain::SameCruise));
 }
@@ -7119,13 +7314,26 @@ fn wrote_c_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
     assert!(!why.contains("THE CHAIN'S RECORDS"), "{why}");
     let (w, why) = one(
         Chain::WroteC,
-        &wrote_c_held(CRUISE_SAID),
+        &wrote_c_held(&cruise_said()),
         "claude",
         Scenario::C3,
     );
+    assert_eq!(w, "FAIL", "said, but main's journal names no arm: {why}");
+    assert!(
+        !why.contains("HELD, NOT SAID") && why.contains("held=(none)"),
+        "{why}"
+    );
+    let (w, why) = one(
+        Chain::WroteC,
+        &three_a_said(wrote_c_held(&cruise_said()), Chain::WroteC),
+        "claude",
+        Scenario::C3,
+    );
+    // Its window's title want stays unread on these records (no opening sweep, no END).
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(
-        !why.contains("HELD, NOT SAID") && why.contains("SKIPPED until 3a is on main"),
+        why.contains(&format!("{}: PASS", surfaces::held::ADDS))
+            && why.contains(&format!("{}: PASS", surfaces::held::SAID)),
         "{why}"
     );
     assert!(Chain::WroteC.same_reply());

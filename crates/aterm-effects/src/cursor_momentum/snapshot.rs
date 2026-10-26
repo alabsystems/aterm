@@ -506,12 +506,23 @@ impl MomentumGlow {
 /// `t − epoch` in signed nanoseconds.
 fn offset_from(epoch: Instant, t: Instant, field: SnapshotField) -> Result<i128, SnapshotRefusal> {
     let refused = SnapshotRefusal::OffsetUnrepresentable { field };
-    let nanos = |d: Duration| i128::try_from(d.as_nanos()).map_err(|_| refused);
     if let Some(after) = t.checked_duration_since(epoch) {
-        nanos(after)
+        let ns = after.as_nanos();
+        if ns <= i128::MAX as u128 {
+            Ok(ns as i128)
+        } else {
+            Err(refused)
+        }
     } else {
-        let before = epoch.checked_duration_since(t).ok_or(refused)?;
-        nanos(before)?.checked_neg().ok_or(refused)
+        let Some(before) = epoch.checked_duration_since(t) else {
+            return Err(refused);
+        };
+        let ns = before.as_nanos();
+        if ns <= i128::MAX as u128 {
+            Ok(-(ns as i128))
+        } else {
+            Err(refused)
+        }
     }
 }
 
@@ -523,15 +534,21 @@ fn instant_at(
 ) -> Result<Instant, SnapshotRefusal> {
     let refused = SnapshotRefusal::Instant { field, offset };
     let magnitude = offset.unsigned_abs();
-    let secs = u64::try_from(magnitude / NANOS_PER_SEC).map_err(|_| refused)?;
-    let nanos = u32::try_from(magnitude % NANOS_PER_SEC).map_err(|_| refused)?;
+    let secs_u128 = magnitude / NANOS_PER_SEC;
+    if secs_u128 > u64::MAX as u128 {
+        return Err(refused);
+    }
+    let secs = secs_u128 as u64;
+    let nanos = (magnitude % NANOS_PER_SEC) as u32;
     let span = Duration::new(secs, nanos);
-    if offset >= 0 {
+    let Some(inst) = (if offset >= 0 {
         epoch.checked_add(span)
     } else {
         epoch.checked_sub(span)
-    }
-    .ok_or(refused)
+    }) else {
+        return Err(refused);
+    };
+    Ok(inst)
 }
 
 /// A float's bits, refused when NaN or `-0.0`.

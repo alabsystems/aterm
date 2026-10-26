@@ -166,7 +166,7 @@ pub(crate) fn complete_current_native_termination() -> bool {
 /// One menu command, independent of AppKit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
-    /// About aterm — open the About route in the native Settings tab.
+    /// About aterm — open the dedicated native About tab.
     About,
     /// Check for Updates….
     SoftwareUpdate,
@@ -2515,7 +2515,7 @@ pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use aterm_objc::{Id, Obj, Retained, Sel, autoreleasepool, class, sel};
+    use aterm_objc::{BlockPtr, Id, Obj, RcBlock, Retained, Sel, autoreleasepool, class, sel};
     use aterm_window::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
@@ -3303,25 +3303,119 @@ mod macos {
         })
     }
 
-    const SECOND_OPEN_DELAY_SECS: f64 = 1.0;
+    const SECOND_OPEN_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// Open System Settings at `pane`.
+    /// `-[NSWorkspace openURL:configuration:completionHandler:]`.
+    pub(super) type OpenUrl = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, BlockPtr);
+    /// Its handler: `void (^)(NSRunningApplication *app, NSError *error)`.
+    pub(super) type OpenedHandler = fn(Id, Id);
+    /// `-[NSWorkspace URLForApplicationToOpenURL:]`.
+    pub(super) type AppForUrl = unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id;
+
+    /// Open System Settings at `pane`, without waiting for it: the first URL an app is
+    /// registered for is handed to LaunchServices ([`open_url_unwaited`]), and the answer says
+    /// which it was, not that System Settings came up (a failed open is logged when macOS says so).
     pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
         if MainThread::new().is_none() {
             return SettingsOpen::Refused;
         }
         let urls = privacy_settings_urls(pane);
         for (i, url) in urls.iter().enumerate() {
-            if !open_in_workspace(url, false) {
+            let anchor = i + 1 < urls.len();
+            if !opens_with_an_app(url)
+                || !open_url_unwaited(url, anchor.then_some(SECOND_OPEN_DELAY))
+            {
                 continue;
             }
-            if i + 1 < urls.len() {
-                open_in_workspace_after_delay(url, SECOND_OPEN_DELAY_SECS);
-                return SettingsOpen::Anchored;
-            }
-            return SettingsOpen::PaneRoot;
+            return if anchor {
+                SettingsOpen::Anchored
+            } else {
+                SettingsOpen::PaneRoot
+            };
         }
         SettingsOpen::Refused
+    }
+
+    /// Whether an app is registered to open the URL `s`: LaunchServices' answer from its own
+    /// database, which launches and asks no app.
+    fn opens_with_an_app(s: &str) -> bool {
+        let Some(ns) = appkit::nsstring(s) else {
+            return false;
+        };
+        // SAFETY: `+URLWithString:` is `-(id)(NSString *)`, autoreleased (nil for a string that
+        // is not a URL, checked); `+sharedWorkspace` is the `-(id)` singleton;
+        // `-URLForApplicationToOpenURL:` is `AppForUrl` on it, its answer only tested for nil.
+        // Every borrow lives inside this pool.
+        autoreleasepool(|_| unsafe {
+            let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
+            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+            if url.is_null() || ws.is_null() {
+                return false;
+            }
+            let app_for: AppForUrl = aterm_objc::checked_msg();
+            !app_for(ws, sel!(URLForApplicationToOpenURL:), url).is_null()
+        })
+    }
+
+    /// Hand the URL `s` to LaunchServices and return at once: System Settings launches while
+    /// this thread goes on (the synchronous `-openURL:` held the frame being drawn 204 ms at a
+    /// hand-over). With `anchor`, the URL is opened again that long after the first open
+    /// completed: a System Settings that was not running comes up at its root, and the second
+    /// open lands on the pane's section. `false` when nothing was handed over. Any thread.
+    fn open_url_unwaited(s: &'static str, anchor: Option<std::time::Duration>) -> bool {
+        if super::os_ui_refused(&format!("opening {s}")) {
+            return false;
+        }
+        let Some(ns) = appkit::nsstring(s) else {
+            return false;
+        };
+        let opened = move |_app: Id, error: Id| {
+            if !error.is_null() {
+                aterm_log::warn!("System Settings did not open {s}: macOS answered an error");
+                return;
+            }
+            let Some(delay) = anchor else {
+                return;
+            };
+            let spawned = std::thread::Builder::new()
+                .name("aterm-settings-anchor".to_owned())
+                .spawn(move || {
+                    std::thread::sleep(delay);
+                    let _ = open_url_unwaited(s, None);
+                });
+            if let Err(e) = spawned {
+                aterm_log::warn!("System Settings' section was not opened again: {e}");
+            }
+        };
+        // SAFETY: `+URLWithString:` is `-(id)(NSString *)`, autoreleased (nil for a string that
+        // is not a URL, checked); `+sharedWorkspace` and `+[NSWorkspaceOpenConfiguration
+        // configuration]` are `-(id)` accessors, autoreleased and checked; the handler is
+        // `OpenedHandler`, exactly `opened`'s; `-openURL:configuration:completionHandler:` is
+        // `OpenUrl` on the workspace, which copies the handler and retains the URL and the
+        // configuration until it calls the handler. Every borrow lives inside this pool.
+        autoreleasepool(|_| unsafe {
+            let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
+            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+            let config = appkit::send_id(
+                class(c"NSWorkspaceOpenConfiguration").as_id(),
+                sel!(configuration),
+            );
+            if url.is_null() || ws.is_null() || config.is_null() {
+                return false;
+            }
+            let Some(handler) = RcBlock::of::<OpenedHandler, _>(opened) else {
+                return false;
+            };
+            let open: OpenUrl = aterm_objc::checked_msg();
+            open(
+                ws,
+                sel!(openURL:configuration:completionHandler:),
+                url,
+                config,
+                handler.as_block_ptr(),
+            );
+            true
+        })
     }
 
     /// Put `window` — a panel aterm itself built, never another app's — in front
@@ -3334,36 +3428,6 @@ mod macos {
         // caller owns, on the main thread (checked above).
         unsafe { appkit::send_v(window, sel!(orderFrontRegardless)) };
         true
-    }
-
-    fn open_in_workspace_after_delay(s: &str, secs: f64) {
-        if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
-            return;
-        }
-        let Some(ns) = appkit::nsstring(s) else {
-            return;
-        };
-        // SAFETY: Standard AppKit. Every `s` reaching here is one of this module's own `&'static
-        // str` URL constants, so `URLWithString:` is non-nil. `NSWorkspace` retains the receiver
-        // and the argument until the perform fires, so nothing here outlives this frame. The
-        // delayed perform invokes `openURL:` (really `BOOL`-returning) as `id`-returning; the value
-        // lands in the same return register on every target aterm builds for and is discarded.
-        autoreleasepool(|_| unsafe {
-            let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
-            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
-            if url.is_null() || ws.is_null() {
-                return;
-            }
-            let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64) =
-                aterm_objc::checked_msg();
-            perform(
-                ws,
-                sel!(performSelector:withObject:afterDelay:),
-                sel!(openURL:),
-                url,
-                secs,
-            );
-        });
     }
 
     #[cfg(test)]
@@ -3412,6 +3476,43 @@ mod macos {
             }
             #[cfg(target_arch = "aarch64")]
             assert_eq!(Bool::ENCODING, "B");
+        }
+
+        /// The System Settings open's sends are the runtime's own prototypes, and the
+        /// configuration it passes is a class the runtime has.
+        #[test]
+        fn the_unwaited_open_states_the_runtimes_prototypes() {
+            let workspace = class(c"NSWorkspace");
+            assert!(!workspace.is_null());
+            assert!(!class(c"NSWorkspaceOpenConfiguration").is_null());
+            // SAFETY: a live class; `prototype_check` reads an encoding and sends nothing.
+            unsafe {
+                assert_eq!(
+                    aterm_objc::prototype_check::<super::OpenUrl>(
+                        workspace,
+                        sel!(openURL:configuration:completionHandler:)
+                    ),
+                    Ok(())
+                );
+                assert_eq!(
+                    aterm_objc::prototype_check::<super::AppForUrl>(
+                        workspace,
+                        sel!(URLForApplicationToOpenURL:)
+                    ),
+                    Ok(())
+                );
+                assert!(
+                    aterm_objc::prototype_check::<
+                        unsafe extern "C-unwind" fn(
+                            aterm_objc::Id,
+                            aterm_objc::Sel,
+                            aterm_objc::Id,
+                        ) -> Bool,
+                    >(workspace, sel!(openURL:configuration:completionHandler:))
+                    .is_err(),
+                    "the control: the synchronous prototype is not this method's"
+                );
+            }
         }
     }
 }

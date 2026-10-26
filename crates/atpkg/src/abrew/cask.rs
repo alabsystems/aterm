@@ -258,6 +258,36 @@ fn install_deps_inner(
     Ok(())
 }
 
+/// Names a dry run would still have to install for `cask`: its
+/// uninstalled `depends_on` casks (each resolved like the real walk)
+/// followed by its uninstalled `depends_on` formulae — the membership
+/// of brew's `Would install N dependencies for <token>` line. Read
+/// only; admission runs separately through the dry install itself.
+pub(super) fn dry_dep_names(api: &super::api::Api, prefix: &Prefix, cask: &Cask) -> Vec<String> {
+    fn walk(api: &super::api::Api, prefix: &Prefix, cask: &Cask, out: &mut Vec<String>) {
+        let Ok(resolved) = resolve(cask, Machine::this()) else {
+            return;
+        };
+        for dep in &resolved.depends_cask {
+            if prefix.installed_one(Kind::Cask, dep).is_none() && !out.contains(dep) {
+                out.push(dep.clone());
+                if let Ok(dc) = api.cask(dep) {
+                    walk(api, prefix, &dc, out);
+                }
+            }
+        }
+        for dep in &resolved.depends_formula {
+            let short = super::Formula::short_name(dep).to_string();
+            if prefix.installed_one(Kind::Formula, &short).is_none() && !out.contains(&short) {
+                out.push(short);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(api, prefix, cask, &mut out);
+    out
+}
+
 /// Install one cask the user named (on request).
 pub fn install(
     prefix: &Prefix,
@@ -276,7 +306,9 @@ fn install_inner(
     cask: &Cask,
     dry_run: bool,
     force: bool,
-    upgrade: bool,
+    // Kept for the install/upgrade/reinstall caller shape; an
+    // outdated install is replaced whichever verb brought us here.
+    _upgrade: bool,
     reinstall: bool,
     on_request: bool,
 ) -> Result<String, InstallError> {
@@ -312,7 +344,10 @@ fn install_inner(
         if reinstall && inst.version == cask.version {
             replacing = true;
             same_version_reinstall = true;
-        } else if (upgrade || reinstall) && older {
+        } else if older {
+            // Brew's plain cask install upgrades an outdated cask
+            // (its "Not upgrading" notice below is the current case),
+            // preserving the receipt's on-request intent read above.
             replacing = true;
         } else if force || reinstall {
             return Err(InstallError::Unsupported(format!(
@@ -321,8 +356,8 @@ fn install_inner(
             )));
         } else {
             eprintln!(
-                "Warning: {} {} is already installed",
-                cask.token, inst.version
+                "Warning: Not upgrading {}, the latest version is already installed",
+                cask.token
             );
             return Ok(inst.version);
         }
@@ -368,7 +403,8 @@ fn install_inner(
         }
     }
     if dry_run {
-        println!("Would install cask {} {}", cask.token, cask.version);
+        // The command layer prints brew's grouped dry-run summary; a
+        // dry cask install itself stays silent.
         return Ok(cask.version.clone());
     }
     prefix.ensure()?;
@@ -458,6 +494,7 @@ fn install_inner(
         }
         extract_nested_tars(&payload, &artifacts, &cask.token)?;
     }
+    println!("==> Installing Cask {}", cask.token);
     stage_wrappers(prefix, cask, &payload, &staged)?;
     for (relative, _, app, exec) in &artifacts {
         let src = payload.join(relative);
@@ -512,6 +549,18 @@ fn install_inner(
         receipt_fields.push((k, v));
     }
     prefix.write_receipt(&payload, &receipt_fields)?;
+    for (artifact, (path, dst, _, _)) in cask.artifacts.iter().zip(&artifacts) {
+        let (label, linked) = artifact_label(artifact);
+        let base = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        println!(
+            "==> {} {label} '{base}' to '{}'",
+            if linked { "Linking" } else { "Moving" },
+            dst.display()
+        );
+    }
     if same_version_reinstall {
         super::install::publish_payload_reinstall(
             prefix,
@@ -532,6 +581,15 @@ fn install_inner(
         publish_payload(prefix, &payload, &staged, &links)?;
     }
     prefix.rebuild_state()?;
+    let verb = if replacing && !same_version_reinstall {
+        "upgraded"
+    } else {
+        "installed"
+    };
+    match super::install_badge() {
+        Some(badge) => println!("{badge}  {} was successfully {verb}!", cask.token),
+        None => println!("{} was successfully {verb}!", cask.token),
+    }
     super::install::note_bin_not_on_path(prefix, false);
     Ok(cask.version.clone())
 }
@@ -1082,6 +1140,78 @@ fn map_generic_target(prefix: &Prefix, target: &str) -> Option<PathBuf> {
 }
 
 /// (payload-relative source, destination, is-directory, must-be-executable).
+/// Brew's per-artifact display class: its `english_name` and whether
+/// the class links (binary, manpage, completions — brew's Symlinked)
+/// rather than moves (everything else) its payload. Drives the
+/// `==> Moving/Linking …` and `==> Removing/Unlinking …` lines.
+fn artifact_label(artifact: &Artifact) -> (&'static str, bool) {
+    match artifact {
+        Artifact::App(..) => ("App", false),
+        Artifact::Binary(..) | Artifact::Wrapper(..) => ("Binary", true),
+        Artifact::Font(..) => ("Font", false),
+        Artifact::Manpage(..) => ("Manpage", true),
+        Artifact::Suite(..) => ("App Suite", false),
+        Artifact::KeyboardLayout(..) => ("Keyboard Layout", false),
+        Artifact::ScreenSaver(..) => ("Screen Saver", false),
+        Artifact::PrefPane(..) => ("Preference Pane", false),
+        Artifact::Service(..) => ("Service", false),
+        Artifact::Generic(..) => ("Generic Artifact", false),
+        Artifact::Library(_, _, dir) => library_artifact_label(dir),
+        _ => ("Generic Artifact", false),
+    }
+}
+
+fn library_artifact_label(dir: &str) -> (&'static str, bool) {
+    match dir {
+        "Library/QuickLook" => ("Quick Look Plugin", false),
+        "Library/ColorPickers" => ("Colorpicker", false),
+        "Library/Dictionaries" => ("Dictionary", false),
+        "Library/Input Methods" => ("Input Method", false),
+        "Library/Internet Plug-Ins" => ("Internet Plugin", false),
+        "Library/Spotlight" => ("Spotlight metadata importer", false),
+        "Library/Audio/Plug-Ins/Components" => ("Audio Unit Plugin", false),
+        "Library/Audio/Plug-Ins/VST" => ("VST Plugin", false),
+        "Library/Audio/Plug-Ins/VST3" => ("VST3 Plugin", false),
+        "share/bash-completion/completions" => ("Bash Completion", true),
+        "share/zsh/site-functions" => ("Zsh Completion", true),
+        "share/fish/vendor_completions.d" => ("Fish Completion", true),
+        _ => ("Generic Artifact", false),
+    }
+}
+
+/// The same classification from a placed destination alone, for
+/// uninstall lines (the receipt records destinations, not kinds).
+fn destination_label(prefix: &Prefix, dst: &Path) -> (&'static str, bool) {
+    let rel = dst.strip_prefix(&prefix.root).unwrap_or(dst);
+    let rel = rel.to_string_lossy();
+    if rel.starts_with("bin/") {
+        ("Binary", true)
+    } else if rel.starts_with("share/man/") {
+        ("Manpage", true)
+    } else if rel.starts_with("Library/Fonts/") {
+        ("Font", false)
+    } else if rel.starts_with("Library/Keyboard Layouts/") {
+        ("Keyboard Layout", false)
+    } else if rel.starts_with("Library/Screen Savers/") {
+        ("Screen Saver", false)
+    } else if rel.starts_with("Library/PreferencePanes/") {
+        ("Preference Pane", false)
+    } else if rel.starts_with("Library/Services/") {
+        ("Service", false)
+    } else if let Some(dir) = rel.rsplit_once('/').map(|(d, _)| d) {
+        let (label, linked) = library_artifact_label(dir);
+        if label != "Generic Artifact" {
+            (label, linked)
+        } else if dst.starts_with(prefix.applications()) {
+            ("App", false)
+        } else {
+            ("Generic Artifact", false)
+        }
+    } else {
+        ("Generic Artifact", false)
+    }
+}
+
 fn artifact_paths(
     prefix: &Prefix,
     cask: &Cask,
@@ -1345,7 +1475,17 @@ fn uninstall_from(
         println!("Would uninstall cask {token}");
         return Ok(());
     }
-    UninstallPlan::prepare(prefix, token, &inst.versions, directories)?.apply(prefix)
+    let plan = UninstallPlan::prepare(prefix, token, &inst.versions, directories)?;
+    println!("==> Uninstalling Cask {token}");
+    for link in plan.links.keys() {
+        let (label, linked) = destination_label(prefix, link);
+        println!(
+            "==> {} {label} '{}'",
+            if linked { "Unlinking" } else { "Removing" },
+            link.display()
+        );
+    }
+    plan.apply(prefix)
 }
 
 struct UninstallPlan {
@@ -1880,10 +2020,11 @@ mod tests {
         assert_eq!(output.stdout, b"naked ready\n");
         std::fs::write(&download, b"#!/bin/sh\nprintf 'naked ready2\\n'\n").unwrap();
         c.version = "2".to_string();
-        assert!(matches!(
-            install(&prefix, &c, false, false, false, false),
-            Ok(v) if v == "1"
-        ));
+        // Brew's plain cask install upgrades an outdated cask.
+        assert_eq!(
+            install(&prefix, &c, false, false, false, false).unwrap(),
+            "2"
+        );
         assert_eq!(
             install(&prefix, &c, false, false, true, false).unwrap(),
             "2"

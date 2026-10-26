@@ -9,8 +9,6 @@ use crate::port::{Cmd, Ran, System};
 use std::path::Path;
 use std::time::Duration;
 
-/// The git every run here uses: the Command Line Tools' own, never one on `PATH`.
-pub(crate) const GIT: &str = crate::items::github::CLT_GIT;
 /// A local read, or one `ls-remote`.
 const READ_BUDGET: Duration = Duration::from_secs(300);
 /// `git fetch origin` of a large history.
@@ -27,10 +25,12 @@ pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
     "maintenance.auto=false",
 ];
 
-/// CLT git as `user`, in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`) and no
-/// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git).
-pub(crate) fn git(user: &User, path: Option<&Path>) -> Cmd {
-    let mut command = Cmd::new(GIT)
+/// The installed git ([`crate::items::github::git_program`]: the Command Line Tools', or a
+/// selected Xcode's) as `user`, in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`)
+/// and no optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own
+/// git).
+pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
+    let mut command = Cmd::new(crate::items::github::git_program(sys))
         .as_user(user)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -283,7 +283,11 @@ fn stdout(ran: &Ran) -> String {
 /// One git read that must succeed, its trimmed standard output.
 fn read_ok(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<String, String> {
     let what = args.first().copied().unwrap_or("read");
-    let ran = run(sys, &git(user, Some(path)).args(args.iter().copied()), what)?;
+    let ran = run(
+        sys,
+        &git(sys, user, Some(path)).args(args.iter().copied()),
+        what,
+    )?;
     if !ran.success() {
         return Err(format!("git {what} failed in the checkout"));
     }
@@ -298,7 +302,7 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
     }
     let urls = run(
         sys,
-        &git(user, Some(path)).args(["config", "--get-all", "remote.origin.url"]),
+        &git(sys, user, Some(path)).args(["config", "--get-all", "remote.origin.url"]),
         "config",
     )?;
     match urls.status {
@@ -326,7 +330,7 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
     }
     let symbolic = run(
         sys,
-        &git(user, Some(path)).args(["symbolic-ref", "--quiet", "HEAD"]),
+        &git(sys, user, Some(path)).args(["symbolic-ref", "--quiet", "HEAD"]),
         "symbolic-ref",
     )?;
     let branch = match symbolic.status {
@@ -342,7 +346,7 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
     };
     let head = run(
         sys,
-        &git(user, Some(path)).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
+        &git(sys, user, Some(path)).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
         "rev-parse",
     )?;
     let head = match head.status {
@@ -375,7 +379,7 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
 fn remote_head(sys: &dyn System, user: &User, path: &Path) -> Result<(String, String), Stop> {
     let ran = run(
         sys,
-        &git(user, Some(path)).args(["ls-remote", "--symref", "origin", "HEAD"]),
+        &git(sys, user, Some(path)).args(["ls-remote", "--symref", "origin", "HEAD"]),
         "ls-remote",
     )?;
     if !ran.success() {
@@ -445,7 +449,7 @@ fn fetched_head(
 ) -> Result<(String, String), NotFetched> {
     let symbolic = run(
         sys,
-        &git(user, Some(path)).args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
+        &git(sys, user, Some(path)).args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
         "symbolic-ref",
     )?;
     let default = match symbolic.status {
@@ -474,7 +478,7 @@ fn fetched_head(
     };
     let tip = run(
         sys,
-        &git(user, Some(path)).args([
+        &git(sys, user, Some(path)).args([
             "rev-parse",
             "--verify",
             "--quiet",
@@ -517,7 +521,7 @@ fn is_ancestor(
 ) -> Result<bool, String> {
     let ran = run(
         sys,
-        &git(user, Some(path)).args(["merge-base", "--is-ancestor", ancestor, of]),
+        &git(sys, user, Some(path)).args(["merge-base", "--is-ancestor", ancestor, of]),
         "merge-base",
     )?;
     match ran.status {
@@ -552,7 +556,7 @@ fn judge(
     }
     let here = run(
         sys,
-        &git(user, Some(path)).args([
+        &git(sys, user, Some(path)).args([
             "rev-parse",
             "--verify",
             "--quiet",
@@ -704,7 +708,7 @@ pub(crate) fn align(
     };
     let fetch = run(
         sys,
-        &git(user, Some(path))
+        &git(sys, user, Some(path))
             .budget(FETCH_BUDGET)
             .args(NO_SIDE_RUNS)
             .args(["fetch", "--quiet", "--no-recurse-submodules", "origin"]),
@@ -729,7 +733,7 @@ pub(crate) fn align(
     };
     let tracking = run(
         sys,
-        &git(user, Some(path)).args([
+        &git(sys, user, Some(path)).args([
             "rev-parse",
             "--verify",
             "--quiet",
@@ -750,7 +754,7 @@ pub(crate) fn align(
     };
     let merge = run(
         sys,
-        &git(user, Some(path)).args(NO_SIDE_RUNS).args([
+        &git(sys, user, Some(path)).args(NO_SIDE_RUNS).args([
             "-c",
             "submodule.recurse=false",
             "merge",

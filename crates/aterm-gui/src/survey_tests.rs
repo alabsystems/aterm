@@ -954,6 +954,48 @@ fn the_attention_excerpt_is_the_ask_the_need_names() {
     );
 }
 
+/// A HARNESS'S REPORT SAYS SO ON THE WIRE (§14.7): a `NEEDS YOU:` report its harness wrote is
+/// `needs=ask needs_by=harness` on the facts row, so a sibling or a fleet peer lists it after the
+/// work that has stopped; CONTROL: the same words as another owner's ask are `needs_by=-`.
+#[test]
+fn a_harness_report_says_needs_by_harness_and_a_direct_ask_does_not() {
+    use aterm_types::needs::AttentionKind;
+    let by = |owner: &str| {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(5);
+        claude_session(&h);
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .set_attention_kind(
+                owner,
+                Some("claude needs you: the release credential \u{2014} carrying on".into()),
+                Some(AttentionKind::Ask),
+            )
+            .expect("a slot");
+        let attention = h.ctx.meta.lock().unwrap().attention_owners.kinded();
+        let verdict = crate::needs::of(&crate::needs::NeedFacts {
+            attention,
+            ..Default::default()
+        });
+        h.ctx.timeline.lock().unwrap().set_need(verdict);
+        store.write().unwrap().register(h);
+        let reply = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here());
+        let row = fields(reply.lines().nth(2).unwrap());
+        (row["needs"].clone(), row["needs_by"].clone())
+    };
+    assert_eq!(
+        by(crate::harness_host::NEEDS_ATTENTION_OWNER),
+        ("ask".to_string(), "harness".to_string())
+    );
+    assert_eq!(
+        by("lab"),
+        ("ask".to_string(), "-".to_string()),
+        "CONTROL: a direct ask"
+    );
+}
+
 #[test]
 fn a_survey_past_its_cap_cuts_the_least_pressing_first() {
     let shell = |local: u64| {

@@ -1494,6 +1494,7 @@ fn a_sessions_row_names_its_agent_once() {
         state.observed = true;
         state.posture = HarnessPosture::On(Autopilot::Cruise);
         state.sessions = vec![HarnessSession {
+            stopped: None,
             local_id: 0,
             sid: "s-0".to_string(),
             title: title.to_string(),
@@ -1596,6 +1597,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     use aterm_agent::harness::acts::{Act, TaskFace};
     const TODAY: i64 = 20_007;
     let dated = |view: AutopilotView, glass: ChipGlass, today: i64| HarnessSessionRow {
+        stopped: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -1778,6 +1780,7 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
     use aterm_agent::harness::acts::{Act, TaskFace};
     const TODAY: i64 = 20_007;
     let row = |view: AutopilotView, glass: ChipGlass| HarnessSessionRow {
+        stopped: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -2577,6 +2580,7 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
 fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
     use aterm_agent::harness::stats::Tally;
     let session = |local_id: u64, title: &str, place: &str| HarnessSession {
+        stopped: None,
         local_id,
         sid: format!("s-{local_id}"),
         title: title.to_string(),
@@ -2664,6 +2668,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
             HarnessStatsReport::new(today, HarnessStats::new(0), now, zone(now / 1000), zone);
         let checked = read_at_words(report.collected_unix_ms, report.offset_s);
         let session = |local_id, sid: &str| HarnessSession {
+            stopped: None,
             local_id,
             sid: sid.to_string(),
             title: sid.to_string(),
@@ -3076,6 +3081,7 @@ fn state_deciding(
     decided.total = total;
     let mut state = state_with_today(Some(today), false);
     state.sessions = vec![HarnessSession {
+        stopped: None,
         local_id: 7,
         sid: "s-7".to_string(),
         title: "fix the build".to_string(),
@@ -3647,6 +3653,7 @@ fn a_fleetless_reading_keeps_the_last_sweep_and_owes_tab_control_one() {
 
 fn listed_with(local_id: u64, verdict: &crate::needs::Verdict) -> HarnessSession {
     HarnessSession {
+        stopped: None,
         local_id,
         sid: format!("s-{local_id}"),
         title: format!("tab {local_id}"),
@@ -3737,6 +3744,7 @@ fn a_need_heads_the_rows_state_line() {
         "claude needs you: sign 0.48.0 (+1 more) \u{2014} carrying on",
     );
     let row = |glass: ChipGlass| HarnessSessionRow {
+        stopped: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),

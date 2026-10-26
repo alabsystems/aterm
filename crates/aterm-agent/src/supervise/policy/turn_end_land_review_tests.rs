@@ -711,9 +711,17 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
                  the force-push to main";
     let rules = "keep each commit small and name the stage it lands ".repeat(8);
     let rules = rules.trim_end();
-    for (mode, base) in [
-        (Autopilot::Cruise, DONE_CHECK),
-        (Autopilot::Land, LAND_NUDGE),
+    for (mode, base, ask) in [
+        (
+            Autopilot::Cruise,
+            done_check_words(0),
+            "land what of it you made first, and leave what you did not make exactly as it is",
+        ),
+        (
+            Autopilot::Land,
+            LAND_NUDGE.to_string(),
+            "commit, merge and push it to the remote main first",
+        ),
     ] {
         for rules in [None, Some(rules)] {
             let mut st = TurnEndState::default();
@@ -739,22 +747,20 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
             let units = text.encode_utf16().count();
             let what = format!("{mode:?} rules={}", rules.is_some());
             assert!(units <= VERBATIM_UNITS, "{what}: {units} units: {text}");
-            assert!(text.starts_with(base), "{what}: {text}");
+            assert!(text.starts_with(base.as_str()), "{what}: {text}");
             for whole in [DONE_CHECK_REVERSIBLE, NEEDS_ACK] {
                 assert!(text.contains(whole), "{what}: {whole:?} in {text}");
             }
-            assert!(
-                text.contains("commit, merge and push it to the remote main first"),
-                "{what}: the repository's ask: {text}"
-            );
+            assert!(text.contains(ask), "{what}: the repository's ask: {text}");
         }
     }
     let found = open_work(Some(&needs::without_needs(claim)));
     assert!(found.len() > OPEN_NAMED, "{found:?}");
     let whole = format!(
-        "{DONE_CHECK} {} {} {DONE_CHECK_REVERSIBLE} {NEEDS_ACK}",
+        "{} {} {} {DONE_CHECK_REVERSIBLE} {NEEDS_ACK}",
+        done_check_words(0),
         open_work_suffix(&found).expect("open"),
-        repo_work_suffix(&repo)
+        own_repo_work_suffix(&repo)
     );
     assert!(
         whole.encode_utf16().count() > VERBATIM_UNITS,
@@ -829,7 +835,7 @@ fn cruise_reads_no_open_work_out_of_a_needs_you_line() {
     assert_eq!(
         check_at(needs_only),
         TurnEndAction::Type {
-            text: act_words(DONE_CHECK, &[NEEDS_ACK], None),
+            text: act_words(&done_check_words(0), &[NEEDS_ACK], None),
             rule_id: RULE_DONE_CHECK,
         }
     );
@@ -839,7 +845,11 @@ fn cruise_reads_no_open_work_out_of_a_needs_you_line() {
     assert_eq!(
         check_at(plain),
         TurnEndAction::Type {
-            text: act_words(DONE_CHECK, &[&open_work_suffix(&open).expect("open")], None),
+            text: act_words(
+                &done_check_words(0),
+                &[&open_work_suffix(&open).expect("open")],
+                None,
+            ),
             rule_id: RULE_DONE_CHECK,
         }
     );

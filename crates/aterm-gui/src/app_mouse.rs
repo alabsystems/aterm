@@ -11692,5 +11692,5 @@ mod client_frame_tests;
 mod menu_regrid_tests;
 
 #[cfg(test)]
-#[path = "app_mouse_startup_review_tests.rs"]
-mod startup_review_tests;
+#[path = "app_mouse_system_state_split_tests.rs"]
+mod system_state_split_tests;

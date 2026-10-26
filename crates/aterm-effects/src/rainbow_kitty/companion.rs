@@ -241,9 +241,9 @@ where
     let geom = query.geom;
     let rest = query.rest;
     let (caret_row, caret_col) = caret;
-    let cw = i32::try_from(geom.cw.max(1)).unwrap_or(i32::MAX);
-    let ch = i32::try_from(geom.ch.max(1)).unwrap_or(i32::MAX);
-    let cols = u16::try_from(geom.cols).unwrap_or(u16::MAX);
+    let cw = geom.cw.clamp(1, i32::MAX as usize) as i32;
+    let ch = geom.ch.clamp(1, i32::MAX as usize) as i32;
+    let cols = geom.cols.min(u16::MAX as usize) as u16;
     let w = i32::from(rest.w);
     let caret_left = i32::from(caret_col).saturating_mul(cw);
     let grid_w = i32::from(cols).saturating_mul(cw);
@@ -712,6 +712,35 @@ impl KeepOut {
         self.boxes.extend_from_slice(&self.cells);
     }
 
+    #[inline]
+    pub(crate) fn set_split_slices(
+        &mut self,
+        icons: &[(i32, i32, i32, i32)],
+        (ox, oy): (i32, i32),
+        cells: &[(i32, i32, i32, i32)],
+    ) {
+        self.cells.clear();
+        let mut i = 0;
+        while i < cells.len() {
+            let b = cells[i];
+            if b.0 < b.1 && b.2 < b.3 {
+                self.cells.push(b);
+            }
+            i += 1;
+        }
+        self.boxes.clear();
+        let mut i = 0;
+        while i < icons.len() {
+            let (x0, x1, y0, y1) = icons[i];
+            let b = (x0 + ox, x1 + ox, y0 + oy, y1 + oy);
+            if b.0 < b.1 && b.2 < b.3 {
+                self.boxes.push(b);
+            }
+            i += 1;
+        }
+        self.boxes.extend_from_slice(&self.cells);
+    }
+
     /// This frame's lettered rows' spans, window pixels: each row's first
     /// lettered or filled cell to its last, the row's whole height.
     #[inline]
@@ -734,6 +763,20 @@ impl KeepOut {
             if b.0 < b.1 && b.2 < b.3 {
                 self.rows.push(b);
             }
+        }
+        self.past = past.max(0);
+    }
+
+    #[inline]
+    pub(crate) fn set_rows_past_slice(&mut self, rows: &[(i32, i32, i32, i32)], past: i32) {
+        self.rows.clear();
+        let mut i = 0;
+        while i < rows.len() {
+            let b = rows[i];
+            if b.0 < b.1 && b.2 < b.3 {
+                self.rows.push(b);
+            }
+            i += 1;
         }
         self.past = past.max(0);
     }

@@ -10,7 +10,7 @@ use super::super::super::upgrade_agy_live::{self as live, Look, Message, Open};
 use super::super::build_start;
 use super::super::upgrade::{Agent, Phase};
 use super::super::{
-    Client, Due, Hand, LiveTab, Opts, Report, St, Terminated, bounded_output, connect, held, load,
+    Client, Due, Hand, LiveTab, Opts, Report, St, Terminated, connect, held, load,
     managed_agent_twin, now_s, restore, said, save, save_checked, screen, store_version, terminate,
 };
 use super::{AgyKernel, ag, carry_in_flight_with, key, ledger, plan, relaunch_held};
@@ -307,64 +307,57 @@ pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> O
     live::wakes(read.as_deref(), &messages, now_ms).ok()
 }
 
-/// Apple's `sqlite3`, named absolutely (a platform binary): the one reader of
-/// agy's summary database, READ ONLY.
-const SQLITE3: &str = aterm_uds::os_path!("sqlite3");
-
 /// File name of `agy`'s conversation summary database.
 pub(super) const SUMMARIES: &str = "conversation_summaries.db";
 
-/// How long one read may take: it takes milliseconds (4 ms typical, 61 ms the
-/// most over 2 179 live reads); the bound is for a wedged process.
-const SUMMARY_WAIT: Duration = Duration::from_secs(5);
+/// Maximum byte size of `conversation_summaries.db` or its `-wal` read into memory.
+const SUMMARY_DB_MAX_BYTES: u64 = 128 << 20;
 
-/// The query: the conversation's own row and its subagents' (`conversation`
-/// a UUIDv4, checked by the caller, so no quote can be in it).
-fn summary_query(conversation: &str) -> String {
-    format!(
-        "SELECT conversation_id, status, not_fully_idle, parent_conversation_id FROM \
-         conversation_summaries WHERE conversation_id = '{conversation}' OR \
-         parent_conversation_id = '{conversation}';"
-    )
-}
-
-/// One run of the reader over `target` (a private copy's path, or an
-/// immutable URI: [`aterm_uds::foreign_db::read`]):
-/// `-readonly`, no `~/.sqliterc` (`-init /dev/null`), `-safe` (no command that
-/// touches another file), `-nofollow`, one `|`-separated line per row, no
-/// header.
-fn run_reader(target: &str, sql: &str) -> Option<String> {
-    let words = [
-        "-init",
-        "/dev/null",
-        "-readonly",
-        "-safe",
-        "-nofollow",
-        "-batch",
-        "-bail",
-        "-noheader",
-        "-list",
-        "-separator",
-        "|",
-        target,
-        sql,
-    ];
-    let args: Vec<&std::ffi::OsStr> = words.iter().map(std::ffi::OsStr::new).collect();
-    bounded_output(Path::new(SQLITE3), &args, SUMMARY_WAIT, 1 << 16)
-}
-
-/// Reads summary rows for `conversation` and its subagents from [`SUMMARIES`] via [`aterm_uds::foreign_db::read`].
+/// Reads summary rows for `conversation` and its subagents from [`SUMMARIES`] via [`aterm_uds::foreign_db::read_bytes`].
 pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String, ()> {
     if !ag::is_conversation_uuid(conversation) {
         return Err(());
     }
     let db = config.join(SUMMARIES);
-    let sql = summary_query(conversation);
     for attempt in 0..2 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(50));
         }
-        if let Ok(out) = aterm_uds::foreign_db::read(&db, |target| run_reader(target, &sql)) {
+        let res = aterm_uds::foreign_db::read_bytes(&db, SUMMARY_DB_MAX_BYTES, |main, wal| {
+            let mut missing_col = false;
+            let lines = crate::harness::sqlite_read::scan_table(
+                main,
+                wal,
+                "conversation_summaries",
+                |schema, row| {
+                    let (Some(id_i), Some(st_i), Some(nfi_i), Some(par_i)) = (
+                        schema.column_index("conversation_id"),
+                        schema.column_index("status"),
+                        schema.column_index("not_fully_idle"),
+                        schema.column_index("parent_conversation_id"),
+                    ) else {
+                        missing_col = true;
+                        return None;
+                    };
+                    let id = row.get(id_i)?.to_list_field();
+                    let parent = row.get(par_i)?.to_list_field();
+                    if id != conversation && parent != conversation {
+                        return None;
+                    }
+                    let status = row.get(st_i)?.to_list_field();
+                    let nfi = row.get(nfi_i)?.to_list_field();
+                    Some(format!("{id}|{status}|{nfi}|{parent}"))
+                },
+            )?;
+            (!missing_col).then(|| {
+                let mut out = lines.join("\n");
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out
+            })
+        });
+        if let Ok(out) = res {
             return Ok(out);
         }
     }

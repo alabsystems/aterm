@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine, or a session on another fleet Mac that lets this one drive it) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v10 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v11 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -104,10 +104,12 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   means re-read and re-arm at `since=<n>` (`subscribe` resumes with `since-log=<seq>
   log-ep=<e>`). Silence is never a need: no `need=` means nothing asked, not stuck.
 - `brief all` folds every session of this instance (Owner-only); `aterm ctl survey` reads
-  every instance; `aterm fabric brief` reads the bridge's log mirror (on while the broker
-  retains logs; `[fabric] log = "off"` opts out). The session journal (`[session_log]
-  journal`, on by default; off with `restore_session = false`, on Windows and headless)
-  lets `@<sid> log` and `@<sid> brief` answer sessions of earlier aterm processes.
+  every instance; `aterm fabric brief [--json]` reads the bridge's log mirror (on while the
+  broker retains logs; `[fabric] log = "off"` opts out; `--json` gives one object whose
+  `sessions` each name their node and whether it is this one, `this`). The session journal
+  (`[session_log] journal`, on by default; off with `restore_session = false`, on Windows
+  and headless) lets `@<sid> log` and `@<sid> brief` answer sessions of earlier aterm
+  processes.
 - Pass `log_seq=` and `log_ep=` from `status` as `since=` and `ep=`, and always re-arm from
   each reply's `seq=`/`ep=` (without `since=`, `await log need` returns immediately with
   `latched=1` while a need stays open). `await log need` wakes on an approval box, question,

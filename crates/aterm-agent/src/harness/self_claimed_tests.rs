@@ -19,6 +19,7 @@ fn record(argv: &[&str], env: &[(&str, &str)]) -> Record {
         cwd: Some("/work".to_string()),
         draft_empty: None,
         frame: None,
+        goal: None,
         initializing: false,
     }
 }
@@ -43,6 +44,7 @@ fn live() -> Live {
         .map(|s| (*s).to_string())
         .collect(),
         codex_home: Some("/Users//u/.codex".to_string()),
+        codex_auth_path: None,
         cwd: Some(PathBuf::from("/work")),
         twin: Some(PathBuf::from("/Users//u/.aterm/agents/codex")),
         managed_launch: None,
@@ -485,6 +487,7 @@ fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
             .collect(),
         session: UUID.to_string(),
         codex_home: Some("/Users//u/.codex".to_string()),
+        codex_auth_path: None,
         cwd: Some("/work".to_string()),
     };
     let got = inherited(Some(&typed), 4242, &relaunched).expect("its own relaunch's line");
@@ -551,6 +554,7 @@ fn an_initial_record_inherits_only_its_proven_relaunch_line() {
             .collect(),
         session: UUID.to_string(),
         codex_home: relaunched.codex_home.clone(),
+        codex_auth_path: None,
         cwd: Some("/work".into()),
     };
     let initial = r#"{"v":1,"pid":4242,"sessionId":null,"resumeArgv":null,"cwd":null,"state":null,"status":"busy","exit":null,"draftEmpty":true,"env":{"CODEX_HOME":"/Users//u/.codex"}}"#;
@@ -1000,4 +1004,113 @@ fn a_proven_claim_names_its_codex_alab_only_when_proven() {
     ] {
         assert_eq!(proven_pid(status), None, "{status}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_auth_path_and_record_goal_round_trip_and_validate() {
+    let mut proc_live = live();
+    proc_live.codex_auth_path = Some("/Users//u/.aterm/accounts-codex/work/auth.json".to_string());
+    let argv = line("/store/codex-alab/bin/codex", &ROOT);
+    let rec = record(
+        &argv,
+        &[
+            ("CODEX_HOME", "/Users//u/.codex"),
+            (
+                "CODEX_AUTH_PATH",
+                "/Users//u/.aterm/accounts-codex/work/auth.json",
+            ),
+        ],
+    );
+    let resume = validate(&rec, 4242, &proc_live).expect("matching auth path validates");
+    assert_eq!(
+        resume.codex_auth_path.as_deref(),
+        Some("/Users//u/.aterm/accounts-codex/work/auth.json")
+    );
+    let omitted = record(&argv, &[("CODEX_HOME", "/Users//u/.codex")]);
+    assert_eq!(
+        validate(&omitted, 4242, &proc_live)
+            .expect("live kernel auth path survives an omitting record")
+            .codex_auth_path
+            .as_deref(),
+        Some("/Users//u/.aterm/accounts-codex/work/auth.json")
+    );
+    let mismatched = record(
+        &argv,
+        &[
+            ("CODEX_HOME", "/Users//u/.codex"),
+            ("CODEX_AUTH_PATH", "/tmp/evil/auth.json"),
+        ],
+    );
+    assert_eq!(validate(&mismatched, 4242, &proc_live), Err("env"));
+    let relative = record(
+        &argv,
+        &[
+            ("CODEX_HOME", "/Users//u/.codex"),
+            ("CODEX_AUTH_PATH", "work/auth.json"),
+        ],
+    );
+    let mut rel_live = proc_live;
+    rel_live.codex_auth_path = Some("work/auth.json".to_string());
+    assert_eq!(validate(&relative, 4242, &rel_live), Err("auth-path"));
+    for bad_auth in [
+        "/pool/acct-1/auth.json/",
+        "/pool/acct-1/auth.json/.",
+        "/pool/acct-1/auth.json/..",
+        "/pool/acct\u{2028}1/auth.json",
+    ] {
+        let bad_rec = record(
+            &argv,
+            &[
+                ("CODEX_HOME", "/Users//u/.codex"),
+                ("CODEX_AUTH_PATH", bad_auth),
+            ],
+        );
+        let mut bad_live = live();
+        bad_live.codex_home = Some("/Users//u/.codex".to_string());
+        bad_live.codex_auth_path = Some(bad_auth.to_string());
+        assert_eq!(
+            validate(&bad_rec, 4242, &bad_live),
+            Err("auth-path"),
+            "rejected CODEX_AUTH_PATH={bad_auth:?}"
+        );
+    }
+
+    // Explicitly empty env vars are preserved verbatim so relaunch overrides a shell export,
+    // while `codex_home_of` resolves `""` to `$HOME/.codex` and relative `CODEX_HOME` against `cwd`.
+    let mut empty_live = live();
+    empty_live.codex_home = Some(String::new());
+    empty_live.codex_auth_path = Some(String::new());
+    let empty_resume = validate(&record(&argv, &[]), 4242, &empty_live)
+        .expect("explicitly empty env vars validate");
+    assert_eq!(empty_resume.codex_home.as_deref(), Some(""));
+    assert_eq!(empty_resume.codex_auth_path.as_deref(), Some(""));
+    assert_eq!(
+        codex_home_of(
+            Some(".codex-local"),
+            Some(Path::new("/work")),
+            Some("/Users//u")
+        ),
+        Some(PathBuf::from("/work/.codex-local"))
+    );
+    assert_eq!(
+        codex_home_of(Some(""), Some(Path::new("/work")), Some("/Users//u")),
+        Some(PathBuf::from("/Users//u/.codex"))
+    );
+
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let sessions = dir.path().join("alab").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    std::fs::write(
+        sessions.join("4242.json"),
+        format!(
+            r#"{{"v":1,"pid":4242,"sessionId":"{UUID}","status":"busy","goal":"  Ship native protocol\nsecond line  "}}"#
+        ),
+    )
+    .expect("write session json");
+    assert_eq!(
+        read_record_goal(dir.path(), 4242, UUID).as_deref(),
+        Some("Ship native protocol second line")
+    );
+    assert_eq!(read_record_goal(dir.path(), 4242, "other-thread"), None);
 }

@@ -1922,6 +1922,8 @@ pub struct StreakSeed {
     pub said: Replies,
     /// The reset the newest of them showed ([`Carried::said_reset_ms`]).
     pub said_reset_ms: Option<i64>,
+    /// The done checks of the Cruise run so far ([`Carried::checks`]).
+    pub checks: u8,
 }
 
 #[must_use]
@@ -1947,6 +1949,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             if let Some(l) = last.as_mut() {
                 l.said = Replies::default();
                 l.said_reset_ms = None;
+                l.checks = 0;
             }
             continue;
         }
@@ -1973,6 +1976,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
                             retry: None,
                             said: Replies::default(),
                             said_reset_ms: None,
+                            checks: 0,
                         });
                     }
                 }
@@ -2009,6 +2013,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             .unwrap_or(0);
         let esc = point && text("reason").is_some_and(|r| r.contains(&format!("({PERSONS_ESC})")));
         let (said, said_reset_ms) = text("reason").and_then(replies_note_of).unwrap_or_default();
+        let checks = text("reason").and_then(checks_note_of).unwrap_or(0);
         last = Some(StreakSeed {
             at_ms,
             short,
@@ -2021,6 +2026,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             retry: text("reason").and_then(retry_mark_of),
             said,
             said_reset_ms,
+            checks,
         });
     }
     last.map(|l| StreakSeed { recorded, ..l })
@@ -2078,10 +2084,11 @@ pub const RULE_POINT: &str = "point@v1";
 #[must_use]
 pub fn point_reason(after: Carried, esc: bool) -> String {
     format!(
-        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}",
+        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}{}",
         after.short,
         retry_mark(after.retry),
         replies_note(after.said, after.said_reset_ms),
+        checks_note(after.checks),
         if esc {
             format!(" ({PERSONS_ESC})")
         } else {
@@ -2100,6 +2107,8 @@ pub struct Carried {
     pub said: Replies,
     /// The reset the newest of them showed, unix milliseconds ([`super::policy::turn_end::TurnEndState::replies_reset`]).
     pub said_reset_ms: Option<i64>,
+    /// The done checks this Cruise run typed ([`super::policy::turn_end::TurnEndState::checks`]), so a loop after this one asks the next angle.
+    pub checks: u8,
 }
 
 impl Carried {
@@ -2110,8 +2119,25 @@ impl Carried {
             retry: None,
             said: Replies::NONE,
             said_reset_ms: None,
+            checks: 0,
         }
     }
+}
+
+const DONE_CHECKS: &str = "done checks this Cruise run";
+
+/// The ledger's note of the done checks this Cruise run typed ([`Carried::checks`]), beside the replies' note: none while there are none, so a ledger that never typed one reads as before.
+fn checks_note(checks: u8) -> String {
+    if checks == 0 {
+        return String::new();
+    }
+    format!(" ({DONE_CHECKS}: {checks})")
+}
+
+/// [`checks_note`] read back: `None` where a reason holds no such note (an older build's, or none typed) or a count that is no number.
+fn checks_note_of(reason: &str) -> Option<u8> {
+    let (_, rest) = reason.split_once(&format!("({DONE_CHECKS}: "))?;
+    rest.split(')').next()?.parse().ok()
 }
 
 const SAME_REPLIES: &str = "the short streak's replies";
@@ -2289,6 +2315,7 @@ pub fn act_reason_after(after: Carried, limit: Option<LimitTry>) -> String {
     reason.push_str(&short_mark(after.short));
     reason.push_str(&retry_mark(after.retry));
     reason.push_str(&replies_note(after.said, after.said_reset_ms));
+    reason.push_str(&checks_note(after.checks));
     if let Some(l) = limit {
         let head = if l.in_place {
             IN_LIMITS_PLACE
@@ -4153,6 +4180,7 @@ mod tests {
                 retry: Some(mark),
                 said: Replies::default(),
                 said_reset_ms: None,
+                checks: 0,
             };
             let reason = act_reason_after(carried, None);
             let path = seed_ledger(
@@ -4197,6 +4225,7 @@ mod tests {
                 }),
                 said: Replies::default(),
                 said_reset_ms: None,
+                checks: 0,
             },
             Some(limit),
         );
@@ -4208,6 +4237,115 @@ mod tests {
         );
         let garbled = format!("the turn-end policy ({RETRY_LADDER}: kind=overloaded attempts=x)");
         assert_eq!(retry_mark_of(&garbled), None);
+    }
+
+    /// v6 §14.5 (5a): the done checks of a Cruise run ride the streak seed's note beside the
+    /// replies' ([`checks_note`]), on the point's row and the act's, so a loop after this one asks
+    /// the next angle; Off's stand ends the run, and an older build's rows (no note) read none.
+    /// NEGATIVE CONTROL: with `checks_note` dropped from `act_reason_after`, the seed reads 0 and
+    /// the test fails at the act's row.
+    #[test]
+    fn the_checks_note_carries_the_cruise_runs_count_and_an_older_row_reads_none() {
+        use super::super::policy::turn_end::{RULE_DONE_CHECK, done_check_words};
+        let sid = Some("@s-9");
+        let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str| {
+            let row = Row {
+                rule_id,
+                outcome,
+                command,
+                reason,
+                box_seq: 1,
+            };
+            format!("{}\n", row.to_json(ts, sid))
+        };
+        let at = |checks: u8| Carried {
+            checks,
+            ..Carried::streak(2)
+        };
+        assert_eq!(checks_note_of(&point_reason(at(4), false)), Some(4));
+        assert_eq!(checks_note_of(&act_reason_after(at(4), None)), Some(4));
+        assert_eq!(
+            checks_note_of(&point_reason(at(0), false)),
+            None,
+            "none typed: no note, as an older build wrote"
+        );
+        let point = row(
+            10_000,
+            RULE_POINT,
+            Outcome::Waiting,
+            "",
+            &point_reason(at(4), false),
+        );
+        assert_eq!(short_streak_in(&point, sid).map(|s| s.checks), Some(4));
+        let typed = format!(
+            "{point}{}",
+            row(
+                20_000,
+                RULE_DONE_CHECK,
+                Outcome::Typed,
+                &done_check_words(4),
+                &act_reason_after(at(5), None)
+            )
+        );
+        let seed = short_streak_in(&typed, sid).expect("a seed");
+        assert_eq!((seed.checks, seed.short), (5, 2));
+        let stood = format!(
+            "{typed}{}",
+            row(30_000, RULE_OFF_STOOD, Outcome::Waiting, "", "Off stood")
+        );
+        assert_eq!(short_streak_in(&stood, sid).map(|s| s.checks), Some(0));
+        let older = typed
+            .replace(&checks_note(5), "")
+            .replace(&checks_note(4), "");
+        assert_ne!(older, typed);
+        assert_eq!(short_streak_in(&older, sid).map(|s| s.checks), Some(0));
+    }
+
+    /// v6 §14.5 (5a): every angle's check, bare and with its suffixes, is delivered as the done
+    /// check (`delivers_check`) and owed as one to a successor (`walk_done_check`), as v1's fixed
+    /// check is. NEGATIVE CONTROLS: the same act under another id seeds no owed check, and v1 under
+    /// a base that is not its prefix is not delivered.
+    #[test]
+    fn every_angled_check_is_delivered_and_owed_as_the_done_check() {
+        use super::super::policy::turn_end::{
+            DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, RULE_CONTINUE, RULE_DONE_CHECK, done_check_act,
+            done_check_words,
+        };
+        let sid = Some("@s-9");
+        let typed = |rule_id: &str, command: &str| {
+            let row = Row {
+                rule_id,
+                outcome: Outcome::Typed,
+                command,
+                reason: &act_reason(None),
+                box_seq: 1,
+            };
+            format!("{}\n", row.to_json(10_000, sid))
+        };
+        let mut checks: Vec<String> = (0..DONE_ANGLES.len())
+            .flat_map(|n| {
+                [
+                    done_check_words(n),
+                    done_check_act(n, Some("never push to main"), true),
+                ]
+            })
+            .collect();
+        checks.push(DONE_CHECK_FIXED_BEFORE.to_string());
+        for check in &checks {
+            assert!(delivers_check(Some(check)), "{check}");
+            let wrapped = check.split_whitespace().collect::<Vec<_>>().join("\n");
+            assert!(delivers_check(Some(&wrapped)), "{check}");
+            let owed = done_check_owed_in(&typed(RULE_DONE_CHECK, check), sid);
+            assert_eq!(owed.map(|o| o.rule), Some(RULE_DONE_CHECK), "{check}");
+            assert_eq!(
+                done_check_owed_in(&typed(RULE_CONTINUE, check), sid),
+                None,
+                "{check}"
+            );
+        }
+        let moved = DONE_CHECK_FIXED_BEFORE.replacen("done is never the end.", "never stop.", 1);
+        assert_ne!(moved, DONE_CHECK_FIXED_BEFORE);
+        assert!(!delivers_check(Some(&moved)), "{moved}");
     }
 
     #[test]
@@ -4419,6 +4557,7 @@ mod tests {
                         retry,
                         said: Replies::default(),
                         said_reset_ms: None,
+                        checks: 0,
                     },
                     false,
                 ),
@@ -4436,6 +4575,7 @@ mod tests {
                         retry: Some(mark(1)),
                         said: Replies::default(),
                         said_reset_ms: None,
+                        checks: 0,
                     },
                     None,
                 ),
@@ -4512,6 +4652,7 @@ mod tests {
                         retry,
                         said: Replies::default(),
                         said_reset_ms: None,
+                        checks: 0,
                     },
                     false,
                 ),
@@ -4705,6 +4846,7 @@ mod tests {
                         retry,
                         said: Replies::default(),
                         said_reset_ms: None,
+                        checks: 0,
                     },
                     false,
                 ),

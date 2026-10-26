@@ -210,15 +210,15 @@ fn a_low_codex_session_moves_onto_its_overlay_home_and_resumes_its_rollout() {
     assert_eq!(
         line,
         format!(
-            " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_HOME={}' \
+            " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_AUTH_PATH={}' \
              '/opt/codex-old/bin/codex' 'resume' '019a-rollout-id'",
-            work.display()
+            work.join("auth.json").display()
         )
     );
     assert!(!line.contains("CLAUDE"), "{line}");
     assert!(
-        work.join("sessions").is_symlink(),
-        "the overlay home shares the default home's rollouts"
+        !work.join("sessions").exists(),
+        "a login-file seam leaves the default home's rollouts shared without an overlay"
     );
     let state = world.load(Cli::Codex);
     assert_eq!(state.active.as_deref(), Some("work"));
@@ -409,13 +409,13 @@ fn a_codex_default_line_unsets_its_home_and_codex_credentials_alone() {
     };
     let main = LoginEnv {
         label: "main".to_string(),
-        var: "CODEX_HOME",
+        var: "CODEX_AUTH_PATH",
         value: None,
     };
     let line = relaunch::pool_line(&how, Cli::Codex, &main).expect("default line");
     assert_eq!(
         line,
-        " '/usr/bin/env' -u 'CODEX_HOME' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' \
+        " '/usr/bin/env' -u 'CODEX_AUTH_PATH' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' \
          '/opt/codex-old/bin/codex' 'resume' '--no-alt-screen' '019a'"
     );
     assert!(!line.contains("OPENAI_API_KEY"), "{line}");
@@ -439,8 +439,8 @@ fn a_codex_line_drops_an_image_list_ahead_of_its_thread() {
     };
     let work = LoginEnv {
         label: "work".to_string(),
-        var: "CODEX_HOME",
-        value: Some("/c/work".to_string()),
+        var: "CODEX_AUTH_PATH",
+        value: Some("/c/work/auth.json".to_string()),
     };
     let line = relaunch::pool_line(&how, Cli::Codex, &work).expect("a row's line");
     assert!(
@@ -474,6 +474,11 @@ fn mode_off_records_every_clis_limits_and_moves_none() {
         let world = World::new(&format!("off-{}", cli.id()));
         world.two(cli);
         world.on_main(cli, &[]);
+        std::fs::write(
+            world.cfg.join("aterm.toml"),
+            "[harness]\naccounts = 'off'\n",
+        )
+        .unwrap();
         let moved = session_move(
             &world.seat(),
             &session(cli, Supervisor::Aterm, Mode::Off, exe),
@@ -575,9 +580,9 @@ fn a_launch_starts_under_the_pin_or_a_fresh_active_else_next() {
     let pick = launch_env(&seat, Cli::Codex, &no_usage).expect("next");
     assert_eq!(
         (pick.label.as_str(), pick.value),
-        ("work", Some(work.display().to_string()))
+        ("work", Some(work.join("auth.json").display().to_string()))
     );
-    assert_eq!(pick.var, "CODEX_HOME");
+    assert_eq!(pick.var, "CODEX_AUTH_PATH");
 
     // Negative: one row is nothing to pick between.
     let one = World::new("launch-one");
@@ -682,8 +687,11 @@ fn a_launch_and_a_move_read_a_renewed_rows_login_where_logins_json_binds_it() {
     let pick = launch_env(&world.seat(), Cli::Codex, &no_usage).map(|p| (p.label, p.value));
     assert_eq!(
         pick,
-        Some(("work".to_string(), Some(staging.display().to_string()))),
-        "the owner's pin on the renewed row starts the launch under its renewed home"
+        Some((
+            "work".to_string(),
+            Some(staging.join("auth.json").display().to_string())
+        )),
+        "the owner's pin on the renewed row starts the launch under its renewed auth file"
     );
 
     let moving = World::new("renewed-move");
@@ -700,8 +708,11 @@ fn a_launch_and_a_move_read_a_renewed_rows_login_where_logins_json_binds_it() {
     );
     let line = moved.line.unwrap_or_default();
     assert!(
-        line.contains(&format!(" 'CODEX_HOME={}' ", staging.display())),
-        "the move names the renewed home: {line}"
+        line.contains(&format!(
+            " 'CODEX_AUTH_PATH={}' ",
+            staging.join("auth.json").display()
+        )),
+        "the move names the renewed auth file: {line}"
     );
 
     // Negative: with explicitly empty bindings, the configured row has no login here, so it
@@ -735,7 +746,10 @@ fn a_launch_keeps_a_low_active_row_when_every_other_row_is_walled() {
     let pick = launch_env(&seat, Cli::Codex, &no_usage).map(|p| (p.label, p.value));
     assert_eq!(
         pick,
-        Some(("work".to_string(), Some(work.display().to_string()))),
+        Some((
+            "work".to_string(),
+            Some(work.join("auth.json").display().to_string())
+        )),
         "the low active row still runs; the default login, main, is walled"
     );
 
@@ -766,7 +780,10 @@ fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
     let pick = launch_env(&world.seat(), Cli::Codex, &read).map(|p| (p.label, p.value));
     assert_eq!(
         pick,
-        Some(("work".to_string(), Some(work.display().to_string()))),
+        Some((
+            "work".to_string(),
+            Some(work.join("auth.json").display().to_string())
+        )),
         "the owner's own pin holds under off"
     );
 
@@ -778,7 +795,10 @@ fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
     let pick = launch_env(&early.seat(), Cli::Codex, &no_usage).map(|p| (p.label, p.value));
     assert_eq!(
         pick,
-        Some(("work".to_string(), Some(work.display().to_string())))
+        Some((
+            "work".to_string(),
+            Some(work.join("auth.json").display().to_string())
+        ))
     );
 }
 
@@ -821,39 +841,37 @@ fn a_keyring_store_holds_the_codex_launch_and_move() {
 #[test]
 fn an_overlay_home_with_shared_entries_of_its_own_is_never_started_on() {
     let world = World::new("drift");
-    let default_home = world.home.join(".codex");
+    let default_home = world.home.join(".kimi-code");
     std::fs::create_dir_all(&default_home).expect("default home");
-    std::fs::write(default_home.join("state_5.sqlite"), "shared").expect("shared db");
-    // What `codex app-server` (0.164.0) made in an empty staging home (lab: state_5.sqlite,
-    // installation_id, skills/).
-    let staging = world.root.join("logins/codex/work+1");
-    std::fs::create_dir_all(staging.join("skills/.system")).expect("staging");
-    std::fs::write(staging.join("state_5.sqlite"), "own").expect("own db");
-    std::fs::write(staging.join("auth.json"), "{}").expect("login");
+    std::fs::write(default_home.join("mcp.json"), "shared").expect("shared mcp");
+    let staging = world.root.join("logins/kimi/work+1");
+    std::fs::create_dir_all(staging.join("credentials")).expect("staging");
+    std::fs::write(staging.join("mcp.json"), "own").expect("own mcp");
+    std::fs::write(staging.join("credentials/kimi-code.json"), "{}").expect("login");
     let row = accounts::Row {
         label: "work".into(),
         dir: Some(staging.display().to_string()),
         ..accounts::Row::default()
     };
-    let refused = login_env(Cli::Codex, &row, &world.home);
+    let refused = login_env(Cli::Kimi, &row, &world.home);
     assert!(refused.is_err(), "{refused:?}");
     assert_eq!(
-        std::fs::read_to_string(staging.join("state_5.sqlite")).expect("left"),
+        std::fs::read_to_string(staging.join("mcp.json")).expect("left"),
         "own",
-        "its own database is left as it is"
+        "its own shared entry is left as it is"
     );
 
     // Negative: a home whose shared entries are all links (as `ensure` makes them) is used.
-    let clean = world.root.join("logins/codex/work+2");
-    std::fs::create_dir_all(&clean).expect("clean");
-    std::fs::write(clean.join("auth.json"), "{}").expect("login");
+    let clean = world.root.join("logins/kimi/work+2");
+    std::fs::create_dir_all(clean.join("credentials")).expect("clean");
+    std::fs::write(clean.join("credentials/kimi-code.json"), "{}").expect("login");
     let row = accounts::Row {
         dir: Some(clean.display().to_string()),
         ..row
     };
-    let env = login_env(Cli::Codex, &row, &world.home).expect("an overlay");
+    let env = login_env(Cli::Kimi, &row, &world.home).expect("an overlay");
     assert_eq!(env.value, Some(clean.display().to_string()));
-    assert!(clean.join("state_5.sqlite").is_symlink());
+    assert!(clean.join("mcp.json").is_symlink());
 }
 
 #[test]
@@ -878,8 +896,8 @@ fn a_moved_session_that_served_its_turn_proves_its_row_and_can_leave_early_again
         home: &world.home,
         now: later,
     };
-    let work_text = work.display().to_string();
-    let env = [("CODEX_HOME", work_text.as_str())];
+    let work_auth = work.join("auth.json").display().to_string();
+    let env = [("CODEX_AUTH_PATH", work_auth.as_str())];
     let low_later = Sample {
         session_reset: Some(later + 3 * HOUR),
         week_reset: Some(later + 3 * 24 * HOUR),
@@ -932,8 +950,8 @@ fn a_superseded_session_observation_cannot_prove_the_current_login() {
         })
         .unwrap();
     let exe = Path::new("/opt/codex-old/bin/codex");
-    let old_text = old.to_string_lossy();
-    let old_env = [("CODEX_HOME", old_text.as_ref())];
+    let old_text = old.join("auth.json").to_string_lossy().into_owned();
+    let old_env = [("CODEX_AUTH_PATH", old_text.as_str())];
     let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Off, exe);
     s.env = &old_env;
     s.sample = None;
@@ -945,8 +963,8 @@ fn a_superseded_session_observation_cannot_prove_the_current_login() {
     );
     assert_eq!(state.account("work").auth, accounts::Auth::SignedOut);
 
-    let new_text = renewed.to_string_lossy();
-    let new_env = [("CODEX_HOME", new_text.as_ref())];
+    let new_text = renewed.join("auth.json").to_string_lossy().into_owned();
+    let new_env = [("CODEX_AUTH_PATH", new_text.as_str())];
     s.env = &new_env;
     let _ = session_move(&world.seat(), &s);
     assert!(
@@ -1072,19 +1090,17 @@ fn a_move_whose_line_cannot_be_written_commits_no_rotation() {
     let world = World::new("line-fails");
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    // The overlay cannot be linked: the default home is not a directory.
-    std::fs::write(world.home.join(".codex"), "not a dir").expect("a file at ~/.codex");
     let exe = Path::new("/opt/codex-old/bin/codex");
-    let moved = session_move(
-        &world.seat(),
-        &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
-    );
+    let remote = ["--remote".to_string(), "ws://h".to_string()];
+    let mut unresumable = session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe);
+    unresumable.relaunch.flags = &remote;
+    let moved = session_move(&world.seat(), &unresumable);
     let state = world.load(Cli::Codex);
     assert_eq!(moved, Moved::stay(StayWhy::NoLine));
     assert_eq!(state.active.as_deref(), Some("main"));
     assert!(state.rotations.is_empty() && state.canary.is_none());
 
-    // Negative: with a default home to link, the same move writes its line and rotates.
+    // Negative: with resumable flags, the same move writes its line and rotates.
     let ok = World::new("line-ok");
     ok.two(Cli::Codex);
     ok.on_main(Cli::Codex, &[]);
@@ -1120,7 +1136,10 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
     let pick = launch_env(&world.seat(), Cli::Codex, &read).map(|p| (p.label, p.value));
     assert_eq!(
         pick,
-        Some(("work".to_string(), Some(work.display().to_string()))),
+        Some((
+            "work".to_string(),
+            Some(work.join("auth.json").display().to_string())
+        )),
         "main's own home reads full, so the launch starts on work"
     );
     let mut read_in = homes.lock().expect("homes").clone();
@@ -1129,8 +1148,8 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
     want.sort();
     assert_eq!(read_in, want, "each row read in its own home");
     assert!(
-        work.join("sessions").is_symlink(),
-        "work's overlay was linked before its read"
+        !work.join("sessions").exists(),
+        "a login-file seam creates no overlay symlinks"
     );
     assert!(matches!(
         condition_of(&world, Cli::Codex, "main"),
@@ -1157,10 +1176,10 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
 #[test]
 fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_holds() {
     let world = World::new("drift-fallthrough");
-    let work = world.work_dir(Cli::Codex);
-    let backup = world.root.join("logins/codex/backup");
-    std::fs::create_dir_all(&backup).expect("backup dir");
-    std::fs::write(backup.join("auth.json"), "{}").expect("backup login");
+    let work = world.work_dir(Cli::Kimi);
+    let backup = world.root.join("logins/kimi/backup");
+    std::fs::create_dir_all(backup.join("credentials")).expect("backup dir");
+    std::fs::write(backup.join("credentials/kimi-code.json"), "{}").expect("backup login");
     let roster_text = format!(
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
          [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n\n\
@@ -1168,40 +1187,25 @@ fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_
         work.display(),
         backup.display()
     );
-    std::fs::write(world.cfg.join("accounts-codex.toml"), roster_text).expect("roster");
-    let default_home = world.home.join(".codex");
+    std::fs::write(world.cfg.join("accounts-kimi.toml"), roster_text).expect("roster");
+    let default_home = world.home.join(".kimi-code");
     std::fs::create_dir_all(&default_home).expect("default home");
-    std::fs::write(default_home.join("state_5.sqlite"), "shared").expect("shared db");
-    std::fs::write(work.join("state_5.sqlite"), "own").expect("drifted work db");
+    std::fs::write(default_home.join("mcp.json"), "shared").expect("shared mcp");
+    std::fs::write(work.join("mcp.json"), "own").expect("drifted work mcp");
 
-    world.on_main(Cli::Codex, &[]);
-    wall(&world, Cli::Codex, "main", NOW + 2 * HOUR);
+    world.on_main(Cli::Kimi, &[]);
+    wall(&world, Cli::Kimi, "main", NOW + 2 * HOUR);
 
-    let pick = launch_env(&world.seat(), Cli::Codex, &no_usage).expect("launch skips drifted work");
+    let pick = launch_env(&world.seat(), Cli::Kimi, &no_usage).expect("launch skips drifted work");
     assert_eq!(pick.label, "backup");
     assert_eq!(pick.value, Some(backup.display().to_string()));
 
-    let exe = Path::new("/opt/codex-old/bin/codex");
-    let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe);
-    s.point = Point::Wall {
-        window: accounts::SESSION_LIMIT.to_string(),
-        at: Some(NOW),
-    };
-    let moved = session_move(&world.seat(), &s);
-    assert!(
-        matches!(&moved.advice, Advice::Move { to, rotates: true, .. } if to == "backup"),
-        "expected rotation past drifted work to backup, got {:?}",
-        moved.advice
-    );
-    assert!(moved.line.is_some());
-    assert_eq!(world.load(Cli::Codex).active.as_deref(), Some("backup"));
-
-    // Negative: when the owner pins drifted `work`, neither launch_env nor session_move ignores
-    // the pin or starts on the drifted overlay.
+    // Negative: when the owner pins drifted `work`, launch_env neither ignores the pin nor starts
+    // on the drifted overlay.
     let mut note = None;
     world
         .seat()
-        .store(Cli::Codex)
+        .store(Cli::Kimi)
         .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
             state.active = Some("work".to_string());
             state.pinned = true;
@@ -1209,17 +1213,15 @@ fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_
             Ok(Vec::new())
         })
         .expect("pin drifted work");
-    assert_eq!(launch_env(&world.seat(), Cli::Codex, &no_usage), None);
-    let pinned_move = session_move(&world.seat(), &s);
-    assert_eq!(pinned_move, Moved::stay(StayWhy::NoLine));
+    assert_eq!(launch_env(&world.seat(), Cli::Kimi, &no_usage), None);
 }
 
 #[test]
-fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_sqlite_never_drifts() {
-    let world = World::new("usage-startup-sqlite");
-    let work = world.two(Cli::Codex);
-    world.on_main(Cli::Codex, &[]);
-    let default_home = world.home.join(".codex");
+fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_files_never_drift() {
+    let world = World::new("usage-startup-overlay");
+    let work = world.two(Cli::Kimi);
+    world.on_main(Cli::Kimi, &[]);
+    let default_home = world.home.join(".kimi-code");
     let full = Usage {
         sample: Sample {
             session_pct: Some(100),
@@ -1230,37 +1232,37 @@ fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_sqlite
         wall: Some((accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))),
     };
     let read = |cli: Cli, home: &Path, _: i64| {
-        assert_eq!(cli, Cli::Codex);
+        assert_eq!(cli, Cli::Kimi);
         std::fs::create_dir_all(home).expect("home dir");
-        let db = home.join("state_5.sqlite");
-        if std::fs::symlink_metadata(&db).is_err() {
-            std::fs::write(&db, "created-at-startup").expect("startup sqlite");
+        let agents = home.join("AGENTS.md");
+        if std::fs::symlink_metadata(&agents).is_err() {
+            std::fs::write(&agents, "created-at-startup").expect("startup file");
         }
         (home == default_home).then(|| full.clone())
     };
-    let pick = launch_env(&world.seat(), Cli::Codex, &read).expect("launch on work");
+    let pick = launch_env(&world.seat(), Cli::Kimi, &read).expect("launch on work");
     assert_eq!(pick.label, "work");
     assert!(
-        work.join("state_5.sqlite").is_symlink(),
+        work.join("AGENTS.md").is_symlink(),
         "default home was read before work's overlay was linked"
     );
 
-    // Negative: a pre-existing real sqlite file in work's overlay still refuses to start there.
+    // Negative: a pre-existing real shared file in work's overlay still refuses to start there.
     let pre_drifted = World::new("usage-pre-drifted");
-    let bad_work = pre_drifted.two(Cli::Codex);
-    pre_drifted.on_main(Cli::Codex, &[]);
-    std::fs::write(bad_work.join("state_5.sqlite"), "already-own").expect("own db");
-    let bad_default = pre_drifted.home.join(".codex");
+    let bad_work = pre_drifted.two(Cli::Kimi);
+    pre_drifted.on_main(Cli::Kimi, &[]);
+    std::fs::write(bad_work.join("AGENTS.md"), "already-own").expect("own file");
+    let bad_default = pre_drifted.home.join(".kimi-code");
     let read_bad = |_: Cli, home: &Path, _: i64| {
         std::fs::create_dir_all(home).expect("home");
-        let db = home.join("state_5.sqlite");
-        if std::fs::symlink_metadata(&db).is_err() {
-            std::fs::write(&db, "shared").expect("shared db");
+        let agents = home.join("AGENTS.md");
+        if std::fs::symlink_metadata(&agents).is_err() {
+            std::fs::write(&agents, "shared").expect("shared file");
         }
         (home == bad_default).then(|| full.clone())
     };
     assert_eq!(
-        launch_env(&pre_drifted.seat(), Cli::Codex, &read_bad),
+        launch_env(&pre_drifted.seat(), Cli::Kimi, &read_bad),
         None,
         "pre-drifted work is still refused when main is full"
     );
@@ -1305,7 +1307,7 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
     let pick = launch_env(&world.seat(), Cli::Codex, &|_, _, _| Some(ok_usage.clone()))
         .expect("single enrolled dedicated row must launch");
     assert_eq!(pick.label, "codex-1");
-    assert_eq!(pick.value, Some(c1.display().to_string()));
+    assert_eq!(pick.value, Some(c1.join("auth.json").display().to_string()));
 
     // Advance past USAGE_FRESH_S so `codex-1` is read again and hits its 7d weekly wall.
     let later = Seat {
@@ -1362,7 +1364,10 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
         .expect("bind codex-2");
     let pick2 = launch_env(&later, Cli::Codex, &no_usage).expect("rolls over to codex-2");
     assert_eq!(pick2.label, "codex-2");
-    assert_eq!(pick2.value, Some(c2_staged.display().to_string()));
+    assert_eq!(
+        pick2.value,
+        Some(c2_staged.join("auth.json").display().to_string())
+    );
 
     // 2. Adopted default row + lazy unenrolled backup (`[main, backup]`): `launch_env` reads
     //    `main`'s usage and persists its wall even while `backup` is still `NotEnrolled`.

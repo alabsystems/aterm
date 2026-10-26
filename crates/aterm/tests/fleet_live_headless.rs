@@ -52,19 +52,44 @@ fn fleet_table(port: u16, allow: &str) -> String {
 
 const RETRY_MS: &str = "100";
 
-fn boot(port: u16) -> Instance {
+#[expect(
+    clippy::disallowed_types,
+    reason = "headless_boot::boot_with's hook, on the binary under test it isolates"
+)]
+fn boot_world(
+    prefix: &str,
+    configure: impl FnOnce(&Path, &mut std::process::Command),
+    ready: impl Fn(&Instance) -> bool,
+) -> Instance {
     headless_boot::boot_with(
-        "aflt",
+        prefix,
+        |tmp, cmd| {
+            cmd.env(aterm_net::loopback::SEAM, "1");
+            configure(tmp, cmd);
+        },
+        ready,
+    )
+}
+
+fn boot(port: u16) -> Instance {
+    boot_on("aflt", &fleet_table(port, "facts"), true)
+}
+
+fn boot_on(prefix: &str, table: &str, guarded: bool) -> Instance {
+    boot_world(
+        prefix,
         |tmp, cmd| {
             let state = tmp.join("state");
             write_key(&state, &SECRET);
             let config = tmp.join("cfg/aterm/aterm.toml");
             let text = std::fs::read_to_string(&config).expect("the scratch config");
-            std::fs::write(&config, format!("{text}{}", fleet_table(port, "facts")))
-                .expect("write the fleet table");
+            std::fs::write(&config, format!("{text}{table}")).expect("write the fleet table");
             cmd.env("ATERM_STATE_HOME", &state)
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
                 .args(["--lines", "24", "--columns", "80"]);
+            if !guarded {
+                cmd.env_remove(aterm_net::loopback::SEAM);
+            }
         },
         |_| true,
     )
@@ -300,12 +325,32 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
     assert_eq!(scope, FleetScope::Content);
 
     let text = std::fs::read_to_string(&config).expect("the config");
-    let elsewhere = format!("[fleet]\nlisten = \"192.0.2.1:{moved}\"\nallow = \"content\"\n");
-    std::fs::write(
-        &config,
-        text.replace(&fleet_table(moved, "content"), &elsewhere),
-    )
-    .expect("edit the config");
+    for off_loopback in ["0.0.0.0", "192.0.2.1"] {
+        let elsewhere =
+            format!("[fleet]\nlisten = \"{off_loopback}:{moved}\"\nallow = \"content\"\n");
+        std::fs::write(
+            &config,
+            text.replace(&fleet_table(moved, "content"), &elsewhere),
+        )
+        .expect("edit the config");
+        fleet_reads(&inst, &sid, "refused:loopback");
+        assert!(
+            TcpStream::connect(("127.0.0.1", moved)).is_err(),
+            "{off_loopback}: the guard binds nothing"
+        );
+        std::fs::write(&config, &text).expect("put the loopback back");
+        fleet_reads(&inst, &sid, "listening");
+    }
+}
+
+#[test]
+fn without_the_guard_a_listen_on_an_address_this_machine_lacks_is_retried() {
+    let inst = boot_on(
+        "aflu",
+        "[fleet]\nlisten = \"192.0.2.1:7100\"\nallow = \"facts\"\n",
+        false,
+    );
+    let (_, sid) = boot_session(&inst);
     fleet_reads(&inst, &sid, "retrying");
 }
 
@@ -334,7 +379,8 @@ fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::launch_isolation::apply(&mut cmd, root);
-    cmd.env("ATERM_STATE_HOME", root.join("state"));
+    cmd.env("ATERM_STATE_HOME", root.join("state"))
+        .env(aterm_net::loopback::SEAM, "1");
     let mut child = cmd.spawn().expect("spawn aterm fleet");
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().expect("its stdin");
@@ -362,7 +408,8 @@ fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::launch_isolation::apply(&mut cmd, root);
-        cmd.env("ATERM_STATE_HOME", root.join("state"));
+        cmd.env("ATERM_STATE_HOME", root.join("state"))
+            .env(aterm_net::loopback::SEAM, "1");
         let mut child = cmd.spawn().expect("spawn aterm ctl");
         if let Some(bytes) = stdin {
             let mut pipe = child.stdin.take().expect("its stdin");
@@ -390,7 +437,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     drop(holder);
     let port = port.to_string();
     let mut init = String::new();
-    let inst = headless_boot::boot_with(
+    let inst = boot_world(
         "afli",
         |tmp, cmd| {
             init = fleet_ok(
@@ -502,7 +549,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     let (holder, other_port) = hold_a_port();
     drop(holder);
     let other_port_word = other_port.to_string();
-    let other = headless_boot::boot_with(
+    let other = boot_world(
         "aflo",
         |tmp, cmd| {
             fleet_ok(
@@ -823,7 +870,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
-    let issuer = headless_boot::boot_with(
+    let issuer = boot_world(
         "afdi",
         |tmp, cmd| {
             fleet_ok(
@@ -874,7 +921,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     drop(holder);
     let member_port_word = member_port.to_string();
     let mut allowed = String::new();
-    let member = headless_boot::boot_with(
+    let member = boot_world(
         "afdm",
         |tmp, cmd| {
             fleet_ok(
@@ -1136,7 +1183,7 @@ fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
-    let issuer = headless_boot::boot_with(
+    let issuer = boot_world(
         tags.0,
         |tmp, cmd| {
             fleet_ok(
@@ -1162,7 +1209,7 @@ fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
     let (holder, member_port) = hold_a_port();
     drop(holder);
     let member_port_word = member_port.to_string();
-    let member = headless_boot::boot_with(
+    let member = boot_world(
         tags.1,
         |tmp, cmd| {
             fleet_ok(
@@ -1332,7 +1379,7 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
-    let held = headless_boot::boot_with(
+    let held = boot_world(
         "afli",
         |tmp, cmd| {
             fleet_ok(
@@ -1352,7 +1399,7 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     let (holder, member_port) = hold_a_port();
     drop(holder);
     let member_port_word = member_port.to_string();
-    let driver = headless_boot::boot_with(
+    let driver = boot_world(
         "aflm",
         |tmp, cmd| {
             fleet_ok(

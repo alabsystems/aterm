@@ -283,18 +283,18 @@ const CHORD_LOOP: [Chord; 8] = [
 
 const CHORD_AFTER_ENTER: u8 = 7;
 
-/// C3: two octaves under the tine and an octave under the bass dyad ([`BASS_BASE_HZ`]).
-pub(super) const BED_BASE_HZ: f32 = TINE_BASE_HZ * 0.25;
+/// C4: one octave under the tine ([`TINE_BASE_HZ`]), clear of the sub-200 Hz hum band.
+pub(super) const BED_BASE_HZ: f32 = TINE_BASE_HZ * 0.5;
 /// The number of chords the sky voices ([`CHORD_LOOP`]'s length), exported for the parent's lattice law.
 pub(super) const SKY_BED_CHORDS: usize = CHORD_LOOP.len();
 const BED_WEIGHT: [f32; 3] = [1.0, 0.80, 0.65];
-const BED_GLIDE_TAU_S: f32 = 2.6;
-const BED_LEVEL: f32 = 0.008_9;
+const BED_GLIDE_TAU_S: f32 = 0.045;
+const BED_LEVEL: f32 = 0.005_5;
 const BED_BREATH_HZ: f32 = 1.0 / 12.0;
 const BED_BREATH_DEPTH: f32 = 0.35;
 const BED_HUE_TAU_S: f32 = 1.2;
-const BED_TILT_LO_HZ: f32 = 350.0;
-const BED_TILT_HI_HZ: f32 = 900.0;
+const BED_TILT_LO_HZ: f32 = 420.0;
+const BED_TILT_HI_HZ: f32 = 980.0;
 const BED_DETUNE_CENTS_LO: f32 = 4.0;
 const BED_DETUNE_CENTS_HI: f32 = 11.0;
 const BED_PARTIALS: [u32; 4] = [1, 2, 3, 4];
@@ -3509,7 +3509,18 @@ impl TrailSynth {
                 + super::sin01(ph * 4.0) * 0.25;
             x * BED_PARTIAL_NORM
         }
-        let tgt = SKY_BED_TARGETS[(self.v2.text.chord as usize) & (SKY_BED_CHORDS - 1)];
+        let ci = (self.v2.text.chord as usize) & (SKY_BED_CHORDS - 1);
+        let tgt = if self.song_key == 0 {
+            SKY_BED_TARGETS[ci]
+        } else {
+            let degs = SKY_BED_DEGREES_TABLE[ci];
+            let key = self.song_key as i32;
+            [
+                penta(BED_BASE_HZ, degs[0] + key),
+                penta(BED_BASE_HZ, degs[1] + key),
+                penta(BED_BASE_HZ, degs[2] + key),
+            ]
+        };
         let b = &mut self.bed;
         if b.sky_glide_dt != dt {
             const INV_BED_GLIDE_TAU_S: f32 = -1.0 / BED_GLIDE_TAU_S;
@@ -7916,6 +7927,123 @@ for it up front.\n\
             assert!(
                 after_nav > after_key,
                 "{voice:?}: a word hop 30 ms after a key must still sound"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sky_pad_tracks_the_chord_and_key_without_low_frequency_hum() {
+        fn lp_series(samples: &[f32], fc: f32) -> Vec<f32> {
+            let k = 1.0 - (-core::f32::consts::TAU * fc / SR).exp();
+            let mut s = [0.0f32; 4];
+            samples
+                .iter()
+                .map(|&x| {
+                    s[0] += k * (x - s[0]);
+                    s[1] += k * (s[0] - s[1]);
+                    s[2] += k * (s[1] - s[2]);
+                    s[3] += k * (s[2] - s[3]);
+                    s[3]
+                })
+                .collect()
+        }
+        fn rms_db(xs: &[f32]) -> f32 {
+            if xs.is_empty() {
+                return -120.0;
+            }
+            let ms = xs.iter().map(|x| x * x).sum::<f32>() / (xs.len() as f32);
+            if ms <= 1e-12 {
+                -120.0
+            } else {
+                10.0 * ms.log10()
+            }
+        }
+
+        let text = "first, fix the aterm typing sound, there is a low frequency humming.";
+        for bed in [false, true] {
+            let mut s = synth();
+            let mut buf = [0.0f32; 1024];
+            let mut active_mono = Vec::new();
+            let mut at_ms = 1_000u32;
+            for (idx, ch) in text.chars().enumerate() {
+                let kind = if ch == ' ' {
+                    SoundKind::Space
+                } else {
+                    SoundKind::Typed
+                };
+                s.push_meta(
+                    SoundEvent {
+                        bed,
+                        hue: ((idx as f32) * 0.07).fract(),
+                        tone: Tone::Frustrated,
+                        ..event(kind, 0.0, ch.is_uppercase())
+                    },
+                    EventMeta {
+                        at_ms,
+                        glyph_class: crate::trail_sound::typed_glyph_class(Some(ch)),
+                        rank: crate::trail_sound::typed_glyph_rank(Some(ch)),
+                        ..EventMeta::default()
+                    },
+                );
+                for _ in 0..7 {
+                    s.render(&mut buf);
+                    for &[l, r] in buf.as_chunks::<2>().0 {
+                        active_mono.push(0.5 * (l + r));
+                    }
+                }
+                at_ms += 75;
+            }
+            let total_db = rms_db(&active_mono);
+            let sub200_db = rms_db(&lp_series(&active_mono, 200.0));
+            assert!(
+                sub200_db < -62.0 && total_db - sub200_db > 24.0,
+                "bed={bed}: sub-200 Hz hum ({sub200_db:.1} dB) must stay deep below signal ({total_db:.1} dB)"
+            );
+            if !bed {
+                // Default bed=false: after 350 ms for the final tine to ring out, tail is quiet.
+                for _ in 0..45 {
+                    s.render(&mut buf);
+                }
+                assert!(
+                    s.is_quiet(),
+                    "bed=false parks the synth as soon as notes end"
+                );
+            } else {
+                // Opt-in bed=true: settles to exact silence within 2.5 s (no multi-second lingering drone).
+                for _ in 0..235 {
+                    s.render(&mut buf);
+                }
+                assert!(
+                    s.is_quiet(),
+                    "bed=true settles cleanly without lingering drone"
+                );
+            }
+        }
+
+        // Chord changes and song_key transpositions converge onto exact lattice pitches within 250 ms.
+        let mut s = synth();
+        s.song_key = 2;
+        let mut buf = [0.0f32; 1024];
+        s.push_meta(
+            SoundEvent {
+                bed: true,
+                ..event(SoundKind::Space, 0.0, false)
+            },
+            EventMeta {
+                at_ms: 1_000,
+                ..EventMeta::default()
+            },
+        );
+        for _ in 0..24 {
+            s.render(&mut buf);
+        }
+        let degs = sky_bed_degrees(usize::from(s.v2.chord()));
+        for (i, deg) in degs.into_iter().enumerate() {
+            let want = penta(BED_BASE_HZ, deg + 2);
+            assert!(
+                (s.bed.var_f[i] - want).abs() < 0.5,
+                "voice {i} ({:.2} Hz) must lock to transposed chord tone {want:.2} Hz instead of sliding microtonally",
+                s.bed.var_f[i]
             );
         }
     }

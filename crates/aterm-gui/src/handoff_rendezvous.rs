@@ -2582,8 +2582,16 @@ mod tests {
         }
     }
 
+    /// The parent hangs up right after the grant, 20 times (the window is a race), and the claim
+    /// still lands: a socket shut both ways answers `setsockopt(SO_RCVTIMEO)` with EINVAL on
+    /// Darwin, which the successor once took for a broken grant. The dialer's code is admitted at
+    /// the same-uid floor: its signature is not what this law is about, and checking a test
+    /// binary's code lists the whole directory it sits in (`SecCodeCopySelf` and the peer check
+    /// each walk the ~300,000 entries of `target/debug/deps`), some 0.9 s an iteration on an
+    /// idle machine and past a minute for the 20 under a full run.
     #[test]
     fn a_grant_whose_connection_closes_at_once_is_still_claimed() {
+        let code = crate::handoff_rendezvous::DialerCode::same_uid_floor_for_test();
         for _ in 0..20 {
             let rendezvous = bind_for_test();
             let (master, slave) = open_pty();
@@ -2604,7 +2612,7 @@ mod tests {
             let peer = admitted(
                 rendezvous.accept_claim(
                     Some(own_pid()),
-                    &crate::handoff_rendezvous::DialerCode::this_process(),
+                    &code,
                     Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                     &|| false,
                 ),

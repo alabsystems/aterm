@@ -1782,6 +1782,9 @@ pub(crate) struct EditorShellMetrics {
     pub(crate) command_gap: f32,
     pub(crate) command_bar_width: f32,
     pub(crate) command_rows: usize,
+    /// The most rows the toolbar's buttons flow into here ([`plan_editor_toolbar`]): fewer than
+    /// [`EDITOR_TOOLBAR_MAX_ROWS`] where more would cost the file its minimum rows.
+    pub(crate) command_row_cap: usize,
     pub(crate) command_button_height: f32,
     pub(crate) command_bar_height: f32,
     pub(crate) content_gap: f32,
@@ -1922,8 +1925,9 @@ pub(crate) fn editor_help_lines(viewport: LogicalRect, help: &str, max_rows: usi
 /// the setting does) takes whole, as the footer always has its reserved rows
 /// ([`EDITOR_FOOTER_RESERVED_ROWS`]): a narrow editor at a large text size gives the
 /// file a row rather than cut "Prime coding agents automatically" to "Prime coding
-/// agents…". The view paints these rows and the input side counts the document's rows
-/// under this panel, so both measure the one panel.
+/// agents…", down to the rows the shell keeps the file ([`editor_shell_metrics_at_scale`]
+/// sheds the panel below them). The view paints these rows and the input side counts the
+/// document's rows under this panel, so both measure the one panel.
 pub(crate) fn editor_help_palette(
     viewport: LogicalRect,
     toolbar: EditorToolbar,
@@ -2034,13 +2038,20 @@ pub(crate) struct EditorToolbarPlan {
 pub(crate) const EDITOR_TOOLBAR_MAX_ROWS: usize = 3;
 
 /// Flow the editor toolbar's buttons into rows `bar_width` wide: the fewest rows, at most
-/// [`EDITOR_TOOLBAR_MAX_ROWS`], that hold them, with labels shortened from the last one first;
-/// only where no row count holds them do the yielding buttons give way, lowest rank first.
+/// `max_rows` (at most [`EDITOR_TOOLBAR_MAX_ROWS`]), that hold them, with labels shortened from
+/// the last one first; only where no row count holds them do the yielding buttons give way,
+/// lowest rank first. None at all for `max_rows` 0, which an `edit` ticket's header row allows
+/// ([`editor_shell_metrics_at_scale`]).
 pub(crate) fn plan_editor_toolbar(
     items: &[EditorToolbarItem],
     bar_width: f32,
     gap: f32,
+    max_rows: usize,
 ) -> EditorToolbarPlan {
+    if max_rows == 0 {
+        return EditorToolbarPlan { rows: Vec::new() };
+    }
+    let max_rows = max_rows.min(EDITOR_TOOLBAR_MAX_ROWS);
     let flow = |chosen: &[(usize, &'static str)]| {
         let mut rows: Vec<Vec<(&'static str, &'static str, f32)>> = Vec::new();
         let mut used = 0.0_f32;
@@ -2061,7 +2072,7 @@ pub(crate) fn plan_editor_toolbar(
     };
     let mut kept: Vec<usize> = (0..items.len()).collect();
     loop {
-        for target in 1..=EDITOR_TOOLBAR_MAX_ROWS {
+        for target in 1..=max_rows {
             let mut chosen: Vec<(usize, &'static str)> = kept
                 .iter()
                 .map(|&index| (index, items[index].long))
@@ -2117,6 +2128,18 @@ pub(crate) fn editor_shell_metrics(
     )
 }
 
+/// THE FILE KEEPS ITS ROWS: an editor in `viewport` with `palette` and `toolbar` lays its chrome
+/// out whole where the file keeps its minimum rows ([`MINIMUM_EDITOR_DOCUMENT_ROWS`]) under it,
+/// and where it would not (80x24 at 2x text showed one row of aterm.toml) sheds chrome by
+/// measure, what it can best spare first. The toolbar's rows past its first give way to the
+/// file's minimum: their buttons yield as in a narrow window, and every one is also a key and
+/// a command by name. The resting help line, which says what the setting under the
+/// caret does, gives way only where the file would show fewer than [`EDITOR_DOCUMENT_FLOOR_ROWS`]
+/// beside it (the toolbar then takes the rows the file can spare); Ctrl-Space still lists
+/// completions under their help. The header, the footer, one toolbar row and a panel the person
+/// asked for stay: each holds what nothing else shows. An `edit` ticket's header row (Done,
+/// which saves, and Abort) is that row where it has one, and the toolbar's buttons may give way
+/// whole under it. Where even that leaves the file short, the most rows it can have.
 pub(crate) fn editor_shell_metrics_at_scale(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
@@ -2124,6 +2147,53 @@ pub(crate) fn editor_shell_metrics_at_scale(
     text_scale: f32,
 ) -> EditorShellMetrics {
     let palette = palette.into();
+    let text_scale = editor_text_scale(text_scale);
+    let layout = |palette: EditorPalette, cap: usize| {
+        editor_shell_layout(viewport, palette, toolbar, text_scale, cap)
+    };
+    let rows = |metrics: &EditorShellMetrics| {
+        whole_editor_rows(&text_viewport_geometry_at_scale(
+            editor_rect_in(viewport, metrics),
+            text_scale,
+            1,
+        ))
+    };
+    // The toolbar's rows give way, from the most, until the file has its minimum rows; else the
+    // fewest the toolbar takes, which leave the file the most.
+    let shed_toolbar = |palette: EditorPalette, natural: EditorShellMetrics| {
+        let toolbar_rows = natural.command_rows - usize::from(toolbar.edit_header);
+        let fewest_rows = usize::from(!toolbar.edit_header);
+        let mut fewest = natural;
+        if rows(&natural) >= MINIMUM_EDITOR_DOCUMENT_ROWS {
+            return natural;
+        }
+        for cap in (fewest_rows..toolbar_rows).rev() {
+            fewest = layout(palette, cap);
+            if rows(&fewest) >= MINIMUM_EDITOR_DOCUMENT_ROWS {
+                break;
+            }
+        }
+        fewest
+    };
+    let kept = shed_toolbar(palette, layout(palette, EDITOR_TOOLBAR_MAX_ROWS));
+    if !matches!(palette, EditorPalette::Help { .. }) || rows(&kept) >= EDITOR_DOCUMENT_FLOOR_ROWS {
+        return kept;
+    }
+    shed_toolbar(
+        EditorPalette::None,
+        layout(EditorPalette::None, EDITOR_TOOLBAR_MAX_ROWS),
+    )
+}
+
+/// The editor's chrome laid out whole, its toolbar in at most `command_row_cap` rows
+/// ([`editor_shell_metrics_at_scale`] chooses the cap).
+fn editor_shell_layout(
+    viewport: LogicalRect,
+    palette: EditorPalette,
+    toolbar: EditorToolbar,
+    text_scale: f32,
+    command_row_cap: usize,
+) -> EditorShellMetrics {
     let (palette_candidates, wanted_help_rows) = match palette {
         EditorPalette::Rows {
             candidates,
@@ -2132,7 +2202,6 @@ pub(crate) fn editor_shell_metrics_at_scale(
         EditorPalette::Help { help_rows } => (0, help_rows),
         EditorPalette::None => (0, 1),
     };
-    let text_scale = editor_text_scale(text_scale);
     let chrome_scale = text_scale.min(1.35);
     let dense_commands = viewport.width < 390.0 * text_scale.min(1.4);
     let (outer_padding, palette_padding) = editor_shell_paddings(viewport, text_scale);
@@ -2147,15 +2216,19 @@ pub(crate) fn editor_shell_metrics_at_scale(
         (36.0 * text_scale).clamp(36.0, 48.0)
     };
     let command_bar_width = (viewport.width - outer_padding * 2.0).max(0.0);
-    let command_rows = plan_editor_toolbar(
+    let toolbar_rows = plan_editor_toolbar(
         &editor_toolbar_items(toolbar),
         command_bar_width,
         command_gap,
+        command_row_cap,
     )
     .rows
-    .len()
-    .max(1)
-        + usize::from(toolbar.edit_header);
+    .len();
+    let command_rows = if command_row_cap == 0 {
+        0
+    } else {
+        toolbar_rows.max(1)
+    } + usize::from(toolbar.edit_header);
     let command_bar_height =
         command_button_height * command_rows as f32 + command_gap * (command_rows - 1) as f32;
     let content_gap = 8.0 * chrome_scale;
@@ -2216,6 +2289,7 @@ pub(crate) fn editor_shell_metrics_at_scale(
         command_gap,
         command_bar_width,
         command_rows,
+        command_row_cap,
         command_button_height,
         command_bar_height,
         content_gap,
@@ -2233,6 +2307,12 @@ pub(crate) fn editor_shell_metrics_at_scale(
 const COMMAND_COMPLETION_RENDER_LIMIT: usize = 8;
 
 const MINIMUM_EDITOR_DOCUMENT_ROWS: usize = 6;
+
+/// The fewest rows the file shows before the resting help line gives way to it
+/// ([`editor_shell_metrics_at_scale`]): the caret's row, a row of context on either side and
+/// one to move into, what an 80x24 window at 2x text has under its header, footer and one
+/// toolbar row.
+const EDITOR_DOCUMENT_FLOOR_ROWS: usize = 4;
 
 /// Exact editor paint rectangle derived from the same responsive shell metrics consumed by
 /// `EditorApp::view`.
@@ -2255,7 +2335,14 @@ fn editor_text_viewport_rect_at_scale(
     toolbar: EditorToolbar,
     text_scale: f32,
 ) -> LogicalRect {
-    let metrics = editor_shell_metrics_at_scale(viewport, palette, toolbar, text_scale);
+    editor_rect_in(
+        viewport,
+        &editor_shell_metrics_at_scale(viewport, palette, toolbar, text_scale),
+    )
+}
+
+/// The editor's paint rectangle in `viewport` under the chrome `metrics` lays out.
+fn editor_rect_in(viewport: LogicalRect, metrics: &EditorShellMetrics) -> LogicalRect {
     let gaps = if metrics.palette_height <= 0.0 {
         1.0
     } else {
@@ -3396,13 +3483,15 @@ pub(crate) fn tab_past_screen(
     // A segment is its control here: Tab from one leaves the control, and
     // never lands on another segment of it.
     let target = match (index_of(current), index_of(next)) {
-        (Some(index), Some(after)) if index == after => {
-            if forward {
-                controls.get(index + 1)
-            } else {
-                controls.get(index.checked_sub(1)?)
-            }
+        // The visible order can wrap before the whole list does. Walk its
+        // hidden stops before wrapping, including when just one stop is shown.
+        (Some(index), Some(after)) if forward && after <= index => {
+            controls.get(index + 1).or_else(|| controls.first())
         }
+        (Some(index), Some(after)) if !forward && after >= index => index
+            .checked_sub(1)
+            .and_then(|before| controls.get(before))
+            .or_else(|| controls.last()),
         (Some(index), None) if forward => controls.get(index + 1),
         (Some(index), None) => controls.get(index.checked_sub(1)?),
         (None, Some(_)) if !order.contains(current) => None,
@@ -8214,12 +8303,12 @@ fn paint_control_surface(
 }
 
 /// The rim of a resting control (a chip, a Secondary or Setting button, a field, a slider, a
-/// boxed switch): its fill stands only a few percent off the ground it sits on, so the rim is
-/// the control's only boundary and holds the non-text floor, 3:1
-/// ([`crate::native_appearance::NativeRoles::control_edge`]), on the card and on the page. The
-/// separator is a 1.5:1 hairline for dividing, never a control's edge. A disabled control's rim
-/// stays soft, as WCAG exempts it.
-const fn resting_rim(roles: &crate::settings::Roles) -> ([u8; 3], u8) {
+/// boxed switch, the command palette's search field): its fill stands only a few percent off
+/// the ground it sits on, so the rim is the control's only boundary and holds the non-text
+/// floor, 3:1 ([`crate::native_appearance::NativeRoles::control_edge`]), on the card and on the
+/// page. The separator is a 1.5:1 hairline for dividing, never a control's edge. A disabled
+/// control's rim stays soft, as WCAG exempts it.
+pub(crate) const fn resting_rim(roles: &crate::settings::Roles) -> ([u8; 3], u8) {
     (roles.control_edge, 255)
 }
 
@@ -12100,15 +12189,15 @@ pub(crate) mod tests {
                 .map(|row| row.iter().map(|(_, label, _)| *label).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         };
-        let plan = plan_editor_toolbar(&items, long_total, gap);
+        let plan = plan_editor_toolbar(&items, long_total, gap, EDITOR_TOOLBAR_MAX_ROWS);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(words(&plan)[0].last(), Some(&"Next Issue"));
         let less = long_total - (width("Next Issue") - width("Next")) + 0.5;
-        let plan = plan_editor_toolbar(&items, less, gap);
+        let plan = plan_editor_toolbar(&items, less, gap, EDITOR_TOOLBAR_MAX_ROWS);
         assert_eq!(plan.rows.len(), 1, "{:?}", words(&plan));
         assert_eq!(words(&plan)[0].last(), Some(&"Next"));
         assert_eq!(words(&plan)[0][6], "Prev Issue", "the last first");
-        let plan = plan_editor_toolbar(&items, long_total * 0.55, gap);
+        let plan = plan_editor_toolbar(&items, long_total * 0.55, gap, EDITOR_TOOLBAR_MAX_ROWS);
         assert_eq!(plan.rows.len(), 2);
         let flat: Vec<&str> = words(&plan).concat();
         assert_eq!(
@@ -12117,7 +12206,7 @@ pub(crate) mod tests {
             "order kept, long words kept"
         );
         let narrow = width("Next Issue") + 1.0;
-        let plan = plan_editor_toolbar(&items, narrow, gap);
+        let plan = plan_editor_toolbar(&items, narrow, gap, EDITOR_TOOLBAR_MAX_ROWS);
         let flat: Vec<&str> = words(&plan).concat();
         for kept in ["Save", "Undo", "Commands"] {
             assert!(flat.contains(&kept), "{kept}: {flat:?}");
@@ -12132,13 +12221,112 @@ pub(crate) mod tests {
                 assert_eq!(*w, width(label), "never squeezed");
             }
         }
-        let three = plan_editor_toolbar(&items, long_total * 0.36, gap);
+        let three = plan_editor_toolbar(&items, long_total * 0.36, gap, EDITOR_TOOLBAR_MAX_ROWS);
         assert!(three.rows.len() <= EDITOR_TOOLBAR_MAX_ROWS);
         assert_eq!(
             three.rows.concat().len(),
             items.len(),
             "{:?}",
             words(&three)
+        );
+    }
+
+    /// THE FILE BEING EDITED SHOWS SEVERAL ROWS AT EVERY STANDARD SIZE AND TEXT SCALE (audit r17,
+    /// r20 MC4): an 80x24 window at 2x text showed aterm.toml one row at a time under two rows of
+    /// toolbar and the help line (80x24 at 1.25x, two). The chrome now sheds by measure: the
+    /// toolbar's rows past its first for the file's minimum rows, the resting help line where the
+    /// file would show fewer than four beside it. So the file keeps its minimum rows at 1x and
+    /// four or more at every larger text size (four is all a header, a footer and one toolbar row
+    /// leave at 80x24 and 2x); the help and the toolbar's rows come back where they fit. An
+    /// `edit` ticket's header row (Done, Abort) stands for the toolbar there, which gives way
+    /// whole under it.
+    #[test]
+    fn the_file_shows_several_rows_at_every_standard_size_and_text_scale() {
+        let windows = [
+            (584.0, 348.0, "80x24"),
+            (738.0, 418.0, "102x29"),
+            (900.0, 600.0, "120x36"),
+            (1_200.0, 800.0, "160x48"),
+        ];
+        // The config editor's toolbars, and an `edit` ticket's with its header row.
+        let toolbars = [false, true].into_iter().flat_map(|edit_header| {
+            [false, true]
+                .into_iter()
+                .flat_map(move |problem_navigation| {
+                    [false, true].map(|reload| EditorToolbar {
+                        problem_navigation,
+                        reload,
+                        edit_header,
+                    })
+                })
+        });
+        for toolbar in toolbars {
+            for (width, height, name) in windows {
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                for scale in [0.85, 1.0, 1.25, 1.5, 1.75, 2.0] {
+                    for palette in [
+                        EditorPalette::None,
+                        EditorPalette::Help { help_rows: 1 },
+                        EditorPalette::Help { help_rows: 2 },
+                    ] {
+                        let editor =
+                            editor_text_viewport_rect_at_scale(viewport, palette, toolbar, scale);
+                        let rows =
+                            whole_editor_rows(&text_viewport_geometry_at_scale(editor, scale, 1));
+                        let floor = if scale <= 1.0 {
+                            MINIMUM_EDITOR_DOCUMENT_ROWS
+                        } else {
+                            4
+                        };
+                        assert!(
+                            rows >= floor,
+                            "{name} at {scale}x, {palette:?}, {toolbar:?}: {rows} rows of the file"
+                        );
+                    }
+                }
+            }
+        }
+        let small = LogicalRect::new(0.0, 0.0, 584.0, 348.0);
+        let shell = editor_shell_metrics_at_scale(
+            small,
+            EditorPalette::Help { help_rows: 1 },
+            EditorToolbar::default(),
+            2.0,
+        );
+        assert_eq!(shell.command_rows, 1, "one toolbar row at 80x24 and 2x");
+        assert_eq!(
+            shell.palette_height, 0.0,
+            "the resting help gives way there"
+        );
+        let ticket = EditorToolbar {
+            edit_header: true,
+            ..EditorToolbar::default()
+        };
+        let shell = editor_shell_metrics_at_scale(small, EditorPalette::None, ticket, 2.0);
+        assert_eq!(
+            (shell.command_rows, shell.command_row_cap),
+            (1, 0),
+            "an edit ticket's header row alone: its Done saves"
+        );
+        let roomy = LogicalRect::new(0.0, 0.0, 738.0, 760.0);
+        let shell = editor_shell_metrics_at_scale(
+            roomy,
+            EditorPalette::Help { help_rows: 1 },
+            EditorToolbar::default(),
+            2.0,
+        );
+        assert!(shell.palette_height > 0.0, "the help line where it fits");
+        assert_eq!(
+            shell.command_rows,
+            plan_editor_toolbar(
+                &editor_toolbar_items(EditorToolbar::default()),
+                shell.command_bar_width,
+                shell.command_gap,
+                EDITOR_TOOLBAR_MAX_ROWS,
+            )
+            .rows
+            .len(),
+            "and the whole toolbar"
         );
     }
 

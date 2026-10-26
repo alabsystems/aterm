@@ -126,6 +126,86 @@ fn sf_monos_styles_are_named_for_the_instances_they_draw() {
     assert_eq!(named(2), (Some("SF Mono Bold Italic"), StyleBits::REGULAR));
 }
 
+/// The coords a variable face draws `style` at: the instance of the face that serves it.
+#[cfg(target_os = "macos")]
+fn drawn_instance(r: &mut Renderer, style: StyleBits) -> Vec<(u32, f32)> {
+    r.ensure_styled_faces();
+    match r.run_face_pick(style) {
+        FacePick::Styled { slot, synthetic } => r.styled_instance(slot, synthetic).0,
+        FacePick::InjectedBold { .. } => r.bold_font_instance.drawn.clone(),
+        FacePick::Primary => r.vf_bold_coords.clone(),
+    }
+    .expect("a variable instance")
+    .to_vec()
+}
+
+/// SF MONO'S BOLD IS THE BOLD ITS DESIGNER DREW (audit r17 FD, r20 MC3): its Bold named instance
+/// is `wght` 683.29 on its own `YAXS` 335.84, and the bold role draws exactly that, as its bold
+/// italic draws the italic file's Bold Italic, so "SF Mono Bold" in Settings names what draws.
+/// Before, the role drew any variable face at `wght` 700 on the Regular's `YAXS`, a face no
+/// record names. Asked a regular weight past that Bold (600), the bold draws a weight class
+/// above it and is named by that weight, not for the Bold it is not.
+#[cfg(target_os = "macos")]
+#[test]
+fn sf_monos_bold_role_draws_the_bold_its_designer_drew() {
+    let upright = "/System/Library/Fonts/SFNSMono.ttf";
+    let designed = |file: &str| {
+        let bytes = std::fs::read(file).expect("macOS ships SF Mono");
+        let probe = variation::probe(&bytes, 0).expect("SF Mono is variable");
+        let bold = probe.bold_coords.expect("a Bold named instance");
+        probe
+            .axes
+            .iter()
+            .map(|axis| axis.tag)
+            .zip(bold)
+            .collect::<Vec<(u32, f32)>>()
+    };
+    let same = |drawn: &[(u32, f32)], want: &[(u32, f32)], what: &str| {
+        assert_eq!(drawn.len(), want.len(), "{what}: {drawn:?}");
+        for (&(tag, value), &(want_tag, want_value)) in drawn.iter().zip(want) {
+            assert_eq!(tag, want_tag, "{what}");
+            assert!(
+                (value - want_value).abs() < 1e-3,
+                "{what}: {drawn:?}, not {want:?}"
+            );
+        }
+    };
+    let bold = designed(upright);
+    let wght = bold.iter().find(|(tag, _)| *tag == WGHT).map(|&(_, v)| v);
+    assert!(
+        wght.is_some_and(|w| (w - 683.29).abs() < 0.01),
+        "the fixture: SF Mono's Bold is not 700 {bold:?}"
+    );
+    let bytes = std::fs::read(upright).expect("macOS ships SF Mono");
+    let mut r =
+        Renderer::from_resolved_font_file(FaceRef::new(upright, 0), &bytes, 24.0, Theme::default())
+            .expect("SF Mono parses");
+    r.seal_admitted_font_sources();
+    same(&drawn_instance(&mut r, StyleBits::BOLD), &bold, "bold");
+    same(
+        &drawn_instance(&mut r, StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0)),
+        &designed("/System/Library/Fonts/SFNSMonoItalic.ttf"),
+        "bold italic",
+    );
+    let named = |r: &Renderer, slot: usize| {
+        r.drawn_faces().expect("sealed").styles[slot]
+            .face
+            .clone()
+            .unwrap_or_default()
+    };
+    assert_eq!(named(&r, 0), "SF Mono Bold");
+
+    assert!(r.set_font_variations(&[(WGHT, 600.0)], 0.0));
+    let heavy = drawn_instance(&mut r, StyleBits::BOLD);
+    let at = heavy.iter().find(|(tag, _)| *tag == WGHT).map(|&(_, v)| v);
+    assert_eq!(
+        at,
+        Some(700.0),
+        "a weight class over a 600 regular: {heavy:?}"
+    );
+    assert_eq!(named(&r, 0), "SF Mono at weight 700");
+}
+
 /// SF Mono's italic file is variable as its upright is, both defaulting to Light: its
 /// regular weight is its "Regular Italic" named instance (`YAXS` 324.33, `wght` 400),
 /// at which it draws as much ink as the upright Regular beside it, and its bold italic

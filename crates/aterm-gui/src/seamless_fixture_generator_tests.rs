@@ -519,6 +519,7 @@ fn fx_window_in(
                 ("markdown", None, Some(uri)) => NativeTabRestore::Markdown { uri: uri.clone() },
                 ("editor", None, Some(uri)) => NativeTabRestore::Editor { uri: uri.clone() },
                 ("system-state", None, None) => NativeTabRestore::SystemState,
+                ("about", None, None) => NativeTabRestore::About,
                 other => panic!("a native tab this generator does not spell: {other:?}"),
             };
             if descriptor.joins_mirror(&native_tabs) {
@@ -3804,6 +3805,9 @@ fn fx_carried_state_desk() -> FxDesk {
                     ],
                     session: thread.to_string(),
                     codex_home: Some("/home/dev/.codex-work".to_string()),
+                    codex_auth_path: Some(
+                        "/home/dev/.local/share/aterm/accounts-codex/work/auth.json".to_string(),
+                    ),
                     cwd: Some(cwd.to_string()),
                 }),
                 carried: None,
@@ -4352,6 +4356,18 @@ fn fx_variants_desk() -> FxDesk {
         } if native.restore_tag == "system-state"
     ));
     tabs.push(system_state);
+    assert!(app.open_about_tab_in_window(crate::WindowId(0)));
+    let about = app.capture_handoff_layout().windows[0]
+        .restored_tabs
+        .pop()
+        .expect("the opened About tab is captured");
+    assert!(matches!(
+        &about.root,
+        RestoredSplitTree::Leaf {
+            view: RestoredView::Native(native),
+        } if native.restore_tag == "about"
+    ));
+    tabs.push(about);
     FxDesk {
         name: "variants",
         nonce_seed: 0x0100_0019,

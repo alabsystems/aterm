@@ -3310,6 +3310,10 @@ impl crate::App {
         let mut accounts: Vec<AccountKey> = Vec::new();
         let mut front_plan = None;
         let mut weeks = Vec::new();
+        // A pane shown in two tabs (Open Active Session in New Window) is one root, in the tab
+        // listed first; each tab then takes the least key of the panes it keeps, so a split tab
+        // whose least pane a twin listed first shows keeps its other panes under their own.
+        let mut seen = std::collections::HashSet::new();
         let front = self.front_window();
         for (wid, ws) in &self.windows {
             let active = ws.tab_set.active_index();
@@ -3333,14 +3337,16 @@ impl crate::App {
                     if let Ok(shell_pid) = u32::try_from(s.pid)
                         && shell_pid > 0
                     {
-                        tabs.push(TabRoot {
-                            key: pane,
-                            tab: pane,
-                            shell_pid,
-                            label: format!("Tab {}", i + 1),
-                            program: tl.agent().program.clone().unwrap_or_default(),
-                            tab_id: Some(tab.id.get()),
-                        });
+                        if seen.insert(pane) {
+                            tabs.push(TabRoot {
+                                key: pane,
+                                tab: pane,
+                                shell_pid,
+                                label: format!("Tab {}", i + 1),
+                                program: tl.agent().program.clone().unwrap_or_default(),
+                                tab_id: Some(tab.id.get()),
+                            });
+                        }
                         layout.push(PaneFact {
                             key: pane,
                             window: wid.0,
@@ -3381,7 +3387,7 @@ impl crate::App {
             if pid == 0 {
                 continue;
             }
-            if !tabs.iter().any(|tab| tab.key == handle.local_id) {
+            if seen.insert(handle.local_id) {
                 tabs.push(TabRoot {
                     key: handle.local_id,
                     tab: handle.local_id,
@@ -3394,8 +3400,6 @@ impl crate::App {
             session_ids.push((handle.local_id, handle.sid.as_str().to_string()));
         }
         drop(store);
-        let mut seen = std::collections::HashSet::new();
-        tabs.retain(|tab| seen.insert(tab.key));
         let tty_sources: Vec<TtySource> = tabs
             .iter()
             .filter_map(|t| {

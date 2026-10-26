@@ -356,7 +356,21 @@ fn native_args(
         ),
         "options" => (&["--compact", "--installed"], 0, usize::MAX, true),
         "linkage" => (&["--test", "--strict", "--reverse"], 0, usize::MAX, true),
-        "uses" | "dependents" => (&["--installed"], 1, usize::MAX, true),
+        "uses" | "dependents" => (
+            &[
+                "--installed",
+                "--missing",
+                "--recursive",
+                "--include-build",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
+            1,
+            usize::MAX,
+            true,
+        ),
         "home" | "homepage" => (&[], 0, usize::MAX, true),
         "cat" => (&["--cask", "--formula"], 1, 1, true),
         "outdated" => (

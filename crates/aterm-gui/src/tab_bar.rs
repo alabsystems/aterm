@@ -336,6 +336,28 @@ const EDITOR_ICON: &[TabIconPrimitive] = &[
     },
 ];
 
+const ABOUT_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::RoundedRect {
+        rect: [1.0, 1.0, 14.0, 14.0],
+        radius: 7.0,
+        width: 1.2,
+    },
+    TabIconPrimitive::Dot {
+        center: [8.0, 4.75],
+        radius: 0.85,
+    },
+    TabIconPrimitive::Line {
+        from: [8.0, 7.0],
+        to: [8.0, 11.5],
+        width: 1.4,
+    },
+    TabIconPrimitive::Line {
+        from: [6.75, 11.5],
+        to: [9.25, 11.5],
+        width: 1.2,
+    },
+];
+
 const RECOVERY_ICON: &[TabIconPrimitive] = &[
     TabIconPrimitive::RoundedRect {
         rect: [2.0, 1.5, 12.0, 13.0],
@@ -356,6 +378,7 @@ const RECOVERY_ICON: &[TabIconPrimitive] = &[
 #[must_use]
 pub(crate) const fn tab_icon_primitives(kind: TabIconKind) -> &'static [TabIconPrimitive] {
     match kind {
+        TabIconKind::About => ABOUT_ICON,
         TabIconKind::Settings => SETTINGS_ICON,
         TabIconKind::Markdown => MARKDOWN_ICON,
         TabIconKind::Editor => EDITOR_ICON,
@@ -2224,6 +2247,7 @@ fn paint_strip_impl(
                             edit.cursor,
                             title,
                             palette,
+                            strip_cell(' ', &colors, band_role).bg,
                             None,
                         );
                     }
@@ -2306,6 +2330,7 @@ fn paint_strip_impl(
                         edit.cursor,
                         raw,
                         palette,
+                        strip_cell(' ', &colors, tab_role).bg,
                         is_active.then_some(colors.accent),
                     );
                 } else {
@@ -2845,7 +2870,14 @@ const RENAME_SCROLL_RIGHT: char = '›';
 const STRIP_OVERFLOW_LEFT: char = RENAME_SCROLL_LEFT;
 const STRIP_OVERFLOW_RIGHT: char = RENAME_SCROLL_RIGHT;
 
-/// Paint the inline session-rename field across `field` (a column range of `row`).
+/// Paint the inline session-rename field across `field` (a column range of `row`), inset in a
+/// strip cell of `ground`: underlined in `underline` (the active tab's accent), else, where the
+/// well's fill stands under 3:1 off `ground` and so does not show where the field is, in the
+/// edge every faint text field draws ([`aterm_messages::ink::well_edge`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the field's geometry, contents and the two tones it is drawn between"
+)]
 fn paint_rename_field(
     row: &mut [RenderCell],
     field: std::ops::Range<usize>,
@@ -2853,6 +2885,7 @@ fn paint_rename_field(
     cursor: usize,
     placeholder: &str,
     palette: ChromePalette,
+    ground: [u8; 3],
     underline: Option<[u8; 3]>,
 ) -> Option<usize> {
     let width = field.len();
@@ -2860,11 +2893,12 @@ fn paint_rename_field(
         return None;
     }
     let c = crate::chrome_band::band_colors(palette);
+    let edge = underline.or_else(|| aterm_messages::ink::well_edge(c.field_bg, ground, c.value));
     let well = |ch: char, fg: [u8; 3], bg: [u8; 3]| {
         let mut cell = crate::chrome_band::cell(ch, fg, bg, false, false);
-        if let Some(accent) = underline {
+        if let Some(ink) = edge {
             cell.underline = UnderlineStyle::Single;
-            cell.underline_color = Some(accent);
+            cell.underline_color = Some(ink);
         }
         cell
     };
@@ -7962,6 +7996,66 @@ mod tests {
         );
     }
 
+    /// THE RENAME FIELD SHOWS WHERE IT IS (audit r20 MC1): in the solo band its well is the
+    /// terminal's ground, which on macOS is the band's own (1:1, a field with no edge at all) and
+    /// elsewhere a step off it (Default 1.4:1, GitHub Light 1.2:1), so the well's cells carry the
+    /// edge every faint text field draws, 3:1 on the well and on the band, and the band's cells
+    /// beside it none.
+    #[test]
+    fn the_solo_bands_rename_field_draws_its_edge() {
+        let light = Theme::from(&aterm_types::scheme::builtin("GitHub Light").expect("built-in"));
+        for theme in [Theme::default(), light] {
+            let metadata = [TabStripMetadata::from_presentation(
+                &crate::tab_model::TabPresentation::terminal("aterm"),
+            )];
+            let segments = forced_solo_segments(40, &metadata);
+            let band = segments[0];
+            let mut row = vec![blank_cell(theme); 40];
+            paint_strip_with_metadata(
+                &mut row,
+                &segments,
+                &["aterm".to_string()],
+                &metadata,
+                StripPaint {
+                    hovered: None,
+                    new_tab_hovered: false,
+                    version_hovered: false,
+                    caption_hovered: None,
+                    subtitle: None,
+                    rename: Some(StripRenameField {
+                        tab: 0,
+                        text: "agent",
+                        cursor: 5,
+                    }),
+                },
+                0,
+                theme,
+                None,
+            );
+            let colors = crate::chrome_band::band_colors(theme);
+            let field = SOLO_EDGE_COLS..usize::from(band.end_col) - SOLO_EDGE_COLS;
+            let ground = row[SOLO_EDGE_COLS - 1].bg;
+            assert!(
+                crate::chrome_band::contrast(colors.field_bg, ground) < 3.0,
+                "{theme:?}: the fixture is only interesting because the well is faint"
+            );
+            for (col, cell) in row.iter().enumerate() {
+                if field.contains(&col) {
+                    let edge = cell.underline_color.expect("the well's edge");
+                    assert_eq!(cell.underline, UnderlineStyle::Single, "{theme:?} {col}");
+                    for on in [colors.field_bg, ground] {
+                        assert!(
+                            crate::chrome_band::contrast(edge, on) >= 3.0,
+                            "{theme:?} {col}: the edge shows on the well and the band"
+                        );
+                    }
+                } else if col < usize::from(band.end_col) {
+                    assert_eq!(cell.underline, UnderlineStyle::None, "{theme:?} {col}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_empty_rename_field_placeholds_with_the_resolved_label() {
         let theme = Theme::default();
@@ -8379,6 +8473,7 @@ mod tests {
     #[test]
     fn memoized_strip_glyphs_match_a_fresh_raster_for_every_key() {
         let kinds = [
+            TabIconKind::About,
             TabIconKind::Settings,
             TabIconKind::Markdown,
             TabIconKind::Editor,

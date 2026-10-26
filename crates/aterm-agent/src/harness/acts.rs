@@ -475,6 +475,117 @@ pub fn held_tip(legs: &str, nudges: u32) -> String {
     }
 }
 
+/// WHY ATERM STOPPED TYPING INTO A TAB (§14.3 of the Autopilot design): the arm of ruling F's
+/// hold that holds it ([`crate::supervise::policy::turn_end::Replies::held_by`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeldBy {
+    /// The newest reply came again with no work (or a read wall's tries are spent at it).
+    SameReply,
+    /// [`crate::supervise::policy::turn_end::NO_WORK_ACTS`] no-work answers in a row, whatever
+    /// their wording.
+    NoWork,
+}
+
+impl HeldBy {
+    /// Both arms.
+    pub const ALL: [HeldBy; 2] = [HeldBy::SameReply, HeldBy::NoWork];
+
+    /// Its word in `status held=` and the journal's `EXCEPTION … held=`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            HeldBy::SameReply => "same-reply",
+            HeldBy::NoWork => "no-work",
+        }
+    }
+
+    /// The arm of `word` ([`Self::word`]'s inverse); `None` for `-` and any other word.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|arm| arm.word() == word)
+    }
+
+    /// What held it, in the written forms (`the same reply twice, no work`).
+    #[must_use]
+    pub fn why(self) -> String {
+        match self {
+            HeldBy::SameReply => "the same reply twice, no work".to_owned(),
+            HeldBy::NoWork => format!(
+                "{} replies in a row, no work",
+                crate::supervise::policy::turn_end::NO_WORK_ACTS
+            ),
+        }
+    }
+
+    /// What held it as a screen reader says it (`the same reply twice, with no work`).
+    #[must_use]
+    pub fn spoken_why(self) -> String {
+        match self {
+            HeldBy::SameReply => "the same reply twice, with no work".to_owned(),
+            HeldBy::NoWork => format!(
+                "{} replies in a row, with no work",
+                crate::supervise::policy::turn_end::NO_WORK_ACTS
+            ),
+        }
+    }
+
+    /// How its program answered aterm's acts, as the hold's exception says it after `answered`
+    /// (`twice with the same reply and no work`; `Exception::repeats`, `Exception::repeats_land`).
+    #[must_use]
+    pub fn answered(self) -> String {
+        match self {
+            HeldBy::SameReply => "twice with the same reply and no work".to_owned(),
+            HeldBy::NoWork => format!(
+                "{} times in a row with no work",
+                crate::supervise::policy::turn_end::NO_WORK_ACTS
+            ),
+        }
+    }
+}
+
+/// What every surface of a stopped tab begins with ([`stop_words`]), read without regard to case.
+pub const STOPPED_TYPING: &str = "stopped typing";
+
+/// What starts a stopped tab's typing again, in the written forms: a mode switch does not
+/// (`act_past_walls` answers a repeat with nothing in either mode), Off's park does.
+pub const TYPES_AGAIN: &str = "types again at your turn or once the agent works";
+
+/// THE FIVE PLACES A STOP IS SAID ([`stop_words`]), as a hold's words are said in five
+/// (`aterm-gui`'s `HoldForm`, which maps onto these one for one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopForm {
+    /// The chip's title, after `autopilot: <mode> — `: one part of it, its own cuts `;`.
+    Title,
+    /// Settings ▸ Harness's state line: its facts ` · ` apart.
+    Line,
+    /// The tab's hover and the Overview (`driven by aterm (land: stopped typing; …)`).
+    Hover,
+    /// A worker's row in the menu bar.
+    Tip,
+    /// The chip's accessibility description's lead.
+    Spoken,
+}
+
+/// A STOPPED AUTOPILOT, IN WORDS (§14.3): ONE function for every surface that says the stop —
+/// the chip's title and description, the state line, the hover and the Overview, a worker's tip —
+/// and for the lab that reads them.
+#[must_use]
+pub fn stop_words(held: HeldBy, form: StopForm) -> String {
+    match form {
+        StopForm::Title => format!("{STOPPED_TYPING}: {}; {TYPES_AGAIN}", held.why()),
+        StopForm::Line => format!(
+            "{STOPPED_TYPING}: {}{FACT_SEPARATOR}{TYPES_AGAIN}",
+            held.why()
+        ),
+        StopForm::Hover => STOPPED_TYPING.to_owned(),
+        StopForm::Tip => format!("{STOPPED_TYPING}: {}", held.why()),
+        StopForm::Spoken => format!(
+            "Stopped typing: {}. It types again at your turn, or once the agent works.",
+            held.spoken_why()
+        ),
+    }
+}
+
 /// One word Land's strict reading found open, as an index into its word tables.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpenWord(std::num::NonZeroU16);
@@ -502,6 +613,34 @@ impl std::fmt::Debug for OpenWord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `status held=` and the journal's ` held=` read back to the arm they print, `-` to none, and
+    /// every form of the stop leads with the one stop word.
+    #[test]
+    fn a_holds_arm_round_trips_its_word_and_every_stop_form_leads_with_the_stop() {
+        for held in HeldBy::ALL {
+            assert_eq!(HeldBy::of_word(held.word()), Some(held));
+            for form in [
+                StopForm::Title,
+                StopForm::Line,
+                StopForm::Hover,
+                StopForm::Tip,
+            ] {
+                assert!(
+                    stop_words(held, form).starts_with(STOPPED_TYPING),
+                    "{held:?} {form:?}"
+                );
+            }
+            let spoken = stop_words(held, StopForm::Spoken);
+            assert!(spoken.ends_with('.'), "{spoken}");
+        }
+        assert_eq!(HeldBy::of_word("-"), None);
+        assert_ne!(
+            stop_words(HeldBy::SameReply, StopForm::Line),
+            stop_words(HeldBy::NoWork, StopForm::Line),
+            "the arms say different whys"
+        );
+    }
 
     #[test]
     fn every_act_has_its_face_and_words_with_no_glyph() {

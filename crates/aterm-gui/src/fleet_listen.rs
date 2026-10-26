@@ -478,6 +478,14 @@ fn run_fleet_generation(generation: u64, wanted: Option<Wanted>) {
         );
         return;
     };
+    if let Err(refused) = aterm_net::loopback::check(aterm_net::loopback::Reach::Listen(addr)) {
+        stand_fleet(
+            generation,
+            Standing::Refused("loopback"),
+            &format!("fleet listener not started: {refused}"),
+        );
+        return;
+    }
     if level_of(wanted.allow.as_deref()).is_none() {
         stand_fleet(
             generation,

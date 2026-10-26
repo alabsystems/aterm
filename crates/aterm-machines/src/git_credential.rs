@@ -57,10 +57,16 @@ pub(crate) struct Git {
 }
 
 impl Git {
-    /// CLT git and its osxkeychain helper: what `aterm init` and the controller run.
-    pub(crate) fn keychain() -> Self {
+    /// The installed git ([`crate::items::github::git_program`]: the Command Line Tools', else
+    /// Xcode's) and its osxkeychain helper: what `aterm init` and the controller run.
+    pub(crate) fn keychain(sys: &dyn System) -> Self {
+        Self::keychain_at(crate::items::github::git_program(sys))
+    }
+
+    /// `program` and its osxkeychain helper.
+    fn keychain_at(program: PathBuf) -> Self {
         Self {
-            program: PathBuf::from(crate::items::github::CLT_GIT),
+            program,
             helper: OSXKEYCHAIN.into(),
             env: Vec::new(),
         }
@@ -710,12 +716,14 @@ pub(crate) mod script {
 
     /// The key of `git credential <verb>`, as `user` or this process.
     pub(crate) fn credential(user: Option<&User>, verb: &str) -> String {
-        Git::keychain().credential(user, verb).display()
+        Git::keychain_at(crate::items::github::CLT_GIT.into())
+            .credential(user, verb)
+            .display()
     }
 
     /// The key of a `git config` run as `user`.
     pub(crate) fn config(user: &User, args: &[&str]) -> String {
-        Git::keychain()
+        Git::keychain_at(crate::items::github::CLT_GIT.into())
             .cmd(Some(user))
             .args(args.iter().copied())
             .display()
@@ -727,12 +735,14 @@ pub(crate) mod script {
 
     /// The settings read [`Git::configured`] makes of every file git reads.
     pub(crate) fn helpers(user: &User) -> String {
-        Git::keychain().read(user, None).display()
+        Git::keychain_at(crate::items::github::CLT_GIT.into())
+            .read(user, None)
+            .display()
     }
 
     /// Its read of `file`, one a conditional include names.
     pub(crate) fn included(user: &User, file: &str) -> String {
-        Git::keychain()
+        Git::keychain_at(crate::items::github::CLT_GIT.into())
             .read(user, Some(std::path::Path::new(file)))
             .display()
     }
@@ -824,7 +834,9 @@ pub(crate) mod script {
     /// `account` at `host` ([`Git::fill_as_configured`]).
     pub(crate) fn lookups_hold(sys: &Fake, user: &User, host: &str, account: &str, token: &str) {
         sys.on(
-            &Git::keychain().as_configured(Some(user)).display(),
+            &Git::keychain_at(crate::items::github::CLT_GIT.into())
+                .as_configured(Some(user))
+                .display(),
             Ran::ok(&format!(
                 "protocol=https\nhost={host}\nusername={account}\npassword={token}\n"
             )),
@@ -1190,7 +1202,7 @@ mod tests {
                 &script::included(&who, inc),
                 Ran::ok(&format!("file:{inc}\0{file}\0")),
             );
-            let read = Git::keychain().configured(&sys, &who, "bot").unwrap();
+            let read = Git::keychain(&sys).configured(&sys, &who, "bot").unwrap();
             assert_eq!(read.ready(), ready, "{file}: {read:?}");
             assert_eq!(
                 sys.calls(),
@@ -1202,11 +1214,11 @@ mod tests {
             &script::helpers(&who),
             Ran::exit(128, "fatal: bad config line"),
         );
-        assert!(Git::keychain().configured(&sys, &who, "bot").is_err());
+        assert!(Git::keychain(&sys).configured(&sys, &who, "bot").is_err());
         let sys = Fake::default();
         sys.on(&script::helpers(&who), Ran::exit(1, ""));
         assert_eq!(
-            Git::keychain().configured(&sys, &who, "bot").unwrap(),
+            Git::keychain(&sys).configured(&sys, &who, "bot").unwrap(),
             Lookups::Not("no credential.helper names osxkeychain for github.com".into())
         );
     }
@@ -1220,7 +1232,7 @@ mod tests {
             ("github.com\nhost=evil", "bot"),
             ("", "bot"),
         ] {
-            assert!(Git::keychain().fill(&sys, None, host, account).is_err());
+            assert!(Git::keychain(&sys).fill(&sys, None, host, account).is_err());
         }
         assert!(sys.calls().is_empty());
     }
@@ -1495,14 +1507,14 @@ mod tests {
 
     #[test]
     fn requests_are_pinned_to_the_helper_and_never_prompt() {
-        let cmd = Git::keychain().credential(Some(&alice()), "fill");
+        let cmd = Git::keychain(&Fake::default()).credential(Some(&alice()), "fill");
         assert_eq!(
             cmd.display(),
             "alice$ GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= /Library/Developer/CommandLineTools/usr/bin/git -c credential.helper= -c credential.helper=osxkeychain credential fill"
         );
         let sys = Fake::default();
         sys.on(&cmd.display(), Ran::exit(128, "terminal prompts disabled"));
-        let fill = |sys: &Fake| Git::keychain().fill(sys, Some(&alice()), GITHUB, "alice");
+        let fill = |sys: &Fake| Git::keychain(sys).fill(sys, Some(&alice()), GITHUB, "alice");
         assert!(fill(&sys).unwrap().is_none());
         let sys = Fake::default();
         sys.on(&cmd.display(), Ran::ok("password=one\npassword=two\n"));
@@ -1517,7 +1529,9 @@ mod tests {
     #[test]
     fn lookups_as_configured_name_no_helper_of_their_own() {
         assert_eq!(
-            Git::keychain().as_configured(Some(&alice())).display(),
+            Git::keychain(&Fake::default())
+                .as_configured(Some(&alice()))
+                .display(),
             "alice$ GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= GCM_INTERACTIVE=never /Library/Developer/CommandLineTools/usr/bin/git credential fill"
         );
     }

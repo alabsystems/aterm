@@ -6,8 +6,10 @@
 use aterm_agent::supervise::policy::turn_end;
 
 use super::super::{at, word};
+use super::held::unstopped;
 use super::{Ctx, Seen, Verdict, observed, page_field, standing, told, worker_field};
 use crate::util::one_line;
+use aterm_agent::harness::acts::StopForm;
 
 /// How far before the land act's journal line a read may already show its
 /// hold (the hold is told as the act is typed, the line written after).
@@ -377,9 +379,10 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
         words.iter().all(|x| line.contains(x)) && !want.not.iter().any(|x| line.contains(x))
     };
     let hover_reads = observed(&w.hover, &w.hover_reads, t1, until);
-    let hovers: Vec<_> = hover_reads
+    // A stopped tab's hover and state line lead with the stop (3a), the hold's words behind it.
+    let hovers: Vec<(i64, std::borrow::Cow<'_, str>)> = hover_reads
         .iter()
-        .copied()
+        .map(|(t, h)| (*t, unstopped(h, StopForm::Hover)))
         .filter(|(_, h)| h.starts_with("driven by aterm (land: not landed yet, "))
         .collect();
     let hover = hovers.iter().find(|(_, h)| says(h, want.hover));
@@ -415,13 +418,13 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
                 "the hover never said {:?} without {:?}: {:?}",
                 want.hover,
                 want.not,
-                hovers.iter().map(|(_, h)| *h).collect::<Vec<_>>()
+                hovers.iter().map(|(_, h)| h.as_ref()).collect::<Vec<_>>()
             ));
         }
     }
-    let lines: Vec<(i64, &str)> = observed(&w.page, &w.page_reads, t1, until)
+    let lines: Vec<(i64, std::borrow::Cow<'_, str>)> = observed(&w.page, &w.page_reads, t1, until)
         .into_iter()
-        .filter_map(|(t, p)| Some((t, page_field(p, "state")?)))
+        .filter_map(|(t, p)| Some((t, unstopped(page_field(p, "state")?, StopForm::Line))))
         .filter(|(_, l)| l.starts_with("not landed yet: "))
         .collect();
     let line = lines.iter().find(|(_, l)| says(l, want.line));
@@ -433,7 +436,7 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
             "the state line never said {:?} without {:?}: {:?}",
             want.line,
             want.not,
-            lines.iter().map(|(_, l)| *l).collect::<Vec<_>>()
+            lines.iter().map(|(_, l)| l.as_ref()).collect::<Vec<_>>()
         ));
     } else if line.is_none() && on_page {
         bad.push("its row on the page never said `not landed yet: `".into());
@@ -444,9 +447,9 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
         match nudge_named(seen, t1) {
             Some(named) => {
                 for said in hover
-                    .map(|(_, h)| *h)
+                    .map(|(_, h)| h.as_ref())
                     .into_iter()
-                    .chain(line.map(|(_, l)| *l))
+                    .chain(line.map(|(_, l)| l.as_ref()))
                 {
                     let words = named_words(said);
                     let quoted =

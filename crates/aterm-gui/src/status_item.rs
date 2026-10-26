@@ -192,8 +192,10 @@ pub(crate) struct SessionRow {
     pub landed: bool,
     /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears `⤓ land` (the task open or unknown), and a hold stands — Land's instruction has been typed to it (`App::shown_hold`).
     pub landing: bool,
-    /// What holds the landing, where a land act's yield did not land or nudges were typed: its worker row's tip, in the hold's words with no clock (`not landed yet: 2 unpushed commits · 3 nudges`, `harness_glass::hold_words`' tip form) — the menu keeps ages, composed at paint, and never a clock that would go stale.
+    /// What holds the landing, where a land act's yield did not land or nudges were typed, led by the stop where aterm stopped typing into it in any mode: its worker row's tip, in the hold's and the stop's words with no clock (`stopped typing: the same reply twice, no work · not landed yet: 2 unpushed commits · 3 nudges`, `harness_glass::stop_words`' and `hold_words`' tip forms; a stopped Cruise tab's is the stop alone) — the menu keeps ages, composed at paint, and never a clock that would go stale.
     pub landing_tip: Option<String>,
+    /// Its need is all that holds its landing (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): it is [`Self::landing`], its hold's yield was read, and the hold's one leg is its needs (`HoldLeg::Needs`, [`crate::harness_glass::HeldGlass::need_alone`]) — no repository work, no open words, no missing defense, no cut. Its report row's tip then says `<Program>'s landing waits on this alone` where any other says `<Program> carries on meanwhile`.
+    pub need_alone: bool,
     /// Where its tab is (`in tab 3`, `in tab 3, left pane`; `App::session_place`), filled by the glance's first pass only where another row shares its label: every row that names the session says it after the label ([`Self::named`]).
     pub place: Option<String>,
 }
@@ -280,6 +282,9 @@ pub(crate) struct SiblingNeed {
     /// The need's words where the row says it is the program's own report (`needs_by=program`,
     /// [`crate::needs::claim_words_of_row`]).
     pub claim: Option<&'static str>,
+    /// The row says the need is a harness's `NEEDS YOU:` report its agent carries on past
+    /// (`needs_by=harness`), so it lists after the needs that stopped their agents ([`NeedRow::carries_on`]).
+    pub carries_on: bool,
 }
 
 /// The stall half of a session's need facts — `input_stall::menu_row`'s words.
@@ -1142,8 +1147,12 @@ pub(crate) struct NeedRow {
     pub worker_of: Option<String>,
     /// The need's words.
     pub what: String,
-    /// A harness's need in its own words ([`crate::needs::Need::harness`]): the row says it clipped to the room its label and age leave ([`need_line`]).
+    /// A harness's need in its own words ([`crate::needs::Need::harness`]): the row says it clipped to the room its label and age leave ([`need_line`]). `Some` only for this aterm's `NEEDS YOU:` report, and its row's tip says its agent carries on ([`report_tip`]).
     pub harness: Option<crate::needs::HarnessAsk>,
+    /// A harness's `NEEDS YOU:` report, which its agent carries on past: this aterm's ([`Self::harness`] is `Some`), a sibling's or a fleet peer's (its facts row's `needs_by=harness`). The list puts it after every need of its severity that has stopped an agent (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7, [`need_order`]).
+    pub carries_on: bool,
+    /// The report is all that holds its session's landing ([`SessionRow::need_alone`]): its tip says the landing waits on it alone. `false` for every need but a local report.
+    pub alone: bool,
     /// Since when it has stood (unix seconds), for its age.
     pub since_unix: Option<i64>,
     /// What a click does.
@@ -1198,7 +1207,7 @@ pub(crate) struct WorkerRow {
     pub read: Option<u16>,
     /// Its session is landing ([`SessionRow::landing`]): Land's instruction was typed to it and a hold stands.
     pub landing: bool,
-    /// Its row's tip while it is landing ([`SessionRow::landing_tip`]).
+    /// Its row's tip while it is landing or stopped ([`SessionRow::landing_tip`]).
     pub tip: Option<String>,
 }
 
@@ -1414,7 +1423,8 @@ pub(crate) struct Glance {
 pub(crate) struct SystemStateLine {
     /// The line's words.
     pub label: String,
-    /// A note under it: the vault approval code a join waits on.
+    /// A note under it: the vault approval code a join waits on, or that an update needs Full Disk
+    /// Access re-allowed.
     pub note: Option<String>,
 }
 
@@ -1447,6 +1457,40 @@ fn slot<T>(table: &mut Vec<T>, item: T) -> Option<u16> {
     let at = u16::try_from(table.len()).ok()?;
     table.push(item);
     Some(at)
+}
+
+/// THE NEEDS YOU ORDER (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, amended by
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): a counted need before one from an old
+/// read; stuck before decide; within a severity, a need that has stopped its agent (an approval
+/// box no harness presses, a question, a frozen or stalled agent, another owner's ask) before a
+/// harness's `NEEDS YOU:` report its agent carries on past ([`NeedRow::carries_on`], this
+/// aterm's, a sibling's or a fleet peer's); then local before sibling before fleet, oldest first
+/// (unknown age last), then by label.
+fn need_order(n: &NeedRow) -> (bool, Severity, bool, Origin, i64, &str) {
+    (
+        !n.counted,
+        n.word.severity(),
+        n.carries_on,
+        n.origin,
+        n.since_unix.unwrap_or(i64::MAX),
+        &n.label,
+    )
+}
+
+/// A `NEEDS YOU:` report row's tip (§14.7): its program carries on meanwhile, or, where the
+/// report is all that holds its session's landing ([`NeedRow::alone`]), its landing waits on it
+/// alone ([`aterm_agent::supervise::mode_words::report_words`]); `None` for any other need.
+#[cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(dead_code, reason = "the menu-bar status item is macOS's")
+)]
+#[must_use]
+fn report_tip(need: &NeedRow) -> Option<String> {
+    let ask = need.harness.as_ref()?;
+    Some(aterm_agent::supervise::mode_words::report_words(
+        ask.program.product(),
+        need.alone,
+    ))
 }
 
 impl Glance {
@@ -1495,6 +1539,8 @@ impl Glance {
                 worker_of,
                 what: need.what.clone(),
                 harness: need.harness.clone(),
+                carries_on: need.harness.is_some(),
+                alone: need.harness.is_some() && row.need_alone,
                 since_unix: row.need_since,
                 at: NeedAt::Go(at),
                 counted: true,
@@ -1526,6 +1572,8 @@ impl Glance {
                         .unwrap_or_else(|| need_words(need.word))
                         .to_string(),
                     harness: None,
+                    carries_on: need.carries_on,
+                    alone: false,
                     since_unix: need.age_ms.map(|ms| {
                         scanned.saturating_sub(i64::try_from(ms / 1000).unwrap_or(i64::MAX))
                     }),
@@ -1536,22 +1584,7 @@ impl Glance {
             }
         }
         g.fleet = fleet.map_or(FleetLine::Off, |slot| g.fleet_needs(slot, now_ms));
-        g.needs.sort_by(|a, b| {
-            (
-                !a.counted,
-                a.word.severity(),
-                a.origin,
-                a.since_unix.unwrap_or(i64::MAX),
-                &a.label,
-            )
-                .cmp(&(
-                    !b.counted,
-                    b.word.severity(),
-                    b.origin,
-                    b.since_unix.unwrap_or(i64::MAX),
-                    &b.label,
-                ))
-        });
+        g.needs.sort_by(|a, b| need_order(a).cmp(&need_order(b)));
         for row in rows {
             let landed = |t: &TaskRow| {
                 t.state == TaskState::Done && t.why == Some(crate::task_record::WHY_LANDED)
@@ -1606,7 +1639,7 @@ impl Glance {
                 go: worker_go,
                 read,
                 landing: row.landing,
-                tip: row.landing.then(|| row.landing_tip.clone()).flatten(),
+                tip: row.landing_tip.clone(),
             };
             match managers.iter_mut().find(|(sid, _)| *sid == task.from) {
                 Some((_, manager)) => manager.workers.push(worker),
@@ -1799,6 +1832,8 @@ impl Glance {
                             .clone()
                             .unwrap_or_else(|| need_words(need.word).to_string()),
                         harness: None,
+                        carries_on: need.carries_on,
+                        alone: false,
                         since_unix: need.age_ms.map(|ms| {
                             read_at.saturating_sub(i64::try_from(ms / 1000).unwrap_or(i64::MAX))
                         }),
@@ -2237,6 +2272,43 @@ pub(crate) fn a_land_desk_at_rest() -> Vec<SessionRow> {
     rows
 }
 
+/// A box beside an older report (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7), at `now_unix`: tab 3's three-hour-old `NEEDS YOU:` report of Claude Code's (`proj-api`), which its agent carries on past, and tab 5's two-minute-old approval box (`build`), which has stopped its agent. Both are decide, both `◇`, and the box lists first. `objc_toolbar_drive` puts them on a real status item and reads the rows and their tips back off AppKit; the unit tests read the same rows.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn a_box_beside_an_older_report(now_unix: i64) -> Vec<SessionRow> {
+    let report = crate::needs::NeedFacts {
+        attention: vec![crate::needs::AttentionFact {
+            owner: crate::harness_host::NEEDS_ATTENTION_OWNER.to_string(),
+            text: "claude needs you: the release credential to sign 0.48.0 (+1 more) \u{2014} carrying on"
+                .to_string(),
+            kind: Some(aterm_types::needs::AttentionKind::Ask),
+        }],
+        ..crate::needs::NeedFacts::default()
+    };
+    let approval = crate::needs::NeedFacts {
+        agent: Some(crate::needs::AgentFact {
+            word: "prompt",
+            detail: Some("bash:not-read-only".to_string()),
+            rev: 1,
+            subject: Some("rm -rf build".to_string()),
+        }),
+        ..crate::needs::NeedFacts::default()
+    };
+    [
+        (3, "proj-api", report, now_unix - 3 * 3600),
+        (5, "build", approval, now_unix - 120),
+    ]
+    .into_iter()
+    .map(|(id, title, facts, since)| SessionRow {
+        id,
+        sid: format!("s-{id:020}"),
+        title: title.to_string(),
+        need: crate::needs::of(&facts).need,
+        need_since: Some(since),
+        ..SessionRow::default()
+    })
+    .collect()
+}
+
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2473,12 +2545,12 @@ fn notify_tip(voice: Option<NoticeVoice>, on: bool) -> String {
             "{what}. They are aterm's own: a click on one about a tab on this Mac goes to that \
              tab, and any other brings aterm forward."
         ),
-        (Center::Unasked, false) => format!(
+        (Center::Unasked | Center::Provisional, false) => format!(
             "{what}. Turning this on asks macOS to let aterm show them as its own, and a click \
              on one about a tab here then goes to that tab; if macOS says no, none reach the \
              desktop."
         ),
-        (Center::Unasked, true) => format!(
+        (Center::Unasked | Center::Provisional, true) => format!(
             "{what}. macOS has not said yet whether aterm may show them as its own, so none \
              reach the desktop until it does: the first one asks macOS (turning this off and on \
              asks again), and after macOS's yes a click on one about a tab here goes to that tab."
@@ -2531,7 +2603,14 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
                 NeedAt::Go(at) => {
                     let go = StatusAction::Go(pick(at));
                     let further = further_need_rows(need, &mut further_left, go);
-                    rows.push(act(need_line(need, now_unix, further.len()), go));
+                    rows.push(StatusRow::Action {
+                        label: need_line(need, now_unix, further.len()),
+                        action: go,
+                        enabled: true,
+                        checked: false,
+                        tip: report_tip(need),
+                        indent: 0,
+                    });
                     rows.extend(further);
                 }
                 NeedAt::Raise(at) => rows.push(act(
@@ -3702,11 +3781,22 @@ mod macos {
         }
     }
 
+    /// One item of the real menu as AppKit holds it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct BarItem {
+        /// `-title`.
+        pub(crate) title: String,
+        /// `-isEnabled`.
+        pub(crate) enabled: bool,
+        /// `-toolTip`, `None` where it is nil.
+        pub(crate) tip: Option<String>,
+    }
+
     /// What the menu bar's real item holds as a person opens it: the live `NSStatusItem`'s `-menu`,
     /// repainted by its own delegate's `menuNeedsUpdate:` (what AppKit sends on that open) from the
-    /// item's glance, each item's `-title` and `-isEnabled` in order. `objc_toolbar_drive` reads
-    /// This Mac off it; empty off the main thread.
-    pub(crate) fn items_on_the_bar(handle: &StatusItemHandle) -> Vec<(String, bool)> {
+    /// item's glance, each item in order. `objc_toolbar_drive` reads This Mac and Needs you off
+    /// it; empty off the main thread.
+    pub(crate) fn items_on_the_bar(handle: &StatusItemHandle) -> Vec<BarItem> {
         if MainThread::new().is_none() {
             return Vec::new();
         }
@@ -3728,11 +3818,12 @@ mod macos {
         })
     }
 
-    /// Each item of the live `menu`, in order: its `-title` and `-isEnabled`.
-    fn items_of(menu: Id) -> Vec<(String, bool)> {
+    /// Each item of the live `menu`, in order: its `-title`, `-isEnabled` and `-toolTip`.
+    fn items_of(menu: Id) -> Vec<BarItem> {
         // SAFETY: `menu` is a live NSMenu; `-numberOfItems` is `-(NSInteger)`, `-itemAtIndex:`
-        // `-(NSMenuItem *)(NSInteger)` within its count, `-title` `-(NSString *)` and `-isEnabled`
-        // `-(BOOL)`, all without side effects on the menu and its items.
+        // `-(NSMenuItem *)(NSInteger)` within its count, `-title` and `-toolTip` `-(NSString *)`
+        // (the tip nil where none was set) and `-isEnabled` `-(BOOL)`, all without side effects on
+        // the menu and its items.
         unsafe {
             let count = appkit::send_isize(menu, sel!(numberOfItems));
             let item_at: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id =
@@ -3740,10 +3831,12 @@ mod macos {
             (0..count)
                 .map(|i| {
                     let item = item_at(menu, sel!(itemAtIndex:), i);
-                    (
-                        appkit::nsstring_to_rust(appkit::send_id(item, sel!(title))),
-                        appkit::send_bool(item, sel!(isEnabled)),
-                    )
+                    let tip = appkit::send_id(item, sel!(toolTip));
+                    BarItem {
+                        title: appkit::nsstring_to_rust(appkit::send_id(item, sel!(title))),
+                        enabled: appkit::send_bool(item, sel!(isEnabled)),
+                        tip: (!tip.is_null()).then(|| appkit::nsstring_to_rust(tip)),
+                    }
                 })
                 .collect()
         }
@@ -5138,6 +5231,7 @@ mod tests {
                 label: "claude".to_string(),
                 age_ms: Some(60_000),
                 claim: None,
+                carries_on: false,
             }],
             scanned_ms: unix_ms(990),
         };
@@ -5178,6 +5272,7 @@ mod tests {
                 label: "claude".to_string(),
                 age_ms: Some(60_000),
                 claim: None,
+                carries_on: false,
             }],
             scanned_ms,
         };
@@ -6394,6 +6489,7 @@ mod tests {
                     age_ms: Some(60_000),
                     what: None,
                     claim: None,
+                    carries_on: false,
                 })
                 .collect(),
             ..crate::fleet_glance::FleetMac::default()
@@ -6661,10 +6757,24 @@ mod tests {
                               Priv\u{2026}";
 
     fn harness_row(id: u64, title: &str, first: &str, since: i64) -> SessionRow {
+        report_row(aterm_phase::Program::Claude, id, title, first, since)
+    }
+
+    /// A `NEEDS YOU:` report of `program`'s, as its harness writes the needs entry.
+    fn report_row(
+        program: aterm_phase::Program,
+        id: u64,
+        title: &str,
+        first: &str,
+        since: i64,
+    ) -> SessionRow {
         let facts = NeedFacts {
             attention: vec![crate::needs::AttentionFact {
                 owner: crate::harness_host::NEEDS_ATTENTION_OWNER.to_string(),
-                text: format!("claude needs you: {first} (+1 more) \u{2014} carrying on"),
+                text: format!(
+                    "{} needs you: {first} (+1 more) \u{2014} carrying on",
+                    program.name()
+                ),
                 kind: Some(aterm_types::needs::AttentionKind::Ask),
             }],
             ..NeedFacts::default()
@@ -6673,6 +6783,242 @@ mod tests {
             need_since: Some(since),
             ..row_of(id, title, &facts)
         }
+    }
+
+    /// The composed menu's row whose label starts `head`: its label and its tip.
+    fn menu_row(rows: &[StatusRow], head: &str) -> Option<(String, Option<String>)> {
+        rows.iter().find_map(|r| match r {
+            StatusRow::Action { label, tip, .. } if label.starts_with(head) => {
+                Some((label.clone(), tip.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// STOPPED WORK FIRST (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): a three-hour-old
+    /// credential report in tab 3 and a two-minute-old approval box in tab 5 are both decide, both
+    /// `◇`; the box lists first, because it has stopped its agent and the report's agent carries
+    /// on past it. Among the requests the oldest still leads, and the menu shows them in that order.
+    #[test]
+    fn a_stopped_need_lists_before_an_older_report() {
+        let now = 100_000_i64;
+        let mut rows = a_box_beside_an_older_report(now);
+        assert!(
+            rows[0].need.as_ref().is_some_and(|n| n.harness.is_some())
+                && rows[1].need.as_ref().is_some_and(|n| n.harness.is_none()),
+            "PRECONDITION: a report beside a box"
+        );
+        rows.push(SessionRow {
+            need_since: Some(now - 600),
+            ..agent_row(6, "lint", "prompt", 1)
+        });
+        let g = local_glance(&rows, &[], now, None);
+        assert!(
+            g.needs
+                .iter()
+                .all(|n| n.word.severity() == Severity::Decide),
+            "PRECONDITION: one severity"
+        );
+        let labels: Vec<&str> = g.needs.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["lint", "build", "proj-api"],
+            "the boxes, oldest first, then the older report"
+        );
+        assert_eq!(g.local_need_sessions(), vec![6, 5, 3]);
+        let menu = compose_status_menu(&g, now);
+        let shown: Vec<&str> = menu
+            .iter()
+            .filter_map(|r| match r {
+                StatusRow::Action {
+                    label, indent: 0, ..
+                } if label.starts_with('\u{25c7}') => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<String> = g.needs.iter().map(|n| need_line(n, now, 0)).collect();
+        assert_eq!(shown, want, "the menu shows them in that order");
+    }
+
+    /// STOPPED WORK FIRST ACROSS ATERMS AND MACS (§14.7): a sibling's or a fleet peer's report,
+    /// which its facts row says with `needs_by=harness`, lists after this aterm's report as it
+    /// did before §14.7 (local before sibling before fleet), and every box, wherever it stands,
+    /// lists before every report. CONTROL: with the row's word not carried (a peer row read as a
+    /// box), the sibling's older report would list above the sibling's box and this aterm's
+    /// report.
+    #[test]
+    fn a_siblings_and_a_peers_report_list_after_every_box_and_after_this_aterms_report() {
+        let now = 100_000_i64;
+        let rows = a_box_beside_an_older_report(now);
+        let need = |sid: &str, word: NeedWord, age_s: u64, carries_on: bool| SiblingNeed {
+            sid: sid.to_string(),
+            word,
+            label: format!("sib-{sid}"),
+            age_ms: Some(age_s * 1000),
+            claim: None,
+            carries_on,
+        };
+        let sibling = SiblingInstance {
+            pid: 900,
+            sock: "/tmp/aterm-900.sock".to_string(),
+            sessions: 2,
+            needs: vec![
+                need("report", NeedWord::Ask, 5 * 3600, true),
+                need("box", NeedWord::Approval, 3600, false),
+            ],
+            scanned_ms: unix_ms(now - 10),
+        };
+        let peer = |sid: &str, word: NeedWord, age_s: u64, carries_on: bool| {
+            crate::fleet_glance::FleetNeed {
+                sid: sid.to_string(),
+                word,
+                who: format!("peer-{sid}"),
+                worker_of: None,
+                age_ms: Some(age_s * 1000),
+                what: None,
+                claim: None,
+                carries_on,
+            }
+        };
+        let slot = fleet_slot(
+            vec![crate::fleet_glance::FleetMac {
+                name: "mac-17".to_string(),
+                dial: "mac-17".to_string(),
+                sessions: 2,
+                agents: 2,
+                needs: vec![
+                    peer("report", NeedWord::Ask, 4 * 3600, true),
+                    peer("box", NeedWord::Approval, 1800, false),
+                ],
+                ..crate::fleet_glance::FleetMac::default()
+            }],
+            unix_ms(now - 20),
+        );
+        let order = |siblings: &[SiblingInstance], slot: &crate::fleet_glance::FleetSlot| {
+            Glance::build(&rows, siblings, Some(slot), unix_ms(now), None)
+                .needs
+                .iter()
+                .map(|n| n.label.clone())
+                .collect::<Vec<_>>()
+        };
+        let g = Glance::build(
+            &rows,
+            std::slice::from_ref(&sibling),
+            Some(&slot),
+            unix_ms(now),
+            None,
+        );
+        assert!(
+            g.needs.iter().all(|n| n.counted),
+            "PRECONDITION: every read is fresh"
+        );
+        assert_eq!(
+            order(std::slice::from_ref(&sibling), &slot),
+            [
+                "build",
+                "sib-box",
+                "mac-17 \u{b7} peer-box",
+                "proj-api",
+                "sib-report",
+                "mac-17 \u{b7} peer-report",
+            ],
+            "every box, local before sibling before fleet; then every report, the same"
+        );
+        let mut read_as_a_box = sibling.clone();
+        for need in &mut read_as_a_box.needs {
+            need.carries_on = false;
+        }
+        assert_eq!(
+            order(std::slice::from_ref(&read_as_a_box), &slot)[1..3],
+            ["sib-report", "sib-box"],
+            "CONTROL: a sibling report not said as one leads its own box"
+        );
+    }
+
+    /// A report row's tip says its program carries on (§14.7), in that program's own name —
+    /// never `Claude Code` for agy or Muse Code — and a box's row carries none.
+    #[test]
+    fn a_report_row_says_it_carries_on() {
+        use aterm_agent::supervise::mode_words::report_words;
+        use aterm_phase::Program;
+        let now = 100_000_i64;
+        for program in [Program::Claude, Program::Agy, Program::Muse] {
+            let rows = [
+                report_row(program, 3, "proj-api", "sign 0.48.0", now - 3600),
+                SessionRow {
+                    need_since: Some(now - 60),
+                    ..agent_row(5, "build", "prompt", 1)
+                },
+            ];
+            let menu = compose_status_menu(&local_glance(&rows, &[], now, None), now);
+            let (_, tip) = menu_row(&menu, "\u{25c7} proj-api \u{2014} sign 0.48.0")
+                .unwrap_or_else(|| panic!("{program:?}: the report's row: {menu:?}"));
+            assert_eq!(
+                tip.as_deref(),
+                Some(report_words(program.product(), false).as_str()),
+                "{program:?}"
+            );
+            let tip = tip.unwrap_or_default();
+            assert!(tip.starts_with(program.product()), "{tip}");
+            assert!(
+                tip.ends_with(aterm_agent::supervise::mode_words::CARRIES_ON),
+                "{tip}"
+            );
+            if program != Program::Claude {
+                assert!(!tip.contains("Claude Code"), "{tip}");
+            }
+            let (_, box_tip) = menu_row(&menu, "\u{25c7} build \u{2014} ").expect("the box's row");
+            assert_eq!(
+                box_tip, None,
+                "CONTROL: a box that stopped its agent says nothing so"
+            );
+            let lines = menu_lines(&menu, &[]);
+            assert!(
+                lines.iter().any(|l| l.contains("proj-api")
+                    && l.contains(&format!(
+                        " tip={:?}",
+                        report_words(program.product(), false)
+                    ))),
+                "chrome's statusmenu carries the tip: {lines:#?}"
+            );
+        }
+    }
+
+    /// Where its need is all that holds its Land session's landing ([`SessionRow::need_alone`]),
+    /// a report row's tip says the landing waits on it alone (§14.7); a landing held by the need
+    /// and its repository too (the control), or no landing at all, says it carries on.
+    #[test]
+    fn a_need_that_alone_holds_a_landing_says_so() {
+        use aterm_agent::supervise::mode_words::report_words;
+        let now = 100_000_i64;
+        let tip_of = |row: SessionRow| {
+            let menu = compose_status_menu(&local_glance(&[row], &[], now, None), now);
+            menu_row(&menu, "\u{25c7} land-d \u{2014} rotate the deploy key")
+                .and_then(|(_, tip)| tip)
+        };
+        let report = harness_row(7, "land-d", "rotate the deploy key", now - 60);
+        let alone = SessionRow {
+            landing: true,
+            need_alone: true,
+            ..report.clone()
+        };
+        assert_eq!(
+            tip_of(alone),
+            Some(report_words(aterm_phase::Program::Claude.product(), true))
+        );
+        assert_eq!(
+            tip_of(SessionRow {
+                landing: true,
+                need_alone: false,
+                ..report.clone()
+            }),
+            Some(report_words(aterm_phase::Program::Claude.product(), false)),
+            "CONTROL: a hold with another leg too carries on meanwhile"
+        );
+        assert_eq!(
+            tip_of(report),
+            Some(report_words(aterm_phase::Program::Claude.product(), false))
+        );
     }
 
     #[test]
@@ -7106,7 +7452,15 @@ mod tests {
             })
             .collect();
         let whose = Some("Claude Code in alpha needs this too");
-        assert_eq!(tips, vec![None, whose, whose], "{section:#?}");
+        let carries_on = aterm_agent::supervise::mode_words::report_words(
+            aterm_phase::Program::Claude.product(),
+            false,
+        );
+        assert_eq!(
+            tips,
+            vec![Some(carries_on.as_str()), whose, whose],
+            "the report's own row says its agent carries on (§14.7): {section:#?}"
+        );
         let lines = menu_lines(&menu, &[]);
         assert_eq!(
             lines.get(3).map(String::as_str),

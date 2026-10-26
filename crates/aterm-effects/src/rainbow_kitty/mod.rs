@@ -757,12 +757,19 @@ pub struct Engine {
     withheld: [u16; witness::WITNESS_ROWS + witness::ARMING_ROWS],
     withheld_n: usize,
     grid_rows: u16,
-    flush_clock: Option<Instant>,
+    flush_clock: Option<(Instant, Option<usize>)>,
     soft_wrap: Option<(ribbon::SoftWrap, Option<Instant>)>,
     lift: Option<(ribbon::Lift, Option<Instant>)>,
     reflow: Option<(ribbon::SoftWrap, (u16, u16))>,
     revive: Option<ribbon::Revive>,
     hidden: bool,
+}
+
+/// Whether `ch` is a box-drawing or vertical block-bar border glyph (`│`, `┃`, `║`, `▏`, `▌`, `▐`, `▕`, …) rather than prose content.
+#[inline]
+#[must_use]
+pub(crate) const fn is_box_border_glyph(ch: char) -> bool {
+    matches!(ch, '\u{2500}'..='\u{257F}' | '\u{258C}'..='\u{2590}' | '\u{2595}')
 }
 
 impl Default for Engine {
@@ -893,13 +900,21 @@ impl Engine {
             | Event::CancelComposerNewline
             | Event::Sweep { .. } => {}
         }
-        if let Some(park) = self.flush_clock {
+        if let Some((park, skip)) = self.flush_clock {
+            let mut seen_typed = 0usize;
             let mut idx = 0;
             while idx < self.events.len() {
                 let (e, at) = &self.events[idx];
-                if matches!(e, Event::Typed { .. }) && *at > park {
-                    self.events.insert(idx, (ev, now));
-                    return;
+                if matches!(e, Event::Typed { .. }) {
+                    let after_park = match skip {
+                        Some(n) => seen_typed >= n || *at > park,
+                        None => *at > park,
+                    };
+                    if after_park {
+                        self.events.insert(idx, (ev, now));
+                        return;
+                    }
+                    seen_typed += 1;
                 }
                 idx += 1;
             }
@@ -910,7 +925,34 @@ impl Engine {
     /// The clock a held park's flush is judged at ([`Engine::on_event`]).
     #[inline]
     pub const fn set_flush_clock(&mut self, at: Option<Instant>) {
-        self.flush_clock = at;
+        self.flush_clock = match at {
+            Some(t) => Some((t, None)),
+            None => None,
+        };
+    }
+
+    /// The clock and buffered-typed-event boundary a held park's flush is judged at ([`Engine::on_event`]).
+    #[inline]
+    pub const fn set_flush_park(&mut self, park: Option<(Instant, usize)>) {
+        self.flush_clock = match park {
+            Some((at, skip)) => Some((at, Some(skip))),
+            None => None,
+        };
+    }
+
+    /// Unreplayed [`Event::Typed`] entries currently queued in this tick's event buffer.
+    #[inline]
+    #[must_use]
+    pub fn buffered_typed_events(&self) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.events.len() {
+            if matches!(self.events[i].0, Event::Typed { .. }) {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// The soft-wrapped caret ([`ribbon::SoftWrap`]).
@@ -2043,15 +2085,28 @@ impl Engine {
             c += 1;
         }
         let mut c = pane_col0;
+        let mut skipped_gutter = false;
         while c < to.1 {
-            if matches!(
-                sample.cols.get(usize::from(c)),
-                Some(&ch) if ch != ' ' && ch != '\0'
-            ) {
-                self.ribbon.note_rewrap_start(from, to, c, None, None);
-                break;
+            let ch = match sample.cols.get(usize::from(c)) {
+                Some(&ch) => ch,
+                None => ' ',
+            };
+            if ch == ' ' || ch == '\0' {
+                c += 1;
+                continue;
             }
-            c += 1;
+            if !skipped_gutter
+                && (is_box_border_glyph(ch)
+                    || (!ch.is_alphanumeric()
+                        && c + 1 < to.1
+                        && matches!(sample.cols.get(usize::from(c + 1)), Some(' '))))
+            {
+                skipped_gutter = true;
+                c += 1;
+                continue;
+            }
+            self.ribbon.note_rewrap_start(from, to, c, None, None);
+            break;
         }
     }
 
@@ -2673,6 +2728,23 @@ impl Engine {
     ) {
         self.stardust.keep_out.set_split(icons, cells);
         self.stardust.keep_out.set_rows_past(rows, past);
+        self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
+        self.meteor.keep_out.clone_from(&self.stardust.keep_out);
+    }
+
+    #[inline]
+    pub(crate) fn note_keep_out_slices(
+        &mut self,
+        icons: &[(i32, i32, i32, i32)],
+        icon_offset: (i32, i32),
+        cells: &[(i32, i32, i32, i32)],
+        rows: &[(i32, i32, i32, i32)],
+        past: i32,
+    ) {
+        self.stardust
+            .keep_out
+            .set_split_slices(icons, icon_offset, cells);
+        self.stardust.keep_out.set_rows_past_slice(rows, past);
         self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
         self.meteor.keep_out.clone_from(&self.stardust.keep_out);
     }

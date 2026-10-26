@@ -57,6 +57,7 @@ pub mod session_usage;
 pub(crate) mod sign_in_ladder;
 pub mod source;
 pub mod spend;
+pub(crate) mod sqlite_read;
 pub mod stats;
 pub mod steps;
 pub mod tap;

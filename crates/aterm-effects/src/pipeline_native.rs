@@ -24,7 +24,7 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
 use aterm_lexicon::Lexicon;
 use aterm_render::GlowQuad;
-use aterm_render::sprites::{FreeSprite, FreeZ};
+use aterm_render::sprites::FreeSprite;
 use aterm_time::Instant;
 
 /// What one content-scroll snapshot did to the cursor family's coordinates
@@ -511,6 +511,7 @@ impl EffectsPipeline {
     /// migration), so every coordinate, probe and stream baseline belongs to the old grid.
     #[inline]
     pub fn front_replaced(&mut self, now: Instant) {
+        self.cursor.glow.set_admission_source(None);
         self.cursor.glow.drop_row_probe();
         self.cursor.glow.clear_blink();
         self.cursor.trail.clear_blink();
@@ -620,7 +621,7 @@ impl EffectsPipeline {
     #[inline]
     pub fn open_words(&mut self) {
         self.clear_word_scratch();
-        self.cursor.glow.note_word_icons(std::iter::empty());
+        self.cursor.glow.clear_word_icons();
         self.decos.begin_host_frame();
     }
 
@@ -628,13 +629,11 @@ impl EffectsPipeline {
     /// next frame's sky and ribbon ([`crate::cursor_glow::CursorGlow::note_word_icons`]).
     #[inline]
     pub(super) fn note_word_icons(&mut self, from: usize) {
-        let icons = self
-            .free_scratch
-            .get(from..)
-            .unwrap_or_default()
-            .iter()
-            .filter(|s| s.z == FreeZ::UnderText && !s.is_blank());
-        self.cursor.glow.note_word_icon_sprites(icons);
+        let sprites = match self.free_scratch.get(from..) {
+            Some(s) => s,
+            None => &[],
+        };
+        self.cursor.glow.note_word_icon_sprite_slice(sprites);
     }
 
     /// Lift the trail's light off the icons the frame's word pass named

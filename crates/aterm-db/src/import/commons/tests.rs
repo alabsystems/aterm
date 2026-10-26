@@ -15,11 +15,52 @@ pub(crate) fn atomic_transition(state: &State, action: &str) -> State {
     let db = Imports::at(lab.paths[0].clone());
     std::fs::write(&path, "email,google\na@example.test,1\n").unwrap();
     let mut stable = true;
+    let mut private_writes = 0;
     let phase = match action {
         "Reject" => {
             assert_eq!(state["phase"], 0);
-            std::fs::write(&path, "email,email\na@example.test,b@example.test\n").unwrap();
-            assert!(db.apply(&path, [1; 16]).is_err());
+            let private = lab._home.path().join("private");
+            crate::local::init(&private, "accounts").unwrap();
+            for (source, expected) in [
+                (
+                    "email, EMAIL ,google\na@example.test,b@example.test,1\n",
+                    "CSV has ambiguous identity columns",
+                ),
+                (
+                    "email, EMAIL ,google\na@example.test,a@example.test,1\n",
+                    "CSV has ambiguous identity columns",
+                ),
+                (
+                    "email,computer, Computer ,google\na@example.test,m3.2,m100,1\n",
+                    "CSV has ambiguous identity columns",
+                ),
+                (
+                    "computer, Computer ,google\nm3.2,m100,1\n",
+                    "CSV has no email column",
+                ),
+            ] {
+                std::fs::write(&path, source).unwrap();
+                assert_eq!(db.apply(&path, [1; 16]).unwrap_err().to_string(), expected);
+                let before = crate::tests::wires(&private);
+                assert_eq!(
+                    crate::import::apply(&private, &path, [1; 16])
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+                let after = crate::tests::wires(&private);
+                private_writes += after.len().checked_sub(before.len()).unwrap();
+                assert_eq!(after, before);
+                let absent = lab._home.path().join("not-created");
+                assert_eq!(
+                    crate::import::apply(&absent, &path, [2; 16])
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+                assert!(!absent.exists());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            }
             1
         }
         "Commit" => {
@@ -37,7 +78,8 @@ pub(crate) fn atomic_transition(state: &State, action: &str) -> State {
     };
     let effects = db
         .snapshot()
-        .map_or(0, |snapshot| snapshot.operations.len());
+        .map_or(0, |snapshot| snapshot.operations.len())
+        + private_writes;
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
     let directory = Directory::new(&lab.paths[0], bootstrap.trust());
@@ -63,10 +105,16 @@ fn atomic_import_conforms_with_negative_controls() {
             if model.action_enabled(action.name, &state) {
                 let next = atomic_transition(&state, action.name);
                 assert!(model.successors(action.name, &state).contains(&next));
-                let mut wrong = next;
+                let mut wrong = next.clone();
                 wrong.insert("stable", 0);
                 assert!(!model.check_invariant("OriginalReceipt", &wrong));
                 assert!(!model.successors(action.name, &state).contains(&wrong));
+                if action.name == "Reject" {
+                    let mut written = next;
+                    written.insert("effects", 1);
+                    assert!(!model.check_invariant("RejectBeforeWrites", &written));
+                    assert!(!model.successors(action.name, &state).contains(&written));
+                }
             }
         }
     }

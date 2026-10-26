@@ -66,11 +66,22 @@ pub mod versions;
 #[path = "disk_ask.rs"]
 pub mod ask;
 
+#[path = "disk_free.rs"]
+pub mod free;
+
+#[path = "disk_fence.rs"]
+pub mod fence;
+
+#[path = "disk_fill.rs"]
+pub mod fill;
+
 #[cfg(windows)]
 #[path = "disk_win.rs"]
 pub(crate) mod win;
 
-pub use target::{CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, Profile, TargetDir};
+pub use target::{
+    CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, PROJECTED_MIN_IDLE_S, Profile, TargetDir,
+};
 
 /// `disk.idle_build_dirs`.
 pub const DEFAULT_IDLE_BUILD_DIRS: bool = true;
@@ -261,6 +272,20 @@ impl Config {
     #[must_use]
     pub fn below_auto_floor(&self, free: Option<u64>) -> bool {
         self.auto_free_gib > 0 && free.is_some_and(|f| f < self.auto_free_gib.saturating_mul(GIB))
+    }
+
+    /// Whether the volume is PRESSED: `free` bytes below the automatic floor, or a projection
+    /// standing (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2), with the floor on.
+    #[must_use]
+    pub fn pressed(&self, free: Option<u64>, projected: Option<&fill::Projection>) -> bool {
+        self.below_auto_floor(free) || (self.auto_free_gib > 0 && projected.is_some())
+    }
+
+    /// The free bytes a tier with a target reclaims up to under `projected`: the floor plus what
+    /// the fill takes over the horizon plus [`PRESSURE_MARGIN_GIB`] (§8.2).
+    #[must_use]
+    pub fn projected_target(&self, projected: &fill::Projection) -> u64 {
+        self.pressure_target_bytes().saturating_add(projected.need)
     }
 
     /// Whether `free` bytes is below the warning: the volume is `low` (or worse) and tiers 1 and 2 run ([`pass_plan`]).
@@ -513,6 +538,8 @@ pub struct Survey {
     pub mounts: Option<aterm_sysprobe::volumes::Table>,
     /// The free bytes an agent's wait needs and the pass adopted (a DEMAND, `await sys free>=`).
     pub demand: Option<u64>,
+    /// The projection standing on the volume ([`fill::Fill`]): pressure now (§8.2).
+    pub projected: Option<fill::Projection>,
 }
 
 impl Survey {
@@ -539,6 +566,7 @@ impl Survey {
             room: None,
             mounts: None,
             demand: None,
+            projected: None,
         }
     }
 }
@@ -562,6 +590,8 @@ pub enum Witness {
         floor_gib: u64,
         until_gib: u64,
         device: u64,
+        /// The projection the pass ran under, when it, not the floor, pressed the volume.
+        projected: Option<fill::Projection>,
     },
     OwnerGone {
         marker: String,
@@ -573,6 +603,8 @@ pub enum Witness {
         floor_gib: u64,
         until_gib: u64,
         device: u64,
+        /// The projection the pass ran under, when it, not a line, pressed the volume.
+        projected: Option<fill::Projection>,
     },
     IdleWhole {
         marker: String,
@@ -621,10 +653,15 @@ impl Witness {
                 threshold_days,
                 floor_gib,
                 until_gib,
+                projected,
                 ..
             } => format!(
-                "{marker} present, profile last written {} ago (inside the {threshold_days}d idle window), no build holding its locks — free space is under the {floor_gib} GiB floor, so the least recently used profiles give up incremental/ first, until {until_gib} GiB are free (costs a slower next build)",
-                target::human_age(*age_s)
+                "{marker} present, profile last written {} ago (inside the {threshold_days}d idle window), no build holding its locks — free space is {}, so the least recently used profiles give up incremental/ first, until {until_gib} GiB are free (costs a slower next build)",
+                target::human_age(*age_s),
+                projected.map_or_else(
+                    || format!("under the {floor_gib} GiB floor"),
+                    |p| p.describe()
+                )
             ),
             Witness::OwnerGone {
                 marker,
@@ -632,10 +669,15 @@ impl Witness {
                 age_s,
                 floor_gib,
                 until_gib,
+                projected,
                 ..
             } => format!(
-                "{marker} present (a cache by its own mark); {evidence}; no build holding its locks, every profile unwritten for {}, no mount point and nothing of another user's inside — free space is under the {floor_gib} GiB line and nobody builds there again, so the whole build directory goes first (until {until_gib} GiB are free is no stop for it: it costs nobody anything)",
-                target::human_age(*age_s)
+                "{marker} present (a cache by its own mark); {evidence}; no build holding its locks, every profile unwritten for {}, no mount point and nothing of another user's inside — free space is {} and nobody builds there again, so the whole build directory goes first (until {until_gib} GiB are free is no stop for it: it costs nobody anything)",
+                target::human_age(*age_s),
+                projected.map_or_else(
+                    || format!("under the {floor_gib} GiB line"),
+                    |p| p.describe()
+                )
             ),
             Witness::IdleWhole {
                 marker,
@@ -811,6 +853,8 @@ pub struct Report {
     pub room: Option<u64>,
     /// The demand the pass adopted ([`Survey::demand`]).
     pub demand: Option<u64>,
+    /// The projection the pass ran under ([`Survey::projected`]).
+    pub projected: Option<fill::Projection>,
 }
 
 /// One build directory — or an x.py checkout's whole `build/` — holding bytes no row of the report would free.
@@ -987,6 +1031,7 @@ impl Report {
             "room_bytes".to_owned(),
             self.room.map_or(Value::Null, Value::from),
         );
+        projection_fields(&mut o, self.projected.as_ref());
         o.insert("apply_allowed".to_owned(), Value::from(self.config.apply));
         o.insert(
             "reclaimable_bytes".to_owned(),
@@ -1273,6 +1318,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         config,
         room: survey.room,
         demand: survey.demand,
+        projected: survey.projected,
     }
 }
 
@@ -1345,11 +1391,14 @@ fn whole_verdict(
     let discover::Owned::Gone { evidence, owner } = &t.owned else {
         return None;
     };
-    let low = config.below_warn(survey.free_bytes) || survey.demand.is_some();
+    let projected = survey.projected.as_ref();
+    let low =
+        config.below_warn(survey.free_bytes) || survey.demand.is_some() || projected.is_some();
     if !config.dead_build_dirs || config.auto_free_gib == 0 || !low {
         return None;
     }
-    let short = config.below_auto_floor(survey.free_bytes);
+    let below = config.below_auto_floor(survey.free_bytes);
+    let short = config.pressed(survey.free_bytes, projected);
     let device = survey.volume_device?;
     Some((|| {
         let marker = t.fences()?;
@@ -1388,6 +1437,9 @@ fn whole_verdict(
             newest = newest.max(m);
         }
         let age_s = survey.now.saturating_sub(newest);
+        #[cfg(any(test, debug_assertions))]
+        let short =
+            short && !(fill::fault::armed(fill::fault::Fault::GoneQuietUnderProjection) && !below);
         let quiet_s = owner.quiet_s(config.quiet_s(), short);
         if age_s < quiet_s {
             return Err(format!(
@@ -1413,6 +1465,7 @@ fn whole_verdict(
             },
             until_gib: config.warn_free_gib,
             device,
+            projected: projected.filter(|_| !below).copied(),
         })
     })())
 }
@@ -1595,7 +1648,10 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
         if !config.dead_build_dirs {
             return format!("{what}; `[disk] dead_build_dirs` is off");
         }
-        if !config.below_warn(survey.free_bytes) && survey.demand.is_none() {
+        if !config.below_warn(survey.free_bytes)
+            && survey.demand.is_none()
+            && survey.projected.is_none()
+        {
             return format!(
                 "{what}; it goes whole once free space is below the {} GiB warning",
                 config.warn_free_gib
@@ -1682,7 +1738,8 @@ fn pressure_rows(
     if survey.targets.is_empty() {
         return;
     }
-    if !config.below_auto_floor(survey.free_bytes) {
+    let projected = survey.projected.as_ref();
+    if !config.pressed(survey.free_bytes, projected) {
         let why = if config.auto_free_gib == 0 {
             "the automatic floor is off".to_owned()
         } else {
@@ -1703,7 +1760,25 @@ fn pressure_rows(
         );
         return;
     }
-    let until_gib = config.auto_free_gib.saturating_add(PRESSURE_MARGIN_GIB);
+    let below = config.below_auto_floor(survey.free_bytes);
+    let projected = projected.filter(|_| !below).copied();
+    // Above the floor a projection takes only profiles unwritten for an hour (§8.2): a session
+    // paused between builds keeps its cache, and its rebuild never reads as a fill aterm made.
+    let min_idle_s = if projected.is_some() {
+        PROJECTED_MIN_IDLE_S
+    } else {
+        PRESSURE_MIN_IDLE_S
+    };
+    #[cfg(any(test, debug_assertions))]
+    let min_idle_s = if fill::fault::armed(fill::fault::Fault::TenMinutesOnProjection) {
+        PRESSURE_MIN_IDLE_S
+    } else {
+        min_idle_s
+    };
+    let until_gib = projected.map_or_else(
+        || config.auto_free_gib.saturating_add(PRESSURE_MARGIN_GIB),
+        |p| config.projected_target(&p).div_ceil(GIB),
+    );
     let mut eligible: Vec<(&TargetDir, String, u64)> = Vec::new();
     for t in survey.targets.iter().take(MAX_TARGETS) {
         let (Ok(marker), Some(device)) = (t.fences(), survey.volume_device) else {
@@ -1733,7 +1808,8 @@ fn pressure_rows(
             continue;
         }
         let speaks = |p: &Profile| speaker(&dirs, &p.path) == Some(i);
-        let (candidates, kept) = t.pressure_candidates(survey.now, config.target_stale_days);
+        let (candidates, kept) =
+            t.pressure_candidates(survey.now, config.target_stale_days, min_idle_s);
         notes.extend(kept.into_iter().filter(|(p, _)| speaks(p)).map(|(p, why)| {
             format!(
                 "cargo-targets under pressure: kept {}: {why}",
@@ -1761,6 +1837,7 @@ fn pressure_rows(
                     floor_gib: config.auto_free_gib,
                     until_gib,
                     device: *device,
+                    projected,
                 },
                 removable: true,
                 blocked: None,
@@ -2091,6 +2168,7 @@ pub fn report_row(now: i64, sid: &str, rep: &Report) -> String {
         "room_bytes".to_owned(),
         rep.room.map_or(Value::Null, Value::from),
     );
+    projection_fields(&mut o, rep.projected.as_ref());
     o.insert(
         "rows".to_owned(),
         Value::from(u64::try_from(rep.rows.len()).unwrap_or(u64::MAX)),
@@ -2105,6 +2183,14 @@ pub fn report_row(now: i64, sid: &str, rep: &Report) -> String {
     );
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| "{\"kind\":\"report\",\"reason\":\"unserializable\"}".to_owned())
+}
+
+/// A projection's `projected_rate_bps` and `projected_eta_s`, when one pressed the pass (§8.6).
+fn projection_fields(o: &mut Map, projected: Option<&fill::Projection>) {
+    if let Some(p) = projected {
+        o.insert("projected_rate_bps".to_owned(), Value::from(p.rate_bps));
+        o.insert("projected_eta_s".to_owned(), Value::from(p.eta_ms / 1_000));
+    }
 }
 
 /// What an apply would do.
@@ -2590,20 +2676,21 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
         return None;
     }
     let low = c.below_warn(Some(free));
-    let short = c.below_auto_floor(Some(free));
+    let short = c.pressed(Some(free), rep.projected.as_ref());
     let demand = rep
         .demand
         .map(|need| need.saturating_add(c.auto_free_gib.saturating_mul(GIB)));
     if !low && !short && demand.is_none() {
         return None;
     }
+    let horizon = rep.projected.as_ref().map_or(0, |p| c.projected_target(p));
     let idle = |measured: bool| {
         let line = if measured {
             c.idle_target_bytes(short)
         } else {
             0
         };
-        line.max(demand.unwrap_or(0))
+        line.max(demand.unwrap_or(0)).max(horizon)
     };
     Some(
         rep.rows
@@ -2616,7 +2703,9 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
                         (low || short || demand.is_some()).then(|| Some(idle(low || short)))
                     }
                     Tier::IdleWhole => (short || demand.is_some()).then(|| Some(idle(short))),
-                    Tier::RecentIncremental => short.then(|| Some(c.pressure_target_bytes())),
+                    Tier::RecentIncremental => {
+                        short.then(|| Some(c.pressure_target_bytes().max(horizon)))
+                    }
                 }?;
                 Some(Planned {
                     row: r.clone(),
@@ -3007,6 +3096,8 @@ pub struct Roots {
     pub placing: Option<discover::checkout::Placing>,
     /// The demand the pass adopted ([`Survey::demand`]).
     pub demand: Option<u64>,
+    /// The projection standing on the volume ([`Survey::projected`]).
+    pub projected: Option<fill::Projection>,
     /// Assess the found build directories for TIER 3 ([`idle::assess`]).
     pub idle_whole: bool,
     /// The working directory of every session of this instance (tier 3's clause 4a).
@@ -3052,11 +3143,13 @@ pub fn scan_with(
     s.transcripts_root = roots.transcripts.clone();
     s.mounts = roots.mounts.clone();
     s.demand = roots.demand;
+    s.projected = roots.projected;
     if let Some(v) = &roots.volume {
         s.root = v.clone();
         s.volume_device = target::dev_of(v);
     }
-    let pressure = config.below_warn(free_bytes) || roots.demand.is_some();
+    let pressure =
+        config.below_warn(free_bytes) || roots.demand.is_some() || roots.projected.is_some();
     let read = versions::read(roots, processes);
     s.versions = read.entries;
     s.live_version = read.live;

@@ -857,4 +857,28 @@ mod tests {
         let a = answer(&b);
         assert_eq!((a.status, a.tag.as_str()), (200, "usage:side"));
     }
+
+    /// v6 §14.5 (5a): the model reads each of Cruise's six angled done checks, bare and as typed
+    /// with its suffixes, and v1's fixed check as the defend step, by the base they share
+    /// (`DONE_CHECK`). NEGATIVE CONTROL: an angle without the base is no done check to it.
+    #[test]
+    fn every_angled_done_check_is_the_defend_step() {
+        use aterm_agent::supervise::policy::turn_end::{
+            DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, done_check_act, done_check_words,
+        };
+        let p = "LEG-continue Write a plan";
+        for (n, angle) in DONE_ANGLES.iter().enumerate() {
+            for check in [
+                done_check_words(n),
+                done_check_act(n, Some("never push to main"), true),
+            ] {
+                assert_eq!(step_of(&body(&[p, &check], None)), Step::Defend, "{check}");
+            }
+            assert_ne!(step_of(&body(&[p, angle], None)), Step::Defend, "{angle}");
+        }
+        assert_eq!(
+            step_of(&body(&[p, DONE_CHECK_FIXED_BEFORE], None)),
+            Step::Defend
+        );
+    }
 }

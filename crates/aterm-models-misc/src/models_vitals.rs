@@ -594,9 +594,11 @@ pub fn explain_honesty_model() -> Model {
 /// THE REAP CREDIT (`docs/DESIGN-system-awareness-2026-10-16.md` §7.5): a tab's cumulative CPU,
 /// live and reaped, across one member parent `p`, alive throughout, and one member child `m` at
 /// a time (`aterm_vitals::explain::reap`). Its `Tick` reads every process at one instant, so the
-/// sweep's order (a zombie read after its parent) is outside it, as are members gone together
-/// and a parent that dies or waits as a zombie (what it leaves is uncertain): the walk is already
-/// 63,082 states of the interpreter's 100,000, so the ledger's and the sweep's own tests hold
+/// sweep's order (a zombie read after its parent) is outside it, as are members gone together,
+/// a parent that dies or waits as a zombie (what it leaves is uncertain), and a parent the kernel
+/// reaps for (`P_NOCLDWAIT`, which adds `m`'s time to `pk` twice, its growth then counting
+/// nothing and its step marked): the walk is already 63,082 states of the interpreter's 100,000,
+/// and that parent's flag would double them, so the ledger's and the sweep's own tests hold
 /// those.
 ///
 /// `pc` and `pk` are `p`'s own CPU and its reaped children's (the kernel adds a child's own and

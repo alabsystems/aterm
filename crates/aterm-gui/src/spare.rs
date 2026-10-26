@@ -2968,6 +2968,8 @@ impl Wake {
             #[cfg(target_os = "macos")]
             Wake::TabMenuRewind { .. } => None,
             #[cfg(target_os = "macos")]
+            Wake::TabMenuSessionAction { .. } => None,
+            #[cfg(target_os = "macos")]
             Wake::BeginSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::CommitSessionRename { .. } => None,

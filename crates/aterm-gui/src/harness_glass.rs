@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::acts::{Act, HoldLeg, LandHeld, TaskFace};
+use aterm_agent::harness::acts::{Act, HeldBy, HoldLeg, LandHeld, TaskFace};
 
 use crate::App;
 use crate::claude_lights::{ChipGlass, Clock, Weekday};
@@ -306,6 +306,8 @@ pub(crate) struct SessionGlass {
     ends: u32,
     /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover and the Overview, the menu bar's worker row and the chip's title (the W4 title slice) say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears `⤓ land` ([`App::shown_hold`]).
     hold: Option<HeldGlass>,
+    /// ATERM STOPPED TYPING INTO IT (§14.3), by which arm of ruling F's hold, as the session's loop last told its standing exception (`HostNote::ResumeException`'s `held`, [`on_stopped`]): set while the hold stands, whatever its urgency, and cleared as the loop lifts it or ends. What the chip's title and description, the state line, the hover and the Overview, a worker's tip and `status held=` say ([`stop_words`]), each only while the chip carries a mode ([`App::shown_stop`]).
+    stopped: Option<HeldBy>,
 }
 
 /// THE KIND OF A TASK'S END (§11.2.3, item 1): under Autopilot Cruise / Autopilot Land only Land's landing, the face moved to `landed`.
@@ -382,6 +384,12 @@ impl SessionGlass {
     /// Land hold last reported by the session's loop ([`App::shown_hold`]).
     pub(crate) const fn hold(&self) -> Option<HeldGlass> {
         self.hold
+    }
+
+    /// Which arm of ruling F's hold stopped the typing, as the session's loop last told it ([`App::shown_stop`] reads it under a mode that carries).
+    #[must_use]
+    pub(crate) const fn stopped(&self) -> Option<HeldBy> {
+        self.stopped
     }
 
     /// Records a new task end `face` with the next serial, unseen and uncheered.
@@ -695,6 +703,23 @@ pub(crate) fn on_land_held(app: &mut App, session: u64, held: Option<LandHeld>) 
     true
 }
 
+/// Updates the stop of `session` to `stopped` (its standing exception's arm, [`SessionGlass::stopped`]), returning whether it changed: a title someone reads is built again ([`SessionGlass::trail_gen`]).
+pub(crate) fn on_stopped(app: &mut App, session: u64, stopped: Option<HeldBy>) -> bool {
+    let was = app.harness_glass.get(&session).copied().unwrap_or_default();
+    if was.stopped == stopped {
+        return false;
+    }
+    let mut now = was;
+    now.stopped = stopped;
+    now.trail_gen = now.trail_gen.wrapping_add(1);
+    if now == SessionGlass::default() {
+        app.harness_glass.remove(&session);
+    } else {
+        app.harness_glass.insert(session, now);
+    }
+    true
+}
+
 /// LAND'S HOLD ON THE GLASS (§12.3.1, §12.3.3 item 3): the hold the loop told ([`LandHeld`]: its legs, open words and counts, its nudges) and its `since` as the local clock and day its unix second falls on, read once where the hold arrived — never a countdown: nothing repaints it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 /// Land hold state on the glass ([`LandHeld`]) with its start stamp.
@@ -731,6 +756,12 @@ impl HeldGlass {
     /// Whether a land act's yield was read and its legs stand.
     pub(crate) const fn read(self) -> bool {
         self.held.read && self.held.legs != 0
+    }
+
+    /// Whether its session's need is all that holds the landing (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): the yield was read ([`Self::read`]) and the hold's one leg is [`HoldLeg::Needs`](aterm_agent::harness::acts::HoldLeg::Needs) — read off the legs [`LandHeld`] carries, never off the hold's words.
+    #[must_use]
+    pub(crate) const fn need_alone(self) -> bool {
+        self.read() && self.held.legs == aterm_agent::harness::acts::HoldLeg::Needs.bit()
     }
 }
 
@@ -816,6 +847,22 @@ pub(crate) fn hold_words(
             Some(out)
         }
     }
+}
+
+/// A STOPPED AUTOPILOT, IN WORDS (§14.3), beside [`hold_words`]: ONE function, in `form`'s place (`aterm_agent::harness::acts::stop_words`, which the lab reads too) — the title's `stopped typing: the same reply twice, no work; types again at your turn or once the agent works`, the state line's with its facts ` · ` apart, the hover's `stopped typing`, a worker's tip without what restarts it, and the description's sentences.
+#[must_use]
+pub(crate) fn stop_words(held: HeldBy, form: HoldForm) -> String {
+    use aterm_agent::harness::acts::StopForm;
+    aterm_agent::harness::acts::stop_words(
+        held,
+        match form {
+            HoldForm::Title => StopForm::Title,
+            HoldForm::Line => StopForm::Line,
+            HoldForm::Hover => StopForm::Hover,
+            HoldForm::Tip => StopForm::Tip,
+            HoldForm::Spoken => StopForm::Spoken,
+        },
+    )
 }
 
 fn leg_words(
@@ -965,6 +1012,16 @@ impl App {
         (crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
             == crate::claude_lights::ChipFace::Land)
             .then_some(hold)
+    }
+
+    /// THE STOP OF SESSION `session` AS ITS SURFACES SAY IT (§14.3): the arm on its glass ([`SessionGlass::stopped`]), only while its chip carries a mode (`∞`, `∞ ⤓18:00`, `⤓ land`: [`crate::claude_lights::ChipFace::of`] over its view and glass), never on an Off, landed or quiet chip.
+    #[must_use]
+    pub(crate) fn shown_stop(&self, session: u64) -> Option<HeldBy> {
+        let stopped = self.harness_glass.get(&session)?.stopped?;
+        let glass = self.chip_glass(session);
+        crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
+            .carries()
+            .then_some(stopped)
     }
 
     /// Whether the act ticker's label is shown at all: `[claude_footer] acts` on (the default) and serious mode off (`SeriousEffect::HarnessTicker`).

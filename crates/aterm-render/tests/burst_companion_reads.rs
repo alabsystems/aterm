@@ -152,6 +152,7 @@ impl Replay {
             protected: &[],
             overlays: &[],
             ink: &[],
+            painted_over: None,
         };
         self.owner
             .observe_console_reserved(&input, &world, PetPane::full(&input), reserve);

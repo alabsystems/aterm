@@ -35,7 +35,7 @@ pub fn path_for(home: &Path) -> PathBuf {
 
 /// Whether `meta` (read without following) is a link: a symlink, and on
 /// Windows any reparse point.
-fn is_link(meta: &std::fs::Metadata) -> bool {
+pub(super) fn is_link(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         atpkg::platform::is_reparse(meta)

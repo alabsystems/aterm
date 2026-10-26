@@ -783,8 +783,8 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 }
 
 /// `base.clt` ([`aterm_machines::init_clt`]): its probe is atpkg's C toolchain probe over
-/// this process's `PATH`, which raises no Apple dialog, beside whether Command Line Tools git
-/// is there; its root half runs from this executable. `None` when this executable cannot name
+/// this process's `PATH`, which raises no Apple dialog, beside whether the git init runs is
+/// there (the tools', else Xcode's); its root half runs from this executable. `None` when this executable cannot name
 /// itself.
 #[cfg(target_os = "macos")]
 fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
@@ -803,19 +803,19 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
 }
 
 /// What `base.clt` reads in a C toolchain verdict ([`atpkg::prereq::CcVerdict`]) and whether
-/// Command Line Tools git is there (`clt_git`): a missing developer directory or `cc` is what
-/// the install supplies, and so is the tools' git beside a compiler that answers (an
-/// Xcode.app's toolchain alone, which the GitHub setup's clones cannot use: they run the
-/// tools' own git); a compiler that refuses with the tools installed is theirs already (an
-/// unaccepted Xcode license, a PATH-first `cc` without an SDK); a compiler that did not answer
-/// is unknown.
+/// the git init runs is there (`clt_git`: [`aterm_machines::items::github::installed_git`],
+/// the tools' own, else Xcode's): a missing developer directory or `cc` is what the install
+/// supplies, and so is git beside a compiler that answers (a developer directory without a
+/// git, which the GitHub setup's clones need); an Xcode with its git is no install's to make;
+/// a compiler that refuses with the tools installed is theirs already (an unaccepted Xcode
+/// license, a PATH-first `cc` without an SDK); a compiler that did not answer is unknown.
 #[cfg(target_os = "macos")]
 fn clt_found(verdict: &atpkg::prereq::CcVerdict, clt_git: bool) -> aterm_machines::init_clt::Found {
     use aterm_machines::init_clt::Found;
     use atpkg::prereq::CcVerdict;
     match verdict {
         CcVerdict::Ready { .. } | CcVerdict::Broken { .. } if !clt_git => Found::Missing(format!(
-            "Command Line Tools git is not installed ({})",
+            "no git for init to run, neither the Command Line Tools' nor Xcode's ({})",
             verdict.line()
         )),
         CcVerdict::Ready { .. } => Found::Present(verdict.line()),
@@ -881,10 +881,12 @@ fn named_by(token: &str, row: &ItemReport) -> bool {
 /// backticks, or nothing when it names none.
 fn remedy(row: &ItemReport) -> String {
     match row.explain.as_ref().map(|e| &e.remedy) {
-        Some(Remedy::Command(command)) => format!(" — `{command}`"),
-        Some(Remedy::Repair) => " — `aterm pkg repair`".to_owned(),
-        Some(Remedy::Init { only }) => format!(" — `aterm init --only {only}`"),
-        Some(Remedy::Develop) => " — `aterm init --develop`".to_owned(),
+        Some(
+            remedy @ (Remedy::Command(_) | Remedy::Repair | Remedy::Init { .. } | Remedy::Develop),
+        ) => remedy
+            .command()
+            .map(|command| format!(" — `{command}`"))
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }

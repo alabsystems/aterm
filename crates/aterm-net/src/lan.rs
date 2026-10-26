@@ -143,6 +143,7 @@ impl Connection {
     /// Check the selected route before dialing, then verify the actual socket.
     /// There is no DNS lookup, public fallback, relay, or route modification.
     pub fn connect(peer: SocketAddr, scope: Scope, within: Duration) -> io::Result<Self> {
+        crate::loopback::check(crate::loopback::Reach::Dial(peer))?;
         if within.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

@@ -10,25 +10,26 @@ pub(crate) fn launch_transition(
     assert_eq!(action, "Choose");
     let world = World::new("launch-admission");
     let case = state["case"];
+    let cli = if case == 6 { Cli::Kimi } else { Cli::Codex };
     if case == 1 {
-        let store = world.seat().store(Cli::Codex);
+        let store = world.seat().store(cli);
         store.ensure().unwrap();
         std::fs::write(store.state_file(), b"unrelated old cache").unwrap();
         std::fs::write(store.logins_file(), b"unrelated old bindings").unwrap();
     } else {
-        let work = world.two(Cli::Codex);
-        world.on_main(Cli::Codex, &[]);
-        wall(&world, Cli::Codex, "main", NOW + HOUR);
-        let store = world.seat().store(Cli::Codex);
+        let work = world.two(cli);
+        world.on_main(cli, &[]);
+        wall(&world, cli, "main", NOW + HOUR);
+        let store = world.seat().store(cli);
         match case {
             3 => std::fs::write(store.state_file(), b"not JSON").unwrap(),
             4 => std::fs::write(store.logins_file(), b"not JSON").unwrap(),
-            5 => wall(&world, Cli::Codex, "work", NOW + HOUR),
+            5 => wall(&world, cli, "work", NOW + HOUR),
             6 => {
-                let home = world.home.join(".codex");
+                let home = world.home.join(".kimi-code");
                 std::fs::create_dir_all(&home).unwrap();
-                std::fs::write(home.join("state_5.sqlite"), b"shared").unwrap();
-                std::fs::write(work.join("state_5.sqlite"), b"own").unwrap();
+                std::fs::write(home.join("mcp.json"), b"shared").unwrap();
+                std::fs::write(work.join("mcp.json"), b"own").unwrap();
             }
             7 => std::fs::write(world.cfg.join("accounts-codex.toml"), b"[bad").unwrap(),
             8 => std::fs::write(
@@ -51,7 +52,7 @@ pub(crate) fn launch_transition(
             _ => {}
         }
     }
-    let store = world.seat().store(Cli::Codex);
+    let store = world.seat().store(cli);
     let before = (case == 10).then(|| std::fs::read(store.state_file()).unwrap());
     let _held = (case == 10).then(|| store.acquire().unwrap());
     let read = |_: Cli, _: &Path, _: i64| {
@@ -64,7 +65,7 @@ pub(crate) fn launch_transition(
             wall: Some(("five_hour", Some(NOW + HOUR))),
         })
     };
-    let outcome = match super::super::launch_env(&world.seat(), Cli::Codex, &read) {
+    let outcome = match super::super::launch_env(&world.seat(), cli, &read) {
         Ok(None) => 0,
         Ok(Some(pick)) => {
             assert_eq!(pick.label, "work");

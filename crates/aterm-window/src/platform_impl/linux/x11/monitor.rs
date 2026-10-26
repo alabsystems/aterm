@@ -5,7 +5,7 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by the aterm project in 2026; see the repository NOTICE. (RandR's requests are
-// aterm-x11's encoders, where upstream used x11rb's.)
+// aterm-x11's encoders, where upstream used x11rb's, and a broken connection has no monitors.)
 
 use super::{util, IgnoreError as _, X11Error, XConnection};
 use crate::dpi::{PhysicalPosition, PhysicalSize};
@@ -219,11 +219,14 @@ impl XConnection {
         Ok(available_monitors)
     }
 
+    /// The server's monitors, cached until RandR reports a change. Once the connection is broken
+    /// the cache describes a server that has gone, so the list is asked for again and that
+    /// request's failure is the answer: no monitor to place or scale a window by.
     pub fn available_monitors(&self) -> Result<Vec<MonitorHandle>, X11Error> {
         let mut monitors_lock = self.monitor_handles.lock().unwrap();
         match *monitors_lock {
-            Some(ref monitors) => Ok(monitors.clone()),
-            None => {
+            Some(ref monitors) if !self.is_broken() => Ok(monitors.clone()),
+            _ => {
                 let monitors = self.query_monitor_list()?;
                 if !DISABLE_MONITOR_LIST_CACHING {
                     *monitors_lock = Some(monitors.clone());

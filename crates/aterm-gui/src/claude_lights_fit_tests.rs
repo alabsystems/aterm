@@ -510,7 +510,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     assert!(ordinary.refresh(
         1,
         landed,
-        || (None, None),
+        || (None, None, None),
         |stamped| {
             assert!(stamped);
             reads.set(reads.get() + 1);
@@ -540,7 +540,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     assert!(trail.refresh(
         1,
         empty,
-        || (None, None),
+        || (None, None, None),
         |stamped| {
             assert!(!stamped);
             ("approved 14:05".to_owned(), Some(TODAY))
@@ -572,7 +572,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
         let rebuilt = reading.refresh(
             0,
             to,
-            || (None, None),
+            || (None, None, None),
             |stamped| {
                 assert!(stamped);
                 reads.set(reads.get() + 1);
@@ -592,7 +592,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     let cleared = restated.refresh(
         0,
         empty,
-        || (None, None),
+        || (None, None, None),
         |stamped| {
             assert!(!stamped);
             clear_reads.set(clear_reads.get() + 1);
@@ -604,7 +604,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     let restored = restated.refresh(
         0,
         landed,
-        || (None, None),
+        || (None, None, None),
         |stamped| {
             assert!(stamped);
             restore_reads.set(restore_reads.get() + 1);

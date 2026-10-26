@@ -247,7 +247,7 @@ impl LayerItem {
     fn remedy(&self) -> Remedy {
         match self.kind {
             Kind::Base => Remedy::Init {
-                only: "base".into(),
+                only: Layer::Base.name().into(),
             },
             Kind::Develop => Remedy::Provision {
                 args: String::new(),
@@ -365,16 +365,14 @@ fn items(host: &Arc<dyn ReleaseHost>) -> Vec<Box<dyn Item>> {
 
 fn fix_words(remedy: &Remedy) -> String {
     match remedy {
-        Remedy::Repair => "aterm pkg repair".into(),
-        Remedy::Init { only } => format!("aterm init --only {only}"),
-        Remedy::Develop => "aterm init --develop".into(),
-        Remedy::Provision { args } => format!("targo --unverified verify provision {args}")
-            .trim_end()
-            .to_owned(),
         Remedy::Person { how, .. } => how.clone(),
         Remedy::Network => "run it again once online".into(),
-        Remedy::Command(command) => command.clone(),
         Remedy::None => "nothing on this machine changes it".into(),
+        Remedy::Repair
+        | Remedy::Init { .. }
+        | Remedy::Develop
+        | Remedy::Provision { .. }
+        | Remedy::Command(_) => remedy.command().unwrap_or_default(),
     }
 }
 

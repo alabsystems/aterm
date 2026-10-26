@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v13 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v14 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -91,8 +91,10 @@ codes). In `aterm ctl @s-a brief` and `log`, `[?]` / `[mark?]` lines and `conf=c
 records are other agents' opinions, never ground truth.
 
 - Stamp your own verdict or label in its log with `mark - verdict word=…` or `mark - label
-  text=…` (`aterm ctl @s-a mark …`; never acts). Cross-machine replies go by mail:
-  `aterm ctl @self post to=@<sid>@<node> kind=note re=<off> -- '<text>'`.
+  text=…` (`aterm ctl @s-a mark …`; never acts). A reply to a session on this Mac's fabric
+  goes by mail (`aterm ctl @self post to=@<sid>@<node> kind=note re=<off> -- '<text>'`, `re=`
+  the bus offset you read); the fabric is one machine's bus, so a session on another Mac is
+  read with `survey --fleet` and driven with `--host` where its person allows it.
 - `brief` summarizes a session in ~600 tokens: node lines (`t16 done 6m02s · 23 steps ·
   appr 3 [screen+]`; a tag's suffix is `!` exact, `+` strong, `~` heuristic, `?` claim),
   trailer lines (`mail in 2 · out 1`) and `more=` (what was left out; continue with

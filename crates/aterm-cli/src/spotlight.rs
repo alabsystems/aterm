@@ -11,6 +11,10 @@ const QUERY: Duration = Duration::from_secs(10);
 
 const RUST_DOCS: &str = "share/doc/rust/html/";
 
+/// init's Rust in Spotlight group, whose items remove rust-docs: `aterm_machines::init_spotlight::ID`,
+/// which this crate reaches on macOS alone.
+const INIT_SPOTLIGHT: &str = "init.spotlight";
+
 /// What Spotlight's index holds under the home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spotlit {
@@ -275,9 +279,14 @@ pub(crate) fn row(measured: &Result<Spotlit, String>) -> (bool, String) {
     }
     if !pages.docs.is_empty() {
         lines.push(format!(
-            "{} rust-docs pages indexed in {home} ({}): `aterm init` removes rust-docs",
+            "{} rust-docs pages indexed in {home} ({}): `{}` removes rust-docs",
             total(&pages.docs),
-            largest(&pages.docs, "toolchains")
+            largest(&pages.docs, "toolchains"),
+            aterm_converge::Remedy::Init {
+                only: INIT_SPOTLIGHT.to_owned()
+            }
+            .command()
+            .unwrap_or_default()
         ));
     }
     if !pages.other.is_empty() {
@@ -482,7 +491,7 @@ mod tests {
         assert_eq!(
             lines[2],
             "84915 rust-docs pages indexed in ~/.rustup (stable-aarch64-apple-darwin 84915): \
-             `aterm init` removes rust-docs"
+             `aterm init --only init.spotlight` removes rust-docs"
         );
         assert_eq!(
             lines[3],
@@ -505,5 +514,12 @@ mod tests {
             row(&Err("a test binary".into())),
             (false, "not measured (a test binary)".into())
         );
+    }
+
+    /// The line that removes rust-docs names init's Spotlight group by the id init takes it by.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_rust_docs_remedy_names_inits_spotlight_group() {
+        assert_eq!(INIT_SPOTLIGHT, aterm_machines::init_spotlight::ID);
     }
 }

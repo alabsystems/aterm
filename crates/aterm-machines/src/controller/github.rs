@@ -38,18 +38,19 @@ fn valid_login(account: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// Why the machine user's token cannot be kept on a Mac without git.
+pub(crate) const NO_GIT: &str = "the machine user's GitHub token is kept through git, from \
+                                 Apple's Command Line Tools or Xcode, and neither is installed \
+                                 (aterm init --only base.clt installs the tools)";
+
 /// Resolve the git binary used to store and read `account`'s token.
 fn keychain(sys: &dyn System, account: &str) -> Result<Git, String> {
     if !valid_login(account) {
         return Err(format!("{account:?} is not a GitHub login"));
     }
-    let git = Git::keychain();
+    let git = Git::keychain(sys);
     if !git.installed(sys) {
-        return Err(
-            "the machine user's GitHub token is kept through Apple's Command Line Tools git, \
-             which is not installed (aterm init --only base.clt installs them)"
-                .into(),
-        );
+        return Err(NO_GIT.into());
     }
     Ok(git)
 }

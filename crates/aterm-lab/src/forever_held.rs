@@ -8,11 +8,13 @@
 //! ([`Chain::same_reply`]) is watched [`PAST_NEXT_STEP_MS`] past it ([`watched_past`]), brought in
 //! front twice inside that minute ([`look_step`]), and wants two things of it ([`with_held`]):
 //!
-//! * what it says, on surfaces every build since 5d prints: each look in front carries a stop word
-//!   ([`STOP_WORD`]) on the chip's description and title where the chip is drawn, else on the
-//!   tab's hover ([`said`]);
-//! * what 3a adds (`status held=`, the state line's stop words, the `Stopped typing` row in `ctl
-//!   messages`): named skips until 3a is on main ([`three_a`]).
+//! * what it says, on surfaces every build since 5d prints: each look in front leads the chip's
+//!   description and title with the stop ([`stop_words`], 3a's one function, the arm the
+//!   journal's `held=` names) where the chip is drawn, else the tab's hover ([`said`]);
+//! * what 3a adds ([`three_a`]): the journal's `when=` and `held=`, `status held=`, the state
+//!   line led by the stop, and, under Land over a repository leg in a session no manager waits on
+//!   ([`loud`]), one `Stopped typing` row in `ctl messages`, withdrawn once the hold lifts (none
+//!   for the others); same-land's person's turn past its looks lifts it ([`person_due`]).
 //!
 //! And the hold stands (limit 1): a lift ([`lift_of`]) with no request of its conversation read by
 //! the stub between the hold and the lift fails it ([`stands`]).
@@ -20,21 +22,21 @@
 //! Any other chain of the measured pass or the coverage chains fails at a `kind=stalled`
 //! ([`stall_fault`]).
 
+use std::borrow::Cow;
+
+use aterm_agent::harness::acts::{FACT_SEPARATOR, HeldBy, StopForm, stop_words};
+use aterm_agent::supervise::policy::exception::REPEATS_LAND_TITLE;
 use aterm_agent::supervise::policy::turn_end;
 
 use super::super::{
     Chain, PAST_NEXT_STEP_MS, Repo, Scenario, Seen, Tab, Verdict, act_rule, at, idle_words, word,
 };
 use super::{
-    Ctx, chip, compose, in_front_drawn, no_footer, observed, quoted, split_title, strip_tabs,
+    Ctx, ax_of, chip, compose, in_front_drawn, no_footer, observed, page_field, quoted,
+    split_title, strip_tabs,
 };
 use crate::door::Door;
 use crate::util::{now_ms, one_line};
-
-/// The stop word a held chain's surfaces must carry (§14.3: the title's and the state line's
-/// `stopped typing:`, the description's `Stopped typing:`, the hover's `stopped typing;`), read
-/// without regard to case.
-pub const STOP_WORD: &str = "stopped typing";
 
 /// When a held chain is brought in front after its hold's journal line: once its window has had
 /// time to take the hold (as [`super::hold`]'s hover slack), and once more near the end of the
@@ -45,7 +47,7 @@ pub const HELD_LOOKS_MS: [i64; 2] = [10_000, 40_000];
 const SETTLE_MS: i64 = HELD_LOOKS_MS[0];
 
 /// The want [`said`] composes under.
-pub const SAID: &str = "held: within 60 s of its hold, each look in front says `stopped typing` \
+pub const SAID: &str = "held: within 60 s of its hold, each look in front leads with the stop \
                         (the chip's description and title where drawn, else the tab's hover)";
 
 /// The want [`three_a`] composes under.
@@ -71,10 +73,57 @@ pub fn stall_of(seen: &Seen, t0: i64) -> Option<&(i64, String)> {
     seen.journal.iter().find(|(t, l)| *t >= t0 && is_stall(l))
 }
 
-/// Whether `text` carries the stop word.
+/// The arm the hold's journal line names (`held=`, 3a's), else the same reply: a build before 3a
+/// names none, and ruling F's chains are held by the same reply.
 #[must_use]
-pub fn says_stop(text: &str) -> bool {
-    text.to_lowercase().contains(STOP_WORD)
+pub fn arm_of(line: &str) -> HeldBy {
+    word(line, "held")
+        .and_then(|w| HeldBy::of_word(&w))
+        .unwrap_or(HeldBy::SameReply)
+}
+
+/// THE ONE LOUD HOLD (§14.3, limit 3): the chain's hold is Land's over a repository leg, in a
+/// session no manager waits on: journaled `when=now`, and one `Stopped typing` row in `ctl
+/// messages` while it stands.
+#[must_use]
+pub fn loud(chain: Chain) -> bool {
+    chain.autopilot() == "land" && chain.repo() != Repo::Clean && !chain.tasked()
+}
+
+/// THE HOLD'S WORDS BEHIND A STOP: `text` with the stop that leads it in `form` (any arm's
+/// [`stop_words`], with the separator after it) taken off, so a reader of a hold's words reads
+/// them past the stop; `text` itself where no stop leads it. The title and the hover keep their
+/// head (`autopilot: land — `, `driven by aterm (land: `).
+#[must_use]
+pub fn unstopped(text: &str, form: StopForm) -> Cow<'_, str> {
+    let head_end = match form {
+        StopForm::Title => text.find(" \u{2014} ").map(|i| i + " \u{2014} ".len()),
+        StopForm::Hover => text.find(": ").map(|i| i + ": ".len()),
+        StopForm::Line | StopForm::Tip | StopForm::Spoken => Some(0),
+    };
+    let Some(at) = head_end else {
+        return Cow::Borrowed(text);
+    };
+    let (head, rest) = text.split_at(at);
+    for arm in HeldBy::ALL {
+        let stop = stop_words(arm, form);
+        let Some(after) = rest.strip_prefix(stop.as_str()) else {
+            continue;
+        };
+        return Cow::Owned(match form {
+            StopForm::Hover => match after.strip_prefix("; ") {
+                Some(why) => format!("{head}{why}"),
+                // `driven by aterm (cruise: stopped typing)`: the mode alone.
+                None => format!("{}{after}", head.strip_suffix(": ").unwrap_or(head)),
+            },
+            StopForm::Spoken => format!("{head}{}", after.trim_start()),
+            _ => format!(
+                "{head}{}",
+                after.strip_prefix(FACT_SEPARATOR).unwrap_or(after)
+            ),
+        });
+    }
+    Cow::Borrowed(text)
 }
 
 /// Whether journal `line` lifts a hold: `CLEARED … exception=stalled` (`Exception::repeats`'s
@@ -121,7 +170,7 @@ pub fn requests_between(dumps: &[(i64, usize)], from: i64, until: i64) -> usize 
 
 /// The decision journaled for the first point after `t`: a `WAITING` (not the take window's), the
 /// hold, a `DONE` or a `LEFT`.
-fn decided_after(seen: &Seen, t: i64) -> Option<&(i64, String)> {
+pub(in crate::forever) fn decided_after(seen: &Seen, t: i64) -> Option<&(i64, String)> {
     seen.journal.iter().find(|(at, l)| {
         *at > t
             && ((l.starts_with("WAITING ") && !l.contains(" the worker to take the "))
@@ -171,6 +220,11 @@ pub(in crate::forever) fn look_step(door: &Door<'_>, tab: &mut Tab, back: Option
     let line = read
         .as_ref()
         .map_or_else(|| NOT_IN_STRIP.to_string(), |(_, l)| l.clone());
+    let nodes = if read.is_some() {
+        ax_of(&door.out(&["chrome"]), &tab.sid)
+    } else {
+        "-".to_string()
+    };
     println!(
         "  [{}] +{} held    in front {} s past its hold ({}): {}",
         tab.chain.name(),
@@ -181,6 +235,7 @@ pub(in crate::forever) fn look_step(door: &Door<'_>, tab: &mut Tab, back: Option
         one_line(&line, 400)
     );
     tab.seen.window.held.push((t, line));
+    tab.seen.window.held_ax.push((t, nodes));
     if let Some(label) = restore
         && let Some(i) = strip_tabs(&door.out(&["chrome"]))
             .into_iter()
@@ -303,7 +358,9 @@ pub fn judge_hold(chain: Chain, seen: &Seen, t0: i64) -> Verdict {
             typed.join("; ")
         ));
     }
-    if let Some((ta, la)) = acts.iter().find(|(t, _)| t > ts) {
+    // Past same-land's person's turn the hold is lifted by it, and Land may type again.
+    let person = seen.stop_person_ms.unwrap_or(i64::MAX);
+    if let Some((ta, la)) = acts.iter().find(|(t, _)| t > ts && *t < person) {
         return Verdict::Fail(format!(
             "{held}, yet {} typed at +{}: {}",
             act_rule(la).unwrap_or("?"),
@@ -346,10 +403,10 @@ pub fn with_held(s: Scenario, seen: &Seen, cx: &Ctx<'_>, v: Verdict) -> Verdict 
 }
 
 /// THE HOLD STANDS (limit 1, §14.10: a tab aterm stopped stays stopped): no lift before the next
-/// act ([`lift_of`]), or one on a request of its conversation the stub read between the hold and
-/// the lift (the agent working, someone's turn: [`Seen::lift_stub`]). A lift with none is aterm
-/// reading a reply nobody gave (an agent redrawing its tall reply as its tab comes in front):
-/// HELD, THEN LIFTED WITH NO NEW REPLY.
+/// act ([`lift_of`]), or one at same-land's person's turn ([`person_due`]), or one on a request of
+/// its conversation the stub read between the hold and the lift (the agent working, someone's
+/// turn: [`Seen::lift_stub`]). A lift with none is aterm reading a reply nobody gave (an agent
+/// redrawing its tall reply as its tab comes in front): HELD, THEN LIFTED WITH NO NEW REPLY.
 #[must_use]
 pub fn stands(seen: &Seen, cx: &Ctx<'_>, (ts, _): &(i64, String)) -> Verdict {
     let Some((tl, ll)) = lift_of(seen, *ts) else {
@@ -372,6 +429,14 @@ pub fn stands(seen: &Seen, cx: &Ctx<'_>, (ts, _): &(i64, String)) -> Verdict {
             )
         });
     let lifted = format!("at +{} ({}){look}", at(cx.t0, *tl), one_line(ll, 140));
+    if let Some(p) = seen.stop_person_ms.filter(|p| tl >= p) {
+        return Verdict::Pass(format!(
+            "lifted {lifted}, on the person's turn at +{}{}",
+            at(cx.t0, p),
+            seen.stop_person_sent_ms
+                .map_or_else(String::new, |t| format!(" (sent at +{})", at(cx.t0, t)))
+        ));
+    }
     match seen.lift_stub {
         Some(0) => Verdict::Fail(format!(
             "HELD, THEN LIFTED WITH NO NEW REPLY {lifted}: the stub read no request of its \
@@ -387,18 +452,36 @@ pub fn stands(seen: &Seen, cx: &Ctx<'_>, (ts, _): &(i64, String)) -> Verdict {
     }
 }
 
-/// WHAT IT SAYS: every look in front from [`SETTLE_MS`] past the hold to its lift carries
-/// [`STOP_WORD`] on the chip's description and title where the chip is drawn, and, where a look
-/// read the footless line (`face=- drawn=- why=no-footer`: a program whose composer draws no
-/// footer), every hover read in that span does; at least one look within [`PAST_NEXT_STEP_MS`]
-/// of the hold. A look whose chip a footer would draw but did not (`why=not-drawn` past the
-/// capture's hang detector, `hidden`, `switch-only`) reads nothing: a named UNOBSERVED, never the
-/// hover in its place.
+/// The heads a held chain's surfaces lead with under `mode` (`land`, `cruise`) and `arm`: the
+/// description's, the title's and the hover's ([`stop_words`]).
+#[must_use]
+pub fn stop_heads(mode: &str, arm: HeldBy) -> [String; 3] {
+    [
+        stop_words(arm, StopForm::Spoken),
+        format!(
+            "autopilot: {mode} \u{2014} {}",
+            stop_words(arm, StopForm::Title)
+        ),
+        format!(
+            "driven by aterm ({mode}: {}",
+            stop_words(arm, StopForm::Hover)
+        ),
+    ]
+}
+
+/// WHAT IT SAYS: every look in front from [`SETTLE_MS`] past the hold to its lift leads the
+/// chip's description and title with the stop ([`stop_heads`]) where the chip is drawn, and,
+/// where a look read the footless line (`face=- drawn=- why=no-footer`: a program whose composer
+/// draws no footer), every hover read in that span does; at least one look within
+/// [`PAST_NEXT_STEP_MS`] of the hold. A look whose chip a footer would draw but did not
+/// (`why=not-drawn` past the capture's hang detector, `hidden`, `switch-only`) reads nothing: a
+/// named UNOBSERVED, never the hover in its place.
 #[must_use]
 pub fn said(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
     let w = &seen.window;
     let ts = *ts;
     let until = lifted(seen, ts);
+    let [spoken, titled, hovered] = stop_heads(cx.chain.autopilot(), arm_of(line));
     let held = format!("held at +{} ({})", at(cx.t0, ts), one_line(line, 140));
     let looks: Vec<&(i64, String)> = w
         .held
@@ -439,13 +522,13 @@ pub fn said(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
         let description = quoted(&rest, "description").unwrap_or_else(|| "-".into());
         let title = title.unwrap_or_else(|| "?".into());
         let mut missing = Vec::new();
-        if !says_stop(&description) {
+        if !description.starts_with(&spoken) {
             missing.push(format!(
                 "the description \"{}\"",
                 one_line(&description, 160)
             ));
         }
-        if !says_stop(&title) {
+        if !title.starts_with(&titled) {
             missing.push(format!("the title \"{}\"", one_line(&title, 200)));
         }
         if missing.is_empty() {
@@ -456,8 +539,10 @@ pub fn said(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
             ));
         } else {
             bad.push(format!(
-                "{when}: {} carry no `{STOP_WORD}`",
-                missing.join(" and ")
+                "{when}: {} lead with no stop ({:?}, {:?})",
+                missing.join(" and "),
+                one_line(&spoken, 60),
+                one_line(&titled, 80)
             ));
         }
     }
@@ -466,11 +551,14 @@ pub fn said(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
         if hovers.is_empty() {
             unread.push("no hover read where no chip is drawn".into());
         }
-        let mut quiet = hovers.iter().filter(|(_, h)| !says_stop(h)).peekable();
+        let mut quiet = hovers
+            .iter()
+            .filter(|(_, h)| !h.starts_with(&hovered))
+            .peekable();
         if quiet.peek().is_some() {
             bad.extend(quiet.map(|(t, h)| {
                 format!(
-                    "+{} the hover \"{}\" carries no `{STOP_WORD}`",
+                    "+{} the hover \"{}\" leads with no stop ({hovered:?})",
                     at(cx.t0, *t),
                     one_line(h, 160)
                 )
@@ -507,31 +595,369 @@ pub fn said(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
     }
 }
 
-/// WHAT 3A ADDS (§14.3): `status held=same-reply|no-work`, the state line's stop words and, under
-/// Land with a repository leg in a session no manager waits on, one `Stopped typing` row in `ctl
-/// messages` (none for the others). They read fields 3a brings, so they are a named UNOBSERVED skip
-/// until 3a is on main, whatever this build's `status` prints.
+/// The rows `ctl messages tag=harness` printed of tab `sid`'s resume ask (`harness.resume-ask.<sid>`,
+/// the band a `Now` exception raises): `<id> state=<state> title=<title>` each, `|` apart, its
+/// title decoded; `-` where none.
 #[must_use]
-pub fn three_a(seen: &Seen, cx: &Ctx<'_>, (ts, _): &(i64, String)) -> Verdict {
-    let printed = seen
-        .status
-        .iter()
-        .filter(|(t, _)| *t >= *ts)
-        .find_map(|(_, s)| word(s, "held"));
-    let row = if cx.chain.autopilot() == "land" && cx.chain.repo() != Repo::Clean {
-        "one `Stopped typing` row in `ctl messages`"
+pub fn band_rows(messages: &str, sid: &str) -> String {
+    let key = format!("harness.resume-ask.{sid}");
+    let rows: Vec<String> = messages
+        .lines()
+        .filter_map(|l| l.strip_prefix("message "))
+        .filter(|l| word(l, "key").as_deref() == Some(key.as_str()))
+        .map(|l| {
+            format!(
+                "{} state={} title={}",
+                l.split_whitespace().next().unwrap_or("?"),
+                word(l, "state").unwrap_or_else(|| "?".into()),
+                super::super::pct_decode(&word(l, "title").unwrap_or_default())
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        "-".to_string()
     } else {
-        "no `Stopped typing` row in `ctl messages`"
+        rows.join(" | ")
+    }
+}
+
+/// The rows of a [`band_rows`] read standing on the band, titled for the stop
+/// ([`REPEATS_LAND_TITLE`]).
+#[must_use]
+pub fn stop_rows(band: &str) -> Vec<&str> {
+    band.split(" | ")
+        .filter(|r| {
+            word(r, "state").as_deref() == Some("live")
+                && r.split_once(" title=")
+                    .is_some_and(|(_, t)| t.starts_with(REPEATS_LAND_TITLE.0))
+        })
+        .collect()
+}
+
+/// When same-land's person types their turn into its held tab (§14.3: the band is withdrawn once
+/// the hold lifts, and someone's turn lifts it): once it was held and watched past its hold
+/// ([`watched_past`]), the looks had; never twice.
+#[must_use]
+pub fn person_due(chain: Chain, seen: &Seen, t0: i64, now: i64) -> bool {
+    chain == Chain::SameLand
+        && seen.stop_person_ms.is_none()
+        && stall_of(seen, t0).is_some()
+        && seen.all_acts().len() >= 2
+        && watched_past(seen, now)
+}
+
+/// The person's turn same-land types once its hold was watched ([`person_due`]): plain words,
+/// with no key a composer reads as a shortcut of its own.
+pub const PERSON_TURN: &str = "tell me what is still open here";
+
+/// Records same-land's person's turn on `seen`: `began`, when the lab began typing it, is the
+/// turn (their first key lifts the hold: aterm journals `a person is typing`), and `sent` when its
+/// Enter was read back (`None`: the composer did not take it), which the verdicts name beside it.
+pub fn person_typed(seen: &mut Seen, began: i64, sent: Option<i64>) {
+    seen.stop_person_ms = Some(began);
+    seen.stop_person_sent_ms = sent;
+}
+
+/// WHAT 3A ADDS (§14.3), read while the hold stands (from [`SETTLE_MS`] past it to its lift):
+///
+/// * the hold's journal line names its arm (`held=`) and is `when=now` for the loud hold
+///   ([`loud`]), `when=later` for every other;
+/// * every `status` read prints `held=<arm>`;
+/// * every state line read on the Harness page leads with the stop ([`stop_words`]'s line), where
+///   its row is drawn: the page draws its first sessions' rows, so a row it never drew while the
+///   tab held is a named skip that keeps the verdict's word (as [`super::hold`]'s legs read it);
+/// * the loud hold has exactly one `Stopped typing` row standing in `ctl messages` at every read
+///   ([`band_rows`]), and once same-land's person's turn lifts it, none ([`person_due`]); every
+///   other hold never has one;
+/// * a screen reader is handed the stop ([`heard`]): the chip's node in the window's accessibility
+///   tree, and the loud hold's band row node.
+#[must_use]
+pub fn three_a(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
+    let ts = *ts;
+    let arm = arm_of(line);
+    let loud = loud(cx.chain);
+    let until = lifted(seen, ts);
+    let from = ts + SETTLE_MS - 1;
+    let mut bad: Vec<String> = Vec::new();
+    let mut read: Vec<String> = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let when = if loud { "now" } else { "later" };
+    match (word(line, "when"), word(line, "held")) {
+        (Some(w), Some(h)) if w == when && h == arm.word() => {
+            read.push(format!("journaled when={w} held={h}"));
+        }
+        (w, h) => bad.push(format!(
+            "its journal line reads when={} held={}, not when={when} held={}",
+            w.as_deref().unwrap_or("-"),
+            h.as_deref().unwrap_or("(none)"),
+            arm.word()
+        )),
+    }
+    let status = observed(&seen.status, &seen.status_reads, from, until);
+    let off: Vec<String> = status
+        .iter()
+        .filter(|(_, s)| word(s, "held").as_deref() != Some(arm.word()))
+        .map(|(t, s)| {
+            format!(
+                "+{} held={}",
+                at(cx.t0, *t),
+                word(s, "held").unwrap_or_else(|| "(none)".into())
+            )
+        })
+        .collect();
+    if status.is_empty() {
+        unread.push("no `status` read while it held".into());
+    } else if off.is_empty() {
+        read.push(format!(
+            "{} status read(s) held={}",
+            status.len(),
+            arm.word()
+        ));
+    } else {
+        bad.push(format!(
+            "status did not print held={}: {}",
+            arm.word(),
+            off.join(", ")
+        ));
+    }
+    let w = &seen.window;
+    if w.read {
+        let lead = stop_words(arm, StopForm::Line);
+        let rows = observed(&w.page, &w.page_reads, from, until);
+        let drawn: Vec<(i64, &str)> = rows.iter().copied().filter(|(_, p)| *p != "-").collect();
+        let lines: Vec<(i64, &str)> = drawn
+            .iter()
+            .filter_map(|(t, p)| Some((*t, page_field(p, "state")?)))
+            .collect();
+        match lines.iter().find(|(_, l)| !l.starts_with(&lead)) {
+            _ if rows.is_empty() => {
+                unread.push("the Harness page was not read while it held".into())
+            }
+            // The page draws its first sessions' rows (as the hold's legs read them, [`super::hold`]).
+            _ if drawn.is_empty() => skipped.push(format!(
+                "the state line: SKIPPED (its row was not drawn on the Harness page in {} read(s) \
+                 while it held)",
+                rows.len()
+            )),
+            _ if lines.is_empty() => bad.push(format!(
+                "+{} its row on the Harness page drew no state line",
+                at(cx.t0, drawn[0].0)
+            )),
+            Some((t, l)) => bad.push(format!(
+                "+{} the state line \"{}\" leads with no stop ({lead:?})",
+                at(cx.t0, *t),
+                one_line(l, 200)
+            )),
+            None => read.push(format!("the state line \"{}\"", one_line(lines[0].1, 160))),
+        }
+        heard(
+            seen,
+            cx,
+            (ts, until),
+            (arm, loud),
+            [&mut read, &mut bad, &mut unread, &mut skipped],
+        );
+    } else {
+        skipped.push("the state line: SKIPPED (--no-surfaces)".into());
+    }
+    let band = observed(&seen.band, &seen.band_reads, from, until);
+    if band.is_empty() {
+        unread.push("`ctl messages` was not read while it held".into());
+    } else if loud {
+        match band.iter().find(|(_, b)| stop_rows(b).len() != 1) {
+            Some((t, b)) => bad.push(format!(
+                "+{} `ctl messages` stood {} `Stopped typing` row(s), not one: {}",
+                at(cx.t0, *t),
+                stop_rows(b).len(),
+                one_line(b, 200)
+            )),
+            None => read.push(format!(
+                "one `Stopped typing` row: {}",
+                one_line(stop_rows(band[0].1)[0], 120)
+            )),
+        }
+    }
+    if !loud {
+        let after = observed(&seen.band, &seen.band_reads, ts - 1, seen.end_ms + 1);
+        match after.iter().find(|(_, b)| !stop_rows(b).is_empty()) {
+            Some((t, b)) => bad.push(format!(
+                "+{} a `Stopped typing` row for a hold that is not Land's over a repository leg: {}",
+                at(cx.t0, *t),
+                one_line(b, 200)
+            )),
+            None if !after.is_empty() => read.push("no `Stopped typing` row".into()),
+            None => {}
+        }
+    }
+    if cx.chain == Chain::SameLand {
+        match seen.stop_person_ms {
+            None => unread.push("no person's turn was typed past its looks".into()),
+            Some(p) => {
+                let lift = seen.journal.iter().find(|(t, l)| *t >= p && is_lift(l));
+                let past = lift
+                    .map(|(tl, _)| observed(&seen.band, &seen.band_reads, *tl, seen.end_ms + 1));
+                match (lift, past) {
+                    (Some((tl, _)), Some(past)) if past.is_empty() => unread.push(format!(
+                        "the person's turn at +{} lifted the hold at +{}; `ctl messages` was not \
+                         read past the lift",
+                        at(cx.t0, p),
+                        at(cx.t0, *tl)
+                    )),
+                    (Some((tl, _)), Some(past)) => {
+                        match past.iter().find(|(_, b)| stop_rows(b).is_empty()) {
+                            Some((tg, _)) => read.push(format!(
+                                "the person's turn at +{}, the lift at +{}, the row gone by +{}",
+                                at(cx.t0, p),
+                                at(cx.t0, *tl),
+                                at(cx.t0, *tg)
+                            )),
+                            None => bad.push(format!(
+                                "the person's turn at +{} lifted the hold at +{}, yet the `Stopped \
+                             typing` row stood to +{}",
+                                at(cx.t0, p),
+                                at(cx.t0, *tl),
+                                at(cx.t0, seen.end_ms)
+                            )),
+                        }
+                    }
+                    (_, _) => bad.push(format!(
+                        "the person's turn at +{} lifted no hold by +{}",
+                        at(cx.t0, p),
+                        at(cx.t0, seen.end_ms)
+                    )),
+                }
+            }
+        }
+    }
+    let mut said = if read.is_empty() {
+        "-".to_string()
+    } else {
+        read.join("; ")
     };
-    Verdict::Unobserved(format!(
-        "SKIPPED until 3a is on main: `status held=`, the state line's stop words, {row} ({})",
-        printed.map_or_else(
-            || "status prints no held=".to_string(),
-            |v| format!("status prints held={v}; 3a's judge reads it")
-        )
-    ))
+    for s in skipped {
+        said = format!("{said}; {s}");
+    }
+    if !bad.is_empty() {
+        Verdict::Fail(format!("{said}; {}", bad.join("; ")))
+    } else if unread.is_empty() {
+        Verdict::Pass(said)
+    } else {
+        Verdict::Unobserved(format!("{said}: {}", unread.join("; ")))
+    }
+}
+
+/// THE SCREEN READER'S NODES (§14.3's windowed read; `chrome`'s `a11y` lines, a development
+/// build's): at each look in front from [`SETTLE_MS`] past the hold to its lift whose chip was
+/// drawn ([`look_step`]), the window's accessibility tree, as it is built for the adapter
+/// ([`ax_of`]), holds the tab's Autopilot chip node, and that node says the description `chrome`
+/// read at the same look, led by the stop ([`stop_words`]' spoken form); for the loud hold a band
+/// row node names its `Stopped typing` row's title ([`stop_rows`]), unless the band's three rows
+/// all name others (a named skip that keeps the verdict's word). A look with no `a11y` node at
+/// all (a build that prints none) is unread. `parts` are `three_a`'s read, bad, unread and
+/// skipped.
+fn heard(
+    seen: &Seen,
+    cx: &Ctx<'_>,
+    (ts, until): (i64, i64),
+    (arm, loud): (HeldBy, bool),
+    [read, bad, unread, skipped]: [&mut Vec<String>; 4],
+) {
+    let w = &seen.window;
+    let spoken = stop_words(arm, StopForm::Spoken);
+    let title = loud
+        .then(|| {
+            observed(&seen.band, &seen.band_reads, ts - 1, until)
+                .iter()
+                .find_map(|(_, b)| {
+                    let row = stop_rows(b).into_iter().next()?;
+                    Some(row.split_once(" title=")?.1.to_string())
+                })
+        })
+        .flatten();
+    let mut chip_heard: Option<(i64, String)> = None;
+    let mut band_heard: Option<(i64, String)> = None;
+    for (i, (t, l)) in w.held.iter().enumerate() {
+        if *t < ts + SETTLE_MS || *t >= until || l == NOT_IN_STRIP || l == "-" {
+            continue;
+        }
+        let (rest, _) = split_title(l);
+        if chip(&rest).drawn.is_none() {
+            continue;
+        }
+        let when = format!("+{} in front", at(cx.t0, *t));
+        let nodes = w
+            .held_ax
+            .get(i)
+            .filter(|(ta, _)| ta == t)
+            .map_or("-", |(_, n)| n.as_str());
+        if nodes == "-" {
+            unread.push(format!(
+                "{when}: `chrome` printed no `a11y` node, so the screen reader's was not read"
+            ));
+            continue;
+        }
+        let described = quoted(&rest, "description");
+        match nodes.lines().find(|n| n.contains(" autopilot sid=")) {
+            None => bad.push(format!(
+                "{when}: its chip was drawn, yet the window's accessibility tree held no node \
+                 for it"
+            )),
+            Some(n) => {
+                let d = quoted(n, "description");
+                if d.is_some()
+                    && d == described
+                    && d.as_deref().is_some_and(|d| d.starts_with(&spoken))
+                {
+                    chip_heard.get_or_insert((*t, d.unwrap_or_default()));
+                } else {
+                    bad.push(format!(
+                        "{when}: the chip's node says {:?}, not the stop `chrome` read ({:?})",
+                        d.as_deref()
+                            .map_or_else(|| "-".to_string(), |d| one_line(d, 120)),
+                        described
+                            .as_deref()
+                            .map_or_else(|| "-".to_string(), |d| one_line(d, 80))
+                    ));
+                }
+            }
+        }
+        let Some(title) = &title else {
+            continue;
+        };
+        let rows: Vec<&str> = nodes.lines().filter(|n| n.contains(" band row=")).collect();
+        match rows
+            .iter()
+            .find_map(|n| quoted(n, "label").filter(|l| l.contains(title.as_str())))
+        {
+            Some(label) => {
+                band_heard.get_or_insert((*t, label));
+            }
+            None if rows.len() >= 3 => skipped.push(format!(
+                "the band's node: SKIPPED ({when}: its three rows named other holds)"
+            )),
+            None => bad.push(format!(
+                "{when}: no band row node names \"{title}\" ({} row node(s))",
+                rows.len()
+            )),
+        }
+    }
+    if let Some((t, d)) = chip_heard {
+        read.push(format!(
+            "+{} the chip's node says \"{}\"",
+            at(cx.t0, t),
+            one_line(&d, 100)
+        ));
+    }
+    if let Some((t, l)) = band_heard {
+        read.push(format!(
+            "+{} a band row's node says \"{}\"",
+            at(cx.t0, t),
+            one_line(&l, 100)
+        ));
+    }
 }
 
 #[cfg(test)]
 #[path = "forever_held_tests.rs"]
-mod tests;
+pub(in crate::forever) mod tests;

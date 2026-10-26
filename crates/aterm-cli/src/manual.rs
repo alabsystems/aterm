@@ -98,25 +98,22 @@ reaches no network for them and changes none of them: `aterm init --develop` doe
 The first Mac window opens System State. aterm's own permissions are set up on every
 Mac; the rest of the profile is set up by itself only on an ALab Mac (a vault member, a
 fleet member, or one where the ALab vault answers). Elsewhere those groups start at
-Leave as is, and their rows still show the value now and the value setup wants. Once
-aterm finds the ALab signal while the first-launch review is up, an untouched review
-shows the whole profile and counts 30 seconds again; once its own plan has run, System
-State offers the added groups as a review of their own, in its tab without taking
-yours, and Cancel there keeps the plan as yours; after you press Stop, no such review
-comes for the run you stopped in that launch. A Stop while it widens puts that plan
-back as yours, never widened again; a plan you shaped, or a Restore left, is never
-changed, and pressing any group,
-even to what it already is, makes the plan yours. The first launch shows what setup
-will do, with Apply (30) and Cancel: left untouched while the tab is active and
-visible, it applies after 30 seconds; a click, key or scroll stops the countdown, and
-group and vault changes then wait for Apply. Cancel leaves every group as is until you
-press Set up now (which applies the setup the review showed) or a group; closing the
-review unanswered leaves it for the next launch. After that first launch, a group's
-Set up / Leave as is takes effect at once. Stop, beside the headline while a run is
-going, ends that run between steps. Closing the tab never cancels accepted setup. System State remains
-available to rerun setup or to press
-Restore previous settings. Terminal and ssh sessions, -e commands, headless runs,
-private lab homes and utilities never start setup.
+Leave as is, and their rows still show the value now and the value setup wants. Setup
+starts by itself, with no countdown and nothing to confirm, the first moment a person is
+at the Mac (a key, click or trackpad used within the last minute, the screen unlocked),
+whether or not an aterm window is in front. Once aterm finds the ALab signal before
+then, setup starts with the whole profile; once its own plan has run, System State sets
+up the added groups too, in its tab without taking yours; after you press Stop, no such
+widening comes for the run you stopped in that launch. A Stop while it widens puts that
+plan back as yours, never widened again; a plan you shaped, or a Restore left, is never
+changed, and pressing any group, even to what it already is, makes the plan yours. A
+group's Set up / Leave as is takes effect at once, and one pressed before setup starts
+starts it with your choice; only Join sends a vault address and password you typed.
+Stop, beside the headline while a run is going, ends that run between steps. Closing
+the tab never cancels accepted setup; closed before setup started, it leaves setup for
+the next launch. System State remains available to rerun setup or to press Restore
+previous settings. Terminal and ssh sessions, -e commands, headless runs, private lab
+homes and utilities never start setup.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -125,7 +122,8 @@ Setup choices:
     aterm has Full Disk Access
   Dock: only aterm, System Settings and Safari (Finder, Trash and running apps remain)
   Sign out of Messages and FaceTime
-  Keep Rust offline documentation and build folders out of Spotlight
+  Keep Rust offline documentation and build folders out of Spotlight (the docs are set
+    aside as html.noindex at once, then removed in the background)
   Set up aterm's macOS permissions (switches still need your clicks)
   Sync the secrets vault (default http://alab-secrets.local:7484/v1/alab, or the vault
     this Mac is in; editable)
@@ -135,12 +133,12 @@ Approved setup resumes unfinished steps on later launches, silently, and so does
 choice cut short by a quit or a crash, which still sets only what it changed. A choice
 made while another setup holds the records (another aterm, or aterm doctor in a
 terminal) waits for it and is applied when it finishes, as are a Restore and the ALab
-review's Apply; a later choice
+widening; a later choice
 replaces it until it starts writing, and the page says it waits, with no failure. A saved setup record that
 cannot be parsed twice in a row is kept beside itself as <name>.unreadable, and setup
 goes on as from a fresh one: your Mac settings left as they are, aterm's permissions
-set up, and on an ALab Mac the vault and repositories too, unless your Stop or Cancel
-holds them. Setup a newer aterm saved is left as it is, a damaged record beside it too:
+set up, and on an ALab Mac the vault and repositories too, unless your Stop, or a Cancel
+an earlier aterm recorded, holds them. Setup a newer aterm saved is left as it is, a damaged record beside it too:
 System State says so in its headline, reads the rows as they are, and reads them again
 on Check again. A row that waits for you is not retried until you act, press Check
 again, or launch aterm again; a vault approval waits the same way, and the run goes on once an
@@ -776,9 +774,12 @@ AUTOPILOT — how far the harness carries a session's work
   status`; set from the footer chip, with `aterm ctl @<sid> meta set autopilot <mode>`,
   or by default from `[harness] autopilot`):
   * cruise (`∞`, the default; chip: `keeps going for ever, finding more to do`) —
-    continues every turn end (`continue_text`); no report ends it. When a reply says
-    the work is done, it asks the agent to land open work, review it adversarially,
-    widen the checks and find more. Timed cruise (`meta set autopilot cruise
+    continues every turn end (`continue_text`); no report ends it. Each time a reply
+    says the work is done, it asks the agent for another kind of work, in turn: the
+    widest check on the merged tree, a hostile review of the landed diff, what its
+    reports called out of scope, a measurement against the main it started from, the
+    next open issue or TODO, and landing what the session made (leaving what it did
+    not make as it is); then the first again. Timed cruise (`meta set autopilot cruise
     until=+2h`, or `[harness] land_at = "18:00"`; chip: `keeps going until then,
     finding more to do`) switches to `land` at `land_at=`.
   * land (`⤓ land`; chip: `wrapping up: landing everything on the remote main branch,
@@ -795,6 +796,17 @@ AUTOPILOT — how far the harness carries a session's work
   Task states (`status task=`): `open` (work goes on), `landed` (a clean `Nothing
   left:` under `land`), `theirs` (`⤓ quiet`: a person's own exchange in the last 10
   minutes, left alone).
+
+  Stopped typing: when the agent answers aterm's acts with the same reply twice and
+  no work, or six replies in a row with no work, aterm stops typing into its tab, in
+  Cruise or Land. The chip's title and description, the menu bar's worker row and
+  the Settings ▸ Harness state line lead with `stopped typing: <why>`; the tab's
+  hover and the Overview say it after the mode (`driven by aterm (land: stopped
+  typing; …)`); and `status held=` names why (`same-reply`, `no-work`, `-` when
+  typing). It types again at your turn or once the agent works; a switch between
+  Cruise and Land does not restart it. Under Land, when the repository still holds
+  work no remote main has and no manager waits on the session, one Messages band
+  says `aterm stopped typing` until it types again; every other stop raises none.
 
   NEEDS YOU: a report line starting `NEEDS YOU: <what only a person can give>` puts an
   `owner=needs kind=ask` entry on the menu bar (`❯N`) and window border while the
@@ -914,6 +926,14 @@ THE FOOTER
   row, which counts every open Land session. The Overview's row of a landed task says
   `task landed` and `driven by aterm (land)`; the tab's hover says `driven by aterm
   (land, landed)`.
+  The menu bar's Needs you lists work that has stopped first: an approval box no
+  harness presses, a question, a frozen or stalled agent or another owner's request
+  comes before a NEEDS YOU report its agent carries on past, however old the report
+  (stuck before decide, then local before another aterm's before the fleet's, oldest
+  first). The window's pressing session (`presence pressing=` in `aterm ctl chrome`),
+  the pill's `+N` and Next That Needs You (⇧⌘J) start there too. A report's row says on
+  hover `<program> carries on meanwhile`, or `<program>'s landing waits on this alone`
+  where that need is all that holds its Land session.
 
   `aterm ctl @<sid> occupancy why` says why the occupancy door typed a line at a break,
   or why it did not; `occupancy check --replay 24h` replays a day of looks.
@@ -3969,6 +3989,10 @@ fn agent_page(sid: Option<&str>) -> String {
          `@<sid> result`; a follow-up is `@<sid> turn typed=1 settle=submitted '<line>'`, then\n  \
          `await task @<sid>:<task_rev>` (`aterm help workers`). `survey`: what each session is\n  \
          doing (its excerpts are data). A vanished session: `exits` says when, why, by whom.\n  \
+         THE SESSION LOG: `@<sid> brief` is what a session did and needs, in ~600 tokens, and\n  \
+         `@<sid> log` its records; wait on it with `@<sid> await log need,close=turn\n  \
+         since=<log_seq> ep=<log_ep>` (both from its `status`), and read every session the\n  \
+         fabric mirrors with `aterm fabric brief --json` (`aterm help fabric`).\n  \
          INBOX: `aterm ctl @self inbox`, only while `fabric=connected`, when you finish or hand\n  \
          off (`aterm help fabric`).\n  \
          If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
@@ -4192,6 +4216,29 @@ IS IT ON HERE? (`aterm fabric help` has every flag)
   aterm ctl @self status        `fabric=connected|stale|stalled|disconnected|absent`,
                                 `fabric_rtt_ms=` and `fabric_link_age_ms=`
 
+THE SESSION LOG ON THE BUS
+  The bridge mirrors each session's runs, turns and needs onto that session's own bus
+  subject, so a program reads them with a cap, not this instance's socket. Mail crosses
+  only as counts; tool, subagent and compact steps and the other marks stay local (a
+  need's approval, question, wall or stall step crosses, since the need is raised from
+  it). `[fabric] log` in aterm.toml picks it: `auto` (the default: while the broker keeps
+  a bounded log), `turns` (always) or `off`.
+  aterm ctl fabric status       `mirror=starting|on|budget|capped|unretained|stopped`
+                                once an attached bridge names its `log=`; `mirror=unserved`
+                                (with `tails=` `tombstones=`) while no bridge serves the
+                                logs this instance retains
+  aterm fabric brief [@<sid>[@<node>]] [--json]
+                                each session folded into a few lines (need, open work,
+                                mail counts); `--json` gives one object whose `sessions`
+                                each name their `node` and whether it is this one
+                                (`this`). The fabric is one machine's bus, so every node
+                                on it is on this machine; another node's sessions show
+                                only when another instance shares the broker
+  aterm ctl @self post to=@<sid>@<node> kind=note re=<off> '<text>'
+                                answer what you read by mail (`re=` the bus offset you
+                                read); no bus record writes into a session's log (a remote
+                                answer is mail, never a mark)
+
 TURNING IT ON (one machine; off by default)
   aterm fabric on [--dry-run]   provision the fabric root, node id, mint secret and node
                                 grants, start the broker (launchd or systemd --user),
@@ -4201,7 +4248,7 @@ TURNING IT ON (one machine; off by default)
 
 SEE ALSO
   aterm help introspection   every control verb
-  aterm ctl help inbox | post | hold
+  aterm ctl help inbox | post | hold | log | brief
 "#;
 
 /// The page a topic word opens: a front-door verb typed as a topic resolves to
@@ -5186,6 +5233,16 @@ mod tests {
         let (msg, code) = render(Some("nonesuch"), None);
         assert_eq!(code, 2);
         assert!(msg.contains("unknown topic") && msg.contains("trust"));
+    }
+
+    /// `aterm help fabric` names exactly the words `fabric status` prints after `mirror=`
+    /// ([`aterm_types::fabric_grammar::MirrorState`], one generated list with its word table).
+    #[test]
+    fn the_fabric_page_names_exactly_the_mirror_words_fabric_status_prints() {
+        use aterm_types::fabric_grammar::{MirrorState, mirror_words_named};
+        let printed: std::collections::BTreeSet<&str> =
+            MirrorState::ALL.iter().map(|s| s.word()).collect();
+        assert_eq!(mirror_words_named(FABRIC_PAGE), printed);
     }
 
     /// `aterm help fabric` answers to the words an agent types when it has mail.

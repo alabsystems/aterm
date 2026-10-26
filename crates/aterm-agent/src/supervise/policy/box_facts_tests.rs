@@ -218,3 +218,39 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert_eq!(ctx.shell_cwds, facts.shell_cwds);
     assert_eq!(ctx.worker_agent, Some(aterm_phase::Program::Agy));
 }
+
+/// A session whose starter trusted it the disk-worker folder under the harness state is a
+/// disk-free worker ([`ApprovalCtx::disk_worker`]). CONTROL: no trusted folder, and another
+/// trusted folder, are not.
+#[test]
+fn a_trusted_disk_worker_folder_makes_a_disk_worker() {
+    let env = ApprovalEnv {
+        home: Some(PathBuf::from("/Users//owner")),
+        uid: 501,
+        tmpdir: None,
+        worker: WorkerSource::Session,
+    };
+    let of = |trusted: Option<&str>| {
+        let facts = BoxFacts {
+            trusted_cwd: trusted.map(PathBuf::from),
+            ..BoxFacts::default()
+        };
+        ApprovalCtx::from(
+            &SupervisorConfig::default(),
+            &env,
+            &[],
+            &facts,
+            Arc::new(LiveProbe),
+        )
+        .disk_worker
+    };
+    assert!(of(Some(
+        "/Users//owner/Library/Application Support/aterm/harness/claude-harness/disk-worker"
+    )));
+    assert!(!of(None));
+    assert!(!of(Some("/Users//owner/src/app")));
+    assert!(!of(every_fact()
+        .trusted_cwd
+        .as_deref()
+        .and_then(Path::to_str)));
+}

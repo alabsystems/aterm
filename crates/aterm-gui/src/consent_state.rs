@@ -835,6 +835,23 @@ impl ConsentState {
         self.retire(&self.shared.fda);
     }
 
+    /// Retire the FDA answer and clear its retry floor: a look owed a fresh read now
+    /// (`consent_card::SettleLook`) is not held back by a read made just before it, which would
+    /// leave the look pending with no answer to wake it.
+    pub(crate) fn refresh_fda(&self) {
+        self.retire(&self.shared.fda);
+        self.shared.fda.clear_floor();
+    }
+
+    /// As if the FDA and Developer Tools slots had each sent a read just now: their retry floors
+    /// hold a minute (test-only).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn hold_retry_floors_for_test(&self) {
+        let until = Some(Instant::now() + Duration::from_secs(60));
+        self.shared.fda.slot.lock_or_recover().retry_after = until;
+        self.shared.devtools.slot.lock_or_recover().retry_after = until;
+    }
+
     /// The census slot's epoch, for the host's wake test.
     #[cfg(test)]
     pub(crate) fn census_generation_for_test(&self) -> u64 {
@@ -953,6 +970,14 @@ impl ConsentState {
     /// Retire the Developer Tools slot while preserving its in-flight bit and retry floor.
     pub(crate) fn invalidate_devtools(&self) {
         self.retire(&self.shared.devtools);
+    }
+
+    /// Retire the Developer Tools slot and clear its retry floor: a fact its reading rests on
+    /// changed (Full Disk Access came on), so the next read is made at once, not refused for a
+    /// read made just before the change, whose answer the retirement threw away.
+    pub(crate) fn refresh_devtools(&self) {
+        self.retire(&self.shared.devtools);
+        self.shared.devtools.clear_floor();
     }
 
     /// Read the Developer Tools row and dispatch a refresh worker when due.
@@ -2054,12 +2079,20 @@ mod tests {
         assert!(!state.devtools(ProbeGate::on(), false).pending());
         assert_eq!(RUNS.load(Ordering::Acquire), 1, "served, not rerun");
 
+        // A read made just before: its retry floor still holds.
+        state.shared.devtools.slot.lock_or_recover().retry_after =
+            Some(Instant::now() + Duration::from_secs(60));
         state.invalidate_devtools();
-        state.shared.devtools.clear_floor();
+        assert!(state.devtools(ProbeGate::on(), false).pending());
+        assert!(
+            state.devtools_slot_idle_for_test(),
+            "the control: retired inside the floor, no read is sent and nothing will answer"
+        );
+        state.refresh_devtools();
         assert!(state.devtools(ProbeGate::on(), false).pending());
         wait();
         assert!(!state.devtools(ProbeGate::on(), false).pending());
-        assert_eq!(RUNS.load(Ordering::Acquire), 2);
+        assert_eq!(RUNS.load(Ordering::Acquire), 2, "a refresh reads at once");
 
         {
             let mut slot = state.shared.devtools.slot.lock_or_recover();

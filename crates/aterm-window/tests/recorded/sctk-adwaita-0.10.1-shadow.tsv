@@ -1,3 +1,5 @@
+# Added by the aterm project in 2026 to its copy of winit 0.30.13
+# (see the repository NOTICE).
 # The shadow sctk-adwaita 0.10.1 drew outside a client-decorated window
 # before LW.5 (MIT, Copyright (c) 2022 Bartłomiej Maryńczak), recorded
 # 2026-10-20 by crates/aterm-gui/tests/recorder-adwaita (`record planes`;

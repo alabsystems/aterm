@@ -15,8 +15,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// The group's id, as `aterm init --only` and every remedy that names it spell it.
+pub const ID: &str = "init.spotlight";
+
 /// The rustup profile that installs no documentation.
 const MINIMAL: &str = "minimal";
+
+/// Where a toolchain keeps `rust-docs`' offline HTML: the one folder rustup's manifest names
+/// for the component.
+const DOCS_HTML: &str = "share/doc/rust/html";
+
+/// The name `rust-docs`' HTML is set aside under, beside where it was: Spotlight never reads a
+/// folder whose name ends in `.noindex`.
+const DOCS_ASIDE: &str = "html.noindex";
+
+/// What the removal that runs in the background does, as this user: rustup takes the component
+/// out of its records (removing the link that stands where the HTML was), then the HTML set aside
+/// goes. `$1` is rustup, `$2` the toolchain and `$3` the folder set aside.
+const REMOVE_IN_BACKGROUND: &str =
+    "\"$1\" component remove rust-docs --toolchain \"$2\" && /bin/rm -rf -- \"$3\"";
 
 /// Keep this login's Rust docs and aterm's build caches out of Spotlight.
 ///
@@ -570,8 +587,8 @@ impl Rustup {
         }
     }
 
-    /// The toolchains rustup installed that carry `rust-docs`.
-    fn with_docs(&self, sys: &dyn System) -> Result<Vec<String>, String> {
+    /// The toolchains rustup installed that carry `rust-docs`, and where each one's HTML is.
+    fn with_docs(&self, sys: &dyn System) -> Result<Vec<Docs>, String> {
         let list = self.read(sys, &["toolchain", "list"])?;
         let mut out = Vec::new();
         for name in list.lines().filter_map(|l| l.split_whitespace().next()) {
@@ -589,11 +606,75 @@ impl Rustup {
                 .lines()
                 .any(|c| c == "rust-docs" || c.starts_with("rust-docs-"))
             {
-                out.push(name.to_owned());
+                let html = dir.join(DOCS_HTML);
+                // A link in its place stands for the HTML set aside.
+                let indexed = sys.read_link(&html).is_err()
+                    && match sys.stat(&html) {
+                        Ok(stat) => stat.dir && !stat.symlink,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                        Err(e) => return Err(format!("{}: {e}", html.display())),
+                    };
+                out.push(Docs {
+                    toolchain: name.to_owned(),
+                    html,
+                    indexed,
+                });
             }
         }
         Ok(out)
     }
+
+    /// Set `docs`' HTML aside where Spotlight never reads it, at once: the folder is renamed
+    /// `html.noindex` and a link to it stands in its place, so rustup's removal still finds the
+    /// folder its manifest names. Then start rustup's removal of the component, and the HTML's,
+    /// in the background ([`REMOVE_IN_BACKGROUND`]): removing tens of thousands of files is no
+    /// step a setup run waits on.
+    fn set_aside(&self, sys: &dyn System, docs: &Docs) -> Result<(), String> {
+        let aside = docs.html.with_file_name(DOCS_ASIDE);
+        // An aside an earlier run left (its removal failed, then rustup put the docs back) is not
+        // this run's to remove or to merge with: the row says where it is.
+        match sys.stat(&aside) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is there already; remove it, then run this again",
+                    aside.display()
+                ));
+            }
+            Err(e) => return Err(format!("{}: {e}", aside.display())),
+        }
+        sys.rename(&docs.html, &aside)
+            .map_err(|e| format!("{} -> {}: {e}", docs.html.display(), aside.display()))?;
+        sys.symlink(Path::new(DOCS_ASIDE), &docs.html)
+            .map_err(|e| format!("{} -> {DOCS_ASIDE}: {e}", docs.html.display()))?;
+        if sys.euid() == 0 {
+            // Run as root for this user: the link is theirs, as the folder it replaces was.
+            sys.chown(&docs.html, self.user.uid, self.user.gid)
+                .map_err(|e| format!("{}: {e}", docs.html.display()))?;
+        }
+        let removal = Cmd::new("/bin/sh")
+            .as_user(&self.user)
+            .env("CARGO_HOME", self.cargo_home.to_string_lossy())
+            .env("RUSTUP_HOME", self.rustup_home.to_string_lossy())
+            .args(["-c", REMOVE_IN_BACKGROUND, "sh"])
+            .arg(self.bin())
+            .arg(docs.toolchain.as_str())
+            .arg(&aside);
+        sys.spawn_detached(&removal, Path::new("/dev/null"))
+            .map(drop)
+            .map_err(|e| format!("{}: {e}", removal.display()))
+    }
+}
+
+/// A toolchain rustup installed with `rust-docs` ([`Rustup::with_docs`]).
+#[derive(Debug)]
+struct Docs {
+    toolchain: String,
+    /// Where its HTML is: [`DOCS_HTML`] in the toolchain.
+    html: PathBuf,
+    /// The HTML is a plain folder there, which Spotlight indexes. Otherwise it was set aside in
+    /// [`DOCS_ASIDE`] behind a link, or is gone, and its removal is rustup's, under way or ended.
+    indexed: bool,
 }
 
 /// rustup installs its `minimal` profile, so a toolchain installed later brings no docs.
@@ -665,18 +746,34 @@ impl Item for NoDocs {
             Ok(None) => {}
             Err(why) => return Probe::Unusable { why },
         }
-        match self.0.with_docs(sys) {
-            Err(why) => Probe::Unusable { why },
-            Ok(docs) if docs.is_empty() => Probe::Ok {
-                now: "no rustup toolchain carries rust-docs".into(),
+        let docs = match self.0.with_docs(sys) {
+            Ok(docs) => docs,
+            Err(why) => return Probe::Unusable { why },
+        };
+        let names = |indexed: bool| {
+            docs.iter()
+                .filter(|docs| docs.indexed == indexed)
+                .map(|docs| docs.toolchain.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if docs.iter().any(|docs| docs.indexed) {
+            self.1.set(Some(Reading::DocsInstalled));
+            return Probe::Change {
+                from: format!("rust-docs installed in {}", names(true)),
+                to: format!("set aside as {DOCS_ASIDE} at once, then removed in the background"),
+            };
+        }
+        Probe::Ok {
+            now: if docs.is_empty() {
+                "no rustup toolchain carries rust-docs".into()
+            } else {
+                format!(
+                    "rust-docs in {} is set aside as {DOCS_ASIDE}, which Spotlight never reads; \
+                     rustup removes it in the background",
+                    names(false)
+                )
             },
-            Ok(docs) => {
-                self.1.set(Some(Reading::DocsInstalled));
-                Probe::Change {
-                    from: format!("rust-docs installed in {}", docs.join(", ")),
-                    to: "removed".into(),
-                }
-            }
         }
     }
 
@@ -684,19 +781,22 @@ impl Item for NoDocs {
         self.1.detail()
     }
 
+    /// Set each indexed toolchain's docs aside at once and remove them in the background
+    /// ([`Rustup::set_aside`]): the journal's one entry names both.
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        for name in self.0.with_docs(sys)? {
-            self.0.read(
-                sys,
-                &["component", "remove", "rust-docs", "--toolchain", &name],
-            )?;
+        for docs in self.0.with_docs(sys)? {
+            if docs.indexed {
+                self.0.set_aside(sys, &docs)?;
+            }
         }
         Ok(())
     }
 
     fn revert(&self) -> Option<String> {
         Some(format!(
-            "{} component add rust-docs --toolchain <each toolchain it was removed from>",
+            "while the background removal has not run, replace each toolchain's \
+             {DOCS_HTML} link with its {DOCS_ASIDE}; once it has, {} component add rust-docs \
+             --toolchain <each toolchain it was removed from>",
             self.0.bin().display()
         ))
     }
@@ -718,6 +818,10 @@ mod tests {
     const WITH_DOCS: &[u8] =
         b"cargo-aarch64-apple-darwin\nrust-docs-aarch64-apple-darwin\nrustc-aarch64-apple-darwin\n";
     const WITHOUT: &[u8] = b"cargo-aarch64-apple-darwin\nrustc-aarch64-apple-darwin\n";
+    const STABLE_HTML: &str =
+        "/Users//alice/.rustup/toolchains/stable-aarch64-apple-darwin/share/doc/rust/html";
+    const STABLE_ASIDE: &str =
+        "/Users//alice/.rustup/toolchains/stable-aarch64-apple-darwin/share/doc/rust/html.noindex";
 
     fn context() -> Ctx {
         ctx(&[user("alice", 501)])
@@ -737,9 +841,15 @@ mod tests {
         engine::run(&items, mode, sys, &context(), &mut NoJournal)
     }
 
-    /// A Mac whose rustup reports `profile` first.
+    /// A Mac whose rustup reports `profile` first, with stable's `rust-docs` HTML in place when
+    /// its components record lists them.
     fn mac(profile: &str, stable: &[u8]) -> Fake {
         let sys = Fake::root();
+        if stable == WITH_DOCS {
+            sys.create_dir_all(Path::new(&format!("{STABLE_HTML}/std")), 0o755)
+                .unwrap();
+            sys.file(&format!("{STABLE_HTML}/std/index.html"), b"<html>");
+        }
         sys.file("/Users//alice/.cargo/bin/rustup", b"")
             .on(&format!("{ENV} show profile"), Ran::ok(profile))
             .on(
@@ -767,50 +877,100 @@ mod tests {
         );
         assert_eq!(Reading::of(&rows[1]), Some(Reading::DocsInstalled));
         assert!(
-            !sys.calls()
-                .iter()
-                .any(|c| c.contains(" set ") || c.contains(" remove ")),
+            !sys.calls().iter().any(|c| c.contains(" set ")
+                || c.contains(" remove ")
+                || c.starts_with("rename ")
+                || c.starts_with("symlink ")
+                || c.starts_with("detach ")),
             "{:?}",
             sys.calls()
         );
     }
 
+    /// Apply sets the profile, and keeps stable's docs out of Spotlight at once: the HTML is
+    /// renamed `html.noindex` with a link to it in its place, and rustup's removal of the
+    /// component, then of the HTML, starts in the background; no removal runs in the pass. Both
+    /// rows read back done at once.
     #[test]
-    fn apply_sets_the_profile_removes_the_docs_and_reads_both_back() {
+    fn apply_sets_the_profile_and_the_docs_aside_at_once_and_removes_them_in_the_background() {
         let sys = mac("default\n", WITH_DOCS);
         let set = format!("{ENV} set profile minimal");
-        let remove =
-            format!("{ENV} component remove rust-docs --toolchain stable-aarch64-apple-darwin");
         sys.on(&format!("{ENV} show profile"), Ran::ok("minimal\n"))
-            .on(&set, Ran::ok(""))
-            .on(&remove, Ran::ok(""))
-            .on_write(&remove, Path::new(STABLE), WITHOUT);
+            .on(&set, Ran::ok(""));
         let rows = run(&sys, Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
         assert_eq!(rows[1].outcome, Outcome::Changed, "{rows:?}");
         let calls = sys.calls();
         assert_eq!(calls.iter().filter(|c| **c == set).count(), 1, "{calls:?}");
-        assert_eq!(
-            calls.iter().filter(|c| **c == remove).count(),
-            1,
-            "{calls:?}"
+        let rename = format!("rename {STABLE_HTML} {STABLE_ASIDE}");
+        let link = format!("symlink {STABLE_HTML} -> html.noindex");
+        let removal = format!(
+            "detach alice$ CARGO_HOME=/Users//alice/.cargo RUSTUP_HOME=/Users//alice/.rustup \
+             /bin/sh -c {} sh /Users//alice/.cargo/bin/rustup stable-aarch64-apple-darwin \
+             {STABLE_ASIDE} >> /dev/null",
+            crate::port::shell_word(REMOVE_IN_BACKGROUND)
+        );
+        let at = |want: &str| calls.iter().position(|c| c == want);
+        let (rename, link, removal) = (at(&rename), at(&link), at(&removal));
+        assert!(
+            rename.is_some() && rename < link && link < removal,
+            "set aside, linked, then the removal in the background: {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c.contains("--toolchain trust") || c.contains("--toolchain 1.97.1")),
+                .any(|c| c.starts_with(ENV) && c.contains(" component remove ")),
+            "no removal runs in the pass: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("--toolchain trust") || c.contains("1.97.1")),
             "{calls:?}"
+        );
+        assert_eq!(
+            sys.read_file(Path::new(&format!("{STABLE_ASIDE}/std/index.html")))
+                .unwrap(),
+            b"<html>"
+        );
+        // Read again, the docs set aside are kept out and nothing runs again.
+        let again = run(&sys, Mode::Apply);
+        assert_eq!(again[1].outcome, Outcome::Ok, "{again:?}");
+        assert_eq!(Reading::of(&again[1]), None);
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|c| c.starts_with("detach "))
+                .count(),
+            1,
+            "{:?}",
+            sys.calls()
         );
     }
 
+    /// An aside an earlier run left is not this run's to remove: the row fails, says where it
+    /// is, and moves nothing.
     #[test]
-    fn a_removal_that_does_not_read_back_fails() {
+    fn an_aside_already_there_fails_the_row_and_moves_nothing() {
         let sys = mac("minimal\n", WITH_DOCS);
-        let remove =
-            format!("{ENV} component remove rust-docs --toolchain stable-aarch64-apple-darwin");
-        sys.on(&remove, Ran::ok(""));
+        sys.create_dir_all(Path::new(STABLE_ASIDE), 0o755).unwrap();
         let rows = run(&sys, Mode::Apply);
         assert_eq!(rows[1].outcome, Outcome::Failed, "{rows:?}");
+        assert!(
+            rows[1]
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains(STABLE_ASIDE)),
+            "{rows:?}"
+        );
+        assert!(
+            !sys.calls().iter().any(|c| c.starts_with("rename ")
+                || c.starts_with("symlink ")
+                || c.starts_with("detach ")
+                || c.contains(" component remove ")),
+            "{:?}",
+            sys.calls()
+        );
     }
 
     #[test]

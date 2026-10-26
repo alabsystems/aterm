@@ -1468,6 +1468,7 @@ fn a_rotate_returns_once_this_machines_listener_serves_the_new_key() {
     let serving = Listener::rereading(held, &issuer.places.state);
     let rotated = ok(init(&issuer.places, &args(&["--rotate"])));
     assert!(!rotated.contains("  listener "), "{rotated}");
+    assert!(rotated.contains(FOLLOWS), "{rotated}");
     let code = std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap();
     let member = World::new("rotate-serves-member");
     let opts = Opts {
@@ -1484,6 +1485,10 @@ fn a_rotate_returns_once_this_machines_listener_serves_the_new_key() {
              key was written"
         )),
         "{again}"
+    );
+    assert!(
+        !again.contains(FOLLOWS) && again.contains(&format!("\nMembers dial 127.0.0.1:{port}.\n")),
+        "no close that says it listens: {again}"
     );
     drop(stuck);
 }
@@ -1547,6 +1552,7 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
     );
     assert!(bound.borrow().is_some(), "the init asked for an aterm here");
     assert!(!fresh.contains("  listener "), "{fresh}");
+    assert!(fresh.contains(FOLLOWS), "{fresh}");
     let code = std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap();
     let member = World::new("init-binds-member");
     let opts = Opts {
@@ -1570,9 +1576,16 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
     assert!(
         waited.contains(&format!(
             "  listener   nothing listens on 127.0.0.1:{port} 3 s after the new key was written, \
-             though an aterm runs here"
+             though an aterm runs here: `aterm ctl status` here reads fleet=off where that aterm \
+             reads another aterm.toml than {}",
+            unbound.places.config.display()
         )),
         "{waited}"
+    );
+    assert!(
+        !waited.contains(FOLLOWS)
+            && waited.contains(&format!("\nMembers dial 127.0.0.1:{port}.\n")),
+        "no close that says it listens: {waited}"
     );
 }
 
@@ -1598,6 +1611,10 @@ fn a_join_after_a_leave_waits_for_this_machines_listener_to_serve_the_new_key() 
              key was written"
         )),
         "{joined}"
+    );
+    assert!(
+        !joined.contains(FOLLOWS) && joined.contains("\nOn a Mac, the local-network consent"),
+        "no close that says it listens: {joined}"
     );
     drop(stuck);
 }
@@ -2608,8 +2625,9 @@ fn a_leave_says_only_what_its_write_ended() {
 
     let (issuer, code, _serving) = issuing("leave-said-issuer");
     let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    let port = closed_port();
     let opts = Opts {
-        port: Some(closed_port()),
+        port: Some(port),
         ..Opts::default()
     };
     let member = World::new("leave-said-member");
@@ -2622,11 +2640,23 @@ fn a_leave_says_only_what_its_write_ended() {
     );
     ok(join(&member.places, &opts, &code));
     ok(peers(&member.places, &args(&["rm", &issuer_node])));
-    let left = ok(leave(&member.places, &[]));
+    let left = ok(leave_within(&member.places, HANG));
+    assert!(
+        !left.contains(UNLISTENS) && !left.contains(UNTOLD),
+        "nothing listened here: {left}"
+    );
+    ok(join(&member.places, &opts, &code));
+    let listening = Listener::serve(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap(),
+        &member.places.state,
+    );
+    ok(peers(&member.places, &args(&["rm", &issuer_node])));
+    let left = ok(leave_within(&member.places, HANG));
     assert!(
         left.contains(UNLISTENS) && !left.contains(UNTOLD),
-        "a book that names no issuer: {left}"
+        "a book that names no issuer, its listener serving: {left}"
     );
+    drop(listening);
     ok(join(&member.places, &opts, &code));
     member.write_config("[fleet]\nlisten = \"\"\n");
     let left = ok(leave(&member.places, &[]));
@@ -2646,7 +2676,7 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
     let secret = FleetSecret::new(&code.secret).unwrap();
     let registration = Registration {
         node: "ab".repeat(16),
-        host: "lab-mini".to_owned(),
+        host: "lab-mini.invalid".to_owned(),
         port: 7100,
         version: "0.95.0".to_owned(),
         key: None,
@@ -2663,8 +2693,12 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
         "{refused:?}"
     );
     let fresh = World::new("past-the-lan");
+    let opts = Opts {
+        host: Some("past-the-lan.invalid".to_owned()),
+        ..Opts::default()
+    };
     assert!(matches!(
-        join(&fresh.places, &Opts::default(), &code.text()),
+        join(&fresh.places, &opts, &code.text()),
         Err(Failure::Failed(_))
     ));
     assert!(!fresh.places.state.join(KEY_FILE).exists(), "no key");
@@ -6024,7 +6058,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             node: Some(node.clone()),
             key: Some(key),
             key_from: None,
-            host: "lab-mini".to_owned(),
+            host: "lab-mini.invalid".to_owned(),
             addr: Some(IpAddr::from(Ipv4Addr::LOCALHOST)),
             port: third_port,
             version: None,
@@ -6077,7 +6111,9 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             .err()
             .expect("nothing listens there");
         assert!(
-            dialled.why.starts_with(&format!("lab-mini:{third_port}: ")),
+            dialled
+                .why
+                .starts_with(&format!("lab-mini.invalid:{third_port}: ")),
             "{word}: {dialled:?}"
         );
     }
@@ -6089,7 +6125,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         let read =
             survey_fleet_in(&member.places, &ask).unwrap_or_else(|why| panic!("{word}: {why}"));
         let labels: Vec<&str> = read.peers.iter().map(|peer| peer.label.as_str()).collect();
-        assert_eq!(labels, [format!("lab-mini:{third_port}")], "{word}");
+        assert_eq!(labels, [format!("lab-mini.invalid:{third_port}")], "{word}");
     }
 
     for word in [alone.as_str(), elsewhere.as_str()] {
@@ -6351,7 +6387,7 @@ fn serve_a_join(
 ) -> Result<String, Failure> {
     let reg = Registration {
         node: "e5".repeat(16),
-        host: "lab-mini".to_owned(),
+        host: "lab-mini.invalid".to_owned(),
         port: 7199,
         version: "0.130.0".to_owned(),
         key: None,

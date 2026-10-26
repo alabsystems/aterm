@@ -861,9 +861,7 @@ impl crate::App {
         let shown = match target {
             AuxTarget::Front => return None,
             AuxTarget::Prefs => self.native_settings_front_view_target().is_some(),
-            AuxTarget::About => self
-                .native_settings_route_view_target(SettingsRoute::About)
-                .is_some(),
+            AuxTarget::About => self.front_about_view().is_some(),
             AuxTarget::Update => self
                 .native_settings_route_view_target(SettingsRoute::SoftwareUpdate)
                 .is_some(),
@@ -1096,12 +1094,16 @@ mod window_target_refusal_tests {
         assert!(app.window_target_refusal(AuxTarget::Update).is_some());
 
         assert!(app.open_settings_tab(SettingsRoute::About));
-        assert_eq!(app.window_target_refusal(AuxTarget::About), None);
+        assert!(app.window_target_refusal(AuxTarget::About).is_some());
         assert_eq!(
             app.window_target_refusal(AuxTarget::Prefs),
             None,
             "any route is the Settings surface"
         );
+
+        assert!(app.open_about_tab());
+        assert_eq!(app.window_target_refusal(AuxTarget::About), None);
+        assert!(app.window_target_refusal(AuxTarget::Prefs).is_some());
 
         app.switch_tab_in(WindowId(0), 0);
         assert!(
@@ -2795,7 +2797,8 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
                 _ => return Err(()),
             });
         } else if let Some(v) = tok.strip_prefix("of=") {
-            if v.is_empty() {
+            // A bare sid, as `from=` and a hold's argument name one.
+            if v.is_empty() || v.starts_with('@') {
                 return Err(());
             }
             origin = Some(aterm_session::SessionId::new(v));
@@ -3359,11 +3362,17 @@ impl crate::App {
         spawned.sid
     }
 
-    /// Checks whether this instance can launch a worker for `agent` and returns its shell dialect.
+    /// Checks whether this instance can launch a worker for `agent` and returns its shell dialect;
+    /// an agent no Mac starts is refused as that before anything of this one is asked.
     pub(crate) fn worker_shell(
         &self,
         agent: aterm_phase::Program,
     ) -> Result<(std::path::PathBuf, aterm_agent::harness::upgrade::Dialect), WorkerBlock> {
+        if let Some(why) =
+            aterm_agent::harness::worker::worker_cli(agent).and_then(|cli| cli.end_unseen())
+        {
+            return Err(WorkerBlock::Unseen(why));
+        }
         if self.harness.is_none() {
             return Err(WorkerBlock::Unhosted);
         }
@@ -3373,11 +3382,6 @@ impl crate::App {
             agent,
         ) {
             return Err(WorkerBlock::Unsupervised(switch));
-        }
-        if let Some(why) =
-            aterm_agent::harness::worker::worker_cli(agent).and_then(|cli| cli.end_unseen())
-        {
-            return Err(WorkerBlock::Unseen(why));
         }
         if !self.session_factory.integrate {
             return Err(WorkerBlock::NoIntegration);
@@ -4138,6 +4142,10 @@ mod spawn_parse_tests {
             parse_spawn_args("connected=controlled place=tab of="),
             Err(())
         );
+        assert_eq!(
+            parse_spawn_args("connected=controlled place=tab of=@s-abc"),
+            Err(())
+        );
         for knob in [
             "window=1",
             "raise=false",
@@ -4604,6 +4612,54 @@ mod worker_start_app_tests {
             panic!("a Grok Build worker was planned");
         };
         assert_eq!(why, refusal);
+    }
+
+    #[test]
+    fn a_grok_worker_is_refused_as_grok_before_this_macs_harness_is_asked() {
+        use super::{SpawnAim, WorkerBlock};
+        let unsupervised: [fn(&mut App); 3] = [
+            |app| app.harness = None,
+            |app| {
+                app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                    crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+                );
+            },
+            |app| {
+                app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                    crate::app_config::HarnessPolicy::read(
+                        "[harness]\nenabled = true\nheadless = true\nautopilot = \"off\"\n",
+                    ),
+                );
+            },
+        ];
+        for turn_off in unsupervised {
+            let mut app = supervising_app();
+            turn_off(&mut app);
+            let muse = app.worker_shell(aterm_phase::Program::Muse);
+            assert!(
+                matches!(
+                    muse,
+                    Err(WorkerBlock::Unhosted | WorkerBlock::Unsupervised(_))
+                ),
+                "PRECONDITION: this Mac supervises no worker: {muse:?}"
+            );
+            let block = app
+                .worker_shell(aterm_phase::Program::Grok)
+                .expect_err("refused");
+            assert!(matches!(block, WorkerBlock::Unseen(_)), "{block:?}");
+            let order = TaskOrder::of_frame(
+                Some(b"the task".to_vec()),
+                aterm_phase::Program::Grok,
+                None,
+                None,
+                None,
+            )
+            .expect("a well-formed order");
+            let Err(why) = app.resolve_spawn(SpawnAim::Front, Some(order)) else {
+                panic!("a Grok Build worker was planned");
+            };
+            assert!(why.starts_with("spawn agent=grok: "), "{why}");
+        }
     }
 
     fn sid_of(app: &App, local: u64) -> String {

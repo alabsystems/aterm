@@ -586,27 +586,12 @@ impl App {
         &mut self,
         wid: WindowId,
         tab: crate::tab_model::TabId,
-        origin: crate::session_chrome::RewindMenuOrigin,
+        origin: crate::session_chrome::TerminalMenuOrigin,
         at_ms: u64,
     ) {
-        let Some(index) = self.tab_index_for_id(wid, tab) else {
+        let Some(index) = self.terminal_menu_origin_index(wid, tab, origin) else {
             return;
         };
-        if !self
-            .windows
-            .get(&wid)
-            .and_then(|window| window.tab_set.get(tab))
-            .is_some_and(|tab| tab.root.contains(origin.view))
-            || self
-                .view_store
-                .get(origin.view)
-                .copied()
-                .and_then(crate::tab_model::View::terminal_session)
-                != Some(origin.session)
-            || self.pool.get(origin.session).is_none()
-        {
-            return;
-        }
         self.switch_tab_in(wid, index);
         self.focus_session_pane(wid, origin.session, origin.view);
         let back_us = crate::turn_ledger::now_ms()

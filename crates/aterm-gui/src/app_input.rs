@@ -920,7 +920,7 @@ pub(crate) fn take_physical_release_trace() -> Option<PhysicalReleaseTrace> {
     PHYSICAL_RELEASE_TRACE.with(|trace| trace.borrow_mut().take())
 }
 
-/// Compatibility `open prefs|about|update` spellings resolve to durable routes in the
+/// Compatibility `open prefs|update` spellings resolve to durable routes in the
 /// process-singleton Settings tab.
 const fn native_settings_route_for_aux(
     target: crate::app_introspect::AuxTarget,
@@ -929,9 +929,9 @@ const fn native_settings_route_for_aux(
     use crate::native_settings::SettingsRoute;
     match target {
         AuxTarget::Prefs => Some(SettingsRoute::Home),
-        AuxTarget::About => Some(SettingsRoute::About),
         AuxTarget::Update => Some(SettingsRoute::SoftwareUpdate),
         AuxTarget::Front
+        | AuxTarget::About
         | AuxTarget::Menu
         | AuxTarget::TabMenu
         | AuxTarget::AutopilotMenu
@@ -7095,7 +7095,8 @@ impl App {
                     .is_some_and(|field| field.preedit.is_some())
             }
             Some(
-                crate::native_app::AppViewState::Markdown(_)
+                crate::native_app::AppViewState::About(_)
+                | crate::native_app::AppViewState::Markdown(_)
                 | crate::native_app::AppViewState::Recovery(_),
             )
             | None => false,
@@ -7158,7 +7159,11 @@ impl App {
                 let text = app.text_input(key.as_str())?.selected_text();
                 (!text.is_empty()).then(|| read(&[text]))
             }
-            Some(crate::native_app::AppViewState::Recovery(_)) | None => None,
+            Some(
+                crate::native_app::AppViewState::About(_)
+                | crate::native_app::AppViewState::Recovery(_),
+            )
+            | None => None,
         }
     }
 
@@ -8395,8 +8400,7 @@ impl App {
                     .open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Home);
             }
             Action::ToggleAbout => {
-                let _ = self
-                    .open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::About);
+                let _ = self.open_about_tab_in_window(wid);
             }
             Action::ToggleMatrixRain => self.toggle_matrix_rain(wid),
             Action::ToggleSeriousMode => {
@@ -9060,7 +9064,8 @@ impl App {
         let (title, prompt) = match kind {
             crate::native_app::AppKind::Markdown => ("Open Markdown", "Open as Markdown"),
             crate::native_app::AppKind::Editor => ("Open File", "Open"),
-            crate::native_app::AppKind::Settings
+            crate::native_app::AppKind::About
+            | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
             | crate::native_app::AppKind::Recovery => return,
         };
@@ -9192,12 +9197,7 @@ impl App {
             return;
         }
         match action {
-            MenuAction::About => {
-                let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::About);
-            }
-            MenuAction::Version => {
-                let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::About);
-            }
+            MenuAction::About | MenuAction::Version => self.open_about_from_menu(),
             MenuAction::SoftwareUpdate => {
                 let _ = self.open_software_update_route_and_check();
             }
@@ -9340,12 +9340,26 @@ impl App {
             MenuAction::Paste => self.paste_into_front_field(),
             MenuAction::CopySessionId | MenuAction::CopyCwd | MenuAction::RenameSession => {
                 if let Some(window) = self.frontmost_window
-                    && let Some(tab) = self
+                    && let Some((tab, origin)) = self
                         .windows
                         .get(&window)
-                        .and_then(|ws| ws.tab_set.active_id())
+                        .and_then(|ws| ws.tab_set.active())
+                        .and_then(|tab| {
+                            let session = self
+                                .view_store
+                                .get(tab.focus)
+                                .copied()
+                                .and_then(crate::tab_model::View::terminal_session)?;
+                            Some((
+                                tab.id,
+                                crate::session_chrome::TerminalMenuOrigin {
+                                    view: tab.focus,
+                                    session,
+                                },
+                            ))
+                        })
                 {
-                    self.dispatch_tab_menu_action(el, window, tab, action);
+                    self.dispatch_tab_menu_session_action(window, tab, origin, action);
                 }
             }
             MenuAction::SelectAll => {
@@ -9426,6 +9440,29 @@ impl App {
         }
     }
 
+    /// Resolve the original terminal leaf without substituting its focused sibling or a mirror.
+    pub(crate) fn terminal_menu_origin_index(
+        &self,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+        origin: crate::session_chrome::TerminalMenuOrigin,
+    ) -> Option<usize> {
+        let index = self.tab_index_for_id(window, tab)?;
+        (self
+            .windows
+            .get(&window)
+            .and_then(|ws| ws.tab_set.get(tab))
+            .is_some_and(|tab| tab.root.contains(origin.view))
+            && self
+                .view_store
+                .get(origin.view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                == Some(origin.session)
+            && self.pool.get(origin.session).is_some())
+        .then_some(index)
+    }
+
     /// Validate the captured tab before fencing movement or settling its window's rename.
     pub(crate) fn prepare_tab_menu_action(
         &mut self,
@@ -9446,7 +9483,7 @@ impl App {
         Some(index)
     }
 
-    /// Dispatch one tab context-menu action against the exact tab it was popped on.
+    /// Dispatch a whole-tab context command; session rows use their captured terminal owner.
     pub(crate) fn dispatch_tab_menu_action(
         &mut self,
         el: &ActiveEventLoop,
@@ -9455,59 +9492,83 @@ impl App {
         action: menu::MenuAction,
     ) {
         use menu::MenuAction;
+        if action != MenuAction::CloseTab {
+            aterm_log::info!("tab context-menu {action:?} dropped: no captured terminal owner");
+            return;
+        }
         let Some(index) = self.prepare_tab_menu_action(window, tab, action) else {
             return;
         };
+        // As the `Wake::CloseTab` handler: the last tab escalates the window.
+        if self.close_tab_at(window, index)
+            && let Some(ws) = self.windows.get_mut(&window)
+        {
+            ws.pending_close = true;
+        }
+        self.escalate_pending_close(el);
+    }
+
+    /// Dispatch a session row using the terminal leaf that supplied its words and state.
+    pub(crate) fn dispatch_tab_menu_session_action(
+        &mut self,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+        origin: crate::session_chrome::TerminalMenuOrigin,
+        action: menu::MenuAction,
+    ) {
+        use menu::MenuAction;
+        let field = match action {
+            MenuAction::RenameSession => Some(crate::session_timeline::MetaField::Title),
+            MenuAction::SetRole => Some(crate::session_timeline::MetaField::Role),
+            MenuAction::CopySessionId
+            | MenuAction::CopyCwd
+            | MenuAction::TakeOver
+            | MenuAction::HandBack
+            | MenuAction::HarnessLog => None,
+            _ => {
+                aterm_log::info!(
+                    "session context-menu {action:?} dropped: unsupported session command"
+                );
+                return;
+            }
+        };
+        let Some(index) = self.terminal_menu_origin_index(window, tab, origin) else {
+            return;
+        };
+        if self.prepare_tab_menu_action(window, tab, action).is_none() {
+            return;
+        }
+        if let Some(field) = field {
+            self.switch_tab_in(window, index);
+            self.focus_session_pane(window, origin.session, origin.view);
+            let _ = self.begin_session_meta_edit(window, tab, field);
+            return;
+        }
         match action {
             MenuAction::CopySessionId => {
-                if let Some(text) = self.tab_session_id_text(window, index) {
+                if let Some(text) = self.session_id_text(origin.session) {
                     let _ = crate::control::pbcopy(&text);
                 }
             }
             MenuAction::CopyCwd => {
-                if let Some(cwd) = self.tab_session_cwd(window, index) {
+                if let Some(cwd) = self.session_cwd(origin.session) {
                     let _ = crate::control::pbcopy(&cwd);
                 }
             }
-            MenuAction::RenameSession => {
-                self.begin_session_rename(window, tab);
-            }
-            MenuAction::CloseTab => {
-                // As the `Wake::CloseTab` handler: the last tab escalates the window.
-                if self.close_tab_at(window, index)
-                    && let Some(ws) = self.windows.get_mut(&window)
-                {
-                    ws.pending_close = true;
-                }
-                self.escalate_pending_close(el);
-            }
             MenuAction::TakeOver | MenuAction::HandBack => {
-                let Some(session) = self.tab_terminal_session(window, index) else {
-                    aterm_log::info!("{action:?} dropped: the tab has no session");
-                    return;
-                };
                 let done = if action == MenuAction::TakeOver {
-                    self.take_over_session(session)
+                    self.take_over_session(origin.session)
                 } else {
-                    self.hand_back_session(session)
+                    self.hand_back_session(origin.session)
                 };
                 if let Err(why) = done {
                     self.pending_action_refusal = Some(why);
                 }
             }
             MenuAction::HarnessLog => {
-                if let Some(session) = self.tab_terminal_session(window, index) {
-                    self.open_session_ledger_for(window, session);
-                }
+                self.open_session_ledger_for(window, origin.session);
             }
-            MenuAction::SetRole => {
-                let _ = self.begin_session_meta_edit(
-                    window,
-                    tab,
-                    crate::session_timeline::MetaField::Role,
-                );
-            }
-            other => self.dispatch_menu_action(el, other),
+            _ => {}
         }
     }
 
@@ -9580,9 +9641,8 @@ impl App {
         }
     }
 
-    /// The registry `sid` string for the terminal session labeling tab `index` of `window`.
-    pub(crate) fn tab_session_id_text(&self, window: WindowId, index: usize) -> Option<String> {
-        let session = self.tab_terminal_session(window, index)?;
+    /// The registry `sid` string for the named terminal session.
+    pub(crate) fn session_id_text(&self, session: u64) -> Option<String> {
         self.store
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -9590,10 +9650,9 @@ impl App {
             .map(|h| h.sid.as_str().to_string())
     }
 
-    /// Raw shell-reported cwd of the terminal session for tab `index` of `window`, or `None`.
-    pub(crate) fn tab_session_cwd(&self, window: WindowId, index: usize) -> Option<String> {
+    /// Raw shell-reported cwd of the named terminal session, or `None`.
+    pub(crate) fn session_cwd(&self, session: u64) -> Option<String> {
         use crate::cwd_native::ReportedCwd as _;
-        let session = self.tab_terminal_session(window, index)?;
         let s = self.pool.get(session)?;
         let term = crate::term_lock(&s.term);
         term.native_working_directory()
@@ -9651,6 +9710,10 @@ impl App {
             };
         }
         match target {
+            AuxTarget::About => self
+                .open_about_tab()
+                .then_some(())
+                .ok_or_else(|| "About could not be opened in the requesting window".to_string()),
             AuxTarget::Menu => {
                 self.palette_enter();
                 Ok(())
@@ -9678,7 +9741,7 @@ impl App {
             AuxTarget::Front => {
                 Err("the front terminal window is already open (use window/chrome)".to_string())
             }
-            AuxTarget::Prefs | AuxTarget::About | AuxTarget::Update => {
+            AuxTarget::Prefs | AuxTarget::Update => {
                 Err("native Settings alias routing failed".to_string())
             }
         }
@@ -9691,7 +9754,11 @@ impl App {
     ) -> Result<(), String> {
         use crate::app_introspect::AuxTarget;
         match target {
-            AuxTarget::Prefs | AuxTarget::About | AuxTarget::Update => {
+            AuxTarget::About => {
+                self.close_about_tabs();
+                Ok(())
+            }
+            AuxTarget::Prefs | AuxTarget::Update => {
                 self.close_settings_tabs();
                 Ok(())
             }
@@ -9807,9 +9874,8 @@ mod native_aux_alias_tests {
     use crate::{App, WindowId};
 
     #[test]
-    fn legacy_about_and_update_spellings_navigate_native_settings_routes() {
+    fn update_spellings_navigate_native_settings_routes() {
         for (spelling, route) in [
-            ("about", SettingsRoute::About),
             ("update", SettingsRoute::SoftwareUpdate),
             ("software-update", SettingsRoute::SoftwareUpdate),
         ] {
@@ -10002,10 +10068,6 @@ mod menu_only_action_dispatch_tests {
 #[cfg(test)]
 #[path = "app_input_native_keyboard_boundary_tests.rs"]
 mod native_keyboard_boundary_tests;
-
-#[cfg(test)]
-#[path = "app_input_startup_review_tests.rs"]
-mod startup_review_tests;
 
 #[cfg(test)]
 #[path = "app_input_native_clipboard_owner_tests.rs"]

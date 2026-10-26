@@ -24,9 +24,10 @@
 //! much is pending against its nearest member ancestor still alive (through processes with no
 //! row), whose reaped-children time will hold it again, and that growth is absorbed rather than
 //! counted twice. A parent still alive reaped it, so that is certain and waits however long the
-//! parent's reaped time takes to show it; a parent with no row (another user's `sudo`) passes it
-//! up only when it goes itself, so it is held there until then and its own parent's reaped time
-//! absorbs nothing of it before. A parent gone too, or a zombie, reaped it only if it outlived it
+//! parent's reaped time takes to show it; a parent with no row, or whose reading leaves its row
+//! unread (another user's `sudo`, or a member that ran `exec sudo`), passes it up only when it
+//! goes itself, so it is held there until then and its own parent's reaped time absorbs nothing
+//! of it before. A parent gone too, or a zombie, reaped it only if it outlived it
 //! (a build killed with its compilers leaves them to launchd), and its reaper's reaped time then
 //! holds both already, or by its next reading where it reaped while the sweep ran; so that is
 //! uncertain: it waits through the reaper's next reading and is then dropped. A reaper whose
@@ -40,17 +41,27 @@
 //! growth covered all of it at the first reading. Reaped growth past what is absorbed counts,
 //! save where it may hold work twice: a process the kernel reaps for, at its reading or the one
 //! before, and the reaper of a gone one (or of a member gone under one) over its next two
-//! readings count none of it, so the tab's figure there is a lower bound.
+//! readings count none of it, so the tab's figure there is a lower bound. That is as far as the
+//! readings see the flag: the sweep reads it of every process at each one, and nothing records
+//! it between two readings or after a process exits, so a parent that ignores `SIGCHLD` and
+//! starts and exits between two readings, or ignores it only between them (around its
+//! children's exits), passes its children's doubled time to its reaper unseen, whose reaped
+//! growth counts it (save over the two readings after a child read with the flag goes): the tab's
+//! figure over such a window can read up to twice that work, exact, which shows only as the
+//! split's `unaccounted` reading lower, below 0 where nothing else hides it.
 //!
 //! A process listed but unread (mid-exit, or another user's after a setuid exec, which keeps its
 //! birth) keeps its row, unread; one listed under another birth is a new process at the pid. One
 //! last read under launchd leaves nothing pending, and its tail since that reading is lost; one
 //! first seen as a zombie or read as one is counted at its final figure, which later readings leave
-//! as it is. A member counts from its birth only where it was born since the last step (by its
+//! as it is. A member counts from its birth only where it was born since the last step: by its
 //! start, unix ms, against the last reading's wall clock, read before its sweep listed the
-//! processes; where the host read it no birth, a short job gone before it could, by its kernel
-//! start against the newest the last sweep read); one older, such as a tab's shell adopted from a
-//! predecessor, counts from the step that first reads it. A delegated job's member counts there
+//! processes, or by its kernel start, newer than every one the last sweep read, so that sweep
+//! read it no start (a process still being spawned as it listed, its fork stamped before that
+//! reading's clock, had run nothing; and a short job gone before the host read its birth has
+//! only this). One older, such as a tab's shell adopted from a predecessor, counts from the step
+//! that first reads it, and so does one being spawned as a sweep listed where that sweep read a
+//! newer process: what it ran before that step is missed. A delegated job's member counts there
 //! while the job holds it, from where this ledger's counter left it ([`ReapLedger::credited`]);
 //! after, one of aterm's processes counts here again, and one outside them stays out, its work its
 //! own coalition's.
@@ -561,8 +572,9 @@ impl ReapLedger {
 
         // Processes with no row gone since the last step that held members' work: each passes it
         // to its parent with its own reap, as a gone member does (below): to a member that is its
-        // parent and alive, certain; to another live process with no row, held again; else
-        // uncertain, at its nearest member ancestor still listed, or, with none, lost.
+        // parent and alive, certain; to another live parent, which has no row or whose row its
+        // reading leaves unread (a member that ran `exec sudo`), held again; else uncertain, at
+        // its nearest member ancestor still listed, or, with none, lost.
         let freed: Vec<(u32, Held)> = held
             .iter()
             .filter(|(pid, h)| {
@@ -598,7 +610,7 @@ impl ReapLedger {
                 }
                 continue;
             }
-            if h.ppid > 1 && alive_at(h.ppid) && !rows.contains_key(&h.ppid) && h.parent.is_some() {
+            if h.ppid > 1 && alive_at(h.ppid) && h.parent.is_some_and(|(p, _)| p != h.ppid) {
                 let next = &i.procs[here[&h.ppid]];
                 let e = held.entry(h.ppid).or_insert(Held {
                     birth: next.birth_ms,
@@ -871,12 +883,14 @@ impl ReapLedger {
         // in; the walk up passes processes whose usage is not read (another user's `sudo`),
         // which get no row. It counts from its birth where it was born since the last step, so
         // nothing counted it before, else from now: a tab's shell adopted from a predecessor, a
-        // process the last sweep could not read, and every process at the first step; after the
-        // first, what such a process ran since the last step is missed. Born since is by its
-        // birth against the last reading's wall clock, or, where the host read it no birth (a
-        // short job gone before it could), by its kernel start against the newest the last sweep
-        // read: one alive then was listed then, so one newer than every start read then was born
-        // since, or was listed then with its own start unread.
+        // process the last sweep could not read that is older than one it read, and every
+        // process at the first step; after the first, what such a process ran since the last
+        // step is missed. Born since is by its birth against the last reading's wall clock, or by
+        // its kernel start against the newest the last sweep read: one alive then was listed
+        // then, so one newer than every start read then was born since, or was listed then with
+        // its own start unread, such as one still being spawned as it listed (its fork stamped
+        // before that reading's wall clock), which had run nothing; this alone dates a short job
+        // gone before the host read its birth.
         memo.clear();
         let mut first: Vec<u32> = Vec::new();
         for &k0 in &fresh {
@@ -931,10 +945,8 @@ impl ReapLedger {
                 let (Some(scope), Some(start), true) = (scope, p.start, countable(k)) else {
                     continue;
                 };
-                let born = match p.birth_ms {
-                    Some(b) => since_ms.is_some_and(|t| b >= t),
-                    None => since_start.is_some_and(|s| start > s),
-                };
+                let born = p.birth_ms.zip(since_ms).is_some_and(|(b, t)| b >= t)
+                    || since_start.is_some_and(|s| start > s);
                 let (cpu, child) = (p.cpu_ns.unwrap_or(0), p.child_cpu_ns.unwrap_or(0));
                 let delegated = i.delegated.get(k).copied().unwrap_or(false);
                 let unwaited = p.reaps_unwaited == Some(true);

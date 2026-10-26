@@ -40,7 +40,7 @@ pub(crate) const EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF: &str = "cursor_trail_style_
 pub(crate) const EDIT_TRAIL_SOUNDS: &str = "trail_sounds";
 /// Tone-melody toggle (`Config::tone_melody`, default ON).
 pub(crate) const EDIT_TONE_MELODY: &str = "tone_melody";
-/// Ambient-bed toggle (`Config::trail_sound_bed`, default ON).
+/// Ambient-bed toggle (`Config::trail_sound_bed`, default OFF).
 pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
 /// Typing-sound picker (`Config::trail_sound_style`, default `auto`).
 pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";

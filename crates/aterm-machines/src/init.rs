@@ -8,7 +8,7 @@ use crate::engine::{Journal, Place};
 use crate::items::defaults::Target;
 use crate::items::{Ctx, Item};
 use crate::model::{Effect, HostFacts, ItemReport, Mode, Outcome, PValue, Probe, Read};
-use crate::port::{Cmd, Live, System};
+use crate::port::{Live, System};
 use aterm_converge::{Class, Laps, Layer, Remedy, Report, ReportMode, Requires};
 use aterm_types::macos_setup::{Access, Selection, Setting};
 use std::ffi::OsString;
@@ -359,6 +359,15 @@ pub trait Held {
         Ok(())
     }
 
+    /// Retain fully verified Mac stages of a whole-profile pass, even if another
+    /// stage failed. `settings` covers each completed stage in full.
+    ///
+    /// # Errors
+    /// The completion record cannot be written.
+    fn checkpoint(&self, _settings: Selection) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Record the whole profile verified, as `aterm doctor --apply` records its pass; only for a
     /// hold taken `whole`.
     ///
@@ -665,7 +674,7 @@ fn needs_you(row: &ItemReport) -> bool {
 /// the workstation out (root refused). The context is built only once the account's own
 /// `init.toml` has a `[develop]` table or cannot be read, or an `--only` word asks
 /// ([`crate::init_develop::may_record`]), so on a Mac that records no develop layer doctor runs
-/// nothing for it (no `id -un`, no `dscl`) and shows no row. The caller asks only in the
+/// nothing for it (no account reading) and shows no row. The caller asks only in the
 /// account's own shell.
 pub struct Doctor<S: System = Live> {
     sys: S,
@@ -754,6 +763,73 @@ const ONLY_WORDS: &str = "a base id such as base.clt or base.shell.rc, a family 
                           such as develop.checkout@~/aterm, a family such as checkout, or \
                           develop";
 
+/// Why `aterm init` refuses `line` (`aterm init …`, as a remedy prints it:
+/// [`aterm_converge::Remedy::command`]) before it changes anything, with `base` the base layer
+/// and `station` the workstation's items: its arguments do not parse, or an `--only` word names
+/// nothing init runs ([`ONLY_WORDS`]). `None` when init takes it.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn refusal(line: &str, base: &Base, station: &[Box<dyn Item>]) -> Option<String> {
+    let Some(args) = line.strip_prefix("aterm init") else {
+        return Some(format!("{line:?} is not an `aterm init` line"));
+    };
+    let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
+    let options = match options(&args) {
+        Ok(options) => options,
+        Err(why) => return Some(why),
+    };
+    let unknown: Vec<String> = unnamed(base, &options.only)
+        .into_iter()
+        .filter(|word| {
+            !station.iter().any(|item| {
+                aterm_converge::selects(word, &item.id(), item.family(), Some(Layer::Workstation))
+            })
+        })
+        .collect();
+    (!unknown.is_empty())
+        .then(|| format!("--only {} names no item ({ONLY_WORDS})", unknown.join(",")))
+}
+
+/// Each `aterm init …` command `text` names, as far as its flags go (`--only` and `--vault`
+/// with their value), its value's trailing punctuation and backtick cut: what a person copies
+/// from a printed remedy into [`refusal`].
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn init_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("aterm init") {
+        let mut line = String::from("aterm init");
+        let cut = |word: &str| word.trim_end_matches(['`', ')', ',', ';', '.', ':']).len();
+        let mut words = rest[at + "aterm init".len()..].split_whitespace();
+        while let Some(word) = words.next() {
+            let flag = &word[..cut(word)];
+            if !flag.starts_with("--") {
+                break;
+            }
+            line.push(' ');
+            line.push_str(flag);
+            if flag.len() < word.len() {
+                break;
+            }
+            if matches!(flag, "--only" | "--vault") {
+                let Some(value) = words.next() else {
+                    break;
+                };
+                let kept = &value[..cut(value)];
+                line.push(' ');
+                line.push_str(kept);
+                if kept.len() < value.len() {
+                    break;
+                }
+            }
+        }
+        lines.push(line);
+        rest = &rest[at + "aterm init".len()..];
+    }
+    lines
+}
+
 /// Return `--only` words that match no base item, `workstation`, or develop selector.
 fn unnamed(base: &Base, only: &[String]) -> Vec<String> {
     base.unnamed(only)
@@ -787,6 +863,54 @@ struct Front<'a> {
     records: &'a dyn Records,
     /// Hears each row as its item finishes, from whichever lane ran it ([`run_layers`]).
     on_row: &'a (dyn Fn(&ItemReport) + Sync),
+}
+
+#[cfg(any(test, debug_assertions))]
+type TestWorkstation<'a> = dyn Fn(&Ctx) -> Result<Vec<Vec<Box<dyn Item>>>, String> + 'a;
+
+/// The actual CLI convergence and records handoff, with inert workstation groups supplied by
+/// another crate's tests. The base layer is empty; the injected system supplies every read and
+/// effect of the workstation items.
+///
+/// # Errors
+/// As the CLI's context, item composition, record hold or convergence.
+#[cfg(any(test, debug_assertions))]
+pub fn converge_workstation_for_test(
+    sys: &dyn System,
+    records: &dyn Records,
+    only: &[String],
+    prepare: &TestWorkstation<'_>,
+) -> Result<Vec<ItemReport>, String> {
+    let groups = |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+        Ok((
+            prepare(ctx)?
+                .into_iter()
+                .map(|items| (items, workstation_place(Class::Preference)))
+                .collect(),
+            Choice::ALL,
+        ))
+    };
+    converge(
+        sys,
+        &Options {
+            only: only.to_vec(),
+            station: only.to_vec(),
+            ..Options::default()
+        },
+        &Front {
+            base: &|_| Base::none(),
+            groups: &groups,
+            targo: None,
+            cwd: None,
+            records,
+            on_row: &|_| {},
+        },
+        &mut crate::engine::NoJournal,
+        &mut Laps::start(),
+    )
+    .map_err(|refused| match refused {
+        Refused::Usage(why) | Refused::Failed(why) => why,
+    })
 }
 
 /// Converge the requested base, workstation, and develop layers, each step a phase of `laps`:
@@ -951,15 +1075,22 @@ fn converge(
             held.withheld(&withheld)?;
         }
         let rows = lane()?;
-        if whole
-            && rows
-                .iter()
-                .filter(|row| {
-                    row.layer == Some(Layer::Workstation) && row.class == Some(Class::Preference)
-                })
-                .all(|row| counts(row, Action::Apply))
-        {
-            held.verified()?;
+        if whole {
+            let verified = verified_mac_settings(&ctx, &groups, &rows);
+            if !verified.is_empty() {
+                held.checkpoint(verified)?;
+            }
+            if verified == Selection::all().workstation()
+                && rows
+                    .iter()
+                    .filter(|row| {
+                        row.layer == Some(Layer::Workstation)
+                            && row.class == Some(Class::Preference)
+                    })
+                    .all(|row| counts(row, Action::Apply))
+            {
+                held.verified()?;
+            }
         }
         Ok(rows)
     };
@@ -1040,6 +1171,55 @@ fn waiting(row: &ItemReport) -> bool {
         row.stood_aside,
         Some(aterm_converge::StoodAside::Waiting(_))
     )
+}
+
+/// Fully covered Mac stages in a whole raw init. Keep the prepared preference
+/// IDs and the native services' expected IDs, so absent or unbuilt rows cannot
+/// earn completion merely because every row that happened to return succeeded.
+fn verified_mac_settings(ctx: &Ctx, groups: &[Group], rows: &[ItemReport]) -> Selection {
+    let accounts = crate::init_accounts::items(ctx)
+        .ok()
+        .map(|items| items.iter().map(|item| item.id()).collect::<Vec<_>>());
+    let preferences: Vec<String> = groups
+        .iter()
+        .filter(|(_, place)| place.layer == Layer::Workstation && place.class == Class::Preference)
+        .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+        .filter(|id| {
+            id != ACCOUNTS_GROUP
+                && accounts
+                    .as_ref()
+                    .is_none_or(|accounts| !accounts.contains(id))
+        })
+        .collect();
+    let covered = |expected: &[String]| {
+        !expected.is_empty()
+            && expected.iter().all(|id| {
+                let mut matching = rows
+                    .iter()
+                    .filter(|row| {
+                        row.layer == Some(Layer::Workstation)
+                            && row.class == Some(Class::Preference)
+                            && row.id == *id
+                    })
+                    .peekable();
+                matching.peek().is_some() && matching.all(|row| counts(row, Action::Apply))
+            })
+    };
+    let mut verified = Selection::none();
+    for (group, expected) in [
+        (WorkstationGroup::Preferences, Some(preferences)),
+        (WorkstationGroup::Accounts, accounts),
+    ] {
+        if expected.as_deref().is_some_and(&covered) {
+            let selected = group.selected(Selection::all());
+            for setting in Setting::ALL {
+                if selected.contains(setting) {
+                    verified.set(setting, true);
+                }
+            }
+        }
+    }
+    verified
 }
 
 /// The workstation items shared by init, doctor and first-launch setup.
@@ -1723,6 +1903,8 @@ fn workstation_items_selected(
 /// Items that share one place in the desired state.
 type Group = (Vec<Box<dyn Item>>, Place);
 
+const ACCOUNTS_GROUP: &str = "init.accounts";
+
 /// What [`converge`] read and was told before the workstation's groups are built.
 struct Reading<'a> {
     /// Why the keyboard list could not be read ([`local_context`]): only the Caps Lock rows go
@@ -1987,7 +2169,7 @@ fn groups(
     if person {
         groups.push((
             built(
-                "init.spotlight",
+                crate::init_spotlight::ID,
                 "spotlight",
                 Setting::Spotlight.label(),
                 crate::init_spotlight::items(ctx),
@@ -1998,7 +2180,7 @@ fn groups(
     if person && choice.sign_out {
         groups.push((
             built(
-                "init.accounts",
+                ACCOUNTS_GROUP,
                 "init",
                 "Sign out of Messages and FaceTime",
                 crate::init_accounts::items(ctx),
@@ -2434,11 +2616,16 @@ fn context_reading(
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
     }
-    let name = read(sys, &Cmd::new("/usr/bin/id").arg("-un"))?;
-    let user = crate::facts::user(sys, name.trim())?;
+    // The account and the machine, read in this process (no `id`, `dscl`, `uname` or
+    // `sw_vers` child).
+    let crate::port::Identity {
+        user,
+        arch,
+        os_version,
+    } = sys.identity()?;
     if user.uid != sys.euid() {
         return Err(format!(
-            "`id -un` names {} (uid {}), not this process's uid {}",
+            "the account database names {} (uid {}), not this process's uid {}",
             user.name,
             user.uid,
             sys.euid()
@@ -2449,12 +2636,8 @@ fn context_reading(
     // nobody's, a remote shell) nothing of the console session is read.
     let at_console = !crate::console::remote(sys);
     let facts = HostFacts {
-        arch: read(sys, &Cmd::new("/usr/bin/uname").arg("-m"))?
-            .trim()
-            .into(),
-        os_version: read(sys, &Cmd::new("/usr/bin/sw_vers").arg("-productVersion"))?
-            .trim()
-            .into(),
+        arch,
+        os_version,
         console_user: at_console.then(|| user.name.clone()),
         users: vec![user.clone()],
         full_disk_access: sys.full_disk_access(),
@@ -2510,16 +2693,6 @@ fn context_reading(
     ))
 }
 
-fn read(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
-    let ran = sys
-        .run(cmd)
-        .map_err(|e| format!("{}: {e}", cmd.display()))?;
-    if !ran.success() {
-        return Err(format!("{}: {}", cmd.display(), ran.describe()));
-    }
-    Ok(ran.out())
-}
-
 fn complete(rows: &[ItemReport], action: Action) -> bool {
     !rows.is_empty() && rows.iter().all(|row| counts(row, action))
 }
@@ -2570,14 +2743,14 @@ mod tests {
 
     /// A machines item whose probes answer from a list (the last one repeats).
     struct Listed {
-        id: &'static str,
+        id: String,
         probes: Mutex<Vec<Probe>>,
     }
 
     impl Listed {
-        fn boxed(id: &'static str, probes: Vec<Probe>) -> Box<dyn Item> {
+        fn boxed(id: impl Into<String>, probes: Vec<Probe>) -> Box<dyn Item> {
             Box::new(Self {
-                id,
+                id: id.into(),
                 probes: Mutex::new(probes),
             })
         }
@@ -2585,13 +2758,13 @@ mod tests {
 
     impl Item for Listed {
         fn id(&self) -> String {
-            self.id.into()
+            self.id.clone()
         }
         fn family(&self) -> &'static str {
             "test"
         }
         fn title(&self) -> String {
-            self.id.into()
+            self.id.clone()
         }
         fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
             let mut probes = self.probes.lock().unwrap();
@@ -2618,6 +2791,14 @@ mod tests {
             from: "a".into(),
             to: "b".into(),
         }
+    }
+
+    fn verified_accounts(ctx: &Ctx) -> Vec<Box<dyn Item>> {
+        crate::init_accounts::items(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|item| Listed::boxed(item.id(), vec![ok()]))
+            .collect()
     }
 
     /// [`prepare_groups`] for an apply with no flag, no `--only`, no vault look and no grant.
@@ -2826,12 +3007,7 @@ mod tests {
             let mut sys = Fake::root();
             sys.euid = 501;
             sys.full_disk_access = full_disk_access;
-            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-            sys.on(
-                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-                Ran::ok("GroupMembership: alice\n"),
-            );
-            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
             sys.stat_of(
                 "/dev/console",
                 Stat {
@@ -2843,8 +3019,6 @@ mod tests {
                     len: 0,
                 },
             );
-            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
             sys.on(
                 "alice$ /usr/bin/defaults export com.apple.WindowManager -",
                 export("<dict><key>StandardHideWidgets</key><true/><key>StageManagerHideWidgets</key><true/></dict>"),
@@ -2896,12 +3070,7 @@ mod tests {
             let mut sys = Fake::root();
             sys.euid = 501;
             sys.full_disk_access = full_disk_access;
-            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-            sys.on(
-                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-                Ran::ok("GroupMembership: alice\n"),
-            );
-            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
             sys.stat_of(
                 "/dev/console",
                 Stat {
@@ -2913,8 +3082,6 @@ mod tests {
                     len: 0,
                 },
             );
-            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
             sys.on(
                 "alice$ /usr/bin/defaults export com.apple.notificationcenterui -",
                 export("<dict><key>widgets</key><dict><key>instances</key><array><data>Kg==</data></array></dict></dict>"),
@@ -2985,12 +3152,7 @@ mod tests {
     fn a_single_selected_account_needs_no_keyboard_inventory_or_other_service_read() {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-        sys.on(
-            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-            Ran::ok("GroupMembership: alice\n"),
-        );
-        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
         sys.stat_of(
             "/dev/console",
             Stat {
@@ -3002,8 +3164,6 @@ mod tests {
                 len: 0,
             },
         );
-        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
         sys.on(
             "alice$ /usr/bin/defaults export com.apple.imservice.ids.iMessage -",
             export("<dict/>"),
@@ -3882,6 +4042,61 @@ mod tests {
         assert!(options(&["--only=".into()]).is_err());
     }
 
+    /// Every `aterm init` command this crate prints is one init takes: each [`Remedy::Init`]
+    /// it builds ([`crate::init_clt::place`], [`crate::init_spotlight::ID`], the base layer)
+    /// rendered by [`Remedy::command`], the one spelling every surface prints, and each one
+    /// its texts name. A word that names nothing, a value left off and a word without `--only`
+    /// are the negative controls.
+    #[test]
+    fn every_init_remedy_this_crate_prints_is_a_line_init_takes() {
+        let base = Base {
+            items: Vec::new(),
+            held: None,
+            clt: Some(crate::init_clt::CommandLineTools::new(
+                Box::new(|_: &dyn System| crate::init_clt::Found::Present("cc".into())),
+                PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+            )),
+            targo: None,
+        };
+        let alice = crate::items::defaults::tests::user("alice", 501);
+        let station =
+            crate::init_spotlight::items(&crate::items::defaults::tests::ctx(&[alice])).unwrap();
+        let line = |only: &str| Remedy::Init { only: only.into() }.command().unwrap();
+        let mut lines = vec![
+            crate::init_clt::place().remedy.command().unwrap(),
+            line(crate::init_spotlight::ID),
+            line(Layer::Base.name()),
+            line(Layer::Workstation.name()),
+            Remedy::Develop.command().unwrap(),
+        ];
+        for text in [
+            crate::init_clt::NO_TTY,
+            crate::items::developer::LOW_DATA,
+            crate::init_github::NEEDS_GIT,
+            crate::controller::github::NO_GIT,
+        ] {
+            let named = init_lines(text);
+            assert!(!named.is_empty(), "{text}");
+            lines.extend(named);
+        }
+        for line in &lines {
+            assert_eq!(refusal(line, &base, &station), None, "{line}");
+        }
+        for refused in [
+            line("init.spotlite"),
+            line("base.cl"),
+            "aterm init --only".to_owned(),
+            "aterm init base.clt".to_owned(),
+            "aterm pkg repair".to_owned(),
+        ] {
+            assert!(refusal(&refused, &base, &station).is_some(), "{refused}");
+        }
+        assert_eq!(
+            init_lines("run `aterm init --only base.clt` in a terminal; or (aterm init --develop)"),
+            ["aterm init --only base.clt", "aterm init --develop"]
+        );
+    }
+
     #[test]
     fn only_narrows_the_base_layer_and_names_the_words_it_does_not_know() {
         let base = || Base {
@@ -3979,12 +4194,7 @@ mod tests {
     fn alice_at(console_uid: u32) -> Fake {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-        sys.on(
-            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-            Ran::ok("GroupMembership: alice\n"),
-        );
-        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
         sys.stat_of(
             "/dev/console",
             Stat {
@@ -3996,8 +4206,6 @@ mod tests {
                 len: 0,
             },
         );
-        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
         sys.on(
             &crate::facts::hidutil_keyboards().display(),
             Ran::ok("Services:\n\nDevices:\n"),
@@ -4321,12 +4529,7 @@ mod tests {
         let current_user = || {
             let mut sys = Fake::root();
             sys.euid = 501;
-            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-            sys.on(
-                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-                Ran::ok("GroupMembership: alice\n"),
-            );
-            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
             sys.stat_of(
                 "/dev/console",
                 Stat {
@@ -4338,8 +4541,6 @@ mod tests {
                     len: 0,
                 },
             );
-            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
             sys
         };
         let command = crate::facts::hidutil_keyboards();
@@ -4440,12 +4641,7 @@ mod tests {
     fn alice_with_checkout(console_uid: u32, profile: Option<&str>) -> Fake {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-        sys.on(
-            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-            Ran::ok("GroupMembership: alice\n"),
-        );
-        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
         let owned = |uid: u32, dir: bool| Stat {
             uid,
             gid: 20,
@@ -4457,8 +4653,6 @@ mod tests {
         sys.stat_of("/dev/console", owned(console_uid, false));
         sys.stat_of("/Users//alice", owned(501, true));
         sys.stat_of("/Users//alice/aterm", owned(501, true));
-        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
         sys.on(
             &crate::facts::hidutil_keyboards().display(),
             Ran::ok("Services:\n\nDevices:\n"),
@@ -4882,7 +5076,7 @@ mod tests {
                     "",
                 );
                 sys.on(
-                    &crate::checkout::git(&alice, Some(Path::new("/Users//alice/aterm")))
+                    &crate::checkout::git(&sys, &alice, Some(Path::new("/Users//alice/aterm")))
                         .args(["ls-remote", "--symref", "origin", "HEAD"])
                         .display(),
                     Ran::exit(128, stderr),
@@ -4968,8 +5162,8 @@ mod tests {
     }
 
     /// alice's Mac as doctor's develop layer sees it: euid 501, her home, and her `init.toml`
-    /// when given; the account's context cannot be built (no `id -un` answer is scripted, as
-    /// for an account the local directory node does not hold).
+    /// when given; the account's context cannot be built (no account is scripted, as for an
+    /// account the local directory node does not hold).
     fn develop_doctor(profile: Option<&str>, home: bool) -> (Doctor<Fake>, usize) {
         let mut sys = Fake::root();
         let alice = user("alice", 501);
@@ -4989,12 +5183,12 @@ mod tests {
     }
 
     /// With no `init.toml`, or one with no `[develop]` table, doctor composes and reads no
-    /// develop row and never builds the account's context (no `id -un`, no `dscl`). A profile
+    /// develop row and never builds the account's context (no account reading). A profile
     /// that records a checkout, an `--only` develop word, or no home from the account record
     /// (the controls) build it, and its failure here is the one `develop.record` row.
     #[test]
     fn doctor_runs_nothing_for_the_develop_layer_of_a_mac_that_records_none() {
-        let id = Cmd::new("/usr/bin/id").arg("-un").display();
+        let id = "identity".to_owned();
         for profile in [None, Some("[github]\naccount = \"alice\"\n")] {
             let (doctor, setup) = develop_doctor(profile, true);
             let composed = doctor.compose(false);
@@ -5528,17 +5722,15 @@ mod tests {
 
     #[test]
     fn a_whole_profile_pass_records_what_it_verified_and_a_part_records_nothing() {
-        let dock = |_: &Ctx| {
-            vec![(
-                vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
-                place(Class::Preference),
-            )]
+        let dock = |ctx: &Ctx| {
+            let mut items = verified_accounts(ctx);
+            items.push(Listed::boxed("init.test.dock", vec![change(), ok()]));
+            vec![(items, place(Class::Preference))]
         };
-        let unverified = |_: &Ctx| {
-            vec![(
-                vec![Listed::boxed("init.test.dock", vec![change(), change()])],
-                place(Class::Preference),
-            )]
+        let unverified = |ctx: &Ctx| {
+            let mut items = verified_accounts(ctx);
+            items.push(Listed::boxed("init.test.dock", vec![change(), change()]));
+            vec![(items, place(Class::Preference))]
         };
         let profile = Options {
             choice: Some(Choice {
@@ -5626,6 +5818,7 @@ mod tests {
             items.push(then("init.test.after-withheld", "test", move || {
                 lane.lock().unwrap().push("desktop".into());
             }));
+            items.extend(verified_accounts(ctx));
             vec![(items, place(Class::Preference))]
         };
         let result = converge_with(

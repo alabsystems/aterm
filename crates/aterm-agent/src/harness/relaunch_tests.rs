@@ -3316,6 +3316,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         argv: vec![launch.clone(), "resume".to_string(), UUID.to_string()],
         session: UUID.to_string(),
         codex_home: None,
+        codex_auth_path: None,
         cwd: None,
     };
     let snap = |self_claimed: Option<super::super::self_claimed::Resume>| Snapshot {
@@ -4355,7 +4356,7 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
 #[test]
 fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
     use crate::supervise::policy::needs::NEEDS_HINT;
-    use crate::supervise::policy::turn_end::DONE_CHECK;
+    use crate::supervise::policy::turn_end::done_check_words;
     assert!(upgrade::CARRY_ON.ends_with(NEEDS_HINT));
     assert!(!upgrade::CARRY_ON.contains("ATERM-TASK-DONE"));
     let agents = ["Claude Code", upgrade::Agent::Agy.product(), "Muse Code"];
@@ -4388,7 +4389,7 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
     for text in &texts {
         assert!(text.ends_with(upgrade::CARRY_ON), "{text}");
         let checked = upgrade::checking(text, false);
-        assert!(checked.ends_with(DONE_CHECK), "{checked}");
+        assert!(checked.ends_with(&done_check_words(0)), "{checked}");
         assert!(!checked.contains(upgrade::CARRY_ON), "{checked}");
     }
     let other = format!("{} Upgraded.", upgrade::HARNESS_MARK);
@@ -4502,7 +4503,7 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
     );
     let codex = pool_args(
         accounts::Cli::Codex,
-        &row("CODEX_HOME", Some("/c")),
+        &row("CODEX_AUTH_PATH", Some("/c/auth.json")),
         home,
         &flags,
     )
@@ -4532,7 +4533,12 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
         &flags,
     )
     .expect("kimi default row");
-    assert_eq!(kimi_default.unset, kimi.unset, "the default row's line too");
+    assert_eq!(kimi_default.unset[0], "KIMI_CODE_HOME");
+    assert_eq!(
+        &kimi_default.unset[1..],
+        kimi.unset,
+        "the default row's line too"
+    );
     assert_eq!(
         ahead_env(accounts::Cli::Claude),
         [
@@ -4553,7 +4559,7 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
     ]);
     let main = row("GROK_AUTH_PATH", None);
     let default = pool_args(accounts::Cli::Grok, &main, home, &carried).expect("default row");
-    assert_eq!(default.unset, ["GROK_AUTH"]);
+    assert_eq!(default.unset, ["GROK_AUTH_PATH", "GROK_AUTH"]);
     assert_eq!(
         default.flags,
         words(&[

@@ -1269,6 +1269,47 @@ fn other_named_instance_name(bytes: &[u8], index: u32, coords: &[(u32, f32)]) ->
     named_instance_display_name(bytes, index, &NamedInstance::from_fixed(record.coords))
 }
 
+/// What face `index` of `bytes` drawn in a bold role at `coords` is called: the named instance
+/// they are (`SF Mono Bold`, `SF Mono Heavy` a weight class above a heavy regular); else its
+/// family and `Bold` (`Bold Italic` on a slanted face) where they draw its designed Bold's
+/// weight (on axes the user set) or, for a face that designs no Bold, the standard Bold weight
+/// ([`variation::BOLD_WGHT`]); else its family and the weight they draw (`SF Mono at weight
+/// 700` over a regular asked at 600, past SF Mono's Bold at 683): never a designed face they do
+/// not draw. `None` for coords without a weight.
+fn bold_instance_name(bytes: &[u8], index: u32, coords: &[(u32, f32)]) -> Option<String> {
+    if let Some(name) = other_named_instance_name(bytes, index, coords) {
+        return Some(name);
+    }
+    let face = aterm_font::Face::parse(bytes, index).ok()?;
+    let probe = variation::probe_face(&face)?;
+    let weight = coords
+        .iter()
+        .find(|&&(tag, _)| tag == variation::WGHT_TAG)
+        .map(|&(_, value)| value)?;
+    let designed = probe
+        .axes
+        .iter()
+        .position(|axis| axis.tag == variation::WGHT_TAG)
+        .and_then(|w| {
+            probe
+                .bold_coords
+                .as_deref()
+                .and_then(|bold| bold.get(w).copied())
+        });
+    let bold = (weight - designed.unwrap_or(variation::BOLD_WGHT)).abs() < 0.5;
+    let family = face_family_name(bytes, index)?;
+    let italic = if face.is_italic() || face.is_oblique() {
+        " Italic"
+    } else {
+        ""
+    };
+    Some(if bold {
+        format!("{family} Bold{italic}")
+    } else {
+        format!("{family}{italic} at weight {}", weight.round())
+    })
+}
+
 fn face_family_name(bytes: &[u8], index: u32) -> Option<String> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     let face = aterm_font::Face::parse(bytes, index).ok()?;
@@ -5913,7 +5954,7 @@ impl FaceTarget {
                     let regular =
                         variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
                     if self.weight >= 600 {
-                        variation::bold_role_coords(axes, &regular)
+                        variation::bold_role_coords(&probe, &regular, &[])
                     } else {
                         regular
                     }
@@ -6219,7 +6260,7 @@ fn role_named_elsewhere(
     let probe = variation::probe_face(face)?;
     let regular = variation::resolve_default_coords(&probe.axes, probe.regular_coords.as_deref());
     let coords = if bold {
-        variation::bold_role_coords(&probe.axes, &regular)
+        variation::bold_role_coords(&probe, &regular, &[])
     } else {
         regular
     };
@@ -8033,9 +8074,13 @@ impl Renderer {
                         self.bold_font_bytes.as_deref().and_then(|bytes| {
                             if let Some(named) = &self.bold_font_named {
                                 named_instance_display_name(bytes, self.bold_font_index, named)
-                            } else if self.bold_font_instance.drawn.is_some() {
-                                face_family_name(bytes, self.bold_font_index)
-                                    .map(|family| format!("{family} Bold"))
+                            } else if let Some(coords) = self.bold_font_instance.drawn.as_deref() {
+                                bold_instance_name(bytes, self.bold_font_index, coords).or_else(
+                                    || {
+                                        face_family_name(bytes, self.bold_font_index)
+                                            .map(|family| format!("{family} Bold"))
+                                    },
+                                )
                             } else {
                                 face_display_name(bytes, self.bold_font_index)
                             }
@@ -8068,13 +8113,17 @@ impl Renderer {
                                 };
                                 // At another named instance than its role's own (the
                                 // italic of a primary named `SF Mono Light`), that one's
-                                // name.
-                                (
+                                // name; a bold by the weight it draws.
+                                let named = if drawn.contains(StyleBits::BOLD) {
+                                    bold_instance_name(&face.bytes, face.index, &coords)
+                                } else {
                                     other_named_instance_name(&face.bytes, face.index, &coords)
-                                        .or_else(|| {
-                                            face_family_name(&face.bytes, face.index)
-                                                .map(|family| format!("{family} {words}"))
-                                        }),
+                                };
+                                (
+                                    named.or_else(|| {
+                                        face_family_name(&face.bytes, face.index)
+                                            .map(|family| format!("{family} {words}"))
+                                    }),
                                     instanced,
                                 )
                             }
@@ -8088,7 +8137,15 @@ impl Renderer {
                         if style.contains(StyleBits::BOLD) && self.vf_bold_coords.is_some() =>
                     {
                         (
-                            regular.as_ref().map(|family| format!("{family} Bold")),
+                            self.vf_bold_coords
+                                .as_deref()
+                                .zip(self.shaping_primary_bytes.as_deref())
+                                .and_then(|(coords, bytes)| {
+                                    bold_instance_name(bytes, self.primary_index, coords)
+                                })
+                                .or_else(|| {
+                                    regular.as_ref().map(|family| format!("{family} Bold"))
+                                }),
                             StyleBits(style.0 & !StyleBits::BOLD.0),
                         )
                     }
@@ -9275,6 +9332,7 @@ impl Renderer {
                 dark_nudge,
             ),
         };
+        let kept = self.users_axes(requests);
         let base = variation::apply_requests(axes, base, requests);
         let pair = |coords: &[f32]| -> Vec<(u32, f32)> {
             axes.iter().zip(coords).map(|(a, &v)| (a.tag, v)).collect()
@@ -9316,9 +9374,14 @@ impl Renderer {
             }
         };
         let var_coords = instance(&coords);
+        // The face's designed Bold ([`variation::designed_bold_coords`]), else `wght` 700 where
+        // that is a weight class above what the regular text draws: else bold is synthetic.
         let vf_bold: VarCoords = wght_idx.and_then(|wi| {
+            if let Some(bold) = variation::designed_bold_coords(&probe, &coords, &kept) {
+                return Some(pair(&bold).into());
+            }
             let bold_w = variation::clamp_axis(&axes[wi], variation::BOLD_WGHT);
-            if bold_w >= coords[wi] + 100.0 {
+            if bold_w >= coords[wi] + variation::BOLD_STEP {
                 let bold = variation::apply_requests(
                     axes,
                     coords.clone(),
@@ -9383,13 +9446,28 @@ impl Renderer {
             (FaceRole::Bold, None) => {
                 let base = variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
                 let base = variation::apply_requests(axes, base, &requests);
+                let kept = self.users_axes(&requests);
                 FaceInstance {
-                    drawn: instance(&variation::bold_role_coords(axes, &base)),
+                    drawn: instance(&variation::bold_role_coords(&probe, &base, &kept)),
                     // A bold face serves the bold itself.
                     bold: None,
                 }
             }
         }
+    }
+
+    /// The axes `requests` set that are the user's own (`font_variation`), which a bold role
+    /// keeps ([`variation::bold_role_coords`]): none of `wght`, and none where the primary's
+    /// font name chose its instance, whose pins ([`Self::role_requests`]) are its design.
+    fn users_axes(&self, requests: &[(u32, f32)]) -> Vec<u32> {
+        if self.primary_named.is_some() {
+            return Vec::new();
+        }
+        requests
+            .iter()
+            .map(|&(tag, _)| tag)
+            .filter(|&tag| tag != variation::WGHT_TAG)
+            .collect()
     }
 
     /// What a styled face its role weighs ([`FaceRole`]) is drawn under: the user's

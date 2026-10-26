@@ -2585,9 +2585,10 @@ const KEPT_CREDENTIALS: &[(accounts::Cli, &str)] = &[
     // another account.") and what `codex login --with-api-key` reads on stdin (`printenv
     // OPENAI_API_KEY | codex login --with-api-key`, its `login --help`); none of it names the
     // variable as read ahead of `auth.json`, where a piped key is stored (its `OPENAI_API_KEY`
-    // field) in the home a row's `CODEX_HOME` names. It is no Codex variable: tools the agent
-    // runs read it (Codex's bundled image skill's CLI fallback "Requires `OPENAI_API_KEY`"), and
-    // aterm passes it to the shells it opens, so removing it would take it from those tools.
+    // field) at the login file `CODEX_AUTH_PATH` (or `$CODEX_HOME/auth.json`) names. It is no Codex
+    // variable: tools the agent runs read it (Codex's bundled image skill's CLI fallback "Requires
+    // `OPENAI_API_KEY`"), and aterm passes it to the shells it opens, so removing it would take it
+    // from those tools.
     (accounts::Cli::Codex, "OPENAI_API_KEY"),
     // grok 1.0.70's own "Auth Precedence": a per-model `api_key` or `env_key`, then the session
     // token in `auth.json`, then `XAI_API_KEY`, the "fallback when no session token is active".
@@ -2702,7 +2703,8 @@ fn names_row_socket(path: &str, home: Option<&Path>) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolArgs {
     /// The variables it removes from the program's environment: the CLI's credential variables
-    /// carried in place of a stored login ([`ahead_env`]), and for Grok Build on a row of its
+    /// carried in place of a stored login ([`ahead_env`]), the login seam for a default row,
+    /// and for Grok Build on a row of its
     /// own `GROK_LEADER_SOCKET`, so the row's own socket flag is the one read. The default row
     /// keeps `GROK_LEADER_SOCKET`, a person's own choice whose value the line does not read.
     pub unset: Vec<&'static str>,
@@ -2731,6 +2733,9 @@ pub fn pool_args(
     flags: &[String],
 ) -> Result<PoolArgs, String> {
     let mut unset = ahead_env(cli);
+    if env.value.is_none() {
+        unset.insert(0, env.var);
+    }
     if cli != accounts::Cli::Grok {
         return Ok(PoolArgs {
             unset,
@@ -2807,7 +2812,7 @@ pub fn pool_line(
     cli: accounts::Cli,
     env: &super::accounts_pool::LoginEnv,
 ) -> Result<String, String> {
-    let PoolArgs { mut unset, flags } = pool_args(cli, env, how.home, how.flags)?;
+    let PoolArgs { unset, flags } = pool_args(cli, env, how.home, how.flags)?;
     let args: Vec<String> = match cli {
         accounts::Cli::Codex => {
             let argv: Vec<String> = std::iter::once(String::new()).chain(flags).collect();
@@ -2825,10 +2830,7 @@ pub fn pool_line(
     };
     let set: Vec<(&str, &str)> = match env.value.as_deref() {
         Some(value) => vec![(env.var, value)],
-        None => {
-            unset.insert(0, env.var);
-            Vec::new()
-        }
+        None => Vec::new(),
     };
     if unset.is_empty() {
         upgrade::relaunch_line_env(how.dialect, None, how.cd, &set, how.exe, &args)

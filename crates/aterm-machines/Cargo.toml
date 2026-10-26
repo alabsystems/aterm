@@ -62,6 +62,14 @@ aterm-log = { workspace = true }
 # Not aterm-phase, which holds the screen reader deny.toml keeps to aterm-gui and aterm-agent.
 aterm-agent-names = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The Command Line Tools' Low Data Mode look (port/low_data.rs): Network.framework's path
+# monitor takes its update handler as a block, on a dispatch queue.
+aterm-objc = { workspace = true }
+# The app macOS holds responsible for this process (`System::responsible_app`), which the
+# sign-out's Accessibility grant goes to.
+aterm-containment = { workspace = true }
+
 # Dev only (AGENTS.md: `aterm` is the one shipped executable): the crate as a standalone
 # executable, `aterm-machines-dev machines <verb>`, so the agent can be enrolled into a test VM
 # before `aterm machines` is routed in crates/aterm, plus `enroll-through`, which enrolls over an

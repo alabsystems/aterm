@@ -361,6 +361,9 @@ pub(crate) fn resume_words(kept: Vec<String>, thread: Option<&str>) -> Vec<Strin
 /// The variable Codex keeps its home by.
 pub const HOME_ENV: &str = "CODEX_HOME";
 
+/// The variable `codex-alab` reads and refreshes a pooled login's `auth.json` at.
+pub const AUTH_PATH_ENV: &str = "CODEX_AUTH_PATH";
+
 /// THE ENVIRONMENT A CODEX RELAUNCH LINE MUST CARRY.
 #[must_use]
 pub fn line_env(home: Option<&str>) -> Vec<(&'static str, &str)> {

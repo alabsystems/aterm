@@ -133,7 +133,7 @@ impl<'a> Repos<'a> {
 
     /// A new repository at `dir` (bare when asked), with no template.
     pub(crate) fn init(&self, dir: &Path, bare: bool) {
-        let mut cmd = git(&self.who, None).args(["init", "--quiet", "--template="]);
+        let mut cmd = git(self.live, &self.who, None).args(["init", "--quiet", "--template="]);
         if bare {
             cmd = cmd.arg("--bare");
         }
@@ -142,7 +142,7 @@ impl<'a> Repos<'a> {
 
     /// A clone of `from` at `to`, with no template.
     pub(crate) fn clone_into(&self, from: &Path, to: &Path) {
-        self.ok(&git(&self.who, None)
+        self.ok(&git(self.live, &self.who, None)
             .args(["clone", "--quiet", "--template="])
             .arg(from)
             .arg(to));
@@ -150,7 +150,7 @@ impl<'a> Repos<'a> {
 
     /// One fixture git run in `dir` (never through the record under test).
     pub(crate) fn g(&self, dir: &Path, args: &[&str]) -> String {
-        self.ok(&git(&self.who, Some(dir)).args(args.iter().copied()))
+        self.ok(&git(self.live, &self.who, Some(dir)).args(args.iter().copied()))
     }
 
     /// A new commit on origin's `main`, made in the seed clone: its id.
@@ -235,7 +235,7 @@ fn a_clean_checkout_behind_its_origin_fast_forwards() {
     let repos = Repos::new(&live, "checkout-control");
     let control = Spawns::new(&live);
     let ran = control
-        .run(&git(&repos.who, Some(&repos.work)).args(["stash", "list"]))
+        .run(&git(repos.live, &repos.who, Some(&repos.work)).args(["stash", "list"]))
         .unwrap();
     assert!(ran.success(), "{}", ran.describe());
     assert_eq!(
@@ -512,11 +512,13 @@ fn align_runs_no_hook_and_fetches_from_origin_alone() {
         }
         assert_eq!(repos.head(&work), tip, "by_init {by_init}");
         let fetched_here = live
-            .run(&git(&repos.who, Some(&work.join("vendor/astream"))).args([
-                "cat-file",
-                "-e",
-                &format!("{two}^{{commit}}"),
-            ]))
+            .run(
+                &git(repos.live, &repos.who, Some(&work.join("vendor/astream"))).args([
+                    "cat-file",
+                    "-e",
+                    &format!("{two}^{{commit}}"),
+                ]),
+            )
             .unwrap()
             .success();
         let ran = std::fs::read_to_string(&marker).unwrap_or_default();

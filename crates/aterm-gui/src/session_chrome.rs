@@ -180,9 +180,9 @@ pub(crate) struct TimelineNote {
     pub at_ms: u64,
 }
 
-/// The terminal leaf whose recording a timeline row describes.
+/// The terminal leaf whose session a menu row describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RewindMenuOrigin {
+pub(crate) struct TerminalMenuOrigin {
     pub view: crate::tab_model::ViewId,
     pub session: u64,
 }
@@ -199,15 +199,23 @@ pub(crate) enum TabMenuEntry {
         words: String,
         at_ms: u64,
         /// Bound on a per-tab clone; the session's cached template has no view owner.
-        origin: Option<RewindMenuOrigin>,
+        origin: Option<TerminalMenuOrigin>,
     },
     /// A native separator.
     Separator,
-    /// A command row: the `NSMenuItem` carries `action`'s tag, so the click dispatches through the menu bar's tag→[`MenuAction`] decode.
+    /// A command against the whole captured tab, independent of its focused pane.
     Action {
         label: String,
         action: MenuAction,
         enabled: bool,
+    },
+    /// A command against the terminal session that supplied this row's words and state.
+    SessionAction {
+        label: String,
+        action: MenuAction,
+        enabled: bool,
+        /// Bound on a per-tab clone, never in the shared session template.
+        origin: Option<TerminalMenuOrigin>,
     },
     /// A per-peer row (Show / Configure… / Disconnect) against `peer_sid`.
     ConnectionAction {
@@ -244,10 +252,12 @@ pub(crate) struct TabChromeExt {
 }
 
 impl TabChromeExt {
-    /// Bind this tab's cloned timeline rows without changing the shared session cache.
-    pub(crate) fn bind_rewind_origin(&mut self, origin: RewindMenuOrigin) {
+    /// Bind this tab's cloned session rows without changing the shared session cache.
+    pub(crate) fn bind_terminal_origin(&mut self, origin: TerminalMenuOrigin) {
         for entry in &mut self.menu {
-            if let TabMenuEntry::RewindTo { origin: owner, .. } = entry {
+            if let TabMenuEntry::RewindTo { origin: owner, .. }
+            | TabMenuEntry::SessionAction { origin: owner, .. } = entry
+            {
                 *owner = Some(origin);
             }
         }
@@ -260,6 +270,8 @@ pub(crate) struct CachedChrome {
     pub high_id: u64,
     /// The resolved tab label: an OSC title can move without a timeline record.
     pub label: String,
+    /// Whether the window that composed these rows could present the session editor.
+    pub can_rename: bool,
     /// The session-status revision at compose time.
     pub activity_revision: u64,
     /// The connection table's revision (`ConnectionTable::bump_revision`): a mint, revoke or sweep moves no other epoch.
@@ -667,10 +679,11 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
     }
     entries.push(TabMenuEntry::Separator);
     entries.push(TabMenuEntry::Header("AGENT".to_string()));
-    let action = |label: &str, action: MenuAction, enabled: bool| TabMenuEntry::Action {
+    let action = |label: &str, action: MenuAction, enabled: bool| TabMenuEntry::SessionAction {
         label: label.to_string(),
         action,
         enabled,
+        origin: None,
     };
     let agent = &input.agent;
     entries.push(if agent.person_hold {
@@ -744,7 +757,11 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         MenuAction::CopyCwd,
         input.cwd.as_deref().is_some_and(|c| !c.is_empty()),
     ));
-    entries.push(action("Close Tab", MenuAction::CloseTab, true));
+    entries.push(TabMenuEntry::Action {
+        label: "Close Tab".into(),
+        action: MenuAction::CloseTab,
+        enabled: true,
+    });
     entries
 }
 
@@ -770,6 +787,14 @@ pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
         TabMenuEntry::Action { label, enabled, .. } => {
             format!("{label}{}", disabled_suffix(*enabled))
         }
+        TabMenuEntry::SessionAction {
+            label,
+            enabled,
+            origin,
+            ..
+        } => {
+            format!("{label}{}", disabled_suffix(*enabled && origin.is_some()))
+        }
         TabMenuEntry::ConnectionAction {
             label,
             peer_sid,
@@ -792,6 +817,7 @@ mod tests {
         CachedChrome {
             high_id: 0,
             label: "session".to_string(),
+            can_rename: true,
             activity_revision: 0,
             connections_revision: 0,
             upgrade_revision: 0,
@@ -1047,6 +1073,7 @@ mod tests {
             | TabMenuEntry::RewindTo { words: label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Action { label, .. }
+            | TabMenuEntry::SessionAction { label, .. }
             | TabMenuEntry::ConnectionAction { label, .. }
             | TabMenuEntry::Upgrade { label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
@@ -1229,7 +1256,7 @@ mod tests {
             menu: rows.clone(),
             ..TabChromeExt::default()
         };
-        bound.bind_rewind_origin(RewindMenuOrigin {
+        bound.bind_terminal_origin(TerminalMenuOrigin {
             view: crate::tab_model::ViewId::from_stored(1),
             session: 2,
         });
@@ -1331,7 +1358,8 @@ mod tests {
         let actions: Vec<MenuAction> = menu
             .iter()
             .filter_map(|e| match e {
-                TabMenuEntry::Action { action, .. } => Some(*action),
+                TabMenuEntry::Action { action, .. }
+                | TabMenuEntry::SessionAction { action, .. } => Some(*action),
                 _ => None,
             })
             .collect();
@@ -1371,7 +1399,7 @@ mod tests {
         };
         let first_agent_action = |input: &SessionChromeInput| {
             compose_tab_menu(input).iter().find_map(|e| match e {
-                TabMenuEntry::Action { action, .. } => Some(*action),
+                TabMenuEntry::SessionAction { action, .. } => Some(*action),
                 _ => None,
             })
         };
@@ -1477,7 +1505,7 @@ mod tests {
         );
         let greyed = |a: MenuAction| {
             menu.iter().any(|e| {
-                matches!(e, TabMenuEntry::Action { action, enabled: false, .. } if *action == a)
+                matches!(e, TabMenuEntry::SessionAction { action, enabled: false, .. } if *action == a)
             })
         };
         for a in [

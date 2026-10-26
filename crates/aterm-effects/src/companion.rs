@@ -858,6 +858,7 @@ impl CompanionOwner {
                 protected: exclusions,
                 overlays,
                 ink: &[],
+                painted_over: None,
             },
         )
     }

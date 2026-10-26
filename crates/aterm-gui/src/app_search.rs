@@ -725,6 +725,7 @@ impl App {
                     crate::native_app::AppKind::Settings => Some("settings/search"),
                     crate::native_app::AppKind::Editor => Some("editor/find"),
                     crate::native_app::AppKind::Markdown
+                    | crate::native_app::AppKind::About
                     | crate::native_app::AppKind::SystemState
                     | crate::native_app::AppKind::Recovery => None,
                 });

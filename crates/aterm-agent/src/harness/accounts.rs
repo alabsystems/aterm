@@ -1233,6 +1233,24 @@ pub fn profile_configured(configs: &Path) -> bool {
     }
 }
 
+fn login_file_dir<'a>(value: &'a str, file: &str) -> Option<&'a Path> {
+    if value
+        .chars()
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+    {
+        return None;
+    }
+    let stem = value.strip_suffix(file)?;
+    if !stem.ends_with('/') && !stem.ends_with(std::path::MAIN_SEPARATOR) {
+        return None;
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() || path.file_name() != Some(std::ffi::OsStr::new(file)) {
+        return None;
+    }
+    path.parent().filter(|dir| !dir.as_os_str().is_empty())
+}
+
 impl ProcessLogin {
     /// Extracts [`ProcessLogin`] facts from `(name, value)` environment pairs.
     #[must_use]
@@ -1267,9 +1285,11 @@ impl ProcessLogin {
 
     /// Extracts a `cli` process's [`ProcessLogin`] facts from `(name, value)` environment pairs:
     /// Claude Code's are [`ProcessLogin::of_env`]. Another CLI's login is the directory its seam
-    /// variable names; for a [`Seam::LoginFile`], the named file's directory, where the file has
-    /// the seam's name (one of another name is no stored login of the pool's). Its home is the
-    /// default unless a home variable of its own, other than the seam's, is set. Two different
+    /// variable names; for a [`Seam::LoginFile`], the named file's directory, where the path is
+    /// absolute, ends at the seam's name with no trailing separator or control character, and the
+    /// file has the seam's name. A relative path, trailing separator, control character or another
+    /// filename is retained as unbound: this reader has no process working directory to resolve it.
+    /// Its home is the default unless a home variable of its own, other than the seam's, is set. Two different
     /// values of the seam variable, or a credential variable the CLI reads ahead of or in place
     /// of its stored login ([`crate::harness::relaunch::ahead_env`], the ones a pooled line
     /// removes), mean it runs on no stored login. Any non-empty value of such a variable judges
@@ -1280,6 +1300,30 @@ impl ProcessLogin {
     /// the CLI's (`OPENAI_API_KEY` for Codex) judges nothing, so the line that moves a session
     /// and the judge of where it runs agree.
     #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLoginAttribution",
+            action = "AnotherProvider",
+            reason = "Select the Codex or Grok file-seam fixture."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLoginAttribution",
+            action = "AnotherCase",
+            reason = "Select the native environment fixture before observing it."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountLoginAttribution",
+            action = "Observe",
+            project = "aterm_agent::harness::accounts::tests::login_attribution::attribution_transition"
+        )
+    )]
     pub fn of_env_for<'a>(
         cli: Cli,
         env: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -1316,16 +1360,13 @@ impl ProcessLogin {
             }
         }
         out.login = login.filter(|v| !v.is_empty()).map(|value| match seam {
-            Seam::LoginFile { file, .. } => {
-                let path = Path::new(value);
-                match (path.file_name(), path.parent()) {
-                    (Some(name), Some(dir)) if name == file => dir.to_string_lossy().into_owned(),
-                    _ => {
-                        out.stored_login = false;
-                        value.to_owned()
-                    }
+            Seam::LoginFile { file, .. } => match login_file_dir(value, file) {
+                Some(dir) => dir.to_string_lossy().into_owned(),
+                None => {
+                    out.stored_login = false;
+                    value.to_owned()
                 }
-            }
+            },
             Seam::LoginDir { .. } | Seam::Overlay { .. } => value.to_owned(),
         });
         out

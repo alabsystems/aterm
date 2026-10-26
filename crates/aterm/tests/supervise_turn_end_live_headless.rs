@@ -881,9 +881,10 @@ fn evidence(inst: &Instance, out: &str) -> String {
     )
 }
 
-/// The suggestion is accepted once via the accept key and fenced Enter, and the decision after it is escalated.
+/// Cruise types its whole continuation over the worker's grey suggestion, never the accept key
+/// (v6 §14.5), once, and the decision after it is escalated.
 #[test]
-fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
+fn the_suggestion_is_typed_over_once_and_the_decision_after_it_is_escalated() {
     let inst = boot("s");
     let sid = boot_session(&inst);
     let (keys, subs, _events) = start_worker(&inst, &sid, "goal");
@@ -898,16 +899,13 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
     let submitted = submits_when(&inst, &subs, 2);
     assert_eq!(
         submitted,
-        ["SUBMIT:go", "SUBMIT:keep going"],
-        "exactly one continuation; {ev}"
+        ["SUBMIT:go".to_string(), cruise_submit()],
+        "exactly one continuation, Cruise's own words; {ev}"
     );
     let log = std::fs::read(&keys).expect("the key log");
     let rights = log.windows(3).filter(|w| *w == b"\x1b[C").count();
-    assert_eq!(rights, 1, "one accept key; {ev}");
-    assert!(
-        out.contains("rule=continue-suggestion@v1 keep going"),
-        "{ev}"
-    );
+    assert_eq!(rights, 0, "no accept key; {ev}");
+    assert!(continued_with(&out, "continue@v1", CONTINUE_TEXT), "{ev}");
     assert!(
         meta.contains("attention_owner=supervisor"),
         "escalated under the supervisor's key: {meta}\n{ev}"
@@ -1109,8 +1107,7 @@ fn a_decision_is_answered_with_the_answer_text() {
 /// Under full power, a worker whose every turn is short (`min_work` an hour) and says the same is continued twice, then held under the stalled exception without escalating.
 #[test]
 fn a_short_turn_loop_saying_the_same_is_continued_twice_then_held_and_never_escalates() {
-    const HELD: &str =
-        "kind=stalled when=later Its program answers aterm's acts with the same reply";
+    const HELD: &str = "kind=stalled when=later held=same-reply Its program answers aterm's acts with the same reply";
     let inst = boot("b");
     let sid = boot_session(&inst);
     let (_keys, _subs, events) = start_looping_worker(&inst, &sid, "done");

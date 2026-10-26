@@ -735,7 +735,10 @@ impl CursorGlow {
         let mut start = None;
         let mut col = usize::from(pane_col0);
         while col < end {
-            if !matches!(self.row_below_cur[col], ' ' | '\0') {
+            let ch = self.row_below_cur[col];
+            if !matches!(ch, ' ' | '\0')
+                && !(col == usize::from(pane_col0) && rk::is_box_border_glyph(ch))
+            {
                 start = Some(col);
                 break;
             }
@@ -878,7 +881,8 @@ impl CursorGlow {
         let mut landing_start = None;
         let mut col = pane_col0;
         while col < cc {
-            if !matches!(rk::witness::unit_at(&self.row_cur, col).ch, ' ' | '\0') {
+            let ch = rk::witness::unit_at(&self.row_cur, col).ch;
+            if !matches!(ch, ' ' | '\0') && !(col == pane_col0 && rk::is_box_border_glyph(ch)) {
                 landing_start = Some(col);
                 break;
             }
@@ -1254,26 +1258,30 @@ impl CursorGlow {
         {
             return None;
         }
-        let width = match self.v2.ribbon().moved_word_len((pr, pc), now) {
-            0 => self.v2.ribbon().typed_suffix_len((pr, pc), now),
-            width => width,
+        let pane_start = match self.pane_columns {
+            Some((start, _)) => start,
+            None => 0,
         };
-        let source_start = pc.checked_sub(width)?;
-        let source_end = pc.checked_sub(1)?;
-        let source_now = if same_row {
-            &self.row_cur
+        let moved_word = self.v2.ribbon().moved_word_len((pr, pc), now);
+        let ended_at_space = pc > 0 && old_row.get(usize::from(pc - 1)) == Some(&' ');
+        let width = if moved_word > 0 {
+            moved_word
+        } else if ended_at_space {
+            0
         } else {
-            &self.row_above_cur
+            self.v2.ribbon().typed_suffix_len((pr, pc), now)
         };
-        if width == 0 {
-            return None;
-        }
+        let source_end = pc.checked_sub(1)?;
         let mut has_end = false;
         let ribbon_cells = self.v2.ribbon().cells();
         let mut ci = 0;
         while ci < ribbon_cells.len() {
             let cell = &ribbon_cells[ci];
-            if cell.row == pr && cell.col == source_end && cell.typing && !cell.leaving() {
+            if cell.row == pr
+                && (cell.col == source_end || (ended_at_space && pc >= 2 && cell.col == pc - 2))
+                && cell.typing
+                && !cell.leaving()
+            {
                 has_end = true;
                 break;
             }
@@ -1282,6 +1290,87 @@ impl CursorGlow {
         if !has_end {
             return None;
         }
+        if width == 0 {
+            if current.above != NbrProbe::Probed
+                || self.ink_end_in_pane(&self.row_cur) != usize::from(cc)
+            {
+                return None;
+            }
+            let pc_trim = if ended_at_space { pc - 1 } else { pc };
+            if pc_trim <= pane_start
+                || self.ink_end_in_pane(&self.row_above_cur) > usize::from(pc_trim)
+                || old_row.get(usize::from(pane_start)..usize::from(pc_trim))
+                    != self
+                        .row_above_cur
+                        .get(usize::from(pane_start)..usize::from(pc_trim))
+            {
+                return None;
+            }
+            let mut col = pane_start;
+            while col < cc {
+                let glyph = match self.row_cur.get(usize::from(col)) {
+                    Some(&c) => c,
+                    None => break,
+                };
+                if matches!(glyph, ' ' | '\0') {
+                    col += 1;
+                    continue;
+                }
+                let landing_len = usize::from(cc - col);
+                let dropped_space = usize::from(!ended_at_space);
+                let cells = dropped_space + landing_len;
+                if (1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells) {
+                    let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+                    let mut valid = true;
+                    let mut i = 0;
+                    let mut c = col;
+                    while c < cc {
+                        let ch = match self.row_cur.get(usize::from(c)) {
+                            Some(&ch) => ch,
+                            None => ' ',
+                        };
+                        if ch == '\0' {
+                            valid = false;
+                            break;
+                        }
+                        glyphs[dropped_space + i] = ch;
+                        i += 1;
+                        c += 1;
+                    }
+                    if valid
+                        && let Some(slot) = self.type_press_ring.exact_unpaid_run_with_tail_window(
+                            now,
+                            previous.at,
+                            &glyphs[..cells],
+                            IN_FLIGHT_PATIENCE_DUR,
+                        )
+                    {
+                        return Some(ExactTypedRun {
+                            origin_row: pr,
+                            slot,
+                            source: None,
+                            landing_start: col,
+                            cells,
+                            rewrap_start: Some((col, 0)),
+                        });
+                    }
+                }
+                if rk::is_box_border_glyph(glyph)
+                    || (!glyph.is_alphanumeric() && old_row.get(usize::from(col)) == Some(&glyph))
+                {
+                    col += 1;
+                    continue;
+                }
+                break;
+            }
+            return None;
+        }
+        let source_start = pc.checked_sub(width)?;
+        let source_now = if same_row {
+            &self.row_cur
+        } else {
+            &self.row_above_cur
+        };
         let mut col = source_start;
         while col < pc {
             if let Some(&glyph) = source_now.get(usize::from(col))
@@ -1291,61 +1380,72 @@ impl CursorGlow {
             }
             col += 1;
         }
-        let pane_start = match self.pane_columns {
-            Some((start, _)) => start,
-            None => 0,
-        };
-        let mut start = None;
+        let expected_word = old_row.get(usize::from(source_start)..usize::from(pc))?;
         let mut col = pane_start;
-        while col < cc {
-            if let Some(&glyph) = self.row_cur.get(usize::from(col))
-                && !matches!(glyph, ' ' | '\0')
-            {
-                start = Some(col);
-                break;
-            }
-            col += 1;
-        }
-        let start = start?;
-        let landing_start = start.checked_add(width)?;
-        let cells = usize::from(cc.checked_sub(landing_start)?);
-        if !(1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
-            || old_row.get(usize::from(source_start)..usize::from(pc))?
-                != self
-                    .row_cur
-                    .get(usize::from(start)..usize::from(landing_start))?
-        {
-            return None;
-        }
-        let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
-        let mut i = 0;
-        let mut col = landing_start;
         while col < cc {
             let glyph = match self.row_cur.get(usize::from(col)) {
                 Some(&c) => c,
-                None => ' ',
+                None => break,
             };
-            if glyph == '\0' {
-                return None;
+            if matches!(glyph, ' ' | '\0') {
+                col += 1;
+                continue;
             }
-            glyphs[i] = glyph;
-            i += 1;
-            col += 1;
+            if let Some(landing_start) = col.checked_add(width)
+                && let Some(raw_cells) = cc.checked_sub(landing_start)
+            {
+                let cells = usize::from(raw_cells);
+                if (1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
+                    && self
+                        .row_cur
+                        .get(usize::from(col)..usize::from(landing_start))
+                        == Some(expected_word)
+                {
+                    let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+                    let mut valid = true;
+                    let mut i = 0;
+                    let mut c = landing_start;
+                    while c < cc {
+                        let ch = match self.row_cur.get(usize::from(c)) {
+                            Some(&ch) => ch,
+                            None => ' ',
+                        };
+                        if ch == '\0' {
+                            valid = false;
+                            break;
+                        }
+                        glyphs[i] = ch;
+                        i += 1;
+                        c += 1;
+                    }
+                    if valid
+                        && let Some(slot) = self.type_press_ring.exact_unpaid_run_with_tail_window(
+                            now,
+                            previous.at,
+                            &glyphs[..cells],
+                            IN_FLIGHT_PATIENCE_DUR,
+                        )
+                    {
+                        return Some(ExactTypedRun {
+                            origin_row: pr,
+                            slot,
+                            source: None,
+                            landing_start,
+                            cells,
+                            rewrap_start: Some((col, width)),
+                        });
+                    }
+                }
+            }
+            if rk::is_box_border_glyph(glyph)
+                || (!glyph.is_alphanumeric() && old_row.get(usize::from(col)) == Some(&glyph))
+            {
+                col += 1;
+                continue;
+            }
+            break;
         }
-        let slot = self.type_press_ring.exact_unpaid_run_with_tail_window(
-            now,
-            previous.at,
-            &glyphs[..cells],
-            IN_FLIGHT_PATIENCE_DUR,
-        )?;
-        Some(ExactTypedRun {
-            origin_row: pr,
-            slot,
-            source: None,
-            landing_start,
-            cells,
-            rewrap_start: Some((start, width)),
-        })
+        None
     }
 
     /// Witness for a one-glyph echo when a TUI redraws the caret back onto its old cell in the same bracket.
@@ -1790,10 +1890,13 @@ impl CursorGlow {
             || (p.landing_row == p.row
                 && p.origin > p.landing
                 && p.origin - p.landing >= rk::ribbon::RE_ANCHOR_MIN_CELLS);
-        self.v2
-            .set_flush_clock(if reanchor { Some(p.at) } else { None });
+        self.v2.set_flush_park(if reanchor {
+            Some((p.at, p.v2_typed_before))
+        } else {
+            None
+        });
         let licensed = self.judging_on_rows(p.row, p.landing_row, |glow| {
-            glow.with_presses_banked_through(p.at, |glow| {
+            glow.with_presses_at_park(p.at, p.press_mask, |glow| {
                 glow.spawn_judged(
                     p.row,
                     p.origin,
@@ -1815,8 +1918,22 @@ impl CursorGlow {
             self.v2
                 .prove_short_reanchor((p.row, p.origin), (p.landing_row, p.landing), p.at);
         }
-        self.v2.set_flush_clock(None);
+        self.v2.set_flush_park(None);
         self.type_hint.merge(later_stamps);
+    }
+
+    /// Run `judge` against the press ring as it stood when the park was held.
+    #[inline]
+    pub(super) fn with_presses_at_park<R>(
+        &mut self,
+        at: Instant,
+        mask_at_park: u128,
+        judge: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let later = self.type_press_ring.split_off_for_park(at, mask_at_park);
+        let r = judge(self);
+        self.type_press_ring.merge(later);
+        r
     }
 
     /// Run `judge` against the press ring as it stood at `at`.
@@ -1853,6 +1970,8 @@ impl CursorGlow {
             landing_glyph: self.landing_glyph_at(cr, cc),
             landing_cell: self.probe_glyph_before(cr, cc, now),
             content_followed: false,
+            press_mask: self.type_press_ring.occupied,
+            v2_typed_before: self.v2.buffered_typed_events(),
         });
     }
 
@@ -1886,7 +2005,7 @@ impl CursorGlow {
         let before = if p.cross_row {
             self.typed_credits_within(now)
         } else {
-            self.type_press_ring.cells_where(now, |t| t <= p.at)
+            self.type_press_ring.cells_at_park(now, p.at, p.press_mask)
         };
         before >= cells || Self::share_rule(before, before, cells)
     }
@@ -1934,6 +2053,7 @@ impl CursorGlow {
             || self
                 .coalesced_fold_shape(pr, pc, cr, cc, now, geom)
                 .is_some()
+            || self.indented_wrap_landing(pr, pc, cr, cc, geom)
             || self.park_source_intact != Some((pr, pc))
         {
             return false;
@@ -1951,6 +2071,52 @@ impl CursorGlow {
     #[inline]
     pub(super) const fn landing_ends_a_print(&self, row: u16, col: u16) -> bool {
         self.print_in_tick && matches!(self.print_anchor, Some((r, c, _)) if r == row && c == col)
+    }
+
+    /// Whether a `pr -> pr + 1` move is an indented/bordered composer wrap landing rather than a background cross-row park.
+    pub(super) fn indented_wrap_landing(
+        &self,
+        pr: u16,
+        pc: u16,
+        cr: u16,
+        cc: u16,
+        geom: Geom,
+    ) -> bool {
+        if pr.checked_add(1) != Some(cr)
+            || cc >= pc
+            || !matches!(self.hand_row, Some(hand) if hand.row == pr)
+            || !self.landing_ends_a_print(cr, cc)
+            || self.ink_end_in_pane(&self.row_cur) != usize::from(cc)
+        {
+            return false;
+        }
+        let (pane_cols, pc_local, cc_local, pane_contains_move) = self.pane_local(pc, cc, geom);
+        if !pane_contains_move || cc_local == 0 || pc_local.saturating_add(8) < pane_cols {
+            return false;
+        }
+        let pane_start = match self.pane_columns {
+            Some((start, _)) => start,
+            None => 0,
+        };
+        let mut col = pane_start;
+        let mut saw_word = false;
+        while col < cc {
+            let ch = match self.row_cur.get(usize::from(col)) {
+                Some(&c) => c,
+                None => ' ',
+            };
+            if matches!(ch, ' ' | '\0') {
+                if saw_word {
+                    return false;
+                }
+            } else if !saw_word && col == pane_start && rk::is_box_border_glyph(ch) {
+                // Left box border at `pane_start`.
+            } else {
+                saw_word = true;
+            }
+            col += 1;
+        }
+        saw_word
     }
 
     /// A cross-row park needs content evidence.
@@ -2057,19 +2223,31 @@ impl CursorGlow {
     /// One past the last glyph of a sampled row inside the focused pane (the whole row when no pane is set).
     #[inline]
     pub(super) const fn ink_end_in_pane(&self, cols: &[char]) -> usize {
-        let pane_end = match self.pane_columns {
+        let (pane_start, pane_end) = match self.pane_columns {
             Some((c0, n)) => {
-                let end = c0 as usize + n as usize;
-                if end < cols.len() { end } else { cols.len() }
+                let start = c0 as usize;
+                let end = start + n as usize;
+                let clamped = if end < cols.len() { end } else { cols.len() };
+                (if start < clamped { start } else { clamped }, clamped)
             }
-            None => cols.len(),
+            None => (0, cols.len()),
         };
         let mut i = pane_end;
-        while i > 0 {
+        let mut skipped_border = false;
+        while i > pane_start {
             i -= 1;
-            if cols[i] != ' ' {
-                return i + 1;
+            let ch = cols[i];
+            if ch == ' ' {
+                continue;
             }
+            if !skipped_border && rk::is_box_border_glyph(ch) {
+                skipped_border = true;
+                continue;
+            }
+            if i == pane_start && rk::is_box_border_glyph(ch) {
+                return 0;
+            }
+            return i + 1;
         }
         0
     }

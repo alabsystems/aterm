@@ -3357,7 +3357,9 @@ enum AtAddr<R> {
 /// The addresses of a dial to `host` (`addr` first) on `port` by `deadline`, never one in
 /// `avoid`: `attempt` of each in turn until one is reached or ends the dial. When none answers
 /// the reason is the first failure, or the first past the peer's proof (a busy address),
-/// which says where it answers.
+/// which says where it answers. The loopback guard ([`crate::loopback::check`]) skips an
+/// address or a lookup that would leave the loopback, as one past the fleet's kind is skipped,
+/// its refusal the reason when nothing else came first.
 fn walk<R>(
     (host, addr, port): (&str, Option<IpAddr>, u16),
     (deadline, within): (Instant, Duration),
@@ -3369,6 +3371,10 @@ fn walk<R>(
     let mut at = |to: SocketAddr, first: &mut Option<Unreached>| {
         if !crate::fleet::is_fleet_source(to.ip()) {
             first.get_or_insert(Unreached::NotFleet(to));
+            return None;
+        }
+        if let Err(refused) = crate::loopback::check(crate::loopback::Reach::Dial(to)) {
+            first.get_or_insert(Unreached::Local(refused.to_string()));
             return None;
         }
         match attempt(to) {
@@ -3405,6 +3411,7 @@ fn walk<R>(
                 first.unwrap_or_else(|| Unreached::Local(format!("could not look {host} up: {e}")))
             );
         }
+        Lookup::Refused(e) => return Err(first.unwrap_or_else(|| Unreached::Local(e.to_string()))),
     };
     for to in resolved {
         if tried.contains(&to) {
@@ -3467,6 +3474,8 @@ enum Lookup {
     Found(Vec<SocketAddr>),
     Late,
     Unstarted(io::Error),
+    /// The loopback guard asked no resolver ([`crate::loopback::check`]).
+    Refused(io::Error),
 }
 
 const RESOLVER_THREADS_MAX: usize = 2 * AT_ONCE;
@@ -3504,6 +3513,9 @@ fn resolve_within(host: &str, port: u16, within: Duration, resolver: Resolver) -
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Lookup::Found(vec![SocketAddr::new(ip, port)]);
     }
+    if let Err(refused) = crate::loopback::check(crate::loopback::Reach::Lookup(host)) {
+        return Lookup::Refused(refused);
+    }
     if within.is_zero() {
         return Lookup::Late;
     }
@@ -3512,6 +3524,7 @@ fn resolve_within(host: &str, port: u16, within: Duration, resolver: Resolver) -
     if !host.contains('.') {
         names.push(format!("{host}.local"));
     }
+    names.retain(|name| crate::loopback::check(crate::loopback::Reach::Lookup(name)).is_ok());
     let (tx, rx) = std::sync::mpsc::sync_channel(names.len());
     let mut asking = 0usize;
     let mut unstarted = None;

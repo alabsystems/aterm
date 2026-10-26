@@ -109,6 +109,8 @@ struct Leg {
     sid: String,
     /// Its `CODEX_HOME`.
     home: PathBuf,
+    /// Optional isolated `CODEX_AUTH_PATH` outside `CODEX_HOME`.
+    auth_path: Option<PathBuf>,
     proj: PathBuf,
 }
 
@@ -1019,13 +1021,41 @@ impl Proof {
         autopilot: Option<&str>,
         program: Option<&Path>,
     ) -> Result<Leg, Fail> {
+        self.start_leg_using_auth(name, prompt, extra, folder, autopilot, program, false)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "lab leg builder bundles prompt, config, folder, autopilot, binary, and auth isolation"
+    )]
+    fn start_leg_using_auth(
+        &mut self,
+        name: &'static str,
+        prompt: Option<&str>,
+        extra: &str,
+        folder: Folder,
+        autopilot: Option<&str>,
+        program: Option<&Path>,
+        isolated_auth: bool,
+    ) -> Result<Leg, Fail> {
         let dir = self.s.join("legs").join(name);
         let home = dir.join("codex-home");
+        let auth_dir = dir.join("isolated-auth");
         let proj = dir.join("proj");
-        let made = (|| -> Result<PathBuf, String> {
+        let made = (|| -> Result<(PathBuf, Option<PathBuf>), String> {
             let io = |e: std::io::Error| e.to_string();
             std::fs::create_dir_all(&home).map_err(io)?;
             std::fs::create_dir_all(&proj).map_err(io)?;
+            let auth_path = if isolated_auth {
+                std::fs::create_dir_all(&auth_dir).map_err(io)?;
+                Some(
+                    std::fs::canonicalize(&auth_dir)
+                        .map_err(io)?
+                        .join("auth.json"),
+                )
+            } else {
+                None
+            };
             let proj = std::fs::canonicalize(&proj).map_err(io)?;
             let dir = std::fs::canonicalize(&dir).map_err(io)?;
             self.lay_folder(&dir, &proj, folder)?;
@@ -1034,9 +1064,9 @@ impl Proof {
                 codex_config(self.port, &proj, &home, extra),
             )
             .map_err(io)?;
-            Ok(proj)
+            Ok((proj, auth_path))
         })();
-        let proj = made.map_err(|e| format!("cannot lay out leg {name}: {e}"))?;
+        let (proj, auth_path) = made.map_err(|e| format!("cannot lay out leg {name}: {e}"))?;
         let spawned = self
             .inst
             .ctl(&["spawn", &format!("cwd={}", proj.display())]);
@@ -1066,8 +1096,11 @@ impl Proof {
             || program.clone(),
             |p| format!("{program} {}", sh_quote(&format!("LEG-{name} {p}"))),
         );
+        let auth_export = auth_path.as_deref().map_or_else(String::new, |path| {
+            format!(" CODEX_AUTH_PATH={}", sh_quote(&path.to_string_lossy()))
+        });
         let line = format!(
-            "export CODEX_HOME={}; cd {} && {codex}\r",
+            "export CODEX_HOME={}{auth_export}; cd {} && {codex}\r",
             sh_quote(&home.to_string_lossy()),
             sh_quote(&proj.to_string_lossy()),
         );
@@ -1085,6 +1118,7 @@ impl Proof {
             name,
             sid,
             home,
+            auth_path,
             proj,
         })
     }
@@ -1140,6 +1174,7 @@ impl Proof {
                 name,
                 sid,
                 home,
+                auth_path: None,
                 proj,
             }
         }))
@@ -4247,6 +4282,7 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
             name,
             sid: format!("s-{name}"),
             home: PathBuf::from("/nonexistent/home"),
+            auth_path: None,
             proj: PathBuf::from("/nonexistent/proj"),
         };
         let (land, reland, repo) = (leg("land"), leg("reland"), leg("repo"));

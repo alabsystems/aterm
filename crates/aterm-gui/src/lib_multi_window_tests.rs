@@ -408,8 +408,21 @@ fn migrate_active_tab_moves_view_to_next_window() {
     app.frontmost_window = Some(WindowId(0));
     app.sync_active_session();
     let pool_before = app.pool.iter().count();
+    let _ = crate::app_tabs::take_raised_windows();
     let _ = app.migrate_active_tab_to_next_window();
     assert_eq!(app.windows.len(), 2);
+    assert_eq!(
+        crate::app_tabs::take_raised_windows(),
+        vec![wid_b],
+        "the destination is raised"
+    );
+    assert_eq!(
+        app.frontmost_window,
+        Some(WindowId(0)),
+        "the front waits for the OS to focus the destination"
+    );
+    app.window_focus_event(WindowId(0), false);
+    app.window_focus_event(wid_b, true);
     assert_eq!(app.frontmost_window, Some(wid_b), "focus follows the tab");
     assert_eq!(focuses(&app, WindowId(0)), vec![0], "source lost the tab");
     assert_eq!(focuses(&app, wid_b), vec![sid1, sid2], "appended to B");
@@ -636,6 +649,94 @@ fn ledger_shortcut_exports_the_event_windows_session() {
     assert!(ownership_failures.is_empty(), "{ownership_failures:#?}");
 }
 
+/// Move Tab to Next Window into a window that takes no focus (minimized on macOS, where
+/// `focus_window` does nothing; any window on Wayland): the window that keeps the keyboard
+/// stays the front, so ⌘V, ⌘W and a bare ctl verb act on the tab the person sees, never on
+/// the moved tab in the hidden window, and the destination is raised (un-minimized).
+#[test]
+fn a_tab_moved_into_a_window_that_takes_no_focus_leaves_the_keyboard_window_in_front() {
+    let mut app = App::headless_for_test();
+    let wid_a = WindowId(0);
+    let kept = app.next_session_id;
+    app.push_stub_tab(wid_a, stub_session(kept));
+    let hidden = app.next_session_id;
+    let wid_b = app.insert_logical_window(stub_session(hidden), 24, 80);
+    let moved = app.next_session_id;
+    app.push_stub_tab(wid_a, stub_session(moved));
+    app.windows.get_mut(&wid_a).expect("A").focused = true;
+    app.windows.get_mut(&wid_b).expect("B").focused = false;
+    app.frontmost_window = Some(wid_a);
+    app.sync_active_session();
+    let _ = crate::app_tabs::take_raised_windows();
+    let active_id = |app: &App| {
+        app.active_handle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|active| active.id)
+    };
+    assert_eq!(
+        active_id(&app),
+        Some(moved),
+        "fixture: the moved tab is in front"
+    );
+
+    app.migrate_active_tab_to_next_window()
+        .expect("two windows: the tab moves");
+    assert_eq!(
+        app.focused_session_id(wid_b),
+        Some(moved),
+        "the tab moved to B"
+    );
+    assert_eq!(
+        crate::app_tabs::take_raised_windows(),
+        vec![wid_b],
+        "the destination is raised, which un-minimizes it, not only focused"
+    );
+    assert_eq!(
+        app.frontmost_window,
+        Some(wid_a),
+        "no Focused event came, so the window with the keyboard stays the front"
+    );
+    assert_eq!(
+        app.clipboard_session_in(wid_a),
+        Some(kept),
+        "⌘V pastes into the tab the person sees"
+    );
+    assert_eq!(
+        active_id(&app),
+        Some(kept),
+        "a bare ctl verb names the visible tab"
+    );
+    assert_eq!(
+        app.focus_report_holder(),
+        Some(kept),
+        "the typed-into tab holds focus"
+    );
+
+    let _ = app.close_active_tab();
+    assert_eq!(
+        app.focused_session_id(wid_b),
+        Some(moved),
+        "⌘W leaves the moved tab in the hidden window alone"
+    );
+    assert_eq!(
+        app.windows[&wid_a].tab_set.len(),
+        1,
+        "⌘W closed A's front tab"
+    );
+
+    app.window_focus_event(wid_a, false);
+    app.window_focus_event(wid_b, true);
+    assert_eq!(
+        app.frontmost_window,
+        Some(wid_b),
+        "the OS focus moves the front"
+    );
+    assert_eq!(active_id(&app), Some(moved));
+    assert!(app.structural_invariants_ok());
+}
+
 #[test]
 fn a_moved_mixed_tab_s_terminal_takes_the_destination_leaf_grid() {
     let mut app = App::headless_for_test();
@@ -664,6 +765,8 @@ fn a_moved_mixed_tab_s_terminal_takes_the_destination_leaf_grid() {
 
     app.migrate_active_tab_to_next_window()
         .expect("the mixed tab moves");
+    app.window_focus_event(wid_a, false);
+    app.window_focus_event(wid_b, true);
     assert_eq!(app.frontmost_window, Some(wid_b), "focus follows the tab");
     assert_eq!(app.focused_session_id(wid_b), Some(session));
     let target = leaf_grid(&app, wid_b);

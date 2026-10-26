@@ -37,6 +37,7 @@ pub(crate) struct ActRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
+    About,
     SystemState,
     Settings(crate::native_settings::SettingsRoute),
     Markdown(String),
@@ -135,6 +136,7 @@ pub(crate) fn parse_act(rest: &str) -> Result<ActRequest, String> {
 
 pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
     match aterm_types::app_inspection::parse_open_app(rest).map_err(|error| error.to_string())? {
+        WireOpenAppRequest::About => Ok(OpenRequest::About),
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Settings { route } => {
             let route = if route == "/" {
@@ -225,6 +227,9 @@ impl App {
             .semantic(&key)
             .is_none_or(|node| node.offscreen)
             && match self.native_runtime.view_state_mut(request.view) {
+                Some(crate::native_app::AppViewState::About(state)) => {
+                    state.reveal_listed_control(&key)
+                }
                 Some(crate::native_app::AppViewState::Settings(state)) => {
                     state.reveal_listed_control(&key)
                 }
@@ -321,6 +326,10 @@ impl App {
 
     pub(crate) fn open_app(&mut self, request: OpenRequest) -> Result<String, String> {
         match request {
+            OpenRequest::About => self
+                .open_about_tab()
+                .then(|| "app about".to_string())
+                .ok_or_else(|| "About could not be opened in the requesting window".to_string()),
             OpenRequest::SystemState => self
                 .open_system_state_tab()
                 .then(|| "app system-state".to_string())
@@ -1275,6 +1284,7 @@ mod tests {
 
     #[test]
     fn wire_requests_become_stable_owned_targets() {
+        assert_eq!(parse_open("app about").unwrap(), OpenRequest::About);
         assert_eq!(
             parse_open("app system-state").unwrap(),
             OpenRequest::SystemState

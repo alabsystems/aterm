@@ -103,6 +103,11 @@ pub struct PetReserve<'a> {
     pub overlays: &'a [PetRect],
     /// Predicted echo and IME preedit rectangles treated as ink.
     pub ink: &'a [PetRect],
+    /// The content sequence ([`RenderInput::content_seq`]) of the frame [`Self::protected`] was
+    /// painted over, when the host paints its chrome after the pet has looked at a frame (its last
+    /// pass's chrome, over the frame before this one): the console carries it with the rows it was
+    /// painted on where they have moved since. `None`: laid over this very frame.
+    pub painted_over: Option<u64>,
 }
 
 impl<'a> PetReserve<'a> {
@@ -115,6 +120,7 @@ impl<'a> PetReserve<'a> {
             protected,
             overlays: &[],
             ink: &[],
+            painted_over: None,
         }
     }
 }
@@ -503,9 +509,9 @@ impl PetWorld {
     pub const fn stamp(&self) -> Option<PetWorldStamp> {
         self.stamp
     }
+    /// The part of the pane this map observed (its map row 0 is the pane's `coverage().row`).
     #[inline]
     #[must_use]
-    #[cfg(test)]
     pub const fn coverage(&self) -> PetPane {
         self.coverage
     }
@@ -612,6 +618,7 @@ impl PetWorld {
                 protected: exclusions,
                 overlays,
                 ink: &[],
+                painted_over: None,
             },
         )
     }
@@ -643,6 +650,7 @@ impl PetWorld {
             protected: exclusions,
             overlays,
             ink: reserved_ink,
+            ..
         } = reserve;
         const fn all_valid(rects: &[PetRect]) -> bool {
             let mut i = 0;
@@ -1854,6 +1862,31 @@ impl PetWorld {
         max_distance: f32,
         from: Option<PetRect>,
     ) -> Option<PetRect> {
+        self.nearest_clear_perch_in(near, margin, max_distance, from, false)
+    }
+
+    /// [`Self::nearest_clear_perch`] on `near`'s own row band only: the nearest clean seat along
+    /// the ground `near` stands on, as far as `max_distance` and the ground reachable from `from`
+    /// go.
+    #[must_use]
+    pub const fn nearest_clear_perch_along(
+        &self,
+        near: PetRect,
+        margin: f32,
+        max_distance: f32,
+        from: Option<PetRect>,
+    ) -> Option<PetRect> {
+        self.nearest_clear_perch_in(near, margin, max_distance, from, true)
+    }
+
+    const fn nearest_clear_perch_in(
+        &self,
+        near: PetRect,
+        margin: f32,
+        max_distance: f32,
+        from: Option<PetRect>,
+        along: bool,
+    ) -> Option<PetRect> {
         const fn fill(extent: f32, margin: f32) -> Option<(usize, f32)> {
             let cells = (extent + 2.0 * margin + 2.0 * PERCH_SLACK).ceil();
             if cells.is_finite() && cells >= 1.0 {
@@ -2075,7 +2108,7 @@ impl PetWorld {
                     ci += 1;
                 }
             }
-            if !live_band && step > 0 {
+            if along || (!live_band && step > 0) {
                 break;
             }
             step += 1;
@@ -3628,6 +3661,7 @@ mod tests {
                 protected: &[],
                 overlays: &[],
                 ink: &typed,
+                painted_over: None,
             }
         ));
         assert_eq!(world.cell(9, 20), PetCell::Ink);
@@ -3658,6 +3692,7 @@ mod tests {
                 protected: &[],
                 overlays: &typed,
                 ink: &[],
+                painted_over: None,
             }
         ));
         assert_eq!(world.cell(9, 20), PetCell::Protected);
@@ -3676,6 +3711,7 @@ mod tests {
                 protected: &[],
                 overlays: &[],
                 ink: &nan,
+                painted_over: None,
             }
         ));
         assert_eq!(world.stamp(), None);
@@ -4540,6 +4576,7 @@ mod tests {
             protected: &rect,
             overlays: &rect,
             ink: &rect,
+            painted_over: None,
         };
         const fn consumed(i: &RenderInput) -> (&RenderInput, PetFill) {
             (i, PetFill::Consumed)

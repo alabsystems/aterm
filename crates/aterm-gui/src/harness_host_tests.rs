@@ -4502,6 +4502,7 @@ fn self_copy(
             argv,
             session: "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
             codex_home: None,
+            codex_auth_path: None,
             cwd: None,
         }),
     }
@@ -4518,6 +4519,7 @@ fn standing_record() -> self_claimed::Seen {
         cwd: None,
         draft_empty: None,
         frame: None,
+        goal: None,
         initializing: false,
     })
 }
@@ -5049,6 +5051,7 @@ fn a_handed_self_claimed_agent_keeps_no_line_its_successor_never_validated() {
         ],
         session: "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
         codex_home: None,
+        codex_auth_path: None,
         cwd: None,
     };
     let handed = Snapshot {
@@ -5290,6 +5293,7 @@ fn a_handed_self_claimed_line_survives_publication_into_the_crash_image() {
                 argv: line.argv,
                 session: line.session,
                 codex_home: line.codex_home,
+                codex_auth_path: line.codex_auth_path,
                 cwd: line.cwd,
             });
         assert_eq!(captured, expected, "{why}");
@@ -35302,6 +35306,7 @@ fn an_unread_initial_record_relaunches_only_with_its_validated_line_and_shell() 
             image: Some(line[0].clone().into()),
             argv: line.clone(),
             codex_home: None,
+            codex_auth_path: None,
             cwd: None,
             twin: None,
             managed_launch: None,

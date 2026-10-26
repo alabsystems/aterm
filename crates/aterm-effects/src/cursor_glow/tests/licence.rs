@@ -6,6 +6,77 @@
 use super::*;
 
 #[test]
+fn admission_source_is_retained_without_changing_light_or_licences() {
+    let a = AdmissionSource {
+        view: 11,
+        session: 7,
+    };
+    let b = AdmissionSource {
+        view: 12,
+        session: 7,
+    };
+    for style in [GlowStyle::Classic, GlowStyle::RainbowKitty] {
+        let config = cfg(style, true);
+        let geometry = geom();
+        let start = Instant::now();
+        let mut plain = CursorGlow::default();
+        let mut bound = CursorGlow::default();
+        let mut plain_ink = Vec::new();
+        let mut bound_ink = Vec::new();
+        plain.tick(Some((2, 0)), start, &config, geometry, &mut plain_ink);
+        bound.tick(Some((2, 0)), start, &config, geometry, &mut bound_ink);
+        for (index, source) in [Some(a), Some(b), None].into_iter().enumerate() {
+            let previous = bound.admission_log().copied().collect::<Vec<_>>();
+            bound.set_admission_source(source);
+            assert_eq!(bound.admission_log().copied().collect::<Vec<_>>(), previous);
+            let at = start + Duration::from_millis((index as u64 + 1) * 16);
+            let caret = (2, index as u16 + 1);
+            for glow in [&mut plain, &mut bound] {
+                glow.note_typed_cells(at, 1);
+            }
+            plain_ink.clear();
+            bound_ink.clear();
+            assert_eq!(
+                plain.tick(Some(caret), at, &config, geometry, &mut plain_ink),
+                bound.tick(Some(caret), at, &config, geometry, &mut bound_ink)
+            );
+            assert_eq!(plain_ink, bound_ink);
+            assert_eq!(plain.spawns(), bound.spawns());
+            assert_eq!(plain.move_licensed(at), bound.move_licensed(at));
+            assert_eq!(plain.admission_tally(), bound.admission_tally());
+            assert_eq!(plain.ribbon_segments(), bound.ribbon_segments());
+            let recorded = bound.admission_log().last().unwrap();
+            assert_eq!(recorded.source, source);
+            assert_eq!(plain.admission_log().last().unwrap().source, None);
+            if source.is_none() {
+                let row = recorded.line(at);
+                assert!(
+                    row.split_ascii_whitespace()
+                        .any(|field| field == "source=unknown")
+                );
+            }
+        }
+        let prior = bound.admission_log().copied().collect::<Vec<_>>();
+        assert_eq!(prior.len(), 3);
+        assert_eq!(prior[0].source, Some(a));
+        assert_eq!(prior[1].source, Some(b));
+        assert_eq!(prior[2].source, None);
+        bound.set_admission_source(Some(a));
+        let late = start + Duration::from_secs(2);
+        bound.tick(Some((2, 9)), late, &config, geometry, &mut bound_ink);
+        let declined = bound.admission_log().last().unwrap();
+        if style == GlowStyle::RainbowKitty {
+            assert_eq!(declined.phase, AdmissionPhase::Declined);
+        }
+        assert_eq!(declined.source, Some(a));
+        assert_eq!(
+            bound.admission_log().take(3).copied().collect::<Vec<_>>(),
+            prior
+        );
+    }
+}
+
+#[test]
 fn rainbow_ribbon_survives_word_boundaries_and_keeps_its_head() {
     use std::fmt::Write as _;
     let g = geom();
@@ -307,14 +378,11 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         1,
         "…by the in-flight pool alone"
     );
-    let last = idle
-        .admission_log()
-        .last()
-        .map(|r| r.line(stale_at))
-        .expect("one ring row");
-    assert!(
-        last.ends_with(" licence=inflight"),
-        "the ring names the in-flight licence: {last}"
+    let last = idle.admission_log().last().expect("one ring row");
+    assert_eq!(
+        last.licence,
+        AdmissionRecord::LICENCE_IN_FLIGHT,
+        "the ring names the in-flight licence"
     );
     assert_eq!(idle_echoed["resident"], 1, "light was born");
     assert_eq!(

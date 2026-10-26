@@ -17,7 +17,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const GIT: &str = crate::checkout::GIT;
 const PAGE_SIZE: usize = 30;
 const CLONE_BUDGET: Duration = Duration::from_secs(1800);
 
@@ -269,12 +268,13 @@ pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
     Ok(())
 }
 
-/// Why [`admit_home`] refuses a Mac without Command Line Tools git.
-pub(super) const NO_GIT: &str = "Command Line Tools git is not installed; no repositories changed";
+/// Why [`admit_home`] refuses a Mac with neither the Command Line Tools' git nor Xcode's.
+pub(super) const NO_GIT: &str =
+    "git is not installed (neither the Command Line Tools nor Xcode); no repositories changed";
 
-/// Whether Command Line Tools git, which every clone runs, is installed.
+/// Whether the git every clone runs is installed ([`crate::items::github::installed_git`]).
 pub(super) fn git_installed(sys: &dyn System) -> bool {
-    sys.stat(Path::new(GIT)).is_ok_and(|stat| !stat.dir)
+    crate::items::github::installed_git(sys).is_some()
 }
 
 /// The room a clone takes per byte of GitHub's `size`: 54 repositories GitHub sized at 10 GiB
@@ -491,7 +491,7 @@ fn repo(value: &Value, expected_owner: Option<&str>) -> Result<Repo, String> {
 fn git_read(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<String, String> {
     text(
         sys,
-        &git(user, Some(path)).args(args.iter().copied()),
+        &git(sys, user, Some(path)).args(args.iter().copied()),
         "cannot verify the existing Git worktree; left untouched",
     )
 }
@@ -536,7 +536,7 @@ fn verify_integrity(sys: &dyn System, user: &User, path: &Path) -> Result<(), St
         return Err("the new clone is shallow; not published".into());
     }
     let partial = sys
-        .run_complete_stdout(&git(user, Some(path)).args([
+        .run_complete_stdout(&git(sys, user, Some(path)).args([
             "config",
             "--get-regexp",
             "^(extensions\\.partialclone|remote\\..*\\.(promisor|partialclonefilter))$",
@@ -623,7 +623,7 @@ fn admit_endpoint(
 ) -> Result<String, String> {
     let expanded = text(
         sys,
-        &git(user, None).args(["ls-remote", "--get-url", "--", url]),
+        &git(sys, user, None).args(["ls-remote", "--get-url", "--", url]),
         "cannot inspect Git's effective GitHub repository URL",
     )?;
     let mut lines = expanded.lines();
@@ -642,8 +642,13 @@ struct CloneGuard<'a> {
     current: &'a dyn Fn() -> Result<(), String>,
 }
 
-fn network_git(user: &User, endpoint: &str, guard: Option<&CloneGuard<'_>>) -> Cmd {
-    let cmd = git(user, None);
+fn network_git(
+    sys: &dyn System,
+    user: &User,
+    endpoint: &str,
+    guard: Option<&CloneGuard<'_>>,
+) -> Cmd {
+    let cmd = git(sys, user, None);
     let Some(guard) = guard else { return cmd };
     // Command-line config only. The exact effective URL outranks less-specific
     // credential settings and clears every inherited helper for this request.
@@ -728,7 +733,7 @@ fn clone_one_with(
     current()?;
     let source = text(
         sys,
-        &network_git(user, &endpoint, guard).args([
+        &network_git(sys, user, &endpoint, guard).args([
             "ls-remote",
             "--symref",
             "--",
@@ -766,7 +771,7 @@ fn clone_one_with(
     let mut staging = Scratch::new_in(sys, home, "github-clone")
         .map_err(|_| "cannot allocate private repository staging in this home")?;
     let clone = staging.path().join("repo");
-    let command = network_git(user, &endpoint, guard)
+    let command = network_git(sys, user, &endpoint, guard)
         .budget(CLONE_BUDGET)
         .args([
             "clone",
@@ -823,7 +828,7 @@ fn verify_new(
 ) -> Result<(), String> {
     verify_integrity(sys, user, clone)?;
     let head = sys
-        .run_complete_stdout(&git(user, Some(clone)).args([
+        .run_complete_stdout(&git(sys, user, Some(clone)).args([
             "rev-parse",
             "--verify",
             "HEAD^{commit}",
@@ -839,7 +844,7 @@ fn verify_new(
             if let Some(branch) = &repo.default_branch {
                 text(
                     sys,
-                    &git(user, Some(clone)).args([
+                    &git(sys, user, Some(clone)).args([
                         "symbolic-ref",
                         "HEAD",
                         &format!("refs/heads/{branch}"),
@@ -981,7 +986,7 @@ mod tests {
         let who = user("alice", 501);
         sys.euid = who.uid;
         sys.stat_of(&who.home, directory(who.uid));
-        sys.file(GIT, b"synthetic git");
+        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
         script::configured(&sys, &who, "alice");
         script::holds(&sys, Some(&who), GITHUB, "alice", KEYCHAIN);
         sys.on_github_api(&who, "/user", json(r#"{"login":"alice"}"#));
@@ -1167,10 +1172,13 @@ mod tests {
                 String::new(),
             ),
         ] {
-            sys.on(&git(who, Some(path)).args(args).display(), Ran::ok(&output));
+            sys.on(
+                &git(sys, who, Some(path)).args(args).display(),
+                Ran::ok(&output),
+            );
         }
         sys.on(
-            &git(who, Some(path))
+            &git(sys, who, Some(path))
                 .args([
                     "config",
                     "--get-regexp",
@@ -1206,7 +1214,10 @@ mod tests {
                 status.to_owned(),
             ),
         ] {
-            sys.on(&git(who, Some(path)).args(args).display(), Ran::ok(&output));
+            sys.on(
+                &git(sys, who, Some(path)).args(args).display(),
+                Ran::ok(&output),
+            );
         }
     }
 
@@ -1224,7 +1235,7 @@ mod tests {
             }
             script_read(&sys, &who, &dirty, "dirty", " M README\0");
             sys.on(
-                &git(&who, Some(&dirty))
+                &git(&sys, &who, Some(&dirty))
                     .args(["ls-remote", "--symref", "origin", "HEAD"])
                     .display(),
                 Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n")),
@@ -1483,7 +1494,7 @@ mod tests {
             script_existing(&sys, &who, &present, "present");
             script_read(&sys, &who, &present, "present", "");
             sys.on(
-                &git(&who, Some(&present))
+                &git(&sys, &who, Some(&present))
                     .args(["ls-remote", "--symref", "origin", "HEAD"])
                     .display(),
                 Ran::exit(128, stderr),
@@ -1548,7 +1559,7 @@ mod tests {
             sys.stat_of(aterm.to_str().unwrap(), directory(who.uid));
             script_existing(&sys, &who, &aterm, "aterm");
             script_read(&sys, &who, &aterm, "aterm", "");
-            let remote_head = git(&who, Some(&aterm))
+            let remote_head = git(&sys, &who, Some(&aterm))
                 .args(["ls-remote", "--symref", "origin", "HEAD"])
                 .display();
             sys.on(
@@ -1652,8 +1663,11 @@ mod tests {
                 }
                 2 => {
                     sys.stat_of(path.to_str().unwrap(), directory(who.uid));
-                    let cmd =
-                        git(&who, Some(&path)).args(["config", "--get-all", "remote.origin.url"]);
+                    let cmd = git(&sys, &who, Some(&path)).args([
+                        "config",
+                        "--get-all",
+                        "remote.origin.url",
+                    ]);
                     sys.on(
                         &cmd.display(),
                         Ran::ok("https://private-token@github.com/alice/one.git\n"),
@@ -1703,7 +1717,7 @@ mod tests {
         };
         let url = "https://github.com/alice/new.git";
         sys.on(
-            &git(who, None)
+            &git(sys, who, None)
                 .args(["ls-remote", "--get-url", "--", url])
                 .display(),
             Ran::ok(url),
@@ -1715,7 +1729,7 @@ mod tests {
                 "ref: refs/heads/main\tHEAD\n{A}\tHEAD\n{A}\trefs/heads/main\n{B}\trefs/heads/topic\n{B}\trefs/tags/v1\n"
             )
         };
-        let command = network_git(who, url, guard).args([
+        let command = network_git(sys, who, url, guard).args([
             "ls-remote",
             "--symref",
             "--",
@@ -1726,7 +1740,7 @@ mod tests {
         ]);
         sys.on(&command.display(), Ran::ok(&remote));
         let staged = Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
-        let command = network_git(who, url, guard)
+        let command = network_git(sys, who, url, guard)
             .budget(CLONE_BUDGET)
             .args([
                 "clone",
@@ -1745,12 +1759,12 @@ mod tests {
         sys.on_write(&clone_key, &staged.join(".git/fixture"), b"complete clone");
         script_existing(sys, who, &staged, "new");
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["rev-parse", "--git-path", "objects/info/alternates"])
                 .display(),
             Ran::ok(".git/objects/info/alternates\n"),
         );
-        let head = git(who, Some(&staged)).args(["rev-parse", "--verify", "HEAD^{commit}"]);
+        let head = git(sys, who, Some(&staged)).args(["rev-parse", "--verify", "HEAD^{commit}"]);
         sys.on(
             &head.display(),
             if empty {
@@ -1767,43 +1781,43 @@ mod tests {
             )
         };
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["for-each-ref", "--format=%(objectname) %(refname)"])
                 .display(),
             Ran::ok(&refs),
         );
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["symbolic-ref", "HEAD", "refs/heads/main"])
                 .display(),
             Ran::ok(""),
         );
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["symbolic-ref", "--quiet", "HEAD"])
                 .display(),
             Ran::ok("refs/heads/main\n"),
         );
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
                 .display(),
             Ran::ok("refs/remotes/origin/main\n"),
         );
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["config", "--get", "branch.main.remote"])
                 .display(),
             Ran::ok("origin\n"),
         );
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["config", "--get", "branch.main.merge"])
                 .display(),
             Ran::ok("refs/heads/main\n"),
         );
         sys.on(
-            &git(who, Some(&staged))
+            &git(sys, who, Some(&staged))
                 .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
                 .display(),
             Ran::ok(""),
@@ -1843,7 +1857,7 @@ mod tests {
             "ssh://git@github.com:22/alice/new.git",
         ] {
             let (sys, who, _) = fixture();
-            let key = git(&who, None)
+            let key = git(&sys, &who, None)
                 .args([
                     "ls-remote",
                     "--get-url",
@@ -1916,7 +1930,7 @@ mod tests {
             };
             let url = "https://github.com/alice/new.git";
             sys.on(
-                &git(&who, None)
+                &git(&sys, &who, None)
                     .args(["ls-remote", "--get-url", "--", url])
                     .display(),
                 Ran::ok(endpoint),
@@ -1937,7 +1951,7 @@ mod tests {
                 Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
             if !race {
                 sys.on(
-                    &git(&who, Some(&staged))
+                    &git(&sys, &who, Some(&staged))
                         .args(["fsck", "--connectivity-only", "--no-dangling"])
                         .display(),
                     Ran::exit(1, "failure includes secret-like bytes that must not escape"),
@@ -1976,7 +1990,7 @@ mod tests {
             "",
         ] {
             let (sys, who, _) = fixture();
-            let key = git(&who, None)
+            let key = git(&sys, &who, None)
                 .args([
                     "ls-remote",
                     "--get-url",
@@ -1993,7 +2007,7 @@ mod tests {
                 && !call.contains("scratch allocated")));
         }
         let (sys, who, _) = fixture();
-        let key = git(&who, None)
+        let key = git(&sys, &who, None)
             .args([
                 "ls-remote",
                 "--get-url",
@@ -2023,7 +2037,7 @@ mod tests {
         let path = home.path().join("existing");
         text(
             &sys,
-            &git(&who, None)
+            &git(&sys, &who, None)
                 .args(["init", "--template=", "--initial-branch=main"])
                 .arg(&path),
             "fixture init",
@@ -2033,7 +2047,7 @@ mod tests {
             &sys,
             // A commit starts automatic maintenance too, whose fork would hold this drain's
             // pipe past git's exit on a loaded machine.
-            &git(&who, Some(&path))
+            &git(&sys, &who, Some(&path))
                 .args(crate::checkout::NO_SIDE_RUNS)
                 .args([
                     "-c",
@@ -2050,7 +2064,7 @@ mod tests {
         .unwrap();
         text(
             &sys,
-            &git(&who, Some(&path)).args([
+            &git(&sys, &who, Some(&path)).args([
                 "remote",
                 "add",
                 "origin",
@@ -2061,7 +2075,7 @@ mod tests {
         .unwrap();
         text(
             &sys,
-            &git(&who, Some(&path)).args(["switch", "-c", "topic"]),
+            &git(&sys, &who, Some(&path)).args(["switch", "-c", "topic"]),
             "fixture branch",
         )
         .unwrap();
@@ -2093,7 +2107,7 @@ mod tests {
         let path = Path::new(&who.home).join("existing");
         script_existing(&sys, &who, &path, "existing");
         sys.refuse_complete_stdout(
-            &git(&who, Some(&path))
+            &git(&sys, &who, Some(&path))
                 .args(["rev-parse", "--is-shallow-repository"])
                 .display(),
             "history intentionally unavailable",
@@ -2131,7 +2145,10 @@ mod tests {
             let (sys, who, _) = fixture();
             let staged =
                 Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
-            sys.on(&git(&who, Some(&staged)).args(args).display(), Ran::ok(bad));
+            sys.on(
+                &git(&sys, &who, Some(&staged)).args(args).display(),
+                Ran::ok(bad),
+            );
             let (repo, _, _) = script_clone(&sys, &who, false);
             assert!(clone_one(&sys, &who, "alice", &repo).is_err());
             assert!(sys.stat(&Path::new(&who.home).join("new")).is_err());

@@ -29,6 +29,7 @@ const STARVED: Pace = Pace {
     wall_ms: 10,
     load: Some(3000),
     cores: 14,
+    threads: None,
 };
 
 /// A loaded run that was not starved: CPU/wall 0.9 at load 10 on 14 cores.
@@ -37,6 +38,7 @@ const UNSTARVED: Pace = Pace {
     wall_ms: 10,
     load: Some(1000),
     cores: 14,
+    threads: None,
 };
 
 fn git(dir: &Path, args: &[&str]) -> String {

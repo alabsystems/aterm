@@ -157,6 +157,13 @@ impl CursorGlow {
         self.word_icons_unshaded = true;
     }
 
+    #[inline]
+    pub(crate) fn clear_word_icons(&mut self) {
+        self.word_icons.clear();
+        self.word_icon_src.clear();
+        self.word_icons_unshaded = true;
+    }
+
     /// This frame's [`rk::companion::KeepOut`] for the ribbon and its sky,
     /// window pixels: the word icons, and each run of lettered or filled
     /// cells (a ground that is not the page) of every row of the frame's
@@ -241,12 +248,8 @@ impl CursorGlow {
             }
             i += 1;
         }
-        let icons = self
-            .word_icons
-            .iter()
-            .map(|&(x0, x1, y0, y1)| (x0 + ox, x1 + ox, y0 + oy, y1 + oy));
         self.v2
-            .note_keep_out((icons, boxes.iter().copied()), (rows.iter().copied(), cw));
+            .note_keep_out_slices(&self.word_icons, (ox, oy), &boxes, &rows, cw);
         self.keep_out_scratch = boxes;
         self.keep_rows_scratch = rows;
     }

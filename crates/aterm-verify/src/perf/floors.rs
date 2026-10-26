@@ -373,7 +373,10 @@ effects_keys! {
         "episode_emit_per_ginsn",
         "episode_raster_per_ginsn",
         "episode_encode_per_ginsn",
-        "flowing_emit_per_ginsn",
+        // Half the flowing card's frames are its steps' draws and half the replays of the keys
+        // between them, so its median frame is its costliest replay, one frame's outlier: its
+        // emit is rated by all its frames over all their instructions.
+        "flowing_emit_mean_per_ginsn",
         "flowing_raster_per_ginsn",
         "flowing_encode_per_ginsn",
         "settled_raster_per_ginsn",
@@ -415,6 +418,7 @@ const EFFECTS_FEATURES: &[&str] = &["dev-seams"];
 /// The 42s-freeze-class absolute fences.
 pub(crate) const RESIZE_RING_WORST_CAP_MS: f64 = 5_000.0;
 pub(crate) const RESIZE_TIERED_SYNC_WORST_CAP_MS: f64 = 100.0;
+pub(crate) const RESIZE_DEEP_STEP_WORST_CAP_MS: f64 = 100.0;
 
 /// The gated values of `json`, in key order.
 pub(crate) fn parse_keyed(lane: &FloorLane, json: &Value) -> Option<Vec<(&'static str, f64)>> {
@@ -791,16 +795,51 @@ pub(crate) fn tail_tap_fence(json: &Value) -> Result<(), String> {
 
 /// The resize report's LOWER-is-better latencies: same-box trend samples,
 /// INVERTED, so a creep under the absolute caps is still caught on the box
-/// that has history.
-const RESIZE_INVERTED_TREND_KEYS: [&str; 7] = [
-    "resize_ring_worst_ms",
-    "resize_tiered_sync_worst_ms",
+/// that has history. A synchronous resize's worst is the median of its
+/// passes' worsts, not the run's one worst, which one stall lifts past a
+/// ceiling of its best / 0.70 (the 1.1 ms tiered sync read 10.7 ms at a load
+/// of 42); a resize made slower is slower in every pass. A pump step's worst
+/// is fenced, not trended ([`RESIZE_FENCES`]): the worst of the hundreds of
+/// steps a pass takes is the machine's tail, and even its median over five
+/// passes read 0.88 to 1.29 ms over ten runs of unchanged code at a load of
+/// 17 to 45, past the 1 / 0.70 the trend allows.
+const RESIZE_INVERTED_TREND_KEYS: [&str; 5] = [
+    "resize_ring_worst_p50_ms",
+    "resize_tiered_sync_worst_p50_ms",
     "deep_mixed_pump_total_ms",
-    "deep_mixed_step_worst_ms",
-    "deep_mixed_sync_worst_ms",
+    "deep_mixed_sync_worst_p50_ms",
     "deep_wrapall_pump_total_ms",
-    "deep_wrapall_step_worst_ms",
 ];
+
+/// Each absolute fence: the key it holds, its cap, and what a breach is. A
+/// synchronous resize is held by the run's one worst; a pump step by the
+/// median of its passes' worsts, since one stall reached 132.8 ms in a run
+/// whose median read 1.29 ms (load 42).
+const RESIZE_FENCES: [(&str, f64, &str); 4] = [
+    (
+        "resize_ring_worst_ms",
+        RESIZE_RING_WORST_CAP_MS,
+        SYNC_FREEZE,
+    ),
+    (
+        "resize_tiered_sync_worst_ms",
+        RESIZE_TIERED_SYNC_WORST_CAP_MS,
+        SYNC_FREEZE,
+    ),
+    (
+        "deep_mixed_step_worst_p50_ms",
+        RESIZE_DEEP_STEP_WORST_CAP_MS,
+        STEP_FREEZE,
+    ),
+    (
+        "deep_wrapall_step_worst_p50_ms",
+        RESIZE_DEEP_STEP_WORST_CAP_MS,
+        STEP_FREEZE,
+    ),
+];
+
+const SYNC_FREEZE: &str = "the 42s-freeze class (synchronous O(history) rewrap) is back";
+const STEP_FREEZE: &str = "a bounded pump step costs O(history) again, in every pass";
 
 /// Resize/rewrap: the ratio floors, the absolute fences (which hold with no baseline at all).
 pub(crate) fn gate_resize(record: bool) -> LaneRun {
@@ -837,7 +876,11 @@ fn judge_resize(json: &Value, record: bool) -> LaneRun {
         .map(|o| o.keys().map(String::as_str).collect::<Vec<_>>())
         .unwrap_or_default()
         .into_iter()
-        .filter(|k| !RESIZE_LANE.keys.contains(k) && !RESIZE_INVERTED_TREND_KEYS.contains(k))
+        .filter(|k| {
+            !RESIZE_LANE.keys.contains(k)
+                && !RESIZE_INVERTED_TREND_KEYS.contains(k)
+                && !RESIZE_FENCES.iter().any(|(fenced, ..)| fenced == k)
+        })
         .collect();
     if !ungated.is_empty() {
         // Several are the run's shape (ring_lines, n, warmup); converge_stale_width
@@ -851,20 +894,13 @@ fn judge_resize(json: &Value, record: bool) -> LaneRun {
 /// The absolute worst-case fences.
 pub(crate) fn resize_fences(json: &Value) -> Vec<String> {
     let mut findings = Vec::new();
-    for (key, cap) in [
-        ("resize_ring_worst_ms", RESIZE_RING_WORST_CAP_MS),
-        (
-            "resize_tiered_sync_worst_ms",
-            RESIZE_TIERED_SYNC_WORST_CAP_MS,
-        ),
-    ] {
+    for (key, cap, breach) in RESIZE_FENCES {
         match number(json, key) {
             Some(v) if v <= cap => {
                 eprintln!("    {key}: GREEN — {v:.1} ms <= absolute cap {cap:.0} ms");
             }
             Some(v) => findings.push(format!(
-                "{key} {v:.1} ms > absolute cap {cap:.0} ms: the 42s-freeze class \
-                 (synchronous O(history) rewrap) is back"
+                "{key} {v:.1} ms > absolute cap {cap:.0} ms: {breach}"
             )),
             None => findings.push(format!("{key} missing from the harness report")),
         }
@@ -1093,22 +1129,21 @@ mod tests {
 
     #[test]
     fn resize_fences_hold_absolutely() {
-        let fences = |s: &str| resize_fences(&json(s));
-        assert!(
-            fences("{\"resize_ring_worst_ms\":73.3,\"resize_tiered_sync_worst_ms\":15.0}")
-                .is_empty()
-        );
+        let fences = |ring: f64, sync: f64, step: f64| {
+            resize_fences(&json(&format!(
+                "{{\"resize_ring_worst_ms\":{ring},\"resize_tiered_sync_worst_ms\":{sync},\
+                 \"deep_mixed_step_worst_p50_ms\":{step},\"deep_wrapall_step_worst_p50_ms\":2.5}}"
+            )))
+        };
+        assert!(fences(73.3, 15.0, 0.9).is_empty());
+        assert_eq!(fences(42000.0, 15.0, 0.9).len(), 1);
+        assert_eq!(fences(73.3, 150.0, 0.9).len(), 1);
+        let step = fences(73.3, 15.0, 420.0);
+        assert_eq!(step.len(), 1);
+        assert!(step[0].contains("pump step"), "{step:?}");
         assert_eq!(
-            fences("{\"resize_ring_worst_ms\":42000.0,\"resize_tiered_sync_worst_ms\":15.0}").len(),
-            1
-        );
-        assert_eq!(
-            fences("{\"resize_ring_worst_ms\":73.3,\"resize_tiered_sync_worst_ms\":150.0}").len(),
-            1
-        );
-        assert_eq!(
-            fences("{\"resize_ring_worst_ms\":73.3}").len(),
-            1,
+            resize_fences(&json("{\"resize_ring_worst_ms\":73.3}")).len(),
+            3,
             "missing is a breach"
         );
     }
@@ -1135,24 +1170,46 @@ mod tests {
         assert!(run.failed(), "{run:?}");
     }
 
+    /// The trend takes each synchronous latency's median over the passes, inverted; the
+    /// run's one worst and a pump step's worst are the fences' alone. NEGATIVE CONTROL: a
+    /// report with only the worsts gives the trend nothing to judge them by.
     #[test]
-    fn resize_samples_its_latencies_inverted() {
-        let mut s = String::from("{");
-        for key in RESIZE_LANE.keys {
-            s.push_str(&format!("\"{key}\":10.0,"));
-        }
-        s.push_str("\"resize_ring_worst_ms\":70.0,\"resize_tiered_sync_worst_ms\":15.0,\"n\":5}");
-        let run = judge_resize(&json(&s), false);
-        let inverted: Vec<&str> = run
-            .samples
-            .iter()
-            .filter(|t| t.inverted)
-            .map(|t| t.metric.as_str())
-            .collect();
-        assert_eq!(
-            inverted,
-            vec!["resize_ring_worst_ms", "resize_tiered_sync_worst_ms"]
+    fn resize_trends_its_passes_median_worsts_inverted_and_fences_the_tails() {
+        let report = |extra: &str| {
+            let mut s = String::from("{");
+            for key in RESIZE_LANE.keys {
+                s.push_str(&format!("\"{key}\":10.0,"));
+            }
+            s.push_str(
+                "\"resize_ring_worst_ms\":70.0,\"resize_tiered_sync_worst_ms\":15.0,\
+                 \"deep_mixed_step_worst_p50_ms\":0.9,\"deep_wrapall_step_worst_p50_ms\":2.5,",
+            );
+            s.push_str(extra);
+            s.push_str("\"n\":5}");
+            json(&s)
+        };
+        let inverted = |run: &LaneRun| -> Vec<String> {
+            run.samples
+                .iter()
+                .filter(|t| t.inverted)
+                .map(|t| t.metric.clone())
+                .collect()
+        };
+        let medians = report(
+            "\"resize_ring_worst_p50_ms\":66.0,\"resize_tiered_sync_worst_p50_ms\":1.1,\
+             \"deep_mixed_sync_worst_p50_ms\":0.9,",
         );
+        let run = judge_resize(&medians, false);
+        assert!(!run.failed(), "{run:?}");
+        assert_eq!(
+            inverted(&run),
+            vec![
+                "resize_ring_worst_p50_ms",
+                "resize_tiered_sync_worst_p50_ms",
+                "deep_mixed_sync_worst_p50_ms"
+            ]
+        );
+        assert!(inverted(&judge_resize(&report(""), false)).is_empty());
     }
 
     /// A synthetic value comfortably above the committed effects floors, so these

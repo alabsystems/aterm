@@ -36,6 +36,10 @@ const SKIPPED: &str = "skipped at the prompt; aterm secrets join <url> joins a v
 /// What an unconfigured Mac's row says where no ALab vault answers: nothing is asked.
 pub const NOT_HERE: &str = "no secrets vault on this network; aterm secrets join <url> or aterm init --vault <url> joins yours";
 
+/// How the vault item's stand-aside begins when the vault's address answered with no vault there
+/// ([`Look::NoVault`]), so a caller tells that answer from one nobody gave.
+pub const NO_VAULT_NOW: &str = "no vault is there now, so nothing was changed";
+
 /// What it says where macOS refuses aterm the local network, so no vault could be looked for.
 const LAN_REFUSED: &str = "macOS does not let aterm use the local network, so no vault was looked for: turn aterm on in System Settings > Privacy & Security > Local Network, or name one with aterm init --vault <url>";
 
@@ -512,17 +516,13 @@ fn wait_for_approval(
             "with the join password an admin Mac's subscriber approves within seconds; {mistyped}"
         ));
     }
-    let long_poll = matches!(
-        aterm_secrets::client::config(paths),
-        Ok(Some(config)) if matches!(config.source, Source::Url(_))
-    );
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         let started = Instant::now();
         let left = deadline
             .saturating_duration_since(started)
             .min(Duration::from_secs(50));
-        if let Err(error) = aterm_secrets::client::sync(paths, long_poll.then_some(left)) {
+        if let Err(error) = aterm_secrets::client::sync_within(paths, left) {
             say(&format!("still waiting ({error})"));
         }
         if let Some(joined) = joined() {
@@ -534,8 +534,8 @@ fn wait_for_approval(
     None
 }
 
-/// How long one long-poll of [`approved_within`] holds, so a caught Ctrl-C ends the wait within
-/// about that.
+/// How long one long-poll of [`approved_within`] holds, and its read of a verdict after it, so a
+/// caught Ctrl-C ends the wait within about twice that.
 const APPROVAL_SLICE: Duration = Duration::from_secs(1);
 
 /// Wait up to `window` for this Mac to be let into the vault it asked to join, in long-polls
@@ -552,10 +552,6 @@ fn approved_within(paths: &Paths, window: Duration, stopped: &dyn Fn() -> bool) 
             })
         )
     };
-    let long_poll = matches!(
-        aterm_secrets::client::config(paths),
-        Ok(Some(config)) if matches!(config.source, Source::Url(_))
-    );
     let deadline = Instant::now() + window;
     while !inside() {
         let started = Instant::now();
@@ -566,12 +562,21 @@ fn approved_within(paths: &Paths, window: Duration, stopped: &dyn Fn() -> bool) 
             .saturating_duration_since(started)
             .min(APPROVAL_SLICE);
         // A sync that failed is the next slice's to retry; the window bounds them all.
-        let _ = aterm_secrets::client::sync(paths, long_poll.then_some(slice));
+        let _ = aterm_secrets::client::sync_within(paths, slice);
         if inside() {
             return true;
         }
-        // The verdict also ends the long-poll, so it is read as soon as it is kept.
-        if aterm_secrets::client::read_verdict(paths).unwrap_or(false) {
+        if stopped() {
+            return false;
+        }
+        // The verdict also ends the long-poll, so it is read as soon as it is kept, within
+        // what is left of the window (at most a slice), as the long-poll took its own.
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .min(APPROVAL_SLICE);
+        if !left.is_zero()
+            && aterm_secrets::client::read_verdict_within(paths, left).unwrap_or(false)
+        {
             return false;
         }
         std::thread::sleep(slice.saturating_sub(started.elapsed()));
@@ -1966,9 +1971,7 @@ impl Item for Vault {
             Look::Held(why) => Some(StoodAside::Offline(format!(
                 "the vault does not answer, so nothing was changed: {why}; {LOCAL_NETWORK}"
             ))),
-            Look::NoVault(why) => Some(StoodAside::Offline(format!(
-                "no vault is there now, so nothing was changed: {why}"
-            ))),
+            Look::NoVault(why) => Some(StoodAside::Offline(format!("{NO_VAULT_NOW}: {why}"))),
         }
     }
 

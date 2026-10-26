@@ -294,7 +294,7 @@ pub(crate) fn thermal() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Machine {
     pub chip: String,
-    /// Off the M4-class bench box: every number is labelled non-publishable.
+    /// Off the M4 Max bench box: every number is labelled non-publishable.
     pub dev_smoke: bool,
 }
 
@@ -308,15 +308,19 @@ impl Machine {
     }
 }
 
-/// The bench-box check: publishable head-to-heads run on the M4 class only,
-/// and anywhere else only when the caller says `--dev-smoke`.
+/// Rule zero §2's hardware (`docs/measured/arena/README.md`): publishable
+/// head-to-heads run on the M4 Max only, as `sysctl` names it exactly.
+pub(crate) fn rule_zero_hardware(chip: &str) -> bool {
+    chip.trim() == "Apple M4 Max"
+}
+
+/// The bench-box check: publishable head-to-heads run on [`rule_zero_hardware`]
+/// only, and anywhere else only when the caller says `--dev-smoke`.
 pub(crate) fn bench_box(chip: &str, dev_smoke: bool) -> Result<Machine, Halt> {
-    let bench_class = ["M4 Max", "M4 Pro", "M4 Ultra"]
-        .iter()
-        .any(|c| chip.contains(c));
+    let bench_class = rule_zero_hardware(chip);
     if !bench_class && !dev_smoke {
         return Err(Halt::skip(
-            format!("this is '{chip}', not the M4-class bench machine"),
+            format!("this is '{chip}', not the M4 Max bench machine"),
             "re-run with --dev-smoke to measure here, every number labelled non-publishable",
         ));
     }
@@ -427,6 +431,16 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
                         "check the network, or pass --dmg PATH",
                     ));
                 }
+                if sha256_file(&part)? != tip.artifact_sha256 {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(Halt::Fail(format!(
+                        "{} served a dmg that does not hash to the pinned sha256, so it is not \
+                         the pinned build, and nothing was cached; {} names it by its \
+                         per-commit artifact, never the rolling `tip` release, which moves.",
+                        tip.artifact,
+                        manifest_path().display()
+                    )));
+                }
                 std::fs::rename(&part, &d)
                     .map_err(|e| format!("could not place {}: {e}", d.display()))?;
             }
@@ -435,9 +449,15 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
     };
     if sha256_file(&dmg)? != tip.artifact_sha256 {
         return Err(Halt::Fail(format!(
-            "{} does not hash to the pinned sha256 — the tip moved past the pin. Re-pin \
-             {} first.",
+            "{} does not hash to the pinned sha256, so it is not the pinned build{}; {} names \
+             it by its per-commit artifact, never the rolling `tip` release, which moves.",
             dmg.display(),
+            if dmg.starts_with(&arena) {
+                " (a download an earlier run cached: remove it, and the next run downloads the \
+                 pinned artifact)"
+            } else {
+                ""
+            },
             manifest_path().display()
         )));
     }
@@ -825,15 +845,17 @@ mod tests {
     }
 
     #[test]
-    fn the_bench_box_is_the_m4_class_or_a_labelled_dev_smoke() {
+    fn the_bench_box_is_the_m4_max_or_a_labelled_dev_smoke() {
         assert!(!bench_box("Apple M4 Max", false).expect("bench").dev_smoke);
-        match bench_box("Apple M5 Max", false) {
-            Err(Halt::Skip { fix, .. }) => assert!(fix.contains("--dev-smoke"), "{fix}"),
-            other => panic!("expected a skip, got {other:?}"),
+        for chip in ["Apple M5 Max", "Apple M4 Pro", "Virtual Apple M4 Max"] {
+            match bench_box(chip, false) {
+                Err(Halt::Skip { fix, .. }) => assert!(fix.contains("--dev-smoke"), "{fix}"),
+                other => panic!("{chip}: expected a skip, got {other:?}"),
+            }
+            let smoke = bench_box(chip, true).expect("labelled");
+            assert!(smoke.dev_smoke, "{chip}");
+            assert!(smoke.label().ends_with("NON-PUBLISHABLE"), "{chip}");
         }
-        let smoke = bench_box("Apple M5 Max", true).expect("labelled");
-        assert!(smoke.dev_smoke);
-        assert!(smoke.label().ends_with("NON-PUBLISHABLE"));
     }
 
     #[test]

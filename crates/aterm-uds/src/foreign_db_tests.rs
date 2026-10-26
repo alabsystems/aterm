@@ -121,6 +121,46 @@ fn the_reader_gets_the_file_itself_or_a_private_copy() {
     assert_eq!(names, ["x.db", "x.db-shm", "x.db-wal"], "nothing beside it");
 }
 
+#[test]
+fn read_bytes_slurps_main_and_wal_in_memory_without_links_or_copies() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let db = dir.path().join("mem.db");
+    assert_eq!(
+        read_bytes(&db, 1024, |_, _| -> Option<()> { panic!("never asked") }),
+        Err(Unread::Missing)
+    );
+    std::fs::write(&db, b"main-bytes").expect("db");
+    assert_eq!(
+        read_bytes(&db, 4, |_, _| -> Option<()> { panic!("over max_bytes") }),
+        Err(Unread::Failed),
+        "bounded by max_bytes"
+    );
+    assert_eq!(
+        read_bytes(&db, 1024, |m, w| Some((m.to_vec(), w.map(<[u8]>::to_vec)))),
+        Ok((b"main-bytes".to_vec(), None))
+    );
+    let wal = beside(&db, "-wal");
+    std::fs::write(&wal, b"").expect("empty wal");
+    assert_eq!(
+        read_bytes(&db, 1024, |m, w| Some((m.to_vec(), w.map(<[u8]>::to_vec)))),
+        Ok((b"main-bytes".to_vec(), None)),
+        "an empty wal is None"
+    );
+    std::fs::write(&wal, b"wal-bytes").expect("wal");
+    assert_eq!(
+        read_bytes(&db, 1024, |m, w| Some((m.to_vec(), w.map(<[u8]>::to_vec)))),
+        Ok((b"main-bytes".to_vec(), Some(b"wal-bytes".to_vec())))
+    );
+    let db_mut = db.clone();
+    assert_eq!(
+        read_bytes(&db, 1024, move |_, _| {
+            std::fs::write(&db_mut, b"changed").expect("mutate");
+            Some(())
+        }),
+        Err(Unread::Changed)
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod live {
     use super::*;

@@ -9,7 +9,7 @@ use aterm_phase::wall::WallKind;
 use aterm_phase::{LoginScreen, Program};
 
 use super::super::background::BackgroundCall;
-use super::super::config::SupervisorConfig;
+use super::super::config::{Autopilot, SupervisorConfig};
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
@@ -17,6 +17,8 @@ use super::turn_end::{
     TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced, login_wall_moves,
     login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
 };
+use crate::harness::acts::{HeldBy, HoldLeg};
+use crate::harness::repo_work::RepoWork;
 
 /// Whether the person is needed now or only when they next look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,15 @@ impl Urgency {
     }
 }
 
+/// THE LOUD HOLD'S ACTION ([`Exception::repeats_land`]): what restarts the typing. One action, as
+/// a standing ask carries one ([`aterm_messages`]' `Step::fault` refuses an `or`); Off stays the
+/// chip's click.
+pub const REPEATS_LAND_ACTION: &str = "Open the tab and tell it what is still open.";
+
+/// THE LOUD HOLD'S TITLE and its short form ([`Exception::repeats_land`]; the band reads `aterm
+/// stopped typing in window 2, tab 3`, the ask's place after it).
+pub const REPEATS_LAND_TITLE: (&str, &str) = ("aterm stopped typing", "Stopped typing");
+
 /// One exception: the digest's item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exception {
@@ -51,6 +62,12 @@ pub struct Exception {
     pub escalated: bool,
     /// The owner's four-part notice ([`super::notice`]).
     pub notice: Option<Notice>,
+    /// WHICH ARM OF RULING F'S HOLD stopped the typing (§14.3: [`Self::repeats`],
+    /// [`Self::repeats_land`]); `None` for every other exception.
+    pub held: Option<HeldBy>,
+    /// A plain ask's title and its short form where no notice titles it (§14.3:
+    /// [`Self::repeats_land`]'s `aterm stopped typing`); `None` keeps the ask's default.
+    pub title: Option<(&'static str, &'static str)>,
 }
 
 impl Exception {
@@ -94,6 +111,8 @@ impl Exception {
                 undo: filled.undo,
                 back: text.back,
             }),
+            held: None,
+            title: None,
         }
     }
 
@@ -110,6 +129,8 @@ impl Exception {
             clears: "the conversation read, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
@@ -125,21 +146,66 @@ impl Exception {
             clears: "the screen moving on, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
-    /// The same no-work reply to aterm's acts, held ([`TurnEndState::repeats`]).
+    /// The same no-work reply to aterm's acts, held ([`TurnEndState::repeats`]), by `held`'s arm
+    /// ([`TurnEndState::held_by`]): a fact for later (limit 3 of §14.0).
+    /// The same-reply arm's why keeps no count, because a read wall's spent tries hold by it too
+    /// ([`super::turn_end::Kept::holds`]); the no-work arm's names its count ([`HeldBy::answered`]),
+    /// as no reply came again, and a different reply does not lift it.
     #[must_use]
-    pub fn repeats() -> Self {
+    pub fn repeats(held: HeldBy) -> Self {
+        let (why, clears) = match held {
+            HeldBy::SameReply => (
+                "Its program answers aterm's acts with the same reply and no work, so aterm types nothing more."
+                    .to_string(),
+                "a different reply, a person's turn a point saw busy, a lead's new prompt above Claude Code's reply, or the agent working",
+            ),
+            HeldBy::NoWork => (
+                format!(
+                    "Its program answered aterm's acts {}, so aterm types nothing more.",
+                    held.answered()
+                ),
+                "a person's turn a point saw busy, a lead's new prompt above Claude Code's reply, or the agent working",
+            ),
+        };
         Self {
             kind: ExceptionKind::Stalled,
             when: Urgency::Later,
-            why: "Its program answers aterm's acts with the same reply and no work, so aterm types nothing more."
-                .to_string(),
+            why,
             action: "Open the tab and do what its last reply asks.".to_string(),
-            clears: "a different reply, a person's turn a point saw busy, a lead's new prompt above Claude Code's reply, or the agent working",
+            clears,
             escalated: false,
             notice: None,
+            held: Some(held),
+            title: None,
+        }
+    }
+
+    /// THE ONE LOUD HOLD (§14.3, limit 3 of §14.0): [`Self::repeats`] under Land whose last
+    /// reading still has repository work git measured (the hold's Repo leg), in a session no
+    /// manager waits on. Its kind stays [`ExceptionKind::Stalled`]; it is needed now, its why
+    /// names the repository's finding (`repo`, [`RepoWork::summary`], cut as Land's act cuts it;
+    /// `None`: the leg's bare words), and it carries its own title, so no program is named.
+    #[must_use]
+    pub fn repeats_land(held: HeldBy, repo: Option<&RepoWork>) -> Self {
+        let answered = held.answered();
+        let finding = repo
+            .map(super::turn_end::repo_finding)
+            .filter(|f| !f.is_empty())
+            .map_or_else(String::new, |f| format!(" ({f})"));
+        Self {
+            when: Urgency::Now,
+            why: format!(
+                "Under Land it answered {answered}, and its repository still holds work no remote \
+                 main has{finding}, so aterm types nothing more."
+            ),
+            action: REPEATS_LAND_ACTION.to_string(),
+            title: Some(REPEATS_LAND_TITLE),
+            ..Self::repeats(held)
         }
     }
 
@@ -159,6 +225,8 @@ impl Exception {
             clears: "a new reset or wall, a person's turn a point saw busy, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
@@ -176,6 +244,8 @@ impl Exception {
             clears: "the screen moving on, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
@@ -191,6 +261,8 @@ impl Exception {
             clears: "the screen moving on, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
@@ -206,6 +278,8 @@ impl Exception {
             clears: "the screen moving on, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
@@ -233,6 +307,8 @@ impl Exception {
             clears: "the wall leaving the screen, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 
@@ -280,6 +356,8 @@ impl Exception {
             clears: "the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         }
     }
 }
@@ -485,6 +563,18 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
 }
 
 const LOGIN_CLEARS: &str = "`Login successful` on the screen, or the agent working";
+
+/// What clears a login exception when aterm's own Esc left the `/login` it typed at its method
+/// picker ([`super::turn_end::TurnEndState::login_backed_out_since`]): the `CLEARED` line names
+/// that back-out, not [`LOGIN_CLEARS`].
+pub const LOGIN_BACKED_OUT: &str =
+    "aterm backed out of the /login it typed (its dialog's Esc, no method picked)";
+
+/// What clears a login exception when the turn end backs out of the `/login` aterm typed past
+/// its picker (the browser hand-off, or the dialog's error: a method was picked there), the
+/// login's sign-in now nobody's to make ([`super::login::backs_out`]): the `CLEARED` line,
+/// written as that decision's Esc goes in, names the back-out, not [`LOGIN_CLEARS`].
+pub const LOGIN_BACKING_OUT: &str = "aterm backs out of the /login it typed (its dialog's Esc)";
 
 const fn draft_notice_text(text: &NoticeText, composer: &Composer) -> NoticeText {
     NoticeText {
@@ -838,7 +928,7 @@ pub fn exception_for(
         // Held at the screen's reply, or at the wall a track still stands for: a limit's, or another's.
         return held.then(|| {
             if state.repeats(reading) || !state.has_limit_track() {
-                Exception::repeats()
+                held_repeats(state, reading)
             } else {
                 Exception::limit_repeats(reading.program, state.waits_on_named_reset())
             }
@@ -854,6 +944,8 @@ pub fn exception_for(
             clears: "the /goal indicator back on the screen, or the agent working",
             escalated: false,
             notice: None,
+            held: None,
+            title: None,
         });
     }
     match kind {
@@ -868,6 +960,8 @@ pub fn exception_for(
                 clears,
                 escalated: true,
                 notice: None,
+                held: None,
+                title: None,
             })
         }
         WallKind::Spend if reading.reset_at.is_none() || !cfg.resume_limits => {
@@ -880,6 +974,8 @@ pub fn exception_for(
                 clears: "the agent working",
                 escalated: false,
                 notice: None,
+                held: None,
+                title: None,
             })
         }
         WallKind::ModelBucket { .. }
@@ -922,6 +1018,8 @@ pub fn exception_for(
                 clears: "the agent working",
                 escalated: false,
                 notice: None,
+                held: None,
+                title: None,
             })
         }
         WallKind::UsageSession
@@ -941,6 +1039,8 @@ pub fn exception_for(
                 clears: "a new reset or wall, a person's turn a point saw busy, or the agent working",
                 escalated: false,
                 notice: None,
+                held: None,
+                title: None,
             })
         }
         WallKind::Context
@@ -965,8 +1065,28 @@ pub fn exception_for(
             | WallKind::ModelBucket { .. } => {
                 Exception::limit_repeats(reading.program, reading.reset_at.is_some())
             }
-            _ => Exception::repeats(),
+            _ => Exception::repeats(state.held_by().unwrap_or(HeldBy::SameReply)),
         }),
+    }
+}
+
+/// THE HOLD AT THE SCREEN'S REPLY (§14.3): [`Exception::repeats_land`] under Land where the last
+/// yield read held the Repo leg (git measured work no remote main has), the hold is the agent's
+/// own replies' and no manager waits on the session; [`Exception::repeats`] for every other hold,
+/// an Open-only one, a need's, a managed worker's, Cruise's and a read wall's among them (limit 3
+/// of §14.0). A wall's hold (its tries spent at the newest kept reply, a reply a read wall said)
+/// stays Later once its notice has left the screen too: an error answered the same is no reply
+/// the agent gave twice, and its turn is not the repository's.
+fn held_repeats(state: &TurnEndState, reading: &TurnEndReading) -> Exception {
+    let held = state.held_by().unwrap_or(HeldBy::SameReply);
+    let repo_leg = state
+        .land_held()
+        .is_some_and(|hold| hold.read && hold.holds(HoldLeg::Repo));
+    let walled = state.replies().last().is_some_and(|kept| kept.walled);
+    if reading.autopilot == Autopilot::Land && repo_leg && !walled && !state.managed() {
+        Exception::repeats_land(held, state.repo_owed())
+    } else {
+        Exception::repeats(held)
     }
 }
 

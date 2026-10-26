@@ -2854,6 +2854,20 @@ impl App {
         {
             self.interact_system_state_view(wid, view);
         }
+        // A key acts on the target page's current layout, including a wheel over an
+        // unfocused About pane. About's Details changes its scroll range before a paint.
+        if kind == crate::native_app::AppKind::About
+            && matches!(
+                event,
+                AppEvent::ScrollPage(_)
+                    | AppEvent::ScrollLines(_)
+                    | AppEvent::ScrollAt { .. }
+                    | AppEvent::StepFocus(_)
+            )
+        {
+            let viewport = self.native_ui_viewport_for(wid, view)?;
+            self.compiled_native_ui_for(wid, instance, view, viewport)?;
+        }
         // A KEY THAT MOVES BY WHAT THE PAGE SHOWS ACTS ON THE PAGE AS IT IS NOW: Settings steps
         // its list by the screens its last layout recorded, so a list no render has laid out
         // since it changed (a page just opened, a search typed, the window or text resized) is
@@ -3829,7 +3843,15 @@ impl App {
             let compiled = self.current_native_ui(wid)?;
             let focus_order = &compiled.focus_order;
             if focus_order.is_empty() {
-                return Ok(());
+                let Some(mut key) = compiled.tab_into_unshown_list(!backwards) else {
+                    return Ok(());
+                };
+                if let Some(current) = current.as_ref()
+                    && let Some(next) = compiled.tab_past_screen(current, &key, !backwards)
+                {
+                    key = next;
+                }
+                return self.focus_native_control(wid, view, key, true).map(|_| ());
             }
             let order_of = |key: &crate::native_ui::UiKey| {
                 compiled.semantics.iter().position(|node| &node.key == key)
@@ -6447,6 +6469,17 @@ impl App {
             };
 
         match request {
+            RecoveryRequest::Retry(RecoveryCapability::About) => {
+                if self.open_about_tab_in_window(wid) {
+                    RecoveryOutcome::Opened {
+                        message: "Reopened About".into(),
+                    }
+                } else {
+                    RecoveryOutcome::Failed {
+                        message: "About could not be reopened".into(),
+                    }
+                }
+            }
             RecoveryRequest::Retry(RecoveryCapability::SystemState) => {
                 if self.open_system_state_tab_in_window(wid) {
                     RecoveryOutcome::Opened {

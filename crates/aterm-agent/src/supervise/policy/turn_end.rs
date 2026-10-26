@@ -39,8 +39,60 @@ pub fn is_challenge_rule(rule: &str) -> bool {
 }
 /// The journal's name for a person's own exchange left to them ([`TurnEndState::left_to_person`]).
 pub const RULE_LEFT: &str = "left-to-person@v1";
-/// CRUISE'S DEFEND-AND-FIND-MORE PROMPT.
+/// CRUISE'S DONE CHECK, ITS SHARED BASE: every act typed under [`RULE_DONE_CHECK`] opens with
+/// it, then one of [`DONE_ANGLES`] in turn and [`DONE_TAIL`] ([`done_check_words`]), so every
+/// reader keyed on the check's text ([`is_done_check`], the ledger's and the upgrade's) reads each
+/// angle, and v1's whole text ([`DONE_CHECK_FIXED_BEFORE`]) too, by this prefix.
 pub const DONE_CHECK: &str = concat!(
+    harness_mark!(),
+    " Autopilot is Cruise: done is never the end."
+);
+
+/// CRUISE'S SIX KINDS OF WORK, one asked at each done claim in turn ([`TurnEndState::checks`]):
+/// the widest check, a hostile review, the deferred work, a measurement, the next issue, and the
+/// session's own leftovers. Each names only the agent's own work: none says delete, remove, reset,
+/// retire, drop or prune, and the sixth leaves every worktree, branch and stash the agent did not
+/// make exactly as it is.
+pub const DONE_ANGLES: [&str; NO_WORK_ACTS] = [
+    "This time, run the widest check this repository has on the merged tree and fix what it finds.",
+    "This time, review the diff you landed as a hostile reviewer would: edge cases, error paths, \
+     missing tests. Fix what you find.",
+    "This time, do what your reports called out of scope, later or a follow-up.",
+    "This time, measure what you changed against the main it started from and fix any regression.",
+    "This time, take the next open issue or TODO beside your work.",
+    "This time, land every worktree, branch and stash you made in this session that no remote \
+     main has. Leave every one you did not make exactly as it is.",
+];
+
+/// Where [`TurnEndState::checks`] counts round: a whole number of turns of [`DONE_ANGLES`] (42 of
+/// them). The count after it is [`CHECKS_ROUND`], never 0, so the angles go on in order across it
+/// and a count above 0 always names the angle typed last ([`next_checks`]).
+const CHECKS_WRAP: u8 = 252;
+const _: () = assert!((CHECKS_WRAP as usize).is_multiple_of(DONE_ANGLES.len()));
+/// One whole turn of [`DONE_ANGLES`]: the count a wrap goes back to, and the first a seeded count
+/// at or past [`CHECKS_WRAP`] (one no loop writes) is folded onto ([`TurnEndState::seed_checks`]).
+const CHECKS_ROUND: u8 = 6;
+const _: () = assert!(CHECKS_ROUND as usize == DONE_ANGLES.len());
+
+/// The count once one more check is typed after `checks`: the next, or [`CHECKS_ROUND`] at the
+/// wrap, so the angle typed last is still `count - 1`'s.
+const fn next_checks(checks: u8) -> u8 {
+    match checks.checked_add(1) {
+        Some(n) if n < CHECKS_WRAP => n,
+        _ => CHECKS_ROUND,
+    }
+}
+
+/// What follows each of [`DONE_ANGLES`]: NEEDS YOU's rule, and the defense the owner asked for
+/// (2026-10-19) with what it ran, then the hunt goes on.
+pub const DONE_TAIL: &str = "Put what only a person can give on a line starting NEEDS YOU: and \
+     carry on. If this turns up nothing, say what you ran and what it showed in a few lines \
+     starting Nothing left:, then look for another kind of gap and close it.";
+
+/// RETIRED: v1's one fixed done check (until 5a, v6 §14.5), which every done claim got word for
+/// word. It opens with [`DONE_CHECK`], so the base's own rule reads it with its suffixes; it is not
+/// one of [`RETIRED_DONE_CHECKS`], whose stricter tail would drop them.
+pub const DONE_CHECK_FIXED_BEFORE: &str = concat!(
     harness_mark!(),
     " Autopilot is Cruise: done is never the end. Land every open item, then look harder: \
      review your own work adversarially, widen the checks, fix what they find, close every \
@@ -48,6 +100,16 @@ pub const DONE_CHECK: &str = concat!(
      are certain nothing is left, defend it in a few lines starting Nothing left: and keep \
      looking."
 );
+
+/// The done check's words at its `n`th claim (`n` counts from 0; the seventh is the first again):
+/// [`DONE_CHECK`], the angle, [`DONE_TAIL`], before any suffix or the standing rules.
+#[must_use]
+pub fn done_check_words(n: usize) -> String {
+    format!(
+        "{DONE_CHECK} {} {DONE_TAIL}",
+        DONE_ANGLES[n % DONE_ANGLES.len()]
+    )
+}
 
 /// RETIRED: the done check of `4bff4848b4`.
 pub const DONE_CHECK_COMMITTED_BEFORE: &str = "Before you stop: do every open item, skipped \
@@ -246,7 +308,25 @@ impl Replies {
     /// The newest reply came again, or [`NO_WORK_ACTS`] no-work answers came in a row.
     #[must_use]
     pub fn holds(&self) -> bool {
-        self.last().is_some_and(|k| k.holds()) || self.run >= NO_WORK_ACTS
+        self.held_by().is_some()
+    }
+
+    /// WHICH ARM HOLDS (§14.3): the newest kept reply's own ([`Kept::holds`]: it came again, or a
+    /// read wall's tries are spent at it) is [`HeldBy::SameReply`], else [`NO_WORK_ACTS`] no-work
+    /// answers in a row is [`HeldBy::NoWork`]; `None` where neither holds.
+    ///
+    /// [`HeldBy::SameReply`]: crate::harness::acts::HeldBy::SameReply
+    /// [`HeldBy::NoWork`]: crate::harness::acts::HeldBy::NoWork
+    #[must_use]
+    pub fn held_by(&self) -> Option<crate::harness::acts::HeldBy> {
+        use crate::harness::acts::HeldBy;
+        if self.last().is_some_and(|k| k.holds()) {
+            Some(HeldBy::SameReply)
+        } else if self.run >= NO_WORK_ACTS {
+            Some(HeldBy::NoWork)
+        } else {
+            None
+        }
     }
 
     /// One more answer that settled to `mark` (`own`: to a wall's own act; `idle`: no work): a reply kept already counts it again.
@@ -8850,7 +8930,7 @@ pub fn is_land_rule(rule: &str) -> bool {
     matches!(rule, RULE_LAND | RULE_LAND_NUDGE | RULE_LAND_ANSWER)
 }
 
-/// The worker's own suggestion accepted.
+/// RETIRED AS AN ACT: the worker's own suggestion accepted, as builds before v6's 5a did under Cruise. Kept so older books, the stats and the tape corpus read it; Cruise types [`RULE_CONTINUE`] over a suggestion now.
 pub const RULE_SUGGESTION: &str = "continue-suggestion@v1";
 /// A continuation after an overload or an API error's wait.
 pub const RULE_API_RETRY: &str = "api-retry@v1";
@@ -9882,7 +9962,7 @@ pub fn is_answer_rule(rule: &str) -> bool {
 /// Claude Code's own `/model` aliases: the only names a switch back is typed with.
 pub const MODEL_ALIASES: &[&str] = &["sonnet", "opus", "haiku", "fable"];
 
-/// Pieces a suggestion may be made of to be accepted as a continuation, joined by `,`, `;`, `.`, ` and ` or ` then `.
+/// Pieces a suggestion may be made of to be a continuation, joined by `,`, `;`, `.`, ` and ` or ` then `: what builds before v6's 5a accepted bare under [`RULE_SUGGESTION`] ([`suggestion_allowed`]). Cruise now types its own continuation over any suggestion.
 pub const SUGGESTION_ALLOW: &[&str] = &[
     "keep going",
     "continue",
@@ -10894,10 +10974,6 @@ pub enum TurnEndAction {
         text: String,
         rule_id: &'static str,
     },
-    Accept {
-        text: String,
-        rule_id: &'static str,
-    },
     TypeCommand {
         command: String,
         rule_id: &'static str,
@@ -10931,7 +11007,6 @@ impl TurnEndAction {
     pub const fn rule_id(&self) -> Option<&'static str> {
         match self {
             TurnEndAction::Type { rule_id, .. }
-            | TurnEndAction::Accept { rule_id, .. }
             | TurnEndAction::TypeCommand { rule_id, .. }
             | TurnEndAction::Submit { rule_id }
             | TurnEndAction::Confirm { rule_id, .. }
@@ -11452,6 +11527,11 @@ pub struct TurnEndState {
     account_moves: VecDeque<Instant>,
     stale_input: bool,
     done: u8,
+    /// HOW MANY DONE CHECKS THIS CRUISE RUN TYPED ([`Self::checks`]), so the next asks the next
+    /// of [`DONE_ANGLES`]: bumped as one is typed ([`Self::acted`]), carried across loops in the
+    /// streak seed's note ([`Self::seed_checks`]), and reset at someone's turn and at a word other
+    /// than Cruise.
+    checks: u8,
     checking: bool,
     seeded_check: Option<&'static str>,
     check_point_seed: Option<&'static str>,
@@ -11599,6 +11679,7 @@ impl TurnEndState {
             account_moves: VecDeque::new(),
             stale_input: false,
             done: 0,
+            checks: 0,
             checking: false,
             seeded_check: None,
             check_point_seed: None,
@@ -12223,6 +12304,23 @@ impl TurnEndState {
         self.replies_at = (said != Replies::default()).then(|| now.checked_sub(ago).unwrap_or(now));
     }
 
+    /// THE DONE CHECKS A LOOP BEFORE THIS ONE TYPED IN THIS CRUISE RUN, as its note says
+    /// ([`Self::checks`]): this loop's next asks the angle after them.
+    pub const fn seed_checks(&mut self, checks: u8) {
+        self.checks = if checks < CHECKS_WRAP {
+            checks
+        } else {
+            CHECKS_ROUND + checks % CHECKS_ROUND
+        };
+    }
+
+    /// How many done checks this Cruise run typed: the next one asks [`DONE_ANGLES`]'s angle at
+    /// this count, the seventh the first again ([`done_check_words`]).
+    #[must_use]
+    pub const fn checks(&self) -> u8 {
+        self.checks
+    }
+
     /// THE RESET THE NEWEST REPLY SEEDED SHOWED, as its record says ([`Self::replies_reset`]).
     pub const fn seed_replies_reset(&mut self, at: Option<Instant>) {
         self.replies_reset = at;
@@ -12595,6 +12693,13 @@ impl TurnEndState {
         self.replies
     }
 
+    /// Which arm of ruling F's hold holds the acts now ([`Replies::held_by`]), whether or not a
+    /// decision at this point reads it.
+    #[must_use]
+    pub fn held_by(&self) -> Option<crate::harness::acts::HeldBy> {
+        self.replies.held_by()
+    }
+
     /// The reset the newest answer counted showed ([`Self::repeats`]).
     #[must_use]
     pub const fn replies_reset(&self) -> Option<Instant> {
@@ -12768,6 +12873,20 @@ impl TurnEndState {
         }
     }
 
+    /// WHETHER THE LOOP'S OWN ESC LEFT THE `/login` IT TYPED, at `since` or later: it backed out
+    /// of that `/login`'s dialog then ([`Self::login_backed_out_at`]) and the `/login` was left
+    /// since ([`Self::login_typed_left`]). The login exception that then ends is cleared by that
+    /// back-out ([`super::exception::LOGIN_BACKED_OUT`]), not by a sign-in or the agent working.
+    #[must_use]
+    pub fn login_backed_out_since(&self, since: Instant) -> bool {
+        self.login_typed_left()
+            && self
+                .wall
+                .as_ref()
+                .and_then(|t| t.login.backed_out)
+                .is_some_and(|at| at >= since)
+    }
+
     /// THE `/login` THIS LOOP TYPED INTO THE LOST LOGIN STANDING WAS LEFT: the dialog the loop
     /// backed out of read gone ([`LoginBooks::closed`]), or `⎿  Login interrupted` read, whether
     /// the loop's Esc or a person's closed it ([`LoginBooks::cancelled`]). Over a roster row's
@@ -12914,6 +13033,7 @@ impl TurnEndState {
         self.land = LandEpisode::default();
         self.replies = Replies::default();
         self.replies_at = None;
+        self.checks = 0;
         self.settling = None;
         self.landing = false;
         self.cut_check = false;
@@ -13228,7 +13348,10 @@ impl TurnEndState {
                     _ => land_nudge_text(rules),
                 }
             } else {
-                done_check_text(rules, true)
+                // The check the cut took, by its angle: the count's last (a loop before this
+                // one that counted none typed the first, or v1's fixed check).
+                let typed = usize::from(self.checks.saturating_sub(1));
+                act_words(&done_check_words(typed), &[reversible_clause(true)], rules)
             }
         }))
     }
@@ -14180,6 +14303,10 @@ impl TurnEndState {
         if reading.autopilot != Autopilot::Land {
             self.leave_land_episode();
         }
+        if reading.autopilot != Autopilot::Cruise {
+            // Out of Cruise: the next Cruise run's first done claim asks the first angle.
+            self.checks = 0;
+        }
         self.autopilot = Some(reading.autopilot);
         let stopped = reading.interrupted && !matches!(reading.phase, Phase::Busy | Phase::Prompt);
         // The harness's own Esc stopped this turn ([`Self::woken_esc`]): no person's. A point
@@ -14718,6 +14845,13 @@ impl TurnEndState {
             (None, _) => None,
         };
         self.settling = None;
+        // SOMEONE'S TURN (a turn on someone's prompt that no act asked, this loop's or, seeded,
+        // the loop's before it) starts the done checks' angles again ([`Self::checks`]); the
+        // agent's own work between its claims does not, so a worker that works between them still
+        // meets every angle.
+        if awaited.is_none() && seeded_yield.is_none() && reading.worked.is_some() && prompted {
+            self.checks = 0;
+        }
         // A turn the books say ran that no loop timed is work to it.
         let quiet = !unseen_turn && !reading.ran_tools;
         let idle = quiet && reading.worked.is_none_or(|w| w < min);
@@ -15500,14 +15634,14 @@ impl TurnEndState {
             wall_retry: is_wall_retry(rule) || in_limits_place,
             own: is_wall_retry(rule) || in_limits_place || self.after.is_some(),
             said: match action {
-                TurnEndAction::Type { text, .. } | TurnEndAction::Accept { text, .. } => {
+                TurnEndAction::Type { text, .. } => {
                     Some(crate::supervise::approvals::words_hash(text))
                 }
                 _ => None,
             },
             over: reading.answered.map(|a| a.prompt),
             lead: match action {
-                TurnEndAction::Type { text, .. } | TurnEndAction::Accept { text, .. } => {
+                TurnEndAction::Type { text, .. } => {
                     Some(crate::supervise::approvals::words_lead(text))
                 }
                 _ => None,
@@ -15554,12 +15688,7 @@ impl TurnEndState {
             TurnEndAction::Type { text, .. } => Some(text.clone()),
             _ => None,
         };
-        self.act_words = match action {
-            TurnEndAction::Type { text, .. } | TurnEndAction::Accept { text, .. } => {
-                Some(text.clone())
-            }
-            _ => None,
-        };
+        self.act_words.clone_from(&typed_text);
         let land_text = reading.autopilot == Autopilot::Land
             && typed_text.as_deref().is_some_and(is_land_words);
         let land_given = land_text && typed_text.as_deref().is_some_and(|t| t.starts_with(LAND));
@@ -15573,6 +15702,11 @@ impl TurnEndState {
             None
         };
         self.checking = typed_rule == Some(RULE_DONE_CHECK) || cut_check;
+        if typed_rule == Some(RULE_DONE_CHECK) {
+            // The next done claim asks the next angle ([`DONE_ANGLES`]); a wall's retry or a
+            // `/compact`'s that types this one again asks nothing new.
+            self.checks = next_checks(self.checks);
+        }
         self.open.clear();
         self.repo = crate::harness::repo_work::RepoRead::Clean;
         if matches!(action, TurnEndAction::Type { text, .. } if text.contains(NEEDS_ACK)) {
@@ -15964,7 +16098,7 @@ pub fn done_row_clock(rows: &[String]) -> Option<String> {
     (clock.starts_with(|c: char| c.is_ascii_digit())).then(|| clock.to_string())
 }
 
-/// Whether a suggestion is a continuation.
+/// Whether a suggestion is a continuation ([`SUGGESTION_ALLOW`]): one a build before v6's 5a accepted bare. The lab's placeholder scene drafts one, so a build that still accepted it would.
 #[must_use]
 pub fn suggestion_allowed(text: &str) -> bool {
     let lower = text
@@ -16292,10 +16426,26 @@ pub fn continuation_text(cfg: &SupervisorConfig, rules: Option<&str>) -> String 
     with_rules(&cfg.continue_text, rules)
 }
 
-/// What to type where the worker claims it is done under Cruise.
+/// What to type where the worker claims it is done under Cruise, as one whole act: the first
+/// angle's ([`done_check_words`]). The loop's own done checks go round the angles
+/// ([`TurnEndState::checks`]); this one is for a reader that types one text (the `harness policy`
+/// reply's `done_check_text`, an upgrade's check after its restart).
 #[must_use]
 pub fn done_check_text(rules: Option<&str>, irreversible: bool) -> String {
-    act_words(DONE_CHECK, &[reversible_clause(irreversible)], rules)
+    done_check_act(0, rules, irreversible)
+}
+
+/// The done check at its `n`th claim of a Cruise run (from 0) as the loop types it where the
+/// claim names no open work, the repository holds none and no need is owed: its words
+/// ([`done_check_words`]), the reversible clause where the claim names an irreversible act, and
+/// the standing rules fitted after them.
+#[must_use]
+pub fn done_check_act(n: usize, rules: Option<&str>, irreversible: bool) -> String {
+    act_words(
+        &done_check_words(n),
+        &[reversible_clause(irreversible)],
+        rules,
+    )
 }
 
 /// Whether `typed` — a prompt's words as a transcript keeps them — is the
@@ -16341,25 +16491,60 @@ fn open_named(found: &[&str], most: usize) -> Option<String> {
 /// THE REPOSITORY SUFFIX: its finding in a few words, cut to [`REPO_SUMMARY_UNITS`] so the act stays a line the composer holds as typed.
 #[must_use]
 pub fn repo_work_suffix(repo: &crate::harness::repo_work::RepoWork) -> String {
-    repo_said(&fit_units(&repo.summary(), REPO_SUMMARY_UNITS))
+    repo_said_to(&repo_finding(repo), RepoAsk::All)
 }
 
-fn repo_said(summary: &str) -> String {
+/// THE REPOSITORY'S FINDING as Land's act names it ([`repo_work_suffix`]) and Cruise's
+/// ([`own_repo_work_suffix`]): its summary, cut to [`REPO_SUMMARY_UNITS`] (`…/land-c: 1 untracked
+/// (wip-notes.txt)`).
+#[must_use]
+pub fn repo_finding(repo: &crate::harness::repo_work::RepoWork) -> String {
+    fit_units(&repo.summary(), REPO_SUMMARY_UNITS).into_owned()
+}
+
+/// CRUISE'S REPOSITORY SUFFIX, the done check's: the finding as [`repo_work_suffix`] names it,
+/// then the agent's own work landed and the rest left as it is. The probe reads the whole
+/// repository, another session's stash and worktrees included, and Cruise's ask is always the
+/// agent's own work (v6 §14.5's angle 6), so it never says to land all of it.
+#[must_use]
+pub fn own_repo_work_suffix(repo: &crate::harness::repo_work::RepoWork) -> String {
+    repo_said_to(&repo_finding(repo), RepoAsk::Own)
+}
+
+/// What the repository suffix asks of the work it names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepoAsk {
+    /// All of it on the remote main: Land's.
+    All,
+    /// What the agent made, the rest left as it is: Cruise's done check's.
+    Own,
+}
+
+fn repo_said_to(summary: &str, ask: RepoAsk) -> String {
+    let ask = match ask {
+        RepoAsk::All => REPO_ALL,
+        RepoAsk::Own => REPO_OWN,
+    };
     if summary.is_empty() {
-        return REPO_BARE.to_string();
+        return format!("{REPO_HEAD}: {ask}");
     }
-    format!(
-        "Your repository still holds work no remote main has ({summary}): commit, merge and push \
-         it to the remote main first."
-    )
+    format!("{REPO_HEAD} ({summary}): {ask}")
 }
 
-const REPO_BARE: &str = "Your repository still holds work no remote main has: commit, merge \
-                         and push it to the remote main first.";
+const REPO_HEAD: &str = "Your repository still holds work no remote main has";
+const REPO_ALL: &str = "commit, merge and push it to the remote main first.";
+const REPO_OWN: &str = "land what of it you made first, and leave what you did not make exactly \
+                        as it is.";
 
 /// THE REPOSITORY SUFFIX WHERE THE PROBE COULD NOT READ THE REPOSITORY ([`crate::harness::repo_work::RepoRead::Unread`]).
 pub const REPO_UNREAD: &str = "Your repository could not be read: show its git status yourself \
                                and land what it holds first.";
+
+/// [`REPO_UNREAD`] under Cruise's done check ([`own_repo_work_suffix`]): the agent lands what of it
+/// it made.
+pub const REPO_UNREAD_OWN: &str = "Your repository could not be read: show its git status \
+                                   yourself, land what of it you made first, and leave what you \
+                                   did not make exactly as it is.";
 
 const REPO_SUMMARY_UNITS: usize = 160;
 
@@ -16412,7 +16597,8 @@ fn act_words(base: &str, after: &[&str], rules: Option<&str>) -> String {
 enum Suffix<'a> {
     Fixed(&'a str),
     Open(&'a [&'static str]),
-    Repo(&'a crate::harness::repo_work::RepoRead),
+    /// The repository's work, and what of it to land ([`RepoAsk`]).
+    Repo(&'a crate::harness::repo_work::RepoRead, RepoAsk),
 }
 
 fn units(s: &str) -> usize {
@@ -16436,24 +16622,31 @@ fn fitted_act(base: &str, parts: &[Suffix<'_>], rules: Option<&str>) -> String {
             _ => None,
         })
         .unwrap_or(&[]);
-    let repo_read = parts.iter().find_map(|p| match p {
-        Suffix::Repo(r) => Some(*r),
-        _ => None,
-    });
+    let (repo_read, ask) = parts
+        .iter()
+        .find_map(|p| match p {
+            Suffix::Repo(r, ask) => Some((Some(*r), *ask)),
+            _ => None,
+        })
+        .unwrap_or((None, RepoAsk::All));
     let repo = repo_read.and_then(|r| r.found());
     let unread = repo_read.is_some_and(|r| r.is_unread());
+    let unread_said = match ask {
+        RepoAsk::All => REPO_UNREAD,
+        RepoAsk::Own => REPO_UNREAD_OWN,
+    };
     let repo_in = |room: usize| -> Option<String> {
         if unread {
-            return (units(REPO_UNREAD) < room).then(|| REPO_UNREAD.to_string());
+            return (units(unread_said) < room).then(|| unread_said.to_string());
         }
         let repo = repo?;
-        let whole = repo_work_suffix(repo);
+        let whole = repo_said_to(&fit_units(&repo.summary(), REPO_SUMMARY_UNITS), ask);
         if units(&whole) < room {
             return Some(whole);
         }
-        let frame = units(&repo_said("x"));
+        let frame = units(&repo_said_to("x", ask));
         let cut = fit_units(&repo.summary(), room.saturating_sub(frame)).into_owned();
-        let said = repo_said(&cut);
+        let said = repo_said_to(&cut, ask);
         (units(&said) < room).then_some(said)
     };
     let mut chosen: (Option<String>, Option<String>) = (None, None);
@@ -16475,7 +16668,7 @@ fn fitted_act(base: &str, parts: &[Suffix<'_>], rules: Option<&str>) -> String {
         let said = match p {
             Suffix::Fixed(f) => Some(*f),
             Suffix::Open(_) => open.as_deref(),
-            Suffix::Repo(_) => repo_s.as_deref(),
+            Suffix::Repo(..) => repo_s.as_deref(),
         };
         if let Some(a) = said.filter(|a| !a.is_empty()) {
             text.push(' ');
@@ -17394,26 +17587,22 @@ fn continue_policy(
     ) {
         return act;
     }
+    // CRUISE'S WORDS, never the vendor's: a grey suggestion in the composer (Claude Code's `keep
+    // going`) is typed over with the whole continuation, which carries the hunt and NEEDS YOU's
+    // rule; it is no longer accepted bare (v6 §14.5; [`RULE_SUGGESTION`] stays for older books).
+    // Land never comes here ([`words_act`]), nor does Off ([`decide_unridden`]).
     let ack = state.needs_ack_owed();
-    match &reading.composer {
-        Composer::Placeholder(s) if suggestion_allowed(s) && !ack => {
-            budgeted(TurnEndAction::Accept {
-                text: s.clone(),
-                rule_id: RULE_SUGGESTION,
-            })
-        }
-        _ => budgeted(TurnEndAction::Type {
-            text: act_words(
-                &cfg.continue_text,
-                &[
-                    reversible_clause(ack && state.needs_destroy()),
-                    ack_clause(ack),
-                ],
-                reading.rules.as_deref(),
-            ),
-            rule_id: RULE_CONTINUE,
-        }),
-    }
+    budgeted(TurnEndAction::Type {
+        text: act_words(
+            &cfg.continue_text,
+            &[
+                reversible_clause(ack && state.needs_destroy()),
+                ack_clause(ack),
+            ],
+            reading.rules.as_deref(),
+        ),
+        rule_id: RULE_CONTINUE,
+    })
 }
 
 fn words_gate(cfg: &SupervisorConfig, asked: Option<&str>, done: bool) -> Option<TurnEndAction> {
@@ -17446,10 +17635,10 @@ fn words_act(
     if done {
         return Some(budgeted(TurnEndAction::Type {
             text: fitted_act(
-                DONE_CHECK,
+                &done_check_words(usize::from(state.checks)),
                 &[
                     Suffix::Open(&state.open),
-                    Suffix::Repo(&state.repo),
+                    Suffix::Repo(&state.repo, RepoAsk::Own),
                     Suffix::Fixed(reversible_clause(irreversible || need_destroys)),
                     Suffix::Fixed(ack_s),
                 ],
@@ -17508,7 +17697,7 @@ fn land_words(state: &TurnEndState, reading: &TurnEndReading) -> (String, &'stat
                 LAND_NUDGE,
                 &[
                     Suffix::Open(&state.open),
-                    Suffix::Repo(&state.repo),
+                    Suffix::Repo(&state.repo, RepoAsk::All),
                     Suffix::Fixed(rev),
                     Suffix::Fixed(ack_s),
                 ],

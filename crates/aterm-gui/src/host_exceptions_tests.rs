@@ -281,6 +281,8 @@ fn resume_exception(kind: ExceptionKind) -> Exception {
         ),
     };
     Exception {
+        held: None,
+        title: None,
         kind,
         when: if kind == ExceptionKind::Login {
             Urgency::Now
@@ -4328,5 +4330,64 @@ fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
             .entries
             .iter()
             .any(|entry| entry.key == key)
+    );
+}
+
+/// §14.3's one loud hold: an agy tab's Land hold over repository work raises one band that
+/// names aterm, never Claude, with exactly its action and its why; the same hold told again raises
+/// no second, its lift withdraws it, and a `Later` hold raises none.
+#[test]
+fn a_loud_hold_is_one_band_that_names_aterm_and_its_lift_withdraws_it() {
+    use aterm_agent::harness::acts::HeldBy;
+    let mut app = App::headless_for_test();
+    let told = |app: &mut App, standing: Option<Exception>| {
+        app.note_harness_host(HostNote::ResumeException {
+            sid: "s-1".to_string(),
+            agent: Program::Agy,
+            standing,
+        });
+    };
+    let asks = |app: &App| -> Vec<(String, Option<String>, Vec<String>)> {
+        app.messages
+            .live_rows()
+            .filter(|row| matches!(row.msg.need(), aterm_messages::need::Need::Now(_)))
+            .map(|row| {
+                (
+                    row.msg.title.clone(),
+                    row.msg.short_title.clone(),
+                    row.msg.detail.clone(),
+                )
+            })
+            .collect()
+    };
+    let loud = Exception::repeats_land(HeldBy::SameReply, None);
+    let (title, short) = loud.title.expect("CONTROL: the loud hold titles itself");
+    told(&mut app, Some(loud.clone()));
+    let raised = asks(&app);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    let (said, said_short, detail) = &raised[0];
+    assert!(said.starts_with(title), "{said}");
+    assert!(!said.contains("Claude"), "no program named: {said}");
+    assert_eq!(said_short.as_deref(), Some(short));
+    assert_eq!(detail, &[loud.action.clone(), loud.why.clone()]);
+    told(&mut app, Some(loud.clone()));
+    assert_eq!(asks(&app), raised, "raised once per hold");
+    told(&mut app, None);
+    assert!(asks(&app).is_empty(), "the lift withdraws it");
+    told(&mut app, Some(Exception::repeats(HeldBy::SameReply)));
+    assert!(asks(&app).is_empty(), "a Later hold raises no band");
+    told(&mut app, None);
+    // The control: untitled, the same ask names Claude for an agy tab.
+    told(
+        &mut app,
+        Some(Exception {
+            title: None,
+            ..loud
+        }),
+    );
+    let untitled = asks(&app);
+    assert!(
+        untitled.len() == 1 && untitled[0].0.starts_with("Claude needs you"),
+        "{untitled:#?}"
     );
 }

@@ -41,6 +41,8 @@ pub(crate) struct FleetNeed {
     pub(crate) what: Option<String>,
     /// The need's words where the row says it is the program's own report (`needs_by=program`, [`crate::needs::claim_words_of_row`]): aterm's fixed words, no content of the peer's.
     pub(crate) claim: Option<&'static str>,
+    /// The row says the need is a harness's `NEEDS YOU:` report its agent carries on past (`needs_by=harness`): Needs you lists it after the needs that stopped their agents ([`crate::status_item::NeedRow::carries_on`]).
+    pub(crate) carries_on: bool,
 }
 
 /// One session on a fleet peer that this Mac holds over the fleet.
@@ -421,6 +423,7 @@ fn mac_of(
                 .map(str::to_string)
                 .or_else(|| content.then(|| content_what(need, row)).flatten()),
             claim,
+            carries_on: field(row, "needs_by") == Some("harness"),
         });
     }
     mac

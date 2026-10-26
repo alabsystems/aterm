@@ -3565,9 +3565,9 @@ impl SessionTimeline {
         true
     }
 
-    /// Forget the rollout tap's facts: its tap went.
-    pub(crate) fn clear_codex_survey(&mut self) {
-        self.codex_survey = None;
+    /// Forget the rollout tap's facts: its tap went. Returns whether any facts were cleared.
+    pub(crate) fn clear_codex_survey(&mut self) -> bool {
+        self.codex_survey.take().is_some()
     }
 
     /// The codex facts the survey shows, or `None` when the program in front is not the one they
@@ -3625,7 +3625,7 @@ impl SessionTimeline {
 
     /// The active goal of the agent in front, one line ([`aterm_agent::harness::goal`]): what
     /// its own records say (Claude Code's `/goal` and Muse Code's goal store through the footer
-    /// resolver's facts, codex-alab's goal store through the rollout tap's), or `None` while it
+    /// resolver's facts, codex-alab's session record through the rollout tap's), or `None` while it
     /// has none or keeps none aterm reads.
     pub(crate) fn goal(&self) -> Option<&str> {
         self.claude_footer()

@@ -885,6 +885,9 @@ pub struct Ended {
     pub cpu: Duration,
     /// Peak resident set size in bytes.
     pub maxrss: u64,
+    /// How long its processes' threads ran and were runnable ([`TreeTimes`]); `None` when no
+    /// read of the process table found them.
+    pub threads: Option<trust_facts::Threads>,
 }
 
 /// Handle to a running verification check.
@@ -1309,6 +1312,52 @@ pub fn pace_of(f: &Finished, cores: usize) -> trust_facts::Pace {
         )]
         load: f.load.map(|l| (l * 100.0).round() as u64),
         cores: cores as u64,
+        threads: f.ended.threads,
+    }
+}
+
+/// How often a running check's processes are read for their threads' times ([`TreeTimes`]).
+const THREADS_EVERY: Duration = Duration::from_secs(5);
+
+/// A check's processes' CPU and runnable time ([`trust_facts::Threads`]), from reads of the
+/// process table while it runs: each process's latest read, by pid and start, summed at the
+/// end, so one that ended between reads keeps what it last showed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TreeTimes {
+    seen: BTreeMap<(u32, u64), (u64, u64)>,
+}
+
+impl TreeTimes {
+    /// Takes from `procs` `root` and every process under it, by parent, that a read showed both
+    /// times of.
+    pub fn take(&mut self, root: u32, procs: &[aterm_sysprobe::procs::ProcessReading]) {
+        let mut under: BTreeMap<u32, Vec<&aterm_sysprobe::procs::ProcessReading>> = BTreeMap::new();
+        for p in procs.iter().filter(|p| p.pid != p.ppid) {
+            under.entry(p.ppid).or_default().push(p);
+        }
+        let mut next: Vec<_> = procs.iter().filter(|p| p.pid == root).collect();
+        let mut been = BTreeSet::new();
+        while let Some(p) = next.pop() {
+            if !been.insert(p.pid) {
+                continue;
+            }
+            if let (Some(start), Some(cpu), Some(runnable)) = (p.start, p.cpu_ns, p.runnable_ns) {
+                self.seen.insert((p.pid, start), (cpu, runnable));
+            }
+            next.extend(under.get(&p.pid).into_iter().flatten().copied());
+        }
+    }
+
+    /// The sums, in milliseconds; `None` while nothing was taken.
+    #[must_use]
+    pub fn threads(&self) -> Option<trust_facts::Threads> {
+        let ns = |pick: fn(&(u64, u64)) -> u64| {
+            self.seen.values().map(pick).fold(0u64, u64::saturating_add) / 1_000_000
+        };
+        (!self.seen.is_empty()).then(|| trust_facts::Threads {
+            ran_ms: ns(|t| t.0),
+            runnable_ms: ns(|t| t.1),
+        })
     }
 }
 
@@ -1510,6 +1559,7 @@ impl Bench for Machine {
             t0: Instant::now(),
             locks: BTreeMap::new(),
             serial: aterm_uds::process::process_serial,
+            sweep: || aterm_sysprobe::procs::processes().map(|s| s.procs),
             admission: Admission::new(
                 aterm_capacity::Ledger::user(),
                 &aterm_capacity::Live,
@@ -3633,6 +3683,8 @@ struct RealChecks<'a> {
     locks: BTreeMap<PathBuf, bool>,
     /// Reads a spawned root's serial ([`aterm_uds::process::process_serial`]).
     serial: fn(i32) -> Option<u64>,
+    /// Reads the process table, for a running check's times ([`TreeTimes`]).
+    sweep: fn() -> Option<Vec<aterm_sysprobe::procs::ProcessReading>>,
     /// Each check's memory claim, admitted at the launch gate.
     admission: Admission<'a>,
     /// Where the gate says what a check waits for.
@@ -3766,6 +3818,9 @@ impl Checks for RealChecks<'_> {
             target,
             mark,
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: self.sweep,
         }))
     }
 
@@ -3836,9 +3891,26 @@ struct RealCheck {
     /// What its processes carry.
     mark: proc_tree::Mark,
     ended: Option<Ended>,
+    /// Its processes' times, from reads of the process table ([`RealChecks::sweep`]).
+    times: TreeTimes,
+    /// When it last read them.
+    read_at: Option<Instant>,
+    sweep: fn() -> Option<Vec<aterm_sysprobe::procs::ProcessReading>>,
 }
 
 impl RealCheck {
+    /// Reads its processes' times: when `now`, or once [`THREADS_EVERY`] has passed since the
+    /// last read.
+    fn read_times(&mut self, now: bool) {
+        if !now && self.read_at.is_some_and(|t| t.elapsed() < THREADS_EVERY) {
+            return;
+        }
+        self.read_at = Some(Instant::now());
+        if let (Some(root), Some(procs)) = (self.held(), (self.sweep)()) {
+            self.times.take(root.unsigned_abs(), &procs);
+        }
+    }
+
     /// The root's pid, which this process holds until it reaps the root.
     fn held(&self) -> Option<i32> {
         i32::try_from(self.child.id()).ok()
@@ -3861,6 +3933,7 @@ impl RealCheck {
                 .unwrap_or_else(|| 128 + usage.status.signal().unwrap_or(0)),
             cpu: usage.cpu,
             maxrss: usage.maxrss,
+            threads: self.times.threads(),
         };
         if left.spent() && held {
             let _ = fs::remove_file(&self.record);
@@ -3876,8 +3949,10 @@ impl Check for RealCheck {
             return Ok(Some(e));
         }
         if !self.child.exited()? {
+            self.read_times(false);
             return Ok(None);
         }
+        self.read_times(true);
         // What the root started may run on without it, in its session or adopted by launchd;
         // it is ended while the root is still unreaped, so its session is proven the check's.
         // Only a root that exited 0 with nothing left showed that what ran in the slot ran: a
@@ -3901,6 +3976,7 @@ impl Check for RealCheck {
         if let Some(e) = self.ended {
             return e;
         }
+        self.read_times(true);
         let left = proc_tree::end_marked(
             &self.mark,
             self.held(),
@@ -3921,6 +3997,7 @@ impl Check for RealCheck {
                 code: 128 + proc_tree::SIGKILL,
                 cpu: Duration::ZERO,
                 maxrss: 0,
+                threads: self.times.threads(),
             };
             self.ended = Some(e);
             if left.spent() && held {
@@ -5747,6 +5824,7 @@ mod tests {
                 code,
                 cpu: Duration::from_secs(1),
                 maxrss: 1,
+                threads: None,
             }
         }
     }
@@ -6478,6 +6556,7 @@ mod tests {
                 code,
                 cpu: Duration::from_secs(4),
                 maxrss: 9,
+                threads: None,
             },
             wall: Duration::from_secs(5),
             over_budget: over,
@@ -6520,6 +6599,132 @@ mod tests {
             fs::read_to_string(beside("trustd")).unwrap(),
             "foreign\tanother build\n"
         );
+        let mut f = finished(d.path(), DONE, 0, false);
+        f.ended.threads = Some(trust_facts::Threads {
+            ran_ms: 3600,
+            runnable_ms: 4000,
+        });
+        record(&f, Duration::from_secs(60), 14, &mut || String::new()).unwrap();
+        let pace = fs::read_to_string(beside("pace")).unwrap();
+        assert_eq!(pace, "4000 5000 3000 14 3600 4000\n");
+        let pace = trust_facts::Pace::parse(pace.trim()).unwrap();
+        assert!(!pace.starved(), "its threads ran: {}", pace.said());
+    }
+
+    /// A check's times are its own processes', each at its latest read.
+    #[test]
+    fn a_checks_times_sum_its_own_processes_latest_reads() {
+        use aterm_sysprobe::procs::ProcessReading;
+        let p = |pid, ppid, start, ran_ms: u64, runnable_ms: Option<u64>| ProcessReading {
+            pid,
+            ppid,
+            start: Some(start),
+            cpu_ns: Some(ran_ms * 1_000_000),
+            runnable_ns: runnable_ms.map(|r| r * 1_000_000),
+            ..ProcessReading::default()
+        };
+        let sums = |t: &TreeTimes| t.threads().map(|t| (t.ran_ms, t.runnable_ms));
+        let mut t = TreeTimes::default();
+        assert_eq!(sums(&t), None);
+        // The root 10, its child 11 and grandchild 12; a stranger 20 and its child 21; pid 0,
+        // its own parent.
+        let stranger = [
+            p(20, 1, 200, 7000, Some(7000)),
+            p(21, 20, 210, 7000, Some(7000)),
+        ];
+        let first = [
+            p(0, 0, 1, 9, Some(9)),
+            p(10, 1, 100, 1, Some(1)),
+            p(11, 10, 110, 50, Some(60)),
+            p(12, 11, 120, 400, Some(900)),
+        ];
+        t.take(10, &[&first[..], &stranger[..]].concat());
+        assert_eq!(
+            sums(&t),
+            Some((451, 961)),
+            "the stranger's are not the check's"
+        );
+        // 12 ended and keeps what it last showed; 11 counts once, at its latest read.
+        t.take(
+            10,
+            &[p(10, 1, 100, 2, Some(2)), p(11, 10, 110, 80, Some(100))],
+        );
+        assert_eq!(sums(&t), Some((482, 1002)));
+        // A pid used again under the root by another process is that other process; one read
+        // without its runnable time is left out.
+        t.take(
+            10,
+            &[
+                p(10, 1, 100, 2, Some(2)),
+                p(12, 10, 130, 5, Some(5)),
+                p(13, 10, 140, 900, None),
+            ],
+        );
+        assert_eq!(sums(&t), Some((487, 1007)));
+        let mut none = TreeTimes::default();
+        none.take(10, &stranger);
+        assert_eq!(sums(&none), None, "no root read, nothing taken");
+    }
+
+    /// A running check's times come off the live process table: its root's and what the root
+    /// started, no other process's. Negative control: a check that reads no table has none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_checks_times_are_its_own_tree_s_in_the_live_table() {
+        let d = tmp("trust-lane-times");
+        let pidfile = d.path().join("pid");
+        let mut cmd = command("/bin/sh");
+        cmd.arg("-c")
+            .arg("\"$2\" 600 & echo $! > \"$1\"; wait")
+            .arg("sh")
+            .arg(&pidfile)
+            .arg(readable("/bin/sleep"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        proc_tree::new_session(&mut cmd);
+        let child = cmd.spawn().unwrap();
+        let root = child.id();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let under = loop {
+            if let Some(p) = fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+            {
+                break Leftover::new(p);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the root never started its child"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            runs_from(under.pid, &readable("/bin/sleep")),
+            "the root's child never ran its program"
+        );
+        let mut check = RealCheck {
+            child,
+            record: d.path().join(".check.0"),
+            target: d.path().join("j0"),
+            mark: proc_tree::Mark {
+                nonce: None,
+                root: None,
+                kept: BTreeSet::new(),
+            },
+            ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
+        };
+        check.read_times(true);
+        assert_eq!(check.times.threads(), None, "no table read, no times");
+        check.sweep = || aterm_sysprobe::procs::processes().map(|s| s.procs);
+        check.read_times(true);
+        let read: BTreeSet<u32> = check.times.seen.keys().map(|(pid, _)| *pid).collect();
+        assert_eq!(read, BTreeSet::from([root, under.pid]), "{:?}", check.times);
+        check.child.kill().unwrap();
+        let _ = check.child.wait();
     }
 
     #[cfg(target_os = "macos")]
@@ -6634,6 +6839,7 @@ mod tests {
                 code: 0,
                 cpu: Duration::from_secs(1),
                 maxrss: 1,
+                threads: None,
             }
         }
     }
@@ -10230,6 +10436,9 @@ mod tests {
             target: target.clone(),
             mark,
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         let ended = loop {
@@ -10617,6 +10826,9 @@ mod tests {
             record: record.clone(),
             target: target.clone(),
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         let ended = loop {
@@ -11019,6 +11231,9 @@ mod tests {
                 kept: BTreeSet::new(),
             },
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
         };
         real.end();
         let kept = record.exists();
@@ -11311,6 +11526,7 @@ mod tests {
             t0: Instant::now(),
             locks: BTreeMap::new(),
             serial,
+            sweep: || None,
             admission: Admission::new(
                 None,
                 &aterm_capacity::Live,
@@ -11987,6 +12203,9 @@ mod tests {
                 kept: BTreeSet::new(),
             },
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
         };
         let read = |file: &Path| {
             fs::read_to_string(file)
@@ -12071,6 +12290,9 @@ mod tests {
             record: d.path().join(".check.1"),
             target: target.clone(),
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         let ended = loop {
@@ -12117,6 +12339,9 @@ mod tests {
             record: record.clone(),
             target: target.clone(),
             ended: None,
+            times: TreeTimes::default(),
+            read_at: None,
+            sweep: || None,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         let ended = loop {

@@ -60,6 +60,10 @@ aterm-codec = { workspace = true }
 # (`http::download_bytes`) and its Ed25519 check (`roster::verify_roster`), the verifier the
 # updater's own roster uses. Already in the graph through atpkg.
 aterm-update-core = { workspace = true }
+# First-party HTTP/1.1 client for Codex's native OAuth token exchange/refresh and `/wham/usage`
+# read (`src/harness/codex_app_login.rs`), avoiding any external `codex app-server` subprocess.
+# Already in the shipped graph through `aterm-update-core` / `atpkg`.
+aterm-http = { workspace = true }
 # The fleet document's owner tools (`aterm ai fleet keygen|sign`): an Ed25519 keypair and a
 # detached signature. The shipped binary already carries ring with these features (TLS).
 ring = { workspace = true, features = ["alloc"] }

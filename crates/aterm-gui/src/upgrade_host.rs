@@ -3230,10 +3230,14 @@ mod tests {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         app.tab_strip_rows = 1;
-        let first = app.tab_session_id_text(wid, 0).expect("tab 0's session");
+        let first = app
+            .tab_terminal_session(wid, 0)
+            .and_then(|session| app.session_id_text(session))
+            .expect("tab 0's session");
         let _ = app.split_active_stub_tab(wid);
         let sid = app
-            .tab_session_id_text(wid, 0)
+            .tab_terminal_session(wid, 0)
+            .and_then(|session| app.session_id_text(session))
             .expect("the focused pane's session");
         assert_ne!(first, sid, "the new pane has the focus");
         assert!(upgrade_items(&app.tab_context_menu_model(wid, 0)).is_empty());
@@ -3253,7 +3257,12 @@ mod tests {
         );
         assert!(app.open_tab_context_menu(wid, 0, 5, false));
         assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
-        assert_eq!(app.tab_session_id_text(wid, 0).as_deref(), Some(&*first));
+        assert_eq!(
+            app.tab_terminal_session(wid, 0)
+                .and_then(|session| app.session_id_text(session))
+                .as_deref(),
+            Some(&*first)
+        );
         app.apply_agent_upgrades(vec![
             row(&first, 60),
             Row {

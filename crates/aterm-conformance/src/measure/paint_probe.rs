@@ -11,7 +11,8 @@ use super::instance::{
     Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, uint_field,
 };
 use super::paint::{
-    BUDGET_SECS, Capture, Companion, Ledger, PaintReport, PaintRow, Scene, Split, judge,
+    BUDGET_SECS, Capture, Companion, Expect, Ledger, PaintReport, PaintRow, Scene, Split, Style,
+    judge,
 };
 use super::scan::{Cell, RecordingIndex, StatusRow, TakeContext, scan_dir};
 use super::starvation::{DEFAULT_LATE_THRESHOLD_US, Sampler, SchedInputs, classify, paint_verdict};
@@ -33,6 +34,22 @@ const PLANE_CARET: &str = "9";
 
 const COMPANION_PLANE: &str = r"printf '\033[2J\033[10;10H'; sleep 30";
 
+/// The take a process makes once, before its first measured row, and throws away: a fresh
+/// bundle's first recording and first trail frames start cold (the driven window opens later and
+/// a frame hole can pass twice the nominal, which voids the take), a first-use cost like
+/// [`super::instance::first_exec`]'s that no measured take should carry.
+const WARM_ROW: PaintRow = PaintRow {
+    scene: Scene::Prompt,
+    keys: "r,a,i,n,b,o,w,k,i,t,t,y",
+    expect: Expect::Ink,
+    capture: Capture::PinnedVideo,
+    style: Style::Flying,
+    companion: None,
+    split: None,
+};
+
+static WARMED: std::sync::Once = std::sync::Once::new();
+
 /// Measure one row.
 /// # Errors
 /// [`CouldNotRun`] when the take decided nothing.
@@ -43,6 +60,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
     row.validate()?;
     let bench_band = super::instance::Band::take_own();
     super::instance::first_exec(&rig.fake_tui);
+    WARMED.call_once(|| warm(rig));
     let started = Instant::now();
     let budget = Budget::from_now(BUDGET_SECS);
     let mut sampler = Sampler::start(SAMPLER_TICK);
@@ -93,6 +111,30 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         band: take.band,
         bench_band,
     })
+}
+
+/// [`WARM_ROW`]'s take, whatever it finds: it decides nothing, so its result is only said.
+fn warm(rig: &Rig) {
+    super::instance::first_exec(&rig.aterm);
+    let outcome = Scratch::new("atpaint").map_or_else(
+        |e| format!("no scratch world: {e}"),
+        |scratch| {
+            let mut sampler = Sampler::start(SAMPLER_TICK);
+            let take = run_take(
+                rig,
+                &WARM_ROW,
+                scratch.path(),
+                &sampler,
+                Budget::from_now(BUDGET_SECS),
+            );
+            let _ = sampler.finish();
+            take.map_or_else(
+                |why| format!("it ended early: {why}"),
+                |_| "taken".to_owned(),
+            )
+        },
+    );
+    eprintln!("measure warm-up: paint — a take that decides nothing ({outcome})");
 }
 
 struct Take {

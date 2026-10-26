@@ -26,6 +26,13 @@ impl AdmissionPhase {
     }
 }
 
+/// Opaque host identities of the terminal view that produced an admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionSource {
+    pub view: u64,
+    pub session: u64,
+}
+
 /// One entry of the admission diagnosis ring ([`CursorGlow::admission_log`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionRecord {
@@ -42,6 +49,8 @@ pub struct AdmissionRecord {
     pub alternate_screen: bool,
     /// Licence class token that admitted the move.
     pub licence: &'static str,
+    /// The owner bound when the verdict was appended, unknown for unbound hosts.
+    pub source: Option<AdmissionSource>,
 }
 
 impl AdmissionRecord {
@@ -63,8 +72,14 @@ impl AdmissionRecord {
     /// Format one diagnostic line in the `trail` verb's row shape.
     #[must_use]
     pub fn line(&self, now: Instant) -> String {
+        let source_view = self
+            .source
+            .map_or_else(|| "-".to_string(), |s| s.view.to_string());
+        let source_session = self
+            .source
+            .map_or_else(|| "-".to_string(), |s| s.session.to_string());
         format!(
-            "admission seq={} phase={} reason={} age_ms={:.0} origin={},{} target={},{} alt={} licence={}",
+            "admission seq={} phase={} reason={} age_ms={:.0} origin={},{} target={},{} alt={} licence={} source={} source_view={} source_session={}",
             self.seq,
             self.phase.as_str(),
             self.reason,
@@ -75,6 +90,13 @@ impl AdmissionRecord {
             self.target.1,
             u8::from(self.alternate_screen),
             self.licence,
+            if self.source.is_some() {
+                "bound"
+            } else {
+                "unknown"
+            },
+            source_view,
+            source_session,
         )
     }
 }
@@ -549,6 +571,12 @@ impl TrailStatus<'_> {
 }
 
 impl CursorGlow {
+    /// Bind diagnostic provenance for future verdicts without changing retained history or ink.
+    #[inline]
+    pub const fn set_admission_source(&mut self, source: Option<AdmissionSource>) {
+        self.admission_source = source;
+    }
+
     /// Rainbow kitty v2 `trail status` counters when v2 owns the frame.
     #[inline]
     #[must_use]
@@ -648,6 +676,7 @@ impl CursorGlow {
             target,
             alternate_screen: self.ctx_alt,
             licence,
+            source: self.admission_source,
         });
     }
 
@@ -669,6 +698,7 @@ impl CursorGlow {
             target,
             alternate_screen: self.ctx_alt,
             licence: AdmissionRecord::LICENCE_NONE,
+            source: self.admission_source,
         });
     }
 

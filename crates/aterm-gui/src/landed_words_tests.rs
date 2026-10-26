@@ -248,7 +248,7 @@ fn two_panes_of_one_tab_with_one_label_say_which_pane() {
     }
 }
 
-struct TestHost(crate::harness_host::HostHandle);
+pub(super) struct TestHost(crate::harness_host::HostHandle);
 
 impl Drop for TestHost {
     fn drop(&mut self) {
@@ -256,7 +256,7 @@ impl Drop for TestHost {
     }
 }
 
-fn desk(word: &str) -> (App, String, TestHost) {
+pub(super) fn desk(word: &str) -> (App, String, TestHost) {
     let mut app = App::headless_for_test();
     let host = TestHost(crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
@@ -286,7 +286,7 @@ fn desk(word: &str) -> (App, String, TestHost) {
     (app, ctx.self_id.as_str().to_string(), host)
 }
 
-fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
+pub(super) fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, crate::HarnessFact::Task(face));
 }
 
@@ -503,7 +503,7 @@ fn the_overview_says_landed_once() {
     );
 }
 
-fn idle(app: &App) {
+pub(super) fn idle(app: &App) {
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
     ctx.timeline.lock().expect("timeline").publish_agent(
         "idle",
@@ -528,7 +528,13 @@ fn a_timer_on_another_day_names_its_day() {
         ..ChipGlass::default()
     };
     let words = |other_day| {
-        crate::app_presence::driven_words(ChipFace::CruiseUntil, &glass(other_day), None, false)
+        crate::app_presence::driven_words(
+            ChipFace::CruiseUntil,
+            &glass(other_day),
+            None,
+            false,
+            None,
+        )
     };
     assert_eq!(words(None).as_deref(), Some("cruise, lands at 18:00"));
     assert_eq!(

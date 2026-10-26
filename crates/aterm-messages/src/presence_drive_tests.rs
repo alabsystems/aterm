@@ -298,7 +298,12 @@ fn a_need_without_a_pill_does_not_hide_another_tabs_prompt() {
     assert_eq!(d.view(1).rim, Rim::Decide);
     assert!(d.view(1).pill.is_none());
     d.publish(2, decide(2));
-    assert_eq!(d.view(1).pressing, Some(1));
+    assert_eq!(
+        d.view(1).pressing,
+        Some(2),
+        "the request that stopped its agent, ahead of the front report it carries on past (§14.7)"
+    );
+    assert_eq!(d.view(1).rim, Rim::Decide);
     assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.session), Some(2));
     assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.more), Some(1));
     assert_eq!(d.next_need_after(1, 2), Some(1));
@@ -306,6 +311,73 @@ fn a_need_without_a_pill_does_not_hide_another_tabs_prompt() {
     assert_eq!(d.next_need_after(1, 2), Some(1));
     d.publish(2, None);
     assert!(d.view(1).pill.is_none());
+    assert_eq!(d.view(1).pressing, Some(1), "the report alone again");
+}
+
+/// STOPPED WORK FIRST (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): within a
+/// severity, the window's pressing session (the rim's target, `chrome`'s `pressing=`) and the
+/// next need its pill's `+N` opens start from a need that has stopped its agent, not from an
+/// older report its agent carries on past, even one in the front tab; stuck still outranks
+/// decide, and among the stopped needs the front session and then the oldest lead.
+#[test]
+fn pressing_and_next_need_lead_with_a_stopped_need() {
+    let mut d = desk(vec![vec![1], vec![2], vec![3]]);
+    let mut report = decide(1).expect("a need");
+    report.show_pill = false;
+    d.publish(1, Some(report.clone()));
+    d.now += Duration::from_secs(1);
+    d.publish(2, decide(2));
+    d.now += Duration::from_secs(1);
+    d.publish(3, decide(3));
+    let p = d.pressing_session(1).expect("a need");
+    assert_eq!(
+        (p.session, p.tab, p.front_tab, p.more),
+        (2, 1, false, 2),
+        "the older of the two requests, past the oldest need, the front tab's report"
+    );
+    assert_eq!(d.view(1).pressing, Some(2));
+    assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.session), Some(2));
+    let line = drive::chrome_line(&d, Some(1));
+    assert!(line.contains(" pressing=@s-2 "), "{line}");
+    assert_eq!(
+        d.next_need_after(1, 2),
+        Some(3),
+        "from the front report: past the pill's request to the next one"
+    );
+    d.wins.get_mut(&1).unwrap().front_tab = 1;
+    drive::refresh_window(&mut d, 1);
+    assert_eq!(d.next_need_after(1, 2), Some(3), "from the first request");
+    d.wins.get_mut(&1).unwrap().front_tab = 2;
+    drive::refresh_window(&mut d, 1);
+    assert_eq!(
+        d.pressing_session(1).map(|p| p.session),
+        Some(3),
+        "a stopped need in front wins its tie"
+    );
+    assert_eq!(
+        d.next_need_after(1, 3),
+        Some(1),
+        "the report last, then it wraps"
+    );
+    d.wins.get_mut(&1).unwrap().front_tab = 0;
+    drive::refresh_window(&mut d, 1);
+    let mut stuck_report = stuck(1).expect("a need");
+    stuck_report.show_pill = false;
+    d.publish(1, Some(stuck_report));
+    assert_eq!(
+        d.pressing_session(1).map(|p| p.session),
+        Some(1),
+        "stuck still outranks decide, report or not"
+    );
+    assert_eq!(d.view(1).rim, Rim::Stuck);
+    d.publish(1, Some(report));
+    d.publish(2, None);
+    d.publish(3, None);
+    assert_eq!(
+        d.pressing_session(1).map(|p| p.session),
+        Some(1),
+        "the report alone presses"
+    );
 }
 
 #[test]
@@ -326,6 +398,80 @@ fn more_walks_past_a_front_report_to_the_other_reports() {
     assert_eq!(d.next_need_after(1, 1), Some(2));
     d.wins.get_mut(&1).unwrap().front_tab = 0;
     assert_eq!(d.next_need_after(1, 1), Some(2));
+}
+
+/// A report with no pill, as a harness's `NEEDS YOU:` is published.
+fn report(key: u64) -> Option<NeedFact> {
+    let mut need = decide(key)?;
+    need.show_pill = false;
+    Some(need)
+}
+
+/// STOPPED WORK FIRST IN THE `+N` WALK (§14.7): from a front request, the next need is the
+/// other request even where a report stands between the two by age, since `needing_order` puts
+/// every report of a severity after the needs that stopped their agents.
+#[test]
+fn the_next_need_from_a_request_is_the_other_request_before_an_older_report() {
+    let mut d = desk(vec![vec![1], vec![2], vec![3]]);
+    d.wins.get_mut(&1).unwrap().front_tab = 1;
+    d.publish(2, decide(2));
+    d.now += Duration::from_secs(1);
+    d.publish(1, report(1));
+    d.now += Duration::from_secs(1);
+    d.publish(3, decide(3));
+    drive::refresh_window(&mut d, 1);
+    assert_eq!(d.view(1).pressing, Some(2));
+    assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.session), Some(2));
+    assert_eq!(
+        d.next_need_after(1, 2),
+        Some(3),
+        "the other request, before the report older than it"
+    );
+    d.wins.get_mut(&1).unwrap().front_tab = 2;
+    drive::refresh_window(&mut d, 1);
+    assert_eq!(
+        d.next_need_after(1, 3),
+        Some(1),
+        "past the last request, the report"
+    );
+}
+
+/// FROM A FRONT REPORT, THE `+N` OPENS THE STOPPED WORK AFTER THE PILL'S (§14.7, §12.11): the
+/// front tab's report, two requests and a younger report; the pill names the older request, and
+/// its `+N` opens the other request, not the younger report that follows the front one. Where a
+/// report stands between two requests by age, the walk still keeps to the requests.
+#[test]
+fn more_from_a_front_report_opens_the_other_request_before_a_younger_report() {
+    let mut d = desk(vec![vec![1], vec![2], vec![3], vec![4]]);
+    d.publish(1, report(1));
+    d.now += Duration::from_secs(1);
+    d.publish(2, decide(2));
+    d.now += Duration::from_secs(1);
+    d.publish(3, decide(3));
+    d.now += Duration::from_secs(1);
+    d.publish(4, report(4));
+    let pill = d.view(1).pill.as_ref().expect("the older request's pill");
+    assert_eq!((pill.session, pill.more), (2, 3));
+    assert_eq!(
+        d.next_need_after(1, 2),
+        Some(3),
+        "the other request, not the younger report"
+    );
+
+    let mut d = desk(vec![vec![1], vec![2], vec![3], vec![4]]);
+    d.publish(1, report(1));
+    d.now += Duration::from_secs(1);
+    d.publish(2, decide(2));
+    d.now += Duration::from_secs(1);
+    d.publish(3, report(3));
+    d.now += Duration::from_secs(1);
+    d.publish(4, decide(4));
+    assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.session), Some(2));
+    assert_eq!(
+        d.next_need_after(1, 2),
+        Some(4),
+        "the other request, past a report older than it"
+    );
 }
 
 /// Pressing session selection orders stuck before decide, then front session, then oldest need.

@@ -410,6 +410,7 @@ pub(crate) struct HarnessSession {
     pub(crate) set_by: Option<crate::autopilot::SetByWords>,
     pub(crate) need: Option<crate::needs::HarnessAsk>,
     pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
+    pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
 }
 
 /// One `[harness]` key of the effective table.
@@ -903,6 +904,7 @@ impl HarnessState {
                     setting: setting_line(session, self.today),
                     need: session.need.clone(),
                     hold: session.hold,
+                    stopped: session.stopped,
                 }
             })
             .collect()
@@ -1570,6 +1572,7 @@ pub(crate) struct HarnessSessionRow {
     pub(crate) setting: String,
     pub(crate) need: Option<crate::needs::HarnessAsk>,
     pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
+    pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
 }
 
 impl HarnessSessionRow {
@@ -1596,6 +1599,12 @@ impl HarnessSessionRow {
         };
         let face = ChipFace::of(self.view, glass);
         let hold = self.hold.filter(|_| face == ChipFace::Land);
+        let stop = self
+            .stopped
+            .filter(|_| face.carries())
+            .map(|arm| crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Line));
+        // A stopped tab is not pausing: the pause it waited out before the hold has lapsed.
+        let pause = glass.pause.filter(|_| stop.is_none());
         let line = match face {
             ChipFace::CruiseUntil => glass.land_at.map(lands),
             ChipFace::Landed => Some(at("landed")),
@@ -1609,7 +1618,7 @@ impl HarnessSessionRow {
                         today,
                     )
                 })
-                .map(|held| match glass.pause {
+                .map(|held| match pause {
                     Some(pause) => format!(
                         "{held}{}{}",
                         crate::native_ui::FACT_SEPARATOR,
@@ -1629,7 +1638,7 @@ impl HarnessSessionRow {
             })
         });
         let rest = line
-            .or_else(|| glass.pause.map(|p| p.state_words(today)))
+            .or_else(|| pause.map(|p| p.state_words(today)))
             .or_else(|| {
                 glass.last.map(|(act, stamp)| {
                     format!(
@@ -1640,12 +1649,11 @@ impl HarnessSessionRow {
                     )
                 })
             });
-        match (need.map(need_head), rest) {
-            (Some(need), Some(rest)) => {
-                Some(format!("{need}{}{rest}", crate::native_ui::FACT_SEPARATOR))
-            }
-            (need, rest) => need.or(rest),
-        }
+        let sep = crate::native_ui::FACT_SEPARATOR;
+        [stop, need.map(need_head), rest]
+            .into_iter()
+            .flatten()
+            .reduce(|line, more| format!("{line}{sep}{more}"))
     }
 }
 
@@ -2515,6 +2523,7 @@ impl App {
                 .harness_ask()
                 .cloned();
             let hold = self.shown_hold(handle.local_id).filter(|_| supervised);
+            let stopped = self.shown_stop(handle.local_id).filter(|_| supervised);
             sessions.push(HarnessSession {
                 local_id: handle.local_id,
                 sid: handle.sid.as_str().to_string(),
@@ -2530,6 +2539,7 @@ impl App {
                 set_by,
                 need,
                 hold,
+                stopped,
             });
         }
         sessions.sort_by_key(|s| s.local_id);

@@ -78,7 +78,8 @@ fn one_carried_request(rows: &[J], owed: &J, not_before: i64) -> bool {
             .is_some_and(|at| at >= not_before)
         && owed.get("text").and_then(J::as_str).is_some_and(|text| {
             rows[0]
-                .get("u")
+                .get("u_full")
+                .or_else(|| rows[0].get("u"))
                 .and_then(J::as_str)
                 .is_some_and(|user| user.contains(text))
         })
@@ -91,17 +92,42 @@ fn active_image_record(record: &J, version: &str, pid: i32) -> bool {
         && record.get("claim").and_then(J::as_str) == Some(format!("codex-alab@{pid}").as_str())
 }
 
+const UPGRADE_CONFIG_EXTRA: &str =
+    "[tui]\nscreen_reader_detection_done = true\n\n[features]\ngoals = true\n";
+const NATIVE_GOAL_OBJECTIVE: &str = "align native codex goal";
+
+fn package_supports_auth_and_goal(package: &Path) -> bool {
+    std::fs::read(package.join("bin/codex")).is_ok_and(|bytes| {
+        bytes
+            .windows(b"CODEX_AUTH_PATH".len())
+            .any(|w| w == b"CODEX_AUTH_PATH")
+    })
+}
+
+fn record_carries_auth_path(record: &J, auth_path: &Path) -> bool {
+    let Some(auth_str) = auth_path.to_str() else {
+        return false;
+    };
+    record
+        .get("env")
+        .and_then(|env| env.get("CODEX_AUTH_PATH"))
+        .and_then(J::as_str)
+        == Some(auth_str)
+}
+
 pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail> {
     proof.link(old).map_err(Fail::die)?;
     proof.inst.await_socket(instance::BOOT)?;
     let _ = proof.inst.ctl(&["ready"]);
     println!("upgrade-only (one real TUI, saved paced continuation, private package link)");
-    let leg = proof.spawn_leg(
+    let leg = proof.start_leg_using_auth(
         "continue",
-        "Write a plan, then stop.",
-        "[tui]\nscreen_reader_detection_done = true\n",
+        Some("Write a plan, then stop."),
+        UPGRADE_CONFIG_EXTRA,
         Folder::Scratch,
         Some("cruise"),
+        None,
+        true,
     )?;
     let Some(pid) = proof.claim_with_limit(&leg, HANG)? else {
         return Ok(());
@@ -260,9 +286,82 @@ fn handoff(
             && proof.proven_pid(&leg.sid) == Some(pid)
             && Proof::record(leg, pid).as_ref().is_some_and(|after| same_custody(&before, after)),
     );
+    if let Some(auth_path) = leg.auth_path.as_deref() {
+        if package_supports_auth_and_goal(old) {
+            proof.check(
+                "upgrade-only: the old image records isolated CODEX_AUTH_PATH outside CODEX_HOME",
+                record_carries_auth_path(&before, auth_path)
+                    && !leg.home.join("auth.json").exists(),
+            );
+        }
+        if package_supports_auth_and_goal(new) {
+            proof.check(
+                "upgrade-only: the upgraded image preserves isolated CODEX_AUTH_PATH across live execve",
+                after
+                    .as_ref()
+                    .is_some_and(|after| record_carries_auth_path(after, auth_path))
+                    && !leg.home.join("auth.json").exists(),
+            );
+            verify_native_goal_roundtrip(proof, leg, pid)?;
+        }
+    }
     if !proof.fails.is_empty() {
         proof.diagnose(&[leg]);
     }
+    Ok(())
+}
+
+fn verify_native_goal_roundtrip(proof: &mut Proof, leg: &Leg, pid: i32) -> Result<(), Stopped> {
+    let set_line = format!("/goal {NATIVE_GOAL_OBJECTIVE}\r");
+    let sent = proof.inst.ctl_stdin(
+        &[&format!("@{}", leg.sid), "send", "--stdin"],
+        set_line.as_bytes(),
+    );
+    let pid_u32 = u32::try_from(pid).unwrap_or(0);
+    let mut published = false;
+    let observed = Proof::wait_for(HANG, Duration::from_millis(250), || {
+        let Some(record) = Proof::record(leg, pid) else {
+            return false;
+        };
+        let Some(thread) = record.get("sessionId").and_then(J::as_str) else {
+            return false;
+        };
+        let record_ok = record.get("goal").and_then(J::as_str) == Some(NATIVE_GOAL_OBJECTIVE);
+        let reader_ok =
+            aterm_agent::harness::self_claimed::read_record_goal(&leg.home, pid_u32, thread)
+                .as_deref()
+                == Some(NATIVE_GOAL_OBJECTIVE);
+        let survey_ok = proof
+            .survey_of(&leg.sid)
+            .and_then(|row| row.get("goal").and_then(J::as_str).map(str::to_owned))
+            .as_deref()
+            == Some(NATIVE_GOAL_OBJECTIVE);
+        published = record_ok && reader_ok && survey_ok;
+        published
+    })?;
+    proof.check(
+        "upgrade-only: `/goal` publishes Record.goal in sessions/<pid>.json and `aterm ctl survey` reads it natively",
+        sent.code == 0 && observed && published,
+    );
+
+    let clear_sent = proof.inst.ctl_stdin(
+        &[&format!("@{}", leg.sid), "send", "--stdin"],
+        b"/goal clear\r",
+    );
+    let cleared = Proof::wait_for(HANG, Duration::from_millis(250), || {
+        let record_cleared = Proof::record(leg, pid)
+            .is_some_and(|record| record.get("goal").is_none_or(|g| g == &J::Null));
+        let survey_cleared = proof
+            .survey_of(&leg.sid)
+            .and_then(|row| row.get("goal").and_then(J::as_str).map(str::to_owned))
+            .as_deref()
+            == Some("-");
+        record_cleared && survey_cleared
+    })?;
+    proof.check(
+        "upgrade-only: `/goal clear` clears Record.goal and resets `aterm ctl survey` goal=-",
+        clear_sent.code == 0 && cleared,
+    );
     Ok(())
 }
 
@@ -397,13 +496,14 @@ pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), 
         .map_err(|error| format!("cannot preserve produced primary: {error}"))?;
     std::fs::remove_file(&entry)
         .map_err(|error| format!("cannot remove the owned entry symlink: {error}"))?;
-    let leg = proof.start_leg_using(
+    let leg = proof.start_leg_using_auth(
         "continue",
         Some("Write a plan, then stop."),
-        "[tui]\nscreen_reader_detection_done = true\n",
+        UPGRADE_CONFIG_EXTRA,
         Folder::Scratch,
         Some("cruise"),
         Some(&primary),
+        true,
     )?;
     let Some(pid) = proof.claim_with_limit(&leg, HANG)? else {
         return Ok(());
@@ -460,6 +560,23 @@ pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), 
         "raw: automatic native crash relaunch repaired the entry and changed kernel argv0 and exec route from physical A to the logical entry",
         repaired && recovered_launch && active_image_record(&recovered, &old_version, relaunched_pid),
     );
+    if let Some(auth_path) = leg.auth_path.as_deref() {
+        let relaunched_env_ok = u32::try_from(relaunched_pid)
+            .ok()
+            .and_then(atpkg::caller_shell::process_args)
+            .and_then(|args| {
+                args.env
+                    .into_iter()
+                    .find_map(|entry| entry.strip_prefix("CODEX_AUTH_PATH=").map(PathBuf::from))
+            })
+            .as_deref()
+            == Some(auth_path)
+            && !leg.home.join("auth.json").exists();
+        proof.check(
+            "raw: native crash relaunch preserves isolated CODEX_AUTH_PATH outside CODEX_HOME",
+            relaunched_env_ok,
+        );
+    }
     let carried = same_conversation(&initial, &recovered)
         && initial
             .get("owed")
@@ -627,5 +744,42 @@ mod tests {
             "new",
             42
         ));
+    }
+
+    #[test]
+    fn auth_path_witness_matches_exact_isolated_path() {
+        let auth = Path::new("/private/scratch/isolated-auth/auth.json");
+        let ok = J::obj([(
+            "env",
+            J::obj([
+                ("CODEX_HOME", J::s("/private/scratch/codex-home")),
+                (
+                    "CODEX_AUTH_PATH",
+                    J::s("/private/scratch/isolated-auth/auth.json"),
+                ),
+            ]),
+        )]);
+        let wrong = J::obj([(
+            "env",
+            J::obj([("CODEX_AUTH_PATH", J::s("/private/scratch/other/auth.json"))]),
+        )]);
+        let missing = J::obj([("env", J::obj([("CODEX_HOME", J::s("/private/scratch"))]))]);
+        assert!(record_carries_auth_path(&ok, auth));
+        assert!(!record_carries_auth_path(&wrong, auth));
+        assert!(!record_carries_auth_path(&missing, auth));
+    }
+
+    #[test]
+    fn carried_request_reads_full_user_text_past_excerpt_cap() {
+        let full = aterm_agent::supervise::config::CONTINUE_TEXT;
+        assert!(full.len() > 300);
+        let tail = &full[full.len() - 300..];
+        let owed = J::obj([("text", J::s(full))]);
+        let row = J::obj([
+            ("t", J::Int(1_792_998_984_130)),
+            ("u", J::s(tail)),
+            ("u_full", J::s(full)),
+        ]);
+        assert!(one_carried_request(&[row], &owed, 1_792_998_984_055));
     }
 }

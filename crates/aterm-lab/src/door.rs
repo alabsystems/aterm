@@ -218,8 +218,9 @@ impl<'a> Door<'a> {
         ))
     }
 
-    /// `aterm harness <args>` under the lab's jail and scratch (its state root the instance's), captured: the
-    /// harness's read views of this lab (`disk why`, `ledger disk`).
+    /// `aterm harness <args>` in the lab's jail and scratch (its state root the instance's), captured:
+    /// the harness's verbs on this lab's files, never the owner's (`accounts add`, `disk why`,
+    /// `ledger disk`).
     /// # Errors
     /// The client could not start.
     pub fn harness(&self, args: &[&str]) -> Result<Reply, String> {

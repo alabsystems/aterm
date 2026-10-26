@@ -199,6 +199,7 @@ pub(crate) enum Moment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Facts {
     pub(crate) grant: DevToolGrant,
+    /// Read whole and empty, the page needs `spctl` to list Terminal first ([`Self::lists_terminal`]).
     pub(crate) list: DevToolList,
     /// The owner's Not now still holds ([`declined_for`]).
     pub(crate) declined: bool,
@@ -211,6 +212,13 @@ pub(crate) struct Facts {
     /// (`App::devtools_shown_this_revision`), judged as the page would open: a hand-over asked
     /// while no revision stood waits queued for one.
     pub(crate) shown_this_revision: bool,
+}
+
+impl Facts {
+    /// The list was read whole and empty: a hand-over lists Terminal (`spctl`) before the page.
+    pub(crate) fn lists_terminal(&self) -> bool {
+        self.list.label == DevToolListLabel::Read && self.list.rows == Some(0)
+    }
 }
 
 /// Why a hand-over did nothing.
@@ -280,7 +288,7 @@ pub(crate) enum Admit {
 /// Who may bring the Developer Tools page up, and when.
 #[must_use]
 pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
-    let empty = facts.list.label == DevToolListLabel::Read && facts.list.rows == Some(0);
+    let empty = facts.lists_terminal();
     if origin.owner_press() {
         return match facts.grant {
             DevToolGrant::Granted => Admit::PaneOnly,
@@ -2392,6 +2400,11 @@ pub(crate) struct Lane {
     listing_rider: Option<Rider>,
     fda_ended: Option<FdaEnded>,
     listing: Option<Listing>,
+    /// A `spctl` run is out ahead of a queued hand-over's moment ([`Self::list_ahead`]) with no
+    /// [`Listing`] riding it: its end is kept, never given back.
+    ahead: bool,
+    /// A run ahead of the moment ended Ok and no hand-over has used it yet.
+    listed_ahead: bool,
     waiting: Waiting,
     panel: Option<Panel>,
     generation: u64,
@@ -2445,6 +2458,8 @@ impl Lane {
             listing_rider: None,
             fda_ended: None,
             listing: None,
+            ahead: false,
+            listed_ahead: false,
             waiting: Waiting::default(),
             panel: None,
             generation: 0,
@@ -2958,7 +2973,8 @@ impl Lane {
         unlapsed(self.listing_rider.take(), now, "devtools")
     }
 
-    /// Start `spctl developer-mode enable-terminal` on a worker for `listing`.
+    /// Start `spctl developer-mode enable-terminal` on a worker for `listing`; one out ahead of
+    /// the moment ([`Self::list_ahead`]) is ridden, its end then `listing`'s.
     pub(crate) fn start_listing(&mut self, listing: Listing, wake: Wake) -> bool {
         if let Some(out) = self.listing {
             if listing.rank() > out.rank() {
@@ -2967,6 +2983,41 @@ impl Lane {
             self.note_waiting(listing);
             return true;
         }
+        if self.ahead {
+            self.listing = Some(listing);
+            self.waiting = Waiting::default();
+            self.note_waiting(listing);
+            return true;
+        }
+        if !self.spawn_listing(wake) {
+            return false;
+        }
+        self.listing = Some(listing);
+        self.waiting = Waiting::default();
+        self.note_waiting(listing);
+        true
+    }
+
+    /// Start the `spctl` run a hand-over queued for its moment will need (its list read whole and
+    /// empty, [`Facts::lists_terminal`]) now, so the page needs no run at the moment: the run takes
+    /// as long as syspolicyd does, and a moment that passed during it waits for the next. Its end
+    /// is kept for that hand-over ([`Self::take_listed_ahead`]); an ask made while it is out rides
+    /// it ([`Self::start_listing`]). Nothing starts while a run is out or one ahead already
+    /// listed Terminal.
+    pub(crate) fn list_ahead(&mut self, wake: Wake) {
+        if self.listing.is_some() || self.ahead || self.listed_ahead {
+            return;
+        }
+        self.ahead = self.spawn_listing(wake);
+    }
+
+    /// Whether a run made ahead of the moment is out with nothing riding it.
+    #[cfg(test)]
+    pub(crate) const fn listing_ahead(&self) -> bool {
+        self.ahead && self.listing.is_none()
+    }
+
+    fn spawn_listing(&self, wake: Wake) -> bool {
         let list_terminal = self.reach.list_terminal;
         let shared = Arc::clone(&self.shared);
         let spawned = crate::qos::spawn_lane_thread(
@@ -2979,12 +3030,7 @@ impl Lane {
             },
         );
         match spawned {
-            Ok(_) => {
-                self.listing = Some(listing);
-                self.waiting = Waiting::default();
-                self.note_waiting(listing);
-                true
-            }
+            Ok(_) => true,
             Err(e) => {
                 aterm_log::warn!("devtools: the `spctl` worker could not start: {e}");
                 false
@@ -3057,13 +3103,35 @@ impl Lane {
 
     /// A `spctl` run that ended: whose end it is, what it answered, and the owner's presses that
     /// waited on it.
+    /// A run made ahead of the moment that nothing rode is kept here instead
+    /// ([`Self::take_listed_ahead`]), never given back.
     pub(crate) fn take_listed(&mut self) -> Option<(Listing, Result<(), String>, Waiting)> {
-        self.listing?;
+        if !self.ahead {
+            self.listing?;
+        }
         let listed = self.shared.lock_or_recover().listed.take()?;
+        self.ahead = false;
+        if self.listing.is_none() {
+            aterm_log::info!(
+                "devtools: `{}` ahead of the hand-over's moment: {}",
+                atpkg::devtools::LIST_TERMINAL,
+                listed
+                    .as_ref()
+                    .map_or_else(String::clone, |()| "ok".to_string())
+            );
+            self.listed_ahead = listed.is_ok();
+            return None;
+        }
         let waiting = std::mem::take(&mut self.waiting);
         self.listing
             .take()
             .map(|listing| (listing, listed, waiting))
+    }
+
+    /// Whether a run made ahead of the moment ([`Self::list_ahead`]) listed Terminal for a
+    /// hand-over that has not opened the page yet; spent by the hand-over that takes it.
+    pub(crate) fn take_listed_ahead(&mut self) -> bool {
+        std::mem::take(&mut self.listed_ahead)
     }
 
     /// The panel's Show it ended.
@@ -3298,7 +3366,7 @@ impl Lane {
                 fold(now + PANEL_TICK);
             }
         }
-        if self.listing.is_some() {
+        if self.listing.is_some() || self.ahead {
             fold(now + PANEL_TICK);
         }
         let devtools = self.queued.as_ref().filter(|_| !self.fda_first());
@@ -7472,6 +7540,58 @@ mod tests {
             )),
             "one run, the hand-over's"
         );
+    }
+
+    /// A `spctl` run started ahead of a queued hand-over's moment is kept for it, once, and
+    /// nothing starts a second; an ask made while one is out rides it and takes its end.
+    /// Negative control: with no run ahead nothing is kept, so the moment would make one.
+    #[test]
+    fn a_run_ahead_of_the_moment_is_kept_for_the_hand_over_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        let mut reach = test_reach();
+        reach.list_terminal = || {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let ended = |lane: &mut Lane| {
+            until(|| {
+                assert_eq!(lane.take_listed(), None, "a run ahead gives nothing back");
+                !lane.listing_ahead()
+            });
+        };
+        let mut lane = Lane::windowed_for_test(reach, test_arm());
+        assert!(!lane.take_listed_ahead(), "the control: nothing ran ahead");
+        lane.list_ahead(nudge());
+        assert!(lane.listing_ahead(), "started before the moment");
+        assert_eq!(lane.listing(), None, "no hand-over waits on it");
+        lane.list_ahead(nudge());
+        ended(&mut lane);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "one run");
+        lane.list_ahead(nudge());
+        assert!(!lane.listing_ahead(), "Terminal is listed: no run");
+        assert!(lane.take_listed_ahead(), "kept for the hand-over");
+        assert!(!lane.take_listed_ahead(), "spent once");
+
+        lane.list_ahead(nudge());
+        assert!(lane.start_listing(Listing::HandOver(Origin::Automatic), nudge()));
+        assert_eq!(lane.listing(), Some(Listing::HandOver(Origin::Automatic)));
+        let mut taken = None;
+        until(|| {
+            taken = lane.take_listed();
+            taken.is_some()
+        });
+        assert_eq!(
+            taken,
+            Some((
+                Listing::HandOver(Origin::Automatic),
+                Ok(()),
+                Waiting::default()
+            )),
+            "the ask that rode it takes its end"
+        );
+        assert!(!lane.take_listed_ahead(), "and nothing is kept");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2, "no run of its own");
     }
 
     #[test]
