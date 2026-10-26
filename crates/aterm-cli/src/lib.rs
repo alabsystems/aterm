@@ -569,15 +569,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        concat!(
-            "Check this machine (the shell, macOS access, running instances, the\n",
-            "fabric's broker, past crashes, open exceptions, the packages) and repair what\n",
-            "aterm lays. --read-only changes nothing; --json prints the report as JSON;\n",
-            "--only <id,...> narrows to those items, families or layers. On macOS,\n",
-            "--check, --apply and --restore act on the fleet settings profile alone.\n",
-            "Exits 0 when every selected check is satisfied or not applicable, 2 on a\n",
-            "usage error, else 1. `aterm help doctor` has the rest.",
-        ),
+        "Check this machine and repair what aterm lays (`aterm doctor --help` lists its forms).",
     ),
     ("list-fonts", "List available font families, one per line."),
     (
@@ -597,6 +589,20 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
         "List what needs a look later and the newest ten filed entries; --all lists every filed entry in the log's newest MiB.",
     ),
 ];
+
+/// `aterm <cmd> --help` for a diagnostic: `aterm doctor`'s grammar and its five forms
+/// ([`doctor::help`]), else the command's description and usage.
+fn diag_help_text(cmd: &str) -> String {
+    if cmd == "doctor" {
+        return doctor::help();
+    }
+    let desc = DIAG_COMMANDS
+        .iter()
+        .find(|(name, _)| *name == cmd)
+        .map(|(_, d)| *d)
+        .unwrap_or("");
+    format!("{cmd} — {desc}\nusage: {}\n", diag_usage(cmd))
+}
 
 fn diag_usage(cmd: &str) -> String {
     match cmd {
@@ -1017,7 +1023,11 @@ fn exceptions_report_at(path: &std::path::Path, all: bool, now_ms: u64, offset_s
     out
 }
 
-type ExceptionsFacts = Result<usize, String>;
+/// How many exceptions are open, and the titles of the newest [`EXCEPTIONS_SHOWN`].
+type ExceptionsFacts = Result<(usize, Vec<String>), String>;
+
+/// How many open exceptions the `exceptions:` row names by title.
+const EXCEPTIONS_SHOWN: usize = 3;
 
 fn exceptions_facts() -> ExceptionsFacts {
     let path = exceptions_log_path().ok_or_else(|| "no log folder".to_string())?;
@@ -1025,18 +1035,33 @@ fn exceptions_facts() -> ExceptionsFacts {
     if let Some(unreadable) = &read.unreadable {
         return Err(format!("{} cannot be read", unreadable.name()));
     }
-    Ok(read
+    let open: Vec<&aterm_messages::log::LogRecord> = read
         .log
         .records()
+        .rev()
         .filter(|r| r.later && r.is_live())
-        .count())
+        .collect();
+    Ok((
+        open.len(),
+        open.iter()
+            .take(EXCEPTIONS_SHOWN)
+            .map(|r| r.title.clone())
+            .collect(),
+    ))
 }
 
 fn exceptions_row(facts: &ExceptionsFacts) -> (Mark, String) {
     match facts {
         Err(why) => (Mark::Note, format!("not measured ({why})")),
-        Ok(0) => (Mark::Ok, "none open".to_string()),
-        Ok(n) => (Mark::Note, format!("{n} open (aterm exceptions)")),
+        Ok((0, _)) => (Mark::Ok, "none open".to_string()),
+        Ok((n, titles)) => {
+            let newest = if titles.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", titles.join("; "))
+            };
+            (Mark::Note, format!("{n} open{newest} (aterm exceptions)"))
+        }
     }
 }
 
@@ -1143,7 +1168,8 @@ fn privacy_facts() -> PrivacyFacts {
     }
 }
 
-/// Classify the running bundle's designated requirement via `codesign -d -r-`.
+/// Classify the running bundle's designated requirement as the copy census reads it
+/// ([`aterm_containment::consent::bundle_identity`]): one `codesign` answers both.
 #[cfg(target_os = "macos")]
 fn designated_requirement_class() -> DrClass {
     let Some(exe) = aterm_containment::consent::fence_exe() else {
@@ -1152,17 +1178,11 @@ fn designated_requirement_class() -> DrClass {
     let Some(app_root) = aterm_containment::consent::app_bundle_root(&exe) else {
         return DrClass::Unknown;
     };
-    let Ok(out) = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/codesign")
-            .args(["-d", "-r-"])
-            .arg(&app_root),
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
-    ) else {
-        return DrClass::Unknown;
-    };
-    let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stdout));
-    aterm_containment::classify_dr(&text)
+    aterm_containment::consent::bundle_identity(
+        &app_root,
+        &aterm_containment::consent::protected_roots(&[]),
+    )
+    .map_or(DrClass::Unknown, |identity| identity.dr)
 }
 
 /// Off macOS there is no TCC and no designated requirement to read.
@@ -1425,19 +1445,20 @@ impl FactReads<'static> {
 /// `aterm doctor`'s own rows that `reads` names (the shell's always), each probe on a thread
 /// of its own, and the Developer Tools facts when the hand-over is due after the report
 /// ([`devtools_hand_over_due`]). Nothing here waits on a person or opens a pane.
-fn doctor_facts_rows(
-    fix: bool,
-    reads: &dyn Fn(&str) -> bool,
-) -> (Vec<DoctorRow>, Option<atpkg::devtools::Facts>) {
+fn doctor_facts_rows(fix: bool, reads: &dyn Fn(&str) -> bool) -> FactsRead {
     facts_rows_over(fix, reads, &FactReads::LIVE)
 }
 
+/// What [`facts_rows_over`] read: the rows, the Developer Tools hand-over due after the report,
+/// and whether Spotlight indexes `rust-docs` pages ([`spotlight::Spotlit::docs_indexed`]).
+struct FactsRead {
+    rows: Vec<DoctorRow>,
+    hand_over: Option<atpkg::devtools::Facts>,
+    rust_docs: bool,
+}
+
 /// [`doctor_facts_rows`] over `ports`.
-fn facts_rows_over(
-    fix: bool,
-    reads: &dyn Fn(&str) -> bool,
-    ports: &FactReads<'_>,
-) -> (Vec<DoctorRow>, Option<atpkg::devtools::Facts>) {
+fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_>) -> FactsRead {
     let program_check = ["syspolicyd:", "devtools:", "instances:", "fabric:"]
         .into_iter()
         .any(reads)
@@ -1453,7 +1474,7 @@ fn facts_rows_over(
     fn unread<T>() -> Result<T, String> {
         Err("not read".to_owned())
     }
-    let (mut rows, hand_over) = std::thread::scope(|scope| {
+    let (mut rows, hand_over, rust_docs) = std::thread::scope(|scope| {
         let check_full = withheld.is_some();
         let devtools =
             reads("devtools:").then(|| scope.spawn(move || (ports.devtools)(fix, check_full)));
@@ -1494,6 +1515,10 @@ fn facts_rows_over(
         );
         let instances = instances.map_or_else(unread, join);
         let (devtools, hand_over) = devtools.map_or_else(|| (DevtoolsFacts::absent(), None), join);
+        let rust_docs = machine
+            .spotlight
+            .as_ref()
+            .is_some_and(|lit| lit.as_ref().is_ok_and(spotlight::Spotlit::docs_indexed));
         #[cfg(not(windows))]
         let rows = {
             let (shell, origin) = unix_shell(aterm_pty::select_shell_with_origin(None));
@@ -1526,10 +1551,14 @@ fn facts_rows_over(
                 &machine,
             )
         };
-        (rows, hand_over)
+        (rows, hand_over, rust_docs)
     });
     rows.retain(|row| reads(row.label));
-    (rows, hand_over)
+    FactsRead {
+        rows,
+        hand_over,
+        rust_docs,
+    }
 }
 
 /// `aterm-cli`'s half of `aterm doctor`, without the packages' items: gathered, then
@@ -2166,13 +2195,13 @@ const fn mark_of_level(level: atpkg::doctor::Level) -> Mark {
     }
 }
 
-type RecoveryFacts = Result<(Vec<aterm_update::recovery_ledger::Row>, std::path::PathBuf), String>;
+type RecoveryFacts = Result<(aterm_update::recovery_ledger::Checked, std::path::PathBuf), String>;
 
 fn recovery_facts() -> RecoveryFacts {
     let path = aterm_update::recovery_ledger::default_ledger_path()
         .ok_or_else(|| "no log folder, so there is no ledger".to_owned())?;
     aterm_update::recovery_ledger::read_rows_checked(&path)
-        .map(|rows| (rows, path.clone()))
+        .map(|checked| (checked, path.clone()))
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -2180,12 +2209,23 @@ fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
     if cfg!(windows) {
         return (Mark::Note, "not recorded on Windows".to_string());
     }
-    let (rows, path) = match facts {
+    let (checked, path) = match facts {
         Ok(read) => read,
         Err(why) => return (Mark::Note, format!("not measured ({why})")),
     };
-    let (lines, unexpected) = aterm_update::recovery_ledger::doctor_lines(rows, path);
-    let mark = if unexpected { Mark::Note } else { Mark::Ok };
+    let (mut lines, unexpected) = aterm_update::recovery_ledger::doctor_lines(&checked.rows, path);
+    let mark = if unexpected || checked.skipped > 0 {
+        Mark::Note
+    } else {
+        Mark::Ok
+    };
+    if checked.skipped > 0 {
+        lines.push(format!(
+            "{} ledger row{} this build cannot read, skipped (a newer aterm's, or cut short)",
+            checked.skipped,
+            if checked.skipped == 1 { "" } else { "s" },
+        ));
+    }
     (mark, lines.join("\n"))
 }
 
@@ -2414,9 +2454,15 @@ fn doctor_rows(
     }
     if let Some(row) = devtools.facts.as_ref().and_then(atpkg::devtools::row) {
         let mark = mark_of_level(row.level);
-        let fact = match &devtools.did {
-            Some(did) => format!("{}\n{did}", row.text),
+        // The first line is the state and its one action, which bare doctor shows alone
+        // ([`atpkg::devtools::brief`]); `--verbose` prints the whole row under it.
+        let fact = match devtools.facts.as_ref().and_then(atpkg::devtools::brief) {
+            Some(brief) => format!("{brief}\n{}", row.text),
             None => row.text,
+        };
+        let fact = match &devtools.did {
+            Some(did) => format!("{fact}\n{did}"),
+            None => fact,
         };
         checks.push(DoctorRow {
             label: "devtools:",
@@ -2779,14 +2825,7 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
             &version_text(aterm_update::which_copy::observe().as_ref()),
             0,
         ),
-        CliAction::DiagHelp { cmd } => {
-            let desc = DIAG_COMMANDS
-                .iter()
-                .find(|(name, _)| *name == cmd)
-                .map(|(_, d)| *d)
-                .unwrap_or("");
-            answer_and_exit(&format!("{cmd} — {desc}\nusage: {}\n", diag_usage(&cmd)), 0)
-        }
+        CliAction::DiagHelp { cmd } => answer_and_exit(&diag_help_text(&cmd), 0),
         CliAction::Diag { cmd, arg } => match diag_report(&cmd, arg.as_deref()) {
             Some((report, 0)) => answer_and_exit(&report, 0),
             Some((report, code)) => {
@@ -3226,13 +3265,13 @@ mod tests {
 
     fn no_recovery() -> RecoveryFacts {
         Ok((
-            Vec::new(),
+            aterm_update::recovery_ledger::Checked::default(),
             std::path::PathBuf::from("/logs/recovery-ledger.log"),
         ))
     }
 
     fn no_exceptions() -> ExceptionsFacts {
-        Ok(0)
+        Ok((0, Vec::new()))
     }
 
     fn no_census() -> Result<aterm_ctl::census::Census, String> {
@@ -3311,7 +3350,7 @@ mod tests {
             &no_devtools(),
             &no_census(),
             &no_recovery(),
-            &Ok(2),
+            &Ok((2, Vec::new())),
             &MachineFacts::absent(),
         ));
         let rows = gathered.plan();
@@ -3375,9 +3414,22 @@ mod tests {
         }
     }
 
+    /// `aterm doctor --help` is the doctor's grammar and five forms; another diagnostic's help
+    /// is its description and usage (the control).
+    #[test]
+    fn doctor_help_is_its_grammar_and_forms() {
+        assert_eq!(super::diag_help_text("doctor"), crate::doctor::help());
+        let exceptions = super::diag_help_text("exceptions");
+        assert!(
+            exceptions.starts_with("exceptions — ")
+                && exceptions.ends_with("usage: aterm exceptions [--all]\n"),
+            "{exceptions}"
+        );
+    }
+
     #[test]
     fn doctor_operand_grammar_is_enforced_at_the_edge() {
-        const USAGE: &str = "usage: aterm doctor [--read-only] [--json] [--only <id,...>] | (--check | --apply | --restore) [--json]";
+        const USAGE: &str = "usage: aterm doctor [--read-only] [--json] [--verbose] [--only <id,...>] | (--check [--verbose] | --apply | --restore) [--json]";
         assert_eq!(decide(&["doctor"]), diag("doctor", None));
         assert_eq!(
             decide(&["doctor", "--read-only"]),
@@ -3391,8 +3443,18 @@ mod tests {
             decide(&["doctor", "--check", "--json"]),
             diag("doctor", Some("--check --json"))
         );
+        assert_eq!(
+            decide(&["doctor", "--verbose", "--read-only"]),
+            diag("doctor", Some("--verbose --read-only"))
+        );
+        assert_eq!(
+            decide(&["doctor", "--check", "--verbose"]),
+            diag("doctor", Some("--check --verbose"))
+        );
         for argv in [
             vec!["doctor", "--fix"],
+            vec!["doctor", "--verbose", "--verbose"],
+            vec!["doctor", "--apply", "--verbose"],
             vec!["doctor", "--read-only", "x"],
             vec!["doctor", "--json", "--json"],
             vec!["doctor", "--check", "--apply"],
@@ -3663,16 +3725,30 @@ mod tests {
             assert_eq!(code, 0, "{r}");
             r
         };
-        let none = row(Ok(0));
+        let none = row(Ok((0, Vec::new())));
         assert!(
             none.lines().any(|l| l == "exceptions: ok    none open"),
             "{none}"
         );
-        let two = row(Ok(2));
+        let two = row(Ok((2, Vec::new())));
         assert!(
             two.lines()
                 .any(|l| l == "exceptions: note  2 open (aterm exceptions)"),
             "{two}"
+        );
+        // The newest open ones by title, inline.
+        let titled = row(Ok((
+            5,
+            vec![
+                "disk low".to_owned(),
+                "update held".to_owned(),
+                "vault quiet".to_owned(),
+            ],
+        )));
+        assert!(
+            titled.lines().any(|l| l
+                == "exceptions: note  5 open: disk low; update held; vault quiet (aterm exceptions)"),
+            "{titled}"
         );
         let homeless = row(Err("no log folder".to_string()));
         assert!(
@@ -4771,7 +4847,8 @@ mod tests {
             restores: None,
         };
         let path = std::path::PathBuf::from("/logs/recovery-ledger.log");
-        let (r, code) = check(Ok((vec![killed], path)));
+        let read = |rows, skipped| aterm_update::recovery_ledger::Checked { rows, skipped };
+        let (r, code) = check(Ok((read(vec![killed], 0), path.clone())));
         assert_eq!(code, 0, "a past kill never fails doctor: {r}");
         assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
         assert!(
@@ -4784,6 +4861,20 @@ mod tests {
         assert_eq!(code, 0, "{r}");
         assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
         assert_eq!(r.matches("recovery:").count(), 1, "{r}");
+
+        // A row a newer aterm wrote is skipped and named; the row is a note, measured.
+        let (r, code) = check(Ok((read(Vec::new(), 2), path)));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
+        assert!(
+            r.contains("2 ledger rows this build cannot read, skipped"),
+            "{r}"
+        );
+        let recovery = r
+            .lines()
+            .find(|l| l.starts_with("recovery:"))
+            .unwrap_or_default();
+        assert!(!recovery.contains("not measured"), "{r}");
     }
 
     #[test]
@@ -5078,6 +5169,7 @@ mod tests {
             )
         };
         let lit = crate::spotlight::Spotlit {
+            docs_kept: None,
             builds: vec![("~/w/target".into(), 12)],
             rustup: None,
         };
@@ -5087,6 +5179,7 @@ mod tests {
         assert!(r.contains("~/w/target 12"), "{r}");
         assert!(r.contains("health: OK\n"), "{r}");
         let clean = crate::spotlight::Spotlit {
+            docs_kept: None,
             builds: vec![],
             rustup: None,
         };
@@ -5500,7 +5593,7 @@ mod tests {
                     None
                 },
             };
-            let (rows, _) = super::facts_rows_over(false, reads, &ports);
+            let rows = super::facts_rows_over(false, reads, &ports).rows;
             let mut read = self.reads.lock().unwrap().clone();
             read.sort_unstable();
             (rows.iter().map(|row| row.label).collect(), read)

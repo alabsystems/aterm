@@ -2313,6 +2313,59 @@ fn an_empty_take_that_says_more_waits_its_retry_and_never_spins() {
     assert_eq!(w.bridge.mirror.as_deref().unwrap().batch().0.len(), 1);
 }
 
+/// An empty take whose endpoint held a moved mail count's snapshot back to its rate (`due=`, LOOP-2)
+/// owes a take at that instant, not at the roster's next wake; a record appended meanwhile is
+/// still taken at once, and once the instant passes the pass takes again.
+#[test]
+fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
+    let mut w = World::new();
+    w.lane.mirror.lock().unwrap().refuse_take = Some("OK 0 slots=0 due=400\n".to_string());
+    let before = Instant::now();
+    w.bridge.roster_due = before + ROSTER_REFRESH;
+    w.bridge.mirror_step();
+    let after = Instant::now();
+    assert_eq!(
+        w.lane.mirror.lock().unwrap().takes,
+        1,
+        "PRECONDITION: a take was asked"
+    );
+    assert!(
+        w.bridge.mirror.as_deref().unwrap().batch().0.is_empty(),
+        "PRECONDITION: it took nothing"
+    );
+    let wait = Duration::from_millis(400);
+    let due = w
+        .bridge
+        .mirror_due(after)
+        .expect("the held-back snapshot owes a take");
+    assert!(
+        due >= before + wait && due <= after + wait,
+        "the take is owed when the snapshot is due"
+    );
+    let park = w.bridge.park_wait(after);
+    assert!(
+        park > Duration::ZERO && park <= wait,
+        "the loop wakes for it, not at the roster's next round: {park:?}"
+    );
+    w.bridge.mirror_wake();
+    assert_eq!(
+        w.bridge.mirror_due(after),
+        Some(after),
+        "an append meanwhile is taken at once"
+    );
+    w.lane.mirror.lock().unwrap().refuse_take = Some("OK 0 slots=0 due=0\n".to_string());
+    w.bridge.mirror_step();
+    assert_eq!(w.lane.mirror.lock().unwrap().takes, 2, "PRECONDITION");
+    w.lane.mirror.lock().unwrap().refuse_take = None;
+    w.bridge.mirror_step();
+    assert_eq!(
+        w.lane.mirror.lock().unwrap().takes,
+        3,
+        "once the snapshot is due, the pass takes again"
+    );
+    assert_eq!(w.bridge.mirror.as_deref().unwrap().batch().0.len(), 1);
+}
+
 /// A directory's permissions, put back when the test ends however it ends.
 #[cfg(unix)]
 struct RestorePermissions(std::path::PathBuf, std::fs::Permissions);

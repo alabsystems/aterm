@@ -19,6 +19,7 @@
 mod models_account_adopt_identity;
 mod models_account_adopt_source;
 mod models_account_alias_relabel;
+mod models_account_answer_observation;
 mod models_account_attempt_generation;
 mod models_account_binding_retention;
 mod models_account_create_label;
@@ -48,6 +49,7 @@ mod models_account_renewal_read;
 mod models_account_report_read;
 mod models_account_sample_context;
 mod models_account_selection_commit;
+mod models_account_shared_selection;
 mod models_account_sheet_columns;
 mod models_account_signin;
 mod models_account_signin_epoch;
@@ -80,6 +82,7 @@ mod models_occupancy;
 mod models_program_queue;
 mod models_program_resolution;
 mod models_relaunch_prompt;
+mod models_shared_renewal;
 mod models_supervise;
 mod models_supervise_accounts;
 mod models_supervise_tape;
@@ -88,6 +91,7 @@ mod models_wakes;
 pub use models_account_adopt_identity::account_adopt_identity_model;
 pub use models_account_adopt_source::account_adopt_source_model;
 pub use models_account_alias_relabel::account_alias_relabel_model;
+pub use models_account_answer_observation::account_answer_observation_model;
 pub use models_account_attempt_generation::account_attempt_generation_model;
 pub use models_account_binding_retention::account_binding_retention_model;
 pub use models_account_create_label::account_create_label_model;
@@ -117,6 +121,7 @@ pub use models_account_renewal_read::account_renewal_read_model;
 pub use models_account_report_read::{account_report_attribution_model, account_report_read_model};
 pub use models_account_sample_context::account_sample_context_model;
 pub use models_account_selection_commit::account_selection_commit_model;
+pub use models_account_shared_selection::account_shared_selection_model;
 pub use models_account_sheet_columns::account_sheet_columns_model;
 pub use models_account_signin::account_signin_admission_model;
 pub use models_account_signin_epoch::account_signin_epoch_model;
@@ -164,6 +169,7 @@ pub use models_program_queue::{
 };
 pub use models_program_resolution::program_resolution_retry_model;
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
+pub use models_shared_renewal::{shared_browser_model, shared_renewal_model};
 pub use models_supervise::{
     supervisor_box_ask_model, supervisor_box_hold_model, supervisor_break_offer_model,
     supervisor_claim_model, supervisor_credits_hold_liveness, supervisor_credits_hold_model,

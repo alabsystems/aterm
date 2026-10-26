@@ -66,8 +66,9 @@ pub(crate) const GLIDE_STEP_MAX: Duration = Duration::from_secs(10);
 /// three after it, so it has come in 750 ms after the reading, on the beat's frames.
 pub(crate) const SLIDE_FRAMES: u32 = 4;
 
-/// The now marker's line sits this far right of the strip's last cell, pt.
-pub(crate) const LINE_DX: f64 = 1.5;
+/// The now marker's line sits this far right of the strip's last cell, pt (leaving breathing room
+/// for the real-time `now` box's thermal glow halo).
+pub(crate) const LINE_DX: f64 = 2.5;
 
 /// The dot's radius, pt.
 pub(crate) const DOT_R: f64 = 2.4;
@@ -84,6 +85,12 @@ const BEAT_ALPHA: f32 = 0.7;
 /// A stalled marker's line is dashed: dashes and gaps this long, pt.
 pub(crate) const STALE_DASH: f64 = 1.5;
 
+/// Exponential smoothing time constant for gauge, bar, core and `now`-box transitions.
+pub(crate) const TWEEN_TAU: Duration = Duration::from_millis(180);
+
+/// Settle threshold above which [`exp_blend`] snaps to `None` so idle CPU drops to zero frames.
+pub(crate) const TWEEN_SETTLE: f32 = 0.985;
+
 /// What the deck's live edge shows in one frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DeckLive {
@@ -96,6 +103,9 @@ pub(crate) struct DeckLive {
     /// How far through the newest reading's beat, `0..1` ([`beat_phase`] of its frame); `None`
     /// rings nothing.
     pub(crate) beat: Option<f32>,
+    /// Smooth exponential interpolation factor (`0..1`) from the previous snapshot's values toward
+    /// the current snapshot's values; `None` once settled (`>= TWEEN_SETTLE`) or without motion.
+    pub(crate) blend: Option<f32>,
     /// Whether readings keep coming: `false` draws the marker grey and hollow.
     pub(crate) fresh: bool,
 }
@@ -107,6 +117,7 @@ impl DeckLive {
         glide_ms: None,
         slide: None,
         beat: None,
+        blend: None,
         fresh: true,
     };
 
@@ -115,6 +126,7 @@ impl DeckLive {
         glide_ms: None,
         slide: None,
         beat: None,
+        blend: None,
         fresh: false,
     };
 
@@ -125,6 +137,7 @@ impl DeckLive {
         self.glide_ms.hash(&mut h);
         self.slide.map(f32::to_bits).hash(&mut h);
         self.beat.map(f32::to_bits).hash(&mut h);
+        self.blend.map(f32::to_bits).hash(&mut h);
         self.fresh.hash(&mut h);
         h.finish() | 1
     }
@@ -139,6 +152,12 @@ pub(crate) enum LiveLayer {
     /// The now marker and its beat: they move with [`DeckLive::beat`] and
     /// [`DeckLive::fresh`].
     Marker,
+    /// The glowing far-right `now` box on each strip: moves when [`DeckLive::fresh`] toggles or
+    /// [`DeckLive::blend`] interpolates live heat, never on a lone dot beat.
+    NowBox,
+    /// Gauges, overlapping scope bars and core heat cells: they move only while
+    /// [`DeckLive::blend`] interpolates between consecutive readings.
+    Values,
 }
 
 impl LiveLayer {
@@ -147,6 +166,8 @@ impl LiveLayer {
         match self {
             Self::Glide => was.glide_ms != now.glide_ms || was.slide != now.slide,
             Self::Marker => was.beat != now.beat || was.fresh != now.fresh,
+            Self::NowBox => was.fresh != now.fresh || was.blend != now.blend,
+            Self::Values => was.blend != now.blend,
         }
     }
 }
@@ -174,6 +195,7 @@ pub(crate) fn open_frac(at_ms: i64, now_ms: i64, period_s: u32) -> f64 {
 /// below 1 each sits `(1 − f)` pitches right of its slot, rounded to a whole device pixel so every
 /// cell edge is drawn sharp, so the open column shows only the part of its period that has run,
 /// and the strip's clip cuts what passes its ends.
+#[cfg(test)]
 pub(crate) fn column_xs(x0: f32, pitch: f32, cell: f32, n: usize, f: f64) -> Vec<Option<f32>> {
     let right = x0 + n.saturating_sub(1) as f32 * pitch + cell;
     let shift = ((1.0 - f.clamp(0.0, 1.0)) as f32 * pitch).round();
@@ -187,6 +209,7 @@ pub(crate) fn column_xs(x0: f32, pitch: f32, cell: f32, n: usize, f: f64) -> Vec
 
 /// The columns (counted as [`column_xs`] counts them) that open a wall-clock minute, when the
 /// open column of `period_s` opened at `open_ms`.
+#[cfg(test)]
 pub(crate) fn minute_columns(open_ms: i64, period_s: u32, n: usize) -> Vec<usize> {
     let p = i64::from(period_s.max(1)) * 1000;
     (0..=n)
@@ -201,6 +224,44 @@ pub(crate) fn beat_ring(phase: f32) -> (f64, f32) {
     let rest = 1.0 - t;
     let widen = 1.0 - rest * rest;
     (BEAT_REACH * f64::from(widen), BEAT_ALPHA * rest)
+}
+
+/// Exponential smoothing factor `1 - exp(-elapsed / tau)` quantized to `1/64` steps, returning
+/// `None` once settled (`>= TWEEN_SETTLE`) so idle CPU schedules zero frames.
+pub(crate) fn exp_blend(elapsed: Duration, tau: Duration) -> Option<f32> {
+    let dt = elapsed.as_secs_f32();
+    let tau_s = tau.as_secs_f32().max(0.001);
+    if !dt.is_finite() || dt < 0.0 {
+        return None;
+    }
+    let raw = 1.0 - (-dt / tau_s).exp();
+    if raw >= TWEEN_SETTLE {
+        return None;
+    }
+    let q = ((raw * 64.0).round() / 64.0).clamp(0.0, 1.0);
+    (q < TWEEN_SETTLE).then_some(q)
+}
+
+/// Smooth interpolation factor on frame `k` of the live grid (`0`, the reading's own frame), or
+/// `None` once settled after [`BEAT_FRAMES`] frames.
+pub(crate) fn tween_phase(k: u32) -> Option<f32> {
+    (k < BEAT_FRAMES).then(|| {
+        exp_blend(
+            Duration::from_millis(140).saturating_add(FRAME.saturating_mul(k)),
+            TWEEN_TAU,
+        )
+    })?
+}
+
+/// Linearly interpolates between `prev` and `curr` by `blend` (`None` returns `curr`).
+pub(crate) fn lerp_opt(prev: Option<f32>, curr: Option<f32>, blend: Option<f32>) -> Option<f32> {
+    match (prev, curr, blend) {
+        (Some(a), Some(b), Some(t)) if a.is_finite() && b.is_finite() => {
+            let t = t.clamp(0.0, 1.0);
+            Some(a + (b - a) * t)
+        }
+        _ => curr,
+    }
 }
 
 /// The phase the beat draws in frame `k` of its reading's grid (`k` from 0, the reading's own
@@ -272,6 +333,8 @@ pub(crate) struct LiveFacts {
     pub(crate) motion: bool,
     /// The dot may beat ([`SeriousEffect::DeckBeat`], and the card presented alone).
     pub(crate) beat: bool,
+    /// Consecutive readings are available to interpolate gauges, bars, cores and the `now` box.
+    pub(crate) tween: bool,
     /// How the strips move.
     pub(crate) flow: Flow,
 }
@@ -315,6 +378,7 @@ impl LiveFacts {
             glide_ms,
             slide,
             beat: beat_phase(k).filter(|_| self.beat),
+            blend: tween_phase(k).filter(|_| self.tween),
             fresh: true,
         }
     }
@@ -422,6 +486,7 @@ impl crate::App {
             stale_after: stale_after(period, self.vitals.landed_period),
             motion,
             beat,
+            tween: snap.is_some() && self.vitals.prev_snapshot.is_some(),
             flow,
         })
     }

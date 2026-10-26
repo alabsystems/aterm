@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::linux_proof::{
-    WestonView, bands_held, compare_rgb, drew_on_gpu, field, held_at, parse_ppm, present_summary,
-    reply,
+    WestonView, bands_held, compare_rgb, drew_on_gpu, field, held_at, input_summary, parse_ppm,
+    present_summary, reply,
 };
 use crate::paths::paths;
 use crate::windows::{self, GPU_ID, Layout, Up, not_run, run_on_desktop, task_name};
@@ -29,15 +29,56 @@ const LIFT: i32 = 120;
 pub const EXPOSED_TYPED: &str = "Clear-Host; Write-Output ('ROWS-' + 6*7)";
 pub const EXPOSED_ECHO: &str = "ROWS-42";
 
-/// The `r` part of a `w`-pixel-wide image of `n`-byte pixels.
-fn crop(px: &[u8], w: usize, n: usize, r: desk::Rect) -> (Vec<u8>, usize, usize) {
-    let col = |v: i32| usize::try_from(v).unwrap_or(0);
-    let (l, t, rr, b) = (col(r.l), col(r.t), col(r.r), col(r.b));
-    let mut out = Vec::with_capacity((rr - l) * (b - t) * n);
-    for y in t..b {
-        out.extend_from_slice(&px[(y * w + l) * n..(y * w + rr) * n]);
+/// Puts in `window` (a readback, RGB, `cw` x `ch`), at each client pixel on none of `on` (the client
+/// area's parts on the monitors, [`desk::Place::on_monitors`]), what a hold expects there: the pixel
+/// of `frame` (RGBA, its top-left at `at` in the client area) nearest it. Windows draws no window
+/// pixel off every monitor, past the virtual screen's edge or in a part of it no monitor covers, and
+/// the readback finds there what the window held when the pixel was last on a monitor, or white where
+/// it never was. Answers how many pixels it put and the rectangle they span, in client coordinates.
+fn off_monitors_as_framed(
+    window: &mut [u8],
+    (cw, ch): (usize, usize),
+    on: &[desk::Rect],
+    frame: &(Vec<u8>, usize, usize),
+    (ox, oy): (i64, i64),
+) -> (usize, Option<desk::Rect>) {
+    let (f, w, h) = (&frame.0, frame.1, frame.2);
+    if w == 0 || h == 0 || f.len() < w * h * 4 || window.len() < cw * ch * 3 {
+        return (0, None);
     }
-    (out, rr - l, b - t)
+    let (mut put, mut span) = (0usize, None::<desk::Rect>);
+    for y in 0..ch {
+        for x in 0..cw {
+            let (Ok(xi), Ok(yi)) = (i32::try_from(x), i32::try_from(y)) else {
+                continue;
+            };
+            if on.iter().any(|r| r.holds((xi, yi))) {
+                continue;
+            }
+            let nx = (x as i64 - ox).clamp(0, w as i64 - 1) as usize;
+            let ny = (y as i64 - oy).clamp(0, h as i64 - 1) as usize;
+            let (at, want) = ((y * cw + x) * 3, (ny * w + nx) * 4);
+            window[at..at + 3].copy_from_slice(&f[want..want + 3]);
+            put += 1;
+            let s = span.get_or_insert(desk::Rect {
+                l: xi,
+                t: yi,
+                r: xi + 1,
+                b: yi + 1,
+            });
+            (s.l, s.t, s.r, s.b) = (s.l.min(xi), s.t.min(yi), s.r.max(xi + 1), s.b.max(yi + 1));
+        }
+    }
+    (put, span)
+}
+
+/// `l,t,r,b` for each of `rects`.
+fn rects_text(rects: &[desk::Rect]) -> String {
+    let each: Vec<String> = rects
+        .iter()
+        .map(|r| format!("{},{},{},{}", r.l, r.t, r.r, r.b))
+        .collect();
+    each.join(" ")
 }
 
 /// What the IME row types around the composition.
@@ -71,9 +112,113 @@ pub const EDGE_IN: i32 = 4;
 /// The scaling steps the DPI rows set: 150 % (each step is 25 %).
 pub const SCALED: i32 = 2;
 
-/// Microsoft's Japanese IME's keyboard layout language, and English (US).
+/// Microsoft's Japanese IME's keyboard layout language, English (US), and German (Germany).
 pub const JAPANESE: &str = "0411";
 pub const ENGLISH: &str = "0409";
+pub const GERMAN: &str = "0407";
+
+/// What the dead-key row types on the US layout around its German keys.
+pub const DEAD_BEFORE: &str = "Write-Output ('DK-' + '";
+pub const DEAD_AFTER: &str = "')\n";
+
+/// The dead-key row's German keys, as the USB keyboard's keys (qcodes) at their places: a dead
+/// key's chord, then the key after it. `´` is the key right of `ß` (the US `=`), `^` the key left of
+/// `1` (the US `` ` ``), and `` ` `` is Shift with `´`.
+pub const DEAD_KEYS: [(&[&str], &str); 5] = [
+    (&["equal"], "e"),
+    (&["grave_accent"], "o"),
+    (&["equal"], "spc"),
+    (&["equal"], "x"),
+    (&["shift", "equal"], "a"),
+];
+
+/// What [`DEAD_KEYS`] type on German: `´ e` é, `^ o` ô, `´ Space` the accent alone, `´ x` the accent
+/// and the `x` it does not compose with, `` ` a`` à.
+pub const DEAD_TYPED: &str = "éô´´xà";
+pub const DEAD_ECHO: &str = "DK-éô´´xà";
+
+/// What the AltGr row types on the US layout around its German keys.
+pub const ALTGR_BEFORE: &str = "Write-Output ('AG-' + '";
+
+/// The keys pressed with AltGr (the right Alt, `alt_r`) on German, and what they type.
+pub const ALTGR_KEYS: [&str; 4] = ["q", "e", "8", "9"];
+pub const ALTGR_TYPED: &str = "@€[]";
+pub const ALTGR_ECHO: &str = "AG-@€[]";
+
+/// What a new aterm window's style words and DWM state are, as the launch rows read them: recorded
+/// on aterm-window before WC.5's Windows half folded the attributes no aterm crate sets into the
+/// backend's creation (tree 06b9d62a8c, both architectures, both launch rows), which must leave
+/// them as they were. `WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VISIBLE`;
+/// `WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES`; DWM answers backdrop 1
+/// (`DWMSBT_NONE`) for the `DWMSBT_AUTO` upstream wrote, and dark mode on (aterm's dark theme).
+pub const LAUNCH_STYLES: Styles = Styles {
+    style: 0x16cf_0000,
+    exstyle: 0x0004_0110,
+    backdrop: Some(1),
+    dark: Some(1),
+};
+
+/// A window's style words and DWM state ([`desk::Window`]'s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Styles {
+    pub style: u32,
+    pub exstyle: u32,
+    pub backdrop: Option<i32>,
+    pub dark: Option<i32>,
+}
+
+impl Styles {
+    fn of(w: &desk::Window) -> Self {
+        Self {
+            style: w.style,
+            exstyle: w.exstyle,
+            backdrop: w.backdrop,
+            dark: w.dark,
+        }
+    }
+}
+
+/// How far the modal resize row drags the window's right edge right, in pixels, holding the button.
+pub const HELD_DRAG: i32 = 150;
+
+/// The tag PowerShell prints its console width under while the button is held.
+pub const HELD_TAG: &str = "HELD-";
+
+/// What the drop row types before and after the dropped file's path, and the file it drops (a
+/// space in its name, so aterm quotes it).
+pub const DROP_BEFORE: &str = "Write-Output ('DND-' + (Split-Path -Leaf ";
+pub const DROP_AFTER: &str = "))\n";
+pub const DROP_FILE: &str = "drop 42.txt";
+pub const DROP_ECHO: &str = "DND-drop 42.txt";
+
+/// Where the drag stands, from the drag source's log: its last `over effect=<e> at=<x>,<y>` line
+/// (desk.ps1 `dragsource` writes one each time OLE's `GiveFeedback` brings a new effect or cursor
+/// position) when that is Copy with the cursor on `target` and off `source`. That is the answer
+/// aterm's window gave OLE's `DragOver` where the button is about to be released.
+/// # Errors
+/// No line yet, or the last one is another effect, or elsewhere.
+fn accepted_over(
+    log: &str,
+    target: &desk::Rect,
+    source: &desk::Rect,
+) -> Result<(i32, i32), String> {
+    let last = log
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("over "))
+        .ok_or_else(|| "no drop target has answered the drag yet".to_string())?;
+    let word = |key: &str| {
+        last.split_whitespace()
+            .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    };
+    let at = word("at")
+        .and_then(|p| p.split_once(','))
+        .and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?)));
+    match (word("effect"), at) {
+        (Some("Copy"), Some(at)) if target.holds(at) && !source.holds(at) => Ok(at),
+        _ => Err(format!("the last answer: over {last}")),
+    }
+}
 
 /// The display a run drives.
 #[derive(Clone, Debug)]
@@ -232,6 +377,19 @@ fn click(l: &Layout, d: &Display, (x, y): (i32, i32)) -> Result<(), String> {
 
 /// Drag with the tablet's left button from `from` to `to` on the primary monitor, in steps.
 fn drag(l: &Layout, d: &Display, from: (i32, i32), to: (i32, i32)) -> Result<(), String> {
+    press_to(l, d, from, to, 30)?;
+    release(l)
+}
+
+/// Press the tablet's left button at `from` and move it to `to` in steps `pause_ms` apart, holding
+/// the button.
+fn press_to(
+    l: &Layout,
+    d: &Display,
+    from: (i32, i32),
+    to: (i32, i32),
+    pause_ms: u64,
+) -> Result<(), String> {
     let r = d.primary.rect;
     let at = |(x, y): (i32, i32)| desk::tablet_move(x - r.l, y - r.t, r.width(), r.height());
     qmp(l, at(from))?;
@@ -247,9 +405,14 @@ fn drag(l: &Layout, d: &Display, from: (i32, i32), to: (i32, i32)) -> Result<(),
                 from.1 + (to.1 - from.1) * i / steps,
             )),
         )?;
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(pause_ms));
     }
     std::thread::sleep(Duration::from_millis(200));
+    Ok(())
+}
+
+/// Release the tablet's left button where it is.
+fn release(l: &Layout) -> Result<(), String> {
     qmp(l, desk::tablet_button(false))?;
     std::thread::sleep(Duration::from_millis(300));
     Ok(())
@@ -354,6 +517,11 @@ impl<'a> Session<'a> {
     /// `aterm-ctl` (over SSH, as the runner) to this instance.
     fn ctl(&self, words: &[&str]) -> Result<String, String> {
         self.ask(words, true)
+    }
+
+    /// Wait (up to a minute) until a visible row holds `text` as written ([`literal`]).
+    fn await_text(&self, text: &str) -> Result<String, String> {
+        self.ctl(&["await", "match", &literal(text), "timeout=60000"])
     }
 
     /// `aterm-ctl` to this instance.
@@ -584,11 +752,15 @@ type Row = (String, Result<String, String>);
 type Step<'a> = dyn Fn(&Session<'_>) -> Result<String, String> + 'a;
 
 /// The rows one arch's run went through, in order.
-pub const ROWS: [&str; 8] = [
+pub const ROWS: [&str; 12] = [
     "launch",
     "type",
     "IME",
+    "dead keys",
+    "AltGr",
     "resize",
+    "modal resize",
+    "drop",
     "DPI change",
     "second monitor",
     "close",
@@ -682,55 +854,53 @@ impl Run<'_> {
             ));
         }
         let files = format!("frame {}, window {}", png.display(), ppm.display());
-        let seen = place.on_screen().ok_or_else(|| {
-            format!(
-                "the window's client area ({cw}x{ch} at {:?}) is off the virtual screen {:?}",
-                place.at, place.screen
-            )
-        })?;
-        let whole = desk::Rect {
-            l: 0,
-            t: 0,
-            r: i32::try_from(cw).unwrap_or(i32::MAX),
-            b: i32::try_from(ch).unwrap_or(i32::MAX),
+        let monitors = [self.display.primary.rect, self.display.second.rect];
+        let on = place.on_monitors(&monitors);
+        if on.is_empty() {
+            return Err(format!(
+                "the window's client area ({cw}x{ch} at {:?}) is on no monitor ({})",
+                place.at,
+                rects_text(&monitors)
+            ));
+        }
+        let (ox, oy) = if (cw, ch) == (w, h) {
+            (0, 0)
+        } else {
+            let d = s.ctl(&["dims"])?;
+            let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
+            if (num("surface_w"), num("surface_h"))
+                != (i64::try_from(cw).ok(), i64::try_from(ch).ok())
+            {
+                return Err(format!(
+                    "the window's client area is {cw}x{ch}, the frame {w}x{h}, and `dims` names \
+                     another surface: {d} ({files})"
+                ));
+            }
+            (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0))
         };
-        if (cw, ch) == (w, h) && seen == whole {
-            compare_rgb(&presented.0, w, h, &window, 0..0)
-                .map_err(|why| format!("{why} ({files})"))?;
-            return Ok(format!(
-                "the window's {cw}x{ch} client pixels (GetDIBits) equal the presented frame exactly"
-            ));
-        }
+        let mut window = window;
+        let (put, span) =
+            off_monitors_as_framed(&mut window.0, (cw, ch), &on, &presented, (ox, oy));
+        let off = span.map_or_else(String::new, |r| {
+            format!(
+                "; its {put} pixels on no monitor (columns {}..{}, rows {}..{}, the client area at \
+                 {:?} and the monitors {}), which Windows does not draw, are not held",
+                r.l,
+                r.r,
+                r.t,
+                r.b,
+                place.at,
+                rects_text(&monitors)
+            )
+        });
         if (cw, ch) == (w, h) {
-            let (rgba, vw, vh) = crop(&presented.0, w, 4, seen);
-            let (rgb, _, _) = crop(&window.0, cw, 3, seen);
-            compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0).map_err(|why| {
-                format!("on the screen's part {seen:?} of the client area: {why} ({files})")
-            })?;
+            compare_rgb(&presented.0, w, h, &window, 0..0)
+                .map_err(|why| format!("{why}{off} ({files})"))?;
             return Ok(format!(
-                "the window's {vw}x{vh} client pixels on the virtual screen (columns {}..{}, rows \
-                 {}..{} of {cw}x{ch}; Windows draws none past its edge {:?}) equal the presented \
-                 frame's exactly",
-                seen.l, seen.r, seen.t, seen.b, place.screen
+                "the window's {cw}x{ch} client pixels (GetDIBits) equal the presented frame \
+                 exactly{off}"
             ));
         }
-        if seen != whole {
-            return Err(format!(
-                "the window's client area is {cw}x{ch}, the frame {w}x{h}, and only {seen:?} of \
-                 the client area is on the virtual screen {:?}: not held ({files})",
-                place.screen
-            ));
-        }
-        let d = s.ctl(&["dims"])?;
-        let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
-        if (num("surface_w"), num("surface_h")) != (i64::try_from(cw).ok(), i64::try_from(ch).ok())
-        {
-            return Err(format!(
-                "the window's client area is {cw}x{ch}, the frame {w}x{h}, and `dims` names another \
-                 surface: {d} ({files})"
-            ));
-        }
-        let (ox, oy) = (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0));
         let rgba = (
             window
                 .0
@@ -749,12 +919,12 @@ impl Run<'_> {
             height: ch,
             format: "XRGB8888".into(),
         };
-        held_at(&rgba, &presented, ox, oy, 0..0).map_err(|why| format!("{why} ({files})"))?;
+        held_at(&rgba, &presented, ox, oy, 0..0).map_err(|why| format!("{why}{off} ({files})"))?;
         let n = bands_held(&rgba, &presented, &view, (ox, oy))
-            .map_err(|why| format!("{why} ({files})"))?;
+            .map_err(|why| format!("{why}{off} ({files})"))?;
         Ok(format!(
             "the window's {cw}x{ch} client pixels (GetDIBits) hold the presented {w}x{h} frame \
-             exactly at ({ox},{oy}), and its {n} band pixels each the frame's nearest"
+             exactly at ({ox},{oy}), and its {n} band pixels each the frame's nearest{off}"
         ))
     }
 
@@ -790,7 +960,7 @@ impl Run<'_> {
         }
         s.ctl(&["send", EXPOSED_TYPED])?;
         s.ctl(&["key", "enter"])?;
-        s.ctl(&["await", "match", EXPOSED_ECHO, "timeout=60000"])?;
+        s.await_text(EXPOSED_ECHO)?;
         std::thread::sleep(Duration::from_secs(1));
         let above = self.held(s, &format!("{what}-cut"))?;
         let top = (at.screen.b - ch).min(at.at.1).max(at.screen.t);
@@ -849,6 +1019,13 @@ impl Run<'_> {
                 "its window is not at {want_dpi} dpi on the primary monitor: {w:?}"
             ));
         }
+        if Styles::of(&w) != LAUNCH_STYLES {
+            return Err(format!(
+                "its window's {}, not the recorded {}",
+                styles(&w),
+                styles_of(LAUNCH_STYLES)
+            ));
+        }
         let dims = s.dims()?;
         if dims.scale != want_scale || dims.geometry != "window" {
             return Err(format!(
@@ -879,14 +1056,15 @@ impl Run<'_> {
         };
         Ok(format!(
             "pid {} (machine {}, {}), window class {ATERM_CLASS} {}x{} client at {} dpi, per-monitor aware, geometry=window, \
-             {}; drew on {device}",
+             {}; {}; drew on {device}",
             s.pid,
             w.machine,
             self.arch.runs(),
             w.client.0,
             w.client.1,
             w.dpi,
-            dims.brief()
+            dims.brief(),
+            styles(&w)
         ))
     }
 
@@ -895,7 +1073,7 @@ impl Run<'_> {
         let before = count(&s.ctl(&["metrics"])?, "n_input").unwrap_or(0);
         click(self.l(), &self.display, w.rect.centre())?;
         type_text(self.l(), &format!("{TYPED}\n"))?;
-        s.ctl(&["await", "match", crate::linux_proof::ECHO, "timeout=60000"])?;
+        s.await_text(crate::linux_proof::ECHO)?;
         let metrics = s.ctl(&["metrics"])?;
         let after = count(&metrics, "n_input").unwrap_or(0);
         if after <= before {
@@ -974,21 +1152,37 @@ impl Run<'_> {
         }
     }
 
-    /// The window's keyboard layout made `want` (`0411`, `0409`).
+    /// The window's keyboard layout made `want` (`0411`, `0409`, `0407`): Win+Space, each press the
+    /// next of the session's input languages ([`guest::LANGUAGES`]), until it is.
     fn to_layout(&self, s: &Session<'_>, want: &str) -> Result<bool, String> {
-        if s.window()?.layout == want {
+        let mut now = s.window()?.layout;
+        if now == want {
             return Ok(false);
         }
-        chord(self.l(), &["meta_l", "spc"])?;
-        within(&format!("Win+Space to layout {want}"), || {
-            let w = s.window()?;
-            if w.layout == want {
-                Ok(())
-            } else {
-                Err(format!("layout {}", w.layout))
+        let mut seen = vec![now.clone()];
+        for _ in 0..guest::LANGUAGES.len() {
+            chord(self.l(), &["meta_l", "spc"])?;
+            let from = now.clone();
+            now = within(
+                &format!("Win+Space from layout {from} toward {want}"),
+                || {
+                    let w = s.window()?;
+                    if w.layout == from {
+                        Err(format!("layout {}", w.layout))
+                    } else {
+                        Ok(w.layout)
+                    }
+                },
+            )?;
+            if now == want {
+                return Ok(true);
             }
-        })?;
-        Ok(true)
+            seen.push(now.clone());
+        }
+        Err(format!(
+            "Win+Space went through layouts {} and not to {want}",
+            seen.join(" ")
+        ))
     }
 
     fn ime_steps(&self, s: &Session<'_>) -> Result<String, String> {
@@ -1040,7 +1234,7 @@ impl Run<'_> {
             "already back on"
         };
         type_text(self.l(), IME_AFTER)?;
-        s.ctl(&["await", "match", IME_ECHO, "timeout=60000"])?;
+        s.await_text(IME_ECHO)?;
         self.and_held(s, "ime", format!(
             "{switched} Microsoft IME (layout {JAPANESE}), IME {opened} (conversion mode {}), `{IME_READING}` composed \
              key by key ({} in aterm), converted (Space, {IME_CONVERTED:?}) and committed (Enter) into PowerShell's line, \
@@ -1050,11 +1244,271 @@ impl Run<'_> {
         ))
     }
 
+    /// German's keys typed between `before` and PowerShell's `')`, by `keys`, awaiting `echo`: the
+    /// input goes back to English whatever happens.
+    fn german(
+        &self,
+        s: &Session<'_>,
+        before: &str,
+        keys: &dyn Fn(&Layout) -> Result<(), String>,
+        echo: &str,
+    ) -> Result<String, String> {
+        let w = s.window()?;
+        if !w.foreground {
+            click(self.l(), &self.display, w.rect.centre())?;
+        }
+        type_text(self.l(), before)?;
+        let typed = self.to_layout(s, GERMAN).and_then(|switched| {
+            keys(self.l())?;
+            Ok(switched)
+        });
+        let back = self.to_layout(s, ENGLISH);
+        let switched = typed.map_err(|e| format!("{e}; {}", Self::holds(s)))?;
+        back.map_err(|e| format!("input not put back to English: {e}"))?;
+        type_text(self.l(), DEAD_AFTER)?;
+        s.await_text(echo)
+            .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
+        Ok(if switched {
+            "Win+Space to German (layout 0407) and back to English (0409)".to_string()
+        } else {
+            "already on German (layout 0407), Win+Space back to English (0409)".to_string()
+        })
+    }
+
+    fn dead_keys(&self, s: &Session<'_>) -> Result<String, String> {
+        let keys = |l: &Layout| {
+            for (dead, next) in DEAD_KEYS {
+                chord(l, dead)?;
+                chord(l, &[next])?;
+            }
+            Ok(())
+        };
+        let how = self.german(s, DEAD_BEFORE, &keys, DEAD_ECHO)?;
+        let detail = format!(
+            "{how}; German's dead keys `´ e`, `^ o`, `´ Space`, `´ x` and `` ` a`` typed {DEAD_TYPED:?} into \
+             PowerShell's line, which printed {DEAD_ECHO}; {}",
+            self.shot("dead-keys", Some(GPU_ID))
+        );
+        self.and_held(s, "dead-keys", detail)
+    }
+
+    fn altgr(&self, s: &Session<'_>) -> Result<String, String> {
+        let keys = |l: &Layout| {
+            for k in ALTGR_KEYS {
+                chord(l, &["alt_r", k])?;
+            }
+            Ok(())
+        };
+        let how = self.german(s, ALTGR_BEFORE, &keys, ALTGR_ECHO)?;
+        let detail = format!(
+            "{how}; AltGr (the right Alt) with {} typed {ALTGR_TYPED:?}, not Ctrl+Alt chords, into \
+             PowerShell's line, which printed {ALTGR_ECHO}; {}",
+            ALTGR_KEYS.join(", "),
+            self.shot("altgr", Some(GPU_ID))
+        );
+        self.and_held(s, "altgr", detail)
+    }
+
+    /// The window's right edge dragged right with the button held: while Windows' modal size loop
+    /// runs, aterm takes the resize, PowerShell prints its new width and aterm presents it.
+    fn modal_resize(&self, s: &Session<'_>) -> Result<String, String> {
+        let w = s.window()?;
+        let before = s.dims()?;
+        let y = w.rect.centre().1;
+        let edge = w.rect.r - EDGE_IN;
+        press_to(
+            self.l(),
+            &self.display,
+            (edge, y),
+            (edge + HELD_DRAG, y),
+            50,
+        )?;
+        let verdict = self.held_in_loop(s, &before);
+        let released = release(self.l());
+        let ended = within("Windows' size loop ending at the release", || {
+            let w = s.window()?;
+            if w.move_size {
+                Err("the window's thread is still in its size loop".into())
+            } else {
+                Ok(())
+            }
+        });
+        let detail = verdict?;
+        released?;
+        ended?;
+        let status = s.ctl(&["status"])?;
+        if field(&status, "render") != Some("ok") {
+            return Err(format!("after the release `status` says {status}"));
+        }
+        Ok(format!("{detail}; released, the loop ended, render=ok"))
+    }
+
+    /// What [`Run::modal_resize`] holds while the button is down.
+    fn held_in_loop(&self, s: &Session<'_>, before: &Dims) -> Result<String, String> {
+        let in_loop = || {
+            let w = s.window()?;
+            if w.move_size {
+                Ok(w)
+            } else {
+                Err("the window's thread is not in Windows' size loop".to_string())
+            }
+        };
+        within("Windows' size loop on aterm's window", in_loop)?;
+        let during = within("the grid wider with the button held", || {
+            let d = s.dims()?;
+            if d.window_cols >= before.window_cols + 10 {
+                Ok(d)
+            } else {
+                Err(format!("window_cols {}", d.window_cols))
+            }
+        })?;
+        let frames = count(&s.ctl(&["metrics"])?, "frames").unwrap_or(0);
+        s.ctl(&[
+            "send",
+            &format!("Write-Output ('{HELD_TAG}' + [Console]::WindowWidth)"),
+        ])?;
+        s.ctl(&["key", "enter"])?;
+        let echo = format!("{HELD_TAG}{}", during.cols);
+        s.await_text(&echo)
+            .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
+        let after = within("a frame presented after the echo", || {
+            let n = count(&s.ctl(&["metrics"])?, "frames").unwrap_or(0);
+            if n > frames {
+                Ok(n)
+            } else {
+                Err(format!("frames {n}"))
+            }
+        })?;
+        let held = self.and_held(s, "modal-resize", String::new())?;
+        let w = in_loop().map_err(|e| format!("{e} after the echo, with the button held"))?;
+        Ok(format!(
+            "right edge pressed and dragged {HELD_DRAG} px right, the button held: the window's thread in \
+             Windows' size loop (GUI_INMOVESIZE), grid {}x{} -> {}x{} and client {}x{} while held; PowerShell \
+             printed {echo} and aterm presented it in the loop (frames {frames} -> {after}){held}; {}",
+            before.cols,
+            before.rows,
+            during.cols,
+            during.rows,
+            w.client.0,
+            w.client.1,
+            self.shot("modal-resize", Some(GPU_ID))
+        ))
+    }
+
+    /// A file dragged by OLE from a window of the desk helper's onto aterm's: aterm pastes its path,
+    /// quoted, and PowerShell reads it.
+    fn drop(&self, s: &Session<'_>) -> Result<String, String> {
+        let w = s.window()?;
+        if !w.foreground {
+            click(self.l(), &self.display, w.rect.centre())?;
+        }
+        type_text(self.l(), DROP_BEFORE)?;
+        let file = format!("{}\\{DROP_FILE}", s.dir);
+        let log = format!("{}\\dragsource.txt", s.dir);
+        let p = self.display.primary.rect;
+        let (x, y) = (p.r - 320, p.b - 280);
+        let task = task_name(&format!("drag-{}", self.arch.name()));
+        let started = run_on_desktop(
+            self.up,
+            &task,
+            &helper_line(&["dragsource", &file, &x.to_string(), &y.to_string(), &log]),
+            Desktop::Started,
+            false,
+        );
+        if !started.ok() {
+            return Err(format!(
+                "the drag source did not start: {}",
+                started.tail(5)
+            ));
+        }
+        let verdict = self.dragged(s, &w, &log);
+        let _ = self.up.admin.ps(&guest::desktop_stop(&task));
+        let (source, over, effect) = verdict?;
+        let w = s.window()?;
+        if !w.foreground {
+            click(self.l(), &self.display, w.rect.centre())?;
+        }
+        type_text(self.l(), DROP_AFTER)?;
+        s.await_text(DROP_ECHO)
+            .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
+        let detail = format!(
+            "`{DROP_FILE}` dragged by OLE (CF_HDROP) from a window at ({},{}) onto aterm's window at ({},{}), \
+             which answered Copy under the cursor at ({},{}) before the release, effect {effect}; aterm \
+             pasted its path quoted and PowerShell printed {DROP_ECHO}; {}",
+            source.l,
+            source.t,
+            w.rect.l,
+            w.rect.t,
+            over.0,
+            over.1,
+            self.shot("drop", Some(GPU_ID))
+        );
+        self.and_held(s, "drop", detail)
+    }
+
+    /// The drag itself: the source's label found, pressed, the tablet moved onto aterm's client
+    /// area, and released once aterm's window has answered OLE's `DragOver` there with Copy
+    /// ([`accepted_over`]); the source's rectangle, where that answer came, and the drag's effect.
+    fn dragged(
+        &self,
+        s: &Session<'_>,
+        w: &Window,
+        log: &str,
+    ) -> Result<(desk::Rect, (i32, i32), String), String> {
+        let read = || self.up.ssh.run(&format!("type \"{log}\"")).text;
+        let source = within("the drag source's window", || {
+            read()
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("source at="))
+                .and_then(|r| {
+                    let mut it = r.split(',').map(|n| n.trim().parse::<i32>().ok());
+                    Some(desk::Rect {
+                        l: it.next()??,
+                        t: it.next()??,
+                        r: it.next()??,
+                        b: it.next()??,
+                    })
+                })
+                .ok_or_else(|| "not shown yet".to_string())
+        })?;
+        if w.rect.holds(source.centre()) || source.holds(w.rect.centre()) {
+            return Err(format!(
+                "the drag source {source:?} overlaps aterm's window {:?}",
+                w.rect
+            ));
+        }
+        press_to(
+            self.l(),
+            &self.display,
+            source.centre(),
+            w.rect.centre(),
+            60,
+        )?;
+        let over = within("aterm's window answering the drag under the cursor", || {
+            accepted_over(&read(), &w.rect, &source)
+        })
+        .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
+        release(self.l())?;
+        let effect = within("the drag's end", || {
+            read()
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("dropped effect=").map(str::to_string))
+                .ok_or_else(|| "the source has not ended its drag".to_string())
+        })
+        .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
+        if effect != "Copy" {
+            return Err(format!(
+                "the drop ended with effect {effect}, not Copy: aterm refused it"
+            ));
+        }
+        Ok((source, over, effect))
+    }
+
     /// Type [`width_typed`]`(tag)` and await PowerShell's `<tag><cols>`.
     fn shell_width(&self, s: &Session<'_>, tag: &str, cols: u32) -> Result<String, String> {
         type_text(self.l(), &width_typed(tag))?;
         let echo = format!("{tag}{cols}");
-        s.ctl(&["await", "match", &echo, "timeout=60000"])
+        s.await_text(&echo)
             .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
         Ok(echo)
     }
@@ -1201,7 +1655,8 @@ impl Run<'_> {
         if !w.foreground {
             click(self.l(), &self.display, w.rect.centre())?;
         }
-        let summary = present_summary(&s.ctl(&["metrics", "percentiles"])?);
+        let metrics = s.ctl(&["metrics", "percentiles"])?;
+        let summary = format!("{}; {}", present_summary(&metrics), input_summary(&metrics));
         chord(self.l(), &["alt", "f4"])?;
         let code = within("aterm-gui's exit after Alt+F4", || {
             s.exit().ok_or_else(|| "still running".to_string())
@@ -1281,7 +1736,7 @@ fn arch_rows(
             left = &ROWS[1..];
         }
         Ok(s) => {
-            let steps: [&Step<'_>; 7] = [
+            let steps: [&Step<'_>; 11] = [
                 &|s| {
                     run.launch(s, "1.00", display.primary.dpi)
                         .map(|d| format!("{d}; {}", run.shot("launch", Some(GPU_ID))))
@@ -1289,7 +1744,11 @@ fn arch_rows(
                 },
                 &|s| run.typed(s),
                 &|s| run.ime(s),
+                &|s| run.dead_keys(s),
+                &|s| run.altgr(s),
                 &|s| run.resize(s),
+                &|s| run.modal_resize(s),
+                &|s| run.drop(s),
                 &|s| run.dpi_change(s),
                 &|s| run.second_monitor(s),
                 &|s| run.close(s),
@@ -1318,7 +1777,7 @@ fn arch_rows(
                     s2.end();
                     verdict
                 });
-                push(ROWS[7], at150);
+                push(ROWS[11], at150);
                 left = &[];
             }
         }
@@ -1457,41 +1916,264 @@ pub fn cmd_window(args: &[String]) -> Res {
     windows::released(i32::from(failed > 0), cleanup)
 }
 
+/// `text` as an `await match` pattern that matches it as written: `await match` takes a regular
+/// expression, so `text` is escaped (the AltGr row's `[]` is syntax unescaped), and the control
+/// protocol splits its words on whitespace, so a space is `\s` (the drop row's `DND-drop 42.txt`).
+fn literal(text: &str) -> String {
+    text.split(' ')
+        .map(aterm_regex::escape)
+        .collect::<Vec<_>>()
+        .join("\\s")
+}
+
+/// A window's style words and what DWM answers for its backdrop and dark mode, as the launch rows
+/// report them (`-` where DWM did not answer).
+fn styles(w: &desk::Window) -> String {
+    styles_of(Styles::of(w))
+}
+
+fn styles_of(s: Styles) -> String {
+    let dwm = |v: Option<i32>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
+    format!(
+        "style {:08x} exstyle {:08x}, DWM backdrop {} dark {}",
+        s.style,
+        s.exstyle,
+        dwm(s.backdrop),
+        dwm(s.dark)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_hold_on_the_screens_part_ignores_the_rows_past_its_edge_and_no_others() {
-        let (w, h) = (3, 4);
+    /// A `w` x `h` RGBA frame whose pixels all differ, and the RGB readback of a window that shows it.
+    fn frame_and_window(w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
         let frame: Vec<u8> = (0..w * h)
             .flat_map(|i| [i as u8, 0x10, 0x20, 0xff])
             .collect();
-        let mut window: Vec<u8> = frame
+        let window = frame
             .as_chunks::<4>()
             .0
             .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
+        (frame, window)
+    }
+
+    #[test]
+    fn a_hold_on_the_screens_part_ignores_the_rows_past_its_edge_and_no_others() {
+        let (w, h) = (3, 4);
+        let (frame, mut window) = frame_and_window(w, h);
         window[3 * w * 3..].fill(0xff);
         let place =
             desk::parse_place("readback client=3x4 at=10,7 screen=0,0,100,10").expect("a place");
-        let seen = place.on_screen().expect("on the screen");
-        assert_eq!((seen.t, seen.b, seen.l, seen.r), (0, 3, 0, 3));
-        let (rgba, vw, vh) = crop(&frame, w, 4, seen);
-        let (rgb, _, _) = crop(&window, w, 3, seen);
-        assert_eq!((vw, vh), (3, 3));
-        assert_eq!(compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0), Ok(()));
-        assert!(compare_rgb(&frame, w, h, &(window.clone(), w, h), 0..0).is_err());
-        window[w * 3 + 1] ^= 1;
-        let (rgb, _, _) = crop(&window, w, 3, seen);
+        let on = place.on_monitors(&[place.screen]);
         assert_eq!(
-            compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0),
+            on,
+            vec![desk::Rect {
+                l: 0,
+                t: 0,
+                r: 3,
+                b: 3
+            }]
+        );
+        assert!(compare_rgb(&frame, w, h, &(window.clone(), w, h), 0..0).is_err());
+        let framed = (frame.clone(), w, h);
+        let mut held = window.clone();
+        let (put, span) = off_monitors_as_framed(&mut held, (w, h), &on, &framed, (0, 0));
+        assert_eq!(
+            (put, span),
+            (
+                3,
+                Some(desk::Rect {
+                    l: 0,
+                    t: 3,
+                    r: 3,
+                    b: 4
+                })
+            )
+        );
+        assert_eq!(compare_rgb(&frame, w, h, &(held, w, h), 0..0), Ok(()));
+        window[w * 3 + 1] ^= 1;
+        let mut held = window;
+        off_monitors_as_framed(&mut held, (w, h), &on, &framed, (0, 0));
+        assert_eq!(
+            compare_rgb(&frame, w, h, &(held, w, h), 0..0),
             Err(
-                "1 of 9 pixels differ; first at (0,1): presented [03, 10, 20], server [03, 11, 20]"
+                "1 of 12 pixels differ; first at (0,1): presented [03, 10, 20], server [03, 11, 20]"
                     .into()
             )
         );
+    }
+
+    /// The second monitor row's place on 2026-10-25: back on the primary, the client area reached
+    /// past its right edge and below the smaller second monitor beside it. Scaled down, a 10x10
+    /// primary with a 4x5 monitor to its right, and a 6x8 client area at (6,1).
+    #[test]
+    fn a_hold_ignores_the_pixels_between_the_monitors_and_no_others() {
+        let monitors = [
+            desk::Rect {
+                l: 0,
+                t: 0,
+                r: 10,
+                b: 10,
+            },
+            desk::Rect {
+                l: 10,
+                t: 0,
+                r: 14,
+                b: 5,
+            },
+        ];
+        let place =
+            desk::parse_place("readback client=6x8 at=6,1 screen=0,0,14,10").expect("a place");
+        assert_eq!(
+            place.on_screen(),
+            Some(desk::Rect {
+                l: 0,
+                t: 0,
+                r: 6,
+                b: 8
+            }),
+            "all of it is on the virtual screen"
+        );
+        let on = place.on_monitors(&monitors);
+        assert_eq!(
+            on,
+            vec![
+                desk::Rect {
+                    l: 0,
+                    t: 0,
+                    r: 4,
+                    b: 8
+                },
+                desk::Rect {
+                    l: 4,
+                    t: 0,
+                    r: 6,
+                    b: 4
+                }
+            ]
+        );
+        let (w, h) = (6, 8);
+        let (frame, mut window) = frame_and_window(w, h);
+        let framed = (frame.clone(), w, h);
+        // What Windows left between the monitors: the theme's background, not the frame.
+        for y in 4..8 {
+            for x in 4..6 {
+                window[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[0x11, 0x13, 0x18]);
+            }
+        }
+        assert!(compare_rgb(&frame, w, h, &(window.clone(), w, h), 0..0).is_err());
+        let mut held = window.clone();
+        let (put, span) = off_monitors_as_framed(&mut held, (w, h), &on, &framed, (0, 0));
+        assert_eq!(
+            (put, span),
+            (
+                8,
+                Some(desk::Rect {
+                    l: 4,
+                    t: 4,
+                    r: 6,
+                    b: 8
+                })
+            )
+        );
+        assert_eq!(compare_rgb(&frame, w, h, &(held, w, h), 0..0), Ok(()));
+        // A wrong pixel beside the gap, on the primary, and one on the second monitor above it.
+        for at in [(3, 6), (5, 3)] {
+            let mut planted = window.clone();
+            planted[(at.1 * w + at.0) * 3] ^= 1;
+            off_monitors_as_framed(&mut planted, (w, h), &on, &framed, (0, 0));
+            let got = compare_rgb(&frame, w, h, &(planted, w, h), 0..0);
+            assert!(
+                got.as_ref()
+                    .is_err_and(|e| e.contains(&format!("first at ({},{})", at.0, at.1))),
+                "{at:?}: {got:?}"
+            );
+        }
+    }
+
+    /// A frame smaller than the client area sits at `dims`' offset and its bands hold its nearest
+    /// pixels; a pixel on no monitor is put to what that rule expects there, and no other.
+    #[test]
+    fn a_hold_off_the_monitors_puts_the_frames_nearest_pixel_at_an_offset() {
+        let (w, h) = (4, 6);
+        let (cw, ch) = (6, 6);
+        let (frame, _) = frame_and_window(w, h);
+        let framed = (frame.clone(), w, h);
+        let (ox, oy) = (1, 0);
+        let nearest = |x: usize, y: usize| {
+            let nx = (x as i64 - ox).clamp(0, w as i64 - 1) as usize;
+            let ny = (y as i64 - oy).clamp(0, h as i64 - 1) as usize;
+            [
+                frame[(ny * w + nx) * 4],
+                frame[(ny * w + nx) * 4 + 1],
+                frame[(ny * w + nx) * 4 + 2],
+            ]
+        };
+        let mut window: Vec<u8> = (0..ch)
+            .flat_map(|y| (0..cw).map(move |x| (x, y)))
+            .flat_map(|(x, y)| nearest(x, y))
+            .collect();
+        let on = [
+            desk::Rect {
+                l: 0,
+                t: 0,
+                r: 4,
+                b: 6,
+            },
+            desk::Rect {
+                l: 4,
+                t: 0,
+                r: 6,
+                b: 3,
+            },
+        ];
+        for y in 3..6 {
+            for x in 4..6 {
+                window[(y * cw + x) * 3..(y * cw + x) * 3 + 3].fill(0xff);
+            }
+        }
+        let rgba = |px: &[u8]| -> (Vec<u8>, usize, usize) {
+            (
+                px.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                    .collect(),
+                cw,
+                ch,
+            )
+        };
+        let view = WestonView {
+            x: 0,
+            y: 0,
+            width: cw,
+            height: ch,
+            format: "XRGB8888".into(),
+        };
+        assert!(held_at(&rgba(&window), &framed, ox, oy, 0..0).is_err());
+        let mut held = window.clone();
+        let (put, span) = off_monitors_as_framed(&mut held, (cw, ch), &on, &framed, (ox, oy));
+        assert_eq!(
+            (put, span),
+            (
+                6,
+                Some(desk::Rect {
+                    l: 4,
+                    t: 3,
+                    r: 6,
+                    b: 6
+                })
+            )
+        );
+        assert_eq!(held_at(&rgba(&held), &framed, ox, oy, 0..0), Ok((4, 6)));
+        assert_eq!(bands_held(&rgba(&held), &framed, &view, (ox, oy)), Ok(12));
+        // The band column 0 is on the primary: a wrong pixel there still fails.
+        held[(2 * cw) * 3] ^= 1;
+        assert!(bands_held(&rgba(&held), &framed, &view, (ox, oy)).is_err());
     }
 
     #[test]
@@ -1532,9 +2214,149 @@ mod tests {
                 assert!(other == *tag || !other.starts_with(tag), "{tag} {other}");
             }
         }
+        for (before, after, typed, echo) in [
+            (DEAD_BEFORE, DEAD_AFTER, DEAD_TYPED, DEAD_ECHO),
+            (ALTGR_BEFORE, DEAD_AFTER, ALTGR_TYPED, ALTGR_ECHO),
+        ] {
+            assert!(
+                format!("{before}{after}")
+                    .chars()
+                    .all(|c| desk::qcodes(c).is_some())
+            );
+            assert!(!format!("{before}{typed}{after}").contains(echo), "{echo}");
+            assert!(echo.ends_with(typed), "{echo}");
+        }
+        assert!(DEAD_TYPED.chars().any(|c| desk::qcodes(c).is_none()));
+        assert_eq!(ALTGR_KEYS.len(), ALTGR_TYPED.chars().count());
+        assert!(
+            format!("{DROP_BEFORE}{DROP_AFTER}")
+                .chars()
+                .all(|c| desk::qcodes(c).is_some())
+        );
+        let pasted =
+            format!("{DROP_BEFORE}\"C:\\lane\\desk\\aarch64-1\\{DROP_FILE}\" {DROP_AFTER}");
+        assert!(!pasted.contains(DROP_ECHO));
+        assert!(DROP_ECHO.ends_with(DROP_FILE) && DROP_FILE.contains(' '));
+        assert!(
+            !format!("Write-Output ('{HELD_TAG}' + [Console]::WindowWidth)")
+                .contains(&format!("{HELD_TAG}8"))
+        );
         assert_eq!(IME_STEPS.len(), IME_READING.chars().count());
         assert!(IME_STEPS.iter().all(|step| !step.contains(IME_CONVERTED)));
         assert!(IME_STEPS.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn every_echo_is_awaited_as_written() {
+        let widths = WIDTH_TAGS.map(|tag| format!("{tag}80"));
+        for echo in [
+            EXPOSED_ECHO,
+            crate::linux_proof::ECHO,
+            IME_ECHO,
+            DEAD_ECHO,
+            ALTGR_ECHO,
+            DROP_ECHO,
+            &format!("{HELD_TAG}80"),
+        ]
+        .into_iter()
+        .chain(widths.iter().map(String::as_str))
+        {
+            let pattern = literal(echo);
+            assert!(!pattern.contains(char::is_whitespace), "{pattern}");
+            let re = aterm_regex::Regex::new(&pattern).unwrap_or_else(|e| panic!("{echo}: {e:?}"));
+            assert!(
+                re.is_match(&format!("PS C:\\Users\\lane> {echo}")),
+                "{echo}"
+            );
+        }
+        // Negative controls: unescaped, the AltGr echo is no expression at all (the lane's
+        // `ERR badregex`), escaped alone the drop echo keeps its space (which the wire splits, the
+        // lane's next `ERR badregex`), and the drop's `.` matches a byte it does not hold.
+        assert!(aterm_regex::Regex::new(ALTGR_ECHO).is_err());
+        assert!(aterm_regex::escape(DROP_ECHO).contains(' '));
+        let dot = aterm_regex::Regex::new(DROP_ECHO).unwrap_or_else(|e| panic!("{e:?}"));
+        let near = DROP_ECHO.replace('.', "x");
+        assert!(dot.is_match(&near));
+        let escaped =
+            aterm_regex::Regex::new(&literal(DROP_ECHO)).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(!escaped.is_match(&near));
+    }
+
+    #[test]
+    fn the_drop_is_released_only_on_aterms_copy_under_the_cursor() {
+        let aterm = desk::Rect {
+            l: 100,
+            t: 50,
+            r: 1200,
+            b: 950,
+        };
+        let source = desk::Rect {
+            l: 1600,
+            t: 900,
+            r: 1860,
+            b: 1060,
+        };
+        let start = "source at=1600,900,1860,1060\n";
+        let crossing = "over effect=None at=1700,950\nover effect=Copy at=1500,700\n";
+        let on_aterm = "over effect=Copy at=650,500\n";
+        assert_eq!(
+            accepted_over(&format!("{start}{crossing}{on_aterm}"), &aterm, &source),
+            Ok((650, 500))
+        );
+        // Negative controls: no answer yet; Copy from a window the path crossed (the desktop);
+        // aterm's window refusing; and the source's own label, where it overlaps aterm's.
+        assert!(accepted_over(start, &aterm, &source).is_err());
+        assert!(accepted_over(&format!("{start}{crossing}"), &aterm, &source).is_err());
+        assert!(
+            accepted_over(
+                &format!("{start}{crossing}over effect=None at=650,500\n"),
+                &aterm,
+                &source
+            )
+            .is_err()
+        );
+        let over_aterm = desk::Rect {
+            l: 600,
+            t: 450,
+            r: 860,
+            b: 610,
+        };
+        assert!(accepted_over(&format!("{start}{on_aterm}"), &aterm, &over_aterm).is_err());
+        // The last answer is the one that stands: the cursor left aterm's window after it.
+        assert!(
+            accepted_over(
+                &format!("{start}{on_aterm}over effect=None at=1700,950\n"),
+                &aterm,
+                &source
+            )
+            .is_err()
+        );
+        assert!(desk::HELPER.contains("\"over effect={0} at={1},{2}\""));
+    }
+
+    #[test]
+    fn the_launch_rows_report_the_style_words_and_dwm() {
+        let w = desk::parse_windows(
+            "window class=aterm rect=0,0,10,10 client=8x8 dpi=96 foreground=1 awareness=2 layout=0409 ime=0 \
+             machine=aa64 conv=0 movesize=0 style=16cf0000 exstyle=00200100 backdrop=0 dark=-",
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(
+            styles(&w[0]),
+            "style 16cf0000 exstyle 00200100, DWM backdrop 0 dark -"
+        );
+        // The recorded words hold the window they were read from (the before-run's launch line) and
+        // not another: this one's extended style, backdrop and dark mode differ.
+        let recorded = desk::parse_windows(
+            "window class=aterm rect=0,0,10,10 client=8x8 dpi=96 foreground=1 awareness=2 layout=0409 ime=0 \
+             machine=aa64 conv=0 movesize=0 style=16cf0000 exstyle=00040110 backdrop=1 dark=1",
+        );
+        assert_eq!(Styles::of(&recorded[0]), LAUNCH_STYLES);
+        assert_ne!(Styles::of(&w[0]), LAUNCH_STYLES);
+        assert_eq!(
+            styles_of(LAUNCH_STYLES),
+            "style 16cf0000 exstyle 00040110, DWM backdrop 1 dark 1"
+        );
     }
 
     #[test]

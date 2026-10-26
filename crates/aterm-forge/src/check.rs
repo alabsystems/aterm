@@ -99,8 +99,9 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
         notes += 1;
         let _ = writeln!(
             log,
-            "  • NOTE [OB-7] UNVERIFIED for {}: attest diffed none of its files (no pristine copy \
-             here), so this check does not attest its §4(b) notices.",
+            "  • NOTE [OB-7] UNVERIFIED for {}: attest diffed none of its files (it got no \
+             pristine copy; its NOTE above says why), so this check does not attest its §4(b) \
+             notices.",
             attested.unverified.join(", ")
         );
     }

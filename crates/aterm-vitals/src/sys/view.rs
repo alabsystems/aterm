@@ -2048,6 +2048,12 @@ fn net_summary_words(s: &Snapshot, net: &crate::model::NetView) -> String {
             tcp.connecting()
         ));
     }
+    if let Some(ms) = net.srtt_ms {
+        parts.push(format!("rtt {ms:.1} ms"));
+    }
+    if let Some(sock) = net.aterm_sockets {
+        parts.push(format!("aterm {sock} sockets"));
+    }
     if parts.is_empty() {
         unavailable("not_sampled")
     } else {
@@ -2071,7 +2077,7 @@ fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
         Some(tcp) => lines.push(line(
             "tcp",
             format!(
-                "tcp     total={} established={} listen={} time_wait={} close_wait={} syn_sent={} syn_recv={} fin_wait1={} fin_wait2={} closing={} last_ack={} close={}",
+                "tcp     total={} established={} listen={} time_wait={} close_wait={} syn_sent={} syn_recv={} fin_wait1={} fin_wait2={} closing={} last_ack={} close={} srtt_us={}",
                 tcp.total(),
                 tcp.established,
                 tcp.listen,
@@ -2083,7 +2089,11 @@ fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
                 tcp.fin_wait2,
                 tcp.closing,
                 tcp.last_ack,
-                tcp.close
+                tcp.close,
+                rec(
+                    net.srtt_ms.map(|ms| (ms * 1000.0).round().max(0.0) as u64),
+                    "not_sampled"
+                ),
             ),
         )),
         None => lines.push(line(
@@ -3471,7 +3481,19 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
         })
         .collect();
     Jv::obj([
+        ("state", Jv::s(net.state.word())),
         ("primary_link", primary),
+        (
+            "srtt_us",
+            Jv::known_or(
+                net.srtt_ms.map(|ms| (ms * 1000.0).round().max(0.0) as u64),
+                "not_sampled",
+            ),
+        ),
+        (
+            "aterm_sockets",
+            Jv::known_or(net.aterm_sockets.map(u64::from), "not_sampled"),
+        ),
         (
             "per_s",
             net.rates

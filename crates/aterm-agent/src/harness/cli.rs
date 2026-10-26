@@ -29,6 +29,9 @@ use crate::supervise::run::{Ctl, Session};
 use crate::supervise::transport::{Endpoint, RelayCtl};
 use crate::supervise::{SupervisorConfig, approvals, limit};
 
+#[path = "cli_shared_renewal.rs"]
+pub mod shared_renewal;
+
 /// The harness name, which is also the state directory's name (design §1.3): one definition with the folder the tools that admit a disk need read the disk watch's rooms from (`aterm_capacity::room::state_dir`).
 pub const HARNESS: &str = aterm_capacity::room::HARNESS;
 
@@ -89,6 +92,8 @@ USAGE:
                                                  open the row's own browser profile for a person to sign in once
     aterm harness accounts renew [--due | <label>...] [--on <host>,... | --here]
                                                  renew logins via staging sign-in (and over ssh)
+    aterm harness accounts shared-renew <label> --account <digest> --decision <digest> --request <nonce>
+                                                 renew one local Claude row under an exact root decision
     aterm harness accounts use <label> | --auto  pin an account or return to automatic rotation
     aterm harness accounts sync [<source>] [--machine <mN>] [--json]
                                                  sync accounts.toml and fleet-accounts.toml from <source>
@@ -5167,6 +5172,13 @@ pub trait AccountsHost {
         Err("this host checks nothing".to_string())
     }
 
+    /// Full provider identity from this exact staging home, read only after
+    /// its successful named authentication check. Inert on test hosts unless
+    /// supplied explicitly; no platform or default-home fallback is implied.
+    fn claude_principal_in_home(&self, _home: &str) -> Option<[u8; 32]> {
+        None
+    }
+
     /// `ssh -t <host> <aterm> harness accounts renew --due --here` (`argv` after the host), its stdio this process's, waited for: the remote machine's own renewal, run in the same sitting.
     fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
         let _ = (host, argv);
@@ -5323,6 +5335,10 @@ impl AccountsHost for LiveAccounts {
             &|name| std::env::var_os(name),
             AUTH_CHECK_BUDGET,
         )
+    }
+
+    fn claude_principal_in_home(&self, home: &str) -> Option<[u8; 32]> {
+        profile::principal_in_home(Path::new(home))
     }
 
     fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
@@ -7246,6 +7262,7 @@ fn record_plain_login(
     now: i64,
     policy: accounts::RenewalPolicy<'_>,
     staging: &str,
+    principal: Option<[u8; 32]>,
     err: &mut dyn Write,
 ) -> Result<Vec<accounts::Event>, String> {
     let label = policy.row.label.as_str();
@@ -7257,6 +7274,7 @@ fn record_plain_login(
         &mut note,
         policy,
         |state, logins| {
+            shared_renewal::unmanaged(logins, policy.row, principal, true)?;
             Ok(accounts::note_renewed(
                 state, logins, label, previous, staging, None, now,
             ))
@@ -7326,9 +7344,16 @@ fn signin_policy_ready(
     verb: &str,
     err: &mut dyn Write,
 ) -> bool {
-    match store.transact_renewal_within(&accounts::LOCK_LADDER, now, &mut None, policy, |_, _| {
-        Ok(Vec::new())
-    }) {
+    match store.transact_renewal_within(
+        &accounts::LOCK_LADDER,
+        now,
+        &mut None,
+        policy,
+        |_, logins| {
+            shared_renewal::unmanaged(logins, policy.row, None, false)?;
+            Ok(Vec::new())
+        },
+    ) {
         Ok(_) => true,
         Err(why) => {
             let _ = writeln!(
@@ -7527,7 +7552,14 @@ fn run_accounts_login(
         let _ = writeln!(err, "{label}: {}; staging was not bound", answer.words());
         return ExitCode::from(1);
     }
-    if let Err(why) = record_plain_login(&store, now, policy, staging_text, err) {
+    if let Err(why) = record_plain_login(
+        &store,
+        now,
+        policy,
+        staging_text,
+        host.claude_principal_in_home(staging_text),
+        err,
+    ) {
         let _ = writeln!(
             err,
             "aterm harness accounts login: staging was not bound: {why}"
@@ -7936,6 +7968,33 @@ fn renew_one(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Renewal {
+    renew_one_guarded(
+        env,
+        host,
+        store,
+        _signin,
+        policy,
+        own_dir,
+        browser,
+        out,
+        err,
+        &mut shared_renewal::Guard::Local,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn renew_one_guarded(
+    env: &Env,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    _signin: &accounts::Lock,
+    policy: accounts::RenewalPolicy<'_>,
+    own_dir: Option<&str>,
+    browser: &RenewBrowser,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    guard: &mut shared_renewal::Guard<'_>,
+) -> Renewal {
     let row = policy.row;
     let label = row.label.as_str();
     let Some(email) = row.email.as_deref() else {
@@ -7946,6 +8005,16 @@ fn renew_one(
     }
     let say = |err: &mut dyn Write, what: &str| {
         let _ = writeln!(err, "aterm harness accounts renew: {label}: {what}");
+    };
+    if let Err(why) = guard.preflight(row, policy.logins, browser) {
+        say(err, &why);
+        return Renewal::Failed;
+    }
+    let retain_staging = guard.retains_staging();
+    let discard_staging = |path: &Path, err: &mut dyn Write| {
+        if !retain_staging {
+            drop_staging(path, err);
+        }
     };
     if let Err(why) = store.transact_renewal_within(
         &accounts::LOCK_LADDER,
@@ -7971,9 +8040,23 @@ fn renew_one(
         }
     };
     let Some(staging_text) = staging.to_str().map(str::to_owned) else {
-        drop_staging(&staging, err);
+        discard_staging(&staging, err);
         say(err, "the staging directory's name is not UTF-8");
         return Renewal::Failed;
+    };
+    let began = match guard.begin(store, policy, &staging_text, env.now) {
+        Ok(logins) => logins,
+        Err(why) => {
+            say(
+                err,
+                &format!("{why}; staging is retained at {}", staging.display()),
+            );
+            return Renewal::Failed;
+        }
+    };
+    let policy = accounts::RenewalPolicy {
+        logins: &began,
+        ..policy
     };
     let how = match browser {
         RenewBrowser::Default => "it opens in your default browser".to_string(),
@@ -7997,6 +8080,10 @@ fn renew_one(
     let _ = writeln!(out, "renewing `{label}`: Claude Code's own sign-in; {how}");
     let _ = out.flush();
     let _ = err.flush();
+    if let Err(why) = guard.check(row) {
+        say(err, &why);
+        return Renewal::Failed;
+    }
     let exited = host.renew_flow(&staging_text, email, browser);
     let now = host.now().max(env.now);
     if let Err(why) =
@@ -8013,7 +8100,7 @@ fn renew_one(
     let exited = match exited {
         Ok(code) => code,
         Err(why) => {
-            drop_staging(&staging, err);
+            discard_staging(&staging, err);
             say(
                 err,
                 &format!("`claude` could not be run: {}", super::one_line(&why, 160)),
@@ -8022,21 +8109,18 @@ fn renew_one(
         }
     };
     if exited != 0 {
-        drop_staging(&staging, err);
+        discard_staging(&staging, err);
         say(
             err,
-            &format!(
-                "`claude auth login` exited {exited}; nothing was recorded, nothing else was run, \
-                 and nothing live changed"
-            ),
+            &format!("`claude auth login` exited {exited}; no login was bound"),
         );
         return Renewal::authentication_failed(Some(exited));
     }
     if !accounts::login_made(&staging) {
-        drop_staging(&staging, err);
+        discard_staging(&staging, err);
         say(
             err,
-            "the sign-in exited 0 and left no login; nothing was recorded",
+            "the sign-in exited 0 and left no login; no login was bound",
         );
         return Renewal::AuthFailed;
     }
@@ -8054,10 +8138,10 @@ fn renew_one(
     let (facts, status_code) = match facts {
         Ok(facts) => facts,
         Err(why) => {
-            drop_staging(&staging, err);
+            discard_staging(&staging, err);
             say(
                 err,
-                &format!("the new login could not be checked ({why}); nothing was recorded"),
+                &format!("the new login could not be checked ({why}); no login was bound"),
             );
             return Renewal::Failed;
         }
@@ -8081,7 +8165,7 @@ fn renew_one(
             );
             return Renewal::Failed;
         }
-        drop_staging(&staging, err);
+        discard_staging(&staging, err);
         say(
             err,
             &format!(
@@ -8102,7 +8186,7 @@ fn renew_one(
         };
     }
     if !facts.renews() {
-        drop_staging(&staging, err);
+        discard_staging(&staging, err);
         let what = if facts.signed_in {
             "a login that is not a Claude subscription's"
         } else {
@@ -8110,17 +8194,30 @@ fn renew_one(
         };
         say(
             err,
-            &format!("the new login answers {what}; nothing was recorded"),
+            &format!("the new login answers {what}; no login was bound"),
         );
         return Renewal::authentication_failed(status_code);
     }
     let now = host.now().max(now);
+    let principal = if guard.retains_staging() || !began.shared.is_empty() {
+        host.claude_principal_in_home(&staging_text)
+    } else {
+        None
+    };
+    if let Err(why) = guard.check(row) {
+        say(
+            err,
+            &format!("{why}; staging is retained at {}", staging.display()),
+        );
+        return Renewal::Failed;
+    }
     let done = store.transact_renewal_within(
         &accounts::LOCK_LADDER,
         now,
         &mut None,
         policy,
         |state, logins| {
+            guard.publish(logins, row, principal, now)?;
             accounts::write_renewal_checkpoint(
                 label,
                 row.expected_identity_email().unwrap_or(email),
@@ -8661,6 +8758,7 @@ fn sign_in_plan(
     let parent = accounts::RenewalParent::capture(captured_logins, label);
     if let Err(why) =
         store.transact_logins_within(&accounts::LOCK_LADDER, now, &mut None, |_, current| {
+            shared_renewal::unmanaged(current, row, None, false)?;
             parent.require_current(current, label)?;
             signin_policy_current(cli, row, roster_path, own_dir)?;
             Ok(Vec::new())
@@ -9066,6 +9164,16 @@ fn bind_signed_in(
             // and before creating any recoverable completion checkpoint.
             plan.parent.require_current(logins, label)?;
             signin_policy_matches(row, raw, own_dir)?;
+            if cli == Cli::Claude {
+                shared_renewal::unmanaged(
+                    logins,
+                    row,
+                    host.claude_principal_in_home(&plan.staging_text),
+                    true,
+                )?;
+            } else if logins.shared.required(row)?.is_some() {
+                return Err("this account requires a supported shared renewal adapter".into());
+            }
             if !email.is_empty() {
                 accounts::write_renewal_checkpoint_for(
                     cli,

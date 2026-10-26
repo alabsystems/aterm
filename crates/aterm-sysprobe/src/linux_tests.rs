@@ -1194,3 +1194,19 @@ fn clipped_tcp_tables_cannot_supply_a_complete_count() {
         "a complete IPv4 table cannot conceal clipped IPv6"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn open_socket_count_counts_only_socket_symlinks_in_fd_dir() {
+    use std::os::unix::fs::symlink;
+    let root = tree(&[]);
+    let fd_dir = root.path().join("proc/4242/fd");
+    std::fs::create_dir_all(&fd_dir).expect("fd dir");
+    symlink("/dev/pts/3", fd_dir.join("0")).expect("tty symlink");
+    symlink("pipe:[9911]", fd_dir.join("1")).expect("pipe symlink");
+    symlink("socket:[12345]", fd_dir.join("3")).expect("socket 3");
+    symlink("socket:[67890]", fd_dir.join("4")).expect("socket 4");
+    symlink("anon_inode:[eventpoll]", fd_dir.join("5")).expect("epoll");
+    assert_eq!(Root::new(root.path()).open_socket_count(4242), Some(2));
+    assert_eq!(Root::new(root.path()).open_socket_count(9999), None);
+}

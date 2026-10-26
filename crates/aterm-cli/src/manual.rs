@@ -72,28 +72,19 @@ macro_rules! aterm_page_shell {
 const TOPICS: &[Topic] = &[
     Topic {
         name: "doctor",
-        tagline: "health checks and Mac setup",
+        tagline: "health checks and repairs",
+        body: None,
+    },
+    Topic {
+        name: "setup",
+        tagline: "the Mac setup System State runs",
         body: Some(
-            r#"aterm doctor — health, repairs and macOS setup
+            r#"setup — the Mac setup System State runs, and doctor's settings modes
 
-  aterm doctor                 check and repair: shell integration, installed
-                               commands and ~/.local/bin links, reroute stubs, the
-                               rustup link, exec roots and stale aterm copies
-  aterm doctor --read-only     the same checks, changing nothing
-  aterm doctor --only <id,...> only those items, families or layers
   aterm doctor --check         check only the macOS settings profile
   aterm doctor --apply         apply or repair only the macOS settings profile
   aterm doctor --restore       restore the preferences saved before setup
-  The report goes to stdout, including on failure; --json makes it structured.
-  At the Mac's console, bare doctor then opens Developer Tools if aterm is
-  missing there; --json, piped output, SSH and coding agents never open a pane.
-
-On a develop machine (~/.config/aterm/init.toml records [develop] checkouts) doctor,
-bare or --read-only, also reads the develop items: each checkout against origin as
-it was last fetched, its vendor/astream submodule, and, where `aterm init` runs it
-too (a clean checkout of aterm's origin with HEAD on a branch, any branch), its
-tools' `verify provision --check` (cargo --offline, stopped after two minutes). It
-reaches no network for them and changes none of them: `aterm init --develop` does.
+  Each exits 0 when verified, 1 for drift or unfinished work, 2 for bad usage.
 
 The first Mac window opens System State. aterm's own permissions are set up on every
 Mac; the rest of the profile is set up by itself only on an ALab Mac (a vault member, a
@@ -205,10 +196,13 @@ for setup's offer, so the next launch reruns nothing it did; System State also
 does Spotlight, the vault and repositories. The Messages and FaceTime sign-outs run
 last, only while System State is on screen, where Stop can end them.
 
-Settings modes exit 0 when verified, 1 for drift or unfinished work, 2 for bad
-usage. A health run exits 0 only when every selected check is satisfied or not
-applicable; blocked, deferred, unknown and failed checks exit 1. The shell is
-always checked; for it alone: `aterm doctor --read-only --only base.shell.starts`.
+DEVELOP MACHINES
+On a develop machine (~/.config/aterm/init.toml records [develop] checkouts) doctor,
+bare or --read-only, also reads the develop items: each checkout against origin as
+it was last fetched, its vendor/astream submodule, and, where `aterm init` runs it
+too (a clean checkout of aterm's origin with HEAD on a branch, any branch), its
+tools' `verify provision --check` (cargo --offline, stopped after two minutes). It
+reaches no network for them and changes none of them: `aterm init --develop` does.
 "#,
         ),
     },
@@ -634,8 +628,18 @@ CONFIGURATION — `[ai]` in `aterm.toml`
         name: "secrets",
         tagline: "one credentials file for every machine: the vault, its server and ~/.secrets (status | join | sync | edit | password | approve | serve …)",
         body: Some(
-            r#"secrets — an encrypted, Ed25519-signed credentials vault synced to `~/.secrets/<name>`
-(`aterm secrets`, macOS and Linux; `aterm secrets --help` has every verb and flag).
+            r#"secrets — one encrypted, signed credentials file for every machine, written to
+`~/.secrets/<name>` (macOS and Linux; `aterm secrets --help` has every verb and flag).
+
+  aterm secrets join <url>#<key>               a new machine: paste the line `create` printed
+  aterm secrets approve <age1…> --name <host>  an admin lets in one that typed no password
+  aterm secrets                                what this machine holds, and whether it syncs
+
+DETAILS
+
+  A vault Mac starts with `aterm secrets create http://127.0.0.1:7484/v1/<name> --serve`:
+  its server set up and answering, then the vault, then the `join` line to paste on the
+  other machines (with this Mac's LAN name) and, at a terminal, the join password.
 
 HOW IT WORKS
   An admin machine encrypts the vault (age X25519, one locker per audience), signs
@@ -661,7 +665,7 @@ VERBS
   every machine   status (the default), join, sync, watch, ls, get <name>, agent
   an admin        create, edit, set, unset, password, requests, approve, revoke,
                   admins, rotate-key
-  a server        serve, server on|off|status
+  a server        serve, server on|off|status (`server on` returns once it answers)
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
   that type the join password. `agent off` records that choice, which setup keeps,
   and every install of the subscriber removes it. A path vault has no join queue:
@@ -1547,6 +1551,22 @@ const EXTRA_PAGES: &[&str] = &[
     "kitty",
     "topics",
 ];
+
+/// `aterm help doctor`: the page `aterm doctor --help` prints ([`crate::doctor::help`]), what
+/// the report shows, and the exit codes; the Mac setup prose is `aterm help setup`'s.
+fn doctor_page() -> String {
+    format!(
+        "aterm doctor \u{2014} health checks and repairs\n\n{}\n\
+         Bare doctor prints one verdict line, then only the rows that need you, each with its\n\
+         one fix; at the Mac's console it then opens Developer Tools if aterm is missing there\n\
+         (never for --json, a pipe, SSH or a coding agent). On a develop machine it also reads\n\
+         each checkout init.toml records, changing none (`aterm help setup`).\n\n\
+         Exit codes: 0 every selected check satisfied or not applicable (the shell is always\n\
+         checked); 1 something needs you, failed or was not measured; 2 a usage error.\n\n\
+         More: `aterm help setup` (what System State sets up), `aterm help permissions`.\n",
+        crate::doctor::help()
+    )
+}
 
 /// `aterm help kitty`, the prose half of the page.
 const KITTY_PAGE_HEAD: &str = r#"kitty — talk to the cursor cat: the words it obeys when you TYPE them
@@ -2499,13 +2519,116 @@ fn protected_folder_names() -> String {
         .join(", ")
 }
 
-/// `aterm help permissions`: macOS privacy (TCC), debugger access and first-run checks.
+/// What each permission the table at the head of `aterm help permissions` names reads now:
+/// Full Disk Access, the Developer Tools list and debugger access, each probe on a thread of its
+/// own, and the app macOS holds responsible for this process when it is not aterm (a shell in
+/// Terminal, a login over ssh): macOS grants Full Disk Access to that app, so the cell is not
+/// aterm's and reads `not aterm's`. A test binary reads none.
+fn permission_states() -> ([&'static str; 3], Option<String>) {
+    use aterm_containment::consent::{self, DebuggerMode, DevToolListing, FdaState};
+    if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
+        return (["not read"; 3], None);
+    }
+    if !cfg!(target_os = "macos") {
+        return (["macOS only"; 3], None);
+    }
+    let gate = aterm_containment::ProbeGate::on;
+    let protected = consent::protected_roots(&[]);
+    let subject = consent::fence_exe()
+        .as_deref()
+        .and_then(consent::app_bundle_root)
+        .and_then(|root| consent::bundle_id_of(&root, &protected));
+    let elsewhere = i32::try_from(std::process::id())
+        .ok()
+        .and_then(consent::responsible_app)
+        .filter(|app| {
+            let theirs = consent::app_bundle_root(&app.path)
+                .and_then(|root| consent::bundle_id_of(&root, &protected));
+            theirs.is_none() || theirs != subject
+        })
+        .map(|app| app.display_name);
+    let states = std::thread::scope(|scope| {
+        let fda = scope.spawn(|| {
+            if elsewhere.is_some() {
+                return "not aterm's";
+            }
+            match aterm_containment::probe_fda(gate()).state {
+                FdaState::Granted => "granted",
+                FdaState::Denied => "off",
+                FdaState::Unknown => "unknown",
+            }
+        });
+        let devtools = scope.spawn(|| {
+            let id = subject.as_deref().unwrap_or_default();
+            match consent::probe_devtool_list(gate(), id).listing {
+                DevToolListing::On => "on",
+                DevToolListing::Off => "off",
+                DevToolListing::Absent => "not listed",
+                DevToolListing::Unknown => "unknown",
+            }
+        });
+        let debugger = match consent::probe_debugger(gate()).mode {
+            DebuggerMode::Enabled => "allowed",
+            DebuggerMode::Disabled => "asks",
+            DebuggerMode::Unrecognized | DebuggerMode::Unknown => "unknown",
+        };
+        let join = |handle: std::thread::ScopedJoinHandle<'_, &'static str>| {
+            handle.join().unwrap_or("unknown")
+        };
+        [join(fda), join(devtools), debugger]
+    });
+    (states, elsewhere)
+}
+
+/// The table `aterm help permissions` opens with: each permission, why aterm wants it, what it
+/// reads now (`states`, in [`permission_states`]'s order) and the one fix, then, when this
+/// process runs under another app (`elsewhere`), one line saying whose grant that is.
+fn permissions_table(states: [&str; 3], elsewhere: Option<&str>) -> String {
+    const ROWS: [(&str, &str, &str); 3] = [
+        (
+            "Full Disk Access",
+            "protected folders and other apps' data read without EPERM",
+            "System Settings \u{25b8} Privacy & Security \u{25b8} Full Disk Access: turn on aterm",
+        ),
+        (
+            "Developer Tools",
+            "new programs start without waiting on macOS's first-run scan",
+            "`aterm doctor` opens Privacy & Security \u{25b8} Developer Tools: turn on aterm",
+        ),
+        (
+            "Debugger access",
+            "lldb attaches without a password dialog",
+            "aterm Settings \u{25b8} Security: allow debugger access",
+        ),
+    ];
+    let mut table = String::from("  PERMISSION        NOW         WHY, THEN THE ONE FIX\n");
+    for ((name, why, fix), now) in ROWS.into_iter().zip(states) {
+        let _ = writeln!(table, "  {name:<18}{now:<12}{why}");
+        let _ = writeln!(table, "  {:<18}fix: {fix}", "");
+    }
+    if let Some(app) = elsewhere {
+        let _ = writeln!(
+            table,
+            "  This shell runs under {app}: macOS grants Full Disk Access here to {app}, not aterm"
+        );
+    }
+    table
+}
+
+/// `aterm help permissions`: aterm's macOS permissions as they read now, then macOS privacy
+/// (TCC), debugger access and first-run checks in detail.
 fn permissions_page() -> String {
     let folders = protected_folder_names();
     let revert = aterm_containment::consent::DEBUGGER_ACCESS_REVERT;
+    let (states, elsewhere) = permission_states();
+    let table = permissions_table(states, elsewhere.as_deref());
     format!(
         "\
-permissions — macOS privacy (TCC) and debugger access
+permissions — aterm's macOS permissions, read now; then privacy (TCC) and debugger access
+
+{table}  (`aterm ctl privacy` says why each reads so; `aterm doctor` checks them all)
+
+DETAILS
 
 WHAT YOU ARE SEEING
   `Operation not permitted` (EPERM) on a path under a folder macOS protects
@@ -4108,7 +4231,10 @@ fn push_macos_walls(s: &mut String) {
          `aterm ctl @<sid> await consent timeout=<ms>` parks until the posture changes. If\n  \
          `attribution=adopted`, this session outlived the aterm process that started it and its\n  \
          file access may differ from a fresh tab's: open a new tab. Full page: `aterm help\n  \
-         permissions`.\n",
+         permissions`.\n  \
+         This Mac's setup (its grants, the vault, the repositories) is `setup=` in `aterm ctl\n  \
+         @self status` (`done`, or `pending:fda,devtools,…`): reading it changes nothing, where a\n  \
+         bare `aterm doctor` repairs and can open System Settings in front of the person.\n",
         protected_folder_names(),
     );
     s.push_str(
@@ -4278,6 +4404,7 @@ fn page_of(t: &str) -> &str {
         "awake" | "keep-awake" => "caffeine",
         "secret" | "vault" | "credentials" => "secrets",
         "amacs" | "editor" => "edit",
+        "privacy" => "permissions",
         other => other,
     }
 }
@@ -4333,10 +4460,13 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
         Some("kitty") => (kitty_page(), 0),
         Some("init") => (init_page(), 0),
+        Some("doctor") => (doctor_page(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
                 let body = t.body.unwrap_or_else(|| {
-                    unreachable!("introspection, rust, sys, theme, init and agh are generated")
+                    unreachable!(
+                        "introspection, rust, sys, theme, init, doctor and agh are generated"
+                    )
                 });
                 (format!("{body}\n"), 0)
             }
@@ -5199,6 +5329,130 @@ mod tests {
                 page.lines().last()
             );
         }
+    }
+
+    /// THE DOCTOR'S HELP IS SHORT, BY ROW KIND: `aterm doctor --help` is its usage line and five
+    /// forms; `aterm help doctor` is the same block, what the report shows, one exit-code
+    /// paragraph naming 0, 1 and 2, and one pointer line, in at most 20 lines. The setup prose
+    /// moved to `aterm help setup`, which keeps the settings modes and the develop paragraph.
+    #[test]
+    fn the_doctor_help_is_its_forms_and_exit_codes_and_setup_has_the_prose() {
+        let help = crate::doctor::help();
+        let kinds =
+            |text: &str, kind: &dyn Fn(&str) -> bool| text.lines().filter(|l| kind(l)).count();
+        let usage = |l: &str| l.starts_with("usage: aterm doctor ");
+        let form = |l: &str| l.starts_with("  aterm doctor");
+        assert_eq!(kinds(&help, &usage), 1, "{help}");
+        assert_eq!(kinds(&help, &form), 5, "{help}");
+        assert_eq!(
+            help.lines().count(),
+            6,
+            "the usage line and five forms: {help}"
+        );
+
+        let (page, code) = render(Some("doctor"), None);
+        assert_eq!(code, 0);
+        assert!(page.contains(&help), "{page}");
+        assert!(
+            page.lines().count() <= 20,
+            "{} lines:\n{page}",
+            page.lines().count()
+        );
+        assert_eq!(kinds(&page, &usage), 1, "{page}");
+        assert_eq!(kinds(&page, &form), 5, "{page}");
+        let exits = kinds(&page, &|l: &str| l.starts_with("Exit codes:"));
+        assert_eq!(exits, 1, "{page}");
+        let paragraph = page
+            .split("\n\n")
+            .find(|p| p.starts_with("Exit codes:"))
+            .unwrap();
+        for code in [
+            "0 every selected check",
+            "1 something needs you",
+            "2 a usage error",
+        ] {
+            assert!(paragraph.contains(code), "{code}: {paragraph}");
+        }
+        assert_eq!(
+            kinds(&page, &|l: &str| l.starts_with("More: ")),
+            1,
+            "{page}"
+        );
+        assert!(
+            !page.contains("System State remains"),
+            "the setup prose moved: {page}"
+        );
+
+        let (setup, code) = render(Some("setup"), None);
+        assert_eq!(code, 0);
+        for kept in [
+            "aterm doctor --check",
+            "aterm doctor --restore",
+            "System State remains",
+            "Restore previous settings",
+            "DEVELOP MACHINES",
+            "verify provision --check",
+        ] {
+            assert!(setup.contains(kept), "{kept}: {setup}");
+        }
+    }
+
+    /// `aterm help privacy` is the permissions page, which opens with a table of at most ten
+    /// lines (a header, and per permission what it reads now and its one fix) before DETAILS.
+    /// A test binary reads no state; the table shows the states it is given (the control).
+    #[test]
+    fn help_privacy_is_the_permissions_page_and_it_opens_with_the_live_table() {
+        let (page, code) = render(Some("privacy"), None);
+        assert_eq!(code, 0, "{page}");
+        assert_eq!(page, render(Some("permissions"), None).0);
+        assert!(page.starts_with("permissions — "), "{page}");
+        let head = &page[..page.find("\nDETAILS\n").expect("a DETAILS heading")];
+        let table: Vec<&str> = head
+            .lines()
+            .skip_while(|l| !l.starts_with("  PERMISSION"))
+            .take_while(|l| l.starts_with("  ") && !l.starts_with("  (`"))
+            .collect();
+        assert!(table.len() <= 10, "{table:#?}");
+        let rows = |name: &str| {
+            table
+                .iter()
+                .filter(|l| l.starts_with(&format!("  {name}")))
+                .count()
+        };
+        for name in ["Full Disk Access", "Developer Tools", "Debugger access"] {
+            assert_eq!(rows(name), 1, "{name}: {table:#?}");
+        }
+        assert_eq!(
+            table
+                .iter()
+                .filter(|l| l.trim_start().starts_with("fix: "))
+                .count(),
+            3
+        );
+        assert_eq!(
+            table.iter().filter(|l| l.contains("not read")).count(),
+            3,
+            "{table:#?}"
+        );
+        assert!(page.contains("WHAT TO DO, IN ORDER"), "the details stay");
+
+        let live = permissions_table(["granted", "off", "asks"], None);
+        let line = |name: &str| {
+            live.lines()
+                .find(|l| l.starts_with(&format!("  {name}")))
+                .unwrap()
+        };
+        assert!(line("Full Disk Access").contains(" granted "), "{live}");
+        assert!(line("Developer Tools").contains(" off "), "{live}");
+        assert!(line("Debugger access").contains(" asks "), "{live}");
+        assert!(live.lines().all(|l| l.chars().count() <= 100), "{live}");
+        assert!(!live.contains("This shell runs under"), "{live}");
+        let terminal = permissions_table(["not aterm's", "on", "asks"], Some("Terminal"));
+        assert!(
+            terminal.contains("macOS grants Full Disk Access here to Terminal, not aterm"),
+            "{terminal}"
+        );
+        assert!(terminal.lines().count() <= 10, "{terminal}");
     }
 
     /// Every page in [`EXTRA_PAGES`] dispatches.

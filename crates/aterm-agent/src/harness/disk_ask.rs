@@ -3009,18 +3009,19 @@ const CONFIRM: &str = "Check with `aterm ctl @self status` (disk=, disk_free_mb=
 const HOLDER_PATH_CAP: usize = 56;
 
 /// The `disk-free@v1` line: the mark, the volume and how full it is (below its floor, or within
-/// [`END_MARGIN`] above it), why aterm is done, the largest holders the pass left, what is safe
-/// to remove and how to confirm, then `(rule disk-free@v1)`, in at most [`LINE_CAP`]
-/// characters. A holder's path is said only in plain characters (letters, digits, `/._-~+@:,=`
-/// and spaces) and clipped; any other is said as "a build directory", so a folder's name
-/// carries nothing planted into an agent's prompt. A line too long for both holders names the
-/// largest alone. One too long for that says the volume's name clipped in its middle to the room
-/// the line leaves it ([`clip_within`]), or as "its volume", before it clips the holder: the
-/// holder is what the agent acts on, and the asked tab's own keeps its path and its mark. Only a
-/// line too long even then names the holder with its path clipped to the room left, so a line
-/// whose pass left a holder never says it names none. A projected line ([`Line::projected`])
-/// still too long with the fill rate says its crossing without the rate, so every line keeps to
-/// the cap.
+/// [`END_MARGIN`] above it), why aterm is done, the largest holder the pass left and the asked
+/// tab's own (the two largest where the largest is its own or it has none), what is safe to
+/// remove and how to confirm, then `(rule disk-free@v1)`, in at most [`LINE_CAP`] characters. A
+/// holder's path is said only in plain characters (letters, digits, `/._-~+@:,=` and spaces) and
+/// clipped; any other is said as "a build directory", so a folder's name carries nothing planted
+/// into an agent's prompt. A line too long for both holders names the asked tab's own alone, or
+/// the largest where it has none, as the session was elected for its own build. One too long for
+/// that says the volume's name clipped in its middle to the room the line leaves it
+/// ([`clip_within`]), or as "its volume", before it clips the holder: the holder is what the
+/// agent acts on, and the asked tab's own keeps its path and its mark. Only a line too long even
+/// then names the holder with its path clipped to the room left, so a line whose pass left a
+/// holder never says it names none. A projected line ([`Line::projected`]) still too long with
+/// the fill rate says its crossing without the rate, so every line keeps to the cap.
 #[must_use]
 pub fn line(l: &Line<'_>) -> String {
     line_within(l, LINE_CAP)
@@ -3081,8 +3082,8 @@ fn line_within(l: &Line<'_>, cap: usize) -> String {
 }
 
 /// The `disk-free@v1` line [`line_within`] says in at most `cap` characters, its fact saying the
-/// volume `pct` full and `below`, and aterm done because `why`, with the largest holders the pass
-/// left that fit.
+/// volume `pct` full and `below`, and aterm done because `why`, with the holders the pass left
+/// that fit, as [`line`] says which.
 fn said_within(l: &Line<'_>, pct: u64, below: &str, why: &str, cap: usize) -> String {
     let volume = plain(&l.mount.display().to_string()).unwrap_or_else(|| UNSAID_VOLUME.to_owned());
     let said_on = |volume: &str, named: &str| {
@@ -3107,36 +3108,55 @@ fn said_within(l: &Line<'_>, pct: u64, below: &str, why: &str, cap: usize) -> St
             .map(|shown| said_on(&shown, named))
     };
     let capped = |named: &str| fit(named).unwrap_or_else(|| said_on(UNSAID_VOLUME, named));
-    let largest = |named: &[String]| format!(" Largest left: {}.", named.join("; "));
-    let holders: Vec<String> = l
-        .holders
-        .iter()
-        .take(2)
-        .map(|h| holder(h, l, &shown_path(holder_path(h), l.home)))
-        .collect();
-    for keep in (1..=holders.len()).rev() {
-        let text = said(&largest(&holders[..keep]));
+    // `top`: the holders named are the largest, in order.
+    let largest = |named: &[String], top: bool| {
+        if top {
+            format!(" Largest left: {}.", named.join("; "))
+        } else {
+            format!(" Among the largest left: {}.", named.join("; "))
+        }
+    };
+    let usual = |h: &Hog| holder(h, l, &shown_path(holder_path(h), l.home));
+    // The session was elected for its own build, so the line names it whatever its rank: next to
+    // the largest, and alone where the line has room for one holder. A session asked after a
+    // hand-off seldom holds the largest (the first pick's build is still there), and a line that
+    // named only the largest told it of another tab's build and never of its own.
+    let mine = l.holders.iter().position(|h| own(h, l));
+    let pair = match mine {
+        Some(at) if at > 0 => Some((0, at)),
+        _ => (l.holders.len() > 1).then_some((0, 1)),
+    };
+    if let Some((a, b)) = pair {
+        let text = said(&largest(
+            &[usual(&l.holders[a]), usual(&l.holders[b])],
+            b == 1,
+        ));
         if text.chars().count() <= cap {
             return text;
         }
     }
-    // Not even the largest fits as it is usually said. The volume's name gives way first: the
-    // holder is what the agent acts on, and the asked tab's own keeps its path and its mark.
-    if let Some(first) = l.holders.first() {
-        if let Some(text) = holders
-            .first()
-            .and_then(|h| fit(&largest(std::slice::from_ref(h))))
-        {
+    let alone = mine.unwrap_or(0);
+    if let Some(first) = l.holders.get(alone) {
+        let top = alone == 0;
+        let one = largest(&[usual(first)], top);
+        let text = said(&one);
+        if text.chars().count() <= cap {
+            return text;
+        }
+        // Not even that holder fits as it is usually said. The volume's name gives way first:
+        // the holder is what the agent acts on, and the asked tab's own keeps its path and its
+        // mark.
+        if let Some(text) = fit(&one) {
             return text;
         }
         // Then its path, clipped to the room the line leaves it, so a line with a holder to name
         // never says it has none.
-        let bare = said_on(UNSAID_VOLUME, &largest(&[holder(first, l, "")]))
+        let bare = said_on(UNSAID_VOLUME, &largest(&[holder(first, l, "")], top))
             .chars()
             .count();
         if let Some(shown) = shown_path_within(holder_path(first), l.home, cap.saturating_sub(bare))
         {
-            return said_on(UNSAID_VOLUME, &largest(&[holder(first, l, &shown)]));
+            return said_on(UNSAID_VOLUME, &largest(&[holder(first, l, &shown)], top));
         }
         return capped(" `aterm harness disk` lists the largest holders left.");
     }
@@ -3151,21 +3171,24 @@ fn holder_path(h: &Hog) -> &Path {
     h.serves.as_deref().unwrap_or(&h.path)
 }
 
+/// Whether holder `h` builds for the asked session's checkout ([`Line::checkout`]), exactly.
+fn own(h: &Hog, l: &Line<'_>) -> bool {
+    l.checkout
+        .zip(h.serves.as_deref())
+        .is_some_and(|(c, s)| c == s)
+}
+
 /// Holder `h` as the line says it, its path ([`holder_path`]) said as `shown`:
 /// `<checkout>'s builds <size>`, or `<directory> <size>`, marked when it builds for the asked
 /// session's checkout: `(this tab's)`, or `(this tab's checkout, shared)` where another session
 /// works there too ([`Line::shared`]), so the agent is never told a build cache other sessions
 /// build in is its own.
 fn holder(h: &Hog, l: &Line<'_>, shown: &str) -> String {
-    let mine = l
-        .checkout
-        .zip(h.serves.as_deref())
-        .is_some_and(|(c, s)| c == s);
     let place = match h.serves.as_deref() {
         Some(s) if s != h.path => format!("{shown}'s builds"),
         _ => shown.to_owned(),
     };
-    let mark = match (mine, l.shared) {
+    let mark = match (own(h, l), l.shared) {
         (false, _) => "",
         (true, false) => " (this tab's)",
         (true, true) => " (this tab's checkout, shared)",

@@ -224,11 +224,7 @@ thread_local! {
 
 /// A bell asked for the attention of `window` (focused or not).
 pub(crate) fn note_bell(window: &aterm_window::window::Window, focused: bool) {
-    use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Some(hwnd) = window.window_handle().ok().and_then(|h| match h.as_raw() {
-        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
-        _ => None,
-    }) else {
+    let Some(hwnd) = crate::platform_win::hwnd_of(window) else {
         return;
     };
     BADGES.with(|b| {

@@ -68,6 +68,18 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     ])
 }
 
+/// The one item of [`items`] that keeps this login's `rust-docs` out of Spotlight
+/// (`init.spotlight.rust-docs@<user>`), as bare `aterm doctor` applies it.
+///
+/// # Errors
+/// As [`items`].
+pub(crate) fn rust_docs_item(ctx: &Ctx) -> Result<Box<dyn Item>, String> {
+    items(ctx)?
+        .into_iter()
+        .find(|item| item.id().starts_with("init.spotlight.rust-docs@"))
+        .ok_or_else(|| "aterm init composes no rust-docs item".to_owned())
+}
+
 /// How long one Spotlight search of a home folder for build folders stands ([`Inventory`]),
 /// found or failed: a setup run, a check and System State's reading share one for this
 /// long instead of each searching the home folder again. Check again searches anew

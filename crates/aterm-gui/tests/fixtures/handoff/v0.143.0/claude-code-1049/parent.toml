@@ -1,0 +1,64 @@
+# What the v0.143.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.143.0"
+producer_commit = "21c9b17038ff"
+outgoing_build = 1793022609
+park_carry_ceiling = "full"
+manifest = "seamless-84071-00000000000000000000000001000002.toml"
+nonce = "00000000000000000000000001000002"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "11fc07a4cdb13f179a38ead8630f2394abff99533845645f9e85ef718036bc63"
+layout_digest = "94045d57c1a4bb1a0f3354e338e2fc6f287f5ca22dba0c9b6aee48ae330d9184"
+proof_target_build = 1793109009
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 3, 40000], [1, 5, 40001]]
+proof_count = 2
+proof_digest = "a9f6392e4abe9e40a99cc8b61f0cdf28d3dfa08d04100a74c37d644fe8ebf2da"
+ready_wire = "4153523100000002a9f6392e4abe9e40a99cc8b61f0cdf28d3dfa08d04100a74c37d644fe8ebf2da"
+commit_wire = "4153433100000002a9f6392e4abe9e40a99cc8b61f0cdf28d3dfa08d04100a74c37d644fe8ebf2da"
+files = ["seamless-84071-00000000000000000000000001000002.layout.toml", "seamless-84071-00000000000000000000000001000002.s0.altgrid", "seamless-84071-00000000000000000000000001000002.s0.ctl", "seamless-84071-00000000000000000000000001000002.s0.grid", "seamless-84071-00000000000000000000000001000002.s1.ctl", "seamless-84071-00000000000000000000000001000002.s1.grid", "seamless-84071-00000000000000000000000001000002.toml"]
+
+[[session]]
+local_id = 0
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = true
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41000
+absolute_row_counter = 30
+alt_absolute_row_counter = 30
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 1
+rows = 30
+cols = 100
+history_lines = 91
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 40001
+absolute_row_counter = 121
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+

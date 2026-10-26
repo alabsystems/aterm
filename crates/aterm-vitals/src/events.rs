@@ -736,6 +736,7 @@ mod tests {
             wait: None,
             footprint: None,
             peak: None,
+            read_bps: None,
             write_bps: None,
             state: ProcState::Run,
             scope,

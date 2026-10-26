@@ -771,7 +771,9 @@ impl RotationPolicy {
 }
 
 /// Run [`LOG_TOOL`] with `args`, feeding every stdout line to `on_line`, then kill and reap the
-/// child here, on the worker that spawned it: this module's one spawn and one `wait()`.
+/// child here, on the worker that spawned it: this module's one spawn and one `wait()`. The
+/// child is tethered: a window killed outright takes its stream with it, which would otherwise
+/// run out its `--timeout`.
 #[cfg(target_os = "macos")]
 fn run_log_tool(
     args: &[String],
@@ -780,18 +782,20 @@ fn run_log_tool(
     on_spawn: impl FnOnce(),
     mut on_line: impl FnMut(&str),
 ) -> Result<(), UnavailableReason> {
-    use aterm_uds::spawnfd::{ChildStdio, LaneCommand};
+    use aterm_uds::spawnfd::{Stdio, Tether as _};
     use std::io::BufRead;
 
     let Ok((stdout, stdout_end)) = std::io::pipe() else {
         return Err(UnavailableReason::LogToolUnavailable);
     };
-    let mut cmd = LaneCommand::new(LOG_TOOL);
-    cmd.args(args)
-        .stdin(ChildStdio::Null)
-        .stdout(ChildStdio::Fd(stdout_end.into()))
-        .stderr(ChildStdio::Null);
-    let Ok(mut child) = aterm_uds::spawnfd::spawn(cmd) else {
+    let Ok(mut child) = aterm_uds::spawnfd::command(LOG_TOOL)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_end))
+        .stderr(Stdio::null())
+        .tether()
+        .spawn()
+    else {
         return Err(UnavailableReason::LogToolUnavailable);
     };
     let reading = slot.publish(i32::try_from(child.id()).unwrap_or(0), send_signal);

@@ -135,6 +135,7 @@ fn repair_rc(home: &Path, login: &'static str) -> Vec<aterm_converge::ItemReport
         rustup_home: None,
         login_rc: Some(login),
         pass: Pass::Repair,
+        reads: Default::default(),
     });
     let items: Vec<Box<dyn aterm_converge::Item>> = repair::items(&ground)
         .into_iter()

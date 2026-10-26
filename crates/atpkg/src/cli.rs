@@ -3910,6 +3910,7 @@ fn repair_store_rows(
         rustup_home: None,
         login_rc: None,
         pass: crate::converge::repair::Pass::Repair,
+        reads: Default::default(),
     });
     repair_rows(
         &ground,

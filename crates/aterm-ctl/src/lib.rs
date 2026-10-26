@@ -642,6 +642,36 @@ fn front_door_probe(path: &str) -> Option<String> {
     CtlStream::connect(&resolved).is_ok().then_some(resolved)
 }
 
+/// What the instance a front-door request goes to did with one request ([`front_door_ask`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontDoorAnswer {
+    /// No control socket takes a connection: no aterm runs here.
+    Absent,
+    /// One takes a connection but answered nothing within the wait; the process behind it, where the socket names one.
+    Silent(Option<u32>),
+    /// Its first reply line, trimmed.
+    Answered(String),
+}
+
+/// Hand `request` to the instance a front-door request goes to, each step of it waited for at most `within`: whether an aterm runs here and answers, not merely takes a connection.
+#[must_use]
+pub fn front_door_ask(request: &str, within: std::time::Duration) -> FrontDoorAnswer {
+    match resolve_path(None, None, env::var(SELF_SID_ENV).ok()) {
+        Ok(path) => front_door_ask_at(&aterm_uds::latest::resolve(&path), request, within),
+        Err(_) => FrontDoorAnswer::Absent,
+    }
+}
+
+fn front_door_ask_at(path: &str, request: &str, within: std::time::Duration) -> FrontDoorAnswer {
+    match front_door_send_within(path, request, within, within) {
+        Ok(line) => FrontDoorAnswer::Answered(line),
+        Err(_) => match CtlStream::connect(path) {
+            Ok(stream) => FrontDoorAnswer::Silent(aterm_uds::fdpass::peer_pid(&stream).ok()),
+            Err(_) => FrontDoorAnswer::Absent,
+        },
+    }
+}
+
 /// Hand one request line to the instance at `path` and return its first reply line, trimmed.
 pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
     front_door_send_within(path, request, FRONT_DOOR_DEADLINE, FRONT_DOOR_DEADLINE)

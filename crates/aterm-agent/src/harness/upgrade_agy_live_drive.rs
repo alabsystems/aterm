@@ -324,21 +324,19 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
             std::thread::sleep(Duration::from_millis(50));
         }
         let res = aterm_uds::foreign_db::read_bytes(&db, SUMMARY_DB_MAX_BYTES, |main, wal| {
-            let mut missing_col = false;
-            let lines = crate::harness::sqlite_read::scan_table(
+            let lines = crate::harness::sqlite_read::scan_table_with(
                 main,
                 wal,
                 "conversation_summaries",
-                |schema, row| {
-                    let (Some(id_i), Some(st_i), Some(nfi_i), Some(par_i)) = (
-                        schema.column_index("conversation_id"),
-                        schema.column_index("status"),
-                        schema.column_index("not_fully_idle"),
-                        schema.column_index("parent_conversation_id"),
-                    ) else {
-                        missing_col = true;
-                        return None;
-                    };
+                |schema| {
+                    Some((
+                        schema.column_index("conversation_id")?,
+                        schema.column_index("status")?,
+                        schema.column_index("not_fully_idle")?,
+                        schema.column_index("parent_conversation_id")?,
+                    ))
+                },
+                |&(id_i, st_i, nfi_i, par_i), row| {
                     let id = row.get(id_i)?.to_list_field();
                     let parent = row.get(par_i)?.to_list_field();
                     if id != conversation && parent != conversation {
@@ -349,13 +347,11 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
                     Some(format!("{id}|{status}|{nfi}|{parent}"))
                 },
             )?;
-            (!missing_col).then(|| {
-                let mut out = lines.join("\n");
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out
-            })
+            let mut out = lines.join("\n");
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            Some(out)
         });
         if let Ok(out) = res {
             return Ok(out);

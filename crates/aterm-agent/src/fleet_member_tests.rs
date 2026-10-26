@@ -1518,7 +1518,7 @@ fn a_new_fleets_init_returns_once_this_machines_listener_serves_its_key() {
     drop(serving);
 }
 
-fn with_aterm_here<R>(hook: impl FnMut() -> bool + 'static, act: impl FnOnce() -> R) -> R {
+fn with_aterm_here<R>(hook: impl FnMut() -> Here + 'static, act: impl FnOnce() -> R) -> R {
     ATERM_HERE.with(|here| *here.borrow_mut() = Some(Box::new(hook)));
     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
     ATERM_HERE.with(|here| *here.borrow_mut() = None);
@@ -1540,7 +1540,7 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
                     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
                     *bound.borrow_mut() = Some(Listener::serve(listener, &state));
                 }
-                true
+                Here::Answers(Some("off".to_owned()))
             }
         },
         || {
@@ -1565,7 +1565,7 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
     let unbound = World::new("init-unbound");
     let port = closed_port();
     let waited = with_aterm_here(
-        || true,
+        || Here::Answers(Some("off".to_owned())),
         || {
             ok(init(
                 &unbound.places,
@@ -1575,9 +1575,9 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
     );
     assert!(
         waited.contains(&format!(
-            "  listener   nothing listens on 127.0.0.1:{port} 3 s after the new key was written, \
-             though an aterm runs here: `aterm ctl status` here reads fleet=off where that aterm \
-             reads another aterm.toml than {}",
+            "  listener   nothing listens on 127.0.0.1:{port} 3 s after the new key was written: \
+             the aterm running here reads fleet=off, so it has not read [fleet] yet, or it reads \
+             another aterm.toml than {}, whose [fleet] is off",
             unbound.places.config.display()
         )),
         "{waited}"
@@ -1587,6 +1587,143 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
             && waited.contains(&format!("\nMembers dial 127.0.0.1:{port}.\n")),
         "no close that says it listens: {waited}"
     );
+}
+
+#[test]
+fn an_init_beside_an_aterm_that_answers_nothing_says_so_at_once() {
+    // A listener bound before its aterm stopped takes a connection, and answers nothing.
+    let bound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let held = bound.local_addr().unwrap().port();
+    let closed = closed_port();
+    let unbound = format!("nothing listens on 127.0.0.1:{closed}");
+    let stalled = format!("127.0.0.1:{held} takes a connection but finishes no fleet handshake");
+    for (port, here, line) in [
+        (
+            closed,
+            Here::Stopped(4242),
+            format!("{unbound}: the aterm running here (pid 4242) is stopped"),
+        ),
+        (
+            closed,
+            Here::Silent(Some(4242)),
+            format!(
+                "{unbound}: the aterm running here (pid 4242) takes a connection but answered no \
+                 request"
+            ),
+        ),
+        (
+            held,
+            Here::Stopped(4242),
+            format!(
+                "{stalled}: the aterm running here (pid 4242) is stopped, so a listener it bound \
+                 takes a connection in the kernel and answers nothing: `kill -CONT 4242` resumes it"
+            ),
+        ),
+        (
+            held,
+            Here::Silent(Some(4242)),
+            format!(
+                "{stalled}: the aterm running here (pid 4242) answered no request either, so it is \
+                 frozen or too busy to answer"
+            ),
+        ),
+    ] {
+        let world = World::new("init-silent");
+        let asked = Rc::new(Cell::new(0));
+        let said = with_aterm_here(
+            {
+                let (asked, here) = (Rc::clone(&asked), here.clone());
+                move || {
+                    asked.set(asked.get() + 1);
+                    here.clone()
+                }
+            },
+            || {
+                ok(init(
+                    &world.places,
+                    &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+                ))
+            },
+        );
+        assert_eq!(asked.get(), 1, "{here:?} is not waited out: {said}");
+        assert!(
+            said.contains(&format!("  listener   {line}")) && !said.contains(FOLLOWS),
+            "{said}"
+        );
+        if port == held {
+            let listed = with_aterm_here(move || here.clone(), || ok(peers(&world.places, &[])));
+            let head = listed.lines().next().unwrap_or_default();
+            assert!(
+                head.contains(&format!(
+                    "([fleet] listen is 127.0.0.1:{held} and allow is facts, but {}",
+                    line.replacen(
+                        "finishes no fleet handshake",
+                        "finishes no fleet handshake just now",
+                        1
+                    )
+                )) && !head.contains("another program holds that port"),
+                "{listed}"
+            );
+        }
+    }
+    drop(bound);
+}
+
+#[test]
+fn a_peers_header_never_calls_a_listener_the_aterm_here_refused_serving() {
+    let (_issuer, code, _serving) = issuing("refused-header-issuer");
+    let member = World::new("refused-header-member");
+    let port = closed_port();
+    let opts = Opts {
+        port: Some(port),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let head = |listed: &str| listed.lines().next().unwrap_or_default().to_owned();
+    let refused = with_aterm_here(
+        || Here::Answers(Some("refused:allow".to_owned())),
+        || ok(peers(&member.places, &[])),
+    );
+    assert!(
+        head(&refused).contains(&format!(
+            "([fleet] listen is 127.0.0.1:{port} and allow is facts, but nothing listens on \
+             127.0.0.1:{port} just now: the aterm running here refused the listen \
+             (fleet=refused:allow): the [fleet] allow it read is none of \"facts\", \"content\" \
+             and \"drive\", though {} names one, so it has not read it yet, or it reads another \
+             aterm.toml",
+            member.places.config.display()
+        )) && !head(&refused).contains("serving"),
+        "{refused}"
+    );
+    let config = member.config();
+    member.write_config(&config.replace("allow = \"facts\"", "allow = \"bogus\""));
+    let bogus = ok(peers(&member.places, &[]));
+    assert!(
+        head(&bogus).contains(
+            "([fleet] allow is \"bogus\", none of \"facts\", \"content\" and \"drive\", so no \
+             aterm here listens for the fleet (`aterm ctl status` here reads \
+             fleet=refused:allow): `aterm fleet allow facts` (or `content`) writes one in "
+        ) && !head(&bogus).contains("serving"),
+        "{bogus}"
+    );
+    // The aterm here listens by another aterm.toml, or has not read this one yet.
+    let serving = Listener::serve(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap(),
+        &member.places.state,
+    );
+    let proved = head(&ok(peers(&member.places, &[])));
+    assert!(
+        proved.contains(&format!(
+            "(it listens on 127.0.0.1:{port}, though [fleet] allow is \"bogus\", none of \
+             \"facts\", \"content\" and \"drive\": the aterm listening there has not read it yet"
+        )) && !proved.contains("no aterm here listens")
+            && !proved.contains("serving"),
+        "{proved}"
+    );
+    drop(serving);
+    ok(allow(&member.places, &args(&["facts"])));
+    assert_eq!(member.config(), config, "the remedy it names mends it");
 }
 
 #[test]
@@ -3717,17 +3854,11 @@ fn a_listen_place_another_node_answers_at_is_one_this_listener_is_not_on() {
     let head = |listed: &str| listed.lines().next().unwrap_or_default().to_owned();
     let unserved = ok(peers(&member.places, &[]));
     assert!(
-        head(&unserved).contains(&format!(
-            "([fleet] listen is 127.0.0.1:{port}, serving facts, but this machine's node did not \
-             prove itself there just now (nothing listens on 127.0.0.1:{port}"
+        head(&unserved).ends_with(&format!(
+            "([fleet] listen is 127.0.0.1:{port} and allow is facts, but nothing listens on \
+             127.0.0.1:{port} just now: no aterm runs here (no control socket here takes a \
+             connection): one started here reads [fleet] at launch and listens there)"
         )),
-        "{unserved}"
-    );
-    assert!(
-        head(&unserved).ends_with(
-            "): no aterm runs here, or it has not read [fleet] yet (`aterm ctl status` here says \
-             fleet=listening once it has))"
-        ),
         "{unserved}"
     );
     let held = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -3769,7 +3900,7 @@ fn a_listen_place_another_node_answers_at_is_one_this_listener_is_not_on() {
             assert!(head(&listed).ends_with(&said), "{listed}");
         } else {
             let said = format!(
-                "([fleet] listen is {place}, serving facts, but this machine's node did not \
+                "([fleet] listen is {place} and allow is facts, but this machine's node did not \
                  prove itself there just now (node {} answers at 127.0.0.1:{taken})",
                 &node[..8]
             );
@@ -5969,7 +6100,7 @@ fn a_members_drive_grant_follows_its_issuers_book() {
             && listed
                 .lines()
                 .next()
-                .is_some_and(|head| head.contains("serving content")),
+                .is_some_and(|head| head.contains("and allow is content, but")),
         "the header says the level the read's own write left: {listed}"
     );
     assert_eq!(grants(), Vec::<String>::new(), "the issuer took it out");
@@ -6184,6 +6315,8 @@ enum Other {
     Kill,
     // The book's lock held across the verb's next write, then the verb again.
     Busy,
+    // A level's write (`allow content`), tried inside a step under the book's lock too.
+    Level,
 }
 
 const DRIVER: &str = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
@@ -6267,7 +6400,7 @@ const RACES: &[Race] = &[
     Race {
         verb: "leave",
         fixture: Fixture::Granted,
-        steps: &["removed", "unlisten"],
+        steps: &["removed", "config", "unlisten"],
         run: |_, places, _| leave(places, &[]),
         again: None,
         alone: |end| end.key == "-" && !end.listen,
@@ -6275,7 +6408,7 @@ const RACES: &[Race] = &[
     Race {
         verb: "leave of no state directory",
         fixture: Fixture::Stale,
-        steps: &["removed", "unlisten"],
+        steps: &["removed", "config", "unlisten"],
         run: |_, places, _| leave(places, &[]),
         again: None,
         alone: |end| end.key == "-" && !end.listen,
@@ -6435,6 +6568,7 @@ fn interfere(other: Other, c_code: &str, places: &Places) {
         Other::Init => drop(init(places, &racing_init()).or_else(|_| init(places, &[]))),
         Other::Kill => panic!("killed here"),
         Other::Busy => unreachable!("the hook holds the book"),
+        Other::Level => drop(allow(places, &args(&["content"]))),
     }
 }
 
@@ -6624,6 +6758,12 @@ impl Racing {
                                 }
                                 other => interfere(other, &c_code, &here),
                             }
+                        } else if pending.get() && matches!(other, Other::Level) {
+                            // Inside the step: only a level written without the book's lock lands here.
+                            let landed = member::lock_waiting(Duration::ZERO, || {
+                                allow(&here, &args(&["content"]))
+                            });
+                            pending.set(landed.is_err());
                         }
                     }
                 };
@@ -6659,6 +6799,7 @@ fn race(racing: &Racing, race: &Race) -> Vec<String> {
         Other::Init,
         Other::Kill,
         Other::Busy,
+        Other::Level,
     ] {
         let (serial, instead) = if matches!(other, Other::Kill | Other::Busy) {
             (vec![alone.clone()], None)

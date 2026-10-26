@@ -1556,12 +1556,15 @@ fn captions_drawn(
     captions
 }
 
+/// The screens `event` steps through from where the page stands, until one repeats: the stops
+/// each shows whole, the captions it draws and its faults; `inspect` sees every screen.
 fn walk_screens(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
     view: crate::native_app::ViewId,
     cx: &ViewCx<'_>,
     event: &AppEvent,
+    mut inspect: impl FnMut(&crate::native_ui::CompiledUi),
 ) -> Walk {
     let mut walk = Walk::default();
     let mut before = None;
@@ -1577,6 +1580,7 @@ fn walk_screens(
             break;
         }
         before = Some(place);
+        inspect(&compiled);
         walk.whole.extend(shown_whole_on(&compiled, &plan, top));
         for (caption, whole) in captions_drawn(&compiled, &plan, top) {
             *walk.captions.entry(caption).or_insert(false) |= whole;
@@ -1653,11 +1657,23 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
                     state.page_reveal = None;
                 };
                 to_top(&mut runtime);
-                let wheel =
-                    walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollLines(1));
+                let wheel = walk_screens(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &cx,
+                    &AppEvent::ScrollLines(1),
+                    |_| {},
+                );
                 to_top(&mut runtime);
-                let page =
-                    walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollPage(1));
+                let page = walk_screens(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &cx,
+                    &AppEvent::ScrollPage(1),
+                    |_| {},
+                );
                 let never = |walk: &Walk| {
                     (0..n)
                         .filter(|stop| plan.paints(*stop) && !walk.whole.contains(stop))
@@ -2364,30 +2380,37 @@ fn the_wheel_leaves_no_note_alone_and_no_screen_draws_a_caption_twice() {
 /// the room holds) is all a screen can show of it. Negative control: Manual, Wallpaper, Tab Color, Tab Control, Harness, AI
 /// CLIs, Packages and About drew a 128pt list in 72pt at 2×, a control's height over a room the
 /// status bar's keep had taken, so the chrome ladder never gave the list that room; and a wrapped
-/// Auto/Light/Dark never showed Dark.
+/// Auto/Light/Dark never showed Dark. The room checks ride the stops' walks where a page has them
+/// (the wheel's screens once, not twice), and the windows spread over workers.
 #[test]
 fn a_narrow_short_window_gives_its_list_the_room_and_no_more() {
     at_each_text_scale(&[1.0, 2.0], "narrow short windows", |scale| {
-        let mut faults = Vec::new();
-        for (width, height) in [(178.0_f32, 152.0_f32), (164.0, 98.0)] {
-            let cx = view_cx_at(width, height);
-            for route in SettingsRoute::ALL {
+        let windows: Vec<(f32, f32, SettingsRoute)> = [(178.0_f32, 152.0_f32), (164.0, 98.0)]
+            .into_iter()
+            .flat_map(|(width, height)| {
+                SettingsRoute::ALL
+                    .into_iter()
+                    .map(move |route| (width, height, route))
+            })
+            .collect();
+        let faults = std::sync::Mutex::new(Vec::new());
+        on_workers(
+            &windows,
+            "narrow short windows",
+            |&(width, height, route)| {
+                let cx = view_cx_at(width, height);
                 let context = format!("{route:?} {width}x{height} {scale}x");
-                let (mut runtime, instance, view) = if route == SettingsRoute::Messages {
-                    super::setup_with_messages()
-                } else {
-                    paging_view("", route)
-                };
-                let mut before = None;
-                for _ in 0..400 {
-                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let mut found = Vec::new();
+                // Every screen: no list runs past the window's bottom edge, and an icon toolbar
+                // is as tall at 2x as at 1x.
+                let mut room = |compiled: &crate::native_ui::CompiledUi| {
                     for node in &compiled.paint {
                         let list = matches!(
                             &node.content,
                             UiContent::Group(spec) if spec.role == SemanticRole::List
                         );
                         if list && node.rect.bottom() > height + 0.5 {
-                            faults.push(format!(
+                            found.push(format!(
                                 "{context}: {} {:?} runs past the window",
                                 node.key.as_str(),
                                 node.rect
@@ -2405,38 +2428,57 @@ fn a_narrow_short_window_gives_its_list_the_room_and_no_more() {
                             .is_some();
                     if let Some(toolbar) = toolbar.filter(|toolbar| icons && toolbar.height > 52.5)
                     {
-                        faults.push(format!("{context}: an icon toolbar {toolbar:?} grew"));
+                        found.push(format!("{context}: an icon toolbar {toolbar:?} grew"));
                     }
-                    let state = messages_view_state(&runtime, view);
-                    let place = (state.page_scroll, state.messages_drawn.get());
-                    if before == Some(place) {
-                        break;
+                };
+                // The stops' walks by the wheel and by Page Down (Messages and the least window
+                // aside), whose screens the room checks see; else the wheel's screens alone.
+                let plan = (route != SettingsRoute::Messages && height >= 150.0)
+                    .then(|| {
+                        let (runtime, instance, view) = paging_view("", route);
+                        let _ = compile_settings_view(&runtime, instance, view, &cx);
+                        let plan = messages_view_state(&runtime, view).scroll_plan()?;
+                        Some((plan, runtime, instance, view))
+                    })
+                    .flatten();
+                let Some((plan, mut runtime, instance, view)) = plan else {
+                    let (mut runtime, instance, view) = if route == SettingsRoute::Messages {
+                        super::setup_with_messages()
+                    } else {
+                        paging_view("", route)
+                    };
+                    let mut before = None;
+                    for _ in 0..400 {
+                        room(&compile_settings_view(&runtime, instance, view, &cx));
+                        let state = messages_view_state(&runtime, view);
+                        let place = (state.page_scroll, state.messages_drawn.get());
+                        if before == Some(place) {
+                            break;
+                        }
+                        before = Some(place);
+                        runtime
+                            .dispatch(instance, view, AppEvent::ScrollLines(1))
+                            .unwrap();
                     }
-                    before = Some(place);
-                    runtime
-                        .dispatch(instance, view, AppEvent::ScrollLines(1))
-                        .unwrap();
-                }
-                if route == SettingsRoute::Messages || height < 150.0 {
-                    continue;
-                }
-                let (mut runtime, instance, view) = paging_view("", route);
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
-                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
-                    continue;
+                    faults
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend(found);
+                    return;
                 };
                 let held: Vec<usize> = (0..plan.len())
                     .filter(|&stop| {
                         plan.paints(stop) && plan.span(stop..stop + 1) <= plan.room() + 0.5
                     })
                     .collect();
+                let mut more = Vec::new();
                 for event in [AppEvent::ScrollLines(1), AppEvent::ScrollPage(1)] {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
                     state.scroll_page_to(0);
                     state.page_reveal = None;
-                    let walk = walk_screens(&mut runtime, instance, view, &cx, &event);
+                    let walk = walk_screens(&mut runtime, instance, view, &cx, &event, &mut room);
                     let never: Vec<String> = held
                         .iter()
                         .filter(|stop| !walk.whole.contains(stop))
@@ -2447,7 +2489,7 @@ fn a_narrow_short_window_gives_its_list_the_room_and_no_more() {
                         })
                         .collect();
                     if !never.is_empty() {
-                        faults.push(format!("{context} {event:?}: never whole {never:?}"));
+                        more.push(format!("{context} {event:?}: never whole {never:?}"));
                     }
                     // By the wheel every caption is whole on some screen; Page Down starts a
                     // screen bare where its stop fits only without its caption ([`starts_bare`]).
@@ -2458,11 +2500,19 @@ fn a_narrow_short_window_gives_its_list_the_room_and_no_more() {
                         .map(|(caption, _)| caption)
                         .collect();
                     if matches!(event, AppEvent::ScrollLines(_)) && !unread.is_empty() {
-                        faults.push(format!("{context}: captions never whole {unread:?}"));
+                        more.push(format!("{context}: captions never whole {unread:?}"));
                     }
                 }
-            }
-        }
+                found.extend(more);
+                faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(found);
+            },
+        );
+        let mut faults = faults
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         faults.sort();
         faults.dedup();
         assert!(

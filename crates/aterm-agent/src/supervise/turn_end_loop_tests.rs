@@ -24069,6 +24069,9 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         let (mut seen, mut books) = (0, Vec::new());
         let mut m = Mock::new(vec![spend.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
+        // Both clocks must stand while this fixture jumps to exact deadlines.
+        // A live monotonic read can move between the wall-clock conversions.
+        s.set_mono_standing();
         s.set_zone_lookup(test_zones);
         s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
         s.set_turn_end_timing(TurnEndTiming {
@@ -24121,15 +24124,17 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         let seed = usage_attempt(&books_path, Some("@s-1"));
         let mut m2 = Mock::new(vec![spend.clone()]);
         let mut s2 = session(&mut m2, Some("@s-1".to_string()));
+        s2.set_mono_standing();
         s2.set_clock(attach, PDT);
         s2.set_zone_lookup(test_zones);
         s2.ledger = Ledger::open(Some(&books_path), Some("@s-1"), &mut Vec::new());
+        let seeded_at = s2.fx.mono();
         seed_usage_act(
             &mut s2.turn_end,
             &books_path,
             s2.setup.sid.as_deref(),
             attach * 1000,
-            Instant::now(),
+            seeded_at,
         );
         s2.seed_wall_memory(open_wall(&books_path, Some("@s-1")));
         let next = if after {

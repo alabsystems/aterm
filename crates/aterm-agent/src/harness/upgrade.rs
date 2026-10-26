@@ -908,7 +908,9 @@ fn relaunch_line_exact(
         .chain(env.iter().map(|(_, v)| *v))
         .chain(cd)
     {
-        if w.chars().any(char::is_control) {
+        if w.chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return Err("a control character in the line".to_string());
         }
     }

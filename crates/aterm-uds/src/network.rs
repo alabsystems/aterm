@@ -202,3 +202,212 @@ mod tests {
         assert_eq!(value, Some(Ipv4Addr::new(255, 255, 0, 0).into()));
     }
 }
+
+/// A socket the kernel writes to on each change to this machine's addresses and links (and, on
+/// Linux, routes): `PF_ROUTE` on macOS, `NETLINK_ROUTE` joined to those groups on Linux. A retry
+/// that waits on it starts at the change (another Wi-Fi, a VPN, a wake), not at its next look.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub struct RouteChanges(std::os::fd::OwnedFd);
+
+/// The netlink groups [`RouteChanges`] joins (`linux/rtnetlink.h`): links, and IPv4 and IPv6
+/// addresses and routes; never neighbours, whose cache churns with LAN traffic.
+#[cfg(target_os = "linux")]
+const RTMGRP_CHANGES: u32 = 0x1 | 0x10 | 0x40 | 0x100 | 0x400;
+
+/// How long [`RouteChanges::wait`] gathers the rest of a burst once a change came: one change
+/// (an interface coming up) is several messages within milliseconds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const BURST: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The `PF_ROUTE` message types (`net/route.h`) that name a change of network: `RTM_NEWADDR`,
+/// `RTM_DELADDR`, `RTM_IFINFO` and `RTM_IFINFO2`.
+#[cfg(target_os = "macos")]
+const NETWORK_CHANGES: [u8; 4] = [0xc, 0xd, 0xe, 0x12];
+
+/// Whether one message a [`RouteChanges`] socket read names a change of network. On macOS
+/// `PF_ROUTE` carries every routing-table message, the ARP and neighbour entries that come and
+/// go with LAN traffic and each lookup's miss included: only an address added or removed, or a
+/// link's state, counts (`rtm_type`, the fourth byte of every header). On Linux the groups
+/// joined carry only changes. A read that overflowed (`ENOBUFS`) lost messages, so it counts.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn names_a_change(message: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        message
+            .get(3)
+            .is_some_and(|kind| NETWORK_CHANGES.contains(kind))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        !message.is_empty()
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl RouteChanges {
+    /// A socket that hears each change from now on; `None` where the kernel refuses one.
+    pub fn open() -> Option<RouteChanges> {
+        use std::os::fd::FromRawFd as _;
+        #[cfg(target_os = "macos")]
+        let (domain, kind, protocol) = (libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC);
+        #[cfg(target_os = "linux")]
+        let (domain, kind, protocol) = (
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        );
+        // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
+        let raw = unsafe { libc::socket(domain, kind, protocol) };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: F_SETFD takes an integer flag on this live descriptor.
+            if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return None;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: an all-zero sockaddr_nl is a valid value of the plain C struct.
+            let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            address.nl_groups = RTMGRP_CHANGES;
+            // SAFETY: `address` is a live sockaddr_nl and the length passed is its size.
+            let bound = unsafe {
+                libc::bind(
+                    raw,
+                    std::ptr::from_ref(&address).cast(),
+                    std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                )
+            };
+            if bound < 0 {
+                return None;
+            }
+        }
+        crate::keep_out_of_children(&fd).ok()?;
+        Some(RouteChanges(fd))
+    }
+
+    /// Wait at most `most` for a change of network ([`names_a_change`]), then read the rest of
+    /// its burst: whether one came. Messages that name none are read and passed over. A socket
+    /// that fails otherwise waits out `most` and says none came, so a retry that waits on it
+    /// keeps its own pace.
+    pub fn wait(&self, most: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + most;
+        let wait_out = || {
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+            false
+        };
+        loop {
+            match self.readable(deadline) {
+                Some(true) => {}
+                Some(false) => return false,
+                None => return wait_out(),
+            }
+            match self.drain() {
+                Some(true) => {
+                    let burst = std::time::Instant::now() + BURST;
+                    while self.readable(burst) == Some(true) && self.drain().is_some() {}
+                    return true;
+                }
+                Some(false) => {}
+                None => return wait_out(),
+            }
+        }
+    }
+
+    /// Whether a message is waiting by `deadline`; `None` when poll(2) failed otherwise than
+    /// by a signal's interruption (which looks again).
+    fn readable(&self, deadline: std::time::Instant) -> Option<bool> {
+        use std::os::fd::AsRawFd as _;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut poll = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: `poll` is one live pollfd and the count passed is 1.
+            let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
+            if ready >= 0 {
+                return Some(ready > 0);
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+    }
+
+    /// Read every message waiting: whether one named a change of network; `None` when the
+    /// socket failed (an overflow, which lost messages, counts as a change).
+    fn drain(&self) -> Option<bool> {
+        use std::os::fd::AsRawFd as _;
+        let mut buf = [0u8; 8192];
+        let mut changed = false;
+        loop {
+            // SAFETY: `buf` is live and writable for its whole length.
+            let read = unsafe {
+                libc::recv(
+                    self.0.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if let Ok(read) = usize::try_from(read)
+                && read > 0
+            {
+                changed |= names_a_change(&buf[..read]);
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                _ if read == 0 => changed.then_some(true),
+                Some(libc::EAGAIN | libc::EINTR) => Some(changed),
+                Some(libc::ENOBUFS) => Some(true),
+                _ => changed.then_some(true),
+            };
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod route_change_tests {
+    use super::*;
+
+    /// The kernel gives a process its route-change socket, and a wait on it ends by its bound
+    /// whether or not a change came meanwhile.
+    #[test]
+    fn a_route_change_socket_opens_and_its_wait_ends() {
+        let changes = RouteChanges::open().expect("the kernel's route socket");
+        let _came = changes.wait(std::time::Duration::from_millis(50));
+    }
+
+    /// An address added or removed, or a link's state, is a change of network; the ARP and
+    /// neighbour entries LAN traffic adds and drops, and a lookup's miss, are not (macOS's
+    /// `PF_ROUTE` carries them all).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_an_address_or_a_link_is_a_change_of_network() {
+        let message = |kind: u8| {
+            let mut header = vec![0u8; 92];
+            header[2] = 5; // RTM_VERSION
+            header[3] = kind;
+            header
+        };
+        // RTM_NEWADDR, RTM_DELADDR, RTM_IFINFO, RTM_IFINFO2.
+        for kind in [0xc, 0xd, 0xe, 0x12] {
+            assert!(names_a_change(&message(kind)), "type {kind:#x}");
+        }
+        // RTM_ADD, RTM_DELETE, RTM_CHANGE, RTM_GET, RTM_MISS, RTM_RESOLVE, RTM_NEWMADDR.
+        for kind in [0x1, 0x2, 0x3, 0x4, 0x7, 0xb, 0xf] {
+            assert!(!names_a_change(&message(kind)), "type {kind:#x}");
+        }
+        assert!(!names_a_change(&[]));
+    }
+}

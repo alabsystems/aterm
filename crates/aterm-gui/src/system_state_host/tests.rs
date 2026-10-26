@@ -5072,3 +5072,59 @@ fn a_widen_apply_the_watch_refuses_returns_the_page_to_the_plan_in_force() {
         "the watch may offer the review again"
     );
 }
+
+/// The threads the status reader's reads ran on, in order ([`one_thread_reads_every_status`]).
+static READ_ON: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+
+fn read_on_reader() -> SetupStatus {
+    READ_ON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(std::thread::current().id());
+    SetupStatus::default()
+}
+
+/// Wait (a hang detector) until the reader has read `n` times.
+fn reads_reach(n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while READ_ON.lock().map_or(0, |reads| reads.len()) < n {
+        assert!(Instant::now() < deadline, "the status reader never read");
+        std::thread::yield_now();
+    }
+}
+
+/// Every poll is read on one long-lived thread, never a thread per second; once setup finished
+/// and no page shows it the reader is let go and nothing is polled, and the next poll a worker's
+/// publication asks for starts a reader again.
+#[test]
+fn one_thread_reads_every_status() {
+    let mut app = App::headless_for_test();
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        status: read_on_reader,
+        ..InitialSetupHandlers::inert_for_test()
+    });
+    for n in 1..=3 {
+        app.system_state_host.status_in_flight = false;
+        app.system_state_host.next_status = Some(Instant::now());
+        app.poll_system_state_status(Instant::now());
+        reads_reach(n);
+    }
+    let reads = READ_ON.lock().unwrap().clone();
+    assert_eq!(reads.len(), 3);
+    assert!(
+        reads.iter().all(|thread| *thread == reads[0]),
+        "one reader thread: {reads:?}"
+    );
+    assert_ne!(reads[0], std::thread::current().id(), "never the UI thread");
+    app.publish_system_state(SetupStatus {
+        finished: true,
+        ..SetupStatus::default()
+    });
+    assert!(app.system_state_host.status_reader.is_none(), "let go");
+    assert_eq!(app.system_state_host.next_status, None, "nothing polled");
+    app.publish_system_state(running());
+    assert!(
+        app.system_state_host.next_status.is_some(),
+        "a run going is read again"
+    );
+}

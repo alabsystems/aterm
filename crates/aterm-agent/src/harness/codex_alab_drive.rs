@@ -285,6 +285,12 @@ pub(super) fn self_claimed_after_exit(
     let Some(run) = snap.codex() else {
         return said(r, "refused:not-codex");
     };
+    if let Err(why) = resume.validate_structural() {
+        return said(r, format!("refused:{why}"));
+    }
+    let Some(twin) = resume.argv.first().cloned() else {
+        return said(r, "refused:no-resume-line");
+    };
     let _held = match super::sweep_lock(opts) {
         Ok(lock) => lock,
         Err(why) => return said(r, format!("busy:{why}")),
@@ -294,8 +300,12 @@ pub(super) fn self_claimed_after_exit(
     }
     let witnesses = super::super::self_claimed::Witnesses::under(&opts.state);
     if let Some(mut st) = load(opts, &session).filter(St::in_flight) {
+        let want_cwd = resume.cwd.as_deref().unwrap_or(snap.cwd.as_str());
         if st.pid == snap.pid
             && st.resume_argv == resume.argv
+            && st.cwd == want_cwd
+            && st.codex_home_env == resume.codex_home
+            && st.codex_auth_path == resume.codex_auth_path
             && (st.resume_start.is_empty() || st.resume_start == snap.start)
         {
             st.resume_start.clone_from(&snap.start);
@@ -335,7 +345,7 @@ pub(super) fn self_claimed_after_exit(
         codex_auth_path: resume.codex_auth_path.clone(),
         argv: snap.argv.clone(),
         cwd: resume.cwd.clone().unwrap_or_else(|| snap.cwd.clone()),
-        twin: resume.argv[0].clone(),
+        twin,
         resume_argv: resume.argv.clone(),
         resume_home: resume.codex_home.clone().unwrap_or_default(),
         resume_start: snap.start.clone(),

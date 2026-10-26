@@ -28,8 +28,8 @@ pub use carry::{
 };
 pub use journal_log::{JOURNAL_IMAGE_MAX_RECORDS, JournalImage};
 pub use mirror::{
-    BusCopy, BusCursor, CoverWhy, ENTRY_BYTES, LOG_MIRROR_BYTES, LandRefused, Landed, Prior,
-    SNAP_EVERY, Slot, SlotKind, TAKE_MAX, Take, cover_body, is_bus_step,
+    BusCopy, BusCursor, CoverWhy, ENTRY_BYTES, LOG_MIRROR_BYTES, LandRefused, Landed,
+    MAIL_SNAP_GAP_MS, Prior, SNAP_EVERY, Slot, SlotKind, TAKE_MAX, Take, cover_body, is_bus_step,
 };
 #[path = "log_quota.rs"]
 mod quota;

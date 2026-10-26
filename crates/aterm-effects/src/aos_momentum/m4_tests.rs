@@ -916,13 +916,20 @@ fn each_grid_plans_label_is_selects_feedback() {
     }
 }
 
+/// A pool's outcome, folded from its labels, is the outcome the search selects from its plans,
+/// on sixteen subsets of `T_0`'s first pool. Each `select` trains its plans anew on every
+/// training item (the test's whole cost: 64 subsets ran past a minute at a machine load of 40),
+/// and these sixteen already reach every way a search ends: a selection, `NoGain` and
+/// `NoneAdmitted`, each with one to three plans admitted, and a winner tied on `ΣT` (so `ΣZ`
+/// and the bytes decide) under a selection and under `NoGain`.
 #[test]
 fn a_pool_outcome_is_selects_outcome() {
     let ev = evaluator();
     let (pool, labels) = train_pool();
     let mut r = SplitMix::new(0x6d36_6469_6666_6572);
     let mut classes = [0usize; 3];
-    for _ in 0..64 {
+    let mut tied = [false; 2];
+    for _ in 0..16 {
         let mut picked: Vec<usize> = Vec::new();
         while picked.len() < JUDGED {
             let i = usize::try_from(r.below(64)).expect("an index");
@@ -932,6 +939,16 @@ fn a_pool_outcome_is_selects_outcome() {
         }
         let outcome = ev.pool_outcome(core::array::from_fn(|n| &labels[picked[n]]));
         classes[usize::from(outcome.class())] += 1;
+        let ticks: Vec<u64> = picked
+            .iter()
+            .filter_map(|&i| labels[i].totals().map(|t| t.ticks))
+            .collect();
+        if let Some(least) = ticks.iter().min()
+            && ticks.iter().filter(|&&t| t == *least).count() > 1
+            && let Some(tie) = tied.get_mut(usize::from(outcome.class()))
+        {
+            *tie = true;
+        }
         let mut spy = Spy {
             plans: picked.iter().map(|&i| pool[i]).collect(),
             asked: Vec::new(),
@@ -964,8 +981,9 @@ fn a_pool_outcome_is_selects_outcome() {
         }
     }
     assert!(
-        classes[0] > 0 && classes[1] > 0,
-        "the subsets reach both a selection and NoGain, so the split between them is tested: {classes:?}"
+        classes.iter().all(|&n| n > 0) && tied.iter().all(|&t| t),
+        "the subsets reach a selection, NoGain and NoneAdmitted, and a tied winner under the \
+         first two, so each way a search ends is tested: {classes:?} {tied:?}"
     );
 }
 

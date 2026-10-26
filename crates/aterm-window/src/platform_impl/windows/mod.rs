@@ -6,68 +6,44 @@
 
 use crate::keyboard::SmolStr;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, WINDOW_LONG_PTR_INDEX};
+use windows_sys::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX;
 
 pub(crate) use self::event_loop::{
-    ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle,
-    PlatformSpecificEventLoopAttributes,
+    ActiveEventLoop, EventLoop, EventLoopProxy, PlatformSpecificEventLoopAttributes,
 };
-pub(crate) use self::icon::{SelectedCursor, WinIcon};
+pub(crate) use self::icon::WinIcon;
 pub(crate) use self::keyboard::scancode_to_physicalkey;
-pub(crate) use self::monitor::{MonitorHandle, VideoModeHandle};
+pub(crate) use self::monitor::MonitorHandle;
 pub(crate) use self::window::Window;
 
-pub(crate) use self::icon::WinCursor as PlatformCustomCursor;
 pub use self::icon::WinIcon as PlatformIcon;
-pub(crate) use crate::cursor::OnlyCursorImageSource as PlatformCustomCursorSource;
 use crate::platform_impl::Fullscreen;
 
 use crate::event::DeviceId as RootDeviceId;
 use crate::icon::Icon;
 use crate::keyboard::Key;
-use crate::platform::windows::{BackdropType, Color, CornerPreference};
 
+/// LOCAL PATCH (aterm): only what `WindowAttributesExtWindows` still sets. Upstream's owner window,
+/// menu, drag-and-drop switch, taskbar skip, undecorated shadow, system backdrop, clip-children
+/// switch, border, caption and title colours and corner preference had no aterm caller; their
+/// defaults are folded into `window::init` (no owner or menu, an OLE drop target, on the taskbar,
+/// `WS_CLIPCHILDREN`, and DWM's own backdrop, colours and corners).
 #[derive(Clone, Debug)]
 pub struct PlatformSpecificWindowAttributes {
-    pub owner: Option<HWND>,
-    pub menu: Option<HMENU>,
     pub taskbar_icon: Option<Icon>,
     pub no_redirection_bitmap: bool,
-    pub drag_and_drop: bool,
-    pub skip_taskbar: bool,
     pub class_name: String,
-    pub decoration_shadow: bool,
-    pub backdrop_type: BackdropType,
-    pub clip_children: bool,
-    pub border_color: Option<Color>,
-    pub title_background_color: Option<Color>,
-    pub title_text_color: Option<Color>,
-    pub corner_preference: Option<CornerPreference>,
 }
 
 impl Default for PlatformSpecificWindowAttributes {
     fn default() -> Self {
         Self {
-            owner: None,
-            menu: None,
             taskbar_icon: None,
             no_redirection_bitmap: false,
-            drag_and_drop: true,
-            skip_taskbar: false,
             class_name: "Window Class".to_string(),
-            decoration_shadow: false,
-            backdrop_type: BackdropType::default(),
-            clip_children: true,
-            border_color: None,
-            title_background_color: None,
-            title_text_color: None,
-            corner_preference: None,
         }
     }
 }
-
-unsafe impl Send for PlatformSpecificWindowAttributes {}
-unsafe impl Sync for PlatformSpecificWindowAttributes {}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceId(u32);
@@ -78,22 +54,11 @@ impl DeviceId {
     }
 }
 
-impl DeviceId {
-    pub fn persistent_identifier(&self) -> Option<String> {
-        if self.0 != 0 {
-            raw_input::get_raw_input_device_name(handle::from_usize(self.0 as usize))
-        } else {
-            None
-        }
-    }
-}
-
 // Constant device ID, to be removed when this backend is updated to report real device IDs.
+//
+// LOCAL PATCH (aterm): the only one: the raw-input devices that had their own ids reported device
+// events, which no aterm crate reads, and the backend registers for raw input no more.
 const DEVICE_ID: RootDeviceId = RootDeviceId(DeviceId(0));
-
-fn wrap_device_id(id: u32) -> RootDeviceId {
-    RootDeviceId(DeviceId(id))
-}
 
 pub type OsError = std::io::Error;
 
@@ -193,14 +158,13 @@ mod dpi;
 mod drop_handler;
 mod handle;
 
-pub(crate) use self::handle::{from_isize as handle_from_isize, to_isize as handle_to_isize};
+pub(crate) use self::handle::to_isize as handle_to_isize;
 mod event_loop;
 mod icon;
 mod ime;
 mod keyboard;
 mod keyboard_layout;
 mod monitor;
-mod raw_input;
 #[cfg(any(test, debug_assertions))]
 pub mod recorded;
 mod window;

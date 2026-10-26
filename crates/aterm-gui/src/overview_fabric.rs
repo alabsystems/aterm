@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OVERVIEW'S "ON THE FABRIC" GROUP: what the fabric's log says the sessions on this aterm's fabric's OTHER machines need of the person — a UX decision made from the stream alone, readable with `controls overview`.
+//! THE OVERVIEW'S "ON THE FABRIC" GROUP: what the fabric's log says the sessions of this aterm's fabric's OTHER nodes need of the person — a UX decision made from the stream alone, readable with `controls overview`. This node's own sessions (`"this":true`) are left to the window groups. The fabric is one machine's bus today (one root and one broker socket per HOME, a Unix-socket transport, and no aterm command that puts a second node on a broker), so the group stays empty until another node shares the broker, which needs astream to carry a bus between machines.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,15 @@ const READ_BUDGET: &str = "100000";
 /// sessions); the rest are not listed.
 const NEEDS_MAX: usize = 1024;
 
-/// One session on another machine whose fold names an observed need.
+/// The brief's key saying a session is this node's own (`"this":true`),
+/// which the group leaves to the window groups and Summarize's sentence
+/// ([`crate::summarize::FABRIC_READ`]) names.
+pub(crate) const THIS_KEY: &str = "this";
+
+/// The brief's key naming a session's node.
+pub(crate) const NODE_KEY: &str = "node";
+
+/// One session of another node whose fold names an observed need.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FabricNeed {
     /// Its node id.
@@ -33,7 +41,7 @@ pub(crate) struct FabricNeed {
     pub(crate) detail: Option<String>,
     /// How old the fold's newest record was at the read, in seconds; `None` when the brief could not say.
     pub(crate) age_s: Option<u64>,
-    /// Its node is gone (the brief's `partial` holds `node-gone`): the session ended without its close, and nobody can answer it there.
+    /// The brief judges it gone (its `partial` holds a [`aterm_slog::bus::Gone`] word, `node-gone` or `no-close`): the session ended without its close, and nobody can answer it there.
     pub(crate) gone: bool,
 }
 
@@ -80,6 +88,31 @@ fn word(obj: &aterm_json::Map, key: &str) -> Option<String> {
         .map(|w| crate::needs::fold_clip(w, 64))
 }
 
+/// The need's `detail` of a brief object (a wall's reset, `in 1m` or
+/// `3pm (America/Los_Angeles)`; a failure's exit code), its spaces kept and
+/// clipped as a word is: `None` for a blank one or one holding a control
+/// character. Only the chip's words show it; `controls overview` prints
+/// `need=` and never the detail, so a space cannot split its line.
+fn detail(obj: &aterm_json::Map) -> Option<String> {
+    obj.get("detail")
+        .and_then(aterm_json::Value::as_str)
+        .filter(|d| !d.trim().is_empty() && !d.chars().any(char::is_control))
+        .map(|d| crate::needs::fold_clip(d, 64))
+}
+
+/// Whether the brief judges a session gone without its close: its
+/// `partial` holds a word [`aterm_slog::bus::Gone`] names (its node gone, or
+/// its own presence exited), the words the brief writes.
+fn gone(obj: &aterm_json::Map) -> bool {
+    obj.get("partial")
+        .and_then(aterm_json::Value::as_array)
+        .is_some_and(|why| {
+            why.iter()
+                .filter_map(aterm_json::Value::as_str)
+                .any(|w| aterm_slog::bus::Gone::of_word(w).is_some())
+        })
+}
+
 /// THE READ, PARSED: `json` is `aterm fabric brief --json`'s answer, read at `now_ms`.
 pub(crate) fn parse(json: &str, now_ms: u64) -> Result<FabricSnapshot, ReadFail> {
     let value: aterm_json::Value = aterm_json::from_str(json).map_err(|_| ReadFail::NoBrief)?;
@@ -90,18 +123,15 @@ pub(crate) fn parse(json: &str, now_ms: u64) -> Result<FabricSnapshot, ReadFail>
     let needs = sessions
         .iter()
         .filter_map(aterm_json::Value::as_object)
-        .filter(|s| s.get("this").and_then(aterm_json::Value::as_bool) != Some(true))
+        .filter(|s| s.get(THIS_KEY).and_then(aterm_json::Value::as_bool) != Some(true))
         .filter_map(|s| {
             Some(FabricNeed {
-                node: word(s, "node")?,
+                node: word(s, NODE_KEY)?,
                 sid: word(s, "sid")?,
                 need: word(s, "need")?,
-                detail: word(s, "detail"),
+                detail: detail(s),
                 age_s: s.get("age_s").and_then(aterm_json::Value::as_u64),
-                gone: s
-                    .get("partial")
-                    .and_then(aterm_json::Value::as_array)
-                    .is_some_and(|why| why.iter().any(|w| w.as_str() == Some("node-gone"))),
+                gone: gone(s),
             })
         })
         .take(NEEDS_MAX)

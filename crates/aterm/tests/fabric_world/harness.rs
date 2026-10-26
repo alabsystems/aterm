@@ -1678,7 +1678,7 @@ pub fn alive(pid: i32) -> bool {
 impl World {
     /// Relaunches `aterm` against the same scratch world.
     pub fn relaunch_gui(w: &World) -> OwnedChild {
-        Self::relaunch_gui_by(w, false)
+        Self::relaunch_gui_by(w, false, &[])
     }
 
     /// [`World::relaunch_gui`] taking the durable flushes aterm ships: the instance, and the
@@ -1686,10 +1686,16 @@ impl World {
     /// takes a plain `fsync(2)` ([`ship_durable_flushes`]), so what their lines time is what
     /// ships.
     pub fn relaunch_gui_shipping_flushes(w: &World) -> OwnedChild {
-        Self::relaunch_gui_by(w, true)
+        Self::relaunch_gui_by(w, true, &[])
     }
 
-    fn relaunch_gui_by(w: &World, shipping_flushes: bool) -> OwnedChild {
+    /// [`World::relaunch_gui_shipping_flushes`] with `env` on the instance, as [`World::boot_with`]
+    /// puts it on the first.
+    pub fn relaunch_gui_shipping_flushes_with(w: &World, env: &[(&str, &str)]) -> OwnedChild {
+        Self::relaunch_gui_by(w, true, env)
+    }
+
+    fn relaunch_gui_by(w: &World, shipping_flushes: bool, env: &[(&str, &str)]) -> OwnedChild {
         let fabric_cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd"))
             .expect("the boot recorded its fabric command");
         let out = std::fs::OpenOptions::new()
@@ -1713,6 +1719,9 @@ impl World {
             .stderr(err);
         if shipping_flushes {
             ship_durable_flushes(&mut cmd);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         let lifeline =
             aterm_uds::lifeline::Lifeline::arm(&mut cmd, &w.tmp).expect("relaunch lifeline");

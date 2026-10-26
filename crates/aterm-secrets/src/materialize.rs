@@ -32,7 +32,7 @@ pub struct Report {
     /// looked at, or ` if-absent` entries whose target or anchor is the machine's own or whose
     /// anchor could not be looked at.
     pub left: Vec<String>,
-    /// Not written: the name and why (never the value).
+    /// Not written, or not removed: the name and why (never the value).
     pub failed: Vec<(String, String)>,
 }
 
@@ -187,6 +187,9 @@ pub fn apply_resuming(
     let mut claimed: BTreeMap<(u64, u64), String> = BTreeMap::new();
     let mut spared: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut withdrawn: Vec<(String, String)> = Vec::new();
+    // Each directory a write renamed a file into: the entries written there, and the digest
+    // each held before ([`flush_written`]).
+    let mut written_in: BTreeMap<PathBuf, Vec<(String, Option<String>)>> = BTreeMap::new();
     for entry in entries {
         let mut held_digest = held.files.get(&entry.name);
         let placed = match target_path(home, &entry.name) {
@@ -263,6 +266,15 @@ pub fn apply_resuming(
                     .files
                     .insert(entry.name.clone(), digest_hex(entry.value.as_slice()));
                 report.written.push(entry.name.clone());
+                if let Some(dir) = target_path(home, &entry.name)
+                    .ok()
+                    .and_then(|target| target.parent().map(Path::to_path_buf))
+                {
+                    written_in
+                        .entry(dir)
+                        .or_default()
+                        .push((entry.name.clone(), held_digest.cloned()));
+                }
             }
             Ok(Placed::Unchanged) => {
                 manifest
@@ -289,6 +301,7 @@ pub fn apply_resuming(
             }
         }
     }
+    flush_written(&written_in, &mut manifest, &mut report);
     let dropped = held
         .files
         .iter()
@@ -327,6 +340,34 @@ pub fn apply_resuming(
         }
     }
     Ok((manifest, report))
+}
+
+/// Flush once each directory this pass's writes renamed files into (`written_in`), after their
+/// ordered writes ([`fsx::write_ordered`]): N files cost N ordered flushes and one durable flush
+/// per directory, not two durable flushes each, and their renames are durable before the state
+/// that names them is saved. An entry whose directory's flush failed (other than as one the
+/// volume cannot flush) failed, with the digest it held before kept, as a write that failed
+/// after its rename always has: the next pass writes it again.
+fn flush_written(
+    written_in: &BTreeMap<PathBuf, Vec<(String, Option<String>)>>,
+    manifest: &mut Manifest,
+    report: &mut Report,
+) {
+    for (dir, written) in written_in {
+        let Err(error) = aterm_durable::Flush::Durable.dir_best_effort(dir) else {
+            continue;
+        };
+        for (name, held) in written {
+            report.written.retain(|done| done != name);
+            match held {
+                Some(digest) => manifest.files.insert(name.clone(), digest.clone()),
+                None => manifest.files.remove(name),
+            };
+            report
+                .failed
+                .push((name.clone(), format!("{}: {error}", dir.display())));
+        }
+    }
 }
 
 fn to_write(
@@ -518,7 +559,7 @@ fn place(
         let to = move_aside(places, &entry.name, target)?;
         report.moved_aside.push((entry.name.clone(), to));
     }
-    fsx::write_atomic(target, value, 0o600).map_err(|error| error.0)?;
+    fsx::write_ordered(target, value, 0o600).map_err(|error| error.0)?;
     Ok(Placed::Written)
 }
 
@@ -537,7 +578,7 @@ fn fill(
     };
     match kind {
         Kind::Missing if standing == Standing::Vaults => {
-            if fsx::write_new(target, value, 0o600).map_err(|error| error.0)? {
+            if fsx::write_new_ordered(target, value, 0o600).map_err(|error| error.0)? {
                 Ok(Placed::Written)
             } else {
                 changed()
@@ -552,7 +593,7 @@ fn fill(
                 Ok(Placed::Unchanged)
             }
             (Judged::Ours, Standing::Vaults) => {
-                fsx::write_atomic(target, value, 0o600).map_err(|error| error.0)?;
+                fsx::write_ordered(target, value, 0o600).map_err(|error| error.0)?;
                 Ok(Placed::Written)
             }
             (Judged::Same | Judged::Ours, Standing::Own) => Ok(Placed::Withdrawn),

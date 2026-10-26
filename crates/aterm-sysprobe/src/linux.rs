@@ -457,6 +457,206 @@ pub fn tcp_counts_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<TcpCo
     any.then_some(counts)
 }
 
+const NLMSG_HDRLEN: usize = 16;
+const NLMSG_NOOP: u16 = 1;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
+const INET_DIAG_MSG_LEN: usize = 72;
+const INET_DIAG_DST_AT: usize = 24;
+const INET_DIAG_INFO_ATTR: u16 = 2;
+const NLA_HDRLEN: usize = 4;
+const NLA_TYPE_MASK: u16 = 0x3fff;
+/// Byte offset of `tcpi_rtt` (`u32`, microseconds) inside Linux UAPI `struct tcp_info`.
+const TCPI_RTT_AT: usize = 68;
+const LINUX_AF_INET: u8 = 2;
+const LINUX_AF_INET6: u8 = 10;
+const LINUX_TCP_ESTABLISHED: u8 = 1;
+
+fn inet_diag_remote_peer(family: u8, dst: &[u8]) -> bool {
+    if dst.len() < 16 {
+        return false;
+    }
+    match family {
+        LINUX_AF_INET => dst[0] != 127 && dst[..4] != [0, 0, 0, 0],
+        LINUX_AF_INET6 => {
+            if dst[..16] == [0u8; 16] {
+                return false;
+            }
+            if dst[..15] == [0u8; 15] && dst[15] == 1 {
+                return false;
+            }
+            if dst[..10] == [0u8; 10]
+                && dst[10..12] == [0xff, 0xff]
+                && (dst[12] == 127 || dst[12..16] == [0, 0, 0, 0])
+            {
+                return false;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Parse one `NETLINK_SOCK_DIAG` datagram of `SOCK_DIAG_BY_FAMILY` messages, appending positive
+/// non-loopback `tcpi_rtt` readings (converted from microseconds to milliseconds) into `rtts`.
+/// Returns `Some(true)` once `NLMSG_DONE` is seen, `Some(false)` when more datagrams follow, and
+/// `None` on `NLMSG_ERROR` or malformed framing.
+pub fn parse_inet_diag_rtts(buf: &[u8], rtts: &mut Vec<f32>) -> Option<bool> {
+    let mut off = 0usize;
+    while off + NLMSG_HDRLEN <= buf.len() {
+        let nlmsg_len = u32::from_ne_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
+        if nlmsg_len < NLMSG_HDRLEN || off + nlmsg_len > buf.len() {
+            return None;
+        }
+        let nlmsg_type = u16::from_ne_bytes(buf.get(off + 4..off + 6)?.try_into().ok()?);
+        let msg = &buf[off + NLMSG_HDRLEN..off + nlmsg_len];
+        match nlmsg_type {
+            NLMSG_NOOP => {}
+            NLMSG_DONE => return Some(true),
+            NLMSG_ERROR => return None,
+            SOCK_DIAG_BY_FAMILY if msg.len() >= INET_DIAG_MSG_LEN => {
+                let family = msg[0];
+                let state = msg[1];
+                let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
+                if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
+                    let mut attrs = &msg[INET_DIAG_MSG_LEN..];
+                    while attrs.len() >= NLA_HDRLEN {
+                        let nla_len =
+                            u16::from_ne_bytes(attrs.get(0..2)?.try_into().ok()?) as usize;
+                        if nla_len < NLA_HDRLEN || nla_len > attrs.len() {
+                            break;
+                        }
+                        let nla_type =
+                            u16::from_ne_bytes(attrs.get(2..4)?.try_into().ok()?) & NLA_TYPE_MASK;
+                        if nla_type == INET_DIAG_INFO_ATTR {
+                            let info = &attrs[NLA_HDRLEN..nla_len];
+                            if let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4) {
+                                let rtt_us = u32::from_ne_bytes(raw.try_into().ok()?);
+                                if rtt_us > 0 {
+                                    let ms = (rtt_us as f32) / 1_000.0;
+                                    if ms.is_finite() && ms > 0.0 {
+                                        rtts.push(ms);
+                                    }
+                                }
+                            }
+                        }
+                        let step = nla_len.next_multiple_of(4);
+                        if step >= attrs.len() {
+                            break;
+                        }
+                        attrs = &attrs[step..];
+                    }
+                }
+            }
+            _ => {}
+        }
+        let step = nlmsg_len.next_multiple_of(4);
+        if off.saturating_add(step) <= off {
+            break;
+        }
+        off = off.saturating_add(step);
+    }
+    Some(false)
+}
+
+/// Median RTT in milliseconds over `rtts` (sorts `rtts` in place), or `None` when empty.
+#[must_use]
+pub fn median_rtt_ms(rtts: &mut [f32]) -> Option<f32> {
+    if rtts.is_empty() {
+        return None;
+    }
+    rtts.sort_by(f32::total_cmp);
+    let n = rtts.len();
+    Some((rtts[(n - 1) / 2] + rtts[n / 2]) * 0.5)
+}
+
+/// Read median passive kernel TCP smoothed RTT (`tcpi_rtt`, milliseconds) across established
+/// non-loopback IPv4 and IPv6 sockets via `NETLINK_SOCK_DIAG`, or `None` if unavailable/empty.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn tcp_srtt_ms() -> Option<f32> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    const NLM_F_REQUEST: u16 = 0x01;
+    const NLM_F_DUMP: u16 = 0x300;
+    const REQ_LEN: usize = NLMSG_HDRLEN + 56;
+    // SAFETY: Plain integer flags; non-blocking + close-on-exec datagram netlink socket owned by `OwnedFd`.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_SOCK_DIAG,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a freshly created file descriptor >= 0.
+    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut rtts = Vec::new();
+    let mut recv_buf = [0u8; 32 * 1024];
+    for (seq, family) in [(1u32, LINUX_AF_INET), (2u32, LINUX_AF_INET6)] {
+        let mut req = [0u8; REQ_LEN];
+        req[0..4].copy_from_slice(&(REQ_LEN as u32).to_ne_bytes());
+        req[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+        req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        req[8..12].copy_from_slice(&seq.to_ne_bytes());
+        req[NLMSG_HDRLEN] = family;
+        req[NLMSG_HDRLEN + 1] = libc::IPPROTO_TCP as u8;
+        req[NLMSG_HDRLEN + 2] = 1u8 << (INET_DIAG_INFO_ATTR - 1);
+        req[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8]
+            .copy_from_slice(&(1u32 << LINUX_TCP_ESTABLISHED).to_ne_bytes());
+        // SAFETY: `sock` is valid and `req` is `REQ_LEN` readable bytes.
+        let sent = unsafe { libc::send(sock.as_raw_fd(), req.as_ptr().cast(), REQ_LEN, 0) };
+        if sent != REQ_LEN as isize {
+            continue;
+        }
+        for _ in 0..64 {
+            // SAFETY: `sock` is valid and `recv_buf` is writable for `recv_buf.len()` bytes.
+            let n = unsafe {
+                libc::recv(
+                    sock.as_raw_fd(),
+                    recv_buf.as_mut_ptr().cast(),
+                    recv_buf.len(),
+                    0,
+                )
+            };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            match parse_inet_diag_rtts(&recv_buf[..n as usize], &mut rtts) {
+                Some(true) | None => break,
+                Some(false) => {}
+            }
+        }
+    }
+    median_rtt_ms(&mut rtts)
+}
+
+/// Count `socket:[...]` symlinks inside a `/proc/<pid>/fd` directory (at most 4096 descriptors).
+#[must_use]
+pub fn open_sockets_in_fd_dir(fd_dir: &Path) -> Option<u32> {
+    let entries = std::fs::read_dir(fd_dir).ok()?;
+    let mut count = 0u32;
+    for entry in entries.flatten().take(4096) {
+        if let Ok(target) = std::fs::read_link(entry.path())
+            && target
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(b"socket:[")
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Some(count)
+}
+
 /// The kernel's count of every thread on the machine, kernel threads included.
 #[must_use]
 pub fn loadavg_tasks(text: &str) -> Option<u64> {
@@ -963,6 +1163,12 @@ impl Root {
     pub fn present_or_parallelism(&self) -> Vec<u16> {
         self.present()
             .unwrap_or_else(|| (0..crate::machine::parallelism()).collect())
+    }
+
+    /// Count open socket descriptors for `pid` under `<root>/proc/<pid>/fd`.
+    #[must_use]
+    pub fn open_socket_count(&self, pid: u32) -> Option<u32> {
+        open_sockets_in_fd_dir(&self.at(&format!("proc/{pid}/fd")))
     }
 
     /// Every thread on the machine (`/proc/loadavg`, [`loadavg_tasks`]), the count `kernel/pid_max` and `threads-max` bound.

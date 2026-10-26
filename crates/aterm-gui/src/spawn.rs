@@ -8409,14 +8409,17 @@ fn login_shell_path_with(
     args: &[&str],
     budget: std::time::Duration,
 ) -> Option<String> {
+    use aterm_uds::spawnfd::Tether as _;
     #[cfg(test)]
     LOGIN_SHELL_ASKS.with(|asks| asks.set(asks.get() + 1));
     let mut command = crate::qos::command(crate::qos::Role::Background, program);
+    // Tethered: a login shell can wait on its rc files for ever, and only `budget` ends it.
     command
         .args(args)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .stderr(aterm_uds::spawnfd::Stdio::null());
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .tether();
     #[cfg(unix)]
     command.setsid(true);
     let mut child = command.spawn().ok()?;

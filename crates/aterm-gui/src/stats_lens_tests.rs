@@ -1642,3 +1642,61 @@ fn a_cjk_line_of_the_lens_wraps_between_its_characters() {
         ["one two", "three"]
     );
 }
+
+#[test]
+fn cpu_and_network_lenses_surface_chip_connectivity_latency_and_scoped_sockets() {
+    let mut snap = lens_scene(Scene::Calm);
+    snap.facts.cpu_brand = Some("Apple M5 Max".into());
+    let cpu_laid = lay_lens(
+        &shell(1119.0, 760.0, 2.0),
+        &input(&snap, dark_inks()),
+        &pinned(Instrument::Cpu),
+        &FaceMetrics::helvetica_neue(),
+        false,
+    );
+    assert!(
+        cpu_laid
+            .boxes
+            .iter()
+            .any(|b| b.text.contains("Apple M5 Max")),
+        "CPU lens header names the processor chip: {:?}",
+        cpu_laid.boxes
+    );
+
+    snap.net = Some(aterm_vitals::NetView {
+        rates: Some(aterm_vitals::LinkRates {
+            rx_bps: 8_400_000.0,
+            tx_bps: 1_200_000.0,
+            rx_pps: 6_000.0,
+            tx_pps: 1_000.0,
+            rx_err_ps: 0.0,
+            tx_err_ps: 0.0,
+            rx_drop_ps: 0.0,
+            tx_drop_ps: None,
+        }),
+        srtt_ms: Some(14.6),
+        state: aterm_vitals::NetState::Online,
+        aterm_sockets: Some(12),
+        tab_sockets: vec![(1, 4)],
+        ..aterm_vitals::NetView::default()
+    });
+    snap.resources[Resource::Network.index()].aterm = aterm_vitals::ScopeFig {
+        now: Some(12.0),
+        missing: None,
+        ..aterm_vitals::ScopeFig::default()
+    };
+    let net = heard(&snap, pinned(Instrument::Network));
+    let details = well(&net, "Details");
+    assert!(
+        details.contains("Connectivity: Online") && details.contains("14.6 ms"),
+        "Network lens surfaces live state and passive TCP RTT: {details}"
+    );
+    assert!(
+        details.contains("open sockets counted per scope"),
+        "Network lens explains per-scope socket attribution: {details}"
+    );
+    assert!(
+        !details.contains("no per-app network figure"),
+        "Network lens drops 'no per-app network figure' when socket figures are present: {details}"
+    );
+}

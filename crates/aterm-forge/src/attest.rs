@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_toml::edit::{DocumentMut, Item, TableLike};
 
+use crate::pristine::Pristine;
 use crate::{Outcome, PRECISION_NOTE};
 
 /// The marker each Trust-discharged fix inside a fork carries.
@@ -626,6 +627,11 @@ pub fn report(root: &Path) -> Attestation {
 
 /// [`report`], asking `cargo` for the vendored submodule's metadata.
 pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
+    report_using(cargo, &Pristine::host(), root)
+}
+
+/// [`report_with`], `[OB-7]` taking its pristine copies from `pristine`.
+fn report_using(cargo: &crate::resolve::Cargo, pristine: &Pristine, root: &Path) -> Attestation {
     let mut log = String::new();
     let mut fails = 0usize;
     let mut could_not_run = None;
@@ -707,7 +713,8 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
     fails += ob4_provenance_files(&forks, &mut log);
     fails += ob5_license_files(&redistributed, &mut log);
     fails += ob6_notice_agreement(root, &redistributed, &mut log);
-    let (ob7_fails, unverified) = ob7_apache_modification_notices(root, &redistributed, &mut log);
+    let (ob7_fails, unverified) =
+        ob7_apache_modification_notices(root, pristine, &redistributed, &mut log);
     fails += ob7_fails;
     fails += ob8_marker_census(&forks, &mut log);
     fails += ob9_spdx_allowlist(root, &redistributed, &mut log);
@@ -732,8 +739,8 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
             let _ = writeln!(
                 log,
                 "cargo forge attest: PASS, [OB-7] UNVERIFIED — nothing violated {over}, but \
-                 [OB-7] diffed no file of {}: no pristine copy here (its NOTE above names the \
-                 fix).",
+                 [OB-7] diffed no file of {}: it got no pristine copy (its NOTE above says \
+                 why).",
                 unverified.join(", ")
             );
         }
@@ -1470,9 +1477,11 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
     fails
 }
 
-/// `[OB-7]` Apache-2.0 §4(b).
+/// `[OB-7]` Apache-2.0 §4(b), each fork diffed against the copy crates.io published
+/// ([`Pristine::copy`]).
 fn ob7_apache_modification_notices(
     root: &Path,
+    pristine: &Pristine,
     forks: &[VendoredFork],
     log: &mut String,
 ) -> (usize, Vec<String>) {
@@ -1487,20 +1496,20 @@ fn ob7_apache_modification_notices(
         }
         scoped.push(fork.name.clone());
 
-        let Some(pristine) = pristine_dir(root, &fork.name, &fork.version) else {
-            let _ = writeln!(
-                log,
-                "  • NOTE [OB-7] fork `{}` cannot be diffed: no pristine copy of `{} {}` under \
-                 `vendor/.forge/{}/pristine/` or the local registry src; UNVERIFIED for it, \
-                 not satisfied. FIX: unpack the published `{}-{}.crate` into \
-                 `vendor/.forge/{}/pristine/` (`cargo fetch` cannot: a patched-out package \
-                 has a source-less lock entry, so cargo never downloads it).",
-                fork.name, fork.name, fork.version, fork.name, fork.name, fork.version, fork.name
-            );
-            unverified.push(fork.name.clone());
-            continue;
+        let held = match pristine.copy(&fork.name, &fork.version) {
+            Ok(held) => held,
+            Err(why) => {
+                let _ = writeln!(
+                    log,
+                    "  • NOTE [OB-7] fork `{}` cannot be diffed: there is no pristine copy of `{} \
+                     {}`: {why}. UNVERIFIED for it, not satisfied.",
+                    fork.name, fork.name, fork.version
+                );
+                unverified.push(fork.name.clone());
+                continue;
+            }
         };
-        let Some(Divergence { modified, added }) = diff_against_pristine(&pristine, &fork.dir)
+        let Some(Divergence { modified, added }) = diff_against_pristine(&held.dir, &fork.dir)
         else {
             let _ = writeln!(
                 log,
@@ -1513,9 +1522,11 @@ fn ob7_apache_modification_notices(
         };
         let _ = writeln!(
             log,
-            "    [OB-7] `{}` vs pristine `{}`: {} modified file(s), {} added.",
+            "    [OB-7] `{}` vs pristine `{} {}` ({}): {} modified file(s), {} added.",
             fork.rel,
-            pristine.display(),
+            fork.name,
+            fork.version,
+            held.provenance(),
             modified.len(),
             added.len()
         );
@@ -1567,10 +1578,13 @@ fn ob7_apache_modification_notices(
         log,
         "    [OB-7] scope: forks where the Apache-2.0 arm is UNAVOIDABLE ({}). Dual `... OR MIT` \
          forks elect the MIT arm, which imposes no §4(b) duty. Modified files are detected by \
-         a BYTE DIFF against the pristine registry copy — not by aterm's own markers — so a file \
-         edited without leaving a marker is still caught. An added licence text (`LICENSE*`, \
-         `LICENCE*`) stays as its holder wrote it, and its notice is NOTICE naming it by path. A \
-         fork with no pristine copy available is reported UNVERIFIED, never passed.",
+         a BYTE DIFF against the pristine copy — the `.crate` crates.io published, fetched by \
+         attest, held to the sha256 the crates.io index records and unpacked into its cache, \
+         not aterm's own markers — so a file edited without leaving a marker is still caught. \
+         An added licence text (`LICENSE*`, `LICENCE*`) stays as its holder wrote it, and its \
+         notice is NOTICE naming it by path. A fork attest gets no pristine copy of (offline, \
+         or a download the index does not vouch for, which is refused) is reported \
+         UNVERIFIED, never passed.",
         if scoped.is_empty() {
             "none".to_string()
         } else {
@@ -1600,31 +1614,6 @@ struct Divergence {
     modified: Vec<String>,
     /// Paths present only in the fork.
     added: Vec<String>,
-}
-
-/// The unpacked pristine source for `name@version`, if this checkout or the local registry has it.
-fn pristine_dir(root: &Path, name: &str, version: &str) -> Option<PathBuf> {
-    let local = root
-        .join("vendor")
-        .join(".forge")
-        .join(name)
-        .join("pristine");
-    if local.is_dir() {
-        return Some(local);
-    }
-    let home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
-    let src = home.join("registry").join("src");
-    let wanted = format!("{name}-{version}");
-    for entry in std::fs::read_dir(src).ok()? {
-        let dir = entry.ok()?.path();
-        let candidate = dir.join(&wanted);
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 /// Byte-compare `fork` against `pristine` (skipping `.cargo-ok`, `.git` and `target`).
@@ -1867,6 +1856,31 @@ fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pristine::tests::{Served, crate_file};
+
+    /// [`report`] with `[OB-7]`'s pristine copies from `served`, cached in a folder of its own.
+    fn report_served(root: &Path, served: Served) -> Attestation {
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let pristine = Pristine::at(Some(cache.path().to_path_buf()), Box::new(served));
+        report_using(&crate::resolve::Cargo::from_env(), &pristine, root)
+    }
+
+    /// The absorbed fixtures' upstream manifest.
+    const ABSORBED_MANIFEST: &str =
+        "[package]\nname = \"absorbed\"\nversion = \"2.0.0\"\nlicense = \"Apache-2.0\"\n";
+
+    /// crates.io's `absorbed 2.0.0`, the upstream the absorbed fixtures diverge from.
+    fn absorbed_upstream() -> Served {
+        let archive = crate_file(
+            "absorbed-2.0.0",
+            &[
+                ("Cargo.toml", ABSORBED_MANIFEST.as_bytes()),
+                ("LICENSE", b"Apache\n"),
+                ("src/lib.rs", b"pub fn upstream() {}\n"),
+            ],
+        );
+        Served::honest("absorbed", "2.0.0", archive)
+    }
 
     #[test]
     fn apache_is_only_mandatory_when_no_other_arm_exists() {
@@ -2091,14 +2105,6 @@ mod tests {
             "deny.toml",
             "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n",
         );
-        let manifest =
-            "[package]\nname = \"absorbed\"\nversion = \"2.0.0\"\nlicense = \"Apache-2.0\"\n";
-        w("vendor/.forge/absorbed/pristine/Cargo.toml", manifest);
-        w("vendor/.forge/absorbed/pristine/LICENSE", "Apache\n");
-        w(
-            "vendor/.forge/absorbed/pristine/src/lib.rs",
-            "pub fn upstream() {}\n",
-        );
         if renamed {
             w(
                 "crates/aterm-absorbed/Cargo.toml",
@@ -2106,7 +2112,7 @@ mod tests {
                  version = \"2.0.0\"\nlicense = \"Apache-2.0\"\n",
             );
         } else {
-            w("crates/aterm-absorbed/Cargo.toml", manifest);
+            w("crates/aterm-absorbed/Cargo.toml", ABSORBED_MANIFEST);
         }
         w("crates/aterm-absorbed/LICENSE", "Apache\n");
         w(
@@ -2124,7 +2130,7 @@ mod tests {
     #[test]
     fn an_absorbed_crate_owes_the_license_obligations() {
         let fixture = absorbed_fixture("absorbed-green", false);
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(ok, "a complete absorbed crate must attest clean:\n{log}");
 
         let fixture = absorbed_fixture("absorbed-no-notice", false);
@@ -2133,7 +2139,7 @@ mod tests {
             "pub fn upstream() { /* edited */ }\n",
         )
         .unwrap();
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
         let fixture = absorbed_fixture("absorbed-no-notice-line", false);
@@ -2143,14 +2149,14 @@ mod tests {
             "",
         );
         std::fs::write(&notice, text).unwrap();
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
     }
 
     #[test]
     fn a_renamed_absorbed_member_owes_the_license_obligations() {
         let fixture = absorbed_fixture("member-green", true);
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(
             ok,
             "a complete renamed absorbed member must attest clean:\n{log}"
@@ -2167,17 +2173,17 @@ mod tests {
             "pub fn upstream() { /* edited */ }\n",
         )
         .unwrap();
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
         let fixture = absorbed_fixture("member-no-license", true);
         std::fs::remove_file(fixture.0.path().join("crates/aterm-absorbed/LICENSE")).unwrap();
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(!ok && log.contains("FAIL [OB-5]"), "{log}");
 
         let fixture = absorbed_fixture("member-gone", true);
         std::fs::remove_dir_all(fixture.0.path().join("crates/aterm-absorbed")).unwrap();
-        let Attestation { ok, log, .. } = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
     }
 
@@ -2194,7 +2200,7 @@ mod tests {
             let mut text = std::fs::read_to_string(&path).unwrap();
             text.push_str(notice);
             std::fs::write(path, text).unwrap();
-            report(root)
+            report_served(root, absorbed_upstream())
         };
         let licence = "crates/aterm-absorbed/LICENSE-MIT-other";
         let named = |rel: &str| format!("Its shadow is other's, MIT: see `{rel}`.\n");
@@ -2223,6 +2229,9 @@ mod tests {
         );
     }
 
+    /// Attest fetches the copy it diffs. Offline, or handed a download the index does not vouch
+    /// for, it has none: the member is UNVERIFIED, unticked and not refused, and the NOTE says
+    /// why.
     #[test]
     fn a_member_without_a_pristine_copy_is_unverified_never_ticked() {
         let fixture = absorbed_fixture("member-pristine", true);
@@ -2231,35 +2240,52 @@ mod tests {
             log,
             unverified,
             ..
-        } = report(fixture.0.path());
+        } = report_served(fixture.0.path(), absorbed_upstream());
         assert!(ok && unverified.is_empty(), "{log}");
         assert!(
-            log.contains("✓ [OB-7]"),
+            log.contains("✓ [OB-7]")
+                && log.contains("`absorbed-2.0.0.crate`, fetched from crates.io by this run"),
             "a diffed member earns the tick:\n{log}"
         );
 
-        let fixture = absorbed_fixture("member-no-pristine", true);
-        std::fs::remove_dir_all(fixture.0.path().join("vendor/.forge/absorbed")).unwrap();
-        std::fs::write(
-            fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
-            "pub fn upstream() { /* edited */ }\n",
-        )
-        .unwrap();
-        let Attestation {
-            ok,
-            log,
-            unverified,
-            ..
-        } = report(fixture.0.path());
-        assert_eq!(unverified, ["absorbed"], "{log}");
-        assert!(
-            !log.contains("✓ [OB-7]") && log.contains("UNVERIFIED [OB-7] no file of absorbed"),
-            "an undiffed member must not be ticked:\n{log}"
-        );
-        assert!(
-            ok && log.contains("cargo forge attest: PASS, [OB-7] UNVERIFIED"),
-            "the verdict names what was not judged, and finds nothing wrong:\n{log}"
-        );
+        let mut wrong = absorbed_upstream();
+        wrong.sha256 = "ab".repeat(32);
+        for (case, served, why) in [
+            (
+                "offline",
+                Served::offline(),
+                "GET https://index.crates.io/ab/so/absorbed",
+            ),
+            (
+                "wrong sha",
+                wrong,
+                "the download is refused and nothing was unpacked",
+            ),
+        ] {
+            let fixture = absorbed_fixture(&format!("member-{}", case.replace(' ', "-")), true);
+            std::fs::write(
+                fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
+                "pub fn upstream() { /* edited */ }\n",
+            )
+            .unwrap();
+            let Attestation {
+                ok,
+                log,
+                unverified,
+                ..
+            } = report_served(fixture.0.path(), served);
+            assert_eq!(unverified, ["absorbed"], "{case}: {log}");
+            assert!(
+                !log.contains("✓ [OB-7]")
+                    && log.contains("UNVERIFIED [OB-7] no file of absorbed")
+                    && log.contains(why),
+                "{case}: an undiffed member must not be ticked, and the NOTE says why:\n{log}"
+            );
+            assert!(
+                ok && log.contains("cargo forge attest: PASS, [OB-7] UNVERIFIED"),
+                "{case}: the verdict names what was not judged, and finds nothing wrong:\n{log}"
+            );
+        }
     }
 
     #[test]
@@ -2360,22 +2386,24 @@ mod tests {
             "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n",
         )
         .unwrap();
-        let pristine = root.join("vendor/.forge/goodfork/pristine/src");
-        std::fs::create_dir_all(&pristine).unwrap();
-        std::fs::write(pristine.join("lib.rs"), "// upstream\n").unwrap();
-        for rel in [
+        let mut upstream: Vec<(&str, Vec<u8>)> = [
             "Cargo.toml",
             "Cargo.toml.orig",
             ".cargo_vcs_info.json",
             "LICENSE-MIT",
-        ] {
-            std::fs::copy(
-                root.join("vendor/goodfork").join(rel),
-                root.join("vendor/.forge/goodfork/pristine").join(rel),
+        ]
+        .into_iter()
+        .map(|rel| {
+            (
+                rel,
+                std::fs::read(root.join("vendor/goodfork").join(rel)).unwrap(),
             )
-            .unwrap();
-        }
-        let Attestation { ok, log, .. } = report(root);
+        })
+        .collect();
+        upstream.push(("src/lib.rs", b"// upstream\n".to_vec()));
+        let files: Vec<(&str, &[u8])> = upstream.iter().map(|(r, b)| (*r, b.as_slice())).collect();
+        let served = || Served::honest("goodfork", "1.2.3", crate_file("goodfork-1.2.3", &files));
+        let Attestation { ok, log, .. } = report_served(root, served());
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
         std::fs::write(
@@ -2383,7 +2411,7 @@ mod tests {
             "// Modified by aterm: bounds proof discharged here.\n// aterm-trust: ok\n",
         )
         .unwrap();
-        let Attestation { ok, log, .. } = report(root);
+        let Attestation { ok, log, .. } = report_served(root, served());
         assert!(ok, "a header notice must discharge §4(b):\n{log}");
     }
 }

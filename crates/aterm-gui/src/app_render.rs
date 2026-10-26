@@ -16744,6 +16744,12 @@ impl App {
         } else {
             crate::find_bar::FindSeam::BottomUnderline
         };
+        // The well's focus line is a rail where the cell holds one and no seam rail owns the
+        // field row's foot; else the well's cells underline it ([`crate::find_bar::find_bar_paint`]).
+        let well_rail = rails
+            && rail_h(2).is_some()
+            && !(seam == crate::find_bar::FindSeam::BottomRail
+                && crate::find_bar::field_row(band_rows) + 1 == band_rows);
         let panel = self.chrome_palette(ChromeSurface::OverGrid(wid));
         let content = self.chrome_palette(ChromeSurface::Content(wid));
         let tokens = content.tokens();
@@ -16752,7 +16758,8 @@ impl App {
         let current_fill = aterm_render::rgb_to_u32(current_rgb);
         let current_ink =
             aterm_render::rgb_to_u32(crate::find_bar::current_match_ink(&tokens, current_rgb));
-        let painted = crate::find_bar::find_bar_paint(&view, region.cols, band_rows, panel, seam);
+        let painted =
+            crate::find_bar::find_bar_paint(&view, region.cols, band_rows, panel, seam, well_rail);
         let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale as f32);
         let fluent = crate::find_bar::fluent_bar(&crate::find_bar::FluentInput {
             view: &view,
@@ -16931,8 +16938,7 @@ impl App {
         }
         if let Some(ink) = painted.well_line
             && fluent.is_none()
-            && rails
-            && !(seam_rail && painted.field_row + 1 == band_rows)
+            && well_rail
             && let Some(well_h) = rail_h(2)
             && let Ok(row) = u16::try_from(frame_bar_row + painted.field_row)
         {

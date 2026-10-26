@@ -566,25 +566,18 @@ fn a_capture_refusal_that_comes_back_is_spaced_not_retried_every_probe() {
     };
     for refusal in 1..=4_u32 {
         let floor = crate::app_native::capture_refusal_spacing(refusal).as_secs();
+        // The refusal is stamped somewhere between these two readings, however long the
+        // reducer takes on a loaded machine: each assert reads from the side that bounds it.
+        let before = std::time::Instant::now();
         refuse_capture(&mut app, build);
-        let refused_at = std::time::Instant::now();
+        let after = std::time::Instant::now();
         move_desk(&mut app);
         assert!(
-            app.capture_refusal_holds(
-                build,
-                dmg,
-                false,
-                refused_at + Duration::from_secs(floor - 2)
-            ),
+            app.capture_refusal_holds(build, dmg, false, before + Duration::from_secs(floor - 2)),
             "refusal {refusal}: a changed desk is not attempted before {floor} s"
         );
         assert!(
-            !app.capture_refusal_holds(
-                build,
-                dmg,
-                false,
-                refused_at + Duration::from_secs(floor + 2)
-            ),
+            !app.capture_refusal_holds(build, dmg, false, after + Duration::from_secs(floor + 2)),
             "refusal {refusal}: a changed desk is attempted at {floor} s"
         );
         assert!(
@@ -611,6 +604,9 @@ fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
     let dmg = [0xab_u8; 32];
     refuse_capture(&mut app, build);
     let busy = HeldEngine::hold(&app.pool.iter().next().expect("a session").term);
+    // The refusal is stamped between these two readings: a hold is read from the first, a
+    // release from the second, so a slow reducer on a loaded machine moves neither.
+    let before = std::time::Instant::now();
     app.arm_capture_refusal_retry(build, dmg, false, "the park's capture refused");
     let refused_at = std::time::Instant::now();
     drop(busy);
@@ -640,18 +636,13 @@ fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
     );
     assert!(
         app.capture_refusal_reprobe_at(refused_at + probe)
-            >= refused_at + spacing - Duration::from_secs(1)
+            >= before + spacing - Duration::from_secs(1)
     );
     for session in app.pool.iter() {
         crate::term_lock(&session.term).resize(31, 100);
     }
     assert!(
-        app.capture_refusal_holds(
-            build,
-            dmg,
-            false,
-            refused_at + spacing - Duration::from_secs(2)
-        ),
+        app.capture_refusal_holds(build, dmg, false, before + spacing - Duration::from_secs(2)),
         "the spacing still holds the release"
     );
     assert!(
@@ -699,10 +690,16 @@ impl Drop for HeldEngine {
     }
 }
 
-/// A desk of three tabs whose first one a reader holds.
+/// A desk of three tabs whose first one a reader holds, and the two readings the second
+/// refusal was stamped between (a hold is read from the first, a release from the second).
 fn second_refusal_beside_a_busy_engine(
     app: &mut App,
-) -> (u64, HeldEngine, [u64; 2], std::time::Instant) {
+) -> (
+    u64,
+    HeldEngine,
+    [u64; 2],
+    (std::time::Instant, std::time::Instant),
+) {
     let build = stage_one_build(app);
     let dmg = [0xab_u8; 32];
     let busy_term = app.pool.iter().next().expect("a session").term.clone();
@@ -713,6 +710,7 @@ fn second_refusal_beside_a_busy_engine(
     }
     app.arm_capture_refusal_retry(build, dmg, false, "the park's capture refused");
     let busy = HeldEngine::hold(&busy_term);
+    let before = std::time::Instant::now();
     app.arm_capture_refusal_retry(build, dmg, false, "the park's capture refused");
     let refused_at = std::time::Instant::now();
     let record = app
@@ -725,7 +723,7 @@ fn second_refusal_beside_a_busy_engine(
         1,
         "PRECONDITION: only the busy tab's reading is missing"
     );
-    (build, busy, quiet, refused_at)
+    (build, busy, quiet, (before, refused_at))
 }
 
 #[test]
@@ -738,7 +736,8 @@ fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() 
     };
     for change in ["close", "resize", "nothing"] {
         let mut app = App::headless_for_test();
-        let (build, busy, quiet, refused_at) = second_refusal_beside_a_busy_engine(&mut app);
+        let (build, busy, quiet, (before, refused_at)) =
+            second_refusal_beside_a_busy_engine(&mut app);
         match change {
             "close" => assert!(app.pool.detach(quiet[0]), "PRECONDITION: the tab closes"),
             "resize" => {
@@ -753,7 +752,7 @@ fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() 
             spacing - Duration::from_secs(2),
         ] {
             assert!(
-                app.capture_refusal_holds(build, dmg, false, refused_at + probe),
+                app.capture_refusal_holds(build, dmg, false, before + probe),
                 "{change}: the spacing holds the release at {probe:?}"
             );
         }
@@ -805,7 +804,7 @@ fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() 
 fn a_poll_that_waits_for_activity_still_reads_a_busy_tabs_baseline() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
-    let (_build, busy, _quiet, refused_at) = second_refusal_beside_a_busy_engine(&mut app);
+    let (_build, busy, _quiet, (_, refused_at)) = second_refusal_beside_a_busy_engine(&mut app);
     let intent = app.auto_apply_intent.expect("the lane keeps its intent");
     assert!(
         intent.retry_at <= refused_at + crate::app_native::CAPTURE_REFUSAL_BASELINE_PROBE,

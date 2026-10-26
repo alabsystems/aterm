@@ -29,6 +29,7 @@ fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32
         pgid: pid,
         sid: 0,
         state: ProcState::Run,
+        disk_read: None,
         disk_written: cpu_ms.map(|ms| ms * 1000),
         runnable_ns: cpu_ms.map(|ms| ms * 1_200_000),
         peak: Some((mib + 10) << 20),
@@ -1704,6 +1705,35 @@ fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
     assert_eq!(tcp.get("close_wait"), Some(&Jv::u(1)));
     assert_eq!(tcp.get("connecting"), Some(&Jv::u(1)));
     assert_eq!(tcp.get("closing_total"), Some(&Jv::u(3)));
+    assert_eq!(net.get("state"), Some(&Jv::s("degraded")));
+    assert_eq!(net.get("srtt_us"), Some(&Jv::why("not_sampled")));
+    assert_eq!(net.get("aterm_sockets"), Some(&Jv::why("not_sampled")));
+
+    let mut with_rtt = s.clone();
+    let nv = with_rtt.net.as_mut().expect("net view");
+    nv.state = crate::NetState::Online;
+    nv.srtt_ms = Some(14.2);
+    nv.aterm_sockets = Some(18);
+    let c_rtt = ctx(&w, Some(&with_rtt), true, true);
+    let j_rtt = render_json(&query(View::Net, true), &c_rtt);
+    assert_eq!(
+        j_rtt.get("net").and_then(|n| n.get("state")),
+        Some(&Jv::s("online"))
+    );
+    let text_rtt = all_text(&render_text(&query(View::Net, false), &c_rtt));
+    assert!(
+        text_rtt.contains("rtt 14.2 ms · aterm 18 sockets") && text_rtt.contains("srtt_us=14200"),
+        "{text_rtt}"
+    );
+    let j_rtt = render_json(&query(View::Net, true), &c_rtt);
+    assert!(
+        contract_violations(&j_rtt).is_empty(),
+        "{}",
+        j_rtt.to_text()
+    );
+    let net_rtt = j_rtt.get("net").expect("net");
+    assert_eq!(net_rtt.get("srtt_us"), Some(&Jv::u(14_200)));
+    assert_eq!(net_rtt.get("aterm_sockets"), Some(&Jv::u(18)));
 }
 
 /// Seventy one-second sweeps of [`sample`]: past the minute a program's hour needs.

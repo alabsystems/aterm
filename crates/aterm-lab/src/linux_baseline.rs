@@ -4094,7 +4094,6 @@ impl Session<'_> {
         let drew = windows.unwrap_or(&gpu).to_string();
         match self.ctl(&["metrics", "percentiles"]) {
             Ok(m) => {
-                let get = |k: &str| proof::field(&m, k).unwrap_or("?").to_string();
                 self.rec.measured(
                     "present.software",
                     format!(
@@ -4103,16 +4102,8 @@ impl Session<'_> {
                         proof::present_summary(&m)
                     ),
                 );
-                self.rec.measured(
-                    "input.software",
-                    format!(
-                        "n_input={} input_p50/p95/p99_ms={}/{}/{}",
-                        get("n_input"),
-                        get("input_p50_ms"),
-                        get("input_p95_ms"),
-                        get("input_p99_ms")
-                    ),
-                );
+                self.rec
+                    .measured("input.software", proof::input_summary(&m));
             }
             Err(e) => self
                 .rec

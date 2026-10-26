@@ -14,16 +14,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod account;
 mod admin_keys;
 mod admission;
 mod creation;
 mod enrollment;
+mod entry;
 mod inspection;
 mod locker_skew;
 mod retirement;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
 pub use enrollment::admin_cached;
+pub use entry::{EntrySnapshot, VerifiedEntry, read_account_bound_entry, read_verified_entry};
 pub use inspection::CommonsControlInspection;
 pub use retirement::{Retirement, Revocation, admin_retire, admin_revoke};
 #[cfg(test)]
@@ -107,6 +110,18 @@ pub struct Config {
     pub followed: Vec<[u8; 32]>,
     /// The name this machine asked to be called.
     pub host: String,
+}
+
+/// Whether `config` is the ALab vault: pinned to a key this build names for it
+/// ([`crate::ALAB_SIGNER`], [`crate::ALAB_RETIRED`]), or reached from one by verified
+/// handoffs, and not a pin that gives way to the current key ([`Retired::gives_way`]).
+/// Its address does not decide: anyone can serve at any address, and only the signer says
+/// whose vault it is.
+#[must_use]
+pub fn alab_vault(config: &Config) -> bool {
+    config
+        .signer
+        .is_some_and(|signer| Retired::compiled().names(&signer, &config.followed))
 }
 
 /// Whether a requested join pin admits this configured authority without fetching.
@@ -1769,6 +1784,16 @@ fn configured(paths: &Paths) -> crate::Result<Config> {
 
 /// Fetch, verify, decrypt, and materialize once, optionally long-polling for `wait`.
 pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome> {
+    sync_repairing(paths, wait, None)
+}
+
+/// [`sync`], where a subscriber's pass of a vault at a path writes the files of a version it
+/// holds again only as [`put_back_due`] rules, by `repaired`.
+fn sync_repairing(
+    paths: &Paths,
+    wait: Option<Duration>,
+    repaired: Option<&mut Repaired>,
+) -> crate::Result<SyncOutcome> {
     let config = configured(paths)?;
     let before = load_state(paths)?;
     let fetched = match (&config.source, wait) {
@@ -1779,7 +1804,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         )?,
         _ => transport::fetch(&config.source, None, Duration::from_secs(30))?,
     };
-    apply_fetched(paths, config, before, fetched)
+    apply_fetched_repairing(paths, config, before, fetched, repaired)
 }
 
 /// [`sync`] as one try of a bounded wait (an approval's): a long-poll whose whole request ends
@@ -1824,9 +1849,21 @@ fn sync_with(paths: &Paths, bytes: Vec<u8>) -> crate::Result<SyncOutcome> {
 
 fn apply_fetched(
     paths: &Paths,
+    config: Config,
+    before: State,
+    fetched: Fetched,
+) -> crate::Result<SyncOutcome> {
+    apply_fetched_repairing(paths, config, before, fetched, None)
+}
+
+/// [`apply_fetched`], where a subscriber's pass of a vault at a path holds `repaired` to rule on
+/// writing the files of a version it holds again ([`put_back_due`]).
+fn apply_fetched_repairing(
+    paths: &Paths,
     mut config: Config,
     before: State,
     fetched: Fetched,
+    repaired: Option<&mut Repaired>,
 ) -> crate::Result<SyncOutcome> {
     let lock = StateLock::take(paths)?;
     if self::config(paths)?.as_ref() != Some(&config) {
@@ -1900,6 +1937,24 @@ fn apply_fetched(
             ));
         }
         let entries = plain_entries(&config, path)?;
+        // The text is the version: the same text with the same files not as written is
+        // put back once, not every minute.
+        let version = (
+            sha256(&[source_identity(&config).as_slice(), bytes.as_slice()].concat()),
+            0,
+        );
+        let settled = state.membership == Stored::Plain
+            && source_bound(&config, &state)
+            && !state.failed
+            && state.pending.is_empty()
+            && state.own.is_some();
+        if settled
+            && repaired.is_some_and(|repaired| !put_back_due(paths, &state, version, repaired))
+        {
+            state.heard = now();
+            save_state(paths, &state)?;
+            return Ok(SyncOutcome::Unchanged { seq: 0 });
+        }
         let report = apply_entries(paths, &mut state, &entries)?;
         state.membership = Stored::Plain;
         state.failed = !report.failed.is_empty();
@@ -1967,7 +2022,18 @@ fn apply_fetched(
         && state.membership == Stored::In
         && source_bound(&config, &state)
         && state.own.is_some()
-        && files_intact(paths, &state)
+        && (files_intact(paths, &state)
+            || (!state.failed
+                && state.pending.is_empty()
+                && cache_intact(paths, &state)
+                && repaired.is_some_and(|repaired| {
+                    !put_back_due(
+                        paths,
+                        &state,
+                        (source_identity(&config), state.seq),
+                        repaired,
+                    )
+                })))
     {
         save_state(paths, &state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
@@ -2009,38 +2075,77 @@ pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     })
 }
 
-fn nap(stop: &AtomicBool, total: Duration) {
+/// Sleep `total`, ending early once `stop` is set or `moved` says so (each looked at every
+/// `look`).
+fn nap_unless(stop: &AtomicBool, total: Duration, look: Duration, moved: &dyn Fn() -> bool) {
     let deadline = Instant::now() + total;
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !moved() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return;
         }
-        std::thread::sleep(left.min(Duration::from_secs(1)));
+        std::thread::sleep(left.min(look));
     }
+}
+
+/// How often an approver's wait for a version this Mac applies looks at its seq
+/// ([`approver_nap`]).
+const NAP_LOOK: Duration = Duration::from_millis(100);
+/// How often a resting approver looks at whether to stop ([`approver_nap`]).
+const REST_LOOK: Duration = Duration::from_secs(1);
+/// The longest approver nap that watches this Mac's seq ([`approver_nap`]).
+const WATCHED_NAP: Duration = Duration::from_secs(2);
+
+/// An approver's nap of `pause`. A short one, the wait for this Mac's subscriber to apply a
+/// version the queue moved with, ends once this Mac's seq (`seq`) moves, looked at every
+/// [`NAP_LOOK`]: that version may admit a Mac, or end one's asking. A longer one is an approver
+/// resting (this Mac is no admin, the usual case on every member Mac, or a pass failed): it reads
+/// nothing and looks only at `stop`, each [`REST_LOOK`].
+fn approver_nap(stop: &AtomicBool, pause: Duration, seq: &dyn Fn() -> Option<u64>) {
+    if pause > WATCHED_NAP {
+        nap_unless(stop, pause, REST_LOOK, &|| false);
+        return;
+    }
+    let held = seq();
+    nap_unless(stop, pause, NAP_LOOK, &|| seq() != held);
 }
 
 const FIRST_RETRY: Duration = Duration::from_secs(5);
 const LONGEST_RETRY: Duration = Duration::from_secs(300);
 
 const LONGEST_ERROR_RETRY: Duration = Duration::from_secs(60);
+/// How often a wait looks at the network where the kernel tells it of no change
+/// ([`crate::network::RouteChanges`]).
 const MOVED_STEP: Duration = Duration::from_secs(5);
 
+/// Wait `total` unless the network moves first (`moved`, looked at after each `wait`, which
+/// waits at most the time it is given and says how long it took): whether it moved.
 fn nap_unless_moved(
     total: Duration,
     moved: &mut dyn FnMut() -> bool,
-    sleep: &mut dyn FnMut(Duration),
+    wait: &mut dyn FnMut(Duration) -> Duration,
 ) -> bool {
     let mut left = total;
     while !left.is_zero() {
-        let step = left.min(MOVED_STEP);
-        sleep(step);
-        left = left.saturating_sub(step);
+        left = left.saturating_sub(wait(left));
         if moved() {
             return true;
         }
     }
     false
+}
+
+/// [`nap_unless_moved`]'s wait: until the kernel tells of a change to the routes, addresses or
+/// links ([`crate::network::RouteChanges`]), else a look every [`MOVED_STEP`].
+fn wait_for_a_change(changes: Option<&crate::network::RouteChanges>, most: Duration) -> Duration {
+    let started = Instant::now();
+    match changes {
+        Some(changes) => {
+            changes.wait(most);
+        }
+        None => std::thread::sleep(most.min(MOVED_STEP)),
+    }
+    started.elapsed()
 }
 
 fn retry_after(backoff: Duration, moved: bool) -> Duration {
@@ -2051,16 +2156,39 @@ fn retry_after(backoff: Duration, moved: bool) -> Duration {
     }
 }
 
-fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -> Duration {
+/// How one subscriber pass went, beyond its outcome ([`pause_after`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pass {
+    /// How long it took.
+    took: Duration,
+    /// Whether it moved this Mac's seq (a version applied, or one that leaves it out).
+    moved: bool,
+}
+
+/// A pass that took at least this long was a long-poll the server held, not one it answered at
+/// once ([`pause_after`]).
+const HELD: Duration = Duration::from_secs(1);
+
+/// The pause after a pass that ended with `outcome`, from its start. A pass that moved this
+/// Mac's seq, or that the server held, is followed by the next at once: that one is held until
+/// something changes. Only one answered at once with nothing new pauses, so a source that
+/// holds nothing is not asked in a loop.
+fn pause_after(
+    source: &Source,
+    outcome: &SyncOutcome,
+    failing: &mut Duration,
+    pass: Pass,
+) -> Duration {
     let pause = match (source, outcome) {
         (Source::Path(_), _) => Duration::from_secs(60),
-        (_, SyncOutcome::NotIn) => Duration::from_secs(30),
         (_, SyncOutcome::Applied { report, .. }) if report.failed.is_empty() => Duration::ZERO,
         (_, SyncOutcome::Applied { .. } | SyncOutcome::PutBack { served: None, .. }) => {
             let pause = *failing;
             *failing = failing.saturating_mul(2).min(LONGEST_RETRY);
             return pause;
         }
+        _ if pass.moved || pass.took >= HELD => Duration::ZERO,
+        (_, SyncOutcome::NotIn) => Duration::from_secs(30),
         (_, SyncOutcome::Unchanged { .. } | SyncOutcome::PutBack { .. }) => Duration::from_secs(10),
     };
     *failing = FIRST_RETRY;
@@ -2119,8 +2247,8 @@ fn pass_line(
     line.filter(|line| *line != last)
 }
 
-/// The last repair a subscriber made: of which version (source and seq), and the files that
-/// were not as written then.
+/// The last repair a subscriber made: of which version (source and seq, or for a plain file at a
+/// path the digest of its source and text, and 0), and the files that were not as written then.
 type Repaired = Option<(([u8; 32], u64), BTreeSet<String>)>;
 
 /// Whether this pass repairs the files a version wrote, rather than long-polling: when they are
@@ -2150,6 +2278,28 @@ fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
         && repaired
             .as_ref()
             .is_none_or(|(last, files)| *last != version || *files != changed);
+    if due {
+        *repaired = Some((version, changed));
+    }
+    due
+}
+
+/// Whether a subscriber's pass of a vault at a path, which reads it every minute in place of a
+/// long-poll, writes the files of `version` (its source and seq, or a plain file's text) again:
+/// the first time it meets that version, then as [`repair_due`] rules for a URL, once per set of
+/// files not as written ([`unsettled`]), so a file a program on this Mac keeps rewriting is put
+/// back once, not every minute.
+fn put_back_due(
+    paths: &Paths,
+    state: &State,
+    version: ([u8; 32], u64),
+    repaired: &mut Repaired,
+) -> bool {
+    let changed = unsettled(paths, state);
+    let due = match repaired.as_ref() {
+        Some((last, files)) if *last == version => !changed.is_empty() && *files != changed,
+        _ => true,
+    };
     if due {
         *repaired = Some((version, changed));
     }
@@ -2186,9 +2336,15 @@ fn subscriber_loop_until(
         // A verdict kept before this round's long-poll begins does not end it (only a new one
         // does), so it is read first: one that came while this subscriber started, or paused.
         heed_verdict(paths, log);
+        let seq = || load_state(paths).ok().map(|state| state.seq);
+        let before = seq();
         let started = Instant::now();
         match subscriber_pass(paths, &mut repaired) {
             Ok((config, outcome)) => {
+                let pass = Pass {
+                    took: started.elapsed(),
+                    moved: seq() > before,
+                };
                 backoff = Duration::from_secs(5);
                 last_error.clear();
                 if let Some(line) = pass_line(paths, &config, &outcome, &mut repeated) {
@@ -2197,7 +2353,7 @@ fn subscriber_loop_until(
                 ask_again_if_due(paths, &config, log);
                 // A verdict that ended the long-poll.
                 heed_verdict(paths, log);
-                let pause = pause_after(&config.source, &outcome, &mut failing);
+                let pause = pause_after(&config.source, &outcome, &mut failing, pass);
                 std::thread::sleep(pause.saturating_sub(started.elapsed()));
             }
             Err(error) => {
@@ -2208,11 +2364,13 @@ fn subscriber_loop_until(
                     ));
                     last_error = text;
                 }
+                // Opened before the routes are read, so a change between the two is heard.
+                let changes = crate::network::RouteChanges::open();
                 let routes = crate::server::route_sources();
                 let moved = nap_unless_moved(
                     backoff,
                     &mut || crate::server::route_sources() != routes,
-                    &mut std::thread::sleep,
+                    &mut |most| wait_for_a_change(changes.as_ref(), most),
                 );
                 // Until macOS lets aterm onto the LAN, asking again soon is what joins.
                 backoff = if error.kind() == crate::ErrorKind::LocalNetworkPending {
@@ -2248,11 +2406,15 @@ fn subscriber_pass(paths: &Paths, repaired: &mut Repaired) -> crate::Result<(Con
     let config = config(paths)?
         .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
     let before = repaired.clone();
-    let wait = match config.source {
-        Source::Url(_) if !repair_due(paths, repaired) => Some(Duration::from_secs(55)),
-        Source::Url(_) | Source::Path(_) => None,
+    let synced = match config.source {
+        Source::Url(_) => {
+            let wait = (!repair_due(paths, repaired)).then_some(LONG_POLL);
+            sync(paths, wait)
+        }
+        // Read every minute, not long-polled: the pass itself rules on putting files back.
+        Source::Path(_) => sync_repairing(paths, None, Some(&mut *repaired)),
     };
-    match sync(paths, wait) {
+    match synced {
         Ok(outcome) => {
             // A put-back wrote no file here: the repair this pass was for is still due.
             if matches!(outcome, SyncOutcome::PutBack { .. }) {
@@ -2273,6 +2435,11 @@ fn subscriber_pass(paths: &Paths, repaired: &mut Repaired) -> crate::Result<(Con
         }
     }
 }
+
+/// How long a subscriber's long-poll waits for the server's answer, before the margin
+/// [`sync`] adds: as long as a server holds one by default, so a request a sleeping Mac lost
+/// ends within about that long of its waking.
+const LONG_POLL: Duration = crate::server::DEFAULT_HOLD;
 
 /// How often a machine still waiting asks again ([`ask_again_if_due`]).
 const REASK: u64 = 60 * 60;
@@ -2465,13 +2632,68 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
 }
 
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
+    approver_loop_napping(paths, log, stop, &mut |pause| {
+        approver_nap(stop, pause, &|| {
+            load_state(paths).map(|state| state.seq).ok()
+        });
+    });
+}
+
+/// [`approver_loop`], each pause between two passes taken by `nap`.
+fn approver_loop_napping(
+    paths: &Paths,
+    log: &(dyn Fn(&str) + Sync),
+    stop: &AtomicBool,
+    nap: &mut dyn FnMut(Duration),
+) {
     let mut approver = Approver::resumed(paths);
     if let Err(error) = clear_dead_stuck(paths) {
         log(&format!("could not clear old approver records: {error}"));
     }
     while !stop.load(Ordering::Relaxed) {
         let pause = approver_pass(paths, log, &mut approver);
-        nap(stop, pause);
+        if !pause.is_zero() {
+            nap(pause);
+        }
+    }
+}
+
+/// How long an approver's long-poll of the join queue waits for the server's answer, past
+/// [`transport::FETCH_MARGIN`]: as long as the server holds one by default.
+const JOINS_WAIT: Duration = crate::server::DEFAULT_HOLD;
+
+/// The join queue as an approver last heard it: where, the version the server named (`None`:
+/// a server that names none, polled), and its lines.
+#[derive(Default)]
+struct Heard {
+    url: String,
+    version: Option<u64>,
+    lines: Vec<String>,
+}
+
+/// The join queue of the vault at `config`'s URL, long-polled past the version `heard` holds
+/// when the server named one; and whether it moved (a fresh listing, rather than the one
+/// `heard` held, which the server says is still current).
+fn hear_joins(config: &Config, heard: &mut Heard) -> crate::Result<(Vec<String>, bool)> {
+    let Source::Url(url) = &config.source else {
+        return Ok((Vec::new(), true));
+    };
+    let after = heard.version.filter(|_| heard.url == *url);
+    match transport::wait_joins(url, after, JOINS_WAIT) {
+        Ok(transport::Joins::Listed(lines, version)) => {
+            *heard = Heard {
+                url: url.clone(),
+                version,
+                lines: lines.clone(),
+            };
+            Ok((lines, true))
+        }
+        Ok(transport::Joins::Unchanged) => Ok((heard.lines.clone(), false)),
+        Err(error) => {
+            // Read plainly next: a server put back by an older one refuses the long-poll.
+            heard.version = None;
+            Err(error)
+        }
     }
 }
 
@@ -2527,6 +2749,36 @@ struct Approver {
     answered: std::collections::BTreeSet<Answered>,
     /// Whether `answered` differs from its record, which a failed write left behind.
     answered_unwritten: bool,
+    /// The join queue as last heard ([`hear_joins`]).
+    heard: Heard,
+    /// The key the vault's join password stretches to ([`JoinKeys`]).
+    keys: JoinKeys,
+}
+
+/// The key a vault's join password stretches to, kept from one approver pass to the next while
+/// the vault and its password stay: stretching it ([`join::ITERATIONS`] of PBKDF2) is the costly
+/// part of judging, and the approver judges at each change to the join queue, which any host on
+/// the LAN can make by asking to join.
+#[derive(Default)]
+struct JoinKeys {
+    held: Option<(String, SecretBytes, join::Key)>,
+}
+
+impl JoinKeys {
+    /// The key `password` stretches to for `vault`, stretched only when either changed.
+    fn of(&mut self, vault: &str, password: &SecretBytes) -> &join::Key {
+        if !matches!(&self.held, Some((held, kept, _)) if held == vault && kept == password) {
+            self.held = None;
+        }
+        let (_, _, key) = self.held.get_or_insert_with(|| {
+            (
+                vault.to_owned(),
+                SecretBytes::from(password.as_slice()),
+                join::Key::derive(vault, password.as_slice()),
+            )
+        });
+        key
+    }
 }
 
 impl Approver {
@@ -2716,8 +2968,8 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
             return Duration::from_secs(2);
         }
     };
-    let pending = match requests_for(&config, None) {
-        Ok(pending) => pending,
+    let (pending, moved) = match hear_joins(&config, &mut approver.heard) {
+        Ok((lines, moved)) => (requests_in(lines, &[]), moved),
         Err(error) => {
             approver.trouble(
                 paths,
@@ -2743,14 +2995,23 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
     // A request that came or went, a version that let a Mac in, or a request the vault answered
     // whose time moved (a Mac let go asking again) is read again too, so the record of the Macs
     // an admin approves by hand follows the queue and the vault.
-    if due || approver.listed.as_ref() != Some(&listed) {
+    let judging = due || approver.listed.as_ref() != Some(&listed);
+    if judging {
         let mut publishing = false;
         let mut answered = approver.answered.clone();
+        let keys = &mut approver.keys;
         let done = admin_open(paths).and_then(|admin| {
             if admin.config != config || admin.seq != seq {
                 return Err(Error::new("the vault changed while checking approval"));
             }
-            auto_approve_opened(paths, &admin, &mut publishing, &mut answered)
+            auto_approve_listed(
+                paths,
+                &admin,
+                &pending,
+                &mut publishing,
+                &mut answered,
+                keys,
+            )
         });
         match done {
             Ok(mut done) => {
@@ -2792,11 +3053,15 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         }
     }
     approver.untroubled(paths, log, "approving again");
-    // A vault an admin approves only by code is read every 10 s, as often as its notices need.
-    if approval.is_some() {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(10)
+    match approver.heard.version {
+        // A server that names no version of its queue holds no long-poll of it: one that an
+        // admin approves only by code is read every 10 s, as often as its notices need.
+        None if approval.is_some() => Duration::from_secs(2),
+        None => Duration::from_secs(10),
+        // A queue that moved with nothing to judge: the server's new version, which this Mac's
+        // subscriber applies within moments ([`approver_loop`] naps until it does).
+        Some(_) if moved && !judging => Duration::from_secs(2),
+        Some(_) => Duration::ZERO,
     }
 }
 
@@ -2880,17 +3145,38 @@ pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     auto_approve_opened(paths, &admin, &mut false, &mut read_answered(paths))
 }
 
-/// [`auto_approve`] with `admin` opened; `publishing` is set once a publish is attempted that may
-/// have landed: any failed one but one the vault refused before storing it
-/// ([`crate::ErrorKind::NotStored`]). A request in `answered` from a key no longer in the vault
-/// is judged and left alone: no approval, no refusal, no ask. On success `answered` holds the
-/// requests the vault has answered now: those of keys in the vault (this pass's approvals
-/// included), and those it held before that are still queued.
+/// [`auto_approve_listed`] of the requests queued at `admin`'s source now.
 fn auto_approve_opened(
     paths: &Paths,
     admin: &Admin,
     publishing: &mut bool,
     answered: &mut std::collections::BTreeSet<Answered>,
+) -> crate::Result<AutoApproved> {
+    let pending = requests_for(&admin.config, None)?;
+    auto_approve_listed(
+        paths,
+        admin,
+        &pending,
+        publishing,
+        answered,
+        &mut JoinKeys::default(),
+    )
+}
+
+/// [`auto_approve`] with `admin` opened, of the requests `pending` queued at its source;
+/// `publishing` is set once a publish is attempted that may have landed: any failed one but one
+/// the vault refused before storing it ([`crate::ErrorKind::NotStored`]). A request in
+/// `answered` from a key no longer in the vault is judged and left alone: no approval, no
+/// refusal, no ask. On success `answered` holds the requests the vault has answered now: those
+/// of keys in the vault (this pass's approvals included), and those it held before that are
+/// still queued. The join password's key comes from `keys`.
+fn auto_approve_listed(
+    paths: &Paths,
+    admin: &Admin,
+    pending: &[Request],
+    publishing: &mut bool,
+    answered: &mut std::collections::BTreeSet<Answered>,
+    keys: &mut JoinKeys,
 ) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
     let policy = Approval::of(&admin.published_doc);
@@ -2899,7 +3185,7 @@ fn auto_approve_opened(
         .published_doc
         .join_password()
         .filter(|_| policy == Some(Approval::Password))
-        .map(|password| join::Key::derive(name, password.as_slice()));
+        .map(|password| keys.of(name, &password));
     let mut members: Vec<String> = admin
         .published_doc
         .machines()
@@ -2911,7 +3197,7 @@ fn auto_approve_opened(
     let mut admissions = Vec::new();
     let mut refusals = Vec::new();
     let mut kept = std::collections::BTreeSet::new();
-    for request in requests_for(&admin.config, None)? {
+    for request in pending.iter().cloned() {
         let answer = Answered::of(&request);
         if members.contains(&request.recipient) {
             kept.extend(answer);
@@ -2932,11 +3218,9 @@ fn auto_approve_opened(
             let admitted = match approval {
                 Approval::Open => !code_only.contains(&request.recipient),
                 Approval::Password => {
-                    key.as_ref()
-                        .zip(request.proof.as_ref())
-                        .is_some_and(|(key, proof)| {
-                            key.verify(name, &request.recipient, &request.host, proof)
-                        })
+                    key.zip(request.proof.as_ref()).is_some_and(|(key, proof)| {
+                        key.verify(name, &request.recipient, &request.host, proof)
+                    })
                 }
             };
             if admitted {
@@ -3298,10 +3582,17 @@ pub fn probe_within(url: &str, total: Duration) -> crate::Result<ProbeOutcome> {
 /// [`probe_within`] of the ALab vault under the compiled-in signer ([`ProbeOutcome::Absent`]
 /// when none is compiled in).
 pub fn probe_default(total: Duration) -> crate::Result<ProbeOutcome> {
-    if decode_key32(crate::ALAB_SIGNER).is_none() {
+    if !alab_signer_built_in() {
         return Ok(ProbeOutcome::Absent);
     }
     probe_within(crate::ALAB_DEFAULT_URL, total)
+}
+
+/// Whether this build carries the ALab vault's signer, without which [`probe_default`] asks
+/// nothing of the network and answers [`ProbeOutcome::Absent`].
+#[must_use]
+pub fn alab_signer_built_in() -> bool {
+    decode_key32(crate::ALAB_SIGNER).is_some()
 }
 
 /// Who asks to join, which says what [`request_join`] records.
@@ -3467,6 +3758,19 @@ fn join_with(
                 "{source_display} does not serve an aterm secrets vault"
             )));
         };
+        // A signer typed with the path, or the one this Mac pins for it, says a signed vault
+        // belongs there: plain text in its place is not that vault, and reading it would drop
+        // the pin without a word, taking whatever anyone who can write the file puts there.
+        let stored = previous
+            .as_ref()
+            .filter(|previous| previous.source == source && previous.name == name)
+            .and_then(|previous| previous.signer);
+        if let Some(pin) = fragment.or(stored) {
+            return Err(Error::new(format!(
+                "{source_display} holds plain text, not the vault signed by {} that this join expects; nothing changed (to read a plain file, join it at another path)",
+                envelope::fingerprint(&pin)
+            )));
+        }
         let config = Config {
             source: source.clone(),
             name,
@@ -4975,8 +5279,13 @@ fn requests_for(config: &Config, doc: Option<&Document>) -> crate::Result<Vec<Re
     let known: Vec<String> = doc
         .map(|doc| doc.machines().into_iter().map(|m| m.recipient).collect())
         .unwrap_or_default();
+    Ok(requests_in(transport::list_joins(url)?, &known))
+}
+
+/// The join requests the queue's `lines` hold, but those of keys in `known`.
+fn requests_in(lines: Vec<String>, known: &[String]) -> Vec<Request> {
     let mut out = Vec::new();
-    for line in transport::list_joins(url)? {
+    for line in lines {
         let Ok(request) = transport::parse_join_line(&line) else {
             continue;
         };
@@ -4994,7 +5303,7 @@ fn requests_for(config: &Config, doc: Option<&Document>) -> crate::Result<Vec<Re
             proof: request.proof,
         });
     }
-    Ok(out)
+    out
 }
 
 /// Return an unused valid machine name in `doc` based on `wanted`, avoiding join-code shapes.
@@ -5254,33 +5563,44 @@ mod tests {
 
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
+    /// A wait after an error ends at the change the kernel tells of, not at a later look: the
+    /// kernel's word that the routes changed 7 s in ends a minute's wait there. A message that
+    /// leaves the routes as they were (a neighbour's entry) waits on to the end.
     #[test]
     fn a_wait_after_an_error_ends_once_the_network_changes() {
-        let mut slept = Duration::ZERO;
+        // Each wait: the kernel's next message, this long after the last.
+        let waits = |messages: Vec<u64>| {
+            let mut messages = messages.into_iter();
+            move |most: Duration| {
+                messages
+                    .next()
+                    .map_or(most, |after| Duration::from_secs(after).min(most))
+            }
+        };
         let mut looks = 0;
         let moved = nap_unless_moved(
             LONGEST_ERROR_RETRY,
             &mut || {
                 looks += 1;
-                looks == 3
+                looks == 2
             },
-            &mut |step| slept += step,
+            &mut waits(vec![3, 4]),
         );
         assert!(moved);
-        assert_eq!(slept, MOVED_STEP * 3);
+        assert_eq!(looks, 2, "a look at each message, none between them");
 
         let mut slept = Duration::ZERO;
+        let mut kernel = waits(vec![3, 4]);
         assert!(!nap_unless_moved(
             LONGEST_ERROR_RETRY,
             &mut || false,
-            &mut |step| slept += step
+            &mut |most| {
+                let waited = kernel(most);
+                slept += waited;
+                waited
+            }
         ));
         assert_eq!(slept, LONGEST_ERROR_RETRY);
-        let mut steps = Vec::new();
-        nap_unless_moved(Duration::from_secs(2), &mut || false, &mut |step| {
-            steps.push(step)
-        });
-        assert_eq!(steps, [Duration::from_secs(2)]);
     }
 
     #[test]
@@ -5742,6 +6062,108 @@ mod tests {
         );
     }
 
+    /// A pass the server answered at once, leaving this Mac's seq as it was.
+    const ANSWERED_AT_ONCE: Pass = Pass {
+        took: Duration::ZERO,
+        moved: false,
+    };
+
+    /// A pass that moved this Mac's seq (a version that let another Mac in, leaving this one
+    /// out) or that the server held is followed by the next long-poll at once, so an approval
+    /// that comes next is heard as it lands. Negative control: one answered at once with
+    /// nothing new pauses, as before (30 s after a NotIn, 10 s after nothing newer).
+    #[test]
+    fn a_pass_that_moved_the_seq_or_was_held_is_followed_at_once() {
+        let url = Source::Url("http://127.0.0.1:7484/v1/alab".to_string());
+        let mut failing = FIRST_RETRY;
+        let moved = Pass {
+            took: Duration::from_millis(20),
+            moved: true,
+        };
+        let held = Pass {
+            took: crate::server::DEFAULT_HOLD,
+            moved: false,
+        };
+        let unchanged = SyncOutcome::Unchanged { seq: 2 };
+        for (outcome, pass) in [
+            (&SyncOutcome::NotIn, moved),
+            (&SyncOutcome::NotIn, held),
+            (&unchanged, held),
+        ] {
+            assert_eq!(
+                pause_after(&url, outcome, &mut failing, pass),
+                Duration::ZERO,
+                "{outcome:?} {pass:?}"
+            );
+        }
+        let at_once = |outcome| {
+            let mut failing = FIRST_RETRY;
+            pause_after(&url, outcome, &mut failing, ANSWERED_AT_ONCE)
+        };
+        assert_eq!(at_once(&SyncOutcome::NotIn).as_secs(), 30);
+        assert_eq!(at_once(&unchanged).as_secs(), 10);
+    }
+
+    /// A resting approver (longer than [`WATCHED_NAP`]: no admin here, as on every member Mac,
+    /// or after a failure) reads nothing of this Mac's state while it naps; the short wait for a
+    /// version this Mac applies reads the seq it waits past. Negative control: a nap that
+    /// watches the seq whatever its length reads the state of every member Mac ten times a
+    /// second.
+    #[test]
+    fn a_resting_approver_reads_no_state_while_it_naps() {
+        let stopped = AtomicBool::new(true);
+        let reads = std::cell::Cell::new(0);
+        let seq = || {
+            reads.set(reads.get() + 1);
+            Some(7)
+        };
+        approver_nap(&stopped, Duration::from_secs(30), &seq);
+        assert_eq!(reads.get(), 0, "a resting approver read this Mac's state");
+        approver_nap(&stopped, WATCHED_NAP, &seq);
+        assert_eq!(
+            reads.get(),
+            1,
+            "the wait for a version reads the seq it waits past"
+        );
+    }
+
+    /// A pass that writes N files flushes each in order before its rename and its directory
+    /// once, not each file and its directory durably: 20 entries cost the [pending] record's 2
+    /// durable flushes, 20 ordered ones and 1 for `~/.secrets`, where they cost 42 durable
+    /// ones. Negative control: `write_atomic` in `place` brings back 2 durable flushes a file.
+    #[test]
+    fn a_pass_of_many_entries_flushes_each_in_order_and_its_directory_once() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(root.path());
+        fsx::ensure_private_dir(&paths.dir).expect("state dir");
+        let entries: Vec<Entry> = (0..20)
+            .map(|n| Entry {
+                name: format!("token{n:02}"),
+                value: SecretBytes::from(format!("inert-{n}").as_bytes()),
+                audience: crate::text::Audience::Everyone,
+                if_absent: false,
+                anchor: None,
+            })
+            .collect();
+        let mut state = State::default();
+        let recording = aterm_durable::seam::Recording::start();
+        let report = apply_entries(&paths, &mut state, &entries).expect("applied");
+        let flushes = recording.take();
+        assert_eq!(report.written.len(), 20, "{report:?}");
+        let durable = flushes.iter().filter(|flush| flush.is_durable()).count();
+        let ordered = flushes.iter().filter(|flush| flush.is_ordered()).count();
+        assert_eq!((durable, ordered), (2 + 1, 20), "{flushes:?}");
+        // What a cut-short pass resumes from is on disk before the first file is written.
+        assert!(state.pending.is_empty(), "every write landed");
+        for entry in &entries {
+            let target = materialize::target_path(&paths.home, &entry.name).expect("target");
+            assert_eq!(
+                std::fs::read(target).expect("written"),
+                entry.value.as_slice()
+            );
+        }
+    }
+
     #[test]
     fn a_pass_that_leaves_an_entry_failed_backs_off_and_a_clean_one_starts_again() {
         let url = Source::Url("http://127.0.0.1:7484/v1/alab".to_string());
@@ -5756,17 +6178,32 @@ mod tests {
         };
         let mut failing = FIRST_RETRY;
         let pauses: Vec<u64> = (0..8)
-            .map(|_| pause_after(&url, &applied(1), &mut failing).as_secs())
+            .map(|_| pause_after(&url, &applied(1), &mut failing, ANSWERED_AT_ONCE).as_secs())
             .collect();
         assert_eq!(pauses, [5, 10, 20, 40, 80, 160, 300, 300]);
-        assert_eq!(pause_after(&url, &applied(0), &mut failing), Duration::ZERO);
-        assert_eq!(pause_after(&url, &applied(2), &mut failing), FIRST_RETRY);
-        pause_after(&url, &applied(2), &mut failing);
+        assert_eq!(
+            pause_after(&url, &applied(0), &mut failing, ANSWERED_AT_ONCE),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pause_after(&url, &applied(2), &mut failing, ANSWERED_AT_ONCE),
+            FIRST_RETRY
+        );
+        pause_after(&url, &applied(2), &mut failing, ANSWERED_AT_ONCE);
         let unchanged = SyncOutcome::Unchanged { seq: 2 };
-        assert_eq!(pause_after(&url, &unchanged, &mut failing).as_secs(), 10);
-        assert_eq!(pause_after(&url, &applied(1), &mut failing), FIRST_RETRY);
+        assert_eq!(
+            pause_after(&url, &unchanged, &mut failing, ANSWERED_AT_ONCE).as_secs(),
+            10
+        );
+        assert_eq!(
+            pause_after(&url, &applied(1), &mut failing, ANSWERED_AT_ONCE),
+            FIRST_RETRY
+        );
         let path = Source::Path(PathBuf::from("/tmp/vault"));
-        assert_eq!(pause_after(&path, &applied(1), &mut failing).as_secs(), 60);
+        assert_eq!(
+            pause_after(&path, &applied(1), &mut failing, ANSWERED_AT_ONCE).as_secs(),
+            60
+        );
     }
 
     fn bound() -> std::net::TcpListener {
@@ -5981,6 +6418,50 @@ mod tests {
     }
 
     #[test]
+    fn a_store_holds_the_alab_vault_only_under_a_key_this_build_names_for_it() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        // A vault named `alab`, signed by a scratch key standing in for the ALab key.
+        let admin = Paths::for_home(&root.path().join("admin"));
+        let source = store.join("alab.vault");
+        create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let signer = pinned(&admin).signer.expect("pin");
+        let other = envelope::signer_public(&[239; 32]).expect("public key");
+        assert!(
+            !crate::server::holds_alab(&store),
+            "a vault named alab under a key this build does not name is anyone's"
+        );
+        assert!(retiring(Vec::new(), signer, || crate::server::holds_alab(
+            &store
+        )));
+        assert!(
+            !retiring(vec![signer], other, || crate::server::holds_alab(&store)),
+            "a retired key's vault gives way"
+        );
+        // Another vault's bytes in the ALab vault's file, or bytes that do not verify, are not it.
+        let bytes = std::fs::read(&source).unwrap();
+        let elsewhere = Paths::for_home(&root.path().join("elsewhere"));
+        let home = root.path().join("home.vault");
+        create(&elsewhere, home.to_str().unwrap(), None, Some("elsewhere")).unwrap();
+        let home_signer = pinned(&elsewhere).signer.expect("pin");
+        std::fs::copy(&home, &source).unwrap();
+        assert!(
+            !retiring(Vec::new(), home_signer, || crate::server::holds_alab(
+                &store
+            )),
+            "the vault `home` is not the ALab vault"
+        );
+        let mut forged = bytes;
+        let at = forged.len() / 2;
+        forged[at] = if forged[at] == b'A' { b'B' } else { b'A' };
+        std::fs::write(&source, &forged).unwrap();
+        assert!(!retiring(Vec::new(), signer, || crate::server::holds_alab(
+            &store
+        )));
+    }
+
+    #[test]
     fn pin_admission_follows_verified_rotation_and_compiled_replacement() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let source = root.path().join("team.vault");
@@ -6021,6 +6502,89 @@ mod tests {
         assert!(!pin_admitted(&unsigned, Some(current)));
         unsigned.source = Source::Url("https://vault.example/v1/team".into());
         assert!(!pin_admitted(&unsigned, None));
+    }
+
+    #[test]
+    fn a_join_of_a_signed_path_that_now_holds_plain_text_keeps_the_pin_and_writes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        let created = create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let before = pinned(&admin);
+        assert!(before.signer.is_some());
+        // Someone who can write the file puts plain text in the vault's place.
+        fsx::write_atomic(&source, b"~/.tool/planted=inert-planted\n", 0o600).unwrap();
+        let planted = |paths: &Paths| {
+            materialize::target_path(&paths.home, "~/.tool/planted")
+                .unwrap()
+                .exists()
+        };
+        let join_typed = |paths: &Paths, typed: String| {
+            join(
+                paths,
+                &JoinOptions {
+                    source: typed,
+                    host: Some("reader".into()),
+                    interactive: false,
+                    wait: Duration::ZERO,
+                    confirm: &|_| false,
+                    password: JoinPassword::Given(None),
+                    fetched: None,
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            )
+        };
+
+        // The Mac that pins it, joining again by the bare path.
+        let refused = join_typed(&admin, source.display().to_string()).expect_err("refused");
+        assert!(
+            refused.to_string().contains("holds plain text"),
+            "{refused}"
+        );
+        assert_eq!(pinned(&admin), before, "the pin stands");
+        assert!(!planted(&admin));
+        // A Mac that names the signer it expects.
+        let fresh = Paths::for_home(&root.path().join("fresh"));
+        join_typed(&fresh, format!("{}#{}", source.display(), created.signer))
+            .expect_err("refused");
+        assert!(config(&fresh).unwrap().is_none(), "nothing configured");
+        assert!(!planted(&fresh));
+        // A Mac that pins nothing there may read a plain file.
+        let plain = Paths::for_home(&root.path().join("plain"));
+        join_typed(&plain, source.display().to_string()).expect("a plain file");
+        assert!(planted(&plain));
+    }
+
+    #[test]
+    fn only_a_pin_this_build_names_for_alab_or_one_reached_from_it_is_the_alab_vault() {
+        let key = |seed: u8| envelope::signer_public(&[seed; 32]).expect("public key");
+        let (retired, current, successor, other) = (key(1), key(2), key(3), key(4));
+        let config = |signer: Option<[u8; 32]>, followed: Vec<[u8; 32]>| Config {
+            source: Source::Url("https://anywhere.example/v1/alab".into()),
+            name: "alab".into(),
+            signer,
+            followed,
+            host: "mac".into(),
+        };
+        let judged = retiring(vec![retired], current, || {
+            [
+                // The key this build names, at any address.
+                alab_vault(&config(Some(current), Vec::new())),
+                // A rotation this build does not know yet, reached from the current key.
+                alab_vault(&config(Some(successor), vec![current])),
+                // Another vault, and a plain file.
+                alab_vault(&config(Some(other), Vec::new())),
+                alab_vault(&config(None, Vec::new())),
+                // A retired pin, and a key a retired one endorsed that this build does not
+                // know: both give way to the current key, so neither is the vault this build trusts.
+                alab_vault(&config(Some(retired), Vec::new())),
+                alab_vault(&config(Some(other), vec![retired])),
+                // A retired key's endorsement of the current one is the ALab vault's own handoff.
+                alab_vault(&config(Some(current), vec![retired])),
+            ]
+        });
+        assert_eq!(judged, [true, true, false, false, false, false, true]);
     }
 
     #[test]
@@ -6216,6 +6780,56 @@ mod tests {
                 Some(source_identity(&new_config))
             );
         }
+    }
+
+    #[test]
+    fn a_path_subscriber_puts_back_a_rewritten_file_once_per_version() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let replaced = |paths: &Paths| {
+            std::fs::read_dir(paths.home.join(".secrets").join(materialize::REPLACED_DIR))
+                .map_or(0, Iterator::count)
+        };
+        // A signed vault at a path, read by its admin.
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        // A plain file at a path.
+        let text = root.path().join("home.secrets");
+        fsx::write_atomic(&text, b"token=inert-token\n", 0o600).unwrap();
+        let plain = Paths::for_home(&root.path().join("plain"));
+        join_pinned(&plain, text.to_str().unwrap(), "plain");
+
+        let (mut on_admin, mut on_plain) = (None, None);
+        for (paths, repaired) in [(&admin, &mut on_admin), (&plain, &mut on_plain)] {
+            let token = materialize::target_path(&paths.home, "token").unwrap();
+            let mut pass = || subscriber_pass(paths, repaired).expect("a pass");
+            pass();
+            assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
+            assert_eq!(replaced(paths), 0);
+            // A program on this Mac rewrites the file: put back once...
+            fsx::write_atomic(&token, b"program-1", 0o600).unwrap();
+            pass();
+            assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
+            assert_eq!(replaced(paths), 1);
+            pass();
+            // ...not every minute it rewrites it again.
+            fsx::write_atomic(&token, b"program-2", 0o600).unwrap();
+            pass();
+            pass();
+            assert_eq!(std::fs::read(&token).unwrap(), b"program-2");
+            assert_eq!(replaced(paths), 1, "one copy moved aside, not one a minute");
+        }
+        // A new version of the plain file is written whatever was put back before.
+        fsx::write_atomic(&text, b"token=inert-token\nnote=inert-note\n", 0o600).unwrap();
+        subscriber_pass(&plain, &mut on_plain).expect("a pass");
+        let read = |name: &str| std::fs::read(materialize::target_path(&plain.home, name).unwrap());
+        assert_eq!(read("note").unwrap(), b"inert-note");
+        assert_eq!(read("token").unwrap(), b"inert-token");
     }
 
     #[test]
@@ -8208,7 +8822,7 @@ mod tests {
         );
         let mut failing = FIRST_RETRY;
         assert_eq!(
-            pause_after(&config.source, &outcome, &mut failing),
+            pause_after(&config.source, &outcome, &mut failing, ANSWERED_AT_ONCE),
             FIRST_RETRY
         );
 
@@ -8251,7 +8865,7 @@ mod tests {
         let (mut failing, mut repeated) = (FIRST_RETRY, String::new());
         let mut pass = |outcome: &SyncOutcome| {
             (
-                pause_after(&config.source, outcome, &mut failing).as_secs(),
+                pause_after(&config.source, outcome, &mut failing, ANSWERED_AT_ONCE).as_secs(),
                 pass_line(&paths, &config, outcome, &mut repeated),
             )
         };

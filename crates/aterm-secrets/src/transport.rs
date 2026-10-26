@@ -222,10 +222,16 @@ pub fn describe(url: &str) -> String {
     }
 }
 
-/// A server's reason.
+/// A server's reason: its first line, sanitized, without the words aterm reads as macOS's Local
+/// Network refusal ([`crate::client::refused_by_local_network`]), which only this Mac's own
+/// lookup says, so a server quoting them reads as no refusal.
 pub fn reason(body: &[u8]) -> String {
-    one_line(body, REASON_CHARS)
+    one_line(body, REASON_CHARS).replace(aterm_http::LOCAL_NETWORK_REFUSED, QUOTED_REFUSAL)
 }
+
+/// What stands in a server's reason for the words of macOS's Local Network refusal ([`reason`]):
+/// shorter than they are, so the reason stays within its cap.
+const QUOTED_REFUSAL: &str = "[a refusal the server quoted]";
 
 /// The first line of `bytes`, at most `cap` characters, each byte outside printable ASCII a `?`.
 fn one_line(bytes: &[u8], cap: usize) -> String {
@@ -448,12 +454,17 @@ fn get_via(
         Some(connect) => request.connect_within(connect),
         None => request,
     };
-    let response = match request.send(&[]) {
+    let response = match request.send_phased(&[]) {
         Ok(response) => response,
-        Err(error) if foreign_reply(&error) => {
+        // A long-poll the server still held at the request's deadline (one held longer than
+        // the asker waits, by an older server): nothing newer was heard.
+        Err(failed) if after.is_some() && held_past_deadline(&failed) => {
+            return Ok(Answer::Fetched(Fetched::NoNewer(None)));
+        }
+        Err(aterm_http::SendError { error, .. }) if foreign_reply(&error) => {
             return Ok(Answer::Foreign(transport_error("fetching", url, &error).0));
         }
-        Err(error) => {
+        Err(aterm_http::SendError { error, .. }) => {
             return Err(Unheard {
                 why: transport_error("fetching", url, &error),
                 held: held(&error),
@@ -473,6 +484,13 @@ fn get_via(
         status if foreign_status(status) => Ok(Answer::Foreign(failed(status).why.0)),
         status => Err(failed(status)),
     }
+}
+
+/// Whether `failed` is a request the server took and never answered by its deadline: the
+/// whole request went out ([`aterm_http::Phase::Sent`]) and its time ran out.
+fn held_past_deadline(failed: &aterm_http::SendError) -> bool {
+    failed.phase == aterm_http::Phase::Sent
+        && matches!(&failed.error, aterm_http::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
 }
 
 /// Whether `error` is [`Unheard::held`]: aterm-http's resolver gives up on a lookup with no
@@ -884,27 +902,69 @@ fn retry_after(response: &aterm_http::Response) -> Option<Duration> {
 
 /// `GET <url>/join`: the pending request lines ([`parse_join_line`]).
 pub fn list_joins(url: &str) -> crate::Result<Vec<String>> {
-    let target = join_url(url);
-    let response = client(EXCHANGE)
+    match wait_joins(url, None, EXCHANGE)? {
+        Joins::Listed(lines, _) => Ok(lines),
+        Joins::Unchanged => Ok(Vec::new()),
+    }
+}
+
+/// What one read of a vault's join queue heard ([`wait_joins`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Joins {
+    /// The pending request lines, and the queue's version where the server names one (its
+    /// `ETag`): a server that names none holds no join long-poll.
+    Listed(Vec<String>, Option<u64>),
+    /// The queue is still at the version asked past: the server's hold ran out, or it held the
+    /// request past `wait`.
+    Unchanged,
+}
+
+/// `GET <url>/join`, or with `after`, `GET <url>/join?after=<n>`: a long-poll the server holds
+/// until a request is queued or changed past version `n` or the vault takes a new version, or
+/// its hold runs out, the whole request within `wait` and [`FETCH_MARGIN`].
+pub fn wait_joins(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Joins> {
+    let target = match after {
+        Some(after) => with_query(&join_url(url), &format!("after={after}")),
+        None => join_url(url),
+    };
+    let response = match client(wait.saturating_add(FETCH_MARGIN))
         .get(&target)
         .limit(JOINS_BODY)
-        .send(&[])
-        .map_err(|e| transport_error("listing join requests at", &target, &e))?;
-    if response.status() != 200 {
-        return Err(refused(
-            "listing join requests at",
-            &target,
-            response.status(),
-            response.body(),
-        ));
+        .send_phased(&[])
+    {
+        Ok(response) => response,
+        Err(failed) if after.is_some() && held_past_deadline(&failed) => {
+            return Ok(Joins::Unchanged);
+        }
+        Err(failed) => {
+            return Err(transport_error(
+                "listing join requests at",
+                &target,
+                &failed.error,
+            ));
+        }
+    };
+    match response.status() {
+        200 => {}
+        204 if after.is_some() => return Ok(Joins::Unchanged),
+        status => {
+            return Err(refused(
+                "listing join requests at",
+                &target,
+                status,
+                response.body(),
+            ));
+        }
     }
     let text = std::str::from_utf8(response.body())
         .map_err(|_| Error::new("the join queue is not UTF-8 text"))?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect())
+    Ok(Joins::Listed(
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        response.header("etag").and_then(etag_seq),
+    ))
 }
 
 /// `POST <url>/join/verdict` with one line, `age1… refused <tag>`: an admin Mac's word that the
@@ -1250,6 +1310,20 @@ mod tests {
         assert_eq!(reason("caf\u{e9}".as_bytes()), "caf??");
         assert_eq!(reason(&[b'x'; 500]).len(), 200);
         assert_eq!(reason(b""), "");
+        // A server quoting macOS's Local Network refusal is no refusal of this Mac's.
+        let quoted = format!("oops: {}", aterm_http::LOCAL_NETWORK_REFUSED);
+        assert_eq!(
+            reason(quoted.as_bytes()),
+            "oops: [a refusal the server quoted]"
+        );
+        // The client, which reads the refusal, builds on unix only.
+        #[cfg(unix)]
+        assert!(!crate::client::refused_by_local_network(&refused(
+            "fetching",
+            "http://alab-secrets.local:7484/v1/alab",
+            500,
+            quoted.as_bytes()
+        )));
     }
 
     /// This machine's own failure to reach a server keeps a remedy a server's reason would have
@@ -1769,20 +1843,24 @@ mod tests {
     }
 
     /// A bounded wait's try ([`fetch_within`]) ends at its own total on a server that holds it,
-    /// with no [`FETCH_MARGIN`] after it, as a timeout its caller hears as no news.
+    /// with no [`FETCH_MARGIN`] after it: a long-poll still held then heard nothing newer (an
+    /// older server holds one longer than this asker waits). Negative control: a GET that is no
+    /// long-poll (no `after`), which a server answers at once, failing so is a timeout.
     #[test]
-    fn a_bounded_fetch_ends_at_its_total_as_a_timeout() {
+    fn a_bounded_fetch_ends_at_its_total_as_no_news() {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
         let total = Duration::from_millis(200);
         let started = std::time::Instant::now();
-        let error = fetch_within(&url, Some(3), total).expect_err("a server that never answers");
+        let held = fetch_within(&url, Some(3), total).expect("a held long-poll is no news");
         let took = started.elapsed();
-        assert_eq!(error.kind(), ErrorKind::TimedOut, "{error:?}");
+        assert_eq!(held, Fetched::NoNewer(None));
         assert!(
             took < FETCH_MARGIN,
             "the try waited the fetch margin past its total: {took:?}"
         );
+        let error = fetch_within(&url, None, total).expect_err("a look that is never answered");
+        assert_eq!(error.kind(), ErrorKind::TimedOut, "{error:?}");
         drop(silent);
     }
 

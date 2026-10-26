@@ -199,8 +199,12 @@ pub fn auth_path_in_home(home: &Path) -> PathBuf {
     }
 }
 
-fn load_stored_auth(home: &Path) -> Option<StoredAuth> {
+fn read_auth_file_bounded(home: &Path) -> Option<String> {
+    if std::fs::symlink_metadata(home).is_ok_and(|md| md.file_type().is_symlink()) {
+        return None;
+    }
     let path = auth_path_in_home(home);
+    #[cfg(not(unix))]
     if std::fs::symlink_metadata(&path)
         .ok()?
         .file_type()
@@ -208,7 +212,30 @@ fn load_stored_auth(home: &Path) -> Option<StoredAuth> {
     {
         return None;
     }
-    let text = std::fs::read_to_string(&path).ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let limit = MESSAGE_MAX as u64;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > limit {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn load_stored_auth(home: &Path) -> Option<StoredAuth> {
+    let text = read_auth_file_bounded(home)?;
     let doc: Value = aterm_json::from_str(&text).ok()?;
     if let Some(mode) = doc.get("auth_mode").and_then(Value::as_str)
         && mode != "chatgpt"
@@ -312,17 +339,46 @@ pub fn read_account_email(home: &Path) -> Option<String> {
     read_account_in_home(home)?.email
 }
 
-fn is_loopback_endpoint(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or("");
-    let host_port = rest.split('/').next().unwrap_or("");
-    if host_port == "[::1]" || host_port.starts_with("[::1]:") {
-        return true;
+fn endpoint_authority(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url
+        .strip_prefix("https://")
+        .map(|r| ("https", r))
+        .or_else(|| url.strip_prefix("http://").map(|r| ("http", r)))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.bytes().any(|b| b <= 0x20 || b >= 0x7f)
+    {
+        return None;
     }
-    let host = host_port.split(':').next().unwrap_or("");
-    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
+    Some((scheme, authority))
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    if let Some(rest) = authority.strip_prefix("[::1]") {
+        return rest.is_empty()
+            || rest
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .is_some();
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if !(host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")) {
+        return false;
+    }
+    port.is_none_or(|p| p.parse::<u16>().is_ok())
+}
+
+fn is_loopback_endpoint(url: &str) -> bool {
+    endpoint_authority(url).is_some_and(|(_, auth)| is_loopback_authority(auth))
+}
+
+fn is_allowed_auth_endpoint(url: &str) -> bool {
+    endpoint_authority(url)
+        .is_some_and(|(scheme, auth)| scheme == "https" || is_loopback_authority(auth))
 }
 
 fn http_client(url: &str, timeout: Duration) -> Client {
@@ -351,6 +407,18 @@ fn needs_proactive_refresh(stored: &StoredAuth, now: i64) -> bool {
     false
 }
 
+/// Reloads `auth.json` when another process (such as a live `codex-alab` session sharing
+/// `CODEX_AUTH_PATH`) rotated the stored access token since `prior` was read, avoiding replay of a
+/// single-use OAuth refresh token.
+fn reload_updated_disk_auth(home: &Path, prior: &StoredAuth) -> Option<StoredAuth> {
+    let disk = load_stored_auth(home)?;
+    let same_account = match (prior.account_id.as_deref(), disk.account_id.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    (same_account && disk.access_token != prior.access_token).then_some(disk)
+}
+
 fn refresh_stored_auth(
     home: &Path,
     stored: &StoredAuth,
@@ -358,7 +426,7 @@ fn refresh_stored_auth(
     wait: Duration,
     now: i64,
 ) -> Option<StoredAuth> {
-    if wait.is_zero() {
+    if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
         return None;
     }
     let refresh_token = stored.refresh_token.as_deref()?;
@@ -427,23 +495,29 @@ fn refresh_stored_auth(
 }
 
 fn read_configured_base_url(config_path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(config_path).ok()?;
+    let text = super::accounts::read_bounded(config_path, 256 * 1024).ok()??;
     let table: aterm_toml::Value = aterm_toml::from_str(&text).ok()?;
     table
         .get("chatgpt_base_url")
         .and_then(aterm_toml::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+        .map(usage_url_from_base)
+        .filter(|url| is_allowed_auth_endpoint(url))
 }
 
 /// Resolves the ChatGPT usage endpoint URL from `<home>/config.toml` or `<user_home>/.codex/config.toml`.
 #[must_use]
 pub fn resolve_usage_url(home: &Path, user_home: &Path) -> String {
-    let raw = read_configured_base_url(&home.join("config.toml"))
+    let config_dir = if home.extension().and_then(|e| e.to_str()) == Some("json") && !home.is_dir()
+    {
+        home.parent().unwrap_or(home)
+    } else {
+        home
+    };
+    read_configured_base_url(&config_dir.join("config.toml"))
         .or_else(|| read_configured_base_url(&user_home.join(".codex/config.toml")))
-        .unwrap_or_else(|| DEFAULT_CHATGPT_BASE_URL.to_owned());
-    usage_url_from_base(&raw)
+        .unwrap_or_else(|| usage_url_from_base(DEFAULT_CHATGPT_BASE_URL))
 }
 
 /// Normalizes `base_url` using Codex's backend rules and appends `/wham/usage` or `/api/codex/usage`.
@@ -618,7 +692,7 @@ pub fn usage_from_backend(payload: &Value, now: i64) -> Option<Usage> {
 }
 
 fn get_usage_once(usage_url: &str, stored: &StoredAuth, wait: Duration) -> Option<(u16, Vec<u8>)> {
-    if wait.is_zero() {
+    if wait.is_zero() || !is_allowed_auth_endpoint(usage_url) {
         return None;
     }
     let client = http_client(usage_url, wait);
@@ -657,13 +731,25 @@ pub fn read_usage_with(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
     let mut stored = load_stored_auth(home)?;
     if needs_proactive_refresh(&stored, now) {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if let Some(refreshed) = refresh_stored_auth(home, &stored, token_url, left, now) {
-            stored = refreshed;
+        if let Some(reloaded) = reload_updated_disk_auth(home, &stored) {
+            stored = reloaded;
+        }
+        if needs_proactive_refresh(&stored, now) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Some(refreshed) = refresh_stored_auth(home, &stored, token_url, left, now) {
+                stored = refreshed;
+            }
         }
     }
     let left = deadline.saturating_duration_since(Instant::now());
     let (mut status, mut body) = get_usage_once(usage_url, &stored, left)?;
+    if status == 401
+        && let Some(reloaded) = reload_updated_disk_auth(home, &stored)
+    {
+        stored = reloaded;
+        let left = deadline.saturating_duration_since(Instant::now());
+        (status, body) = get_usage_once(usage_url, &stored, left)?;
+    }
     if status == 401 && stored.refresh_token.is_some() {
         let left = deadline.saturating_duration_since(Instant::now());
         let refreshed = refresh_stored_auth(home, &stored, token_url, left, now)?;
@@ -799,18 +885,26 @@ fn send_loopback_cancel(port: u16) {
     let _ = stream.read(&mut scratch);
 }
 
-fn bind_callback_listener(ports: &[u16]) -> std::io::Result<TcpListener> {
-    let mut last_err =
-        std::io::Error::new(std::io::ErrorKind::AddrInUse, "no callback port configured");
+fn bind_callback_listener(ports: &[u16], deadline: Instant) -> std::io::Result<TcpListener> {
+    let mut last_err = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "no callback port configured",
+    );
     for &port in ports {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
                 last_err = err;
-                if port == LOOPBACK_PORTS[0] {
+                if port == LOOPBACK_PORTS[0] && Instant::now() < deadline {
                     send_loopback_cancel(port);
                     for _ in 0..8 {
-                        std::thread::sleep(Duration::from_millis(50));
+                        let nap = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(50));
+                        if nap.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(nap);
                         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
                             return Ok(listener);
                         }
@@ -1069,7 +1163,7 @@ fn exchange_code_and_persist(
     wait: Duration,
     now: i64,
 ) -> Option<Option<String>> {
-    if wait.is_zero() {
+    if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
         return None;
     }
     let form = encode_form(&[
@@ -1171,12 +1265,14 @@ pub fn login_with(
         };
     };
 
-    let probe_url = build_authorize_url(
-        &endpoints.issuer,
-        "http://127.0.0.1:1455/auth/callback",
-        &code_challenge,
-        &state,
-    );
+    let probe_port = endpoints
+        .callback_ports
+        .first()
+        .copied()
+        .unwrap_or(LOOPBACK_PORTS[0]);
+    let probe_redirect = format!("http://127.0.0.1:{probe_port}/auth/callback");
+    let probe_url =
+        build_authorize_url(&endpoints.issuer, &probe_redirect, &code_challenge, &state);
     let host = https_host(&probe_url);
     if !pinned(&probe_url, hosts) {
         return Drove {
@@ -1184,8 +1280,14 @@ pub fn login_with(
             host,
         };
     }
+    if Instant::now() >= deadline {
+        return Drove {
+            outcome: Outcome::Hung,
+            host,
+        };
+    }
 
-    let listener = match bind_callback_listener(&endpoints.callback_ports) {
+    let listener = match bind_callback_listener(&endpoints.callback_ports, deadline) {
         Ok(listener) => listener,
         Err(e) => {
             return Drove {

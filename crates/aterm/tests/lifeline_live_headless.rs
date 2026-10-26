@@ -281,7 +281,12 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     launch_isolation::apply(&mut cmd, &root_b);
     let out = cmd
         .arg("doctor")
-        .args(["--read-only", "--only", "base.session.instances"])
+        .args([
+            "--read-only",
+            "--verbose",
+            "--only",
+            "base.session.instances",
+        ])
         .stdin(Stdio::null())
         .output()
         .expect("run aterm doctor");

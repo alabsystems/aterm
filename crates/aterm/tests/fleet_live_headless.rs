@@ -1086,6 +1086,23 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     );
     let (closed, _) = drive_ok(&issuer.tmp, &target, &[&format!("@{spawned_sid}"), "close"]);
     assert!(closed.starts_with("OK closed"), "{closed}");
+    let grok = drive_fed(
+        &issuer.tmp,
+        &target,
+        &["spawn", "agent=grok", &format!("cwd={work}"), "-"],
+        b"a task from the issuer",
+    );
+    let refused = String::from_utf8_lossy(&grok.stderr);
+    assert!(
+        grok.status.code() == Some(1)
+            && refused.contains(
+                "spawn agent=grok: Grok Build is read, not supervised, by the aterm of the Mac \
+                 asked to start it"
+            )
+            && !refused.contains(" here")
+            && !refused.contains("this Mac"),
+        "the driving Mac reads the driven Mac's refusal: {grok:?}"
+    );
 
     fleet_ok(&stranger.0, &["peers", "--timeout", "10"], None);
     fleet_ok(&member.tmp, &["peers", "--timeout", "10"], None);
@@ -1489,4 +1506,130 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     assert_eq!(lifted.trim(), "OK hold=0 lifted=remote", "{lifted}");
     assert_eq!(field(&status(&held, &sid), "hold_by"), Some("-"));
     ctl_ok(&held, &[&at, "send", "y"]);
+}
+
+#[test]
+fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let inst = boot_world(
+        "afnl",
+        |tmp, cmd| {
+            use std::os::unix::fs::PermissionsExt as _;
+            // The aterm here reads another aterm.toml than the fleet verbs write.
+            let own = tmp.join("cfg-here");
+            std::fs::create_dir_all(own.join("aterm")).expect("its config folder");
+            for dir in [own.clone(), own.join("aterm")] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
+            std::fs::copy(
+                tmp.join("cfg/aterm/aterm.toml"),
+                own.join("aterm/aterm.toml"),
+            )
+            .expect("its config");
+            cmd.env("XDG_CONFIG_HOME", &own)
+                .env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, sid) = boot_session(&inst);
+    let pid = i32::try_from(inst.child.id()).expect("a pid");
+    let signal = |sig| {
+        // SAFETY: `kill(2)` on the instance this test started and still holds.
+        assert_eq!(unsafe { libc::kill(pid, sig) }, 0, "signal {sig}");
+    };
+    let config = inst.tmp.join("cfg/aterm/aterm.toml");
+    let place = format!("127.0.0.1:{port}");
+    let port_word = port.to_string();
+
+    signal(libc::SIGSTOP);
+    let init = fleet(
+        &inst.tmp,
+        &["init", "--host", "127.0.0.1", "--port", &port_word],
+        None,
+    );
+    signal(libc::SIGCONT);
+    let said = String::from_utf8_lossy(&init.stdout);
+    assert!(
+        init.status.success()
+            && said.contains(&format!(
+                "  listener   nothing listens on {place}: the aterm running here (pid {pid}) is \
+                 stopped, so it answers nothing and listens nowhere: `kill -CONT {pid}` resumes it"
+            ))
+            && !said.contains("follows [fleet]"),
+        "a stopped aterm takes a connection and answers nothing: {init:?}"
+    );
+
+    fleet_reads(&inst, &sid, "off");
+    let head = |listed: String| listed.lines().next().unwrap_or_default().to_owned();
+    let off = head(fleet_ok(&inst.tmp, &["peers"], None));
+    assert!(
+        off.contains(&format!(
+            "([fleet] listen is {place} and allow is facts, but nothing listens on {place} just \
+             now: the aterm running here reads fleet=off, so it has not read [fleet] yet, or it \
+             reads another aterm.toml than {}, whose [fleet] is off",
+            config.display()
+        )),
+        "{off}"
+    );
+
+    let bogus = std::fs::read_to_string(&config)
+        .expect("the verbs' config")
+        .replace("allow = \"facts\"", "allow = \"bogus\"");
+    assert!(bogus.contains("allow = \"bogus\""), "{bogus}");
+    std::fs::write(inst.tmp.join("cfg-here/aterm/aterm.toml"), &bogus)
+        .expect("write the aterm's own config");
+    fleet_reads(&inst, &sid, "refused:allow");
+    let refused = head(fleet_ok(&inst.tmp, &["peers"], None));
+    assert!(
+        refused.contains(&format!(
+            "([fleet] listen is {place} and allow is facts, but nothing listens on {place} just \
+             now: the aterm running here refused the listen (fleet=refused:allow): the [fleet] \
+             allow it read is none of \"facts\", \"content\" and \"drive\""
+        )) && !refused.contains("serving"),
+        "{refused}"
+    );
+
+    let valid = std::fs::read_to_string(&config).expect("the verbs' config");
+    std::fs::write(inst.tmp.join("cfg-here/aterm/aterm.toml"), &valid)
+        .expect("write the aterm's own config");
+    fleet_reads(&inst, &sid, "listening");
+    std::fs::write(&config, &bogus).expect("write the verbs' config");
+    let proved = head(fleet_ok(&inst.tmp, &["peers"], None));
+    std::fs::write(&config, &valid).expect("write the verbs' config");
+    assert!(
+        proved.contains(&format!(
+            "(it listens on {place}, though [fleet] allow is \"bogus\", none of \"facts\", \
+             \"content\" and \"drive\": the aterm listening there has not read it yet, or reads \
+             another aterm.toml"
+        )) && !proved.contains("no aterm here listens"),
+        "its node's proof outweighs aterm.toml's word: {proved}"
+    );
+
+    signal(libc::SIGSTOP);
+    let rotate = fleet(&inst.tmp, &["init", "--rotate"], None);
+    let stalled = head(fleet_ok(&inst.tmp, &["peers"], None));
+    signal(libc::SIGCONT);
+    let said = String::from_utf8_lossy(&rotate.stdout);
+    let stopped = format!(
+        "the aterm running here (pid {pid}) is stopped, so a listener it bound takes a connection \
+         in the kernel and answers nothing: `kill -CONT {pid}` resumes it"
+    );
+    assert!(
+        rotate.status.success()
+            && said.contains(&format!(
+                "  listener   {place} takes a connection but finishes no fleet handshake: {stopped}"
+            ))
+            && !said.contains("follows [fleet]"),
+        "a stopped aterm's bound listener takes a connection and answers nothing: {rotate:?}"
+    );
+    assert!(
+        stalled.contains(&format!(
+            "but {place} takes a connection but finishes no fleet handshake just now: {stopped}"
+        )),
+        "{stalled}"
+    );
 }

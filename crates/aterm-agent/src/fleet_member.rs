@@ -15,8 +15,8 @@ use aterm_net::fleet::{
 };
 use aterm_net::fleet_member::{
     self as member, Began, BookRead, BookUnread, CODE_FILE, Held, HeldBook, ISSUER_BOOK_FILE,
-    JoinCode, Keyring, Leaving, NODE_FILE, NODE_KEY_FILE, PEERS_FILE, Peer, Recorded, Registration,
-    Unreached, Unwritten, Via, target_of,
+    JoinCode, Keyring, Leaving, Leveling, NODE_FILE, NODE_KEY_FILE, PEERS_FILE, Peer, Recorded,
+    Registration, Unreached, Unwritten, Via, target_of,
 };
 use aterm_uds::atomic_file::ConfigFile;
 use aterm_uds::private_file::ANOTHER_LINK;
@@ -893,7 +893,7 @@ fn renews(places: &Places, node: &str, key: Option<NodeKey>) -> bool {
         })
 }
 
-/// A test's hook at each step a kill, or another verb, could come before: [`join`]'s (`lock` once it dialled, `key`, `drop`, `config`, `book`), [`init`]'s first write (`key`), its key's write past its code's (`code`) and its write of aterm.toml (`config`), a grant's write (`grant`) and a level's (`level`), a read's copy of the issuer's book (`keep`), and [`leave`]'s, under the book's lock, once it removed the fleet's files (`removed`) and once it edited aterm.toml (`unlisten`): a panic stops the verb there as a kill would, and a step reached inside the hook runs none.
+/// A test's hook at each step a kill, or another verb, could come before: [`join`]'s (`lock` once it dialled, `key`, `drop`, `config`, `book`), [`init`]'s first write (`key`), its key's write past its code's (`code`) and its write of aterm.toml (`config`), a grant's write (`grant`) and a level's (`level`), a read's copy of the issuer's book (`keep`), and [`leave`]'s, under the book's lock, once it removed the fleet's files (`removed`), once it read aterm.toml (`config`) and once it edited it (`unlisten`): a panic stops the verb there as a kill would, and a step reached inside the hook runs none.
 #[cfg(test)]
 type StepHook = Box<dyn FnMut(&str)>;
 
@@ -2268,17 +2268,13 @@ fn own_listener(
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     within: Duration,
 ) -> Option<Result<SocketAddr, Unreached>> {
-    let listen: SocketAddr = table.listen.as_deref()?.parse().ok()?;
+    let place = own_place(table)?;
     let me = me?;
-    let ip = match listen.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
+    let ip = place.ip();
     let target = member::Target {
         host: ip.to_string(),
         addr: Some(ip),
-        port: listen.port(),
+        port: place.port(),
         node: Some(me.node().to_owned()),
         key: Some(me.key()),
     };
@@ -2288,6 +2284,17 @@ fn own_listener(
         (secret, me),
         within,
     ))
+}
+
+/// The place [`own_listener`] dials: `[fleet] listen`, a wildcard's at the loopback.
+fn own_place(table: &FleetTable) -> Option<SocketAddr> {
+    let listen: SocketAddr = table.listen.as_deref()?.parse().ok()?;
+    let ip = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    Some(SocketAddr::new(ip, listen.port()))
 }
 
 /// How long a verb that wrote the key waits for an aterm running here to serve it: its listener
@@ -2303,10 +2310,12 @@ const PROBE_MAX: Duration = Duration::from_secs(1);
 
 /// Once a verb wrote `secret` as the key an aterm running here serves, wait, at most
 /// [`SERVES_NEW_KEY`], while its `[fleet] listen` place answers under another secret, or nothing
-/// listens there and an aterm runs here ([`aterm_runs_here`]) to bind it, so a reader or a join
+/// listens there and an aterm here answers ([`aterm_here`]) to bind it, so a reader or a join
 /// that comes next meets the new key; the line saying so where it still does, which the report's
 /// close then follows ([`follows`]). Nothing is waited for where anything else answers there, or
-/// nothing does and no aterm runs here.
+/// nothing does and no aterm here answers ([`nothing_listens`] says which), or the place takes a
+/// connection and finishes no handshake beside an aterm here that answers nothing
+/// ([`answers_no_handshake`] says which).
 fn serves_new_key(places: &Places, secret: &FleetSecret) -> Option<String> {
     let table = ConfigFile::open(&places.config)
         .map_err(failed)
@@ -2314,8 +2323,12 @@ fn serves_new_key(places: &Places, secret: &FleetSecret) -> Option<String> {
     let (Some(me), Ok(table)) = (own_identity(places), table) else {
         return None;
     };
+    let after = format!(
+        " {} s after the new key was written",
+        SERVES_NEW_KEY.as_secs()
+    );
     let end = Instant::now() + SERVES_NEW_KEY;
-    let mut runs = None;
+    let mut here = None;
     loop {
         let left = end.saturating_duration_since(Instant::now());
         let unserved = match own_listener(
@@ -2323,39 +2336,62 @@ fn serves_new_key(places: &Places, secret: &FleetSecret) -> Option<String> {
             (secret, Some(&me)),
             left.clamp(PROBE_MIN, PROBE_MAX),
         ) {
-            Some(Err(Unreached::Handshake(at, FleetError::ListenerWrongSecret))) => format!(
-                "{at} still answers under another secret {} s after the new key was written: an \
-                 aterm here that has not read it (`aterm ctl status` here reads fleet=listening, \
-                 or refused:<why>), or another fleet's listener holding that port \
-                 (fleet=retrying then)",
-                SERVES_NEW_KEY.as_secs()
-            ),
+            Some(Err(Unreached::Handshake(at, FleetError::ListenerWrongSecret))) => Err(at),
             Some(Err(Unreached::Connect(at, e)))
-                if e.kind() == io::ErrorKind::ConnectionRefused
-                    && *runs.get_or_insert_with(aterm_runs_here) =>
+                if e.kind() == io::ErrorKind::ConnectionRefused =>
             {
-                format!(
-                    "nothing listens on {at} {} s after the new key was written, though an aterm \
-                     runs here: `aterm ctl status` here reads fleet=off where that aterm reads \
-                     another aterm.toml than {}, whose [fleet] is off (one relaunched to read this \
-                     one listens; `aterm explain-config` in one of its tabs names the one it \
-                     reads), or fleet=refused:<why>, which names what keeps it from listening",
-                    SERVES_NEW_KEY.as_secs(),
-                    places.config.display()
-                )
+                match here.get_or_insert_with(|| aterm_here(left.max(PROBE_MIN))) {
+                    Here::Absent => return None,
+                    asked @ (Here::Stopped(_) | Here::Silent(_)) => {
+                        return Some(format!(
+                            "  listener   {}\n",
+                            nothing_listens(places, at, "", asked)
+                        ));
+                    }
+                    Here::Answers(_) => Ok(at),
+                }
+            }
+            // A stopped aterm's bound listener still takes a connection, in the kernel.
+            Some(Err(Unreached::Deadline(member::Stage::Handshake, _))) => {
+                let asked = here.get_or_insert_with(|| aterm_here(left.max(PROBE_MIN)));
+                return own_place(&table)
+                    .and_then(|at| answers_no_handshake(at, "", asked))
+                    .map(|line| format!("  listener   {line}\n"));
             }
             _ => return None,
         };
         if Instant::now() >= end {
-            return Some(format!("  listener   {unserved}\n"));
+            let line = match unserved {
+                Err(at) => format!(
+                    "{at} still answers under another secret{after}: an aterm here that has not \
+                     read it (`aterm ctl status` here reads fleet=listening, or refused:<why>), or \
+                     another fleet's listener holding that port (fleet=retrying then)"
+                ),
+                // Its word as the wait ends, not as it began.
+                Ok(at) => nothing_listens(places, at, &after, &aterm_here(PROBE_MAX)),
+            };
+            return Some(format!("  listener   {line}\n"));
         }
         std::thread::sleep(PROBE_MIN.min(end.saturating_duration_since(Instant::now())));
     }
 }
 
-/// A test's answer to whether an aterm runs here ([`aterm_runs_here`]); with none, no aterm does.
+/// An aterm here, as [`aterm_here`] found it asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Here {
+    /// No control socket here takes a connection.
+    Absent,
+    /// One takes a connection and answered no request, from this stopped process.
+    Stopped(u32),
+    /// One takes a connection and answered no request; the process behind it, where known.
+    Silent(Option<u32>),
+    /// One answers; its `status`'s `fleet=` word, where the answer names one.
+    Answers(Option<String>),
+}
+
+/// A test's answer to how an aterm here stands ([`aterm_here`]); with none, no aterm runs here.
 #[cfg(test)]
-type AtermHere = Box<dyn FnMut() -> bool>;
+type AtermHere = Box<dyn FnMut() -> Here>;
 
 #[cfg(test)]
 thread_local! {
@@ -2382,16 +2418,192 @@ fn listens_here(places: &Places, within: Duration) -> bool {
     )
 }
 
-/// Whether an aterm runs here, to serve `[fleet] listen` once it reads it: its control socket
-/// answers ([`aterm_ctl::front_door_instance`]).
-fn aterm_runs_here() -> bool {
+/// How an aterm here stands, asked `status` within `within` ([`aterm_ctl::front_door_ask`]): it
+/// counts as running only where its control socket answers, never where it merely takes a
+/// connection, as a stopped or frozen one does.
+fn aterm_here(within: Duration) -> Here {
     #[cfg(test)]
     {
-        ATERM_HERE.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook()))
+        let _ = within;
+        ATERM_HERE.with(|hook| {
+            hook.borrow_mut()
+                .as_mut()
+                .map_or(Here::Absent, |hook| hook())
+        })
     }
     #[cfg(not(test))]
+    match aterm_ctl::front_door_ask("status\n", within) {
+        aterm_ctl::FrontDoorAnswer::Absent => Here::Absent,
+        aterm_ctl::FrontDoorAnswer::Silent(Some(pid)) if stopped(pid) => Here::Stopped(pid),
+        aterm_ctl::FrontDoorAnswer::Silent(pid) => Here::Silent(pid),
+        aterm_ctl::FrontDoorAnswer::Answered(line) => Here::Answers(
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix("fleet="))
+                .map(str::to_owned),
+        ),
+    }
+}
+
+/// Whether process `pid` is stopped (a `SIGSTOP`, a tracer).
+#[cfg(not(test))]
+fn stopped(pid: u32) -> bool {
+    #[cfg(target_vendor = "apple")]
     {
-        aterm_ctl::front_door_instance().is_some()
+        i32::try_from(pid)
+            .ok()
+            .and_then(aterm_uds::process::read_short_info)
+            .is_some_and(|info| info.pbsi_status == aterm_uds::process::BsdShortInfo::SSTOP)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// THE ONE SENTENCE for this machine's own `[fleet] listen` place `at` where nothing listens,
+/// `after` a verb's wait: its cause as the aterm here stands (`here`, [`aterm_here`]) and the
+/// remedy, in an init, a join, a rotate and `peers` alike.
+fn nothing_listens(places: &Places, at: SocketAddr, after: &str, here: &Here) -> String {
+    let another = |whose: &str| {
+        format!(
+            "reads another aterm.toml than {}{whose} (one relaunched to read this one listens; \
+             `aterm explain-config` in one of its tabs names the one it reads)",
+            places.config.display()
+        )
+    };
+    let cause = match here {
+        Here::Absent => "no aterm runs here (no control socket here takes a connection): one \
+                         started here reads [fleet] at launch and listens there"
+            .to_owned(),
+        Here::Stopped(pid) => format!(
+            "the aterm running here (pid {pid}) is stopped, so it answers nothing and listens \
+             nowhere: `kill -CONT {pid}` resumes it, and it listens there once it reads [fleet]"
+        ),
+        Here::Silent(pid) => {
+            let pid = pid.map_or_else(|| "<its pid>".to_owned(), |pid| pid.to_string());
+            format!(
+                "the aterm running here (pid {pid}) takes a connection but answered no request, \
+                 so it is frozen or too busy to answer: it listens there once it answers again, \
+                 and one that stays frozen once it is quit and opened again (`kill -CONT {pid}` \
+                 resumes one that is stopped)"
+            )
+        }
+        Here::Answers(None) => format!(
+            "the aterm running here did not say how its listener stands, so it has not read \
+             [fleet] yet, it {}, or it refused the listen (`aterm ctl status` in one of its tabs \
+             reads fleet=off or refused:<why> then)",
+            another("")
+        ),
+        Here::Answers(Some(word)) => match word.as_str() {
+            "off" => format!(
+                "the aterm running here reads fleet=off, so it has not read [fleet] yet, or it {}",
+                another(", whose [fleet] is off")
+            ),
+            "listening" => format!(
+                "the aterm running here listens elsewhere (fleet=listening), so it has not read \
+                 this [fleet] listen yet, or it {}",
+                another("")
+            ),
+            "retrying" => format!(
+                "the aterm running here reads fleet=retrying: it has not bound {at} yet (an \
+                 address this machine does not hold, or a port another program held when it \
+                 tried), and binds it once it can"
+            ),
+            word => match word.strip_prefix("refused:") {
+                Some(why) => format!(
+                    "the aterm running here refused the listen (fleet=refused:{why}): {}",
+                    refused_listen(places, why, &another(""))
+                ),
+                None => format!("the aterm running here reads fleet={word}"),
+            },
+        },
+    };
+    format!("nothing listens on {at}{after}: {cause}")
+}
+
+/// The sentence for this machine's own `[fleet] listen` place `at` that takes a connection and
+/// finishes no handshake `after` a verb's wait, beside an aterm here that answers nothing
+/// (`here`): its cause and remedy; None beside one that answers, or none.
+fn answers_no_handshake(at: SocketAddr, after: &str, here: &Here) -> Option<String> {
+    let cause = match here {
+        Here::Stopped(pid) => format!(
+            "the aterm running here (pid {pid}) is stopped, so a listener it bound takes a \
+             connection in the kernel and answers nothing: `kill -CONT {pid}` resumes it"
+        ),
+        Here::Silent(pid) => {
+            let pid = pid.map_or_else(|| "<its pid>".to_owned(), |pid| pid.to_string());
+            format!(
+                "the aterm running here (pid {pid}) answered no request either, so it is frozen \
+                 or too busy to answer: it answers there once it answers again, and one that \
+                 stays frozen once it is quit and opened again (`kill -CONT {pid}` resumes one \
+                 that is stopped)"
+            )
+        }
+        Here::Absent | Here::Answers(_) => return None,
+    };
+    Some(format!(
+        "{at} takes a connection but finishes no fleet handshake{after}: {cause}"
+    ))
+}
+
+/// What a listener's `refused:<why>` (`why`) says, and its remedy, where `another` is the words
+/// for an aterm that reads another aterm.toml than this verb's.
+fn refused_listen(places: &Places, why: &str, another: &str) -> String {
+    match why {
+        "listen" => format!(
+            "the [fleet] listen it read is no numeric IP and port, so it has not read this one \
+             yet, or it {another}"
+        ),
+        "allow" => {
+            let names_one = ConfigFile::open(&places.config)
+                .ok()
+                .and_then(|config| fleet_table(text_of(&config).ok()?).ok())
+                .is_some_and(|table| table.level().is_some());
+            let config = places.config.display();
+            if names_one {
+                format!(
+                    "the [fleet] allow it read is none of \"facts\", \"content\" and \"drive\", \
+                     though {config} names one, so it has not read it yet, or it {another}"
+                )
+            } else {
+                format!(
+                    "the [fleet] allow it read is none of \"facts\", \"content\" and \"drive\": \
+                     `aterm fleet allow facts` (or `content`) writes one in {config}"
+                )
+            }
+        }
+        "loopback" => "it listens on the loopback alone (ATERM_DEBUG_LOOPBACK_ONLY in its \
+                       environment), and this place is not there: one started without that \
+                       guard listens there"
+            .to_owned(),
+        "nested" => "it was started inside another aterm (from one of its tabs), and leaves the \
+                     listen to that one, which does not listen there either: `aterm ctl status` \
+                     in one of the outer aterm's tabs says why (its fleet= word), and one \
+                     started outside any aterm listens itself"
+            .to_owned(),
+        "bind" => format!(
+            "it could not bind that place (its log's `fleet listener not started: bind` line \
+             says why): {}",
+            member::moves_listener(&places.state)
+        ),
+        "thread" => "its listener could not start a thread: one quit and opened again listens \
+                     there"
+            .to_owned(),
+        "stopped" => "its listener stopped: one quit and opened again listens there".to_owned(),
+        "unsupported" => "this platform serves no fleet connection".to_owned(),
+        key if key.starts_with("key") || key == "no-key" => {
+            match aterm_net::fleet::read_key_file(&places.state) {
+                Err(e) => no_key(places, &e),
+                Ok(_) => format!(
+                    "it reads no key it can use, though {} holds one: it has not read it yet (it \
+                     reads it every {} s), or it reads another state folder",
+                    places.state.join(KEY_FILE).display(),
+                    aterm_net::fleet::KEY_READ_EVERY.as_secs()
+                ),
+            }
+        }
+        _ => "which names what keeps it from listening".to_owned(),
     }
 }
 
@@ -2555,7 +2767,9 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
         listing.rows.len(),
         match (&listing.unchecked, &table.listen) {
             (Some(why), _) => format!(" — not checked: {why}"),
-            (None, Some(listen)) => listens_words(places, &listing, listen, own.as_deref()),
+            (None, Some(listen)) => {
+                listens_words(places, &listing, (listen, within), own.as_deref())
+            }
             (None, None) => " (it has no [fleet] listen: no peer can read it)".to_owned(),
         }
     );
@@ -2670,9 +2884,17 @@ const fn reads_no_peer(unnamed: bool) -> &'static str {
 
 /// What `peers`' header says of this machine's listener at `listen`, on evidence alone: its own
 /// node proved there, another node proved there (and the act that moves it), or, with neither,
-/// that it did not prove itself there and what may hold the place; a `listen` that is no
-/// IP:port, which no listener takes, is named as that.
-fn listens_words(places: &Places, listing: &Listing, listen: &str, own: Option<&str>) -> String {
+/// that it did not prove itself there and what may hold the place, where nothing listens or
+/// nothing finishes a handshake as the aterm here, asked within `within`, stands
+/// ([`nothing_listens`], [`answers_no_handshake`]); a `listen` that is no IP:port or an `allow`
+/// that is no level, which no listener takes, is named as that, and an `allow` beside its node's
+/// proof as one the aterm listening there has not read.
+fn listens_words(
+    places: &Places,
+    listing: &Listing,
+    (listen, within): (&str, Duration),
+    own: Option<&str>,
+) -> String {
     let table = &listing.table;
     let shown = aterm_codec::tty::one_line(listen, 60);
     let level = table.level().unwrap_or(FleetScope::Facts.word());
@@ -2684,6 +2906,28 @@ fn listens_words(places: &Places, listing: &Listing, listen: &str, own: Option<&
             places.config.display()
         );
     };
+    if let Some(allow) = table.allow.as_deref().filter(|_| table.level().is_none()) {
+        let allow = aterm_codec::tty::one_line(allow, 40);
+        let writes = format!(
+            "`aterm fleet allow facts` (or `content`) writes one in {}",
+            places.config.display()
+        );
+        // Its node's proof there outweighs aterm.toml's word.
+        return if matches!(listing.listener, Some(Ok(_))) {
+            format!(
+                " (it listens on {shown}, though [fleet] allow is \"{allow}\", none of \"facts\", \
+                 \"content\" and \"drive\": the aterm listening there has not read it yet, or \
+                 reads another aterm.toml, and one that reads it refuses the listen \
+                 (fleet=refused:allow); {writes})"
+            )
+        } else {
+            format!(
+                " ([fleet] allow is \"{allow}\", none of \"facts\", \"content\" and \"drive\", so \
+                 no aterm here listens for the fleet (`aterm ctl status` here reads \
+                 fleet=refused:allow): {writes})"
+            )
+        };
+    }
     let specific = !place.ip().is_unspecified();
     let other = holder_of_listen(table, &listing.rows, own).or_else(|| match &listing.listener {
         Some(Err(Unreached::OtherNode { said, .. })) if specific && own != Some(said.as_str()) => {
@@ -2698,18 +2942,26 @@ fn listens_words(places: &Places, listing: &Listing, listen: &str, own: Option<&
             member::moves_listener(&places.state)
         );
     }
+    let stalled = match &listing.listener {
+        Some(Err(Unreached::Deadline(member::Stage::Handshake, _))) => own_place(table)
+            .and_then(|at| answers_no_handshake(at, " just now", &aterm_here(within))),
+        _ => None,
+    };
+    if let Some(stalled) = stalled {
+        return format!(" ([fleet] listen is {shown} and allow is {level}, but {stalled})");
+    }
     match &listing.listener {
         Some(Ok(_)) => format!(" (it listens on {shown}, serving {level})"),
+        Some(Err(Unreached::Connect(at, e))) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            format!(
+                " ([fleet] listen is {shown} and allow is {level}, but {})",
+                nothing_listens(places, *at, " just now", &aterm_here(within))
+            )
+        }
         Some(Err(why)) => {
             let moves = member::moves_listener(&places.state);
             let held = format!("`aterm ctl status` here reads fleet=retrying then, and {moves}");
             let (seen, then) = match why {
-                Unreached::Connect(at, e) if e.kind() == io::ErrorKind::ConnectionRefused => (
-                    format!("nothing listens on {at}"),
-                    "no aterm runs here, or it has not read [fleet] yet (`aterm ctl status` here \
-                     says fleet=listening once it has)"
-                        .to_owned(),
-                ),
                 Unreached::Handshake(at, FleetError::ListenerWrongSecret) => (
                     format!("{at} answers under another secret"),
                     format!(
@@ -2730,13 +2982,13 @@ fn listens_words(places: &Places, listing: &Listing, listen: &str, own: Option<&
                 ),
             };
             format!(
-                " ([fleet] listen is {shown}, serving {level}, but this machine's node did not \
+                " ([fleet] listen is {shown} and allow is {level}, but this machine's node did not \
                  prove itself there just now ({}): {then})",
                 aterm_codec::tty::one_line(&seen, 160)
             )
         }
         None => format!(
-            " ([fleet] listen is {shown}, serving {level}; this machine holds no node key to \
+            " ([fleet] listen is {shown} and allow is {level}; this machine holds no node key to \
              prove itself there, so `aterm ctl status` says whether it listens)"
         ),
     }
@@ -2920,7 +3172,7 @@ fn allow(places: &Places, args: &[String]) -> Result<String, Failure> {
     }
 }
 
-/// [`allow`]'s write of `level`, with the drive grants `from` names at drive. A grant is written by [`member::write_held`], under the fleet whose book named its nodes, each still bound to the key it names; facts or content names no fleet, so its write reads and writes aterm.toml alone, whose write takes the text it read or nothing (`ConfigFile::replace`): it lands before or after any other edit of `[fleet]`, a leave's or a join's included, as some serial order would, and no odd state directory or busy book blocks it.
+/// [`allow`]'s write of `level`, with the drive grants `from` names at drive. A grant is written by [`member::write_held`], under the fleet whose book named its nodes, each still bound to the key it names; facts or content names no fleet, so its write is held as a leave's is ([`member::level_held`]), under the book's lock that every other edit of `[fleet]` holds: it lands before or after a leave's, a join's or an init's whole write, as some serial order would, and no odd state directory blocks it.
 fn set_level(
     places: &Places,
     level: &str,
@@ -2942,12 +3194,27 @@ fn set_level(
         }
         scope.word()
     };
+    if !drive {
+        let mut narrowed_line = String::new();
+        let mut report = member::level_held(&places.state, |held| {
+            if let Some(was) = held.narrowed() {
+                narrowed_line = narrowed(places, was);
+            }
+            let config = ConfigFile::open(&places.config).map_err(failed)?;
+            in_a_fleet(text_of(&config)?)?;
+            at_step("level");
+            write_level(places, held, &config, (word, Vec::new()))
+        })
+        .map_err(failed)?
+        .inspect_err(|_| say(&narrowed_line))?;
+        report.insert_str(
+            report.find('\n').map_or(report.len(), |at| at + 1),
+            &narrowed_line,
+        );
+        return Ok(report);
+    }
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     in_a_fleet(text_of(&config)?)?;
-    if !drive {
-        at_step("level");
-        return write_level(places, None, &config, (word, Vec::new()));
-    }
     // The fleet the grant begins under, read before the book names its nodes: a missing key is a leave stopped short of aterm.toml.
     let key = places.state.join(KEY_FILE);
     let began = match aterm_net::fleet::read_key_file(&places.state) {
@@ -2994,7 +3261,7 @@ fn set_level(
             nodes.retain(|word| DriveGrant::node_of(word) != grant.node);
             nodes.push(grant.word());
         }
-        write_level(places, Some(book), &config, (word, nodes))
+        write_level(places, book, &config, (word, nodes))
     })
     .map_err(|unwritten| {
         failed(format!(
@@ -3017,10 +3284,10 @@ fn in_a_fleet(text: &str) -> Result<FleetTable, Failure> {
 }
 
 /// Write `[fleet] allow = word` and `drive_from = nodes` over aterm.toml as `config` read it,
-/// under the book's lock `held` where it is a grant's.
+/// beside `held`: a grant's book, or a level's hold.
 fn write_level(
     places: &Places,
-    held: Option<&HeldBook<'_>>,
+    held: &impl Beside,
     config: &ConfigFile,
     (word, nodes): (&str, Vec<String>),
 ) -> Result<String, Failure> {
@@ -3046,13 +3313,7 @@ fn write_level(
             places.config.display()
         ),
         Some(text) => {
-            let bak = match held {
-                Some(held) => replace_held(held, config, &text)?,
-                None => config
-                    .lock()
-                    .and_then(|edit| edit.replace(&text))
-                    .map_err(failed)?,
-            };
+            let bak = replace_held(held, config, &text)?;
             format!(
                 "aterm fleet allow: {said} in {}{}\n",
                 places.config.display(),
@@ -3411,6 +3672,7 @@ fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
         }
         at_step("removed");
         let config = ConfigFile::open(&places.config).map_err(failed)?;
+        at_step("config");
         let listened = fleet_table(text_of(&config)?)
             .map_err(failed)?
             .listen_port()
@@ -4408,14 +4670,16 @@ fn text_of(config: &ConfigFile) -> Result<&str, Failure> {
     Ok(config.text().map_err(failed)?.unwrap_or(""))
 }
 
-/// What an edit of aterm.toml's `[fleet]` is made beside ([`replace_held`]): the book's lock, or a leave's hold.
+/// What an edit of aterm.toml's `[fleet]` is made beside ([`replace_held`]): the book's lock, or a leave's or a level's hold.
 trait Beside {}
 
 impl Beside for HeldBook<'_> {}
 
 impl Beside for Leaving<'_> {}
 
-/// Replace aterm.toml as `config` read it with `text`, beside `_held` ([`member::write_held`], [`member::leave_held`]), and aterm.toml's write lock after the book's: every edit of `[fleet]` but a level's ([`set_level`]).
+impl Beside for Leveling {}
+
+/// Replace aterm.toml as `config` read it with `text`, beside `_held` ([`member::write_held`], [`member::leave_held`], [`member::level_held`]), and aterm.toml's write lock after the book's: every edit of `[fleet]`.
 fn replace_held(
     _held: &impl Beside,
     config: &ConfigFile,

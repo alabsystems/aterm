@@ -13,7 +13,7 @@ use crate::iokit::{
 use crate::machine::{DtCpu, Level, VmPages};
 use crate::{
     CoreTicks, CpuLayout, GpuClients, GpuDriver, GpuReading, LinkReading, MAX_GPU_CLIENTS,
-    MemoryDetail, PATH_CAP, ProcessLimits, TcpCounts, VolumeReading, pressure_of,
+    MemoryDetail, PATH_CAP, ProcessLimits, TcpSummary, VolumeReading, pressure_of,
 };
 
 /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`).
@@ -1209,10 +1209,84 @@ pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> 
     Some(links)
 }
 
-/// [`crate::tcp_counts_into`] on macOS (`net.inet.tcp.pcblist64`).
-pub(crate) fn tcp_counts_into(scratch: &mut Vec<u8>) -> Option<TcpCounts> {
+/// [`crate::tcp_summary_into`] on macOS (`net.inet.tcp.pcblist64`).
+pub(crate) fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
     let n = iflist::read_growing(IFLIST_FIRST, IFLIST_CAP, scratch, pcblist64_sysctl)?;
-    iflist::tcp_counts_of_pcblist64(&scratch[..n])
+    iflist::tcp_summary_of_pcblist64(&scratch[..n])
+}
+
+/// [`crate::open_socket_count`] on macOS (`PROC_PIDLISTFDS` only — lists descriptor types under `proc_fdlock` without taking a socket I/O reference, avoiding XNU's `SS_DRAINING` hazard).
+pub(crate) fn open_socket_count(pid: u32) -> Option<u32> {
+    const STACK_FDS: usize = 256;
+    const CAP_FDS: usize = 4096;
+    const FD_SIZE: usize = std::mem::size_of::<libc::proc_fdinfo>();
+    let pid = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+    let mut stack = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; STACK_FDS];
+    let stack_bytes = (STACK_FDS * FD_SIZE) as c_int;
+    // SAFETY: `stack` is writable for `stack_bytes` bytes; `errno` is cleared first so a zero-fd
+    // process (`n == 0, errno == 0`) is distinguished from an unreadable/exited pid (`errno != 0`).
+    let (n, errno) = unsafe {
+        *libc::__error() = 0;
+        let n = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            stack.as_mut_ptr().cast::<c_void>(),
+            stack_bytes,
+        );
+        (n, *libc::__error())
+    };
+    if n < 0 || (n == 0 && errno != 0) {
+        return None;
+    }
+    let written = usize::try_from(n).ok()?;
+    let sock_type = libc::PROX_FDTYPE_SOCKET.cast_unsigned();
+    if written < STACK_FDS * FD_SIZE {
+        let count = stack[..written / FD_SIZE]
+            .iter()
+            .filter(|f| f.proc_fdtype == sock_type)
+            .count();
+        return u32::try_from(count).ok();
+    }
+    // SAFETY: A null buffer asks for the descriptor list's byte size now.
+    let need =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let want = usize::try_from(need).ok().map(|b| {
+        (b / FD_SIZE)
+            .saturating_add(16)
+            .clamp(STACK_FDS + 1, CAP_FDS)
+    })?;
+    let mut heap = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        want
+    ];
+    let heap_bytes = c_int::try_from(want * FD_SIZE).ok()?;
+    // SAFETY: `heap` is writable for `heap_bytes` bytes.
+    let (n2, errno2) = unsafe {
+        *libc::__error() = 0;
+        let n2 = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            heap.as_mut_ptr().cast::<c_void>(),
+            heap_bytes,
+        );
+        (n2, *libc::__error())
+    };
+    if n2 < 0 || (n2 == 0 && errno2 != 0) {
+        return None;
+    }
+    let count = heap[..(usize::try_from(n2).ok()? / FD_SIZE).min(want)]
+        .iter()
+        .filter(|f| f.proc_fdtype == sock_type)
+        .count();
+    u32::try_from(count).ok()
 }
 
 /// One `sysctlbyname` of `net.inet.tcp.pcblist64` into `buf`, or, with no buffer, of the size it needs now.
@@ -1384,5 +1458,19 @@ mod tests {
         assert!(walked > 0, "a CPU node");
         // SAFETY: `iter` is a live iterator.
         assert_ne!(unsafe { iokit::IOIteratorIsValid(iter.0) }, 0);
+    }
+
+    #[test]
+    fn open_socket_count_tracks_live_descriptors_and_rejects_invalid_pids() {
+        assert_eq!(open_socket_count(0), None);
+        let me = std::process::id();
+        let before = open_socket_count(me).expect("self socket count");
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("unix socket pair");
+        let during = open_socket_count(me).expect("self socket count with pair");
+        assert!(
+            during >= before + 2,
+            "expected at least 2 more sockets ({before} -> {during})"
+        );
+        drop((a, b));
     }
 }

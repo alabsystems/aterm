@@ -776,6 +776,45 @@ pub fn account_of(env: &[String], user_home: &Path) -> Option<AccountKey> {
     .flatten()
 }
 
+/// Full-width identity of the exact Claude profile at `path`. Unlike the short
+/// display `AccountKey`, this digest may bind local authorization state. The
+/// caller must first prove a successful login in this same staging home; a
+/// profile file alone is not provider authentication or a capability.
+#[must_use]
+pub fn principal_at(path: &Path) -> Option<[u8; 32]> {
+    read_with(path, |bytes| {
+        let Obj(raw) = aterm_json::from_slice::<Obj<RawPrincipal>>(bytes)
+            .map_err(|_| NoProfile::Unreadable)?;
+        let Some(Address(Some(id))) = raw.and_then(|file| file.oauth.0).map(|oauth| oauth.id)
+        else {
+            return Ok(None);
+        };
+        Ok(principal_id(&id))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Stable full-width representation of an explicit provider identifier. This
+/// hashes a name; only a checked provider response authenticates that name.
+#[must_use]
+pub fn principal_id(id: &str) -> Option<[u8; 32]> {
+    if id.is_empty() || id.len() > ID_MAX {
+        return None;
+    }
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm/claude-provider-principal/1\0");
+    hash.update((id.len() as u64).to_be_bytes());
+    hash.update(id.as_bytes());
+    Some(hash.finalize())
+}
+
+/// The full identity in this exact home, including only its own legacy profile.
+#[must_use]
+pub fn principal_in_home(home: &Path) -> Option<[u8; 32]> {
+    principal_at(&effective(&home.join(".claude.json"), Some(home), false))
+}
+
 /// How long a cached `/usage` reading stays current ([`current_windows`]).
 const USAGE_CURRENT_S: i64 = 15 * 60;
 
@@ -2749,6 +2788,20 @@ struct RawKey {
 struct RawKeyOauth {
     #[serde(rename = "accountUuid")]
     key: Hashed,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawPrincipal {
+    #[serde(rename = "oauthAccount")]
+    oauth: Obj<RawPrincipalOauth>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawPrincipalOauth {
+    #[serde(rename = "accountUuid")]
+    id: Address,
 }
 
 /// The email-only allowlist shared by the login check and volatile footer display.

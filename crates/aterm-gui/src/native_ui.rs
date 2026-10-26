@@ -1524,24 +1524,36 @@ impl TextViewportSpec {
     }
 }
 
-/// The footer rows the editor always leaves room for: its shell keeps the document's
-/// minimum rows under a footer this tall ([`editor_shell_metrics`]).
+/// The footer rows the editor leaves room for: its shell sizes its panels for the document's
+/// minimum rows under a footer this tall ([`editor_shell_metrics`]), and the footer takes them
+/// wherever the document keeps its floor under them ([`editor_footer_row_cap`]).
 pub(crate) const EDITOR_FOOTER_RESERVED_ROWS: usize = 3;
 
 /// The most rows the editor footer ever takes.
 pub(crate) const EDITOR_FOOTER_MAX_ROWS: usize = 8;
 
-/// The rows the footer of an editor in `rect` may take: the rows it always has room for, and
-/// past them every row the document can spare above its minimum rows.
+/// The rows the footer of an editor in `rect` may take: every row the document can spare above
+/// its minimum rows, and at least the rows it always has room for
+/// ([`EDITOR_FOOTER_RESERVED_ROWS`]) as far as the document keeps its floor
+/// ([`EDITOR_DOCUMENT_FLOOR_ROWS`]) under them: the file's floor ranks above the status's rows
+/// past its first, as above the help's and the toolbar's. A config error wrapped to three rows
+/// at 80x24 and 2x took the file from four rows to two, and to one under a completion list;
+/// there the status shows its shorter forms ([`editor_footer_lines`]) on the rows the file can
+/// spare, at least one.
 pub(crate) fn editor_footer_row_cap(rect: LogicalRect) -> usize {
     let one_row = text_viewport_geometry(rect, 1);
-    let minimum = MINIMUM_EDITOR_DOCUMENT_ROWS as f32 * one_row.line_h;
-    let spare = ((one_row.body_h - minimum).max(0.0)
-        / editor_footer_line_h(crate::native_appearance::text_scale()))
-    .floor() as usize;
-    spare
+    let footer_line_h = editor_footer_line_h(crate::native_appearance::text_scale());
+    let spare_above = |rows: usize| {
+        ((one_row.body_h + 0.01 - rows as f32 * one_row.line_h).max(0.0) / footer_line_h).floor()
+            as usize
+    };
+    let reserved = spare_above(EDITOR_DOCUMENT_FLOOR_ROWS)
         .saturating_add(1)
-        .clamp(EDITOR_FOOTER_RESERVED_ROWS, EDITOR_FOOTER_MAX_ROWS)
+        .min(EDITOR_FOOTER_RESERVED_ROWS);
+    spare_above(MINIMUM_EDITOR_DOCUMENT_ROWS)
+        .saturating_add(1)
+        .max(reserved)
+        .clamp(1, EDITOR_FOOTER_MAX_ROWS)
 }
 
 /// What the editor header's title wears while the buffer has unsaved changes.
@@ -1922,12 +1934,15 @@ pub(crate) fn editor_help_lines(viewport: LogicalRect, help: &str, max_rows: usi
 /// `candidates` rows where it lists any, and the help line's rows: the form
 /// [`editor_help_lines`] paints in the rows the document can spare it
 /// ([`EditorShellMetrics::spare_help_rows`]), and always in the rows its first fact (what
-/// the setting does) takes whole, as the footer always has its reserved rows
+/// the setting does) takes whole, as the footer has its reserved rows
 /// ([`EDITOR_FOOTER_RESERVED_ROWS`]): a narrow editor at a large text size gives the
 /// file a row rather than cut "Prime coding agents automatically" to "Prime coding
 /// agents…", down to the rows the shell keeps the file ([`editor_shell_metrics_at_scale`]
-/// sheds the panel below them). The view paints these rows and the input side counts the
-/// document's rows under this panel, so both measure the one panel.
+/// sheds the resting panel below them). Over a completion list, which stays, the help's rows
+/// past its first give way where they would leave the file fewer than
+/// [`EDITOR_DOCUMENT_FLOOR_ROWS`], or than one help row leaves it (its shorter forms, then its
+/// first fact cut at a whole word on one row). The view paints these rows and the input side counts the document's rows under
+/// this panel, so both measure the one panel.
 pub(crate) fn editor_help_palette(
     viewport: LogicalRect,
     toolbar: EditorToolbar,
@@ -1945,10 +1960,27 @@ pub(crate) fn editor_help_palette(
     let first_fact = editor_help_forms(help).last().map_or(1, |first| {
         editor_help_lines(viewport, first, EDITOR_HELP_MAX_ROWS).len()
     });
-    let rows = spare
+    let wanted = spare
         .saturating_add(1)
         .max(first_fact)
         .min(EDITOR_HELP_MAX_ROWS);
+    let file_rows = |help_rows: usize| {
+        whole_editor_rows(&text_viewport_geometry(
+            editor_text_viewport_rect_with_palette(viewport, palette(help_rows), toolbar),
+            1,
+        ))
+    };
+    // Over a list, the most help rows that leave the file its floor, or as many rows as one
+    // help row leaves it where none does.
+    let rows = if candidates.is_some() {
+        let floor = file_rows(1).min(EDITOR_DOCUMENT_FLOOR_ROWS);
+        (1..=wanted)
+            .rev()
+            .find(|&rows| file_rows(rows) >= floor)
+            .unwrap_or(1)
+    } else {
+        wanted
+    };
     let lines = editor_help_lines(viewport, help, rows);
     (palette(lines.len()), lines)
 }
@@ -2136,10 +2168,16 @@ pub(crate) fn editor_shell_metrics(
 /// a command by name. The resting help line, which says what the setting under the
 /// caret does, gives way only where the file would show fewer than [`EDITOR_DOCUMENT_FLOOR_ROWS`]
 /// beside it (the toolbar then takes the rows the file can spare); Ctrl-Space still lists
-/// completions under their help. The header, the footer, one toolbar row and a panel the person
-/// asked for stay: each holds what nothing else shows. An `edit` ticket's header row (Done,
-/// which saves, and Abort) is that row where it has one, and the toolbar's buttons may give way
-/// whole under it. Where even that leaves the file short, the most rows it can have.
+/// completions under their help. The header, the footer and an `edit` ticket's header row (Done,
+/// which saves, and Abort) stay: each holds what nothing else shows; one toolbar row stays too,
+/// and the toolbar's buttons may give way whole under a ticket's header row. A completion list
+/// the person asked for stays, and where it would leave the file fewer than
+/// [`EDITOR_DOCUMENT_FLOOR_ROWS`] (80x24 at 2x showed the one row being completed) it takes only
+/// the room the file can spare: its rows close up to the help line's height and its padding to
+/// the dense toolbar's, then the toolbar's last row gives way to it while it is open, and last a
+/// ticket's header row (every button and both of the header's parts are keys and commands by
+/// name, and all of them are back when the list closes). Where even that leaves the file short,
+/// the most rows it can have.
 pub(crate) fn editor_shell_metrics_at_scale(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
@@ -2149,7 +2187,7 @@ pub(crate) fn editor_shell_metrics_at_scale(
     let palette = palette.into();
     let text_scale = editor_text_scale(text_scale);
     let layout = |palette: EditorPalette, cap: usize| {
-        editor_shell_layout(viewport, palette, toolbar, text_scale, cap)
+        editor_shell_layout(viewport, palette, toolbar, text_scale, cap, false)
     };
     let rows = |metrics: &EditorShellMetrics| {
         whole_editor_rows(&text_viewport_geometry_at_scale(
@@ -2176,23 +2214,51 @@ pub(crate) fn editor_shell_metrics_at_scale(
         fewest
     };
     let kept = shed_toolbar(palette, layout(palette, EDITOR_TOOLBAR_MAX_ROWS));
-    if !matches!(palette, EditorPalette::Help { .. }) || rows(&kept) >= EDITOR_DOCUMENT_FLOOR_ROWS {
+    if rows(&kept) >= EDITOR_DOCUMENT_FLOOR_ROWS {
         return kept;
     }
-    shed_toolbar(
-        EditorPalette::None,
-        layout(EditorPalette::None, EDITOR_TOOLBAR_MAX_ROWS),
-    )
+    match palette {
+        EditorPalette::None => kept,
+        EditorPalette::Help { .. } => shed_toolbar(
+            EditorPalette::None,
+            layout(EditorPalette::None, EDITOR_TOOLBAR_MAX_ROWS),
+        ),
+        EditorPalette::Rows { .. } => {
+            let dense = |toolbar: EditorToolbar, cap: usize| {
+                editor_shell_layout(viewport, palette, toolbar, text_scale, cap, true)
+            };
+            let closed_up = dense(toolbar, kept.command_row_cap);
+            if rows(&closed_up) >= EDITOR_DOCUMENT_FLOOR_ROWS {
+                return closed_up;
+            }
+            // The toolbar's buttons, then an `edit` ticket's header row, which left the file one
+            // row under M-x at 80x24 and 2x.
+            let without_buttons = dense(toolbar, 0);
+            if !toolbar.edit_header || rows(&without_buttons) >= EDITOR_DOCUMENT_FLOOR_ROWS {
+                return without_buttons;
+            }
+            dense(
+                EditorToolbar {
+                    edit_header: false,
+                    ..toolbar
+                },
+                0,
+            )
+        }
+    }
 }
 
-/// The editor's chrome laid out whole, its toolbar in at most `command_row_cap` rows
-/// ([`editor_shell_metrics_at_scale`] chooses the cap).
+/// The editor's chrome laid out whole, its toolbar in at most `command_row_cap` rows (none at 0,
+/// where no `edit` ticket's header row stands either) and a listed palette's rows `dense` (the
+/// help line's height, inside the dense toolbar's padding); [`editor_shell_metrics_at_scale`]
+/// chooses both.
 fn editor_shell_layout(
     viewport: LogicalRect,
     palette: EditorPalette,
     toolbar: EditorToolbar,
     text_scale: f32,
     command_row_cap: usize,
+    dense: bool,
 ) -> EditorShellMetrics {
     let (palette_candidates, wanted_help_rows) = match palette {
         EditorPalette::Rows {
@@ -2205,6 +2271,11 @@ fn editor_shell_layout(
     let chrome_scale = text_scale.min(1.35);
     let dense_commands = viewport.width < 390.0 * text_scale.min(1.4);
     let (outer_padding, palette_padding) = editor_shell_paddings(viewport, text_scale);
+    let palette_padding = if dense {
+        palette_padding.min(4.0 * chrome_scale)
+    } else {
+        palette_padding
+    };
     let command_gap = if dense_commands {
         4.0 * chrome_scale
     } else {
@@ -2229,15 +2300,23 @@ fn editor_shell_layout(
     } else {
         toolbar_rows.max(1)
     } + usize::from(toolbar.edit_header);
-    let command_bar_height =
-        command_button_height * command_rows as f32 + command_gap * (command_rows - 1) as f32;
+    let command_bar_height = command_button_height * command_rows as f32
+        + command_gap * command_rows.saturating_sub(1) as f32;
     let content_gap = 8.0 * chrome_scale;
+    // The gaps over the editor with a palette: under the toolbar where it stands, and under the
+    // palette.
+    let palette_gaps = usize::from(command_rows > 0) + 1;
     let help_row_height = (28.0 * text_scale).clamp(28.0, 40.0);
-    let palette_row_height = (34.0 * text_scale).clamp(34.0, 48.0);
+    let palette_row_height = if dense {
+        help_row_height
+    } else {
+        (34.0 * text_scale).clamp(34.0, 48.0)
+    };
     let palette_row_gap = 3.0 * chrome_scale;
-    // The footer with the rows it always has room for ([`EDITOR_FOOTER_RESERVED_ROWS`]): a
-    // status that wraps to them never costs the document its minimum rows, and the
-    // palette's rows never change with it.
+    // The footer with the rows it has room for ([`EDITOR_FOOTER_RESERVED_ROWS`]): where the
+    // panels fit, a status that wraps to them never costs the document its minimum rows, and
+    // the palette's rows never change with it ([`editor_footer_row_cap`] keeps the floor
+    // where they do not).
     let editor_chrome_height = (EDITOR_HEADER_H + EDITOR_FOOTER_H) * chrome_scale
         + (EDITOR_FOOTER_RESERVED_ROWS - 1) as f32 * editor_footer_line_h(text_scale);
     let minimum_editor_height =
@@ -2245,7 +2324,7 @@ fn editor_shell_layout(
     let available_palette_height = (viewport.height
         - outer_padding * 2.0
         - command_bar_height
-        - content_gap * 2.0
+        - content_gap * palette_gaps as f32
         - minimum_editor_height)
         .max(0.0);
     // The rows past its first the help line can take where the document keeps its minimum
@@ -2341,13 +2420,11 @@ fn editor_text_viewport_rect_at_scale(
     )
 }
 
-/// The editor's paint rectangle in `viewport` under the chrome `metrics` lays out.
+/// The editor's paint rectangle in `viewport` under the chrome `metrics` lays out: a gap over
+/// it for the toolbar where it stands and one for the palette where it shows.
 fn editor_rect_in(viewport: LogicalRect, metrics: &EditorShellMetrics) -> LogicalRect {
-    let gaps = if metrics.palette_height <= 0.0 {
-        1.0
-    } else {
-        2.0
-    };
+    let gaps =
+        (usize::from(metrics.command_rows > 0) + usize::from(metrics.palette_height > 0.0)) as f32;
     LogicalRect::new(
         0.0,
         0.0,
@@ -2375,23 +2452,11 @@ pub(crate) fn editor_visible_line_capacity_with_palette(
     whole_editor_rows(&geometry)
 }
 
-/// The document rows the editor paints above a footer `footer_rows` rows tall.
-pub(crate) fn editor_painted_line_capacity_with_palette(
-    viewport: LogicalRect,
-    palette: impl Into<EditorPalette>,
-    toolbar: EditorToolbar,
-    footer_rows: usize,
-) -> usize {
-    let geometry = text_viewport_geometry(
-        editor_text_viewport_rect_with_palette(viewport, palette, toolbar),
-        footer_rows,
-    );
-    ((geometry.body_h / geometry.line_h).ceil() as usize)
-        .saturating_add(1)
-        .clamp(1, 256)
-}
-
-fn whole_editor_rows(geometry: &TextViewportGeometry) -> usize {
+/// THE ROWS THE BODY SHOWS WHOLE, and the only rows the editor paints, counts and exposes: a row
+/// the footer would cover is not drawn (a sliver of its glyph tops showed under the footer), and
+/// the strip under the last whole row stays the body's ground. At least one, so a body shorter
+/// than a row still shows the caret's row.
+pub(crate) fn whole_editor_rows(geometry: &TextViewportGeometry) -> usize {
     (((geometry.body_h + 0.01) / geometry.line_h).floor() as usize).clamp(1, 256)
 }
 
@@ -5231,22 +5296,19 @@ fn text_viewport_paint_audit(node: &PaintNode, spec: &TextViewportSpec) -> Strin
     let geometry = spec.geometry(node.rect);
     let projection = spec.projection.as_ref();
     let painted_rows = projection.map_or(0, |projection| {
-        ((geometry.body_h / geometry.line_h).ceil() as usize)
-            .saturating_add(1)
-            .min(projection.lines.len())
+        whole_editor_rows(&geometry).min(projection.lines.len())
     });
-    let visible_rows = projection.map_or(0, |projection| {
-        projection
-            .lines
-            .iter()
-            .take(painted_rows)
-            .enumerate()
-            .filter(|(index, _)| {
-                let top = geometry.body_y + *index as f32 * geometry.line_h;
-                top < node.clip.bottom() && top + geometry.line_h > node.clip.y
-            })
-            .count()
-    });
+    // A row is visible where it shows whole: inside the body (under the header, over the
+    // footer) and inside the node's clip.
+    let shown_top = geometry.body_y.max(node.clip.y);
+    let shown_bottom = (geometry.body_y + geometry.body_h).min(node.clip.bottom());
+    let visible_rows = (0..painted_rows)
+        .filter(|&index| {
+            let top = geometry.body_y + index as f32 * geometry.line_h;
+            top + CLIP_EDGE_EPSILON >= shown_top
+                && top + geometry.line_h <= shown_bottom + CLIP_EDGE_EPSILON
+        })
+        .count();
     let carets = projection.map_or(0, |projection| {
         projection
             .lines
@@ -7467,9 +7529,7 @@ fn paint_text_viewport(
         h: body_h,
     });
     if let Some(projection) = spec.projection.as_ref() {
-        let visible = ((body_h / line_h).ceil() as usize)
-            .saturating_add(1)
-            .min(projection.lines.len());
+        let visible = whole_editor_rows(&geometry).min(projection.lines.len());
         for (row, line) in projection.lines.iter().take(visible).enumerate() {
             let y = body_y + row as f32 * line_h;
             if line.carets.iter().any(|(_, primary)| *primary) {
@@ -10564,6 +10624,113 @@ pub(crate) mod tests {
             focus_visible: true,
             action: Some(ActionId::new("editor/focus-buffer")),
         }
+    }
+
+    /// THE EDITOR PAINTS, COUNTS AND EXPOSES ONLY THE ROWS IT SHOWS WHOLE (audit r20 ED2, ED3): a
+    /// body four and a half rows tall drew a fifth row the footer cut (a sliver of its glyph tops
+    /// under the footer at 2x), and the paint audit said six rows were visible, counting the cut
+    /// row and one wholly under the footer, so its clip check ran on rows no one sees. The body
+    /// draws its whole rows alone, the audit counts the rows that show whole inside the body and
+    /// the node's clip, and a clip that cuts one of them is still caught.
+    #[test]
+    fn the_editor_paints_and_counts_only_the_rows_it_shows_whole() {
+        use crate::native_editor::{EditorViewportLine, EditorViewportProjection};
+        let mut spec = one_line_viewport(0..4, 0, "line");
+        spec.projection = Some(EditorViewportProjection {
+            first_line: 0,
+            total_lines: 9,
+            lines: (0..9)
+                .map(|number| EditorViewportLine {
+                    number,
+                    source: number * 5..number * 5 + 4,
+                    column_start: 0,
+                    text: "line".to_string(),
+                    selections: Vec::new(),
+                    carets: if number == 0 {
+                        vec![(0, true)]
+                    } else {
+                        Vec::new()
+                    },
+                    syntax: Vec::new(),
+                    diagnostics: Vec::new(),
+                })
+                .collect(),
+        });
+        let probe = spec.geometry(LogicalRect::new(0.0, 0.0, 400.0, 400.0));
+        let height = probe.header_h + probe.footer_h + 4.5 * probe.line_h;
+        let rect = LogicalRect::new(0.0, 0.0, 400.0, height);
+        let geometry = spec.geometry(rect);
+        assert_eq!(
+            whole_editor_rows(&geometry),
+            4,
+            "premise: four whole rows and a half"
+        );
+        let audit = |compiled: &CompiledUi| {
+            compiled
+                .paint_audit_lines()
+                .into_iter()
+                .find(|line| line.starts_with("paint-editor "))
+                .expect("the editor's audit")
+        };
+
+        let compiled = UiTree::new(UiNode::new(
+            "editor/buffer",
+            UiContent::TextViewport(spec.clone()),
+        ))
+        .compile(rect)
+        .unwrap();
+        let line = audit(&compiled);
+        assert!(
+            line.contains(" painted-rows=4 visible-rows=4 ")
+                && line.contains(" clip-truncated=false "),
+            "{line}"
+        );
+        assert!(
+            compiled.sliced_marks().is_empty(),
+            "{:#?}",
+            compiled.sliced_marks()
+        );
+        let numbers: Vec<String> = compiled
+            .tray(aterm_render::Theme::default(), 13.0)
+            .prims
+            .into_iter()
+            .filter_map(|prim| match prim {
+                crate::widget::DrawPrim::Text { s, .. } if s.parse::<usize>().is_ok() => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            numbers,
+            ["1", "2", "3", "4"],
+            "the gutter numbers the rows drawn"
+        );
+
+        // Scrolled up under a clip, the first row's top is cut: three of the four show whole.
+        let offset = probe.header_h + probe.line_h * 0.5;
+        let clipped = UiTree::new(
+            UiNode::new(
+                "editor/scroll",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::column()
+                    .height(Length::Fixed(height))
+                    .scrolled(offset)
+                    .clipped(),
+            )
+            .children(vec![
+                UiNode::new("editor/buffer", UiContent::TextViewport(spec))
+                    .layout(Layout::default().height(Length::Fixed(height))),
+            ]),
+        )
+        .compile(rect)
+        .unwrap();
+        let line = audit(&clipped);
+        assert!(
+            line.contains(" painted-rows=4 visible-rows=3 ")
+                && line.contains(" clip-truncated=true "),
+            "{line}"
+        );
     }
 
     #[test]

@@ -1648,3 +1648,45 @@ fn the_retired_lanes_pin_stamps_and_goal_records_go_once_a_week_old() {
     prune_retired(&opts, now);
     assert!(!pins.exists(), "emptied, the directory goes too");
 }
+
+#[test]
+fn self_claimed_after_exit_refuses_malformed_resume_and_closes_mismatched_in_flight_auth() {
+    let rig = Rig::new("self-claim-guard", &["zsh: killed     codex"]);
+    let snap = rig.snap(None);
+
+    let mut empty_argv = rig.resume(None);
+    empty_argv.argv.clear();
+    let r = self_claimed_after_exit(&rig.opts, &snap, &empty_argv, ExitCause::Exit, &rig.kernel);
+    assert_eq!(r.step, "refused:no-resume-line", "{r:?}");
+    assert!(rig.typed().is_empty());
+
+    let mut bad_auth = rig.resume(None);
+    bad_auth.codex_auth_path = Some("relative/auth.json".to_string());
+    let r = self_claimed_after_exit(&rig.opts, &snap, &bad_auth, ExitCause::Exit, &rig.kernel);
+    assert_eq!(r.step, "refused:auth-path", "{r:?}");
+    assert!(rig.typed().is_empty());
+
+    // Defer an in-flight relaunch under auth-A, then resume under auth-B: the deferred
+    // auth-A state must not be reused with the old CODEX_AUTH_PATH.
+    let mut auth_a = rig.resume(None);
+    auth_a.codex_auth_path = Some("/Users//me/.aterm/accounts-codex/acct-a/auth.json".to_string());
+    *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
+    let held = self_claimed_after_exit(&rig.opts, &snap, &auth_a, ExitCause::Exit, &rig.kernel);
+    assert_eq!(held.step, "wait:held", "{held:?}");
+    assert!(rig.state().in_flight());
+
+    rig.status_extra.lock().expect("status").clear();
+    let mut auth_b = rig.resume(None);
+    auth_b.codex_auth_path = Some("/Users//me/.aterm/accounts-codex/acct-b/auth.json".to_string());
+    let done = self_claimed_after_exit(&rig.opts, &snap, &auth_b, ExitCause::Exit, &rig.kernel);
+    assert_eq!(done.step, "done:resumed", "{done:?}");
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{typed:#?}");
+    assert!(
+        typed[0].contains("CODEX_AUTH_PATH=/Users//me/.aterm/accounts-codex/acct-b/auth.json")
+            || typed[0]
+                .contains("CODEX_AUTH_PATH='/Users//me/.aterm/accounts-codex/acct-b/auth.json'"),
+        "relaunch must carry acct-b, not stale in-flight acct-a: {typed:#?}"
+    );
+    assert!(!typed[0].contains("acct-a"), "{typed:#?}");
+}

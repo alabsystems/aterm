@@ -683,6 +683,8 @@ pub struct Doctor<S: System = Live> {
     home: Option<PathBuf>,
     targo: Option<crate::init_develop::Targo>,
     ctx: std::sync::OnceLock<Result<Ctx, String>>,
+    /// This login's rust-docs item ([`Self::rust_docs`]), built once.
+    docs: std::sync::OnceLock<Result<Box<dyn Item>, String>>,
 }
 
 impl Doctor {
@@ -701,7 +703,37 @@ impl<S: System> Doctor<S> {
             home,
             targo,
             ctx: std::sync::OnceLock::new(),
+            docs: std::sync::OnceLock::new(),
         }
+    }
+
+    /// This login's `init.spotlight.rust-docs@<user>` item ([`crate::init_spotlight`]) bound as
+    /// a relay-class repair of the account's own, for bare `aterm doctor` to apply once Spotlight
+    /// is found indexing rust-docs pages: the context and the item are built only on this call,
+    /// so a Mac whose docs are out of Spotlight runs nothing for it.
+    ///
+    /// # Errors
+    /// This login's context cannot be read, or it resolves no one user.
+    pub fn rust_docs(&self) -> Result<Vec<Box<dyn aterm_converge::Item + '_>>, String> {
+        let ctx = self.ctx().as_ref().map_err(Clone::clone)?;
+        let item = self
+            .docs
+            .get_or_init(|| crate::init_spotlight::rust_docs_item(ctx))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(crate::engine::bind(
+            [(
+                item.as_ref(),
+                Place {
+                    layer: Layer::Workstation,
+                    class: Class::Relay,
+                    requires: Requires::Account,
+                    remedy: Remedy::Command("aterm doctor".into()),
+                },
+            )],
+            &self.sys,
+            ctx,
+        ))
     }
 
     fn ctx(&self) -> &Result<Ctx, String> {
@@ -5228,6 +5260,86 @@ mod tests {
                 "{profile:?} {asked} {home}"
             );
         }
+    }
+
+    /// DOCTOR'S RUST-DOCS REPAIR is the workstation item `init.spotlight.rust-docs@alice` bound
+    /// as a relay-class repair of the account's own: nothing is read before the call, and bare
+    /// doctor's scope applies it and reads it back done. NEGATIVE CONTROL: outside the account's
+    /// own shell the same item is blocked and its apply never runs.
+    #[test]
+    fn doctor_s_rust_docs_repair_is_a_relay_item_of_the_account_s_own() {
+        const RUSTUP: &str = "alice$ CARGO_HOME=/Users//alice/.cargo \
+                              RUSTUP_HOME=/Users//alice/.rustup /Users//alice/.cargo/bin/rustup";
+        const STABLE: &str = "/Users//alice/.rustup/toolchains/stable-aarch64-apple-darwin";
+        let remove =
+            format!("{RUSTUP} component remove rust-docs --toolchain stable-aarch64-apple-darwin");
+        let mac = || {
+            let sys = alice_with_checkout(501, None);
+            let record = format!("{STABLE}/lib/rustlib/components");
+            let html = format!("{STABLE}/share/doc/rust/html");
+            sys.create_dir_all(Path::new(&format!("{html}/std")), 0o755)
+                .unwrap();
+            sys.file(&format!("{html}/std/index.html"), b"<html>")
+                .file("/Users//alice/.cargo/bin/rustup", b"")
+                .on(
+                    &format!("{RUSTUP} toolchain list"),
+                    Ran::ok("stable-aarch64-apple-darwin (active, default)\n"),
+                )
+                .file(
+                    &record,
+                    b"cargo-aarch64-apple-darwin\nrust-docs-aarch64-apple-darwin\n",
+                )
+                .on(&remove, Ran::ok(""))
+                .on_write(&remove, Path::new(&record), b"cargo-aarch64-apple-darwin\n");
+            let setup = sys.calls().len();
+            (
+                Doctor::over(sys, Some(PathBuf::from("/Users//alice")), None),
+                setup,
+            )
+        };
+        let run = |doctor: &Doctor<Fake>, scope: aterm_converge::Scope| {
+            let items = doctor.rust_docs().expect("alice's context reads");
+            aterm_converge::run_scoped(
+                &items,
+                aterm_converge::Mode::Apply,
+                scope,
+                &mut aterm_converge::NoJournal,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+
+        let (doctor, setup) = mac();
+        assert_eq!(
+            doctor.sys.calls().len(),
+            setup,
+            "nothing read before the call"
+        );
+        let rows = run(&doctor, aterm_converge::Scope::REPAIR);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "init.spotlight.rust-docs@alice");
+        assert_eq!(rows[0].class, Some(Class::Relay));
+        assert_eq!(rows[0].layer, Some(Layer::Workstation));
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+
+        let (doctor, _) = mac();
+        let rows = run(
+            &doctor,
+            aterm_converge::Scope {
+                not_own_account: Some("it runs as root"),
+                ..aterm_converge::Scope::REPAIR
+            },
+        );
+        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert!(
+            !doctor
+                .sys
+                .calls()
+                .iter()
+                .any(|call| call == &remove || call.starts_with("rename ")),
+            "{:?}",
+            doctor.sys.calls()
+        );
     }
 
     /// Lanes meeting in their probes: [`Meet::arrive`] returns once `count` lanes stand in it

@@ -14,8 +14,6 @@ use aterm_window::dpi::{
 };
 use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::CursorIcon;
-#[cfg(windows)]
-use aterm_window::window::WindowButtons;
 
 /// One recorded conversion: `(input, scale factor, output)`, both as `(x, y)`.
 type Row<I, O> = ((I, I), f64, (O, O));
@@ -290,14 +288,4 @@ fn flag_types_answer_as_recorded() {
             && !mods.contains(ModifiersState::ALT | ModifiersState::SHIFT)
     );
     assert!(mods.intersects(ModifiersState::ALT | ModifiersState::SHIFT));
-}
-
-/// `WindowButtons` exists only on Windows, the one backend that reads it.
-#[cfg(windows)]
-#[test]
-fn window_buttons_answer_as_recorded() {
-    assert_eq!(WindowButtons::all().bits(), 0b111);
-    assert_eq!(WindowButtons::CLOSE.bits() | WindowButtons::MINIMIZE.bits(), 0b011);
-    assert_eq!(WindowButtons::MAXIMIZE.bits(), 0b100);
-    assert!(WindowButtons::empty().is_empty());
 }

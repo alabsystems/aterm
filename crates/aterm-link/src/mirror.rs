@@ -68,11 +68,22 @@ pub struct TakeSlot {
     pub body: String,
 }
 
-/// Parse a `log-take` reply header and body into slots and whether more remain.
+/// A `log-take` reply read ([`parse_take`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Taken {
+    /// The slots, oldest first.
+    pub slots: Vec<TakeSlot>,
+    /// More remain past them (`more=1`): the take stopped at its room.
+    pub more: bool,
+    /// `due=<ms>`: a snapshot the endpoint held back to its rate (a moved mail count, `aterm_slog::MAIL_SNAP_GAP_MS`) is due this long from now, with nothing appended to wake a take for it.
+    pub due: Option<std::time::Duration>,
+}
+
+/// Parse a `log-take` reply header and body into slots, whether more remain, and when a held-back snapshot is due.
 ///
 /// # Errors
 /// Missing count in header, malformed slot line, or mismatched slot count.
-pub fn parse_take(header: &str, body: &[u8]) -> Result<(Vec<TakeSlot>, bool), String> {
+pub fn parse_take(header: &str, body: &[u8]) -> Result<Taken, String> {
     let mut toks = header.split_whitespace();
     if toks.next() != Some("OK") {
         return Err(format!("log-take answered {header:?}"));
@@ -80,11 +91,14 @@ pub fn parse_take(header: &str, body: &[u8]) -> Result<(Vec<TakeSlot>, bool), St
     let _bytes = toks.next();
     let mut want: Option<usize> = None;
     let mut more = false;
+    let mut due = None;
     for t in toks {
         if let Some(k) = t.strip_prefix("slots=") {
             want = k.parse().ok();
         } else if t == "more=1" {
             more = true;
+        } else if let Some(ms) = t.strip_prefix("due=").and_then(|ms| ms.parse().ok()) {
+            due = Some(std::time::Duration::from_millis(ms));
         }
     }
     let want = want.ok_or_else(|| format!("log-take header without slots=: {header:?}"))?;
@@ -108,7 +122,7 @@ pub fn parse_take(header: &str, body: &[u8]) -> Result<(Vec<TakeSlot>, bool), St
             slots.len()
         ));
     }
-    Ok((slots, more))
+    Ok(Taken { slots, more, due })
 }
 
 /// One pinned slot: the producer sequence it is published at, and the take's slot.

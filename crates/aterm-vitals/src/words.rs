@@ -7,8 +7,8 @@ use crate::explain::{Context, deck_cause};
 use crate::history::Filling;
 use crate::jobs::Verdict;
 use crate::model::{
-    CapBasis, DiskLevel, HeatCell, LinkKind, NoFigure, Pressure, ProcScope, Resource, ResourceView,
-    RowFacts, ScopeFig, Snapshot, State, TabView, VolumeSample,
+    CapBasis, DiskLevel, HeatCell, LinkKind, NetState, NoFigure, Pressure, ProcScope, Resource,
+    ResourceView, RowFacts, ScopeFig, Snapshot, State, TabView, VolumeSample,
 };
 use crate::peaks::{NET_LEARN_S, TOKENS_LEARN_S};
 use crate::ring::BUCKET_MS;
@@ -997,7 +997,15 @@ fn scope_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
             let unit = plural(n, "process", "processes");
             vec![format!("{} {unit}", grouped(n)), grouped(n)]
         }
-        Resource::Gpu | Resource::Network => return words2("not per app"),
+        Resource::Network => {
+            let n = half_up(v) as u64;
+            let unit = plural(n, "socket", "sockets");
+            vec![
+                format!("{} {unit}", grouped(n)),
+                format!("{} sock", grouped(n)),
+            ]
+        }
+        Resource::Gpu => return words2("not per app"),
     };
     ScopeCell {
         forms,
@@ -1616,6 +1624,25 @@ fn network_learning(snap: &Snapshot) -> Option<Clause> {
 fn network_details(snap: &Snapshot) -> Vec<Clause> {
     let view = &snap.resources[Resource::Network.index()];
     let mut out: Vec<Clause> = network_learning(snap).into_iter().collect();
+    if let Some(net) = snap.net.as_ref() {
+        match net.state {
+            NetState::Offline => out.push(
+                Clause::new(0, vec!["offline, no active link".into(), "offline".into()])
+                    .kept()
+                    .marked(Some(Mark::Dot))
+                    .inked(InkKind::Warn)
+                    .said("Network offline, no active link.".into()),
+            ),
+            NetState::Degraded => out.push(
+                Clause::new(0, vec!["link degraded".into(), "degraded".into()])
+                    .kept()
+                    .marked(Some(Mark::Dot))
+                    .inked(InkKind::Warn)
+                    .said("Network link degraded.".into()),
+            ),
+            NetState::Online | NetState::Idle => {}
+        }
+    }
     let (other, mark, word, verb) = if second_binds(view) {
         (Some(view.first()), Mark::Down, "down", "Receiving")
     } else {
@@ -1635,6 +1662,13 @@ fn network_details(snap: &Snapshot) -> Vec<Clause> {
             _ => (vec![short], format!("{verb} {n} megabytes per second.")),
         };
         out.push(Clause::new(0, forms).marked(Some(mark)).said(said));
+    }
+    if let Some(ms) = snap.net.as_ref().and_then(|n| n.srtt_ms) {
+        let rtt = rtt_word(ms);
+        out.push(
+            Clause::new(1, vec![format!("{rtt} RTT"), rtt.clone()])
+                .said(format!("TCP latency {rtt}.")),
+        );
     }
     if let Some(l) = snap.facts.link.as_ref() {
         let kind = match l.kind {
@@ -2214,7 +2248,8 @@ fn glance_processes(view: &ResourceView, platform: Platform) -> Vec<String> {
 /// the deck draws nothing there, and the lens says why.
 #[must_use]
 pub fn glance_scope(res: Resource, view: &ResourceView, loc: &Locale) -> Option<ScopeForms> {
-    if matches!(res, Resource::Gpu | Resource::Network)
+    if res == Resource::Gpu
+        || (res == Resource::Network && view.aterm.now.is_none())
         || view.aterm.missing == Some(NoFigure::NotPerApp)
     {
         return None;
@@ -2229,8 +2264,10 @@ pub fn glance_scope(res: Resource, view: &ResourceView, loc: &Locale) -> Option<
 }
 
 fn glance_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
-    let (Some(v), Resource::Cpu | Resource::Memory | Resource::Disk | Resource::Processes) =
-        (fig.now, res)
+    let (
+        Some(v),
+        Resource::Cpu | Resource::Memory | Resource::Disk | Resource::Network | Resource::Processes,
+    ) = (fig.now, res)
     else {
         return scope_cell(res, fig);
     };
@@ -2251,6 +2288,10 @@ fn glance_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
                 None => f,
             })
             .collect(),
+        Resource::Network => {
+            let n = grouped(half_up(v) as u64);
+            vec![format!("{n} sock"), n]
+        }
         _ => vec![grouped(half_up(v) as u64)],
     };
     ScopeCell {
@@ -2341,23 +2382,360 @@ fn glance_cpu(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
 
 fn glance_network_details(snap: &Snapshot) -> Vec<Clause> {
     let view = &snap.resources[Resource::Network.index()];
-    let (other, mark, verb) = if second_binds(view) {
-        (Some(view.first()), Mark::Down, "Receiving")
-    } else {
-        (view.second.clone(), Mark::Up, "Sending")
-    };
-    let Some(now) = other.and_then(|s| s.now) else {
-        return Vec::new();
-    };
-    if half_up(now / 1e5) < 1.0 {
-        return Vec::new();
+    let mut out = Vec::new();
+    let link_word = snap.facts.link.as_ref().and_then(|l| match l.kind {
+        LinkKind::Wifi => Some("Wi-Fi"),
+        LinkKind::Ethernet => Some("Ethernet"),
+        LinkKind::Cellular => Some("Cellular"),
+        LinkKind::Vpn => Some("VPN"),
+        LinkKind::Bridge | LinkKind::Other => None,
+    });
+    if let Some(net) = snap.net.as_ref() {
+        match net.state {
+            NetState::Offline => out.push(
+                Clause::new(0, vec!["offline".into()])
+                    .kept()
+                    .marked(Some(Mark::Dot))
+                    .inked(InkKind::Warn)
+                    .said("Network offline.".into()),
+            ),
+            NetState::Degraded => out.push(
+                Clause::new(0, vec!["degraded".into()])
+                    .kept()
+                    .marked(Some(Mark::Dot))
+                    .inked(InkKind::Warn)
+                    .said("Network degraded.".into()),
+            ),
+            NetState::Online => {
+                let forms = match link_word {
+                    Some(lk) => vec![format!("Online \u{b7} {lk}"), "Online".into()],
+                    None => vec!["Online".into()],
+                };
+                out.push(
+                    Clause::new(0, forms)
+                        .inked(InkKind::Words)
+                        .said("Network online.".into()),
+                );
+            }
+            NetState::Idle => {
+                let forms = match link_word {
+                    Some(lk) => vec![format!("Idle \u{b7} {lk}"), "Idle".into()],
+                    None => vec!["Idle".into()],
+                };
+                out.push(
+                    Clause::new(1, forms)
+                        .inked(InkKind::Words2)
+                        .said("Network idle.".into()),
+                );
+            }
+        }
     }
-    let n = rate_figure(now / 1e6);
-    vec![
-        Clause::new(0, vec![format!("{n} MB/s")])
-            .marked(Some(mark))
-            .said(format!("{verb} {n} megabytes per second.")),
+    let dual_in_amount = snap.net.as_ref().is_some_and(|n| n.rates.is_some());
+    if !dual_in_amount {
+        let (other, mark, verb) = if second_binds(view) {
+            (Some(view.first()), Mark::Down, "Receiving")
+        } else {
+            (view.second.clone(), Mark::Up, "Sending")
+        };
+        if let Some(now) = other.and_then(|s| s.now)
+            && half_up(now / 1e5) >= 1.0
+        {
+            let n = rate_figure(now / 1e6);
+            out.push(
+                Clause::new(0, vec![format!("{n} MB/s")])
+                    .marked(Some(mark))
+                    .said(format!("{verb} {n} megabytes per second.")),
+            );
+        }
+    }
+    if let Some(ms) = snap.net.as_ref().and_then(|n| n.srtt_ms) {
+        let rtt = rtt_word(ms);
+        out.push(
+            Clause::new(1, vec![format!("{rtt} RTT"), rtt.clone()])
+                .inked(InkKind::Words2)
+                .said(format!("TCP latency {rtt}.")),
+        );
+    }
+    out
+}
+
+/// Format a passive TCP smoothed round-trip latency in milliseconds (`<1 ms`, `14 ms`, `240 ms`).
+#[must_use]
+pub fn rtt_word(srtt_ms: f32) -> String {
+    if !srtt_ms.is_finite() || srtt_ms <= 0.0 {
+        return "0 ms".into();
+    }
+    if srtt_ms < 1.0 {
+        "<1 ms".into()
+    } else if srtt_ms < 10.0 {
+        format!("{srtt_ms:.1} ms")
+    } else {
+        format!("{:.0} ms", half_up(f64::from(srtt_ms)))
+    }
+}
+
+/// Condense an OS processor brand string into a crisp hardware badge (`"M5 Max"`, `"Ryzen 9 9950X"`).
+#[must_use]
+pub fn compact_cpu_brand(brand: &str) -> String {
+    let cleaned = brand
+        .replace("(R)", "")
+        .replace("(TM)", "")
+        .replace("(tm)", "");
+    let before_at = cleaned.split('@').next().unwrap_or(&cleaned);
+    let mut kept = Vec::new();
+    for raw in before_at.split_whitespace() {
+        if raw.eq_ignore_ascii_case("Apple")
+            || raw.eq_ignore_ascii_case("AMD")
+            || raw.eq_ignore_ascii_case("Intel")
+            || raw.eq_ignore_ascii_case("Genuine")
+            || raw.eq_ignore_ascii_case("CPU")
+            || raw.eq_ignore_ascii_case("Processor")
+            || raw.ends_with("-Core")
+            || raw.ends_with("-core")
+            || (raw.ends_with("th") && raw[..raw.len() - 2].chars().all(|c| c.is_ascii_digit()))
+            || raw.eq_ignore_ascii_case("Gen")
+        {
+            continue;
+        }
+        kept.push(raw);
+    }
+    if kept.is_empty() {
+        before_at.trim().to_owned()
+    } else {
+        kept.join(" ")
+    }
+}
+
+fn disk_total_compact(bytes: u64) -> (String, String) {
+    if bytes >= 1_000_000_000_000 {
+        let tb10 = half_up(bytes as f64 / 100_000_000_000.0) as u64;
+        if tb10.is_multiple_of(10) {
+            let whole = tb10 / 10;
+            (format!("{whole} TB"), format!("{whole}T"))
+        } else {
+            let whole = tb10 / 10;
+            let frac = tb10 % 10;
+            (format!("{whole}.{frac} TB"), format!("{whole}.{frac}T"))
+        }
+    } else if bytes >= 1_000_000_000 {
+        let gb = half_up(bytes as f64 / 1_000_000_000.0).max(1.0) as u64;
+        (format!("{gb} GB"), format!("{gb}G"))
+    } else {
+        let s = disk(bytes);
+        (s.clone(), s)
+    }
+}
+
+/// Compact hardware identity and total capacity candidates (longest first) for the Deck header:
+/// processor chip & core count, total physical memory, and total storage capacity.
+#[must_use]
+pub fn machine_totals_forms(snap: &Snapshot) -> Vec<String> {
+    let cores = snap
+        .total_cores()
+        .or_else(|| {
+            snap.resources[Resource::Cpu.index()]
+                .capacity
+                .map(|c| c as usize)
+        })
+        .filter(|&n| n > 0);
+    let chip = snap
+        .facts
+        .cpu_brand
+        .as_deref()
+        .map(compact_cpu_brand)
+        .filter(|b| !b.is_empty());
+    let proc_full = match (&chip, cores) {
+        (Some(b), Some(n)) => Some(format!("{b} \u{b7} {n}c")),
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(n)) => Some(format!("{n}c")),
+        (None, None) => None,
+    };
+    let proc_tight = match (&chip, cores) {
+        (Some(b), Some(n)) => Some(format!("{b} {n}c")),
+        _ => None,
+    };
+    let proc_short = cores.map(|n| format!("{n}c")).or_else(|| chip.clone());
+    let ram_bytes = snap
+        .mem
+        .as_ref()
+        .map(|m| m.sample.total)
+        .or_else(|| {
+            snap.resources[Resource::Memory.index()]
+                .capacity
+                .map(|c| c as u64)
+        })
+        .filter(|&b| b > 0);
+    let ram = ram_bytes.map(|b| format!("{} GiB", gib_total(b)));
+    let ram_short = ram_bytes.map(|b| format!("{}G", gib_total(b)));
+    let hd_bytes = snap
+        .volume
+        .as_ref()
+        .map(|v| v.total)
+        .or_else(|| {
+            snap.resources[Resource::Disk.index()]
+                .capacity
+                .map(|c| c as u64)
+        })
+        .filter(|&b| b > 0);
+    let hd = hd_bytes.map(disk);
+    let hd_compact = hd_bytes.map(disk_total_compact);
+    let hd_trim = hd_compact.as_ref().map(|(t, _)| t.as_str());
+    let hd_short = hd_compact.as_ref().map(|(_, s)| s.as_str());
+
+    let join = |items: &[Option<&str>]| -> Option<String> {
+        let v: Vec<&str> = items.iter().filter_map(|x| *x).collect();
+        (!v.is_empty()).then(|| v.join(" \u{b7} "))
+    };
+    let mut out = Vec::new();
+    for candidate in [
+        join(&[proc_full.as_deref(), ram.as_deref(), hd.as_deref()]),
+        join(&[proc_full.as_deref(), ram.as_deref(), hd_trim]),
+        join(&[proc_full.as_deref(), ram_short.as_deref(), hd_short]),
+        join(&[proc_tight.as_deref(), ram_short.as_deref(), hd_short]),
+        join(&[proc_short.as_deref(), ram.as_deref(), hd.as_deref()]),
+        join(&[proc_short.as_deref(), ram.as_deref(), hd_trim]),
+        join(&[proc_short.as_deref(), ram_short.as_deref(), hd_short]),
+        join(&[proc_full.as_deref(), ram.as_deref()]),
+        join(&[proc_short.as_deref(), ram.as_deref()]),
+        join(&[proc_short.as_deref(), ram_short.as_deref()]),
+        proc_full,
+        proc_short,
     ]
+    .into_iter()
+    .flatten()
+    {
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Compact live Network connectivity, upload/download, and latency summary forms (longest first).
+#[must_use]
+pub fn net_summary_forms(snap: &Snapshot) -> Vec<String> {
+    let view = &snap.resources[Resource::Network.index()];
+    let net = snap.net.as_ref();
+    let state = net.map_or(NetState::Idle, |n| n.state);
+    if state == NetState::Offline {
+        return vec!["Offline".into()];
+    }
+    let rx = net.and_then(|n| n.rates.map(|r| r.rx_bps)).or(view.now);
+    let tx = net
+        .and_then(|n| n.rates.map(|r| r.tx_bps))
+        .or_else(|| view.second.as_ref().and_then(|s| s.now));
+    let link_word = snap.facts.link.as_ref().and_then(|l| match l.kind {
+        LinkKind::Wifi => Some("Wi-Fi"),
+        LinkKind::Ethernet => Some("Eth"),
+        LinkKind::Cellular => Some("Cell"),
+        LinkKind::Vpn => Some("VPN"),
+        LinkKind::Bridge | LinkKind::Other => None,
+    });
+    let rtt = net.and_then(|n| n.srtt_ms).map(rtt_word);
+    let rtt_tight = rtt.as_deref().map(|r| r.replace(' ', ""));
+    let fmt_rate = |bps: f64| -> String {
+        if bps < 950_000.0 {
+            format!("{}K", grouped(half_up(bps.max(0.0) / 1e3) as u64))
+        } else {
+            format!("{}M", rate_figure(bps / 1e6))
+        }
+    };
+    let traffic = match (rx, tx) {
+        (Some(r), Some(t)) => Some(format!("\u{2193}{} \u{2191}{}/s", fmt_rate(r), fmt_rate(t))),
+        (Some(r), None) => Some(format!("\u{2193}{}/s", fmt_rate(r))),
+        (None, Some(t)) => Some(format!("\u{2191}{}/s", fmt_rate(t))),
+        (None, None) => None,
+    };
+    let traffic_tight = match (rx, tx) {
+        (Some(r), Some(t)) => Some(format!("\u{2193}{} \u{2191}{}", fmt_rate(r), fmt_rate(t))),
+        (Some(r), None) => Some(format!("\u{2193}{}", fmt_rate(r))),
+        (None, Some(t)) => Some(format!("\u{2191}{}", fmt_rate(t))),
+        (None, None) => None,
+    };
+    let st = state.label();
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<String>, s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    if let (Some(lk), Some(tr), Some(rt)) = (link_word, traffic.as_deref(), rtt.as_deref()) {
+        push(&mut out, format!("{st} {lk} \u{b7} {tr} \u{b7} {rt}"));
+    }
+    if let (Some(tr), Some(rt)) = (traffic.as_deref(), rtt.as_deref()) {
+        push(&mut out, format!("{st} \u{b7} {tr} \u{b7} {rt}"));
+        if state != NetState::Degraded {
+            push(&mut out, format!("{tr} \u{b7} {rt}"));
+        }
+    }
+    if let (Some(trt), Some(rtt_t)) = (traffic_tight.as_deref(), rtt_tight.as_deref()) {
+        if state == NetState::Degraded {
+            push(&mut out, format!("{st} \u{b7} {trt} \u{b7} {rtt_t}"));
+        } else {
+            push(&mut out, format!("{trt} \u{b7} {rtt_t}"));
+        }
+    }
+    if let (Some(lk), Some(tr)) = (link_word, traffic.as_deref()) {
+        push(&mut out, format!("{st} {lk} \u{b7} {tr}"));
+    }
+    if let (Some(lk), Some(trt)) = (link_word, traffic_tight.as_deref()) {
+        push(&mut out, format!("{st} {lk} \u{b7} {trt}"));
+    }
+    if let Some(tr) = traffic.as_deref() {
+        push(&mut out, format!("{st} \u{b7} {tr}"));
+        if let Some(trt) = traffic_tight.as_deref() {
+            push(&mut out, format!("{st} \u{b7} {trt}"));
+        }
+        if state != NetState::Degraded {
+            push(&mut out, tr.to_owned());
+        }
+    }
+    if let (Some(lk), Some(rt)) = (link_word, rtt.as_deref()) {
+        push(&mut out, format!("{st} {lk} \u{b7} {rt}"));
+    }
+    if let Some(rt) = rtt.as_deref() {
+        push(&mut out, format!("{st} \u{b7} {rt}"));
+    }
+    if let Some(lk) = link_word {
+        push(&mut out, format!("{st} {lk}"));
+    }
+    push(&mut out, st.to_owned());
+    out
+}
+
+/// Network Amount-column forms when the Details column stands beside it (`Ladder::Det`): reports
+/// dual download/upload throughput without repeating connectivity state or RTT already shown in
+/// Details.
+#[must_use]
+pub fn net_amount_det_forms(snap: &Snapshot) -> Vec<String> {
+    let view = &snap.resources[Resource::Network.index()];
+    let net = snap.net.as_ref();
+    let state = net.map_or(NetState::Idle, |n| n.state);
+    if state == NetState::Offline {
+        return vec!["0 MB/s".into()];
+    }
+    let rx = net.and_then(|n| n.rates.map(|r| r.rx_bps)).or(view.now);
+    let tx = net
+        .and_then(|n| n.rates.map(|r| r.tx_bps))
+        .or_else(|| view.second.as_ref().and_then(|s| s.now));
+    let fmt_rate = |bps: f64| -> String {
+        if bps < 950_000.0 {
+            format!("{}K", grouped(half_up(bps.max(0.0) / 1e3) as u64))
+        } else {
+            format!("{}M", rate_figure(bps / 1e6))
+        }
+    };
+    let mut out = Vec::new();
+    match (rx, tx) {
+        (Some(r), Some(t)) => {
+            out.push(format!("\u{2193}{} \u{2191}{}/s", fmt_rate(r), fmt_rate(t)));
+            out.push(format!("\u{2193}{} \u{2191}{}", fmt_rate(r), fmt_rate(t)));
+        }
+        (Some(r), None) => out.push(format!("\u{2193}{}/s", fmt_rate(r))),
+        (None, Some(t)) => out.push(format!("\u{2191}{}/s", fmt_rate(t))),
+        (None, None) => {}
+    }
+    out
 }
 
 fn glance_processes_details(snap: &Snapshot) -> Vec<Clause> {
@@ -4143,6 +4521,49 @@ mod tests {
         assert_eq!(
             forms(Resource::Processes, &p).last(),
             Some(&strings(&["yours 9,000 of 10,666", "yours 9,000"]))
+        );
+    }
+
+    #[test]
+    fn machine_totals_and_network_summary_format_hardware_identity_and_latency() {
+        assert_eq!(compact_cpu_brand("Apple M5 Max"), "M5 Max");
+        assert_eq!(
+            compact_cpu_brand("AMD Ryzen 9 9950X 16-Core Processor"),
+            "Ryzen 9 9950X"
+        );
+        assert_eq!(
+            compact_cpu_brand("13th Gen Intel(R) Core(TM) i9-13900K @ 3.00GHz"),
+            "Core i9-13900K"
+        );
+        let mut s = scenario_a();
+        s.facts.cpu_brand = Some("Apple M5 Max".into());
+        let totals = machine_totals_forms(&s);
+        assert_eq!(
+            totals.first().map(String::as_str),
+            Some("M5 Max \u{b7} 10c \u{b7} 32 GiB \u{b7} 2.00 TB")
+        );
+
+        s.facts.link = Some(LinkSample {
+            name: "en0".into(),
+            kind: LinkKind::Wifi,
+            up: true,
+            counts: true,
+            ..LinkSample::default()
+        });
+        s.net = Some(crate::NetView {
+            state: NetState::Online,
+            srtt_ms: Some(14.2),
+            rates: Some(crate::LinkRates {
+                rx_bps: 12_400_000.0,
+                tx_bps: 1_800_000.0,
+                ..crate::LinkRates::default()
+            }),
+            ..crate::NetView::default()
+        });
+        let net_forms = net_summary_forms(&s);
+        assert_eq!(
+            net_forms.first().map(String::as_str),
+            Some("Online Wi-Fi \u{b7} \u{2193}12.4M \u{2191}1.8M/s \u{b7} 14 ms")
         );
     }
 }

@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 
-use aterm_vitals::Strain;
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
-use aterm_vitals::model::{DiskLevel, HeatCell, Resource, ResourceView, ScopeFig, Snapshot, State};
+use aterm_vitals::model::{
+    DiskLevel, HeatCell, HeatSlot, Resource, ResourceView, ScopeFig, Snapshot, State,
+};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform, ScopeForms};
+use aterm_vitals::{GapKind, MultiScaleSpec, Strain, StripEvent, StripEventKind, TimeGap};
 
 #[cfg(test)]
 use crate::deck_face::Boxed;
@@ -344,6 +346,9 @@ pub(crate) struct DeckGeom {
 pub(crate) struct DeckInput<'a> {
     /// The latest snapshot, `None` before the first.
     pub(crate) snap: Option<&'a Snapshot>,
+    /// The snapshot immediately preceding [`Self::snap`], when available, for smooth value
+    /// interpolation across readings.
+    pub(crate) prev_snap: Option<&'a Snapshot>,
     /// This window's active tab's sessions, its focused pane first (`App::deck_tab_panes`):
     /// every figure of "this tab" is theirs summed ([`Snapshot::resource`], [`Snapshot::tab_of`]).
     pub(crate) tab_panes: Vec<u64>,
@@ -374,14 +379,17 @@ const HEADER_BASE_FULL: f64 = 11.5;
 const HEADER_BASE_FOLDED: f64 = 9.5;
 const HEADER_HIT_FULL: f64 = 14.5;
 const HEADER_HIT_FOLDED: f64 = 12.5;
-const GRID_FROM_FULL: f64 = 14.5;
-const GRID_FROM_FOLDED: f64 = 12.5;
 const SMALL_PT: f64 = 9.5;
 /// The least height of a time-scale tick, device px.
 const TICK_MIN_PX: f32 = 2.0;
 const MARK_EM: f64 = 1.1;
 const STATE_GAP: f64 = 6.0;
-const STRIP_PERIODS: [u32; 3] = [10, 20, 30];
+const STRIP_SPECS: [MultiScaleSpec; 4] = [
+    MultiScaleSpec::FULL_HOUR,
+    MultiScaleSpec::FOLD_15M,
+    MultiScaleSpec::COMPACT_5M,
+    MultiScaleSpec::MINI_1M,
+];
 /// How far back one reading may speak for the seconds before it that hold none of their own, in
 /// a Folded strip's slots ([`ResourceView::heat_slots`]): three of the background cadence, v2
 /// §5.4's gap rule, so a strip read while aterm was behind other apps keeps its readings and a
@@ -450,19 +458,15 @@ struct RowWords {
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
     /// forms, longest first (rule F).
     strip_text: Option<Vec<Txt>>,
-    /// The strip's columns at each of [`STRIP_PERIODS`]: ten minutes', oldest first and the
-    /// open one last, and the one before them, which the glide slides out at the left (a Full
-    /// strip's, [`RowWords::strip_cols`]).
-    cols: [Vec<HeatCell>; 3],
-    /// A Folded strip's slots: its last [`plan::FOLD_SLOTS_MAX`] seconds, a reading's each,
-    /// oldest first and the one holding the snapshot's reading last, and the one before them,
-    /// which the slide brings out at the left.
+    /// Multi-scale progressive time-series slots for each of [`STRIP_SPECS`], oldest (widest)
+    /// first and the live `now` slot last.
+    multi_scale: [Vec<HeatSlot>; 4],
+    /// A Folded strip's fine slots for slide lead-in.
     slots: Vec<HeatCell>,
     bar: Option<BarFill>,
-    /// The amount's forms on each ladder ([`Table::ladder`]): the glance's in Full wide and mid
-    /// ([`words::glance_amount`]); elsewhere Det (with the compact forms that repeat no Details
-    /// figure after them), Cols and NoCols.
-    amount: [Vec<Txt>; 4],
+    /// The amount's forms on each ladder ([`Table::ladder`]): the glance's with Details (`[0]`)
+    /// and without Details (`[1]`), then Det (`[2]`), Cols (`[3]`) and NoCols (`[4]`).
+    amount: [Vec<Txt>; 5],
     state: Option<StateTxt>,
     /// The aterm and Tab cells: the glance's, then the other tables' ([`Table::said`]).
     scope: [ScopeTxt; 2],
@@ -479,11 +483,69 @@ struct CoreCluster {
     heat: Vec<Option<f32>>,
 }
 
+/// Previous snapshot's numeric targets for smooth [`DeckLive::blend`] interpolation.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct DeckPrev {
+    strain: Option<Strain>,
+    rows: Vec<(Option<f32>, Option<BarFill>)>,
+    cores: Vec<Vec<Option<f32>>>,
+}
+
+impl DeckPrev {
+    fn of(snap: &Snapshot, panes: &[u64]) -> Self {
+        let rows = DECK_RESOURCES
+            .iter()
+            .map(|&res| {
+                let view = snap.resource(res, panes);
+                let heat = view.heat_now.filter(|h| !h.is_nan());
+                let bar = bar_fill(res, &view, snap, panes);
+                (heat, bar)
+            })
+            .collect();
+        let cores = snap
+            .cpu
+            .as_ref()
+            .map(|cpu| {
+                cpu.clusters
+                    .iter()
+                    .map(|c| {
+                        c.cores
+                            .iter()
+                            .map(|&i| {
+                                cpu.cores
+                                    .get(i)
+                                    .map(|core| core.load.level)
+                                    .filter(|v| v.is_finite())
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            strain: Some(Strain::of(snap)),
+            rows,
+            cores,
+        }
+    }
+}
+
 /// The deck's words for one snapshot: what every row says, measured in the deck's face.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeckWords {
     rows: Vec<RowWords>,
     cores: Vec<CoreCluster>,
+    /// Hardware identity & capacity totals forms (`this Mac · M5 Max · 18c · 128 GiB · 2 TB`, …),
+    /// longest first.
+    machine_forms: Vec<String>,
+    /// Processor & machine totals forms for trailing room on the `Cores` row (`M5 Max · 128 GiB · 2 TB`, …).
+    cores_tail_forms: Vec<Txt>,
+    /// Recorded time discontinuities (sleep, crash, pause) within the ring's horizon.
+    time_gaps: Vec<TimeGap>,
+    /// Discrete event markers (crash, restart, sleep/wake, spike) on the time series.
+    strip_events: Vec<StripEvent>,
+    /// Previous snapshot's values for fluid [`DeckLive::blend`] transitions.
+    prev: Option<DeckPrev>,
     /// How hard the whole Mac works now and for how long: the gauge's reading. `None` with no
     /// snapshot yet.
     strain: Option<Strain>,
@@ -533,9 +595,39 @@ impl DeckWords {
                     .collect()
             })
             .unwrap_or_default();
+        let machine_base = input.locale.platform.machine();
+        let raw_totals = words::machine_totals_forms(snap);
+        let machine_forms = raw_totals
+            .iter()
+            .map(|tot| format!("{machine_base} \u{b7} {tot}"))
+            .collect();
+        let mut tail_candidates: Vec<String> = Vec::new();
+        if let Some(brand) = snap.facts.cpu_brand.as_deref().filter(|b| !b.is_empty()) {
+            let short_brand = brand.strip_prefix("Apple ").unwrap_or(brand);
+            for tot in &raw_totals {
+                if tot.starts_with(short_brand) && !tail_candidates.contains(tot) {
+                    tail_candidates.push(tot.clone());
+                }
+            }
+            if !tail_candidates.iter().any(|s| s == brand) {
+                tail_candidates.push(brand.to_owned());
+            }
+            if short_brand != brand && !tail_candidates.iter().any(|s| s == short_brand) {
+                tail_candidates.push(short_brand.to_owned());
+            }
+        }
+        let cores_tail_forms = txts(tail_candidates, m);
+        let prev = input
+            .prev_snap
+            .map(|prev_snap| DeckPrev::of(prev_snap, &input.tab_panes));
         Self {
             rows,
             cores,
+            machine_forms,
+            cores_tail_forms,
+            time_gaps: snap.time_gaps.clone(),
+            strip_events: snap.strip_events.clone(),
+            prev,
             strain: Some(Strain::of(snap)),
             reading: false,
         }
@@ -551,7 +643,7 @@ impl DeckWords {
                 heat_now: None,
                 pct: Txt::new(words::pct(None), m),
                 strip_text: Some(vec![Txt::new("reading\u{2026}", m)]),
-                cols: [Vec::new(), Vec::new(), Vec::new()],
+                multi_scale: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
                 slots: Vec::new(),
                 bar: None,
                 amount: Default::default(),
@@ -563,17 +655,21 @@ impl DeckWords {
         Self {
             rows,
             cores: Vec::new(),
+            machine_forms: Vec::new(),
+            cores_tail_forms: Vec::new(),
+            time_gaps: Vec::new(),
+            strip_events: Vec::new(),
+            prev: None,
             strain: None,
             reading: true,
         }
     }
 
-    /// Whether a strip of `strip`'s period draws an over mark: in any column it holds, the one
-    /// the glide slides out included, so the key holds still while the strips glide.
+    /// Whether a strip of `strip`'s multi-scale horizon draws an over mark in any slot.
     fn over_shown(&self, strip: &Strip) -> bool {
-        self.rows
-            .iter()
-            .any(|row| row.strip_text.is_none() && row.strip_cols(strip).iter().any(|c| c.over))
+        self.rows.iter().any(|row| {
+            row.strip_text.is_none() && row.multi_scale_slots(strip).iter().any(|s| s.cell.over)
+        })
     }
 
     fn clusters(&self) -> Vec<Cluster<'_>> {
@@ -592,12 +688,48 @@ impl RowWords {
         let view = snap.resource(res, panes);
         let facts = &snap.facts;
         let forms = |ladder| words::amount_forms(res, &view, facts, ladder, loc);
-        let glance = words::glance_amount(res, &view, loc);
+        let mut glance_det = words::glance_amount(res, &view, loc);
+        let mut glance_bare = glance_det.clone();
         let mut det = forms(Ladder::Det);
-        let cols = forms(Ladder::Cols);
+        let mut cols = forms(Ladder::Cols);
+        let mut no_cols = forms(Ladder::NoCols);
         for f in &cols {
             if !f.contains("freed") && !det.contains(f) {
                 det.push(f.clone());
+            }
+        }
+        if res == Resource::Network && snap.net.is_some() {
+            let det_forms = words::net_amount_det_forms(snap);
+            if !det_forms.is_empty() {
+                let mut g = det_forms.clone();
+                for f in glance_det {
+                    if !g.contains(&f) {
+                        g.push(f);
+                    }
+                }
+                glance_det = g;
+                let mut d = det_forms;
+                for f in det {
+                    if !d.contains(&f) {
+                        d.push(f);
+                    }
+                }
+                det = d;
+            }
+            let net_forms = words::net_summary_forms(snap);
+            if !net_forms.is_empty() {
+                let prepend = |head: &[String], tail: Vec<String>| -> Vec<String> {
+                    let mut v = head.to_vec();
+                    for f in tail {
+                        if !v.contains(&f) {
+                            v.push(f);
+                        }
+                    }
+                    v
+                };
+                glance_bare = prepend(&net_forms, glance_bare);
+                cols = prepend(&net_forms, cols);
+                no_cols = prepend(&net_forms, no_cols);
             }
         }
         let strip_text = words::strip_words(res, snap).map(|forms| txts(forms, m));
@@ -646,20 +778,22 @@ impl RowWords {
             heat_now: view.heat_now.filter(|h| !h.is_nan()),
             pct: Txt::new(words::pct(view.heat_now), m),
             strip_text,
-            cols: STRIP_PERIODS
-                .map(|per| view.heat_columns(per, (600 / per) as usize + 1, snap.at_unix_ms)),
+            multi_scale: STRIP_SPECS.map(|spec| {
+                view.heat_multi_scale(spec, snap.at_unix_ms, SLOT_COVER_MS, &snap.time_gaps)
+            }),
             slots: view.heat_slots(
                 snap.slot_grid,
                 plan::FOLD_SLOTS_MAX + 1,
                 snap.at_unix_ms,
                 SLOT_COVER_MS,
             ),
-            bar: bar_fill(res, &view, snap),
+            bar: bar_fill(res, &view, snap, panes),
             amount: [
-                txts(glance, m),
+                txts(glance_det, m),
+                txts(glance_bare, m),
                 txts(det, m),
                 txts(cols, m),
-                txts(forms(Ladder::NoCols), m),
+                txts(no_cols, m),
             ],
             state,
             scope,
@@ -668,17 +802,56 @@ impl RowWords {
     }
 }
 
-fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot) -> Option<BarFill> {
-    let cap = view.binding().capacity;
+fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot, panes: &[u64]) -> Option<BarFill> {
+    if res == Resource::Tokens {
+        return None;
+    }
+    let shares = snap.bar_shares(res, panes);
+    let cap = view
+        .binding()
+        .capacity
+        .or(view.capacity)
+        .filter(|&c| c > 0.0);
     let share = |fig: &ScopeFig| -> Option<f32> {
         let (v, c) = (fig.now?, cap?);
         (c > 0.0).then(|| (v / c).clamp(0.0, 1.0) as f32)
     };
-    let machine = view.heat_now.filter(|h| !h.is_nan()).map(|h| h.min(1.0));
-    let global = machine.filter(|_| res != Resource::Tokens);
-    let scoped = res.scope_shares_capacity();
-    let aterm = if scoped { share(&view.aterm) } else { None };
-    let tab = if scoped { share(&view.tab) } else { None };
+    let machine = view
+        .heat_now
+        .filter(|h| !h.is_nan())
+        .map(|h| h.clamp(0.0, 1.0));
+    let global = machine.or_else(|| shares.map(|s| s[0]));
+    let (aterm, tab) = match res {
+        Resource::Cpu | Resource::Memory | Resource::Processes => {
+            let a = share(&view.aterm)
+                .or_else(|| shares.filter(|_| snap.aterm.is_some()).map(|s| s[1]));
+            let t = share(&view.tab).or_else(|| {
+                shares
+                    .filter(|_| !panes.is_empty() && snap.tab_of(panes).is_some())
+                    .map(|s| s[2])
+            });
+            (a, t)
+        }
+        Resource::Disk | Resource::Network => {
+            let has_aterm = snap.aterm.is_some()
+                || view.aterm.now.is_some()
+                || snap.net.as_ref().is_some_and(|n| n.aterm_sockets.is_some());
+            let has_tab = !panes.is_empty()
+                && (snap.tab_of(panes).is_some()
+                    || view.tab.now.is_some()
+                    || snap.net.as_ref().is_some_and(|n| !n.tab_sockets.is_empty()));
+            let a = shares
+                .filter(|s| has_aterm || s[1] > 0.0)
+                .map(|s| s[1])
+                .or_else(|| share(&view.aterm));
+            let t = shares
+                .filter(|s| has_tab || s[2] > 0.0)
+                .map(|s| s[2])
+                .or_else(|| share(&view.tab));
+            (a, t)
+        }
+        Resource::Gpu | Resource::Tokens => (None, None),
+    };
     if global.is_none() && aterm.is_none() {
         return None;
     }
@@ -702,29 +875,90 @@ fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot) -> Option<BarFi
     })
 }
 
-fn period_ix(strip: &Strip) -> usize {
-    STRIP_PERIODS
+fn spec_ix(strip: &Strip) -> usize {
+    STRIP_SPECS
         .iter()
-        .position(|&p| p == strip.period_s)
+        .position(|&s| s == strip.spec)
         .unwrap_or(0)
 }
 
-impl RowWords {
-    /// What `strip` draws of this row: the newest `strip.cols + 1` of its columns at the
-    /// strip's period, oldest first and the open one last, the one the glide or the slide
-    /// brings out at the left included. A Full strip spans ten minutes and takes them all; a
-    /// Folded one takes the newest of its row's slots, a reading's second each
-    /// (`stats_plan::FOLD_SLOT_S`).
-    fn strip_cols(&self, strip: &Strip) -> &[HeatCell] {
-        let cols = if strip.period_s == plan::FOLD_SLOT_S {
-            self.slots.as_slice()
+/// Whole-pixel slot layout `(slot_idx, x_px, w_px, is_live_now)` for `strip` at `scale`, shifting
+/// the real-time band right by `shift_px` while keeping coarse multi-minute aggregate buckets and
+/// the far-right `now` box anchored to the X-axis ticks.
+pub(crate) fn multi_scale_slot_rects(
+    strip: &Strip,
+    scale: f64,
+    shift_px: f32,
+) -> Vec<(usize, f32, f32, bool)> {
+    let s = scale.max(0.5);
+    let px = |v: f64| (v * s + 0.5).floor() as f32;
+    let x0 = px(strip.x);
+    let x1 = px(strip.end());
+    let total_w = (x1 - x0).max(1.0);
+    let gap_px = px(1.0).max(1.0);
+    let slots = strip.spec.slots();
+    let n = slots.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut base_rects: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(n);
+    for (j, slot) in slots.iter().enumerate() {
+        let lx = (x0 + slot.x0 * total_w).round();
+        let rx = if j + 1 == n {
+            x1
         } else {
-            self.cols
-                .get(period_ix(strip))
-                .map_or(&[][..], Vec::as_slice)
+            (x0 + slot.x1 * total_w).round() - gap_px
         };
-        let n = strip.cols as usize + 1;
-        cols.get(cols.len().saturating_sub(n)..).unwrap_or_default()
+        let cw = (rx - lx).max(1.0);
+        base_rects.push((j, lx, cw, slot.is_live_now));
+    }
+    let shift = shift_px.round();
+    if shift == 0.0 {
+        return base_rects;
+    }
+    let slide_max_ms = (i64::from(strip.period_s) * 1_000).max(2_000);
+    let zone_start = slots
+        .iter()
+        .position(|slot| !slot.is_live_now && (slot.age_hi_ms - slot.age_lo_ms) <= slide_max_ms)
+        .unwrap_or(0);
+    let zone_x0 = base_rects.get(zone_start).map_or(x0, |r| r.1);
+    let live_x = base_rects
+        .last()
+        .filter(|r| r.3)
+        .map_or(x1, |r| r.1 - gap_px);
+    let mut out = Vec::with_capacity(n + 1);
+    for &(j, lx, cw, is_live_now) in &base_rects[..zone_start] {
+        out.push((j, lx, cw, is_live_now));
+    }
+    if shift > 0.0
+        && let Some(&(_, first_x, first_w, false)) = base_rects.get(zone_start)
+    {
+        let lead_x = first_x - first_w - gap_px + shift;
+        let clip_l = lead_x.max(zone_x0);
+        let clip_r = (lead_x + first_w).min(live_x);
+        if clip_r - clip_l >= 1.0 {
+            let lead_idx = zone_start.saturating_sub(1);
+            out.push((lead_idx, clip_l, clip_r - clip_l, false));
+        }
+    }
+    for &(j, lx, cw, is_live_now) in &base_rects[zone_start..] {
+        if is_live_now {
+            out.push((j, lx, cw, true));
+        } else {
+            let sx = lx + shift;
+            if sx + cw > zone_x0 && sx < live_x {
+                out.push((j, sx, cw, false));
+            }
+        }
+    }
+    out
+}
+
+impl RowWords {
+    fn multi_scale_slots(&self, strip: &Strip) -> &[HeatSlot] {
+        self.multi_scale
+            .get(spec_ix(strip))
+            .map_or(&[][..], Vec::as_slice)
     }
 }
 
@@ -816,9 +1050,9 @@ impl Table {
     /// The row's amount forms this table says ([`RowWords::amount`]).
     fn ladder(&self) -> usize {
         if self.glance {
-            0
+            usize::from(self.details.is_none())
         } else {
-            1 + ladder_ix(self.details.is_some(), self.aterm.is_some())
+            2 + ladder_ix(self.details.is_some(), self.aterm.is_some())
         }
     }
 
@@ -1102,7 +1336,31 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn strip(&mut self, strip: &Strip, top: f64, cell_h: f64, cols: &[HeatCell]) {
+    const fn gap_ink(&self, kind: GapKind) -> Rgb {
+        match kind {
+            GapKind::Crash => self.inks.critical_text,
+            GapKind::Sleep => self.inks.stuck,
+            GapKind::Paused => self.inks.words2,
+        }
+    }
+
+    const fn event_ink(&self, kind: StripEventKind) -> Rgb {
+        match kind {
+            StripEventKind::Crash => self.inks.critical_text,
+            StripEventKind::Restart => self.inks.warn_text,
+            StripEventKind::SleepWake => self.inks.stuck,
+            StripEventKind::PressureSpike => self.inks.over,
+        }
+    }
+
+    fn strip(
+        &mut self,
+        strip: &Strip,
+        top: f64,
+        cell_h: f64,
+        slots: &[HeatSlot],
+        live_heat: Option<f32>,
+    ) {
         let cap_room = self
             .cap_px()
             .map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
@@ -1112,42 +1370,57 @@ impl<'a> Deck<'a> {
             "",
             None,
         );
-        let n = strip.cols as usize;
+        let pitch_px = self.px(strip.pitch);
         let f = self.glide(strip);
-        self.cells += if f < 1.0 { n + 1 } else { n };
+        let shift_px = ((1.0 - f.clamp(0.0, 1.0)) as f32 * pitch_px).round();
+        let rects = multi_scale_slot_rects(strip, self.s, shift_px);
+        self.cells += rects.len();
         if !self.draw {
             return;
         }
-        let (x0, y, h) = (self.px(strip.x), self.px(top), self.px(cell_h));
-        let (pitch, cw) = (self.px(strip.pitch), self.px(strip.cell));
+        let (x0, x1, y, h) = (
+            self.px(strip.x),
+            self.px(strip.end()),
+            self.px(top),
+            self.px(cell_h),
+        );
+        let gap_px = self.px(1.0).max(1.0);
         let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
-        let small = self.small_cells(strip, cell_h);
         let cap = self.cap_px();
-        // `cols` holds the span's columns and the one before (`RowWords::cols`), oldest first;
-        // a short ring leaves the oldest unread.
-        let unread = (n + 1).saturating_sub(cols.len());
-        let clip = f < 1.0;
-        if clip {
-            let right = x0 + n.saturating_sub(1) as f32 * pitch + cw;
-            let h_card = self.px(self.h_pt);
-            self.p.prims.push(DrawPrim::ClipPush {
-                x: x0,
-                y: 0.0,
-                w: right - x0,
-                h: h_card,
-            });
-        }
-        for (k, x) in live::column_xs(x0, pitch, cw, n, f).into_iter().enumerate() {
-            let Some(x) = x else {
+        let live_slot = rects.iter().copied().find(|r| r.3);
+        let history_end = live_slot.map_or(x1, |(_, lx, _, _)| (lx - gap_px).max(x0));
+        let slide_max_ms = (i64::from(strip.period_s) * 1_000).max(2_000);
+        let spec_slots = strip.spec.slots();
+        let zone_start = spec_slots
+            .iter()
+            .position(|slot| !slot.is_live_now && (slot.age_hi_ms - slot.age_lo_ms) <= slide_max_ms)
+            .unwrap_or(0);
+        let zone_x0 = spec_slots
+            .get(zone_start)
+            .map_or(x0, |slot| (x0 + slot.x0 * (x1 - x0).max(1.0)).round());
+        let clip = shift_px != 0.0 && history_end > zone_x0;
+        let mut pushed_clip = false;
+        for (ri, &(idx, x, cw, is_live_now)) in rects.iter().enumerate() {
+            if is_live_now {
                 continue;
-            };
-            let cell = k
-                .checked_sub(unread)
-                .and_then(|j| cols.get(j))
-                .copied()
-                .unwrap_or_default();
-            let Some(v) = cell.heat.filter(|v| !v.is_nan()) else {
-                self.hollow_cell((x, y, cw, h), radius, small);
+            }
+            if clip && !pushed_clip && ri >= zone_start {
+                let h_card = self.px(self.h_pt);
+                self.p.prims.push(DrawPrim::ClipPush {
+                    x: zone_x0,
+                    y: 0.0,
+                    w: history_end - zone_x0,
+                    h: h_card,
+                });
+                pushed_clip = true;
+            }
+            let slot_data = slots.get(idx).copied().unwrap_or_default();
+            if let Some(gap_kind) = slot_data.cell.gap {
+                self.gap_cell((x, y, cw, h), radius, gap_kind);
+                continue;
+            }
+            let Some(v) = slot_data.cell.heat.filter(|v| !v.is_nan()) else {
+                self.hollow_cell((x, y, cw, h), radius, cw < 4.0 || h < 4.0);
                 continue;
             };
             let step = ink::heat_step(v);
@@ -1157,7 +1430,7 @@ impl<'a> Deck<'a> {
                 h
             };
             self.rect((x, y + h - hh, cw, hh), radius, self.heat(step));
-            if cell.over {
+            if slot_data.cell.over {
                 let over = self.inks.over;
                 match cap {
                     Some((ch, gap)) => self.rect((x, y - ch - gap, cw, ch), 0.0, over),
@@ -1165,8 +1438,93 @@ impl<'a> Deck<'a> {
                 }
             }
         }
-        if clip {
+        if pushed_clip {
             self.p.prims.push(DrawPrim::ClipPop);
+        }
+        if let Some((idx, x, cw, _)) = live_slot {
+            let slot_data = slots.get(idx).copied().unwrap_or_default();
+            let v_opt = live_heat.or(slot_data.cell.heat).filter(|v| !v.is_nan());
+            let Some(v) = v_opt else {
+                self.hollow_cell((x, y, cw, h), radius, cw < 4.0 || h < 4.0);
+                return;
+            };
+            let base_rgb = self.inks.thermal_at(v, self.ic);
+            let fill_rgb = if self.live.fresh {
+                base_rgb
+            } else {
+                ink::mix(self.inks.ground, base_rgb, 0.55)
+            };
+            let hh = if self.dwc {
+                ink::dwc_height(h as u32, ink::heat_step(v)) as f32
+            } else {
+                h
+            };
+            if self.live.fresh && !self.dwc {
+                let glow_rgb = self.inks.glow_veil(base_rgb, 0.85);
+                let vc = v.clamp(0.0, 1.0);
+                if self.s >= 2.0 {
+                    let a_outer = ((0.11 + 0.22 * vc) * 255.0).round().clamp(1.0, 255.0) as u8;
+                    self.p.prims.push(DrawPrim::Stroke {
+                        x: x - 1.5,
+                        y: y - 1.5,
+                        w: cw + 3.0,
+                        h: h + 3.0,
+                        radius: radius + 2.0,
+                        width: 1.5,
+                        color: rgba(glow_rgb, a_outer),
+                    });
+                }
+                let a_inner = ((0.26 + 0.36 * vc) * 255.0).round().clamp(1.0, 255.0) as u8;
+                self.p.prims.push(DrawPrim::Stroke {
+                    x: x - 0.5,
+                    y: y - 0.5,
+                    w: cw + 1.0,
+                    h: h + 1.0,
+                    radius: radius + 1.0,
+                    width: 1.0,
+                    color: rgba(glow_rgb, a_inner),
+                });
+            }
+            self.rect((x, y + h - hh, cw, hh), radius, fill_rgb);
+            if slot_data.cell.over {
+                let over = self.inks.over;
+                match cap {
+                    Some((ch, gap)) => self.rect((x, y - ch - gap, cw, ch), 0.0, over),
+                    None => self.rect((x, y, cw, h.min(2.0)), 0.0, over),
+                }
+            }
+        }
+    }
+
+    fn gap_cell(&mut self, (x, y, w, h): Rect, radius: f32, kind: GapKind) {
+        let gap_ink = self.gap_ink(kind);
+        let fill = ink::mix(self.inks.ground, gap_ink, if self.ic { 0.24 } else { 0.14 });
+        self.rect((x, y, w, h), radius, fill);
+        if self.draw && w >= 2.0 {
+            let on = (1.5 * self.s).round().max(1.0) as f32;
+            let rail = rgba(gap_ink, 0xCC);
+            self.p.prims.push(DrawPrim::Dashed {
+                x,
+                y: y + 0.5,
+                w,
+                h: 0.0,
+                width: 1.0,
+                on,
+                off: on,
+                color: rail,
+            });
+            if h >= 4.0 {
+                self.p.prims.push(DrawPrim::Dashed {
+                    x,
+                    y: y + h - 0.5,
+                    w,
+                    h: 0.0,
+                    width: 1.0,
+                    on,
+                    off: on,
+                    color: rail,
+                });
+            }
         }
     }
 
@@ -1187,25 +1545,7 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn gridlines(&mut self, strip: &Strip, y0: f64, y1: f64, holes: &[(f64, f64)]) {
-        if !self.draw {
-            return;
-        }
-        let per_min = (60 / strip.period_s.max(1)).max(1) as usize;
-        let pitch = self.px(strip.pitch);
-        let cw = self.px(strip.cell);
-        let gap = pitch - cw;
-        let x0 = self.px(strip.x);
-        let n = strip.cols as usize;
-        let xs = live::column_xs(x0, pitch, cw, n, self.glide(strip));
-        // Each line stands in the gap before a column that opens a wall-clock minute, so it
-        // travels with the columns; before the first reading, every minute from the left.
-        let starts: Vec<usize> = match self.at_ms {
-            Some(at) => {
-                live::minute_columns(live::open_start_ms(at, strip.period_s), strip.period_s, n)
-            }
-            None => (per_min..n).step_by(per_min).map(|j| j + 1).collect(),
-        };
+    fn strip_spans(y0: f64, y1: f64, holes: &[(f64, f64)]) -> Vec<(f64, f64)> {
         let mut spans = Vec::new();
         let mut y = y0;
         for &(a, b) in holes {
@@ -1217,31 +1557,191 @@ impl<'a> Deck<'a> {
         if y < y1 {
             spans.push((y, y1));
         }
+        spans
+    }
+
+    fn gridlines(&mut self, strip: &Strip, y0: f64, y1: f64, holes: &[(f64, f64)]) {
+        if !self.draw {
+            return;
+        }
+        // Scale-band gridlines anchor to the X-axis ticks (`shift_px = 0.0`) so coarse horizons
+        // (`-15m`, `-5m`, `-1m`, `-10s`) never drift off their tick marks during glide/slide.
+        let rects = multi_scale_slot_rects(strip, self.s, 0.0);
+        let slots = strip.spec.slots();
+        let gap_px = self.px(1.0).max(1.0);
+        let x0 = self.px(strip.x);
+        let spans = Self::strip_spans(y0, y1, holes);
         let grid = self.inks.grid;
-        for k in starts {
-            let Some(cx) = xs.get(k).copied().flatten() else {
+        let mut prev_weight: Option<u16> = None;
+        for &(idx, sx, _, is_live_now) in &rects {
+            let Some(slot) = slots.get(idx) else {
                 continue;
             };
-            let gx = cx - gap;
+            let boundary = match prev_weight {
+                Some(pw) => pw != slot.weight || is_live_now,
+                None => false,
+            };
+            prev_weight = Some(slot.weight);
+            if !boundary {
+                continue;
+            }
+            let gx = sx - gap_px;
             if gx < x0 {
                 continue;
             }
             for &(a, b) in &spans {
                 let (ya, yb) = (self.px(a), self.px(b));
-                self.rect((gx, ya, gap.max(1.0), yb - ya), 0.0, grid);
+                self.rect((gx, ya, 1.0, yb - ya), 0.0, grid);
             }
         }
     }
 
-    /// `strip`'s live edge: its glide's rect, and the now marker at its right end, a line from
-    /// the dot on the header line at `base` down to `last` (the strip rows' bottom), the dot
-    /// beating while readings keep coming, grey and hollow when they stop.
-    fn live_edge(&mut self, strip: &Strip, base: f64, last: f64) {
+    /// Draws the strip's X-axis baseline rail, discontinuity break notches over [`TimeGap`]s, and
+    /// vertical event marker lines + cap pips for [`StripEvent`]s (`Crash`, `Restart`,
+    /// `SleepWake`, `PressureSpike`).
+    fn strip_axis_and_events(
+        &mut self,
+        strip: &Strip,
+        base: f64,
+        y0: f64,
+        last: f64,
+        holes: &[(f64, f64)],
+        words: &DeckWords,
+    ) {
+        if !self.draw {
+            return;
+        }
+        let x0 = self.px(strip.x);
+        let x1 = self.px(strip.end());
+        if x1 <= x0 {
+            return;
+        }
+        let y_tick0 = self.px(base + 1.0);
+        let y_tick1 = self.px(base + 2.5).max(y_tick0 + TICK_MIN_PX);
+        let y_axis = (y_tick1 - 1.0).max(y_tick0);
+        self.rect((x0, y_axis, x1 - x0, 1.0), 0.0, self.inks.grid);
+        let Some(now_ms) = self.at_ms else {
+            return;
+        };
+        let horizon = strip.spec.horizon_ms();
+        let total_w = x1 - x0;
+        for gap in words.time_gaps.iter().rev().take(4) {
+            if gap.end_ms <= now_ms - horizon || gap.start_ms >= now_ms {
+                continue;
+            }
+            let age_start = (now_ms - gap.start_ms).clamp(0, horizon);
+            let age_end = (now_ms - gap.end_ms).clamp(0, horizon);
+            let (Some(f0), Some(f1)) = (
+                strip.spec.x_frac_of_age_ms(age_start),
+                strip.spec.x_frac_of_age_ms(age_end),
+            ) else {
+                continue;
+            };
+            let gx0 = (x0 + f0 * total_w).round().clamp(x0, x1);
+            let gx1 = (x0 + f1 * total_w).round().clamp(x0, x1);
+            if gx1 > gx0 {
+                let gink = self.gap_ink(gap.kind);
+                self.rect((gx0, y_axis, gx1 - gx0, 1.0), 0.0, gink);
+                let nh = (2.0 * self.s as f32).round().max(2.0);
+                self.rect((gx0, y_axis + 1.0 - nh, 1.0, nh), 0.0, gink);
+                if gx1 - gx0 >= 2.0 {
+                    self.rect((gx1 - 1.0, y_axis + 1.0 - nh, 1.0, nh), 0.0, gink);
+                }
+            }
+        }
+        if words.strip_events.is_empty() {
+            return;
+        }
+        let spans = Self::strip_spans(y0, last, holes);
+        let mut events: Vec<&StripEvent> = words
+            .strip_events
+            .iter()
+            .filter(|ev| ev.at_unix_ms <= now_ms && now_ms - ev.at_unix_ms <= horizon)
+            .collect();
+        // Highest-severity events first (Crash > Restart > PressureSpike > SleepWake), then newest.
+        events.sort_by(|a, b| {
+            b.kind
+                .cmp(&a.kind)
+                .then_with(|| b.at_unix_ms.cmp(&a.at_unix_ms))
+        });
+        let mut drawn_xs: Vec<i32> = Vec::with_capacity(6);
+        for ev in events {
+            if drawn_xs.len() >= 6 {
+                break;
+            }
+            let Some(x_pt) = strip.x_at_age_ms(now_ms - ev.at_unix_ms) else {
+                continue;
+            };
+            let ex = (x_pt * self.s) as f32;
+            let bucket_px = ex.round() as i32;
+            if drawn_xs.iter().any(|&px| (px - bucket_px).abs() <= 1) {
+                continue;
+            }
+            drawn_xs.push(bucket_px);
+            let ev_ink = self.event_ink(ev.kind);
+            let lw = (0.85 * self.s).round().max(1.0) as f32;
+            let lx = (ex - lw / 2.0).round().clamp(x0, (x1 - lw).max(x0));
+            let pip = (2.2 * self.s).round().max(2.0) as f32;
+            let px_pip = (ex - pip / 2.0).round().clamp(x0, (x1 - pip).max(x0));
+            let py_pip = (y_axis + 0.5 - pip / 2.0).round().max(0.0);
+            self.rect((px_pip, py_pip, pip, pip), (0.5 * self.s) as f32, ev_ink);
+            for &(a, b) in &spans {
+                let (ya, yb) = (self.px(a), self.px(b));
+                if yb <= ya {
+                    continue;
+                }
+                match ev.kind {
+                    StripEventKind::Crash | StripEventKind::Restart => {
+                        let alpha = if ev.kind == StripEventKind::Crash {
+                            0xFF
+                        } else {
+                            0xE0
+                        };
+                        self.p
+                            .prims
+                            .push(panel(lx, ya, lw, yb - ya, 0.0, rgba(ev_ink, alpha)));
+                    }
+                    StripEventKind::SleepWake | StripEventKind::PressureSpike => {
+                        let on = (2.0 * self.s).round().max(2.0) as f32;
+                        let off = (1.5 * self.s).round().max(1.0) as f32;
+                        self.p.prims.push(DrawPrim::Dashed {
+                            x: lx,
+                            y: ya,
+                            w: 0.0,
+                            h: yb - ya,
+                            width: lw,
+                            on,
+                            off,
+                            color: rgba(ev_ink, 0xDF),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// `strip`'s live edge: its glide's rect, the glowing `now` box's rect, and the now marker at
+    /// its right end, a line from the dot on the header line at `base` down to `last` (the strip
+    /// rows' bottom), the dot beating while readings keep coming, grey and hollow when they stop.
+    fn live_edge(&mut self, strip: &Strip, base: f64, top0: f64, last: f64) {
         let s = self.s;
         let card_h = self.px(self.h_pt);
-        let (sx0, sx1) = (self.px(strip.x) - 2.0, self.px(strip.end()) + 2.0);
+        let (sx0, sx1) = (self.px(strip.x) - 3.0, self.px(strip.end()) + 3.0);
         self.live_rects
             .push((LiveLayer::Glide, (sx0, 0.0, sx1 - sx0, card_h)));
+        if let Some((_, lx, _, _)) = multi_scale_slot_rects(strip, self.s, 0.0)
+            .into_iter()
+            .find(|r| r.3)
+        {
+            let nx0 = (lx - 4.0).max(0.0);
+            let nx1 = self.px(strip.end()) + 4.0;
+            let ny0 = (self.px(top0) - 6.0).max(0.0);
+            let ny1 = (self.px(last) + 4.0).min(card_h);
+            if nx1 > nx0 && ny1 > ny0 {
+                self.live_rects
+                    .push((LiveLayer::NowBox, (nx0, ny0, nx1 - nx0, ny1 - ny0)));
+            }
+        }
         let pitch_px = f64::from(self.px(strip.pitch));
         if strip.period_s == plan::FOLD_SLOT_S {
             self.slide_pitch_px = self.slide_pitch_px.max(pitch_px);
@@ -1360,43 +1860,46 @@ impl<'a> Deck<'a> {
         let (x, w, y, h) = (self.px(col.x), self.px(col.w), self.px(top), self.px(h_pt));
         let r = (1.5 * s).round().max(1.0);
         self.rect((x, y, w, h), r, self.inks.track);
-        let gap = s.round().max(1.0);
-        let at = |v: f32| x + (v * w).round().max(gap);
-        let seg = |deck: &mut Self, x1: f32, x2: f32, bar: Bar, first: bool| {
-            if x2 - x1 >= gap {
-                let hh = match (deck.dwc, bar) {
-                    (false, _) | (true, Bar::Global) => h,
-                    (true, Bar::Aterm) => (h * 0.67).round(),
-                    (true, Bar::Tab) => (h * 0.33).round().max(1.0),
-                };
-                let ink = deck.scope_ink(bar);
-                deck.rect(
-                    (x1, y + h - hh, x2 - x1, hh),
-                    if first { r } else { 0.0 },
-                    ink,
-                );
+        let inset = s.round().max(1.0);
+        let width_of = |v: Option<f32>| -> f32 {
+            match v.filter(|v| v.is_finite() && *v > 0.0) {
+                Some(v) => (v.clamp(0.0, 1.0) * w).round().clamp(inset, w),
+                None => 0.0,
             }
         };
-        match (fill.global, fill.aterm, fill.tab) {
-            (Some(g), Some(a), Some(t)) => {
-                let (gx, ax, tx) = (at(g), at(a.min(g)), at(t.min(a)));
-                seg(self, x, tx, Bar::Tab, true);
-                seg(self, tx + gap, ax, Bar::Aterm, false);
-                seg(self, ax + gap, gx, Bar::Global, false);
-            }
-            (Some(g), Some(a), None) => {
-                let (gx, ax) = (at(g), at(a.min(g)));
-                seg(self, x, ax, Bar::Aterm, true);
-                seg(self, ax + gap, gx, Bar::Global, false);
-            }
-            (Some(g), None, _) => seg(self, x, at(g), Bar::Global, true),
-            (None, Some(a), Some(t)) => {
-                let (ax, tx) = (at(a), at(t.min(a)));
-                seg(self, x, tx, Bar::Tab, true);
-                seg(self, tx + gap, ax, Bar::Aterm, false);
-            }
-            (None, Some(a), None) => seg(self, x, at(a), Bar::Aterm, true),
-            (None, None, _) => {}
+        let tw = width_of(fill.tab);
+        let aw = if fill.aterm.is_some() {
+            width_of(fill.aterm).max(tw)
+        } else {
+            0.0
+        };
+        let gw = if fill.global.is_some() {
+            width_of(fill.global).max(aw).max(tw)
+        } else {
+            0.0
+        };
+        let ah = (h - 2.0 * inset).max(3.0).min(h);
+        let th_inset = if ah >= 6.0 { inset } else { 1.0 };
+        let th = (ah - 2.0 * th_inset).max(1.0).min(ah);
+        let (ay, ty) = if self.dwc {
+            (y + h - ah, y + h - th)
+        } else {
+            (y + ((h - ah) * 0.5).floor(), y + ((h - th) * 0.5).floor())
+        };
+        // Overlapping 3-scope bars from left edge `x`: Global outermost, aterm nested middle,
+        // this tab innermost core.
+        if gw > 0.0 {
+            self.rect((x, y, gw, h), r, self.scope_ink(Bar::Global));
+        }
+        if aw > 0.0 {
+            self.rect(
+                (x, ay, aw, ah),
+                (r - 0.5).max(0.5),
+                self.scope_ink(Bar::Aterm),
+            );
+        }
+        if tw > 0.0 {
+            self.rect((x, ty, tw, th), 0.5, self.scope_ink(Bar::Tab));
         }
         if let Some(n) = fill.ticks.filter(|&n| n > 1 && col.w / f64::from(n) >= 3.0) {
             let tw = (0.5 * s).round().max(1.0);
@@ -1573,11 +2076,20 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn row(&mut self, t: &Table, r: u32, row: &RowWords, reading: bool) {
+    fn row(
+        &mut self,
+        t: &Table,
+        r: u32,
+        row: &RowWords,
+        prev_row: Option<(Option<f32>, Option<BarFill>)>,
+        reading: bool,
+    ) {
         let rows = t.rows;
         let top = rows.top(r);
         let base = top + rows.baseline;
         let words_ink = self.inks.words;
+        let blend = self.live.blend;
+        let live_heat = live::lerp_opt(prev_row.and_then(|p| p.0), row.heat_now, blend);
         self.text(
             t.name.x,
             base,
@@ -1612,8 +2124,8 @@ impl<'a> Deck<'a> {
                 );
             }
             None => {
-                let cols = row.strip_cols(&t.strip);
-                self.strip(&t.strip, top, rows.cell, cols);
+                let slots = row.multi_scale_slots(&t.strip);
+                self.strip(&t.strip, top, rows.cell, slots, live_heat);
             }
         }
         if let Some(col) = t.pct {
@@ -1633,7 +2145,22 @@ impl<'a> Deck<'a> {
             );
         }
         if let (Some(col), Some(fill)) = (t.bar, row.bar.as_ref()) {
-            self.bar(col, top + (rows.cell - rows.bar_h) / 2.0, rows.bar_h, fill);
+            let blended = match (prev_row.and_then(|p| p.1), blend) {
+                (Some(pf), Some(b)) => BarFill {
+                    global: live::lerp_opt(pf.global, fill.global, Some(b)),
+                    aterm: live::lerp_opt(pf.aterm, fill.aterm, Some(b)),
+                    tab: live::lerp_opt(pf.tab, fill.tab, Some(b)),
+                    ticks: fill.ticks,
+                    warn_tick: fill.warn_tick,
+                },
+                _ => *fill,
+            };
+            self.bar(
+                col,
+                top + (rows.cell - rows.bar_h) / 2.0,
+                rows.bar_h,
+                &blended,
+            );
         }
         if let Some(col) = t.amount {
             self.amount(col, base, rows.amount_pt, row, t);
@@ -1682,7 +2209,29 @@ impl<'a> Deck<'a> {
         );
         let radius = if side < 4.0 { 0.0 } else { radius };
         match heat {
-            Some(v) => self.rect(rect, radius, self.heat(ink::heat_step(v))),
+            Some(v) => {
+                let vc = v.clamp(0.0, 1.0);
+                let fill = if vc >= 0.55 {
+                    self.inks.thermal_at(vc, self.ic)
+                } else {
+                    self.heat(ink::heat_step(vc))
+                };
+                if vc >= 0.70 && !self.dwc && side >= 3.0 {
+                    let t = ((vc - 0.70) / 0.30).clamp(0.0, 1.0);
+                    let alpha = ((0.28 + 0.42 * t) * 255.0).round().clamp(1.0, 255.0) as u8;
+                    let glow = self.inks.glow_veil(fill, 0.85);
+                    self.p.prims.push(DrawPrim::Stroke {
+                        x: rect.0 - 0.5,
+                        y: rect.1 - 0.5,
+                        w: side + 1.0,
+                        h: side + 1.0,
+                        radius: radius + 0.5,
+                        width: 1.0,
+                        color: rgba(glow, alpha),
+                    });
+                }
+                self.rect(rect, radius, fill);
+            }
             None => self.hollow_cell(rect, radius, side < 4.0),
         }
     }
@@ -1707,17 +2256,32 @@ impl<'a> Deck<'a> {
     /// The dial of radius `r` pt at `centre`, its bloom clipped to `slot` (pt, `x0, y0, x1, y1`).
     fn dial(&mut self, (cx, cy): (f64, f64), r: f64, slot: [f64; 4], words: &DeckWords) {
         self.note(BoxKind::Gauge, [cx - r, cy - r, cx + r, cy + r], "", None);
+        let (x, y, w, h) = self.px_rect(slot[0], slot[1], slot[2], slot[3]);
+        self.live_rects.push((LiveLayer::Values, (x, y, w, h)));
         if !self.draw {
             return;
         }
-        let g = words.strain.as_ref().map_or(Gauge::UNREAD, Gauge::of);
+        let g_curr = words.strain.as_ref().map_or(Gauge::UNREAD, Gauge::of);
+        let g = match (
+            words.prev.as_ref().and_then(|p| p.strain.as_ref()),
+            self.live.blend,
+        ) {
+            (Some(ps), Some(t)) if g_curr.needle.is_some() => {
+                let gp = Gauge::of(ps);
+                Gauge {
+                    needle: live::lerp_opt(gp.needle, g_curr.needle, Some(t)),
+                    soak: live::lerp_opt(Some(gp.soak), Some(g_curr.soak), Some(t))
+                        .unwrap_or(g_curr.soak),
+                }
+            }
+            _ => g_curr,
+        };
         let heat = if self.ic {
             self.inks.heat_ic
         } else {
             self.inks.heat
         };
         let inks = GaugeInks::new(&self.inks, heat, g.soak);
-        let (x, y, w, h) = self.px_rect(slot[0], slot[1], slot[2], slot[3]);
         let place = gauge::Place {
             centre: (self.px(cx), self.px(cy)),
             slot: [x, y, x + w, y + h],
@@ -1727,6 +2291,10 @@ impl<'a> Deck<'a> {
         gauge::draw(g, place, &inks, &mut self.p.prims);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the Cores row's slot, cell geometry, mode, caption size, words and header scope"
+    )]
     fn cores_row(
         &mut self,
         room: Col,
@@ -1735,6 +2303,7 @@ impl<'a> Deck<'a> {
         mode: CoresMode,
         caption_pt: f64,
         words: &DeckWords,
+        global_head: Option<&str>,
     ) {
         let clusters = words.clusters();
         let base = top + cell - 1.0;
@@ -1745,9 +2314,12 @@ impl<'a> Deck<'a> {
             self.text(room.x, base, text, caption_pt, false, words2, within);
             return;
         }
+        let c_rect = self.px_rect(room.x - 2.0, top - 2.0, room.end() + 2.0, top + cell + 2.0);
+        self.live_rects.push((LiveLayer::Values, c_rect));
         let radius = self.s.round().max(1.0) as f32;
+        let blend = self.live.blend;
         let mut x = room.x;
-        for (cluster, cc) in clusters.iter().zip(&words.cores) {
+        for (ci, (cluster, cc)) in clusters.iter().zip(&words.cores).enumerate() {
             x += self.text(
                 x,
                 base,
@@ -1768,8 +2340,11 @@ impl<'a> Deck<'a> {
                 _ => ((cell - 0.5) / 2.0, 2, top, (cell - 0.5) / 2.0 + 0.5, 0.0),
             };
             let grid = self.lattice(x, y0, step, side);
+            let prev_cluster = words.prev.as_ref().and_then(|p| p.cores.get(ci));
             for (i, &heat) in cc.heat.iter().enumerate() {
-                self.core(&grid, (i / per_col, i % per_col), heat, r);
+                let prev_h = prev_cluster.and_then(|pc| pc.get(i)).copied().flatten();
+                let blended = live::lerp_opt(prev_h, heat, blend);
+                self.core(&grid, (i / per_col, i % per_col), blended, r);
             }
             let cols = n.div_ceil(per_col) as f64;
             let w = (cols - 1.0).max(0.0) * step + side;
@@ -1780,6 +2355,32 @@ impl<'a> Deck<'a> {
             };
             self.note(BoxKind::Core, [x, y0, x + w, bottom], "", None);
             x += w + 8.0;
+        }
+        let header_has_totals = global_head.is_some_and(|g| g.contains(" \u{b7} "));
+        let short_chip = words.cores_tail_forms.last().map(|t| t.s.as_str());
+        let header_has_chip = match (global_head, short_chip) {
+            (Some(g), Some(chip)) => !chip.is_empty() && g.contains(chip),
+            _ => false,
+        };
+        if !(header_has_totals && header_has_chip)
+            && let Some((tail, tw)) = words
+                .cores_tail_forms
+                .iter()
+                .filter(|t| !header_has_totals || !t.s.contains(" \u{b7} "))
+                .find_map(|t| {
+                    let tw = self.m.width(&t.s, caption_pt, false);
+                    (x + tw <= room.end()).then_some((t, tw))
+                })
+        {
+            self.text(
+                room.end() - tw,
+                base,
+                tail.s.clone(),
+                caption_pt,
+                false,
+                words2,
+                within,
+            );
         }
     }
 
@@ -1987,6 +2588,20 @@ impl<'a> Deck<'a> {
         if plan.ground_only {
             return;
         }
+        let text = HeaderText {
+            tab: self.tab,
+            machine: self.machine,
+            machine_forms: &words.machine_forms,
+            over: words.over_shown(&plan.strip),
+        };
+        let head = self
+            .head
+            .take()
+            .unwrap_or_else(|| planned_header(|| plan::header_full(&plan, text, self.m)));
+        let global_head = head
+            .labels
+            .iter()
+            .find_map(|l| (l.label == Label::Scope(Bar::Global)).then_some(l.text.as_str()));
         let t = Table::of_full(&plan);
         let rows = plan.rows;
         let gap = rows.pitch - rows.cell;
@@ -1998,7 +2613,7 @@ impl<'a> Deck<'a> {
             .map(|(_, r)| (rows.top(r) - gap / 2.0, rows.top(r) + rows.cell + gap / 2.0))
             .collect();
         let last = rows.top(DECK_RESOURCES.len() as u32 - 1) + rows.cell;
-        self.gridlines(&plan.strip, GRID_FROM_FULL, last, &holes);
+        self.gridlines(&plan.strip, rows.top(0), last, &holes);
         match plan.cores {
             CoresAt::Block { at, divider } => {
                 self.gauge(at, &rows, words);
@@ -2027,7 +2642,7 @@ impl<'a> Deck<'a> {
                 let mode = plan
                     .cores_mode(&words.clusters(), self.m)
                     .unwrap_or(CoresMode::CountOnly);
-                self.cores_row(room, top, rows.cell, mode, SMALL_PT, words);
+                self.cores_row(room, top, rows.cell, mode, SMALL_PT, words, global_head);
                 if !words.reading {
                     let (y0, y1) = t.band(r);
                     let rect = self.px_rect(plan.name.x, y0, room.end(), y1);
@@ -2035,19 +2650,27 @@ impl<'a> Deck<'a> {
                 }
             }
         }
-        for (row, r) in words.rows.iter().zip(0_u32..) {
-            self.row(&t, r, row, words.reading);
+        if let Some(bar) = plan.bar {
+            let br = self.px_rect(bar.x - 2.0, rows.top(0) - 2.0, bar.end() + 2.0, last + 2.0);
+            self.live_rects.push((LiveLayer::Values, br));
         }
-        self.live_edge(&plan.strip, HEADER_BASE_FULL, last);
-        let text = HeaderText {
-            tab: self.tab,
-            machine: self.machine,
-            over: words.over_shown(&plan.strip),
-        };
-        let head = self
-            .head
-            .take()
-            .unwrap_or_else(|| planned_header(|| plan::header_full(&plan, text, self.m)));
+        for (row, r) in words.rows.iter().zip(0_u32..) {
+            let prev_row = words
+                .prev
+                .as_ref()
+                .and_then(|p| p.rows.get(r as usize))
+                .copied();
+            self.row(&t, r, row, prev_row, words.reading);
+        }
+        self.strip_axis_and_events(
+            &plan.strip,
+            HEADER_BASE_FULL,
+            rows.top(0),
+            last,
+            &holes,
+            words,
+        );
+        self.live_edge(&plan.strip, HEADER_BASE_FULL, rows.top(0), last);
         let small = self.small_cells(&plan.strip, rows.cell);
         self.header(&head, HEADER_BASE_FULL, small, &[]);
         self.head = Some(head);
@@ -2063,68 +2686,19 @@ impl<'a> Deck<'a> {
         if plan.ground_only {
             return;
         }
-        let w = (0.5 * self.s).round().max(1.0) as f32;
-        let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
-        let grid = self.inks.grid;
-        self.rect((self.px(plan.divider), y0, w, y1 - y0), 0.0, grid);
-        if let Some(g) = plan.gauge {
-            self.folded_gauge(&g, words);
-            self.rect((self.px(g.divider), y0, w, y1 - y0), 0.0, grid);
-            if !words.reading {
-                let rect = self.px_rect(g.at.x, 0.0, g.at.end(), self.h_pt - 6.0);
-                self.hits_first.push(Hit::cores(rect));
-            }
-        }
-        let clusters = words.clusters();
-        let mut states: Vec<HeadState<'_>> = Vec::new();
-        for (bi, block) in plan.blocks.iter().enumerate() {
-            let t = Table::of_block(block);
-            let rows = block.rows;
-            let ours: Vec<&RowWords> = words.rows.iter().skip(bi * 4).take(4).collect();
-            let gap = 1.5;
-            let holes: Vec<(f64, f64)> = ours
-                .iter()
-                .zip(0_u32..)
-                .filter(|(row, _)| row.strip_text.is_some())
-                .map(|(_, r)| (rows.top(r) - gap, rows.top(r) + rows.cell + gap))
-                .collect();
-            let last = rows.top(ours.len().saturating_sub(1) as u32) + rows.cell;
-            self.gridlines(&block.strip, GRID_FROM_FOLDED, last, &holes);
-            for (row, r) in ours.iter().zip(0_u32..) {
-                self.row(&t, r, row, words.reading);
-            }
-            self.live_edge(&block.strip, HEADER_BASE_FOLDED, last);
-            if let Some(st) = block_state(&ours, block.name.x) {
-                states.push(st);
-            }
-            if bi == 1 {
-                let r = 3;
-                let top = rows.top(r);
-                if block.kind != BlockKind::Slim {
-                    let ink = self.inks.words;
-                    self.text(
-                        block.name.x,
-                        top + rows.baseline,
-                        "Cores".into(),
-                        rows.name_pt,
-                        true,
-                        ink,
-                        Some((block.name.x, block.name.end())),
-                    );
-                }
-                let mode = block.cores_mode(&clusters, self.m);
-                let caption = block.kind.cores_caption_pt();
-                self.cores_row(block.cores, top, rows.cell, mode, caption, words);
-                if !words.reading {
-                    let (y0, y1) = t.band(r);
-                    let rect = self.px_rect(block.name.x, y0, block.at.end(), y1);
-                    self.hits_first.push(Hit::cores(rect));
-                }
-            }
-        }
+        let states: Vec<HeadState<'_>> = plan
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(bi, block)| {
+                let ours: Vec<&RowWords> = words.rows.iter().skip(bi * 4).take(4).collect();
+                block_state(&ours, block.name.x)
+            })
+            .collect();
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
+            machine_forms: &words.machine_forms,
             over: plan
                 .blocks
                 .first()
@@ -2144,6 +2718,91 @@ impl<'a> Deck<'a> {
             .head
             .take()
             .unwrap_or_else(|| planned_header(|| plan::header_folded(&plan, text, labels, self.m)));
+        let global_head = head
+            .labels
+            .iter()
+            .find_map(|l| (l.label == Label::Scope(Bar::Global)).then_some(l.text.as_str()));
+        let w = (0.5 * self.s).round().max(1.0) as f32;
+        let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
+        let grid = self.inks.grid;
+        self.rect((self.px(plan.divider), y0, w, y1 - y0), 0.0, grid);
+        if let Some(g) = plan.gauge {
+            self.folded_gauge(&g, words);
+            self.rect((self.px(g.divider), y0, w, y1 - y0), 0.0, grid);
+            if !words.reading {
+                let rect = self.px_rect(g.at.x, 0.0, g.at.end(), self.h_pt - 6.0);
+                self.hits_first.push(Hit::cores(rect));
+            }
+        }
+        let clusters = words.clusters();
+        for (bi, block) in plan.blocks.iter().enumerate() {
+            let t = Table::of_block(block);
+            let rows = block.rows;
+            let ours: Vec<&RowWords> = words.rows.iter().skip(bi * 4).take(4).collect();
+            let gap = 1.5;
+            let holes: Vec<(f64, f64)> = ours
+                .iter()
+                .zip(0_u32..)
+                .filter(|(row, _)| row.strip_text.is_some())
+                .map(|(_, r)| (rows.top(r) - gap, rows.top(r) + rows.cell + gap))
+                .collect();
+            let last = rows.top(ours.len().saturating_sub(1) as u32) + rows.cell;
+            self.gridlines(&block.strip, rows.top(0), last, &holes);
+            if let Some(bar) = block.bar {
+                let br = self.px_rect(bar.x - 2.0, rows.top(0) - 2.0, bar.end() + 2.0, last + 2.0);
+                self.live_rects.push((LiveLayer::Values, br));
+            }
+            for (row, r) in ours.iter().zip(0_u32..) {
+                let row_ix = bi * 4 + r as usize;
+                let prev_row = words
+                    .prev
+                    .as_ref()
+                    .and_then(|p| p.rows.get(row_ix))
+                    .copied();
+                self.row(&t, r, row, prev_row, words.reading);
+            }
+            self.strip_axis_and_events(
+                &block.strip,
+                HEADER_BASE_FOLDED,
+                rows.top(0),
+                last,
+                &holes,
+                words,
+            );
+            self.live_edge(&block.strip, HEADER_BASE_FOLDED, rows.top(0), last);
+            if bi == 1 {
+                let r = 3;
+                let top = rows.top(r);
+                if block.kind != BlockKind::Slim {
+                    let ink = self.inks.words;
+                    self.text(
+                        block.name.x,
+                        top + rows.baseline,
+                        "Cores".into(),
+                        rows.name_pt,
+                        true,
+                        ink,
+                        Some((block.name.x, block.name.end())),
+                    );
+                }
+                let mode = block.cores_mode(&clusters, self.m);
+                let caption = block.kind.cores_caption_pt();
+                self.cores_row(
+                    block.cores,
+                    top,
+                    rows.cell,
+                    mode,
+                    caption,
+                    words,
+                    global_head,
+                );
+                if !words.reading {
+                    let (y0, y1) = t.band(r);
+                    let rect = self.px_rect(block.name.x, y0, block.at.end(), y1);
+                    self.hits_first.push(Hit::cores(rect));
+                }
+            }
+        }
         let small = plan
             .blocks
             .first()
@@ -2551,6 +3210,11 @@ impl crate::App {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.vitals.snapshot.as_ref().map(|s| s.seq).hash(&mut h);
+        self.vitals
+            .prev_snapshot
+            .as_ref()
+            .map(|s| s.seq)
+            .hash(&mut h);
         f.form.hash(&mut h);
         for v in [f.geom.w, f.geom.h, f.geom.pad, f.geom.scale, f.geom.font_px] {
             v.to_bits().hash(&mut h);
@@ -2572,6 +3236,7 @@ impl crate::App {
     pub(crate) fn deck_input(&self, f: &DeckFrame) -> DeckInput<'_> {
         DeckInput {
             snap: self.vitals.snapshot.as_deref(),
+            prev_snap: self.vitals.prev_snapshot.as_deref(),
             tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,
@@ -3658,6 +4323,7 @@ pub(crate) mod tests {
     pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         DeckInput {
             snap: Some(snap),
+            prev_snap: None,
             tab_panes: vec![7],
             tab_label: "Tab 1".into(),
             tab_count: 1,

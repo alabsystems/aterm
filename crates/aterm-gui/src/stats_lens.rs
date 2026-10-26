@@ -1844,19 +1844,28 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
     let n = snap.total_cores().unwrap_or(0);
     let at = c.at();
     let sources = match snap.cpu.as_ref().filter(|_| n > 0) {
-        Some(cpu) => vec![
-            format!(
-                "{n} cores in {} {} \u{b7} as of {at}",
+        Some(cpu) => {
+            let clusters_word = if cpu.clusters.len() == 1 {
+                "cluster"
+            } else {
+                "clusters"
+            };
+            let mut out = Vec::new();
+            if let Some(brand) = snap.facts.cpu_brand.as_deref().filter(|b| !b.is_empty()) {
+                out.push(format!(
+                    "{brand} \u{b7} {n} cores in {} {clusters_word} \u{b7} as of {at}",
+                    cpu.clusters.len(),
+                ));
+                out.push(format!("{brand} \u{b7} {n} cores \u{b7} as of {at}"));
+            }
+            out.push(format!(
+                "{n} cores in {} {clusters_word} \u{b7} as of {at}",
                 cpu.clusters.len(),
-                if cpu.clusters.len() == 1 {
-                    "cluster"
-                } else {
-                    "clusters"
-                }
-            ),
-            format!("{n} cores \u{b7} as of {at}"),
-            format!("as of {at}"),
-        ],
+            ));
+            out.push(format!("{n} cores \u{b7} as of {at}"));
+            out.push(format!("as of {at}"));
+            out
+        }
         None => vec![format!("as of {at}")],
     };
     let explainer = if n > 0 {
@@ -3389,7 +3398,20 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                 LinkKind::Wifi | LinkKind::Ethernet | LinkKind::Cellular | LinkKind::Other => None,
             });
             lines.extend(counted);
-            lines.push("no per-app network figure".into());
+            if let Some(net) = snap.net.as_ref() {
+                let mut state_line = format!("Connectivity: {}", net.state.label());
+                if let Some(rtt) = net.srtt_ms {
+                    state_line.push_str(&format!(" \u{b7} median TCP RTT {rtt:.1} ms"));
+                }
+                lines.push(state_line);
+            }
+            if snap.resources[Resource::Network.index()].aterm.missing
+                == Some(aterm_vitals::NoFigure::NotPerApp)
+            {
+                lines.push("no per-app network figure".into());
+            } else if snap.net.as_ref().is_some_and(|n| n.aterm_sockets.is_some()) {
+                lines.push("throughput is machine-wide; open sockets counted per scope".into());
+            }
         }
         Resource::Tokens => {
             match f.plan.as_ref() {
@@ -3867,6 +3889,7 @@ impl crate::App {
     fn lens_input(&self, f: &crate::stats_deck::DeckFrame) -> DeckInput<'_> {
         DeckInput {
             snap: self.vitals.snapshot.as_deref(),
+            prev_snap: None,
             tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,

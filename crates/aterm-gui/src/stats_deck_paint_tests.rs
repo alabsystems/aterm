@@ -648,6 +648,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
     let long = snap.tab(FRONT).is_some_and(|t| t.label == LONG_TAB);
     DeckInput {
         snap: Some(snap),
+        prev_snap: None,
         tab_panes: vec![FRONT],
         tab_label: if long { LONG_TAB } else { "Tab 2" }.into(),
         tab_count: 2,
@@ -1269,11 +1270,12 @@ fn a_gap_is_never_drawn_as_step_zero() {
         (DeckForm::Full, 1119.0, 2.0),
         (DeckForm::Full, 1119.0, 1.0),
         (DeckForm::Full, 350.0, 1.0),
+        (DeckForm::Full, 180.0, 1.0),
         (DeckForm::Folded, 1119.0, 2.0),
         (DeckForm::Folded, 450.0, 1.0),
         (DeckForm::Folded, 350.0, 1.0),
     ] {
-        let snap = if form == DeckForm::Folded {
+        let snap = if form == DeckForm::Folded || w <= 200.0 {
             &holed
         } else {
             &first
@@ -1282,25 +1284,27 @@ fn a_gap_is_never_drawn_as_step_zero() {
         let words = DeckWords::new(&input, &m);
         let laid = lay(&geom(w, s, form), &input, &words, &m, true);
         for (strip, rows, at) in strips(w, form, &m) {
-            let (pitch, cw) = (px(strip.pitch, s), px(strip.cell, s));
+            let rects = multi_scale_slot_rects(&strip, s, 0.0);
             for (r, res) in at {
                 if words::strip_words(res, snap).is_some() {
                     continue;
                 }
-                let n = strip.cols as usize;
                 let view = &snap.resources[res.index()];
-                let cols = if strip.period_s == plan::FOLD_SLOT_S {
-                    view.heat_slots(snap.slot_grid, n, AT, SLOT_COVER_MS)
-                } else {
-                    view.heat_columns(strip.period_s, n, AT)
-                };
+                let slots = view.heat_multi_scale(strip.spec, AT, SLOT_COVER_MS, &snap.time_gaps);
                 let (y, h) = (px(rows.top(r), s), px(rows.cell, s));
-                for (i, col) in cols.iter().enumerate() {
-                    if col.heat.is_some() {
+                for &(i, x, cw, is_live_now) in &rects {
+                    let Some(slot_data) = slots.get(i) else {
+                        continue;
+                    };
+                    let has_heat = if is_live_now {
+                        view.heat_now.or(slot_data.cell.heat).is_some()
+                    } else {
+                        slot_data.cell.heat.is_some() || slot_data.cell.gap.is_some()
+                    };
+                    if has_heat {
                         continue;
                     }
-                    let x = px(strip.x, s) + i as f32 * pitch;
-                    let at = format!("{form:?} {w} pt at {s}×, {res:?} column {i}");
+                    let at = format!("{form:?} {w} pt at {s}×, {res:?} slot {i}");
                     let inside = |px0: f32, py0: f32, pw: f32, ph: f32| {
                         px0 < x + cw && px0 + pw > x && py0 < y + h && py0 + ph > y
                     };
@@ -1777,6 +1781,394 @@ fn deck_gallery() {
         }
     }
     assert_eq!(written.len(), scenes.len() * 6 * 2 * 2);
+}
+
+#[test]
+fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut snap = scene(Scene::Calm);
+    snap.time_gaps = vec![
+        aterm_vitals::TimeGap {
+            start_ms: AT - 500_000,
+            end_ms: AT - 320_000,
+            kind: aterm_vitals::GapKind::Sleep,
+        },
+        aterm_vitals::TimeGap {
+            start_ms: AT - 150_000,
+            end_ms: AT - 80_000,
+            kind: aterm_vitals::GapKind::Crash,
+        },
+    ];
+    snap.strip_events = vec![
+        aterm_vitals::StripEvent {
+            at_unix_ms: AT - 150_000,
+            kind: aterm_vitals::StripEventKind::Crash,
+            label: "aterm crash".into(),
+        },
+        aterm_vitals::StripEvent {
+            at_unix_ms: AT - 80_000,
+            kind: aterm_vitals::StripEventKind::Restart,
+            label: "aterm restart".into(),
+        },
+        aterm_vitals::StripEvent {
+            at_unix_ms: AT - 320_000,
+            kind: aterm_vitals::StripEventKind::SleepWake,
+            label: "wake".into(),
+        },
+        aterm_vitals::StripEvent {
+            at_unix_ms: AT - 25_000,
+            kind: aterm_vitals::StripEventKind::PressureSpike,
+            label: "memory pressure".into(),
+        },
+    ];
+    let inks = super::tests::dark_inks();
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        let w = 1119.0;
+        let s = 2.0;
+        let input = scene_input(&snap, form);
+        let words = DeckWords::new(&input, &m);
+        let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+        let strip = match form {
+            DeckForm::Full => plan::plan_full(w, &m).strip,
+            DeckForm::Folded => plan::plan_folded(w, &m).blocks[0].strip,
+        };
+
+        // Gap cells emit horizontal `DrawPrim::Dashed` top/bottom rails (`h == 0.0 && w > 0.0`),
+        // distinct from hollow_cell (`DrawPrim::Stroke` in `inks.hollow`).
+        let gap_rails = laid
+            .prims
+            .iter()
+            .filter(|&p| matches!(*p, DrawPrim::Dashed { w, h, .. } if w > 0.0 && h == 0.0))
+            .count();
+        assert!(
+            gap_rails >= 4,
+            "{form:?}: sleep/crash time gaps emit horizontal dashed gap rails ({gap_rails})"
+        );
+
+        // Verify each of the 4 event kinds renders at its exact continuous X coordinate on the
+        // multi-scale strip (`strip.x_at_age_ms`).
+        for ev in &snap.strip_events {
+            let x_pt = strip
+                .x_at_age_ms(AT - ev.at_unix_ms)
+                .expect("event within 15m/1h horizon");
+            let ex = (x_pt * s) as f32;
+            let want_rgb = match ev.kind {
+                aterm_vitals::StripEventKind::Crash => inks.critical_text,
+                aterm_vitals::StripEventKind::Restart => inks.warn_text,
+                aterm_vitals::StripEventKind::SleepWake => inks.stuck,
+                aterm_vitals::StripEventKind::PressureSpike => inks.over,
+            };
+            // Cap pip on the X-axis rail.
+            let has_pip = laid.prims.iter().any(|p| match *p {
+                DrawPrim::Panel { x, w, h, fill, .. } => {
+                    (x + w / 2.0 - ex).abs() <= 2.0
+                        && (w - h).abs() < 0.01
+                        && w >= 3.0
+                        && [fill[0], fill[1], fill[2]] == want_rgb
+                }
+                _ => false,
+            });
+            assert!(
+                has_pip,
+                "{form:?}: {:?} missing X-axis cap pip at {ex}",
+                ev.kind
+            );
+
+            // Vertical event line through the strip rows: solid Panel for Crash/Restart, vertical
+            // Dashed for SleepWake/PressureSpike.
+            let has_line = match ev.kind {
+                aterm_vitals::StripEventKind::Crash | aterm_vitals::StripEventKind::Restart => {
+                    laid.prims.iter().any(|p| match *p {
+                        DrawPrim::Panel { x, w, h, fill, .. } => {
+                            w <= 3.0
+                                && h > 15.0
+                                && (x + w / 2.0 - ex).abs() <= 2.0
+                                && [fill[0], fill[1], fill[2]] == want_rgb
+                        }
+                        _ => false,
+                    })
+                }
+                aterm_vitals::StripEventKind::SleepWake
+                | aterm_vitals::StripEventKind::PressureSpike => {
+                    laid.prims.iter().any(|p| match *p {
+                        DrawPrim::Dashed { x, w, h, color, .. } => {
+                            w == 0.0
+                                && h > 15.0
+                                && (x - ex).abs() <= 2.0
+                                && [color[0], color[1], color[2]] == want_rgb
+                        }
+                        _ => false,
+                    })
+                }
+            };
+            assert!(
+                has_line,
+                "{form:?}: {:?} missing vertical event marker line at {ex}",
+                ev.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn overlapping_three_scope_bars_hardware_totals_hot_core_glow_and_network_summary() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut snap = scene(Scene::Calm);
+    snap.facts.cpu_brand = Some("Apple M5 Max".into());
+    snap.net = Some(aterm_vitals::NetView {
+        tcp: Some(aterm_vitals::TcpCounts {
+            established: 24,
+            ..Default::default()
+        }),
+        state: aterm_vitals::NetState::Online,
+        rates: Some(aterm_vitals::LinkRates {
+            rx_bps: 12_400_000.0,
+            tx_bps: 1_800_000.0,
+            ..Default::default()
+        }),
+        srtt_ms: Some(14.0),
+        aterm_sockets: Some(8),
+        tab_sockets: vec![(FRONT, 3)],
+        ..Default::default()
+    });
+    if let Some(a) = snap.aterm.as_mut() {
+        a.read_bps = Some(8_000_000.0);
+        a.write_bps = Some(4_000_000.0);
+    }
+    if let Some(t) = snap.tabs.first_mut() {
+        t.scope.read_bps = Some(3_000_000.0);
+    }
+    if let Some(cpu) = snap.cpu.as_mut() {
+        if let Some(c0) = cpu.cores.get_mut(0) {
+            c0.load.level = 0.15;
+        }
+        if let Some(c1) = cpu.cores.get_mut(1) {
+            c1.load.level = 0.95;
+        }
+    }
+
+    let inks = super::tests::dark_inks();
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        let w = 1424.0;
+        let s = 2.0;
+        let input = scene_input(&snap, form);
+        let words = DeckWords::new(&input, &m);
+
+        // Deliverable 7: All 5 resources carry Global, Aterm, and Tab shares in `RowWords::bar`.
+        for res in [
+            Resource::Cpu,
+            Resource::Memory,
+            Resource::Disk,
+            Resource::Network,
+            Resource::Processes,
+        ] {
+            let row = words.rows.iter().find(|r| r.res == res).expect("row");
+            let fill = row
+                .bar
+                .unwrap_or_else(|| panic!("{form:?} {res:?}: missing BarFill"));
+            assert!(
+                fill.global.is_some_and(|v| v > 0.0)
+                    && fill.aterm.is_some_and(|v| v > 0.0)
+                    && fill.tab.is_some_and(|v| v > 0.0),
+                "{form:?} {res:?}: expected all 3 scopes positive, got {fill:?}"
+            );
+        }
+
+        let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+
+        // Deliverable 4: Hardware identity & capacity totals in two-tone header typography.
+        let texts: Vec<&str> = laid
+            .boxes
+            .iter()
+            .filter(|b| b.kind == BoxKind::Text)
+            .map(|b| b.text.as_str())
+            .collect();
+        assert!(
+            texts.contains(&"this Mac"),
+            "{form:?}: header primary noun missing: {texts:?}"
+        );
+        if form == DeckForm::Full {
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t.contains("M5 Max") && t.contains("18c") && t.contains("128 GiB")),
+                "Full: header hardware capacity totals missing: {texts:?}"
+            );
+        } else {
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t.contains("18c") && t.contains("128G") && t.contains("2T")),
+                "Folded: header compact hardware capacity totals missing: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t.contains("M5 Max")),
+                "Folded 1424 pt: Cores row supplies M5 Max when header fits compact totals only: {texts:?}"
+            );
+        }
+
+        // Deliverable 5: Network row renders upload/download arrows and connectivity/latency.
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains('\u{2193}') && t.contains('\u{2191}')),
+            "{form:?}: Network upload/download summary missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Online")),
+            "{form:?}: Network live connectivity state missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("14 ms")),
+            "{form:?}: Network TCP latency missing: {texts:?}"
+        );
+
+        // Deliverable 7 (painted geometry): Verify overlapping nested 3-scope bars share left edge
+        // `x` with `gw >= aw >= tw > 0` and `gh > ah > th > 0` in `inks.machine` / `inks.aterm` /
+        // `inks.tab`.
+        let bar_cols: Vec<Col> = match form {
+            DeckForm::Full => plan::plan_full(w, &m).bar.into_iter().collect(),
+            DeckForm::Folded => plan::plan_folded(w, &m)
+                .blocks
+                .into_iter()
+                .filter_map(|b| b.bar)
+                .collect(),
+        };
+        assert!(!bar_cols.is_empty(), "{form:?}: bar columns present");
+        let mut three_scope_bars = 0;
+        for col in bar_cols {
+            let bx = px(col.x, s);
+            let machine_c = rgba(inks.machine, 0xFF);
+            let aterm_c = rgba(inks.aterm, 0xFF);
+            let tab_c = rgba(inks.tab, 0xFF);
+            let globals: Vec<(f32, f32, f32)> = laid
+                .prims
+                .iter()
+                .filter_map(|p| match *p {
+                    DrawPrim::Panel {
+                        x, y, w, h, fill, ..
+                    } if (x - bx).abs() < 0.01 && fill == machine_c && h >= 6.0 => Some((y, w, h)),
+                    _ => None,
+                })
+                .collect();
+            for (gy, gw, gh) in globals {
+                let aterm_bar = laid.prims.iter().find_map(|p| match *p {
+                    DrawPrim::Panel {
+                        x, y, w, h, fill, ..
+                    } if (x - bx).abs() < 0.01 && fill == aterm_c && y > gy && y + h < gy + gh => {
+                        Some((w, h))
+                    }
+                    _ => None,
+                });
+                let tab_bar = laid.prims.iter().find_map(|p| match *p {
+                    DrawPrim::Panel {
+                        x, y, w, h, fill, ..
+                    } if (x - bx).abs() < 0.01 && fill == tab_c && y > gy && y + h < gy + gh => {
+                        Some((w, h))
+                    }
+                    _ => None,
+                });
+                if let (Some((aw, ah)), Some((tw, th))) = (aterm_bar, tab_bar) {
+                    assert!(
+                        gw >= aw && aw >= tw && tw > 0.0 && gh > ah && ah > th,
+                        "{form:?}: nested bar geometry {gw}x{gh} >= {aw}x{ah} >= {tw}x{th}"
+                    );
+                    three_scope_bars += 1;
+                }
+            }
+        }
+        assert_eq!(
+            three_scope_bars, 5,
+            "{form:?}: all 5 resources (Cpu, Memory, Disk, Network, Processes) must paint \
+             overlapping 3-scope bars"
+        );
+    }
+
+    // Deliverable 6: In Folded (and Full narrow/slim where individual core squares draw), hot core
+    // (0.95) renders in orange-to-red thermal color with a soft translucent Stroke glow halo!
+    let folded_input = scene_input(&snap, DeckForm::Folded);
+    let folded_words = DeckWords::new(&folded_input, &m);
+    let folded_laid = lay(
+        &geom(1424.0, 2.0, DeckForm::Folded),
+        &folded_input,
+        &folded_words,
+        &m,
+        true,
+    );
+    let hot_core_fill = rgba(inks.thermal_at(0.95, false), 0xFF);
+    let hot_core = folded_laid.prims.iter().find_map(|p| match *p {
+        DrawPrim::Panel {
+            x, y, w, h, fill, ..
+        } if (w - h).abs() < 0.01 && fill == hot_core_fill => Some((x, y, w)),
+        _ => None,
+    });
+    let (hx, hy, hw) = hot_core.expect("hot 0.95 core square painted in orange-to-red thermal ink");
+    let has_core_glow = folded_laid.prims.iter().any(|p| match *p {
+        DrawPrim::Stroke {
+            x, y, w, h, color, ..
+        } => {
+            (x - (hx - 0.5)).abs() < 0.01
+                && (y - (hy - 0.5)).abs() < 0.01
+                && (w - (hw + 1.0)).abs() < 0.01
+                && (h - (hw + 1.0)).abs() < 0.01
+                && color[3] < 0xFF
+        }
+        _ => false,
+    });
+    assert!(
+        has_core_glow,
+        "hot core square must emit soft Stroke glow halo"
+    );
+
+    // Regression (mid-width Folded 1074 pt & slim 750 pt):
+    // 1. At 1074 pt (`BlockKind::Mid`), `header_folded` fits `M5 Max · 18c · 128 GiB · 2.00 TB`
+    //    directly in the header, so `Cores` suppresses the duplicate `cores_tail_forms` while
+    //    `Network` (which has no `details` column in `Mid`) still surfaces live `Online`, `↓/↑`,
+    //    and `14 ms` via `glance_bare`!
+    // 2. At 750 pt (`BlockKind::Narrow`), the header drops hardware totals down to bare `this Mac`,
+    //    so `Cores` steps in and renders `cores_tail_forms` (`M5 Max · 18c · 128G · 2T` / `M5 Max`).
+    let mid_laid = lay(
+        &geom(1074.0, 2.0, DeckForm::Folded),
+        &folded_input,
+        &folded_words,
+        &m,
+        true,
+    );
+    let mid_texts: Vec<&str> = mid_laid
+        .boxes
+        .iter()
+        .filter(|b| b.kind == BoxKind::Text)
+        .map(|b| b.text.as_str())
+        .collect();
+    let chip_mentions = mid_texts.iter().filter(|t| t.contains("M5 Max")).count();
+    assert_eq!(
+        chip_mentions, 1,
+        "Folded 1074 pt must show M5 Max once in header without duplicating on Cores row: {mid_texts:?}"
+    );
+    assert!(
+        mid_texts
+            .iter()
+            .any(|t| t.contains("Online") && t.contains('\u{2193}') && t.contains("14 ms")),
+        "Folded 1074 pt (no Details column) must show live Network state, arrows, and RTT in Amount: {mid_texts:?}"
+    );
+
+    let narrow_laid = lay(
+        &geom(750.0, 2.0, DeckForm::Folded),
+        &folded_input,
+        &folded_words,
+        &m,
+        true,
+    );
+    let narrow_texts: Vec<&str> = narrow_laid
+        .boxes
+        .iter()
+        .filter(|b| b.kind == BoxKind::Text)
+        .map(|b| b.text.as_str())
+        .collect();
+    assert!(
+        narrow_texts.iter().any(|t| t.contains("M5 Max")),
+        "Folded 750 pt must fall back to showing M5 Max on the Cores row when header omits totals: {narrow_texts:?}"
+    );
 }
 
 #[path = "stats_deck_owner_scenes.rs"]

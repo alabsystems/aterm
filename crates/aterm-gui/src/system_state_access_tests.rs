@@ -16,7 +16,7 @@ use aterm_types::macos_setup::{
 
 use super::{
     JOIN_PENDING_KEY, LOCAL_NETWORK_ALERT_HOLD, LanInterface, RETIRED_KEYS, StepsReach, lan_target,
-    menu_line,
+    menu_line, setup_field,
 };
 use crate::status_item::SystemStateLine;
 use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
@@ -145,6 +145,57 @@ fn line(label: &str, note: Option<&str>) -> Option<SystemStateLine> {
         label: label.to_string(),
         note: note.map(str::to_string),
     })
+}
+
+/// `status`'s `setup=` names each managed row a person, a wait or a failure still holds, from the
+/// worker's last status alone; a finished plan with none left is `done`, and a row a finished
+/// setup set once that differs now is the person's, not pending.
+#[test]
+fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let devtools = Subject::Access(Access::DeveloperTools);
+    let accessibility = Subject::Access(Access::Accessibility);
+    let vault = Subject::Setting(Setting::Secrets);
+    let dock = Subject::Setting(Setting::Dock);
+    assert_eq!(setup_field(&SetupStatus::default()), "-", "no worker spoke");
+    let mut permissions_and_vault = Selection::none();
+    permissions_and_vault.set(Setting::Permissions, true);
+    permissions_and_vault.set(Setting::Secrets, true);
+    permissions_and_vault.set(Setting::Dock, true);
+    let pending = status(
+        permissions_and_vault,
+        vec![
+            observed(fda, Standing::NeedsYou, None),
+            observed(devtools, Standing::Waiting, None),
+            observed(vault, Standing::Failed, None),
+            observed(dock, Standing::InPlace, None),
+            // Accessibility is unmanaged without a sign-out.
+            observed(accessibility, Standing::NeedsYou, None),
+        ],
+    );
+    assert_eq!(setup_field(&pending), "pending:fda,devtools,vault");
+    let finished = SetupStatus {
+        finished: true,
+        ..status(
+            permissions_and_vault,
+            vec![
+                observed(fda, Standing::InPlace, None),
+                observed(devtools, Standing::NotNeeded, None),
+                observed(vault, Standing::InPlace, None),
+                observed(dock, Standing::Differs, None),
+            ],
+        )
+    };
+    assert_eq!(setup_field(&finished), "done");
+    let running = status(
+        permissions_and_vault,
+        vec![observed(dock, Standing::Differs, None)],
+    );
+    assert_eq!(
+        setup_field(&running),
+        "pending:dock",
+        "still to set while the run goes"
+    );
 }
 
 /// The menu line says only rows the approved plan manages that need a person or failed: one is

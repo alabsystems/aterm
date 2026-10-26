@@ -99,6 +99,10 @@ aterm-link = { path = "../aterm-link" }
 # refuses by name (`secrets_unavailable` in src/main.rs).
 aterm-secrets = { workspace = true }
 aterm-db = { workspace = true }
+# The shared-login composition binds full Commons identities and parses public
+# request digests; both libraries are already present through aterm-db.
+aterm-codec = { workspace = true }
+aterm-digest = { workspace = true }
 
 # `aterm machines` — a lab of Macs managed from this one over SSH
 # (docs/DESIGN-machines-2026-10-16.md). MACOS ONLY: it drives macOS's own tools

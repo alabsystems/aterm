@@ -104,13 +104,12 @@ fn snapshot(app: &mut App) {
 }
 
 fn snapshot_now(app: &mut App) {
-    let nonce = aterm_time::since_epoch()
-        .expect("clock after epoch")
-        .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("aterm-route-chrome-{}-{nonce}", std::process::id()));
-    crate::control_auth::ensure_private_dir(&dir).expect("snapshot dir");
-    let path = dir.join("snapshot.png");
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-route-chrome-")
+        .tempdir()
+        .expect("exclusive snapshot dir");
+    crate::control_auth::ensure_private_dir(dir.path()).expect("snapshot dir");
+    let path = dir.path().join("snapshot.png");
     app.snapshot_at_path(path.display().to_string());
     let mut done = path.into_os_string();
     done.push(".done");
@@ -120,7 +119,7 @@ fn snapshot_now(app: &mut App) {
         assert!(Instant::now() < deadline, "the snapshot was published");
         std::thread::sleep(Duration::from_millis(2));
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir);
 }
 
 fn one_order(present: &[ChromeStep], capture: &[ChromeStep]) -> bool {

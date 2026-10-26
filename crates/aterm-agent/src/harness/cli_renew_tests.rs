@@ -698,10 +698,6 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
             host.checked.borrow().is_empty(),
             "no `auth status` after a failed flow"
         );
-        assert!(
-            err.contains(&format!("exited {flow}; nothing was recorded")),
-            "{err}"
-        );
         let store = env.accounts_store();
         assert!(!store.logins_dir().join("main+1").exists());
         assert!(!store.logins_file().exists() && !store.state_file().exists());

@@ -65,15 +65,24 @@ const PEERS_FILE_MAX: usize = 256 * 1024;
 
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
     /// A test's wait for the book's lock on its thread in place of [`LOCK_WAIT`], and who is told each time the lock is found held.
     static TEST_WAIT: std::cell::RefCell<Option<(Duration, Option<std::sync::mpsc::Sender<()>>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// `run` with this thread's waits for the book's lock lasting `wait` in place of [`LOCK_WAIT`] (a test seam).
+#[cfg(any(test, debug_assertions))]
+pub fn lock_waiting<R>(wait: Duration, run: impl FnOnce() -> R) -> R {
+    let before = TEST_WAIT.with_borrow_mut(|seam| seam.replace((wait, None)));
+    let ran = run();
+    TEST_WAIT.with_borrow_mut(|seam| *seam = before);
+    ran
+}
+
 fn lock_wait() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(wait) = TEST_WAIT.with_borrow(|seam| seam.as_ref().map(|(wait, _)| *wait)) {
         return wait;
     }
@@ -81,7 +90,7 @@ fn lock_wait() -> Duration {
 }
 
 fn found_held() {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     TEST_WAIT.with_borrow(|seam| {
         if let Some((_, Some(told))) = seam {
             let _ = told.send(());
@@ -1079,7 +1088,7 @@ impl fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`] and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's swaps aterm.toml alone. The files are written by the [`HeldBook`] `write` is handed, and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, for at most two seconds; aterm.toml's write lock, where `write` takes it, comes after it.
+/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`] and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, for at most two seconds; aterm.toml's write lock, where `write` takes it, comes after it.
 /// # Errors
 /// [`Unwritten::Lock`]: another writer holds the lock past its wait, the lock cannot be
 /// taken, or a leave's directory open to others cannot be narrowed; [`Unwritten::Moved`]:
@@ -1108,6 +1117,29 @@ pub fn write_held<R>(
 /// # Errors
 /// [`Unwritten::Lock`]: the directory cannot be made or narrowed, or the lock taken, for a reason that does not stop every writer ([`stops_every_edit`]): another writer holding the lock past its wait, the directory removed under it, no descriptor or space free among them.
 pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Result<R, Unwritten> {
+    let (narrowed, lock) = unnamed_held(dir)?;
+    Ok(remove(&Leaving {
+        dir,
+        narrowed,
+        _lock: lock,
+    }))
+}
+
+/// A level's write (`allow facts|content`), which names no fleet either: held as a leave's is ([`leave_held`]), so no odd state directory blocks it. `write` is handed a [`Leveling`], which writes none of the fleet's files.
+/// # Errors
+/// As [`leave_held`]'s.
+pub fn level_held<R>(dir: &Path, write: impl FnOnce(&Leveling) -> R) -> Result<R, Unwritten> {
+    let (narrowed, lock) = unnamed_held(dir)?;
+    Ok(write(&Leveling {
+        narrowed,
+        _lock: lock,
+    }))
+}
+
+/// [`leave_held`]'s and [`level_held`]'s hold: the mode the directory had where it was narrowed, and the book's lock where any writer could take it.
+/// # Errors
+/// As [`leave_held`]'s.
+fn unnamed_held(dir: &Path) -> Result<(Option<u32>, Option<BookLock>), Unwritten> {
     let narrowed = match judge_private_dir(dir) {
         Ok(PrivateDir::Missing | PrivateDir::Open(_)) => match ensure_private_dir(dir) {
             Ok(narrowed) => narrowed,
@@ -1116,11 +1148,7 @@ pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Resu
                 if stops_every_edit(&e)
                     && matches!(judge_private_dir(dir), Ok(PrivateDir::Missing)) =>
             {
-                return Ok(remove(&Leaving {
-                    dir,
-                    narrowed: None,
-                    _lock: None,
-                }));
+                return Ok((None, None));
             }
             // There but not made private (an access list it inherits, a volume that ignores modes): its lock decides, as any directory's does.
             Err(e) if stops_every_edit(&e) => None,
@@ -1141,11 +1169,7 @@ pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Resu
             }));
         }
     };
-    Ok(remove(&Leaving {
-        dir,
-        narrowed,
-        _lock: lock,
-    }))
+    Ok((narrowed, lock))
 }
 
 /// The book's lock in a state directory, held while this lives ([`write_held`]): no other writer, an older aterm's edit of the book included, comes between the writes made under it. Through this API it alone writes the fleet's files ([`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`]), so none is written without the lock; a leave removes them by a [`Leaving`].
@@ -1160,6 +1184,20 @@ pub struct Leaving<'a> {
     dir: &'a Path,
     narrowed: Option<u32>,
     _lock: Option<BookLock>,
+}
+
+/// A level's hold on a state directory ([`level_held`]): the book's lock, or none where no writer could take it either. It writes none of the fleet's files.
+pub struct Leveling {
+    narrowed: Option<u32>,
+    _lock: Option<BookLock>,
+}
+
+impl Leveling {
+    /// The mode the state directory had before it was narrowed, where it was open to others.
+    #[must_use]
+    pub const fn narrowed(&self) -> Option<u32> {
+        self.narrowed
+    }
 }
 
 impl Leaving<'_> {

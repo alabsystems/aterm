@@ -1095,6 +1095,15 @@ impl TcpCounts {
     }
 }
 
+/// Machine-wide TCP state counts together with passive smoothed RTT across established remote peers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TcpSummary {
+    /// TCP socket counts grouped by state.
+    pub counts: TcpCounts,
+    /// Median kernel smoothed RTT (`t_srtt`, milliseconds) across established non-loopback connections, if any.
+    pub srtt_ms: Option<f32>,
+}
+
 /// Read machine-wide TCP connection counts using a temporary scratch buffer.
 #[must_use]
 pub fn tcp_counts() -> Option<TcpCounts> {
@@ -1104,17 +1113,50 @@ pub fn tcp_counts() -> Option<TcpCounts> {
 /// Read machine-wide TCP connection counts using caller-provided `scratch` storage.
 #[must_use]
 pub fn tcp_counts_into(scratch: &mut Vec<u8>) -> Option<TcpCounts> {
+    tcp_summary_into(scratch).map(|s| s.counts)
+}
+
+/// Read machine-wide TCP state counts and passive smoothed RTT using a temporary scratch buffer.
+#[must_use]
+pub fn tcp_summary() -> Option<TcpSummary> {
+    tcp_summary_into(&mut Vec::new())
+}
+
+/// Read machine-wide TCP state counts and passive smoothed RTT using caller-provided `scratch` storage.
+#[must_use]
+pub fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
     #[cfg(target_os = "macos")]
     {
-        crate::macos::tcp_counts_into(scratch)
+        crate::macos::tcp_summary_into(scratch)
     }
     #[cfg(target_os = "linux")]
     {
-        crate::linux::tcp_counts_under_into(Path::new("/"), scratch)
+        crate::linux::tcp_counts_under_into(Path::new("/"), scratch).map(|counts| TcpSummary {
+            counts,
+            srtt_ms: crate::linux::tcp_srtt_ms(),
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = scratch;
+        None
+    }
+}
+
+/// Count open socket file descriptors held by `pid` without taking descriptor I/O references (`PROC_PIDLISTFDS` on macOS, `/proc/<pid>/fd` symlinks on Linux), or `None` when unreadable.
+#[must_use]
+pub fn open_socket_count(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::open_socket_count(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::Root::system().open_socket_count(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
         None
     }
 }

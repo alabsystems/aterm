@@ -119,7 +119,7 @@ pub(crate) struct FindBarPaint {
     pub field_scroll: usize,
     /// The separator rule's tone, which the splice paints a [`FindSeam::BottomRail`] in, so the rail and the cell-drawn seams cannot disagree.
     pub seam: [u8; 3],
-    /// The accent line a focused Fluent text box closes on, which the splice lays along the bottom of the well ([`WELL_ACCENT_LINE`]).
+    /// The accent line a focused Fluent text box closes on ([`WELL_ACCENT_LINE`]): the Fluent raster draws it, and the splice lays it along the bottom of the well as a rail where the paint was told it can (`well_rail` in [`find_bar_paint`]); elsewhere the well's cells carry it as their underline ([`well_edge`]).
     pub well_line: Option<[u8; 3]>,
     /// Cell columns of the status readout on the field row (`2/7`, `no matches`), or `None` when none was painted.
     pub status_cols: Option<Range<usize>>,
@@ -299,6 +299,24 @@ fn well_rule(c: &BandColors) -> Option<[u8; 3]> {
     c.well_rule.filter(|_| !well_focus_line())
 }
 
+/// THE WELL'S EDGE, ONE RULE: every field shows a 3:1 boundary. Returns the focus line the well closes on (`focus_line`, Windows' accent, [`well_focus_line`]) and the ink its cells underline: the focus line itself where the splice cannot lay it as a rail (`well_rail` false: a cell too short or a face without the room for one, a pane's band that cannot lift its words, a one-row band whose seam rail owns the row's foot), which drew neither the line nor an edge; else the border a faint well draws ([`well_rule`]), none under a focus line the rail draws.
+fn well_edge(
+    c: &BandColors,
+    focus_line: bool,
+    well_rail: bool,
+) -> (Option<[u8; 3]>, Option<[u8; 3]>) {
+    if focus_line {
+        (Some(c.accent), (!well_rail).then_some(c.accent))
+    } else {
+        (None, c.well_rule)
+    }
+}
+
+/// The row of a `height`-row panel that carries the well: the second of three, else the first.
+pub(crate) const fn field_row(height: usize) -> usize {
+    if height >= 3 { 1 } else { 0 }
+}
+
 /// The well's caret ink: on Windows ([`FIND_TOOLBAR`]) the band's accent, the colour of the well's focus line ([`well_focus_line`]), floored to AA in the well, so caret and focus line are one mark in the user's accent where the caret was the terminal cursor's green whatever the accent; elsewhere, and under an OS-forced palette (whose well carries a border, not a focus line), the band's own caret ink ([`BandColors::caret`]).
 fn caret_ink(c: &BandColors) -> [u8; 3] {
     if FIND_TOOLBAR && well_focus_line() {
@@ -335,17 +353,18 @@ fn hint_text(cols: usize) -> &'static str {
     TINY
 }
 
-/// Build the find panel.
+/// Build the find panel. `well_rail` says whether the splice lays the well's focus line as a rail along its foot ([`well_edge`]).
 pub(crate) fn find_bar_paint(
     v: &FindBarView,
     cols: usize,
     height: usize,
     palette: impl Into<chrome_band::ChromePalette>,
     seam: FindSeam,
+    well_rail: bool,
 ) -> FindBarPaint {
     let c = chrome_band::band_colors(palette);
     let height = height.max(1);
-    let field_row = usize::from(height >= 3);
+    let field_row = field_row(height);
     let hint_row = (height >= 2).then_some(height - 1);
     let mut rows: Vec<Vec<RenderCell>> = (0..height)
         .map(|_| blank_row(cols, c.label, c.bar_bg, false))
@@ -375,10 +394,12 @@ pub(crate) fn find_bar_paint(
         field_layout(v, &c, cols, well_start)
     };
     let field_cols = layout.well.clone();
+    let (well_line, well_underline) =
+        well_edge(&c, well_focus_line() && !field_cols.is_empty(), well_rail);
     let field_scroll = {
         let row = &mut rows[field_row];
         write_str(row, cols, LEFT_PAD, PROMPT, c.value, c.bar_bg, true);
-        let scroll = paint_well(row, v, &c, field_cols.clone());
+        let scroll = paint_well(row, v, &c, field_cols.clone(), well_underline);
         for (start, segs) in [
             layout.indicators.as_ref(),
             layout.status.as_ref(),
@@ -425,15 +446,23 @@ pub(crate) fn find_bar_paint(
     match seam {
         FindSeam::Top => chrome_band::seal_band_top(&mut rows[0], c.seam),
         FindSeam::BottomUnderline => {
-            for cell in &mut rows[height - 1] {
-                cell.underline = aterm_core::terminal::UnderlineStyle::Single;
-                cell.underline_color = Some(c.seam);
+            // Across the band's foot but the well's cells on a one-row band, which keep the
+            // edge they carry ([`well_edge`]).
+            let well = if height - 1 == field_row && well_underline.is_some() {
+                field_cols.clone()
+            } else {
+                0..0
+            };
+            for (col, cell) in rows[height - 1].iter_mut().enumerate() {
+                if !well.contains(&col) {
+                    cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+                    cell.underline_color = Some(c.seam);
+                }
             }
         }
         FindSeam::BottomRail => {}
     }
 
-    let well_line = (well_focus_line() && !field_cols.is_empty()).then_some(c.accent);
     FindBarPaint {
         rows,
         field_row,
@@ -533,6 +562,7 @@ fn paint_well(
     v: &FindBarView,
     c: &BandColors,
     field: Range<usize>,
+    underline: Option<[u8; 3]>,
 ) -> usize {
     let width = field.len();
     if width == 0 {
@@ -578,7 +608,7 @@ fn paint_well(
     if last < chars.len() && cursor != last {
         row[field.end - 1] = chrome_band::cell(SCROLL_RIGHT, c.label, c.field_bg, false, false);
     }
-    if let Some(rule) = well_rule(c) {
+    if let Some(rule) = underline {
         for cell in &mut row[field] {
             cell.underline = aterm_core::terminal::UnderlineStyle::Single;
             cell.underline_color = Some(rule);
@@ -1399,7 +1429,14 @@ mod tests {
     }
 
     fn paint(v: &FindBarView, cols: usize) -> FindBarPaint {
-        find_bar_paint(v, cols, FIND_BAR_ROWS, Theme::default(), FindSeam::Top)
+        find_bar_paint(
+            v,
+            cols,
+            FIND_BAR_ROWS,
+            Theme::default(),
+            FindSeam::Top,
+            true,
+        )
     }
 
     fn text(row: &[RenderCell]) -> String {
@@ -1778,7 +1815,7 @@ mod tests {
                     is_regex,
                     ..view("q")
                 };
-                let p = find_bar_paint(&v, 111, FIND_BAR_ROWS, theme, FindSeam::Top);
+                let p = find_bar_paint(&v, 111, FIND_BAR_ROWS, theme, FindSeam::Top, true);
                 let row = &p.rows[p.field_row];
                 for (span, on) in [
                     (p.case_cols.clone().expect("drawn"), case_sensitive),
@@ -1823,7 +1860,7 @@ mod tests {
             },
         };
         let c = chrome_band::band_colors(palette);
-        let p = find_bar_paint(&view("ab"), 90, FIND_BAR_ROWS, palette, FindSeam::Top);
+        let p = find_bar_paint(&view("ab"), 90, FIND_BAR_ROWS, palette, FindSeam::Top, true);
         let caret = p.rows[p.field_row][p.field_cols.start + 2].bg;
         assert_eq!(caret, caret_ink(&c));
         assert!(contrast(caret, c.field_bg) >= WELL_INK);
@@ -1890,6 +1927,7 @@ mod tests {
             FIND_BAR_ROWS,
             Theme::default(),
             FindSeam::Top,
+            true,
         );
         assert!(
             bottom.rows[0].iter().all(|c| c.overline),
@@ -1907,6 +1945,7 @@ mod tests {
             FIND_BAR_ROWS,
             Theme::default(),
             FindSeam::BottomUnderline,
+            true,
         );
         assert!(
             top.rows[FIND_BAR_ROWS - 1]
@@ -1924,6 +1963,7 @@ mod tests {
             FIND_BAR_ROWS,
             Theme::default(),
             FindSeam::BottomRail,
+            true,
         );
         assert!(
             railed.rows.iter().flatten().all(|c| !c.overline)
@@ -1945,6 +1985,7 @@ mod tests {
                 height,
                 Theme::default(),
                 FindSeam::Top,
+                true,
             );
             let seam = &short.rows[0];
             assert!(
@@ -2045,6 +2086,96 @@ mod tests {
         }
     }
 
+    /// EVERY FIELD SHOWS A 3:1 BOUNDARY, ONE RULE ([`well_edge`], audit r20 ED5): on Windows the
+    /// query well closes on the accent focus line, which the splice lays as a rail; where the bar
+    /// cannot draw a rail (a cell under the rail floor, a face without the room, a pane's band
+    /// that cannot lift its words, a one-row band whose seam rail owns the row's foot) the well
+    /// drew neither the line nor an edge. There the well's cells carry the focus line as their
+    /// underline; off Windows a faint well carries its border.
+    #[test]
+    fn every_find_well_shows_its_edge_whether_or_not_a_rail_can_be_drawn() {
+        use aterm_core::terminal::UnderlineStyle;
+        let light = Theme::from(&aterm_types::scheme::builtin("GitHub Light").expect("built-in"));
+        for theme in [Theme::default(), light] {
+            let c = chrome_band::band_colors(theme);
+            assert!(
+                aterm_messages::ink::contrast(c.accent, c.bar_bg) >= 3.0,
+                "{theme:?}: the focus line stands 3:1 off the band"
+            );
+            assert_eq!(
+                well_edge(&c, true, true),
+                (Some(c.accent), None),
+                "{theme:?}: the rail draws the focus line"
+            );
+            assert_eq!(
+                well_edge(&c, true, false),
+                (Some(c.accent), Some(c.accent)),
+                "{theme:?}: without a rail the well's cells underline the focus line"
+            );
+            assert_eq!(
+                well_edge(&c, false, false),
+                (None, c.well_rule),
+                "{theme:?}: off Windows, the faint well's border"
+            );
+            assert!(c.well_rule.is_some(), "{theme:?}: premise: a faint well");
+
+            for well_rail in [true, false] {
+                let p = find_bar_paint(
+                    &view("abc"),
+                    90,
+                    FIND_BAR_ROWS,
+                    theme,
+                    FindSeam::Top,
+                    well_rail,
+                );
+                let well = &p.rows[p.field_row][p.field_cols.clone()];
+                let (line, underline) = well_edge(&c, WELL_ACCENT_LINE, well_rail);
+                assert_eq!(p.well_line, line, "{theme:?} rail={well_rail}");
+                assert!(
+                    well.iter().all(|cell| match underline {
+                        Some(ink) =>
+                            cell.underline == UnderlineStyle::Single
+                                && cell.underline_color == Some(ink),
+                        None => cell.underline == UnderlineStyle::None,
+                    }),
+                    "{theme:?} rail={well_rail}: the well's cells carry {underline:?}"
+                );
+            }
+        }
+    }
+
+    /// A ONE-ROW FIND BAND KEEPS ITS WELL'S EDGE UNDER ITS SEAM: the band's foot is the well's
+    /// row there, and the seam's underline, laid over the whole row, painted the well's edge (its
+    /// 3:1 border, or Windows' focus line where no rail draws it) in the seam's grey. The seam
+    /// runs across the band's foot but the well's cells, which keep their edge.
+    #[test]
+    fn a_one_row_find_band_keeps_the_well_edge_under_its_seam() {
+        use aterm_core::terminal::UnderlineStyle;
+        let light = Theme::from(&aterm_types::scheme::builtin("GitHub Light").expect("built-in"));
+        for theme in [Theme::default(), light] {
+            let c = chrome_band::band_colors(theme);
+            let one = find_bar_paint(&view("abc"), 90, 1, theme, FindSeam::BottomUnderline, false);
+            let row = &one.rows[0];
+            let (_, underline) = well_edge(&c, WELL_ACCENT_LINE, false);
+            assert!(
+                underline.is_some(),
+                "{theme:?}: premise: the well carries its edge"
+            );
+            for (col, cell) in row.iter().enumerate() {
+                let want = if one.field_cols.contains(&col) {
+                    underline
+                } else {
+                    Some(c.seam)
+                };
+                assert_eq!(
+                    (cell.underline, cell.underline_color),
+                    (UnderlineStyle::Single, want),
+                    "{theme:?}: column {col} of a one-row band"
+                );
+            }
+        }
+    }
+
     /// THE QUERY WELL KEEPS A BOUNDARY: a theme's well stands only a step off the band (Default 1.4:1, GitHub Light's white well on its grey band 1.2:1), too faint to show where the field is, so off Windows an unbroken border is stamped across the whole well, as on every control's 3:1 edge, and on Windows the accent focus line marks its foot instead; under every stock Windows High-Contrast scheme the well's fill matches the band, and the border is stamped there too.
     #[test]
     fn the_query_well_keeps_a_boundary_under_a_forced_palette() {
@@ -2057,7 +2188,14 @@ mod tests {
                 aterm_messages::ink::contrast(band.field_bg, band.bar_bg) < 3.0,
                 "{theme:?}: the fixture is only interesting because the well is faint"
             );
-            let plain = find_bar_paint(&view("abc"), cols, FIND_BAR_ROWS, theme, FindSeam::Top);
+            let plain = find_bar_paint(
+                &view("abc"),
+                cols,
+                FIND_BAR_ROWS,
+                theme,
+                FindSeam::Top,
+                true,
+            );
             let well = &plain.rows[plain.field_row][plain.field_cols.clone()];
             if WELL_ACCENT_LINE {
                 assert!(
@@ -2274,6 +2412,7 @@ mod tests {
                         height,
                         Theme::default(),
                         seam,
+                        true,
                     );
                     assert_eq!(p.rows.len(), height, "cols={cols} height={height}");
                     assert!(p.rows.iter().all(|r| r.len() == cols));
@@ -2282,7 +2421,7 @@ mod tests {
                 }
             }
         }
-        let one = find_bar_paint(&view("kept"), 90, 1, Theme::default(), FindSeam::Top);
+        let one = find_bar_paint(&view("kept"), 90, 1, Theme::default(), FindSeam::Top, true);
         assert_eq!(one.field_row, 0);
         assert!(text(&one.rows[0]).contains("kept"));
     }
@@ -2324,7 +2463,7 @@ mod tests {
                 case_sensitive: true,
                 ..view("q")
             };
-            let p = find_bar_paint(&v, 111, FIND_BAR_ROWS, theme, FindSeam::Top);
+            let p = find_bar_paint(&v, 111, FIND_BAR_ROWS, theme, FindSeam::Top, true);
             let span = p.case_cols.clone().expect("drawn");
             let cell = &p.rows[p.field_row][span.start + 1];
             (cell.fg, cell.bg)
@@ -2374,7 +2513,7 @@ mod tests {
         theme: Theme,
         preedit: Option<Range<usize>>,
     ) -> (FindBarPaint, Arc<FluentBar>) {
-        let paint = find_bar_paint(v, 111, FIND_BAR_ROWS, theme, FindSeam::BottomRail);
+        let paint = find_bar_paint(v, 111, FIND_BAR_ROWS, theme, FindSeam::BottomRail, true);
         let bar = fluent_bar(&FluentInput {
             view: v,
             paint: &paint,
@@ -2768,7 +2907,14 @@ mod tests {
     fn the_cells_stand_without_a_face_for_the_query() {
         let bar = |query: &str| {
             let v = view(query);
-            let paint = find_bar_paint(&v, 111, FIND_BAR_ROWS, Theme::default(), FindSeam::Top);
+            let paint = find_bar_paint(
+                &v,
+                111,
+                FIND_BAR_ROWS,
+                Theme::default(),
+                FindSeam::Top,
+                true,
+            );
             fluent_bar(&FluentInput {
                 view: &v,
                 paint: &paint,

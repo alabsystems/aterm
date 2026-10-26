@@ -218,81 +218,435 @@ impl SearchQuery {
             }
         }
     }
+}
 
-    fn hits(
-        &self,
-        name: &str,
-        desc: &str,
-        want_desc: bool,
-    ) -> Result<bool, aterm_regex::StepLimitExceeded> {
-        if want_desc {
-            self.hits_any(&[name, desc])
-        } else {
-            self.hits_any(&[name])
+/// Ruby's DidYouMean Jaro distance, ported literally (bit flags
+/// become bool vectors; names are far below any width limit).
+fn jaro_distance(s1: &[char], s2: &[char]) -> f64 {
+    let (s1, s2) = if s1.len() > s2.len() {
+        (s2, s1)
+    } else {
+        (s1, s2)
+    };
+    let (len1, len2) = (s1.len(), s2.len());
+    let range = if len2 > 3 { len2 / 2 - 1 } else { 0 };
+    let mut flags1 = vec![false; len1];
+    let mut flags2 = vec![false; len2];
+    let mut m = 0f64;
+    for i in 0..len1 {
+        let last = i + range;
+        let mut j = i.saturating_sub(range);
+        while j <= last && j < len2 {
+            if !flags2[j] && s1[i] == s2[j] {
+                flags2[j] = true;
+                flags1[i] = true;
+                m += 1.0;
+                break;
+            }
+            j += 1;
         }
+    }
+    let mut t = 0f64;
+    let mut k = 0usize;
+    for i in 0..len1 {
+        if flags1[i] {
+            let mut j = k;
+            let mut index = k;
+            while j < len2 {
+                index = j;
+                if flags2[j] {
+                    k = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+            if index < len2 && s1[i] != s2[index] {
+                t += 1.0;
+            }
+        }
+    }
+    let t = (t / 2.0).floor();
+    if m == 0.0 {
+        0.0
+    } else {
+        (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
     }
 }
 
-pub(super) fn cmd_search(api: &Api, rest: &[String]) -> ExitCode {
+fn jaro_winkler_distance(s1: &[char], s2: &[char]) -> f64 {
+    let jaro = jaro_distance(s1, s2);
+    if jaro > 0.7 {
+        let mut prefix = 0usize;
+        while prefix < 4 && prefix < s1.len() && prefix < s2.len() && s1[prefix] == s2[prefix] {
+            prefix += 1;
+        }
+        jaro + (prefix as f64 * 0.1 * (1.0 - jaro))
+    } else {
+        jaro
+    }
+}
+
+/// The did_you_mean gem's Levenshtein (the compact in-place variant).
+fn levenshtein_distance(s1: &[char], s2: &[char]) -> usize {
+    let (n, m) = (s1.len(), s2.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut d: Vec<usize> = (0..=m).collect();
+    let mut x = 0usize;
+    for (idx, c1) in s1.iter().enumerate() {
+        let mut i = idx + 1;
+        for j in 0..m {
+            let cost = usize::from(*c1 != s2[j]);
+            x = (d[j + 1] + 1).min(i + 1).min(d[j] + cost);
+            d[j] = i;
+            i = x;
+        }
+        d[m] = x;
+    }
+    x
+}
+
+/// DidYouMean::SpellChecker#correct over `dictionary`, in the gem's
+/// result order (Jaro-Winkler gate, distance-sorted, then the
+/// mistype/misspell Levenshtein cuts). This is brew's fuzzy search.
+fn spell_correct(dictionary: &[String], input: &str) -> Vec<String> {
+    fn normalize(s: &str) -> Vec<char> {
+        s.to_lowercase().chars().filter(|c| *c != '@').collect()
+    }
+    let ninput = normalize(input);
+    let threshold = if ninput.len() > 3 { 0.834 } else { 0.77 };
+    let mut words: Vec<&String> = dictionary
+        .iter()
+        .filter(|w| jaro_winkler_distance(&normalize(w), &ninput) >= threshold)
+        .filter(|w| w.as_str() != input)
+        .collect();
+    // The gem sorts ascending then reverses; the observable order
+    // is distance-descending with dictionary order breaking ties
+    // (Ruby's sort is unstable there, but brew's own output for
+    // exact Jaro-Winkler ties follows the dictionary), so sort
+    // descending with a stable sort.
+    words.sort_by(|a, b| {
+        let da = jaro_winkler_distance(&a.chars().collect::<Vec<_>>(), &ninput);
+        let db = jaro_winkler_distance(&b.chars().collect::<Vec<_>>(), &ninput);
+        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mistype = (ninput.len() as f64 * 0.25).ceil() as usize;
+    let corrections: Vec<String> = words
+        .iter()
+        .filter(|w| levenshtein_distance(&normalize(w), &ninput) <= mistype)
+        .map(|w| (*w).clone())
+        .collect();
+    if !corrections.is_empty() {
+        return corrections;
+    }
+    words
+        .iter()
+        .filter(|w| {
+            let nw = normalize(w);
+            levenshtein_distance(&nw, &ninput) < ninput.len().min(nw.len())
+        })
+        .take(1)
+        .map(|w| (*w).clone())
+        .collect()
+}
+
+fn search_inspect(query: &str) -> String {
+    // Ruby String#inspect for the shapes a search term takes.
+    let mut out = String::from("\"");
+    for c in query.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Brew's pretty install status as visible text (the marks are
+/// terminal-only; abrew prints them without brew's ANSI colours,
+/// like every other abrew headline).
+fn pretty_search_name(
+    name: &str,
+    row: Option<&super::api::SearchRow>,
+    installed: bool,
+    tty: bool,
+) -> String {
+    if !tty {
+        return name.to_string();
+    }
+    let mut out = name.to_string();
+    if installed {
+        if super::install_badge().is_some() {
+            out.push_str(" ✔");
+        } else {
+            out.push_str(" (installed)");
+        }
+    }
+    if let Some(row) = row {
+        if row.disabled {
+            out.push_str(" (disabled)");
+        } else if row.deprecated {
+            out.push_str(" (deprecated)");
+        }
+    }
+    out
+}
+
+pub(super) fn cmd_search(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    use std::io::IsTerminal as _;
     let joined = operands(rest).join(" ");
     if joined.is_empty() {
         return usage("search needs a term");
     }
     let desc = has_flag(rest, "--desc", "");
-    let (query, display) = match search_regex_pattern(&joined) {
+    let formula_wanted = !has_flag(rest, "--cask", "") && !has_flag(rest, "--casks", "");
+    let cask_wanted = !has_flag(rest, "--formula", "") && !has_flag(rest, "--formulae", "");
+    enum Mode {
+        Text(String),
+        Regex(aterm_regex::Regex),
+    }
+    let mode = match search_regex_pattern(&joined) {
         Some(pattern) => match compile_search_regex(pattern) {
-            Ok(re) => (SearchQuery::Regex(re), joined.clone()),
-            Err(_) => return failed(&format!("abrew: {joined} is not a valid regex.")),
+            Ok(re) => Mode::Regex(re),
+            Err(_) => return failed(&format!("Error: {joined} is not a valid regex.")),
         },
-        None => {
-            let lowered = joined.to_ascii_lowercase();
-            let canonical = super::api::canonical_cask_token(&joined);
-            (SearchQuery::text(canonical), lowered)
-        }
+        None => Mode::Text(joined.clone()),
     };
-    let mut shown = 0usize;
-    for casks in [false, true] {
-        if has_flag(rest, "--cask", "") && !casks {
-            continue;
-        }
-        if has_flag(rest, "--formula", "") && casks {
-            continue;
-        }
-        match api.index(casks) {
-            Ok(rows) => {
-                for (name, d) in rows {
-                    match query.hits(&name, &d, desc) {
-                        Ok(true) => {
-                            if casks {
-                                println!("{name} (cask)");
-                            } else {
-                                println!("{name}");
-                            }
-                            shown += 1;
-                            if shown >= 200 {
-                                println!("… (first 200 matches)");
-                                return ExitCode::SUCCESS;
-                            }
-                        }
+    let budget = "abrew: native regex search ran out of its work budget; simplify the pattern";
+    let field_hits = |mode: &Mode, fields: &[&str]| -> Result<bool, ExitCode> {
+        match mode {
+            Mode::Text(q) => {
+                let q = simplify_search_text(q);
+                Ok(fields
+                    .iter()
+                    .any(|f| simplify_search_text(f).contains(q.as_str())))
+            }
+            Mode::Regex(re) => {
+                for f in fields {
+                    match re.try_is_match(f) {
+                        Ok(true) => return Ok(true),
                         Ok(false) => {}
-                        Err(_) => {
-                            return failed(
-                                "abrew: native regex search ran out of its work budget; simplify the pattern",
-                            );
-                        }
+                        Err(_) => return Err(failed(budget)),
                     }
                 }
+                Ok(false)
             }
+        }
+    };
+    let installed_f: std::collections::BTreeSet<String> = prefix
+        .installed(Kind::Formula)
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    let installed_c: std::collections::BTreeSet<String> = prefix
+        .installed(Kind::Cask)
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    let tty = std::io::stdout().is_terminal();
+    if desc {
+        let mut first_section = true;
+        for casks in [false, true] {
+            if (casks && !cask_wanted) || (!casks && !formula_wanted) {
+                continue;
+            }
+            if !first_section {
+                println!();
+            }
+            first_section = false;
+            println!("==> {}", if casks { "Casks" } else { "Formulae" });
+            let rows = match api.search_index(casks) {
+                Ok(rows) => rows,
+                Err(e) => return failed(&e),
+            };
+            let mut lines: Vec<(String, &super::api::SearchRow)> = Vec::new();
+            for row in &rows {
+                let hit = if casks {
+                    let mut fields: Vec<&str> =
+                        row.display_names.iter().map(String::as_str).collect();
+                    fields.push(row.desc.as_str());
+                    field_hits(&mode, &fields)
+                } else {
+                    field_hits(&mode, &[row.desc.as_str()])
+                };
+                match hit {
+                    Ok(true) => lines.push((row.name.clone(), row)),
+                    Ok(false) => {}
+                    Err(code) => return code,
+                }
+            }
+            lines.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, row) in lines {
+                let shown = pretty_search_name(
+                    &name,
+                    Some(row),
+                    installed_f.contains(&name) || installed_c.contains(&name),
+                    tty,
+                );
+                if casks {
+                    let desc_text = if row.desc.is_empty() {
+                        "[no description]".to_string()
+                    } else {
+                        row.desc.clone()
+                    };
+                    if row.display_names.is_empty() {
+                        println!("{shown}: {desc_text}");
+                    } else {
+                        println!("{shown}: ({}) {desc_text}", row.display_names.join(", "));
+                    }
+                } else if !row.desc.is_empty() {
+                    println!("{shown}: {}", row.desc);
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    // A tap-qualified name resolves exactly, in its own section only
+    // (string queries only — a /regex/ also splits into three parts).
+    let tap_parts: Vec<&str> = if matches!(mode, Mode::Text(_)) {
+        joined.split('/').collect()
+    } else {
+        Vec::new()
+    };
+    let mut formula_hits: Vec<String> = Vec::new();
+    let mut cask_hits: Vec<String> = Vec::new();
+    let mut formula_rows: Vec<super::api::SearchRow> = Vec::new();
+    let mut cask_rows: Vec<super::api::SearchRow> = Vec::new();
+    if formula_wanted {
+        match api.search_index(false) {
+            Ok(rows) => formula_rows = rows,
             Err(e) => return failed(&e),
         }
     }
-    if shown == 0 {
-        if desc {
-            println!("No formulae or casks matching \"{display}\".");
-        } else {
-            eprintln!("Error: No formulae or casks found for \"{display}\".");
-            return ExitCode::from(1);
+    if cask_wanted {
+        match api.search_index(true) {
+            Ok(rows) => cask_rows = rows,
+            Err(e) => return failed(&e),
         }
+    }
+    let by_name_f: std::collections::BTreeMap<&str, &super::api::SearchRow> =
+        formula_rows.iter().map(|r| (r.name.as_str(), r)).collect();
+    if tap_parts.len() == 3 {
+        let short = tap_parts[2];
+        let is_cask_tap = tap_parts[1] == "cask" || tap_parts[0] != "homebrew";
+        if !is_cask_tap && formula_wanted && by_name_f.contains_key(short) {
+            formula_hits.push(short.to_string());
+        } else if cask_wanted && cask_rows.iter().any(|r| r.name == short) {
+            cask_hits.push(short.to_string());
+        }
+    } else {
+        if formula_wanted {
+            // Candidates: canonical names then aliases, displayed as found.
+            let mut candidates: Vec<(String, &super::api::SearchRow, bool)> = Vec::new();
+            for row in &formula_rows {
+                candidates.push((row.name.clone(), row, false));
+            }
+            for row in &formula_rows {
+                for alias in &row.aliases {
+                    candidates.push((alias.clone(), row, true));
+                }
+            }
+            let mut results: Vec<(String, &super::api::SearchRow, bool)> = Vec::new();
+            for cand in &candidates {
+                match field_hits(&mode, &[cand.0.as_str()]) {
+                    Ok(true) => results.push(cand.clone()),
+                    Ok(false) => {}
+                    Err(code) => return code,
+                }
+            }
+            results.sort_by(|a, b| {
+                let (ab, av) = a.0.split_once('@').unwrap_or((a.0.as_str(), "0"));
+                let (bb, bv) = b.0.split_once('@').unwrap_or((b.0.as_str(), "0"));
+                ab.cmp(bb)
+                    .then_with(|| super::formula::version_cmp(av, bv))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            if let Mode::Text(q) = &mode {
+                // Brew's fuzzy dictionary is names + full names —
+                // canonical names only, never aliases.
+                let dictionary: Vec<String> = formula_rows.iter().map(|r| r.name.clone()).collect();
+                for correction in spell_correct(&dictionary, q) {
+                    if let Some(row) = by_name_f.get(correction.as_str())
+                        && !results.iter().any(|r| r.0 == row.name)
+                    {
+                        results.push((row.name.clone(), row, false));
+                    }
+                }
+            }
+            let found: std::collections::BTreeSet<String> =
+                results.iter().map(|r| r.0.clone()).collect();
+            for (name, row, is_alias) in results {
+                if is_alias && found.contains(row.name.as_str()) {
+                    continue;
+                }
+                // Brew's valid_platform? filter never fires for
+                // API-loaded formulae (the OS-requirement flags are
+                // only recorded while evaluating a formula class),
+                // so no platform filtering happens here.
+                let installed = installed_f.contains(&row.name);
+                formula_hits.push(pretty_search_name(&name, Some(row), installed, tty));
+            }
+        }
+        if cask_wanted {
+            let mut results: Vec<&super::api::SearchRow> = Vec::new();
+            for row in &cask_rows {
+                match field_hits(&mode, &[row.name.as_str()]) {
+                    Ok(true) => results.push(row),
+                    Ok(false) => {}
+                    Err(code) => return code,
+                }
+            }
+            if let Mode::Text(q) = &mode {
+                let dictionary: Vec<String> = cask_rows.iter().map(|r| r.name.clone()).collect();
+                for correction in spell_correct(&dictionary, q) {
+                    if let Some(row) = cask_rows.iter().find(|r| r.name == correction)
+                        && !results.iter().any(|r| r.name == row.name)
+                    {
+                        results.push(row);
+                    }
+                }
+            }
+            results.sort_by(|a, b| a.name.cmp(&b.name));
+            for row in results {
+                cask_hits.push(pretty_search_name(
+                    &row.name,
+                    Some(row),
+                    installed_c.contains(&row.name),
+                    tty,
+                ));
+            }
+        }
+    }
+    if !formula_hits.is_empty() {
+        if tty {
+            println!("==> Formulae");
+        }
+        print_columns(&formula_hits);
+    }
+    if !formula_hits.is_empty() && !cask_hits.is_empty() {
+        println!();
+    }
+    if !cask_hits.is_empty() {
+        if tty {
+            println!("==> Casks");
+        }
+        print_columns(&cask_hits);
+    }
+    if formula_hits.is_empty() && cask_hits.is_empty() {
+        eprintln!(
+            "Error: No formulae or casks found for {}.",
+            search_inspect(&joined)
+        );
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
@@ -778,8 +1132,15 @@ fn enrich_cask_json(prefix: &Prefix, value: &mut aterm_json::Value) {
     );
     map.insert("installed".to_string(), installed);
     map.insert("installed_time".to_string(), installed_time);
-    map.insert("pinned".to_string(), aterm_json::Value::Bool(false));
-    map.insert("pinned_version".to_string(), aterm_json::Value::Null);
+    let pinned_version = prefix.cask_pinned_version(&token);
+    map.insert(
+        "pinned".to_string(),
+        aterm_json::Value::Bool(pinned_version.is_some()),
+    );
+    map.insert(
+        "pinned_version".to_string(),
+        pinned_version.map_or(aterm_json::Value::Null, aterm_json::Value::String),
+    );
     map.insert("outdated".to_string(), aterm_json::Value::Bool(outdated));
 }
 
@@ -1468,12 +1829,15 @@ pub(super) fn cmd_desc(api: &Api, rest: &[String]) -> ExitCode {
     }
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
-    let mut lines = Vec::new();
+    // Brew collects named descriptions into a hash keyed by full
+    // name and prints it sorted (Descriptions#print), so operand
+    // order and duplicates collapse.
+    let mut lines: Vec<(String, String)> = Vec::new();
     for name in operands(rest) {
         let short = Formula::short_name(&name);
         if !want_cask {
             if let Ok(f) = api.formula(&name) {
-                lines.push(format!("{}: {}", f.name, f.desc));
+                lines.push((f.name.clone(), format!("{}: {}", f.name, f.desc)));
                 continue;
             }
             if want_formula {
@@ -1486,11 +1850,14 @@ pub(super) fn cmd_desc(api: &Api, rest: &[String]) -> ExitCode {
         }
         if !want_formula {
             if let Ok(c) = api.cask(short) {
-                lines.push(if c.name.is_empty() {
-                    format!("{}: {}", c.token, c.desc)
-                } else {
-                    format!("{}: ({}) {}", c.token, c.name, c.desc)
-                });
+                lines.push((
+                    c.token.clone(),
+                    if c.name.is_empty() {
+                        format!("{}: {}", c.token, c.desc)
+                    } else {
+                        format!("{}: ({}) {}", c.token, c.name, c.desc)
+                    },
+                ));
                 continue;
             }
             if want_cask {
@@ -1503,7 +1870,9 @@ pub(super) fn cmd_desc(api: &Api, rest: &[String]) -> ExitCode {
         }
         return failed(&no_such(api, &name, None));
     }
-    for line in lines {
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    lines.dedup_by(|a, b| a.0 == b.0);
+    for (_, line) in lines {
         println!("{line}");
     }
     ExitCode::SUCCESS
@@ -2282,6 +2651,85 @@ fn print_dry_sections(
     }
 }
 
+/// The terminal width for column layout: stdout's window size,
+/// else `$COLUMNS`, else 80 (brew's `Tty.width` sources).
+fn terminal_width() -> usize {
+    #[cfg(unix)]
+    {
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCGWINSZ` writes one `winsize` into the struct
+        // handed to it and reads nothing else; fd 1 is our stdout.
+        let rc = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col > 0 {
+            return usize::from(ws.ws_col);
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(80)
+}
+
+/// Brew's `Formatter.columns`: layout names in columns fitting
+/// `width`, filled column-first; a non-terminal (or a single
+/// column's width) falls back to one per line, which is all a
+/// pipe ever sees.
+fn format_columns(objects: &[String], width: usize, tty: bool) -> String {
+    let lines = || objects.join("\n");
+    if objects.is_empty() || !tty {
+        return lines();
+    }
+    let gap = 2usize;
+    let max_len = objects.iter().map(|o| o.chars().count()).max().unwrap_or(0);
+    let mut cols = (width + gap) / (max_len + gap);
+    if cols < 2 {
+        return lines();
+    }
+    let rows = objects.len().div_ceil(cols);
+    cols = objects.len().div_ceil(rows);
+    let col_width = (width + gap) / cols - gap;
+    let mut out = String::new();
+    for row in 0..rows {
+        let mut cells: Vec<String> = Vec::new();
+        let mut idx = row;
+        while idx < objects.len() {
+            cells.push(objects[idx].clone());
+            idx += rows;
+        }
+        let last = cells.pop().unwrap_or_default();
+        for cell in &cells {
+            out.push_str(cell);
+            for _ in cell.chars().count()..col_width {
+                out.push(' ');
+            }
+            out.push_str("  ");
+        }
+        out.push_str(&last);
+        if row + 1 < rows {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Prints names through [`format_columns`] against the real stdout.
+fn print_columns(objects: &[String]) {
+    use std::io::IsTerminal as _;
+    if objects.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        format_columns(objects, terminal_width(), std::io::stdout().is_terminal())
+    );
+}
+
 /// Brew's `Utils::Text.to_sentence`: "a", "a and b", "a, b, and c".
 pub(super) fn to_sentence(items: &[String]) -> String {
     match items {
@@ -2361,11 +2809,24 @@ pub(super) fn cmd_uninstall(
             failures += 1;
             continue;
         }
-        let r = if has_flag(rest, "--cask", "")
+        let as_cask = has_flag(rest, "--cask", "")
             || (!has_flag(rest, "--formula", "")
                 && prefix.installed_one(Kind::Formula, short).is_none()
-                && prefix.installed_one(Kind::Cask, cask_short).is_some())
+                && prefix.installed_one(Kind::Cask, cask_short).is_some());
+        if as_cask
+            && !force
+            && !dry
+            && prefix.cask_is_pinned(cask_short)
+            && let Some(inst) = prefix.installed_one(Kind::Cask, cask_short)
         {
+            eprintln!(
+                "Error: {} is pinned. You must unpin it to uninstall.",
+                prefix.specified_name(&inst)
+            );
+            failures += 1;
+            continue;
+        }
+        let r = if as_cask {
             if force
                 && has_flag(rest, "--cask", "")
                 && prefix.installed_one(Kind::Cask, cask_short).is_none()
@@ -2519,6 +2980,27 @@ pub(super) fn cmd_reinstall(
         } else {
             api.formula(name).is_err() && api.cask(cask_short).is_ok()
         };
+        // Brew refuses to reinstall a pinned package (both kinds).
+        let pinned_inst = if as_cask {
+            prefix
+                .cask_is_pinned(cask_short)
+                .then(|| prefix.installed_one(Kind::Cask, cask_short))
+                .flatten()
+        } else {
+            prefix
+                .pinned_version(short)
+                .is_some()
+                .then(|| prefix.installed_one(Kind::Formula, short))
+                .flatten()
+        };
+        if let Some(inst) = pinned_inst {
+            eprintln!(
+                "Error: {} is pinned. You must unpin it to reinstall.",
+                prefix.specified_name(&inst)
+            );
+            failures += 1;
+            continue;
+        }
         let r: Result<(), install::InstallError> = if as_cask {
             match api.cask(cask_short) {
                 Ok(c) => cask::install_with_deps(api, prefix, &c, opts.dry_run, true, false, true)
@@ -2598,7 +3080,11 @@ fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> a
                 .collect()
         })
         .unwrap_or_default();
-    let pinned = kind == Kind::Formula && prefix.is_pinned(name);
+    let pinned_version = match kind {
+        Kind::Formula => prefix.pinned_version(name),
+        Kind::Cask => prefix.cask_pinned_version(name),
+    };
+    let pinned = pinned_version.is_some();
     let mut map = aterm_json::Map::new();
     map.insert(
         "name".to_string(),
@@ -2615,14 +3101,9 @@ fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> a
     map.insert("pinned".to_string(), aterm_json::Value::Bool(pinned));
     map.insert(
         "pinned_version".to_string(),
-        if pinned {
-            prefix
-                .pinned_version(name)
-                .map(aterm_json::Value::String)
-                .unwrap_or(aterm_json::Value::Null)
-        } else {
-            aterm_json::Value::Null
-        },
+        pinned_version
+            .map(aterm_json::Value::String)
+            .unwrap_or(aterm_json::Value::Null),
     );
     aterm_json::Value::Object(map)
 }
@@ -2729,7 +3210,12 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
                 } else {
                     versions
                 };
-                let pin = match prefix.pinned_version(name) {
+                let pinned_at = if casks {
+                    prefix.cask_pinned_version(name)
+                } else {
+                    prefix.pinned_version(name)
+                };
+                let pin = match pinned_at {
                     Some(p) => format!(" [pinned at {p}]"),
                     _ => String::new(),
                 };
@@ -3097,50 +3583,124 @@ fn cmd_upgrade_casks(
     prior_native_progress: bool,
 ) -> ExitCode {
     let mut failures = 0;
-    let rows: Vec<(String, String, String)> = if !names.is_empty() {
-        let mut rows = Vec::new();
+    let greedy = has_flag(rest, "--greedy", "");
+    // Resolve every candidate up front, partition like brew's
+    // outdated_casks: unknown-name errors, current-version and
+    // :latest notices (named only), then pinned, then the summary.
+    let mut upgradable: Vec<(super::formula::Cask, String)> = Vec::new();
+    let mut pinned_rows: Vec<(String, String, String, Option<String>)> = Vec::new();
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if !names.is_empty() {
         for name in &names {
             let short = Formula::short_name(name);
             let cask_short = super::api::canonical_cask_token(short);
             let Some(inst) = prefix.installed_one(Kind::Cask, cask_short) else {
-                eprintln!("abrew: cask {short} is not installed (upgrade does not install)");
+                eprintln!("Error: Cask '{cask_short}' is not installed.");
                 failures += 1;
                 continue;
             };
-            rows.push((cask_short.to_string(), inst.version, String::new()));
+            candidates.push((cask_short.to_string(), inst.version));
         }
-        rows
     } else {
-        match outdated_rows(prefix, api, true, has_flag(rest, "--greedy", "")) {
-            Ok(rows) => rows,
+        match outdated_rows(prefix, api, true, greedy) {
+            Ok(rows) => candidates = rows.into_iter().map(|(n, have, _)| (n, have)).collect(),
             Err(error) => return failed(&error),
         }
-    };
-    if rows.is_empty() {
+    }
+    for (token, have) in candidates {
+        let c = match api.cask(&token) {
+            Ok(c) => c,
+            Err(error) => return from_install(prefix, args, Err(error.into())),
+        };
+        if super::formula::version_cmp(&have, &c.version) != std::cmp::Ordering::Less {
+            if !names.is_empty() && !opts.quiet {
+                if have == "latest" {
+                    eprintln!(
+                        "Warning: Not upgrading {token}, the downloaded artifact has not changed"
+                    );
+                } else {
+                    eprintln!(
+                        "Warning: Not upgrading {token}, the latest version is already installed"
+                    );
+                }
+            }
+            continue;
+        }
+        if prefix.cask_is_pinned(&token) {
+            pinned_rows.push((token, have, c.version.clone(), None));
+            continue;
+        }
+        upgradable.push((c, have));
+    }
+    if !pinned_rows.is_empty() {
+        let count = pinned_rows.len();
+        if !names.is_empty() {
+            eprintln!(
+                "Error: Not upgrading {count} pinned {}:",
+                if count == 1 { "package" } else { "packages" }
+            );
+            failures += 1;
+        } else if !opts.quiet {
+            eprintln!(
+                "Warning: Not upgrading {count} pinned {}:",
+                if count == 1 { "package" } else { "packages" }
+            );
+        }
+        if !opts.quiet {
+            for line in version_change_lines(&pinned_rows) {
+                eprintln!("{line}");
+            }
+        }
+    }
+    if upgradable.is_empty() {
+        if failures == 0 {
+            return ExitCode::SUCCESS;
+        }
+        return ExitCode::FAILURE;
+    }
+    if names.is_empty() && !greedy && !super::no_env_hints() {
+        println!(
+            "Some casks with `auto_updates true` or `version :latest` may still require `--greedy`,"
+        );
+        println!("`HOMEBREW_UPGRADE_GREEDY` or `HOMEBREW_UPGRADE_GREEDY_CASKS` to be upgraded.");
+        println!("Hide these hints with `HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).");
+    }
+    if !opts.quiet {
+        let verb = if opts.dry_run {
+            "Would upgrade"
+        } else {
+            "Upgrading"
+        };
+        println!(
+            "==> {verb} {} outdated {}:",
+            upgradable.len(),
+            if upgradable.len() == 1 {
+                "package"
+            } else {
+                "packages"
+            }
+        );
+        let table: Vec<(String, String, String, Option<String>)> = upgradable
+            .iter()
+            .map(|(c, have)| (c.token.clone(), have.clone(), c.version.clone(), None))
+            .collect();
+        for line in version_change_lines(&table) {
+            println!("{line}");
+        }
+    }
+    if opts.dry_run {
         if failures == 0 {
             return ExitCode::SUCCESS;
         }
         return ExitCode::FAILURE;
     }
     let mut completed = prior_native_progress;
-    for (token, have, _latest) in rows {
-        let c = match api.cask(&token) {
-            Ok(c) => c,
-            Err(error) => return from_install(prefix, args, Err(error.into())),
-        };
-        if names.is_empty() && c.auto_updates && !has_flag(rest, "--greedy", "") {
-            eprintln!("==> {token} ({have}) auto-updates; skipping");
-            continue;
+    for (c, have) in upgradable {
+        let token = c.token.clone();
+        if !opts.quiet {
+            println!("==> Upgrading {token}");
+            println!("  {have} -> {}", c.version);
         }
-        if super::formula::version_cmp(&have, &c.version) != std::cmp::Ordering::Less {
-            if !names.is_empty() {
-                eprintln!(
-                    "Warning: Not upgrading {token}, the latest version is already installed"
-                );
-            }
-            continue;
-        }
-        println!("==> Upgrading cask {token} {have} -> {}", c.version);
         let result =
             cask::install_with_deps(api, prefix, &c, opts.dry_run, opts.force, true, false);
         completed |= super::native_attempt_may_have_progress(&result);
@@ -3624,7 +4184,10 @@ pub(super) fn cmd_unpin(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode
             failures += 1;
             continue;
         }
-        let pinned = prefix.pinned_version(short).is_some() || prefix.pin_link_dangling_ours(short);
+        let token = super::api::canonical_cask_token(short);
+        let pinned = prefix.pinned_version(short).is_some()
+            || prefix.pin_link_dangling_ours(short)
+            || prefix.cask_pin_link_present(token);
         let installed = prefix.installed_one(Kind::Formula, short).is_some()
             || prefix
                 .installed_one(Kind::Cask, super::api::canonical_cask_token(short))
@@ -3633,7 +4196,15 @@ pub(super) fn cmd_unpin(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode
             !pinned && !installed && package_definitively_unknown(prefix, api, short, true, true);
         match unpin_outcome(pinned, installed, unknown) {
             UnpinOutcome::Remove => {
-                if let Err(error) = prefix.unpin(short) {
+                let removed = if prefix.cask_pin_link_present(token)
+                    && prefix.pinned_version(short).is_none()
+                    && !prefix.pin_link_dangling_ours(short)
+                {
+                    prefix.unpin_cask(token)
+                } else {
+                    prefix.unpin(short)
+                };
+                if let Err(error) = removed {
                     eprintln!("{error}");
                     failures += 1;
                 }
@@ -4325,8 +4896,18 @@ pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
         let kind = if casks { Kind::Cask } else { Kind::Formula };
         #[cfg(unix)]
         let mut lister = long.then(LongLister::new);
+        // Plain name listings go through brew's column layout on a
+        // terminal (lines when piped or with -1).
+        let plain_names = !versions && !long && !has_flag(rest, "-1", "");
+        let mut names: Vec<String> = Vec::new();
         for i in prefix.installed(kind) {
-            if has_flag(rest, "--pinned", "") && (casks || !prefix.is_pinned(&i.name)) {
+            if has_flag(rest, "--pinned", "")
+                && !(if casks {
+                    prefix.cask_is_pinned(&i.name)
+                } else {
+                    prefix.is_pinned(&i.name)
+                })
+            {
                 continue;
             }
             #[cfg(unix)]
@@ -4345,9 +4926,14 @@ pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
             };
             if versions {
                 println!("{} {}", shown, i.versions.join(" "));
+            } else if plain_names {
+                names.push(shown);
             } else {
                 println!("{shown}");
             }
+        }
+        if plain_names {
+            print_columns(&names);
         }
     }
     ExitCode::SUCCESS
@@ -4950,9 +5536,7 @@ pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         .collect();
     hits.sort();
     hits.dedup();
-    for hit in &hits {
-        println!("{hit}");
-    }
+    print_columns(&hits);
     if unknown && !hits.is_empty() {
         eprintln!("Error: Missing formulae should not have dependents!");
         return ExitCode::FAILURE;
@@ -4961,31 +5545,74 @@ pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
 }
 
 pub(super) fn cmd_leaves(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
-    let on_request_only = has_flag(rest, "--installed-on-request", "");
-    let as_dependency_only = has_flag(rest, "--installed-as-dependency", "");
+    let on_request_only = has_flag(rest, "--installed-on-request", "-r");
+    let as_dependency_only = has_flag(rest, "--installed-as-dependency", "-p");
     let installed = prefix.installed(Kind::Formula);
+    // Brew unions every installed keg's tab runtime_dependencies
+    // (the install-time closure) with installed casks' direct
+    // formula deps; abrew receipts record no tab closure, so the
+    // declared closure over the current graph stands in.
     let mut needed: std::collections::BTreeSet<String> = Default::default();
+    let mut formulae: Vec<(super::prefix::Installed, Formula)> = Vec::new();
     for i in &installed {
         let f = match api.formula(&i.name) {
             Ok(f) => f,
             Err(error) => return failed(&error),
         };
-        for d in f.dependencies {
-            needed.insert(Formula::short_name(&d).to_string());
+        let mut queue: Vec<String> = f
+            .dependencies
+            .iter()
+            .map(|d| Formula::short_name(d).to_string())
+            .collect();
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        while let Some(cur) = queue.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            needed.insert(cur.clone());
+            if let Ok(dep) = api.formula(&cur) {
+                queue.extend(
+                    dep.dependencies
+                        .iter()
+                        .map(|d| Formula::short_name(d).to_string()),
+                );
+            }
+        }
+        formulae.push((i.clone(), f));
+    }
+    for token in prefix.installed(Kind::Cask) {
+        match api.cask(&token.name) {
+            Ok(c) => {
+                for d in &c.depends_formula {
+                    needed.insert(Formula::short_name(d).to_string());
+                }
+            }
+            Err(error) => return failed(&error),
         }
     }
-    for i in &installed {
-        if needed.contains(&i.name) {
+    let mut leaves: Vec<String> = Vec::new();
+    for (i, f) in &formulae {
+        // Brew rejects a leaf when any of its possible names (name,
+        // aliases, old names) is depended upon.
+        let depended = std::iter::once(f.name.as_str())
+            .chain(f.aliases.iter().map(String::as_str))
+            .chain(f.oldnames.iter().map(String::as_str))
+            .any(|n| needed.contains(Formula::short_name(n)));
+        if depended {
             continue;
         }
-        if on_request_only && !super::prefix::receipt_on_request(&prefix.keg(&i.name, &i.version)) {
+        let on_request = super::prefix::receipt_on_request(&prefix.keg(&i.name, &i.version));
+        if on_request_only && !on_request {
             continue;
         }
-        if as_dependency_only && super::prefix::receipt_on_request(&prefix.keg(&i.name, &i.version))
-        {
+        if as_dependency_only && on_request {
             continue;
         }
-        println!("{}", i.name);
+        leaves.push(prefix.specified_name(i));
+    }
+    leaves.sort();
+    for leaf in leaves {
+        println!("{leaf}");
     }
     ExitCode::SUCCESS
 }
@@ -6111,15 +6738,15 @@ mod tests {
         assert_eq!(search_regex_pattern("/a\nb/"), None);
 
         let query = |p: &str| SearchQuery::Regex(compile_search_regex(p).unwrap());
-        assert!(query("wget").hits("wget2", "", false).unwrap());
-        assert!(!query("WGET").hits("wget", "", false).unwrap());
-        assert!(query("(?i)WGET").hits("wget", "", false).unwrap());
-        assert!(query("get").hits("wget", "", false).unwrap());
-        assert!(!query("^get").hits("wget", "", false).unwrap());
-        assert!(query("^lib.*@\\d$").hits("libfoo@3", "", false).unwrap());
-        assert!(query("").hits("anything", "", false).unwrap());
-        assert!(!query("HTTP").hits("wget", "HTTP client", false).unwrap());
-        assert!(query("HTTP").hits("wget", "HTTP client", true).unwrap());
+        assert!(query("wget").hits_any(&["wget2"]).unwrap());
+        assert!(!query("WGET").hits_any(&["wget"]).unwrap());
+        assert!(query("(?i)WGET").hits_any(&["wget"]).unwrap());
+        assert!(query("get").hits_any(&["wget"]).unwrap());
+        assert!(!query("^get").hits_any(&["wget"]).unwrap());
+        assert!(query("^lib.*@\\d$").hits_any(&["libfoo@3"]).unwrap());
+        assert!(query("").hits_any(&["anything"]).unwrap());
+        assert!(!query("HTTP").hits_any(&["wget"]).unwrap());
+        assert!(query("HTTP").hits_any(&["wget", "HTTP client"]).unwrap());
 
         for refused in [r"(?=http)client", r"(\w)\1", r"\p{L}+", "(a{200}){200}"] {
             assert!(compile_search_regex(refused).is_err(), "{refused}");
@@ -6130,13 +6757,9 @@ mod tests {
     fn text_search_simplifies_like_brew_and_desc_fields_select() {
         assert_eq!(simplify_search_text("Node.js C++ @3"), "nodejsc++@3");
         let q = SearchQuery::text("node js");
-        assert!(q.hits("node", "Platform built on Node.js", true).unwrap());
-        assert!(
-            SearchQuery::text("alt-tab")
-                .hits("alt-tab", "", false)
-                .unwrap()
-        );
-        assert!(!q.hits("deno", "A runtime", true).unwrap());
+        assert!(q.hits_any(&["node", "Platform built on Node.js"]).unwrap());
+        assert!(SearchQuery::text("alt-tab").hits_any(&["alt-tab"]).unwrap());
+        assert!(!q.hits_any(&["deno", "A runtime"]).unwrap());
 
         let by = |s: &str| SearchQuery::text(s);
         assert!(desc_matches(&by("wget"), DescField::Name, false, "wget", "", "HTTP").unwrap());
@@ -6887,6 +7510,50 @@ mod tests {
             (Some("2.5".to_string()), Some("409".to_string()))
         );
         assert_eq!(cask_bundle_versions(tmp.path()), (None, None));
+    }
+
+    #[test]
+    fn search_regex_anchors_match_brew() {
+        let re = compile_search_regex("^py").unwrap();
+        assert!(re.try_is_match("py-spy").unwrap());
+        assert!(!re.try_is_match("airspy").unwrap());
+        assert!(
+            compile_search_regex("wget")
+                .unwrap()
+                .try_is_match("wget2")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn spell_correct_matches_did_you_mean() {
+        let dict: Vec<String> = ["zsxd", "zstd", "firefox", "firefly", "hello"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // The oracle's own outcomes: `brew search zstd` also finds
+        // zsxd, and `brew search firefx` finds firefox (exact input
+        // is never its own correction).
+        assert_eq!(spell_correct(&dict, "zstd"), ["zsxd"]);
+        assert_eq!(spell_correct(&dict, "firefx"), ["firefox", "firefly"]);
+        assert!(spell_correct(&dict, "zzzzzz").is_empty());
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        assert_eq!(levenshtein_distance(&chars("kitten"), &chars("sitting")), 3);
+        assert!(jaro_winkler_distance(&chars("zsxd"), &chars("zstd")) >= 0.834);
+    }
+
+    #[test]
+    fn format_columns_matches_brews_layout() {
+        let names: Vec<String> = ["a", "bb", "ccc", "dd", "e"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // Oracle: brew's Formatter.columns at width 12 (pty-captured).
+        assert_eq!(format_columns(&names, 12, true), "a      dd\nbb     e\nccc");
+        // Piped output is always one per line, at any width.
+        assert_eq!(format_columns(&names, 80, false), "a\nbb\nccc\ndd\ne");
+        // Too narrow for two columns falls back to lines.
+        assert_eq!(format_columns(&names, 4, true), "a\nbb\nccc\ndd\ne");
     }
 
     #[test]

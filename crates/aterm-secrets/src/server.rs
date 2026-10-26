@@ -37,8 +37,9 @@ pub struct Options {
     pub keep_awake: bool,
 }
 
-/// Default hold duration for a long-poll.
-pub const DEFAULT_HOLD: Duration = Duration::from_secs(50);
+/// Default hold duration for a long-poll: a held request that a sleeping Mac lost is asked
+/// again within about this long of its waking ([`crate::client`]'s long-poll waits as long).
+pub const DEFAULT_HOLD: Duration = Duration::from_secs(25);
 /// The most connections served at once.
 pub const MAX_CONNECTIONS: usize = 1024;
 /// The most connections served at once from one address ([`MAX_CONNECTIONS`]).
@@ -254,6 +255,12 @@ impl Running {
     pub(crate) fn envelope_gets(&self) -> usize {
         self.shared.envelope_gets.load(Ordering::SeqCst)
     }
+
+    /// How many GETs of a vault's join queue it has answered.
+    #[cfg(test)]
+    pub(crate) fn join_gets(&self) -> usize {
+        self.shared.join_gets.load(Ordering::SeqCst)
+    }
 }
 
 /// The address that reaches a listener bound to `addr` from this machine.
@@ -406,6 +413,8 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         served: AtomicUsize::new(0),
         #[cfg(test)]
         envelope_gets: AtomicUsize::new(0),
+        #[cfg(test)]
+        join_gets: AtomicUsize::new(0),
     });
     let (refusals, refused) = sync_channel::<TcpStream>(REFUSALS_QUEUED);
     std::thread::Builder::new()
@@ -457,6 +466,38 @@ struct Slot {
     /// Verdicts kept on this vault's join requests since the start: each one ends the
     /// long-polls held then, so a refused Mac waiting on one reads it at once.
     verdicts: u64,
+    /// The version of this vault's join queue, moved by each change to it (a request queued,
+    /// changed or expired): the queue's `ETag`, and each move ends the join long-polls held then
+    /// ([`list_joins`]). It starts at [`queue_epoch`], so a version an approver heard from an
+    /// earlier run of this server names no version of this run's queue.
+    joins: u64,
+}
+
+impl Slot {
+    fn new(held: Held) -> Slot {
+        Slot {
+            held,
+            wake: Arc::new(Condvar::new()),
+            verdicts: 0,
+            joins: queue_epoch(),
+        }
+    }
+}
+
+/// Where a join queue's version starts in this run of the server: random (else the clock's
+/// nanoseconds), below 2^62 so its moves never wrap. A server put back with a fresh count would
+/// otherwise reach a version an approver holds from before it, and hold that approver's
+/// long-poll while a request it never heard waits in the queue.
+fn queue_epoch() -> u64 {
+    let mut bytes = [0u8; 8];
+    let random = aterm_uds::rand::fill(&mut bytes)
+        .map(|()| u64::from_le_bytes(bytes))
+        .unwrap_or_else(|_| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos() as u64)
+        });
+    random >> 2
 }
 
 /// A queued join request and the address it came from (`None`: no `peer` line in the store).
@@ -505,6 +546,9 @@ struct Shared {
     /// GETs of a vault's envelope (`/v1/<name>`, long-polls among them) since the start.
     #[cfg(test)]
     envelope_gets: AtomicUsize,
+    /// GETs of a vault's join queue (`/v1/<name>/join`, long-polls among them) since the start.
+    #[cfg(test)]
+    join_gets: AtomicUsize,
 }
 
 impl Shared {
@@ -590,14 +634,7 @@ fn load(store: &Path, now: u64) -> crate::Result<State> {
             }
             match load_vault(&path, name) {
                 Ok(held) => {
-                    state.vaults.insert(
-                        name.to_owned(),
-                        Slot {
-                            held,
-                            wake: Arc::new(Condvar::new()),
-                            verdicts: 0,
-                        },
-                    );
+                    state.vaults.insert(name.to_owned(), Slot::new(held));
                 }
                 Err(e) => note(&format!("{file}: skipped: {e}")),
             }
@@ -635,6 +672,24 @@ fn load_vault(path: &Path, name: &str) -> crate::Result<Held> {
         signer: envelope.signer,
         handoff: envelope.handoff,
         bytes: Arc::new(bytes),
+    })
+}
+
+/// The ALab vault's name in a store ([`crate::ALAB_DEFAULT_URL`]'s last segment).
+pub(crate) const ALAB_VAULT: &str = "alab";
+
+/// Whether `store` holds the ALab vault: an `alab.vault` that verifies, signed by a key this
+/// build names for it or one reached from such a key by verified handoffs
+/// ([`envelope::Retired::names`], as [`crate::client::alab_vault`] judges a member's pin).
+pub(crate) fn holds_alab(store: &Path) -> bool {
+    let Ok(Some(bytes)) = fsx::read_owned(&store.join(format!("{ALAB_VAULT}.vault")), MAX_ENVELOPE)
+    else {
+        return false;
+    };
+    envelope::parse(&bytes).is_ok_and(|envelope| {
+        envelope.name == ALAB_VAULT
+            && envelope.verify_signature().is_ok()
+            && envelope::Retired::compiled().names(&envelope.signer, &envelope.reached_from())
     })
 }
 
@@ -1279,8 +1334,8 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
     if method == "GET" && (request.length.unwrap_or(0) > 0 || !request.early.is_empty()) {
         return Reply::text(400, "a GET carries no body");
     }
-    let vault_get = matches!((&route, method), (Route::Vault(_), "GET"));
-    if request.query.is_some() && !vault_get {
+    let waits = matches!((&route, method), (Route::Vault(_) | Route::Join(_), "GET"));
+    if request.query.is_some() && !waits {
         return Reply::text(400, "this path takes no query");
     }
     match (route, method) {
@@ -1309,7 +1364,11 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
                 Err(reply) => reply,
             }
         }
-        (Route::Join(name), "GET") => list_joins(shared, name),
+        (Route::Join(name), "GET") => {
+            #[cfg(test)]
+            shared.join_gets.fetch_add(1, Ordering::SeqCst);
+            list_joins(shared, stream, name, request.query.as_deref())
+        }
         (Route::Join(name), _) => match body_length(&request, MAX_JOIN_BODY)
             .and_then(|length| read_body(stream, request, length, &shared.tuning))
         {
@@ -1433,46 +1492,42 @@ fn envelope_reply(held: &Held) -> Reply {
     }
 }
 
-fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str>) -> Reply {
-    let after = match query {
-        None => None,
-        Some(query) => match query.strip_prefix("after=") {
-            Some(digits)
-                if !digits.is_empty()
-                    && digits.len() <= 20
-                    && digits.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                match digits.parse::<u64>() {
-                    Ok(after) => Some(after),
-                    Err(_) => return Reply::text(400, "after= is not a seq"),
-                }
-            }
-            _ => return Reply::text(400, "the only query is after=<seq>"),
-        },
+/// The `n` of a long-poll's query, `after=<n>` (`None`: no query).
+fn after_query(query: Option<&str>) -> Result<Option<u64>, Reply> {
+    let Some(query) = query else {
+        return Ok(None);
     };
-    let mut state = shared.lock_server_state();
-    take_from_store(shared, &mut state, name);
-    let Some(slot) = state.vaults.get(name) else {
-        return Reply::text(404, format!("no vault named {name} here"));
-    };
-    let Some(after) = after else {
-        return envelope_reply(&slot.held);
-    };
-    if slot.held.seq > after {
-        return envelope_reply(&slot.held);
+    match query.strip_prefix("after=") {
+        Some(digits)
+            if !digits.is_empty()
+                && digits.len() <= 20
+                && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            digits
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| Reply::text(400, "after= is not a number"))
+        }
+        _ => Err(Reply::text(400, "the only query is after=<n>")),
     }
-    let wake = Arc::clone(&slot.wake);
-    let verdicts = slot.verdicts;
+}
+
+/// Hold a long-poll on `wake` until `done` says so, the server stops, [`Shared::hold`] runs
+/// out or the client goes away ([`gone`]), and return the state then. `done` is asked first,
+/// and again after each wake, under `server_state`.
+fn park_until_news<'s>(
+    shared: &'s Shared,
+    stream: &TcpStream,
+    mut state: MutexGuard<'s, State>,
+    wake: &Condvar,
+    mut done: impl FnMut(&mut State) -> bool,
+) -> MutexGuard<'s, State> {
     let deadline = Instant::now().checked_add(shared.hold);
     let every = shared.tuning.liveness_every;
     #[cfg(test)]
     shared.waiting.fetch_add(1, Ordering::SeqCst);
     loop {
-        take_from_store(shared, &mut state, name);
-        let (newer, verdict) = state.vaults.get(name).map_or((false, false), |slot| {
-            (slot.held.seq > after, slot.verdicts != verdicts)
-        });
-        if newer || verdict || shared.stopping.load(Ordering::SeqCst) {
+        if done(&mut state) || shared.stopping.load(Ordering::SeqCst) {
             break;
         }
         let slice = match deadline {
@@ -1495,6 +1550,34 @@ fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str
     }
     #[cfg(test)]
     shared.waiting.fetch_sub(1, Ordering::SeqCst);
+    state
+}
+
+fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str>) -> Reply {
+    let after = match after_query(query) {
+        Ok(after) => after,
+        Err(reply) => return reply,
+    };
+    let mut state = shared.lock_server_state();
+    take_from_store(shared, &mut state, name);
+    let Some(slot) = state.vaults.get(name) else {
+        return Reply::text(404, format!("no vault named {name} here"));
+    };
+    let Some(after) = after else {
+        return envelope_reply(&slot.held);
+    };
+    if slot.held.seq > after {
+        return envelope_reply(&slot.held);
+    }
+    let wake = Arc::clone(&slot.wake);
+    let verdicts = slot.verdicts;
+    let state = park_until_news(shared, stream, state, &wake, |state| {
+        take_from_store(shared, state, name);
+        state
+            .vaults
+            .get(name)
+            .is_some_and(|slot| slot.held.seq > after || slot.verdicts != verdicts)
+    });
     match state.vaults.get(name) {
         Some(slot) if slot.held.seq > after => envelope_reply(&slot.held),
         Some(slot) => {
@@ -1606,15 +1689,13 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
         bytes: Arc::new(body.to_vec()),
     };
     let first = !state.vaults.contains_key(name);
-    let slot = state.vaults.entry(name.to_owned()).or_insert_with(|| Slot {
-        held: Held {
+    let slot = state.vaults.entry(name.to_owned()).or_insert_with(|| {
+        Slot::new(Held {
             seq: 0,
             signer: envelope.signer,
             handoff: Vec::new(),
             bytes: Arc::new(Vec::new()),
-        },
-        wake: Arc::new(Condvar::new()),
-        verdicts: 0,
+        })
     });
     slot.held = held;
     slot.wake.notify_all();
@@ -1770,6 +1851,10 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
     let mut state = shared.lock_server_state();
     let queue = keep_verdicts(queue, state.joins.get(name).map(Vec::as_slice));
     state.joins.insert(name.to_owned(), queue);
+    if let Some(slot) = state.vaults.get_mut(name) {
+        slot.joins += 1;
+        slot.wake.notify_all();
+    }
     drop(state);
     if let Some(line) = noted {
         note(&format!("{name}: {line}"));
@@ -1921,18 +2006,56 @@ fn make_room(
     }
 }
 
-fn list_joins(shared: &Shared, name: &str) -> Reply {
-    let now = (shared.tuning.now)();
+/// `GET /v1/<name>/join[?after=<n>]`: the queued requests, one line each, with the queue's
+/// [`Slot::joins`] as the `ETag`. With `after=<n>` while the queue is still at `n`, held until
+/// a request is queued or changed or the vault takes a new version (`200`, the lines), or the
+/// hold runs out (`204`): an admin Mac's approver hears a new request at once, with one
+/// request per hold while none comes.
+fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str>) -> Reply {
+    let after = match after_query(query) {
+        Ok(after) => after,
+        Err(reply) => return reply,
+    };
     let mut state = shared.lock_server_state();
-    if !state.vaults.contains_key(name) {
+    let now = (shared.tuning.now)();
+    let State { vaults, joins } = &mut *state;
+    let Some(slot) = vaults.get_mut(name) else {
         return Reply::text(404, format!("no vault named {name} here"));
+    };
+    // A request that expired since the last listing moves the queue, so an approver that holds
+    // that listing reads it again rather than judging a request the queue dropped.
+    if let Some(queue) = joins.get_mut(name) {
+        let held = queue.len();
+        expire(queue, now);
+        if queue.len() != held {
+            slot.joins += 1;
+            slot.wake.notify_all();
+        }
     }
+    if let Some(after) = after.filter(|after| *after == slot.joins) {
+        let (wake, seq) = (Arc::clone(&slot.wake), slot.held.seq);
+        state = park_until_news(shared, stream, state, &wake, |state| {
+            state
+                .vaults
+                .get(name)
+                .is_none_or(|slot| slot.joins != after || slot.held.seq != seq)
+        });
+        if let Some(slot) = state
+            .vaults
+            .get(name)
+            .filter(|slot| slot.joins == after && slot.held.seq == seq)
+        {
+            let mut reply = Reply::empty(204);
+            reply.etag = Some(slot.joins);
+            return reply;
+        }
+    }
+    let generation = state.vaults.get(name).map(|slot| slot.joins);
     let queue = state.joins.entry(name.to_owned()).or_default();
-    expire(queue, now);
     Reply {
         status: 200,
         body: Body::Text(join_lines(queue)),
-        etag: None,
+        etag: generation,
         allow: None,
         retry_after: None,
     }
@@ -2067,6 +2190,9 @@ struct ChildSet {
     /// The last start of [`CAFFEINATE`] failed, so the log said so ([`tend_awake`]).
     awake_failed: bool,
     dns_sd: Option<(aterm_uds::spawnfd::Child, Ipv4Addr)>,
+    /// The registration ended by itself (`dns-sd -P` gives up a name another device on the
+    /// network answers to), so the log said so, until one stays up ([`reregister`]).
+    dns_sd_lost: bool,
 }
 
 fn quiet(program: &str, args: &[String]) -> io::Result<aterm_uds::spawnfd::Child> {
@@ -2120,7 +2246,9 @@ impl Children {
                             tend_awake(&mut set, &|| quiet(CAFFEINATE, &caffeinate_args(pid)));
                         }
                         if let Some((name, port)) = &advertise {
-                            reregister(&mut set, name, *port, lan_ipv4());
+                            reregister(&mut set, name, lan_ipv4(), &|ip| {
+                                quiet(DNS_SD, &dns_sd_args(name, *port, ip))
+                            });
                         }
                     }
                     std::thread::sleep(ADVERTISE_EVERY);
@@ -2165,24 +2293,52 @@ fn tend_awake(set: &mut ChildSet, spawn: &dyn Fn() -> io::Result<aterm_uds::spaw
     }
 }
 
-/// Keep one `dns-sd -P` registered at `ip`: a live registration at the same address stays.
-fn reregister(set: &mut ChildSet, name: &str, port: u16, ip: Option<Ipv4Addr>) {
+/// Keep one `dns-sd -P` (started by `spawn`) registered at `ip`: a live registration at the
+/// same address stays. One that ended by itself gave the name up to another device on the
+/// network, which new Macs may then reach in place of this vault: the log says so once, and
+/// again once a registration stays up.
+fn reregister(
+    set: &mut ChildSet,
+    name: &str,
+    ip: Option<Ipv4Addr>,
+    spawn: &dyn Fn(Ipv4Addr) -> io::Result<aterm_uds::spawnfd::Child>,
+) {
+    let mut gave_up = false;
     if let (Some((child, held_ip)), Some(ip)) = (set.dns_sd.as_mut(), ip)
         && *held_ip == ip
-        && matches!(child.try_wait(), Ok(None))
     {
-        return;
+        match child.try_wait() {
+            Ok(None) => {
+                if std::mem::take(&mut set.dns_sd_lost) {
+                    note(&format!("advertising {name}.local at {ip} again"));
+                }
+                return;
+            }
+            Ok(Some(_)) => gave_up = true,
+            Err(_) => {}
+        }
     }
     if let Some((mut child, _)) = set.dns_sd.take() {
         end(&mut child);
     }
+    if gave_up && !set.dns_sd_lost {
+        set.dns_sd_lost = true;
+        note(&format!(
+            "{DNS_SD} gave up advertising {name}.local: another device on this network answers \
+             to that name, so new Macs may reach it in place of this vault (--advertise <name> \
+             picks another); trying again every {}s",
+            ADVERTISE_EVERY.as_secs()
+        ));
+    }
     let Some(ip) = ip else {
         return;
     };
-    match quiet(DNS_SD, &dns_sd_args(name, port, ip)) {
+    match spawn(ip) {
         Ok(child) => {
             set.dns_sd = Some((child, ip));
-            note(&format!("advertising {name}.local at {ip}:{port}"));
+            if !set.dns_sd_lost {
+                note(&format!("advertising {name}.local at {ip}"));
+            }
         }
         Err(e) => note(&format!("could not start {DNS_SD}: {e}")),
     }
@@ -2767,6 +2923,128 @@ mod tests {
             waiter.join().expect("waiter").expect("ended"),
             Fetched::NoNewer(Some(5))
         );
+    }
+
+    /// A join request ends the queue's long-poll at once, naming the queue's next version, and
+    /// so does a new version of the vault; one held while nothing changes ends at the hold.
+    /// Negative control: a server without the long-poll refuses its query.
+    #[test]
+    fn a_join_long_poll_wakes_on_a_request_or_a_version_and_ends_at_the_hold() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), HANG_DETECTOR));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let at = url(&running);
+        let listed = transport::wait_joins(&at, None, HANG_DETECTOR).expect("listed");
+        let transport::Joins::Listed(lines, Some(version)) = listed else {
+            panic!("the queue names its version: {listed:?}");
+        };
+        assert!(lines.is_empty());
+        let waiting = |after| {
+            let at = at.clone();
+            std::thread::spawn(move || transport::wait_joins(&at, Some(after), HANG_DETECTOR))
+        };
+
+        let waiter = waiting(version);
+        until_waiting(&running, 1);
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let line = join_line(1, "m22");
+        assert_eq!(
+            post_join(&running.shared, "alab", line.as_bytes(), peer).status,
+            204
+        );
+        let woke = waiter.join().expect("waiter").expect("woken");
+        let transport::Joins::Listed(lines, Some(next)) = woke else {
+            panic!("the request is listed at once: {woke:?}");
+        };
+        assert_eq!(next, version + 1);
+        assert!(lines.len() == 1 && lines[0].starts_with(&line), "{lines:?}");
+
+        let waiter = waiting(next);
+        until_waiting(&running, 1);
+        put(&running, &envelope(&OLD, 2)).expect("a new version");
+        assert_eq!(
+            waiter.join().expect("waiter").expect("woken"),
+            transport::Joins::Listed(lines, Some(next)),
+            "a new version of the vault ends the queue's long-poll"
+        );
+        running.stop();
+
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        let at = url(&running);
+        let Ok(transport::Joins::Listed(_, Some(version))) =
+            transport::wait_joins(&at, None, HANG_DETECTOR)
+        else {
+            panic!("listed with its version");
+        };
+        assert_eq!(
+            transport::wait_joins(&at, Some(version), HANG_DETECTOR).expect("held"),
+            transport::Joins::Unchanged
+        );
+        assert_eq!(running.join_gets(), 2);
+        running.stop();
+    }
+
+    /// The clock [`a_held_queue_version_from_another_run_or_before_an_expiry_is_answered_at_once`]
+    /// moves, in unix seconds.
+    static QUEUE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A queue version an approver holds is answered at once, with the queue as it is, when it
+    /// names the queue of an earlier run of the server (a server put back counts its changes
+    /// afresh) or when a request in the listing it names expired since. Negative controls: a
+    /// count that starts at zero each run, or an expiry that leaves the version where it was,
+    /// holds the approver's long-poll while the queue it holds differs from the queue.
+    #[test]
+    fn a_held_queue_version_from_another_run_or_before_an_expiry_is_answered_at_once() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let ask = |running: &Running, n: u8, host: &str| {
+            let line = join_line(n, host);
+            assert_eq!(
+                post_join(&running.shared, "alab", line.as_bytes(), peer).status,
+                204
+            );
+        };
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        ask(&running, 1, "m22");
+        let Ok(transport::Joins::Listed(_, Some(heard))) =
+            transport::wait_joins(&url(&running), None, HANG_DETECTOR)
+        else {
+            panic!("listed with its version");
+        };
+        running.stop();
+
+        // Put back from its store, then as many changes as the first run had.
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        ask(&running, 2, "m23");
+        let woke =
+            transport::wait_joins(&url(&running), Some(heard), HANG_DETECTOR).expect("answered");
+        let transport::Joins::Listed(lines, Some(version)) = woke else {
+            panic!("a version from the last run named this run's queue: {woke:?}");
+        };
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        running.stop();
+
+        QUEUE_CLOCK.store(now(), Ordering::SeqCst);
+        let tuning = Tuning {
+            now: || QUEUE_CLOCK.load(Ordering::SeqCst),
+            ..Tuning::default()
+        };
+        let running = run_tuned(&options(root.path(), Duration::from_millis(200)), tuning);
+        let Ok(transport::Joins::Listed(lines, Some(version))) =
+            transport::wait_joins(&url(&running), Some(version), HANG_DETECTOR)
+        else {
+            panic!("listed with its version");
+        };
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        QUEUE_CLOCK.fetch_add(JOIN_TTL_SECS + 60, Ordering::SeqCst);
+        let woke =
+            transport::wait_joins(&url(&running), Some(version), HANG_DETECTOR).expect("answered");
+        assert!(
+            matches!(&woke, transport::Joins::Listed(lines, Some(next)) if lines.is_empty() && *next != version),
+            "the requests expired, and the listing that held them is answered: {woke:?}"
+        );
+        running.stop();
     }
 
     #[test]
@@ -4219,6 +4497,38 @@ mod tests {
         );
     }
 
+    /// A registration that ends by itself (dns-sd giving up a name another device answers to)
+    /// is said once, and started again; once one stays up, that is said too. Negative control:
+    /// one this server ends at an address change is no conflict.
+    #[test]
+    fn an_advertisement_that_gives_up_its_name_is_said_once() {
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path");
+        let spawn = |_| quiet(sleep, &["60".to_owned()]);
+        let children = Children::default();
+        let mut set = children.lock();
+        let (here, there) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
+
+        reregister(&mut set, "alab-secrets", Some(here), &spawn);
+        assert!(set.dns_sd.is_some() && !set.dns_sd_lost);
+        reregister(&mut set, "alab-secrets", Some(there), &spawn);
+        assert!(!set.dns_sd_lost, "a move to another address is no conflict");
+
+        let (gone, _) = set.dns_sd.as_mut().expect("registered");
+        gone.kill().expect("killed");
+        gone.wait().expect("reaped");
+        reregister(&mut set, "alab-secrets", Some(there), &spawn);
+        assert!(
+            set.dns_sd_lost,
+            "a registration that ended by itself is said"
+        );
+        let again = set.dns_sd.as_ref().map(|(child, _)| child.id());
+        assert!(again.is_some(), "started again");
+        reregister(&mut set, "alab-secrets", Some(there), &spawn);
+        assert!(!set.dns_sd_lost, "one that stays up is said");
+        assert_eq!(set.dns_sd.as_ref().map(|(child, _)| child.id()), again);
+    }
+
     #[test]
     fn a_keep_awake_that_ends_is_started_again() {
         let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
@@ -4298,16 +4608,12 @@ mod tests {
         let big = Arc::new(vec![b'x'; 15 << 20]);
         running.shared.lock_server_state().vaults.insert(
             "alab".to_owned(),
-            Slot {
-                held: Held {
-                    seq: 1,
-                    signer: OLD,
-                    handoff: Vec::new(),
-                    bytes: Arc::clone(&big),
-                },
-                wake: Arc::new(Condvar::new()),
-                verdicts: 0,
-            },
+            Slot::new(Held {
+                seq: 1,
+                signer: OLD,
+                handoff: Vec::new(),
+                bytes: Arc::clone(&big),
+            }),
         );
         let stream = sent(&running, b"GET /v1/alab HTTP/1.1\r\nHost: x\r\n\r\n");
         until("the server gives up on the answer", || {

@@ -741,7 +741,7 @@ fn about_and_legacy_settings_drafts_survive_split_restore_and_update_carry() {
         );
         assert_eq!(settings_snapshot(&app, settings_view), before);
 
-        let captured = app.capture_handoff_layout();
+        let captured = app.capture_manifest(true);
         assert_eq!(captured.windows[0].restored_tabs[0].root, root);
         assert_eq!(
             captured.windows[0].restored_tabs[0].focused_path,

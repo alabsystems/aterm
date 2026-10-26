@@ -549,6 +549,96 @@ impl Prefix {
         self.pinned_version(name).is_some()
     }
 
+    /// The version `token` is pinned at by a brew cask pin
+    /// (`var/homebrew/pinned_casks/<token>` → the versioned caskroom
+    /// path), when that target is this prefix's owned payload.
+    pub fn cask_pinned_version(&self, token: &str) -> Option<String> {
+        if !super::valid_component(token) {
+            return None;
+        }
+        let dir = self.root.join("var/homebrew/pinned_casks");
+        let link = dir.join(token);
+        let target = std::fs::read_link(&link).ok()?;
+        let joined = if target.is_absolute() {
+            target.clone()
+        } else {
+            dir.join(&target)
+        };
+        // Brew writes the pin as a relative symlink full of `..`;
+        // compare canonical forms so the spelling doesn't matter.
+        let resolved = std::fs::canonicalize(&joined).ok()?;
+        let version = resolved.file_name()?.to_str()?.to_owned();
+        let staged = self.cask_dir(token, &version);
+        (std::fs::canonicalize(&staged).ok().as_ref() == Some(&resolved)
+            && owned_receipt(&staged, Kind::Cask, token, &version))
+        .then_some(version)
+    }
+
+    pub fn cask_is_pinned(&self, token: &str) -> bool {
+        self.cask_pinned_version(token).is_some()
+    }
+
+    /// Whether any pin symlink (ours or dangling) sits at the brew
+    /// cask pin path for `token`.
+    pub fn cask_pin_link_present(&self, token: &str) -> bool {
+        super::valid_component(token)
+            && std::fs::symlink_metadata(self.root.join("var/homebrew/pinned_casks").join(token))
+                .is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    /// Pins cask `token` at its installed version, brew's shape: a
+    /// relative symlink in `var/homebrew/pinned_casks`.
+    pub fn pin_cask(&self, token: &str) -> Result<(), String> {
+        if !super::valid_component(token) {
+            return Err(format!("abrew: invalid cask token {token}"));
+        }
+        self.ensure()?;
+        let Some(inst) = self.installed_one(Kind::Cask, token) else {
+            return Err(format!("abrew: {token} is not installed"));
+        };
+        let dir = self.root.join("var/homebrew/pinned_casks");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("abrew: {e}"))?;
+        let link = dir.join(token);
+        let dangling_ours = std::fs::read_link(&link).is_ok_and(|target| {
+            target
+                .to_string_lossy()
+                .contains(&format!("Caskroom/{token}/"))
+        });
+        match std::fs::symlink_metadata(&link) {
+            Ok(_) if self.cask_is_pinned(token) || dangling_ours => {
+                std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "abrew: pin {} is not owned by abrew",
+                    link.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("abrew: {e}")),
+        }
+        let target =
+            std::path::PathBuf::from(format!("../../../Caskroom/{token}/{}", inst.version));
+        symlink_dir(&target, &link)
+    }
+
+    /// Removes cask `token`'s pin symlink (and the directory, when
+    /// it empties), refusing foreign entries like `unpin`.
+    pub fn unpin_cask(&self, token: &str) -> Result<(), String> {
+        if !super::valid_component(token) {
+            return Err(format!("abrew: invalid cask token {token}"));
+        }
+        self.ensure()?;
+        let dir = self.root.join("var/homebrew/pinned_casks");
+        let link = dir.join(token);
+        if !self.cask_pin_link_present(token) {
+            return Err(format!("abrew: {token} has no owned pin"));
+        }
+        std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
+        let _ = std::fs::remove_dir(&dir);
+        Ok(())
+    }
+
     /// Returns whether `name` has a pin entry, failing on inspection errors other than `NotFound`.
     pub(super) fn is_pinned_checked(&self, name: &str) -> Result<bool, String> {
         if !super::valid_component(name) {
@@ -1022,6 +1112,47 @@ mod tests {
         assert!(overlaps_brew_roots(&own, &[dangling.as_path()]));
         assert_eq!(std::fs::read(&file).unwrap(), b"owner file");
         assert_eq!(std::fs::read_dir(&brew).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cask_pin_reads_brews_pinned_casks_symlink() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let dir = p.cask_dir("widget", "2.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        p.write_receipt(
+            &dir,
+            &[
+                ("installed_by", "abrew"),
+                ("token", "widget"),
+                ("version", "2.0"),
+            ],
+        )
+        .unwrap();
+        assert!(!p.cask_is_pinned("widget"));
+        let pins = p.root.join("var/homebrew/pinned_casks");
+        std::fs::create_dir_all(&pins).unwrap();
+        symlink_dir(
+            std::path::Path::new("../../../Caskroom/widget/2.0"),
+            &pins.join("widget"),
+        )
+        .unwrap();
+        assert_eq!(p.cask_pinned_version("widget").as_deref(), Some("2.0"));
+        assert!(p.cask_is_pinned("widget"));
+        // A pin at a payload we do not own does not count.
+        std::fs::remove_file(pins.join("widget")).unwrap();
+        symlink_dir(std::path::Path::new("/tmp"), &pins.join("widget")).unwrap();
+        assert!(!p.cask_is_pinned("widget"));
+        // The write side refuses that foreign symlink, then round-trips.
+        assert!(p.pin_cask("widget").is_err());
+        std::fs::remove_file(pins.join("widget")).unwrap();
+        p.pin_cask("widget").unwrap();
+        assert!(p.cask_is_pinned("widget"));
+        p.unpin_cask("widget").unwrap();
+        assert!(!p.cask_is_pinned("widget"));
+        assert!(std::fs::symlink_metadata(&pins).is_err());
     }
 
     #[test]

@@ -3041,7 +3041,9 @@ impl WorkerBlock {
         let word = agent.name();
         match self {
             Self::Unhosted => {
-                "unsupervised: no window harness runs here (no control socket)".to_string()
+                "unsupervised: the aterm of the Mac asked to start it runs no window harness \
+                 (no control socket)"
+                    .to_string()
             }
             Self::Unsupervised(switch) => format!("unsupervised: {switch}"),
             Self::Unseen(why) => format!("spawn agent={word}: {why}"),

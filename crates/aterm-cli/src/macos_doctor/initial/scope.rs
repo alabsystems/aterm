@@ -112,7 +112,14 @@ pub(super) fn probe_lan() -> VaultHere {
             access::lan_answered(LanAnswer::Reached);
             VaultHere::Absent
         }
-        Ok(ProbeOutcome::Absent) => VaultHere::Absent,
+        // A server there answered with no vault (a 404 or 204), as the join's look reads it;
+        // only a build with no signer built in asks nothing of the network.
+        Ok(ProbeOutcome::Absent) => {
+            if aterm_secrets::client::alab_signer_built_in() {
+                access::lan_answered(LanAnswer::Reached);
+            }
+            VaultHere::Absent
+        }
         Err(why) => {
             if aterm_secrets::client::refused_by_local_network(&why) {
                 access::lan_answered(LanAnswer::Refused);
@@ -136,49 +143,48 @@ fn vault_here_now() -> VaultHere {
     probe_vault()
 }
 
-/// This login already belongs to a vault, or has asked to join the ALab one
-/// under the key built into aterm. A pending request to any other vault is not
-/// the ALab signal: anyone can ask.
+/// This login belongs to the ALab vault, or has asked to join it at its address
+/// under the key built into aterm ([`member_of_the_alab_vault`]).
 fn vault_member() -> bool {
     use aterm_secrets::client::{self, Paths};
     Paths::live()
         .ok()
         .and_then(|paths| client::status(&paths).ok())
-        .is_some_and(|status| member_of_a_vault(&status))
+        .is_some_and(|status| member_of_the_alab_vault(&status))
 }
 
-fn member_of_a_vault(status: &aterm_secrets::client::Status) -> bool {
-    use aterm_secrets::client::Membership;
+/// Only the ALab vault says a Mac is ALab's (DESIGN-init-on-by-default §8.1): a
+/// membership of a vault pinned to its key ([`aterm_secrets::client::alab_vault`]),
+/// or a pending request to it at its address. Anyone can run a vault of their own,
+/// read a plain file, or ask to join some vault, and none of that is a reason to
+/// set up a Mac as ALab's or sign it out of Messages and FaceTime.
+fn member_of_the_alab_vault(status: &aterm_secrets::client::Status) -> bool {
+    use aterm_secrets::client::{self, Membership};
+    let Some(config) = status.config.as_ref() else {
+        return false;
+    };
     match status.membership {
-        Membership::In { .. } | Membership::Plain => true,
-        Membership::Pending => status.config.as_ref().is_some_and(|config| {
+        Membership::In { .. } => client::alab_vault(config),
+        Membership::Pending => {
             config.source
                 == aterm_secrets::transport::Source::Url(
                     aterm_types::macos_setup::DEFAULT_VAULT_URL.into(),
                 )
-                && config.signer.is_some_and(|signer| {
-                    aterm_secrets::b64::decode_padded(aterm_secrets::ALAB_SIGNER)
-                        .is_some_and(|alab| alab == signer)
-                })
-        }),
-        Membership::Unconfigured | Membership::Revoked { .. } => false,
+                && client::alab_vault(config)
+        }
+        Membership::Plain | Membership::Unconfigured | Membership::Revoked { .. } => false,
     }
-}
-
-/// This Mac holds an aterm fleet's key (`aterm_net::fleet::KEY_FILE` in the
-/// state directory, where `aterm fleet init|join` writes it).
-fn fleet_member() -> bool {
-    aterm_types::dirs::state_dir().is_some_and(|dir| dir.join("fleet.key").is_file())
 }
 
 /// Whether this is an ALab Mac (§3.5): local records first, then one bounded
 /// probe of the ALab vault. Only a yes is kept for the process: a probe that
 /// heard nothing (macOS's Local Network question still open, the network, the
-/// vault down) proves nothing, so the next caller asks again.
+/// vault down) proves nothing, so the next caller asks again. Holding a fleet's
+/// key is no signal: `aterm fleet init` makes a fleet of anyone's Macs.
 pub fn alab_mac() -> bool {
     static ALAB: AtomicBool = AtomicBool::new(false);
     kept_if_found(&ALAB, || {
-        vault_member() || fleet_member() || vault_here_now() == VaultHere::Found
+        vault_member() || vault_here_now() == VaultHere::Found
     })
 }
 
@@ -1712,9 +1718,9 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let status = |membership: Membership, url: &str, signer: Option<[u8; 32]>| Status {
+        let status = |membership: Membership, source: Source, signer: Option<[u8; 32]>| Status {
             config: Some(Config {
-                source: Source::Url(url.into()),
+                source,
                 name: "alab".into(),
                 signer,
                 followed: Vec::new(),
@@ -1724,33 +1730,67 @@ mod tests {
             membership,
             names: Vec::new(),
         };
-        let default = aterm_types::macos_setup::DEFAULT_VAULT_URL;
-        let other = "https://vault.example/v1/team";
-        assert!(member_of_a_vault(&status(Membership::Plain, other, None)));
-        assert!(member_of_a_vault(&status(
-            Membership::Pending,
-            default,
+        let url = |text: &str| Source::Url(text.into());
+        let default = || url(aterm_types::macos_setup::DEFAULT_VAULT_URL);
+        let other = || url("https://vault.example/v1/team");
+        let in_ = || Membership::In { seq: 3, heard: 0 };
+        // The ALab vault's membership, wherever it is served from.
+        assert!(member_of_the_alab_vault(&status(
+            in_(),
+            default(),
             Some(alab)
         )));
-        // Anyone can ask to join some vault, or the ALab address under another key.
-        assert!(!member_of_a_vault(&status(
-            Membership::Pending,
-            other,
+        assert!(member_of_the_alab_vault(&status(
+            in_(),
+            other(),
             Some(alab)
         )));
-        assert!(!member_of_a_vault(&status(
+        assert!(member_of_the_alab_vault(&status(
             Membership::Pending,
-            default,
+            default(),
+            Some(alab)
+        )));
+        // Another vault of one's own, a plain file of one's own, or one at the ALab address
+        // under another key is not ALab's.
+        assert!(!member_of_the_alab_vault(&status(
+            in_(),
+            other(),
             Some([7; 32])
         )));
-        assert!(!member_of_a_vault(&status(
-            Membership::Pending,
-            default,
+        assert!(!member_of_the_alab_vault(&status(
+            in_(),
+            default(),
+            Some([7; 32])
+        )));
+        assert!(!member_of_the_alab_vault(&status(
+            Membership::Plain,
+            other(),
             None
         )));
-        assert!(!member_of_a_vault(&status(
+        assert!(!member_of_the_alab_vault(&status(
+            Membership::Plain,
+            Source::Path("/Users//someone/home.secrets".into()),
+            None
+        )));
+        // Anyone can ask to join some vault, or the ALab key at another address.
+        assert!(!member_of_the_alab_vault(&status(
+            Membership::Pending,
+            other(),
+            Some(alab)
+        )));
+        assert!(!member_of_the_alab_vault(&status(
+            Membership::Pending,
+            default(),
+            Some([7; 32])
+        )));
+        assert!(!member_of_the_alab_vault(&status(
+            Membership::Pending,
+            default(),
+            None
+        )));
+        assert!(!member_of_the_alab_vault(&status(
             Membership::Unconfigured,
-            default,
+            default(),
             Some(alab)
         )));
     }

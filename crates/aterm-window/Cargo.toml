@@ -91,13 +91,13 @@ rustdoc-args = [
 [features]
 # LOCAL PATCH (aterm) (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6): `rwh_06` is
 # not a default. On macOS a window hands over its content view through first-party
-# `aterm_objc::HasNsView`, which the Metal presenter and aterm-gui's chrome read, and an X11 or
-# Wayland window hands over its handles through first-party
-# `aterm_types::native_window::HasNativeWindow`, which the GL arm and the CPU presenters read,
-# so raw-window-handle is in neither graph; the opt-in `rwh_06` handles there wrap the same
-# answer. The targets that still present through wgpu or read a Win32 HWND (Windows; the BSDs,
-# which have no cell and no CPU presenter: aterm-gui's `present::CpuSurface` is macOS, Linux
-# and Windows only) turn it on: aterm-gui's dependency row for them.
+# `aterm_objc::HasNsView`, which the Metal presenter and aterm-gui's chrome read, and an X11,
+# Wayland or Win32 window hands over its handles through first-party
+# `aterm_types::native_window::HasNativeWindow`, which the GL and D3D11 arms and the CPU
+# presenters read, so raw-window-handle is in no cell's graph; the opt-in `rwh_06` handles
+# there wrap the same answer. The targets that still present through wgpu (the BSDs, which have
+# no cell and no CPU presenter: aterm-gui's `present::CpuSurface` is macOS, Linux and Windows
+# only) turn it on: aterm-gui's dependency row for them.
 default = [
     "x11",
     "wayland",
@@ -131,9 +131,9 @@ name = "recorded_answers"
 path = "tests/recorded_answers.rs"
 
 # LOCAL PATCH (aterm) (docs/AUDIT-third-party-2026-10-15.md, winit-core steps 5 and 6): the
-# crate's seven flag types (ModifiersState, ModifiersKeys, WindowButtons, macOS's location mask,
-# Windows' modifier, cursor and window flags) are `aterm_types::bitflags!`, where upstream uses
-# `bitflags` 2, and an X11 or Wayland window's handles are `aterm_types::native_window`.
+# crate's six flag types (ModifiersState, ModifiersKeys, macOS's location mask, Windows'
+# modifier, cursor and window flags) are `aterm_types::bitflags!`, where upstream uses `bitflags`
+# 2, and an X11, Wayland or Win32 window's handles are `aterm_types::native_window`.
 # FIRST-PARTY and path-only; aterm-gui already links it in every cell this crate compiles in.
 [dependencies.aterm-types]
 path = "../aterm-types"
@@ -238,10 +238,8 @@ path = "../aterm-grapheme"
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]
 version = "0.61.2"
 features = [
-    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Globalization",
-    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_System_Com_StructuredStorage",

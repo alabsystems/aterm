@@ -177,7 +177,12 @@ fn failed_observation_storage_keeps_the_durable_attempt_and_adapter_evidence() {
         if observation == answer && !reason.is_empty())
     );
     assert_ne!(result.receipt.id, [0; 32]);
-    assert!(db.attempt(REQUEST).is_err());
+    // Demotion keeps read access to the retained liability, even though it
+    // prevents recording the outcome or entering the adapter again.
+    let retained = db.attempt(REQUEST).unwrap().unwrap();
+    assert_eq!(retained.receipt, result.receipt);
+    assert_eq!(retained.observation, ObservationState::Unknown);
+    assert_eq!(db.snapshot().unwrap().used.values().sum::<u64>(), 1);
     assert!(
         db.dispatch_once(REQUEST, 1, OPERATION, || panic!("retired writer reentered"))
             .is_err()

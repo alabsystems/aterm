@@ -152,7 +152,7 @@ pub(crate) struct FabricChip {
     pub(crate) words: String,
     /// Age of its log's newest record in seconds as of the compose.
     pub(crate) age_s: Option<u64>,
-    /// Whether its read is older than `COUNT_FRESH` or its node is gone.
+    /// Whether its read is older than `COUNT_FRESH` or the brief judges it gone (`FabricNeed::gone`).
     pub(crate) older: bool,
 }
 

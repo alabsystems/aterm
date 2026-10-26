@@ -12596,7 +12596,7 @@ impl GpuRenderer {
     ) -> Result<GpuSurface, String> {
         #[cfg(target_os = "macos")]
         let target = AppKitSurfaceTarget(target);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let target = NativeSurfaceTarget(target);
         let surface = self
             .ctx
@@ -23235,13 +23235,13 @@ pub trait WindowTarget: aterm_objc::HasNsView + Send + Sync + 'static {}
 impl<T> WindowTarget for T where T: aterm_objc::HasNsView + Send + Sync + 'static {}
 
 /// A window a GPU backend can attach a swapchain to.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub trait WindowTarget:
     aterm_types::native_window::HasNativeWindow + Send + Sync + 'static
 {
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl<T> WindowTarget for T where
     T: aterm_types::native_window::HasNativeWindow + Send + Sync + 'static
 {
@@ -23279,13 +23279,23 @@ pub trait FrameSink: Send {
 pub type FrameDraw<'a> = dyn FnMut(&mut [u32], [u32; 4]) -> Result<(), String> + 'a;
 
 /// A window a GPU backend can attach a swapchain to.
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    windows,
+    target_arch = "wasm32"
+)))]
 pub trait WindowTarget:
     raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static
 {
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    windows,
+    target_arch = "wasm32"
+)))]
 impl<T> WindowTarget for T where
     T: raw_window_handle::HasWindowHandle
         + raw_window_handle::HasDisplayHandle
@@ -23316,23 +23326,36 @@ impl<W> wgpu::rwh::HasDisplayHandle for AppKitSurfaceTarget<W> {
     }
 }
 
-#[cfg(all(target_os = "linux", wgpu_arm))]
+#[cfg(all(any(target_os = "linux", windows), wgpu_arm))]
 struct NativeSurfaceTarget<W>(W);
 
-#[cfg(all(target_os = "linux", wgpu_arm))]
+#[cfg(all(any(target_os = "linux", windows), wgpu_arm))]
 impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasWindowHandle
     for NativeSurfaceTarget<W>
 {
     fn window_handle(&self) -> Result<wgpu::rwh::WindowHandle<'_>, wgpu::rwh::HandleError> {
         use aterm_types::native_window::NativeWindow;
         let raw = match self.0.native_window() {
+            #[cfg(target_os = "linux")]
             Some(NativeWindow::Xlib { window, visual, .. }) => {
                 let mut h = wgpu::rwh::XlibWindowHandle::new(window.into());
                 h.visual_id = visual.into();
                 wgpu::rwh::RawWindowHandle::Xlib(h)
             }
+            #[cfg(target_os = "linux")]
             Some(NativeWindow::Wayland { surface, .. }) => {
                 wgpu::rwh::RawWindowHandle::Wayland(wgpu::rwh::WaylandWindowHandle::new(surface))
+            }
+            #[cfg(windows)]
+            Some(NativeWindow::Win32 { hwnd, hinstance }) => {
+                let id = |p: std::ptr::NonNull<std::ffi::c_void>| {
+                    std::num::NonZeroIsize::new(p.as_ptr().addr().cast_signed())
+                };
+                let mut h = wgpu::rwh::Win32WindowHandle::new(
+                    id(hwnd).ok_or(wgpu::rwh::HandleError::Unavailable)?,
+                );
+                h.hinstance = hinstance.and_then(id);
+                wgpu::rwh::RawWindowHandle::Win32(h)
             }
             None => return Err(wgpu::rwh::HandleError::Unavailable),
         };
@@ -23341,21 +23364,28 @@ impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasWindowHandle
     }
 }
 
-#[cfg(all(target_os = "linux", wgpu_arm))]
+#[cfg(all(any(target_os = "linux", windows), wgpu_arm))]
 impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasDisplayHandle
     for NativeSurfaceTarget<W>
 {
     fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
         use aterm_types::native_window::NativeWindow;
         let raw = match self.0.native_window() {
+            #[cfg(target_os = "linux")]
             Some(NativeWindow::Xlib {
                 display, screen, ..
             }) => wgpu::rwh::RawDisplayHandle::Xlib(wgpu::rwh::XlibDisplayHandle::new(
                 Some(display),
                 screen,
             )),
+            #[cfg(target_os = "linux")]
             Some(NativeWindow::Wayland { display, .. }) => {
                 wgpu::rwh::RawDisplayHandle::Wayland(wgpu::rwh::WaylandDisplayHandle::new(display))
+            }
+            // Win32 has no display connection.
+            #[cfg(windows)]
+            Some(NativeWindow::Win32 { .. }) => {
+                wgpu::rwh::RawDisplayHandle::Windows(wgpu::rwh::WindowsDisplayHandle::new())
             }
             None => return Err(wgpu::rwh::HandleError::Unavailable),
         };

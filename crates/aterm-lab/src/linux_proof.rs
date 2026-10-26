@@ -673,6 +673,19 @@ pub fn present_summary(reply: &str) -> String {
     )
 }
 
+/// `n_input` and the input percentiles (a key to its frame) of a `metrics percentiles` reply.
+#[must_use]
+pub fn input_summary(reply: &str) -> String {
+    let get = |k: &str| field(reply, k).unwrap_or("?");
+    format!(
+        "n_input={} input_p50/p95/p99_ms={}/{}/{}",
+        get("n_input"),
+        get("input_p50_ms"),
+        get("input_p95_ms"),
+        get("input_p99_ms")
+    )
+}
+
 /// What the guest's journal says aterm-gui renders on (`GPU rendering on …`).
 #[must_use]
 pub fn renderer(journal: &str) -> Option<&str> {

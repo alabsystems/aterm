@@ -1680,7 +1680,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         format!(
             "schema sid subject subject_source observed phase since_ms outcome exit_code signal \
              detail confidence reasons attribution fs_consent conflict revision enabled hold \
-             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet hand hand_pid level story why \
+             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet setup hand hand_pid level story why \
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
              agent_since_ms agent_gen agent_fp program_state program_state_ms \
              last_act os_appearance theme_side reported_scheme scheme_from bg_dark \

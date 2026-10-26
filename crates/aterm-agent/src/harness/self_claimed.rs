@@ -255,6 +255,74 @@ pub struct Resume {
     pub cwd: Option<String>,
 }
 
+fn has_unsafe_line_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+fn is_structural_abs_path(s: &str) -> bool {
+    Path::new(s).is_absolute() || s.starts_with('/')
+}
+
+impl Resume {
+    /// Validate that this resume command and environment satisfy every structural invariant of a
+    /// live-validated `codex-alab` resume record (non-empty absolute executable, canonical UUID
+    /// session, kept-flag-only `resume <uuid>` tail, safe paths, and no control or Unicode line
+    /// separator characters).
+    ///
+    /// # Errors
+    /// Returns the [`Refusal`] code explaining why this [`Resume`] cannot be executed or restored.
+    pub fn validate_structural(&self) -> Result<(), Refusal> {
+        let Some((launch, rest)) = self.argv.split_first() else {
+            return Err("no-resume-line");
+        };
+        if !is_uuid(&self.session) {
+            return Err("session-not-uuid");
+        }
+        if launch.is_empty() || !is_structural_abs_path(launch) || has_unsafe_line_char(launch) {
+            return Err("launch-path");
+        }
+        if rest.last().map(String::as_str) != Some(self.session.as_str())
+            || !rest.iter().any(|arg| arg == "resume")
+        {
+            return Err("no-resume");
+        }
+        if rest.iter().any(|arg| has_unsafe_line_char(arg)) {
+            return Err("foreign-argv");
+        }
+        let expected =
+            codex_alab::rewrite_argv(&self.argv, Some(&self.session)).map_err(|_| "live-argv")?;
+        if rest != expected.as_slice() {
+            return Err("foreign-argv");
+        }
+        if let Some(c) = self.cwd.as_deref()
+            && (c.is_empty() || !is_structural_abs_path(c) || has_unsafe_line_char(c))
+        {
+            return Err("cwd");
+        }
+        if let Some(h) = self.codex_home.as_deref().filter(|s| !s.is_empty())
+            && (has_unsafe_line_char(h) || (!is_structural_abs_path(h) && self.cwd.is_none()))
+        {
+            return Err("home-path");
+        }
+        if let Some(auth) = self.codex_auth_path.as_deref().filter(|s| !s.is_empty()) {
+            let last_seg = auth
+                .rsplit(['/', std::path::MAIN_SEPARATOR])
+                .next()
+                .unwrap_or("");
+            let auth_path = Path::new(auth);
+            if !is_structural_abs_path(auth)
+                || matches!(last_seg, "" | "." | "..")
+                || auth_path.is_dir()
+                || has_unsafe_line_char(auth)
+            {
+                return Err("auth-path");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Validate `record`'s resume command against `pid` and `live` process facts.
 ///
 /// # Errors
@@ -276,6 +344,7 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     let image = live.image.as_deref().map(Path::to_string_lossy);
     let twin = live.twin.as_deref().map(Path::to_string_lossy);
     if !(Path::new(launch).is_absolute()
+        && !has_unsafe_line_char(launch)
         && (*launch == live.exec_path
             || image.as_deref() == Some(launch.as_str())
             || twin.as_deref() == Some(launch.as_str())
@@ -293,7 +362,7 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
         return Err("no-resume");
     }
     let expected = codex_alab::rewrite_argv(&live.argv, Some(session)).map_err(|_| "live-argv")?;
-    if argv[1..] != expected[..] {
+    if argv[1..] != expected[..] || argv[1..].iter().any(|arg| has_unsafe_line_char(arg)) {
         return Err("foreign-argv");
     }
     let same = |named: &str, running: &Path| {
@@ -304,7 +373,7 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
         (Some(_), None) => return Err("cwd"),
         (_, running) => running.map(|p| p.to_string_lossy().into_owned()),
     };
-    let cwd = cwd.filter(|c| Path::new(c).is_absolute() && !c.chars().any(char::is_control));
+    let cwd = cwd.filter(|c| Path::new(c).is_absolute() && !has_unsafe_line_char(c));
     for (name, value) in &record.env {
         let matches_live = match name.as_str() {
             codex_alab::HOME_ENV => live.codex_home.as_deref() == Some(value.as_str()),
@@ -316,34 +385,25 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
         }
     }
     if let Some(h) = live.codex_home.as_deref().filter(|s| !s.is_empty())
-        && (h
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
-            || (!Path::new(h).is_absolute() && cwd.is_none()))
+        && !Path::new(h).is_absolute()
+        && cwd.is_none()
     {
         return Err("home-path");
     }
-    if let Some(auth) = live.codex_auth_path.as_deref().filter(|s| !s.is_empty()) {
-        let last_seg = auth
-            .rsplit(['/', std::path::MAIN_SEPARATOR])
-            .next()
-            .unwrap_or("");
-        if !Path::new(auth).is_absolute()
-            || matches!(last_seg, "" | "." | "..")
-            || auth
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
-        {
-            return Err("auth-path");
-        }
+    if let Some(auth) = live.codex_auth_path.as_deref().filter(|s| !s.is_empty())
+        && !Path::new(auth).is_absolute()
+    {
+        return Err("auth-path");
     }
-    Ok(Resume {
+    let resume = Resume {
         argv: argv.clone(),
         session: session.to_string(),
         codex_home: live.codex_home.clone(),
         codex_auth_path: live.codex_auth_path.clone(),
         cwd,
-    })
+    };
+    resume.validate_structural()?;
+    Ok(resume)
 }
 
 /// Outcome of reading a live process's session record.

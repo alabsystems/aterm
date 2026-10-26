@@ -252,6 +252,10 @@ pub(crate) struct Host {
     operation: Option<SetupOperation>,
     next_status: Option<Instant>,
     status_in_flight: bool,
+    /// The one thread that reads the worker's status, one read for each poll sent it
+    /// ([`Host::send_status_poll`]): started at the first poll, and let go once setup has
+    /// nothing left to say ([`App::publish_system_state`]).
+    status_reader: Option<Sender<StatusPoll>>,
     /// Reads in a row that met a write of the saved setup ([`SetupStatus::changing`]).
     changing_reads: u8,
     next_tick: Option<Instant>,
@@ -292,7 +296,40 @@ pub(crate) struct Host {
     fixture_review: Option<crate::system_state::FixtureReview>,
 }
 
+/// One read the status reader is asked for: the status handler in force, and the generation its
+/// answer carries ([`Host::send_status_poll`]).
+type StatusPoll = (fn() -> SetupStatus, u64);
+
 impl Host {
+    /// Ask the status reader for one read of `status` (the handlers in force when the poll is
+    /// sent), answered with `generation`, starting the reader if none runs (or the last one
+    /// ended). `false` when no reader could take it.
+    fn send_status_poll(&mut self, status: fn() -> SetupStatus, generation: u64) -> bool {
+        if let Some(reader) = &self.status_reader
+            && reader.send((status, generation)).is_ok()
+        {
+            return true;
+        }
+        let (polls, asked) = mpsc::channel::<StatusPoll>();
+        let started = std::thread::Builder::new()
+            .name("aterm-setup-status".into())
+            .spawn(move || {
+                // Ends once the window lets the reader go and no poll is left to answer.
+                while let Ok((status, generation)) = asked.recv() {
+                    crate::workstation_setup::send_setup_wake(Wake::InitialSetupStatus {
+                        generation: Some(generation),
+                        status: status(),
+                    });
+                }
+            });
+        if started.is_err() || polls.send((status, generation)).is_err() {
+            self.status_reader = None;
+            return false;
+        }
+        self.status_reader = Some(polls);
+        true
+    }
+
     /// The status last published to System State (`system_state_access`'s
     /// menu line reads it).
     pub(crate) const fn latest_status(&self) -> &SetupStatus {
@@ -616,9 +653,24 @@ impl App {
         }
         self.system_state_host.access_step = step;
         self.refresh_system_state_menu_line();
+        // Setup that finished, or that a person cancelled, says nothing more by itself while no
+        // page shows it: the reader is let go and no poll is due. A worker's own publication, a
+        // page opening or a person's press asks for a read again, which starts a reader.
+        let quiet = (status.finished || status.cancelled)
+            && !status.busy
+            && self.system_state_host.pending.is_none()
+            && self
+                .native_runtime
+                .instance_by_kind(AppKind::SystemState)
+                .is_none();
         let changed = self.native_runtime.publish_system_state(status);
         self.system_state_host.status_in_flight = false;
-        self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
+        if quiet {
+            self.system_state_host.next_status = None;
+            self.system_state_host.status_reader = None;
+        } else {
+            self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
+        }
         // A Command Line Tools install a pass asked for opens its tab once it is due.
         self.tick_developer_tools_install();
         // A tab indicator that changed redraws its own window (its tab chrome).
@@ -1155,15 +1207,10 @@ impl App {
             self.system_state_host.status_in_flight = true;
             self.system_state_host.next_status = None;
             let generation = self.system_state_host.generation;
-            let started = std::thread::Builder::new()
-                .name("aterm-setup-status".into())
-                .spawn(move || {
-                    crate::workstation_setup::send_setup_wake(Wake::InitialSetupStatus {
-                        generation: Some(generation),
-                        status: (handlers.status)(),
-                    });
-                });
-            if started.is_err() {
+            if !self
+                .system_state_host
+                .send_status_poll(handlers.status, generation)
+            {
                 self.system_state_host.status_in_flight = false;
                 self.system_state_host.next_status = Some(now + Duration::from_secs(1));
             }

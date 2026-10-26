@@ -868,7 +868,89 @@ pub fn bundle_identity(root: &Path, protected: &[PathBuf]) -> Option<BundleIdent
 }
 
 fn signed_identity(root: &Path, bundle_id: Option<String>) -> BundleIdentity {
-    identity_from_report(codesign_report(root).as_deref(), bundle_id)
+    identity_from_report(kept_report(root, codesign_report).as_deref(), bundle_id)
+}
+
+/// One bundle's signature report, read once: a reader that asks while another reads it waits.
+type KeptReport = std::sync::Arc<std::sync::OnceLock<Option<String>>>;
+
+/// The `codesign` reports this process read, by [`signature_key`]: `aterm doctor`'s privacy row
+/// and its copy census both read the running bundle's, on two threads at once, and one spawn
+/// answers both.
+static REPORTS: std::sync::Mutex<Vec<(String, KeptReport)>> = std::sync::Mutex::new(Vec::new());
+
+/// What a bundle's signature report depends on, read without spawning: the bundle's real path
+/// and the identity (device, inode, mode, length, modification and status-change times) of its
+/// `Info.plist`, its `_CodeSignature/CodeResources` and every file directly in `Contents/MacOS`.
+/// A re-sign rewrites the seal and the executables, and a change of mode or owner (an
+/// executable codesign can no longer read) moves the status-change time, so either changes the
+/// key. `None` when the bundle's path cannot be resolved.
+fn signature_key(root: &Path) -> Option<String> {
+    use std::fmt::Write as _;
+    let real = std::fs::canonicalize(root).ok()?;
+    let contents = real.join("Contents");
+    let mut files = vec![
+        contents.join("Info.plist"),
+        contents.join("_CodeSignature").join("CodeResources"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(contents.join("MacOS")) {
+        let mut exes: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        exes.sort();
+        files.extend(exes);
+    }
+    let mut key = real.display().to_string();
+    for file in files {
+        let _ = write!(key, "\u{1f}{}", file.display());
+        match std::fs::symlink_metadata(&file) {
+            Ok(meta) => {
+                let at = meta
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |at| at.as_nanos());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let _ = write!(
+                        key,
+                        " {}:{} {:o} {}.{}",
+                        meta.dev(),
+                        meta.ino(),
+                        meta.mode(),
+                        meta.ctime(),
+                        meta.ctime_nsec()
+                    );
+                }
+                let _ = write!(key, " {} {at}", meta.len());
+            }
+            Err(_) => key.push_str(" absent"),
+        }
+    }
+    Some(key)
+}
+
+/// `root`'s signature report through `read` ([`codesign_report`]), read once per
+/// [`signature_key`] in this process; a bundle whose key cannot be read is read every time.
+fn kept_report(root: &Path, read: impl FnOnce(&Path) -> Option<String>) -> Option<String> {
+    let Some(key) = signature_key(root) else {
+        return read(root);
+    };
+    let once = {
+        let mut reports = REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, once)) = reports.iter().find(|(k, _)| *k == key) {
+            std::sync::Arc::clone(once)
+        } else {
+            if reports.len() >= 32 {
+                reports.remove(0);
+            }
+            let once = KeptReport::default();
+            reports.push((key, std::sync::Arc::clone(&once)));
+            once
+        }
+    };
+    once.get_or_init(|| read(root)).clone()
 }
 
 fn identity_from_report(report: Option<&str>, bundle_id: Option<String>) -> BundleIdentity {
@@ -2826,8 +2908,10 @@ pub fn log_store_readable() -> bool {
     std::fs::read_dir(DIAGNOSTICS_DIR).is_ok()
 }
 
-/// How far back [`probe_devtool`] reads tccd's answers, in seconds.
-pub const DEVTOOL_WINDOW_S: u64 = 600;
+/// How far back [`probe_devtool`] reads tccd's answers, in seconds: tccd answers as a new
+/// program starts, and the window's Developer Tools reading is never older than this
+/// (`DEVTOOLS_TTL`), so a longer read finds nothing a reader still needs.
+pub const DEVTOOL_WINDOW_S: u64 = 120;
 
 /// Where a person adds aterm to the Developer Tools list, in words.
 pub const DEVTOOLS_SETTINGS_WORDS: &str =
@@ -2849,7 +2933,7 @@ const DEVTOOL_PREDICATE: &str = "process == \"tccd\" AND eventMessage BEGINSWITH
 const DEVTOOL_LOG_ARGS: [&str; 10] = [
     "show",
     "--last",
-    "10m",
+    "2m",
     "--info",
     "--style",
     "ndjson",
@@ -2926,6 +3010,10 @@ pub enum DevToolProbeLabel {
     Observed,
     /// Tccd's log was read whole and held no answer for the subject in the window.
     NoRecentRequest,
+    /// Not read: the list holds the subject switched on, unchanged since this process
+    /// started, and the verdict is left to the switch ([`devtool_grant`]); a row that no
+    /// longer matches this copy goes unseen by such a run.
+    NotNeeded,
     /// The log store could not be read.
     LogUnavailable,
     /// `log` ran on an account that can read the store, and exited non-zero or by a signal.
@@ -2960,6 +3048,7 @@ impl DevToolProbeLabel {
             Self::Pending => "pending",
             Self::Observed => "observed",
             Self::NoRecentRequest => "no_recent_request",
+            Self::NotNeeded => "not_needed",
             Self::LogUnavailable => "log_unavailable",
             Self::LogFailed => "log_failed",
             Self::FormatUnrecognized => "format_unrecognized",
@@ -4932,6 +5021,56 @@ pub fn a_real_volume_mounted_in_the_bundle_is_not_crossed(dir: &Path) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One process reads a bundle's signature report once, whoever asks (the privacy row, the
+    /// copy census); a re-signed executable reads it afresh. NEGATIVE CONTROL: another bundle,
+    /// the same bundle after its executable changed, and after its mode shut codesign out, each
+    /// read again.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundles_signature_report_is_read_once_until_it_is_re_signed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let bundle = |name: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(root.join("Contents/MacOS")).unwrap();
+            std::fs::write(root.join("Contents/Info.plist"), "<plist/>").unwrap();
+            std::fs::write(root.join("Contents/MacOS/aterm"), "one").unwrap();
+            root
+        };
+        let one = bundle("One.app");
+        let other = bundle("Other.app");
+        let reads = std::cell::Cell::new(0);
+        let read = |_: &Path| {
+            reads.set(reads.get() + 1);
+            Some(format!("report {}", reads.get()))
+        };
+        assert_eq!(kept_report(&one, read).as_deref(), Some("report 1"));
+        assert_eq!(kept_report(&one, read).as_deref(), Some("report 1"));
+        assert_eq!(reads.get(), 1, "the second reader took the first report");
+        assert_eq!(kept_report(&other, read).as_deref(), Some("report 2"));
+        std::fs::write(one.join("Contents/MacOS/aterm"), "re-signed").unwrap();
+        assert_eq!(kept_report(&one, read).as_deref(), Some("report 3"));
+        assert_eq!(reads.get(), 3, "a changed executable reads afresh");
+        let exe = one.join("Contents/MacOS/aterm");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(kept_report(&one, read).as_deref(), Some("report 4"));
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            reads.get(),
+            4,
+            "an executable codesign can no longer read reads afresh"
+        );
+        assert_eq!(
+            kept_report(&dir.path().join("Gone.app"), read).as_deref(),
+            Some("report 5")
+        );
+        assert_eq!(
+            kept_report(&dir.path().join("Gone.app"), read).as_deref(),
+            Some("report 6")
+        );
+        assert_eq!(reads.get(), 6, "an unresolvable bundle is read every time");
+    }
 
     #[cfg(target_os = "macos")]
     type ReadersAct = Box<dyn FnOnce(&mut std::time::Instant)>;

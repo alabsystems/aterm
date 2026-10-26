@@ -40,6 +40,10 @@ pub const NOT_HERE: &str = "no secrets vault on this network; aterm secrets join
 /// ([`Look::NoVault`]), so a caller tells that answer from one nobody gave.
 pub const NO_VAULT_NOW: &str = "no vault is there now, so nothing was changed";
 
+/// How a join's failure after the vault answered it starts (the subscriber not installed or not
+/// staying up): the vault was reached, which System State keeps for Local Network.
+pub const VAULT_ANSWERED_BUT: &str = "the vault answered, but";
+
 /// What it says where macOS refuses aterm the local network, so no vault could be looked for.
 const LAN_REFUSED: &str = "macOS does not let aterm use the local network, so no vault was looked for: turn aterm on in System Settings > Privacy & Security > Local Network, or name one with aterm init --vault <url>";
 
@@ -1511,7 +1515,7 @@ impl Vault {
         installed
             .get_or_init(|| self.subscribe())
             .clone()
-            .map_err(|why| format!("the vault answered, but {why}"))?;
+            .map_err(|why| format!("{VAULT_ANSWERED_BUT} {why}"))?;
         let JoinOutcome::Pending { mut code, .. } = outcome else {
             return Ok(());
         };

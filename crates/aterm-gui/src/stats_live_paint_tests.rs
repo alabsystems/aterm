@@ -8,7 +8,6 @@
 use super::paint_tests::{AT, Scene, scene, scene_input};
 use super::*;
 use crate::stats_live::{BEAT_REACH, DOT_R, DOT_RISE, LINE_DX, glide_step};
-use aterm_vitals::SlotGrid;
 
 /// 10:42:10: a 10 s column opens (the scene's reading, 10:42:17, moved back to it).
 const OPEN: i64 = AT - 7_000;
@@ -77,45 +76,75 @@ fn px(v: f64, s: f64) -> f32 {
     (v * s + 0.5).floor() as f32
 }
 
-/// The left edges of the filled cells of `d`'s first row (the heat panels, which stand on the
-/// row's foot), sorted.
-fn row_cells(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<f32> {
+/// The `(x, w)` spans of the filled multi-scale cells of `d`'s first row, sorted left to right.
+fn row_cells_xw(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<(f32, f32)> {
     let strip = &d.strip;
-    let (x0, cw, foot) = (
+    let (x0, x1, top, cell_h) = (
         px(strip.x, s),
-        px(strip.cell, s),
-        px(d.top, s) + px(d.cell, s),
+        px(strip.end(), s),
+        px(d.top, s),
+        px(d.cell, s),
     );
     let pitch = px(strip.pitch, s);
-    let mut xs: Vec<f32> = prims
+    let mut xs: Vec<(f32, f32)> = prims
         .iter()
         .filter_map(|p| match *p {
             DrawPrim::Panel { x, y, w, h, .. }
-                if (w - cw).abs() < 0.01
-                    && (y + h - foot).abs() < 0.01
-                    && x > x0 - pitch - 0.01
-                    && x < x0 + strip.cols as f32 * pitch =>
+                if (y - top).abs() < 0.01
+                    && (h - cell_h).abs() < 0.01
+                    && x + w > x0 - pitch - 0.01
+                    && x < x1 + pitch + 0.01 =>
             {
-                Some(x)
+                Some((x, w))
             }
             _ => None,
         })
         .collect();
-    xs.sort_by(f32::total_cmp);
+    xs.sort_by(|a, b| a.0.total_cmp(&b.0));
     xs
+}
+
+/// The left edges of the filled cells of `d`'s first row, sorted.
+fn row_cells(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<f32> {
+    row_cells_xw(prims, d, s)
+        .into_iter()
+        .map(|(x, _)| x)
+        .collect()
 }
 
 /// The left edges of the unread (hollow) cells of `d`'s first row, sorted.
 fn row_hollow(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<f32> {
     let strip = &d.strip;
-    let (cw, top) = (px(strip.cell, s), px(d.top, s));
+    let (x0, x1, top, cell_h) = (
+        px(strip.x, s),
+        px(strip.end(), s),
+        px(d.top, s),
+        px(d.cell, s),
+    );
+    let pitch = px(strip.pitch, s);
+    let hollow = rgba(super::tests::dark_inks().hollow, 0xFF);
     let mut xs: Vec<f32> = prims
         .iter()
         .filter_map(|p| match *p {
-            DrawPrim::Stroke { x, y, w, .. }
-                if (w - (cw - 1.0)).abs() < 0.01 && (y - 0.5 - top).abs() < 0.01 =>
+            DrawPrim::Stroke {
+                x, y, w, h, color, ..
+            } if color == hollow
+                && (y - 0.5 - top).abs() < 0.01
+                && (h - (cell_h - 1.0)).abs() < 0.01
+                && x + w > x0 - pitch - 0.01
+                && x < x1 + pitch + 0.01 =>
             {
                 Some(x - 0.5)
+            }
+            DrawPrim::Panel {
+                x, y, w, h, fill, ..
+            } if fill == hollow
+                && (y - (top + cell_h - 1.0)).abs() < 0.01
+                && (h - 1.0).abs() < 0.01
+                && x + w > x0 - pitch - 0.01
+                && x < x1 + pitch + 0.01 =>
+            {
+                Some(x)
             }
             _ => None,
         })
@@ -195,17 +224,25 @@ fn the_newest_column_ends_under_the_now_marker() {
                     ..
                 } = d;
                 let at = format!("{form:?} {w} pt {s}x, strip at {}", strip.x);
-                let cells = row_cells(&prims, &d, s);
+                let expected = multi_scale_slot_rects(&strip, s, 0.0);
+                let cells_xw = row_cells_xw(&prims, &d, s);
+                let hollow = row_hollow(&prims, &d, s);
                 assert_eq!(
-                    cells.len(),
-                    strip.cols as usize,
-                    "{at}: the first row's cells"
+                    cells_xw.len() + hollow.len(),
+                    expected.len(),
+                    "{at}: the first row's multi-scale slots (filled + hollow)"
                 );
-                let newest = cells.last().copied().unwrap_or_default();
+                if expected.len() >= 3 {
+                    assert!(
+                        expected[0].2 >= expected[expected.len() - 2].2,
+                        "{at}: progressive boxes grow wider toward the left: {expected:?}"
+                    );
+                }
+                let &(newest, newest_w) = cells_xw.last().expect("live now box filled");
                 assert!(
-                    (newest + px(strip.cell, s) - px(strip.end(), s)).abs() < 0.01,
-                    "{at}: the newest column ends at {} not {}",
-                    newest + px(strip.cell, s),
+                    (newest + newest_w - px(strip.end(), s)).abs() < 0.01,
+                    "{at}: the newest live box ends at {} not {}",
+                    newest + newest_w,
                     px(strip.end(), s)
                 );
                 let (cx, cy) = (
@@ -219,7 +256,7 @@ fn the_newest_column_ends_under_the_now_marker() {
                 assert_eq!(dot.2, (DOT_R * s) as f32, "{at}");
                 assert_eq!(dot.3, ink(inks.words, 0xFF), "{at}: the dot's ink");
                 assert!(
-                    cx > newest + px(strip.cell, s) - 0.01,
+                    cx > newest + newest_w - 0.01,
                     "{at}: the dot is past the strip"
                 );
                 let (y0, y1, line) =
@@ -259,11 +296,18 @@ fn the_strips_glide_left_by_the_part_of_the_period_run() {
             glide_ms: Some(ms),
             slide: None,
             beat: None,
+            blend: None,
             fresh: true,
         };
         let still = paint(&snap, form, w, s, DeckLive::STILL);
-        let slots = row_cells(&still, &d, s);
-        assert_eq!(slots.len(), strip.cols as usize, "CONTROL");
+        let all_xs = |prims: &[DrawPrim]| -> Vec<f32> {
+            let mut v = row_cells(prims, &d, s);
+            v.extend(row_hollow(prims, &d, s));
+            v.sort_by(f32::total_cmp);
+            v
+        };
+        let base_slots = multi_scale_slot_rects(&strip, s, 0.0);
+        assert_eq!(all_xs(&still).len(), base_slots.len(), "CONTROL");
         // The strips' clips: the gauge left of the names clips its own bands.
         let clips = |prims: &[DrawPrim]| {
             prims
@@ -286,39 +330,35 @@ fn the_strips_glide_left_by_the_part_of_the_period_run() {
             prims_fp(&still),
             "{s}x"
         );
-        assert!(
-            row_hollow(&still, &d, s).is_empty(),
-            "CONTROL: every slot read"
-        );
         let pitch = px(strip.pitch, s);
-        let x0 = px(strip.x, s);
-        // t = 0: the closed columns in their slots, the open one not yet on the strip: each
-        // column stands one slot left of where the still frame drew it, so the oldest slot holds
-        // the column before the span (unread in this scene, whose readings span ten minutes).
+        let right = px(strip.end(), s);
+        // t = 0: historical slots shift right by `pitch`, clipped before the anchored `now` box,
+        // and a leading hollow slot slides in at the left.
         let t0 = paint(&snap, form, w, s, glide(OPEN));
-        assert_eq!(row_cells(&t0, &d, s), slots[1..], "{s}x: t = 0");
-        assert_eq!(row_hollow(&t0, &d, s), [x0], "{s}x: t = 0");
+        let expected_t0: Vec<f32> = multi_scale_slot_rects(&strip, s, pitch)
+            .into_iter()
+            .map(|r| r.1)
+            .collect();
+        assert_eq!(all_xs(&t0), expected_t0, "{s}x: t = 0");
         assert_eq!(
             clips(&t0),
             DECK_RESOURCES.len(),
             "{s}x: each row clips its strip"
         );
-        // t = half the period: every column half a pitch right of its slot, the one before the
-        // span half in at the left, and the open column's first half at the right end.
+        // t = half the period: historical boxes stand half a pitch right of their slots while the
+        // live `now` box stays anchored at `strip.end()`.
+        let half_shift = (0.5 * pitch).round();
         let half = paint(&snap, form, w, s, glide(OPEN + 5_000));
-        let shifted: Vec<f32> = slots.iter().map(|x| x + pitch / 2.0).collect();
-        assert_eq!(row_cells(&half, &d, s), shifted, "{s}x: t = half");
-        assert_eq!(
-            row_hollow(&half, &d, s),
-            [x0 - pitch / 2.0],
-            "{s}x: t = half"
-        );
-        let right = px(strip.end(), s);
+        let expected_half: Vec<f32> = multi_scale_slot_rects(&strip, s, half_shift)
+            .into_iter()
+            .map(|r| r.1)
+            .collect();
+        assert_eq!(all_xs(&half), expected_half, "{s}x: t = half");
+        let half_filled = row_cells_xw(&half, &d, s);
+        let &(now_x, now_w) = half_filled.last().expect("anchored live now box");
         assert!(
-            shifted
-                .last()
-                .is_some_and(|x| *x < right && x + px(strip.cell, s) > right),
-            "{s}x: the open column runs off the strip's end, clipped"
+            (now_x + now_w - right).abs() < 0.01,
+            "{s}x: the live now box stays anchored on strip.end()"
         );
     }
 }
@@ -344,6 +384,7 @@ fn every_live_frame_draws_its_cells_on_whole_pixels() {
                     glide_ms: Some(glide_ms),
                     slide: None,
                     beat: None,
+                    blend: None,
                     fresh: true,
                 };
                 let prims = paint(&snap, DeckForm::Full, w, s, live);
@@ -382,45 +423,6 @@ fn every_live_frame_draws_its_cells_on_whole_pixels() {
         fractional >= 10,
         "CONTROL: unrounded, {fractional} of these frames fall between pixels"
     );
-}
-
-/// The shift, `-max..=max` device px, that best lines `b`'s pixel row `y` up with `a`'s over
-/// `x0..x1` (`b[x]` against `a[x + shift]`, so a positive shift is content gone left), and the
-/// mean channel difference left there and with no shift at all.
-fn best_shift(
-    a: &[u8],
-    b: &[u8],
-    pw: u32,
-    y: u32,
-    (x0, x1): (u32, u32),
-    max: i32,
-) -> (i32, f64, f64) {
-    let at = |img: &[u8], x: i64| -> [u8; 4] {
-        let i = (y as usize * pw as usize + x as usize) * 4;
-        img.get(i..i + 4)
-            .and_then(|p| <[u8; 4]>::try_from(p).ok())
-            .unwrap_or_default()
-    };
-    let cost = |d: i32| -> f64 {
-        let (lo, hi) = (
-            i64::from(x0) + i64::from(max),
-            i64::from(x1) - i64::from(max),
-        );
-        let mut sum = 0.0;
-        for x in lo..hi {
-            let (p, q) = (at(b, x), at(a, x + i64::from(d)));
-            sum += p
-                .iter()
-                .zip(q)
-                .map(|(&u, v)| f64::from(u.abs_diff(v)))
-                .sum::<f64>();
-        }
-        sum / (hi - lo).max(1) as f64
-    };
-    let best = (-max..=max)
-        .min_by(|&p, &q| cost(p).total_cmp(&cost(q)))
-        .unwrap_or(0);
-    (best, cost(best), cost(0))
 }
 
 /// `snap` with its CPU row's readings replaced: one a second for the minute before `at` (its
@@ -476,18 +478,18 @@ fn the_default_window_is_seen_sliding_left() {
             );
         }
     }
-    // NEGATIVE CONTROL: a Full strip keeps its ten minutes, and at 1x glides under a pixel a
-    // second (Full is drawn only where it is chosen).
+    // NEGATIVE CONTROL: a Full strip spans its 1h multi-scale horizon, and at 1x glides under a
+    // pixel a second (Full is drawn only where it is chosen).
     let full = plan::plan_full(1119.0, &m).strip;
-    assert_eq!(full.span_s(), 600);
+    assert_eq!(full.span_s(), 3_600);
     assert!(full.pt_per_s() < 1.0, "{full:?}");
 
     let (form, w) = (DeckForm::Folded, 600.0);
     let d = strips(form, w)[0];
     assert_eq!(
         (d.strip.period_s, d.strip.span_s(), d.strip.pitch),
-        (1, 20, 3.0),
-        "the default window's strip spans 20 s, a reading's second on each 3 pt cell"
+        (1, 60, 3.0),
+        "the default window's multi-scale strip spans 60 s with fine real-time slots on the right"
     );
     let at0 = OPEN + 300;
     let snap_at = |at: i64| with_cpu_readings(scene(Scene::Calm), at, varied);
@@ -504,30 +506,45 @@ fn the_default_window_is_seen_sliding_left() {
             (f64::from(pitch), 0.0),
             "{s}x: a Folded card slides and never glides: {out:?}"
         );
-        // The prims through one reading's slide: the first row's cells stand a shift right of
-        // their slots, which runs from a whole pitch (the reading before's strip, read in the new
-        // one's slots) down to none, each frame a whole pixel or more and under half a pitch.
         let frames = slide_frames(out.slide_pitch_px);
         assert!(frames >= 3, "{s}x: {frames} frames");
-        let x0 = px(d.strip.x, s);
-        let shift_of = |cells: &[f32]| -> f32 {
-            let shifts: Vec<f32> = cells.iter().map(|x| (x - x0).rem_euclid(pitch)).collect();
-            assert!(
-                shifts.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
-                "{s}x: the cells moved as one: {cells:?}"
-            );
-            shifts.first().copied().unwrap_or_default()
-        };
+        let base_rects = multi_scale_slot_rects(&d.strip, s, 0.0);
+        let slide_max_ms = (i64::from(d.strip.period_s) * 1_000).max(2_000);
+        let zone_idx = d
+            .strip
+            .spec
+            .slots()
+            .iter()
+            .position(|slot| !slot.is_live_now && (slot.age_hi_ms - slot.age_lo_ms) <= slide_max_ms)
+            .unwrap_or(0);
+        let base_zone_x = base_rects[zone_idx].1;
         let next = snap_at(at0 + 1_000);
         let mut shifts = vec![pitch];
         for k in 0..frames {
-            let cells = row_cells(
-                &paint(&next, form, w, s, slid(slide_phase(k, frames))),
-                &d,
-                s,
+            let phase = slide_phase(k, frames);
+            let prims = paint(&next, form, w, s, slid(phase));
+            let cells = row_cells(&prims, &d, s);
+            assert!(!cells.is_empty(), "{s}x: {cells:?}");
+            let shift = match phase {
+                Some(f) => ((1.0 - f) * pitch).round(),
+                None => 0.0,
+            };
+            let shifted_rects = multi_scale_slot_rects(&d.strip, s, shift);
+            assert!(
+                shifted_rects.iter().all(|r| r.0 != usize::MAX),
+                "{s}x: slide frame {k} must never forge an out-of-range hollow slot"
             );
-            assert!(cells.len() >= d.strip.cols as usize, "{s}x: {cells:?}");
-            shifts.push(shift_of(&cells));
+            let expected: Vec<f32> = shifted_rects.iter().map(|r| r.1).collect();
+            let mut got = cells.clone();
+            got.extend(row_hollow(&prims, &d, s));
+            got.sort_by(f32::total_cmp);
+            assert_eq!(got, expected, "{s}x: slide frame {k}");
+            let first_sliding = shifted_rects
+                .into_iter()
+                .find(|r| r.0 == zone_idx)
+                .map(|r| r.1 - base_zone_x)
+                .unwrap_or(0.0);
+            shifts.push(first_sliding);
         }
         assert_eq!(shifts.last(), Some(&0.0), "{s}x: it comes in: {shifts:?}");
         for m in shifts.windows(2).map(|w| w[0] - w[1]) {
@@ -541,66 +558,88 @@ fn the_default_window_is_seen_sliding_left() {
             row_cells(&paint(&snap_at(at0), form, w, s, slid(None)), &d, s),
             "{s}x: come in, a reading's strip stands in the slots the last one's did"
         );
-        // The raster, read as two screenshots are: two readings on, the strip's pixels stand
-        // two pitches left.
+        // Over the fine 2 s slots near `now` (`6..4s` and `4..2s`), a 2 s pulse at `at0` stands
+        // in `4..2s`, and 2 s later (`at0 + 2_000`) has shifted one fine-slot pitch left into
+        // `6..4s` on the raster.
         let raster = |snap: &Snapshot| {
             let mut input = scene_input(snap, form);
             input.live = DeckLive::STILL;
             let (prims, _) = deck_paint(&g, &input);
             crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0; 4]).0
         };
-        let (a, b) = (raster(&snap_at(at0)), raster(&snap_at(at0 + 2_000)));
+        let pulse_sec = at0.div_euclid(1000) - 3;
+        let pulse_at = |at: i64| {
+            with_cpu_readings(scene(Scene::Calm), at, |t| {
+                if (pulse_sec - 1..=pulse_sec).contains(&t) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+        };
+        let n_slots = base_rects.len();
+        let fine_pitch = base_rects[n_slots - 2].1 - base_rects[n_slots - 3].1;
+        let (a, b) = (raster(&pulse_at(at0)), raster(&pulse_at(at0 + 2_000)));
         let y = (px(d.top, s) + px(d.cell, s) / 2.0) as u32;
-        let span = (px(d.strip.x, s) as u32, px(d.strip.end(), s) as u32);
-        let max = (3.0 * pitch) as i32;
-        let (shift, left, unmoved) = best_shift(&a, &b, g.w as u32, y, span, max);
+        let (s6_x, s6_w) = (base_rects[n_slots - 3].1, base_rects[n_slots - 3].2);
+        let (s4_x, s4_w) = (base_rects[n_slots - 2].1, base_rects[n_slots - 2].2);
+        let px_at = |img: &[u8], x: f32| -> [u8; 4] {
+            let cx = (x + 1.0) as usize;
+            let i = (y as usize * g.w as usize + cx) * 4;
+            img[i..i + 4].try_into().expect("rgba")
+        };
         assert_eq!(
-            shift as f32,
-            2.0 * pitch,
-            "{s}x: two readings moved the strip {shift} px"
+            px_at(&a, s4_x),
+            px_at(&b, s6_x),
+            "{s}x: 2 s later, the hot 2 s reading shifted left by {fine_pitch} px ({s4_w} -> {s6_w})"
         );
-        assert!(left < 1.0, "{s}x: {left} left after lining up");
-        assert!(
-            unmoved > 10.0,
-            "CONTROL {s}x: the frames differ ({unmoved})"
+        assert_ne!(
+            px_at(&a, s4_x),
+            px_at(&a, s6_x),
+            "CONTROL {s}x: hot and cold slots differ on the raster"
         );
     }
 }
 
-/// A Folded strip draws each second's reading, the newest at its right end: with the CPU hot for
-/// its last 8 seconds and cold for the minute before, the default window's 20 cells are 12 cold
-/// then 8 hot, and the other way round 12 hot then 8 cold.
+/// A Folded multi-scale strip draws fine real-time readings on the right and aggregated history
+/// on the left: with CPU hot for the last 6 s and cold for the 54 s before, every historical slot
+/// older than 6 s draws cold while the fine 2 s slots inside the last 6 s draw hot (and the
+/// far-right `now` box glows in its live thermal color).
 #[test]
 fn a_folded_strip_draws_each_seconds_reading() {
     let (form, w) = (DeckForm::Folded, 600.0);
     let d = strips(form, w)[0];
     let at = OPEN + 300;
-    let cells_of = |snap: &Snapshot, s: f64| -> Vec<[u8; 4]> {
+    let hist_cells_of = |snap: &Snapshot, s: f64| -> Vec<[u8; 4]> {
         let prims = paint(snap, form, w, s, DeckLive::STILL);
-        let xs = row_cells(&prims, &d, s);
-        let mut cells: Vec<(f32, [u8; 4])> = prims
-            .iter()
-            .filter_map(|p| match *p {
-                DrawPrim::Panel {
-                    x, y, w, h, fill, ..
-                } if xs.contains(&x)
-                    && (w - px(d.strip.cell, s)).abs() < 0.01
-                    && (y + h - (px(d.top, s) + px(d.cell, s))).abs() < 0.01 =>
-                {
-                    Some((x, fill))
-                }
-                _ => None,
+        let rects = multi_scale_slot_rects(&d.strip, s, 0.0);
+        let top = px(d.top, s);
+        let cell_h = px(d.cell, s);
+        rects
+            .into_iter()
+            .filter(|r| !r.3)
+            .filter_map(|(_, rx, rw, _)| {
+                prims.iter().find_map(|p| match *p {
+                    DrawPrim::Panel {
+                        x, y, w, h, fill, ..
+                    } if (x - rx).abs() < 0.01
+                        && (w - rw).abs() < 0.01
+                        && (y - top).abs() < 0.01
+                        && (h - cell_h).abs() < 0.01 =>
+                    {
+                        Some(fill)
+                    }
+                    _ => None,
+                })
             })
-            .collect();
-        cells.sort_by(|a, b| a.0.total_cmp(&b.0));
-        cells.into_iter().map(|(_, fill)| fill).collect()
+            .collect()
     };
     let painted = |hot_last: bool, s: f64| -> Vec<[u8; 4]> {
-        let last8 = at.div_euclid(1000) - 8;
+        let last6 = at.div_euclid(1000) - 6;
         let snap = with_cpu_readings(scene(Scene::Calm), at, |t| {
-            if (t > last8) == hot_last { 1.0 } else { 0.0 }
+            if (t >= last6) == hot_last { 1.0 } else { 0.0 }
         });
-        cells_of(&snap, s)
+        hist_cells_of(&snap, s)
     };
     let inks = super::tests::dark_inks();
     let (hot, cold) = (
@@ -608,51 +647,32 @@ fn a_folded_strip_draws_each_seconds_reading() {
         ink(inks.heat[usize::from(ink::heat_step(0.0))], 0xFF),
     );
     assert_ne!(hot, cold, "CONTROL: the ramp's ends differ");
+    let slots = d.strip.spec.slots();
+    let hist_slots: Vec<_> = slots.iter().filter(|sl| !sl.is_live_now).collect();
+    let split = hist_slots
+        .iter()
+        .position(|sl| sl.age_hi_ms <= 6_000)
+        .expect("fine 2s slots inside last 6s");
     for s in [1.0, 2.0] {
         let newest = painted(true, s);
-        assert_eq!(newest.len(), d.strip.cols as usize, "{s}x: {newest:?}");
-        assert!(newest[..12].iter().all(|&f| f == cold), "{s}x: {newest:?}");
-        assert!(newest[12..].iter().all(|&f| f == hot), "{s}x: {newest:?}");
-        let oldest = painted(false, s);
-        assert_eq!(oldest.len(), d.strip.cols as usize, "{s}x");
-        assert!(oldest[..12].iter().all(|&f| f == hot), "{s}x: {oldest:?}");
-        assert!(oldest[12..].iter().all(|&f| f == cold), "{s}x: {oldest:?}");
-    }
-    // Readings a second apart that straddle the wall clock's second by 30 ms either way, hot
-    // and cold in turn: on the snapshot's grid (its edges half a second in, where the model puts
-    // them for such readings) each stands in its own slot and the strip alternates as they do;
-    // on the wall clock's own seconds two share a slot and the next is spoken for by a third.
-    let straddling = |grid: SlotGrid| {
-        let mut snap = scene(Scene::Calm);
-        let view = &mut snap.resources[Resource::Cpu.index()];
-        let cap = view.capacity.expect("the scene's CPU capacity");
-        view.recent = (0..60_i64)
-            .map(|k| aterm_vitals::Reading {
-                at_ms: OPEN - 59_000 + k * 1000 + if k % 2 == 0 { -30 } else { 30 },
-                v: if k % 2 == 0 { cap } else { 0.0 },
-                over: false,
-            })
-            .collect();
-        snap.at_unix_ms = OPEN + 30;
-        snap.slot_grid = grid;
-        snap
-    };
-    let grid = SlotGrid {
-        origin_ms: 500,
-        ..SlotGrid::SECONDS
-    };
-    for s in [1.0, 2.0] {
-        let cells = cells_of(&straddling(grid), s);
-        assert_eq!(cells.len(), d.strip.cols as usize, "{s}x: {cells:?}");
-        assert_eq!(cells.last(), Some(&cold), "{s}x: the newest reading's");
+        assert_eq!(newest.len(), hist_slots.len(), "{s}x: {newest:?}");
         assert!(
-            cells.windows(2).all(|p| p[0] != p[1]) && cells.iter().all(|c| [hot, cold].contains(c)),
-            "{s}x: a reading a cell: {cells:?}"
+            newest[..split].iter().all(|&f| f == cold),
+            "{s}x: {newest:?}"
         );
-        let seconds = cells_of(&straddling(SlotGrid::SECONDS), s);
         assert!(
-            !seconds.windows(2).all(|p| p[0] != p[1]),
-            "CONTROL {s}x: on the wall clock's seconds the readings pair up: {seconds:?}"
+            newest[split..].iter().all(|&f| f == hot),
+            "{s}x: {newest:?}"
+        );
+        let oldest = painted(false, s);
+        assert_eq!(oldest.len(), hist_slots.len(), "{s}x");
+        assert!(
+            oldest[..split].iter().all(|&f| f == hot),
+            "{s}x: {oldest:?}"
+        );
+        assert!(
+            oldest[split..].iter().all(|&f| f == cold),
+            "{s}x: {oldest:?}"
         );
     }
 }
@@ -711,6 +731,7 @@ fn a_stalled_deck_greys_its_marker_and_beats_nothing() {
         glide_ms: None,
         slide: None,
         beat: Some(phase),
+        blend: None,
         fresh: true,
     };
     let early = paint(&snap, form, w, s, beat(0.25));
@@ -989,6 +1010,7 @@ fn every_glide_frame_moves_the_cards_pixels() {
                 stale_after: Duration::from_secs(3),
                 motion: true,
                 beat: false,
+                tween: false,
                 flow,
             };
             let mut now = landed;
@@ -1024,6 +1046,7 @@ fn a_live_frame_patches_only_what_moved_to_the_whole_rasters_bytes() {
         glide_ms: Some(ms),
         slide: None,
         beat: Some(0.0),
+        blend: None,
         fresh: true,
     };
     let sliding = |slide| DeckLive {
@@ -1120,6 +1143,7 @@ fn a_beat_patch_blends_only_the_glyphs_over_its_rects() {
         glide_ms: Some(OPEN + 2_000),
         slide: None,
         beat: Some(0.0),
+        blend: None,
         fresh: true,
     };
     let now = DeckLive {
@@ -1222,6 +1246,7 @@ fn a_live_frame_keeps_the_prim_budget() {
         glide_ms: Some(snap.at_unix_ms + 1),
         slide: Some(0.5),
         beat: Some(0.0),
+        blend: Some(0.5),
         fresh: true,
     };
     for form in [DeckForm::Full, DeckForm::Folded] {
@@ -1256,6 +1281,7 @@ fn deck_live_gallery() {
                 glide_ms: Some(OPEN + 5_000),
                 slide: Some(0.5),
                 beat: None,
+                blend: None,
                 fresh: true,
             },
         ),
@@ -1265,6 +1291,7 @@ fn deck_live_gallery() {
                 glide_ms: Some(OPEN + 1_000),
                 slide: Some(0.25),
                 beat: crate::stats_live::beat_phase(0),
+                blend: crate::stats_live::tween_phase(0),
                 fresh: true,
             },
         ),
@@ -1313,4 +1340,304 @@ fn deck_live_gallery() {
         }
     }
     assert_eq!(written, frames.len() * WIDTHS.len() * 2 * 2);
+
+    // Rich showcase frames exercising 1h multi-scale history, Apple M5 Max + 128 GiB + 8 TB
+    // hardware identity, live Network state/RTT/per-scope sockets, Sleep gap, Crash line, and
+    // hot glowing cores & load dial.
+    let mut show = scene(Scene::Calm);
+    show.at_unix_ms = OPEN;
+    show.facts.cpu_brand = Some("Apple M5 Max".into());
+    if let Some(v) = show.volume.as_mut() {
+        v.total = 8_000_000_000_000;
+    }
+    show.resources[Resource::Disk.index()].capacity = Some(8_000_000_000_000.0);
+    for (ri, base_heat) in [0.92_f64, 0.24, 0.48, 0.62, 0.31, 0.14]
+        .into_iter()
+        .enumerate()
+    {
+        let rv = &mut show.resources[ri];
+        let cap = rv.capacity.unwrap_or(100.0).max(1.0);
+        rv.heat_now = Some(base_heat as f32);
+        rv.now = Some(base_heat * cap);
+        rv.ring = (0..360)
+            .map(|i| {
+                let wave = ((i as f64 * 0.19 + ri as f64).sin() * 0.18 + base_heat * 0.72)
+                    .clamp(0.04, 0.98);
+                let v = wave * cap;
+                aterm_vitals::Cell {
+                    mean: Some(v),
+                    max: Some(v),
+                    over: ri == 0 && i >= 352,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+        rv.ring_k = OPEN.div_euclid(10_000);
+        rv.recent = (0..60_i64)
+            .rev()
+            .map(|back| {
+                let wave = ((back as f64 * 0.35 + ri as f64).cos() * 0.14 + base_heat * 0.85)
+                    .clamp(0.05, 0.99);
+                aterm_vitals::Reading {
+                    at_ms: OPEN - back * 1_000,
+                    v: wave * cap,
+                    over: ri == 0 && back <= 8,
+                }
+            })
+            .collect();
+    }
+    show.facts.link = Some(aterm_vitals::LinkSample {
+        name: "en0".into(),
+        kind: aterm_vitals::LinkKind::Wifi,
+        up: true,
+        counts: true,
+        rate_bps: Some(1_200_000_000),
+        ..aterm_vitals::LinkSample::default()
+    });
+    show.net = Some(aterm_vitals::NetView {
+        links: Vec::new(),
+        rates: Some(aterm_vitals::LinkRates {
+            rx_bps: 14_200_000.0,
+            tx_bps: 1_800_000.0,
+            rx_pps: 9_800.0,
+            tx_pps: 2_100.0,
+            rx_err_ps: 0.0,
+            tx_err_ps: 0.0,
+            rx_drop_ps: 0.0,
+            tx_drop_ps: None,
+        }),
+        tcp: Some(aterm_vitals::TcpCounts {
+            established: 24,
+            listen: 6,
+            time_wait: 3,
+            ..aterm_vitals::TcpCounts::default()
+        }),
+        srtt_ms: Some(12.4),
+        state: aterm_vitals::NetState::Online,
+        aterm_sockets: Some(18),
+        tab_sockets: vec![(2, 6)],
+        ..aterm_vitals::NetView::default()
+    });
+    show.facts.link = Some(aterm_vitals::LinkSample {
+        name: "en0".into(),
+        kind: aterm_vitals::LinkKind::Wifi,
+        up: true,
+        counts: true,
+        rate_bps: Some(866_000_000),
+        ..aterm_vitals::LinkSample::default()
+    });
+    show.resources[Resource::Network.index()].aterm = aterm_vitals::ScopeFig {
+        now: Some(18.0),
+        missing: None,
+        ..aterm_vitals::ScopeFig::default()
+    };
+    let tab_net_fig = aterm_vitals::ScopeFig {
+        now: Some(6.0),
+        missing: None,
+        ..aterm_vitals::ScopeFig::default()
+    };
+    show.resources[Resource::Network.index()].tab = tab_net_fig.clone();
+    show.resources[Resource::Network.index()].tabs = vec![(2, tab_net_fig)];
+    show.time_gaps = vec![aterm_vitals::TimeGap {
+        start_ms: OPEN - 300_000,
+        end_ms: OPEN - 180_000,
+        kind: aterm_vitals::GapKind::Sleep,
+    }];
+    show.strip_events = vec![aterm_vitals::StripEvent {
+        at_unix_ms: OPEN - 25_000,
+        kind: aterm_vitals::StripEventKind::Crash,
+        label: "SIGSEGV".into(),
+    }];
+    for (w, form, ground, inks) in [
+        (1119.0, DeckForm::Folded, "dark", super::tests::dark_inks()),
+        (1119.0, DeckForm::Full, "dark", super::tests::dark_inks()),
+        (
+            1119.0,
+            DeckForm::Folded,
+            "light",
+            super::paint_tests::light_inks(),
+        ),
+        (1424.0, DeckForm::Folded, "dark", super::tests::dark_inks()),
+    ] {
+        let mut input = scene_input(&show, form);
+        input.inks = inks;
+        input.live = DeckLive {
+            glide_ms: Some(OPEN + 1_000),
+            slide: Some(0.25),
+            beat: crate::stats_live::beat_phase(0),
+            blend: None,
+            fresh: true,
+        };
+        let g = geom_at(w, 2.0, form);
+        let (prims, _) = deck_paint(&g, &input);
+        let (rgba, pw, ph) =
+            crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0, 0, 0, 0]);
+        let png = crate::app_introspect::encode_rgba8_png(&rgba, pw, ph).expect("showcase encodes");
+        let fword = if form == DeckForm::Full {
+            "full"
+        } else {
+            "folded"
+        };
+        std::fs::write(
+            dir.join(format!("showcase_{w}pt_2x_{fword}_{ground}.png")),
+            png,
+        )
+        .expect("showcase PNG writes");
+    }
+}
+
+#[test]
+fn glowing_live_now_box_changes_thermal_color_smoothly_and_patches_byte_for_byte() {
+    let mut prev = scene(Scene::Calm);
+    let mut curr = scene(Scene::Calm);
+    prev.resources[Resource::Cpu.index()].heat_now = Some(0.10);
+    curr.resources[Resource::Cpu.index()].heat_now = Some(0.95);
+    if let Some(cpu) = curr.cpu.as_mut() {
+        for c in &mut cpu.cores {
+            c.load.level = 0.92;
+        }
+    }
+    for (ground, inks) in [
+        ("dark", super::tests::dark_inks()),
+        ("light", super::paint_tests::light_inks()),
+    ] {
+        for form in [DeckForm::Folded, DeckForm::Full] {
+            let w = 1119.0;
+            let s = 2.0;
+            let g = geom_at(w, s, form);
+            let d = strips(form, w)[0];
+            let (_, live_x, live_w, _) = multi_scale_slot_rects(&d.strip, s, 0.0)
+                .into_iter()
+                .find(|r| r.3)
+                .expect("live now slot");
+            let top = px(d.top, s);
+            let cell_h = px(d.cell, s);
+
+            let paint_blend = |live: DeckLive, dwc: bool| {
+                let mut input = scene_input(&curr, form);
+                input.prev_snap = Some(&prev);
+                input.inks = inks;
+                input.live = live;
+                input.dwc = dwc;
+                deck_paint_live(&g, &input)
+            };
+
+            let (prims_low, _, _) = paint_blend(
+                DeckLive {
+                    blend: Some(0.20),
+                    ..DeckLive::STILL
+                },
+                false,
+            );
+            let (prims_mid, _, _) = paint_blend(
+                DeckLive {
+                    blend: Some(0.60),
+                    ..DeckLive::STILL
+                },
+                false,
+            );
+            let (prims_done, _, out_done) = paint_blend(DeckLive::STILL, false);
+            let (prims_stale, _, _) = paint_blend(DeckLive::STALE, false);
+            let (prims_dwc, _, _) = paint_blend(DeckLive::STILL, true);
+
+            let live_fill = |prims: &[DrawPrim]| -> [u8; 4] {
+                prims
+                    .iter()
+                    .find_map(|p| match *p {
+                        DrawPrim::Panel {
+                            x, y, w, h, fill, ..
+                        } if (x - live_x).abs() < 0.01
+                            && (w - live_w).abs() < 0.01
+                            && y >= top - 0.01
+                            && (y + h - (top + cell_h)).abs() < 0.01 =>
+                        {
+                            Some(fill)
+                        }
+                        _ => None,
+                    })
+                    .expect("live now panel")
+            };
+            let glow_strokes = |prims: &[DrawPrim]| -> usize {
+                prims
+                    .iter()
+                    .filter(|&p| {
+                        matches!(
+                            *p,
+                            DrawPrim::Stroke { x, y, color, .. }
+                                if (x - (live_x - 0.5)).abs() < 1.5
+                                    && (y - (top - 0.5)).abs() < 1.5
+                                    && color[3] < 0xFF
+                        )
+                    })
+                    .count()
+            };
+
+            let c_low = live_fill(&prims_low);
+            let c_mid = live_fill(&prims_mid);
+            let c_done = live_fill(&prims_done);
+            let c_stale = live_fill(&prims_stale);
+            assert!(
+                c_low != c_mid && c_mid != c_done,
+                "{ground} {form:?}: live now box smoothly shifts color across blend: \
+                 {c_low:?} -> {c_mid:?} -> {c_done:?}"
+            );
+            assert_eq!(
+                c_done,
+                rgba(inks.thermal_at(0.95, false), 0xFF),
+                "{ground} {form:?}: settled live now box matches thermal_at(0.95)"
+            );
+            assert_ne!(
+                c_stale, c_done,
+                "{ground} {form:?}: stale deck dims the live now box"
+            );
+            assert!(
+                glow_strokes(&prims_done) >= 2,
+                "{ground} {form:?}: fresh 2x live now box emits two-pass soft glow halo"
+            );
+            assert_eq!(
+                glow_strokes(&prims_stale),
+                0,
+                "{ground} {form:?}: stale deck emits no live glow halo"
+            );
+            assert_eq!(
+                glow_strokes(&prims_dwc),
+                0,
+                "{ground} {form:?}: dwc omits glow halo"
+            );
+
+            // Verify `patch_live` across `blend` transitions matches a fresh whole raster byte for byte.
+            let was = DeckLive {
+                blend: Some(0.20),
+                ..DeckLive::STILL
+            };
+            let now = DeckLive::STILL;
+            let whole = |prims: &[DrawPrim]| {
+                crate::tray_raster::rasterize_tray(prims, g.w as u32, g.h as u32, 1.0, [0, 0, 0, 0])
+            };
+            let (rgba0, pw, ph) = whole(&prims_low);
+            let (want, _, _) = whole(&prims_done);
+            let mut card = crate::SettingsCard {
+                rgba: rgba0,
+                pw,
+                ph,
+                dx: 0,
+                dy: 0,
+                fp: 1,
+                geom: 1,
+                raster_fingerprint_once: std::sync::OnceLock::new(),
+                scrim: None,
+            };
+            assert!(patch_live(
+                &mut card,
+                &prims_done,
+                &out_done.rects,
+                &was,
+                &now
+            ));
+            assert!(
+                card.rgba == want,
+                "{ground} {form:?}: blend patch_live must equal fresh rasterize_tray byte-for-byte"
+            );
+        }
+    }
 }

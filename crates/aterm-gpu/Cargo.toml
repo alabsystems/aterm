@@ -78,16 +78,16 @@ wgpu = { version = "29", optional = true, default-features = false, features = [
 # no edge.
 aterm-effects = { workspace = true, optional = true }
 
-# The native cells that present on wgpu (Windows, the BSDs): named directly
-# because `renderer::WindowTarget` (`HasWindowHandle + HasDisplayHandle`) bounds
-# the public `create_window_surface`; it adds no package (wgpu already resolves
-# this one version there). macOS's `WindowTarget` is first-party
-# `aterm_objc::HasNsView` and Linux's `aterm_types::native_window::
-# HasNativeWindow`, so neither shipped graph has raw-window-handle; their wgpu
-# oracles reach the crate through `wgpu::rwh` (docs/AUDIT-third-party-2026-10-15.md,
-# winit-core step 6, the macOS and Linux halves). wasm32 attaches no window:
-# its one surface is a canvas (`web::GpuContext::for_canvas`).
-[target.'cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))'.dependencies]
+# The native targets that present on wgpu (the BSDs, which no cell prices): named
+# directly because `renderer::WindowTarget` (`HasWindowHandle + HasDisplayHandle`)
+# bounds the public `create_window_surface`; it adds no package (wgpu already
+# resolves this one version there). macOS's `WindowTarget` is first-party
+# `aterm_objc::HasNsView`, and Linux's and Windows' `aterm_types::native_window::
+# HasNativeWindow`, so no shipped graph has raw-window-handle; their wgpu oracles
+# reach the crate through `wgpu::rwh` (docs/AUDIT-third-party-2026-10-15.md,
+# winit-core step 6: the macOS, Linux and Windows halves). wasm32 attaches no
+# window: its one surface is a canvas (`web::GpuContext::for_canvas`).
+[target.'cfg(not(any(target_os = "macos", target_os = "linux", windows, target_arch = "wasm32")))'.dependencies]
 raw-window-handle = "0.6"
 
 # The unix cells no forge row prices (the BSDs): wgpu's Vulkan, as Linux had

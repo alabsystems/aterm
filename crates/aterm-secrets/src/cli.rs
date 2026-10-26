@@ -28,11 +28,13 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
   aterm secrets get <name>               print one value to stdout
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
-        [--no-agent]                     a new vault with a join password, this machine its
+        [--no-agent] [--serve]           a new vault with a join password, this machine its
                                          first admin (--import: each regular file in <dir>
                                          with a valid entry name goes into [everyone]); for
                                          a <url>, also install the subscriber where it does
-                                         not run, unless --no-agent
+                                         not run, unless --no-agent, and print the `join`
+                                         line other machines paste; --serve: first set up
+                                         this machine's server on the <url>'s port
   aterm secrets edit                     the vault text in $VISUAL or $EDITOR (else vi);
                                          saving publishes it
   aterm secrets set <name> [--for <host|code>...] [--file <path>]
@@ -72,14 +74,16 @@ server and services:
         [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
                                          serve vaults (defaults: 0.0.0.0:7484, the store
                                          ~/.config/aterm/secrets/served, long-polls held
-                                         50 s; a relative --store is under ~). A vault the
+                                         25 s; a relative --store is under ~). A vault the
                                          store lacks takes its first version only from this
                                          machine, unless --pin names the key that signs it
                                          (alab's is built in). On macOS only, it keeps the
                                          Mac from idle sleep unless --no-keep-awake, and
                                          advertises <name>.local over mDNS: by default, on
                                          every address at port 7484, the ALab vault's name
-                                         (--no-advertise: none)
+                                         once the store holds the ALab vault (a new ALab
+                                         server: --advertise alab-secrets; --no-advertise:
+                                         none)
   aterm secrets agent [on|off|status] [--program <path>] [--force]
                                          the subscriber as a launchd or systemd user job
                                          (--program: the aterm it runs, else this aterm;
@@ -151,6 +155,7 @@ enum Command {
         import: Option<String>,
         name: Option<String>,
         agent: bool,
+        serve: bool,
     },
     Edit,
     Set {
@@ -298,12 +303,60 @@ const MAX_HOLD_SECS: u64 = 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServeSettings {
     listen: std::net::SocketAddr,
-    advertise: Option<String>,
+    advertise: Advertise,
     pins: Vec<(String, [u8; 32])>,
     store: Option<String>,
     /// `None`: the server's default.
     hold: Option<std::time::Duration>,
     keep_awake: bool,
+}
+
+/// The name `serve` registers over mDNS, as its flags give it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Advertise {
+    /// `--advertise <name>`.
+    Named(String),
+    /// Neither flag, on macOS, answering where the ALab URL points (every address, port 7484):
+    /// the ALab vault's name, once the store holds the ALab vault ([`alab_role`]).
+    AlabIfHeld,
+    /// `--no-advertise`, or a server answering elsewhere (a check, a test, another OS).
+    Off,
+}
+
+/// What `serve` advertises and whether it pins the ALab vault's name to its built-in key, from
+/// its flags and whether its store holds the ALab vault. Both belong to ALab's server only: one
+/// told so (`--advertise alab-secrets`, the way a new ALab server with an empty store starts) or
+/// one whose store holds the ALab vault. Any other server answering `alab-secrets.local` would
+/// take ALab Macs' copies of the vault (a subscriber that finds no vault there puts its own back)
+/// and serve them as ALab's on every network it goes to, where a new Mac then reads as ALab's.
+/// The second value is a line for the log when the ALab name is held back.
+fn alab_role(
+    advertise: Advertise,
+    holds_alab: bool,
+    pins: &mut Vec<(String, [u8; 32])>,
+    alab_key: Option<[u8; 32]>,
+) -> (Option<String>, Option<String>) {
+    let alab_name = crate::alab_advertised();
+    let (advertised, held_back) = match advertise {
+        Advertise::Named(name) => (Some(name), None),
+        Advertise::AlabIfHeld if holds_alab => (Some(alab_name.to_string()), None),
+        Advertise::AlabIfHeld => (
+            None,
+            Some(format!(
+                "not advertising {alab_name}.local: that is the ALab vault's name, and this store holds no ALab vault (ALab's server starts with --advertise {alab_name}; another vault's members reach this Mac by its own name, or by a name --advertise gives)"
+            )),
+        ),
+        Advertise::Off => (None, None),
+    };
+    if (holds_alab || advertised.as_deref() == Some(alab_name))
+        && !pins
+            .iter()
+            .any(|(name, _)| name == crate::server::ALAB_VAULT)
+        && let Some(key) = alab_key
+    {
+        pins.push((crate::server::ALAB_VAULT.to_string(), key));
+    }
+    (advertised, held_back)
 }
 
 fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
@@ -350,10 +403,10 @@ fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
     let answers_default_url = listen.ip().is_unspecified() && listen.port() == crate::DEFAULT_PORT;
     let advertise = match (advertise, f.has("--no-advertise")) {
         (Some(_), true) => return Err("--advertise and --no-advertise are both given".into()),
-        (None, true) => None,
-        (Some(name), false) => Some(name),
-        (None, false) => (cfg!(target_os = "macos") && answers_default_url)
-            .then(|| crate::alab_advertised().to_string()),
+        (None, true) => Advertise::Off,
+        (Some(name), false) => Advertise::Named(name),
+        (None, false) if cfg!(target_os = "macos") && answers_default_url => Advertise::AlabIfHeld,
+        (None, false) => Advertise::Off,
     };
     let store = f.one("--store");
     Ok(ServeSettings {
@@ -429,13 +482,14 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
         }
         "create" => {
-            let f = flags(rest, &["--import", "--name"], &["--no-agent"])?;
+            let f = flags(rest, &["--import", "--name"], &["--no-agent", "--serve"])?;
             match f.operands.as_slice() {
                 [source] => Ok(Command::Create {
                     source: source.clone(),
                     import: f.one("--import"),
                     name: f.one("--name"),
                     agent: !f.has("--no-agent"),
+                    serve: f.has("--serve"),
                 }),
                 _ => Err("create takes one URL or path".into()),
             }
@@ -655,7 +709,8 @@ fn parse(words: &[String]) -> Result<Command, String> {
 #[cfg(unix)]
 mod unix {
     use super::{
-        Action, Command, Fill, Password, SERVE_SWITCHES, SERVE_VALUED, flags, serve_settings,
+        Action, Command, Fill, Password, SERVE_SWITCHES, SERVE_VALUED, alab_role, flags,
+        serve_settings,
     };
     use crate::client::{
         self, Approval, JoinEvent, JoinOptions, JoinOutcome, JoinPassword, Membership, Paths,
@@ -703,7 +758,7 @@ mod unix {
         // but keeps a program the job names that lasts ([`service::kept_program`]): only
         // `agent on` and a join move it to this aterm.
         let install = || {
-            let program = match service::kept_program(&paths.home, Job::Subscriber) {
+            let program = match service::kept_program_that_starts(&paths.home, Job::Subscriber)? {
                 Some(program) => program,
                 None => service::program_for_service()?,
             };
@@ -741,7 +796,13 @@ mod unix {
                 import,
                 name,
                 agent,
-            } => create(&paths, &source, import, name, agent, &subscriber),
+                serve,
+            } => {
+                if serve {
+                    serve_here(&paths, &source)?;
+                }
+                create(&paths, &source, import, name, agent, &subscriber)
+            }
             Command::Edit => edit(&paths),
             Command::Set {
                 name,
@@ -827,11 +888,13 @@ mod unix {
                 action,
                 program,
                 serve,
-            } => {
-                let mut args = vec!["secrets".to_string(), "serve".to_string()];
-                args.extend(serve);
-                services(&paths, Job::Server, (action, false), program, args)
-            }
+            } => services(
+                &paths,
+                Job::Server,
+                (action, false),
+                program,
+                serve_args(serve),
+            ),
         }
     }
 
@@ -1626,20 +1689,22 @@ mod unix {
         };
         match outcome {
             SyncOutcome::Applied { seq, report } => {
+                // The harness reads this line's seq and its failed count (`Vault::of_sync`).
                 println!(
-                    "applied seq {seq}: {} written, {} unchanged, {} removed, {} left in place, {} moved aside",
+                    "applied seq {seq}: {} written, {} unchanged, {} removed, {} left in place, {} moved aside, {} failed",
                     report.written.len(),
                     report.unchanged.len(),
                     report.removed.len(),
                     report.left.len(),
-                    report.moved_aside.len()
+                    report.moved_aside.len(),
+                    report.failed.len()
                 );
                 first_put_back();
                 for (name, to) in &report.moved_aside {
                     println!("  {name}: the previous file was moved to {}", to.display());
                 }
                 for (name, why) in &report.failed {
-                    println!("  {name}: not written: {why}");
+                    println!("  {name}: failed: {why}");
                 }
                 Ok(if report.failed.is_empty() {
                     ExitCode::SUCCESS
@@ -1667,7 +1732,31 @@ mod unix {
     }
 
     fn get(paths: &Paths, name: &str) -> crate::Result<ExitCode> {
+        let value = get_value(paths, name)?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(value.as_slice())?;
+        out.flush()?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    pub(super) fn get_value(paths: &Paths, name: &str) -> crate::Result<crate::SecretBytes> {
+        let expected = client::config(paths)?
+            .ok_or_else(|| Error::new("no vault configured; run aterm secrets join"))?;
+        if expected.signer.is_some() {
+            return client::read_verified_entry(paths, &expected, name)?
+                .map(|entry| entry.into_parts().0)
+                .ok_or_else(|| {
+                    Error::new("no verified materialized entry; run aterm secrets sync")
+                });
+        }
         let status = client::status(paths)?;
+        if status.config.as_ref() != Some(&expected)
+            || !matches!(status.membership, client::Membership::Plain)
+        {
+            return Err(Error::new(
+                "no applied plaintext source; run aterm secrets sync",
+            ));
+        }
         if !status.names.iter().any(|n| n == name) {
             return Err(Error::new(format!(
                 "{name} is not among this machine's secrets (aterm secrets ls)"
@@ -1680,10 +1769,7 @@ mod unix {
                 path.display()
             ))
         })?;
-        let mut out = std::io::stdout().lock();
-        out.write_all(value.as_slice())?;
-        out.flush()?;
-        Ok(ExitCode::SUCCESS)
+        Ok(value)
     }
 
     /// `create`, then, for a vault at a URL, this Mac's approver unless `--no-agent`
@@ -1725,31 +1811,48 @@ mod unix {
             "signer: {} (fingerprint {})",
             created.signer, created.fingerprint
         );
-        println!(
-            "machines that join it must pin this key: add #{} to the URL, or confirm the fingerprint",
-            created.signer
-        );
         let mut syncs = false;
-        if !matches!(
-            client::config(paths)?.map(|config| config.source),
-            Some(Source::Url(_))
-        ) {
+        if let Some(Source::Url(url)) = client::config(paths)?.map(|config| config.source) {
             println!(
-                "a machine joins it when an admin Mac approves its key: aterm secrets approve <age1…> --name <host>"
+                "on each new Mac: {}",
+                join_command(
+                    &url,
+                    &created.signer,
+                    aterm_uds::process::lan_host_name().as_deref()
+                )
             );
-        } else {
+            if let Some(password) = client::admin_open(paths)
+                .ok()
+                .and_then(|admin| admin.doc.join_password())
+            {
+                let mut out = std::io::stdout().lock();
+                let at_terminal = out.is_terminal();
+                let agent = aterm_types::domain::agent_marker(&|key| std::env::var(key).ok());
+                tell_new_password(&mut out, at_terminal, agent, &password)?;
+            }
             let approver = approver_here(agent, subscriber);
-            if let Some(words) = approver_words(&approver, Approval::Password) {
+            let words = approver_words(&approver, Approval::Password);
+            if let Some(words) = &words {
                 eprintln!("{words}");
             }
             if approver.runs() {
                 println!(
-                    "a joining machine that types the join password is let in by this Mac's subscriber: aterm secrets password shows it"
+                    "a joining machine that types the join password is let in by this Mac's subscriber"
                 );
-            } else {
-                println!("aterm secrets password shows the join password a joining machine types");
+            } else if words.is_none() {
+                println!(
+                    "a joining machine that types the join password is let in once this Mac's subscriber runs (aterm secrets agent on)"
+                );
             }
             syncs = approver.runs();
+        } else {
+            println!(
+                "machines that join it must pin this key: add #{} to the URL, or confirm the fingerprint",
+                created.signer
+            );
+            println!(
+                "a machine joins it when an admin Mac approves its key: aterm secrets approve <age1…> --name <host>"
+            );
         }
         if !created.imported.is_empty() {
             println!("imported into [everyone]: {}", created.imported.join(", "));
@@ -1765,6 +1868,106 @@ mod unix {
             );
         }
         Ok(ExitCode::SUCCESS)
+    }
+
+    /// The command a person pastes on a new Mac to join the vault at `url` signed by `signer`:
+    /// `url` as the other Macs reach it, a loopback host named by `lan` (this Mac's LAN name).
+    pub(super) fn join_command(url: &str, signer: &str, lan: Option<&str>) -> String {
+        let reached = match (aterm_http::Uri::parse(url), lan) {
+            (Some(uri), Some(lan))
+                if matches!(uri.host(), "127.0.0.1" | "localhost" | "[::1]" | "::1") =>
+            {
+                let (head, tail) = url.split_once(uri.host()).unwrap_or((url, ""));
+                format!("{head}{lan}{tail}")
+            }
+            _ => url.to_owned(),
+        };
+        format!("aterm secrets join {reached}#{signer}")
+    }
+
+    /// `create --serve`: this Mac's server job set up and running as `server on` sets it up,
+    /// answering on the port `source` names before the vault is made there.
+    fn serve_here(paths: &Paths, source: &str) -> crate::Result<()> {
+        let port = aterm_http::Uri::parse(source)
+            .map(|uri| uri.port())
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "--serve serves the vault from this Mac: {source} is not a vault URL"
+                ))
+            })?;
+        let mut serve = Vec::new();
+        if port != crate::DEFAULT_PORT {
+            serve = vec!["--listen".to_owned(), format!("0.0.0.0:{port}")];
+        }
+        services(
+            paths,
+            Job::Server,
+            (Action::On, false),
+            None,
+            serve_args(serve),
+        )?;
+        Ok(())
+    }
+
+    /// `secrets serve` and the flags `serve` names: the server job's arguments.
+    fn serve_args(serve: Vec<String>) -> Vec<String> {
+        let mut args = vec!["secrets".to_string(), "serve".to_string()];
+        args.extend(serve);
+        args
+    }
+
+    /// How long `server on` waits for the job it started to answer: a hang detector.
+    const ANSWER_HANG: Duration = Duration::from_secs(60);
+    /// The longest one look at the starting server takes, and the pause after a refused one.
+    const ANSWER_LOOK: Duration = Duration::from_secs(1);
+    const ANSWER_STEP: Duration = Duration::from_millis(50);
+
+    /// Wait until the server `serve`'s flags set up answers a GET on this Mac, so a vault can be
+    /// made or joined there the moment `server on` returns.
+    fn until_answering(serve: &[String]) -> crate::Result<()> {
+        let f = flags(serve, SERVE_VALUED, SERVE_SWITCHES).map_err(Error::new)?;
+        let settings = serve_settings(&f).map_err(Error::new)?;
+        answering(&local_url(&settings), ANSWER_HANG)
+    }
+
+    /// Wait until a GET of `url` hears any answer from a vault server, for at most `hang`.
+    pub(super) fn answering(url: &str, hang: Duration) -> crate::Result<()> {
+        let deadline = std::time::Instant::now() + hang;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match crate::transport::get_within(url, left.clamp(ANSWER_STEP, ANSWER_LOOK)) {
+                Ok(_) => return Ok(()),
+                Err(error) if left <= ANSWER_STEP => {
+                    return Err(Error::new(format!(
+                        "the server did not answer at {url} within {}s: {error}",
+                        hang.as_secs()
+                    )));
+                }
+                Err(_) => std::thread::sleep(ANSWER_STEP),
+            }
+        }
+    }
+
+    /// The URL of a vault the server `settings` sets up answers on this Mac: its first pinned
+    /// name, else the ALab vault's, at its listening address (loopback for all of them).
+    pub(super) fn local_url(settings: &super::ServeSettings) -> String {
+        let ip = match settings.listen.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            }
+            ip => ip,
+        };
+        let name = settings
+            .pins
+            .first()
+            .map_or("alab", |(name, _)| name.as_str());
+        format!(
+            "http://{}/v1/{name}",
+            std::net::SocketAddr::new(ip, settings.listen.port())
+        )
     }
 
     fn expand(paths: &Paths, text: &str) -> PathBuf {
@@ -2442,26 +2645,31 @@ mod unix {
     fn serve(paths: &Paths, args: &[String]) -> crate::Result<ExitCode> {
         let f = flags(args, SERVE_VALUED, SERVE_SWITCHES).map_err(Error::new)?;
         let mut settings = serve_settings(&f).map_err(Error::new)?;
-        if !settings.pins.iter().any(|(name, _)| name == "alab")
-            && let Some(key) = crate::b64::decode_padded(crate::ALAB_SIGNER)
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
-        {
-            settings.pins.push(("alab".to_string(), key));
-        }
         let store = settings
             .store
             .as_deref()
             .map_or_else(|| paths.served(), |dir| store_dir(paths, dir));
+        let alab_key = crate::b64::decode_padded(crate::ALAB_SIGNER)
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
+        let (advertise, held_back) = alab_role(
+            settings.advertise.clone(),
+            crate::server::holds_alab(&store),
+            &mut settings.pins,
+            alab_key,
+        );
         crate::log_line(&format!(
             "{} serving on {}, store {}",
             stamp(),
             settings.listen,
             store.display()
         ));
+        if let Some(line) = held_back {
+            crate::log_line(&format!("{} {line}", stamp()));
+        }
         crate::server::serve(crate::server::Options {
             listen: settings.listen,
             store,
-            advertise: settings.advertise,
+            advertise,
             pins: settings.pins,
             hold: settings.hold.unwrap_or(crate::server::DEFAULT_HOLD),
             keep_awake: cfg!(target_os = "macos") && settings.keep_awake,
@@ -2481,18 +2689,29 @@ mod unix {
         match action {
             Action::On => {
                 let program = match program {
-                    Some(program) => PathBuf::from(program),
+                    Some(program) => {
+                        let program = PathBuf::from(program);
+                        if !program.is_absolute() {
+                            return Err(Error::new("--program must be an absolute path"));
+                        }
+                        // A program a person names may not start (a copy of the app's
+                        // executable outside its bundle): this aterm does.
+                        service::check_program_starts(&program).map_err(|error| {
+                            Error::new(format!("{error}; pass --program <an aterm that runs>"))
+                        })?;
+                        program
+                    }
                     None => service::program_for_service()?,
                 };
-                if !Path::new(&program).is_absolute() {
-                    return Err(Error::new("--program must be an absolute path"));
-                }
                 let install = if force {
                     service::reinstall
                 } else {
                     service::install
                 };
                 println!("{}", install(&paths.home, job, &program, &args)?);
+                if job == Job::Server {
+                    until_answering(args.get(2..).unwrap_or_default())?;
+                }
             }
             Action::Off => {
                 if service::turn_off(&paths.home, job)? {
@@ -2510,6 +2729,93 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_get_refuses_materialized_bytes_changed_after_sync() {
+        use crate::{client, fsx, materialize, text::Audience};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = client::Paths::for_home(&root.path().join("admin"));
+        let source = root.path().join("test.vault");
+        client::create(&paths, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let admin = client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"authentic-value")
+            .unwrap();
+        client::admin_publish(&paths, &admin, &doc).unwrap();
+        assert_eq!(
+            unix::get_value(&paths, "token").unwrap().as_slice(),
+            b"authentic-value"
+        );
+        let path = materialize::target_path(&paths.home, "token").unwrap();
+        fsx::write_atomic(&path, b"changed-after-sync", 0o600).unwrap();
+        assert!(unix::get_value(&paths, "token").is_err());
+        let config_file = paths.dir.join("source.toml");
+        let source_text = fsx::read_private(&config_file, 64 * 1024).unwrap().unwrap();
+        let unsigned = source_text
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("signer = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fsx::write_atomic(&config_file, unsigned.as_bytes(), 0o600).unwrap();
+        assert!(client::config(&paths).unwrap().unwrap().signer.is_none());
+        assert!(
+            unix::get_value(&paths, "token").is_err(),
+            "removing the pin cannot make signed state plaintext"
+        );
+        std::fs::rename(config_file, root.path().join("kept-config")).unwrap();
+        assert!(
+            unix::get_value(&paths, "token").is_err(),
+            "unconfigured state cannot read a previous vault's file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_get_retains_local_reads_without_authenticated_evidence() {
+        use crate::{client, fsx, materialize};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = client::Paths::for_home(&root.path().join("reader"));
+        let source = root.path().join("plain.secrets");
+        fsx::write_atomic(&source, b"token=plain-value\n", 0o600).unwrap();
+        client::join(
+            &paths,
+            &client::JoinOptions {
+                source: source.to_str().unwrap().into(),
+                host: Some("reader".into()),
+                interactive: false,
+                wait: std::time::Duration::ZERO,
+                confirm: &|_| false,
+                password: client::JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unix::get_value(&paths, "token").unwrap().as_slice(),
+            b"plain-value"
+        );
+        let expected = client::config(&paths).unwrap().unwrap();
+        assert!(
+            client::read_verified_entry(&paths, &expected, "token")
+                .unwrap()
+                .is_none()
+        );
+        fsx::write_atomic(
+            &materialize::target_path(&paths.home, "token").unwrap(),
+            b"local-edit",
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            unix::get_value(&paths, "token").unwrap().as_slice(),
+            b"local-edit"
+        );
+    }
 
     fn words(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_string).collect()
@@ -2565,6 +2871,7 @@ mod tests {
                 import: Some("~/.secrets".into()),
                 name: Some("m9".into()),
                 agent: false,
+                serve: false,
             })
         );
         assert_eq!(
@@ -2574,16 +2881,96 @@ mod tests {
                 import: None,
                 name: None,
                 agent: true,
+                serve: false,
             })
         );
+        assert!(matches!(
+            parse(&words("create http://127.0.0.1:7484/v1/alab --serve")),
+            Ok(Command::Create { serve: true, .. })
+        ));
         for refused in [
             "create",
+            "create a --serve b",
             "create a b",
             "create a --no-wait",
             "create a --name",
         ] {
             assert!(parse(&words(refused)).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn the_join_line_names_this_mac_as_the_others_reach_it() {
+        let signer = "age1signer";
+        assert_eq!(
+            unix::join_command("http://127.0.0.1:7484/v1/alab", signer, Some("m9.local")),
+            "aterm secrets join http://m9.local:7484/v1/alab#age1signer"
+        );
+        assert_eq!(
+            unix::join_command("http://localhost:7484/v1/alab", signer, Some("m9.local")),
+            "aterm secrets join http://m9.local:7484/v1/alab#age1signer"
+        );
+        // Control: a host the other Macs already reach, and a loopback one with no LAN name,
+        // stay as they are.
+        assert_eq!(
+            unix::join_command("http://vault.lan:7484/v1/alab", signer, Some("m9.local")),
+            "aterm secrets join http://vault.lan:7484/v1/alab#age1signer"
+        );
+        assert_eq!(
+            unix::join_command("http://127.0.0.1:7484/v1/alab", signer, None),
+            "aterm secrets join http://127.0.0.1:7484/v1/alab#age1signer"
+        );
+    }
+
+    #[test]
+    fn server_on_waits_for_the_vault_it_serves_on_this_mac() {
+        let settings = |line: &str| {
+            let f = flags(&words(line), SERVE_VALUED, SERVE_SWITCHES).expect("flags");
+            serve_settings(&f).expect("settings")
+        };
+        assert_eq!(
+            unix::local_url(&settings("")),
+            format!("http://127.0.0.1:{}/v1/alab", crate::DEFAULT_PORT)
+        );
+        let pin = format!("team={}=", "A".repeat(43));
+        assert_eq!(
+            unix::local_url(&settings(&format!("--listen 0.0.0.0:9001 --pin {pin}"))),
+            "http://127.0.0.1:9001/v1/team"
+        );
+        assert_eq!(
+            unix::local_url(&settings("--listen 10.0.0.7:9001")),
+            "http://10.0.0.7:9001/v1/alab"
+        );
+    }
+
+    /// `server on` returns once the job it started answers: a listener whose server starts
+    /// late is waited for. Negative control: an address nothing answers on ends at the hang.
+    #[test]
+    fn server_on_returns_once_the_server_answers() {
+        let store = aterm_tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1/alab", listener.local_addr().expect("addr"));
+        let options = crate::server::Options {
+            listen: listener.local_addr().expect("addr"),
+            store: store.path().to_path_buf(),
+            advertise: None,
+            pins: Vec::new(),
+            hold: std::time::Duration::from_secs(1),
+            keep_awake: false,
+        };
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::server::start(listener, &options).expect("server starts")
+        });
+        unix::answering(&url, std::time::Duration::from_secs(60)).expect("answered");
+        late.join().expect("started").stop();
+
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let nobody = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
+        drop(silent);
+        let error = unix::answering(&nobody, std::time::Duration::from_millis(300))
+            .expect_err("unanswered");
+        assert!(error.to_string().contains("did not answer"), "{error}");
     }
 
     #[test]
@@ -3037,15 +3424,20 @@ mod tests {
         }
     }
 
-    /// On macOS, `serve` advertises the default vault's name only when listening on all addresses
-    /// at the default port and not told otherwise.
+    /// On macOS, `serve` may advertise the ALab vault's name only when listening on all
+    /// addresses at the default port and not told otherwise ([`alab_role`] decides whether it
+    /// does).
     #[test]
     fn serve_advertises_the_default_vaults_name_unless_told() {
         let advertised = |line: &str| {
             let f = flags(&words(line), SERVE_VALUED, SERVE_SWITCHES).expect("flags");
             serve_settings(&f).expect("settings").advertise
         };
-        let default = cfg!(target_os = "macos").then(|| crate::alab_advertised().to_string());
+        let default = if cfg!(target_os = "macos") {
+            Advertise::AlabIfHeld
+        } else {
+            Advertise::Off
+        };
         assert_eq!(advertised(""), default);
         assert_eq!(advertised("--listen 0.0.0.0:7484"), default);
         assert_eq!(advertised("--listen [::]:7484"), default);
@@ -3055,17 +3447,17 @@ mod tests {
             "--listen 0.0.0.0:7485",
             "--listen [::1]:7484",
         ] {
-            assert_eq!(advertised(elsewhere), None, "{elsewhere}");
+            assert_eq!(advertised(elsewhere), Advertise::Off, "{elsewhere}");
         }
         assert_eq!(
             advertised("--listen 127.0.0.1:7485 --advertise lab-vault"),
-            Some("lab-vault".into())
+            Advertise::Named("lab-vault".into())
         );
         assert_eq!(
             advertised("--advertise lab-vault"),
-            Some("lab-vault".into())
+            Advertise::Named("lab-vault".into())
         );
-        assert_eq!(advertised("--no-advertise"), None);
+        assert_eq!(advertised("--no-advertise"), Advertise::Off);
         assert_eq!(
             parse(&words("server on --no-advertise")),
             Ok(Command::Server {
@@ -3073,6 +3465,58 @@ mod tests {
                 program: None,
                 serve: vec!["--no-advertise".into()],
             })
+        );
+    }
+
+    /// Only ALab's server answers the ALab name or takes another Mac's first version of the ALab
+    /// vault: one told so, or one whose store holds it.
+    #[test]
+    fn only_alabs_server_advertises_the_alab_name_or_pins_the_alab_vault() {
+        let key = [7; 32];
+        let alab = crate::alab_advertised().to_string();
+        let role = |advertise: Advertise, holds: bool, given: &[(&str, [u8; 32])]| {
+            let mut pins: Vec<(String, [u8; 32])> = given
+                .iter()
+                .map(|(name, key)| ((*name).into(), *key))
+                .collect();
+            let (advertised, held_back) = alab_role(advertise, holds, &mut pins, Some(key));
+            let pinned: Vec<&str> = pins.iter().map(|(name, _)| name.as_str()).collect();
+            (advertised, held_back.is_some(), pinned.join(","))
+        };
+        // A personal server: no ALab name, no ALab pin, and a line that says why.
+        assert_eq!(
+            role(Advertise::AlabIfHeld, false, &[]),
+            (None, true, String::new())
+        );
+        assert_eq!(
+            role(Advertise::Named("home".into()), false, &[]),
+            (Some("home".into()), false, String::new())
+        );
+        assert_eq!(
+            role(Advertise::Off, false, &[]),
+            (None, false, String::new())
+        );
+        // ALab's server, by its store or by being told (a new one starts with an empty store).
+        assert_eq!(
+            role(Advertise::AlabIfHeld, true, &[]),
+            (Some(alab.clone()), false, "alab".into())
+        );
+        assert_eq!(
+            role(Advertise::Named(alab.clone()), false, &[]),
+            (Some(alab.clone()), false, "alab".into())
+        );
+        assert_eq!(
+            role(Advertise::Off, true, &[]),
+            (None, false, "alab".into())
+        );
+        // A pin given by hand stands as given.
+        assert_eq!(
+            role(
+                Advertise::AlabIfHeld,
+                true,
+                &[("alab", [9; 32]), ("home", [8; 32])]
+            ),
+            (Some(alab), false, "alab,home".into())
         );
     }
 

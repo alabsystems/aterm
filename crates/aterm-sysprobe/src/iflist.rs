@@ -3,8 +3,11 @@
 
 //! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`), decoded from bytes: Darwin's 64-bit interface counters, which [`crate::net_links`] reads on macOS.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use crate::machine::{
-    LinkCounters, LinkKind, LinkReading, MAX_LINKS, TcpCounts, kind_by_name, never_the_machines,
+    LinkCounters, LinkKind, LinkReading, MAX_LINKS, TcpCounts, TcpSummary, kind_by_name,
+    never_the_machines,
 };
 
 /// `CTL_NET` (`sys/sysctl.h`).
@@ -114,16 +117,34 @@ pub const DL_NLEN_AT: usize = 5;
 /// `offsetof(struct sockaddr_dl, sdl_data)`: the name, then the address.
 pub const DL_DATA_AT: usize = 8;
 
+/// `INP_IPV4` (`netinet/in_pcb.h`).
+pub const INP_IPV4: u8 = 0x1;
+/// `INP_IPV6` (`netinet/in_pcb.h`).
+pub const INP_IPV6: u8 = 0x2;
+/// `TCPS_ESTABLISHED` (`netinet/tcp_fsm.h`).
+pub const TCPS_ESTABLISHED: i32 = 4;
+/// Fixed-point binary shift of Darwin's `xtcpcb64.t_srtt` (`TCP_RTT_SHIFT = 5`, 1/32 ms per unit).
+pub const TCP_SRTT_SCALE: f32 = 32.0;
 /// `sizeof(struct xinpgen)` (`netinet/in_pcb.h`).
 pub const XINPGEN_SIZE: usize = 24;
+/// `offsetof(struct xinpgen, xig_count)` (`netinet/in_pcb.h`).
+pub const XINPGEN_COUNT_AT: usize = 4;
 /// `sizeof(struct xsocket64)` (`sys/socketvar.h`).
 pub const XSOCKET64_SIZE: usize = 108;
 /// `sizeof(struct xtcpcb64)` (`netinet/tcp_var.h`).
 pub const XTCPCB64_SIZE: usize = 472;
+/// `offsetof(struct xtcpcb64, xt_inpcb.inp_vflag)`.
+pub const XTCPCB64_VFLAG_AT: usize = 96;
+/// `offsetof(struct xtcpcb64, xt_inpcb.inp_dependfaddr)` (16 bytes; IPv4 in its last four).
+pub const XTCPCB64_FADDR_AT: usize = 100;
 /// `offsetof(struct xtcpcb64, xt_inpcb.xi_socket.xso_len)`.
 pub const XTCPCB64_XSO_LEN_AT: usize = 148;
 /// `offsetof(struct xtcpcb64, t_state)`.
 pub const XTCPCB64_STATE_AT: usize = 292;
+/// `offsetof(struct xtcpcb64, t_srtt)`.
+pub const XTCPCB64_SRTT_AT: usize = 392;
+/// `offsetof(struct xtcpcb64, t_rttupdated)`.
+pub const XTCPCB64_RTTUPDATED_AT: usize = 408;
 
 /// Every layout row and constant above, as the C expression the SDK must agree with: `tests/iflist_sdk.rs` asserts each on `arm64` and `x86_64`.
 #[cfg(target_os = "macos")]
@@ -231,9 +252,24 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ),
     ("offsetof(struct sockaddr_dl, sdl_nlen)", DL_NLEN_AT as i64),
     ("offsetof(struct sockaddr_dl, sdl_data)", DL_DATA_AT as i64),
+    ("INP_IPV4", INP_IPV4 as i64),
+    ("INP_IPV6", INP_IPV6 as i64),
+    ("TCPS_ESTABLISHED", TCPS_ESTABLISHED as i64),
     ("sizeof(struct xinpgen)", XINPGEN_SIZE as i64),
+    (
+        "offsetof(struct xinpgen, xig_count)",
+        XINPGEN_COUNT_AT as i64,
+    ),
     ("sizeof(struct xsocket64)", XSOCKET64_SIZE as i64),
     ("sizeof(struct xtcpcb64)", XTCPCB64_SIZE as i64),
+    (
+        "offsetof(struct xtcpcb64, xt_inpcb.inp_vflag)",
+        XTCPCB64_VFLAG_AT as i64,
+    ),
+    (
+        "offsetof(struct xtcpcb64, xt_inpcb.inp_dependfaddr)",
+        XTCPCB64_FADDR_AT as i64,
+    ),
     (
         "offsetof(struct xtcpcb64, xt_inpcb.xi_socket.xso_len)",
         XTCPCB64_XSO_LEN_AT as i64,
@@ -241,6 +277,11 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     (
         "offsetof(struct xtcpcb64, t_state)",
         XTCPCB64_STATE_AT as i64,
+    ),
+    ("offsetof(struct xtcpcb64, t_srtt)", XTCPCB64_SRTT_AT as i64),
+    (
+        "offsetof(struct xtcpcb64, t_rttupdated)",
+        XTCPCB64_RTTUPDATED_AT as i64,
     ),
 ];
 
@@ -387,9 +428,52 @@ pub fn links_of(buf: &[u8]) -> Vec<LinkReading> {
     out
 }
 
-/// Decode Darwin's `net.inet.tcp.pcblist64` buffer into [`TcpCounts`].
+/// Whether `rec`'s foreign address in `xtcpcb64` names a non-loopback, non-unspecified remote host.
+fn pcb_remote_peer(rec: &[u8]) -> bool {
+    let Some(&vflag) = rec.get(XTCPCB64_VFLAG_AT) else {
+        return false;
+    };
+    let ip = if vflag & INP_IPV4 != 0 {
+        let Ok(a): Result<[u8; 4], _> = rec
+            .get(XTCPCB64_FADDR_AT + 12..XTCPCB64_FADDR_AT + 16)
+            .unwrap_or_default()
+            .try_into()
+        else {
+            return false;
+        };
+        IpAddr::V4(Ipv4Addr::from(a))
+    } else if vflag & INP_IPV6 != 0 {
+        let Ok(a): Result<[u8; 16], _> = rec
+            .get(XTCPCB64_FADDR_AT..XTCPCB64_FADDR_AT + 16)
+            .unwrap_or_default()
+            .try_into()
+        else {
+            return false;
+        };
+        IpAddr::V6(Ipv6Addr::from(a))
+    } else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
+/// Decode Darwin's `net.inet.tcp.pcblist64` buffer into [`TcpSummary`] (state counts plus passive median smoothed RTT across established remote peers).
+///
+/// On macOS without Full Disk Access, XNU's `sysctl_pcblist64` redacts other processes' PCBs while
+/// leaving the kernel's true `tcbinfo.ipi_count` in both `xinpgen.xig_count` records; when the
+/// emitted records are a tiny fraction of `xig_count`, this returns `None` rather than falsely
+/// reporting zero machine TCP connections.
 #[must_use]
-pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
+pub fn tcp_summary_of_pcblist64(buf: &[u8]) -> Option<TcpSummary> {
     if buf.len() < XINPGEN_SIZE * 2 {
         return None;
     }
@@ -397,8 +481,16 @@ pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
     if head_len < XINPGEN_SIZE || !head_len.is_multiple_of(4) || head_len > buf.len() {
         return None;
     }
+    let head_count = u32::from_ne_bytes(
+        buf.get(XINPGEN_COUNT_AT..XINPGEN_COUNT_AT + 4)?
+            .try_into()
+            .ok()?,
+    );
     let mut counts = TcpCounts::default();
+    let mut rtts: Vec<f32> = Vec::new();
     let mut at = head_len;
+    let mut records = 0u32;
+    let mut trailer_count = 0u32;
     let mut saw_trailer = false;
     while at < buf.len() {
         let len = u32::from_ne_bytes(buf.get(at..at + 4)?.try_into().ok()?) as usize;
@@ -408,6 +500,11 @@ pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
         let rec = &buf[at..at + len];
         at += len;
         if len == head_len && at == buf.len() {
+            trailer_count = u32::from_ne_bytes(
+                rec.get(XINPGEN_COUNT_AT..XINPGEN_COUNT_AT + 4)?
+                    .try_into()
+                    .ok()?,
+            );
             saw_trailer = true;
             break;
         }
@@ -422,14 +519,55 @@ pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
         if xso_len != 0 && xso_len != XSOCKET64_SIZE {
             return None;
         }
+        records = records.saturating_add(1);
         let raw_state = i32::from_ne_bytes(
             rec.get(XTCPCB64_STATE_AT..XTCPCB64_STATE_AT + 4)?
                 .try_into()
                 .ok()?,
         );
         counts.record(crate::jobs::TcpState::from_darwin(raw_state));
+        if raw_state == TCPS_ESTABLISHED
+            && len >= XTCPCB64_RTTUPDATED_AT + 4
+            && pcb_remote_peer(rec)
+        {
+            let srtt = i32::from_ne_bytes(
+                rec.get(XTCPCB64_SRTT_AT..XTCPCB64_SRTT_AT + 4)?
+                    .try_into()
+                    .ok()?,
+            );
+            let updated = u32::from_ne_bytes(
+                rec.get(XTCPCB64_RTTUPDATED_AT..XTCPCB64_RTTUPDATED_AT + 4)?
+                    .try_into()
+                    .ok()?,
+            );
+            if updated > 0 && srtt > 0 {
+                let ms = (srtt as f32) / TCP_SRTT_SCALE;
+                if ms.is_finite() && ms > 0.0 {
+                    rtts.push(ms);
+                }
+            }
+        }
     }
-    saw_trailer.then_some(counts)
+    if !saw_trailer {
+        return None;
+    }
+    let min_count = head_count.min(trailer_count);
+    if (records == 0 && min_count >= 4) || (min_count >= 8 && records.saturating_mul(4) < min_count)
+    {
+        return None;
+    }
+    rtts.sort_by(f32::total_cmp);
+    let srtt_ms = (!rtts.is_empty()).then(|| {
+        let n = rtts.len();
+        (rtts[(n - 1) / 2] + rtts[n / 2]) * 0.5
+    });
+    Some(TcpSummary { counts, srtt_ms })
+}
+
+/// Decode Darwin's `net.inet.tcp.pcblist64` buffer into [`TcpCounts`].
+#[must_use]
+pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
+    tcp_summary_of_pcblist64(buf).map(|s| s.counts)
 }
 
 #[cfg(test)]
@@ -863,5 +1001,111 @@ mod tests {
         bad_xso.extend_from_slice(&pcb(4, 99));
         bad_xso.extend_from_slice(&xinpgen());
         assert_eq!(tcp_counts_of_pcblist64(&bad_xso), None);
+    }
+
+    #[test]
+    fn pcblist64_summary_takes_median_srtt_of_established_remote_peers_only() {
+        let xinpgen = || {
+            let mut b = vec![0u8; XINPGEN_SIZE];
+            put(&mut b, 0, &(XINPGEN_SIZE as u32).to_ne_bytes());
+            b
+        };
+        let v4_pcb = |state: i32, ip: [u8; 4], srtt: i32, updated: u32| {
+            let mut b = vec![0u8; XTCPCB64_SIZE];
+            put(&mut b, 0, &(XTCPCB64_SIZE as u32).to_ne_bytes());
+            put(
+                &mut b,
+                XTCPCB64_XSO_LEN_AT,
+                &(XSOCKET64_SIZE as u32).to_ne_bytes(),
+            );
+            b[XTCPCB64_VFLAG_AT] = INP_IPV4;
+            put(&mut b, XTCPCB64_FADDR_AT + 12, &ip);
+            put(&mut b, XTCPCB64_STATE_AT, &state.to_ne_bytes());
+            put(&mut b, XTCPCB64_SRTT_AT, &srtt.to_ne_bytes());
+            put(&mut b, XTCPCB64_RTTUPDATED_AT, &updated.to_ne_bytes());
+            b
+        };
+        let v6_pcb = |state: i32, ip: [u8; 16], srtt: i32, updated: u32| {
+            let mut b = vec![0u8; XTCPCB64_SIZE];
+            put(&mut b, 0, &(XTCPCB64_SIZE as u32).to_ne_bytes());
+            put(
+                &mut b,
+                XTCPCB64_XSO_LEN_AT,
+                &(XSOCKET64_SIZE as u32).to_ne_bytes(),
+            );
+            b[XTCPCB64_VFLAG_AT] = INP_IPV6;
+            put(&mut b, XTCPCB64_FADDR_AT, &ip);
+            put(&mut b, XTCPCB64_STATE_AT, &state.to_ne_bytes());
+            put(&mut b, XTCPCB64_SRTT_AT, &srtt.to_ne_bytes());
+            put(&mut b, XTCPCB64_RTTUPDATED_AT, &updated.to_ne_bytes());
+            b
+        };
+
+        let mut buf = xinpgen();
+        // Remote established peers: 12.5 ms (400 / 32), 20.0 ms (640 / 32), 80.0 ms (2560 / 32) -> median 20.0 ms.
+        buf.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [1, 1, 1, 1], 400, 3));
+        buf.extend_from_slice(&v6_pcb(
+            TCPS_ESTABLISHED,
+            Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets(),
+            640,
+            5,
+        ));
+        buf.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [8, 8, 8, 8], 2560, 1));
+        // Ignored rows: loopback v4, loopback v6, mapped loopback v6, unmeasured (updated=0), non-established (CLOSE_WAIT=5).
+        buf.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [127, 0, 0, 1], 32, 9));
+        buf.extend_from_slice(&v6_pcb(
+            TCPS_ESTABLISHED,
+            Ipv6Addr::LOCALHOST.octets(),
+            32,
+            9,
+        ));
+        buf.extend_from_slice(&v6_pcb(
+            TCPS_ESTABLISHED,
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets(),
+            32,
+            9,
+        ));
+        buf.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [9, 9, 9, 9], 9600, 0));
+        buf.extend_from_slice(&v4_pcb(5, [9, 9, 9, 9], 9600, 4));
+        buf.extend_from_slice(&xinpgen());
+
+        let summary = tcp_summary_of_pcblist64(&buf).expect("valid summary");
+        assert_eq!(summary.counts.established, 7);
+        assert_eq!(summary.counts.close_wait, 1);
+        assert_eq!(summary.srtt_ms, Some(20.0));
+
+        // Loopback-only table yields `srtt_ms: None`.
+        let mut lo_only = xinpgen();
+        lo_only.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [127, 0, 0, 1], 64, 2));
+        lo_only.extend_from_slice(&xinpgen());
+        let lo_summary = tcp_summary_of_pcblist64(&lo_only).expect("valid loopback summary");
+        assert_eq!(lo_summary.counts.established, 1);
+        assert_eq!(lo_summary.srtt_ms, None);
+
+        // Privacy-redacted pcblist64 (XNU without Full Disk Access: `xig_count` names 33 kernel
+        // PCBs, 0 or 1 own record emitted) returns `None` instead of lying `0 TCP`.
+        let xinpgen_counted = |count: u32| {
+            let mut b = xinpgen();
+            put(&mut b, XINPGEN_COUNT_AT, &count.to_ne_bytes());
+            b
+        };
+        let mut redacted_zero = xinpgen_counted(33);
+        redacted_zero.extend_from_slice(&xinpgen_counted(33));
+        assert_eq!(tcp_summary_of_pcblist64(&redacted_zero), None);
+
+        let mut redacted_own = xinpgen_counted(34);
+        redacted_own.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [127, 0, 0, 1], 64, 2));
+        redacted_own.extend_from_slice(&xinpgen_counted(34));
+        assert_eq!(tcp_summary_of_pcblist64(&redacted_own), None);
+
+        // Unredacted pcblist64 (`xig_count = 10`, `8` active PCBs emitted) parses cleanly.
+        let mut unredacted = xinpgen_counted(10);
+        for _ in 0..8 {
+            unredacted.extend_from_slice(&v4_pcb(TCPS_ESTABLISHED, [1, 1, 1, 1], 640, 3));
+        }
+        unredacted.extend_from_slice(&xinpgen_counted(10));
+        let ok = tcp_summary_of_pcblist64(&unredacted).expect("unredacted pcblist64");
+        assert_eq!(ok.counts.established, 8);
+        assert_eq!(ok.srtt_ms, Some(20.0));
     }
 }

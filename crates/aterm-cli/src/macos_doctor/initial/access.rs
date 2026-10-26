@@ -254,10 +254,24 @@ pub(super) enum DevTools {
 pub(super) enum Debugger {
     On,
     Off,
-    /// A build that is not hardened lets a debugger attach without it, and an
-    /// account that is neither an admin nor a developer cannot turn it on.
+    /// A build that is not hardened lets a debugger attach without it.
     NotNeeded(&'static str),
+    /// The account is neither an admin nor in `_developer`, so macOS lets it turn neither this nor
+    /// aterm's Developer Tools switch on: an administrator does ([`needs_administrator`]).
+    NeedsAdmin,
     Unknown,
+}
+
+/// What a Debugger or Developer Tools row says on an account that is neither an admin nor a
+/// developer ([`Debugger::NeedsAdmin`]): the one command an administrator runs for it.
+pub(super) fn needs_administrator() -> String {
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let user = aterm_uds::account::user_name(uid).unwrap_or_else(|| uid.to_string());
+    format!(
+        "Needs an administrator: macOS lets only an admin or a developer turn it on. An admin runs \
+         `sudo dseditgroup -o edit -a {user} -t user _developer`, and setup asks again."
+    )
 }
 
 /// Every grant, read once.
@@ -333,9 +347,7 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         (SelfHardening::NotHardened, ..) => {
             Debugger::NotNeeded("This aterm is not hardened, so a debugger attaches without it.")
         }
-        (_, DebuggerMember::NotMember, _) => Debugger::NotNeeded(
-            "This account is neither an admin nor a developer, so macOS does not let it turn on.",
-        ),
+        (_, DebuggerMember::NotMember, _) => Debugger::NeedsAdmin,
         (_, _, DebuggerMode::Enabled) => Debugger::On,
         (_, _, DebuggerMode::Disabled) => Debugger::Off,
         _ => Debugger::Unknown,
@@ -425,6 +437,7 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
     } else {
         Standing::Differs
     };
+    let admin = (grants.debugger == Debugger::NeedsAdmin).then(needs_administrator);
     let (standing, now, note, detail): (Standing, Option<&str>, Option<&str>, Option<&str>) =
         match access {
             Access::FullDiskAccess => match grants.fda {
@@ -466,8 +479,8 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
                          last; a signed aterm asks for it.",
                     ),
                 ),
-                DevTools::Off => (person, Some("Off"), None, None),
-                DevTools::NotListed => (person, Some("Not listed"), None, None),
+                DevTools::Off => (person, Some("Off"), None, admin.as_deref()),
+                DevTools::NotListed => (person, Some("Not listed"), None, admin.as_deref()),
                 DevTools::NeedsFullDiskAccess => (
                     Standing::Waiting,
                     None,
@@ -488,6 +501,7 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
                     ),
                 ),
                 Debugger::NotNeeded(why) => (Standing::NotNeeded, None, None, Some(why)),
+                Debugger::NeedsAdmin => (person, Some("Off"), None, admin.as_deref()),
                 Debugger::Unknown => (Standing::Unknown, None, None, None),
             },
             // macOS does not tell an app whether it may use the local network: only a look
@@ -613,6 +627,20 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
                     seen.detail.as_deref().unwrap_or("macOS did not say")
                 ),
             ),
+            // Only an administrator moves these on this account: answered, and the stage
+            // completes on the grants the person can give.
+            (Standing::NeedsYou, _)
+                if grants.debugger == Debugger::NeedsAdmin
+                    && matches!(access, Access::DeveloperTools | Access::Debugger) =>
+            {
+                (
+                    true,
+                    seen.detail
+                        .as_deref()
+                        .unwrap_or("needs an administrator")
+                        .to_owned(),
+                )
+            }
             (_, Some(outcome)) => (
                 true,
                 match outcome {
@@ -750,6 +778,46 @@ mod tests {
         }
         // Local Network, which nothing told aterm of, waits for the window to ask.
         assert_eq!(row("Local Network").status, WAITING);
+    }
+
+    /// An account that is neither an admin nor a developer cannot turn on debugger access or
+    /// aterm's Developer Tools switch: both rows need an administrator, name the one command
+    /// one runs, and count as answered, so the stage completes on the grants the person gives.
+    #[test]
+    fn a_standard_account_completes_the_stage_without_the_admin_only_grants() {
+        let standard = Grants {
+            fda: Fda::On,
+            devtools: DevTools::Off,
+            debugger: Debugger::NeedsAdmin,
+            ..grants()
+        };
+        let lan = [(Access::LocalNetwork, AccessOutcome::Triggered)];
+        let rows = stage_rows(&standard, &lan);
+        assert!(rows.iter().all(|row| row.status == "ok"), "{rows:?}");
+        for name in ["Developer Tools", "Debugger access"] {
+            let row = rows.iter().find(|row| row.name == name).unwrap();
+            assert!(
+                row.detail.starts_with("Needs an administrator")
+                    && row.detail.contains("dseditgroup -o edit -a ")
+                    && row.detail.contains(" -t user _developer"),
+                "{row:?}"
+            );
+        }
+        for access in [Access::DeveloperTools, Access::Debugger] {
+            let seen = observation(access, &standard, managed());
+            assert_eq!(seen.standing, Standing::NeedsYou, "{access:?}");
+            assert!(seen.detail.unwrap().contains("_developer"));
+        }
+        // An admin's account that has not turned them on still waits for the window's steps.
+        let admin = Grants {
+            debugger: Debugger::Off,
+            ..standard
+        };
+        let rows = stage_rows(&admin, &lan);
+        for name in ["Developer Tools", "Debugger access"] {
+            let row = rows.iter().find(|row| row.name == name).unwrap();
+            assert_eq!(row.status, WAITING, "{row:?}");
+        }
     }
 
     #[test]

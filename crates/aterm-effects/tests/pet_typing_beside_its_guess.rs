@@ -111,6 +111,10 @@ struct Knobs {
     /// one the pet looks at. The frame a composer moves in, the pet reads its new rows with the
     /// chrome still where the rows were; the next frame brings the chrome along.
     chrome_lag: bool,
+    /// The window's presents, as a busy window draws them: each a vsync, two or three after
+    /// the one before (one in five, one in twelve), late by up to 3 ms, from this seed
+    /// ([`Host::next_present`]). 0: every vsync, on time.
+    present_seed: u64,
 }
 
 impl Knobs {
@@ -124,6 +128,7 @@ impl Knobs {
         line_walled: false,
         chrome_from_ms: 0,
         chrome_lag: false,
+        present_seed: 0,
     };
 }
 
@@ -172,6 +177,8 @@ struct Host {
     /// The chrome the last present painted, and the content sequence of the frame it painted
     /// over, for [`Knobs::chrome_lag`].
     painted: (Vec<PetRect>, Option<u64>),
+    /// The present schedule's state ([`Knobs::present_seed`]).
+    schedule: u64,
 }
 
 impl Host {
@@ -198,7 +205,27 @@ impl Host {
             shots: Vec::new(),
             input: None,
             painted: (Vec::new(), None),
+            schedule: knobs.present_seed,
         }
+    }
+
+    /// The time to the next present ([`Knobs::present_seed`]): one vsync on a steady host.
+    fn next_present(&mut self) -> Duration {
+        let frame = Duration::from_millis(self.knobs.frame_ms);
+        if self.schedule == 0 {
+            return frame;
+        }
+        let mut x = self.schedule;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.schedule = x;
+        let vsyncs = match x % 100 {
+            0..8 => 3,
+            8..28 => 2,
+            _ => 1,
+        };
+        frame * vsyncs + Duration::from_micros((x >> 32) % 3_000)
     }
 
     fn ms(&self) -> u64 {
@@ -397,7 +424,8 @@ impl Host {
         while self.vsync <= t {
             self.now = self.vsync;
             self.present();
-            self.vsync += Duration::from_millis(self.knobs.frame_ms);
+            let next = self.next_present();
+            self.vsync += next;
         }
         self.now = self.now.max(t);
     }
@@ -1657,14 +1685,15 @@ fn flights_of(shots: &[Shot]) -> Vec<Flown> {
 }
 
 /// The actions the cat shows on the ground before the flight that leaves at
-/// `at`, back to the landing before it, in order, each run of one action once.
-fn grounded_before(shots: &[Shot], at: u64) -> Vec<PetAction> {
+/// `at`, back to the landing before it or to `since` ms, whichever came later, in
+/// order, each run of one action once.
+fn grounded_before(shots: &[Shot], since: u64, at: u64) -> Vec<PetAction> {
     let Some(off) = shots.iter().position(|s| s.ms == at) else {
         return Vec::new();
     };
     let mut seen: Vec<PetAction> = Vec::new();
     for s in shots[..off].iter().rev() {
-        if matches!(s.frame.action, PetAction::Land | PetAction::Leap) {
+        if s.ms < since || matches!(s.frame.action, PetAction::Land | PetAction::Leap) {
             break;
         }
         if seen.last() != Some(&s.frame.action) {
@@ -1676,7 +1705,7 @@ fn grounded_before(shots: &[Shot], at: u64) -> Vec<PetAction> {
 }
 
 /// One host's replay of the generating take: `(label, echo ms, harness, flights, the
-/// actions on the ground before each)`.
+/// actions on the ground before each since the turn end's walk began)`.
 type HostFlights = (String, u64, bool, Vec<Flown>, Vec<Vec<PetAction>>);
 
 /// The generating take at 120 and 60 Hz, echo as recorded and 150 ms late,
@@ -1721,9 +1750,15 @@ fn generating_flights() -> Vec<HostFlights> {
     crate::common::par_map(&runs, |&(frame_ms, echo_ms, host, knobs)| {
         let h = Host::replay(&TAKES[0], knobs);
         let flights = flights_of(&h.shots);
+        // The turn end's walk: the composer's first move to another row from 32 s on.
+        let walk = h
+            .shots
+            .windows(2)
+            .find(|w| w[1].ms >= 32_000 + echo_ms && w[1].caret.0 != w[0].caret.0)
+            .map_or(0, |w| w[1].ms);
         let grounded = flights
             .iter()
-            .map(|&(at, ..)| grounded_before(&h.shots, at))
+            .map(|&(at, ..)| grounded_before(&h.shots, walk, at))
             .collect();
         (
             format!("{frame_ms} ms a frame, echo +{echo_ms} ms, {host}"),
@@ -1753,7 +1788,9 @@ fn generating_flights() -> Vec<HostFlights> {
 /// new words from where the first came down. With the one flight but the
 /// coil stood up when the walk armed the stream watch, the cat crouched,
 /// perked, sat and sprang from the sit: `[Crouch, Perk, Sit]` before the
-/// bound in every host.
+/// bound in every host. (Read from the walk's first move: what the cat did on
+/// the ground before it, beside the writing the wrap's bound brought it down by,
+/// is the writing's.)
 #[test]
 fn a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles() {
     for (label, echo, harness, flights, grounded) in generating_flights() {
@@ -3047,6 +3084,242 @@ fn a_jump_a_program_takes_straight_back_is_no_trip() {
             out_and_back.len() <= usize::from(harness)
                 && out_and_back.iter().all(|(_, _, _, to)| to.1 < 9),
             "{label}: flights (ms, caret, landing at (col, row), caret): {out_and_back:?}"
+        );
+    }
+}
+
+/// How long each flight of `shots` is in the air: `(the present it leaves on, ms aloft)`.
+fn airtimes(shots: &[Shot]) -> Vec<(u64, u64)> {
+    shots
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| {
+            w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap
+        })
+        .filter_map(|(i, w)| {
+            let down = shots[i + 1..]
+                .iter()
+                .find(|s| s.frame.action != PetAction::Leap)?;
+            Some((w[1].ms, down.ms - w[1].ms))
+        })
+        .collect()
+}
+
+/// The big bound's longest shape (ms): no crossing the writing's wrap makes is drawn out
+/// past it.
+const WRAP_BOUND_MS_MAX: u64 = 850;
+
+/// THE WRITING'S WRAP IS A BRISK BOUND. In the generating take Claude Code's composer
+/// word-wraps the writing at 19.9, 30.7 and 61.1 s (a program types the first two lines into
+/// it, the hand the third): the caret goes from the margin back to the next line's start,
+/// 110 cells, and the writing runs on at 20 keys a second. The cat it left at the margin
+/// expected the wrap: it goes at once, no notice beat (it leaves within 200 ms), and crosses
+/// in the bound the animal's own pace makes, in the air no longer than the big bound's longest
+/// shape, at 120 and 60 Hz, the echo as recorded and 150 ms late, plain, with the chips, with
+/// the harness, and with the harness's chrome a present late. So does the long insert's wrap at
+/// 26.9 s, where the word the wrap broke comes down with the caret a present or more after the
+/// caret went to the line's start (8 cells on), each take also under a window's present timing
+/// (a present a vsync, two or three after the one before, late by up to 3 ms, 3 schedules).
+///
+/// NEGATIVE CONTROL (as run on main before the fix): every wrap's bound 1.06 to 1.17 s in the
+/// air, paced as a quiet crossing (0.74 of the pane a second); with the harness the cat, sat at
+/// the margin, perked first and left 424 ms after the wrap. With the word's step read as a jump
+/// that ended the wrap, the long insert's cat at the far margin crossed 101 cells in 0.96 s at
+/// 60 Hz whenever a present showed the step before the cat sprang.
+#[test]
+fn the_writings_wrap_is_a_brisk_bound() {
+    let hosts = [
+        Knobs::SHIPPED,
+        Knobs {
+            chips: true,
+            ..Knobs::SHIPPED
+        },
+        Knobs {
+            chips: true,
+            brand: true,
+            ..Knobs::SHIPPED
+        },
+        Knobs {
+            chips: true,
+            brand: true,
+            chrome_lag: true,
+            ..Knobs::SHIPPED
+        },
+    ];
+    // `(take, the wraps it holds)`: the generating take, and the long insert.
+    let mut runs: Vec<(usize, usize, Knobs)> = Vec::new();
+    for (take, wraps) in [(0usize, 3usize), (3, 1)] {
+        for host in hosts {
+            for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+                for present_seed in 0..=3u64 {
+                    runs.push((
+                        take,
+                        wraps,
+                        Knobs {
+                            frame_ms,
+                            echo_ms,
+                            present_seed,
+                            ..host
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    let seen = crate::common::par_map(&runs, |&(take, wraps_held, knobs)| {
+        let shots = replayed(take, knobs);
+        let cols = TAKES[take].cols;
+        // A wrap: the caret from within six cells of the margin to the first twelve of the
+        // same row (a composer at the screen's foot grows up) or the next.
+        let wraps: Vec<u64> = shots
+            .windows(2)
+            .filter(|w| {
+                let ((pr, pc), (r, c)) = (w[0].caret, w[1].caret);
+                (r == pr || r == pr + 1) && pc + 6 >= cols && c <= 12
+            })
+            .map(|w| w[1].ms)
+            .collect();
+        let flights = airtimes(shots);
+        let crossings: Vec<(u64, Option<(u64, u64)>)> = wraps
+            .iter()
+            .map(|&w| {
+                (
+                    w,
+                    flights
+                        .iter()
+                        .copied()
+                        .find(|&(at, _)| at >= w && at <= w + 1_500),
+                )
+            })
+            .collect();
+        (
+            format!(
+                "{}: {} ms a frame, echo +{} ms, chips {}, harness {}, chrome late {}, present \
+                 schedule {}",
+                TAKES[take].name,
+                knobs.frame_ms,
+                knobs.echo_ms,
+                knobs.chips,
+                knobs.brand,
+                knobs.chrome_lag,
+                knobs.present_seed
+            ),
+            wraps_held,
+            crossings,
+        )
+    });
+    for (label, wraps_held, crossings) in seen {
+        assert!(
+            crossings.len() >= wraps_held,
+            "{label}: the take's {wraps_held} wraps, seen {crossings:?}"
+        );
+        for &(wrap, flight) in &crossings {
+            let Some((at, aloft)) = flight else {
+                panic!("{label}: no bound for the wrap at {wrap} ms");
+            };
+            assert!(
+                at - wrap <= 200 && aloft <= WRAP_BOUND_MS_MAX,
+                "{label}: the wrap at {wrap} ms: the bound left {} ms after it and was {aloft} ms \
+                 in the air",
+                at - wrap
+            );
+        }
+    }
+}
+
+/// The long insert's events as recorded, to the end of its take.
+fn long_insert_as_recorded() -> Vec<(u64, Rec)> {
+    let mut out = Vec::new();
+    for (ms, ev) in recording(TAKES[3].src, 1_000_000) {
+        let end = matches!(&ev, Rec::In(b) if b.as_slice() == b"\x1b[99;5u");
+        out.push((ms, ev));
+        if end {
+            break;
+        }
+    }
+    out
+}
+
+/// A CARET AT REST SENDS A FAR CAT ONCE TO ITS SEAT. At 6.74 s the long insert's dictation
+/// stops with the caret at the end of the composer's text, every line above it lettered to
+/// the margin; the cat is off by the dictation's letters, or watching from the far margin.
+/// No stand by the caret keeps its head off the letters; the seat that does is on the footer
+/// under the caret, two rows down (the far margin is 85 cells off). The cat goes there once,
+/// from wherever it is, before the arrow keys begin at 8.4 s: one flight, never one that comes
+/// down where it rose, landing on the footer's row, under a window's present timing (a present
+/// a vsync, two or three after the one before, late by up to 3 ms, 16 schedules), at 120 and
+/// 60 Hz, plain, with the chips and with the harness, their chrome a present late.
+///
+/// NEGATIVE CONTROL (as run on main before the fix): 82 of the 96 runs failed. 17 took two
+/// flights, the second a rise that came down where the cat stood (the window's hop at column
+/// 138: the stand by the caret read before the caret had rested half a second, the seat at the
+/// far margin after); the rest came down by the caret on its line, the head among the letters,
+/// or off the letters at the far margin.
+#[test]
+fn a_caret_at_rest_sends_a_far_cat_once_to_its_seat() {
+    let hosts = [
+        Knobs::SHIPPED,
+        Knobs {
+            chips: true,
+            chrome_lag: true,
+            ..Knobs::SHIPPED
+        },
+        Knobs {
+            chips: true,
+            brand: true,
+            chrome_lag: true,
+            ..Knobs::SHIPPED
+        },
+    ];
+    let mut runs: Vec<Knobs> = Vec::new();
+    for host in hosts {
+        for frame_ms in [8u64, 16] {
+            for present_seed in 1..=16u64 {
+                runs.push(Knobs {
+                    frame_ms,
+                    present_seed,
+                    ..host
+                });
+            }
+        }
+    }
+    let seen = crate::common::par_map(&runs, |&knobs| {
+        let h = Host::replay_events(&TAKES[3], knobs, long_insert_as_recorded());
+        let mut out = Vec::new();
+        for (i, w) in h.shots.windows(2).enumerate() {
+            if !(w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap)
+                || !(6_740..8_390).contains(&w[1].ms)
+            {
+                continue;
+            }
+            let rose = (w[0].frame.col, w[0].frame.row);
+            if let Some(down) = h.shots[i + 1..]
+                .iter()
+                .find(|s| s.frame.action != PetAction::Leap)
+            {
+                out.push((w[1].ms, rose, (down.frame.col, down.frame.row)));
+            }
+        }
+        (
+            format!(
+                "{} ms a frame, present schedule {}, chips {}, harness {}",
+                knobs.frame_ms, knobs.present_seed, knobs.chips, knobs.brand
+            ),
+            out,
+        )
+    });
+    for (label, flights) in seen {
+        let on_the_spot = flights
+            .iter()
+            .any(|&(_, (c0, r0), (c1, r1))| (r1 - r0).abs() < 0.5 && (c1 - c0).abs() < 3.0);
+        assert!(
+            flights.len() <= 1
+                && !on_the_spot
+                && flights
+                    .iter()
+                    .all(|&(_, _, (_, row))| (row - 59.0).abs() < 0.5),
+            "{label}: flights from the dictation's end to the arrow keys (ms, from, to): \
+             {flights:?}"
         );
     }
 }

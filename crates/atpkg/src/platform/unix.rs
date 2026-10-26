@@ -226,36 +226,20 @@ pub const UNIVERSAL_CONTROL_DOMAIN: &str = "com.apple.universalcontrol";
 #[cfg(target_os = "macos")]
 pub const UNIVERSAL_CONTROL_KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
 
-/// Universal Control's per-host switches, as `defaults -currentHost read` answers.
+/// Universal Control's per-host switches, as one `defaults -currentHost read` of their domain
+/// answers ([`crate::machine::universal_control_from_domain`]).
 #[must_use]
 pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
     #[cfg(target_os = "macos")]
     {
-        let read = |key: &str| {
-            use crate::machine::Read;
-            let mut cmd = aterm_uds::spawnfd::command("/usr/bin/defaults");
-            cmd.arg("-currentHost")
-                .arg("read")
-                .arg(UNIVERSAL_CONTROL_DOMAIN)
-                .arg(key);
-            match bounded_exit_and_stdout(&mut cmd) {
-                Some((true, out)) => match crate::machine::parse_defaults_bool(&out) {
-                    Some(value) => Read::Value(value),
-                    None => Read::Unusable(format!("`defaults read` printed no boolean for {key}")),
-                },
-                Some((false, out)) if out.is_empty() => Read::Absent,
-                Some((false, _)) => Read::Unusable(format!(
-                    "`defaults read` of {key} exited nonzero and printed something"
-                )),
-                None => Read::Unusable(format!(
-                    "`defaults read` of {key} did not run or passed its deadline"
-                )),
-            }
-        };
-        [
-            read(UNIVERSAL_CONTROL_KEYS[0]),
-            read(UNIVERSAL_CONTROL_KEYS[1]),
-        ]
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/defaults");
+        cmd.arg("-currentHost")
+            .arg("read")
+            .arg(UNIVERSAL_CONTROL_DOMAIN);
+        crate::machine::universal_control_from_domain(
+            bounded_exit_and_stdout(&mut cmd),
+            UNIVERSAL_CONTROL_KEYS,
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {

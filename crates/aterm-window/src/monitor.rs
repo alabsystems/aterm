@@ -8,86 +8,8 @@
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::platform_impl;
 
-// LOCAL PATCH (aterm): video modes serve only exclusive fullscreen, which no aterm crate asks for;
-// `VideoModeHandle` and `video_modes` are Windows-only.
-/// Describes a fullscreen video mode of a monitor.
-#[cfg(windows_platform)]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct VideoModeHandle {
-    pub(crate) video_mode: platform_impl::VideoModeHandle,
-}
-
-#[cfg(windows_platform)]
-impl std::fmt::Debug for VideoModeHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.video_mode.fmt(f)
-    }
-}
-
-#[cfg(windows_platform)]
-impl PartialOrd for VideoModeHandle {
-    fn partial_cmp(&self, other: &VideoModeHandle) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[cfg(windows_platform)]
-impl Ord for VideoModeHandle {
-    fn cmp(&self, other: &VideoModeHandle) -> std::cmp::Ordering {
-        self.monitor().cmp(&other.monitor()).then(
-            self.size()
-                .cmp(&other.size())
-                .then(
-                    self.refresh_rate_millihertz()
-                        .cmp(&other.refresh_rate_millihertz())
-                        .then(self.bit_depth().cmp(&other.bit_depth())),
-                )
-                .reverse(),
-        )
-    }
-}
-
-#[cfg(windows_platform)]
-impl VideoModeHandle {
-    /// Returns the resolution of this video mode.
-    #[inline]
-    pub fn size(&self) -> PhysicalSize<u32> {
-        self.video_mode.size()
-    }
-
-    /// Returns the bit depth of this video mode.
-    #[inline]
-    pub fn bit_depth(&self) -> u16 {
-        self.video_mode.bit_depth()
-    }
-
-    /// Returns the refresh rate of this video mode in mHz.
-    #[inline]
-    pub fn refresh_rate_millihertz(&self) -> u32 {
-        self.video_mode.refresh_rate_millihertz()
-    }
-
-    /// Returns the monitor that this video mode is valid for.
-    #[inline]
-    pub fn monitor(&self) -> MonitorHandle {
-        MonitorHandle { inner: self.video_mode.monitor() }
-    }
-}
-
-#[cfg(windows_platform)]
-impl std::fmt::Display for VideoModeHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}x{} @ {} mHz ({} bpp)",
-            self.size().width,
-            self.size().height,
-            self.refresh_rate_millihertz(),
-            self.bit_depth()
-        )
-    }
-}
-
+// LOCAL PATCH (aterm): no video modes: they served only exclusive fullscreen, which no aterm crate
+// asks for.
 /// Handle to a monitor.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MonitorHandle {
@@ -96,7 +18,7 @@ pub struct MonitorHandle {
 
 impl MonitorHandle {
     /// Returns a human-readable name of the monitor, or `None` if unavailable.
-    #[cfg(any(macos_platform, windows_platform))]
+    #[cfg(macos_platform)]
     #[inline]
     pub fn name(&self) -> Option<String> {
         self.inner.name()
@@ -124,12 +46,5 @@ impl MonitorHandle {
     #[inline]
     pub fn scale_factor(&self) -> f64 {
         self.inner.scale_factor()
-    }
-
-    /// Returns all fullscreen video modes supported by this monitor.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn video_modes(&self) -> impl Iterator<Item = VideoModeHandle> {
-        self.inner.video_modes().map(|video_mode| VideoModeHandle { video_mode })
     }
 }

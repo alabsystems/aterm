@@ -102,11 +102,28 @@ fn create_table_ddl_extracts_columns_and_rowid_alias() {
         parse_create_table("CREATE TABLE rev (id INTEGER PRIMARY KEY DESC, body TEXT)").unwrap();
     assert_eq!(desc_pk.rowid_alias_col, None);
 
+    let sized_int =
+        parse_create_table("CREATE TABLE sized (id INTEGER(8) PRIMARY KEY, body TEXT)").unwrap();
+    assert_eq!(sized_int.rowid_alias_col, None);
+
+    let multi_word_int =
+        parse_create_table("CREATE TABLE uns (id INTEGER UNSIGNED PRIMARY KEY, body TEXT)")
+            .unwrap();
+    assert_eq!(multi_word_int.rowid_alias_col, None);
+
     let table_pk = parse_create_table(
         "CREATE TABLE overridden (id INTEGER, slug TEXT, CONSTRAINT pk PRIMARY KEY (id))",
     )
     .unwrap();
     assert_eq!(table_pk.rowid_alias_col, None);
+
+    // IEEE-754 NaN in serial type 7 decodes to `SqlValue::Null`, matching SQLite's `vdbeaux.c`.
+    let mut nan_record = vec![2u8, 7u8];
+    nan_record.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
+    assert_eq!(
+        decode_record(&nan_record, TextEncoding::Utf8),
+        Some(vec![SqlValue::Null])
+    );
 }
 
 #[test]
@@ -403,5 +420,111 @@ mod live_sqlite {
                 ),
             ]
         );
+
+        // `scan_table_with` validates required columns even on an empty table, and `INTEGER(8)` /
+        // `INTEGER UNSIGNED` PRIMARY KEY columns preserve explicit `NULL` instead of aliasing rowid.
+        let quirk_db = std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("quirk.db");
+        run_sqlite(
+            &quirk_db,
+            "CREATE TABLE empty_goals (session_id TEXT PRIMARY KEY, status TEXT);
+             CREATE TABLE sized_pk (id INTEGER(8) PRIMARY KEY, body TEXT);
+             CREATE TABLE unsigned_pk (id INTEGER UNSIGNED PRIMARY KEY, body TEXT);
+             INSERT INTO sized_pk VALUES (NULL, 'sized-null');
+             INSERT INTO unsigned_pk VALUES (NULL, 'unsigned-null');",
+        );
+        assert_eq!(
+            aterm_uds::foreign_db::read_bytes(&quirk_db, 16 << 20, |main, wal| {
+                scan_table_with(
+                    main,
+                    wal,
+                    "empty_goals",
+                    |schema| schema.column_index("objective"),
+                    |_, _| Some(()),
+                )
+            }),
+            Err(aterm_uds::foreign_db::Unread::Failed),
+            "missing required column on an empty table must fail schema preparation"
+        );
+        for tbl in ["sized_pk", "unsigned_pk"] {
+            let rows = aterm_uds::foreign_db::read_bytes(&quirk_db, 16 << 20, |main, wal| {
+                scan_table(main, wal, tbl, |schema, row| {
+                    Some((
+                        row.get(schema.column_index("id")?)?.clone(),
+                        row.get(schema.column_index("body")?)?.to_list_field(),
+                    ))
+                })
+            })
+            .expect("scan non-alias pk");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].0,
+                SqlValue::Null,
+                "{tbl} must preserve explicit NULL"
+            );
+        }
+
+        // UTF-16LE and UTF-16BE databases (both `sqlite_schema.sql` DDL and row text values) plus
+        // multi-page `sqlite_schema` (`page_size=512` with 60 tables so page 1 splits to `0x05`).
+        for (enc_name, file_name) in [("UTF-16le", "utf16le.db"), ("UTF-16be", "utf16be.db")] {
+            let u16_db = std::fs::canonicalize(dir.path())
+                .expect("canonical")
+                .join(file_name);
+            run_sqlite(
+                &u16_db,
+                &format!(
+                    "PRAGMA encoding = '{enc_name}';
+                     CREATE TABLE goals (\"session_id\" TEXT PRIMARY KEY, \"objective\" TEXT, status TEXT);
+                     INSERT INTO goals VALUES ('s-utf16', 'Ship café 🚀 objective', 'active');"
+                ),
+            );
+            let got = aterm_uds::foreign_db::read_bytes(&u16_db, 16 << 20, |main, wal| {
+                scan_table_with(
+                    main,
+                    wal,
+                    "goals",
+                    |s| Some((s.column_index("session_id")?, s.column_index("objective")?)),
+                    |&(sid_i, obj_i), row| {
+                        Some((
+                            row.get(sid_i)?.to_list_field(),
+                            row.get(obj_i)?.to_list_field(),
+                        ))
+                    },
+                )
+            })
+            .expect("scan utf16 db");
+            assert_eq!(
+                got,
+                vec![("s-utf16".to_owned(), "Ship café 🚀 objective".to_owned())],
+                "{enc_name}"
+            );
+        }
+
+        let many_db = std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("many_schema.db");
+        let mut many_sql = String::from("PRAGMA page_size=512;");
+        for t in 0..60 {
+            many_sql.push_str(&format!(
+                "CREATE TABLE pad_table_{t:02} (col_alpha_{t:02} TEXT, col_beta_{t:02} INTEGER);"
+            ));
+        }
+        many_sql.push_str(
+            "CREATE TABLE target_goals (session_id TEXT PRIMARY KEY, objective TEXT, status TEXT);
+             INSERT INTO target_goals VALUES ('s-60', 'Deep schema B-tree', 'active');",
+        );
+        run_sqlite(&many_db, &many_sql);
+        let deep = aterm_uds::foreign_db::read_bytes(&many_db, 16 << 20, |main, wal| {
+            scan_table_with(
+                main,
+                wal,
+                "target_goals",
+                |s| s.column_index("objective"),
+                |&obj_i, row| Some(row.get(obj_i)?.to_list_field()),
+            )
+        })
+        .expect("scan multi-page sqlite_schema");
+        assert_eq!(deep, vec!["Deep schema B-tree".to_owned()]);
     }
 }

@@ -2989,6 +2989,49 @@ fn a_front_door_forward_nobody_accepts_is_never_sent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_front_door_ask_counts_an_aterm_only_where_it_answers() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = tokened_socket_dir("fdask");
+    let sock = dir.join("mock.sock");
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let within = std::time::Duration::from_millis(700);
+    assert_eq!(
+        front_door_ask_at(&path, "status\n", within),
+        FrontDoorAnswer::Absent
+    );
+
+    let listener = UnixListener::bind(&sock).expect("bind, never accept");
+    assert_eq!(
+        front_door_ask_at(&path, "status\n", within),
+        FrontDoorAnswer::Silent(Some(std::process::id())),
+        "a socket that takes a connection and never answers is an aterm not answering"
+    );
+    drop(listener);
+
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let srv = std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+        let mut w = conn;
+        for answer in [&b""[..], b"OK version=test\n", b"OK schema=1 fleet=off\n"] {
+            let mut line = String::new();
+            r.read_line(&mut line).expect("a request line");
+            w.write_all(answer).expect("answer");
+        }
+    });
+    assert_eq!(
+        front_door_ask_at(&path, "status\n", HANG_DETECTOR),
+        FrontDoorAnswer::Answered("OK schema=1 fleet=off".to_owned())
+    );
+    srv.join().expect("mock server");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn flagless_target_falls_back_to_the_newest_live_instance_when_latest_is_dead() {
     let dir = std::env::temp_dir().join(format!("aterm-ctl-latest-{}", std::process::id()));

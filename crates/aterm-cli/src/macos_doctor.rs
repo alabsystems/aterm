@@ -21,20 +21,20 @@ mod initial;
 pub use initial::{
     BroughtForward, InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
-    InitialSetupSnapshotError, InitialSetupUpgrade, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
-    SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, alab_mac, apply_initial_setup,
-    apply_initial_setup_observed, automatic_plan, bring_forward_restored_setup,
-    bring_forward_restored_setup_observing, check_initial_setup, check_initial_setup_observed,
-    decline_provisional_setup_widen, forget_set_aside_setup, initial_setup_access_revision,
-    initial_setup_access_step, initial_setup_admission, initial_setup_finished,
-    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_park_mark,
-    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
-    initial_setup_snapshot_offering, observe_initial_setup, probe_local_network_again,
-    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
-    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
-    run_initial_setup_pass, set_aside_unreadable_setup, set_aside_unreadable_setup_observing,
-    setup_is_newer, setup_records_held, validate_initial_setup_plan, vault_config_unread,
-    with_initial_setup_vault_sync,
+    InitialSetupSnapshotError, InitialSetupUpgrade, ParkWatch, SETUP_BUSY, SetAside, SetupHooks,
+    SetupNext, SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, alab_mac,
+    apply_initial_setup, apply_initial_setup_observed, automatic_plan,
+    bring_forward_restored_setup, bring_forward_restored_setup_observing, check_initial_setup,
+    check_initial_setup_observed, decline_provisional_setup_widen, forget_set_aside_setup,
+    initial_setup_access_revision, initial_setup_access_step, initial_setup_admission,
+    initial_setup_finished, initial_setup_keeps_vault_sync, initial_setup_observation,
+    initial_setup_park_mark, initial_setup_review_revision, initial_setup_revision,
+    initial_setup_snapshot, initial_setup_snapshot_offering, observe_initial_setup,
+    probe_local_network_again, provisional_setup_widened, provisional_setup_widens,
+    put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
+    restart_initial_setup_observed, run_initial_setup_pass, set_aside_unreadable_setup,
+    set_aside_unreadable_setup_observing, setup_is_newer, setup_records_held,
+    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -74,13 +74,24 @@ impl Action {
 /// nothing failed, and the person logs out and back in for it (its detail says so).
 pub const LOGIN: &str = "login";
 
+/// A row's status for a change the engine put off ([`aterm_machines::model::Outcome::Deferred`]):
+/// the person's console, the Mac going idle or the next launch moves it, never a retry a minute
+/// later. Nothing failed and nobody is needed now, so it is no attention ([`Report::needs_attention`]),
+/// but the change is not made either ([`Report::complete`]).
+pub const DEFERRED: &str = "deferred";
+
+/// The longest [`Report::attention_line`], in bytes: an info record keeps 512
+/// (`aterm_log::MAX_RECORD_BYTES`), and the setup worker's line says a little around it.
+pub const ATTENTION_LINE: usize = 400;
+
 /// One preference's observed outcome.
 #[derive(Clone, Debug)]
 pub struct Row {
     /// Human-readable setting name.
     pub name: String,
-    /// `ok`, `drift`, `applied`, `restored`, [`LOGIN`], `blocked`, `waiting`, `unverified` or
-    /// `error`; a setup snapshot's rows also `pending`, `running` or `stopped`.
+    /// `ok`, `drift`, `applied`, `restored`, [`LOGIN`], [`DEFERRED`], `blocked`, `waiting`,
+    /// `unreached`, `unverified` or `error`; a setup snapshot's rows also `pending`, `running` or
+    /// `stopped`.
     pub status: String,
     /// Action or failure detail, without account identifiers.
     pub detail: String,
@@ -88,6 +99,25 @@ pub struct Row {
     /// a shared engine item's own ([`aterm_converge::ItemReport::elapsed_ms`]), else the act
     /// or stage it reports ([`RowClock`]). `None` until one of them times it.
     pub elapsed_ms: Option<u64>,
+}
+
+impl Row {
+    /// Whether the setting or account is out of policy, blocked, waiting, unreached, unverified
+    /// or failed ([`Report::needs_attention`]).
+    #[must_use]
+    pub fn needs_attention(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "drift" | "error" | "blocked" | "waiting" | "unreached" | "unverified"
+        )
+    }
+
+    /// Whether aterm's own step failed or could not be confirmed: what an unattended pass warns
+    /// about. A row that waits on a person, a vault or a service starting is a not-yet.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        matches!(self.status.as_str(), "drift" | "error" | "unverified")
+    }
 }
 
 /// A pass's clock for the rows it adds to a report: each [`RowClock::lap`] gives every row its
@@ -191,15 +221,85 @@ impl Report {
             .map(|row| row.detail.as_str())
     }
 
-    /// Whether a setting or account remains out of policy, blocked, unverified or failed.
+    /// The rows a pass left as they are because they changed after this setup had them as
+    /// wanted ([`SETTLED`]): drift after a row read back ok, which no automatic pass rewrites.
+    #[must_use]
+    pub fn changed_since(&self) -> Vec<&str> {
+        self.rows
+            .iter()
+            .filter(|row| row.detail.ends_with(SETTLED))
+            .map(|row| row.name.as_str())
+            .collect()
+    }
+
+    /// Whether a setting or account remains out of policy, blocked, unverified or failed. A
+    /// [`DEFERRED`] change is none of these: nobody is needed for it now.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        self.rows.iter().any(|r| {
-            matches!(
-                r.status.as_str(),
-                "drift" | "error" | "blocked" | "waiting" | "unreached" | "unverified"
-            )
-        })
+        self.rows.iter().any(Row::needs_attention)
+    }
+
+    /// Whether a row says aterm's own step failed or could not be confirmed ([`Row::failed`]).
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.rows.iter().any(Row::failed)
+    }
+
+    /// Whether every change is made or in place: nothing [`Self::needs_attention`] and nothing is
+    /// [`DEFERRED`]. What records a pass as applied, or a plan as complete.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        !self.needs_attention() && !self.rows.iter().any(|row| row.status == DEFERRED)
+    }
+
+    /// One line for the log: the verdict and each row that needs attention, in that order and
+    /// cut to [`ATTENTION_LINE`] bytes, so the first row that blocks is named however many rows
+    /// are in place, and no row in place is.
+    #[must_use]
+    pub fn attention_line(&self) -> String {
+        let mut line = self.verdict();
+        let attention: Vec<&Row> = self.rows.iter().filter(|r| r.needs_attention()).collect();
+        for (at, row) in attention.iter().enumerate() {
+            let left = attention.len() - at - 1;
+            let tail = if left > 0 {
+                format!("; and {left} more")
+            } else {
+                String::new()
+            };
+            let mut part = format!("; {}: {} — {}", row.name, row.status, row.detail);
+            if line.len() + part.len() + tail.len() > ATTENTION_LINE {
+                if at > 0 {
+                    line.push_str(&format!("; and {} more", left + 1));
+                    break;
+                }
+                // The first row that needs attention is named whatever its detail's length.
+                let mut cut = ATTENTION_LINE
+                    .saturating_sub(line.len() + tail.len() + '\u{2026}'.len_utf8())
+                    .min(part.len());
+                while !part.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                part.truncate(cut);
+                part.push('\u{2026}');
+            }
+            line.push_str(&part);
+        }
+        line
+    }
+
+    /// The report's first line: the action and how many of its rows need attention.
+    fn verdict(&self) -> String {
+        let total = self.rows.len();
+        match self.rows.iter().filter(|r| r.needs_attention()).count() {
+            0 => format!(
+                "macOS workstation profile ({}): nothing needs attention ({total} rows)",
+                self.action.name()
+            ),
+            n => format!(
+                "macOS workstation profile ({}): {n} of {total} rows need attention",
+                self.action.name()
+            ),
+        }
     }
 
     /// A compact JSON report, suitable for fleet automation.
@@ -227,11 +327,23 @@ impl Report {
         .unwrap_or_else(|e| format!("{{\"error\":\"JSON report: {e}\"}}"))
     }
 
-    /// The same report for a terminal.
+    /// The same report for a terminal: the verdict, then each row not in place (what changed,
+    /// what waits, what failed). [`Self::to_text_verbose`] lists every row.
     #[must_use]
     pub fn to_text(&self) -> String {
-        let mut text = format!("macOS workstation profile ({})\n", self.action.name());
-        for row in &self.rows {
+        self.text(false)
+    }
+
+    /// [`Self::to_text`] with every row, the ones in place too, and, for a Check, the backup's
+    /// path, which an Apply or a Restore always gives (`aterm doctor --check --verbose`).
+    #[must_use]
+    pub fn to_text_verbose(&self) -> String {
+        self.text(true)
+    }
+
+    fn text(&self, verbose: bool) -> String {
+        let mut text = format!("{}\n", self.verdict());
+        for row in self.rows.iter().filter(|row| verbose || row.status != "ok") {
             text.push_str(&format!(
                 "  {}: {} — {}\n",
                 row.name, row.status, row.detail
@@ -240,7 +352,10 @@ impl Report {
         for step in &self.manual_steps {
             text.push_str(&format!("  owner action: {step}\n"));
         }
-        text.push_str(&format!("  backup: {}\n", self.backup.display()));
+        // An Apply or a Restore says where the originals are kept; a Check only when asked.
+        if verbose || self.action != Action::Check {
+            text.push_str(&format!("  backup: {}\n", self.backup.display()));
+        }
         text
     }
 }
@@ -450,7 +565,7 @@ fn run_mutation(host: &mut dyn Host, root: &Path, action: Action) -> Result<Repo
     };
     let report = execute(host, root, action)?;
     if let Some(run) = explicit
-        && !report.needs_attention()
+        && report.complete()
     {
         initial::complete_explicit_workstation_plan(root, run)?;
     }
@@ -708,7 +823,7 @@ fn apply_part_with(
         host.select(selected);
         let mut report = execute(host, root, Action::Check)?;
         report.action = Action::Apply;
-        if report.needs_attention() {
+        if !report.complete() {
             for row in &mut report.rows {
                 if row.status != "ok" {
                     row.status = initial::WAITING.into();
@@ -982,16 +1097,44 @@ fn mac_settings_retry_due(
     build: &str,
     now: u64,
 ) -> Result<Option<u64>, String> {
+    mac_settings_second_try(root, revision, build, |dues| {
+        dues.filter(|due| *due <= now).max()
+    })
+}
+
+/// The earliest second automatic Mac settings try in this run and build that is not due yet
+/// ([`mac_settings_retry_due`]'s deadlines still ahead of `now`): when a parked worker looks
+/// again by itself, with no timer before it.
+fn mac_settings_retry_ahead(
+    root: &Path,
+    revision: u64,
+    build: &str,
+    now: u64,
+) -> Result<Option<u64>, String> {
+    mac_settings_second_try(root, revision, build, |dues| {
+        dues.filter(|due| *due > now).min()
+    })
+}
+
+/// The deadline `pick` takes from each second automatic Mac settings try this run and build owes.
+fn mac_settings_second_try(
+    root: &Path,
+    revision: u64,
+    build: &str,
+    pick: impl Fn(&mut dyn Iterator<Item = u64>) -> Option<u64>,
+) -> Result<Option<u64>, String> {
     let automatic = Automatic::load(root, revision).map(|record| {
-        record
-            .failed
-            .iter()
-            .filter(|failed| {
-                failed.build == build && failed.tries == 1 && !record.settled.contains(&failed.item)
-            })
-            .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()))
-            .filter(|due| *due <= now)
-            .max()
+        pick(
+            &mut record
+                .failed
+                .iter()
+                .filter(|failed| {
+                    failed.build == build
+                        && failed.tries == 1
+                        && !record.settled.contains(&failed.item)
+                })
+                .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs())),
+        )
     });
     // A separate Full Disk Access follow-up can fail without an ordinary pass
     // recording that attempt. Its scope includes approved debt from an earlier
@@ -1001,19 +1144,19 @@ fn mac_settings_retry_due(
         let Some(chosen) = initial::withheld_selection(root)? else {
             return Ok(None);
         };
-        Ok(record
-            .failed
-            .iter()
-            .filter(|failed| {
-                failed.build == build
-                    && failed.tries == 1
-                    && record.items.contains(&failed.item)
-                    && aterm_machines::init_preferences::setting_of(&failed.item)
-                        .is_some_and(|setting| chosen.contains(setting))
-            })
-            .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()))
-            .filter(|due| *due <= now)
-            .max())
+        Ok(pick(
+            &mut record
+                .failed
+                .iter()
+                .filter(|failed| {
+                    failed.build == build
+                        && failed.tries == 1
+                        && record.items.contains(&failed.item)
+                        && aterm_machines::init_preferences::setting_of(&failed.item)
+                            .is_some_and(|setting| chosen.contains(setting))
+                })
+                .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs())),
+        ))
     })();
     if initial::revision_at(root)? != revision {
         return Ok(None);
@@ -1021,7 +1164,10 @@ fn mac_settings_retry_due(
     // One unreadable cache must not hide a known deadline from the other, or
     // create a deadline where neither record establishes one.
     match (automatic, withheld) {
-        (Ok(a), Ok(b)) => Ok(a.max(b)),
+        (Ok(a), Ok(b)) => Ok(match (a, b) {
+            (Some(a), Some(b)) => pick(&mut [a, b].into_iter()),
+            (one, None) | (None, one) => one,
+        }),
         (known @ Ok(Some(_)), Err(_)) | (Err(_), known @ Ok(Some(_))) => known,
         (Err(why), _) | (_, Err(why)) => Err(why),
     }
@@ -2333,7 +2479,7 @@ fn execute_pass(
             .map(|attempt| attempt.item),
     );
     settled.extend(host.settled());
-    if !report.needs_attention() {
+    if report.complete() {
         initial::record_applied(root, host.selection())?;
     }
     Ok(Pass {
@@ -7471,6 +7617,11 @@ mod tests {
                 .unwrap();
             assert_eq!(row.status, "ok", "minute {minute}: {}", report.to_text());
             assert!(row.detail.ends_with(SETTLED), "{}", row.detail);
+            assert_eq!(
+                report.changed_since(),
+                [widgets.describe().as_str()],
+                "the fact for later names the row the person changed"
+            );
         }
         assert_eq!(
             host.writes
@@ -8835,5 +8986,83 @@ mod tests {
             }
             assert!(!held.get());
         }
+    }
+
+    fn report_of(rows: &[(&str, &str, &str)]) -> Report {
+        Report {
+            action: Action::Apply,
+            rows: rows
+                .iter()
+                .map(|(name, status, detail)| Row {
+                    name: (*name).into(),
+                    status: (*status).into(),
+                    detail: (*detail).into(),
+                    elapsed_ms: None,
+                })
+                .collect(),
+            manual_steps: Vec::new(),
+            backup: PathBuf::from("original-preferences.json"),
+            restore: None,
+            page: None,
+        }
+    }
+
+    /// The log's line for a pass names the row that blocks however many rows are in place, and
+    /// no row in place; `--check` prints the rows not in place, and `--verbose` every row.
+    #[test]
+    fn a_pass_line_names_only_the_rows_not_in_place() {
+        let in_place = "x".repeat(200);
+        let mut rows: Vec<(String, &str, String)> = (1..=11)
+            .map(|n| (format!("Setting {n}"), "ok", in_place.clone()))
+            .collect();
+        rows.push((
+            "Developer Tools".into(),
+            "blocked",
+            "Needs an administrator".into(),
+        ));
+        let borrowed: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|(name, status, detail)| (name.as_str(), *status, detail.as_str()))
+            .collect();
+        let report = report_of(&borrowed);
+        let line = report.attention_line();
+        assert!(line.len() <= ATTENTION_LINE, "{} bytes: {line}", line.len());
+        assert!(
+            line.contains("1 of 12 rows need attention")
+                && line.contains("Developer Tools: blocked — Needs an administrator"),
+            "{line}"
+        );
+        assert!(!line.contains("Setting 1"), "a row in place: {line}");
+        let text = report.to_text();
+        assert!(text.contains("Developer Tools: blocked"), "{text}");
+        assert!(!text.contains("Setting 1"), "{text}");
+        let verbose = report.to_text_verbose();
+        assert!(
+            (1..=11).all(|n| verbose.contains(&format!("Setting {n}: ok"))),
+            "{verbose}"
+        );
+
+        let long = "\u{e9}".repeat(1500);
+        let report = report_of(&[
+            ("Secrets", "waiting", &long),
+            ("Repositories", "unreached", "after Secrets"),
+        ]);
+        let line = report.attention_line();
+        assert!(line.len() <= ATTENTION_LINE, "{} bytes", line.len());
+        assert!(line.contains("Secrets: waiting"), "{line}");
+        assert!(line.ends_with("; and 1 more"), "{line}");
+    }
+
+    /// A change put off to a later pass waits on nobody, so nothing needs attention, yet the
+    /// pass is not complete; a row that waits is a not-yet, never a failure.
+    #[test]
+    fn a_deferred_change_waits_on_nobody_and_leaves_the_pass_incomplete() {
+        let deferred = report_of(&[("Dock", "ok", ""), ("Spotlight", DEFERRED, "next pass")]);
+        assert!(!deferred.needs_attention() && !deferred.failed());
+        assert!(!deferred.complete());
+        assert!(report_of(&[("Dock", "ok", "")]).complete());
+        let waiting = report_of(&[("Secrets", "waiting", "for the vault")]);
+        assert!(waiting.needs_attention() && !waiting.failed());
+        assert!(report_of(&[("Dock", "error", "write refused")]).failed());
     }
 }

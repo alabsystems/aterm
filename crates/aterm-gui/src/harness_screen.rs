@@ -4175,8 +4175,11 @@ fn parse_loadavg_gui(text: &str) -> Option<[u32; 3]> {
     Some([l1, l5, l15])
 }
 
+/// `dns-sd`, which never ends by itself, for `wait_ms`: tethered, so a window killed outright
+/// takes it along.
 #[cfg(target_os = "macos")]
 fn run_dns_sd_bounded(args: &[&str], wait_ms: u64, stop_substr: Option<&str>) -> String {
+    use aterm_uds::spawnfd::Tether as _;
     use std::io::{BufRead, BufReader, Read};
     let Ok((reader, writer)) = std::io::pipe() else {
         return String::new();
@@ -4185,7 +4188,8 @@ fn run_dns_sd_bounded(args: &[&str], wait_ms: u64, stop_substr: Option<&str>) ->
     cmd.args(args)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::from(writer))
-        .stderr(aterm_uds::spawnfd::Stdio::null());
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .tether();
     let Ok(mut child) = cmd.spawn() else {
         return String::new();
     };

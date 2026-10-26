@@ -1827,6 +1827,65 @@ fn outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed(
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Outside an aterm shell, a foreign copy of an agent program first on PATH is the person's to
+/// keep (an aterm tab puts agents/ first on its own): a note, and the report passes. NEGATIVE
+/// CONTROL: the same PATH inside an aterm shell is a warning; a pinned program that is no
+/// agent is a warning outside too.
+#[cfg(unix)]
+#[test]
+fn an_agent_shadowed_outside_aterm_is_a_note_and_inside_a_warning() {
+    let l = layout("agent-shadow-outside");
+    install(&l, "ay", 19);
+    let v280 = crate::vendor_direct::Version::parse("2.1.280")
+        .unwrap()
+        .build_id();
+    install(&l, "claude", v280);
+    // No twin in agents/: the agent's shadow is the plain one.
+    let _ = std::fs::remove_file(l.agent_shim(&crate::store::ToolName::new("claude").unwrap()));
+    let foreign = crate::testdir::dir("atpkg-doctor-agent-shadow-outside-foreign-");
+    for name in ["claude", "ay"] {
+        let exe = foreign.join(name);
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let home = synthetic_home("agent-shadow-outside");
+    let path = std::env::join_paths([foreign.to_path_buf(), l.bin_dir()]).unwrap();
+    let row_of = |stub_env, program: &str| {
+        let rows = report_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            &Probes {
+                stub_env,
+                ..Probes::default()
+            },
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.id == c::of(c::SHADOW, program))
+            .unwrap_or_else(|| panic!("a shadow row for {program}: {rows:#?}"))
+            .clone();
+        (row, crate::converge::passes(&rows))
+    };
+    let (outside, passes) = row_of(crate::reroute::StubEnv::default(), "claude");
+    assert_eq!(outside.outcome, Outcome::NotApplicable, "{outside:#?}");
+    assert!(passes, "a note never fails the report");
+    let (inside, _) = row_of(crate::reroute::StubEnv { in_aterm: true }, "claude");
+    assert!(
+        matches!(inside.outcome, Outcome::Planned | Outcome::Person),
+        "inside aterm the shadow is a warning: {inside:#?}"
+    );
+    let (pinned, _) = row_of(crate::reroute::StubEnv::default(), "ay");
+    assert!(
+        matches!(pinned.outcome, Outcome::Planned | Outcome::Person),
+        "a pinned program is no agent: {pinned:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_shim_that_exports_less_than_its_build_declares_is_named() {
@@ -3856,4 +3915,104 @@ fn the_refused_row_says_the_current_builds_names_escaped_and_counted() {
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A program's answer to a version question is kept under its identity: asked once, then read
+/// from the cache with nothing spawned. NEGATIVE CONTROL: a rewritten program is asked again,
+/// and an unanswered question is never kept.
+#[test]
+fn a_kept_version_answer_is_asked_once_until_the_program_changes() {
+    let root = synthetic_home("kept-version");
+    let bin = root.join("solver");
+    std::fs::write(&bin, "build one").unwrap();
+    let cache = root.join("state").join(VERSIONS);
+    let asked = std::cell::Cell::new(0);
+    let ask = || {
+        asked.set(asked.get() + 1);
+        Some("1.2.3".to_owned())
+    };
+    assert_eq!(
+        kept_answer(&bin, "--version", Some(&cache), ask).as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(
+        kept_answer(&bin, "--version", Some(&cache), ask).as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(asked.get(), 1, "the same program was asked twice");
+    std::fs::write(&bin, "build number two").unwrap();
+    assert_eq!(
+        kept_answer(&bin, "--version", Some(&cache), ask).as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(asked.get(), 2, "a rewritten program kept the old answer");
+    let commit = || {
+        asked.set(asked.get() + 1);
+        Some("0123456789".to_owned())
+    };
+    assert_eq!(
+        kept_answer(&bin, "-Vv commit-hash", Some(&cache), commit).as_deref(),
+        Some("0123456789"),
+        "another question of the same program is asked, not answered from the first"
+    );
+    assert_eq!(asked.get(), 3);
+    assert_eq!(
+        kept_answer(&bin, "--version", Some(&cache), ask).as_deref(),
+        Some("1.2.3"),
+        "each question keeps its own answer"
+    );
+    assert_eq!(asked.get(), 3);
+    let other = root.join("other");
+    std::fs::write(&other, "x").unwrap();
+    let unanswered = || {
+        asked.set(asked.get() + 1);
+        None
+    };
+    assert_eq!(
+        kept_answer(&other, "--version", Some(&cache), unanswered),
+        None
+    );
+    assert_eq!(
+        kept_answer(&other, "--version", Some(&cache), unanswered),
+        None
+    );
+    assert_eq!(asked.get(), 5, "an unanswered question was kept");
+}
+
+/// Bare doctor's packages line names the row's fix once: appended when the sentence does not
+/// say it, left off when the sentence already names that act. NEGATIVE CONTROL: the same row
+/// whose sentence names no act gets the fix appended.
+#[test]
+fn a_packages_line_names_its_fix_once() {
+    let row = |why: &str| ItemReport {
+        id: "base.pkg.stub@clippy".to_owned(),
+        family: "pkg".to_owned(),
+        title: "reroute stub clippy".to_owned(),
+        outcome: Outcome::Planned,
+        from: None,
+        to: None,
+        why: None,
+        revert: None,
+        effect: aterm_converge::Effect::Now,
+        detail: None,
+        layer: Some(aterm_converge::Layer::Base),
+        class: Some(aterm_converge::Class::Relay),
+        explain: Some(aterm_converge::Explain {
+            why: why.to_owned(),
+            remedy: aterm_converge::Remedy::Repair,
+        }),
+        stood_aside: None,
+        essential: false,
+        elapsed_ms: None,
+    };
+    let named = sentence_and_fix(&row(
+        "reroute stub clippy missing; the next aterm session lays it \u{2014} now: aterm pkg repair",
+    ));
+    assert_eq!(named.matches("aterm pkg repair").count(), 1, "{named}");
+    assert!(!named.contains("fix:"), "{named}");
+    let bare = sentence_and_fix(&row("reroute stub clippy missing"));
+    assert_eq!(
+        bare,
+        "reroute stub clippy missing \u{2014} fix: aterm pkg repair"
+    );
 }

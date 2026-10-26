@@ -2041,7 +2041,8 @@ const LOCAL_VAULT_ENTRY: &str = "NUX_PROBE";
 /// The guest commands that make `vault-local`'s vault as a second identity (its own `$HOME`
 /// under `admin`): a server on 127.0.0.1 that advertises nothing, the vault (the lane's entry in
 /// `[everyone]`, a join password in `admin/password`) and its approver (`aterm secrets watch`);
-/// they print the vault's signer, which the joining Mac pins. `password show` writes the join
+/// they print the vault's signer (off the `join` line `create` prints), which the joining Mac
+/// pins. `password show` writes the join
 /// password only to a terminal, so the setup reads it as the person at one would, on the
 /// pseudo-terminal `expect` spawns it on (its line end's `\r` dropped; a terminal's EOF, which
 /// `script` with no input would type and the terminal echo as `^D`, never reaches it), and a
@@ -2058,7 +2059,7 @@ fn local_vault_setup(aterm: &str, admin: &str) -> String {
          tr -d '\\r' < $A/password.tty > $A/password; \
          case \"$(cat $A/password)\" in ''|*' '*) echo 'password show printed no join password:'; cat $A/password.tty; exit 1;; esac; \
          ({aterm} secrets watch </dev/null >$A/watch.log 2>&1 &); \
-         sed -n 's/.*add #\\([^ ]*\\) to the URL.*/\\1/p' $A/create.out"
+         sed -n 's/.*aterm secrets join [^#]*#\\([^ ]*\\).*/\\1/p' $A/create.out"
     )
 }
 

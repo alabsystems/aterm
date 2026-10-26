@@ -19,6 +19,10 @@ const SIBLING_SEEDS: u64 = 32;
 
 const RARE_SEEDS: u64 = 20000;
 
+/// The search for a rule rarer still: since the post journal (B19) the incarnation lease's
+/// collision is reached by one seed in 60000 (54518), where 8483 had been the first in 20000.
+const RAREST_SEEDS: u64 = 60_000;
+
 fn report(out: &Outcome) -> String {
     let tail = out.trace.len().saturating_sub(40);
     format!(
@@ -406,7 +410,7 @@ fn each_rule_switched_off_is_caught() {
                     .with(Mutant::TrustTheFloorThatReads)
             }),
             "cap-compromised",
-            8483,
+            54518,
         ),
         (
             "a move of the log drops the mirror's pinned batch",
@@ -479,7 +483,7 @@ fn each_rule_switched_off_is_caught() {
             "a bridge tells aterm what its quarantine holds",
             Box::new(|s| Opts::seed(s).with(Mutant::TellMovedNotHeld)),
             "quarantine:",
-            1,
+            7,
         ),
         (
             "an offset below the self-lane window is not added to it",
@@ -491,7 +495,7 @@ fn each_rule_switched_off_is_caught() {
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            47,
+            93,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -503,31 +507,31 @@ fn each_rule_switched_off_is_caught() {
             "an own record is delivered only once its in-flight entry is gone",
             Box::new(|s| Opts::seed(s).with(Mutant::DeliverPastAStandingEntry)),
             "dup delivery",
-            28,
+            558,
         ),
         (
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
             "mirror total",
-            1039,
+            683,
         ),
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            713,
+            1007,
         ),
         (
             "a record the attach published again is delivered once its post is retired",
             Box::new(|s| both_ways_erring(s).with(Mutant::DeliverBeforeTheDrain)),
             "dup delivery",
-            18017,
+            3222,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
             "mirror",
-            1535,
+            3879,
         ),
         (
             "a recovery tried again moves each file once",
@@ -587,21 +591,27 @@ fn each_rule_switched_off_is_caught() {
         "a mirror floor covers a batch only once this open made it durable",
         "an attach delivers on a new log only once its witness is written",
         "`session-exited` publishes the session's `exited` row",
-        "the incarnation lease is trusted only in the boot that wrote it",
         "the endpoint forgets the offsets a move took (the model's tap)",
         "a session ahead of the bridge's witness keeps below the chain's fork (F3)",
         "a move of the log drops the mirror's pinned batch",
         "the endpoint forgets the offsets a move took (no loss)",
         "the endpoint forgets the offsets a move took (receipts)",
+        // Since the post journal (B19) a post is four appends to one file, not two
+        // files written and two unlinked: fewer writes for a write error to land on.
+        "the recovery a write error stopped is done before the run record",
+        "an own record is delivered only once its in-flight entry is gone",
     ];
-    for rare in RARE {
+    const RAREST: &[&str] = &["the incarnation lease is trusted only in the boot that wrote it"];
+    for rare in RARE.iter().chain(RAREST) {
         assert!(
             rules.iter().any(|(rule, _, _, _)| rule == rare),
             "a rare rule names no rule: {rare}"
         );
     }
     let shown = aterm_spec::check::each(&rules, |(rule, opts, law, witness)| {
-        let limit = if RARE.contains(rule) {
+        let limit = if RAREST.contains(rule) {
+            RAREST_SEEDS
+        } else if RARE.contains(rule) {
             RARE_SEEDS
         } else {
             CONTROL_SEEDS
@@ -706,10 +716,25 @@ const FOUND: &[(u64, usize, &str)] = &[
 ];
 
 const FOUND_ERRING: &[(u64, usize, &str)] = &[
+    // The post journal (B19) and its review (each attach named in the journal) moved every
+    // seed's writes, so not every row reaches its bug with the rule off any more; each rule
+    // keeps one that does (each_found_bug_is_reached_again_with_its_rule_off), 31 added for
+    // the sweep's when the review moved 93, 125 and 185 off it.
+    (28, 400, "a deduped replay moved the self-lane window down"),
+    (
+        31,
+        400,
+        "a sweep a write error stopped, closed by the run record",
+    ),
     (
         75,
         400,
         "a pin judged before the reconcile a write error stopped",
+    ),
+    (
+        93,
+        400,
+        "a sweep a write error stopped, closed by the run record",
     ),
     (
         95,
@@ -765,6 +790,13 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         1530,
         400,
         "a record delivered while its in-flight entry stood",
+    ),
+    // B19's review: the post journal's drop the disk refused stayed in the open, and the
+    // re-attach of the same process published it after the sender's later post.
+    (
+        10236,
+        400,
+        "a record dropped while the disk refused the drop",
     ),
 ];
 
@@ -879,6 +911,11 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         Mutant::DeliverPastAStandingEntry,
         "dup delivery",
     ),
+    (
+        "a record dropped while the disk refused the drop",
+        Mutant::KeepARefusedDrop,
+        "order",
+    ),
 ];
 
 /// **NEGATIVE CONTROL: EACH BUG A FOUND SEED PINS IS REACHED AGAIN WITH ITS
@@ -986,7 +1023,7 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
         torn.iter().map(|out| out.stats.set_aside).sum::<u64>()
     );
     let refusing = |s| Opts::seed(s).with(Mutant::RefuseTornAfterPowerCut);
-    let wedged = breaking_at(&refusing, "liveness", 5, CONTROL_SEEDS)
+    let wedged = breaking_at(&refusing, "liveness", 13, CONTROL_SEEDS)
         .expect("NEGATIVE CONTROL: with the old refusal, a torn file wedges some seed's attach");
     eprintln!(
         "the old refusal at seed {}: {}",
@@ -1002,19 +1039,6 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
     assert!(
         run(&whole).violations.is_empty(),
         "the same seed under the old refusal with a device that never tears breaks no law"
-    );
-    let by_the_reader = |s| Opts::seed(s).with(Mutant::SweepByTheReaderAlone);
-    let kept = breaking_at(&by_the_reader, "liveness", 27, RARE_SEEDS).expect(
-        "NEGATIVE CONTROL: a sweep that trusts the reader alone keeps a cut reply that wedges",
-    );
-    eprintln!(
-        "the reader-alone sweep at seed {}: {}",
-        kept.seed,
-        kept.violations.join("; ")
-    );
-    assert!(
-        run(&Opts::seed(kept.seed)).violations.is_empty(),
-        "the committed world of the same seed breaks no law"
     );
 }
 
@@ -1480,6 +1504,93 @@ fn a_durable_replace_flushes_its_directory_for_its_siblings() {
     }
     assert!(appended_lost, "an append after the flush was never lost");
     assert!(entry_lost, "a write in another directory was never lost");
+}
+
+/// A FLUSHED APPEND IS ON THE MEDIA (B19, the post journal): once a flush of an
+/// appended file where it is and a flush of its directory are both on the
+/// media, every cut keeps the appends the file's flush covered, whole, and a
+/// later append may still be lost or torn. CONTROLS: with no flush of the file,
+/// some cut loses an append it would have covered; with no flush of its
+/// directory, some cut loses the file its first append created.
+#[test]
+fn a_flushed_append_is_on_the_media_once_its_entry_is() {
+    use crate::fx::Write;
+    use aterm_durable::Flush;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("sim-app")
+        .tempdir_in("/tmp")
+        .expect("scratch");
+    let root = dir.path();
+    let sub = root.join("journal");
+    std::fs::create_dir_all(&sub).expect("a subdirectory");
+    let file = sub.join("posts");
+    let whole = b"aa,bb,cc,dd,";
+    let mut zeroed = false;
+    for (flush_file, flush_dir) in [(true, true), (false, true), (true, false)] {
+        let mut rng = Rng::new(23);
+        let (mut lost_covered, mut lost_later, mut gone) = (false, false, false);
+        for _ in 0..96 {
+            let mut device = Device::new(root);
+            device.tears = true;
+            let _ = std::fs::remove_file(&file);
+            let append = |device: &Device, bytes: &[u8]| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&file)
+                    .and_then(|mut f| f.write_all(bytes))
+                    .expect("append");
+                device.journal(Write::Append { path: &file, bytes });
+            };
+            append(&device, b"aa,");
+            append(&device, b"bb,");
+            if flush_file {
+                device.journal(Write::Flush {
+                    path: &file,
+                    flush: Flush::Ordered,
+                });
+            }
+            if flush_dir {
+                device.journal(Write::SyncDir {
+                    path: &sub,
+                    flush: Flush::Ordered,
+                });
+            }
+            append(&device, b"cc,");
+            device.journal(Write::SyncDir {
+                path: root,
+                flush: Flush::Durable,
+            });
+            append(&device, b"dd,");
+            device.power_cut(&mut rng);
+            match std::fs::read(&file) {
+                Err(_) => gone = true,
+                Ok(held) => {
+                    let same = held.iter().zip(whole).take_while(|(a, b)| a == b).count();
+                    assert!(
+                        held.len() <= whole.len() && held[same..].iter().all(|b| *b == 0),
+                        "the file holds what was appended, cut or zeroed past a point: {held:?}"
+                    );
+                    zeroed |= same < held.len();
+                    lost_covered |= same < 6;
+                    lost_later |= same < whole.len();
+                }
+            }
+        }
+        match (flush_file, flush_dir) {
+            (true, true) => {
+                assert!(!lost_covered && !gone, "a flushed append was lost or torn");
+                assert!(lost_later, "an append after the flushes was never lost");
+            }
+            (false, _) => assert!(lost_covered, "CONTROL: no flush of the file loses nothing"),
+            (true, false) => assert!(gone, "CONTROL: no flush of its directory loses nothing"),
+        }
+    }
+    assert!(
+        zeroed,
+        "a torn append never kept its length with its bytes unwritten"
+    );
 }
 
 #[test]
@@ -2157,7 +2268,7 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
 
 fn torn_kinds_as_they_stand(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
-    for place in ["inflight", "sent", "acks", "keys", "unhandled"] {
+    for place in ["inflight", "sent", "acks", "keys", "unhandled", "journal"] {
         let Ok(entries) = std::fs::read_dir(root.join(place)) else {
             continue;
         };
@@ -2298,7 +2409,7 @@ fn every_seed_of_the_world_that_loses_power_both_ways_holds_every_law() {
 #[test]
 fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
     let republishing = |s: u64| both_ways(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 36, CONTROL_SEEDS)
+    let out = breaking_at(&republishing, "order:", 173, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",

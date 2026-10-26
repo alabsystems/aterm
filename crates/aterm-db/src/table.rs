@@ -248,6 +248,39 @@ impl<'a> Session<'a> {
     pub fn actor(&self) -> Actor {
         self.access.local().binding().actor()
     }
+
+    pub(crate) fn issue_account(
+        &self,
+        admin: &aterm_secrets::client::Admin,
+        request: aterm_secrets::commons::accounts::Request,
+    ) -> Result<aterm_secrets::commons::accounts::Record> {
+        self.writer()?;
+        admin
+            .prepare_account_decision(self.bootstrap, &self.journal, request)
+            .map_err(failure)
+    }
+
+    pub(crate) fn permit_account(
+        &self,
+        decision: &aterm_secrets::commons::accounts::Record,
+    ) -> Result<()> {
+        use aterm_secrets::commons::accounts::Action;
+        self.writer()?;
+        let Action::Prepare(preparation) = &decision.request().action else {
+            return Err(Error::new("account is stopped"));
+        };
+        if decision.trust() != self.journal.trust()
+            || preparation.device != *self.access.local().binding()
+            || !self
+                .journal
+                .selected_ancestor(decision.control(), *self.access.head())
+        {
+            return Err(Error::new(
+                "account preparation has stale control or another device",
+            ));
+        }
+        Ok(())
+    }
     pub const fn epoch(&self) -> u64 {
         self.access.generation()
     }

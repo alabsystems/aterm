@@ -59,6 +59,17 @@ pub const SYSTEMCTL_PATHS: [&str; 3] = [
     "/run/current-system/sw/bin/systemctl",
 ];
 
+/// Where `loginctl` may be, tried in order: never a `PATH` lookup.
+pub const LOGINCTL_PATHS: [&str; 3] = [
+    "/usr/bin/loginctl",
+    "/bin/loginctl",
+    "/run/current-system/sw/bin/loginctl",
+];
+
+/// Where systemd records that a user lingers: a file named for them.
+#[cfg(not(target_os = "macos"))]
+const LINGER_DIR: &str = "/var/lib/systemd/linger";
+
 /// How long one `launchctl` or `systemctl` call may take before it is called hung.
 const CHILD_HANG: Duration = Duration::from_secs(30);
 
@@ -220,8 +231,23 @@ fn home_of_log(log: &Path) -> Option<&Path> {
     home.is_absolute().then_some(home)
 }
 
-/// The launchd property list for a job, setting `HOME` when `log` is a [`log_path`].
+/// The launchd property list for a job, setting `HOME` when `log` is a [`log_path`]: the plist
+/// [`install`] writes for the login at the Mac's screen, naming no app ([`plist_text_in`]).
 pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> String {
+    plist_text_in(label, program, args, log, Domain::Gui, None)
+}
+
+/// [`plist_text`] for a job in `domain` (its `LimitLoadToSessionType`, [`Domain::session`]),
+/// attributed to the app `bundle_id` names (`AssociatedBundleIdentifiers`: Login Items and the
+/// background-item notice name that app, not the program's file).
+pub fn plist_text_in(
+    label: &str,
+    program: &Path,
+    args: &[String],
+    log: &Path,
+    domain: Domain,
+    bundle_id: Option<&str>,
+) -> String {
     let string = |s: &str| format!("<string>{}</string>", aterm_codec::xml::escape(s));
     let mut argv = String::new();
     for arg in
@@ -239,6 +265,18 @@ pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> S
             string(&home.to_string_lossy())
         )
     });
+    let session = domain.session().map_or_else(String::new, |session| {
+        format!(
+            "\t<key>LimitLoadToSessionType</key>\n\t{}\n",
+            string(session)
+        )
+    });
+    let associated = bundle_id.map_or_else(String::new, |id| {
+        format!(
+            "\t<key>AssociatedBundleIdentifiers</key>\n\t<array>\n\t\t{}\n\t</array>\n",
+            string(id)
+        )
+    });
     let log = string(&log.to_string_lossy());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -251,6 +289,8 @@ pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> S
          \t<array>\n\
          {argv}\
          \t</array>\n\
+         {session}\
+         {associated}\
          \t<key>RunAtLoad</key>\n\
          \t<true/>\n\
          \t<key>KeepAlive</key>\n\
@@ -474,35 +514,79 @@ pub fn exec_program(text: &str) -> Option<PathBuf> {
     }
 }
 
-/// What a `launchctl` call does.
+/// Which of this user's launchd domains a job lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Launchctl<'a> {
-    /// `print gui/<uid>/<label>`: read the job's state.
-    Print(&'a str),
-    /// `bootout gui/<uid>/<label>`: stop the job and unload it.
-    Bootout(&'a str),
-    /// `bootstrap gui/<uid> <plist>`: load (and with `RunAtLoad`, start) the job a plist defines.
-    Bootstrap(&'a Path),
-    /// `kickstart gui/<uid>/<label>`: start the job unless it runs.
-    Kickstart(&'a str),
-    /// `kickstart -k gui/<uid>/<label>`: start the job, killing a running instance first.
-    Restart(&'a str),
+pub enum Domain {
+    /// `gui/<uid>`: the login at the Mac's screen, there only while it lasts; launchd loads the
+    /// job again at each such login, an automatic one after a restart included.
+    Gui,
+    /// `user/<uid>`: this user's background domain, there with no login at the screen (an SSH
+    /// session's): the job runs until the Mac restarts, and no login loads it again.
+    User,
 }
 
-/// The argv (after `/bin/launchctl`) of one call in this user's GUI domain, `gui/<uid>`.
+impl Domain {
+    /// The domain's `launchctl` name for `uid`.
+    pub fn target(self, uid: u32) -> String {
+        match self {
+            Domain::Gui => format!("gui/{uid}"),
+            Domain::User => format!("user/{uid}"),
+        }
+    }
+
+    /// The `LimitLoadToSessionType` a plist needs for `launchctl bootstrap` to load it here:
+    /// `Background` for [`Domain::User`] (launchd refuses any other there: "Bootstrap failed: 5:
+    /// Input/output error"), which also keeps a login at the screen from loading a second copy
+    /// that the first holds the port of; none (`Aqua`) for [`Domain::Gui`].
+    pub const fn session(self) -> Option<&'static str> {
+        match self {
+            Domain::Gui => None,
+            Domain::User => Some("Background"),
+        }
+    }
+
+    /// The other domain.
+    const fn other(self) -> Self {
+        match self {
+            Domain::Gui => Domain::User,
+            Domain::User => Domain::Gui,
+        }
+    }
+}
+
+/// What a `launchctl` call does, in which of this user's domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launchctl<'a> {
+    /// `print <domain>`: whether the domain is there (`gui/<uid>` only with a login at the
+    /// Mac's screen).
+    PrintDomain(Domain),
+    /// `print <domain>/<label>`: read the job's state.
+    Print(Domain, &'a str),
+    /// `bootout <domain>/<label>`: stop the job and unload it.
+    Bootout(Domain, &'a str),
+    /// `bootstrap <domain> <plist>`: load (and with `RunAtLoad`, start) the job a plist defines.
+    Bootstrap(Domain, &'a Path),
+    /// `kickstart <domain>/<label>`: start the job unless it runs.
+    Kickstart(Domain, &'a str),
+    /// `kickstart -k <domain>/<label>`: start the job, killing a running instance first.
+    Restart(Domain, &'a str),
+}
+
+/// The argv (after `/bin/launchctl`) of one call in one of the domains of the user `uid`.
 pub fn launchctl_argv(uid: u32, call: Launchctl<'_>) -> Vec<String> {
-    let domain = format!("gui/{uid}");
+    let job = |domain: Domain, label: &str| format!("{}/{label}", domain.target(uid));
     match call {
-        Launchctl::Print(label) => vec!["print".into(), format!("{domain}/{label}")],
-        Launchctl::Bootout(label) => vec!["bootout".into(), format!("{domain}/{label}")],
-        Launchctl::Bootstrap(plist) => vec![
+        Launchctl::PrintDomain(domain) => vec!["print".into(), domain.target(uid)],
+        Launchctl::Print(domain, label) => vec!["print".into(), job(domain, label)],
+        Launchctl::Bootout(domain, label) => vec!["bootout".into(), job(domain, label)],
+        Launchctl::Bootstrap(domain, plist) => vec![
             "bootstrap".into(),
-            domain,
+            domain.target(uid),
             plist.to_string_lossy().into_owned(),
         ],
-        Launchctl::Kickstart(label) => vec!["kickstart".into(), format!("{domain}/{label}")],
-        Launchctl::Restart(label) => {
-            vec!["kickstart".into(), "-k".into(), format!("{domain}/{label}")]
+        Launchctl::Kickstart(domain, label) => vec!["kickstart".into(), job(domain, label)],
+        Launchctl::Restart(domain, label) => {
+            vec!["kickstart".into(), "-k".into(), job(domain, label)]
         }
     }
 }
@@ -551,6 +635,33 @@ pub fn systemctl_path(
                 candidates.join(" or ")
             ))
         })
+}
+
+/// Linux: whether a `--user` job set up from this session needs systemd to let this user
+/// linger. Without it systemd ends the user's manager, and every job under it, once their last
+/// session ends, and starts none at boot. A remote session (`SSH_CONNECTION`, `SSH_TTY`) or one
+/// with no display (a headless box) is the kind whose end leaves nobody logged in; a desktop's
+/// user logs in again, which starts the jobs. `env` reads this process's environment.
+pub fn needs_linger(env: &dyn Fn(&str) -> Option<String>, lingering: bool) -> bool {
+    let set = |key: &str| env(key).is_some_and(|value| !value.is_empty());
+    let remote = set("SSH_CONNECTION") || set("SSH_TTY");
+    let headless = !set("DISPLAY") && !set("WAYLAND_DISPLAY");
+    !lingering && (remote || headless)
+}
+
+/// The one line [`install`] adds on Linux after asking systemd to let `user` linger: what
+/// `enabled` (the `loginctl enable-linger` it ran) means for the job.
+pub fn linger_line(user: &str, enabled: crate::Result<()>) -> String {
+    match enabled {
+        Ok(()) => format!(
+            "loginctl enable-linger {user}: the job keeps running once this session ends, and \
+             starts at boot"
+        ),
+        Err(e) => format!(
+            "the job stops once {user}'s last session ends ({e}); an admin keeps it running \
+             with: sudo loginctl enable-linger {user}"
+        ),
+    }
 }
 
 /// Whether `path` is in a cargo build directory.
@@ -673,6 +784,115 @@ pub fn program_for_service() -> crate::Result<PathBuf> {
         .canonicalize()
         .map_err(|e| Error::new(format!("{}: {e}; pass --program", exe.display())))?;
     service_program(&exe, &|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+/// How long `program --version` may take to answer ([`check_program_starts`]).
+const STARTS_WITHIN: Duration = Duration::from_secs(30);
+
+/// Check that `program` starts as aterm before a job is pointed at it: one a person names
+/// (`agent on --program`, `server on --program`) or one a job keeps ([`kept_program_that_starts`]):
+/// `program --version` exits 0 and names a release on its first line (`aterm <version>`). A job
+/// whose program never starts keeps this Mac out of sync, or its vault unserved, with nothing
+/// said.
+/// # Errors
+/// It could not be run, did not answer within [`STARTS_WITHIN`], exited otherwise than 0, or
+/// named no aterm release. On macOS one killed at launch is named so: a loose copy of an app's
+/// executable with the ad hoc signing that lets it run outside its bundle, an app's own
+/// executable as a damaged install to put back.
+pub fn check_program_starts(program: &Path) -> crate::Result<()> {
+    let mut command = aterm_uds::spawnfd::command(program);
+    command.arg("--version");
+    let ran = aterm_uds::deadline::output_within(&mut command, STARTS_WITHIN)
+        .map_err(|error| error.to_string());
+    program_started(program, ran)
+}
+
+/// [`check_program_starts`]'s verdict on what `program --version` gave.
+fn program_started(program: &Path, ran: Result<std::process::Output, String>) -> crate::Result<()> {
+    let refused = |why: String| {
+        Error::new(format!(
+            "{} did not start as aterm ({why}), so a job running it would never start",
+            program.display()
+        ))
+    };
+    let out = ran.map_err(refused)?;
+    if !out.status.success() {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if out.status.signal() == Some(9) {
+                return Err(refused(match app_of_executable(program) {
+                    Some(app) => format!(
+                        "macOS killed it at launch: {} no longer matches its signature, a \
+                         damaged or modified install; install aterm again rather than signing it",
+                        app.display()
+                    ),
+                    None => format!(
+                        "macOS killed it at launch, as it does a copy of an app's executable \
+                         outside its bundle, whose signature names the bundle; if it is such a \
+                         copy, sign it ad hoc with codesign --force --sign - {}",
+                        program.display()
+                    ),
+                }));
+            }
+        }
+        return Err(refused(format!("--version: {}", out.status)));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let named = stdout
+        .lines()
+        .next()
+        .and_then(|first| first.strip_prefix("aterm "))
+        .and_then(|release| release.chars().next())
+        .is_some_and(|first| first.is_ascii_digit());
+    if !named {
+        return Err(refused("its --version named no aterm release".to_string()));
+    }
+    Ok(())
+}
+
+/// The app whose own executable `program` is (`<X>.app/Contents/MacOS/<name>`), by its path.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_of_executable(program: &Path) -> Option<&Path> {
+    let macos = program.parent()?;
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && app.extension()? == "app")
+        .then_some(app)
+}
+
+/// [`kept_program`], once it starts as aterm ([`check_program_starts`]): a job is put back on a
+/// program it keeps (a held snapshot) only while that program runs, and never moved off it onto
+/// another aterm, so one that cannot start is refused, naming it.
+/// # Errors
+/// The program the job keeps does not start as aterm.
+pub fn kept_program_that_starts(home: &Path, job: Job) -> crate::Result<Option<PathBuf>> {
+    kept_starting(kept_program(home, job), job, &check_program_starts)
+}
+
+/// [`kept_program_that_starts`] of `kept`, `starts` checking it.
+fn kept_starting(
+    kept: Option<PathBuf>,
+    job: Job,
+    starts: &dyn Fn(&Path) -> crate::Result<()>,
+) -> crate::Result<Option<PathBuf>> {
+    let Some(kept) = kept else {
+        return Ok(None);
+    };
+    starts(&kept).map_err(|error| {
+        let on = match job {
+            Job::Subscriber => "agent on",
+            Job::Server => "server on",
+        };
+        Error::new(format!(
+            "{error}; the {} job runs it: aterm secrets {on} puts it on this aterm, or {on} \
+             --program <an aterm that runs>",
+            job.label()
+        ))
+    })?;
+    Ok(Some(kept))
 }
 
 /// The file that defines `job` under `home`: its launchd plist on macOS ([`plist_path`]), its
@@ -830,19 +1050,27 @@ fn launchctl_ok(call: Launchctl<'_>) -> crate::Result<()> {
 #[cfg(any(target_os = "macos", all(test, unix)))]
 type LaunchctlRun<'a> = dyn FnMut(Launchctl<'_>) -> crate::Result<std::process::Output> + 'a;
 
-/// launchd's view of `label`: `None` when it knows no such job, else its pid if running.
+/// launchd's view of `label` in either domain: `None` when neither holds such a job, else the
+/// first that does ([`Domain::Gui`], then [`Domain::User`]) and its pid if running.
 #[cfg(target_os = "macos")]
-fn launchd_job(label: &str) -> crate::Result<Option<Option<u32>>> {
-    launchd_job_with(label, &mut launchctl)
+fn launchd_job(label: &str) -> crate::Result<Option<(Domain, Option<u32>)>> {
+    for domain in [Domain::Gui, Domain::User] {
+        if let Some(pid) = launchd_job_with(domain, label, &mut launchctl)? {
+            return Ok(Some((domain, pid)));
+        }
+    }
+    Ok(None)
 }
 
-/// [`launchd_job`] through `launchctl`.
+/// launchd's view of `label` in `domain` through `launchctl`: `None` when it holds no such
+/// job, else its pid if running.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn launchd_job_with(
+    domain: Domain,
     label: &str,
     launchctl: &mut LaunchctlRun<'_>,
 ) -> crate::Result<Option<Option<u32>>> {
-    let out = launchctl(Launchctl::Print(label))?;
+    let out = launchctl(Launchctl::Print(domain, label))?;
     Ok(out
         .status
         .success()
@@ -965,7 +1193,8 @@ pub fn repair_subscriber(
 ) -> crate::Result<Option<String>> {
     check_own_home(home)?;
     repair_subscriber_with(home, || {
-        let program = kept_program(home, Job::Subscriber).unwrap_or_else(|| program.to_path_buf());
+        let program = kept_program_that_starts(home, Job::Subscriber)?
+            .unwrap_or_else(|| program.to_path_buf());
         install_job(home, Job::Subscriber, &program, args, false)
     })
 }
@@ -1054,19 +1283,43 @@ fn install_job(
         run_ok(&systemctl, &systemctl_argv(&["daemon-reload"]))?;
         run_ok(&systemctl, &systemctl_argv(&["enable", "--now", &name]))?;
         run_ok(&systemctl, &systemctl_argv(&["restart", &name]))?;
-        Ok(format!(
+        let mut line = format!(
             "{name}: systemd --user unit {} runs {} {} (log: journalctl --user -u {name})",
             unit.display(),
             program.display(),
             args.join(" ")
-        ))
+        );
+        let user = aterm_uds::account::user_name(aterm_uds::peer::our_uid());
+        let lingering = user
+            .as_deref()
+            .is_some_and(|user| Path::new(LINGER_DIR).join(user).exists());
+        if let Some(user) = user
+            && needs_linger(&|key| std::env::var(key).ok(), lingering)
+        {
+            let enabled = LOGINCTL_PATHS
+                .iter()
+                .map(Path::new)
+                .find(|path| path.is_file())
+                .ok_or_else(|| {
+                    Error::new(format!("no loginctl at {}", LOGINCTL_PATHS.join(" or ")))
+                })
+                .and_then(|loginctl| run_ok(loginctl, &["enable-linger".to_owned(), user.clone()]));
+            line.push('\n');
+            line.push_str(&linger_line(&user, enabled));
+        }
+        Ok(line)
     }
 }
 
-/// [`install_job`] on macOS, each `launchctl` call through `launchctl`. A job launchd runs from
-/// the plist this would write is left as it is (one `print`) unless `restart`; any other is
-/// booted out if loaded, bootstrapped (`RunAtLoad` starts it) and kickstarted, killing a
-/// running instance only when `restart`, so a reinstall never cuts a long-poll twice.
+/// [`install_job`] on macOS, each `launchctl` call through `launchctl`. The job goes in
+/// [`Domain::Gui`] while this user is logged in at the Mac's screen, else in [`Domain::User`]
+/// (an SSH session's Mac, where `gui/<uid>` is not there to bootstrap into), its plist
+/// attributed to the app `program` is the executable of. A job launchd runs there from the
+/// plist this would write is left as it is unless `restart` (one `print` in the GUI domain);
+/// any other is booted out of whichever domain holds it (so a job set up over SSH moves to the
+/// login at the screen, never runs twice), bootstrapped (`RunAtLoad` starts it) and
+/// kickstarted, killing a running instance only when `restart`, so a reinstall never cuts a
+/// long-poll twice.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn install_launchd(
     home: &Path,
@@ -1079,7 +1332,9 @@ fn install_launchd(
     let label = job.label();
     let plist = plist_path(home, job);
     let log = log_path(home, job);
-    let text = plist_text(label, program, args, &log);
+    let bundle_id = bundle_id_of(program);
+    let text = |domain| plist_text_in(label, program, args, &log, domain, bundle_id.as_deref());
+    let as_held = |domain| std::fs::read(&plist).is_ok_and(|held| held == text(domain).as_bytes());
     let line = format!(
         "{label}: launchd user agent {} runs {} {} (log {})",
         plist.display(),
@@ -1087,35 +1342,87 @@ fn install_launchd(
         args.join(" "),
         log.display()
     );
-    let loaded = launchd_job_with(label, launchctl)?;
-    if !restart
-        && matches!(loaded, Some(Some(_)))
-        && std::fs::read(&plist).is_ok_and(|held| held == text.as_bytes())
-    {
+    let in_gui = launchd_job_with(Domain::Gui, label, launchctl)?;
+    if !restart && matches!(in_gui, Some(Some(_))) && as_held(Domain::Gui) {
         return Ok(format!("{line}; already running"));
     }
-    write_plist(home, job, program, args)?;
-    if loaded.is_some() {
-        let _ = launchctl(Launchctl::Bootout(label));
-        let settle = Instant::now() + BOOTOUT_SETTLE;
-        while launchd_job_with(label, launchctl)?.is_some() && Instant::now() < settle {
-            std::thread::sleep(Duration::from_millis(100));
+    let gui = in_gui.is_some()
+        || launchctl(Launchctl::PrintDomain(Domain::Gui))?
+            .status
+            .success();
+    let domain = if gui { Domain::Gui } else { Domain::User };
+    let in_user = launchd_job_with(Domain::User, label, launchctl)?;
+    let line = match domain {
+        Domain::Gui => line,
+        Domain::User => format!(
+            "{line}, in {}: with no login at this Mac's screen it runs until the Mac restarts",
+            domain.target(aterm_uds::peer::our_uid())
+        ),
+    };
+    if !restart && domain == Domain::User && matches!(in_user, Some(Some(_))) && as_held(domain) {
+        return Ok(format!("{line}; already running"));
+    }
+    crate::fsx::ensure_private_dir(&secrets_dir(home))?;
+    write_unit_file(&plist, &text(domain))?;
+    let loaded_in = |held| match held {
+        Domain::Gui => in_gui,
+        Domain::User => in_user,
+    };
+    for held in [domain.other(), domain] {
+        if loaded_in(held).is_some() {
+            let _ = launchctl(Launchctl::Bootout(held, label));
+            let settle = Instant::now() + BOOTOUT_SETTLE;
+            while launchd_job_with(held, label, launchctl)?.is_some() && Instant::now() < settle {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
-    launchctl_checked(Launchctl::Bootstrap(&plist), launchctl).map_err(|e| {
-        Error::new(format!(
-            "{e} (gui/{} exists only while this user is logged in at the Mac's screen)",
-            aterm_uds::peer::our_uid()
-        ))
-    })?;
+    launchctl_checked(Launchctl::Bootstrap(domain, &plist), launchctl)?;
     let start = if restart {
-        Launchctl::Restart(label)
+        Launchctl::Restart(domain, label)
     } else {
-        Launchctl::Kickstart(label)
+        Launchctl::Kickstart(domain, label)
     };
     launchctl_checked(start, launchctl)?;
     Ok(line)
 }
+
+/// The bundle identifier of the app `program` is the main executable of
+/// (`X.app/Contents/MacOS/<program>`, its `Contents/Info.plist`'s `CFBundleIdentifier`).
+fn bundle_id_of(program: &Path) -> Option<String> {
+    let macos = program.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    let in_bundle = macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension().is_some_and(|e| e == "app");
+    if !in_bundle {
+        return None;
+    }
+    let mut text = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(
+            std::fs::File::open(contents.join("Info.plist")).ok()?,
+            INFO_PLIST_MOST,
+        ),
+        &mut text,
+    )
+    .ok()?;
+    let text = std::str::from_utf8(&text).ok()?;
+    let tag = "<key>CFBundleIdentifier</key>";
+    let rest = text[text.find(tag)? + tag.len()..]
+        .trim_start()
+        .strip_prefix("<string>")?;
+    let id = &rest[..rest.find("</string>")?];
+    let plain = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    plain.then(|| id.to_owned())
+}
+
+/// The largest `Info.plist` [`bundle_id_of`] reads.
+const INFO_PLIST_MOST: u64 = 256 * 1024;
 
 /// Stop and remove `job`, for this login's own `home` ([`own_home`]).
 pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
@@ -1181,9 +1488,12 @@ fn uninstall_job(home: &Path, job: Job) -> crate::Result<bool> {
     #[cfg(target_os = "macos")]
     {
         let label = job.label();
-        let loaded = launchd_job(label)?.is_some();
-        if loaded {
-            launchctl_ok(Launchctl::Bootout(label))?;
+        let mut loaded = false;
+        for domain in [Domain::Gui, Domain::User] {
+            if launchd_job_with(domain, label, &mut launchctl)?.is_some() {
+                launchctl_ok(Launchctl::Bootout(domain, label))?;
+                loaded = true;
+            }
         }
         let removed = remove(&plist_path(home, job))?;
         Ok(loaded || removed)
@@ -1217,7 +1527,7 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
         let unit = plist_path(home, job);
         let on_disk = crate::fsx::kind(&unit)? != crate::fsx::Kind::Missing;
         match launchd_job(job.label())? {
-            Some(pid) => Ok(State::Installed { pid, unit }),
+            Some((_, pid)) => Ok(State::Installed { pid, unit }),
             None if on_disk => Ok(State::Installed { pid: None, unit }),
             None => Ok(State::Absent),
         }
@@ -1249,6 +1559,108 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job is pointed only at a program that starts as aterm; one macOS kills at launch is
+    /// named: a loose copy of the app's executable (as m22's first snapshot swap met on
+    /// 2026-10-26) with the signing that lets it run, an app's own executable as a damaged
+    /// install, never to be signed again.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_is_pointed_only_at_a_program_that_starts_as_aterm() {
+        use std::os::unix::process::ExitStatusExt;
+        let program = Path::new("/Users//x/.local/share/aterm-secrets/aterm");
+        let out = |raw: i32, stdout: &str| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(raw),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        let release = "aterm 0.142.0\nby Andrew Yates\n";
+        assert_eq!(program_started(program, out(0, release)), Ok(()));
+        assert_eq!(
+            program_started(program, out(0, "aterm 0.142.0+g1a2b3c\n")),
+            Ok(())
+        );
+        // Each refusal below answers as aterm but for the one fault it names, so only the check
+        // of that fault refuses it.
+        let killed = program_started(program, out(9, release)).expect_err("killed at launch");
+        assert!(killed.0.contains("did not start as aterm"), "{killed}");
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                killed.0.contains("macOS killed it at launch")
+                    && killed.0.contains(
+                        "codesign --force --sign - /Users//x/.local/share/aterm-secrets/aterm"
+                    ),
+                "{killed}"
+            );
+            let app = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+            let damaged = program_started(app, out(9, release)).expect_err("a damaged app");
+            assert!(
+                damaged
+                    .0
+                    .contains("/Applications/aterm.app no longer matches its signature")
+                    && !damaged.0.contains("codesign"),
+                "{damaged}"
+            );
+        }
+        let exited = program_started(program, out(1 << 8, release)).expect_err("exit 1");
+        assert!(
+            exited
+                .0
+                .contains("did not start as aterm (--version: exit status: 1)")
+                && !exited.0.contains("codesign"),
+            "{exited}"
+        );
+        let other = program_started(program, out(0, "git version 2.50.1\n")).expect_err("git");
+        assert!(other.0.contains("named no aterm release"), "{other}");
+        let bare = program_started(program, out(0, "aterm \n")).expect_err("no release");
+        assert!(bare.0.contains("named no aterm release"), "{bare}");
+        // The live check runs `<program> --version`: a program that is not there is not run.
+        let absent = check_program_starts(Path::new("/nonexistent/aterm-secrets/aterm"))
+            .expect_err("not there");
+        assert!(
+            absent
+                .0
+                .starts_with("/nonexistent/aterm-secrets/aterm did not start as aterm"),
+            "{absent}"
+        );
+    }
+
+    /// A program a job keeps (a held snapshot) is put back only while it starts, and one that
+    /// does not is refused, naming the job and the commands that move it, never swapped for
+    /// another aterm. Negative control: keeping it unchecked returns the program.
+    #[test]
+    fn a_kept_program_that_does_not_start_is_refused_not_kept_or_replaced() {
+        let held = PathBuf::from("/Users//x/.local/share/aterm-secrets/aterm");
+        let runs = |_: &Path| Ok(());
+        let killed = |program: &Path| {
+            Err(Error::new(format!(
+                "{} did not start as aterm (macOS killed it at launch)",
+                program.display()
+            )))
+        };
+        assert_eq!(
+            kept_starting(Some(held.clone()), Job::Subscriber, &runs),
+            Ok(Some(held.clone()))
+        );
+        assert_eq!(kept_starting(None, Job::Subscriber, &killed), Ok(None));
+        let refused = kept_starting(Some(held.clone()), Job::Subscriber, &killed)
+            .expect_err("a held program that does not start");
+        assert!(
+            refused.0.contains("did not start as aterm")
+                && refused
+                    .0
+                    .contains("the systems.alab.aterm-secrets job runs it")
+                && refused
+                    .0
+                    .contains("aterm secrets agent on puts it on this aterm"),
+            "{refused}"
+        );
+        let server = kept_starting(Some(held), Job::Server, &killed).expect_err("server");
+        assert!(server.0.contains("aterm secrets server on"), "{server}");
+    }
 
     #[test]
     fn a_repair_keeps_the_lasting_program_its_job_names() {
@@ -1667,6 +2079,62 @@ mod tests {
         assert_eq!(text.matches("<key>").count(), 12, "{text}");
     }
 
+    /// A job in the user domain names the session launchd loads it in, and one attributed to an
+    /// app names the app; the plist [`plist_text`] writes names neither.
+    #[test]
+    fn a_background_job_names_its_session_and_an_apps_job_its_app() {
+        let log = Path::new("/l.log");
+        let program = Path::new("/t/aterm");
+        let text = plist_text_in(
+            "l",
+            program,
+            &[],
+            log,
+            Domain::User,
+            Some("com.aterm.aterm"),
+        );
+        assert!(
+            text.contains("\t<key>LimitLoadToSessionType</key>\n\t<string>Background</string>\n")
+        );
+        assert!(text.contains(
+            "\t<key>AssociatedBundleIdentifiers</key>\n\t<array>\n\t\t<string>com.aterm.aterm</string>\n\t</array>\n"
+        ));
+        let plain = plist_text("l", program, &[], log);
+        assert_eq!(
+            plain,
+            plist_text_in("l", program, &[], log, Domain::Gui, None)
+        );
+        assert!(!plain.contains("LimitLoadToSessionType"), "{plain}");
+        assert!(!plain.contains("AssociatedBundleIdentifiers"), "{plain}");
+    }
+
+    /// The app a program is the main executable of is read from its bundle's `Info.plist`;
+    /// a program outside a bundle, or a bundle whose identifier is not a plain one, names none.
+    #[test]
+    fn a_program_in_an_app_names_the_apps_identifier() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let app = root.path().join("aterm.app/Contents");
+        std::fs::create_dir_all(app.join("MacOS")).expect("bundle");
+        let info = |id: &str| {
+            std::fs::write(
+                app.join("Info.plist"),
+                format!(
+                    "<plist><dict>\n\t<key>CFBundleName</key>\n\t<string>aterm</string>\n\
+                     \t<key>CFBundleIdentifier</key>\n\t<string>{id}</string>\n</dict></plist>\n"
+                ),
+            )
+            .expect("Info.plist");
+        };
+        info("com.aterm.aterm");
+        let program = app.join("MacOS/aterm");
+        assert_eq!(bundle_id_of(&program).as_deref(), Some("com.aterm.aterm"));
+        info("a&amp;b");
+        assert_eq!(bundle_id_of(&program), None);
+        info("com.aterm.aterm");
+        assert_eq!(bundle_id_of(&root.path().join("aterm")), None);
+        assert_eq!(bundle_id_of(&app.join("Resources/aterm")), None);
+    }
+
     #[test]
     fn a_log_elsewhere_writes_no_environment() {
         let text = plist_text("l", Path::new("/t/aterm"), &[], Path::new("/var/log/x.log"));
@@ -1709,12 +2177,67 @@ mod tests {
         );
         let (ok, said) = lint("full.plist", &full);
         assert!(ok, "{said}\n{full}");
+        let background = plist_text_in(
+            Job::Server.label(),
+            Path::new("/x.app/Contents/MacOS/aterm"),
+            &words(&["secrets", "serve"]),
+            &log_path(Path::new("/Users//o"), Job::Server),
+            Domain::User,
+            Some("com.aterm.aterm"),
+        );
+        let (ok, said) = lint("background.plist", &background);
+        assert!(ok, "{said}\n{background}");
         let bare = plist_text("l", Path::new("/t/aterm"), &[], Path::new("/l.log"));
         let (ok, said) = lint("bare.plist", &bare);
         assert!(ok, "{said}\n{bare}");
         let broken = full.replace("A&amp;B", "A&B");
         let (ok, _) = lint("broken.plist", &broken);
         assert!(!ok, "the control lints");
+    }
+
+    /// A job set up over SSH or on a box with no display asks systemd to let the user linger,
+    /// so it outlives the session; a desktop session's, or a user who lingers already, does not.
+    #[test]
+    fn a_remote_or_headless_session_asks_to_linger() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let ssh = env(&[
+            ("SSH_CONNECTION", "10.0.0.2 50000 10.0.0.3 22"),
+            ("DISPLAY", ":0"),
+        ]);
+        assert!(needs_linger(&ssh, false));
+        assert!(needs_linger(&env(&[]), false), "no display: headless");
+        assert!(needs_linger(&env(&[("SSH_TTY", "/dev/pts/1")]), false));
+        // Controls: a desktop session, and a user who lingers already.
+        assert!(!needs_linger(
+            &env(&[("WAYLAND_DISPLAY", "wayland-0")]),
+            false
+        ));
+        assert!(!needs_linger(
+            &env(&[("DISPLAY", ":0"), ("SSH_TTY", "")]),
+            false
+        ));
+        assert!(!needs_linger(&ssh, true));
+
+        let enabled = linger_line("ay", Ok(()));
+        assert!(
+            enabled.starts_with("loginctl enable-linger ay:"),
+            "{enabled}"
+        );
+        let refused = linger_line("ay", Err(Error::new("Access denied")));
+        assert!(
+            refused.contains("Access denied") && refused.contains("sudo loginctl enable-linger ay")
+        );
+        assert!(
+            !refused.contains('\n') && !enabled.contains('\n'),
+            "one line each"
+        );
     }
 
     #[test]
@@ -1760,28 +2283,41 @@ mod tests {
 
     #[test]
     fn the_launchctl_and_systemctl_argv_are_plain() {
+        let (gui, user) = (Domain::Gui, Domain::User);
         assert_eq!(
-            launchctl_argv(501, Launchctl::Print("systems.alab.aterm-secrets")),
+            launchctl_argv(501, Launchctl::Print(gui, "systems.alab.aterm-secrets")),
             ["print", "gui/501/systems.alab.aterm-secrets"]
         );
         assert_eq!(
-            launchctl_argv(501, Launchctl::Bootout("l.x")),
+            launchctl_argv(501, Launchctl::Print(user, "l.x")),
+            ["print", "user/501/l.x"]
+        );
+        assert_eq!(
+            launchctl_argv(501, Launchctl::PrintDomain(gui)),
+            ["print", "gui/501"]
+        );
+        assert_eq!(
+            launchctl_argv(501, Launchctl::Bootout(gui, "l.x")),
             ["bootout", "gui/501/l.x"]
         );
         assert_eq!(
             launchctl_argv(
                 501,
-                Launchctl::Bootstrap(Path::new("/h/Library/LaunchAgents/l.x.plist"))
+                Launchctl::Bootstrap(gui, Path::new("/h/Library/LaunchAgents/l.x.plist"))
             ),
             ["bootstrap", "gui/501", "/h/Library/LaunchAgents/l.x.plist"]
         );
         assert_eq!(
-            launchctl_argv(502, Launchctl::Kickstart("l.x")),
+            launchctl_argv(501, Launchctl::Bootstrap(user, Path::new("/p.plist"))),
+            ["bootstrap", "user/501", "/p.plist"]
+        );
+        assert_eq!(
+            launchctl_argv(502, Launchctl::Kickstart(gui, "l.x")),
             ["kickstart", "gui/502/l.x"]
         );
         assert_eq!(
-            launchctl_argv(502, Launchctl::Restart("l.x")),
-            ["kickstart", "-k", "gui/502/l.x"]
+            launchctl_argv(502, Launchctl::Restart(user, "l.x")),
+            ["kickstart", "-k", "user/502/l.x"]
         );
         assert_eq!(
             systemctl_argv(&["daemon-reload"]),
@@ -1797,11 +2333,13 @@ mod tests {
         );
     }
 
-    /// launchd as `install_launchd` sees it: one job, loaded or not, and every call it got.
+    /// launchd as `install_launchd` sees it: one job, loaded in a domain or not, whether this
+    /// user is logged in at the screen (`gui/<uid>` there), and every call it got.
     #[cfg(unix)]
     #[derive(Default)]
     struct FakeLaunchd {
-        loaded: bool,
+        loaded: Option<Domain>,
+        no_gui: bool,
         calls: Vec<Vec<String>>,
     }
 
@@ -1810,12 +2348,30 @@ mod tests {
         fn answer(&mut self, call: Launchctl<'_>) -> crate::Result<std::process::Output> {
             use std::os::unix::process::ExitStatusExt as _;
             self.calls.push(launchctl_argv(0, call));
+            let there = |domain| domain == Domain::User || !self.no_gui;
             let (ok, stdout) = match call {
-                Launchctl::Print(_) if self.loaded => (true, "\tpid = 42\n"),
-                Launchctl::Print(_) => (false, ""),
-                Launchctl::Bootout(_) => (std::mem::take(&mut self.loaded), ""),
-                Launchctl::Bootstrap(_) => (!std::mem::replace(&mut self.loaded, true), ""),
-                Launchctl::Kickstart(_) | Launchctl::Restart(_) => (self.loaded, ""),
+                Launchctl::PrintDomain(domain) => (there(domain), ""),
+                Launchctl::Print(domain, _) if self.loaded == Some(domain) => {
+                    (true, "\tpid = 42\n")
+                }
+                Launchctl::Print(..) => (false, ""),
+                Launchctl::Bootout(domain, _) => {
+                    let held = self.loaded == Some(domain);
+                    if held {
+                        self.loaded = None;
+                    }
+                    (held, "")
+                }
+                Launchctl::Bootstrap(domain, _) => {
+                    let ok = there(domain) && self.loaded.is_none();
+                    if ok {
+                        self.loaded = Some(domain);
+                    }
+                    (ok, "")
+                }
+                Launchctl::Kickstart(domain, _) | Launchctl::Restart(domain, _) => {
+                    (self.loaded == Some(domain), "")
+                }
             };
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
@@ -1856,6 +2412,7 @@ mod tests {
         let label = Job::Subscriber.label();
         let plist = plist_path(&home, Job::Subscriber).display().to_string();
         let print = format!("print gui/0/{label}");
+        let in_user = format!("print user/0/{label}");
         let bootout = format!("bootout gui/0/{label}");
         let bootstrap = format!("bootstrap gui/0 {plist}");
         let kickstart = format!("kickstart gui/0/{label}");
@@ -1865,7 +2422,13 @@ mod tests {
         let (_, calls) = launchd.install(&home, &program, &["secrets", "watch"], false);
         assert_eq!(
             calls,
-            [print.as_str(), bootstrap.as_str(), kickstart.as_str()]
+            [
+                print.as_str(),
+                "print gui/0",
+                in_user.as_str(),
+                bootstrap.as_str(),
+                kickstart.as_str()
+            ]
         );
 
         // `agent on` again, the job running from the same plist: one print, nothing else.
@@ -1879,6 +2442,7 @@ mod tests {
             calls,
             [
                 print.as_str(),
+                in_user.as_str(),
                 bootout.as_str(),
                 print.as_str(),
                 bootstrap.as_str(),
@@ -1896,6 +2460,7 @@ mod tests {
             calls,
             [
                 print.as_str(),
+                in_user.as_str(),
                 bootout.as_str(),
                 print.as_str(),
                 bootstrap.as_str(),
@@ -1906,7 +2471,7 @@ mod tests {
         // A job launchd holds but does not run is started again.
         let (_, calls) = {
             let mut stopped = |call: Launchctl<'_>| match call {
-                Launchctl::Print(_) if launchd.loaded => {
+                Launchctl::Print(..) if launchd.loaded.is_some() => {
                     let mut out = launchd.answer(call)?;
                     out.stdout = b"\tstate = not running\n".to_vec();
                     Ok(out)
@@ -1919,12 +2484,85 @@ mod tests {
             calls,
             [
                 print.as_str(),
+                in_user.as_str(),
                 bootout.as_str(),
                 print.as_str(),
                 bootstrap.as_str(),
                 kickstart.as_str()
             ]
         );
+    }
+
+    /// With no login at the Mac's screen (an SSH session's Mac) the job goes in `user/<uid>`,
+    /// the one domain there, loaded only as a background session's; once this user logs in at
+    /// the screen, setting it up again moves it there and never leaves a second copy running.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_set_up_with_no_login_at_the_screen_runs_in_the_user_domain_until_one() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let program = root.path().join("aterm");
+        std::fs::write(&program, b"").expect("program");
+        let label = Job::Subscriber.label();
+        let plist = plist_path(&home, Job::Subscriber);
+        let shown = plist.display().to_string();
+        let (print, in_user) = (
+            format!("print gui/0/{label}"),
+            format!("print user/0/{label}"),
+        );
+        let mut launchd = FakeLaunchd {
+            no_gui: true,
+            ..FakeLaunchd::default()
+        };
+
+        let (line, calls) = launchd.install(&home, &program, &["secrets", "watch"], false);
+        let bootstrap_user = format!("bootstrap user/0 {shown}");
+        let kickstart_user = format!("kickstart user/0/{label}");
+        assert_eq!(
+            calls,
+            [
+                print.as_str(),
+                "print gui/0",
+                in_user.as_str(),
+                bootstrap_user.as_str(),
+                kickstart_user.as_str()
+            ]
+        );
+        assert_eq!(launchd.loaded, Some(Domain::User));
+        assert!(line.contains("until the Mac restarts"), "{line}");
+        let written = std::fs::read_to_string(&plist).expect("plist");
+        assert!(
+            written.contains("<string>Background</string>\n"),
+            "{written}"
+        );
+
+        let (line, calls) = launchd.install(&home, &program, &["secrets", "watch"], false);
+        assert_eq!(calls, [print.as_str(), "print gui/0", in_user.as_str()]);
+        assert!(line.ends_with("; already running"), "{line}");
+
+        // The person logs in at the screen and sets it up again: out of the user domain, into
+        // theirs, with the plist a login there loads.
+        launchd.no_gui = false;
+        let (line, calls) = launchd.install(&home, &program, &["secrets", "watch"], false);
+        let bootout_user = format!("bootout user/0/{label}");
+        let bootstrap_gui = format!("bootstrap gui/0 {shown}");
+        let kickstart_gui = format!("kickstart gui/0/{label}");
+        assert_eq!(
+            calls,
+            [
+                print.as_str(),
+                "print gui/0",
+                in_user.as_str(),
+                bootout_user.as_str(),
+                in_user.as_str(),
+                bootstrap_gui.as_str(),
+                kickstart_gui.as_str()
+            ]
+        );
+        assert_eq!(launchd.loaded, Some(Domain::Gui));
+        assert!(!line.contains("until the Mac restarts"), "{line}");
+        let written = std::fs::read_to_string(&plist).expect("plist");
+        assert!(!written.contains("LimitLoadToSessionType"), "{written}");
     }
 
     #[cfg(unix)]

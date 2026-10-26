@@ -7,6 +7,8 @@
 
 use crate::{SecretBytes, age::Recipient};
 
+#[cfg(unix)]
+pub mod accounts;
 pub mod binding;
 #[cfg(unix)]
 pub mod bootstrap;

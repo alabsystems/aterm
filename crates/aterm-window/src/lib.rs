@@ -112,3 +112,22 @@ mod utils;
 pub mod window;
 
 pub mod platform;
+
+// LOCAL PATCH (aterm): `SPECS.md`'s `public-handles-send-sync`, proved by rustc on every build of
+// the library on every backend (the generic arm for every `T`), not only under test.
+const _: () = {
+    const fn send<T: Send>() {}
+    const fn sync<T: Sync>() {}
+    const fn proxy<T: 'static + Send>() {
+        send::<event_loop::EventLoopProxy<T>>();
+        sync::<event_loop::EventLoopProxy<T>>();
+    }
+    proxy::<()>();
+    send::<window::Window>();
+    sync::<window::Window>();
+    send::<window::WindowAttributes>();
+    sync::<window::WindowAttributes>();
+    send::<window::WindowId>();
+    send::<event::DeviceId>();
+    send::<monitor::MonitorHandle>();
+};

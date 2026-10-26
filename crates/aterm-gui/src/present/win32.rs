@@ -9,13 +9,13 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
+use aterm_types::native_window::{HasNativeWindow, NativeWindow};
 use aterm_win32::Win32::Foundation::{HWND, RECT};
 use aterm_win32::Win32::Graphics::Gdi::{
     BI_BITFIELDS, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
     DeleteDC, DeleteObject, GdiFlush, GetDC, GetUpdateRect, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
     SRCCOPY, SelectObject, ValidateRect,
 };
-use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use aterm_window::window::Window;
 
 use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
@@ -304,9 +304,8 @@ pub(crate) struct Win32Presenter {
 }
 
 fn hwnd_of(window: &Window) -> Option<HWND> {
-    match window.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(h) => Some(ptr::without_provenance_mut(h.hwnd.get() as usize)),
-        _ => None,
+    match window.native_window()? {
+        NativeWindow::Win32 { hwnd, .. } => Some(hwnd.as_ptr()),
     }
 }
 

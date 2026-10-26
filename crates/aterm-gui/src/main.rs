@@ -11,10 +11,15 @@
 // `attach_parent_console` in `main_entry` reattaches stdio when run from a console.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    // The window's tethered helpers start as this image's own tether verb, as the front door's.
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "this dev-only image is the window and nothing else; it is never shipped"
     )]
     aterm_gui::main_entry(std::env::args_os().skip(1).collect());
+    std::process::ExitCode::SUCCESS
 }

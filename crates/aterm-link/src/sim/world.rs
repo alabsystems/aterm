@@ -78,8 +78,6 @@ pub(crate) enum Mutant {
     IdlePostLeftToBackstop,
     /// A file a power cut tore is refused where it is read, at every attach of every later boot.
     RefuseTornAfterPowerCut,
-    /// The sweep judges a file whole when its reader takes it.
-    SweepByTheReaderAlone,
     /// The first bridge of a boot after an unclean stop leaves every whole
     /// in-flight entry where it is, and the attach publishes each again at its
     /// sequence.
@@ -116,6 +114,10 @@ pub(crate) enum Mutant {
     NoSubjectRetire,
     /// The sweep gives a subject back with the unconditional `/a/retire`, whatever landed on it since it read it.
     RetireUnconditionally,
+    /// A drop of a record in flight that the disk refuses leaves the record in the open, as the
+    /// journal did before B19's review (`StateDir::append_post_frame`): the next attach of
+    /// the same process publishes it again.
+    KeepARefusedDrop,
 }
 
 /// What one run is.
@@ -2062,7 +2064,7 @@ impl World {
 fn quarantine_base(name: &str) -> &str {
     let parts = match name.split('.').next() {
         Some("logpin") => 1,
-        Some("inflight" | "keys" | "unhandled") => 2,
+        Some("inflight" | "keys" | "unhandled" | "journal") => 2,
         Some("sent" | "acks" | "retired") => 3,
         _ => return name,
     };

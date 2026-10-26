@@ -854,6 +854,42 @@ pub fn clear_setup_set_aside() {
     crate::message_inbox::queue_exception_clear(setup_set_aside_entry("").key());
 }
 
+/// The exceptions digest's entry for settings a person changed after this setup had them as
+/// wanted: setup leaves them as they are (no automatic pass rewrites a row that read back ok), a
+/// fact for later, never an alert, whose one navigation opens System State to set them again.
+/// `rows` names them, which the log keeps.
+#[must_use]
+pub fn setup_changed_since_entry(rows: &str) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::need::{Reason, Then, Why};
+    aterm_messages::exceptions::Entry::new(
+        aterm_messages::exceptions::Family::Setup,
+        "",
+        "changed-since",
+        "Settings changed since setup",
+        Why::OnlyYou(Reason::new(
+            "settings this Mac's setup had set were changed since, and setup leaves them as they are",
+        )),
+        Then::step("Open System State and Set up now to set them again"),
+    )
+    .show(aterm_messages::Intent::ReviewVaultSync)
+    .log_line(format!(
+        "System State: changed since setup set them, left as they are: {rows}"
+    ))
+}
+
+/// Raise [`setup_changed_since_entry`] in the exceptions digest.
+#[cfg(unix)]
+pub fn note_setup_changed_since(rows: &str) {
+    crate::message_inbox::queue_exception(setup_changed_since_entry(rows));
+}
+
+/// A check that reads nothing out of place, or a Restore: [`setup_changed_since_entry`] leaves
+/// the exceptions digest.
+#[cfg(unix)]
+pub fn clear_setup_changed_since() {
+    crate::message_inbox::queue_exception_clear(setup_changed_since_entry("").key());
+}
+
 /// The exceptions digest's entry for setup an update successor did not offer (§3.3): an update
 /// may relaunch aterm with nobody at this Mac, so a setup nobody reviewed waits for the person,
 /// a fact for later whose one navigation opens System State, where they review and apply it.

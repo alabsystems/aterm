@@ -173,6 +173,8 @@ pub struct Command {
     disclaim: Option<&'static CStr>,
     /// Start the child stopped at its exec ([`Self::start_suspended`]).
     suspended: bool,
+    /// End the child when this process dies ([`super::Tether`]).
+    tether: bool,
 }
 
 /// The stdio a spawn gives a slot the caller left unset.
@@ -199,6 +201,7 @@ impl Command {
             setsid: false,
             disclaim: None,
             suspended: false,
+            tether: false,
         }
     }
 
@@ -361,6 +364,13 @@ impl Command {
     /// As [`Self::spawn`]'s, and waiting.
     pub fn status(&mut self) -> io::Result<ExitStatus> {
         self.start(Fallback::Inherit, true)?.wait()
+    }
+}
+
+impl super::Tether for Command {
+    fn tether(&mut self) -> &mut Self {
+        self.tether = true;
+        self
     }
 }
 
@@ -673,8 +683,22 @@ impl Command {
                 "an exec cannot start suspended: spawn the child instead",
             ));
         }
-        let mut image = Image::build(&self.program, &self.args, &self.env.capture())?;
-        if let Some(arg0) = &self.arg0 {
+        if self.tether && (replace || self.suspended) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a tethered child is spawned running: neither an exec nor a suspended start",
+            ));
+        }
+        let routed = if self.tether {
+            crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)?
+        } else {
+            None
+        };
+        let mut image = match &routed {
+            Some((exe, args)) => Image::build(exe.as_os_str(), args, &self.env.capture())?,
+            None => Image::build(&self.program, &self.args, &self.env.capture())?,
+        };
+        if let (Some(arg0), None) = (&self.arg0, &routed) {
             image.argv[0] = c_string(arg0.as_bytes())?;
         }
         let cwd = self
@@ -862,6 +886,12 @@ impl Command {
     /// Replace this process with the program: [`super::InheritStrip`] marks this process's own table first, so a failed exec leaves every descriptor close-on-exec ([`super::InheritNothing`] says what that means).
     pub fn exec(&mut self) -> io::Error {
         use std::os::unix::process::CommandExt as _;
+        if self.tether {
+            return io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a tethered child is spawned, never exec'd in this process's place",
+            );
+        }
         match self.forked() {
             Ok(mut command) => command.exec(),
             Err(error) => error,
@@ -949,13 +979,23 @@ impl Command {
             command.process_group(pgroup);
         }
         let setsid = self.setsid;
-        // SAFETY: the hook runs between fork and exec and calls only `sigprocmask` and `setsid`, async-signal-safe, on a stack array.
+        #[cfg(target_os = "linux")]
+        let tether = self
+            .tether
+            .then(|| i32::try_from(std::process::id()))
+            .transpose()
+            .map_err(io::Error::other)?;
+        // SAFETY: the hook runs between fork and exec and calls only `sigprocmask`, `setsid`, `prctl` and `getppid`, async-signal-safe, on a stack array.
         unsafe {
             command.pre_exec(move || {
                 let empty = [0u64; 16];
                 sigprocmask(SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
                 if setsid && new_session() < 0 {
                     return Err(io::Error::last_os_error());
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(parent) = tether {
+                    crate::tether::bind(parent)?;
                 }
                 Ok(())
             });

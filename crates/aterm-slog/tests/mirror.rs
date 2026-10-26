@@ -1741,3 +1741,215 @@ fn a_whole_view_counts_mail_from_its_newest_snapshot() {
         "the view counts the snapshot's mail"
     );
 }
+
+/// A mail mark at `ms`, `dir` `in` or `out` (a local record: mail marks are not bus class).
+fn mail(log: &mut Log, ms: u64, dir: &str) {
+    let f = Fields::new()
+        .word(Key::Dir, dir)
+        .and_then(|f| f.word(Key::MailKind, "note"))
+        .and_then(|f| f.u(Key::Off, 1000 + ms))
+        .expect("mail fields");
+    log.mark(
+        Mark::new(Kind::Mail, Src::Fabric, Conf::Exact)
+            .at(Node::SESSION)
+            .by(Actor::Bridge)
+            .fields(f),
+        at(ms),
+    )
+    .expect("the mail mark");
+}
+
+/// What each slot of `take` is.
+fn kinds_of(take: &aterm_slog::Take) -> Vec<SlotKind> {
+    take.slots.iter().map(|s| s.kind).collect()
+}
+
+/// A snapshot slot's `mail_in=` and `mail_out=`.
+fn mail_counts(slot: &aterm_slog::Slot) -> (Option<u64>, Option<u64>) {
+    let snap = decode_bus(&slot.body).expect("a snapshot decodes").rec;
+    assert_eq!(snap.op, Op::Snap, "PRECONDITION: a snapshot: {}", slot.body);
+    (snap.f.get_u(Key::MailIn), snap.f.get_u(Key::MailOut))
+}
+
+/// **A MAIL COUNT THAT MOVED MAKES A SNAPSHOT DUE** (LOOP-2): a mail mark stays local, so a
+/// session's counts cross only in a snapshot. Once one moves, the next take holds one snapshot and
+/// no record, alone at the landed cursor, counting it, and a bus view counts it. Within the rate's
+/// second a further count waits, past it the next take counts it, and with no change nothing is
+/// owed.
+#[test]
+fn a_mail_count_that_moved_makes_one_snapshot_due_a_second() {
+    let mut log = Log::new(1);
+    session(&mut log);
+    let mut view = BusSpace::new(1);
+    let first = log.bus_copy(64, at(1)).encode(Tier::WireMeta, &alias);
+    assert_eq!(
+        kinds_of(&first),
+        [SlotKind::Record, SlotKind::Snap],
+        "PRECONDITION: the open, then the space's first snapshot"
+    );
+    for s in &first.slots {
+        view.offer(decode_bus(&s.body).expect("decodes"));
+    }
+    log.land(first.slots[1].at).expect("lands");
+    let landed = log.mirror_landed().expect("engaged");
+    mail(&mut log, 10, "in");
+    let take = log.bus_copy(64, at(20)).encode(Tier::WireMeta, &alias);
+    assert_eq!(
+        kinds_of(&take),
+        [SlotKind::Snap],
+        "one snapshot and no record: {take:?}"
+    );
+    assert_eq!(mail_counts(&take.slots[0]), (Some(1), Some(0)));
+    assert_eq!(take.slots[0].at, landed, "alone, at the landed cursor");
+    view.offer(decode_bus(&take.slots[0].body).expect("decodes"));
+    let (bus, _) = view.fold();
+    assert_eq!(
+        (bus.state().totals.mail_in, bus.state().totals.mail_out),
+        (1, 0),
+        "the bus view counts the mail"
+    );
+    assert_eq!(log.land(take.slots[0].at), Ok(Landed::Stale));
+    assert!(
+        log.bus_copy(64, at(30)).is_empty(),
+        "a second take within the same second holds none"
+    );
+    mail(&mut log, 40, "out");
+    assert!(
+        log.bus_copy(64, at(19 + aterm_slog::MAIL_SNAP_GAP_MS))
+            .is_empty(),
+        "a moved count waits out the second"
+    );
+    let later = log
+        .bus_copy(64, at(20 + aterm_slog::MAIL_SNAP_GAP_MS))
+        .encode(Tier::WireMeta, &alias);
+    assert_eq!(kinds_of(&later), [SlotKind::Snap], "{later:?}");
+    assert_eq!(mail_counts(&later.slots[0]), (Some(1), Some(1)));
+    log.land(later.slots[0].at).expect("lands");
+    assert!(
+        log.bus_copy(64, at(60_000)).is_empty(),
+        "with no change, a later take holds none"
+    );
+}
+
+/// **A BURST OF MAIL MAKES AT MOST TWO SNAPSHOTS IN A SECOND** (LOOP-2): a take after each of 100
+/// mail marks inside one second of the session's wall clock hands out at most two snapshots and
+/// no record, and the first take past that second counts all 100.
+#[test]
+fn a_burst_of_mail_makes_at_most_two_snapshots_in_a_second() {
+    let mut log = Log::new(1);
+    session(&mut log);
+    let mut view = BusSpace::new(1);
+    drain(&mut log, &mut view, 1);
+    let mut snaps = 0;
+    let mut last = 0;
+    for i in 0..100 {
+        mail(&mut log, 100 + 9 * i, "in");
+        last = 101 + 9 * i;
+        let take = log.bus_copy(64, at(last)).encode(Tier::WireMeta, &alias);
+        assert!(
+            take.slots.iter().all(|s| s.kind == SlotKind::Snap),
+            "a mail mark is no record of the bus: {take:?}"
+        );
+        snaps += take.slots.len();
+        if let Some(s) = take.slots.last() {
+            log.land(s.at).expect("lands");
+        }
+    }
+    assert!(
+        last - 101 < aterm_slog::MAIL_SNAP_GAP_MS,
+        "PRECONDITION: one second"
+    );
+    assert!(
+        (1..=2).contains(&snaps),
+        "{snaps} snapshots in a second of 100 mail marks"
+    );
+    let past = log
+        .bus_copy(64, at(last + aterm_slog::MAIL_SNAP_GAP_MS))
+        .encode(Tier::WireMeta, &alias);
+    assert_eq!(kinds_of(&past), [SlotKind::Snap], "{past:?}");
+    assert_eq!(mail_counts(&past.slots[0]), (Some(100), Some(0)));
+}
+
+/// **A CLOSED SESSION'S MOVED COUNT CROSSES AT ONCE, WITH ITS CLOSE** (LOOP-2): a count the rate
+/// held back inside the second says when it is due; once the session closes, its tail's next take
+/// holds the close and a snapshot of the last counts inside that same second, and the tail is
+/// whole only once they landed.
+#[test]
+fn a_closed_sessions_moved_count_crosses_at_once_with_its_close() {
+    let mut log = Log::new(1);
+    session(&mut log);
+    let first = log.bus_copy(64, at(1)).encode(Tier::WireMeta, &alias);
+    log.land(first.slots.last().expect("PRECONDITION: the first take").at)
+        .expect("lands");
+    mail(&mut log, 10, "in");
+    let copy = log.bus_copy(64, at(20));
+    assert_eq!(
+        copy.due_in_ms(),
+        None,
+        "a snapshot handed out owes no retry"
+    );
+    let snap = copy.encode(Tier::WireMeta, &alias);
+    assert_eq!(kinds_of(&snap), [SlotKind::Snap], "PRECONDITION: {snap:?}");
+    log.land(snap.slots[0].at).expect("lands");
+    mail(&mut log, 30, "in");
+    let held = log.bus_copy(64, at(40));
+    assert!(held.is_empty(), "PRECONDITION: the rate holds it back");
+    assert_eq!(
+        held.due_in_ms(),
+        Some(aterm_slog::MAIL_SNAP_GAP_MS - 20),
+        "the held-back count says when it is due"
+    );
+    log.close_session(
+        Close::new(Out::Session(SessionOut::ShellExit), Src::Aterm, Conf::Exact),
+        at(50),
+    )
+    .expect("closes");
+    let mut tail = log.bus_tail();
+    let last = tail.bus_copy(64, at(60));
+    assert_eq!(last.due_in_ms(), None, "{last:?}");
+    let last = last.encode(Tier::WireMeta, &alias);
+    assert_eq!(
+        kinds_of(&last),
+        [SlotKind::Record, SlotKind::Snap],
+        "the close and its last counts inside the second: {last:?}"
+    );
+    assert_eq!(mail_counts(&last.slots[1]), (Some(2), Some(0)));
+    tail.land(last.slots[1].at).expect("lands");
+    assert!(tail.mirror_complete(), "the tail is whole");
+}
+
+/// **A CLOSED SESSION'S LAST COUNTS HOLD ITS TAIL UNTIL THEY LAND** (LOOP-2): a take whose room
+/// its records fill hands out no snapshot, so a tail whose records all landed is not yet whole
+/// while its counts are owed (its keeper would drop it), and its next take is the snapshot alone.
+#[test]
+fn a_closed_sessions_last_counts_hold_its_tail_until_they_land() {
+    let mut log = Log::new(1);
+    session(&mut log);
+    let first = log.bus_copy(64, at(1)).encode(Tier::WireMeta, &alias);
+    log.land(first.slots.last().expect("PRECONDITION: the first take").at)
+        .expect("lands");
+    mail(&mut log, 10, "out");
+    log.close_session(
+        Close::new(Out::Session(SessionOut::ShellExit), Src::Aterm, Conf::Exact),
+        at(20),
+    )
+    .expect("closes");
+    let mut tail = log.bus_tail();
+    let full = tail.bus_copy(1, at(30)).encode(Tier::WireMeta, &alias);
+    assert_eq!(
+        kinds_of(&full),
+        [SlotKind::Record],
+        "PRECONDITION: the close fills the room: {full:?}"
+    );
+    tail.land(full.slots[0].at).expect("lands");
+    assert!(
+        !tail.mirror_complete(),
+        "its last counts are owed: the tail is not whole"
+    );
+    let last = tail.bus_copy(64, at(40)).encode(Tier::WireMeta, &alias);
+    assert_eq!(kinds_of(&last), [SlotKind::Snap], "{last:?}");
+    assert_eq!(mail_counts(&last.slots[0]), (Some(0), Some(1)));
+    assert_eq!(last.slots[0].at, full.slots[0].at, "at the landed cursor");
+    tail.land(last.slots[0].at).expect("lands");
+    assert!(tail.mirror_complete(), "the tail is whole once they landed");
+}

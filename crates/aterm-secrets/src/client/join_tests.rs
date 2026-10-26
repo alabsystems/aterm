@@ -389,9 +389,24 @@ fn a_vault_approved_only_by_code_records_every_asking_mac_until_it_is_in() {
 
     let mut approver = Approver::default();
     let pause = approver_pass(&admin, &|_| {}, &mut approver);
-    assert_eq!(pause, Duration::from_secs(10), "by code, read every 10 s");
+    assert_eq!(
+        pause,
+        Duration::ZERO,
+        "by code, the next read is a long-poll"
+    );
     let recorded: Vec<String> = asking(&admin).into_iter().map(|a| a.recipient).collect();
     assert_eq!(recorded, std::slice::from_ref(&key));
+    // That read is held until the queue or the vault moves (here: the server's 200 ms hold),
+    // so asking again at once is no loop.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        approver_pass(&admin, &|_| {}, &mut approver),
+        Duration::ZERO
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the queue was read without the server holding it"
+    );
     // The queue still holds the request once the Mac is in: the new version, not the queue,
     // takes it off the record.
     approve_request(&admin, &key).expect("approves");
@@ -1276,4 +1291,105 @@ fn a_join_keeps_its_new_proof_before_its_request_is_answered() {
     let state = load_state(&mb).expect("state");
     assert_eq!(state.proof.as_deref(), Some(retyped.as_str()));
     assert_eq!(state.requested, 0, "the next pass asks again");
+}
+
+/// A Mac that types the join password is let in by an admin Mac's approver within one request:
+/// the approver long-polls the join queue, so a request ends its wait at once and nothing naps
+/// between them. Negative control: an approver that polls (a server that names no queue
+/// version) naps 2 s between passes, so the request waits out a nap.
+#[test]
+fn a_typed_join_password_is_let_in_with_no_nap_between() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin, source, password) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let stop = AtomicBool::new(false);
+    let naps = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            approver_loop_napping(&admin, &|_| {}, &stop, &mut |pause| {
+                naps.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(pause);
+            });
+        });
+        until("the approver long-polls the queue", || {
+            server.join_gets() >= 2
+        });
+        let joined = join(
+            &mb,
+            &options(
+                &source,
+                JoinPassword::Given(Some(password.clone())),
+                None,
+                HANG_DETECTOR,
+            ),
+        );
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(joined, Ok(JoinOutcome::Joined { .. })),
+            "{joined:?}"
+        );
+    });
+    assert_eq!(naps.load(Ordering::SeqCst), 0, "the approver never napped");
+    server.stop();
+}
+
+/// An idle admin Mac's approver costs one request per hold of the server's, each a long-poll
+/// the server holds: 3600 / 25 = 144 an hour at the default hold, where polling every 2 s cost
+/// 1800. Negative control: a pass that pauses (a polling approver) fails the zero pauses.
+#[test]
+fn an_idle_approver_asks_once_per_hold() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin, _, _) = team(root.path(), &server);
+    let mut approver = Approver::default();
+    let pauses: Vec<Duration> = (0..5)
+        .map(|_| approver_pass(&admin, &|_| {}, &mut approver))
+        .collect();
+    assert_eq!(pauses, [Duration::ZERO; 5]);
+    assert_eq!(server.join_gets(), 5, "one GET of the queue per pass");
+    eprintln!(
+        "idle approver: {} GETs in 5 passes, each held {:?}: {} per idle hour at the default hold",
+        server.join_gets(),
+        Duration::from_millis(200),
+        3600 / crate::server::DEFAULT_HOLD.as_secs()
+    );
+    server.stop();
+}
+
+/// An approver judges at each change to the join queue, which any host on the LAN can make by
+/// asking to join, and stretches the join password once for all of them while it stays: three
+/// passes judging three listings stretch it once. Negative control: a key stretched in each
+/// judging pass is stretched three times.
+#[test]
+fn an_approver_stretches_the_join_password_once_while_it_stays() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin, source, _) = team(root.path(), &server);
+    let mut approver = Approver::default();
+    let derived = || crate::join::DERIVED.with(std::cell::Cell::get);
+    let before = derived();
+    approver_pass(&admin, &|_| {}, &mut approver);
+    for (n, host) in [(1, "mb"), (2, "mc")] {
+        let mac = Paths::for_home(&root.path().join(format!("m{n}")));
+        let mut asking = options(&source, JoinPassword::Given(None), None, Duration::ZERO);
+        asking.host = Some(host.to_owned());
+        let asked = join(&mac, &asking);
+        assert!(
+            matches!(asked, Ok(JoinOutcome::Pending { .. })),
+            "{asked:?}"
+        );
+        approver_pass(&admin, &|_| {}, &mut approver);
+        assert_eq!(
+            approver.heard.lines.len(),
+            n,
+            "the pass judged the queue with this request in it"
+        );
+    }
+    assert_eq!(
+        derived() - before,
+        1,
+        "stretched once for three judged listings"
+    );
+    server.stop();
 }

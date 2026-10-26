@@ -6546,12 +6546,6 @@ impl NativeAppModel for EditorApp {
             toolbar,
             footer.rows,
         );
-        let painted_capacity = crate::native_ui::editor_painted_line_capacity_with_palette(
-            cx.viewport,
-            completion_count,
-            toolbar,
-            footer.rows,
-        );
         let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
             / editor_geometry.cell_w)
             .floor() as usize;
@@ -6569,7 +6563,7 @@ impl NativeAppModel for EditorApp {
                 crate::native_editor::project_viewport_with(
                     &lines,
                     &effective,
-                    painted_capacity,
+                    line_capacity,
                     column_capacity,
                 )
             })
@@ -7245,7 +7239,12 @@ impl NativeAppModel for EditorApp {
                 .children(children),
             )
         });
-        let mut children = vec![command_bar];
+        // The toolbar where it stands: a completion list may take its place while it is open
+        // ([`crate::native_ui::editor_shell_metrics_at_scale`]).
+        let mut children: Vec<UiNode> = (shell.command_rows > 0)
+            .then_some(command_bar)
+            .into_iter()
+            .collect();
         if let Some(command_palette) = command_palette {
             children.push(command_palette);
         } else if let Some(config_palette) = config_palette {
@@ -9196,7 +9195,7 @@ mod markdown_reader_tests {
         let warning = editor_status_message(&app, &view, 1, false).unwrap();
         assert!(warning.contains("not valid UTF-8"), "{warning}");
         assert!(
-            warning.contains("font_px"),
+            warning.contains("Config error · Ln 1, Col 11 · aterm schema: "),
             "the diagnostic stays: {warning}"
         );
         assert_eq!(view.status.as_deref(), Some("Saved"));
@@ -9333,6 +9332,290 @@ mod markdown_reader_tests {
             }
         }
         assert!(shortened, "the negative control");
+    }
+
+    /// THE FILE KEEPS SEVERAL ROWS UNDER AN OPEN COMPLETION LIST (audit r20 ED1): in an 80x24
+    /// window at 1.5x, 1.75x and 2x text, Ctrl-Space left the file the one row being completed
+    /// under the toolbar, the help line, a candidate, the header and the footer, and a help whose
+    /// first fact wraps took the rows the file had left. The list now takes only the room the
+    /// file can spare: its rows close up, the toolbar's last row gives way to it while it is open
+    /// and the help's rows past its first give way over it. So the file shows three rows or more
+    /// under a list at every standard size and text scale (three is what a header, a footer and
+    /// a one-candidate list leave at 80x24 and 2x), the toolbar stands where the file keeps its
+    /// floor beside it, and the view paints the rows the metrics count.
+    #[test]
+    fn the_file_keeps_several_rows_under_an_open_completion_list() {
+        use crate::native_ui::{EditorPalette, EditorToolbar};
+        let helps = [
+            "Prime coding agents automatically · agents_auto_prime · true / false · default true",
+            "Draw the cursor as a block, a beam or an underline, and blink it while the shell \
+             waits for input · cursor_shape · block / beam / underline · default block",
+        ];
+        let windows = [
+            (584.0, 348.0, "80x24"),
+            (738.0, 418.0, "102x29"),
+            (900.0, 600.0, "120x36"),
+            (1_200.0, 800.0, "160x48"),
+        ];
+        let toolbars = [
+            EditorToolbar::default(),
+            EditorToolbar {
+                problem_navigation: true,
+                reload: true,
+                edit_header: false,
+            },
+            // An `edit` ticket's header row (Done and Abort) left one row under M-x at 2x.
+            EditorToolbar {
+                problem_navigation: false,
+                reload: false,
+                edit_header: true,
+            },
+        ];
+        for scale in [0.85_f32, 1.0, 1.25, 1.5, 1.75, 2.0] {
+            let _scale = RestoreAppearance::at(scale);
+            for (width, height, name) in windows {
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                for toolbar in toolbars {
+                    for candidates in [1, 8] {
+                        for help in helps {
+                            let (palette, lines) = crate::native_ui::editor_help_palette(
+                                viewport,
+                                toolbar,
+                                Some(candidates),
+                                help,
+                            );
+                            let rows = crate::native_ui::editor_visible_line_capacity_with_palette(
+                                viewport, palette, toolbar, 1,
+                            );
+                            assert!(
+                                rows >= 3,
+                                "{name} at {scale}x, {candidates} listed, {toolbar:?}, help \
+                                 {lines:?}: {rows} rows of the file"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let tight = |viewport: LogicalRect| {
+            crate::native_ui::editor_shell_metrics(
+                viewport,
+                EditorPalette::Rows {
+                    candidates: 8,
+                    help_rows: 1,
+                },
+                EditorToolbar::default(),
+            )
+        };
+        {
+            let _scale = RestoreAppearance::at(2.0);
+            let small = tight(LogicalRect::new(0.0, 0.0, 584.0, 348.0));
+            assert_eq!(
+                small.command_rows, 0,
+                "the list stands for the toolbar at 80x24 and 2x"
+            );
+            let roomy = tight(LogicalRect::new(0.0, 0.0, 1_200.0, 800.0));
+            assert!(
+                roomy.command_rows > 0,
+                "and the toolbar stands where both fit"
+            );
+        }
+
+        // The view: the config editor at 80x24 with keys listed under the caret, its status on
+        // one row (a status that wraps takes the footer's reserved rows from the body).
+        let source = std::iter::once("agents_auto_prime = false\n".to_string())
+            .chain((1..18).map(|line| format!("# note {line}\n")))
+            .collect::<String>();
+        let (mut app, mut view, snapshot) = editor_fixture(&source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(&source));
+        app.config_analysis_revision = 1;
+        view.config_completion_interaction =
+            Some(crate::native_config_language::ConfigCompletionContext::new(
+                snapshot.id.get(),
+                snapshot.seq.0,
+                0,
+            ));
+        let viewport = LogicalRect::new(0.0, 0.0, 584.0, 348.0);
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _scale = RestoreAppearance::at(scale);
+            let compiled = app
+                .view(&view, &cx(viewport, Some(&snapshot)))
+                .compile(viewport)
+                .unwrap();
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("editor/config-completion/0"))
+                    .is_some(),
+                "{scale}x: the list shows"
+            );
+            let buffer = compiled
+                .semantic(&UiKey::new("editor/buffer"))
+                .expect("the file");
+            let spec = editor_spec(&compiled);
+            assert_eq!(
+                spec.footer_rows(),
+                1,
+                "{scale}x: premise: {:?}",
+                spec.status
+            );
+            let rows = crate::native_ui::whole_editor_rows(&spec.geometry(buffer.rect));
+            assert!(
+                rows >= 3,
+                "{scale}x: {rows} rows of the file under the list"
+            );
+            assert_eq!(
+                spec.projection
+                    .as_ref()
+                    .map(|projection| projection.lines.len()),
+                Some(rows),
+                "{scale}x: the rows shown are the rows projected"
+            );
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new("editor/command-bar"))
+                    .is_some(),
+                scale < 1.5,
+                "{scale}x: the toolbar gives way to the list only where the file needs it"
+            );
+            assert!(
+                compiled.fit_failures().is_empty(),
+                "{scale}x: {:?}",
+                compiled.fit_failures()
+            );
+        }
+
+        // An `edit` ticket's header row stands at rest and gives way last, under the list alone.
+        view.edit_header = Some(EditHeader {
+            for_word: Some("git".to_string()),
+            waiter: EditWaiter::Waiting,
+        });
+        for (scale, listed, header) in [
+            (1.0_f32, true, true),
+            (2.0, false, true),
+            (2.0, true, false),
+        ] {
+            let _scale = RestoreAppearance::at(scale);
+            view.config_completion_interaction = listed.then(|| {
+                crate::native_config_language::ConfigCompletionContext::new(
+                    snapshot.id.get(),
+                    snapshot.seq.0,
+                    0,
+                )
+            });
+            let compiled = app
+                .view(&view, &cx(viewport, Some(&snapshot)))
+                .compile(viewport)
+                .unwrap();
+            let context = format!("{scale}x, listed {listed}");
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new("editor/edit-header"))
+                    .is_some(),
+                header,
+                "{context}"
+            );
+            let buffer = compiled
+                .semantic(&UiKey::new("editor/buffer"))
+                .expect("the file");
+            let rows =
+                crate::native_ui::whole_editor_rows(&editor_spec(&compiled).geometry(buffer.rect));
+            assert!(rows >= 3, "{context}: {rows} rows of the file");
+            assert!(
+                compiled.fit_failures().is_empty(),
+                "{context}: {:?}",
+                compiled.fit_failures()
+            );
+        }
+    }
+
+    /// A CONFIG ERROR'S STATUS NEVER TAKES THE FILE'S FLOOR: typing a new key makes aterm.toml
+    /// unparseable until its `=`, and the status said so in the parser's whole text ("Config
+    /// error · Ln 2, Col 5 · TOML syntax: TOML parse error at line 2, column 5 | 2 | curs | ^
+    /// expected `=` after a key · F8 jumps there"), which wrapped to the footer's three reserved
+    /// rows. At 80x24 and 2x that left the file two rows, and one under the completion list the
+    /// person opened to finish the key. The status now says what the parser found without the
+    /// place it repeats, and its rows past the first give way where the file would show fewer
+    /// than its floor, its shorter forms first. The negative control: a 3-row footer over the
+    /// same editor leaves the file under its floor.
+    #[test]
+    fn a_config_errors_status_never_takes_the_files_floor() {
+        let source = std::iter::once("curs\n".to_string())
+            .chain((1..18).map(|line| format!("# note {line}\n")))
+            .collect::<String>();
+        let (mut app, mut view, snapshot) = editor_fixture(&source, "aterm.toml");
+        app.config_editor = true;
+        let analysis = crate::native_config_language::analyze(&source);
+        let message = &analysis.diagnostic_at(0).expect("the parse error").message;
+        assert_eq!(message, "TOML syntax: expected `=` after a key");
+        app.config_analysis = Some(analysis);
+        app.config_analysis_revision = 1;
+        let viewport = LogicalRect::new(0.0, 0.0, 584.0, 348.0);
+        for listed in [false, true] {
+            view.config_completion_interaction = listed.then(|| {
+                crate::native_config_language::ConfigCompletionContext::new(
+                    snapshot.id.get(),
+                    snapshot.seq.0,
+                    0,
+                )
+            });
+            for scale in [1.0_f32, 1.5, 2.0] {
+                let _scale = RestoreAppearance::at(scale);
+                let context = format!("{scale}x, listed {listed}");
+                let compiled = app
+                    .view(&view, &cx(viewport, Some(&snapshot)))
+                    .compile(viewport)
+                    .unwrap();
+                assert_eq!(
+                    compiled
+                        .semantic(&UiKey::new("editor/config-completion/0"))
+                        .is_some(),
+                    listed,
+                    "{context}"
+                );
+                let rect = compiled
+                    .semantic(&UiKey::new("editor/buffer"))
+                    .expect("the file")
+                    .rect;
+                let spec = editor_spec(&compiled);
+                let painted = spec.status.as_deref().expect("the footer");
+                assert!(
+                    painted
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .contains("expected `=` after a key"),
+                    "{context}: the parser's finding shows whole: {painted:?}"
+                );
+                let rows = crate::native_ui::whole_editor_rows(&spec.geometry(rect));
+                let floor = if listed { 3 } else { 4 };
+                assert!(
+                    rows >= floor,
+                    "{context}: {rows} rows of the file under {painted:?}"
+                );
+                assert_eq!(
+                    spec.projection
+                        .as_ref()
+                        .map(|projection| projection.lines.len()),
+                    Some(rows),
+                    "{context}: the rows shown are the rows projected"
+                );
+                if scale == 2.0 {
+                    let under_three = crate::native_ui::whole_editor_rows(
+                        &crate::native_ui::text_viewport_geometry(rect, 3),
+                    );
+                    assert!(
+                        under_three < floor,
+                        "{context}: negative control: three footer rows leave {under_three}"
+                    );
+                }
+                assert!(
+                    compiled.fit_failures().is_empty(),
+                    "{context}: {:?}",
+                    compiled.fit_failures()
+                );
+            }
+        }
     }
 
     #[test]
@@ -10008,7 +10291,7 @@ mod markdown_reader_tests {
                     let painted_rows = spec.projection.as_ref().expect("projection").lines.len();
                     assert!(
                         painted_rows
-                            <= crate::native_ui::editor_painted_line_capacity_with_palette(
+                            <= crate::native_ui::editor_visible_line_capacity_with_palette(
                                 viewport,
                                 palette,
                                 app.toolbar_in(&view),

@@ -64,7 +64,7 @@ fn slots(reply: &str) -> (Vec<(String, BusCursor, String)>, bool) {
         .and_then(|t| t.strip_prefix("slots="))
         .and_then(|k| k.parse().ok())
         .expect("slots=");
-    let more = header.ends_with(" more=1");
+    let more = header.split(' ').any(|t| t == "more=1");
     let out: Vec<(String, BusCursor, String)> = body
         .lines()
         .map(|l| {
@@ -1501,5 +1501,117 @@ fn an_old_lanes_landing_cannot_advance_a_replacement_bus_log() {
             "OK ok\n",
             "CONTROL: the new owning lane can then land it"
         );
+    });
+}
+
+/// **A SESSION WHOSE ONLY CHANGE IS A DELIVERED MAIL IS IN THE NEXT TAKE** (LOOP-2): a take reads
+/// every live session, and a mail's mark stays local, so once a mail is delivered the next take
+/// holds that session's snapshot alone, counting it, with no word of the mail.
+#[test]
+fn a_delivered_mail_alone_reaches_the_next_take_as_its_count() {
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        let a = session(&store, 1);
+        let (first, _) = slots(&cmd_log_take(&store, "", Some(generation)));
+        assert_eq!(
+            cmd_log_landed(&store, &landings(&first), Some(generation)),
+            "OK ok\n"
+        );
+        let (none, _) = slots(&cmd_log_take(&store, "", Some(generation)));
+        assert!(none.is_empty(), "PRECONDITION: everything landed: {none:?}");
+        let line = format!(
+            "{} off=7 from=s-peer@n-lab kind=note trust=agent text=QZP6WORD",
+            a.sid.as_str()
+        );
+        assert_eq!(crate::fabric::cmd_deliver(&store, &line), "OK 1\n");
+        let (taken, _) = slots(&cmd_log_take(&store, "", Some(generation)));
+        assert_eq!(taken.len(), 1, "the mail's snapshot alone: {taken:?}");
+        let (sid, _, body) = &taken[0];
+        assert_eq!(sid, a.sid.as_str());
+        let snap = decode_bus(body).expect("decodes").rec;
+        assert_eq!(snap.op, aterm_slog::Op::Snap, "{body}");
+        assert_eq!(snap.f.get_u(Key::MailIn), Some(1), "{body}");
+        for word in ["QZP6WORD", "s-peer", "n-lab", "note", " off="] {
+            assert!(!body.contains(word), "{word} crossed: {body}");
+        }
+    });
+}
+
+/// The `due=` of a take's header, if it says one.
+fn due_of(reply: &str) -> Option<u64> {
+    let (header, _) = reply.split_once('\n').expect("a header line");
+    header
+        .split(' ')
+        .find_map(|t| t.strip_prefix("due="))
+        .map(|ms| ms.parse().expect("due= is a count of ms"))
+}
+
+/// **A MAIL COUNT THE RATE HOLDS BACK SAYS WHEN IT IS DUE** (LOOP-2): a second mail inside the
+/// second of the first one's snapshot leaves the take empty, and its header says how long until
+/// the held-back count is due (`due=`), by the session's wall clock, so the bridge takes again
+/// then; once due, the take is the snapshot counting both, and says no `due=`.
+#[test]
+fn a_mail_count_the_rate_holds_back_says_when_it_is_due() {
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        let a = session(&store, 1);
+        let ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let read = std::sync::Arc::clone(&ms);
+        a.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog_mut()
+            .set_clock(crate::session_log::Clock::reading(move || {
+                let t = read.load(std::sync::atomic::Ordering::SeqCst);
+                aterm_slog::Stamp::new(1_760_000_000_000 + t, t)
+            }));
+        let take = |what: &str| {
+            let reply = cmd_log_take(&store, "", Some(generation));
+            let (taken, more) = slots(&reply);
+            assert!(!more, "{what}: {reply}");
+            (taken, due_of(&reply), reply)
+        };
+        let (first, due, reply) = take("the first take");
+        assert_eq!(due, None, "{reply}");
+        assert_eq!(
+            cmd_log_landed(&store, &landings(&first), Some(generation)),
+            "OK ok\n"
+        );
+        let deliver = |off: u64| {
+            let line = format!(
+                "{} off={off} from=s-peer@n-lab kind=note trust=agent text=QZP6WORD",
+                a.sid.as_str()
+            );
+            assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK "));
+        };
+        deliver(7);
+        let (snap, due, reply) = take("the first mail");
+        assert_eq!(snap.len(), 1, "PRECONDITION: its snapshot: {reply}");
+        assert_eq!(due, None, "{reply}");
+        assert_eq!(
+            cmd_log_landed(&store, &landings(&snap), Some(generation)),
+            "OK stale\n",
+            "PRECONDITION: a lone snapshot lands at the landed cursor"
+        );
+        deliver(8);
+        let (held, due, reply) = take("a second mail inside the second");
+        assert!(held.is_empty(), "PRECONDITION: held back: {reply}");
+        assert_eq!(due, Some(aterm_slog::MAIL_SNAP_GAP_MS), "{reply}");
+        ms.fetch_add(300, std::sync::atomic::Ordering::SeqCst);
+        let (held, due, reply) = take("300 ms on");
+        assert!(held.is_empty(), "PRECONDITION: still held back: {reply}");
+        assert_eq!(due, Some(aterm_slog::MAIL_SNAP_GAP_MS - 300), "{reply}");
+        ms.fetch_add(
+            aterm_slog::MAIL_SNAP_GAP_MS - 300,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let (snap, due, reply) = take("once due");
+        assert_eq!(snap.len(), 1, "the held-back count's snapshot: {reply}");
+        assert_eq!(due, None, "{reply}");
+        let snap = decode_bus(&snap[0].2).expect("decodes").rec;
+        assert_eq!(snap.f.get_u(Key::MailIn), Some(2), "{reply}");
     });
 }

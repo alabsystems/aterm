@@ -59,6 +59,7 @@ impl Scratch {
             rustup_home: Some(self.home().join(".rustup")),
             login_rc: None,
             pass: Pass::Doctor,
+            reads: Default::default(),
         })
     }
 
@@ -196,6 +197,7 @@ fn run_as(
             state: journaled.then_some(state.as_path()),
             not_own_account: not_own,
             develop: None,
+            docs: None,
         },
     );
     (ran, gathers.into_inner())
@@ -213,6 +215,14 @@ fn section(report: &str, label: &str) -> String {
         out.push_str(line);
     }
     out
+}
+
+/// Bare doctor's rows under `label`, one line each.
+fn rows_of<'r>(report: &'r str, label: &str) -> Vec<&'r str> {
+    report
+        .lines()
+        .filter(|line| line.starts_with(label))
+        .collect()
 }
 
 /// A report line's mark: the word after its label.
@@ -244,16 +254,24 @@ fn read_only_changes_nothing_in_the_home_the_store_or_the_state_root() {
     let ran = run(&scratch, Mark::Ok, &["--read-only"], true);
     assert_eq!(ran.code, 1, "planned repairs are not ready: {}", ran.text);
     assert_eq!(scratch.tree(), before, "--read-only wrote:\n{}", ran.text);
-    let repair = section(&ran.text, "repair:");
-    assert_eq!(mark(&repair), "warn", "{repair}");
+    let repairs = rows_of(&ran.text, "repair:");
+    assert!(
+        repairs.iter().all(|row| mark(row) == "warn"),
+        "{}",
+        ran.text
+    );
     for broken in [
         "installed programs' commands",
         "~/.local/bin links",
         "shell rc files",
     ] {
         assert!(
-            repair.contains(broken) && repair.contains("bare `aterm doctor` restores it"),
-            "{broken}: {repair}"
+            repairs
+                .iter()
+                .any(|row| row.contains(broken)
+                    && row.ends_with("fix: bare `aterm doctor` restores it")),
+            "{broken}: {}",
+            ran.text
         );
     }
     let json = report(&run(&scratch, Mark::Ok, &["--read-only", "--json"], true));
@@ -330,12 +348,14 @@ fn bare_doctor_restores_a_deleted_shim_and_a_missing_link_and_leaves_an_opted_ou
             .contains("atpkg shell integration"),
         "an rc atpkg never wired is wired"
     );
-    let repair = section(&ran.text, "repair:");
-    assert!(repair.starts_with("repair:"), "{repair}");
     assert!(
-        repair.contains("appended atpkg's block to ~/.zshrc"),
-        "{repair}"
+        rows_of(&ran.text, "changed:")
+            .iter()
+            .any(|row| mark(row) == "done" && row.contains("appended atpkg's block to ~/.zshrc")),
+        "{}",
+        ran.text
     );
+    assert!(rows_of(&ran.text, "repair:").is_empty(), "{}", ran.text);
     let journal = std::fs::read_to_string(scratch.root.join("state/converge/journal.ndjson"))
         .expect("the changes are journaled");
     for id in [repair::SHIMS, repair::LINKS, repair::RC] {
@@ -383,6 +403,26 @@ fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
     let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
     let ran = run(&scratch, Mark::Ok, &[], true);
     assert_eq!(ran.code, 1, "unresolved work is not ready: {}", ran.text);
+    let repairs = rows_of(&ran.text, "repair:");
+    assert!(
+        !repairs.is_empty()
+            && repairs.iter().all(|row| mark(row) == "note"
+                && row.contains("an install pass holds the store")
+                && row.ends_with("fix: run `aterm doctor` again once it ends")),
+        "{}",
+        ran.text
+    );
+    assert!(
+        ran.text
+            .lines()
+            .next()
+            .unwrap()
+            .contains("waiting for another pass"),
+        "{}",
+        ran.text
+    );
+    let ran = run(&scratch, Mark::Ok, &["--verbose"], true);
+    assert_eq!(ran.code, 1, "unresolved work is not ready: {}", ran.text);
     let repair = section(&ran.text, "repair:");
     assert_eq!(mark(&repair), "note", "{repair}");
     assert!(
@@ -417,11 +457,7 @@ fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
 
     drop(held);
     let ran = run(&scratch, Mark::Ok, &[], true);
-    assert!(
-        !section(&ran.text, "repair:").contains(CONTENDED),
-        "{}",
-        ran.text
-    );
+    assert!(!ran.text.contains(CONTENDED), "{}", ran.text);
     assert!(atpkg::platform::resolve_shim(&scratch.shim("ay")).is_some());
 }
 
@@ -432,7 +468,24 @@ fn a_usable_shell_does_not_hide_failed_repairs_or_manual_steps() {
     let scratch = Scratch::new("exit");
     let ran = run(&scratch, Mark::Fail, &[], true);
     assert_eq!(ran.code, 1, "{}", ran.text);
-    assert!(ran.text.contains("readiness: NOT READY"), "{}", ran.text);
+    assert!(
+        ran.text.starts_with("aterm doctor: ") && !ran.text.starts_with("aterm doctor: healthy"),
+        "{}",
+        ran.text
+    );
+    assert!(
+        rows_of(&ran.text, "shell:")
+            .iter()
+            .any(|row| mark(row) == "FAIL" && row.contains("fix: ")),
+        "{}",
+        ran.text
+    );
+    let verbose = run(&scratch, Mark::Fail, &["--verbose"], true);
+    assert!(
+        verbose.text.contains("readiness: NOT READY"),
+        "{}",
+        verbose.text
+    );
     assert!(
         ran.stdout,
         "a NOT READY report goes to stdout too: `aterm doctor | less` reads it"
@@ -448,12 +501,18 @@ fn a_usable_shell_does_not_hide_failed_repairs_or_manual_steps() {
         .unwrap();
     let ran = run(&broken, Mark::Ok, &[], false);
     assert_eq!(ran.code, 1, "{}", ran.text);
-    let repair = section(&ran.text, "repair:");
     assert!(
-        mark(&repair) == "warn" && repair.contains("NOT done"),
-        "{repair}"
+        rows_of(&ran.text, "repair:")
+            .iter()
+            .any(|row| mark(row) == "warn" && row.contains("NOT done")),
+        "{}",
+        ran.text
     );
-    assert!(ran.text.contains("readiness: NOT READY"), "{}", ran.text);
+    assert!(
+        !ran.text.starts_with("aterm doctor: healthy"),
+        "{}",
+        ran.text
+    );
     assert!(!ran.text.contains("health: OK"), "{}", ran.text);
     let json = run(&broken, Mark::Ok, &["--json"], false);
     assert_eq!(json.code, 1);
@@ -467,42 +526,59 @@ fn a_usable_shell_does_not_hide_failed_repairs_or_manual_steps() {
     assert!(!json.readiness.unwrap().all_green);
 }
 
-/// Each result is supplied without platform probes or writes. Nonessential rows still
-/// count toward readiness, while notes/not-applicable remain nonfatal.
+/// Each result is supplied without platform probes or writes. A package row counts as
+/// `aterm pkg doctor` judges it: a failure, or an essential row not done, is unresolved; a
+/// non-essential row's plan, manual step or unknown is a note (counted not applicable), as
+/// notes and not-applicable rows are; the JSON row keeps its outcome either way.
 #[test]
 fn readiness_distinguishes_confirmed_state_from_plans_manual_steps_and_unknowns() {
-    for outcome in [
-        Outcome::Ok,
-        Outcome::Changed,
-        Outcome::NotApplicable,
-        Outcome::Planned,
-        Outcome::Person,
-        Outcome::Blocked,
-        Outcome::Deferred,
-        Outcome::Unknown,
-        Outcome::Failed,
-    ] {
-        let mut row = super::unmeasured("fixture.check", "fixture", None, "evidence".into());
-        row.outcome = outcome;
-        let rows = vec![row];
-        let ran = injected(Mark::Ok, &["--json", "--only", "fixture"], &rows);
-        let report = report(&ran);
-        let ready = matches!(
-            outcome,
-            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
-        );
-        assert_eq!(ran.code, u8::from(!ready), "{outcome:?}: {}", ran.text);
-        assert_eq!(report.complete, ready, "{outcome:?}");
-        let summary = report.readiness.unwrap();
-        assert_eq!(summary.all_green, ready, "{outcome:?}");
-        assert_eq!(summary.scope, ["fixture"]);
-        assert_eq!(
-            summary.not_applicable,
-            usize::from(outcome == Outcome::NotApplicable)
-        );
-        assert_eq!(summary.unresolved.is_empty(), ready, "{outcome:?}");
-        if !ready {
-            assert_eq!(summary.unresolved, ["fixture.check"]);
+    for essential in [false, true] {
+        for outcome in [
+            Outcome::Ok,
+            Outcome::Changed,
+            Outcome::NotApplicable,
+            Outcome::Planned,
+            Outcome::Person,
+            Outcome::Blocked,
+            Outcome::Deferred,
+            Outcome::Unknown,
+            Outcome::Failed,
+        ] {
+            let mut row = super::unmeasured("fixture.check", "fixture", None, "evidence".into());
+            row.outcome = outcome;
+            row.essential = essential;
+            let fails_pkg_doctor = !atpkg::converge::passes(std::slice::from_ref(&row));
+            let rows = vec![row];
+            let ran = injected(Mark::Ok, &["--json", "--only", "fixture"], &rows);
+            let report = report(&ran);
+            let confirmed = matches!(
+                outcome,
+                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+            );
+            let ready = !fails_pkg_doctor;
+            assert_eq!(
+                ready,
+                confirmed
+                    || outcome == Outcome::Deferred
+                    || !essential && outcome != Outcome::Failed,
+                "{outcome:?} essential={essential}"
+            );
+            assert_eq!(ran.code, u8::from(!ready), "{outcome:?}: {}", ran.text);
+            assert_eq!(report.complete, ready, "{outcome:?}");
+            let item = report.items.iter().find(|item| item.id == "fixture.check");
+            assert_eq!(item.unwrap().outcome, outcome, "the row reads as it did");
+            let summary = report.readiness.unwrap();
+            assert_eq!(summary.all_green, ready, "{outcome:?}");
+            assert_eq!(summary.scope, ["fixture"]);
+            assert_eq!(
+                summary.not_applicable,
+                usize::from(ready && !matches!(outcome, Outcome::Ok | Outcome::Changed)),
+                "{outcome:?} essential={essential}"
+            );
+            assert_eq!(summary.unresolved.is_empty(), ready, "{outcome:?}");
+            if !ready {
+                assert_eq!(summary.unresolved, ["fixture.check"]);
+            }
         }
     }
     let note = super::run(
@@ -519,10 +595,30 @@ fn readiness_distinguishes_confirmed_state_from_plans_manual_steps_and_unknowns(
             state: None,
             not_own_account: None,
             develop: None,
+            docs: None,
         },
     );
     assert_eq!(note.code, 0, "{}", note.text);
     assert_eq!(report(&note).readiness.unwrap().not_applicable, 1);
+}
+
+/// Doctor as `words` ask over `scratch`, journaled, on a machine whose only fact is a usable
+/// shell, and `rows` for its packages.
+fn shell_and(scratch: &Scratch, words: &[&str], rows: &[ItemReport]) -> Ran {
+    let ground = scratch.ground();
+    let state = scratch.root.join("state");
+    super::run(
+        &args(words),
+        &Ports {
+            gather: &|_, _| Gathered::of_facts(&[("shell:", Mark::Ok, "/bin/sh (executable)")]),
+            ground: Some(&ground),
+            packages: &|| rows.to_vec(),
+            state: Some(&state),
+            not_own_account: None,
+            develop: None,
+            docs: None,
+        },
+    )
 }
 
 fn injected(shell: Mark, words: &[&str], rows: &[ItemReport]) -> Ran {
@@ -535,8 +631,92 @@ fn injected(shell: Mark, words: &[&str], rows: &[ItemReport]) -> Ran {
             state: None,
             not_own_account: None,
             develop: None,
+            docs: None,
         },
     )
+}
+
+/// A PACKAGES ROW `aterm pkg doctor` PASSES LEAVES DOCTOR GREEN: an installed agent that a
+/// foreign `claude` earlier on PATH shadows, read outside an aterm shell (the 10d row), is a
+/// note, so doctor exits 0 and its brief report is the verdict alone; `--verbose` shows the row
+/// under a `packages:` note. NEGATIVE CONTROL: the same packages and one essential row the
+/// person must do exit 1, and that row is shown.
+#[test]
+fn a_shadowed_agent_outside_aterm_leaves_doctor_green_and_an_essential_step_does_not() {
+    let scratch = Scratch::new("agent-shadow");
+    let claude = atpkg::vendor_direct::Version::parse("2.1.280")
+        .unwrap()
+        .build_id();
+    scratch.install("claude", claude);
+    let _ = std::fs::remove_file(
+        scratch
+            .layout()
+            .agent_shim(&ToolName::new("claude").unwrap()),
+    );
+    let foreign = scratch.root.join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("claude"), b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(
+        foreign.join("claude"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths([foreign, scratch.layout().bin_dir()]).unwrap();
+    let rows = atpkg::doctor::report_with(
+        &scratch.layout(),
+        Some(&scratch.home()),
+        Some(&path),
+        1_790_812_800,
+        None,
+        &atpkg::doctor::Probes::default(),
+    );
+    let shadow = atpkg::converge::of("base.pkg.shadow", "claude");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.id == shadow)
+            .map(|row| row.outcome),
+        Some(Outcome::NotApplicable),
+        "{rows:#?}"
+    );
+    let laid = shell_and(&scratch, &[], &rows);
+    assert!(
+        laid.text.contains("changed:"),
+        "bare doctor lays the repairs: {}",
+        laid.text
+    );
+    let ran = shell_and(&scratch, &["--read-only"], &rows);
+    assert_eq!(ran.code, 0, "{}", ran.text);
+    assert_eq!(ran.text.lines().count(), 1, "{}", ran.text);
+    assert!(
+        ran.text.starts_with("aterm doctor: healthy"),
+        "{}",
+        ran.text
+    );
+    let json = report(&shell_and(&scratch, &["--read-only", "--json"], &rows));
+    assert!(json.complete);
+    let verbose = shell_and(&scratch, &["--read-only", "--verbose"], &rows);
+    assert_eq!(verbose.code, 0, "{}", verbose.text);
+    let packages = section(&verbose.text, "packages:");
+    assert_eq!(mark(&packages), "note", "{packages}");
+
+    let mut step = super::unmeasured("fixture.step", "fixture", None, "turn it on".into());
+    step.outcome = Outcome::Person;
+    step.essential = true;
+    let with_step: Vec<ItemReport> = rows.iter().cloned().chain([step]).collect();
+    let ran = shell_and(&scratch, &["--read-only"], &with_step);
+    assert_eq!(ran.code, 1, "{}", ran.text);
+    assert!(
+        rows_of(&ran.text, "packages:")
+            .iter()
+            .any(|row| mark(row) == "warn"),
+        "{}",
+        ran.text
+    );
+    assert!(
+        ran.text.starts_with("aterm doctor: 1 needs you"),
+        "{}",
+        ran.text
+    );
 }
 
 #[test]
@@ -562,6 +742,15 @@ fn filtered_readiness_excludes_unrequested_checks_but_keeps_shell_usability() {
         }
     );
     let text = injected(Mark::Ok, &["--read-only", "--only", "fixture.ready"], &rows);
+    assert_eq!(
+        text.text,
+        "aterm doctor: healthy\nscope: fixture.ready (plus shell usability)\n"
+    );
+    let text = injected(
+        Mark::Ok,
+        &["--read-only", "--verbose", "--only", "fixture.ready"],
+        &rows,
+    );
     assert!(text.text.contains("readiness: ALL GREEN"), "{}", text.text);
     assert!(
         text.text
@@ -619,6 +808,16 @@ fn changed_settings_awaiting_login_or_restart_are_not_green() {
         assert!(readiness.unresolved.is_empty());
         assert_eq!(readiness.satisfied, 1, "only the shell is satisfied");
         let text = injected(Mark::Ok, &["--only", "fixture"], &rows);
+        assert!(
+            text.text
+                .lines()
+                .next()
+                .unwrap()
+                .contains("1 change takes effect at your next login or restart (fixture.setting)"),
+            "{}",
+            text.text
+        );
+        let text = injected(Mark::Ok, &["--verbose", "--only", "fixture"], &rows);
         assert!(
             text.text
                 .contains("pending activation (login/restart): fixture.setting"),
@@ -740,6 +939,7 @@ fn reads(scratch: &Scratch, words: &[&str]) -> (Ran, Vec<Vec<String>>, usize) {
             state: Some(&state),
             not_own_account: None,
             develop: None,
+            docs: None,
         },
     );
     (ran, gathers.into_inner().unwrap(), packages.into_inner())
@@ -814,6 +1014,7 @@ fn the_packages_are_read_beside_the_gather() {
                 state: None,
                 not_own_account: None,
                 develop: None,
+                docs: None,
             },
         );
         let _ = tx.send(ran.code);
@@ -846,6 +1047,24 @@ fn outside_the_accounts_own_shell_doctor_reads_every_item_and_changes_nothing() 
             ran.text
         );
         assert_eq!(gathers, vec![false], "no hand-over");
+        let repairs = rows_of(&ran.text, "repair:");
+        assert!(
+            repairs.iter().all(|row| mark(row) == "warn")
+                && repairs
+                    .iter()
+                    .any(|row| row.contains("installed programs' commands: "))
+                && repairs.iter().any(|row| row.contains("(it runs as root)"))
+                && !ran.text.contains("bare `aterm doctor` restores it"),
+            "{}",
+            ran.text
+        );
+        let (ran, _) = run_as(
+            &scratch,
+            shell,
+            &["--verbose"],
+            true,
+            Some("it runs as root"),
+        );
         let repair = section(&ran.text, "repair:");
         assert_eq!(mark(&repair), "warn", "{repair}");
         assert!(repair.contains(&hold), "{repair}");
@@ -883,8 +1102,13 @@ fn a_store_lock_that_cannot_be_taken_is_a_warning_and_nothing_is_repaired() {
     std::fs::create_dir(scratch.layout().store_lock()).unwrap();
     let ran = run(&scratch, Mark::Ok, &[], true);
     assert_eq!(ran.code, 1, "{}", ran.text);
-    let repair = section(&ran.text, "repair:");
-    assert_eq!(mark(&repair), "warn", "{repair}");
+    let repairs = rows_of(&ran.text, "repair:");
+    assert!(
+        !repairs.is_empty() && repairs.iter().all(|row| mark(row) == "warn"),
+        "{}",
+        ran.text
+    );
+    let repair = repairs.join("\n");
     assert!(
         repair.contains("the store lock could not be taken"),
         "{repair}"
@@ -1159,6 +1383,7 @@ fn run_developing(
                 names: &develop_word,
                 compose: &compose,
             }),
+            docs: None,
         },
     );
     (ran, gathers.into_inner())
@@ -1212,6 +1437,17 @@ fn a_develop_machine_s_doctor_reads_its_develop_rows_beside_the_others() {
     }
     let stand = Stand::recorded();
     let (ran, _) = run_developing(&scratch, &["--read-only"], &stand, None);
+    assert_eq!(
+        rows_of(&ran.text, "develop:")
+            .iter()
+            .map(|row| (mark(row), row.split_whitespace().nth(2).unwrap_or_default()))
+            .collect::<Vec<_>>(),
+        [("warn", "develop.checkout@~/aterm:")],
+        "only the row that needs the person: {}",
+        ran.text
+    );
+    let stand = Stand::recorded();
+    let (ran, _) = run_developing(&scratch, &["--read-only", "--verbose"], &stand, None);
     let develop = section(&ran.text, "develop:");
     assert_eq!(mark(&develop), "warn", "{develop}");
     assert!(
@@ -1287,6 +1523,15 @@ fn a_broken_init_toml_is_one_develop_row_and_never_stops_the_others() {
         "the packages are read"
     );
     let (ran, _) = run_developing(&scratch, &["--read-only"], &stand, None);
+    let develop = rows_of(&ran.text, "develop:");
+    assert!(
+        develop.len() == 1
+            && mark(develop[0]) == "unread"
+            && develop[0].contains("invalid ~/.config/aterm/init.toml"),
+        "{}",
+        ran.text
+    );
+    let (ran, _) = run_developing(&scratch, &["--read-only", "--verbose"], &stand, None);
     let develop = section(&ran.text, "develop:");
     assert_eq!(mark(&develop), "warn", "{develop}");
     assert!(
@@ -1562,6 +1807,172 @@ fn base_clt_wants_the_tools_git_beside_an_xcode_compiler() {
         super::clt_found(&CcVerdict::Unanswered { driver }, false),
         Found::Unknown(_)
     ));
+}
+
+/// The rust-docs stand-in: the workstation item bare doctor binds, its docs indexed until its
+/// apply sets them aside; each probe and apply counted.
+struct Docs {
+    indexed: std::sync::atomic::AtomicBool,
+    probes: std::sync::atomic::AtomicUsize,
+    applies: std::sync::atomic::AtomicUsize,
+}
+
+impl Docs {
+    fn new() -> Self {
+        Self {
+            indexed: std::sync::atomic::AtomicBool::new(true),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+            applies: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl aterm_converge::Item for &Docs {
+    fn id(&self) -> String {
+        "init.spotlight.rust-docs@alice".into()
+    }
+
+    fn family(&self) -> &'static str {
+        "spotlight"
+    }
+
+    fn layer(&self) -> aterm_converge::Layer {
+        aterm_converge::Layer::Workstation
+    }
+
+    fn class(&self) -> aterm_converge::Class {
+        aterm_converge::Class::Relay
+    }
+
+    fn title(&self) -> String {
+        "no rustup toolchain carries rust-docs".into()
+    }
+
+    fn probe(&self) -> aterm_converge::Probe {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.indexed.load(std::sync::atomic::Ordering::SeqCst) {
+            aterm_converge::Probe::Change {
+                from: "rust-docs installed in stable-aarch64-apple-darwin".into(),
+                to: "set aside".into(),
+            }
+        } else {
+            aterm_converge::Probe::Ok {
+                now: "no rustup toolchain carries rust-docs".into(),
+            }
+        }
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        self.applies
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.indexed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn explain(&self, _: &aterm_converge::Probe) -> aterm_converge::Explain {
+        aterm_converge::Explain {
+            why: "Spotlight indexes rust-docs".into(),
+            remedy: aterm_converge::Remedy::Command("aterm doctor".into()),
+        }
+    }
+}
+
+/// BARE DOCTOR KEEPS RUST-DOCS OUT OF SPOTLIGHT: once the gather finds Spotlight indexing
+/// rust-docs pages, the workstation item is built and applied as a relay-class repair, journaled
+/// and read back, and the change (what it read, then what it reads back) rides on the verdict
+/// line. `--read-only` plans it (a row whose
+/// fix is bare doctor) and applies nothing. NEGATIVE CONTROLS: with no rust-docs indexed, or
+/// from a shell that is not the account's own, the item is never built.
+#[test]
+fn bare_doctor_sets_indexed_rust_docs_aside_and_builds_nothing_otherwise() {
+    let scratch = broken("rust-docs");
+    run(&scratch, Mark::Ok, &[], true);
+    let docs = Docs::new();
+    let built = std::cell::Cell::new(0);
+    let repair = || -> Result<Vec<Box<dyn aterm_converge::Item + '_>>, String> {
+        built.set(built.get() + 1);
+        Ok(vec![Box::new(&docs)])
+    };
+    let ground = scratch.ground();
+    let state = scratch.root.join("state");
+    let indexed = std::cell::Cell::new(true);
+    let gather = |_, _: &[String]| {
+        let facts = Gathered::of_facts(&[("shell:", Mark::Ok, "/bin/sh (executable)")]);
+        if indexed.get() {
+            facts.with_rust_docs_indexed()
+        } else {
+            facts
+        }
+    };
+    let doctor = |words: &[&str], docs_indexed: bool, not_own: Option<&'static str>| {
+        indexed.set(docs_indexed);
+        super::run(
+            &args(words),
+            &Ports {
+                gather: &gather,
+                ground: Some(&ground),
+                packages: &Vec::new,
+                state: Some(&state),
+                not_own_account: not_own,
+                develop: None,
+                docs: Some(&repair),
+            },
+        )
+    };
+
+    let ran = doctor(&["--read-only"], true, None);
+    assert_eq!(built.get(), 1);
+    assert_eq!(Docs::count(&docs.applies), 0, "read-only applies nothing");
+    let rows = rows_of(&ran.text, "rust-docs:");
+    assert!(
+        rows.len() == 1
+            && mark(rows[0]) == "warn"
+            && rows[0].ends_with("fix: bare `aterm doctor` keeps them out of Spotlight"),
+        "{}",
+        ran.text
+    );
+    let json = report(&doctor(&["--read-only", "--json"], true, None));
+    let row = json
+        .items
+        .iter()
+        .find(|row| row.id == "init.spotlight.rust-docs@alice")
+        .expect("the docs row");
+    assert_eq!(row.outcome, Outcome::Planned);
+    assert_eq!(row.layer, Some(aterm_converge::Layer::Workstation));
+
+    let ran = doctor(&[], true, None);
+    assert_eq!(Docs::count(&docs.applies), 1, "{}", ran.text);
+    assert!(
+        ran.text.lines().next().unwrap().contains(
+            "rust-docs installed in stable-aarch64-apple-darwin \u{2192} no rustup toolchain \
+             carries rust-docs"
+        ),
+        "{}",
+        ran.text
+    );
+    assert!(rows_of(&ran.text, "rust-docs:").is_empty(), "{}", ran.text);
+    let journal = std::fs::read_to_string(state.join("converge/journal.ndjson")).unwrap();
+    assert!(
+        journal.contains("init.spotlight.rust-docs@alice"),
+        "journaled: {journal}"
+    );
+
+    let before = (built.get(), Docs::count(&docs.probes));
+    let ran = doctor(&[], false, None);
+    assert_eq!(ran.code, 0, "{}", ran.text);
+    let ran = doctor(&[], true, Some("it runs as root"));
+    assert!(!ran.text.contains("rust-docs:"), "{}", ran.text);
+    assert_eq!(
+        (built.get(), Docs::count(&docs.probes)),
+        before,
+        "nothing built or read without indexed docs, or outside the account's own shell"
+    );
 }
 
 /// Every `aterm init` line this doctor prints for the base layer it composes, and the ones the

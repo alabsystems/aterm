@@ -343,6 +343,27 @@ pub(crate) fn census_of(
                     .collect()
             });
         let age = row.age_s.map_or_else(|| "?".to_string(), age_words);
+        // A tether's watcher (`aterm_uds::tether`) is launchd's by design, for as long as the
+        // helper it watches runs, and no window under any name: not an orphan to report.
+        if words
+            .as_deref()
+            .and_then(|words| words.get(1))
+            .map(String::as_str)
+            == Some(aterm_uds::tether::VERB)
+        {
+            programs.push((
+                row.age_s.unwrap_or(0),
+                Program {
+                    pid: row.pid,
+                    name: "aterm tether".to_string(),
+                    age,
+                    adopted: false,
+                    build: in_build_dir(exe),
+                    deleted: image.deleted,
+                },
+            ));
+            continue;
+        }
         let window = words
             .as_deref()
             .and_then(|words| window_args(exe, words, || k.stdin_terminal(row.pid), door));
@@ -966,6 +987,26 @@ mod tests {
         assert!(
             by_pid[&704].adopted && by_pid[&704].name == "aterm pkg update",
             "{c:?}"
+        );
+        let watcher = |pid, exe| {
+            let argv = [exe, "__tether", "500", "/usr/bin/log", "log", "stream"];
+            under_launchd(proc(pid, 4_000, 20, exe, &argv), Some(31))
+        };
+        let c = census(
+            &Fake::with(vec![
+                proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+                watcher(706, BUNDLE),
+                watcher(707, "/w/target/debug/aterm-gui"),
+            ]),
+            &[],
+        );
+        assert_eq!(c.instances, 0, "a watcher is no window: {c:?}");
+        assert!(
+            c.programs
+                .iter()
+                .all(|p| p.name == "aterm tether" && !p.adopted)
+                && c.programs.len() == 2,
+            "a tether's watcher is launchd's by design: {c:?}"
         );
         let mut unread = Fake::with(vec![
             proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),

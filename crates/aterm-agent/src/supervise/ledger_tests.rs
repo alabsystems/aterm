@@ -796,58 +796,14 @@ fn the_harness_turns_are_not_the_managers() {
             && detail.contains("1 more typed by aterm's window harness (by=harness)"),
         "{detail}"
     );
-
-    let l = with("ctl");
-    assert_eq!(ids(&l), [1, 2, 3, 4]);
-    assert_eq!(l.turns[2].swallowed, [4]);
-    assert_eq!(l.summary().turns, 4);
-    assert!(!history_detail(&l).contains("harness"), "{l:#?}");
-}
-
-/// The drive's carry-on after a relaunch (`history`'s `by=harness`) is the harness's turn, not
-/// the manager's; a `by=ctl` turn is the manager's.
-#[test]
-fn the_drives_carry_on_turn_reads_as_the_harness_not_the_manager() {
-    let with = |by: &str| {
-        let mut body = history().stdout;
-        body.push_str(&format!(
-            "turn 4 submitted=1 status=settled started_ms=250000 dur_ms=0 seq=9 \
-             hash=0000000000000000 by={by} arch=7730:105 text={}\n",
-            aterm_codec::pct::encode(crate::harness::upgrade::CARRY_ON)
-        ));
-        let mut host = whole_host();
-        host.replies
-            .insert("history".to_string(), VecDeque::from(vec![ok(&body)]));
-        read(&mut host, &opts(None))
-    };
-    let ids = |l: &Ledger| l.turns.iter().map(|t| t.id).collect::<Vec<u64>>();
-    let history_detail = |l: &Ledger| {
-        l.sources
-            .iter()
-            .find(|s| s.name == "history")
-            .expect("row")
-            .detail
-            .clone()
-    };
-    let l = with("harness");
-    assert_eq!(ids(&l), [1, 2, 3], "{:#?}", l.turns);
-    assert_eq!(l.summary().turns, 3);
-    let detail = history_detail(&l);
-    assert!(
-        detail.starts_with("3 turn(s) from @s-work")
-            && detail.contains("1 more typed by aterm's window harness (by=harness)"),
-        "{detail}"
-    );
     assert!(
         render_text(&l).contains("1 more typed by aterm's window harness (by=harness)"),
         "SOURCES says so"
     );
+
     let l = with("ctl");
-    assert_eq!(
-        ids(&l),
-        [1, 2, 3, 4],
-        "NEGATIVE CONTROL: as ctl it is the manager's"
-    );
+    assert_eq!(ids(&l), [1, 2, 3, 4]);
+    assert_eq!(l.turns[2].swallowed, [4]);
     assert_eq!(l.summary().turns, 4);
     assert!(!history_detail(&l).contains("harness"), "{l:#?}");
 }

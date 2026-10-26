@@ -457,19 +457,31 @@ fn horizontal_window_anchor(
 ) -> HorizontalWindowAnchor {
     let left_target = column_budget.saturating_mul(3) / 4;
     if caret.saturating_sub(line_start) <= byte_budget {
+        // The caret's column, then how far its line runs past it (scanned no further than one
+        // window: past that the line's end never holds the window back).
         let mut columns = 0usize;
+        let mut line_columns = 0usize;
         let end = line_end(text, caret);
         for (offset, grapheme) in text[line_start..end].grapheme_indices() {
-            if line_start
+            let before_caret = line_start
                 .saturating_add(offset)
                 .saturating_add(grapheme.len())
-                > caret
-            {
+                <= caret;
+            if !before_caret && line_columns >= columns.saturating_add(column_budget) {
                 break;
             }
-            columns = columns.saturating_add(editor_grapheme_columns(grapheme, columns));
+            line_columns =
+                line_columns.saturating_add(editor_grapheme_columns(grapheme, line_columns));
+            if before_caret {
+                columns = line_columns;
+            }
         }
-        return HorizontalWindowAnchor::Columns(columns.saturating_sub(left_target));
+        // The caret sits three quarters of the way across, but the window never scrolls further
+        // than the caret's line needs: where its end and the caret after it fit, the window
+        // stops there, so a line that fits whole shows from its first column (a caret at column
+        // 26 of a 29-column window cut the first four columns off every row of aterm.toml).
+        let needed = line_columns.saturating_add(1).saturating_sub(column_budget);
+        return HorizontalWindowAnchor::Columns(columns.saturating_sub(left_target).min(needed));
     }
 
     let search_start =
@@ -713,6 +725,60 @@ mod tests {
             projection.lines[0].source.start > 0,
             "negative control: the old projection always began ordinary lines at byte zero"
         );
+    }
+
+    /// THE WINDOW SCROLLS NO FURTHER THAN THE CARET'S LINE NEEDS: the window put the caret three
+    /// quarters of the way across whatever the line held, so a caret at the end of
+    /// `agents_auto_prime = false` (column 25) in a 29-column window started every row at column
+    /// 4 ("ts_auto_prime", "ate]", "led = false") although the line fitted whole. Where the
+    /// caret's line ends (the caret after it) inside the window it stops there: a line that fits
+    /// shows from its first column, and a long line's end lands at the right edge.
+    #[test]
+    fn the_horizontal_window_scrolls_no_further_than_the_caret_line_needs() {
+        let text = "agents_auto_prime = false\n[update]\nenabled = false\n";
+        let (_, _, mut view, _) = editor(text);
+        view.selections = vec![Selection::caret(25)];
+        let projection = project_viewport(text, &view, 3, 29);
+        let texts: Vec<&str> = projection
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["agents_auto_prime = false", "[update]", "enabled = false"]
+        );
+        assert!(projection.lines.iter().all(|line| line.column_start == 0));
+        assert_eq!(projection.lines[0].carets, vec![(25, true)]);
+
+        // A line one column too wide for the caret after it scrolls one column, not to 3/4.
+        let view_at = |caret: usize| {
+            let (_, _, mut view, _) = editor(text);
+            view.selections = vec![Selection::caret(caret)];
+            view
+        };
+        let projection = project_viewport(text, &view_at(25), 3, 25);
+        assert_eq!(projection.lines[0].column_start, 1);
+        assert_eq!(projection.lines[0].text, "gents_auto_prime = false");
+
+        // In a long line the caret still keeps a quarter of the window ahead of it, until the
+        // line's end comes into view.
+        let long = format!("{}\n", "0123456789".repeat(10));
+        let (_, _, mut view, _) = editor(&long);
+        for (caret, start) in [(50, 20), (80, 50), (85, 55), (91, 61), (100, 61)] {
+            view.selections = vec![Selection::caret(caret)];
+            let projection = project_viewport(&long, &view, 1, 40);
+            assert_eq!(
+                projection.lines[0].column_start, start,
+                "caret at column {caret}"
+            );
+            let carets = &projection.lines[0].carets;
+            assert_eq!(
+                carets,
+                &vec![(caret - start, true)],
+                "caret at column {caret}"
+            );
+        }
     }
 
     #[test]

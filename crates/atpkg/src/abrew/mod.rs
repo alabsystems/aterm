@@ -448,7 +448,12 @@ fn native_args(
         | "config" | "developer" | "update" => (&[], 0, 0, false),
         "commands" => (&["--quiet", "--include-aliases"], 0, 0, false),
         "leaves" => (
-            &["--installed-on-request", "--installed-as-dependency"],
+            &[
+                "--installed-on-request",
+                "-r",
+                "--installed-as-dependency",
+                "-p",
+            ],
             0,
             0,
             false,
@@ -895,7 +900,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "on" => cmd_on(prefix),
         "off" => cmd_off(prefix),
         "status" => cmd_status(prefix),
-        "search" | "-S" => cmd_search(&api, rest),
+        "search" | "-S" => cmd_search(prefix, &api, rest),
         "info" => cmd_info(prefix, &api, args, rest),
         "desc" => cmd_desc(&api, rest),
         "home" | "homepage" => cmd_home(&api, rest),
@@ -938,7 +943,17 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
                 );
                 return ExitCode::from(1);
             }
-            each_name(rest, |n| prefix.pin(Formula::short_name(n)))
+            each_name(rest, |n| {
+                let short = Formula::short_name(n);
+                let token = api::canonical_cask_token(short);
+                if prefix.installed_one(prefix::Kind::Formula, short).is_some() {
+                    prefix.pin(short)
+                } else if prefix.installed_one(prefix::Kind::Cask, token).is_some() {
+                    prefix.pin_cask(token)
+                } else {
+                    prefix.pin(short)
+                }
+            })
         }
         "unpin" => cmd_unpin(prefix, &api, rest),
         "link" | "ln" => cmd_link(prefix, &api, args, rest, true),

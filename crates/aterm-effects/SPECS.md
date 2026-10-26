@@ -3,6 +3,28 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-26: `show-door` (§1) now says the bound that crosses after the writing's wrap (or back
+> across it under a held delete) flies at the animal's own pace, `BIG_HOP_SPEED_MAX` (half its
+> body a 60 Hz frame), on the big bound's own arc for its span (`PetBrain::brisk_shape`), and that
+> the cat the wrap left at the margin goes for it with no notice beat (the word a composer's word
+> wrap carries down with the caret, a step on along the new line, still belongs to the wrap; only
+> a change of row or a jump back ends it; a wrap the hand's own key made is the writing's with its
+> rhythm open or not, and a cat in the air for anything but the leap ahead of the wrap still makes
+> the brisk crossing once down); every other bound, the leap ahead of a coming wrap
+> among them (timed to land with it), is still paced at `quiet_speed_max`
+> (r21 K5-1: paced as a quiet crossing, each of Claude Code's composer word wraps took 1.06 to
+> 1.17 s, floating over the line as the writing ran 25 cells on). Two motion laws follow it: the
+> frame law (`lawful_tick`) holds every flight to its own pace (`PetBrain::flight_cap`), and
+> `every_new_line_reaction_is_lawful_and_brief` lets the crossing after a scrolled wrap move the
+> brisk bound's 2.3 cells a frame at 80 columns. The head law takes the nearest seat for a stand
+> among letters by a caret at rest, the hand away, under the box before the far margin, and goes
+> there at once from a cat that must travel anyway; an eviction off the letters while the stream
+> watch is still up, the caret already at rest after a program's jump, goes to that seat (r21
+> K5-2: the long insert's cat rose from the far margin and came down where it stood). The effects
+> suite's `a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles` reads the cat's
+> actions on the ground from the walk's first move (before it, the cat walks with the writing the
+> brisk wrap brought it down by).
+
 > 2026-10-25: `rewrap-carries-word`, `glow-park`, and `typed-columns-owned` (§1) gain five
 > rendered-pixel continuity tests in `tests/rainbow_pixel_continuity.rs` (§2): clean word-boundary
 > (`width == 0`) wraps and 4-sided box-bordered / guttered composer wraps relay immediately without
@@ -426,7 +448,7 @@ keep-ahead-lead	contract	PetBrain::{lead,rhythm_open,pace,station_now,station_dr
 chase-convergence-and-facing	contract	PetBrain::tick (follower, facing, drift-brake)	Under a parked caret the follower converges to station_safe without ringing; once the caret rests the step never crosses the station faster than RUN_SPEED and the drift-brake never arms from a chase; facing follows travel with FLIP_SPEED hysteresis and the first moving frame faces the gap; a sleeper turns only through travel; a held repeating jump still moves the pet; a skid once drawn stays on glass STILL_SECS from its brake before the arrival takes the cat.	0,1,2,3,5,7	8
 wall-side	contract	PetBrain::{update_wall,station_now,tick}; pending_wall_transit	wall_side flips to the caret's left when the led station overhangs and back only past WALL_RETURN_MARGIN; a flip with nothing in the air is crossed by one small arc; a flight that already crossed consumes the transit; at the wall the Startle faces the caret; a far caret behind earns the shoulder peek.	0,1,2,3	5
 flight-choreography	contract	PetBrain::{tick,flight_pose,coil_envelope,emit,spawn_dust}	Every caret flight is Crouch, Leap, Land; PetLaunch is the coil's last frame and never airborne; pounces and hops show rise, hero and descend, a short Enter is the tucked hop; the body leaves the floor and lands on the baseline; horizontal flight stretches width; volume changes at most 2% per tick (3% at the cut) and touchdown at most 0.12 in scale_y; the landing squash grows with span and the recovery lands on a contact frame; the screen-crossing show plays its whole sequence with dust; a flight asked for from a stand that ends a stride leaves no sooner than STAND_MIN into the stand (deferred_arc).	0,1,2,3,5,7	14
-show-door	contract	PetBrain::{on_move,leave_ground,predicted_tier,launch_big,begin_big_arc}; quiet_leap; pending_big_jump; bound2	The show plays iff a chosen move opened it (a large same-row jump, a standing gap of BIG_GAP_FRAC during a hold, or a joyful word jump), never for a line change, wrap, snap home or post-burst trip; a snap home is one quiet bound; tiers by span (hop/pounce up to POUNCE_SPAN_MAX, bound beyond, two bounds past TWO_BOUND_FRAC unless the touch point is inked); every bound is paced at quiet_speed_max.	0,1,2,3,7,10	11
+show-door	contract	PetBrain::{on_move,leave_ground,predicted_tier,launch_big,begin_big_arc}; quiet_leap; pending_big_jump; bound2	The show plays iff a chosen move opened it (a large same-row jump, a standing gap of BIG_GAP_FRAC during a hold, or a joyful word jump), never for a line change, wrap, snap home or post-burst trip; a snap home is one quiet bound; tiers by span (hop/pounce up to POUNCE_SPAN_MAX, bound beyond, two bounds past TWO_BOUND_FRAC unless the touch point is inked); every bound is paced at quiet_speed_max but the one that crosses after the writing's wrap (or back across it under a held delete): that one is paced at BIG_HOP_SPEED_MAX on the big bound's own arc for its span (PetBrain::brisk_shape) and goes with no notice beat; the leap ahead of a coming wrap keeps the quiet pace.	0,1,2,3,7,10	11
 new-line-law	contract	PetBrain::{tick,on_move,caret_delta,notices,at_rest}	Every new-line shape (Enters onto 1- and 3-row prompts at any column and width, from any state or behind a one-frame hide, margin and scrolled wraps, printed lines, wide or suggested prompts through the ink seam) reacts with one or two lawful flights, no Startle, at most one notice beat (only from rest), no gather, dust or run, paws down within the shape's bound, rows at most 8 per second, ending on the prompt row without leaving the glass.	0,1,2,3,5,7	14
 retreat-reactions	contract	PetBrain::{on_move,age_gesture_windows}	A retreat under STARTLE_COLS flinches (Perk with a duck), a bigger one or a run of them Startles facing the caret, once a run of deletes for STARTLE_HOLD (a held Backspace neither extends it nor fires it again, and the pet follows the caret back; a forward move or a line change ends the run's bottle), FROLIC_REVERSALS reversals Frolic, and a Startle consumed by an ink hop is never replayed.	0,1,2,3,7	5
 settle-ladder	contract	PetBrain::{tick,enter_settled}; loaf_after; groom_after; groom_skip; wake arm	After arrival: Stand until SIT_AFTER, then Sit or Purr, loaf at loaf_after(seed), groom (second wash skipped iff groom_skip), Sleep at SLEEP_AFTER plus a tick at any cadence down to 1 Hz with a breathing swell; the next key wakes through front then hind stretch inside WAKE_DUR with one ZeePop; each arrival deals a fresh seed; even seeds yawn into the loaf; the loaf peeks before sleep.	0,1,2,3,5,7	14

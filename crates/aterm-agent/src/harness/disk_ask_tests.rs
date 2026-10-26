@@ -2984,6 +2984,77 @@ fn a_line_owed_while_the_episode_is_held_past_its_floor_says_how_near_it_is() {
     assert!(text.chars().count() <= LINE_CAP, "{}", text.chars().count());
 }
 
+/// A session elected after another (a hand-off: the first pick's build, the largest, is still
+/// there) was elected for its own build, so its line names that build with its mark, whether or
+/// not another tab's is larger: next to the largest where the line has room for two holders, and
+/// alone where it has room for one. Before this the line named the two largest, and only the
+/// largest where it had room for one, so the second session asked was told of another tab's
+/// build and never of its own (`lab disk-ask --scenario unanswered` found it).
+#[test]
+fn the_asked_tabs_own_build_is_named_though_another_tabs_is_larger() {
+    let holders = [
+        hog("/Users//u/work/alpha/target", 3, Some("/Users//u/work/alpha")),
+        hog("/Users//u/work/beta/target", 2, Some("/Users//u/work/beta")),
+        hog("/Users//u/work/gamma/target", 1, Some("/Users//u/work/gamma")),
+    ];
+    let at = |mount: &str, own: Option<&str>| {
+        line(&Line {
+            mount: Path::new(mount),
+            total: 12 * GIB,
+            free: 46 * GIB / 10,
+            floor: 8 * GIB,
+            emergency: false,
+            done: Done::Spent,
+            holders: &holders,
+            checkout: own.map(Path::new),
+            shared: false,
+            home: Some(Path::new("/Users//u")),
+            projected: None,
+        })
+    };
+    // A volume mounted at a long path (the lab's image) leaves the line room for one holder.
+    let long = "/private/tmp/at.lab-501/lab-disk-ask-sce-0123abcd/runs/disk-ask-12345/scratch/home";
+    let beta = at(long, Some("/Users//u/work/beta"));
+    assert!(beta.chars().count() <= LINE_CAP, "{}", beta.chars().count());
+    assert!(
+        beta.contains(" Among the largest left: ~/work/beta's builds 2.0 GiB (this tab's). Free"),
+        "{beta}"
+    );
+    assert!(!beta.contains("alpha"), "{beta}");
+    // The largest is the asked tab's own: as before.
+    let alpha = at(long, Some("/Users//u/work/alpha"));
+    assert!(
+        alpha.contains(" Largest left: ~/work/alpha's builds 3.0 GiB (this tab's). Free"),
+        "{alpha}"
+    );
+    // No holder is the asked tab's: the largest.
+    let none = at(long, None);
+    assert!(
+        none.contains(" Largest left: ~/work/alpha's builds 3.0 GiB. Free"),
+        "{none}"
+    );
+    // Room for two: the largest, then the asked tab's own, the second largest or not.
+    let short = "/Volumes/v";
+    for (own, said) in [
+        (
+            "beta",
+            "Largest left: ~/work/alpha's builds 3.0 GiB; ~/work/beta's builds 2.0 GiB (this tab's).",
+        ),
+        (
+            "gamma",
+            "Among the largest left: ~/work/alpha's builds 3.0 GiB; ~/work/gamma's builds 1.0 GiB (this tab's).",
+        ),
+        (
+            "alpha",
+            "Largest left: ~/work/alpha's builds 3.0 GiB (this tab's); ~/work/beta's builds 2.0 GiB.",
+        ),
+    ] {
+        let text = at(short, Some(&format!("/Users//u/work/{own}")));
+        assert!(text.chars().count() <= LINE_CAP, "{}", text.chars().count());
+        assert!(text.contains(said), "{own}: {text}");
+    }
+}
+
 #[test]
 fn a_holder_path_with_any_character_beyond_the_plain_ones_is_not_said() {
     let holders = [hog(

@@ -6,9 +6,9 @@
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
-//! LOCAL PATCH (aterm): the Android, iOS, Orbital and Web arms and the `rwh_05` impls are cut. An
-//! item marked `#[cfg(windows_platform)]` is API no aterm crate calls (custom cursors, device-event
-//! filters, owned display handles, the control-flow getter), which no other backend implements.
+//! LOCAL PATCH (aterm): the Android, iOS, Orbital and Web arms and the `rwh_05` impls are cut, and
+//! so are custom cursors, device-event filters, owned display handles and the control-flow getter,
+//! which no aterm crate calls.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,10 +21,8 @@ use crate::error::{EventLoopError, OsError};
 use crate::event::Event;
 use crate::monitor::MonitorHandle;
 use crate::platform_impl;
-#[cfg(any(macos_platform, windows_platform))]
+#[cfg(macos_platform)]
 use crate::window::Theme;
-#[cfg(windows_platform)]
-use crate::window::{CustomCursor, CustomCursorSource};
 use crate::window::{Window, WindowAttributes};
 
 /// Provides a way to retrieve events from the system and from the windows that were registered to the events loop.
@@ -138,37 +136,10 @@ impl<T> EventLoop<T> {
         EventLoopProxy { event_loop_proxy: self.event_loop.create_proxy() }
     }
 
-    /// Gets a persistent reference to the underlying platform display.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn owned_display_handle(&self) -> OwnedDisplayHandle {
-        OwnedDisplayHandle { platform: self.event_loop.window_target().p.owned_display_handle() }
-    }
-
-    /// Change if or when [`DeviceEvent`]s are captured.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn listen_device_events(&self, allowed: DeviceEvents) {
-        let _span = tracing::debug_span!(
-            "aterm_window::EventLoop::listen_device_events",
-            allowed = ?allowed
-        )
-        .entered();
-
-        self.event_loop.window_target().p.listen_device_events(allowed);
-    }
-
     /// Sets the [`ControlFlow`].
     #[inline]
     pub fn set_control_flow(&self, control_flow: ControlFlow) {
         self.event_loop.window_target().p.set_control_flow(control_flow)
-    }
-
-    /// Create custom cursor.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn create_custom_cursor(&self, custom_cursor: CustomCursorSource) -> CustomCursor {
-        self.event_loop.window_target().p.create_custom_cursor(custom_cursor)
     }
 }
 
@@ -195,15 +166,6 @@ impl ActiveEventLoop {
         Ok(Window { window })
     }
 
-    /// Create custom cursor.
-    #[cfg(windows_platform)]
-    pub fn create_custom_cursor(&self, custom_cursor: CustomCursorSource) -> CustomCursor {
-        let _span =
-            tracing::debug_span!("aterm_window::ActiveEventLoop::create_custom_cursor",).entered();
-
-        self.p.create_custom_cursor(custom_cursor)
-    }
-
     /// Returns the list of all the monitors available on the system.
     #[inline]
     pub fn available_monitors(&self) -> impl Iterator<Item = MonitorHandle> {
@@ -223,20 +185,8 @@ impl ActiveEventLoop {
         self.p.primary_monitor().map(|inner| MonitorHandle { inner })
     }
 
-    /// Change if or when [`DeviceEvent`]s are captured.
-    #[cfg(windows_platform)]
-    pub fn listen_device_events(&self, allowed: DeviceEvents) {
-        let _span = tracing::debug_span!(
-            "aterm_window::ActiveEventLoop::listen_device_events",
-            allowed = ?allowed
-        )
-        .entered();
-
-        self.p.listen_device_events(allowed);
-    }
-
     /// Returns the current system theme.
-    #[cfg(any(macos_platform, windows_platform))]
+    #[cfg(macos_platform)]
     #[inline]
     pub fn system_theme(&self) -> Option<Theme> {
         self.p.system_theme()
@@ -246,13 +196,6 @@ impl ActiveEventLoop {
     #[inline]
     pub fn set_control_flow(&self, control_flow: ControlFlow) {
         self.p.set_control_flow(control_flow)
-    }
-
-    /// Gets the current [`ControlFlow`].
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn control_flow(&self) -> ControlFlow {
-        self.p.control_flow()
     }
 
     /// This exits the event loop.
@@ -289,13 +232,6 @@ impl ActiveEventLoop {
             true
         }
     }
-
-    /// Gets a persistent reference to the underlying platform display.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn owned_display_handle(&self) -> OwnedDisplayHandle {
-        OwnedDisplayHandle { platform: self.p.owned_display_handle() }
-    }
 }
 
 #[cfg(feature = "rwh_06")]
@@ -304,35 +240,6 @@ impl rwh_06::HasDisplayHandle for ActiveEventLoop {
         let raw = self.p.raw_display_handle_rwh_06()?;
         // SAFETY: The display will never be deallocated while the event loop is alive.
         Ok(unsafe { rwh_06::DisplayHandle::borrow_raw(raw) })
-    }
-}
-
-/// A proxy for the underlying display handle.
-#[cfg(windows_platform)]
-#[derive(Clone)]
-pub struct OwnedDisplayHandle {
-    #[cfg_attr(not(feature = "rwh_06"), allow(dead_code))]
-    platform: platform_impl::OwnedDisplayHandle,
-}
-
-#[cfg(windows_platform)]
-impl fmt::Debug for OwnedDisplayHandle {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedDisplayHandle").finish_non_exhaustive()
-    }
-}
-
-#[cfg(all(feature = "rwh_06", windows_platform))]
-impl rwh_06::HasDisplayHandle for OwnedDisplayHandle {
-    #[inline]
-    fn display_handle(&self) -> Result<rwh_06::DisplayHandle<'_>, rwh_06::HandleError> {
-        let raw = self.platform.raw_display_handle_rwh_06()?;
-
-        // SAFETY: The underlying display handle should be safe.
-        let handle = unsafe { rwh_06::DisplayHandle::borrow_raw(raw) };
-
-        Ok(handle)
     }
 }
 
@@ -391,19 +298,6 @@ impl<T> fmt::Display for EventLoopClosed<T> {
 }
 
 impl<T: fmt::Debug> error::Error for EventLoopClosed<T> {}
-
-/// Control when device events are captured.
-#[cfg(windows_platform)]
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub enum DeviceEvents {
-    /// Report device events regardless of window focus.
-    Always,
-    /// Only capture device events while the window is focused.
-    #[default]
-    WhenFocused,
-    /// Never capture device events.
-    Never,
-}
 
 /// Shim for various run APIs.
 #[inline(always)]

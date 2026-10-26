@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
-use aterm_uds::spawnfd::Stdio;
+use aterm_uds::spawnfd::{Stdio, Tether as _};
 
 /// The most bytes of a child's stdout, and of its stderr, a read keeps.
 pub(crate) const OUTPUT_CAP: u64 = 8 << 20;
@@ -115,7 +115,10 @@ impl Drop for RunningChild {
     }
 }
 
-/// Run `program args` with stdin null and stdout/stderr captured, requesting a kill at `cap`.
+/// Run `program args` with stdin null and stdout/stderr captured, requesting a kill at `cap`. A
+/// capped read is tethered: a window that ends, killed outright included, takes it along. An
+/// uncut command (no `cap`, such as a bus install) is not: it ends by itself and must not be cut
+/// off halfway.
 pub(crate) fn run_bounded(
     program: &Path,
     args: &[String],
@@ -137,11 +140,16 @@ fn run_with_readers(
 ) -> Result<Ran, String> {
     let stdout = reader("stdout", &mut start)?;
     let stderr = reader("stderr", &mut start)?;
-    let child = aterm_uds::spawnfd::command(program)
+    let mut command = aterm_uds::spawnfd::command(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if cap.is_some() {
+        command.tether();
+    }
+    let child = command
         .spawn()
         .map_err(|e| format!("{} did not start: {e}", program.display()))?;
     let mut owned = RunningChild {

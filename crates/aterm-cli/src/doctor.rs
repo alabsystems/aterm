@@ -44,8 +44,24 @@ pub fn names(token: &str) -> bool {
 }
 
 /// `aterm doctor`'s grammar after its name.
-pub const GRAMMAR: &str =
-    "[--read-only] [--json] [--only <id,...>] | (--check | --apply | --restore) [--json]";
+pub const GRAMMAR: &str = "[--read-only] [--json] [--verbose] [--only <id,...>] | (--check \
+                           [--verbose] | --apply | --restore) [--json]";
+
+/// One line per way to run `aterm doctor`, as `aterm doctor --help` and `aterm help doctor`
+/// print them under the grammar.
+pub const HELP_ROWS: &str = concat!(
+    "  aterm doctor               check, repair what aterm lays, print only what needs you\n",
+    "  aterm doctor --verbose     every row, the ok ones too\n",
+    "  aterm doctor --read-only   the same checks, changing nothing (--json: the report as JSON)\n",
+    "  aterm doctor --only <id,…> only those items, families or layers\n",
+    "  aterm doctor --check       only the macOS settings profile (--apply, --restore change it)\n",
+);
+
+/// `aterm doctor --help`: the grammar and [`HELP_ROWS`].
+#[must_use]
+pub fn help() -> String {
+    format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
+}
 
 const ROWS: [(&str, &str, &str, &str); 12] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
@@ -125,6 +141,10 @@ pub struct Args {
     pub read_only: bool,
     /// `--json`: the rows in the one report schema, or a settings action's fleet document.
     pub json: bool,
+    /// `--verbose`: every row, the ok and not-applicable ones too, and the readiness counts;
+    /// without it the report is one verdict line and the rows that need the person. With
+    /// `--check`, every settings row, the ones in place too.
+    pub verbose: bool,
     /// `--only <id,...>`: the items, families or layers to run ([`aterm_converge::select`]).
     pub only: Vec<String>,
     /// `--check`, `--apply` or `--restore`: the fleet settings profile alone, none of the items.
@@ -179,6 +199,10 @@ pub fn args(rest: &[String]) -> Result<Args, String> {
                 parsed.json = true;
                 continue;
             }
+            "--verbose" if !parsed.verbose => {
+                parsed.verbose = true;
+                continue;
+            }
             "--only" if !only_given => match rest.next() {
                 Some(value) => value.as_str(),
                 None => return Err(refuse("--only needs a list of items".to_owned())),
@@ -205,6 +229,12 @@ pub fn args(rest: &[String]) -> Result<Args, String> {
             "--only narrows the items, not a settings action".to_owned(),
         ));
     }
+    if parsed.verbose && matches!(parsed.settings, Some(Settings::Apply | Settings::Restore)) {
+        return Err(refuse(
+            "--verbose widens a health run's report or --check's, not --apply or --restore"
+                .to_owned(),
+        ));
+    }
     Ok(parsed)
 }
 
@@ -222,9 +252,9 @@ fn needs_person(
         .flatten()
 }
 
-/// A settings action's report and exit ([`Settings`]).
+/// A settings action's report and exit ([`Settings`]); `verbose` lists every row of the text.
 #[must_use]
-pub fn settings(action: Settings, json: bool) -> (String, u8) {
+pub fn settings(action: Settings, json: bool, verbose: bool) -> (String, u8) {
     #[cfg(target_os = "macos")]
     {
         use super::macos_doctor::{self, Action};
@@ -240,7 +270,12 @@ pub fn settings(action: Settings, json: bool) -> (String, u8) {
             Ok(report) => {
                 let code = u8::from(report.needs_attention());
                 if !json {
-                    return (report.to_text(), code);
+                    let text = if verbose {
+                        report.to_text_verbose()
+                    } else {
+                        report.to_text()
+                    };
+                    return (text, code);
                 }
                 match aterm_json::from_str::<aterm_json::Value>(&report.to_json()) {
                     Ok(settings) => {
@@ -261,7 +296,7 @@ pub fn settings(action: Settings, json: bool) -> (String, u8) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = action;
+        let _ = (action, verbose);
         settings_refused(json, "the fleet settings profile requires macOS")
     }
 }
@@ -295,6 +330,8 @@ pub struct Gathered {
     lines: Vec<DoctorRow>,
     copies: Option<Copies>,
     hand_over: Option<atpkg::devtools::Facts>,
+    /// Spotlight indexes `rust-docs` pages ([`Self::rust_docs_indexed`]).
+    rust_docs: bool,
 }
 
 /// The Developer Tools hand-over a fix-mode gather left due ([`gather`]): aterm is not granted
@@ -310,6 +347,7 @@ impl Gathered {
             lines,
             copies: None,
             hand_over: None,
+            rust_docs: false,
         }
     }
 
@@ -333,7 +371,24 @@ impl Gathered {
                 .collect(),
             copies: None,
             hand_over: None,
+            rust_docs: false,
         }
+    }
+
+    /// These facts with Spotlight found indexing `rust-docs` pages, as a composing crate's tests
+    /// give them.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn with_rust_docs_indexed(mut self) -> Self {
+        self.rust_docs = true;
+        self
+    }
+
+    /// Whether the gather found Spotlight indexing `rust-docs` pages: bare `aterm doctor` then
+    /// sets them aside. `false` when the `spotlight:` row was not read.
+    #[must_use]
+    pub const fn rust_docs_indexed(&self) -> bool {
+        self.rust_docs
     }
 
     /// The Developer Tools hand-over due after the report, when the gather left one.
@@ -400,16 +455,18 @@ pub fn gather(fix: bool, only: &[String]) -> Gathered {
     std::thread::scope(|scope| {
         let copies = (cfg!(target_os = "macos") && reads("copies:"))
             .then(|| scope.spawn(|| atpkg::copies::prune(true)));
-        let (lines, hand_over) = super::doctor_facts_rows(fix, &reads);
+        let read = super::doctor_facts_rows(fix, &reads);
         Gathered {
-            lines,
+            lines: read.rows,
+            rust_docs: read.rust_docs,
             copies: copies.map(|look| {
                 let look = look
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 Copies::new(atpkg::copies::prune, Some(look))
+                    .pruning_after(atpkg::copies::prune_after)
             }),
-            hand_over,
+            hand_over: read.hand_over,
         }
     })
 }
@@ -440,19 +497,24 @@ pub fn render_readiness(
         shell.fact.push_str(super::SHELL_REMEDY);
     }
     let mut text = super::render_doctor_rows(&lines);
-    let scope = if readiness.scope.is_empty() {
-        "all doctor checks".to_owned()
+    if readiness.all_green {
+        text.push_str("readiness: ALL GREEN\n");
     } else {
-        format!("{} (plus shell usability)", readiness.scope.join(", "))
-    };
-    text.push_str(&format!(
-        "readiness: {} — {} satisfied, {} not applicable, {} pending activation, {} unresolved\nscope: {scope}\n",
-        if readiness.all_green { "ALL GREEN" } else { "NOT READY" },
-        readiness.satisfied,
-        readiness.not_applicable,
-        readiness.pending_activation.len(),
-        readiness.unresolved.len(),
-    ));
+        text.push_str(&format!(
+            "readiness: NOT READY — {} satisfied, {} not applicable, {} pending activation, {} \
+             unresolved\n",
+            readiness.satisfied,
+            readiness.not_applicable,
+            readiness.pending_activation.len(),
+            readiness.unresolved.len(),
+        ));
+    }
+    if !readiness.scope.is_empty() {
+        text.push_str(&format!(
+            "scope: {} (plus shell usability)\n",
+            readiness.scope.join(", ")
+        ));
+    }
     if !readiness.pending_activation.is_empty() {
         text.push_str(&format!(
             "pending activation (login/restart): {}\n",
@@ -464,6 +526,256 @@ pub fn render_readiness(
             "unresolved: {}\n",
             readiness.unresolved.join(", ")
         ));
+    }
+    text
+}
+
+/// How long one row of bare `aterm doctor` may be, its label included.
+pub const ROW_CHARS: usize = 160;
+
+/// The label column: the longest label, `exceptions:`, and a space.
+const LABEL_COLUMN: usize = "exceptions: ".len();
+
+/// What a row bare `aterm doctor` shows is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Only the person changes it, or the check failed.
+    NeedsYou,
+    /// The shell aterm starts does not run: aterm cannot open a tab.
+    Fails,
+    /// The check could not read its state.
+    Unread,
+    /// This run changed it.
+    Changed,
+    /// A fact to see that asks nothing now (the open exceptions), or a repair that waits for
+    /// another pass to finish (counted as waiting when it is unresolved).
+    Note,
+}
+
+impl Kind {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "warn",
+            Self::Fails => "FAIL",
+            Self::Unread => "unread",
+            Self::Changed => "done",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// One row bare `aterm doctor` shows: its check's id, label and kind, and one line of at most
+/// [`ROW_CHARS`] that names one fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    /// The row's id (`base.pkg.path`); a change has its item's.
+    pub id: String,
+    /// The left column, such as `devtools:`.
+    pub label: &'static str,
+    /// What the row is.
+    pub kind: Kind,
+    /// The whole printed line.
+    pub line: String,
+}
+
+impl Shown {
+    /// `text`'s first line under `label`, shortened to one row ([`shorten`]).
+    #[must_use]
+    pub fn new(id: impl Into<String>, label: &'static str, kind: Kind, text: &str) -> Self {
+        let lead = format!("{label:<LABEL_COLUMN$}{:<6} ", kind.word());
+        let room = ROW_CHARS.saturating_sub(lead.chars().count());
+        Self {
+            id: id.into(),
+            label,
+            kind,
+            line: format!("{lead}{}", shorten(text, room)),
+        }
+    }
+}
+
+/// Where the one fix in a row's sentence starts: its `fix:` or `run:`, or the `(aterm help …)`
+/// that names where it is told.
+fn fix_at(text: &str) -> Option<usize> {
+    ["fix: ", "run: ", "(aterm help "]
+        .into_iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+}
+
+/// `text`'s first line in at most `room` characters: whole when it fits, else its first clause
+/// and its one fix ([`fix_at`]) with what lies between left out, each cut with `…` when even
+/// that is too long.
+#[must_use]
+pub fn shorten(text: &str, room: usize) -> String {
+    let cut = |text: &str, room: usize| -> String {
+        if text.chars().count() <= room {
+            return text.to_owned();
+        }
+        let mut short: String = text.chars().take(room.saturating_sub(1)).collect();
+        short.push('\u{2026}');
+        short
+    };
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= room {
+        return line.to_owned();
+    }
+    let Some(at) = fix_at(line) else {
+        return cut(line, room);
+    };
+    let fix = line[at..].trim_end_matches([')', '.', ';']).trim();
+    let fix = if fix.starts_with('(') {
+        fix.trim_start_matches('(')
+    } else {
+        fix
+    };
+    let fix = fix
+        .split(" \u{2014} ")
+        .next()
+        .unwrap_or(fix)
+        .split("; ")
+        .next()
+        .unwrap_or(fix);
+    let head = line[..at].trim_end_matches([' ', '(', '\u{2014}', ';', ',', ':']);
+    let clause = head
+        .split(" \u{2014} ")
+        .next()
+        .unwrap_or(head)
+        .split("; ")
+        .next()
+        .unwrap_or(head)
+        .trim();
+    let joint = " \u{2014} ";
+    let fix = cut(fix, room.saturating_sub(joint.len() + 20).max(20));
+    let left = room.saturating_sub(fix.chars().count() + joint.chars().count());
+    if clause.is_empty() || left < 10 {
+        return cut(&fix, room);
+    }
+    format!("{}{joint}{fix}", cut(clause, left))
+}
+
+/// The verdict line bare `aterm doctor` opens with: `healthy` alone, or how many rows need the
+/// person, how many could not be read, how many wait for another pass and which changes wait
+/// for a login or restart, then how many checks are fine; a single change rides on the line,
+/// more stand as rows of their own.
+#[must_use]
+pub fn verdict(readiness: &Readiness, shown: &[Shown], change: Option<&str>) -> String {
+    let ok = readiness.satisfied + readiness.not_applicable;
+    let count = |kind: Kind| shown.iter().filter(|row| row.kind == kind).count();
+    let needs = count(Kind::NeedsYou) + count(Kind::Fails);
+    let unread = count(Kind::Unread);
+    let waiting = shown
+        .iter()
+        .filter(|row| row.kind == Kind::Note && readiness.unresolved.contains(&row.id))
+        .count();
+    let pending = readiness.pending_activation.len();
+    let checks = format!("{ok} check{} ok", if ok == 1 { "" } else { "s" });
+    let mut line = if readiness.all_green {
+        "aterm doctor: healthy".to_owned()
+    } else {
+        let mut parts = Vec::new();
+        if needs > 0 {
+            parts.push(format!(
+                "{needs} need{} you",
+                if needs == 1 { "s" } else { "" }
+            ));
+        }
+        if unread > 0 {
+            parts.push(format!("{unread} not measured"));
+        }
+        if waiting > 0 {
+            parts.push(format!("{waiting} waiting for another pass"));
+        }
+        if pending > 0 {
+            parts.push(format!(
+                "{pending} change{} take{} effect at your next login or restart ({})",
+                if pending == 1 { "" } else { "s" },
+                if pending == 1 { "s" } else { "" },
+                readiness.pending_activation.join(", ")
+            ));
+        }
+        if parts.is_empty() {
+            parts.push(format!("{} unresolved", readiness.unresolved.len()));
+        }
+        format!("aterm doctor: {} \u{2014} {checks}", parts.join(", "))
+    };
+    if let Some(change) = change {
+        let room = ROW_CHARS.saturating_sub(line.chars().count() + 2);
+        line.push_str("; ");
+        line.push_str(&shorten(change, room.max(20)));
+    }
+    line
+}
+
+/// Bare `aterm doctor`'s report: the [`verdict`], the scope when `--only` narrowed it, then one
+/// row per check that needs the person or could not be read, the open exceptions, and each
+/// change when there is more than one.
+/// `more` holds the rows of the repairs, the develop layer and the packages; `changes` what the
+/// repairs changed. The facts' rows are this function's own.
+#[must_use]
+pub fn render_brief(
+    gathered: &Gathered,
+    rows: &[ItemReport],
+    more: &[Shown],
+    readiness: &Readiness,
+    changes: &[String],
+) -> String {
+    let mut shown: Vec<Shown> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    for line in report_lines(gathered, rows, &[]) {
+        let id = if line.label == "copies:" {
+            COPIES
+        } else {
+            named(line.label).map_or("", |(id, ..)| id)
+        };
+        let outcome = rows.iter().find(|row| row.id == id).map(|row| row.outcome);
+        if outcome == Some(Outcome::Changed) {
+            changed.push(line.fact.lines().next().unwrap_or_default().to_owned());
+            continue;
+        }
+        let kind = if !readiness.unresolved.iter().any(|u| u == id) {
+            if line.label == "exceptions:" && line.mark == Mark::Note && !line.unmeasured {
+                Kind::Note
+            } else {
+                continue;
+            }
+        } else if line.unmeasured || outcome == Some(Outcome::Unknown) {
+            Kind::Unread
+        } else if line.mark == Mark::Fail {
+            Kind::Fails
+        } else {
+            Kind::NeedsYou
+        };
+        let text = if kind == Kind::Fails {
+            format!(
+                "{} \u{2014} fix: {}",
+                line.fact.lines().next().unwrap_or_default(),
+                super::SHELL_REMEDY
+            )
+        } else {
+            line.fact.clone()
+        };
+        shown.push(Shown::new(id, line.label, kind, &text));
+    }
+    shown.extend(more.iter().cloned());
+    changed.extend(changes.iter().cloned());
+    let inline = (changed.len() == 1).then(|| changed[0].as_str());
+    let mut text = verdict(readiness, &shown, inline);
+    text.push('\n');
+    if !readiness.scope.is_empty() {
+        text.push_str(&format!(
+            "scope: {} (plus shell usability)\n",
+            readiness.scope.join(", ")
+        ));
+    }
+    for row in &shown {
+        text.push_str(&row.line);
+        text.push('\n');
+    }
+    if changed.len() > 1 {
+        for change in &changed {
+            text.push_str(&Shown::new("", "changed:", Kind::Changed, change).line);
+            text.push('\n');
+        }
     }
     text
 }
@@ -655,6 +967,10 @@ impl Item for Fact<'_> {
 
 struct Copies {
     prune: fn(bool) -> atpkg::copies::Pruned,
+    /// The prune that follows the probe's look, moving what it found with only the census the
+    /// moves are checked against ([`atpkg::copies::prune_after`]); without one the apply prunes
+    /// from a census of its own.
+    after: Option<fn(&atpkg::copies::Pruned) -> atpkg::copies::Pruned>,
     /// The look [`gather`] took beside the other facts, which the first probe takes instead of
     /// looking again.
     early: Mutex<Option<atpkg::copies::Pruned>>,
@@ -666,10 +982,17 @@ impl Copies {
     fn new(prune: fn(bool) -> atpkg::copies::Pruned, early: Option<atpkg::copies::Pruned>) -> Self {
         Self {
             prune,
+            after: None,
             early: Mutex::new(early),
             looked: Mutex::new(None),
             did: Mutex::new(None),
         }
+    }
+
+    /// Prune with `after` once a look was taken ([`Copies::after`]).
+    fn pruning_after(mut self, after: fn(&atpkg::copies::Pruned) -> atpkg::copies::Pruned) -> Self {
+        self.after = Some(after);
+        self
     }
 
     fn shown(&self) -> atpkg::copies::Pruned {
@@ -745,7 +1068,16 @@ impl Item for CopiesItem<'_> {
     }
 
     fn apply(&self) -> Result<(), String> {
-        let pruned = (self.0.prune)(false);
+        let looked = self
+            .0
+            .looked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let pruned = match (self.0.after, looked) {
+            (Some(after), Some(look)) => after(&look),
+            _ => (self.0.prune)(false),
+        };
         let said = atpkg::copies::row(&pruned);
         *self
             .0
@@ -815,9 +1147,18 @@ mod tests {
             Ok(Args {
                 read_only: true,
                 json: true,
+                verbose: false,
                 only: strings(&["pkg", "base.shell.rc"]),
                 settings: None,
             })
+        );
+        assert_eq!(
+            args(&strings(&["--verbose", "--read-only"])).map(|a| (a.verbose, a.read_only)),
+            Ok((true, true))
+        );
+        assert_eq!(
+            args(&strings(&["--check", "--verbose"])).map(|a| (a.settings, a.verbose)),
+            Ok((Some(Settings::Check), true))
         );
         for (flag, action) in [
             ("--check", Settings::Check),
@@ -849,6 +1190,10 @@ mod tests {
             &["--read-only", "--read-only"],
             &["--check", "--only", "pkg"],
             &["--only=pkg", "--restore"],
+            &["--verbose", "--verbose"],
+            &["--apply", "--verbose"],
+            &["--restore", "--verbose"],
+            &["--check", "--verbose", "--verbose"],
         ] {
             let refusal = args(&strings(refused)).unwrap_err();
             assert!(
@@ -905,6 +1250,7 @@ mod tests {
             lines: Vec::new(),
             copies: Some(Copies::new(prune, None)),
             hand_over: None,
+            rust_docs: false,
         };
         let items = gathered.items();
         let planned = aterm_converge::run_scoped(
@@ -938,6 +1284,220 @@ mod tests {
         assert!(line.contains("aterm 2.app"), "{report}");
     }
 
+    /// A HEALTHY RUN IS ONE LINE: the verdict, with no counts; a run that changed one thing says
+    /// it on that line. NEGATIVE CONTROL: one warning adds its one row, at most [`ROW_CHARS`]
+    /// long, with its fix, and the verdict counts it and the checks that passed.
+    #[test]
+    fn a_healthy_report_is_one_line_and_a_warning_adds_its_row() {
+        let healthy = Gathered::of_facts(&[
+            ("shell:", Mark::Ok, "/bin/zsh (executable)"),
+            ("privacy:", Mark::Ok, "Full Disk Access granted"),
+            ("fabric:", Mark::Note, "off: no [fabric] command"),
+            ("exceptions:", Mark::Ok, "none open"),
+        ]);
+        let rows = healthy.plan();
+        let readiness = Readiness::of(&rows, &[]);
+        let text = render_brief(&healthy, &rows, &[], &readiness, &[]);
+        assert_eq!(text, "aterm doctor: healthy\n");
+        let one_change = render_brief(
+            &healthy,
+            &rows,
+            &[],
+            &readiness,
+            &["moved 1 stale copy of aterm to the Trash".to_owned()],
+        );
+        assert_eq!(
+            one_change,
+            "aterm doctor: healthy; moved 1 stale copy of aterm to the Trash\n"
+        );
+        assert!(one_change.lines().count() <= 2);
+
+        let devtools = format!(
+            "aterm is switched off on Privacy & Security \u{25b8} Developer Tools \u{2014} macOS \
+             holds every new program it starts for a first-run check (syspolicyd), one at a \
+             time, so builds and tests wait and timing tests flake{} \u{2014} fix: switch on \
+             aterm's row under Developer Tools (`aterm doctor` opens the pane for you, or `open \
+             x-apple.systempreferences:...`; macOS asks for your password)",
+            "; and more".repeat(20)
+        );
+        let warned = Gathered::of_facts(&[
+            ("shell:", Mark::Ok, "/bin/zsh (executable)"),
+            ("devtools:", Mark::Warn, &devtools),
+            ("exceptions:", Mark::Ok, "none open"),
+        ]);
+        let rows = warned.plan();
+        let readiness = Readiness::of(&rows, &[]);
+        let text = render_brief(&warned, &rows, &[], &readiness, &[]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[0], "aterm doctor: 1 needs you \u{2014} 2 checks ok");
+        assert!(
+            lines[1].starts_with("devtools:   warn   aterm is switched off"),
+            "{text}"
+        );
+        assert!(lines[1].contains("fix: switch on aterm's row"), "{text}");
+        assert!(
+            lines[1].chars().count() <= ROW_CHARS,
+            "{}",
+            lines[1].chars().count()
+        );
+        assert!(devtools.chars().count() > ROW_CHARS);
+    }
+
+    /// The open exceptions show in the brief report by title, and an unread check is named as
+    /// such and counted apart.
+    #[test]
+    fn open_exceptions_and_unread_checks_show_in_the_brief_report() {
+        let gathered = Gathered::of_facts(&[
+            ("shell:", Mark::Ok, "/bin/zsh (executable)"),
+            (
+                "exceptions:",
+                Mark::Note,
+                "2 open: disk low; update held (aterm exceptions)",
+            ),
+        ]);
+        let rows = gathered.plan();
+        let readiness = Readiness::of(&rows, &[]);
+        let text = render_brief(&gathered, &rows, &[], &readiness, &[]);
+        assert!(text.starts_with("aterm doctor: healthy"), "{text}");
+        assert!(
+            text.lines().any(|l| l
+                == "exceptions: note   2 open: disk low; update held (aterm exceptions)"),
+            "{text}"
+        );
+        let unread = Shown::new(
+            "base.pkg.disk",
+            "packages:",
+            Kind::Unread,
+            "could not query free space",
+        );
+        let readiness = Readiness {
+            all_green: false,
+            unresolved: vec!["base.pkg.disk".to_owned()],
+            ..readiness
+        };
+        let text = render_brief(&gathered, &rows, &[unread], &readiness, &[]);
+        assert!(
+            text.starts_with("aterm doctor: 1 not measured \u{2014} "),
+            "{text}"
+        );
+        assert!(
+            text.contains("packages:   unread could not query free space"),
+            "{text}"
+        );
+    }
+
+    /// A row too long for one line keeps its first clause and its one fix. NEGATIVE CONTROL: a
+    /// line that fits is left whole, and one with no fix is cut.
+    #[test]
+    fn a_long_row_keeps_its_first_clause_and_its_fix() {
+        let long = format!(
+            "managed bin/ is not on PATH here{} \u{2014} fix: open a new aterm tab",
+            ", because of a reason".repeat(10)
+        );
+        let short = shorten(&long, 80);
+        assert_eq!(
+            short,
+            "managed bin/ is not on PATH here, because of a reas\u{2026} \u{2014} fix: open a new \
+             aterm tab"
+        );
+        assert!(short.chars().count() <= 80, "{short}");
+        assert_eq!(shorten("fits", 80), "fits");
+        let plain = "x".repeat(100);
+        assert_eq!(shorten(&plain, 10).chars().count(), 10);
+        let help = format!(
+            "no full disk access for the responsible app (Terminal){} (aterm help permissions)",
+            "; and so on".repeat(12)
+        );
+        let short = shorten(&help, 100);
+        assert!(short.ends_with("aterm help permissions"), "{short}");
+        assert!(
+            short.starts_with("no full disk access for the responsible app"),
+            "{short}"
+        );
+        assert_eq!(shorten("one\ntwo", 80), "one", "the first line alone");
+    }
+
+    /// THE APPLY MOVES WHAT THE PROBE'S LOOK FOUND: with a prune-after, the apply hands it the
+    /// look and never prunes from a census of its own. NEGATIVE CONTROL: without one, the apply
+    /// prunes afresh.
+    #[test]
+    fn the_apply_prunes_from_the_look_the_probe_took() {
+        use atpkg::copies::Pruned;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        static OWN: AtomicUsize = AtomicUsize::new(0);
+        static AFTER: AtomicUsize = AtomicUsize::new(0);
+        static MOVED: AtomicBool = AtomicBool::new(false);
+        fn copy() -> PathBuf {
+            PathBuf::from("/Applications/aterm 3.app")
+        }
+        fn prune(dry_run: bool) -> Pruned {
+            if dry_run {
+                return Pruned::Found {
+                    offered: if MOVED.load(SeqCst) {
+                        Vec::new()
+                    } else {
+                        vec![copy()]
+                    },
+                    kept: Vec::new(),
+                    complete: true,
+                };
+            }
+            OWN.fetch_add(1, SeqCst);
+            MOVED.store(true, SeqCst);
+            Pruned::Done {
+                moved: vec![(copy(), aterm_containment::consent::Retired::Moved)],
+                kept: Vec::new(),
+            }
+        }
+        fn after(look: &Pruned) -> Pruned {
+            AFTER.fetch_add(1, SeqCst);
+            MOVED.store(true, SeqCst);
+            let Pruned::Found { offered, kept, .. } = look else {
+                panic!("the probe's look: {look:?}");
+            };
+            assert_eq!(offered, &[copy()]);
+            Pruned::Done {
+                moved: offered
+                    .iter()
+                    .map(|path| (path.clone(), aterm_containment::consent::Retired::Moved))
+                    .collect(),
+                kept: kept.clone(),
+            }
+        }
+        let apply = |copies: Copies| {
+            MOVED.store(false, SeqCst);
+            let gathered = Gathered {
+                lines: Vec::new(),
+                copies: Some(copies),
+                hand_over: None,
+                rust_docs: false,
+            };
+            let rows = aterm_converge::run_scoped(
+                &gathered.items(),
+                aterm_converge::Mode::Apply,
+                aterm_converge::Scope::REPAIR,
+                &mut aterm_converge::NoJournal,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        };
+        apply(Copies::new(prune, None).pruning_after(after));
+        assert_eq!(
+            (AFTER.load(SeqCst), OWN.load(SeqCst)),
+            (1, 0),
+            "pruned from the look"
+        );
+        apply(Copies::new(prune, None));
+        assert_eq!(
+            (AFTER.load(SeqCst), OWN.load(SeqCst)),
+            (1, 1),
+            "no prune-after: afresh"
+        );
+    }
+
     #[test]
     fn an_incomplete_or_refused_copy_census_is_unknown_even_when_it_found_no_copies() {
         use atpkg::copies::Pruned;
@@ -967,6 +1527,7 @@ mod tests {
                 lines: Vec::new(),
                 copies: Some(Copies::new(probe, None)),
                 hand_over: None,
+                rust_docs: false,
             };
             let rows = gathered.plan();
             assert_eq!(rows[0].outcome, expected);
@@ -994,6 +1555,7 @@ mod tests {
             lines: Vec::new(),
             copies: Some(Copies::new(look, Some(early))),
             hand_over: None,
+            rust_docs: false,
         };
         assert_eq!(gathered.plan()[0].outcome, Outcome::Ok, "the early look");
         assert_eq!(LOOKS.load(std::sync::atomic::Ordering::SeqCst), 0);

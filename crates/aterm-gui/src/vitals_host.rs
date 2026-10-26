@@ -22,8 +22,10 @@ use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
     LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
-    Sample, Snapshot, TabRoot, TabTokens, Thermal, Throttle, Ticks, VolumeSample, WeekFact,
+    Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens, Thermal,
+    Throttle, Ticks, VolumeSample, WeekFact,
 };
+use aterm_vitals::ring::{GapKind, SavedRing, TimeGap};
 use aterm_vitals::sys::Machine;
 use aterm_vitals::{Peaks, PlanDay};
 
@@ -46,6 +48,12 @@ const PEAKS_MAX_BYTES: u64 = 16 * 1024;
 /// point of up to 1024 bytes is under [`PEAKS_MAX_BYTES`].
 const FREE_FILE: &str = "vitals-free.json";
 const FREE_SCHEMA: u32 = 1;
+/// The 1-hour multi-scale strip rings, gaps and event markers, checkpointed every 10 s bucket and
+/// on clean stop so restarts and crashes retain pre-crash history.
+const STRIP_EVERY: Duration = Duration::from_secs(10);
+const STRIP_FILE: &str = "vitals-strip.json";
+const STRIP_SCHEMA: u32 = 1;
+const STRIP_MAX_BYTES: u64 = 512 * 1024;
 /// How long the quit waits for the probe thread to end and write the peaks and the free history.
 pub(crate) const STOP_BOUND: Duration = Duration::from_millis(500);
 
@@ -310,6 +318,10 @@ pub(crate) struct Request {
     pub(crate) plan: Option<PlanFact>,
     /// Every account the panes' footers read, each once.
     pub(crate) weeks: Vec<WeekRow>,
+    /// Discontinuity gaps queued on the host to record on the next reading.
+    pub(crate) note_gaps: Vec<aterm_vitals::TimeGap>,
+    /// Strip events (crash, restart, sleep/wake, spike) queued on the host.
+    pub(crate) note_events: Vec<aterm_vitals::StripEvent>,
 }
 
 /// One account a pane's footer read, and its weekly figure where the footer shows one.
@@ -626,6 +638,9 @@ pub(crate) struct VitalsHost {
     /// The wall clock of the snapshot held before it, unix ms: whether the held one opened a new
     /// second of a Folded strip, which then slides (`crate::stats_live::opened_slot`).
     pub(crate) landed_prev_at_ms: Option<i64>,
+    /// The snapshot held immediately before [`Self::snapshot`], for smooth value interpolation
+    /// across readings (`crate::stats_deck`).
+    pub(crate) prev_snapshot: Option<Arc<Snapshot>>,
     /// The bars' cadence when it landed (`None` with no window showing them): a reading speaks
     /// for [`crate::stats_live::STALE_PERIODS`] of the slower of this and the cadence now.
     pub(crate) landed_period: Option<Duration>,
@@ -649,6 +664,8 @@ pub(crate) struct VitalsHost {
     job_revs: std::collections::HashMap<u64, u64>,
     delegated_active: bool,
     chips_shown: bool,
+    pending_gaps: Vec<aterm_vitals::TimeGap>,
+    pending_events: Vec<aterm_vitals::StripEvent>,
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
@@ -671,6 +688,7 @@ impl Default for VitalsHost {
             full_adopted_at: None,
             landed_at: None,
             landed_prev_at_ms: None,
+            prev_snapshot: None,
             landed_period: None,
             next_due: None,
             asked_at: None,
@@ -687,6 +705,8 @@ impl Default for VitalsHost {
             job_revs: std::collections::HashMap::new(),
             delegated_active: false,
             chips_shown: false,
+            pending_gaps: Vec::new(),
+            pending_events: Vec::new(),
             survey: Arc::default(),
             board: &crate::vitals_jobs::BOARD,
             proc_edge: if cfg!(test) {
@@ -750,6 +770,7 @@ impl VitalsHost {
                 }
                 self.landed_at = Some(now);
                 self.landed_prev_at_ms = self.snapshot.as_ref().map(|held| held.at_unix_ms);
+                self.prev_snapshot = self.snapshot.clone();
                 self.read_began = began;
                 self.snapshot = Some(snap);
                 true
@@ -904,14 +925,39 @@ impl VitalsHost {
         }
     }
 
+    /// Queues a discontinuity gap (such as a previous run's crash gap) for the next reading.
+    pub(crate) fn note_time_gap(&mut self, gap: aterm_vitals::TimeGap) {
+        self.pending_gaps.push(gap);
+    }
+
+    /// Queues a special time-series event marker (crash, restart, sleep/wake, spike) for the next
+    /// reading.
+    pub(crate) fn note_strip_event(&mut self, event: aterm_vitals::StripEvent) {
+        self.pending_events.push(event);
+    }
+
     fn offer(&mut self, msg: Msg) -> bool {
         let Some(tx) = self.tx.as_ref() else {
+            if let Msg::Read(r) = msg {
+                self.pending_gaps.extend(r.note_gaps);
+                self.pending_events.extend(r.note_events);
+            }
             return false;
         };
         match tx.try_send(msg) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(msg)) => {
+                if let Msg::Read(r) = msg {
+                    self.pending_gaps.extend(r.note_gaps);
+                    self.pending_events.extend(r.note_events);
+                }
+                false
+            }
+            Err(TrySendError::Disconnected(msg)) => {
+                if let Msg::Read(r) = msg {
+                    self.pending_gaps.extend(r.note_gaps);
+                    self.pending_events.extend(r.note_events);
+                }
                 self.tx = None;
                 false
             }
@@ -963,13 +1009,23 @@ struct Asked {
 impl Asked {
     fn take(&mut self, msg: Msg, req: &mut Request) {
         match msg {
-            Msg::Read(r) => {
+            Msg::Read(mut r) => {
+                let mut gaps = std::mem::take(&mut req.note_gaps);
+                let mut events = std::mem::take(&mut req.note_events);
+                gaps.append(&mut r.note_gaps);
+                events.append(&mut r.note_events);
                 *req = *r;
+                req.note_gaps = gaps;
+                req.note_events = events;
                 self.facts = true;
                 self.read = true;
             }
-            Msg::Facts(r) => {
+            Msg::Facts(mut r) => {
                 let (cadence_ms, machine_only) = (req.cadence_ms, req.machine_only);
+                let gaps = std::mem::take(&mut req.note_gaps);
+                let events = std::mem::take(&mut req.note_events);
+                r.note_gaps = gaps;
+                r.note_events = events;
                 *req = *r;
                 req.cadence_ms = cadence_ms;
                 req.machine_only = machine_only;
@@ -1000,10 +1056,15 @@ fn run(
         shared
     });
     let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
-    let (mut peaks, restored) = PeakFile::open(peaks, Instant::now());
+    let strip = peaks.as_deref().map(|p| p.with_file_name(STRIP_FILE));
+    let open_at = Instant::now();
+    let open_ms = unix_ms_now();
+    let (mut peaks, restored) = PeakFile::open(peaks, open_at);
     source.model().restore_peaks(restored);
-    let (mut free, kept) = FreeFile::open(free, Instant::now(), unix_ms_now());
+    let (mut free, kept) = FreeFile::open(free, open_at, open_ms);
     source.model().restore_free_history(kept);
+    let (mut strip, kept_strip) = StripFile::open(strip, open_at);
+    source.model().restore_strip_history(kept_strip, open_ms);
     let no_machine = Machine::default();
     let mut req = Request::default();
     let mut last_whole: Option<Instant> = None;
@@ -1030,6 +1091,8 @@ fn run(
         } else {
             source.reading(&req)
         };
+        req.note_gaps.clear();
+        req.note_events.clear();
         let snap = Arc::new(snap);
         if !snap.machine_only {
             last_whole = Some(Instant::now());
@@ -1042,11 +1105,15 @@ fn run(
         if (asked.read || jobs_moved) && !post() {
             break;
         }
-        peaks.keep(source.model().peaks(), Instant::now(), false);
-        free.keep(source.model().free_history(), Instant::now(), false);
+        let kept_at = Instant::now();
+        peaks.keep(source.model().peaks(), kept_at, false);
+        free.keep(source.model().free_history(), kept_at, false);
+        strip.keep(&source.model().saved_strip(false), kept_at, false);
     }
-    peaks.keep(source.model().peaks(), Instant::now(), true);
-    free.keep(source.model().free_history(), Instant::now(), true);
+    let stop_at = Instant::now();
+    peaks.keep(source.model().peaks(), stop_at, true);
+    free.keep(source.model().free_history(), stop_at, true);
+    strip.keep(&source.model().saved_strip(true), stop_at, true);
 }
 
 /// A worker's pull: a whole reading, or a cold one's pair [`COLD_PAIR`] apart, with the thread's
@@ -1288,6 +1355,35 @@ impl CoalProbe {
         version: |_| None,
         timeline: || None,
         waketime_ms: || None,
+    };
+}
+
+/// The network lane's passive kernel readers (`KERNEL` in production, `INERT` for deterministic
+/// unit tests).
+#[derive(Clone, Copy)]
+pub(crate) struct NetProbe {
+    /// Interface state and RX/TX counters ([`aterm_sysprobe::net_links_into`]).
+    pub(crate) links: fn(&mut Vec<u8>) -> Option<Vec<aterm_sysprobe::LinkReading>>,
+    /// TCP socket states and passive smoothed RTT ([`aterm_sysprobe::tcp_summary_into`]).
+    pub(crate) tcp: fn(&mut Vec<u8>) -> Option<aterm_sysprobe::TcpSummary>,
+    /// Open `AF_INET`/`AF_INET6` sockets of one process ([`aterm_sysprobe::open_socket_count`]).
+    pub(crate) open_sockets: fn(u32) -> Option<u32>,
+}
+
+impl NetProbe {
+    /// The kernel's passive local readers.
+    pub(crate) const KERNEL: Self = Self {
+        links: aterm_sysprobe::net_links_into,
+        tcp: aterm_sysprobe::tcp_summary_into,
+        open_sockets: aterm_sysprobe::open_socket_count,
+    };
+
+    /// The inert arm for deterministic offline tests.
+    #[cfg(test)]
+    pub(crate) const INERT: Self = Self {
+        links: |_| None,
+        tcp: |_| None,
+        open_sockets: |_| None,
     };
 }
 
@@ -1694,8 +1790,12 @@ impl WhyFixture {
             machine_only: live.machine_only,
             load1: live.load1,
             load: live.load,
+            cpu_brand: live.cpu_brand.clone(),
             swapped_kib: live.swapped_kib,
             links: live.links.clone(),
+            tcp_srtt_ms: live.tcp_srtt_ms,
+            aterm_sockets: live.aterm_sockets,
+            tab_sockets: live.tab_sockets.clone(),
             proc_limits: live.proc_limits,
             pid_counts: live.pid_counts,
             disk: live.disk.clone(),
@@ -1703,6 +1803,8 @@ impl WhyFixture {
             plan: live.plan.clone(),
             weeks: live.weeks.clone(),
             local_day: live.local_day,
+            note_events: live.note_events.clone(),
+            note_gaps: live.note_gaps.clone(),
             ..scene
         }
     }
@@ -1744,6 +1846,8 @@ pub(crate) struct Reader {
     slots: aterm_sysprobe::slots::SlotReader,
     /// The split set's lane and what it keeps between split ticks.
     pub(crate) split: SplitReader,
+    /// The network lane's passive kernel readers.
+    pub(crate) net: NetProbe,
     /// The GPU client lane.
     pub(crate) gpu: crate::vitals_gpu::GpuLane,
     fixture: Option<WhyFixture>,
@@ -1891,6 +1995,7 @@ impl Reader {
             },
             counter_throttle: None,
             split,
+            net: NetProbe::KERNEL,
             gpu: crate::vitals_gpu::GpuLane::host(),
             fixture: None,
             machine: Machine {
@@ -1984,6 +2089,12 @@ impl Reader {
             .unwrap_or_default();
         sample.procs = observed.procs;
         sample.delegated = observed.delegated;
+        if let Some(procs) = sample.procs.as_deref() {
+            let (aterm_sockets, tab_sockets) =
+                read_sockets(procs, req.self_pid, &req.tabs, self.net.open_sockets);
+            sample.aterm_sockets = aterm_sockets;
+            sample.tab_sockets = tab_sockets;
+        }
         sample.gpu_clients = self.gpu.read(req, now).map(|(rows, entries, complete)| {
             aterm_vitals::GpuClientsSample {
                 at_ns: u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -1999,6 +2110,9 @@ impl Reader {
             // pull from whichever whole reading is fresh, so one read without
             // births would leave its ages unread on macOS.
             self.split.births(&mut sample, now);
+            if req.deck {
+                sample.timeline = self.split.timeline();
+            }
         }
         let scene = self.fixture.as_mut().map(|fixture| {
             if split {
@@ -2035,13 +2149,17 @@ impl Reader {
                 .map(|_| snap.delegated.clone()),
         );
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
-        snap.jobs = jobs_step(
+        let events_before = snap.strip_events.len();
+        snap.set_jobs(jobs_step(
             &mut self.jobs,
             &reads,
             sweep.as_ref().map(|s| s.procs.as_slice()),
             req,
             thrashing,
-        );
+        ));
+        for ev in snap.strip_events[events_before..].iter().cloned() {
+            self.vitals.record_strip_event(ev);
+        }
         self.watch_jobs(&mut snap);
         snap
     }
@@ -2056,7 +2174,8 @@ impl Reader {
             .map(|fixture| fixture.reading(&sample, false));
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         self.set_occupancy_facts(&mut snap);
-        snap.jobs = self.jobs.tick(
+        let events_before = snap.strip_events.len();
+        snap.set_jobs(self.jobs.tick(
             sample.at_ns / 1_000_000,
             || sample.at_ns / 1_000_000,
             None,
@@ -2066,7 +2185,10 @@ impl Reader {
             req.self_pid,
             false,
             false,
-        );
+        ));
+        for ev in snap.strip_events[events_before..].iter().cloned() {
+            self.vitals.record_strip_event(ev);
+        }
         self.watch_jobs(&mut snap);
         snap
     }
@@ -2077,6 +2199,9 @@ impl Reader {
         let shelf = &crate::disk_board::SHELF;
         let (volume, key) = home_volume(&self.home, shelf.watched());
         let load = aterm_sysprobe::load_average();
+        let links = (self.net.links)(&mut self.scratch)
+            .map(|links| links.iter().map(link_sample).collect());
+        let tcp_sum = (self.net.tcp)(&mut self.scratch);
         Sample {
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
@@ -2108,11 +2233,14 @@ impl Reader {
             machine_only: req.machine_only,
             load1: load.map(|l| l[0]),
             load,
+            cpu_brand: self.machine.cpu.clone(),
             thermal: (self.thermal)().or_else(|| self.counter_throttle()),
             swapped_kib: aterm_sysprobe::swapped_kib(),
-            links: aterm_sysprobe::net_links_into(&mut self.scratch)
-                .map(|links| links.iter().map(link_sample).collect()),
-            tcp: aterm_sysprobe::tcp_counts_into(&mut self.scratch).map(tcp_counts),
+            links,
+            tcp: tcp_sum.map(|s| tcp_counts(s.counts)),
+            tcp_srtt_ms: tcp_sum.and_then(|s| s.srtt_ms),
+            aterm_sockets: None,
+            tab_sockets: Vec::new(),
             proc_limits: proc_limits(aterm_sysprobe::process_limits()),
             pid_counts: aterm_sysprobe::pid_counts(self.uid.unwrap_or(0)),
             self_uid: self.uid,
@@ -2139,6 +2267,8 @@ impl Reader {
             leads: Vec::new(),
             timeline: None,
             coal_lane: self.split.lane,
+            note_events: req.note_events.clone(),
+            note_gaps: req.note_gaps.clone(),
         }
     }
 }
@@ -2147,6 +2277,40 @@ fn mono_ms_of(at: Instant, epoch: Instant) -> i64 {
     match at.checked_duration_since(epoch) {
         Some(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
         None => i64::try_from(epoch.duration_since(at).as_millis()).map_or(i64::MIN, |ms| -ms),
+    }
+}
+
+/// Counts open `AF_INET`/`AF_INET6` sockets across processes attributed to `self_pid` and `tabs`.
+fn read_sockets(
+    procs: &[ProcSample],
+    self_pid: u32,
+    tabs: &[TabRoot],
+    open_sockets: fn(u32) -> Option<u32>,
+) -> (Option<u32>, Vec<(u64, u32)>) {
+    let membership = aterm_vitals::model::attribute(procs, self_pid, tabs);
+    let mut aterm_total = 0u32;
+    let mut any_read = false;
+    let mut per_tab: Vec<(u64, u32)> = tabs.iter().map(|t| (t.key, 0u32)).collect();
+    for (p, m) in procs.iter().zip(membership) {
+        if !m.aterm && m.tab.is_none() {
+            continue;
+        }
+        if let Some(n) = open_sockets(p.pid) {
+            any_read = true;
+            if m.aterm {
+                aterm_total = aterm_total.saturating_add(n);
+            }
+            if let Some(ti) = m.tab
+                && let Some(slot) = per_tab.get_mut(ti)
+            {
+                slot.1 = slot.1.saturating_add(n);
+            }
+        }
+    }
+    if any_read {
+        (Some(aterm_total), per_tab)
+    } else {
+        (None, Vec::new())
     }
 }
 
@@ -2160,6 +2324,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         child_cpu_ns: p.child_cpu_ns,
         footprint: p.footprint,
         name: p.name.clone(),
+        disk_read: p.disk_read,
         disk_written: p.disk_written,
         uid: p.uid,
         pgid: p.pgid,
@@ -2515,11 +2680,12 @@ const fn window_word(window: Bucket) -> &'static str {
 }
 
 /// A reading the probe thread keeps in a small JSON file: read at the thread's start, then written
-/// atomically when it changed, at most once every [`PEAKS_EVERY`] and again at the thread's stop.
+/// atomically when it changed, at most once every `every` and again at the thread's stop.
 struct KeptFile<T> {
     path: Option<PathBuf>,
     held: T,
     at: Instant,
+    every: Duration,
     /// What the warning of a failed write calls it.
     what: &'static str,
     json: fn(&T) -> Option<String>,
@@ -2529,26 +2695,31 @@ struct KeptFile<T> {
 type PeakFile = KeptFile<Peaks>;
 /// [`FREE_FILE`].
 type FreeFile = KeptFile<FreeHistory>;
+/// [`STRIP_FILE`].
+type StripFile = KeptFile<SavedStrip>;
 
 impl<T: Clone + Default + PartialEq> KeptFile<T> {
     /// The file and what `of` reads from its text; `T::default()` when it is missing, over
-    /// [`PEAKS_MAX_BYTES`] or refused by `of`.
+    /// `max_bytes` or refused by `of`.
     fn read(
         path: Option<PathBuf>,
         now: Instant,
+        every: Duration,
+        max_bytes: u64,
         what: &'static str,
         json: fn(&T) -> Option<String>,
         of: impl FnOnce(&str) -> Option<T>,
     ) -> (Self, T) {
         let held = path
             .as_deref()
-            .and_then(read_small)
+            .and_then(|p| read_bounded(p, max_bytes))
             .and_then(|text| of(&text))
             .unwrap_or_default();
         let file = Self {
             path,
             held: held.clone(),
             at: now,
+            every,
             what,
             json,
         };
@@ -2556,8 +2727,7 @@ impl<T: Clone + Default + PartialEq> KeptFile<T> {
     }
 
     fn keep(&mut self, value: &T, now: Instant, stopping: bool) {
-        if (!stopping && now.saturating_duration_since(self.at) < PEAKS_EVERY)
-            || *value == self.held
+        if (!stopping && now.saturating_duration_since(self.at) < self.every) || *value == self.held
         {
             return;
         }
@@ -2578,7 +2748,15 @@ impl<T: Clone + Default + PartialEq> KeptFile<T> {
 
 impl KeptFile<Peaks> {
     fn open(path: Option<PathBuf>, now: Instant) -> (Self, Peaks) {
-        Self::read(path, now, "the peaks", peaks_json, peaks_of)
+        Self::read(
+            path,
+            now,
+            PEAKS_EVERY,
+            PEAKS_MAX_BYTES,
+            "the peaks",
+            peaks_json,
+            peaks_of,
+        )
     }
 }
 
@@ -2586,20 +2764,43 @@ impl KeptFile<FreeHistory> {
     /// The file's history of the 24 hours ending at `now_unix_ms`; empty when it is missing,
     /// damaged or of another schema.
     fn open(path: Option<PathBuf>, now: Instant, now_unix_ms: i64) -> (Self, FreeHistory) {
-        Self::read(path, now, "the disk's free history", free_json, |text| {
-            free_of(text, now_unix_ms)
-        })
+        Self::read(
+            path,
+            now,
+            PEAKS_EVERY,
+            PEAKS_MAX_BYTES,
+            "the disk's free history",
+            free_json,
+            |text| free_of(text, now_unix_ms),
+        )
     }
 }
 
-fn read_small(path: &Path) -> Option<String> {
+impl KeptFile<SavedStrip> {
+    /// Open [`STRIP_FILE`], arming `at` one [`STRIP_EVERY`] in the past so the first live sample
+    /// immediately checkpoints `clean_stop = false` to disk.
+    fn open(path: Option<PathBuf>, now: Instant) -> (Self, SavedStrip) {
+        let armed = now.checked_sub(STRIP_EVERY).unwrap_or(now);
+        Self::read(
+            path,
+            armed,
+            STRIP_EVERY,
+            STRIP_MAX_BYTES,
+            "the 1-hour strip history",
+            strip_json,
+            strip_of,
+        )
+    }
+}
+
+fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
     let mut text = String::new();
     std::fs::File::open(path)
         .ok()?
-        .take(PEAKS_MAX_BYTES + 1)
+        .take(max_bytes + 1)
         .read_to_string(&mut text)
         .ok()?;
-    (text.len() as u64 <= PEAKS_MAX_BYTES).then_some(text)
+    (text.len() as u64 <= max_bytes).then_some(text)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2740,6 +2941,174 @@ fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
     })
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RingDoc {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    buckets: Vec<(i64, f64, u16, f64, u16)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recent: Vec<(i64, f64, bool)>,
+}
+
+impl RingDoc {
+    fn from_saved(r: &SavedRing) -> Self {
+        Self {
+            buckets: r.buckets.clone(),
+            recent: r.recent.clone(),
+        }
+    }
+
+    fn into_saved(self) -> SavedRing {
+        SavedRing {
+            buckets: self.buckets,
+            recent: self.recent,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StripDoc {
+    schema: u32,
+    last_wall_ms: i64,
+    clean_stop: bool,
+    caps: Vec<Option<f64>>,
+    rings: Vec<RingDoc>,
+    #[serde(default)]
+    net_tx: RingDoc,
+    #[serde(default)]
+    yours: RingDoc,
+    #[serde(default)]
+    pressure: RingDoc,
+    #[serde(default)]
+    aterm: Vec<RingDoc>,
+    #[serde(default)]
+    gaps: Vec<(i64, i64, String)>,
+    #[serde(default)]
+    events: Vec<(i64, String, String)>,
+}
+
+fn gap_kind_word(kind: GapKind) -> &'static str {
+    match kind {
+        GapKind::Paused => "paused",
+        GapKind::Sleep => "sleep",
+        GapKind::Crash => "crash",
+    }
+}
+
+fn gap_kind_of(word: &str) -> Option<GapKind> {
+    match word {
+        "paused" => Some(GapKind::Paused),
+        "sleep" => Some(GapKind::Sleep),
+        "crash" => Some(GapKind::Crash),
+        _ => None,
+    }
+}
+
+fn strip_event_kind_word(kind: StripEventKind) -> &'static str {
+    match kind {
+        StripEventKind::SleepWake => "sleep_wake",
+        StripEventKind::PressureSpike => "pressure_spike",
+        StripEventKind::Restart => "restart",
+        StripEventKind::Crash => "crash",
+    }
+}
+
+fn strip_event_kind_of(word: &str) -> Option<StripEventKind> {
+    match word {
+        "sleep_wake" => Some(StripEventKind::SleepWake),
+        "pressure_spike" => Some(StripEventKind::PressureSpike),
+        "restart" => Some(StripEventKind::Restart),
+        "crash" => Some(StripEventKind::Crash),
+        _ => None,
+    }
+}
+
+fn strip_json(strip: &SavedStrip) -> Option<String> {
+    if strip.last_wall_ms <= 0 {
+        return None;
+    }
+    let doc = StripDoc {
+        schema: STRIP_SCHEMA,
+        last_wall_ms: strip.last_wall_ms,
+        clean_stop: strip.clean_stop,
+        caps: strip.caps.to_vec(),
+        rings: strip.rings.iter().map(RingDoc::from_saved).collect(),
+        net_tx: RingDoc::from_saved(&strip.net_tx),
+        yours: RingDoc::from_saved(&strip.yours),
+        pressure: RingDoc::from_saved(&strip.pressure),
+        aterm: strip.aterm.iter().map(RingDoc::from_saved).collect(),
+        gaps: strip
+            .time_gaps
+            .iter()
+            .map(|g| (g.start_ms, g.end_ms, gap_kind_word(g.kind).to_owned()))
+            .collect(),
+        events: strip
+            .strip_events
+            .iter()
+            .map(|e| {
+                (
+                    e.at_unix_ms,
+                    strip_event_kind_word(e.kind).to_owned(),
+                    e.label.clone(),
+                )
+            })
+            .collect(),
+    };
+    aterm_json::to_string(&doc).ok()
+}
+
+fn strip_of(text: &str) -> Option<SavedStrip> {
+    let doc: StripDoc = aterm_json::from_str(text).ok()?;
+    if doc.schema != STRIP_SCHEMA || doc.last_wall_ms <= 0 {
+        return None;
+    }
+    let mut caps = [None; 7];
+    for (dst, src) in caps.iter_mut().zip(doc.caps) {
+        *dst = src.filter(|x| x.is_finite() && *x > 0.0);
+    }
+    let mut rings: [SavedRing; 7] = std::array::from_fn(|_| SavedRing::default());
+    for (dst, src) in rings.iter_mut().zip(doc.rings) {
+        *dst = src.into_saved();
+    }
+    let mut aterm: [SavedRing; 7] = std::array::from_fn(|_| SavedRing::default());
+    for (dst, src) in aterm.iter_mut().zip(doc.aterm) {
+        *dst = src.into_saved();
+    }
+    let time_gaps = doc
+        .gaps
+        .into_iter()
+        .filter_map(|(start_ms, end_ms, kind)| {
+            (end_ms > start_ms).then_some(TimeGap {
+                start_ms,
+                end_ms,
+                kind: gap_kind_of(&kind)?,
+            })
+        })
+        .collect();
+    let strip_events = doc
+        .events
+        .into_iter()
+        .filter_map(|(at_unix_ms, kind, label)| {
+            Some(StripEvent {
+                at_unix_ms,
+                kind: strip_event_kind_of(&kind)?,
+                label,
+            })
+        })
+        .collect();
+    Some(SavedStrip {
+        last_wall_ms: doc.last_wall_ms,
+        clean_stop: doc.clean_stop,
+        caps,
+        rings,
+        net_tx: doc.net_tx.into_saved(),
+        yours: doc.yours.into_saved(),
+        pressure: doc.pressure.into_saved(),
+        aterm,
+        time_gaps,
+        strip_events,
+    })
+}
+
 impl crate::App {
     pub(crate) fn vitals_audience(&self) -> Audience {
         if self.proxy.is_none() && self.vitals.tx.is_none() {
@@ -2839,6 +3208,8 @@ impl crate::App {
     ) -> bool {
         let mut req = self.vitals_request(period, machine_only);
         req.jobs_now = jobs_now;
+        req.note_gaps = std::mem::take(&mut self.vitals.pending_gaps);
+        req.note_events = std::mem::take(&mut self.vitals.pending_events);
         let layout = self.layout_fingerprint();
         self.vitals.layout_looked = Some(now);
         let sent = self.vitals.offer(Msg::Read(Box::new(req)));
@@ -3434,6 +3805,8 @@ impl crate::App {
             tokens: each_session_once(tokens),
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
             weeks: each_account_once(weeks),
+            note_gaps: Vec::new(),
+            note_events: Vec::new(),
         }
     }
 

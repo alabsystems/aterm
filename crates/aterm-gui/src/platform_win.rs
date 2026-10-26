@@ -9,7 +9,6 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
 use aterm_window::event_loop::EventLoopProxy;
-use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use aterm_window::window::Window;
 use core::ffi::c_void;
 
@@ -215,12 +214,12 @@ fn validate_window_capture_transfer(
     Ok(())
 }
 
-/// Extracts the raw Win32 `HWND` (`isize`) from a winit [`Window`], if realized.
+/// The Win32 `HWND` (`isize`) of a winit [`Window`], if realized; `None` off its event loop's
+/// thread.
 pub(crate) fn hwnd_of(window: &Window) -> Option<isize> {
-    let handle = window.window_handle().ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
-        _ => None,
+    use aterm_types::native_window::{HasNativeWindow, NativeWindow};
+    match window.native_window()? {
+        NativeWindow::Win32 { hwnd, .. } => Some(hwnd.as_ptr().addr().cast_signed()),
     }
 }
 

@@ -2983,11 +2983,7 @@ pub(crate) mod placement {
 
     /// `(maximized, normal-rect top-left in screen physical px)` for `window`.
     pub(crate) fn read(window: &aterm_window::window::Window) -> Option<(bool, (i32, i32))> {
-        use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let hwnd = match window.window_handle().ok()?.as_raw() {
-            RawWindowHandle::Win32(h) => h.hwnd.get(),
-            _ => return None,
-        };
+        let hwnd = crate::platform_win::hwnd_of(window)?;
         // SAFETY: out-params are stack locals of the documented layouts, `length`
         // pre-set as `GetWindowPlacement` requires; no pointer outlives the call.
         unsafe {

@@ -480,7 +480,6 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
     w.wait_ready();
     let (s_a, s_b) = w.two_sessions();
     subscribe(&w, &s_a, "r23.mark");
-    subscribe(&w, &s_a, "r23.deep");
     let backlog: Vec<harness::Record> = (0..=PAGE)
         .map(|i| {
             let node = format!("n-b{:02}", i / 64);
@@ -508,6 +507,10 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
             .then_some(())
     });
 
+    // At the head, past the backlog and before anything is owed: this opt-in spends no page,
+    // and s_a takes none of the backlog. Held from before it, s_a took all 257 records, one
+    // delivery each, which a loaded machine stretched past the minute's wait above.
+    subscribe(&w, &s_a, "r23.deep");
     subscribe(&w, &s_b, &format!("r23.deep since=@{first}"));
     let posted = w.verb(&format!("@{s_a} post to=say:r23.deep kind=note r23live"));
     assert!(posted.ok(), "{}", posted.header());

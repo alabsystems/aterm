@@ -38,6 +38,18 @@ impl InheritNothing for Command {
     }
 }
 
+/// The Unix death tie, a no-op off Unix.
+pub trait Tether {
+    /// No-op off Unix.
+    fn tether(&mut self) -> &mut Self;
+}
+
+impl Tether for Command {
+    fn tether(&mut self) -> &mut Self {
+        self
+    }
+}
+
 /// Build `Command::new(program)` configured with quiet Windows console flags.
 #[must_use]
 pub fn command(program: impl AsRef<OsStr>) -> Command {

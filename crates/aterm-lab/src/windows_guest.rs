@@ -80,8 +80,9 @@ pub const JA_CAPABILITY: &str = "Language.Basic~~~ja-JP~0.0.1.0";
 /// How long that capability's install may take.
 pub const CAPABILITY_WITHIN_SECS: u64 = 3600;
 
-/// The runner's input languages, in order.
-pub const LANGUAGES: [&str; 2] = ["en-US", "ja-JP"];
+/// The runner's input languages, in order: Win+Space goes through them in this order. German
+/// (Germany)'s keyboard is the window smoke's dead keys and AltGr; it needs no capability.
+pub const LANGUAGES: [&str; 3] = ["en-US", "ja-JP", "de-DE"];
 
 /// Visual Studio 2022's Build Tools bootstrapper.
 pub const VS_BOOTSTRAPPER: &str = "https://aka.ms/vs/17/release/vs_BuildTools.exe";
@@ -722,7 +723,7 @@ pub fn languages_step() -> Step {
         first = ps_quote(first),
     );
     Step {
-        label: "the runner's input languages (English, Japanese)",
+        label: "the runner's input languages (English, Japanese, German)",
         script,
         runner: true,
         reboot: false,

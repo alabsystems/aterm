@@ -2906,7 +2906,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
                 source,
                 range,
                 ConfigDiagnosticSeverity::Error,
-                format!("TOML syntax: {}", one_line(&error.to_string())),
+                format!("TOML syntax: {}", parser_message(&error)),
             );
             return analysis;
         }
@@ -2930,7 +2930,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
                 source,
                 range,
                 ConfigDiagnosticSeverity::Error,
-                format!("aterm schema: {}", one_line(&error.to_string())),
+                format!("aterm schema: {}", parser_message(&error)),
             );
             return analysis;
         }
@@ -5668,7 +5668,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's program name (`detail=`: the wrapper's own name when the wrapper's flags are not known, and for a listed tool one known subcommand word; a secret typed at a prompt and run is kept as that name too) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's other arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `aterm ctl @<sid> log` and `aterm ctl @<sid> brief` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
-            " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network, tokens and processes, plus the cores: each row's last 10 minutes as a heat strip (cold to hot, 0 to 100% of that resource's max, a hollow cell where nothing was read), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity and the amount with its unit; Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
+            " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip (up to 15 min Folded, 1 h Full, cold to hot, 0 to 100% of that resource's max, a glowing live now cell at the right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity and the amount with its unit; Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
         }
         "sys.stats_deck_size" => {
             " · default auto: the Deck stays Folded, two blocks of four rows in 62 pt, however tall the window · full: always Full, a header line and a row per resource in about 100 pt, which takes whole terminal rows · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows · View ▸ Deck Size picks one · read live"
@@ -6223,6 +6223,15 @@ fn floor_char_boundary(value: &str, mut byte: usize) -> usize {
 
 fn one_line(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What the parser says went wrong, on one line, without the place it prints before it: the
+/// diagnostic carries its own line and column, and the editor's row is the source line. The
+/// parser's whole text repeats both ("TOML parse error at line 2, column 5 | 2 | curs | ^
+/// expected `=` after a key"), which more than doubled the status and wrapped it to every row
+/// the footer had, taking the file's rows at a large text size.
+fn parser_message(error: &aterm_toml::Error) -> String {
+    one_line(error.message_text())
 }
 
 #[cfg(test)]

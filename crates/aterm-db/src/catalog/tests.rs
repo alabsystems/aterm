@@ -528,6 +528,82 @@ fn catalog_writers_are_independent_when_another_writer_is_demoted() {
     db.open_application(&sb, "third", "data", 1).unwrap();
 }
 
+#[test]
+fn withdrawn_catalog_declarations_keep_only_retained_slots_and_preserve_exclusions_and_conflicts() {
+    let p = Pair::new();
+    let a = p.lab.bootstrap(0);
+    let b = p.lab.bootstrap(1);
+    let sa = Session::open(&a).unwrap();
+    let sb = Session::open(&b).unwrap();
+    let da = p.directory(0);
+    let db = p.directory(1);
+    let kept = da
+        .open_application(&sa, "accounts", "activations", 1)
+        .unwrap();
+    let late = Descriptor::application(a.trust(), "unretained", "data", 1).unwrap();
+    let conflict = Descriptor::application(a.trust(), "accounts", "activations", 2).unwrap();
+    let mut source = da.catalog(&sa).unwrap();
+    let mut target = db.catalog(&sb).unwrap();
+    for id in source.inventory(&sa).unwrap() {
+        target
+            .ingest(&sb, source.wire(&sa, id).unwrap().unwrap())
+            .unwrap();
+    }
+    drop(target);
+    assert!(
+        db.subscriptions(&sb, &Policy::default())
+            .unwrap()
+            .contains_key(&kept.digest())
+    );
+    // Both declarations were validly signed before withdrawal, but neither
+    // has been projected or enrolled on this peer yet.
+    let late_receipt = source.commit_catalog(&sa, &late.encode().unwrap()).unwrap();
+    let conflict_receipt = source
+        .commit_catalog(&sa, &conflict.encode().unwrap())
+        .unwrap();
+    let late_wire = source
+        .wire(&sa, &late_receipt.id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let conflict_wire = source
+        .wire(&sa, &conflict_receipt.id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    drop(source);
+    drop(sa);
+    drop(sb);
+    p.lab.rotate(&[Role::Reader, Role::Writer]);
+    let b = p.lab.bootstrap(1);
+    let sb = Session::open(&b).unwrap();
+    let mut target = db.catalog(&sb).unwrap();
+    target.ingest(&sb, &late_wire).unwrap();
+    drop(target);
+    let snapshot = db.snapshot(&sb).unwrap();
+    assert_eq!(snapshot.entries[&kept.digest()].state, State::Subscribed);
+    assert!(!snapshot.entries.contains_key(&late.scope.digest()));
+    assert!(!db.path(late.scope).unwrap().exists());
+    let excluded = Policy {
+        enabled: true,
+        excluded: BTreeSet::from([kept.digest()]),
+    };
+    assert!(
+        !db.subscriptions(&sb, &excluded)
+            .unwrap()
+            .contains_key(&kept.digest())
+    );
+    assert!(!db.permits(&sb, &excluded, kept.digest()).unwrap());
+    let mut target = db.catalog(&sb).unwrap();
+    target.ingest(&sb, &conflict_wire).unwrap();
+    drop(target);
+    assert_eq!(
+        db.snapshot(&sb).unwrap().entries[&kept.digest()].state,
+        State::Conflict
+    );
+    assert!(!db.permits(&sb, &Policy::default(), kept.digest()).unwrap());
+}
+
 fn subscription_transition(
     state: &aterm_spec::interp::State,
     action: &str,

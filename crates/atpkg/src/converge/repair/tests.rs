@@ -41,6 +41,7 @@ impl Scratch {
             rustup_home: Some(self.home.join(".rustup")),
             login_rc: None,
             pass,
+            reads: Default::default(),
         })
     }
 
@@ -69,11 +70,16 @@ fn item(ground: &Arc<Ground>, id: &str) -> Box<dyn aterm_converge::Item> {
         .unwrap_or_else(|| panic!("no repair item {id}"))
 }
 
+/// A fresh look, as a new pass takes: what an earlier probe on `ground` read is forgotten, since
+/// a test changes the store between looks ([`super::Reads`]).
 fn probe(ground: &Arc<Ground>, id: &str) -> Probe {
+    ground.reads.forget();
     item(ground, id).probe()
 }
 
+/// A fresh pass over `ids` ([`probe`]).
 fn run(ground: &Arc<Ground>, ids: &[&str], mode: Mode) -> Vec<ItemReport> {
+    ground.reads.forget();
     let items: Vec<Box<dyn aterm_converge::Item>> = super::items(ground)
         .into_iter()
         .filter(|item| ids.contains(&item.id().as_str()))
@@ -1170,4 +1176,46 @@ fn break_the_tippy_shim(layout: &Layout) {
         ),
     )
     .unwrap();
+}
+
+/// Exec-root walks [`counted_walk`] made, for the one test that reads them.
+static WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn counted_walk(_: &Layout, build: u64) -> Option<Result<crate::compat::Inspection, String>> {
+    WALKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(Err(format!("counted walk of {build}")))
+}
+
+#[test]
+fn one_pass_walks_the_exec_root_once_until_something_changes() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let scratch = Scratch::new("reads");
+    trust_needing_a_root(&scratch.layout);
+    let mut ground = Arc::unwrap_or_clone(scratch.ground(Pass::Doctor, None));
+    ground.reads = super::Reads::reading(counted_walk);
+    let ground = Arc::new(ground);
+    let look = || item(&ground, super::EXEC_ROOTS).probe();
+    let Probe::Unusable { why } = look() else {
+        panic!("the counted walk answers unread");
+    };
+    assert!(why.contains("counted walk of 8595"), "{why}");
+    assert_eq!(WALKS.load(SeqCst), 1, "the probe walked it");
+    let _ = look();
+    // The packages read asks the same reads for the same build.
+    let _ = ground.reads.inspect(&ground.layout, 8595);
+    assert_eq!(
+        WALKS.load(SeqCst),
+        1,
+        "a second reader reads the first walk"
+    );
+    // Control: reads that are not shared walk again.
+    let _ = ground.reads.clone().inspect(&ground.layout, 8595);
+    assert_eq!(WALKS.load(SeqCst), 2, "a clone starts empty and walks");
+    ground.reads.forget();
+    let _ = look();
+    assert_eq!(
+        WALKS.load(SeqCst),
+        3,
+        "after a change the probe walks afresh"
+    );
 }

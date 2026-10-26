@@ -15,6 +15,9 @@ pub const TAKE_MAX: usize = 64;
 /// A snapshot every this many bus-class records (§5.5): a reader joining at any offset needs at most this many earlier bodies of the session.
 pub const SNAP_EVERY: u64 = 64;
 
+/// A snapshot also when the session's mail counts differ from the last one on the bus, at most one this often by the session's wall clock (§5.5, LOOP-2): mail marks stay local, so a snapshot's `mail_in=`/`mail_out=` are how a count crosses, and a quiet session reaches no 64th record.
+pub const MAIL_SNAP_GAP_MS: u64 = 1_000;
+
 /// One ring entry's size: the shared record's pointer, its encoded bytes, its `ms` and its process-clock reading.
 pub const ENTRY_BYTES: usize = std::mem::size_of::<Entry>();
 
@@ -73,20 +76,25 @@ pub(super) struct Mirror {
     pub(super) landed: BusCursor,
     /// The `ms` head the last snapshot ON THE BUS was taken at (0: none in this space): one counts once its landing reaches it ([`Log::land`]).
     pub(super) snap_ms: u64,
+    /// The mail counts (`mail_in`, `mail_out`) the last snapshot ON THE BUS carried, landed with it: while the session's own differ, a snapshot is owed ([`MAIL_SNAP_GAP_MS`]). A carry starts them at none, so a session with mail owes one snapshot after an update.
+    pub(super) snap_mail: (u32, u32),
+    /// The session's wall clock when a take last handed out a snapshot that moved the mail counts (0: none): the rate [`MAIL_SNAP_GAP_MS`] is counted from it.
+    pub(super) mail_snap_wall: u64,
     /// The space an uncarried update ended, while its tail is owed.
     pub(super) prior: Option<Prior>,
-    /// The snapshot the take in flight handed out (its slot's cursor and its `upto=`), until its landing reaches it.
-    pub(super) snap_owed: Option<(BusCursor, u64)>,
+    /// The snapshot the take in flight handed out (its slot's cursor, its `upto=` and its mail counts), until its landing reaches it.
+    pub(super) snap_owed: Option<(BusCursor, u64, (u32, u32))>,
 }
 
 impl Mirror {
     /// A landing at `at` reached the snapshot in flight: it is on the bus.
     fn land_snap(&mut self, at: BusCursor) {
-        if let Some((c, upto)) = self.snap_owed
+        if let Some((c, upto, mail)) = self.snap_owed
             && at.ep == c.ep
             && (at.ms, at.seq) >= (c.ms, c.seq)
         {
             self.snap_ms = upto;
+            self.snap_mail = mail;
             self.snap_owed = None;
         }
     }
@@ -161,6 +169,7 @@ pub struct BusCopy {
     t: u64,
     items: Vec<(Item, BusCursor)>,
     more: bool,
+    due: Option<u64>,
 }
 
 impl BusCopy {
@@ -180,6 +189,12 @@ impl BusCopy {
     #[must_use]
     pub const fn more(&self) -> bool {
         self.more
+    }
+
+    /// How many ms of the session's wall clock until the snapshot of a moved mail count that the rate held back ([`MAIL_SNAP_GAP_MS`]) is due, when this take left one owed: nothing else appends to wake a taker, so it takes again then.
+    #[must_use]
+    pub const fn due_in_ms(&self) -> Option<u64> {
+        self.due
     }
 
     /// The slots' bodies at `tier` (held at [`Tier::WireMeta`]: the bus never carries an H or C key), an edge's sid written as `alias` names it ([`encode_mirror`]).
@@ -402,11 +417,17 @@ impl Log {
         })
     }
 
-    /// Whether the bus holds this log whole: engaged, no old space owed, and the cursor at the LIVE `ms` head — under a fence too, past which a closing session's records are still owed once the update stands down (what a closed session's tail is kept for).
+    /// Whether the bus holds this log whole: engaged, no old space owed, and the cursor at the LIVE `ms` head — under a fence too, past which a closing session's records are still owed once the update stands down (what a closed session's tail is kept for) — and, once the session closed, its last mail counts landed in a snapshot (mail marks stay local, so its last snapshot is how they cross).
     #[must_use]
     pub fn mirror_complete(&self) -> bool {
         self.mirror.as_ref().is_some_and(|m| {
-            m.prior.is_none() && m.landed.ep == self.base_ep && m.landed.ms >= self.ms_head
+            m.prior.is_none()
+                && m.landed.ep == self.base_ep
+                && m.landed.ms >= self.ms_head
+                && !(self.session_closed && self.ms_head > 0 && {
+                    let t = &self.fold.state().totals;
+                    (t.mail_in, t.mail_out) != m.snap_mail
+                })
         })
     }
 
@@ -416,6 +437,8 @@ impl Log {
             Box::new(Mirror {
                 landed: start,
                 snap_ms: 0,
+                snap_mail: (0, 0),
+                mail_snap_wall: 0,
                 prior: None,
                 snap_owed: None,
             })
@@ -434,7 +457,7 @@ impl Log {
         }
     }
 
-    /// THE TAKE, copied under the timeline's lock: at most `room` slots (capped at [`TAKE_MAX`]) past the landed cursor, oldest first.
+    /// THE TAKE, copied under the timeline's lock: at most `room` slots (capped at [`TAKE_MAX`]) past the landed cursor, oldest first, then a snapshot when one is due: at the space's first take, every [`SNAP_EVERY`] bus-class records, and when the mail counts moved, at most one every [`MAIL_SNAP_GAP_MS`] of `at`'s wall clock (a closed session's last counts are owed at once), alone at the landed cursor when nothing else is past it; a moved count the rate holds back says when it is due ([`BusCopy::due_in_ms`]).
     pub fn bus_copy(&mut self, room: usize, at: Stamp) -> BusCopy {
         let room = room.min(TAKE_MAX);
         let space = self.base_ep;
@@ -529,8 +552,16 @@ impl Log {
             }
         }
         m.snap_owed = None;
+        let mail = {
+            let t = &self.reader_fold().state().totals;
+            (t.mail_in, t.mail_out)
+        };
         let snap_due = fh > 0 && (m.snap_ms == 0 || fh >= m.snap_ms.saturating_add(SNAP_EVERY));
-        if !more && snap_due && items.len() < room {
+        let moved = fh > 0 && mail != m.snap_mail;
+        let since = at.wall_ms.abs_diff(m.mail_snap_wall);
+        let mail_due =
+            moved && (self.session_closed || m.mail_snap_wall == 0 || since >= MAIL_SNAP_GAP_MS);
+        if !more && (snap_due || mail_due) && items.len() < room {
             let fold = self.reader_fold();
             let st = fold.state();
             let open = fold.bus_open_path().into_iter().flatten().collect();
@@ -547,16 +578,22 @@ impl Log {
                     upto: fh,
                     open,
                     needs,
-                    mail_in: st.totals.mail_in,
-                    mail_out: st.totals.mail_out,
+                    mail_in: mail.0,
+                    mail_out: mail.1,
                     ep_now: st.ep,
                 }),
                 last_at,
             ));
-            m.snap_owed = Some((last_at, fh));
+            if mail != m.snap_mail {
+                m.mail_snap_wall = at.wall_ms;
+            }
+            m.snap_owed = Some((last_at, fh, mail));
         }
+        let due = (moved && !mail_due && m.snap_owed.is_none())
+            .then(|| MAIL_SNAP_GAP_MS.saturating_sub(since).max(1));
         if let Some(mine) = self.mirror.as_deref_mut() {
             mine.snap_owed = m.snap_owed;
+            mine.mail_snap_wall = m.mail_snap_wall;
             mine.landed = m.landed;
         }
         BusCopy {
@@ -564,6 +601,7 @@ impl Log {
             t: at.wall_ms,
             items,
             more,
+            due,
         }
     }
 
@@ -639,6 +677,8 @@ impl Log {
         self.mirror = Some(Box::new(Mirror {
             landed,
             snap_ms,
+            snap_mail: (0, 0),
+            mail_snap_wall: 0,
             prior,
             snap_owed: None,
         }));

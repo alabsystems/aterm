@@ -52,6 +52,9 @@ pub(super) enum Vault {
     NotMember,
     /// The sync applied the vault at this sequence.
     Applied(u64),
+    /// The sync applied the vault at this sequence but could not write or remove every file it
+    /// should (`aterm secrets sync` counts them in its first line and names each one and why).
+    AppliedPartly(u64),
     /// The vault had nothing newer than this sequence.
     Unchanged(u64),
     /// The vault does not list this machine (yet).
@@ -66,13 +69,22 @@ impl Vault {
         match self {
             Self::NotMember => "not a member".to_owned(),
             Self::Applied(seq) => format!("applied seq {seq}"),
+            Self::AppliedPartly(seq) => format!("applied seq {seq}, some files failed"),
             Self::Unchanged(seq) => format!("seq {seq}, nothing new"),
             Self::NotIn => "this machine not in it yet".to_owned(),
             Self::Failed(why) => format!("sync failed: {why}"),
         }
     }
 
-    /// What one `aterm secrets sync` printed (its first line) and how it exited.
+    /// Whether the sync may have written files a row reads: it applied the vault, wholly or partly.
+    pub(super) fn wrote_files(&self) -> bool {
+        matches!(self, Self::Applied(_) | Self::AppliedPartly(_))
+    }
+
+    /// What one `aterm secrets sync` printed (its first line) and how it exited. An applied
+    /// vault's line ends with how many files failed (`, 1 failed`), which decides; a line without
+    /// that count (an older aterm) is read by the exit status, which work after the files can
+    /// also make non-zero.
     pub(super) fn of_sync(stdout: &str, code: Option<i32>) -> Self {
         let first = stdout.lines().next().unwrap_or("").trim();
         let seq_after = |marker: &str| -> Option<u64> {
@@ -86,7 +98,16 @@ impl Vault {
             .then(|| seq_after("applied seq "))
             .flatten()
         {
-            return Self::Applied(seq);
+            let failed = first
+                .rsplit_once(", ")
+                .and_then(|(_, tail)| tail.strip_suffix(" failed"))
+                .and_then(|n| n.parse::<u64>().ok());
+            return match failed {
+                Some(0) => Self::Applied(seq),
+                Some(_) => Self::AppliedPartly(seq),
+                None if code == Some(0) => Self::Applied(seq),
+                None => Self::AppliedPartly(seq),
+            };
         }
         if let Some(seq) = seq_after("up to date at seq ") {
             return Self::Unchanged(seq);
@@ -262,7 +283,7 @@ struct Backoff {
 }
 
 /// The vault refresh's own clock: one `aterm secrets sync` at a time, and none sooner than its
-/// wait after the last, which doubles while it brings nothing new.
+/// wait after the last, which doubles until a refresh applies the whole vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VaultRun {
     /// When the last refresh started.
@@ -351,8 +372,8 @@ impl Ladder {
     }
 
     /// The refresh started by [`Self::vault_turn`] ended with `seen`: the next one waits
-    /// [`BACKOFF_FIRST`] after the first refresh or one that applied the vault, else twice the
-    /// wait before it, never past [`BACKOFF_MAX`].
+    /// [`BACKOFF_FIRST`] after the first refresh or one that applied the whole vault, else twice
+    /// the wait before it, never past [`BACKOFF_MAX`].
     pub(super) fn vault_done(&mut self, seen: Vault) {
         let (at, prior) = self
             .vault

@@ -948,3 +948,339 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         assert!(write_auth_doc(&link, &json!({"auth_mode": "chatgpt"})).is_err());
     }
 }
+
+#[test]
+fn concurrent_disk_rotation_reloads_before_refresh_and_cleartext_remote_endpoints_are_refused() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+
+    // 1. Authority & transport guards block userinfo smuggling and non-loopback cleartext HTTP.
+    assert!(is_loopback_endpoint("http://127.0.0.1:1455/wham/usage"));
+    assert!(is_loopback_endpoint("http://[::1]:1455/wham/usage"));
+    assert!(is_loopback_endpoint("http://localhost/wham/usage"));
+    assert!(!is_loopback_endpoint(
+        "http://127.0.0.1:80@evil.example/wham/usage"
+    ));
+    assert!(!is_loopback_endpoint(
+        "http://localhost@evil.example/wham/usage"
+    ));
+    assert!(is_allowed_auth_endpoint(
+        "https://chatgpt.com/backend-api/wham/usage"
+    ));
+    assert!(!is_allowed_auth_endpoint(
+        "https://user@chatgpt.com/backend-api/wham/usage"
+    ));
+    assert!(!is_allowed_auth_endpoint(
+        "http://evil.example/backend-api/wham/usage"
+    ));
+
+    let slot_dir = tmp.path().join("slot");
+    let user_home = tmp.path().join("user-home");
+    std::fs::create_dir_all(&slot_dir).expect("slot_dir");
+    std::fs::create_dir_all(user_home.join(".codex")).expect("user .codex");
+    std::fs::write(
+        slot_dir.join("config.toml"),
+        "chatgpt_base_url = \"http://evil.example/backend-api\"\n",
+    )
+    .expect("bad config");
+    assert_eq!(
+        resolve_usage_url(&slot_dir.join("auth.json"), &user_home),
+        "https://chatgpt.com/backend-api/wham/usage",
+        "cleartext non-loopback chatgpt_base_url must fall back to HTTPS default"
+    );
+    std::fs::write(
+        slot_dir.join("config.toml"),
+        "chatgpt_base_url = \"https://codex.enterprise.example\"\n",
+    )
+    .expect("https config");
+    assert_eq!(
+        resolve_usage_url(&slot_dir.join("auth.json"), &user_home),
+        "https://codex.enterprise.example/api/codex/usage",
+        "explicit auth.json path resolves sibling config.toml"
+    );
+
+    // 2. When a concurrent codex-alab session rotates `auth.json` on disk while `read_usage_with`
+    //    gets 401 on the old access token, `read_usage_with` reloads `auth.json` from disk rather
+    //    than replaying the stale single-use refresh token against `/oauth/token`.
+    let auth_file = tmp.path().join("rotated").join("auth.json");
+    let stale_jwt = format!(
+        "{}.stale_sig",
+        make_chatgpt_jwt(Some("codex-rot@example.com"), "pro", now + 3600)
+            .rsplit_once('.')
+            .expect("jwt")
+            .0
+    );
+    let fresh_jwt = make_chatgpt_jwt(Some("codex-rot@example.com"), "pro", now + 7200);
+    write_auth_doc(
+        &auth_file,
+        &json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": stale_jwt,
+                "access_token": stale_jwt,
+                "refresh_token": "rt_stale_already_used_by_codex_alab",
+                "account_id": "acct_rot"
+            },
+            "last_refresh": "2026-10-25T00:00:00Z"
+        }),
+    )
+    .expect("seed stale auth");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    let token_hits = Arc::new(Mutex::new(0usize));
+    let token_hits_srv = Arc::clone(&token_hits);
+    let auth_file_srv = auth_file.clone();
+    let fresh_jwt_srv = fresh_jwt.clone();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let Some(req) = read_http_request(&mut stream) else {
+                break;
+            };
+            match (req.method.as_str(), req.target.as_str()) {
+                ("POST", "/oauth/token") => {
+                    *token_hits_srv.lock().expect("lock") += 1;
+                    send_http_json(
+                        &mut stream,
+                        "400 Bad Request",
+                        &json!({"error": "refresh_token_reused"}),
+                    );
+                }
+                ("GET", "/backend-api/wham/usage") => {
+                    let auth = req
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k == "authorization")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    if auth.ends_with(".stale_sig") {
+                        // Simulate codex-alab having atomically written the rotated token to disk.
+                        write_auth_doc(
+                            &auth_file_srv,
+                            &json!({
+                                "auth_mode": "chatgpt",
+                                "tokens": {
+                                    "id_token": fresh_jwt_srv,
+                                    "access_token": fresh_jwt_srv,
+                                    "refresh_token": "rt_fresh_from_codex_alab",
+                                    "account_id": "acct_rot"
+                                },
+                                "last_refresh": "2026-10-26T00:00:00Z"
+                            }),
+                        )
+                        .expect("rotate on disk");
+                        send_http_json(
+                            &mut stream,
+                            "401 Unauthorized",
+                            &json!({"error": "token_expired"}),
+                        );
+                    } else {
+                        send_http_json(
+                            &mut stream,
+                            "200 OK",
+                            &json!({
+                                "plan_type": "pro",
+                                "rate_limit": {
+                                    "allowed": true,
+                                    "primary_window": {
+                                        "used_percent": 42.0,
+                                        "limit_window_seconds": 18_000,
+                                        "reset_at": 1_790_010_800
+                                    }
+                                }
+                            }),
+                        );
+                    }
+                }
+                _ => send_http_json(&mut stream, "404 Not Found", &json!({})),
+            }
+        }
+    });
+
+    let usage_url = format!("http://127.0.0.1:{port}/backend-api/wham/usage");
+    let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+    // Cleartext non-loopback URL is rejected before touching the network.
+    assert!(
+        read_usage_with(
+            &auth_file,
+            "http://evil.example/backend-api/wham/usage",
+            &token_url,
+            Duration::from_secs(5),
+            now,
+        )
+        .is_none()
+    );
+    let got = read_usage_with(
+        &auth_file,
+        &usage_url,
+        &token_url,
+        Duration::from_secs(5),
+        now,
+    )
+    .expect("reloaded rotated token from disk");
+    let _ = server.join();
+    assert_eq!(got.sample.session_pct, Some(42));
+    assert_eq!(
+        *token_hits.lock().expect("lock"),
+        0,
+        "must reload rotated auth.json from disk without replaying stale refresh_token"
+    );
+}
+
+#[test]
+fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_login_exits_early() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("bounded");
+    std::fs::create_dir_all(&home).expect("create home");
+    let auth_path = home.join(AUTH_FILE);
+    let jwt = make_chatgpt_jwt(Some("bounded@example.com"), "pro", 1_900_000_000);
+    let base = aterm_json::to_string(&json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "id_token": jwt,
+            "access_token": jwt,
+        }
+    }))
+    .expect("base json");
+    let mut exact = base;
+    exact.extend(std::iter::repeat_n(
+        ' ',
+        MESSAGE_MAX.checked_sub(exact.len()).expect("fits in bound"),
+    ));
+    assert_eq!(exact.len(), MESSAGE_MAX);
+    std::fs::write(&auth_path, &exact).expect("write exact MESSAGE_MAX");
+    assert_eq!(
+        read_account_email(&home).as_deref(),
+        Some("bounded@example.com")
+    );
+
+    exact.push(' ');
+    std::fs::write(&auth_path, &exact).expect("write MESSAGE_MAX + 1");
+    assert!(read_account_in_home(&home).is_none());
+
+    std::fs::write(&auth_path, [0xff, 0xfe]).expect("write invalid utf8");
+    assert!(read_account_in_home(&home).is_none());
+
+    std::fs::remove_file(&auth_path).expect("remove file");
+    std::fs::create_dir(&auth_path).expect("dir at auth.json");
+    assert!(read_account_in_home(&home).is_none());
+    std::fs::remove_dir(&auth_path).expect("remove dir at auth.json");
+
+    #[cfg(unix)]
+    {
+        let real_home = tmp.path().join("real_home");
+        write_auth_doc(
+            &real_home,
+            &json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": jwt,
+                    "access_token": jwt,
+                }
+            }),
+        )
+        .expect("seed real_home");
+        assert_eq!(
+            read_account_email(&real_home).as_deref(),
+            Some("bounded@example.com")
+        );
+
+        let sym_home = tmp.path().join("sym_home");
+        std::os::unix::fs::symlink(&real_home, &sym_home).expect("symlink home dir");
+        assert!(
+            read_account_in_home(&sym_home).is_none(),
+            "symlinked home directory must be refused"
+        );
+
+        let fifo_home = tmp.path().join("fifo_home");
+        std::fs::create_dir_all(&fifo_home).expect("create fifo_home");
+        let fifo_auth = fifo_home.join(AUTH_FILE);
+        let made = aterm_uds::spawnfd::command("mkfifo")
+            .arg(&fifo_auth)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success(), "mkfifo {}", fifo_auth.display());
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let acct = read_account_in_home(&fifo_home);
+            let usage = read_usage_with(
+                &fifo_home,
+                "https://chatgpt.com/backend-api/wham/usage",
+                "https://auth.openai.com/oauth/token",
+                Duration::from_secs(5),
+                1_790_000_000,
+            );
+            tx.send((acct, usage)).expect("send fifo result");
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(60)),
+            Ok((None, None)),
+            "FIFO at auth.json must not block open()"
+        );
+        reader.join().expect("fifo reader thread");
+    }
+
+    let seen = Seen::default();
+    let expired = Instant::now();
+    let mut approver = &seen;
+    let hung = login_with(
+        &home,
+        &Endpoints {
+            issuer: DEFAULT_ISSUER.to_owned(),
+            token_url: format!("{DEFAULT_ISSUER}/oauth/token"),
+            callback_ports: vec![0],
+        },
+        &mut approver,
+        HOSTS,
+        None,
+        expired,
+    );
+    assert_eq!(hung.outcome, Outcome::Hung);
+    assert_eq!(hung.host.as_deref(), Some("auth.openai.com"));
+    assert!(
+        seen.handed.borrow().is_empty(),
+        "expired deadline must not invoke approver"
+    );
+
+    let mut approver = &seen;
+    let off_pin = login_with(
+        &home,
+        &Endpoints {
+            issuer: "https://evil.example".to_owned(),
+            token_url: "https://evil.example/oauth/token".to_owned(),
+            callback_ports: vec![0],
+        },
+        &mut approver,
+        HOSTS,
+        None,
+        expired,
+    );
+    assert_eq!(off_pin.outcome, Outcome::OffPin);
+    assert_eq!(off_pin.host.as_deref(), Some("evil.example"));
+
+    let mut approver = &seen;
+    let portless = login_with(
+        &home,
+        &Endpoints {
+            issuer: DEFAULT_ISSUER.to_owned(),
+            token_url: format!("{DEFAULT_ISSUER}/oauth/token"),
+            callback_ports: Vec::new(),
+        },
+        &mut approver,
+        HOSTS,
+        None,
+        Instant::now() + Duration::from_secs(30),
+    );
+    assert!(
+        matches!(
+            &portless.outcome,
+            Outcome::NotRun(msg) if msg.contains("no callback port configured")
+        ),
+        "unexpected outcome for empty callback_ports: {:?}",
+        portless.outcome
+    );
+    assert!(seen.handed.borrow().is_empty());
+}

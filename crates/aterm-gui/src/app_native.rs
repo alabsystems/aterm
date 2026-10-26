@@ -10368,12 +10368,15 @@ fn spawn_native_machine_read(
     .map(drop)
 }
 
+/// The Settings machine read: tethered, so a window killed outright takes it along.
 fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::MachineState, String> {
+    use aterm_uds::spawnfd::Tether as _;
     let mut command = crate::qos::atpkg_command(atpkg);
     command
         .arg("machine")
         .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
-        .env("PATH", crate::spawn::atpkg_child_path());
+        .env("PATH", crate::spawn::atpkg_child_path())
+        .tether();
     let output = machine_command_output(
         &mut command,
         "atpkg machine",

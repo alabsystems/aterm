@@ -66,6 +66,9 @@ pub(super) struct MirrorRun {
     owed: bool,
     /// A busy answer (`fenced`, `adopting`, an empty bucket) waits until then.
     retry_at: Option<Instant>,
+    /// A snapshot the endpoint held back to its rate (`due=`, a moved mail count) is due then:
+    /// a take is owed at that instant though nothing appends to wake one.
+    held_back: Option<Instant>,
     /// The batch in flight and the node's total.
     pin: Pin,
     /// Per slot: whether THIS process sent it (a never-sent slot's deduped
@@ -137,6 +140,7 @@ impl MirrorRun {
                 stopped: None,
                 owed: false,
                 retry_at: None,
+                held_back: None,
                 pin: Pin {
                     key,
                     ..Pin::default()
@@ -664,14 +668,14 @@ impl Bridge {
         self.broker_retains
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, `None` for nothing.
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing.
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {
             return None;
         }
         let m = self.mirror.as_deref()?;
         if !m.owed {
-            return None;
+            return m.held_back.map(|at| at.max(now));
         }
         if m.outcome.contains(&Outcome::Sending) && m.sent_inc == self.inc {
             return None;
@@ -706,6 +710,7 @@ impl Bridge {
         let inc = self.inc;
         if let Some(m) = self.mirror.as_deref_mut() {
             m.retry_at = None;
+            m.held_back = None;
             if m.sent_inc != inc {
                 for o in &mut m.outcome {
                     if *o == Outcome::Sending {
@@ -806,7 +811,7 @@ impl Bridge {
                 return;
             }
         };
-        let (slots, more) = match mirror::parse_take(&header, &body) {
+        let mirror::Taken { slots, more, due } = match mirror::parse_take(&header, &body) {
             Ok(taken) => taken,
             Err(e) => {
                 self.mirror_stop(&e, "link mirror stopped reason=endpoint");
@@ -816,6 +821,7 @@ impl Bridge {
         if slots.is_empty() {
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.owed = more;
+                m.held_back = due.map(|wait| now + wait);
             }
             if more {
                 self.mirror_retry_in(BUSY_WAIT);

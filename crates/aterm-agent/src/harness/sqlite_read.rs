@@ -180,6 +180,7 @@ impl<'a> Snapshot<'a> {
 ///
 /// Returns `None` if `db`/`wal` is not a readable SQLite 3 database or `table_name` does not exist
 /// in `sqlite_schema`.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn scan_table<R>(
     db: &[u8],
@@ -190,9 +191,36 @@ pub(crate) fn scan_table<R>(
     let snap = Snapshot::open(db, wal)?;
     let (rootpage, create_sql) = find_table_in_schema(&snap, table_name)?;
     let schema = parse_create_table(&create_sql)?;
+    scan_table_rows(&snap, rootpage, &schema, |row| on_row(&schema, row))
+}
+
+/// Validates and projects required column indices from `table_name`'s [`TableSchema`] via `prepare`
+/// before scanning rows, returning `None` immediately (even on an empty table) when `prepare`
+/// rejects the schema.
+#[must_use]
+pub(crate) fn scan_table_with<P, R>(
+    db: &[u8],
+    wal: Option<&[u8]>,
+    table_name: &str,
+    prepare: impl FnOnce(&TableSchema) -> Option<P>,
+    mut on_row: impl FnMut(&P, &[SqlValue]) -> Option<R>,
+) -> Option<Vec<R>> {
+    let snap = Snapshot::open(db, wal)?;
+    let (rootpage, create_sql) = find_table_in_schema(&snap, table_name)?;
+    let schema = parse_create_table(&create_sql)?;
+    let proj = prepare(&schema)?;
+    scan_table_rows(&snap, rootpage, &schema, |row| on_row(&proj, row))
+}
+
+fn scan_table_rows<R>(
+    snap: &Snapshot<'_>,
+    rootpage: u32,
+    schema: &TableSchema,
+    mut on_row: impl FnMut(&[SqlValue]) -> Option<R>,
+) -> Option<Vec<R>> {
     let mut out = Vec::new();
     let mut rows_seen = 0usize;
-    scan_btree(&snap, rootpage, |rowid, record_bytes| {
+    scan_btree(snap, rootpage, |rowid, record_bytes| {
         rows_seen = rows_seen.saturating_add(1);
         if rows_seen > MAX_SCAN_ROWS {
             return false;
@@ -229,7 +257,7 @@ pub(crate) fn scan_table<R>(
         {
             values[alias] = SqlValue::Int(rowid);
         }
-        if let Some(item) = on_row(&schema, &values) {
+        if let Some(item) = on_row(&values) {
             out.push(item);
         }
         true
@@ -631,7 +659,12 @@ fn decode_record(payload: &[u8], encoding: TextEncoding) -> Option<Vec<SqlValue>
                 let end = body_pos.checked_add(8)?;
                 let b: [u8; 8] = payload.get(body_pos..end)?.try_into().ok()?;
                 body_pos = end;
-                SqlValue::Float(f64::from_bits(u64::from_be_bytes(b)))
+                let f = f64::from_bits(u64::from_be_bytes(b));
+                if f.is_nan() {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Float(f)
+                }
             }
             8 => SqlValue::Int(0),
             9 => SqlValue::Int(1),
@@ -1076,11 +1109,35 @@ fn is_virtual_generated_column(rest: &[SqlToken]) -> bool {
         .any(|tok| !tok.quoted && tok.text.eq_ignore_ascii_case("STORED"))
 }
 
+fn is_column_constraint_starter(tok: &SqlToken) -> bool {
+    !tok.quoted
+        && matches!(
+            tok.text.to_ascii_uppercase().as_str(),
+            "CONSTRAINT"
+                | "PRIMARY"
+                | "NOT"
+                | "NULL"
+                | "UNIQUE"
+                | "CHECK"
+                | "DEFAULT"
+                | "COLLATE"
+                | "REFERENCES"
+                | "GENERATED"
+                | "AS"
+        )
+}
+
 fn is_integer_primary_key(rest: &[SqlToken]) -> bool {
     let Some(ty) = rest.first() else {
         return false;
     };
-    if !ty.text.eq_ignore_ascii_case("INTEGER") {
+    // SQLite's `sqlite3AddPrimaryKey` aliases rowid ONLY when the declared type is the exact
+    // single token `INTEGER` (no `(size)` modifier and no multi-word typename like
+    // `INTEGER UNSIGNED` preceding the first column constraint).
+    if !ty.text.eq_ignore_ascii_case("INTEGER")
+        || ty.followed_by_paren
+        || !rest.get(1).is_some_and(is_column_constraint_starter)
+    {
         return false;
     }
     for i in 1..rest.len().saturating_sub(1) {
@@ -1213,7 +1270,9 @@ fn tokenize_sql_words(item: &str) -> Vec<SqlToken> {
                 let end = skip_quoted(bytes, i, b'\'');
                 if depth == 0
                     && out.is_empty()
-                    && let Some(inner) = item.get(i + 1..end.saturating_sub(1))
+                    && end >= i + 2
+                    && bytes.get(end - 1) == Some(&b'\'')
+                    && let Some(inner) = item.get(i + 1..end - 1)
                 {
                     out.push(SqlToken {
                         text: inner.replace("''", "'"),
@@ -1226,7 +1285,9 @@ fn tokenize_sql_words(item: &str) -> Vec<SqlToken> {
             b'"' | b'`' => {
                 let end = skip_quoted(bytes, i, b);
                 if depth == 0
-                    && let Some(inner) = item.get(i + 1..end.saturating_sub(1))
+                    && end >= i + 2
+                    && bytes.get(end - 1) == Some(&b)
+                    && let Some(inner) = item.get(i + 1..end - 1)
                 {
                     let unescaped = if b == b'"' {
                         inner.replace("\"\"", "\"")
@@ -1244,7 +1305,9 @@ fn tokenize_sql_words(item: &str) -> Vec<SqlToken> {
             b'[' => {
                 let end = skip_bracket(bytes, i);
                 if depth == 0
-                    && let Some(inner) = item.get(i + 1..end.saturating_sub(1))
+                    && end >= i + 2
+                    && bytes.get(end - 1) == Some(&b']')
+                    && let Some(inner) = item.get(i + 1..end - 1)
                 {
                     out.push(SqlToken {
                         text: inner.to_owned(),

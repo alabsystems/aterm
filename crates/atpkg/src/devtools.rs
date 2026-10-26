@@ -256,7 +256,8 @@ pub struct Facts {
     pub subject: Option<String>,
     /// The switch's row in the system TCC.db ([`consent::probe_devtool_list`]).
     pub list: DevToolList,
-    /// tccd's answers for the subject in the last ten minutes ([`consent::probe_devtool`]).
+    /// tccd's answers for the subject in the last [`consent::DEVTOOL_WINDOW_S`] seconds
+    /// ([`consent::probe_devtool`]), read only when they can change the verdict ([`facts`]).
     pub log: DevToolProbe,
     /// The display name of the program macOS holds responsible for this process, when it is not
     /// the subject's bundle (a doctor run in Terminal, or over ssh), which aterm's switch does not
@@ -291,7 +292,8 @@ impl Facts {
 /// Read the list and tccd's answers for the running bundle under the probes' own fences, or
 /// `None` off macOS: a binary outside a `.app` (a test binary, `target/release/aterm`) opens and
 /// spawns nothing and is `not measured`; one started through `~/.local/bin/aterm` is judged by
-/// the bundled image ([`consent::fence_exe`]).
+/// the bundled image ([`consent::fence_exe`]). tccd's log is read only when it can change the
+/// verdict ([`log_when_needed`]).
 #[must_use]
 pub fn facts() -> Option<Facts> {
     if !cfg!(target_os = "macos") {
@@ -325,7 +327,13 @@ pub fn facts() -> Option<Facts> {
             program_check: None,
         });
     }
-    let log = consent::probe_devtool(ProbeGate::on(), id);
+    let started_s = i32::try_from(std::process::id())
+        .ok()
+        .and_then(aterm_uds::process::read_process_birth)
+        .map(|birth| birth.seconds);
+    let log = log_when_needed(&list, started_s, || {
+        consent::probe_devtool(ProbeGate::on(), id)
+    });
     let other_responsible = i32::try_from(std::process::id())
         .ok()
         .and_then(consent::responsible_app)
@@ -342,6 +350,35 @@ pub fn facts() -> Option<Facts> {
         other_responsible,
         program_check: None,
     })
+}
+
+/// tccd's answers through `read`, only when the switch alone cannot settle the verdict
+/// ([`consent::devtool_grant`]): the list was not read whole, or does not hold the subject
+/// switched on, or its row changed at or after `started_s` (this process's start, unix seconds;
+/// `None` when unknown). Otherwise `read` is never called and the probe is
+/// [`DevToolProbeLabel::NotNeeded`], which leaves the verdict to the switch.
+///
+/// A decision with its cost: `log show` over [`consent::DEVTOOL_WINDOW_S`] takes 0.7 to 0.9 s
+/// in a macOS guest on every run, and what it alone can add for a switch on since before the
+/// run is a row that no longer matches this copy of aterm (macOS still checked a program aterm
+/// started after the switch moved, [`Step::ListedOn`]). That case is read only by a run that
+/// starts no later than the switch moves, such as System State's own reading.
+fn log_when_needed(
+    list: &DevToolList,
+    started_s: Option<u64>,
+    read: impl FnOnce() -> DevToolProbe,
+) -> DevToolProbe {
+    let on = list.label == DevToolListLabel::Read && list.listing == DevToolListing::On;
+    let settled = list
+        .modified_at_s
+        .and_then(|changed| u64::try_from(changed).ok())
+        .zip(started_s)
+        .is_some_and(|(changed, started)| changed < started);
+    if on && settled {
+        DevToolProbe::refused(DevToolProbeLabel::NotNeeded)
+    } else {
+        read()
+    }
 }
 
 /// `[privacy] observer = false` in the aterm.toml the window loads
@@ -397,7 +434,11 @@ pub const fn log_reason(label: DevToolProbeLabel) -> &'static str {
         DevToolProbeLabel::Pending => "tccd's log has not been read yet",
         DevToolProbeLabel::Observed => "tccd's answer was read",
         DevToolProbeLabel::NoRecentRequest => {
-            "no new program started under aterm in the last 10 minutes, so tccd gave no answer"
+            "no new program started under aterm in the last 2 minutes, so tccd gave no answer"
+        }
+        DevToolProbeLabel::NotNeeded => {
+            "aterm is switched on in the list and nothing moved it since aterm started, so \
+             tccd's log was not read"
         }
         DevToolProbeLabel::LogUnavailable => "only an administrator account can read tccd's log",
         DevToolProbeLabel::LogFailed
@@ -526,6 +567,55 @@ pub fn row(facts: &Facts) -> Option<Row> {
         }
     };
     Some(Row { level, text })
+}
+
+/// The most a [`brief`] line holds: what fits after `aterm doctor`'s label column on one
+/// 160-character row.
+pub const BRIEF_CHARS: usize = 140;
+
+/// The `devtools:` row as bare `aterm doctor` shows it: the state and the one action, at most
+/// [`BRIEF_CHARS`]; `None` when there is nothing for the person to do (granted, or no list).
+/// The whole story stays in [`row`], which `--verbose` prints.
+#[must_use]
+pub fn brief(facts: &Facts) -> Option<String> {
+    if facts.list.label == DevToolListLabel::UnsupportedPlatform {
+        return None;
+    }
+    let line = match facts.grant() {
+        DevToolGrant::Granted => return None,
+        DevToolGrant::NotGranted => match Step::of(&facts.list) {
+            Step::Add => "aterm is not on Developer Tools, so macOS scans each program it \
+                          starts \u{2014} fix: add aterm there (`aterm doctor` opens the pane)"
+                .to_owned(),
+            Step::SwitchOn => "aterm is switched off on Developer Tools, so macOS scans each \
+                               program it starts \u{2014} fix: switch it on (`aterm doctor` \
+                               opens the pane)"
+                .to_owned(),
+            Step::ListedOn => "aterm is on Developer Tools, yet macOS still scans its programs \
+                               \u{2014} fix: remove aterm's row and add it again (`aterm \
+                               doctor` opens the pane)"
+                .to_owned(),
+        },
+        DevToolGrant::Unknown => match facts.other_responsible.as_deref() {
+            Some(app) => format!(
+                "not measured: this shell runs under {app}, not aterm \u{2014} fix: run \
+                 `aterm doctor` in an aterm tab"
+            ),
+            None if facts.list.label == DevToolListLabel::NoFullDiskAccess => {
+                "not measured: the list opens only with Full Disk Access \u{2014} fix: grant \
+                 aterm Full Disk Access (aterm help permissions)"
+                    .to_owned()
+            }
+            None => format!("not measured ({})", list_reason(facts.list.label)),
+        },
+    };
+    Some(if line.chars().count() > BRIEF_CHARS {
+        let mut cut: String = line.chars().take(BRIEF_CHARS - 1).collect();
+        cut.push('\u{2026}');
+        cut
+    } else {
+        line
+    })
 }
 
 /// The `devtools:` row's words for `held` programs (at least one) of this user that macOS's
@@ -1262,6 +1352,43 @@ mod tests {
         }
     }
 
+    /// tccd's log is read only when it can change the verdict: a switch on since before this
+    /// process started leaves `log show` unrun and the verdict the switch's. NEGATIVE CONTROL:
+    /// a switch moved at or after the start, one switched off, an unknown start and an unread
+    /// list each read it.
+    #[test]
+    fn a_switch_on_since_before_the_start_leaves_tccds_log_unread() {
+        let started = 1_000;
+        let ran = std::cell::Cell::new(0);
+        let log = || {
+            ran.set(ran.get() + 1);
+            DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest)
+        };
+        let on_before = read(DevToolListing::On, 999);
+        let skipped = log_when_needed(&on_before, Some(started), log);
+        assert_eq!(ran.get(), 0, "the log was read");
+        assert_eq!(skipped.label, DevToolProbeLabel::NotNeeded);
+        assert_eq!(facts(on_before, skipped).grant(), DevToolGrant::Granted);
+        for (list, start) in [
+            (read(DevToolListing::On, 1_000), Some(started)),
+            (read(DevToolListing::On, 1_005), Some(started)),
+            (read(DevToolListing::Off, 999), Some(started)),
+            (read(DevToolListing::On, 999), None),
+            (
+                DevToolList::refused(DevToolListLabel::NoFullDiskAccess),
+                Some(started),
+            ),
+        ] {
+            let before = ran.get();
+            log_when_needed(&list, start, log);
+            assert_eq!(
+                ran.get(),
+                before + 1,
+                "{list:?} at {start:?} left the log unread"
+            );
+        }
+    }
+
     fn tccd(state: DevToolState, not_allowed: u32, at_ms: i64) -> DevToolProbe {
         DevToolProbe {
             state,
@@ -1416,6 +1543,56 @@ mod tests {
             unknown.text,
             format!("{NOW}; whether aterm is listed is not measured ({why})")
         );
+    }
+
+    /// Bare doctor's devtools line is one state and one action, short enough for one row,
+    /// for every verdict; a granted list has none. NEGATIVE CONTROL: the full row, which
+    /// `--verbose` prints, is longer than a brief line holds.
+    #[test]
+    fn the_brief_line_is_one_action_that_fits_one_row() {
+        let quiet = DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest);
+        let on = facts(read(DevToolListing::On, 100), quiet);
+        assert_eq!(brief(&on), None, "granted: nothing to do");
+        let off = facts(read(DevToolListing::Off, 100), quiet);
+        let absent = facts(
+            read(DevToolListing::Absent, 0),
+            tccd(DevToolState::Unlisted, 96, 1),
+        );
+        let shadowed = facts(
+            read(DevToolListing::On, 100),
+            tccd(DevToolState::Unlisted, 1, 100_001),
+        );
+        let unread = facts(
+            DevToolList::refused(DevToolListLabel::NoFullDiskAccess),
+            DevToolProbe::refused(DevToolProbeLabel::LogUnavailable),
+        );
+        let elsewhere = Facts {
+            other_responsible: Some("tart-guest-agent".to_owned()),
+            ..unread.clone()
+        };
+        for (label, f, want) in [
+            ("off", &off, "fix: switch it on"),
+            ("absent", &absent, "fix: add aterm there"),
+            ("listed but scanned", &shadowed, "fix: remove aterm's row"),
+            ("unread", &unread, "fix: grant aterm Full Disk Access"),
+            (
+                "another app's shell",
+                &elsewhere,
+                "fix: run `aterm doctor` in an aterm tab",
+            ),
+        ] {
+            let line = brief(f).unwrap_or_else(|| panic!("{label}: a line"));
+            assert!(line.chars().count() <= BRIEF_CHARS, "{label}: {line}");
+            assert!(line.contains(want), "{label}: {line}");
+            assert_eq!(
+                line.matches("fix:").count(),
+                1,
+                "{label}: one action: {line}"
+            );
+            assert!(!line.contains('\n'), "{label}: {line}");
+        }
+        let whole = row(&off).expect("a row").text;
+        assert!(whole.chars().count() > BRIEF_CHARS, "{whole}");
     }
 
     /// Verify's word for an app's row: on is yes; off and no row are no; a list not read whole

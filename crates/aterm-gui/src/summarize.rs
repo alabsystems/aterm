@@ -28,9 +28,12 @@ const FLEET_SURVEY: &str = "Run `aterm ctl survey --fleet` once.";
 const MAC_SURVEY: &str = "Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, \
 for what each session's log says.";
 
-/// THE FABRIC'S SENTENCE.
-pub(crate) const FABRIC_READ: &str =
-    "Then run `aterm fabric brief` once, for what the fabric's other machines report.";
+/// THE FABRIC'S SENTENCE: the brief's machine form, the read the Overview
+/// makes, since only it says which sessions are this node's own. The fabric
+/// is one machine's bus, so today every session there is this Mac's.
+pub(crate) const FABRIC_READ: &str = "Then run `aterm fabric brief --json` once: a session \
+with \"this\":true is one of this Mac's own, already in the survey; any other names its node in \
+\"node\".";
 
 /// The brief a summary's worker is given.
 pub(crate) fn summary_brief(fleet: bool, fabric: bool) -> String {
@@ -367,11 +370,35 @@ mod tests {
         }
     }
 
+    /// The read the fabric's sentence names, in backticks: the Overview's own
+    /// (`overview_fabric::ChildRunner::brief`), the machine form, up to its
+    /// budget.
+    fn fabric_read_command() -> String {
+        let args = crate::overview_fabric::ChildRunner::brief().args;
+        let at = args
+            .iter()
+            .position(|a| a == "--budget")
+            .unwrap_or(args.len());
+        format!("`aterm {}`", args[..at].join(" "))
+    }
+
+    /// The marks the sentence must give the worker: which key says a session
+    /// is this node's own, and which names another's node (the keys the
+    /// Overview's own parse reads).
+    fn fabric_read_marks() -> [String; 2] {
+        [
+            format!("\"{}\":true", crate::overview_fabric::THIS_KEY),
+            format!("\"{}\"", crate::overview_fabric::NODE_KEY),
+        ]
+    }
+
     #[test]
     fn the_briefs_read_the_fabric_only_where_it_is_on() {
         let task = |fleet: bool, fabric: bool| {
             String::from_utf8(summary_order(fleet, fabric).task).expect("UTF-8")
         };
+        let command = fabric_read_command();
+        assert!(command.contains(" --json"), "{command}");
         for (fleet, today, survey) in [
             (true, FLEET_BRIEF, FLEET_SURVEY),
             (false, MAC_BRIEF, MAC_SURVEY),
@@ -386,6 +413,10 @@ mod tests {
                 "{read}"
             );
             assert_eq!(read.matches("aterm fabric brief").count(), 1, "{read}");
+            assert_eq!(read.matches(&command).count(), 1, "{command}: {read}");
+            for mark in fabric_read_marks() {
+                assert!(read.contains(&mark), "{mark}: {read}");
+            }
             assert_eq!(read.replacen(&format!(" {FABRIC_READ}"), "", 1), plain);
         }
     }
@@ -400,7 +431,7 @@ mod tests {
             assert!(survey < local, "{brief}");
             assert_eq!(brief.matches("aterm ctl survey").count(), 2, "{brief}");
             if fabric {
-                assert!(local < at("`aterm fabric brief`"), "{brief}");
+                assert!(local < at(&fabric_read_command()), "{brief}");
             }
             let fleet = String::from_utf8(summary_order(true, fabric).task).expect("UTF-8");
             assert!(!fleet.contains("--brief"), "{fleet}");
@@ -418,6 +449,14 @@ mod tests {
             assert_eq!(booking.cwd.as_deref(), folder.to_str());
             let task = String::from_utf8(order.task).expect("UTF-8");
             assert_eq!(task.contains(FABRIC_READ), on, "fabric {on}: {task}");
+            assert_eq!(
+                task.contains(&fabric_read_command()),
+                on,
+                "fabric {on}: {task}"
+            );
+            for mark in fabric_read_marks() {
+                assert_eq!(task.contains(&mark), on, "{mark}, fabric {on}: {task}");
+            }
         }
     }
 

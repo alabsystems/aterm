@@ -416,6 +416,19 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
 /// changes; an unreached vault ([`super::UNREACHED`]) is asked again. The
 /// worker consumes a deadline once; only a later actual try advances it.
 pub(super) fn retry_due(root: &Path, revision: u64, now: u64) -> Option<u64> {
+    let (at, due) = retry_window(root, revision)?;
+    (!(at..due).contains(&now)).then_some(due)
+}
+
+/// The deadline of a retryable try not due yet ([`retry_due`]'s, while it is still ahead of
+/// `now`): when a parked worker looks again by itself, with no timer before it.
+pub(super) fn retry_ahead(root: &Path, revision: u64, now: u64) -> Option<u64> {
+    let (at, due) = retry_window(root, revision)?;
+    (at..due).contains(&now).then_some(due)
+}
+
+/// The last retryable try's time and the deadline of the next ([`retry_due`]).
+fn retry_window(root: &Path, revision: u64) -> Option<(u64, u64)> {
     let last = Attempt::load(root)?;
     if last.revision != revision
         || last.held()
@@ -426,8 +439,7 @@ pub(super) fn retry_due(root: &Path, revision: u64, now: u64) -> Option<u64> {
     {
         return None;
     }
-    let due = last.at.saturating_add(pause(last.tries).as_secs());
-    (!(last.at..due).contains(&now)).then_some(due)
+    Some((last.at, last.at.saturating_add(pause(last.tries).as_secs())))
 }
 
 /// Records the outcome of a Secrets attempt for `revision` at `pace`.

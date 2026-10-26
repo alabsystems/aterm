@@ -18,6 +18,7 @@ pub mod dominator;
 pub mod loc;
 pub mod model;
 pub mod policy;
+mod pristine;
 pub mod provenance;
 pub mod resolve;
 pub mod serde_attrs;

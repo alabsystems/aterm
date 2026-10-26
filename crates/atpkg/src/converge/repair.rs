@@ -75,6 +75,88 @@ pub struct Ground {
     pub login_rc: Option<&'static str>,
     /// Which surface runs the items.
     pub pass: Pass,
+    /// What the items read once and share for this pass.
+    pub reads: Reads,
+}
+
+/// One active Trust build's exec root as [`crate::compat::inspect`] reads it.
+type Inspected = Option<Result<crate::compat::Inspection, String>>;
+
+/// What one pass's items read once and share: the shim plan ([`shim_plan`], which the shims and
+/// store steps both weigh) and the active Trust build's exec root ([`crate::compat::inspect`],
+/// which the exec-roots step and the packages read both walk, `aterm doctor` reading them on two
+/// threads at once). An apply or a refresh forgets both, so whatever reads after a change reads
+/// afresh. A clone starts empty.
+pub struct Reads {
+    plan: Mutex<Option<Arc<ShimPlan>>>,
+    inspected: Mutex<std::collections::BTreeMap<u64, Arc<std::sync::OnceLock<Inspected>>>>,
+    inspect: fn(&Layout, u64) -> Inspected,
+}
+
+impl Default for Reads {
+    fn default() -> Self {
+        Self::reading(crate::compat::inspect)
+    }
+}
+
+impl Clone for Reads {
+    fn clone(&self) -> Self {
+        Self::reading(self.inspect)
+    }
+}
+
+impl std::fmt::Debug for Reads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reads").finish_non_exhaustive()
+    }
+}
+
+impl Reads {
+    /// Reads whose exec-root walks go through `inspect`: [`crate::compat::inspect`], or a test's
+    /// counter.
+    #[must_use]
+    pub fn reading(inspect: fn(&Layout, u64) -> Inspected) -> Self {
+        Self {
+            plan: Mutex::new(None),
+            inspected: Mutex::new(std::collections::BTreeMap::new()),
+            inspect,
+        }
+    }
+
+    /// `build`'s exec root, walked once however many readers ask, at once or after: a reader
+    /// that asks while another walks it waits for that walk.
+    #[must_use]
+    pub fn inspect(&self, layout: &Layout, build: u64) -> Inspected {
+        let once = Arc::clone(
+            self.inspected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(build)
+                .or_default(),
+        );
+        once.get_or_init(|| (self.inspect)(layout, build)).clone()
+    }
+
+    /// The shim plan, weighed once.
+    fn plan(&self, layout: &Layout) -> Arc<ShimPlan> {
+        let mut plan = self
+            .plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(plan.get_or_insert_with(|| Arc::new(shim_plan(layout))))
+    }
+
+    /// Forget everything read: something changed the store.
+    pub fn forget(&self) {
+        *self
+            .plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.inspected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 impl Ground {
@@ -91,6 +173,7 @@ impl Ground {
                 .ok(),
             rustup_home: crate::seam::rustup_home(),
             pass,
+            reads: Reads::default(),
         }
     }
 }
@@ -146,6 +229,34 @@ struct Repair {
 }
 
 impl Repair {
+    /// The step's change, which [`Item::apply`] follows by forgetting the pass's reads.
+    fn apply_step(&self) -> Result<(), String> {
+        match self.step {
+            Step::CopiedCommands => self.apply_copied(),
+            Step::Links => self.apply_links(),
+            Step::Hooks => crate::hooks::lay_hooks(self.layout(), self.home()?),
+            Step::Rc => self.apply_rc(),
+            Step::Stubs => self.apply_stubs(),
+            Step::RustupSeam => self.apply_seam(false),
+            Step::RustupLocal => self.apply_seam(true),
+            Step::HeldUpdate => {
+                if crate::quiet::end_outlived(self.layout()) {
+                    self.say([
+                        "ended the record of a held Trust toolchain update that outlived every \
+                         build it moves off"
+                            .to_owned(),
+                    ]);
+                }
+                Ok(())
+            }
+            Step::Shims => self.apply_shims(),
+            Step::ExecRoots => self.apply_exec_roots(),
+            Step::Store => Err(
+                "only an install puts a build back: `aterm pkg install --default-set`".to_owned(),
+            ),
+        }
+    }
+
     fn say(&self, lines: impl IntoIterator<Item = String>) {
         self.said
             .lock()
@@ -273,42 +384,23 @@ impl Item for Repair {
     }
 
     fn apply(&self) -> Result<(), String> {
-        match self.step {
-            Step::CopiedCommands => self.apply_copied(),
-            Step::Links => self.apply_links(),
-            Step::Hooks => crate::hooks::lay_hooks(self.layout(), self.home()?),
-            Step::Rc => self.apply_rc(),
-            Step::Stubs => self.apply_stubs(),
-            Step::RustupSeam => self.apply_seam(false),
-            Step::RustupLocal => self.apply_seam(true),
-            Step::HeldUpdate => {
-                if crate::quiet::end_outlived(self.layout()) {
-                    self.say([
-                        "ended the record of a held Trust toolchain update that outlived every \
-                         build it moves off"
-                            .to_owned(),
-                    ]);
-                }
-                Ok(())
-            }
-            Step::Shims => self.apply_shims(),
-            Step::ExecRoots => self.apply_exec_roots(),
-            Step::Store => Err(
-                "only an install puts a build back: `aterm pkg install --default-set`".to_owned(),
-            ),
-        }
+        let applied = self.apply_step();
+        self.ground.reads.forget();
+        applied
     }
 
     fn refresh(&self) -> Option<Result<(), String>> {
         if !self.reruns() {
             return None;
         }
-        match self.step {
+        let refreshed = match self.step {
             Step::Shims => Some(self.apply_shims()),
             Step::ExecRoots => Some(self.apply_exec_roots()),
             Step::RustupSeam => Some(self.apply_seam(false)),
             _ => None,
-        }
+        };
+        self.ground.reads.forget();
+        refreshed
     }
 
     fn refresh_changes(&self) -> bool {
@@ -907,7 +999,7 @@ impl Repair {
     }
 
     fn probe_shims(&self) -> Probe {
-        let plan = shim_plan(self.layout());
+        let plan = self.ground.reads.plan(self.layout());
         let broken: Vec<String> = plan
             .lay
             .iter()
@@ -988,7 +1080,7 @@ impl Repair {
         let Some(&build) = crate::ops::active_builds(layout).get(crate::seam::SEAM_PROGRAM) else {
             return ok("no active trust build, so no exec root");
         };
-        match crate::compat::inspect(layout, build) {
+        match self.ground.reads.inspect(layout, build) {
             None => ok(format!("trust build {build} needs no exec root")),
             Some(Err(why)) => Probe::Unusable {
                 why: format!("trust build {build}'s exec root could not be read ({why})"),
@@ -1051,7 +1143,7 @@ impl Repair {
     }
 
     fn probe_store(&self) -> Probe {
-        let plan = shim_plan(self.layout());
+        let plan = self.ground.reads.plan(self.layout());
         if plan.weighed == 0 {
             return not_applicable(
                 "no programs installed — `aterm pkg install --default-set` installs the toolset",

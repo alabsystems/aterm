@@ -127,7 +127,8 @@ impl File {
     /// `(version, torn_from, torn_whole)` — a torn image of a replace is cut
     /// anywhere short of its last byte (`torn_whole`: one whose bytes no
     /// flush point at or below `cut` put on the media), of an append any
-    /// prefix at or above `torn_from` bytes.
+    /// prefix at or above `torn_from` bytes, or its whole length with the bytes
+    /// past such a prefix read as zeros (the size on the media, the bytes not).
     fn versions(&self, keep: usize, floor: usize, cut: u64) -> Vec<(Version, Option<usize>, bool)> {
         let mut out = Vec::new();
         if floor == 0 {
@@ -188,6 +189,20 @@ struct Journal {
     /// Each ordered directory flush: its flush point, the directory, and how
     /// many of each of its files' pending writes it covers.
     dir_points: Vec<(u64, PathBuf, BTreeMap<PathBuf, usize>)>,
+    /// Each flush of a file where it is, either tier: its flush point, the
+    /// file, and how many of its pending writes it covers. Once the point is
+    /// on the media, so are those writes' bytes: a file whose entry is ruled
+    /// in holds no version older than the last of them ([`data_floor`]).
+    file_points: Vec<(u64, PathBuf, usize)>,
+}
+
+/// Whether a flush of a file's first `covered` writes, its point on the media,
+/// puts them on the media for every image: over a file whose media holds
+/// `durable`, where every entry change among them is ruled in by `floor` (a
+/// flush of a file's bytes says nothing of a directory entry a write moved).
+/// Then no image holds fewer of those writes, nor tears the last of them.
+fn data_flushed(durable: &Version, pending: &[Pending], covered: usize, floor: usize) -> bool {
+    covered > 0 && newest_entry(durable, &pending[..covered]).is_none_or(|e| e < floor)
 }
 
 impl Journal {
@@ -223,6 +238,7 @@ impl Journal {
         for (_, _, lens) in &mut self.dir_points {
             lens.remove(path);
         }
+        self.file_points.retain(|(_, p, _)| p != path);
     }
 
     /// A full flush was issued: it is a flush point, and every one before it
@@ -602,6 +618,10 @@ impl Device {
                         last.data_at = Some(at);
                     }
                 }
+                let covered = j.files.get(path).map_or(0, |f| f.pending.len());
+                if covered > 0 {
+                    j.file_points.push((at, path.to_path_buf(), covered));
+                }
             }
             Write::SyncDir {
                 path,
@@ -650,6 +670,7 @@ impl Device {
     /// ([`Device::power_cut`]).
     fn cut_files(&self, j: &mut Journal, rng: &mut Rng, cut: u64) -> Vec<String> {
         let dir_points = std::mem::take(&mut j.dir_points);
+        let file_points = std::mem::take(&mut j.file_points);
         let mut notes = Vec::new();
         for (path, f) in &mut j.files {
             let keep = f.pending.iter().take_while(|p| p.epoch <= cut).count();
@@ -663,6 +684,16 @@ impl Device {
                     floor = floor.max(e + 1);
                 }
             }
+            let mut data_on_media = 0;
+            for (at, flushed, covered) in &file_points {
+                if *at < cut && flushed == path {
+                    let covered = (*covered).min(keep);
+                    if data_flushed(&f.durable, &f.pending, covered, floor) {
+                        floor = floor.max(covered);
+                        data_on_media = data_on_media.max(covered);
+                    }
+                }
+            }
             let versions = f.versions(keep, floor, cut);
             if versions.is_empty() {
                 continue;
@@ -672,7 +703,12 @@ impl Device {
                 (newest, false)
             } else {
                 let pick = usize::try_from(rng.below(versions.len() as u64)).unwrap_or(newest);
-                let tearable = self.tears && (versions[pick].1.is_some() || versions[pick].2);
+                // How many of its pending writes the picked version holds
+                // ([`File::versions`]: the media's own first where `floor` is 0).
+                let writes = if floor == 0 { pick } else { floor + pick };
+                let tearable = self.tears
+                    && writes > data_on_media
+                    && (versions[pick].1.is_some() || versions[pick].2);
                 (pick, tearable && rng.chance(1, 4))
             };
             let (version, torn_from, replace) = versions[pick].clone();
@@ -681,11 +717,19 @@ impl Device {
                     let cut = usize::try_from(rng.below(bytes.len().max(1) as u64)).unwrap_or(0);
                     Version::Bytes(bytes[..cut.min(bytes.len())].to_vec(), mode)
                 }
-                (true, Version::Bytes(bytes, mode)) => {
+                (true, Version::Bytes(mut bytes, mode)) => {
                     let from = torn_from.unwrap_or(0);
                     let cut = from
                         + usize::try_from(rng.below((bytes.len() - from) as u64 + 1)).unwrap_or(0);
-                    Version::Bytes(bytes[..cut.min(bytes.len())].to_vec(), mode)
+                    let cut = cut.min(bytes.len());
+                    if rng.chance(1, 2) {
+                        // The append's length reached the media and its bytes past
+                        // the cut did not: they read as zeros (a tear inside it).
+                        bytes[cut..].fill(0);
+                        Version::Bytes(bytes, mode)
+                    } else {
+                        Version::Bytes(bytes[..cut].to_vec(), mode)
+                    }
                 }
                 (_, v) => v,
             };

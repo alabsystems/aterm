@@ -259,4 +259,42 @@ fn muse_code_store_names_only_an_active_goal() {
         None,
         "the store moved: read again"
     );
+
+    // An empty table missing a required column fails the read (`Unread::Failed`), so `StoreGoal`
+    // retains its previously cached goal rather than mistaking a schema mismatch for a cleared goal.
+    let active_db = store_db(
+        &dir,
+        "migrating-goals.db",
+        MUSE_SCHEMA,
+        &format!(
+            "INSERT INTO goals (session_id,goal_id,revision,objective,status,percent_complete,created_at_ms,updated_at_ms) \
+             VALUES ('{a}','g1','r1','keep across empty schema mismatch','active',50,1,2);"
+        ),
+    );
+    let mut kept = StoreGoal::default();
+    assert_eq!(
+        kept.read(Store::Muse, &active_db, a),
+        Some("keep across empty schema mismatch")
+    );
+    let broken = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .arg(&active_db)
+            .arg(
+                "DROP TABLE goals; \
+                 CREATE TABLE goals (session_id TEXT PRIMARY KEY, status TEXT NOT NULL); \
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            ),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("sqlite3 within the hang detector: {e}"));
+    assert!(broken.status.success(), "{broken:?}");
+    assert_eq!(
+        read_store(Store::Muse, &active_db, a),
+        Err(aterm_uds::foreign_db::Unread::Failed)
+    );
+    assert_eq!(
+        kept.read(Store::Muse, &active_db, a),
+        Some("keep across empty schema mismatch"),
+        "failed schema read keeps last known goal"
+    );
 }

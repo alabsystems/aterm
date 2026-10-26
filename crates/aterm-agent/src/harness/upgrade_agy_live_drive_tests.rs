@@ -1372,6 +1372,28 @@ fn the_summary_database_is_read_only_open_or_closed() {
         "and with none, an answer"
     );
     assert_eq!(live::read_summaries(&config, "not-a-uuid"), Err(()));
+
+    let bad_dir = scratch("summaries-empty-bad-schema");
+    let bad_config = std::fs::canonicalize(&*bad_dir).expect("canonical");
+    let bad_db = bad_config.join(live::SUMMARIES);
+    let bad_made = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .arg(&bad_db)
+            .arg(
+                "PRAGMA journal_mode=WAL; \
+                 CREATE TABLE conversation_summaries (conversation_id text PRIMARY KEY, status text); \
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            ),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("sqlite3 within the hang detector: {e}"));
+    assert!(bad_made.status.success(), "{bad_made:?}");
+    assert_eq!(
+        live::read_summaries(&bad_config, C1),
+        Err(()),
+        "empty table missing required summary columns must fail"
+    );
+    let _ = std::fs::remove_dir_all(&*bad_dir);
     let _ = std::fs::remove_dir_all(&*dir);
 }
 

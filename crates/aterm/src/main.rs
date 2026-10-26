@@ -144,6 +144,10 @@ fn dispatch_link(args: &[String]) -> ExitCode {
 }
 
 pub(crate) fn main() -> ExitCode {
+    // First, while this process has one thread: a window's tethered helper starts as this verb.
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
     #[cfg(windows)]
     if let Some(code) = aterm_pty::serve_console_client() {
         return code;
@@ -275,7 +279,20 @@ pub(crate) fn main() -> ExitCode {
                 eprintln!("aterm db: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
-            aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
+            aterm_cli::Verb::Harness => {
+                #[cfg(unix)]
+                if let Some(result) = shared_login::try_run(&forwarded) {
+                    return result;
+                }
+                #[cfg(not(unix))]
+                if forwarded.first().is_some_and(|arg| arg == "accounts")
+                    && forwarded.get(1).is_some_and(|arg| arg == "shared-renew")
+                {
+                    eprintln!("aterm shared-renew: not available on this platform (Unix only)");
+                    return ExitCode::from(2);
+                }
+                aterm_agent::harness::cli::main_entry(forwarded)
+            }
             aterm_cli::Verb::Ai => aterm_agent::ai::cli::main_entry(forwarded),
             #[cfg(target_os = "macos")]
             aterm_cli::Verb::Machines => aterm_machines::cli::main_entry(forwarded),
@@ -1623,9 +1640,8 @@ fn look_setup_upgrade_with(
 /// coordinator can use its now-free thread without needing another successful spawn.
 #[cfg(target_os = "macos")]
 fn maintain_setup_watch(how: WatchMaintenance) {
-    static WATCHING: SetupWatch = SetupWatch::new();
     maintain_setup_watch_with(
-        &WATCHING,
+        &SETUP_WATCH,
         how,
         provisional_setup_widens_here,
         |reservation| {
@@ -1642,6 +1658,17 @@ fn maintain_setup_watch(how: WatchMaintenance) {
             run_reserved_alab_watch(reservation, || widen_on_alab_signal(&mut watch));
         },
     );
+}
+
+/// The one watch of aterm's own provisional plan ([`maintain_setup_watch`]).
+#[cfg(target_os = "macos")]
+static SETUP_WATCH: SetupWatch = SetupWatch::new();
+
+/// Whether the watch of aterm's own provisional plan is owed: its thread could not start, so a
+/// parked run keeps a timer to try it again ([`park_wait_limit`]).
+#[cfg(target_os = "macos")]
+fn setup_watch_owed() -> bool {
+    SETUP_WATCH.owed.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(target_os = "macos")]
@@ -1665,16 +1692,22 @@ fn maintain_setup_watch_with<'a>(
             break;
         }
         if !reservation.recheck(seen) {
+            watching.owed.store(false, Ordering::SeqCst);
             return;
         }
     }
     match how {
         WatchMaintenance::Spawn => {
-            if let Err(why) = spawn(reservation) {
+            let started = spawn(reservation);
+            watching.owed.store(started.is_err(), Ordering::SeqCst);
+            if let Err(why) = started {
                 aterm_log::warn!("setup: the watch for the ALab vault could not start: {why}");
             }
         }
-        WatchMaintenance::Inline => inline(reservation),
+        WatchMaintenance::Inline => {
+            watching.owed.store(false, Ordering::SeqCst);
+            inline(reservation);
+        }
     }
 }
 
@@ -1682,6 +1715,8 @@ fn maintain_setup_watch_with<'a>(
 struct SetupWatch {
     running: std::sync::atomic::AtomicBool,
     requests: std::sync::atomic::AtomicU64,
+    /// The last try to start the watch's thread failed ([`setup_watch_owed`]).
+    owed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1690,6 +1725,7 @@ impl SetupWatch {
         Self {
             running: std::sync::atomic::AtomicBool::new(false),
             requests: std::sync::atomic::AtomicU64::new(0),
+            owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3170,9 +3206,13 @@ fn report_withheld_preferences<S>(
         _ => {}
     }
     match report.result {
-        Ok(Some(report)) if report.needs_attention() => aterm_log::warn!(
+        Ok(Some(report)) if report.needs_attention() && report.failed() => aterm_log::warn!(
             "setup follow-up with Full Disk Access: {}",
-            report.to_text()
+            report.attention_line()
+        ),
+        Ok(Some(report)) if report.needs_attention() => aterm_log::info!(
+            "setup follow-up with Full Disk Access: {}",
+            report.attention_line()
         ),
         Ok(Some(report)) => aterm_log::info!(
             "setup follow-up with Full Disk Access: {}",
@@ -3474,6 +3514,29 @@ fn run_setup_retry<H: SetupRetryHost>(
     }
 }
 
+/// How long a parked run waits before it reads its mark again by itself: until its next retry
+/// falls due (`next_due`, seconds since the epoch, against `now`), or with no timer at all when
+/// none is ahead. A run whose facts are not all `watched` (a watch that could not start) reads
+/// them at least once a minute, as before watches.
+#[cfg(any(target_os = "macos", test))]
+fn park_wait_limit(next_due: Option<u64>, now: u64, watched: bool) -> Option<std::time::Duration> {
+    const UNWATCHED: std::time::Duration = std::time::Duration::from_secs(60);
+    let due = next_due.map(|due| std::time::Duration::from_secs(due.saturating_sub(now).max(1)));
+    if watched {
+        due
+    } else {
+        Some(due.map_or(UNWATCHED, |due| due.min(UNWATCHED)))
+    }
+}
+
+/// Seconds since the epoch on this Mac's clock.
+#[cfg(target_os = "macos")]
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// Park without holding a setup lease. A local fact that changes or an explicit
 /// wake ends the wait; unchanged readings never run another setup pass.
 #[cfg(any(target_os = "macos", test))]
@@ -3640,12 +3703,11 @@ impl SetupRetryHost for LiveSetupRetry {
             );
             self.accounts_resynced(&resync);
         }
-        let text = report.to_text();
         remember_initial_setup_rows(&report, None, observed.observation);
         if report.needs_attention() {
-            self.failure(&text);
+            report_first_run_doctor_attention(&mut self.last_failure, &report);
         } else if !self.success_reported {
-            aterm_log::info!("first-run macOS doctor: {text}");
+            aterm_log::info!("first-run macOS doctor: {}", report.to_text());
             self.success_reported = true;
         }
         Ok(match next {
@@ -3664,19 +3726,27 @@ impl SetupRetryHost for LiveSetupRetry {
         self.wakes_seen.checked_since(seen)
     }
     fn park(&mut self) -> bool {
-        // Local vault facts, interfaces for pending Secrets or Repositories,
-        // and existing retry deadlines can change without the window. Sampling
-        // once a minute makes no network request or setup pass. A window gaining
-        // focus ends the park only while it waits on what a person does in System
-        // Settings or macOS (an Accounts or Permissions stage left).
+        // Local vault facts, interfaces for pending Secrets or Repositories, the
+        // Command Line Tools and existing retry deadlines can change without the
+        // window. Each is watched (`ParkWatch`), so the park reads its mark again
+        // only when one may have moved, a retry falls due or a wake comes: a run
+        // left waiting on a person alone has no timer. A window gaining focus ends
+        // the park only while it waits on what a person does in System Settings or
+        // macOS (an Accounts or Permissions stage left).
+        use aterm_cli::macos_doctor::{ParkWatch, Watches};
         let seen = self.wakes_seen;
         let due_seen = self.park_due_seen;
         let before_pass = self.park_before_pass.take();
         let mut previous = None;
         let focus = std::cell::Cell::new(false);
+        let facts = std::cell::Cell::new(SETUP_WAKES.marks().facts);
+        let limit = std::cell::Cell::new(None);
+        let mut watching: Option<(Watches, Option<ParkWatch>)> = None;
         let mark = wait_for_setup_park_change_since(
             before_pass.as_ref(),
             || {
+                // Taken before the read: a fact that moves during it ends the next wait at once.
+                facts.set(SETUP_WAKES.marks().facts);
                 let mut mark = read_setup_park_mark_with(
                     aterm_cli::macos_doctor::initial_setup_park_mark,
                     || maintain_setup_watch(WatchMaintenance::Spawn),
@@ -3685,6 +3755,32 @@ impl SetupRetryHost for LiveSetupRetry {
                     mark.retain_known_from(known);
                 }
                 focus.set(mark.waits_on_settings());
+                let watches = mark.watches();
+                if watching.as_ref().map(|(on, _)| *on) != Some(watches) {
+                    // The old watch ends before the new one starts.
+                    drop(watching.take());
+                    let started = (!watches.none())
+                        .then(|| {
+                            ParkWatch::start(watches, wake_setup_facts)
+                                .inspect_err(|why| {
+                                    aterm_log::info!(
+                                        "setup: a parked run reads its facts each minute: {why}"
+                                    );
+                                })
+                                .ok()
+                        })
+                        .flatten();
+                    // A fact that moved between the read and the watch starting: one more read.
+                    if started.is_some() {
+                        facts.set(facts.get().wrapping_sub(1));
+                    }
+                    watching = Some((watches, started));
+                }
+                // A watch that stopped hearing its fact gives the park its timer back.
+                let watched = watching.as_ref().is_some_and(|(on, started)| {
+                    on.none() || started.as_ref().is_some_and(ParkWatch::whole)
+                }) && !setup_watch_owed();
+                limit.set(park_wait_limit(mark.next_due(), unix_seconds(), watched));
                 previous = Some(mark.clone());
                 mark
             },
@@ -3692,7 +3788,7 @@ impl SetupRetryHost for LiveSetupRetry {
             aterm_cli::macos_doctor::InitialSetupParkMark::facts_changed_since,
             || !SETUP_WAKES.marks().ends_run_wait(seen, focus.get()),
             || {
-                SETUP_WAKES.wait_for_run(seen, focus.get(), std::time::Duration::from_secs(60));
+                SETUP_WAKES.wait_for_park(seen, facts.get(), focus.get(), limit.get());
             },
         );
         self.park_due_seen
@@ -4580,6 +4676,90 @@ mod setup_retry_tests {
         assert!(wakes.marks().checked_since(seen));
     }
 
+    /// A park whose facts are all watched has a timer only for a retry ahead, never a zero one;
+    /// a park waiting on a person alone has none. A watch that could not start leaves the park
+    /// reading its facts once a minute.
+    #[test]
+    fn a_park_on_a_person_alone_has_no_timer() {
+        use super::park_wait_limit;
+        use std::time::Duration;
+        assert_eq!(park_wait_limit(None, 100, true), None);
+        assert_eq!(
+            park_wait_limit(Some(130), 100, true),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            park_wait_limit(Some(100), 100, true),
+            Some(Duration::from_secs(1)),
+            "a retry the clock calls due now waits a second, never spins"
+        );
+        assert_eq!(
+            park_wait_limit(None, 100, false),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            park_wait_limit(Some(110), 100, false),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    /// A watched fact moving ends a park's wait, with or without a timer, and no other wait: a
+    /// run backing off a failure and the startup's waits sleep on.
+    #[test]
+    fn a_watched_fact_ends_only_a_parks_wait() {
+        use std::time::Duration;
+        static WAKES: SetupWakes = SetupWakes::new();
+        let seen = WAKES.marks();
+        WAKES.raise_facts();
+        assert!(!WAKES.wait_for_run(seen, true, Duration::ZERO));
+        let mut backoff = seen;
+        assert!(!WAKES.back_off_run(&mut backoff, Duration::ZERO));
+        assert!(
+            !WAKES.wait(seen.all, Duration::ZERO),
+            "the startup hears no fact"
+        );
+        assert!(WAKES.wait_for_park(seen, seen.facts, false, Some(Duration::ZERO)));
+        let looked = WAKES.marks();
+        assert!(
+            !WAKES.wait_for_park(seen, looked.facts, false, Some(Duration::ZERO)),
+            "a fact already looked at ends no later wait"
+        );
+        let (told, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            told.send(WAKES.wait_for_park(seen, looked.facts, false, None))
+                .unwrap();
+        });
+        WAKES.raise_facts();
+        assert_eq!(
+            heard.recv_timeout(Duration::from_secs(60)),
+            Ok(true),
+            "a park with no timer wakes on a watched fact"
+        );
+    }
+
+    /// A wake lock a panicking holder poisoned still counts and still waits: a park with no
+    /// timer sleeps until a fact moves, never returning at once to read its mark again in a spin.
+    #[test]
+    fn a_poisoned_wake_lock_still_waits_for_a_fact() {
+        use std::time::Duration;
+        static WAKES: SetupWakes = SetupWakes::new();
+        let _ = std::thread::spawn(|| {
+            let _held = WAKES.count.lock();
+            panic!("a holder panics");
+        })
+        .join();
+        assert!(WAKES.count.is_poisoned());
+        let seen = WAKES.marks();
+        let (told, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            told.send(WAKES.wait_for_park(seen, seen.facts, false, None))
+                .unwrap();
+        });
+        WAKES.raise_facts();
+        assert_eq!(heard.recv_timeout(Duration::from_secs(60)), Ok(true));
+        assert_ne!(WAKES.marks().facts, seen.facts, "the fact was counted");
+    }
+
     #[derive(Clone, Copy)]
     enum RouteChange {
         WhileParked,
@@ -4939,6 +5119,23 @@ fn report_first_run_doctor_failure(last_failure: &mut Option<String>, text: &str
     }
     aterm_log::warn!("first-run macOS doctor: {text}; automatic setup retries while aterm is open");
     *last_failure = Some(text.to_string());
+}
+
+/// A pass that left rows needing attention, said once until it changes: its verdict and those
+/// rows alone ([`aterm_cli::macos_doctor::Report::attention_line`]), a warning only where
+/// aterm's own step failed. A row that waits on a person, a vault or a service is a not-yet.
+#[cfg(target_os = "macos")]
+fn report_first_run_doctor_attention(
+    last_failure: &mut Option<String>,
+    report: &aterm_cli::macos_doctor::Report,
+) {
+    let line = report.attention_line();
+    if report.failed() {
+        report_first_run_doctor_failure(last_failure, &line);
+    } else if last_failure.as_deref() != Some(line.as_str()) {
+        aterm_log::info!("first-run macOS doctor: {line}");
+        *last_failure = Some(line);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5444,6 +5641,9 @@ struct WakeMarks {
     all: u64,
     focus: u64,
     checks: u64,
+    /// A fact a parked run watches may have moved ([`SetupWakes::raise_facts`]): counted apart
+    /// from `all`, so only a park's wait ends on it ([`SetupWakes::wait_for_park`]).
+    facts: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -5478,6 +5678,7 @@ impl SetupWakes {
                 all: 0,
                 focus: 0,
                 checks: 0,
+                facts: 0,
             }),
             raised: std::sync::Condvar::new(),
         }
@@ -5488,9 +5689,10 @@ impl SetupWakes {
     }
 
     fn marks(&self) -> WakeMarks {
-        self.count
+        *self
+            .count
             .lock()
-            .map_or_else(|_| WakeMarks::default(), |marks| *marks)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn raise(&self) {
@@ -5507,37 +5709,83 @@ impl SetupWakes {
         self.raise_with(|marks| marks.checks = marks.checks.wrapping_add(1));
     }
 
+    /// A fact a parked run watches may have moved (`aterm_cli::macos_doctor::ParkWatch`): the
+    /// park looks at its mark again and runs a pass only if a fact changed. No other wait ends.
+    fn raise_facts(&self) {
+        let mut marks = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        marks.facts = marks.facts.wrapping_add(1);
+        drop(marks);
+        self.raised.notify_all();
+    }
+
     fn raise_with(&self, also: impl FnOnce(&mut WakeMarks)) {
-        if let Ok(mut marks) = self.count.lock() {
-            marks.all = marks.all.wrapping_add(1);
-            also(&mut marks);
-        }
+        let mut marks = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        marks.all = marks.all.wrapping_add(1);
+        also(&mut marks);
+        drop(marks);
         self.raised.notify_all();
     }
 
     /// Wait until a wake after `seen`, or `limit` passes. `true` when woken.
     fn wait(&self, seen: u64, limit: std::time::Duration) -> bool {
-        self.wait_while(limit, |marks| marks.all == seen)
+        self.wait_while(Some(limit), |marks| marks.all == seen)
     }
 
     /// A setup run's wait: until a wake since `seen` that ends it ([`WakeMarks::ends_run_wait`]),
     /// or `limit` passes. `true` when woken.
     fn wait_for_run(&self, seen: WakeMarks, focus: bool, limit: std::time::Duration) -> bool {
-        self.wait_while(limit, |marks| !marks.ends_run_wait(seen, focus))
+        self.wait_while(Some(limit), |marks| !marks.ends_run_wait(seen, focus))
+    }
+
+    /// A parked run's wait for its next look: [`Self::wait_for_run`]'s wakes, or a watched fact's
+    /// since `facts` ([`Self::raise_facts`]), or `limit` (`None`: no timer at all).
+    fn wait_for_park(
+        &self,
+        seen: WakeMarks,
+        facts: u64,
+        focus: bool,
+        limit: Option<std::time::Duration>,
+    ) -> bool {
+        self.wait_while(limit, |marks| {
+            !marks.ends_run_wait(seen, focus) && marks.facts == facts
+        })
     }
 
     fn wait_while(
         &self,
-        limit: std::time::Duration,
+        limit: Option<std::time::Duration>,
         mut waiting: impl FnMut(&WakeMarks) -> bool,
     ) -> bool {
-        let Ok(marks) = self.count.lock() else {
-            std::thread::sleep(limit);
-            return false;
-        };
-        self.raised
-            .wait_timeout_while(marks, limit, |marks| waiting(marks))
-            .is_ok_and(|(_, waited)| !waited.timed_out())
+        // The marks are plain counters, whole even if a holder panicked: a poisoned lock still
+        // waits, or a wait with no timer would return at once and its park would spin.
+        let marks = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match limit {
+            Some(limit) => {
+                let (marks, waited) = self
+                    .raised
+                    .wait_timeout_while(marks, limit, |marks| waiting(marks))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(marks);
+                !waited.timed_out()
+            }
+            None => {
+                drop(
+                    self.raised
+                        .wait_while(marks, |marks| waiting(marks))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                true
+            }
+        }
     }
 
     /// A retry's backoff: wait for a wake after `seen`, or `limit`, then take
@@ -5766,6 +6014,13 @@ fn wake_setup_on_focus() {
 #[cfg(target_os = "macos")]
 fn wake_setup_for_check() {
     SETUP_WAKES.raise_check();
+}
+
+/// A fact a parked run watches may have moved: the secrets folder, the network, the Command Line
+/// Tools (`aterm_cli::macos_doctor::ParkWatch`).
+#[cfg(target_os = "macos")]
+fn wake_setup_facts() {
+    SETUP_WAKES.raise_facts();
 }
 
 /// What the setup worker hears from the window, registered once before the GUI
@@ -7081,6 +7336,17 @@ fn remember_initial_setup_rows(
     // one calm line.
     if let Some(refused) = report.journal_refused() {
         aterm_gui::note_journal_refused(refused);
+    }
+    // A row a person changed after setup had it as wanted is theirs: no automatic pass rewrites
+    // it, and the exceptions digest keeps the fact until a check reads nothing out of place or a
+    // Restore puts the originals back.
+    let changed = report.changed_since();
+    if !changed.is_empty() {
+        aterm_gui::note_setup_changed_since(&changed.join(", "));
+    } else if report.action == aterm_cli::macos_doctor::Action::Restore
+        || (report.action == aterm_cli::macos_doctor::Action::Check && !report.needs_attention())
+    {
+        aterm_gui::clear_setup_changed_since();
     }
     publish_initial_setup_rows(initial_setup_report_rows(report), checked_plan, observation);
 }
@@ -12907,6 +13173,9 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
     first == "doctor" && !rest.iter().any(|arg| arg == "-h" || arg == "--help")
 }
+
+#[cfg(unix)]
+mod shared_login;
 
 #[path = "doctor.rs"]
 mod doctor;

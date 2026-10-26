@@ -1,0 +1,65 @@
+# What the v0.143.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.143.0"
+producer_commit = "21c9b17038ff"
+outgoing_build = 1793022609
+park_carry_ceiling = "full"
+manifest = "seamless-84071-00000000000000000000000001000007.toml"
+nonce = "00000000000000000000000001000007"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "3c6dce2e17109434ed8b162c88e0f4dcdd9e7e5838fe9b4a57a79af0a62fdc41"
+layout_digest = "52439269c492e89cbcb6d3f85754f6d72235ffce3c4d8179805df1b2da5c4131"
+proof_target_build = 1793109009
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 3, 40000], [1, 5, 40001]]
+proof_count = 2
+proof_digest = "41d09b8d95bc0bb398b4104ff409825f0cd88210f48b2024308aa1026329d2da"
+ready_wire = "415352310000000241d09b8d95bc0bb398b4104ff409825f0cd88210f48b2024308aa1026329d2da"
+commit_wire = "415343310000000241d09b8d95bc0bb398b4104ff409825f0cd88210f48b2024308aa1026329d2da"
+files = ["seamless-84071-00000000000000000000000001000007.layout.toml", "seamless-84071-00000000000000000000000001000007.s0.ctl", "seamless-84071-00000000000000000000000001000007.s0.grid", "seamless-84071-00000000000000000000000001000007.s0.hist", "seamless-84071-00000000000000000000000001000007.s1.altgrid", "seamless-84071-00000000000000000000000001000007.s1.ctl", "seamless-84071-00000000000000000000000001000007.s1.grid", "seamless-84071-00000000000000000000000001000007.s1.hist", "seamless-84071-00000000000000000000000001000007.toml"]
+
+[[session]]
+local_id = 0
+rows = 42
+cols = 120
+history_lines = 256
+alt_grid = false
+control = true
+require_shell_integration_nonce = true
+shell_integration_nonce = "9595959595959595959595959595959595959595959595959595959595959595"
+history_take = 391
+history_lost = 0
+fg_holder = 41000
+absolute_row_counter = 689
+alt_absolute_row_counter = 0
+color = true
+shell_phase = 3
+shell_marks = 63
+shell_completed_seq = 150
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 1
+rows = 42
+cols = 119
+history_lines = 0
+alt_grid = true
+control = true
+require_shell_integration_nonce = false
+history_take = 144
+history_lost = 0
+fg_holder = 41001
+absolute_row_counter = 42
+alt_absolute_row_counter = 186
+color = true
+shell_phase = 3
+shell_marks = 9
+shell_completed_seq = 40
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::history::{self, Filling, FreeHistory, Rates};
 use crate::peaks::{DailyMax, NET_LEARN_S, PEAK_DAYS, Peaks, PlanDay, PlanWeek, TOKENS_LEARN_S};
 use crate::ring::{
-    BUCKET_MS, BucketRing, Cell, NOW_WINDOW_MS, Reading, Recent, SLOT_GUARD_MS, SLOT_MS, SlotGrid,
-    columns_of, slots_of,
+    BUCKET_MS, BucketRing, Cell, GapKind, MultiScaleSpec, NOW_WINDOW_MS, ProgSlot, Reading, Recent,
+    SLOT_GUARD_MS, SLOT_MS, ScaleCell, SlotGrid, TimeGap, columns_of, multi_scale_cells, slots_of,
 };
 use crate::trend::{History, Trend, TrendView};
 
@@ -50,6 +50,8 @@ pub struct ProcSample {
     pub footprint: Option<u64>,
     /// The short command name.
     pub name: String,
+    /// Cumulative bytes read from storage, or `None` if unreadable.
+    pub disk_read: Option<u64>,
     /// Cumulative bytes written to storage, or `None` if unreadable.
     pub disk_written: Option<u64>,
     /// Its real user, where read.
@@ -622,7 +624,45 @@ pub struct LinkView {
     pub rates: Option<LinkRates>,
 }
 
-/// Network interfaces, throughput rates, and TCP connection counts.
+/// Live connectivity standing derived from network links, traffic, errors, and TCP sockets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum NetState {
+    /// Link up and idle (no active established connections or significant traffic).
+    #[default]
+    Idle,
+    /// Link up with active traffic or established connections.
+    Online,
+    /// Link up with elevated packet errors/drops or high TCP latency.
+    Degraded,
+    /// No non-loopback network link is up.
+    Offline,
+}
+
+impl NetState {
+    /// Canonical lowercase word (`"idle"`, `"online"`, `"degraded"`, `"offline"`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Online => "online",
+            Self::Degraded => "degraded",
+            Self::Offline => "offline",
+        }
+    }
+
+    /// Title-cased UI badge word (`"Idle"`, `"Online"`, `"Degraded"`, `"Offline"`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Online => "Online",
+            Self::Degraded => "Degraded",
+            Self::Offline => "Offline",
+        }
+    }
+}
+
+/// Network interfaces, throughput rates, connectivity state, latency, and TCP socket counts.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NetView {
     /// Every interface read on this sample, in probe order.
@@ -633,6 +673,38 @@ pub struct NetView {
     pub window_ns: Option<u64>,
     /// Machine-wide TCP socket counts by state, where readable.
     pub tcp: Option<TcpCounts>,
+    /// Passive kernel TCP smoothed RTT median in milliseconds across established remote peers.
+    pub srtt_ms: Option<f32>,
+    /// Live connectivity state across counted links.
+    pub state: NetState,
+    /// Open socket descriptors held by `aterm` and its tab subtrees, where read.
+    pub aterm_sockets: Option<u32>,
+    /// Open socket descriptors held by each tab (`TabRoot::key`), where read.
+    pub tab_sockets: Vec<(u64, u32)>,
+}
+
+/// Category of vertical event marker overlaid on a multi-scale time-series strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StripEventKind {
+    /// System sleep/wake boundary.
+    SleepWake,
+    /// Critical memory pressure, severe thermal throttle, or GPU fault recovery spike.
+    PressureSpike,
+    /// Instance or session restart.
+    Restart,
+    /// Abnormal crash or fatal signal termination.
+    Crash,
+}
+
+/// Vertical event marker anchored to a wall-clock timestamp on a time-series strip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StripEvent {
+    /// Wall-clock timestamp when the event occurred (Unix ms).
+    pub at_unix_ms: i64,
+    /// Visual and semantic category of the marker.
+    pub kind: StripEventKind,
+    /// Short human-readable label (e.g. `"SIGSEGV"`, `"GPU reset"`, `"woke from sleep"`).
+    pub label: String,
 }
 
 /// The most processes the machine and one user may run.
@@ -791,6 +863,18 @@ pub struct Sample {
     pub timeline: Option<crate::explain::TimelineSample>,
     /// Status of the host's coalition probe lane.
     pub coal_lane: crate::explain::CoalLane,
+    /// Hardware processor brand/chip string (e.g. `"Apple M5 Max"`), where known.
+    pub cpu_brand: Option<String>,
+    /// Passive kernel TCP smoothed RTT median in milliseconds across established remote peers.
+    pub tcp_srtt_ms: Option<f32>,
+    /// Open socket descriptors across `aterm` and its tab subtrees, where sampled.
+    pub aterm_sockets: Option<u32>,
+    /// Open socket descriptors per tab (`TabRoot::key`), where sampled.
+    pub tab_sockets: Vec<(u64, u32)>,
+    /// Explicit time-series vertical event markers recorded by the host on this sample.
+    pub note_events: Vec<StripEvent>,
+    /// Explicit wall-clock discontinuities recorded by the host on this sample.
+    pub note_gaps: Vec<TimeGap>,
 }
 
 /// One core's load.
@@ -894,6 +978,8 @@ pub struct ScopeView {
     pub top: Option<(String, f32)>,
     /// Cores-worth of runnable threads waiting for a core, if readable.
     pub wait: Option<f32>,
+    /// Storage read rate in bytes/s across readable members in this scope.
+    pub read_bps: Option<f64>,
     /// Storage write rate in bytes/s across readable members in this scope.
     pub write_bps: Option<f64>,
     /// Members whose CPU time the OS refused.
@@ -903,6 +989,12 @@ pub struct ScopeView {
 }
 
 impl ScopeView {
+    /// Combined storage read + write rate in bytes/s, where either counter was read.
+    #[must_use]
+    pub fn io_bps(&self) -> Option<f64> {
+        plus(self.read_bps, self.write_bps, |a, b| a + b)
+    }
+
     /// Share of demand spent waiting for a core (`wait / (wait + cores)`).
     #[must_use]
     pub fn starved(&self) -> Option<f32> {
@@ -937,6 +1029,7 @@ impl ScopeView {
                 (a, b) => a.clone().or_else(|| b.clone()),
             },
             wait: plus(self.wait, other.wait, |a, b| a + b),
+            read_bps: plus(self.read_bps, other.read_bps, |a, b| a + b),
             write_bps: plus(self.write_bps, other.write_bps, |a, b| a + b),
             refused: self.refused.saturating_add(other.refused),
             gpu: plus(self.gpu, other.gpu, |a, b| a + b),
@@ -1009,6 +1102,8 @@ pub struct ProcView {
     pub footprint: Option<u64>,
     /// Its largest footprint so far, bytes.
     pub peak: Option<u64>,
+    /// Bytes per second read from storage; `None` where unread.
+    pub read_bps: Option<f64>,
     /// Bytes per second written to storage; `None` where unread.
     pub write_bps: Option<f64>,
     /// Its scheduler state.
@@ -1471,6 +1566,17 @@ pub struct HeatCell {
     pub max: Option<f32>,
     /// Over the resource's maximum.
     pub over: bool,
+    /// Discontinuity kind when this cell spans a sleep, crash, or pause gap.
+    pub gap: Option<GapKind>,
+}
+
+/// One progressive box on a multi-scale heat strip, pairing [`HeatCell`] with [`ProgSlot`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeatSlot {
+    /// Heat values and discontinuity marker for this box.
+    pub cell: HeatCell,
+    /// Normalized horizontal bounds and age window of this box.
+    pub slot: ProgSlot,
 }
 
 impl ResourceView {
@@ -1547,6 +1653,55 @@ impl ResourceView {
         out
     }
 
+    /// Resample this row's hour ring and last-minute per-sample readings into progressive
+    /// multi-scale [`HeatSlot`]s for `spec` at `now_unix_ms`, preserving `gaps` without smearing.
+    #[must_use]
+    pub fn heat_multi_scale(
+        &self,
+        spec: MultiScaleSpec,
+        now_unix_ms: i64,
+        cover_ms: i64,
+        gaps: &[TimeGap],
+    ) -> Vec<HeatSlot> {
+        let ceiling = self.basis.heat_ceiling();
+        let convert = |sc: ScaleCell, cap: Option<f64>| HeatSlot {
+            cell: HeatCell {
+                heat: heat_of(sc.cell.mean, cap).map(|h| h.min(ceiling)),
+                max: heat_of(sc.cell.max, cap).map(|h| h.min(ceiling)),
+                over: sc.cell.over,
+                gap: sc.gap,
+            },
+            slot: sc.slot,
+        };
+        let slots_for = |s: &Series| -> Vec<HeatSlot> {
+            multi_scale_cells(
+                &s.ring,
+                self.ring_k,
+                &s.recent,
+                now_unix_ms,
+                spec,
+                cover_ms,
+                gaps,
+            )
+            .into_iter()
+            .map(|sc| convert(sc, s.capacity))
+            .collect()
+        };
+        let mut out = slots_for(&self.first());
+        if let Some(second) = self.second.as_ref() {
+            for (a, b) in out.iter_mut().zip(slots_for(second)) {
+                a.cell.heat = larger(a.cell.heat, b.cell.heat);
+                a.cell.max = larger(a.cell.max, b.cell.max);
+                a.cell.over |= b.cell.over;
+                a.cell.gap = a.cell.gap.or(b.cell.gap);
+                if a.cell.gap.is_some() && b.cell.heat.is_none() && a.cell.heat.is_none() {
+                    a.cell.over = false;
+                }
+            }
+        }
+        out
+    }
+
     fn heat_of_columns(&self, cols: Vec<Cell>, capacity: Option<f64>) -> Vec<HeatCell> {
         let ceiling = self.basis.heat_ceiling();
         cols.into_iter()
@@ -1554,6 +1709,7 @@ impl ResourceView {
                 heat: heat_of(c.mean, capacity).map(|h| h.min(ceiling)),
                 max: heat_of(c.max, capacity).map(|h| h.min(ceiling)),
                 over: c.over,
+                gap: None,
             })
             .collect()
     }
@@ -1642,6 +1798,8 @@ pub struct Writer {
 /// Per-resource auxiliary metrics for the deck's details and lens views.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowFacts {
+    /// CPU: hardware processor brand/chip string, where known.
+    pub cpu_brand: Option<String>,
     /// CPU: the 1-minute load average.
     pub load1: Option<f64>,
     /// CPU: the busiest program this sweep, its processes grouped by name.
@@ -1825,6 +1983,10 @@ pub struct Snapshot {
     pub why: Option<Arc<crate::explain::WhyFacts>>,
     /// Whether the coalition lane reads (`Off` once a read misread the layout).
     pub coal_lane: crate::explain::CoalLane,
+    /// Discontinuous wall-clock intervals (sleep, crash, sampling pauses) in the last hour.
+    pub time_gaps: Vec<TimeGap>,
+    /// Vertical event markers (crashes, restarts, sleep/wake, pressure spikes) in the last hour.
+    pub strip_events: Vec<StripEvent>,
 }
 
 /// aterm's own process rows kept per snapshot, busiest first.
@@ -1894,10 +2056,147 @@ impl Snapshot {
         })
     }
 
-    /// Take the stuck engine's view, and with it the Processes row's state.
+    /// Normalized `[global, aterm, tab]` shares (`0.0..=1.0`, `tab <= aterm <= global`) for the
+    /// overlapping 3-scope bar on `Cpu`, `Memory`, `Disk`, `Network`, and `Processes`.
+    #[must_use]
+    pub fn bar_shares(&self, res: Resource, panes: &[u64]) -> Option<[f32; 3]> {
+        let view = self.resource(res, panes);
+        let clamp01 = |v: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        match res {
+            Resource::Cpu | Resource::Memory | Resource::Processes => {
+                let b = view.binding();
+                let cap = b.capacity.filter(|&c| c > 0.0)?;
+                let global = clamp01((b.now? / cap) as f32);
+                let aterm_val = view.aterm.now.or_else(|| match res {
+                    Resource::Cpu => self.aterm.as_ref().map(|a| f64::from(a.cores.level)),
+                    Resource::Memory => self
+                        .aterm
+                        .as_ref()
+                        .and_then(|a| a.footprint.map(|f| f as f64)),
+                    Resource::Processes => self.aterm.as_ref().map(|a| f64::from(a.procs)),
+                    _ => None,
+                });
+                let tab_val = view.tab.now.or_else(|| {
+                    let t = self.tab_of(panes)?;
+                    match res {
+                        Resource::Cpu => Some(f64::from(t.scope.cores.level)),
+                        Resource::Memory => t.scope.footprint.map(|f| f as f64),
+                        Resource::Processes => Some(f64::from(t.scope.procs)),
+                        _ => None,
+                    }
+                });
+                let aterm = aterm_val
+                    .map(|v| clamp01((v / cap) as f32))
+                    .unwrap_or(0.0)
+                    .min(global);
+                let tab = tab_val
+                    .map(|v| clamp01((v / cap) as f32))
+                    .unwrap_or(0.0)
+                    .min(aterm);
+                Some([global, aterm, tab])
+            }
+            Resource::Disk => {
+                let cap = view.capacity.filter(|&c| c > 0.0)?;
+                let global = clamp01((view.now? / cap) as f32);
+                let aterm_io = self
+                    .aterm
+                    .as_ref()
+                    .and_then(ScopeView::io_bps)
+                    .or(view.aterm.now)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let tab_io = self
+                    .tab_of(panes)
+                    .and_then(|t| t.scope.io_bps())
+                    .or(view.tab.now)
+                    .unwrap_or(0.0)
+                    .max(0.0)
+                    .min(aterm_io);
+                let global_io = self.global.io_bps().unwrap_or(0.0).max(aterm_io);
+                let io_ref = global_io.max(50_000_000.0);
+                let aterm = (global * clamp01((aterm_io / io_ref) as f32)).min(global);
+                let tab = if aterm_io > 0.0 {
+                    (aterm * clamp01((tab_io / aterm_io) as f32)).min(aterm)
+                } else {
+                    0.0
+                };
+                Some([global, aterm, tab])
+            }
+            Resource::Network => {
+                let b = view.binding();
+                let global = if let Some(h) = view.heat_now {
+                    clamp01(h)
+                } else {
+                    let bps = b.now?;
+                    clamp01((bps / 12_500_000.0) as f32)
+                };
+                let (a_sock, t_sock, denom_sock) = if let Some(net) = self.net.as_ref()
+                    && let Some(a) = net.aterm_sockets
+                {
+                    let t: u32 = net
+                        .tab_sockets
+                        .iter()
+                        .filter(|(k, _)| panes.contains(k))
+                        .map(|(_, n)| *n)
+                        .sum::<u32>()
+                        .min(a);
+                    let sys = net.tcp.map(|tcp| tcp.total()).unwrap_or(0).max(a).max(1);
+                    (f64::from(a), f64::from(t), f64::from(sys))
+                } else if let Some(a) = view.aterm.now {
+                    let t = view.tab.now.unwrap_or(0.0).min(a);
+                    let sys = self
+                        .net
+                        .as_ref()
+                        .and_then(|n| n.tcp.map(|tcp| f64::from(tcp.total())))
+                        .unwrap_or(a)
+                        .max(a)
+                        .max(1.0);
+                    (a, t, sys)
+                } else {
+                    (0.0, 0.0, 1.0)
+                };
+                let aterm = (global * clamp01((a_sock / denom_sock) as f32)).min(global);
+                let tab = if a_sock > 0.0 {
+                    (aterm * clamp01((t_sock / a_sock) as f32)).min(aterm)
+                } else {
+                    0.0
+                };
+                Some([global, aterm, tab])
+            }
+            Resource::Gpu | Resource::Tokens => None,
+        }
+    }
+
+    /// Take the stuck engine's view, and with it the Processes row's state and any fatal job crash
+    /// markers on the strip.
     pub fn set_jobs(&mut self, jobs: Option<std::sync::Arc<crate::jobs::JobsView>>) {
         self.resources[Resource::Processes.index()].state =
             jobs.as_deref().and_then(State::of_jobs);
+        if let Some(view) = jobs.as_deref() {
+            for row in &view.rows {
+                if let Some(sig_word) = row.exit.and_then(fatal_crash_signal_word) {
+                    let label = format!("{} ({sig_word})", row.exe);
+                    let dup = self.strip_events.iter().any(|e| {
+                        e.kind == StripEventKind::Crash
+                            && e.label == label
+                            && (self.at_unix_ms - e.at_unix_ms).abs() <= 60_000
+                    });
+                    if !dup {
+                        self.strip_events.push(StripEvent {
+                            at_unix_ms: self.at_unix_ms,
+                            kind: StripEventKind::Crash,
+                            label,
+                        });
+                    }
+                }
+            }
+        }
         self.jobs = jobs;
     }
 
@@ -1905,6 +2204,19 @@ impl Snapshot {
     #[must_use]
     pub fn total_cores(&self) -> Option<usize> {
         self.cpu.as_ref().map(CpuView::total)
+    }
+}
+
+fn fatal_crash_signal_word(exit: i32) -> Option<&'static str> {
+    match exit - 128 {
+        4 => Some("SIGILL"),
+        5 => Some("SIGTRAP"),
+        6 => Some("SIGABRT"),
+        7 | 10 => Some("SIGBUS"),
+        8 => Some("SIGFPE"),
+        9 => Some("SIGKILL"),
+        11 => Some("SIGSEGV"),
+        _ => None,
     }
 }
 
@@ -1933,6 +2245,7 @@ impl ScopeState {
             history: self.history.to_vec(),
             top: acc.top.clone(),
             wait: acc.wait,
+            read_bps: acc.reads,
             write_bps: acc.writes,
             refused: acc.refused,
             gpu: acc.gpu,
@@ -1946,6 +2259,8 @@ struct ScopeAcc {
     footprint: Option<u64>,
     procs: u32,
     top: Option<(String, f32)>,
+    /// Bytes read per second, where any member's counter gave a delta.
+    reads: Option<f64>,
     /// Bytes written per second, where any member's counter gave a delta.
     writes: Option<f64>,
     /// Cores-worth waiting for a core across readable members.
@@ -1966,6 +2281,9 @@ impl ScopeAcc {
         if let Some(f) = p.footprint {
             self.footprint = Some(self.footprint.unwrap_or(0).saturating_add(f));
         }
+        if let Some(rd) = r.read_bps {
+            self.reads = Some(self.reads.unwrap_or(0.0) + rd);
+        }
         if let Some(w) = r.write_bps {
             self.writes = Some(self.writes.unwrap_or(0.0) + w);
         }
@@ -1982,11 +2300,12 @@ impl ScopeAcc {
     }
 }
 
-/// Per-process CPU, wait, and storage write rates over the sample interval.
+/// Per-process CPU, wait, and storage I/O rates over the sample interval.
 #[derive(Clone, Copy, Debug, Default)]
 struct ProcRates {
     cores: Option<f32>,
     wait: Option<f32>,
+    read_bps: Option<f64>,
     write_bps: Option<f64>,
     gpu: Option<f32>,
 }
@@ -2149,8 +2468,12 @@ struct Rows {
     free: FreeHistory,
     cores_at: Option<Stamp>,
     sweep_at: Option<Stamp>,
+    /// Each process of the last sweep: its start and cumulative bytes read (`None` unread).
+    read_bytes: HashMap<u32, (Option<u64>, Option<u64>)>,
     /// Each process of the last sweep: its start and cumulative bytes written (`None` unread).
     written: HashMap<u32, (Option<u64>, Option<u64>)>,
+    /// Cached hardware processor brand once supplied by the host.
+    cpu_brand: Option<String>,
     /// Whether the last sweep read the whole process table (not stopped at its cap).
     sweep_whole: bool,
     /// The last hour of writes per program.
@@ -2227,17 +2550,223 @@ pub struct Vitals {
     slot_times: VecDeque<i64>,
     /// Where the strips' reading slots stand ([`Snapshot::slot_grid`]).
     slot_grid: SlotGrid,
+    last_stamp: Option<Stamp>,
+    restored_wall_ms: i64,
+    last_pressure: Pressure,
+    last_throttle: Throttle,
+    last_gpu_resets: u64,
+    time_gaps: VecDeque<TimeGap>,
+    strip_events: VecDeque<StripEvent>,
 }
 
 /// The readings [`Vitals`] places its slot grid's edges between: eight seconds at the focused
 /// cadence, four at the lens's.
 const SLOT_TIMES: usize = 8;
+const STRIP_HISTORY_CAP: usize = 128;
+const STRIP_HORIZON_MS: i64 = 3_600_000;
+
+/// Persisted 1-hour strip state across restarts and crashes (`vitals-strip.json`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SavedStrip {
+    /// Wall-clock timestamp (Unix ms) of the newest absorbed sample, or `0` when empty.
+    pub last_wall_ms: i64,
+    /// True when written during a graceful probe-thread shutdown; false on periodic live checkpoints.
+    pub clean_stop: bool,
+    /// Fixed capacities learned for each [`Resource`] row.
+    pub caps: [Option<f64>; 7],
+    /// Global 1-hour rings in [`Resource::ALL`] order.
+    pub rings: [crate::ring::SavedRing; 7],
+    /// Network transmit 1-hour ring.
+    pub net_tx: crate::ring::SavedRing,
+    /// User-owned process count 1-hour ring.
+    pub yours: crate::ring::SavedRing,
+    /// Memory pressure rank 1-hour ring.
+    pub pressure: crate::ring::SavedRing,
+    /// aterm-scope 1-hour rings in [`Resource::ALL`] order.
+    pub aterm: [crate::ring::SavedRing; 7],
+    /// Discontinuous wall-clock intervals in the last hour.
+    pub time_gaps: Vec<TimeGap>,
+    /// Vertical event markers in the last hour.
+    pub strip_events: Vec<StripEvent>,
+}
 
 impl Vitals {
     /// A model that has read nothing.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a wall-clock discontinuity (`Sleep`, `Crash`, or `Paused`) on the time-series strip,
+    /// merging overlapping spans of the same kind (or upgrading overlapping spans) without bleeding
+    /// a crash/sleep label into a merely touching earlier span of another kind.
+    pub fn record_time_gap(&mut self, gap: TimeGap) {
+        if gap.end_ms <= gap.start_ms {
+            return;
+        }
+        if let Some(existing) = self.time_gaps.iter_mut().find(|g| {
+            g.overlap_ms(gap.start_ms, gap.end_ms) > 0
+                || (g.kind == gap.kind && (g.end_ms == gap.start_ms || gap.end_ms == g.start_ms))
+        }) {
+            existing.start_ms = existing.start_ms.min(gap.start_ms);
+            existing.end_ms = existing.end_ms.max(gap.end_ms);
+            existing.kind = existing.kind.max(gap.kind);
+            return;
+        }
+        self.time_gaps.push_back(gap);
+        while self.time_gaps.len() > STRIP_HISTORY_CAP {
+            self.time_gaps.pop_front();
+        }
+    }
+
+    /// Record a vertical event marker (`Crash`, `Restart`, `SleepWake`, `PressureSpike`) on the
+    /// multi-scale time-series strip, deduplicating identical adjacent markers and coalescing a
+    /// checkpoint crash estimate with an exact crash-file timestamp inside the same crash gap.
+    pub fn record_strip_event(&mut self, event: StripEvent) {
+        if event.kind == StripEventKind::Crash {
+            let same_crash_span = |a: i64, b: i64| {
+                (a - b).abs() <= 15_000
+                    || self.time_gaps.iter().any(|g| {
+                        g.kind == GapKind::Crash
+                            && a >= g.start_ms.saturating_sub(2_000)
+                            && a <= g.end_ms.saturating_add(2_000)
+                            && b >= g.start_ms.saturating_sub(2_000)
+                            && b <= g.end_ms.saturating_add(2_000)
+                    })
+            };
+            if let Some(existing) = self.strip_events.iter_mut().find(|e| {
+                e.kind == StripEventKind::Crash && same_crash_span(e.at_unix_ms, event.at_unix_ms)
+            }) {
+                if event.at_unix_ms > existing.at_unix_ms {
+                    existing.at_unix_ms = event.at_unix_ms;
+                }
+                if existing.label == "aterm crash" && !event.label.is_empty() {
+                    existing.label = event.label;
+                }
+                return;
+            }
+        }
+        let tol_ms = if event.kind == StripEventKind::Restart {
+            5_000
+        } else {
+            1_500
+        };
+        let dup = self.strip_events.iter().any(|e| {
+            e.kind == event.kind
+                && (e.at_unix_ms - event.at_unix_ms).abs() <= tol_ms
+                && e.label == event.label
+        });
+        if dup {
+            return;
+        }
+        self.strip_events.push_back(event);
+        while self.strip_events.len() > STRIP_HISTORY_CAP {
+            self.strip_events.pop_front();
+        }
+    }
+
+    fn trim_strip_history(&mut self, now_unix_ms: i64) {
+        let cutoff = now_unix_ms.saturating_sub(STRIP_HORIZON_MS);
+        while self.time_gaps.front().is_some_and(|g| g.end_ms < cutoff) {
+            self.time_gaps.pop_front();
+        }
+        while self
+            .strip_events
+            .front()
+            .is_some_and(|e| e.at_unix_ms < cutoff)
+        {
+            self.strip_events.pop_front();
+        }
+    }
+
+    /// Snapshot the 1-hour global and `aterm` time-series rings, discontinuities, and event
+    /// markers for atomic persistence (`clean_stop = true` on graceful probe shutdown).
+    #[must_use]
+    pub fn saved_strip(&self, clean_stop: bool) -> SavedStrip {
+        SavedStrip {
+            last_wall_ms: self.last_stamp.map_or(self.restored_wall_ms, |s| s.wall_ms),
+            clean_stop,
+            caps: self
+                .rows
+                .caps
+                .map(|c| c.filter(|x| x.is_finite() && *x > 0.0)),
+            rings: std::array::from_fn(|i| self.rows.rings[i].saved()),
+            net_tx: self.rows.net_tx.saved(),
+            yours: self.rows.yours.saved(),
+            pressure: self.rows.pressure.saved(),
+            aterm: std::array::from_fn(|i| {
+                self.rows.aterm.0[i]
+                    .as_ref()
+                    .map_or_else(crate::ring::SavedRing::default, BucketRing::saved)
+            }),
+            time_gaps: self.time_gaps.iter().copied().collect(),
+            strip_events: self.strip_events.iter().cloned().collect(),
+        }
+    }
+
+    /// Restore 1-hour time-series history persisted by an earlier run up to `now_unix_ms`.
+    ///
+    /// When the saved checkpoint came from an unclean exit (`!saved.clean_stop`), automatically
+    /// records a [`GapKind::Crash`] discontinuity across `[saved.last_wall_ms, now_unix_ms)` plus
+    /// [`StripEventKind::Crash`] and [`StripEventKind::Restart`] markers. When it came from a
+    /// graceful stop at least one 10 s bucket ago, records a [`GapKind::Paused`] downtime span so
+    /// pre-quit samples are never interpolated across the offline interval.
+    pub fn restore_strip_history(&mut self, saved: SavedStrip, now_unix_ms: i64) {
+        if now_unix_ms <= 0 || saved.last_wall_ms <= 0 {
+            return;
+        }
+        self.restored_wall_ms = saved.last_wall_ms.min(now_unix_ms);
+        for i in 0..7 {
+            if let Some(c) = saved.caps[i].filter(|&x| x.is_finite() && x > 0.0) {
+                self.rows.caps[i] = Some(c);
+            }
+            self.rows.rings[i] = BucketRing::restored(&saved.rings[i], now_unix_ms);
+            let ar = BucketRing::restored(&saved.aterm[i], now_unix_ms);
+            self.rows.aterm.0[i] =
+                (!ar.is_empty() || !saved.aterm[i].recent.is_empty()).then_some(ar);
+        }
+        self.rows.net_tx = BucketRing::restored(&saved.net_tx, now_unix_ms);
+        self.rows.yours = BucketRing::restored(&saved.yours, now_unix_ms);
+        self.rows.pressure = BucketRing::restored(&saved.pressure, now_unix_ms);
+
+        let cutoff = now_unix_ms.saturating_sub(STRIP_HORIZON_MS);
+        for mut gap in saved.time_gaps {
+            if gap.end_ms >= cutoff && gap.start_ms < now_unix_ms {
+                gap.end_ms = gap.end_ms.min(now_unix_ms);
+                self.record_time_gap(gap);
+            }
+        }
+        for ev in saved.strip_events {
+            if ev.at_unix_ms >= cutoff && ev.at_unix_ms <= now_unix_ms {
+                self.record_strip_event(ev);
+            }
+        }
+        if saved.last_wall_ms >= cutoff && saved.last_wall_ms < now_unix_ms {
+            if !saved.clean_stop {
+                self.record_time_gap(TimeGap {
+                    start_ms: saved.last_wall_ms,
+                    end_ms: now_unix_ms,
+                    kind: GapKind::Crash,
+                });
+                self.record_strip_event(StripEvent {
+                    at_unix_ms: saved.last_wall_ms,
+                    kind: StripEventKind::Crash,
+                    label: "aterm crash".into(),
+                });
+                self.record_strip_event(StripEvent {
+                    at_unix_ms: now_unix_ms,
+                    kind: StripEventKind::Restart,
+                    label: "restarted".into(),
+                });
+            } else if now_unix_ms - saved.last_wall_ms >= BUCKET_MS {
+                self.record_time_gap(TimeGap {
+                    start_ms: saved.last_wall_ms,
+                    end_ms: now_unix_ms,
+                    kind: GapKind::Paused,
+                });
+            }
+        }
+        self.trim_strip_history(now_unix_ms);
     }
 
     /// The slot grid with a reading at `at_ms` in it: the one before while that reading stands
@@ -2299,6 +2828,81 @@ impl Vitals {
             .gpu_clients
             .absorb(s.gpu_clients.as_ref(), s.at_ns);
         let stamp = Stamp::of(s);
+        for &gap in &s.note_gaps {
+            self.record_time_gap(gap);
+        }
+        for ev in &s.note_events {
+            self.record_strip_event(ev.clone());
+        }
+        if let Some(prev) = self.last_stamp.replace(stamp)
+            && stamp.wall_ms > prev.wall_ms
+            && stamp.mono_ms >= prev.mono_ms
+        {
+            let wall_dt = stamp.wall_ms - prev.wall_ms;
+            let mono_dt = i64::try_from(stamp.mono_ms - prev.mono_ms).unwrap_or(i64::MAX);
+            let skew = wall_dt.saturating_sub(mono_dt);
+            let pause_limit = i64::try_from(
+                GAP_CADENCES * u64::from(prev.cadence_ms.max(stamp.cadence_ms).max(1_000)),
+            )
+            .unwrap_or(i64::MAX);
+            if skew > SLEEP_SKEW_MS {
+                self.record_time_gap(TimeGap {
+                    start_ms: prev.wall_ms,
+                    end_ms: stamp.wall_ms,
+                    kind: GapKind::Sleep,
+                });
+                self.record_strip_event(StripEvent {
+                    at_unix_ms: stamp.wall_ms,
+                    kind: StripEventKind::SleepWake,
+                    label: "woke from sleep".into(),
+                });
+            } else if mono_dt > pause_limit && wall_dt >= BUCKET_MS {
+                self.record_time_gap(TimeGap {
+                    start_ms: prev.wall_ms,
+                    end_ms: stamp.wall_ms,
+                    kind: GapKind::Paused,
+                });
+            }
+        }
+        if let Some(tl) = s.timeline.as_ref()
+            && let (Some(sleep_ms), Some(wake_ms)) = (tl.sleep_ms, tl.wake_ms)
+            && wake_ms > sleep_ms
+            && wake_ms >= s.at_unix_ms.saturating_sub(STRIP_HORIZON_MS)
+            && wake_ms <= s.at_unix_ms.saturating_add(2_000)
+        {
+            self.record_time_gap(TimeGap {
+                start_ms: sleep_ms,
+                end_ms: wake_ms,
+                kind: GapKind::Sleep,
+            });
+            self.record_strip_event(StripEvent {
+                at_unix_ms: wake_ms,
+                kind: StripEventKind::SleepWake,
+                label: "woke from sleep".into(),
+            });
+        }
+        let cur_pressure = s.mem.map_or(Pressure::Unknown, |m| m.pressure);
+        if cur_pressure == Pressure::Critical && self.last_pressure != Pressure::Critical {
+            self.record_strip_event(StripEvent {
+                at_unix_ms: s.at_unix_ms,
+                kind: StripEventKind::PressureSpike,
+                label: "memory pressure critical".into(),
+            });
+        }
+        if cur_pressure != Pressure::Unknown {
+            self.last_pressure = cur_pressure;
+        }
+        let cur_throttle = s.thermal.map_or(Throttle::None, |t| t.level);
+        if cur_throttle == Throttle::Severe && self.last_throttle != Throttle::Severe {
+            self.record_strip_event(StripEvent {
+                at_unix_ms: s.at_unix_ms,
+                kind: StripEventKind::PressureSpike,
+                label: "severe thermal throttle".into(),
+            });
+        }
+        if s.thermal.is_some() {
+            self.last_throttle = cur_throttle;
+        }
         let cores_dt = match s.cores.as_deref() {
             Some(c) if !c.is_empty() => stamp.rate_dt(self.rows.cores_at.replace(stamp)),
             _ => None,
@@ -2408,6 +3012,17 @@ impl Vitals {
             .map(|c| f64::from(c.busy.raw));
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
         let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        if let Some((resets, _)) = facts.gpu_resets
+            && resets > self.last_gpu_resets
+        {
+            self.last_gpu_resets = resets;
+            self.record_strip_event(StripEvent {
+                at_unix_ms: s.at_unix_ms,
+                kind: StripEventKind::PressureSpike,
+                label: "GPU reset".into(),
+            });
+        }
+        self.trim_strip_history(s.at_unix_ms);
         if let (Some(g), Some((aterm, others, services)), Some(clients)) = (
             gpu.as_mut(),
             pass.gpu_parts,
@@ -2471,6 +3086,8 @@ impl Vitals {
             events: Vec::new(),
             why: None,
             coal_lane: s.coal_lane,
+            time_gaps: self.time_gaps.iter().copied().collect(),
+            strip_events: self.strip_events.iter().cloned().collect(),
         };
         let attribution = pass
             .attribution
@@ -2537,8 +3154,19 @@ impl Vitals {
         global: &mut ScopeView,
         sweep_dt: Option<f64>,
     ) -> ProcPass {
+        let reads = window_counter(
+            &self.rows.read_bytes,
+            self.rows.sweep_whole,
+            procs,
+            sweep_dt,
+            |p| p.disk_read,
+        );
         let writes = window_writes(&self.rows.written, self.rows.sweep_whole, procs, sweep_dt);
         let writes_read = procs.iter().any(|p| p.disk_written.is_some());
+        self.rows.read_bytes = procs
+            .iter()
+            .map(|p| (p.pid, (p.start, p.disk_read)))
+            .collect();
         self.rows.written = procs
             .iter()
             .map(|p| (p.pid, (p.start, p.disk_written)))
@@ -2556,6 +3184,9 @@ impl Vitals {
         let mut rates: Vec<ProcRates> = Vec::with_capacity(procs.len());
         for p in procs {
             let mut r = ProcRates {
+                read_bps: sweep_dt
+                    .zip(reads.get(&p.pid))
+                    .map(|(dt, &bytes)| bytes as f64 / dt),
                 write_bps: sweep_dt
                     .zip(writes.get(&p.pid))
                     .map(|(dt, &bytes)| bytes as f64 / dt),
@@ -2759,6 +3390,7 @@ impl Vitals {
                 wait: r.wait,
                 footprint: p.footprint,
                 peak: p.peak,
+                read_bps: r.read_bps,
                 write_bps: r.write_bps,
                 state: p.state,
                 scope: row_scope,
@@ -2769,6 +3401,7 @@ impl Vitals {
         }
         global.top = global_acc.top.clone();
         global.wait = global_acc.wait;
+        global.read_bps = global_acc.reads;
         global.write_bps = global_acc.writes;
         global.refused = global_acc.refused;
         global.gpu = global_acc.gpu;
@@ -2854,6 +3487,16 @@ fn window_writes(
     procs: &[ProcSample],
     sweep_dt: Option<f64>,
 ) -> HashMap<u32, u64> {
+    window_counter(last, last_whole, procs, sweep_dt, |p| p.disk_written)
+}
+
+fn window_counter(
+    last: &HashMap<u32, (Option<u64>, Option<u64>)>,
+    last_whole: bool,
+    procs: &[ProcSample],
+    sweep_dt: Option<f64>,
+    field: impl Fn(&ProcSample) -> Option<u64>,
+) -> HashMap<u32, u64> {
     if sweep_dt.is_none() {
         return HashMap::new();
     }
@@ -2861,7 +3504,7 @@ fn window_writes(
     procs
         .iter()
         .filter_map(|p| {
-            let now = p.disk_written?;
+            let now = field(p)?;
             let bytes = match last.get(&p.pid) {
                 Some(&(start, Some(before))) if start == p.start => now.saturating_sub(before),
                 Some(&(Some(then), _)) if p.start.is_some_and(|s| s != then) => now,
@@ -2951,7 +3594,11 @@ impl Rows {
     ) -> ([ResourceView; 7], RowFacts, Option<NetView>) {
         use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
         let now = s.at_unix_ms;
+        if let Some(brand) = s.cpu_brand.as_ref().filter(|b| !b.is_empty()) {
+            self.cpu_brand = Some(brand.clone());
+        }
         let mut facts = RowFacts {
+            cpu_brand: self.cpu_brand.clone(),
             load1: s.load1,
             gpu: s.gpu.clone(),
             disk: s.disk.clone(),
@@ -3024,7 +3671,7 @@ impl Rows {
             facts.filling = history::filling(v.available, &facts.disk_rates, ttf);
         }
 
-        let (rx, tx, net) = self.absorb_links(s.links.as_deref(), s.tcp, stamp, &mut facts);
+        let (rx, tx, net) = self.absorb_links(s, stamp, &mut facts);
         let closed_rx = self.rings[Network.index()].push(now, rx, false);
         let closed_tx = self.net_tx.push(now, tx, false);
         note_peak(
@@ -3086,32 +3733,53 @@ impl Rows {
         facts.hour_writers = self.write_hour.top();
         facts.writes_covered_s = self.write_hour.covered_s();
         if let Some(f) = figs {
-            let vals = |acc: &ScopeAcc, tokens: Option<f64>| -> [Option<f64>; 7] {
-                let mut v = [None; 7];
-                v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
-                // Held at the device's reading so each 10 s cell keeps tab <= all tabs <= Mac.
-                v[Gpu.index()] = acc.gpu.map(|g| {
-                    gpu_pct.map_or(f64::from(g) * 100.0, |mac| (f64::from(g) * 100.0).min(mac))
-                });
-                v[Memory.index()] = acc.footprint.map(|b| b as f64);
-                v[Disk.index()] = sweep_dt.and(acc.writes);
-                v[Tokens.index()] = tokens;
-                v[Processes.index()] = Some(f64::from(acc.procs));
-                v
-            };
-            self.aterm.push(now, vals(&f.aterm, tokens.out));
+            let vals =
+                |acc: &ScopeAcc, tokens: Option<f64>, sockets: Option<u32>| -> [Option<f64>; 7] {
+                    let mut v = [None; 7];
+                    v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
+                    // Held at the device's reading so each 10 s cell keeps tab <= all tabs <= Mac.
+                    v[Gpu.index()] = acc.gpu.map(|g| {
+                        gpu_pct.map_or(f64::from(g) * 100.0, |mac| (f64::from(g) * 100.0).min(mac))
+                    });
+                    v[Memory.index()] = acc.footprint.map(|b| b as f64);
+                    v[Disk.index()] = sweep_dt.and(acc.writes);
+                    v[Network.index()] = sockets.map(f64::from);
+                    v[Tokens.index()] = tokens;
+                    v[Processes.index()] = Some(f64::from(acc.procs));
+                    v
+                };
+            self.aterm
+                .push(now, vals(&f.aterm, tokens.out, s.aterm_sockets));
             for (root, acc) in s.tabs.iter().zip(&f.tabs) {
                 let rings = self.tabs.entry(root.key).or_default();
-                rings.push(now, vals(acc, tokens.tabs.get(&root.key).copied()));
+                let tab_sock = s
+                    .tab_sockets
+                    .iter()
+                    .find(|(k, _)| *k == root.key)
+                    .map(|(_, c)| *c);
+                rings.push(
+                    now,
+                    vals(acc, tokens.tabs.get(&root.key).copied(), tab_sock),
+                );
             }
             facts.writers = crate::writes::top_per_scope(f.writers.iter().cloned(), |w| w.scope);
             facts.busiest = f.busiest.clone();
+        } else if let Some(a_sock) = s.aterm_sockets {
+            let mut v = [None; 7];
+            v[Network.index()] = Some(f64::from(a_sock));
+            self.aterm.push(now, v);
+            for &(key, count) in &s.tab_sockets {
+                let mut tv = [None; 7];
+                tv[Network.index()] = Some(f64::from(count));
+                self.tabs.entry(key).or_default().push(now, tv);
+            }
         }
         let gpu_held = self.gpu_clients.held();
+        let net_has_sockets = self.aterm.ring(Network).is_some() || s.aterm_sockets.is_some();
         let missing = |res: Resource, agent: bool| -> Option<NoFigure> {
             match res {
                 Gpu if !gpu_held => Some(NoFigure::NotPerApp),
-                Network => Some(NoFigure::NotPerApp),
+                Network if !net_has_sockets => Some(NoFigure::NotPerApp),
                 Disk if figs.is_some_and(|f| !f.writes_read) => Some(NoFigure::NotReadHere),
                 Tokens if !agent => Some(NoFigure::NoAgent),
                 _ => None,
@@ -3119,8 +3787,12 @@ impl Rows {
         };
         let fig = |rings: Option<&ScopeRings>, res: Resource, agent: bool| {
             let ring = rings.and_then(|r| r.ring(res));
+            let has_scope = figs.is_some() || (res == Network && s.aterm_sockets.is_some());
             ScopeFig {
-                now: figs.and(ring).and_then(|r| r.now_mean(now, window_of(res))),
+                now: has_scope
+                    .then_some(())
+                    .and(ring)
+                    .and_then(|r| r.now_mean(now, window_of(res))),
                 missing: missing(res, agent),
                 run: ring.map_or_else(|| Arc::from([]), |r| r.tail_cells(SCOPE_RUN_BUCKETS).into()),
                 run_k: ring.and_then(BucketRing::open_k).unwrap_or(0),
@@ -3201,14 +3873,28 @@ impl Rows {
 
     fn absorb_links(
         &mut self,
-        links: Option<&[LinkSample]>,
-        tcp: Option<TcpCounts>,
+        s: &Sample,
         stamp: Stamp,
         facts: &mut RowFacts,
     ) -> (Option<f64>, Option<f64>, Option<NetView>) {
+        let links = s.links.as_deref();
+        let tcp = s.tcp;
+        let aterm_sockets = s.aterm_sockets;
+        let tab_sockets = &s.tab_sockets;
+        let srtt = s.tcp_srtt_ms.filter(|x| x.is_finite() && *x >= 0.0);
         let Some(links) = links else {
-            let net = tcp.map(|tcp| NetView {
-                tcp: Some(tcp),
+            let any_net = tcp.is_some() || srtt.is_some() || aterm_sockets.is_some();
+            let state = if tcp.is_some_and(|t| t.established > 0) {
+                NetState::Online
+            } else {
+                NetState::Idle
+            };
+            let net = any_net.then(|| NetView {
+                tcp,
+                srtt_ms: srtt,
+                state,
+                aterm_sockets,
+                tab_sockets: tab_sockets.to_vec(),
                 ..NetView::default()
             });
             return (None, None, net);
@@ -3220,11 +3906,15 @@ impl Rows {
         let (mut rx_drop, mut tx_drop) = (0u64, 0u64);
         let mut any_tx_drop = false;
         let mut measured = false;
+        let mut any_up = false;
         let mut moved_by: Vec<(&LinkSample, u64)> = Vec::new();
         let mut link_views: Vec<LinkView> = Vec::with_capacity(links.len());
         for l in links {
             let prev = self.links.get(&l.name);
             let rates = dt.and_then(|d| prev.and_then(|b| link_rates(b, l, d)));
+            if !l.loopback && l.up {
+                any_up = true;
+            }
             if l.counts {
                 let moved = if rates.is_some()
                     && let Some(b) = prev
@@ -3267,11 +3957,31 @@ impl Rows {
             tx_drop_ps: any_tx_drop.then(|| tx_drop as f64 / d),
         });
         let window_ns = dt.filter(|_| measured).map(|d| (d * 1e9).round() as u64);
-        let net = (!link_views.is_empty() || tcp.is_some()).then_some(NetView {
+        let state = if !any_up && links.iter().any(|l| !l.loopback) {
+            NetState::Offline
+        } else if rates.is_some_and(|r| {
+            r.rx_err_ps + r.tx_err_ps + r.rx_drop_ps + r.tx_drop_ps.unwrap_or(0.0) >= 2.0
+        }) || srtt.is_some_and(|ms| ms >= 250.0)
+        {
+            NetState::Degraded
+        } else if rates.is_some_and(|r| r.rx_bps + r.tx_bps >= 1_024.0)
+            || tcp.is_some_and(|t| t.established > 0)
+        {
+            NetState::Online
+        } else {
+            NetState::Idle
+        };
+        let has_net =
+            !link_views.is_empty() || tcp.is_some() || srtt.is_some() || aterm_sockets.is_some();
+        let net = has_net.then_some(NetView {
             links: link_views,
             rates,
             window_ns,
             tcp,
+            srtt_ms: srtt,
+            state,
+            aterm_sockets,
+            tab_sockets: tab_sockets.to_vec(),
         });
         (rates.map(|r| r.rx_bps), rates.map(|r| r.tx_bps), net)
     }
@@ -6535,5 +7245,283 @@ mod tests {
         let slots = s.resources[Gpu.index()].heat_slots(s.slot_grid, 3, s.at_unix_ms, 15_000);
         assert_eq!(slots[2].heat, None, "{slots:?}");
         assert!(slots[..2].iter().all(|c| c.heat.is_some()), "{slots:?}");
+    }
+
+    #[test]
+    fn sleep_jumps_and_crash_markers_record_time_gaps_and_strip_events() {
+        let mut v = Vitals::new();
+        let mut s0 = at(0, 1_000);
+        s0.note_events.push(StripEvent {
+            at_unix_ms: s0.at_unix_ms - 5_000,
+            kind: StripEventKind::Crash,
+            label: "previous instance SIGSEGV".into(),
+        });
+        let _ = v.absorb(&s0);
+
+        // Simulate 30s of wall-clock sleep while mono_ms advances by only 1s.
+        let mut s1 = at(30_000, 1_000);
+        s1.mono_ms = s0.mono_ms + 1_000;
+        s1.mem = Some(MemSample {
+            total: 32 << 30,
+            app: 30 << 30,
+            pressure: Pressure::Critical,
+            ..MemSample::default()
+        });
+        let snap = v.absorb(&s1);
+        assert!(
+            snap.time_gaps.iter().any(|g| g.kind == GapKind::Sleep
+                && g.start_ms == s0.at_unix_ms
+                && g.end_ms == s1.at_unix_ms),
+            "sleep skew records a Sleep TimeGap: {:?}",
+            snap.time_gaps
+        );
+        assert!(
+            snap.strip_events
+                .iter()
+                .any(|e| e.kind == StripEventKind::Crash),
+            "crash event preserved: {:?}",
+            snap.strip_events
+        );
+        assert!(
+            snap.strip_events
+                .iter()
+                .any(|e| e.kind == StripEventKind::SleepWake),
+            "wake event emitted: {:?}",
+            snap.strip_events
+        );
+        assert!(
+            snap.strip_events
+                .iter()
+                .any(|e| e.kind == StripEventKind::PressureSpike),
+            "critical pressure spike emitted: {:?}",
+            snap.strip_events
+        );
+    }
+
+    #[test]
+    fn bar_shares_nest_tab_inside_aterm_inside_global_across_all_five_resources() {
+        let mut v = Vitals::new();
+        let mut s0 = at(0, 1_000);
+        s0.self_pid = 100;
+        s0.cpu_brand = Some("Apple M5 Max".into());
+        s0.tabs = vec![tab(1, 200, "Tab 1", "cargo")];
+        s0.procs = Some(vec![
+            ProcSample {
+                pid: 100,
+                ppid: 1,
+                start: Some(1),
+                cpu_ns: Some(1_000_000_000),
+                footprint: Some(1 << 30),
+                disk_read: Some(10_000_000),
+                disk_written: Some(5_000_000),
+                name: "aterm".into(),
+                ..ProcSample::default()
+            },
+            ProcSample {
+                pid: 200,
+                ppid: 100,
+                start: Some(2),
+                cpu_ns: Some(2_000_000_000),
+                footprint: Some(3 << 30),
+                disk_read: Some(40_000_000),
+                disk_written: Some(20_000_000),
+                name: "cargo".into(),
+                ..ProcSample::default()
+            },
+        ]);
+        s0.links = Some(vec![LinkSample {
+            name: "en0".into(),
+            kind: LinkKind::Wifi,
+            up: true,
+            counts: true,
+            rx: 1_000_000,
+            tx: 500_000,
+            rate_bps: Some(800_000_000),
+            ..LinkSample::default()
+        }]);
+        s0.tcp = Some(TcpCounts {
+            established: 10,
+            listen: 2,
+            ..TcpCounts::default()
+        });
+        s0.tcp_srtt_ms = Some(14.5);
+        s0.aterm_sockets = Some(6);
+        s0.tab_sockets = vec![(1, 4)];
+        let _ = v.absorb(&s0);
+
+        let mut s1 = s0.clone();
+        s1.at_ns += 1_000_000_000;
+        s1.at_unix_ms += 1_000;
+        s1.mono_ms += 1_000;
+        for c in s1.cores.as_mut().unwrap() {
+            c.busy += 500;
+            c.total += 1_000;
+        }
+        let procs = s1.procs.as_mut().unwrap();
+        procs[0].cpu_ns = Some(1_500_000_000);
+        procs[0].disk_read = Some(25_000_000);
+        procs[0].disk_written = Some(15_000_000);
+        procs[1].cpu_ns = Some(4_000_000_000);
+        procs[1].disk_read = Some(90_000_000);
+        procs[1].disk_written = Some(50_000_000);
+        s1.links.as_mut().unwrap()[0].rx += 20_000_000;
+        s1.links.as_mut().unwrap()[0].tx += 5_000_000;
+        let snap = v.absorb(&s1);
+
+        assert_eq!(snap.facts.cpu_brand.as_deref(), Some("Apple M5 Max"));
+        let net = snap.net.as_ref().expect("net view");
+        assert_eq!(net.state, NetState::Online);
+        assert_eq!(net.srtt_ms, Some(14.5));
+        for res in [
+            Resource::Cpu,
+            Resource::Memory,
+            Resource::Disk,
+            Resource::Network,
+            Resource::Processes,
+        ] {
+            let [g, a, t] = snap
+                .bar_shares(res, &[1])
+                .unwrap_or_else(|| panic!("missing bar_shares for {res:?}"));
+            assert!(
+                g > 0.0 && a > 0.0 && t > 0.0 && t <= a && a <= g && g <= 1.0,
+                "{res:?}: expected 0 < t <= a <= g <= 1, got [{g}, {a}, {t}]"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_strip_preserves_multi_scale_history_across_restarts_and_crashes() {
+        let mut before = Vitals::new();
+        let mut prev_busy = 0u64;
+        let mut prev_total = 0u64;
+        for step in 0..=60u64 {
+            let t_ms = step * 10_000;
+            let mut s = at(t_ms, 10_000);
+            prev_busy += 600;
+            prev_total += 1_000;
+            for c in s.cores.as_mut().unwrap() {
+                c.busy = prev_busy;
+                c.total = prev_total;
+            }
+            s.mem = Some(MemSample {
+                total: 64 << 30,
+                app: 24 << 30,
+                wired: 8 << 30,
+                free: 32 << 30,
+                pressure: Pressure::Normal,
+                ..MemSample::default()
+            });
+            let _ = before.absorb(&s);
+        }
+        let last_ms = before.saved_strip(true).last_wall_ms;
+        assert_eq!(last_ms, T0 + 600_000);
+
+        // 1. Graceful restart 30 s later preserves pre-restart 10m..1m buckets and marks Paused gap.
+        let clean_ckpt = before.saved_strip(true);
+        let relaunch_ms = last_ms + 30_000;
+        let mut after_clean = Vitals::new();
+        after_clean.restore_strip_history(clean_ckpt, relaunch_ms);
+        let mut post = rig(1_000, 630_000, 1_000);
+        post.mem = Some(MemSample {
+            total: 64 << 30,
+            app: 20 << 30,
+            wired: 8 << 30,
+            free: 36 << 30,
+            pressure: Pressure::Normal,
+            ..MemSample::default()
+        });
+        let snap_clean = after_clean.absorb(&post);
+        let mem_slots = snap_clean.resources[Resource::Memory.index()].heat_multi_scale(
+            MultiScaleSpec::FULL_HOUR,
+            snap_clean.at_unix_ms,
+            2_500,
+            &snap_clean.time_gaps,
+        );
+        assert!(
+            mem_slots
+                .iter()
+                .any(|hs| hs.slot.age_lo_ms >= 60_000 && hs.cell.heat.is_some_and(|h| h > 0.3)),
+            "pre-restart 1m..15m multi-scale boxes must retain memory heat: {mem_slots:?}"
+        );
+        assert!(
+            snap_clean
+                .time_gaps
+                .iter()
+                .any(|g| g.kind == GapKind::Paused && g.start_ms == last_ms),
+            "expected Paused downtime gap after clean restart: {:?}",
+            snap_clean.time_gaps
+        );
+
+        // 2. Abrupt SIGKILL (no crash file) synthesizes Crash gap + Crash/Restart markers while
+        //    preserving pre-crash CPU & Memory buckets; a crash-file marker coalesces cleanly.
+        let crash_ckpt = before.saved_strip(false);
+        let crash_relaunch_ms = last_ms + 40_000;
+        let mut after_sigkill = Vitals::new();
+        after_sigkill.restore_strip_history(crash_ckpt.clone(), crash_relaunch_ms);
+        let snap_sigkill = after_sigkill.absorb(&rig(1_000, 640_000, 1_000));
+        assert_eq!(
+            snap_sigkill
+                .strip_events
+                .iter()
+                .filter(|e| e.kind == StripEventKind::Crash)
+                .count(),
+            1,
+            "unclean checkpoint alone must synthesize a Crash marker"
+        );
+        let cpu_slots = snap_sigkill.resources[Resource::Cpu.index()].heat_multi_scale(
+            MultiScaleSpec::FULL_HOUR,
+            snap_sigkill.at_unix_ms,
+            2_500,
+            &snap_sigkill.time_gaps,
+        );
+        assert!(
+            cpu_slots
+                .iter()
+                .any(|hs| hs.slot.age_lo_ms >= 60_000 && hs.cell.heat.is_some_and(|h| h > 0.4)),
+            "pre-crash CPU multi-scale boxes must survive crash recovery: {cpu_slots:?}"
+        );
+
+        let mut after_crash_file = Vitals::new();
+        after_crash_file.restore_strip_history(crash_ckpt, crash_relaunch_ms + 150);
+        let mut first_post = rig(1_000, 640_150, 1_000);
+        let exact_crash_ms = last_ms + 4_200;
+        first_post.note_gaps.push(TimeGap {
+            start_ms: exact_crash_ms,
+            end_ms: crash_relaunch_ms,
+            kind: GapKind::Crash,
+        });
+        first_post.note_events.push(StripEvent {
+            at_unix_ms: exact_crash_ms,
+            kind: StripEventKind::Crash,
+            label: "SIGSEGV".into(),
+        });
+        first_post.note_events.push(StripEvent {
+            at_unix_ms: crash_relaunch_ms,
+            kind: StripEventKind::Restart,
+            label: "restarted".into(),
+        });
+        let snap_coalesced = after_crash_file.absorb(&first_post);
+        let crashes: Vec<&StripEvent> = snap_coalesced
+            .strip_events
+            .iter()
+            .filter(|e| e.kind == StripEventKind::Crash)
+            .collect();
+        assert_eq!(
+            crashes.len(),
+            1,
+            "checkpoint Crash and crash-file Crash must coalesce: {crashes:?}"
+        );
+        assert_eq!(crashes[0].at_unix_ms, exact_crash_ms);
+        assert_eq!(crashes[0].label, "SIGSEGV");
+        assert_eq!(
+            snap_coalesced
+                .strip_events
+                .iter()
+                .filter(|e| e.kind == StripEventKind::Restart)
+                .count(),
+            1,
+            "Restart markers must deduplicate: {:?}",
+            snap_coalesced.strip_events
+        );
     }
 }

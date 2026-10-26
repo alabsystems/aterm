@@ -152,10 +152,119 @@ impl CcHost {
     }
 }
 
-/// Probe this machine's C toolchain against `path_var` (the `PATH` a build would see).
+/// The receipt the Command Line Tools install writes (macOS).
+const CLT_RECEIPT: &str =
+    "/Library/Apple/System/Library/Receipts/com.apple.pkg.CLTools_Executables.plist";
+
+/// Where a `Ready` verdict is kept between runs ([`probe_cached`]).
+#[derive(Clone, Debug)]
+pub struct CcCache {
+    /// The file that keeps it ([`crate::probe_cache`]).
+    pub file: PathBuf,
+    /// The receipt the Command Line Tools install writes: an install, an update or a removal
+    /// changes its time and retires the verdict.
+    pub receipt: PathBuf,
+}
+
+impl CcCache {
+    /// This machine's, under aterm's state root; `None` without one.
+    #[must_use]
+    pub fn this_machine() -> Option<Self> {
+        Some(Self {
+            file: crate::probe_cache::file("cc")?,
+            receipt: PathBuf::from(CLT_RECEIPT),
+        })
+    }
+}
+
+/// Probe this machine's C toolchain against `path_var` (the `PATH` a build would see), reading
+/// a verdict kept from an earlier run when nothing it depends on changed ([`probe_cached`]).
 #[must_use]
 pub fn probe(path_var: Option<&OsStr>) -> CcVerdict {
-    probe_with(path_var, &CcHost::this_machine())
+    probe_cached(
+        path_var,
+        &CcHost::this_machine(),
+        CcCache::this_machine().as_ref(),
+    )
+}
+
+/// [`probe_with`], keeping a `Ready` verdict in `cache` under [`cc_key`]: a later probe whose
+/// key matches answers `Ready` with nothing spawned (no `xcrun`, no compile and link); any other
+/// verdict is probed every time.
+#[must_use]
+pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCache>) -> CcVerdict {
+    if cfg!(windows) {
+        return CcVerdict::NotProbed;
+    }
+    let located = match locate(path_var, host) {
+        Ok(located) => located,
+        Err(verdict) => return verdict,
+    };
+    let kept = cache.and_then(|cache| Some((cache, cc_key(&located, path_var, host, cache)?)));
+    if let Some((cache, key)) = &kept
+        && let Some(driver) = crate::probe_cache::get(&cache.file, key)
+    {
+        return CcVerdict::Ready {
+            driver: PathBuf::from(driver),
+        };
+    }
+    let verdict = probe_located(located, path_var, host);
+    if let (CcVerdict::Ready { driver }, Some((cache, key))) = (&verdict, &kept) {
+        crate::probe_cache::put(&cache.file, key, &driver.to_string_lossy());
+    }
+    verdict
+}
+
+/// What a `Ready` verdict for `located` depends on, read without spawning: the compiler as it is
+/// now ([`crate::probe_cache::identity`]), the active developer directory (`xcode-select`'s
+/// link, else the default) and the identity of the `clang` it holds, the Command Line Tools
+/// receipt's time, the SDK a build would fall back to, `SDKROOT` and the `PATH` the build sees.
+/// `None` when the compiler cannot be read.
+fn cc_key(
+    located: &Located,
+    path_var: Option<&OsStr>,
+    host: &CcHost,
+    cache: &CcCache,
+) -> Option<String> {
+    let (kind, cc) = match located {
+        Located::Plain(cc) => ("plain", cc),
+        Located::Shim(cc) => ("shim", cc),
+    };
+    let developer_dir = std::fs::read_link(&host.xcode_select_link)
+        .unwrap_or_else(|_| host.default_developer_dir.clone());
+    let receipt = std::fs::metadata(&cache.receipt)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "no receipt".to_owned(), |at| at.as_nanos().to_string());
+    let sdk = std::fs::canonicalize(developer_dir.join("SDKs/MacOSX.sdk"))
+        .map_or_else(|_| "no sdk".to_owned(), |sdk| sdk.display().to_string());
+    // The compiler the developer directory holds, where `locate` looks for it: an Xcode
+    // install, update or replacement rewrites it while the Command Line Tools receipt stays,
+    // and an update that leaves `cc` refusing (a license not yet agreed to) must probe again.
+    let clang = [
+        developer_dir.join("usr/bin/clang"),
+        developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"),
+    ]
+    .iter()
+    .map(|clang| crate::probe_cache::identity(clang).unwrap_or_else(|| "absent".to_owned()))
+    .collect::<Vec<_>>()
+    .join(" ");
+    fn lossy(value: Option<&OsStr>) -> String {
+        value
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+    crate::probe_cache::key([
+        Some(kind.to_owned()),
+        crate::probe_cache::identity(cc),
+        Some(developer_dir.display().to_string()),
+        Some(clang),
+        Some(receipt),
+        Some(sdk),
+        Some(lossy(std::env::var_os("SDKROOT").as_deref())),
+        Some(lossy(path_var)),
+    ])
 }
 
 /// [`probe`] over an injected host.
@@ -164,15 +273,22 @@ pub fn probe_with(path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     if cfg!(windows) {
         return CcVerdict::NotProbed;
     }
-    let cc = match locate(path_var, host) {
-        Ok(Located::Plain(cc)) => {
+    match locate(path_var, host) {
+        Ok(located) => probe_located(located, path_var, host),
+        Err(verdict) => verdict,
+    }
+}
+
+/// [`probe_with`] past [`locate`]: the compiler asked, then the build probe.
+fn probe_located(located: Located, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
+    let cc = match located {
+        Located::Plain(cc) => {
             return match ask(&cc, &cc, &["--version"], host.bound) {
                 CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
                 other => other,
             };
         }
-        Ok(Located::Shim(cc)) => cc,
-        Err(verdict) => return verdict,
+        Located::Shim(cc) => cc,
     };
     let shim_dir = cc.parent().unwrap_or(Path::new("/usr/bin"));
     match ask(&shim_dir.join("xcrun"), &cc, &["--find", "cc"], host.bound) {
@@ -772,6 +888,102 @@ mod tests {
             }
         );
         assert!(!verdict.blocks_builds());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `Ready` verdict is kept under what it depends on: a probe with the same key spawns
+    /// nothing (the compiler is never asked again), and a changed Command Line Tools receipt
+    /// probes again. NEGATIVE CONTROL: the receipt's new time re-runs the compiler; with no
+    /// cache every probe runs it.
+    #[test]
+    fn a_kept_cc_verdict_spawns_nothing_until_the_receipt_changes() {
+        let root = scratch("kept");
+        let bin = root.join("bin");
+        let asked = root.join("asked");
+        script(
+            &bin.join("cc"),
+            &format!(
+                "echo \"$1\" >> '{}'; case \"$1\" in --version) echo 'cc version 1';; -o) printf x > \"$2\";; esac",
+                asked.display()
+            ),
+        );
+        let host = plain_host(&root);
+        let receipt = root.join("receipt");
+        std::fs::write(&receipt, "1").unwrap();
+        let cache = CcCache {
+            file: root.join("state").join("cc"),
+            receipt: receipt.clone(),
+        };
+        let path = Some(bin.as_os_str());
+        let runs = || std::fs::read_to_string(&asked).map_or(0, |text| text.lines().count());
+        let ready = CcVerdict::Ready {
+            driver: bin.join("cc"),
+        };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 2, "asked its version, then built the probe");
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 2, "the same key ran the compiler again");
+        std::fs::File::options()
+            .write(true)
+            .open(&receipt)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(86_400))
+            .unwrap();
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 4, "a changed receipt left the old verdict standing");
+        assert_eq!(probe_cached(path, &host, None), ready);
+        assert_eq!(runs(), 6, "no cache: the compiler is asked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An Xcode update replaces the compiler the selected developer directory holds while the
+    /// Command Line Tools receipt stays: the kept verdict retires and the shim is asked again,
+    /// so a `cc` the update left refusing (a license not yet agreed to) is seen. NEGATIVE
+    /// CONTROL: with the same compiler in place the kept verdict answers and nothing spawns.
+    #[test]
+    fn an_xcode_update_retires_the_kept_cc_verdict() {
+        let root = scratch("kept-xcode");
+        let shim = root.join("usr-bin");
+        let asked = root.join("asked");
+        let xcode = root.join("Xcode.app/Contents/Developer");
+        let clang = xcode.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
+        script(&clang, "exit 0");
+        script(
+            &shim.join("xcrun"),
+            &format!("echo '{}/usr/bin/cc'", xcode.display()),
+        );
+        script(
+            &shim.join("cc"),
+            &format!(
+                "echo \"$1\" >> '{}'; [ \"$1\" = -o ] && printf x > \"$2\"",
+                asked.display()
+            ),
+        );
+        let host = CcHost {
+            shim_dir: Some(shim.clone()),
+            xcode_select_link: root.join("xcode_select_link"),
+            ..plain_host(&root)
+        };
+        std::os::unix::fs::symlink(&xcode, &host.xcode_select_link).unwrap();
+        let receipt = root.join("receipt");
+        std::fs::write(&receipt, "1").unwrap();
+        let cache = CcCache {
+            file: root.join("state").join("cc"),
+            receipt,
+        };
+        let path = Some(shim.as_os_str());
+        let runs = || std::fs::read_to_string(&asked).map_or(0, |text| text.lines().count());
+        let ready = CcVerdict::Ready {
+            driver: xcode.join("usr/bin/cc"),
+        };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 1, "the shim built the probe");
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 1, "the same Xcode asked the shim again");
+        std::fs::remove_file(&clang).unwrap();
+        script(&clang, "echo updated; exit 0");
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 2, "an updated Xcode kept the old verdict");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

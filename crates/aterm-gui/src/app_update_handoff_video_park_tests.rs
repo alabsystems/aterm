@@ -896,12 +896,12 @@ fn live_take(
     std::path::PathBuf,
     std::sync::mpsc::Receiver<crate::control::Retained<String>>,
 ) {
-    let root = std::env::temp_dir().join(format!(
-        "aterm-video-park-{}-{}",
-        std::process::id(),
-        crate::metrics::now_us()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+    // Created exclusively, so no other take shares this root and only this take removes it.
+    let root = aterm_tempfile::Builder::new()
+        .prefix("aterm-video-park-")
+        .tempdir()
+        .expect("exclusive recording root")
+        .keep();
     crate::control_auth::ensure_private_dir(&root).expect("private recording root");
     let dir = crate::control_auth::confine_video_dir(&root).expect("confined recording dir");
     let (reply, replies) = std::sync::mpsc::channel();

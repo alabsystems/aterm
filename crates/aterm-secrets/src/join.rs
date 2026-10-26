@@ -39,9 +39,17 @@ fn message(vault: &str, recipient: &str, host: &str) -> Vec<u8> {
     format!("alab-vault/1 join\n{vault}\n{recipient}\n{host}\n").into_bytes()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`Key::derive`] stretched a password on this test thread.
+    pub(crate) static DERIVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Key {
     /// Stretch `password` for `vault`.
     pub fn derive(vault: &str, password: &[u8]) -> Key {
+        #[cfg(test)]
+        DERIVED.with(|derived| derived.set(derived.get() + 1));
         let password = password.trim_ascii();
         let mut out = [0u8; 32];
         pbkdf2::derive(

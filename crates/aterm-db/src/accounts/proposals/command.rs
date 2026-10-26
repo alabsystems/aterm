@@ -46,7 +46,7 @@ pub(super) fn run_at(
     } else {
         None
     };
-    let key = if command == "accounts-get" {
+    let key = if matches!(command, "accounts-get" | "accounts-plan") {
         Some(take(&mut options, "--key")?)
     } else {
         None
@@ -55,6 +55,9 @@ pub(super) fn run_at(
         return Err(Error::new("unknown account proposal option"));
     }
     let db = Proposals::at(paths);
+    if command == "accounts-plan" {
+        return db.plan(key.ok_or_else(|| Error::new("missing account key"))?);
+    }
     if command == "accounts-check" {
         return db.check();
     }

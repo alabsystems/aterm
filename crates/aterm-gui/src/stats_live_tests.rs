@@ -174,6 +174,7 @@ fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
         stale_after: Duration::from_secs(3),
         motion,
         beat,
+        tween: false,
         flow: Flow::Glide {
             step: Duration::from_millis(250),
             end_ms: None,
@@ -454,6 +455,7 @@ fn frames_over(cadence: Duration, moves: Moves, beat: bool, secs: u32) -> (usize
             stale_after: stale_after(cadence, None),
             motion: true,
             beat,
+            tween: false,
             flow,
         };
         frames += 1;
@@ -583,6 +585,7 @@ fn the_card_key_and_the_layers_follow_what_moved() {
 const TEXT: HeaderText<'static> = HeaderText {
     tab: "Tab 2",
     machine: "this Mac",
+    machine_forms: &[],
     over: true,
 };
 
@@ -608,34 +611,48 @@ fn header_pt_words(m: &FaceMetrics, text: &str) -> f64 {
     m.width(text, plan::HEADER_PT, false)
 }
 
-/// The seconds a scale's words name, read as a person reads them: `10 min ago`, `–2.5 min`,
-/// `–80 s`; `None` for anything else.
+/// The seconds a scale's words name, read as a person reads them: `1h ago`, `–15m`, `–10s`,
+/// `10 min ago`, `–2.5 min`, `–80 s`; `None` for anything else.
 fn read_age(words: &str) -> Option<f64> {
     let words = words.strip_suffix(" ago").unwrap_or(words);
     let words = words.strip_prefix('\u{2013}').unwrap_or(words);
-    let (n, unit) = words.split_once(' ')?;
-    let n: f64 = n.parse().ok()?;
-    match unit {
-        "min" => Some(n * 60.0),
-        "s" => Some(n),
-        _ => None,
+    if let Some((n, unit)) = words.split_once(' ') {
+        let n: f64 = n.parse().ok()?;
+        return match unit {
+            "h" => Some(n * 3_600.0),
+            "min" | "m" => Some(n * 60.0),
+            "s" => Some(n),
+            _ => None,
+        };
+    }
+    if let Some(n) = words.strip_suffix('h') {
+        n.parse::<f64>().ok().map(|v| v * 3_600.0)
+    } else if let Some(n) = words.strip_suffix('m') {
+        n.parse::<f64>().ok().map(|v| v * 60.0)
+    } else if let Some(n) = words.strip_suffix('s') {
+        n.parse::<f64>().ok()
+    } else {
+        None
     }
 }
 
-/// How far back the strip reaches as drawn, seconds: its width in pitches, a period each.
+/// How far back the strip reaches as drawn, seconds: its multi-scale horizon.
 fn drawn_span(strip: Strip) -> f64 {
-    (strip.end() + (strip.pitch - strip.cell) - strip.x) / strip.pitch * f64::from(strip.period_s)
+    f64::from(strip.span_s())
 }
 
 #[test]
 fn the_scales_words_read_as_their_ages() {
     // NEGATIVE CONTROL for `read_age`: it reads what a person reads, and nothing else.
+    assert_eq!(read_age("1h ago"), Some(3_600.0));
     assert_eq!(read_age("10 min ago"), Some(600.0));
+    assert_eq!(read_age("\u{2013}15m"), Some(900.0));
     assert_eq!(read_age("\u{2013}2.5 min"), Some(150.0));
     assert_eq!(read_age("\u{2013}80 s"), Some(80.0));
+    assert_eq!(read_age("\u{2013}10s"), Some(10.0));
     assert_eq!(read_age("now"), None);
     assert_eq!(read_age("10 minutes"), None);
-    for age in [30, 40, 60, 80, 120, 150, 300, 600] {
+    for age in [10, 20, 30, 40, 60, 80, 120, 150, 300, 600, 900, 3_600] {
         assert_eq!(
             read_age(&plan::tick_words(age)),
             Some(f64::from(age)),
@@ -690,8 +707,10 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
     }
     let hi = strip.end() - MARKER_ROOM;
     for (i, t) in head.ruler.iter().enumerate() {
-        let want = strip.end() - f64::from(t.age_s) / f64::from(strip.period_s) * strip.pitch;
-        if (t.x - want).abs() > EPS {
+        let want = strip
+            .x_at_age_ms(i64::from(t.age_s) * 1_000)
+            .unwrap_or(strip.x);
+        if (t.x - want).abs() > 1e-4 {
             why.push(format!("{} at {}, not {want}", t.text, t.x));
         }
         if read_age(&t.text) != Some(f64::from(t.age_s)) || f64::from(t.age_s) >= drawn_span(strip)
@@ -733,16 +752,16 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
 /// read" by rule K's own search ([`plan::place_key`]), which the scale never does.
 fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<String> {
     let hi = strip.end() - MARKER_ROOM;
-    let tick = |age: u32| {
-        let x = strip.end() - f64::from(age) / f64::from(strip.period_s) * strip.pitch;
-        (x, header_pt_words(m, &plan::tick_words(age)))
+    let tick = |age: u32| -> Option<(f64, f64)> {
+        let x = strip.x_at_age_ms(i64::from(age) * 1_000)?;
+        Some((x, header_pt_words(m, &plan::tick_words(age))))
     };
     let ages = plan::tick_ages(strip);
     let labels = plan::time_words(strip);
     for label in &labels {
         let lo = strip.x + header_pt_words(m, label) + 6.0;
         for &age in &ages {
-            let (x, w) = tick(age);
+            let Some((x, w)) = tick(age) else { continue };
             if lo.max(x - 0.75 * w) <= (hi - w).min(x - 0.25 * w) {
                 return Some(format!("{} fits beside {label:?}", plan::tick_words(age)));
             }
@@ -767,7 +786,7 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
             continue;
         }
         for &age in &ages {
-            let (tx, w) = tick(age);
+            let Some((tx, w)) = tick(age) else { continue };
             let (least, most) = (strip.x.max(tx - 0.75 * w), (hi - w).min(tx - 0.25 * w));
             if least > most {
                 continue;
@@ -883,23 +902,25 @@ fn the_time_scale_at_the_mockups_widths() {
     assert_eq!(
         got,
         [
-            (10, "10 min ago".into(), vec![60, 120, 300]),
-            (10, "10 min ago".into(), vec![60, 120, 300]),
-            (10, "10 min ago".into(), vec![60, 300]),
-            (10, "10 min ago".into(), vec![60, 300]),
-            (30, "10 min ago".into(), vec![120]),
-            (1, "30 s ago".into(), vec![10, 20]),
-            (1, "–20 s".into(), vec![10]),
-            (1, "20 s ago".into(), vec![10]),
+            (10, "1h ago".into(), vec![10, 60, 300, 900]),
+            (10, "1h ago".into(), vec![10, 60, 300, 900]),
+            (10, "1h ago".into(), vec![10, 60, 300, 900]),
+            (10, "1h ago".into(), vec![10, 60, 300, 900]),
+            (30, "1m ago".into(), vec![10]),
+            (1, "15m ago".into(), vec![10, 60]),
+            (1, "5m ago".into(), vec![10]),
+            (1, "\u{2013}1m".into(), vec![10]),
         ]
     );
-    // The owner's default window (Folded at about 600 pt): the label stands beside block A's
-    // strip and the strip's whole header is the scale's, "–10 s" centred over its middle.
-    let (head, strip) = head_of(DeckForm::Folded, 600.0, &m).expect("the table is drawn");
-    assert_eq!(head.time_tick, Some(strip.x));
+    // The owner's default window (Folded at about 600 pt): its 1m multi-scale strip carries the
+    // "–10s" tick over the fine real-time region, with the tick under the middle half of its words.
+    let (head, _strip) = head_of(DeckForm::Folded, 600.0, &m).expect("the table is drawn");
     let mid = &head.ruler[0];
     let w = header_pt_words(&m, &mid.text);
-    assert!((mid.left + w / 2.0 - mid.x).abs() < EPS, "{mid:?}");
+    assert!(
+        (mid.left + w / 2.0 - mid.x).abs() <= w / 4.0 + EPS,
+        "{mid:?}"
+    );
 }
 
 /// A headless App whose one focused window draws the v2 deck, holding a reading that landed at
@@ -1227,4 +1248,66 @@ fn a_deck_turned_off_and_on_lays_its_card_out_again() {
         Some(DeckLive::STALE.key()),
         "the live edge it drew is known"
     );
+}
+
+#[test]
+fn tween_interpolates_exponentially_settles_cleanly_and_snaps_under_reduce_motion() {
+    assert_eq!(exp_blend(Duration::ZERO, TWEEN_TAU), Some(0.0));
+    let mut prev = 0.0_f32;
+    for ms in [60, 120, 240, 480] {
+        let cur = exp_blend(Duration::from_millis(ms), TWEEN_TAU).expect("still settling");
+        assert!(
+            cur >= prev && cur < TWEEN_SETTLE,
+            "{ms} ms: {prev} -> {cur}"
+        );
+        prev = cur;
+    }
+    assert_eq!(exp_blend(Duration::from_secs(2), TWEEN_TAU), None);
+    assert_eq!(lerp_opt(Some(0.2), Some(0.8), Some(0.5)), Some(0.5));
+    assert_eq!(lerp_opt(Some(0.2), Some(0.8), None), Some(0.8));
+    assert_eq!(lerp_opt(None, Some(0.8), Some(0.5)), Some(0.8));
+
+    let phases: Vec<Option<f32>> = (0..=BEAT_FRAMES).map(tween_phase).collect();
+    assert!(phases[..BEAT_FRAMES as usize].iter().all(Option::is_some));
+    assert_eq!(phases[BEAT_FRAMES as usize], None);
+    for pair in phases[..BEAT_FRAMES as usize].windows(2) {
+        assert!(pair[0] < pair[1], "{phases:?}");
+    }
+
+    let t0 = Instant::now();
+    let f = LiveFacts {
+        landed: Some(t0),
+        stale_after: Duration::from_secs(5),
+        motion: true,
+        beat: false,
+        tween: true,
+        flow: Flow::None,
+    };
+    let mut now = t0;
+    let mut steps = Vec::new();
+    while let Some(next) = f.next_change(now, wall(t0, OPEN, now)) {
+        steps.push(next - t0);
+        now = next;
+    }
+    assert_eq!(
+        steps,
+        [FRAME, FRAME * 2, FRAME * 3, f.stale_after],
+        "tween runs its 3 frames and then schedules zero idle frames before stale_after"
+    );
+    let reduced = LiveFacts { motion: false, ..f };
+    assert_eq!(reduced.live(t0, OPEN), DeckLive::STILL);
+    assert_eq!(reduced.next_change(t0, OPEN), Some(t0 + f.stale_after));
+
+    let blending = DeckLive {
+        blend: Some(0.5),
+        ..DeckLive::STILL
+    };
+    let beating = DeckLive {
+        beat: Some(0.25),
+        ..DeckLive::STILL
+    };
+    assert!(LiveLayer::Values.moved(&DeckLive::STILL, &blending));
+    assert!(LiveLayer::NowBox.moved(&DeckLive::STILL, &blending));
+    assert!(!LiveLayer::Glide.moved(&DeckLive::STILL, &blending));
+    assert!(!LiveLayer::NowBox.moved(&DeckLive::STILL, &beating));
 }

@@ -510,6 +510,7 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
 pub(crate) fn owner_input(snap: &Snapshot) -> DeckInput<'_> {
     DeckInput {
         snap: Some(snap),
+        prev_snap: None,
         tab_panes: vec![FRONT],
         tab_label: TAB.into(),
         tab_count: 1,
@@ -608,33 +609,53 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
             chars(of(Owner::HotHard)) * 10 > calm * more,
             "{form:?}: hot-hard says {how} what light says: {ladder:?}"
         );
-        // What a strip of this form at this width draws: its columns and the one the glide
-        // slides out. Full's are 10 s buckets over ten minutes; Folded's (Mid here) are the
-        // last 20 s, a second's reading each (§12 of the live edge's design).
-        let strip = match form {
-            DeckForm::Full => crate::stats_plan::plan_full(OWNER_W, &m).strip,
-            DeckForm::Folded => crate::stats_plan::plan_folded(OWNER_W, &m).blocks[0].strip,
+        // What a strip of this form at this width draws: Full's 1h multi-scale horizon, or
+        // Folded's multi-scale blocks.
+        let form_strips: Vec<crate::stats_plan::Strip> = match form {
+            DeckForm::Full => vec![crate::stats_plan::plan_full(OWNER_W, &m).strip],
+            DeckForm::Folded => crate::stats_plan::plan_folded(OWNER_W, &m)
+                .blocks
+                .into_iter()
+                .map(|b| b.strip)
+                .collect(),
         };
-        let (period, drawn_cols) = if form == DeckForm::Full {
-            (10, SPAN + 1)
+        let period = if form == DeckForm::Full {
+            10
         } else {
-            (crate::stats_plan::FOLD_SLOT_S, 21)
+            crate::stats_plan::FOLD_SLOT_S
         };
-        assert_eq!(strip.period_s, period, "{form:?}: what a column holds");
-        let drawn = strip.cols as usize + 1;
-        assert_eq!(drawn, drawn_cols, "{form:?}");
+        assert_eq!(
+            form_strips[0].period_s, period,
+            "{form:?}: what a column holds"
+        );
         for (o, runs) in &said {
             // The legend shows a mark only while a strip draws it.
             let scene = owner_scene(*o);
-            let over_drawn = scene.resources[..3].iter().any(|v| {
-                if form == DeckForm::Full {
-                    v.ring.iter().rev().take(drawn).any(|c| c.over)
-                } else {
-                    v.heat_slots(scene.slot_grid, drawn, AT, SLOT_COVER_MS)
+            let over_drawn = match form {
+                DeckForm::Full => scene.resources[..DECK_RESOURCES.len()].iter().any(|v| {
+                    v.heat_multi_scale(form_strips[0].spec, AT, SLOT_COVER_MS, &scene.time_gaps)
                         .iter()
-                        .any(|c| c.over)
+                        .any(|s| s.cell.over)
+                }),
+                DeckForm::Folded => {
+                    // Folded's header queries words.over_shown(&plan.blocks[0].strip), which checks
+                    // all non-text rows against block A's multi-scale spec.
+                    scene.resources[..DECK_RESOURCES.len()]
+                        .iter()
+                        .enumerate()
+                        .any(|(ri, v)| {
+                            aterm_vitals::words::strip_words(DECK_RESOURCES[ri], &scene).is_none()
+                                && v.heat_multi_scale(
+                                    form_strips[0].spec,
+                                    AT,
+                                    SLOT_COVER_MS,
+                                    &scene.time_gaps,
+                                )
+                                .iter()
+                                .any(|s| s.cell.over)
+                        })
                 }
-            });
+            };
             assert_eq!(
                 runs.iter().any(|r| r == "over max"),
                 over_drawn,

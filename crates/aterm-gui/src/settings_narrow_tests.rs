@@ -2585,9 +2585,31 @@ fn whole_words_of(
     ),
     route: SettingsRoute,
 ) -> std::collections::HashMap<String, String> {
+    widest_page_of(prepare, route).words
+}
+
+/// `route` in a window wide enough that nothing cuts it.
+struct WidestPage {
+    /// What each node says.
+    words: std::collections::HashMap<String, String>,
+    /// Every screen's nodes in paint order: each one's key, place (in hundredths of a point) and
+    /// words. Two pages with one layout here are one tree of one size with one text, so they lay
+    /// out alike in every window: colours aside, what a theme changes on a page shows here.
+    layout: Vec<(String, [i64; 4], Option<String>)>,
+}
+
+fn widest_page_of(
+    prepare: impl FnOnce() -> (
+        NativeRuntime,
+        crate::native_app::AppInstanceId,
+        crate::native_app::ViewId,
+    ),
+    route: SettingsRoute,
+) -> WidestPage {
     let (mut runtime, instance, view) = prepare();
     go_to_route(&mut runtime, instance, view, route);
-    let mut whole = std::collections::HashMap::new();
+    let mut words = std::collections::HashMap::new();
+    let mut layout = Vec::new();
     each_screen(
         &mut runtime,
         instance,
@@ -2595,13 +2617,17 @@ fn whole_words_of(
         &view_cx_at(4_000.0, 2_400.0),
         |compiled, _| {
             for node in &compiled.paint {
-                if let Some(text) = painted_text(node) {
-                    whole.insert(node.key.as_str().to_string(), text);
+                let text = painted_text(node);
+                let place = [node.rect.x, node.rect.y, node.rect.width, node.rect.height]
+                    .map(|at| (at * 100.0).round() as i64);
+                layout.push((node.key.as_str().to_string(), place, text.clone()));
+                if let Some(text) = text {
+                    words.insert(node.key.as_str().to_string(), text);
                 }
             }
         },
     );
-    whole
+    WidestPage { words, layout }
 }
 
 /// The nodes under `prefixes` on `screen` that cut a word inside itself ([`cut_inside_a_word`]).
@@ -2641,10 +2667,31 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
         .chain(WIDE_SIZES[..3].iter().copied())
         .collect();
     at_each_text_scale(&[1.0, 1.5, 2.0], "every page", |scale| {
+        // Each page under each source, but a source that lays the page out as the first does
+        // (a theme that changes only its colours): its every screen would repeat the first's.
         let pages: Vec<(SettingsRoute, &str)> = SettingsRoute::ALL
             .into_iter()
-            .flat_map(|route| EVERY_PAGE_SOURCES.map(|source| (route, source)))
+            .flat_map(|route| {
+                let first =
+                    widest_page_of(|| every_page_runtime_over(EVERY_PAGE_SOURCES[0]), route);
+                EVERY_PAGE_SOURCES[1..]
+                    .iter()
+                    .filter(move |source| {
+                        widest_page_of(|| every_page_runtime_over(source), route).layout
+                            != first.layout
+                    })
+                    .chain(&EVERY_PAGE_SOURCES[..1])
+                    .map(move |source| (route, *source))
+                    .collect::<Vec<_>>()
+            })
             .collect();
+        assert!(
+            pages
+                .iter()
+                .any(|(_, source)| *source == EVERY_PAGE_SOURCES[1]),
+            "some page lays out differently under {:?}",
+            EVERY_PAGE_SOURCES[1]
+        );
         on_workers(&pages, "every page", |&(route, source)| {
             let whole = whole_words_of(|| every_page_runtime_over(source), route);
             for &(width, height) in &sizes {

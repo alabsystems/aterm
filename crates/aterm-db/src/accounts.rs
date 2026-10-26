@@ -9,6 +9,10 @@ use crate::{Error, Result, crypto::name};
 use aterm_json::Value;
 
 #[cfg(unix)]
+pub mod activations;
+#[cfg(unix)]
+mod plans;
+#[cfg(unix)]
 pub mod proposals;
 #[cfg(unix)]
 mod references;

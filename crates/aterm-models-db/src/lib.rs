@@ -5,6 +5,13 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 use aterm_spec::derive::Model;
 
+mod account_plan;
+pub use account_plan::account_plan_model;
+mod account_activation;
+pub use account_activation::account_activation_model;
+mod verified_entry;
+pub use verified_entry::verified_entry_model;
+
 mod dispatch;
 pub use dispatch::resource_dispatch_model;
 mod discovery;

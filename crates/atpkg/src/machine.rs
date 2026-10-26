@@ -172,6 +172,72 @@ pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
     }
 }
 
+/// The two Universal Control switches (`keys`, in order) from one `defaults -currentHost read`
+/// of their whole domain: `ran` is its zero exit and stdout, `None` when it did not run or
+/// passed its deadline. A key the domain's top level does not hold is absent, and so are both
+/// when `defaults` exits non-zero printing nothing (no such domain); a key whose value is no
+/// boolean, or a domain that cannot be read, is unusable. One spawn answers both keys.
+#[must_use]
+#[cfg(any(target_os = "macos", test))]
+pub fn universal_control_from_domain(
+    ran: Option<(bool, Vec<u8>)>,
+    keys: [&str; 2],
+) -> [Read<bool>; 2] {
+    let unusable = |why: &str| {
+        [
+            Read::Unusable(why.to_owned()),
+            Read::Unusable(why.to_owned()),
+        ]
+    };
+    let out = match ran {
+        None => return unusable("`defaults read` did not run or passed its deadline"),
+        Some((false, out)) if out.iter().all(u8::is_ascii_whitespace) => {
+            return [Read::Absent, Read::Absent];
+        }
+        Some((false, _)) => {
+            return unusable("`defaults read` exited nonzero and printed something");
+        }
+        Some((true, out)) => out,
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if lines.next() != Some("{") {
+        return unusable("`defaults read` printed no domain");
+    }
+    let mut found: [Option<&str>; 2] = [None, None];
+    let mut depth = 1usize;
+    let mut closed = false;
+    for line in lines {
+        if depth == 1 && line == "}" {
+            closed = true;
+            break;
+        }
+        if depth == 1
+            && let Some((key, value)) = line.split_once(" = ")
+            && let Some(at) = keys.iter().position(|k| *k == key.trim_matches('"'))
+        {
+            found[at] = Some(value.trim_end_matches(';'));
+        }
+        // Nested dictionaries and arrays open and close on their own lines' ends.
+        if line.ends_with('{') || line.ends_with('(') {
+            depth += 1;
+        } else if line.starts_with('}') || line.starts_with(')') {
+            depth = depth.saturating_sub(1).max(1);
+        }
+    }
+    if !closed {
+        return unusable("`defaults read` printed a domain cut short");
+    }
+    let read = |key: &str, value: Option<&str>| match value {
+        None => Read::Absent,
+        Some(value) => parse_defaults_bool(value.trim_matches('"').as_bytes()).map_or_else(
+            || Read::Unusable(format!("`defaults read` printed no boolean for {key}")),
+            Read::Value,
+        ),
+    };
+    [read(keys[0], found[0]), read(keys[1], found[1])]
+}
+
 /// The port to the real `defaults` domain — one read, one write — so the policy is testable against a fake and the tests never touch the machine.
 pub trait UniversalControlPort {
     /// `[Disable, DisableMagicEdges]` as [`crate::platform::universal_control_state`].
@@ -882,6 +948,51 @@ mod tests {
         assert_eq!(parse_defaults_bool(b"{\n    Configuration = x;\n}\n"), None);
         assert_eq!(parse_defaults_bool(b"2"), None);
         assert_eq!(parse_defaults_bool(b"truee"), None);
+    }
+
+    /// One read of the whole domain answers both switches, as two key reads did. NEGATIVE
+    /// CONTROL: a key only a nested dictionary holds is absent at the top level, a value that
+    /// is no boolean is unusable, and a missing domain leaves both absent.
+    #[test]
+    fn one_domain_read_answers_both_universal_control_switches() {
+        const KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
+        let read = |ok: bool, out: &str| {
+            universal_control_from_domain(Some((ok, out.as_bytes().to_vec())), KEYS)
+        };
+        assert_eq!(
+            read(true, "{\n    Disable = 1;\n    DisableMagicEdges = 1;\n}\n"),
+            [Read::Value(true), Read::Value(true)]
+        );
+        assert_eq!(
+            read(true, "{\n    Disable = 0;\n}\n"),
+            [Read::Value(false), Read::Absent]
+        );
+        assert_eq!(
+            read(
+                true,
+                "{\n    Other =     {\n        Disable = 1;\n    };\n    DisableMagicEdges = \
+                 true;\n}\n"
+            ),
+            [Read::Absent, Read::Value(true)],
+            "a nested key is not the domain's"
+        );
+        assert!(matches!(
+            read(true, "{\n    Disable = \"maybe\";\n}\n"),
+            [Read::Unusable(_), Read::Absent]
+        ));
+        assert_eq!(read(false, ""), [Read::Absent, Read::Absent], "no domain");
+        assert!(matches!(
+            read(false, "something"),
+            [Read::Unusable(_), Read::Unusable(_)]
+        ));
+        assert!(matches!(
+            read(true, "{\n    Disable = 1;\n"),
+            [Read::Unusable(_), Read::Unusable(_)]
+        ));
+        assert!(matches!(
+            universal_control_from_domain(None, KEYS),
+            [Read::Unusable(_), Read::Unusable(_)]
+        ));
     }
 
     #[test]

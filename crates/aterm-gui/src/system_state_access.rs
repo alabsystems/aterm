@@ -354,6 +354,70 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
     pick(|address| address.is_private()).or_else(|| pick(|address| address.is_link_local()))
 }
 
+/// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
+/// published (its progress record and its prompt-free readings), so a `status` costs no probe.
+/// `pending:<row,...>` names each managed row that needs a person, waits, failed or, while the
+/// run goes, still differs (`fda`, `devtools`, `vault`, … [`setup_word`]); `done` once the plan
+/// finished or a person cancelled it with none of those left; `pending` while a run goes with
+/// none read; `-` before the worker said anything (no setup in this process).
+pub(crate) fn setup_field(status: &SetupStatus) -> String {
+    let selection = status
+        .plan
+        .as_ref()
+        .map_or_else(Selection::none, |plan| plan.selection);
+    let ended = status.finished || status.cancelled;
+    let mut pending: Vec<&str> = Vec::new();
+    for observation in
+        status.observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
+    {
+        let left = match observation.standing {
+            Standing::NeedsYou | Standing::Waiting | Standing::Failed => true,
+            // A row a finished setup set once and a person changed since is theirs.
+            Standing::Differs => !ended,
+            _ => false,
+        };
+        let word = setup_word(observation.subject);
+        if left
+            && crate::system_state::manages(selection, observation.subject)
+            && !pending.contains(&word)
+        {
+            pending.push(word);
+        }
+    }
+    if !pending.is_empty() {
+        format!("pending:{}", pending.join(","))
+    } else if ended {
+        "done".to_owned()
+    } else if status.plan.is_some() || status.run.is_some() {
+        "pending".to_owned()
+    } else {
+        "-".to_owned()
+    }
+}
+
+/// A System State row's word in `setup=` ([`setup_field`]).
+const fn setup_word(subject: Subject) -> &'static str {
+    match subject {
+        Subject::Access(Access::FullDiskAccess) => "fda",
+        Subject::Access(Access::DeveloperTools) => "devtools",
+        Subject::Access(Access::Debugger) => "debugger",
+        Subject::Access(Access::LocalNetwork) => "lan",
+        Subject::Access(Access::Accessibility) => "ax",
+        Subject::Setting(Setting::CapsLock) => "capslock",
+        Subject::Setting(Setting::NaturalScrolling) => "scrolling",
+        Subject::Setting(Setting::TrackpadScrolling) => "trackpad",
+        Subject::Setting(Setting::Desktop) => "desktop",
+        Subject::Setting(Setting::Widgets) => "widgets",
+        Subject::Setting(Setting::Dock) => "dock",
+        Subject::Setting(Setting::Messages) => "messages",
+        Subject::Setting(Setting::FaceTime) => "facetime",
+        Subject::Setting(Setting::Spotlight) => "spotlight",
+        Subject::Setting(Setting::Permissions) => "permissions",
+        Subject::Setting(Setting::Secrets) => "vault",
+        Subject::Setting(Setting::Repositories) => "repos",
+    }
+}
+
 /// The one quiet signal (§3.6, pure): `System State: <row> needs you`, from the managed rows
 /// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
 /// or a step the last run could not finish, reads `System State: <row> failed` (`1 step

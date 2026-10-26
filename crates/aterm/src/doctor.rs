@@ -36,7 +36,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
         }
     };
     if let Some(action) = args.settings {
-        let (text, code) = cli::settings(action, args.json);
+        let (text, code) = cli::settings(action, args.json, args.verbose);
         return cli::answer(&text, code, true, None);
     }
     let ground = atpkg::store::resolve_configured()
@@ -44,7 +44,8 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
     let packages = || {
         ground
             .as_ref()
-            .map(|ground| atpkg::doctor::packages_rows(&ground.layout))
+            // The repair items walk the same exec root on their own thread: one walk for both.
+            .map(|ground| atpkg::doctor::packages_rows_sharing(&ground.layout, &ground.reads))
             .unwrap_or_default()
     };
     let state = aterm_types::dirs::account_state_dir();
@@ -61,6 +62,12 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
     });
     #[cfg(not(target_os = "macos"))]
     let develop = None;
+    #[cfg(target_os = "macos")]
+    let rust_docs = || reading.rust_docs();
+    #[cfg(target_os = "macos")]
+    let docs: Option<&DocsRepair<'_>> = Some(&rust_docs);
+    #[cfg(not(target_os = "macos"))]
+    let docs = None;
     let ran = run(
         &args,
         &Ports {
@@ -70,6 +77,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             state: state.as_deref(),
             not_own_account: aterm_types::dirs::not_own_account(),
             develop,
+            docs,
         },
     );
     cli::answer(&ran.text, ran.code, ran.stdout, ran.hand_over)
@@ -111,6 +119,14 @@ pub(crate) struct DevelopLayer<'a> {
     pub(crate) rows: DevelopRows<'a>,
 }
 
+/// The repair that keeps this login's `rust-docs` out of Spotlight, its items bound for the
+/// engine, or why they cannot be built: macOS's `aterm_machines::init::Doctor::rust_docs`, a
+/// stand-in in tests, none elsewhere. Called only once the gather found Spotlight indexing them.
+pub(crate) type DocsRepair<'a> = dyn Fn() -> Result<Vec<Box<dyn Item + 'a>>, String> + 'a;
+
+/// The id of the workstation item [`DocsRepair`] binds, without its `@<user>`.
+const RUST_DOCS: &str = "init.spotlight.rust-docs";
+
 /// [`DevelopLayer::rows`]: the `--only` words in, the rows or why they cannot be ordered out.
 pub(crate) type DevelopRows<'a> =
     Box<dyn FnOnce(&[String]) -> Result<Vec<ItemReport>, String> + 'a>;
@@ -138,6 +154,9 @@ pub(crate) struct Ports<'a> {
     /// The develop layer ([`Develop`]), read only in the account's own shell; `None` where
     /// aterm has none (not macOS).
     pub(crate) develop: Option<Develop<'a>>,
+    /// The `rust-docs` repair ([`DocsRepair`]), built and run in the account's own shell when
+    /// the gather found Spotlight indexing rust-docs pages; `None` where aterm has none.
+    pub(crate) docs: Option<&'a DocsRepair<'a>>,
 }
 
 /// A run's answer: the text (the report, the JSON, or the refusal), its exit status,
@@ -307,6 +326,18 @@ fn converge<'a>(
             .collect()
     };
     let (facts, _) = aterm_converge::select(gathered.items(), &fact_tokens);
+    // This login's rust-docs, kept out of Spotlight once the gather found it indexing them (the
+    // workstation item, a relay-class repair of the account's own): built only then, so a Mac
+    // whose docs are out of Spotlight runs nothing for it, and never from another account's
+    // shell, whose rustup is not its own.
+    let mut docs_unbuilt = None;
+    let docs: Vec<Box<dyn Item + 'a>> = match ports.docs {
+        Some(docs) if own && gathered.rust_docs_indexed() => docs().unwrap_or_else(|why| {
+            docs_unbuilt = Some(why);
+            Vec::new()
+        }),
+        _ => Vec::new(),
+    };
 
     let mut lock = None;
     let how = match ports.ground {
@@ -324,19 +355,21 @@ fn converge<'a>(
         _ => How::Applied,
     };
     laps.lap("lock");
-    let (facts, repairs) = match &how {
+    let (facts, repairs, docs) = match &how {
         How::StoodAside(line) => {
             let aside = StoodAside::Lock(line.clone());
             (
                 aterm_converge::standing_aside(facts, &aside),
                 aterm_converge::standing_aside(repairs, &aside),
+                aterm_converge::standing_aside(docs, &aside),
             )
         }
         How::HeldBack(line) => (
             aterm_converge::held_back(facts, line),
             aterm_converge::held_back(repairs, line),
+            aterm_converge::held_back(docs, line),
         ),
-        How::Applied | How::Planned => (facts, repairs),
+        How::Applied | How::Planned => (facts, repairs, docs),
     };
     let mode = if how == How::Planned {
         Mode::Plan
@@ -362,6 +395,24 @@ fn converge<'a>(
     let fact_rows = ran(&facts, "doctor.facts");
     laps.lap("census");
     let repair_rows = ran(&repairs, "doctor.repairs");
+    let mut docs_rows = ran(&docs, "doctor.docs");
+    for row in &mut docs_rows {
+        if row.outcome == Outcome::Changed {
+            row.detail = Some(format!(
+                "{} \u{2192} {}",
+                row.from.as_deref().unwrap_or("rust-docs in Spotlight"),
+                row.to.as_deref().unwrap_or("kept out")
+            ));
+        }
+    }
+    if let Some(why) = docs_unbuilt {
+        refused.push(unmeasured(
+            RUST_DOCS,
+            "spotlight",
+            Some(Layer::Workstation),
+            format!("rust-docs stay in Spotlight: {why}"),
+        ));
+    }
     laps.lap("repairs");
     if !fact_rows.iter().any(|row| row.id == cli::SHELL) {
         refused.push(unmeasured(
@@ -396,6 +447,10 @@ fn converge<'a>(
         !ran_ids.contains(&row.id.as_str())
             && (tokens.is_empty() || tokens.iter().any(|token| named_by(token, row)))
     });
+    // `aterm pkg doctor`'s own policy, judged before the rows join doctor's: only a row that
+    // fails that surface is unresolved here; its other warnings count as notes.
+    let pkg_judged: Vec<ItemReport> = packages.iter().map(as_pkg_doctor_judges).collect();
+    let pkg_failing = packages.iter().any(ItemReport::fails_surface);
     for row in &mut packages {
         row.essential = false;
     }
@@ -447,12 +502,22 @@ fn converge<'a>(
     let rows: Vec<ItemReport> = fact_rows
         .iter()
         .chain(&repair_rows)
+        .chain(&docs_rows)
         .chain(&develop_rows)
         .chain(&packages)
         .chain(&refused)
         .cloned()
         .collect();
-    let readiness = Readiness::of(&rows, tokens);
+    let judged: Vec<ItemReport> = fact_rows
+        .iter()
+        .chain(&repair_rows)
+        .chain(&docs_rows)
+        .chain(&develop_rows)
+        .chain(&pkg_judged)
+        .chain(&refused)
+        .cloned()
+        .collect();
+    let readiness = Readiness::of(&judged, tokens);
     let code = u8::from(!readiness.all_green);
     aterm_log::info!(
         "aterm doctor{}: {} rows, exit {code}; {laps}",
@@ -487,6 +552,7 @@ fn converge<'a>(
             },
         };
     }
+    let refused_rows = refused.clone();
     let mut sections: Vec<Section> = refused
         .into_iter()
         .map(|row| Section {
@@ -503,22 +569,138 @@ fn converge<'a>(
         .collect();
     let hold = ports.not_own_account.map(aterm_converge::not_own_account);
     sections.extend(repair_section(&repair_rows, &how, hold.as_deref()));
+    sections.extend(docs_section(&docs_rows));
     sections.extend(develop_section(&develop_rows));
     if !packages.is_empty() {
         let (healthy, lines) = atpkg::doctor::packages_view(&packages);
         sections.push(Section {
             label: "packages:",
-            mark: if healthy { Mark::Ok } else { Mark::Warn },
+            mark: match (healthy, pkg_failing) {
+                (true, _) => Mark::Ok,
+                (false, false) => Mark::Note,
+                (false, true) => Mark::Warn,
+            },
             fact: lines.join("\n"),
         });
     }
-    let text = cli::render_readiness(&gathered, &fact_rows, &sections, &readiness);
+    let text = if args.verbose {
+        cli::render_readiness(&gathered, &fact_rows, &sections, &readiness)
+    } else {
+        let (more, changes) = brief_rows(
+            &readiness,
+            &fact_rows,
+            [
+                ("repair:", repair_rows.as_slice()),
+                ("rust-docs:", docs_rows.as_slice()),
+                ("develop:", develop_rows.as_slice()),
+                ("packages:", packages.as_slice()),
+                ("doctor:", refused_rows.as_slice()),
+            ],
+            &how,
+        );
+        cli::render_brief(&gathered, &fact_rows, &more, &readiness, &changes)
+    };
     Ran {
         text,
         code,
         stdout: true,
         hand_over: gathered.hand_over(),
     }
+}
+
+/// A packages row as readiness counts it: as `aterm pkg doctor` judges it, so a row that does
+/// not fail that surface ([`ItemReport::fails_surface`], judged while the row still says whether
+/// it is essential) counts as a note, not unresolved. The JSON's row stays as it read.
+fn as_pkg_doctor_judges(row: &ItemReport) -> ItemReport {
+    let mut judged = row.clone();
+    let settled = matches!(
+        row.outcome,
+        Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+    );
+    if !settled && !row.fails_surface() {
+        judged.outcome = Outcome::NotApplicable;
+    }
+    judged
+}
+
+/// The rows bare doctor shows besides its facts' (which [`cli::render_brief`] reads itself):
+/// one per unresolved row of the repairs, the develop layer, the packages and the refusals,
+/// each under its section's label (a repair that stood aside for an install pass is a note: it
+/// waits, nothing is wrong); and what the repairs changed, one phrase each.
+fn brief_rows<'r>(
+    readiness: &Readiness,
+    fact_rows: &[ItemReport],
+    sections: impl IntoIterator<Item = (&'static str, &'r [ItemReport])>,
+    how: &How,
+) -> (Vec<cli::Shown>, Vec<String>) {
+    use cli::{Kind, Shown};
+    let aside = match how {
+        How::StoodAside(line) | How::HeldBack(line) => Some(line.as_str()),
+        How::Applied | How::Planned => None,
+    };
+    let mut shown = Vec::new();
+    let mut changes = Vec::new();
+    for (label, rows) in sections {
+        for row in rows {
+            if row.outcome == Outcome::Changed {
+                match row.detail.as_deref() {
+                    Some(detail) => changes.extend(detail.lines().map(str::to_owned)),
+                    None => changes.push(format!("restored {}", row.title)),
+                }
+                continue;
+            }
+            if !readiness.unresolved.contains(&row.id) {
+                continue;
+            }
+            let why = row.why.as_deref().unwrap_or("not done");
+            let text = match label {
+                "packages:" => atpkg::doctor::sentence_and_fix(row),
+                "rust-docs:" if row.outcome == Outcome::Planned => format!(
+                    "{} \u{2014} fix: {DOCS_FIX}",
+                    row.from.as_deref().unwrap_or("rust-docs in Spotlight")
+                ),
+                "rust-docs:" => format!("{why}{}", remedy(row)),
+                "develop:" => format!("{}: {why}{}", row.id, remedy(row)),
+                "doctor:" => why.to_owned(),
+                _ => match (row.outcome, aside) {
+                    (Outcome::Planned, _) => format!(
+                        "{}: {} \u{2014} fix: bare `aterm doctor` restores it",
+                        row.title,
+                        row.from.as_deref().unwrap_or("not as laid")
+                    ),
+                    (Outcome::Blocked, _) if row.stood_aside.is_some() => format!(
+                        "{}: not repaired, an install pass holds the store \u{2014} fix: run \
+                         `aterm doctor` again once it ends",
+                        row.title
+                    ),
+                    (Outcome::Blocked, Some(aside)) => format!(
+                        "{}: {} \u{2014} {aside}",
+                        row.title,
+                        row.from.as_deref().unwrap_or("not as laid")
+                    ),
+                    (Outcome::Failed, _) => {
+                        format!("{}: NOT done \u{2014} {why}{}", row.title, remedy(row))
+                    }
+                    _ => format!("{}: {why}{}", row.title, remedy(row)),
+                },
+            };
+            let kind = if row.outcome == Outcome::Unknown {
+                Kind::Unread
+            } else if row.stood_aside.is_some() && matches!(how, How::StoodAside(_)) {
+                Kind::Note
+            } else {
+                Kind::NeedsYou
+            };
+            shown.push(Shown::new(row.id.clone(), label, kind, &text));
+        }
+    }
+    // Every unresolved row is shown: one no section above holds and no fact row is, by its id.
+    for id in &readiness.unresolved {
+        if !shown.iter().any(|row| &row.id == id) && !fact_rows.iter().any(|row| &row.id == id) {
+            shown.push(Shown::new(id.clone(), "doctor:", Kind::NeedsYou, id));
+        }
+    }
+    (shown, changes)
 }
 
 /// Missing evidence as a row, not an empty successful report. No probe ran for it, so it took
@@ -889,6 +1071,38 @@ fn remedy(row: &ItemReport) -> String {
             .unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+/// What keeps rust-docs out of Spotlight, as a planned row's fix says it.
+const DOCS_FIX: &str = "bare `aterm doctor` keeps them out of Spotlight";
+
+/// The rust-docs repair's section: what it did, or what is left and why; `None` when it did
+/// not run (Spotlight indexes no rust-docs page, or the run is not in the account's own shell).
+fn docs_section(rows: &[ItemReport]) -> Option<Section> {
+    let row = rows.first()?;
+    let why = row.why.as_deref().unwrap_or("not done");
+    let (mark, fact) = match row.outcome {
+        Outcome::Ok | Outcome::NotApplicable => (Mark::Ok, row.to.clone().unwrap_or_default()),
+        Outcome::Changed => (Mark::Ok, row.detail.clone().unwrap_or_default()),
+        Outcome::Planned => (
+            Mark::Warn,
+            format!(
+                "{} \u{2014} {DOCS_FIX}",
+                row.from.as_deref().unwrap_or("rust-docs in Spotlight")
+            ),
+        ),
+        Outcome::Blocked if row.stood_aside.is_some() => (Mark::Note, why.to_owned()),
+        Outcome::Failed => (
+            Mark::Warn,
+            format!("NOT done \u{2014} {why}{}", remedy(row)),
+        ),
+        _ => (Mark::Warn, format!("{why}{}", remedy(row))),
+    };
+    Some(Section {
+        label: "rust-docs:",
+        mark,
+        fact,
+    })
 }
 
 /// The develop rows' section (design §5, S9): one line per item of the recorded checkouts,

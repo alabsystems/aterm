@@ -1939,7 +1939,9 @@ pub const VERBS: &[VerbSpec] = &[
          attribution=<live|adopted|unknown> fs_consent=<covered|denied|unknown> conflict= \
          revision= enabled=`. Hold and fabric: `hold=<0|1> hold_advisory=<fabric-lost|-> \
          fabric=<absent|connected|stale|stalled|disconnected> fabric_rtt_ms= fabric_link_age_ms= \
-         fleet=`. Presence: \
+         fleet=`. Setup: `setup=<done|pending|pending:<row,…>|->` (this Mac's first-run setup, \
+         read from the last status its worker published: no probe, nothing changed; rows \
+         `fda`, `devtools`, `debugger`, `lan`, `ax`, `vault`, `repos`, …). Presence: \
          `hand=<turn:<id>[:<holder>]|lease:<holder>|driving:<sid>|-> hand_pid= \
          level=<quiet|note|story|driving|driven|attention|limited|hold> story= why= \
          needs=<frozen|stopped|stalled|login|memory|wall|ask|approval|question|-> needs_n= \

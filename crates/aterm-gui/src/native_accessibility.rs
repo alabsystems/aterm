@@ -597,9 +597,7 @@ fn materialize_visible_text(
         && geometry.text_x < rect.right()
         && let Some(projection) = spec.projection.as_ref()
     {
-        let visible = ((geometry.body_h / geometry.line_h).ceil() as usize)
-            .saturating_add(1)
-            .min(projection.lines.len());
+        let visible = crate::native_ui::whole_editor_rows(&geometry).min(projection.lines.len());
         for (row, projected) in projection.lines.iter().take(visible).enumerate() {
             let y = geometry.body_y + row as f32 * geometry.line_h;
             let height = (geometry.body_y + geometry.body_h - y)
@@ -2392,6 +2390,8 @@ mod tests {
         );
     }
 
+    /// The published lines are the rows the editor shows whole (126 pt of body over 20 pt rows:
+    /// six), never the row the footer cuts nor the projection's 2048.
     #[test]
     fn virtual_text_publication_is_bounded_to_rows_intersecting_the_viewport() {
         let lines = (0..2_048)
@@ -2443,8 +2443,8 @@ mod tests {
         let projection = project_native_accessibility(&compiled, None).unwrap();
         let target = &projection.virtual_text()[0];
 
-        assert_eq!(target.lines.len(), 7);
-        assert_eq!(target.lines.last().unwrap().source, 12..13);
+        assert_eq!(target.lines.len(), 6);
+        assert_eq!(target.lines.last().unwrap().source, 10..11);
         assert_eq!(projection.update().nodes.len(), 2 + target.lines.len());
 
         let paint = compiled

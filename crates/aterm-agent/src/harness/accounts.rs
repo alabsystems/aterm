@@ -16,6 +16,9 @@ use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
+#[path = "accounts_shared.rs"]
+pub mod shared;
+
 #[path = "accounts_sync_commit.rs"]
 mod sync_commit;
 pub(super) use sync_commit::SyncTarget;
@@ -1985,6 +1988,9 @@ pub struct Logins {
     pub generation_clock: u64,
     /// The bindings, by label.
     pub labels: BTreeMap<String, Binding>,
+    /// Retained shared authority and consumed preparation generations. Ordinary
+    /// metadata edits cannot remove these pins or lower their high-water marks.
+    pub shared: shared::State,
 }
 
 impl Logins {
@@ -2007,7 +2013,17 @@ impl Logins {
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut o = Map::new();
-        o.insert("schema".to_owned(), Value::from(LOGINS_SCHEMA));
+        o.insert(
+            "schema".to_owned(),
+            Value::from(if self.shared.is_empty() {
+                LOGINS_SCHEMA
+            } else {
+                4
+            }),
+        );
+        if !self.shared.is_empty() {
+            o.insert("shared".into(), self.shared.to_json());
+        }
         o.insert(
             "generation_clock".to_owned(),
             Value::from(self.generation_clock),
@@ -2076,15 +2092,27 @@ impl Logins {
         if !doc.is_object() {
             return Err(Unread::NotOurs("not a JSON object".to_string()));
         }
-        let legacy = match doc.get("schema").and_then(Value::as_u64) {
+        let schema = doc.get("schema").and_then(Value::as_u64);
+        let legacy = match schema {
+            Some(4) => false,
             Some(2 | LOGINS_SCHEMA) => false,
             Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas 1, 2 and {LOGINS_SCHEMA}"
+                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA} and 4"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
+        };
+        let shared = if schema == Some(4) {
+            shared::State::from_json(&doc["shared"]).map_err(Unread::NotOurs)?
+        } else {
+            if doc.get("shared").is_some() {
+                return Err(Unread::NotOurs(
+                    "shared pins require their guarded schema".into(),
+                ));
+            }
+            shared::State::default()
         };
         let entries = doc
             .get("labels")
@@ -2202,9 +2230,15 @@ impl Logins {
                 .filter(|clock| *clock >= highest)
                 .ok_or_else(|| Unread::NotOurs("invalid renewal generation clock".into()))?,
         };
+        if !shared.fits_clock(generation_clock) {
+            return Err(Unread::NotOurs(
+                "shared preparation exceeds its retained generation clock".into(),
+            ));
+        }
         Ok(Logins {
             labels,
             generation_clock,
+            shared,
         })
     }
 }
@@ -2213,11 +2247,24 @@ impl Logins {
 /// insertion, removal and changes to location or proved identity invalidate old parents.
 /// Removal consumes a generation even though no binding remains to hold it. Multiple edits
 /// expose only the final binding. Exhaustion refuses before either account file is saved.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRenewal",
+        action = "MetadataEdit",
+        project = "aterm_agent::harness::cli::tests::shared_renewal_tests::transition"
+    )
+)]
 fn advance_renewal_generations(
     before: &Logins,
     after: &mut Logins,
     events: &[Event],
 ) -> Result<(), String> {
+    if !after.shared.extends(&before.shared) {
+        return Err(
+            "account edit would erase shared custody or consumed preparation history".into(),
+        );
+    }
     let mut changed: BTreeSet<_> = events
         .iter()
         .filter(|event| event.kind == Kind::Renewed)
@@ -2233,6 +2280,20 @@ fn advance_renewal_generations(
                 "account `{label}` renewal has no binding; account records unchanged"
             ));
         }
+    }
+    for (label, current_target) in after.shared.new_attempt_labels(&before.shared) {
+        if !after.labels.contains_key(&label) {
+            // A missing historical binding already invalidates its checkpoints;
+            // do not recreate removed labels merely to advance their fences.
+            if !current_target {
+                continue;
+            }
+            if after.labels.len() >= MAX_ACCOUNTS {
+                return Err("shared preparation exceeds local binding capacity".into());
+            }
+            after.labels.insert(label.clone(), Binding::default());
+        }
+        changed.insert(label);
     }
     changed.extend(
         before
@@ -2265,6 +2326,14 @@ fn advance_renewal_generations(
         clock = next;
     }
     after.generation_clock = clock;
+    after
+        .shared
+        .fence_new_attempts(&before.shared, &after.labels)?;
+    if !after.shared.fits_clock(clock)
+        || !after.shared.published_into(&before.shared, &after.labels)
+    {
+        return Err("shared preparation does not match the committed binding generation".into());
+    }
     Ok(())
 }
 
@@ -7707,14 +7776,38 @@ impl Store {
 
     /// [`Self::select_account`] for `cli`'s pool ([`enrolled_for`]).
     /// # Errors
-    /// As [`Self::select_account`], or when `cli` has no sign-in flow for an unenrolled or
-    /// signed-out row.
+    /// As [`Self::select_account`], when `cli` has no sign-in flow for an unenrolled or
+    /// signed-out row, or a row needing sign-in requires explicit shared authorization.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "AccountSelectionCommit",
             action = "Select",
             project = "aterm_agent::harness::accounts::selection_commit_tests::selection_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedSelection",
+            action = "Queue",
+            project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedSelection",
+            action = "TryShared",
+            project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedSelection",
+            action = "Replace",
+            project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
         )
     )]
     pub fn select_account_for(
@@ -7744,6 +7837,11 @@ impl Store {
                     None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
                     Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
                     Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
+                        if let Some(row) = roster.row(label)
+                            && logins.shared.required(row)?.is_some()
+                        {
+                            return Err("this account requires a fresh root-authorized shared renewal; use `aterm harness accounts shared-renew`".into());
+                        }
                         if cli != Cli::Claude && cli.accounts().signin.is_none() {
                             return Err(why.message(label));
                         }
@@ -7791,7 +7889,10 @@ impl Store {
         now: i64,
     ) -> Result<bool, String> {
         let mut admitted = false;
-        self.transact_renewal_within(&LOCK_LADDER, now, &mut None, policy, |state, _| {
+        self.transact_renewal_within(&LOCK_LADDER, now, &mut None, policy, |state, logins| {
+            if logins.shared.required(policy.row)?.is_some() {
+                return Err("this account requires a fresh root-authorized shared renewal".into());
+            }
             admitted = request.is_none_or(|request| {
                 request.label() == policy.row.label && state.pending_pin.as_ref() == Some(request)
             });

@@ -45,6 +45,47 @@ impl Seed {
     }
 }
 
+/// Declares [`Gone`], its words and [`Gone::ALL`] from one list, so a reader of a brief's
+/// `partial` words knows every reason the brief gives for a session gone without its close.
+macro_rules! gone_reasons {
+    ($($(#[$doc:meta])* $variant:ident => $word:literal,)*) => {
+        /// Why a brief judges a session gone although its close never reached the bus (a
+        /// `partial` word beside [`Seed::why`]'s): nobody there can answer its need.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Gone {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl Gone {
+            /// Every reason, from the same list as the enum's.
+            pub const ALL: &'static [Gone] = &[$(Gone::$variant,)*];
+
+            /// The `partial` (`why=`) word.
+            #[must_use]
+            pub const fn word(self) -> &'static str {
+                match self {
+                    $(Gone::$variant => $word,)*
+                }
+            }
+        }
+    };
+}
+
+gone_reasons! {
+    /// Its node went away, or relaunched since the session's presence said it was live.
+    NodeGone => "node-gone",
+    /// Its own presence says it exited.
+    NoClose => "no-close",
+}
+
+impl Gone {
+    /// The reason a `partial` word names, if it names one.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|g| g.word() == word)
+    }
+}
+
 /// What a body offered to a [`BusSpace`] was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offered {

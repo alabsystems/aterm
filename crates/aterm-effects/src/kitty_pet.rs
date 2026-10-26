@@ -307,6 +307,9 @@ const LONE_SETTLE: f32 = 0.4;
 /// pending, or a gather held, is walked to.
 const BOUND_SPAN_MIN: f32 = 0.5 * POUNCE_JUMP;
 const HAND_ECHO_DUR: Duration = console_life::dur_from_secs_f32(HAND_ECHO);
+/// Seconds the writing's wrap stays the writing's own for the bound that follows it
+/// ([`PetBrain::writing_wrapped`]): the cat's gather and launch come well within it.
+const WRITING_WRAP_FRESH: f32 = SETTLE_CAP;
 
 #[inline]
 const fn stream_jump(cols: u16) -> f32 {
@@ -1369,6 +1372,9 @@ struct Flight {
     late_move: bool,
     running: bool,
     awaits_wrap: bool,
+    /// The bound that follows the writing's wrap ([`PetBrain::brisk_shape`]): re-aimed and
+    /// drawn out at its own pace ([`PetBrain::flight_cap`]).
+    brisk: bool,
     dur0: f32,
     /// The furthest stage of the flight's poses drawn yet ([`PetBrain::flight_stage`]): a
     /// flight drawn out in the air ([`PetBrain::retime`], the wrap's hang) never goes back
@@ -1382,6 +1388,7 @@ struct FlightKind {
     show: bool,
     hop: bool,
     drop: bool,
+    brisk: bool,
 }
 
 impl FlightKind {
@@ -1390,6 +1397,7 @@ impl FlightKind {
         show: false,
         hop: false,
         drop: false,
+        brisk: false,
     };
 }
 
@@ -1541,7 +1549,13 @@ pub struct PetBrain {
     pending_wall_transit: bool,
     wrap_back: bool,
     wrap_ahead: Option<WrapAhead>,
+    /// When (brain clock) the writing last wrapped the caret back to a line's start
+    /// ([`PetBrain::writing_wrapped`]): the bound that follows it is the writing's own.
+    writing_wrap: Option<f64>,
     launch_running: bool,
+    /// The bound being launched crosses for the writing's wrap, after it or back across it
+    /// ([`PetBrain::brisk_shape`]).
+    launch_brisk: bool,
     land_running: bool,
     retreat_run: u8,
     retreat_gap: f32,
@@ -1874,7 +1888,9 @@ impl PetBrain {
             pending_wall_transit: false,
             wrap_back: false,
             wrap_ahead: None,
+            writing_wrap: None,
             launch_running: false,
+            launch_brisk: false,
             land_running: false,
             retreat_run: 0,
             retreat_gap: 60.0,
@@ -2275,7 +2291,10 @@ impl PetBrain {
     }
 
     #[inline]
-    const fn flight_eta(&self, to_col: f32, to_row: f32, cols: u16) -> f32 {
+    /// How long a crossing for the writing's wrap takes the cat: its coil, and its bound, the
+    /// brisk one back across a wrap ([`Self::wrap_back_aim`]), the quiet one ahead of a wrap
+    /// that is coming ([`Self::wrap_ahead_aim`], [`Self::brisk_shape`]).
+    const fn flight_eta(&self, to_col: f32, to_row: f32, cols: u16, brisk: bool) -> f32 {
         let vertical = (to_row - self.row).abs() >= 0.5;
         let span = span_eq(to_col - self.col, to_row - self.row);
         let coil = if matches!(self.action, PetAction::Crouch) {
@@ -2286,8 +2305,7 @@ impl PetBrain {
         if span <= POUNCE_SPAN_MAX {
             Self::flight_shape(span, vertical).0 + if vertical { 0.0 } else { coil }
         } else {
-            let (dur, _) = Self::big_shape(span);
-            coil + dur.max(span / quiet_speed_max(cols))
+            coil + Self::bound_shape(span, brisk, cols).0
         }
     }
 
@@ -2305,7 +2323,7 @@ impl PetBrain {
         let mut aim = (f32::from(cc) + STATION_LEAD).min(limit);
         let mut iter = 0;
         while iter < 3 {
-            let eta = self.flight_eta(aim, row, cols);
+            let eta = self.flight_eta(aim, row, cols, true);
             aim = ((f32::from(cc) - self.run_pace * eta).max(0.0) + STATION_LEAD).min(limit);
             iter += 1;
         }
@@ -2390,6 +2408,26 @@ impl PetBrain {
     /// A paste, or a paste and the Enter after it, pressed under [`PASTE_SETTLE`] ago.
     const fn paste_holding(&self) -> bool {
         matches!(self.paste_hold, Some(until) if self.clock < until)
+    }
+
+    /// The writing wrapped the caret back to a line's start under [`WRITING_WRAP_FRESH`] ago,
+    /// and no bound has gone for it yet: the cat it left at the margin expected it (no notice,
+    /// [`Self::notices`]), and its bound is the brisk one ([`Self::brisk_shape`]).
+    const fn writing_wrapped(&self) -> bool {
+        match self.writing_wrap {
+            Some(at) => ((self.clock - at) as f32) < WRITING_WRAP_FRESH,
+            None => false,
+        }
+    }
+
+    /// The caret came by a jump no hand made and has stayed put since for [`SETTLE`].
+    const fn caret_rested_after_jump(&self) -> bool {
+        match (self.jump_at, self.moved_at) {
+            (Some(jumped), Some(moved)) => {
+                jumped >= moved && ((self.clock - jumped) as f32) >= SETTLE
+            }
+            _ => false,
+        }
     }
 
     /// The last caret jump the hand did not make came under `secs` ago.
@@ -2624,7 +2662,7 @@ impl PetBrain {
         let due = self.wrap_ahead == Some(WrapAhead::Due)
             || !self.typing_on()
             || f32::from(cols.saturating_sub(cc)) / self.run_pace
-                <= self.flight_eta(aim, next, cols);
+                <= self.flight_eta(aim, next, cols, false);
         if due {
             self.wrap_ahead = Some(WrapAhead::Due);
             self.quiet_leap = true;
@@ -3691,10 +3729,23 @@ impl PetBrain {
             None => true,
         };
         let lawful = !head_on_letters && !on_ink;
+        // A cat further from the stand than a short walk ([`BOUND_SPAN_MIN`]; where it stands,
+        // or where its flight comes down) has nothing to watch the caret from: it travels there
+        // either way, so it goes once, to where it rests. Sent to the stand among the letters
+        // while the caret settled, and on to its seat after [`HEAD_SEAT_SETTLE`], the long
+        // insert's cat gathered at the far margin for the stand and launched for the seat it
+        // already stood on: a hop on the spot.
+        let away = match &self.flight {
+            Some(f) => span_eq(f.to_col - want, f.to_row - caret_row),
+            None => span_eq(self.col - want, self.row - caret_row),
+        } > BOUND_SPAN_MIN;
+        // ...once the caret came by a jump no hand made and stayed put after it for [`SETTLE`]:
+        // a program's writing that steps it along a key at a time is no caret at rest.
+        let resting = settled || (away && self.caret_rested_after_jump());
         // Nor along the row past [`HEAD_SEAT_REACH`] while the caret is on the move: slid past
         // the letters over it to the far margin, a cat beside the line's end ran there as the
         // arrow keys walked the caret back into the line, and crossed back once they stopped.
-        let reach = if self.hand_at_work() || !settled {
+        let reach = if self.hand_at_work() || !resting {
             HEAD_SEAT_REACH
         } else {
             f32::INFINITY
@@ -3710,10 +3761,20 @@ impl PetBrain {
                 None => None,
             }
         };
-        let budget = if lawful {
-            shifted
-        } else {
-            shifted + HEAD_SEAT_SLACK
+        // A stand among letters by a caret at rest, the hand away, that the slide along its row
+        // took off to a seat out past the reach the hand's work allows: the seats under the box
+        // nearer than that seat are taken first. Slid along the row alone, the long insert's
+        // cat went to the far margin, 85 cells from the caret, past the composer's footer 2 rows
+        // under it. Where the slide finds no seat at all the stand holds, its head veiled, as a
+        // cat by a program's writing that paused does.
+        let rest_search = match best {
+            Some((d, ..)) => resting && !lawful && !self.hand_at_work() && d > HEAD_SEAT_REACH,
+            None => false,
+        };
+        let budget = match best {
+            Some((d, ..)) if rest_search => d,
+            _ if lawful => shifted,
+            _ => shifted + HEAD_SEAT_SLACK,
         };
         // A cat beside the writing keeps to its row with its head veiled; one already seated
         // under the caret's line stays seated rather than come up to a stand among letters
@@ -3723,7 +3784,7 @@ impl PetBrain {
         // left it, sends the cat to a seat under the box: a caret walked back and forth by
         // words is watched from where the cat stands (sent down as alt-left took the caret
         // three words back, the cat came up again as alt-right brought it home).
-        if ((writing || settled) && !beside) || seated_under {
+        if ((writing || settled) && !beside) || seated_under || rest_search {
             let mut below = 1;
             while below <= HEAD_SEAT_ROWS {
                 let r = caret_row + f32::from(below);
@@ -4848,16 +4909,43 @@ impl PetBrain {
                 self.quiet_leap |= folded;
             }
             let was_asleep = self.action == PetAction::Sleep;
+            let wrapped_on = (folded && dc > 0.0)
+                || (cr >= pcell.0
+                    && cr <= pcell.0.saturating_add(1)
+                    && f32::from(cc) - f32::from(pcell.1) <= -0.5 * f32::from(sense.cols));
+            // The writing wrapped the line ([`Self::writing_wrapped`]): the caret it walked
+            // along the line to the margin, a key at a time (the hand's, or a program's typing
+            // into a composer), went back to a line's start; read before this move ends the
+            // writing's run ([`Self::on_move`]). An Enter is a new line, not a wrap; a change
+            // of row or a jump back after it is no longer the wrap's. A step on along the new
+            // line is the wrap's own: a composer's word wrap brings the word it broke down
+            // with the caret, often a present after the caret went to the line's start (8
+            // cells on in the long insert); read as another jump, a present that showed it
+            // before the cat sprang sent the bound across at a quiet crossing's pace, 0.95 s
+            // in the air for 101 cells in 60 of 200 jittered takes. A wrap the hand's own key
+            // made is the writing's too, its rhythm open or not: typed on after a pause at the
+            // margin, two or three keys short of the rhythm's opening, the wrap read as a
+            // surprise, and the cat perked (0.43 s) and crossed at the quiet pace (1.2 s). A
+            // cat in the air for anything but this wrap (the leap ahead of it, which the wrap
+            // lands) still has the crossing to make once it is down: a hop that came down as
+            // the wrap came sent it across at the quiet pace.
+            if wrapped_on
+                && !matches!(self.flight, Some(f) if f.awaits_wrap)
+                && (self.typing_on()
+                    || self.key_within_dur(HAND_ECHO_DUR) == Some(PetInputKind::Text))
+                && f32::from(pcell.1) + POUNCE_JUMP >= f32::from(sense.cols)
+                && self.key_within_dur(HAND_ECHO_DUR) != Some(PetInputKind::Submit)
+            {
+                self.writing_wrap = Some(self.clock);
+            } else if dr != 0.0 || dc <= -POUNCE_JUMP {
+                self.writing_wrap = None;
+            }
             self.on_move(dr, dc, f32::from(cc), sense.cols, sense.reduced_motion);
             if folded && pcell.0 > cr && dc < 0.0 && self.run_dir < 0 && self.rhythm_open() {
                 self.wrap_back = true;
             } else if dc > 0.0 || dr != 0.0 {
                 self.wrap_back = false;
             }
-            let wrapped_on = (folded && dc > 0.0)
-                || (cr >= pcell.0
-                    && cr <= pcell.0.saturating_add(1)
-                    && f32::from(cc) - f32::from(pcell.1) <= -0.5 * f32::from(sense.cols));
             if wrapped_on
                 && (self.wrap_ahead.is_some() || matches!(self.flight, Some(f) if f.awaits_wrap))
             {
@@ -5312,10 +5400,16 @@ impl PetBrain {
                     self.ink_safe_col(self.col, self.row, width, sense.cols),
                     self.row,
                 )
-            } else if self.stream {
+            } else if self.stream && !self.caret_rested_after_jump() {
                 let stand = self.ink_stand(self.col, self.row, width, sense.cols, sense.rows);
                 self.console_station(stand, (sense.rows, sense.cols), width)
                     .unwrap_or(stand)
+            } else if self.stream {
+                // The caret a program jumped has rested ([`SETTLE`]) while the watch is still up:
+                // the trip off the words is the one to where it rested. Stepped along the
+                // words' row instead, the long insert's cat went off the dictation's letters to
+                // the far margin, and on to the seat under the caret after.
+                self.station_safe((cr, cc), sense.cols, sense.rows, width)
             } else {
                 (target, target_row)
             };
@@ -5511,11 +5605,7 @@ impl PetBrain {
                 let to = (aim + self.station_drift(t_rem))
                     .clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
                 let u_now = (f.t / f.dur).clamp(0.0, 1.0);
-                let cap = if f.big {
-                    quiet_speed_max(sense.cols)
-                } else {
-                    HOP_SPEED_MAX
-                };
+                let cap = Self::flight_cap(&f, sense.cols);
                 let span = span_eq(to - self.col, aim_row - self.row);
                 if u_now <= REAIM_MAX_U {
                     Self::retime(&mut f, span / cap);
@@ -5543,11 +5633,7 @@ impl PetBrain {
                 };
                 let to = (aim + self.station_drift(t_rem)).clamp(0.0, reach.max(0.0));
                 let u_now = (f.t / f.dur).clamp(0.0, 1.0);
-                let cap = if f.big {
-                    quiet_speed_max(sense.cols)
-                } else {
-                    HOP_SPEED_MAX
-                };
+                let cap = Self::flight_cap(&f, sense.cols);
                 if let Some((c2, r2, _)) = self.bound2.as_mut() {
                     let delta2 = to - f.to_col;
                     let to_short = if delta2.abs() > SKID_CELLS {
@@ -5630,11 +5716,7 @@ impl PetBrain {
                         to
                     };
                     let u_now = (f.t / f.dur).clamp(0.0, 1.0);
-                    let cap = if f.big {
-                        quiet_speed_max(sense.cols)
-                    } else {
-                        HOP_SPEED_MAX
-                    };
+                    let cap = Self::flight_cap(&f, sense.cols);
                     // A caret that changed rows takes the landing to its new row too, rebased
                     // as the wrap's landing is: a flight that kept the row it left for came
                     // down on a row the caret had left (a program's repaint moving the prompt
@@ -5715,11 +5797,7 @@ impl PetBrain {
                     && u_now < ROW_REAIM_MAX_U
                     && !self.console_yields_at((to, aim_row), sense)
                 {
-                    let cap = if f.big {
-                        quiet_speed_max(sense.cols)
-                    } else {
-                        HOP_SPEED_MAX
-                    };
+                    let cap = Self::flight_cap(&f, sense.cols);
                     Self::retime(&mut f, span_eq(to - self.col, aim_row - self.row) / cap);
                     f.from_col = (self.col - to * u_now) / (1.0 - u_now);
                     f.from_row = (self.row - aim_row * u_now) / (1.0 - u_now);
@@ -7340,7 +7418,10 @@ impl PetBrain {
             {
                 self.pending_big_jump = true;
             }
-            if self.at_rest() && !matches!(self.action, PetAction::Perk) {
+            // The writing's wrap ([`Self::writing_wrapped`]) is no surprise: the cat it left
+            // at the margin goes for it without the double-take.
+            if self.at_rest() && !matches!(self.action, PetAction::Perk) && !self.writing_wrapped()
+            {
                 if (caret_col - self.col).abs() > 1e-4 {
                     self.facing_left = caret_col < self.col;
                 }
@@ -7927,6 +8008,7 @@ impl PetBrain {
         self.at_rest()
             && !matches!(self.action, PetAction::Perk)
             && !self.drop_stare
+            && !self.writing_wrapped()
             && !self.ink_overlaps(self.col, self.row, width)
             && matches!(
                 self.predicted_tier(to_col, to_row, vertical, cols, width),
@@ -7951,6 +8033,8 @@ impl PetBrain {
             self.pending_pounce = false;
         }
         self.launch_running = matches!(policy, LeapPolicy::Quiet) && self.rhythm_open();
+        self.launch_brisk =
+            matches!(policy, LeapPolicy::Quiet) && (self.writing_wrapped() || self.wrap_back);
         let (aim, span, tier) = match policy {
             LeapPolicy::Show => (to_col, 0.0, Tier::Bound),
             LeapPolicy::Play => {
@@ -8001,6 +8085,10 @@ impl PetBrain {
         self.quiet_leap = false;
         self.drop_stare = false;
         self.launch_running = false;
+        if self.launch_brisk {
+            self.writing_wrap = None;
+        }
+        self.launch_brisk = false;
         if !matches!(policy, LeapPolicy::Play) {
             self.wrap_back = false;
         }
@@ -8029,6 +8117,7 @@ impl PetBrain {
             show,
             hop,
             drop,
+            brisk,
         } = kind;
         let bound = if big {
             BIG_HOP_SPEED_MAX
@@ -8072,6 +8161,7 @@ impl PetBrain {
             late_move: false,
             running: self.launch_running,
             awaits_wrap,
+            brisk,
             dur0: dur.max(0.05),
             stage: 0,
         });
@@ -8113,10 +8203,62 @@ impl PetBrain {
         )
     }
 
+    /// THE WRITING'S WRAP IS A BRISK BOUND. The writing that wraps a line takes the caret from
+    /// the margin back to the next line's start, across most of the pane, and writes on as the
+    /// cat crosses after it (or a held delete takes the caret back across the wrap,
+    /// [`Self::wrap_back_aim`]): the cat goes at the animal's own pace ([`BIG_HOP_SPEED_MAX`],
+    /// half its body a 60 Hz frame at most), on the big bound's own arc for the span
+    /// ([`Self::big_shape`]), high over the line it crosses, and comes down by the writing.
+    /// Paced as a quiet crossing ([`quiet_speed_max`], 0.74 of the pane a second) the bound
+    /// across Claude Code's composer at each of its word wraps took 1.06 to 1.17 s, floating over
+    /// the line as the caret ran 25 cells on. Flown low on a shorter arc, the body crossed the
+    /// line it left and dimmed its letters. The leap ahead of a wrap that is coming
+    /// ([`Self::wrap_ahead_aim`]) keeps the quiet pace: it leaves in time to land with the wrap,
+    /// so the cat is never behind the writing; flown briskly it came down early and hung in the
+    /// air for a wrap the hand was slow to type, or never typed.
+    const fn brisk_shape(span: f32) -> (f32, f32) {
+        let dur = (span / BIG_HOP_SPEED_MAX).max(BIG_FLIGHT_BASE);
+        (dur, Self::big_shape(span).1)
+    }
+
+    /// The pace (cells a second) a bound flies at: the brisk bound's ([`Self::brisk_shape`]),
+    /// or a quiet crossing's ([`quiet_speed_max`]).
+    #[inline]
+    const fn bound_pace(brisk: bool, cols: u16) -> f32 {
+        if brisk {
+            BIG_HOP_SPEED_MAX
+        } else {
+            quiet_speed_max(cols)
+        }
+    }
+
+    /// The fastest a flight in the air may be drawn on to a landing re-aimed under it
+    /// ([`Self::retime`]): its own pace.
+    #[inline]
+    const fn flight_cap(f: &Flight, cols: u16) -> f32 {
+        if f.big {
+            Self::bound_pace(f.brisk, cols)
+        } else {
+            HOP_SPEED_MAX
+        }
+    }
+
+    /// A bound's time in the air and its arc: the brisk bound's ([`Self::brisk_shape`]), or the
+    /// big bound's shape paced as a quiet crossing.
+    #[inline]
+    const fn bound_shape(span: f32, brisk: bool, cols: u16) -> (f32, f32) {
+        if brisk {
+            Self::brisk_shape(span)
+        } else {
+            let (dur, arc) = Self::big_shape(span);
+            (dur.max(span / quiet_speed_max(cols)), arc)
+        }
+    }
+
     const fn begin_big_arc(&mut self, to_col: f32, to_row: f32, cols: u16, show: bool) {
         let span = span_eq(to_col - self.col, to_row - self.row);
-        let (dur, arc) = Self::big_shape(span);
-        let dur = dur.max(span / quiet_speed_max(cols));
+        let brisk = self.launch_brisk && !show;
+        let (dur, arc) = Self::bound_shape(span, brisk, cols);
         let mid_row = (self.row + to_row) * 0.5;
         let arc = arc.min((mid_row + 1.0 - ART_ROWS).max(0.0));
         self.begin_arc(
@@ -8127,6 +8269,7 @@ impl PetBrain {
             FlightKind {
                 big: true,
                 show,
+                brisk,
                 ..FlightKind::PLAIN
             },
         );
@@ -8134,8 +8277,8 @@ impl PetBrain {
 
     const fn launch_big(&mut self, to_col: f32, to_row: f32, cols: u16, width: f32, show: bool) {
         let span0 = span_eq(to_col - self.col, to_row - self.row);
-        let (dur0, _) = Self::big_shape(span0);
-        let dur0 = dur0.max(span0 / quiet_speed_max(cols));
+        let brisk = self.launch_brisk && !show;
+        let (dur0, _) = Self::bound_shape(span0, brisk, cols);
         let drift = if self.play_land.is_none() {
             self.station_drift(dur0 + BIG_LAND_DUR)
         } else {
@@ -8160,7 +8303,7 @@ impl PetBrain {
         let split = if show {
             delta.abs() >= TWO_BOUND_FRAC * cols_f
         } else {
-            delta.abs() / quiet_speed_max(cols) > QUIET_ONE_BOUND_SECS
+            delta.abs() / Self::bound_pace(brisk, cols) > QUIET_ONE_BOUND_SECS
         };
         if split {
             let mid = self.col + delta * BOUND_SPLIT;
@@ -19152,7 +19295,13 @@ mod tests {
                 .unwrap_or_else(|| "(no message)".to_string())
         }
 
-        fn judge(name: &str, p: &Probe, bar: f32, row: u16) -> Vec<String> {
+        // The most a cat may move in one frame of an 80-column pane (cells): a new line's
+        // crossing, or the leap ahead of a wrap, at the quiet pace, under a cell; the crossing
+        // after a wrap at the brisk bound's ([`PetBrain::brisk_shape`]).
+        const QUIET_STEP: f32 = 1.0;
+        const BRISK_STEP: f32 = BIG_HOP_SPEED_MAX * PROBE_FRAME.as_secs_f32() + 1e-3;
+
+        fn judge(name: &str, p: &Probe, bar: f32, row: u16, step: f32) -> Vec<String> {
             let mut out = Vec::new();
             let mut fail = |msg: String| out.push(format!("{name}: {msg}"));
             if p.episodes > 2 {
@@ -19193,7 +19342,7 @@ mod tests {
             if p.dust {
                 fail("dust on a quiet landing".to_string());
             }
-            if p.cols == 80 && p.max_dcol.0 >= 1.0 {
+            if p.cols == 80 && p.max_dcol.0 >= step {
                 fail(format!(
                     "{:.3} cells in one frame at {:+.2}s ({:?})",
                     p.max_dcol.0, p.max_dcol.1, p.max_dcol.2
@@ -19214,12 +19363,13 @@ mod tests {
         }
 
         let mut failures: Vec<String> = Vec::new();
-        let mut check = |name: String, bar: f32, row: u16, build: &mut dyn FnMut() -> Probe| {
-            match catch_unwind(AssertUnwindSafe(build)) {
-                Err(e) => failures.push(format!("{name}: {}", panic_msg(&*e))),
-                Ok(p) => failures.extend(judge(&name, &p, bar, row)),
-            }
-        };
+        let mut check =
+            |name: String, bar: f32, row: u16, step: f32, build: &mut dyn FnMut() -> Probe| {
+                match catch_unwind(AssertUnwindSafe(build)) {
+                    Err(e) => failures.push(format!("{name}: {}", panic_msg(&*e))),
+                    Ok(p) => failures.extend(judge(&name, &p, bar, row, step)),
+                }
+            };
 
         for cols in [80u16, 200] {
             for col0 in [10u16, 40, 78] {
@@ -19241,7 +19391,7 @@ mod tests {
                         let name = format!(
                             "{cols} cols, Enter from {col0} ({state:?}) onto a {prompt_rows}-row prompt"
                         );
-                        check(name, bar, to_row, &mut || {
+                        check(name, bar, to_row, QUIET_STEP, &mut || {
                             let mut p = Probe::judged(cols);
                             p.warm(6, col0);
                             match state {
@@ -19273,6 +19423,7 @@ mod tests {
                 format!("{cols} cols, the typed margin wrap"),
                 wrap_bar,
                 7,
+                QUIET_STEP,
                 &mut || {
                     let mut p = Probe::judged(cols);
                     p.warm(6, cols - 1);
@@ -19291,6 +19442,7 @@ mod tests {
                 format!("{cols} cols, the scrolled Enter after a short command"),
                 1.6,
                 last,
+                QUIET_STEP,
                 &mut || {
                     let mut p = Probe::judged(cols);
                     p.warm(last, 10);
@@ -19309,6 +19461,7 @@ mod tests {
                 format!("{cols} cols, the scrolled wrap on the last row"),
                 wrap_bar,
                 last,
+                BRISK_STEP,
                 &mut || {
                     let mut p = Probe::judged(cols);
                     p.warm(last, cols - 1);
@@ -19587,23 +19740,19 @@ mod tests {
             f.row,
             f.action
         );
-        let cap = |big: bool| {
-            if big {
-                quiet_speed_max(s.cols)
-            } else {
-                HOP_SPEED_MAX
-            }
-        };
+        // Every flight at its own pace ([`PetBrain::flight_cap`]): a hop at the hop's, a bound
+        // at a quiet crossing's, the writing's wrap at the animal's.
+        let cap = |fl: &Flight| PetBrain::flight_cap(fl, s.cols);
         match (pre_flight, pet.flight) {
             (None, Some(fl)) => {
                 let span = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row);
                 let rate = span / fl.dur;
                 assert!(
-                    rate <= cap(fl.big) + 1e-3,
+                    rate <= cap(&fl) + 1e-3,
                     "the flight outruns the animal: launched at {rate:.1} c/s over the {} c/s \
                      cap (span_eq {span:.1} cells in {:.3} s, big {}, ({:.2},r{:.0}) -> \
                      ({:.2},r{:.0}), action {:?})",
-                    cap(fl.big),
+                    cap(&fl),
                     fl.dur,
                     fl.big,
                     fl.from_col,
@@ -19618,10 +19767,10 @@ mod tests {
                 let t_rem = (b.dur - b.t).max(1e-3);
                 let rate = left / t_rem;
                 assert!(
-                    rate <= cap(b.big) + 1e-3,
+                    rate <= cap(&b) + 1e-3,
                     "the re-aim outruns the flight: {left:.2} cells left to fly in {t_rem:.3} s \
                      is {rate:.1} c/s over the {} c/s cap (to {:.2} -> {:.2}, big {})",
-                    cap(b.big),
+                    cap(&b),
                     a.to_col,
                     b.to_col,
                     b.big

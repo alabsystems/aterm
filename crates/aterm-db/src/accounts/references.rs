@@ -16,6 +16,7 @@ const MAX_ISSUES: usize = 2048;
 const MAX_ALIAS_DEPTH: usize = 64;
 const MAX_EVIDENCE: usize = 32;
 type Key = (String, String);
+pub(super) type Links = BTreeMap<Key, BTreeSet<Key>>;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Issue {
@@ -30,6 +31,7 @@ struct Graph<'a> {
     issues: BTreeSet<Issue>,
     limits: BTreeSet<&'static str>,
     steps: usize,
+    links: Links,
 }
 impl<'a> Graph<'a> {
     fn issue(&mut self, object: &Key, field: &str, code: &'static str, target: Option<Key>) {
@@ -78,6 +80,12 @@ impl<'a> Graph<'a> {
     fn get(&mut self, object: &Key, field: &str, target: &Key) -> Option<&'a Value> {
         if !self.step() {
             return None;
+        }
+        if object != target {
+            self.links
+                .entry(object.clone())
+                .or_default()
+                .insert(target.clone());
         }
         let Some(cell) = self.snapshot.cells.get(target) else {
             self.target_issue(object, field, target, "missing-object", "missing-reference");
@@ -302,7 +310,7 @@ impl<'a> Graph<'a> {
     }
 }
 
-fn evidence(cell: Option<&Cell>) -> Value {
+pub(super) fn evidence(cell: Option<&Cell>) -> Value {
     let count = cell.map_or(0, |cell| cell.candidates.len());
     let operations = cell
         .into_iter()
@@ -418,11 +426,18 @@ fn evidence(cell: Option<&Cell>) -> Value {
     )
 )]
 pub(super) fn inspect(snapshot: &Snapshot) -> Value {
+    inspect_with_links(snapshot).0
+}
+
+/// Retain the same explicit edges for a conservative proposal review bundle.
+/// These links and the diagnostic report confer no credential authority.
+pub(super) fn inspect_with_links(snapshot: &Snapshot) -> (Value, Links) {
     let mut graph = Graph {
         snapshot,
         issues: BTreeSet::new(),
         limits: BTreeSet::new(),
         steps: 0,
+        links: Links::new(),
     };
     let mut addresses = BTreeMap::<String, Vec<Key>>::new();
     let mut inspected = 0;
@@ -464,7 +479,7 @@ pub(super) fn inspect(snapshot: &Snapshot) -> Value {
         "target":issue.target.as_ref().map(|key|json!({"collection":key.0,"key":key.1,
             "evidence":evidence(snapshot.cells.get(key))}))
     })).collect::<Vec<_>>();
-    json!({
+    let report = json!({
         "schema":1,"kind":"account-reference-check","scope":"observed-local-proposals",
         "table":hex::encode_lower(&snapshot.scope.digest()),
         "authority":"none","machine_assignments":"proposals-only",
@@ -475,7 +490,8 @@ pub(super) fn inspect(snapshot: &Snapshot) -> Value {
             "unavailable_records":snapshot.operations.iter().filter(|op|!op.available).count(),
             "refused_records":snapshot.operations.iter().filter(|op|op.refusal.is_some()).count()
         }
-    })
+    });
+    (report, graph.links)
 }
 
 #[cfg(test)]

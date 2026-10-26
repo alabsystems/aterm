@@ -16,6 +16,43 @@ use std::{path::PathBuf, time::Duration};
 
 const NETWORK: [u8; 16] = [9; 16];
 
+pub(crate) fn repair_commons(lab: &Lab, rounds: usize) {
+    use crate::control::{Endpoint, Repair, Side};
+    use aterm_net::lan::{Connection, Scope as LinkScope};
+    let endpoints: Vec<_> = (0..2)
+        .map(|n| {
+            Endpoint::from_bootstrap(&lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config.toml"))
+                .unwrap()
+        })
+        .collect();
+    let (mut left, mut right) = (Repair::default(), Repair::default());
+    for _ in 0..rounds {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::scope(|tasks| {
+            let incoming = tasks.spawn(|| {
+                endpoints[1].exchange(
+                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                    Side::Responder,
+                    &mut right,
+                )
+            });
+            endpoints[0]
+                .exchange(
+                    Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60))
+                        .unwrap(),
+                    Side::Initiator,
+                    &mut left,
+                )
+                .unwrap();
+            incoming.join().unwrap().unwrap();
+        });
+    }
+}
+
 #[test]
 fn a_public_foundation_never_requests_a_historical_epoch_key() {
     let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);

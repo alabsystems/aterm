@@ -1099,6 +1099,14 @@ fn codex_auth_path_and_record_goal_round_trip_and_validate() {
     );
 
     let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let existing_dir = dir.path().to_string_lossy().into_owned();
+    let mut dir_auth_live = live();
+    dir_auth_live.codex_auth_path = Some(existing_dir);
+    assert_eq!(
+        validate(&record(&argv, &[]), 4242, &dir_auth_live),
+        Err("auth-path"),
+        "existing directory in CODEX_AUTH_PATH is rejected identically to codex-alab"
+    );
     let sessions = dir.path().join("alab").join("sessions");
     std::fs::create_dir_all(&sessions).expect("mkdir sessions");
     std::fs::write(
@@ -1113,4 +1121,100 @@ fn codex_auth_path_and_record_goal_round_trip_and_validate() {
         Some("Ship native protocol second line")
     );
     assert_eq!(read_record_goal(dir.path(), 4242, "other-thread"), None);
+}
+
+#[test]
+fn structural_resume_validation_and_relaunch_lines_reject_malformed_or_line_breaking_inputs() {
+    use crate::harness::upgrade::{Dialect, relaunch_line_env};
+
+    let valid = Resume {
+        argv: vec![
+            "/store/codex-alab/bin/codex".to_string(),
+            "--search".to_string(),
+            "--no-alt-screen".to_string(),
+            "resume".to_string(),
+            UUID.to_string(),
+        ],
+        session: UUID.to_string(),
+        codex_home: Some("/Users//u/.codex".to_string()),
+        codex_auth_path: Some("/Users//u/.aterm/accounts-codex/work/auth.json".to_string()),
+        cwd: Some("/work".to_string()),
+    };
+    assert_eq!(valid.validate_structural(), Ok(()));
+
+    let empty_argv = Resume {
+        argv: Vec::new(),
+        ..valid.clone()
+    };
+    assert_eq!(empty_argv.validate_structural(), Err("no-resume-line"));
+
+    let bad_uuid = Resume {
+        session: "not-a-uuid".to_string(),
+        ..valid.clone()
+    };
+    assert_eq!(bad_uuid.validate_structural(), Err("session-not-uuid"));
+
+    let rel_launch = Resume {
+        argv: vec!["codex".to_string(), "resume".to_string(), UUID.to_string()],
+        ..valid.clone()
+    };
+    assert_eq!(rel_launch.validate_structural(), Err("launch-path"));
+
+    let unapproved_flag = Resume {
+        argv: vec![
+            "/store/codex-alab/bin/codex".to_string(),
+            "--unknown-flag".to_string(),
+            "resume".to_string(),
+            UUID.to_string(),
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(unapproved_flag.validate_structural(), Err("live-argv"));
+
+    let sep_in_arg = Resume {
+        argv: vec![
+            "/store/codex-alab/bin/codex".to_string(),
+            "-c".to_string(),
+            "foo=bar\u{2028}baz".to_string(),
+            "resume".to_string(),
+            UUID.to_string(),
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(sep_in_arg.validate_structural(), Err("foreign-argv"));
+
+    let sep_in_cwd = Resume {
+        cwd: Some("/work\u{2029}injected".to_string()),
+        ..valid.clone()
+    };
+    assert_eq!(sep_in_cwd.validate_structural(), Err("cwd"));
+
+    let rel_home_no_cwd = Resume {
+        codex_home: Some("relative-home".to_string()),
+        cwd: None,
+        ..valid.clone()
+    };
+    assert_eq!(rel_home_no_cwd.validate_structural(), Err("home-path"));
+
+    let rel_auth = Resume {
+        codex_auth_path: Some("work/auth.json".to_string()),
+        ..valid
+    };
+    assert_eq!(rel_auth.validate_structural(), Err("auth-path"));
+
+    for sep in ['\u{2028}', '\u{2029}'] {
+        let env_val = format!("/Users//u/acct{sep}1/auth.json");
+        assert!(
+            relaunch_line_env(
+                Dialect::Zsh,
+                None,
+                Some("/work"),
+                &[("CODEX_AUTH_PATH", env_val.as_str())],
+                Path::new("/store/codex-alab/bin/codex"),
+                &["resume".to_string(), UUID.to_string()],
+            )
+            .is_err(),
+            "relaunch_line_env must reject {sep:?}"
+        );
+    }
 }

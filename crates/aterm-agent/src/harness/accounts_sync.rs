@@ -5830,6 +5830,9 @@ fn auto_renew_candidates_tiered(
             tiered.push((tier, next_row.clone()));
         }
     }
+    // These rows need explicit root authorization for a new sign-in. Keep
+    // their existing logins in rotation, but never dispatch an ordinary worker.
+    tiered.retain(|(_, row)| matches!(logins.shared.required(row), Ok(None)));
     tiered.sort_by_key(|(tier, row)| {
         let task_at = match store {
             Some(store) => unaddressed_sign_in_task_at(store, logins, &row.label),
@@ -5952,6 +5955,15 @@ fn complete_staging_renewal_result(
                     "account `{matched_label}` changed during sign-in; nothing recorded"
                 ));
             }
+            let matched_row = roster
+                .row(&matched_label)
+                .ok_or_else(|| "matched account is no longer listed".to_owned())?;
+            let principal = if logins.shared.is_empty() {
+                None
+            } else {
+                super::profile::principal_in_home(staging)
+            };
+            super::cli::shared_renewal::unmanaged(logins, matched_row, principal, true)?;
             accounts::write_renewal_checkpoint(
                 &matched_label,
                 &matched_email,
@@ -6266,6 +6278,22 @@ fn recover_interrupted_staging_renewals_with(
                     }) else {
                         return Ok(Vec::new());
                     };
+                    let principal = if cli == Cli::Claude && !logins.shared.is_empty() {
+                        super::profile::principal_in_home(&dir)
+                    } else {
+                        None
+                    };
+                    if cli == Cli::Claude
+                        && !logins.shared.is_empty()
+                        && !logins.shared.checkpoint_allowed(
+                            row,
+                            principal,
+                            &proof.dir,
+                            &proof.parent,
+                        )
+                    {
+                        return Ok(Vec::new());
+                    }
                     let account = state.accounts.get(&row.label);
                     // Wall time can move backward. Only the binding captured under the writer
                     // lock when this checkpoint was created can accept its completion.
@@ -6291,9 +6319,21 @@ fn recover_interrupted_staging_renewals_with(
                         .accounts
                         .get(&row.label)
                         .is_some_and(|a| a.auth == accounts::Auth::SignedOut);
-                    let needs_recovery = !enrolled.contains(&row.label) || is_signed_out;
+                    let pending_shared =
+                        cli == Cli::Claude && logins.shared.pending_for(row, principal);
+                    let needs_recovery =
+                        !enrolled.contains(&row.label) || is_signed_out || pending_shared;
                     if is_limited || newer_auth || newer_binding || !needs_recovery {
                         return Ok(Vec::new());
+                    }
+                    if cli == Cli::Claude && !logins.shared.is_empty() {
+                        let generation = logins
+                            .generation_clock
+                            .checked_add(1)
+                            .ok_or_else(|| "local binding generation exhausted".to_owned())?;
+                        logins
+                            .shared
+                            .recover_checkpoint(row, principal, &proof, generation)?;
                     }
                     let own_dir = file_roster.row(&row.label).and_then(|r| r.dir.as_deref());
                     let events = accounts::note_renewed(
@@ -6324,6 +6364,14 @@ fn recover_interrupted_staging_renewals_with(
     any_recovered
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedSelection",
+        action = "Progress",
+        project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
+    )
+)]
 fn auto_renew_next_account(
     home: &Path,
     state_dir: &Path,
@@ -6615,7 +6663,17 @@ fn resume_pending_pin_for(
         fx.spawn_renewal,
     );
     if result == RenewalDispatch::Failed {
-        let _ = store.cancel_pin_request(&request, now);
+        if let Err(why) = store.cancel_pin_request(&request, now) {
+            return Some(RenewalDispatch::store_refusal(&why));
+        }
+        // A definite refusal may have retired an obsolete shared-account
+        // selection. Continue useful work in this pass only after observing
+        // that no newer selection took its place. Read failures stay fenced.
+        return match store.load(now) {
+            Ok((state, _)) if state.pending_pin.is_none() => None,
+            Ok(_) => Some(RenewalDispatch::Superseded),
+            Err(why) => Some(RenewalDispatch::store_refusal(&why)),
+        };
     }
     Some(result)
 }
@@ -6678,6 +6736,14 @@ fn renew_requested_pin(
     clippy::too_many_arguments,
     reason = "requested-pin renewal binds CLI, paths, saved request, clock, admission guard, and spawn seam"
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedSelection",
+        action = "Resolve",
+        project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
+    )
+)]
 fn renew_requested_pin_for(
     cli: Cli,
     home: &Path,
@@ -6718,6 +6784,13 @@ fn renew_requested_pin_for(
             };
             let mut probe = st.clone();
             if accounts::pin(&mut probe, &roster, &enrolled, request.label(), now).is_err() {
+                if logins.shared.required(&next_row)?.is_some() {
+                    // This exact request predates shared custody (or an older
+                    // writer queued it). An ordinary worker cannot service it.
+                    st.pending_pin = None;
+                    disposition = RenewalDispatch::Failed;
+                    return Ok(Vec::new());
+                }
                 target = Some((raw.clone(), next_row, logins.clone()));
                 return Ok(Vec::new());
             }
@@ -6942,7 +7015,7 @@ fn ladder_route(
         } else {
             Vault::NotMember
         };
-        if matches!(vault, Vault::Applied(_)) {
+        if vault.wrote_files() {
             read = ladder_read(home, store, logins, row, ctx);
         }
         read.vault = Some(vault);
@@ -8281,6 +8354,10 @@ mod dashboard_tests;
 #[cfg(test)]
 #[path = "accounts_renewal_read_tests.rs"]
 mod renewal_read_tests;
+
+#[cfg(test)]
+#[path = "accounts_shared_selection_tests.rs"]
+mod shared_selection_tests;
 
 #[cfg_attr(
     any(test, debug_assertions),
@@ -11163,6 +11240,87 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
+    fn shared_checkpoint_recovery_commits_identity_and_consumed_outcome_together() {
+        let w = World::new();
+        let store = accounts::Store::at(&w.state);
+        let row = Row {
+            label: "m3.2".into(),
+            email: Some("owner@example.test".into()),
+            ..Row::default()
+        };
+        let roster = Roster {
+            rows: vec![row.clone()],
+        };
+        let staging = store.claim_staging_dir(&row.label).unwrap();
+        let source = accounts::shared::Source {
+            network: [1; 32],
+            account: [2; 32],
+        };
+        store
+            .transact_logins_within(
+                &accounts::LOCK_LADDER,
+                UPKEEP_NOW - 10,
+                &mut None,
+                |_, logins| {
+                    logins.shared.begin(
+                        accounts::shared::Intent {
+                            source,
+                            decision: [3; 32],
+                            generation: 1,
+                            configuration: [4; 32],
+                            request: [5; 16],
+                            label: row.label.clone(),
+                            identity: row.email.clone().unwrap(),
+                            staging: staging.to_str().unwrap().into(),
+                            before_generation: None,
+                            begun_at: UPKEEP_NOW - 10,
+                        },
+                        None,
+                    )?;
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        fs::write(staging.join(".claude.json"), r#"{"oauthAccount":{"emailAddress":"owner@example.test","accountUuid":"stable-provider","organizationType":"claude_max"}}"#).unwrap();
+        let logins = store.load_logins(UPKEEP_NOW).unwrap().0;
+        // Model a crash after the provider proof and durable checkpoint but
+        // before the atomic binding/outcome transaction reached disk.
+        accounts::write_renewal_checkpoint(
+            &row.label,
+            row.email.as_deref().unwrap(),
+            staging.to_str().unwrap(),
+            Some("max"),
+            UPKEEP_NOW - 5,
+            &logins,
+        )
+        .unwrap();
+        let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+        assert!(recover_interrupted_staging_renewals(
+            &store, &roster, &guard, UPKEEP_NOW
+        ));
+        let recovered = store.load_logins(UPKEEP_NOW).unwrap().0;
+        let principal = super::super::profile::principal_id("stable-provider").unwrap();
+        assert_eq!(recovered.shared.principal_source(principal), Some(source));
+        let published = recovered.labels[&row.label].renewal_generation;
+        assert_eq!(
+            recovered.shared.latest(source).unwrap().outcome,
+            accounts::shared::Outcome::Published {
+                generation: published
+            }
+        );
+        assert!(!recover_interrupted_staging_renewals(
+            &store,
+            &roster,
+            &guard,
+            UPKEEP_NOW + 1
+        ));
+        let mut retry = recovered.shared.latest(source).unwrap().intent.clone();
+        retry.request = [6; 16];
+        let mut state = recovered.shared.clone();
+        assert!(state.begin(retry, None).is_err());
+    }
+
+    #[test]
     fn recover_interrupted_staging_renewals_adopts_completed_login_and_preserves_other_work() {
         let w = World::new();
         let store = accounts::Store::at(&w.state);
@@ -11518,7 +11676,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         };
         assert_eq!(
             resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
-            Some(RenewalDispatch::Failed)
+            None,
+            "a failed startup leaves no pending choice to block the rest of upkeep"
         );
         assert!(store.load(UPKEEP_NOW).unwrap().0.pending_pin.is_none());
         assert!(!guard.lock().unwrap().in_flight);
@@ -13334,7 +13493,9 @@ totp = "JBSWY3DPEHPK3PXP"
                 "http_url = \"http://127.0.0.1:9/inbox\"\n",
             )
             .unwrap();
-            Vault::Applied(52)
+            // A refresh that wrote the mailbox but failed another file still brings it: the
+            // row is read again after a partial apply too (`Vault::wrote_files`).
+            Vault::AppliedPartly(52)
         }
 
         let w = World::new();

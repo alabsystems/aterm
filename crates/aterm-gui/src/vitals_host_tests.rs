@@ -4358,3 +4358,261 @@ fn the_verdict_refresh_waits_out_a_backed_up_episode() {
     adopt(&mut app, 4, Findings::default());
     assert_eq!(app.devtools_helper.refreshes_started(), 1, "once");
 }
+
+#[test]
+fn net_probe_seam_and_socket_attribution_reach_the_snapshot() {
+    use aterm_vitals::model::NetState;
+
+    let procs = vec![
+        ProcSample {
+            pid: 100,
+            ppid: 1,
+            name: "aterm".into(),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 200,
+            ppid: 100,
+            name: "zsh".into(),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 201,
+            ppid: 200,
+            name: "curl".into(),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 300,
+            ppid: 1,
+            name: "other".into(),
+            ..ProcSample::default()
+        },
+    ];
+    let tabs = vec![TabRoot {
+        key: 7,
+        tab: 7,
+        tab_id: Some(7),
+        shell_pid: 200,
+        label: "Tab 1".into(),
+        program: String::new(),
+    }];
+    let (aterm_sockets, tab_sockets) = read_sockets(&procs, 100, &tabs, |pid| match pid {
+        100 => Some(2),
+        200 => Some(0),
+        201 => Some(3),
+        300 => panic!("unattributed process should not be queried for open sockets"),
+        _ => None,
+    });
+    assert_eq!(aterm_sockets, Some(5));
+    assert_eq!(tab_sockets, vec![(7, 3)]);
+    assert_eq!(
+        read_sockets(&procs, 100, &tabs, |_| None),
+        (None, Vec::new()),
+        "unsupported platform yields None rather than a false zero"
+    );
+
+    let mut reader = Reader::new(Arc::default());
+    reader.net = NetProbe {
+        links: |_| {
+            Some(vec![aterm_sysprobe::LinkReading {
+                name: "en0".into(),
+                kind: aterm_sysprobe::LinkKind::Wifi,
+                up: true,
+                rx: aterm_sysprobe::LinkCounters {
+                    bytes: 1_000_000,
+                    ..aterm_sysprobe::LinkCounters::default()
+                },
+                tx: aterm_sysprobe::LinkCounters {
+                    bytes: 250_000,
+                    ..aterm_sysprobe::LinkCounters::default()
+                },
+                ..aterm_sysprobe::LinkReading::default()
+            }])
+        },
+        tcp: |_| {
+            Some(aterm_sysprobe::TcpSummary {
+                counts: aterm_sysprobe::TcpCounts {
+                    established: 4,
+                    ..aterm_sysprobe::TcpCounts::default()
+                },
+                srtt_ms: Some(18.5),
+            })
+        },
+        open_sockets: |_| Some(2),
+    };
+    let req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        ..Request::default()
+    };
+    let snap = reader.read_machine(&req);
+    let net = snap.net.as_ref().expect("net view present");
+    assert_eq!(net.state, NetState::Online);
+    assert_eq!(net.srtt_ms, Some(18.5));
+    assert_eq!(snap.facts.cpu_brand, reader.machine.cpu);
+    let mut inert = Reader::new(Arc::default());
+    inert.net = NetProbe::INERT;
+    assert_eq!(inert.read_machine(&req).net, None);
+}
+
+#[test]
+fn proc_sample_forwards_disk_read_and_host_keeps_crash_notes_on_backpressure() {
+    let reading = aterm_sysprobe::ProcessReading {
+        pid: 42,
+        ppid: 1,
+        cpu_ns: Some(0),
+        footprint: Some(4096),
+        disk_read: Some(8192),
+        disk_written: Some(2048),
+        name: "cargo".into(),
+        start: Some(1),
+        uid: Some(501),
+        pgid: 42,
+        state: RunState::Running,
+        ..aterm_sysprobe::ProcessReading::default()
+    };
+    let sampled = proc_sample(&reading, Instant::now());
+    assert_eq!(sampled.disk_read, Some(8192));
+    assert_eq!(sampled.disk_written, Some(2048));
+
+    let mut host = VitalsHost::default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_millis() as i64;
+    let gap = aterm_vitals::TimeGap {
+        start_ms: now_ms - 25_000,
+        end_ms: now_ms - 10_000,
+        kind: aterm_vitals::GapKind::Crash,
+    };
+    let crash = aterm_vitals::StripEvent {
+        at_unix_ms: now_ms - 25_000,
+        kind: aterm_vitals::StripEventKind::Crash,
+        label: "aterm crash".into(),
+    };
+    host.note_time_gap(gap);
+    host.note_strip_event(crash.clone());
+    let req = Request {
+        note_gaps: std::mem::take(&mut host.pending_gaps),
+        note_events: std::mem::take(&mut host.pending_events),
+        ..Request::default()
+    };
+    assert!(
+        !host.offer(Msg::Read(Box::new(req))),
+        "no thread yet: offer refuses without dropping crash notes"
+    );
+    assert_eq!(host.pending_gaps, vec![gap]);
+    assert_eq!(host.pending_events, vec![crash.clone()]);
+
+    let mut reader = Reader::new(Arc::default());
+    reader.net = NetProbe::INERT;
+    let snap = reader.read_machine(&Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        note_gaps: std::mem::take(&mut host.pending_gaps),
+        note_events: std::mem::take(&mut host.pending_events),
+        ..Request::default()
+    });
+    assert!(snap.time_gaps.contains(&gap));
+    assert!(snap.strip_events.contains(&crash));
+}
+
+#[test]
+fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(STRIP_FILE);
+    let now = Instant::now();
+    let t0_ms: i64 = 1_793_000_000_000;
+
+    let (mut file, empty) = StripFile::open(Some(path.clone()), now);
+    assert_eq!(empty.last_wall_ms, 0);
+
+    let mut vitals = aterm_vitals::Vitals::new();
+    for step in 0..=12i64 {
+        let _ = vitals.absorb(&Sample {
+            at_ns: (step as u64) * 10_000_000_000,
+            at_unix_ms: t0_ms + step * 10_000,
+            mono_ms: (step as u64) * 10_000,
+            cadence_ms: 10_000,
+            mem: Some(MemSample {
+                total: 32 << 30,
+                app: 16 << 30,
+                wired: 4 << 30,
+                free: 12 << 30,
+                pressure: Pressure::Normal,
+                ..MemSample::default()
+            }),
+            ..Sample::default()
+        });
+    }
+
+    // First sample immediately checkpoints `clean_stop = false` because StripFile::open arms `at`.
+    file.keep(&vitals.saved_strip(false), now, false);
+    assert!(
+        path.exists(),
+        "first live sample must checkpoint strip file"
+    );
+
+    // Simulate abrupt kill (no `stopping = true` call) and reopen 30 s later.
+    let reopen_ms = t0_ms + 150_000;
+    let (_, crashed_saved) = StripFile::open(Some(path.clone()), now + Duration::from_secs(30));
+    assert!(!crashed_saved.clean_stop);
+    let mut recovered = aterm_vitals::Vitals::new();
+    recovered.restore_strip_history(crashed_saved, reopen_ms);
+    let snap = recovered.absorb(&Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: reopen_ms,
+        mono_ms: 1_000,
+        cadence_ms: 1_000,
+        mem: Some(MemSample {
+            total: 32 << 30,
+            app: 10 << 30,
+            wired: 4 << 30,
+            free: 18 << 30,
+            pressure: Pressure::Normal,
+            ..MemSample::default()
+        }),
+        ..Sample::default()
+    });
+    assert!(
+        snap.time_gaps.iter().any(|g| g.kind == GapKind::Crash),
+        "abrupt exit must restore Crash gap: {:?}",
+        snap.time_gaps
+    );
+    assert!(
+        snap.strip_events
+            .iter()
+            .any(|e| e.kind == StripEventKind::Crash),
+        "abrupt exit must restore Crash vertical marker: {:?}",
+        snap.strip_events
+    );
+    let slots = snap.resources[Resource::Memory.index()].heat_multi_scale(
+        aterm_vitals::MultiScaleSpec::FULL_HOUR,
+        reopen_ms,
+        2_500,
+        &snap.time_gaps,
+    );
+    assert!(
+        slots
+            .iter()
+            .any(|hs| hs.slot.age_lo_ms >= 60_000 && hs.cell.heat.is_some_and(|h| h > 0.5)),
+        "pre-crash memory history must survive StripFile round-trip: {slots:?}"
+    );
+    let live_now = slots.last().expect("live_now slot");
+    assert!(live_now.slot.is_live_now);
+    assert!(
+        live_now.cell.heat.is_some_and(|h| h > 0.3) && live_now.cell.gap.is_none(),
+        "live_now box must immediately resume live heat after crash reopen: {live_now:?}"
+    );
+
+    // Graceful shutdown writes `clean_stop = true`.
+    let (mut clean_file, _) = StripFile::open(Some(path.clone()), now + Duration::from_secs(31));
+    clean_file.keep(
+        &recovered.saved_strip(true),
+        now + Duration::from_secs(32),
+        true,
+    );
+    let (_, clean_saved) = StripFile::open(Some(path), now + Duration::from_secs(33));
+    assert!(clean_saved.clean_stop);
+}

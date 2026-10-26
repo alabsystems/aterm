@@ -1932,3 +1932,89 @@ fn the_hypervisors_kernel_switch_reads_on_macos_and_nowhere_else() {
     #[cfg(not(target_os = "macos"))]
     assert_eq!(hv_support(), None);
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() {
+    let words = crate::machine_words();
+    let cpu = words.cpu.as_deref().expect("CPU brand on this host");
+    assert!(!cpu.trim().is_empty(), "{words:?}");
+
+    let root = crate::volume(Path::new("/")).expect("root volume space");
+    assert!(
+        root.total > 0 && root.total >= root.available && root.total >= root.free,
+        "{root:?}"
+    );
+
+    let me = std::process::id();
+    let before = crate::open_socket_count(me).expect("own open socket count");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let mut scratch = Vec::new();
+    if let Some(tcp) = crate::tcp_summary_into(&mut scratch) {
+        assert!(
+            tcp.counts.listen >= 1,
+            "unredacted pcblist64 must include our loopback listener: {tcp:?}"
+        );
+        if let Some(rtt) = tcp.srtt_ms {
+            assert!(rtt.is_finite() && rtt > 0.0 && rtt < 60_000.0, "{tcp:?}");
+        }
+    }
+    let during = crate::open_socket_count(me).expect("own open socket count with listener");
+    assert!(
+        during > before,
+        "opening a TCP listener must increment open_socket_count: before={before}, during={during}"
+    );
+    drop(listener);
+}
+
+#[test]
+fn linux_inet_diag_rtt_parser_extracts_non_loopback_median_and_skips_loopback() {
+    fn diag_msg(family: u8, state: u8, dst16: [u8; 16], rtt_us: u32) -> Vec<u8> {
+        let mut tcp_info = [0u8; 76];
+        tcp_info[68..72].copy_from_slice(&rtt_us.to_ne_bytes());
+        let nla_len: u16 = (4 + tcp_info.len()) as u16;
+        let nlmsg_len: u32 = (16 + 72 + usize::from(nla_len)) as u32;
+        let mut msg = vec![0u8; nlmsg_len as usize];
+        msg[0..4].copy_from_slice(&nlmsg_len.to_ne_bytes());
+        msg[4..6].copy_from_slice(&20u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
+        msg[16] = family;
+        msg[17] = state;
+        msg[16 + 24..16 + 40].copy_from_slice(&dst16);
+        let attr_at = 16 + 72;
+        msg[attr_at..attr_at + 2].copy_from_slice(&nla_len.to_ne_bytes());
+        msg[attr_at + 2..attr_at + 4].copy_from_slice(&2u16.to_ne_bytes()); // INET_DIAG_INFO
+        msg[attr_at + 4..attr_at + 4 + tcp_info.len()].copy_from_slice(&tcp_info);
+        msg
+    }
+    let mut done = vec![0u8; 20];
+    done[0..4].copy_from_slice(&20u32.to_ne_bytes());
+    done[4..6].copy_from_slice(&3u16.to_ne_bytes()); // NLMSG_DONE
+
+    let mut stream = Vec::new();
+    // Remote IPv4 (1.1.1.1): 12.5 ms
+    let mut v4_remote = [0u8; 16];
+    v4_remote[0..4].copy_from_slice(&[1, 1, 1, 1]);
+    stream.extend_from_slice(&diag_msg(2, 1, v4_remote, 12_500));
+    // Loopback IPv4 (127.0.0.1): 100 us -> must be excluded!
+    let mut v4_loop = [0u8; 16];
+    v4_loop[0..4].copy_from_slice(&[127, 0, 0, 1]);
+    stream.extend_from_slice(&diag_msg(2, 1, v4_loop, 100));
+    // Loopback IPv6 (::1): 80 us -> must be excluded!
+    let mut v6_loop = [0u8; 16];
+    v6_loop[15] = 1;
+    stream.extend_from_slice(&diag_msg(10, 1, v6_loop, 80));
+    // Remote IPv6 (2606:4700::1): 24.5 ms
+    let mut v6_remote = [0u8; 16];
+    v6_remote[0..2].copy_from_slice(&[0x26, 0x06]);
+    v6_remote[15] = 1;
+    stream.extend_from_slice(&diag_msg(10, 1, v6_remote, 24_500));
+    stream.extend_from_slice(&done);
+
+    let mut rtts = Vec::new();
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts(&stream, &mut rtts),
+        Some(true)
+    );
+    assert_eq!(rtts, vec![12.5, 24.5]);
+    assert_eq!(crate::linux::median_rtt_ms(&mut rtts), Some(18.5));
+}

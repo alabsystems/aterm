@@ -18,20 +18,25 @@ name = "aterm_forge"
 path = "src/lib.rs"
 
 [dependencies]
-# No third-party dependencies: the tool that measures the surface does not
-# enlarge it. `aterm-toml`'s comment-preserving document model reads the policy
-# file, whose comments carry the fork reasons.
+# No third-party dependency of its own: the tool that measures the surface does
+# not enlarge it (aterm-http brings rustls and ring, the KEEP closure the
+# workspace already holds). `aterm-toml`'s comment-preserving document model
+# reads the policy file, whose comments carry the fork reasons.
 aterm-toml = { workspace = true }
 # The shared source walk, the [patch] classification and the census review
 # (`reviewed_forks`, read from vendor/forge.toml), so each has one definition.
 aterm-census = { workspace = true }
-# Parses cargo's metadata JSON.
+# Parses cargo's metadata JSON and the crates.io index's rows.
 aterm-json = { workspace = true }
 # Descriptor-safe children, delegated to verify's cancellation scope when embedded.
 aterm-uds = { workspace = true }
-
-[dev-dependencies]
-# Fixture workspaces removed on drop.
+# [OB-7]'s pristine copies: each `.crate` fetched from crates.io (aterm-http),
+# held to the index's sha256 (aterm-digest), gunzipped (aterm-codec) and unpacked
+# into a fresh folder (aterm-tempfile) renamed into the cache; the tests'
+# fixture workspaces are aterm-tempfile folders too.
+aterm-http = { workspace = true }
+aterm-digest = { workspace = true }
+aterm-codec = { workspace = true }
 aterm-tempfile = { workspace = true }
 
 [lints]

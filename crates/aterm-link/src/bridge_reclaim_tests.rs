@@ -185,8 +185,8 @@ fn a_session_back_after_its_subjects_went_is_advertised_again_and_routes() {
 }
 
 /// **A SESSION WITH A POST STILL RESERVED KEEPS ITS SUBJECTS**: B left with a post of its
-/// own reserved (`sent/s-b.<id>`), so nothing of B's goes; once the post is retired,
-/// both go.
+/// own reserved (a reserve record of the post journal), so nothing of B's goes; once the
+/// post is retired, both go.
 #[cfg(unix)]
 #[test]
 fn a_departed_session_with_a_post_still_reserved_keeps_its_subjects() {

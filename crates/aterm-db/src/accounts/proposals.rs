@@ -53,6 +53,12 @@ impl Proposals {
     pub fn check(&self) -> Result<aterm_json::Value> {
         Ok(super::references::inspect(&self.snapshot()?))
     }
+    /// Describe one observed account and its complete explicit contact closure.
+    /// Digests identify a proposal for review, never permission to use a login.
+    /// No credentials are read and no application operation is appended.
+    pub fn plan(&self, account: &str) -> Result<aterm_json::Value> {
+        super::plans::inspect(&self.snapshot()?, account)
+    }
     /// Commit one whole-value transaction. Requests are scoped to this certified
     /// writer incarnation. Exact retries return their original durable receipt.
     /// `None` deletes a value reversibly; this API creates no permanent stop.

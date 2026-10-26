@@ -101,16 +101,13 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
-        use raw_window_handle::RawWindowHandle;
+        use aterm_types::native_window::NativeWindow;
         if !self.d3d11_armed {
             return Err(self.d3d11_start_error());
         }
-        let handle = target
-            .window_handle()
-            .map_err(|e| format!("the window has no handle: {e}"))?;
-        let hwnd: HWND = match handle.as_raw() {
-            RawWindowHandle::Win32(h) => h.hwnd.get() as HWND,
-            other => return Err(format!("not a Win32 window: {other:?}")),
+        let hwnd: HWND = match target.native_window() {
+            Some(NativeWindow::Win32 { hwnd, .. }) => hwnd.as_ptr(),
+            None => return Err("the window has no handle".to_string()),
         };
         if !self.d3d11_arm_ready() {
             return Err(self.d3d11_start_error());

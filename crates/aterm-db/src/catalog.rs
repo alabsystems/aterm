@@ -216,14 +216,11 @@ impl Directory {
     }
     /// Current catalog view, revalidated against the locked control observation.
     pub fn snapshot(&self, session: &Session<'_>) -> Result<Snapshot> {
-        self.project(self.catalog(session)?.catalog(session)?, &Policy::default())
+        self.project(self.discovery_records(session)?, &Policy::default())
     }
     /// Local view with the same policy used by automatic network repair.
     pub fn snapshot_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
-        self.project(
-            self.catalog(session)?.catalog(session)?,
-            &Policy::read(config)?,
-        )
+        self.project(self.discovery_records(session)?, &Policy::read(config)?)
     }
     pub(crate) fn permits(
         &self,
@@ -238,7 +235,7 @@ impl Directory {
             return Ok(true);
         }
         Ok(self
-            .project(self.catalog(session)?.catalog(session)?, policy)?
+            .project(self.discovery_records(session)?, policy)?
             .entries
             .get(&id)
             .is_some_and(|entry| entry.state == State::Subscribed))
@@ -308,7 +305,7 @@ impl Directory {
         if !policy.enabled || policy.excluded.contains(&scope.digest()) {
             return Ok(BTreeMap::new());
         }
-        let snapshot = self.project(self.catalog(session)?.catalog(session)?, policy)?;
+        let snapshot = self.project(self.discovery_records(session)?, policy)?;
         let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
         for entry in snapshot
             .entries
@@ -329,6 +326,31 @@ impl Directory {
         aterm_durable::durable_dir(&self.root)?;
         Ok(tables)
     }
+    /// Withdrawing a creator cannot erase discovery of already-retained tables:
+    /// they may carry outstanding liabilities or root-signed stops. Historical
+    /// declarations only retain existing slots, never admit a new table. Local
+    /// exclusion and descriptor-conflict checks still run in `project`.
+    fn discovery_records(&self, session: &Session<'_>) -> Result<Vec<crate::table::Record>> {
+        let catalog = self.catalog(session)?;
+        let mut records = catalog.catalog(session)?;
+        let mut seen: BTreeSet<_> = records.iter().map(|r| r.header().id).collect();
+        let (retained, _) = self.retained()?;
+        for evidence in catalog.metadata_evidence(session)? {
+            let Some(record) = evidence.record else {
+                continue;
+            };
+            let Ok(descriptor) = Descriptor::decode(self.trust, record.payload()) else {
+                continue;
+            };
+            if retained.contains(&descriptor.scope.digest()) && seen.insert(record.header().id) {
+                records.push(record);
+            }
+        }
+        // The eligible prefix keeps its original causal order and new-table
+        // quota choices. The appended history only describes retained slots.
+        Ok(records)
+    }
+
     fn project(&self, records: Vec<crate::table::Record>, policy: &Policy) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
         let mut created: BTreeMap<Actor, BTreeSet<Digest>> = BTreeMap::new();
@@ -380,10 +402,11 @@ impl Directory {
                 || policy.excluded.contains(&self.catalog_scope().digest())
             {
                 State::Excluded
-            } else if !entry
-                .declarations
-                .iter()
-                .any(|d| created[&d.actor].contains(id))
+            } else if !retained.contains(id)
+                && !entry
+                    .declarations
+                    .iter()
+                    .any(|d| created[&d.actor].contains(id))
             {
                 State::CreatorLimit
             } else {

@@ -8,8 +8,6 @@
 // Orbital and Web backends: no aterm cell compiles them.)
 
 use crate::monitor::MonitorHandle as RootMonitorHandle;
-#[cfg(windows_platform)]
-use crate::monitor::VideoModeHandle as RootVideoModeHandle;
 use crate::window::Fullscreen as RootFullscreen;
 
 #[cfg(any(x11_platform, wayland_platform))]
@@ -28,21 +26,15 @@ use windows as platform;
 
 pub use self::platform::*;
 
-/// Helper for converting between platform-specific and generic
-/// `VideoModeHandle`/[`MonitorHandle`]
+/// Helper for converting between platform-specific and generic [`MonitorHandle`]s.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Fullscreen {
-    // Windows only (winit-core step 5, WC.8): see `crate::window::Fullscreen`.
-    #[cfg(windows_platform)]
-    Exclusive(VideoModeHandle),
     Borderless(Option<MonitorHandle>),
 }
 
 impl From<RootFullscreen> for Fullscreen {
     fn from(f: RootFullscreen) -> Self {
         match f {
-            #[cfg(windows_platform)]
-            RootFullscreen::Exclusive(mode) => Self::Exclusive(mode.video_mode),
             RootFullscreen::Borderless(Some(handle)) => Self::Borderless(Some(handle.inner)),
             RootFullscreen::Borderless(None) => Self::Borderless(None),
         }
@@ -52,10 +44,6 @@ impl From<RootFullscreen> for Fullscreen {
 impl From<Fullscreen> for RootFullscreen {
     fn from(f: Fullscreen) -> Self {
         match f {
-            #[cfg(windows_platform)]
-            Fullscreen::Exclusive(video_mode) => {
-                Self::Exclusive(RootVideoModeHandle { video_mode })
-            },
             Fullscreen::Borderless(Some(inner)) => {
                 Self::Borderless(Some(RootMonitorHandle { inner }))
             },

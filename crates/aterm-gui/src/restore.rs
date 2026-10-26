@@ -382,14 +382,19 @@ impl AlabRestore {
         }
     }
 
-    fn into_resume(self) -> aterm_agent::harness::self_claimed::Resume {
-        aterm_agent::harness::self_claimed::Resume {
+    fn into_valid_resume(self) -> Option<aterm_agent::harness::self_claimed::Resume> {
+        let resume = aterm_agent::harness::self_claimed::Resume {
             argv: self.argv,
             session: self.session,
             codex_home: self.codex_home,
             codex_auth_path: self.codex_auth_path,
             cwd: self.cwd,
-        }
+        };
+        resume.validate_structural().ok().map(|()| resume)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.clone().into_valid_resume().is_some()
     }
 }
 
@@ -482,10 +487,11 @@ impl AgentRestore {
         let run = match (agent, self.run) {
             (Agent::Claude, _) => AgentRun::Claude,
             (Agent::Codex, Some(RunRestore::Codex(run))) => {
+                let alab = run.alab.and_then(AlabRestore::into_valid_resume)?;
                 AgentRun::Codex(aterm_agent::harness::relaunch::CodexRun {
                     home: std::path::PathBuf::from(run.home),
                     home_env: run.home_env,
-                    self_claimed: run.alab.map(AlabRestore::into_resume),
+                    self_claimed: Some(alab),
                 })
             }
             (Agent::Codex, None) => return None,
@@ -581,10 +587,10 @@ impl AgentRestore {
     }
 
     /// Whether any relaunch brings this agent back.
-    pub(crate) const fn relaunched(&self) -> bool {
+    pub(crate) fn relaunched(&self) -> bool {
         match &self.run {
             None | Some(RunRestore::Muse(_) | RunRestore::Agy(_)) => true,
-            Some(RunRestore::Codex(run)) => run.alab.is_some(),
+            Some(RunRestore::Codex(run)) => run.alab.as_ref().is_some_and(AlabRestore::is_valid),
         }
     }
 
@@ -604,7 +610,9 @@ impl AgentRestore {
         use aterm_agent::harness::accounts::{HOME_ENV, LOGIN_ENV};
         use aterm_agent::harness::upgrade::{Agent, Dialect, is_session_id, quote};
         let word = |w: &str| -> Option<String> {
-            if w.chars().any(char::is_control) {
+            if w.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            {
                 return None;
             }
             let plain = !w.is_empty()
@@ -656,7 +664,7 @@ impl AgentRestore {
             ),
             Some(RunRestore::Codex(CodexRestore {
                 alab: Some(alab), ..
-            })) => (
+            })) if alab.is_valid() => (
                 alab.codex_home
                     .as_deref()
                     .map(|home| ("CODEX_HOME", home))
@@ -673,8 +681,7 @@ impl AgentRestore {
                     .collect::<Option<Vec<_>>>()?
                     .join(" "),
             ),
-            Some(RunRestore::Muse(_) | RunRestore::Agy(_)) => return None,
-            Some(RunRestore::Codex(CodexRestore { alab: None, .. })) => return None,
+            Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Codex(_)) => return None,
         };
         let mut said = String::new();
         for (name, value) in env {
@@ -6613,6 +6620,40 @@ metadata = "opaque=copy-me"
                 .is_none(),
             "an older leaf with no line is relaunched by nobody"
         );
+        for (label, tampered) in [
+            (
+                "empty argv",
+                wire.replace(
+                    "argv = [\"/Users//me/.aterm/agents/codex\", \"--no-alt-screen\", \"resume\", \"0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c\"]",
+                    "argv = []",
+                ),
+            ),
+            (
+                "foreign argv flag",
+                wire.replace("\"--no-alt-screen\"", "\"--evil-flag\""),
+            ),
+            (
+                "relative codex_auth_path",
+                wire.replace(
+                    "/Users//me/.aterm/accounts-codex/work/auth.json",
+                    "work/auth.json",
+                ),
+            ),
+            (
+                "unicode line separator in codex_home",
+                wire.replace("/Users//me/lab codex/", "/Users//me/lab\u{2028}codex/"),
+            ),
+        ] {
+            assert_ne!(tampered, wire, "{label} fixture must mutate wire");
+            let parsed: AgentRestore = aterm_toml::from_str(&tampered).expect("reads");
+            assert!(!parsed.relaunched(), "{label}: must not mark relaunched");
+            assert!(!parsed.resumes(), "{label}: must not mark resumes");
+            assert_eq!(parsed.resume_line(), None, "{label}: must emit no resume_line");
+            assert!(
+                parsed.snapshot("s-new".into(), 6161).is_none(),
+                "{label}: must yield no relaunch snapshot"
+            );
+        }
 
         let old = AgentRestore0101 {
             pid: 4242,

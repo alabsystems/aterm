@@ -116,6 +116,8 @@ mod pending_wake;
 pub mod pin;
 pub mod platform;
 pub mod prereq;
+/// Readings a doctor keeps between runs under keys that name what they depend on.
+pub mod probe_cache;
 pub mod progress;
 /// Folders guarded by macOS TCC consent dialogs so unattended lanes never open them.
 pub mod protected;

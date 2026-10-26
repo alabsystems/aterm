@@ -520,7 +520,7 @@ struct Copied {
     copy: BusCopy,
 }
 
-/// `log-take …`: the bridge-only take ([`crate::control`]'s dispatch hands it the lane's generation).
+/// `log-take …`: the bridge-only take ([`crate::control`]'s dispatch hands it the lane's generation), answered `OK <bytes> slots=<k> [more=1] [due=<ms>]`: `due=` says when the soonest snapshot a session's mail rate held back is due (`aterm_slog::BusCopy::due_in_ms`), so the bridge takes again then.
 pub(crate) fn cmd_log_take(
     store: &crate::session_store::Store,
     rest: &str,
@@ -566,6 +566,7 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
     };
     let mut room = req.n;
     let mut more = false;
+    let mut due = u64::MAX;
     let mut copies: Vec<Copied> = Vec::new();
     for (_, sid, ctx) in &live {
         if room == 0 {
@@ -584,6 +585,7 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
         let copy = tl.slog_mut().mirror_log().bus_copy(room, now);
         drop(tl);
         more |= copy.more();
+        due = due.min(copy.due_in_ms().unwrap_or(u64::MAX));
         room = room.saturating_sub(copy.len());
         if !copy.is_empty() {
             copies.push(Copied {
@@ -604,6 +606,7 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
             }
             let copy = tail.log.bus_copy(room, now);
             more |= copy.more();
+            due = due.min(copy.due_in_ms().unwrap_or(u64::MAX));
             room = room.saturating_sub(copy.len());
             if !copy.is_empty() {
                 copies.push(Copied {
@@ -636,7 +639,12 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
         slots += 1;
     }
     let more = if more { " more=1" } else { "" };
-    format!("OK {} slots={slots}{more}\n{body}", body.len())
+    let due = if due == u64::MAX {
+        String::new()
+    } else {
+        format!(" due={due}")
+    };
+    format!("OK {} slots={slots}{more}{due}\n{body}", body.len())
 }
 
 fn push_slot(out: &mut String, sid: &str, s: &Slot) {

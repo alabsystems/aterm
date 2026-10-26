@@ -194,23 +194,26 @@ pub fn read_store(
         Store::Muse => ("goals", "session_id"),
     };
     aterm_uds::foreign_db::read_bytes(db, GOAL_DB_MAX_BYTES, |main, wal| {
-        let mut missing_col = false;
-        let matches = crate::harness::sqlite_read::scan_table(main, wal, table, |schema, row| {
-            let (Some(k_i), Some(obj_i), Some(st_i)) = (
-                schema.column_index(key),
-                schema.column_index("objective"),
-                schema.column_index("status"),
-            ) else {
-                missing_col = true;
-                return None;
-            };
-            if row.get(k_i)?.as_str() == Some(id) && row.get(st_i)?.as_str() == Some("active") {
-                Some(row.get(obj_i)?.to_list_field())
-            } else {
-                None
-            }
-        })?;
-        (!missing_col).then(|| matches.into_iter().next().and_then(|s| objective_of(&s)))
+        let matches = crate::harness::sqlite_read::scan_table_with(
+            main,
+            wal,
+            table,
+            |schema| {
+                Some((
+                    schema.column_index(key)?,
+                    schema.column_index("objective")?,
+                    schema.column_index("status")?,
+                ))
+            },
+            |&(k_i, obj_i, st_i), row| {
+                if row.get(k_i)?.as_str() == Some(id) && row.get(st_i)?.as_str() == Some("active") {
+                    Some(row.get(obj_i)?.to_list_field())
+                } else {
+                    None
+                }
+            },
+        )?;
+        Some(matches.into_iter().next().and_then(|s| objective_of(&s)))
     })
 }
 

@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-use aterm_slog::bus::BusSpace;
+use aterm_slog::bus::{BusSpace, Gone};
 
 use crate::bridge::Config;
 use crate::fabric::J;
@@ -277,19 +277,19 @@ const fn line_tokens(line: &str) -> usize {
 
 /// Why a session's fold is partial, beyond where it was seeded: its close
 /// never reached the bus although its node or its own presence says it is
-/// gone.
-fn gone_without_close(r: &Read, node: &str, s: &Session) -> Option<&'static str> {
+/// gone (the words are [`Gone`]'s, which the Overview reads too).
+fn gone_without_close(r: &Read, node: &str, s: &Session) -> Option<Gone> {
     if r.nodes_gone.iter().any(|n| n == node) {
-        return Some("node-gone");
+        return Some(Gone::NodeGone);
     }
     if s.presence.as_deref() == Some("exited") {
-        return Some("no-close");
+        return Some(Gone::NoClose);
     }
     let earlier = match (s.presence_inc, r.node_inc.get(node)) {
         (Some(mine), Some(now)) => mine < *now,
         _ => false,
     };
-    (s.presence.as_deref() == Some("live") && earlier).then_some("node-gone")
+    (s.presence.as_deref() == Some("live") && earlier).then_some(Gone::NodeGone)
 }
 
 /// One session the read holds, by its `(node, sid)`.
@@ -322,8 +322,8 @@ fn partial_why(
     if let Some(w) = seed.why() {
         why.push(w);
     }
-    if let Some(w) = gone_without_close(r, node, s).filter(|_| !closed) {
-        why.push(w);
+    if let Some(gone) = gone_without_close(r, node, s).filter(|_| !closed) {
+        why.push(gone.word());
     }
     why
 }

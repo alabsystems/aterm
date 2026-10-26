@@ -26,15 +26,18 @@ pub use gpu_clients::{GpuClientRow, GpuClientsSample, GpuSplit};
 pub use history::{Filling, FreeHistory, Rates};
 pub use model::{
     AccountIx, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView, CommitSample, CoreView,
-    CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, Hog, LinkKind, LinkRates,
-    LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView, NetView, NoFigure, PlanFact,
-    PlanRun, Pressure, ProcLimits, ProcSample, ProcState, ProcView, Resource, ResourceView,
-    RowFacts, RowScope, Sample, ScopeFig, ScopeView, Series, Snapshot, Split, State, TabRoot,
-    TabTokens, TabView, TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, WeekFact,
-    Writer,
+    CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot, Hog, LinkKind,
+    LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView, NetState, NetView,
+    NoFigure, PlanFact, PlanRun, Pressure, ProcLimits, ProcSample, ProcState, ProcView, Resource,
+    ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView, Series, Snapshot,
+    Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView, TcpCounts, Thermal,
+    Throttle, Ticks, Vitals, VolumeSample, WeekFact, Writer,
 };
 pub use peaks::{DailyMax, PeakRow, Peaks, PlanDay, PlanWeek};
-pub use ring::{Bucket, BucketRing, Cell, Reading, SlotGrid};
+pub use ring::{
+    AxisTick, Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
+    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, TimeGap,
+};
 pub use strain::Strain;
 pub use trend::{History, Motion, Trend, TrendView};
 pub use writes::{ProgramHour, WriteHour};

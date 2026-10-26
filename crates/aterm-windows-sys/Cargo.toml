@@ -54,12 +54,9 @@ aterm-win32 = { path = "../aterm-win32" }
 # BEGIN GENERATED FEATURES (aterm-win32-oracle gen)
 default = []
 Win32 = ["Win32_Foundation"]
-Win32_Devices = ["Win32"]
-Win32_Devices_HumanInterfaceDevice = ["Win32_Devices"]
 Win32_Foundation = ["Win32"]
 Win32_Globalization = ["Win32"]
 Win32_Graphics = ["Win32"]
-Win32_Graphics_Dwm = ["Win32_Graphics"]
 Win32_Graphics_Gdi = ["Win32_Graphics"]
 Win32_Media = ["Win32"]
 Win32_Security = ["Win32"]

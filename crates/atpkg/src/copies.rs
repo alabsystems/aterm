@@ -158,20 +158,90 @@ pub fn prune_with(
     }
 }
 
-/// Prune the stale copies of the running aterm ([`prune_with`], [`trash`], [`look_with`]).
-#[must_use]
-pub fn prune(dry_run: bool) -> Pruned {
+/// [`prune_with`] right after `look` ([`look_with`]) took its census: the moves follow the look's
+/// plan, so only the fresh census each move is checked against runs, not a second planning one.
+/// `None` when `look` is no look (the caller prunes from a census of its own).
+pub fn prune_after_with(
+    look: &Pruned,
+    bundle_id: &str,
+    census: impl Fn(&str) -> Claimants,
+    unchanged: impl Fn(&consent::Claimant, &str) -> bool,
+    in_use: impl Fn(&Path) -> Option<bool>,
+    move_to_trash: impl Fn(&Path) -> Result<(), String>,
+) -> Option<Pruned> {
+    let Pruned::Found {
+        offered,
+        kept,
+        complete,
+    } = look
+    else {
+        return None;
+    };
+    let moved = if offered.is_empty() {
+        Vec::new()
+    } else {
+        let fresh = census(bundle_id);
+        consent::retire_claimants(
+            offered,
+            &fresh,
+            |copy| unchanged(copy, bundle_id),
+            in_use,
+            move_to_trash,
+        )
+    };
+    Some(if *complete {
+        Pruned::Done {
+            moved,
+            kept: kept.clone(),
+        }
+    } else {
+        Pruned::Incomplete { moved }
+    })
+}
+
+/// The running aterm's bundle identifier, or why there is none to prune for.
+fn running_bundle() -> Result<String, Pruned> {
     if !cfg!(target_os = "macos") {
-        return Pruned::NotLooked("macOS only".to_string());
+        return Err(Pruned::NotLooked("macOS only".to_string()));
     }
     let Some(root) = consent::fence_exe()
         .as_deref()
         .and_then(consent::app_bundle_root)
     else {
-        return Pruned::NotLooked("running outside the app bundle".to_string());
+        return Err(Pruned::NotLooked(
+            "running outside the app bundle".to_string(),
+        ));
     };
-    let Some(id) = consent::bundle_id_of(&root, &consent::protected_roots(&[])) else {
-        return Pruned::NotLooked("this build has no readable bundle identifier".to_string());
+    consent::bundle_id_of(&root, &consent::protected_roots(&[])).ok_or_else(|| {
+        Pruned::NotLooked("this build has no readable bundle identifier".to_string())
+    })
+}
+
+/// Prune the stale copies of the running aterm the moment after `look` ([`prune`] with
+/// `dry_run`) found them ([`prune_after_with`]); a `look` that is no look prunes afresh.
+#[must_use]
+pub fn prune_after(look: &Pruned) -> Pruned {
+    let id = match running_bundle() {
+        Ok(id) => id,
+        Err(not) => return not,
+    };
+    prune_after_with(
+        look,
+        &id,
+        consent::claimants_for,
+        consent::still_claims,
+        crate::gc::runs_from,
+        trash,
+    )
+    .unwrap_or_else(|| prune(false))
+}
+
+/// Prune the stale copies of the running aterm ([`prune_with`], [`trash`], [`look_with`]).
+#[must_use]
+pub fn prune(dry_run: bool) -> Pruned {
+    let id = match running_bundle() {
+        Ok(id) => id,
+        Err(not) => return not,
     };
     let tool = Path::new(TRASH_TOOL).is_file();
     if dry_run {
@@ -435,6 +505,83 @@ mod tests {
             let got = prune(dry_run);
             assert!(matches!(got, Pruned::NotLooked(_)), "{got:?}");
         }
+        let look = look_with("x", |_| owners_mac(), true);
+        let got = prune_after(&look);
+        assert!(matches!(got, Pruned::NotLooked(_)), "{got:?}");
+    }
+
+    /// A prune right after a look takes one census, the fresh one its moves are checked against,
+    /// and moves what a prune from its own census moves. NEGATIVE CONTROL: [`prune_with`] after
+    /// the same look takes two (the planning census again, then the fresh one).
+    #[test]
+    fn a_prune_after_a_look_takes_only_the_fresh_census() {
+        let censuses = std::cell::Cell::new(0);
+        let census = |_: &str| {
+            censuses.set(censuses.get() + 1);
+            owners_mac()
+        };
+        let in_use = |path: &Path| Some(path.ends_with("aterm-local-1789361388.app"));
+        let look = look_with("com.aterm.aterm", census, true);
+        assert_eq!(censuses.get(), 1, "the look's census");
+        let after = prune_after_with(
+            &look,
+            "com.aterm.aterm",
+            census,
+            |_, _| true,
+            in_use,
+            |_| Ok(()),
+        )
+        .expect("a look");
+        assert_eq!(
+            censuses.get(),
+            2,
+            "one census more: the fresh one before the moves"
+        );
+        let alone = prune_with(
+            "com.aterm.aterm",
+            census,
+            |_, _| true,
+            in_use,
+            |_| Ok(()),
+            true,
+        );
+        assert_eq!(
+            censuses.get(),
+            4,
+            "a prune of its own plans and re-reads: two"
+        );
+        assert_eq!(after, alone, "the same moves and the same kept copies");
+        assert!(
+            matches!(&after, Pruned::Done { moved, .. }
+                if moved.iter().filter(|(_, r)| *r == consent::Retired::Moved).count() == 1),
+            "one copy moved, the one in use kept: {after:?}"
+        );
+        let nothing = Pruned::Found {
+            offered: Vec::new(),
+            kept: Vec::new(),
+            complete: true,
+        };
+        let never = |_: &Path| -> Result<(), String> { panic!("nothing may move") };
+        assert_eq!(
+            prune_after_with(&nothing, "x", census, |_, _| true, in_use, never),
+            Some(Pruned::Done {
+                moved: Vec::new(),
+                kept: Vec::new()
+            })
+        );
+        assert_eq!(censuses.get(), 4, "nothing offered: no census at all");
+        assert_eq!(
+            prune_after_with(
+                &Pruned::NotLooked("no".into()),
+                "x",
+                census,
+                |_, _| true,
+                in_use,
+                never
+            ),
+            None,
+            "no look: the caller prunes from its own census"
+        );
     }
 
     #[test]

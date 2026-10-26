@@ -423,17 +423,36 @@ impl RequestBuilder<'_> {
     /// # Errors
     /// As [`Self::send`].
     pub fn send_with_env<E: EnvSource>(self, body: &[u8], env: &E) -> Result<Response, Error> {
+        self.send_phased_with_env(body, env)
+            .map_err(|failed| failed.error)
+    }
+
+    /// [`Self::send`], saying of a failure how far the request got: a long-poll whose deadline
+    /// passed while the server held it failed [`Phase::Sent`].
+    /// # Errors
+    /// As [`Self::send`], with its [`Phase`].
+    pub fn send_phased(self, body: &[u8]) -> Result<Response, SendError> {
+        self.send_phased_with_env(body, &ProcessEnv)
+    }
+
+    fn send_phased_with_env<E: EnvSource>(
+        self,
+        body: &[u8],
+        env: &E,
+    ) -> Result<Response, SendError> {
         let Exchange {
             status,
             headers,
             body,
-        } = self
-            .exchange_with_env(Body::Bytes(body), env)
-            .map_err(|failed| failed.error)?;
+        } = self.exchange_with_env(Body::Bytes(body), env)?;
+        let body = read_to_end(body.inner).map_err(|error| SendError {
+            phase: Phase::Answered,
+            error,
+        })?;
         Ok(Response {
             status,
             headers,
-            body: read_to_end(body.inner)?,
+            body,
         })
     }
 

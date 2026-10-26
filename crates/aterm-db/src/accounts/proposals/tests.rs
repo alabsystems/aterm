@@ -58,6 +58,67 @@ fn reference_report_reads_existing_proposals_without_publishing_or_changing_hist
         .is_err()
     );
 }
+
+#[test]
+fn account_plans_are_read_only_and_converge_after_offline_label_edits() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let options = std::collections::BTreeMap::from([("--key", "one")]);
+    assert!(command::run_at("accounts-plan", options.clone(), lab.paths[0].clone()).is_err());
+    assert!(app(&lab, 0).snapshot().is_err());
+    app(&lab, 0)
+        .write(
+            [1; 16],
+            vec![
+                account("basic"),
+                Change {
+                    collection: "mailboxes".into(),
+                    key: "inbox".into(),
+                    value: Some(json!({"name":"inbox"})),
+                },
+            ],
+        )
+        .unwrap();
+    let before =
+        command::run_at("accounts-history", Default::default(), lab.paths[0].clone()).unwrap();
+    let initial = command::run_at("accounts-plan", options.clone(), lab.paths[0].clone()).unwrap();
+    assert_eq!(initial["complete"].as_bool(), Some(true));
+    assert_eq!(initial["authority"].as_str(), Some("none"));
+    assert_eq!(
+        before,
+        command::run_at("accounts-history", Default::default(), lab.paths[0].clone()).unwrap()
+    );
+    rounds(&lab, 3);
+    assert_eq!(
+        initial["configuration_digest"],
+        app(&lab, 1).plan("one").unwrap()["configuration_digest"]
+    );
+    let mut renamed = account("basic");
+    renamed
+        .value
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("label".into(), json!("m100.2"));
+    app(&lab, 1).write([2; 16], vec![renamed]).unwrap();
+    let offline = app(&lab, 1).plan("one").unwrap();
+    assert_eq!(
+        initial["configuration_digest"],
+        offline["configuration_digest"]
+    );
+    assert_ne!(initial["proposal_digest"], offline["proposal_digest"]);
+    rounds(&lab, 3);
+    let after = app(&lab, 0).plan("one").unwrap();
+    assert_eq!(
+        offline["configuration_digest"],
+        after["configuration_digest"]
+    );
+    assert_eq!(offline["proposal_digest"], after["proposal_digest"]);
+    let mut extra = options;
+    extra.insert("--collection", "accounts");
+    assert!(command::run_at("accounts-plan", extra, lab.paths[0].clone()).is_err());
+}
+
 fn cell(snapshot: &Snapshot) -> &crate::database::Cell {
     &snapshot.cells[&("accounts".into(), "one".into())]
 }

@@ -388,6 +388,108 @@ fn a_held_key_runs_and_each_wrap_typed_through_is_one_flight() {
     }
 }
 
+/// How long each flight from `from` ms on is in the air: `(the present it leaves on, ms aloft)`.
+fn airtimes(shots: &[Shot], from: u64) -> Vec<(u64, u64)> {
+    let shots: Vec<&Shot> = shots.iter().filter(|s| s.ms >= from).collect();
+    shots
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| {
+            w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap
+        })
+        .filter_map(|(i, w)| {
+            let down = shots[i + 1..]
+                .iter()
+                .find(|s| s.frame.action != PetAction::Leap)?;
+            Some((w[1].ms, down.ms - w[1].ms))
+        })
+        .collect()
+}
+
+/// A take of the wrap law: `(label, the prompt's row, the keys, ms the judged span starts at or
+/// 0 for the first key past column 12)`.
+type WrapTake = (String, u16, Vec<(u64, Key)>, u64);
+
+/// THE WRITING'S WRAP IS A BRISK BOUND, AT THE SHELL TOO. A line typed past the margin with
+/// the prompt on the last row wraps onto the line the screen scrolls up, and the cat crosses
+/// after the wrap; a held delete takes the caret back across a wrap, and the cat crosses after
+/// it. Each crossing is the animal's own pace on its arc, in the air no longer than the big
+/// bound's longest shape (850 ms): typed at 33 and 20 keys a second and by hand, typed on after
+/// a pause at the margin, and deleted back across one and two wraps from mid-screen and from the
+/// last row. (The leap ahead of a wrap that is coming, mid-screen, is timed to land with the
+/// wrap and keeps the quiet pace.)
+///
+/// NEGATIVE CONTROL (as run on main before the fix): every crossing 0.99 to 1.17 s in the air,
+/// paced as a quiet crossing, 0.74 of the pane a second. With the wrap the writing's only while
+/// its rhythm was open and the cat on the ground, a wrap typed two or three keys after a pause
+/// crossed in 1.2 s after a perk, and one that came as a hop came down in 1.17 s.
+#[test]
+fn each_wrap_typed_through_is_a_brisk_bound() {
+    let mut takes: Vec<WrapTake> = Vec::new();
+    for (name, keys) in [
+        ("33 keys a second", typed(240, 30)),
+        ("20 keys a second", typed(240, 50)),
+        ("by hand", by_hand(240)),
+    ] {
+        takes.push((format!("{name}, the prompt on the last row"), 23, keys, 0));
+    }
+    // Typed on after a pause at the margin: the wrap comes two or three keys after the pause,
+    // short of the writing's rhythm opening again, or as the cat comes down from a hop.
+    for (n0, gap0, pause, n1, gap1) in [
+        (75usize, 150u64, 800u64, 9usize, 130u64),
+        (75, 100, 1_500, 9, 120),
+        (70, 100, 1_500, 14, 120),
+        (76, 90, 2_500, 8, 150),
+    ] {
+        let mut keys = typed(n0, gap0);
+        keys.extend(typed(n0 + n1, gap1).into_iter().skip(n0));
+        keys[n0].0 = pause;
+        takes.push((
+            format!(
+                "{n0} keys {gap0} ms apart, a {pause} ms pause, {n1} keys {gap1} ms apart, the \
+                 prompt on the last row"
+            ),
+            23,
+            keys,
+            0,
+        ));
+    }
+    for row0 in [12u16, 23] {
+        for (len, dels) in [(130usize, 110usize), (220, 200)] {
+            let mut keys = typed(len, 60);
+            keys.push((1_500, Key::Type(b' ')));
+            let from = 300 + keys.iter().map(|k| k.0).sum::<u64>();
+            keys.extend((0..dels).map(|_| (48, Key::Delete)));
+            takes.push((
+                format!("{dels} deletes back from {len} keys, the prompt on row {row0}"),
+                row0,
+                keys,
+                from,
+            ));
+        }
+    }
+    for (label, row0, keys, from) in &takes {
+        let h = Host::replay(line_editor(*row0, keys));
+        let start = if *from > 0 {
+            *from
+        } else {
+            h.shots
+                .iter()
+                .find(|s| s.caret.1 >= 12 && s.frame.action != PetAction::Leap)
+                .map_or(0, |s| s.ms)
+        };
+        let flights = airtimes(&h.shots, start);
+        assert!(
+            !flights.is_empty(),
+            "{label}: fixture — the wraps are flown"
+        );
+        assert!(
+            flights.iter().all(|&(_, aloft)| aloft <= 850),
+            "{label}: crossings (ms, ms aloft) {flights:?}"
+        );
+    }
+}
+
 fn faintest_in_flight(shots: &[Shot]) -> (f32, u64) {
     let mut worst = (1.0f32, 0u64);
     let mut i = 1;

@@ -5054,6 +5054,7 @@ fn the_setups_facts_for_later_are_digest_entries() {
         setup_not_started_entry("initial-setup.json: Permission denied"),
         setup_set_aside_entry("initial-setup.json.unreadable"),
         setup_unfinished_entry(),
+        setup_changed_since_entry("Dock"),
     ] {
         assert_eq!(entry.family(), aterm_messages::exceptions::Family::Setup);
         assert!(entry.message().is_ok(), "{:?}", entry.message().err());
@@ -5065,6 +5066,11 @@ fn the_setups_facts_for_later_are_digest_entries() {
     assert_ne!(
         setup_not_started_entry("").key(),
         setup_set_aside_entry("").key()
+    );
+    assert_eq!(
+        setup_changed_since_entry("Dock").key(),
+        setup_changed_since_entry("").key(),
+        "a later pass's rows replace the entry, and its clear finds it"
     );
 }
 

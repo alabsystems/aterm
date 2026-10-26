@@ -33,7 +33,11 @@ USAGE
         a member NOTICE lists): patch, vendor/ and Cargo.lock agreement,
         [workspace] stubs, .cargo_vcs_info.json and Cargo.toml.orig, retained
         licenses, NOTICE, Apache-2.0 §4(b) notices, fork markers, deny.toml's
-        license list and .gitignore. vendor/astream must be a clean checkout
+        license list and .gitignore. The §4(b) notices are judged by a diff
+        against the .crate crates.io published, which attest fetches, holds
+        to the sha256 the crates.io index records and caches in this user's
+        aterm cache folder; offline, with no cached copy, that fork is
+        UNVERIFIED. vendor/astream must be a clean checkout
         of its gitlink, not behind the pin origin/main had at the merge-base
         unless a commit on the branch says `astream-pin-rollback: <reason>`.
 

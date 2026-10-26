@@ -1189,6 +1189,19 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
+/// A child that ends when this process dies, killed outright or crashed included
+/// ([`crate::tether`]): for a helper whose end this process enforces (a read it stops or bounds by
+/// its own clock, a stream that never ends by itself), which would otherwise run on, adopted, for
+/// as long as it can. On Linux the tie is to the spawning THREAD (`PR_SET_PDEATHSIG`), so spawn
+/// from a thread that outlives the child. On Darwin the spawn runs through this executable
+/// ([`crate::tether::executable`]), and in a process whose `main` never called
+/// [`crate::tether::entry`] the child starts untethered. Neither an exec nor a suspended start
+/// can be tethered.
+pub trait Tether {
+    /// Tie the child to this process.
+    fn tether(&mut self) -> &mut Self;
+}
+
 #[path = "spawnfd_transparent.rs"]
 mod pass_through;
 pub use pass_through::{TransparentChild, TransparentCommand, transparent};

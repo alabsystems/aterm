@@ -332,17 +332,18 @@ fn sids(inst: &Inst) -> Vec<String> {
         .collect()
 }
 
-/// A script that writes one whole shell-integration block in one write, A to D;0, its command
-/// line `echo <SECRET> 42` (OSC 633;E) and its output `ran-42`, each mark signed with the tab's
-/// nonce when the shell was handed one.
-fn marked_command(root: &Path, secret: &str) -> PathBuf {
+/// A script `name` under `root` that writes one whole shell-integration block in one write, A to
+/// D;0, its command line `line` (OSC 633;E, with no `;` or backslash) and its output `ran-42`,
+/// each mark signed with the tab's nonce when the shell was handed one. Nothing runs `line`: the
+/// shell's marks report it, as a shell runs it.
+fn marked_command(root: &Path, name: &str, line: &str) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
          n=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
-         printf '\\033]133;A%s\\007$ \\033]133;B%s\\007\\033]633;E;echo {secret} 42%s\\007\\r\\n\\033]133;C%s\\007ran-%s\\r\\n\\033]133;D;0%s\\007' \
+         printf '\\033]133;A%s\\007$ \\033]133;B%s\\007\\033]633;E;{line}%s\\007\\r\\n\\033]133;C%s\\007ran-%s\\r\\n\\033]133;D;0%s\\007' \
          \"$n\" \"$n\" \"$n\" \"$n\" \"$((40+2))\" \"$n\"\n"
     );
-    let path = root.join("marked.sh");
+    let path = root.join(name);
     std::fs::write(&path, script).expect("write the marked command");
     path
 }
@@ -598,12 +599,16 @@ fn menu(inst: &Inst, sid: &str, tab: usize) -> Vec<String> {
 
 /// The stand-in `claude` Summarize starts on B: it runs each backticked `aterm …` command its
 /// brief (its argv) names, and prints the lines of what they said that start with `@` or hold
-/// `need=`, then `summary-end`, and stays (a worker's tab keeps its screen).
+/// `need=`, and, as the brief's fabric sentence says to read `aterm fabric brief --json`, each
+/// session object that is not this node's own (`"this":false`) and names a need, as
+/// `@<sid>@<node> need=<word>`; then `summary-end`, and stays (a worker's tab keeps its screen).
 const SUMMARIZER: &str = "#!/bin/sh\n\
      case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
      case \" $* \" in *' -p /usage '*|*' -p /model '*) exit 0 ;; esac\n\
      printf '%s\\n' \"$*\" | grep -o '`aterm [^`]*`' | tr -d '`' > \"$HOME/brief.cmds\"\n\
-     while read -r c; do $c 2>&1 | grep -E '^@|need='; done < \"$HOME/brief.cmds\"\n\
+     while read -r c; do $c 2>&1 | tr '{' '\\n' | sed -nE \
+     -e 's/^\"node\":\"([^\"]*)\",\"sid\":\"([^\"]*)\",\"this\":false,.*\"need\":\"([^\"]*)\".*/@\\2@\\1 need=\\3/p' \
+     -e t -e '/^@|need=/p'; done < \"$HOME/brief.cmds\"\n\
      echo summary-end\n\
      exec sleep 600\n";
 
@@ -917,7 +922,8 @@ fn the_owners_ask_over_the_stream() {
         "B reaches A's sessions locally: {survey}"
     );
 
-    // Leg 4: Summarize's worker on B shows S's need, which only `aterm fabric brief` says.
+    // Leg 4: Summarize's worker on B shows S's need as another node's, which only
+    // `aterm fabric brief --json` says.
     let screen = summarize(&b);
     assert!(
         screen.contains(&face) && screen.contains("need=approval:bash"),
@@ -948,6 +954,11 @@ fn the_owners_ask_over_the_stream() {
         rows.contains("mail dir=in kind=note").then_some(rows)
     });
     eprintln!("mail: {mail}");
+    // Mail crosses only as counts, in a snapshot, and one is due once S's counts move (at most one
+    // a second, LOOP-2): B's brief counts P's note with no further record of S's.
+    until("B's brief to count P's note", || {
+        bus_num(&brief_json(&b), &s, "mail_in").filter(|n| *n == 1)
+    });
     assert!(
         keys_read(&a, "k1").is_empty(),
         "the note reached S's PTY: {:?}",
@@ -1053,7 +1064,7 @@ fn the_owners_ask_over_the_stream() {
     );
     assert_eq!(menu(&a, &s, 1).first(), Some(&title));
 
-    // The turn ends; its close carries the mail counts to B; a ctl label never shows.
+    // The turn ends; still no word of the mail crossed; a ctl label never shows.
     let at = cursor(&a, &s);
     release(&a, "k1", 4);
     await_log(&a, &s, "close=turn", &at);
@@ -1065,22 +1076,6 @@ fn the_owners_ask_over_the_stream() {
             .any(|l| l.starts_with("t2 ") && l.contains(" by=harness")),
         "the carry-on's turn: {brief}"
     );
-    // The mirror carries mail as its snapshot's counts, a snapshot every `SNAP_EVERY` bus-class
-    // records: a manager's review asks, each cleared, carry S past the next one.
-    let json = brief_json(&b);
-    assert_eq!(
-        bus_num(&json, &s, "mail_in"),
-        Some(0),
-        "counts cross only in a snapshot: {json}"
-    );
-    for _ in 0..aterm_slog::SNAP_EVERY.div_ceil(2) + 1 {
-        for mark in ["need word=review", "clear word=review"] {
-            paced_mark(&a, &s, mark);
-        }
-    }
-    until("B's brief to count P's note", || {
-        bus_num(&brief_json(&b), &s, "mail_in").filter(|n| *n == 1)
-    });
     for body in bus_bodies(&owner, &format!("/f/{FLEET}/pub/>")) {
         for leak in [
             " kind=note",
@@ -1228,7 +1223,7 @@ fn the_journal_across_a_quit_and_a_kill() {
     a.wait_ready(&owner);
     write_fake(&a, "resets in 1m");
     let shell = sids(&a)[0].clone();
-    let script = marked_command(&a.root, "QZP6SECRET1");
+    let script = marked_command(&a.root, "marked.sh", "echo QZP6SECRET1 42");
     type_line(&a, &shell, &format!("sh {}", script.display()));
     until_on(&a, &shell, DEADLINE, "the shell's run in its log", || {
         a.text(&format!("@{shell} log"))
@@ -1887,15 +1882,24 @@ fn on_bash_a_relaunch_into_another_directory_lifts_the_failure_too() {
     );
 }
 
-/// The sentinels (`QZP6SECRET<n>`, any case) `bytes` holds, by their digit.
+/// The sentinels (`QZP6SECRET<n>`, any case, `<n>` its whole run of digits) `bytes` holds, by
+/// their number.
 fn sentinels(bytes: &[u8]) -> Vec<u8> {
     let low = bytes.to_ascii_lowercase();
     let needle = b"qzp6secret";
-    let mut out: Vec<u8> = low
-        .windows(needle.len() + 1)
-        .filter(|w| w.starts_with(needle) && w[needle.len()].is_ascii_digit())
-        .map(|w| w[needle.len()] - b'0')
-        .collect();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while let Some(at) = low[i..].windows(needle.len()).position(|w| w == needle) {
+        let digits = &low[i + at + needle.len()..];
+        let len = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+        if len > 0 {
+            let n = digits[..len].iter().fold(0u32, |n, d| {
+                n.saturating_mul(10).saturating_add(u32::from(d - b'0'))
+            });
+            out.push(u8::try_from(n).unwrap_or(u8::MAX));
+        }
+        i += at + needle.len();
+    }
     out.sort_unstable();
     out.dedup();
     out
@@ -1947,12 +1951,127 @@ impl Sweep {
     }
 }
 
-/// **LEG 7 (U22, U23(d), U36, 6F-7): THE PRIVACY SWEEP.** A sentinel is planted in each kind of
-/// caller and program text the log meets (a command's later word, a title, an attention text, a
-/// topic name, a hold reason, a mail body, a config value, a post's `key=`, a `via=` hop); after
-/// the mirror has carried past them and A has quit and come back, every file of both instances
-/// and the broker, every bus body and every reader's view holds a sentinel only where the design
-/// keeps one.
+/// The restore store a quit leaves at rest, relative to an instance's root: `session.toml` and
+/// the crash journal's files (`journal-<pid>-<nanos>.toml`) beside it in the state root.
+fn restore_store(rel: &Path) -> bool {
+    let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    rel.parent() == Some(Path::new("astate"))
+        && (name == "session.toml" || (name.starts_with("journal-") && name.ends_with(".toml")))
+}
+
+/// Where the design keeps each sentinel on disk, by a file's path relative to an instance's root
+/// (or the broker's state dir, `b.log`). The journals (0600) keep the post's key and hop as
+/// `idem=` and `via=` (H); the bridge's state dir keeps the key it was handed (`link/keys/`, for
+/// its dedupe) and each session's topic names (`link/topics/`, which it subscribes by), each file
+/// 0600; the Messages store (0600) and stderr keep the config warning the person is shown, which
+/// names the font they wrote; the restore store (0600) keeps the title, the person's own
+/// attention and the standing hold's reason (B23's ruled reading of A11), and never the
+/// supervisor's attention; the broker's log is the bus's own store, so it holds the bus's
+/// records: the presence row's attention (the supervisor's while it stands, the person's), and
+/// the mail's own record, its body and hop (never the post's key, which stays on the node); the
+/// test's own inputs hold what it wrote. Each is recorded with its reason in DESIGN-session-log
+/// §10 (Phase 6, the end to end).
+fn kept_on_disk(rel: &Path) -> Vec<u8> {
+    if rel.starts_with("astate/logs/session-log") {
+        vec![8, 9]
+    } else if restore_store(rel) {
+        vec![2, 5, 10]
+    } else if rel.starts_with("link/keys") {
+        vec![8]
+    } else if rel.starts_with("link/topics") {
+        vec![4]
+    } else if [
+        "astate/logs/messages.log",
+        "gui.log",
+        "cfg/aterm/aterm.toml",
+    ]
+    .iter()
+    .any(|p| rel == Path::new(p))
+    {
+        vec![7]
+    } else if rel == Path::new("marked.sh") {
+        vec![1]
+    } else if rel == Path::new("wrapped.sh") {
+        vec![11]
+    } else if rel == Path::new("title.sh") {
+        vec![2]
+    } else if rel == Path::new("b.log") {
+        vec![3, 6, 9, 10]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `subscribe @<sid> log since-log=<seq> log-ep=<ep>` on a connection of its own: what it pushes
+/// from `from` until a `LOG` frame reaches `upto`, each read within the hang detector.
+fn log_frames(inst: &Inst, sid: &str, from: &(String, String), upto: u64) -> String {
+    use std::io::{BufRead as _, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(&inst.sock).expect("connect");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("a read bound");
+    write!(
+        stream,
+        "AUTH {}\nsubscribe @{sid} log since-log={} log-ep={}\n",
+        inst.token, from.0, from.1
+    )
+    .expect("subscribe");
+    let mut reader = std::io::BufReader::new(stream);
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .unwrap_or_else(|e| panic!("subscribe @{sid} log: {e}; so far:\n{out}"));
+        assert!(n > 0, "subscribe @{sid} log closed; so far:\n{out}");
+        let seq = line
+            .strip_prefix("LOG ")
+            .and_then(|r| r.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u64>().ok());
+        out.push_str(&line);
+        if seq.is_some_and(|s| s >= upto) {
+            return out;
+        }
+    }
+}
+
+/// `line` on a connection of its own, on a thread: an `await` sent before what wakes it.
+fn parked(inst: &Inst, line: String) -> std::thread::JoinHandle<String> {
+    let (sock, token) = (inst.sock.clone(), inst.token.clone());
+    std::thread::spawn(move || {
+        let r = connect(&sock, &token)
+            .expect("connect to aterm")
+            .request(&line)
+            .unwrap_or_else(|e| panic!("{line}: {e}"));
+        format!("{}\n{}", r.header(), r.rows().join("\n"))
+    })
+}
+
+/// A headless instance's clean quit by its terminating signal, by PID: a standing hold refuses
+/// `invoke Quit` (a window verb) across the instance.
+fn quit_by_signal(inst: &mut Inst) {
+    harness::kill(inst.pid() as i32, 15);
+    let gui = inst.gui.as_mut().expect("a running instance");
+    let ended = aterm_spec::wait::within(DEADLINE, Duration::from_millis(25), || {
+        gui.try_wait().ok().flatten()
+    });
+    assert!(ended.is_some(), "{} quits on SIGTERM", inst.name);
+    inst.gui = None;
+    inst.lifeline.take();
+    harness::end_bridge(&inst.root.join("link"), inst.launcher);
+}
+
+/// **LEG 7 (U22, U23(d), U36, 6F-7, PRIV-4, PLAN2-3): THE PRIVACY SWEEP.** A sentinel is planted
+/// in each kind of caller and program text the log meets: a command's later word, a wrapper's
+/// flag value (`env -C <dir>`), a title, the supervisor's attention and the person's own, a topic
+/// name, a hold reason (the hold left standing across the quit), a mail body, a config value, a
+/// post's `key=` and a `via=` hop. Once the mirror has carried past them, every reader's view (at
+/// each tier, `survey` and `survey --brief`, an `await log` each plant woke, `subscribe log`'s
+/// frames), every bus body, the crash journal while A runs (a clean quit retires it), the
+/// `session.toml` the quit leaves at rest, and after the relaunch every file of both instances
+/// and the broker hold a sentinel only where the design keeps one.
 #[test]
 fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     let owner = Owner::boot();
@@ -1971,13 +2090,22 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     b.wait_ready(&owner);
     let x = sids(&a)[0].clone();
     let y = sids(&b)[0].clone();
+    let start = cursor(&a, &x);
 
-    // The plants.
-    let script = marked_command(&a.root, "QZP6SECRET1");
-    type_line(&a, &x, &format!("sh {}", script.display()));
-    until_on(&a, &x, DEADLINE, "the command's run", || {
-        a.text(&format!("@{x} log")).contains(" cmd ").then_some(())
-    });
+    // The plants: a command's later word (1); a wrapper's flag value (11), which a program-name
+    // reader without the wrapper's grammar keeps as the program (PRIV-1); a title (2).
+    for (name, line, detail) in [
+        ("marked.sh", "echo QZP6SECRET1 42", "detail=echo"),
+        ("wrapped.sh", "env -C /tmp/QZP6SECRET11 make", "detail=make"),
+    ] {
+        let script = marked_command(&a.root, name, line);
+        type_line(&a, &x, &format!("sh {}", script.display()));
+        until_on(&a, &x, DEADLINE, &format!("the run of {name}"), || {
+            a.text(&format!("@{x} log tier=host"))
+                .contains(detail)
+                .then_some(())
+        });
+    }
     let title = a.root.join("title.sh");
     std::fs::write(&title, "printf '\\033]0;QZP6SECRET2\\007'\n").expect("the title script");
     type_line(&a, &x, &format!("sh {}", title.display()));
@@ -1996,12 +2124,20 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
             .any(|(_, s, b)| *s == y_row && String::from_utf8_lossy(b).contains("state=live"))
             .then_some(())
     });
+    // The supervisor's attention (3) is screen text no file keeps; the person's own (10) is
+    // restored metadata (b9a0903e34 had moved the plant to the supervisor's alone).
+    let at = cursor(&a, &x);
+    let mail_await = parked(
+        &a,
+        format!(
+            "@{x} await log kind=mail since={} ep={} timeout=60000",
+            at.0, at.1
+        ),
+    );
     for line in [
-        // Supervisor screen text is ephemeral; bare user attention is restored metadata.
         format!("@{x} meta set attention owner=supervisor QZP6SECRET3"),
+        format!("@{x} meta set attention QZP6SECRET10"),
         format!("@{x} topic add qzp6secret4"),
-        format!("hold {x} on reason=QZP6SECRET5"),
-        format!("hold {x} off"),
         format!(
             "@{x} post to=@{y}@{NODE_B} kind=note key=QZP6SECRET8 via=h-qzp6secret9 QZP6SECRET6"
         ),
@@ -2014,6 +2150,17 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
             .contains(" mail dir=in ")
             .then_some(())
     });
+    // The hold (5) stands from here across the quit.
+    let at = cursor(&a, &x);
+    let hold_await = parked(
+        &a,
+        format!(
+            "@{x} await log kind=hold since={} ep={} timeout=60000",
+            at.0, at.1
+        ),
+    );
+    let r = a.verb(&format!("hold {x} on reason=QZP6SECRET5"));
+    assert!(r.ok(), "hold: {}", r.header());
     // The mirror has carried every record before a review mark (bus class) once B's view of X
     // reaches the mark.
     paced_mark(&a, &x, "need word=review");
@@ -2033,7 +2180,7 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     for (args, allowed) in [
         ("log n=400", &[8, 9][..]),
         ("log tier=host n=400", &[8, 9][..]),
-        ("log tier=content n=400", &[2, 3, 4, 5, 8, 9][..]),
+        ("log tier=content n=400", &[2, 3, 4, 5, 8, 9, 10][..]),
         ("brief", &[][..]),
     ] {
         let line = format!("@{x} {args}");
@@ -2046,8 +2193,45 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     let (_, text, _) = cli(&b, &["fabric", "brief"]);
     sweep.read("B fabric brief", text.as_bytes(), &[]);
     sweep.read("B controls overview", overview(&b).as_bytes(), &[]);
+    // The survey Summarize's worker reads, both forms, on each instance. `survey` reads at its
+    // local default, `content`, whose excerpts quote the title and the person's attention
+    // (`help survey`: `title=`, `attention=`) from RAM, as `log tier=content` does; `--brief`
+    // quotes the node log and the briefs.
+    for (name, inst) in [("A", &a), ("B", &b)] {
+        for (args, allowed) in [
+            (&["ctl", "survey"][..], &[2, 10][..]),
+            (&["ctl", "survey", "--brief"][..], &[][..]),
+        ] {
+            let (code, out, err) = cli(inst, args);
+            assert_eq!(code, 0, "{name} {args:?}: {out}\n{err}");
+            sweep.read(
+                &format!("{name} {}", args.join(" ")),
+                out.as_bytes(),
+                allowed,
+            );
+        }
+    }
+    // An `await log` each plant woke, and `subscribe log`'s frames over every plant: the Host
+    // tier, whose positive control is the post's key and hop.
+    let host_keys = |what: &str, text: &str| {
+        let held = sentinels(text.as_bytes());
+        assert!(
+            held.contains(&8) && held.contains(&9),
+            "CONTROL: {what} serves the post's key and hop: {text}"
+        );
+    };
+    let woke = mail_await.join().expect("the mail's await");
+    assert!(woke.starts_with("OK seq="), "await log kind=mail: {woke}");
+    host_keys("await log kind=mail", &woke);
+    sweep.read("A await log kind=mail", woke.as_bytes(), &[8, 9]);
+    let woke = hold_await.join().expect("the hold's await");
+    assert!(woke.starts_with("OK seq="), "await log kind=hold: {woke}");
+    sweep.read("A await log kind=hold", woke.as_bytes(), &[]);
+    let frames = log_frames(&a, &x, &start, barrier);
+    host_keys("subscribe log", &frames);
+    sweep.read("A subscribe log", frames.as_bytes(), &[8, 9]);
     // Every bus body: the attention text is the presence row's (`meta set attention`, DESIGN
-    // §8 presence), the mail's own record its body, key and hop.
+    // §8 presence), the mail's own record its body and hop; the post's key stays on the node.
     let mut c = owner.root_client();
     let mut from = 0u64;
     loop {
@@ -2056,9 +2240,9 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
             .expect("the bus");
         for (_, subject, body) in rows {
             let allowed: &[u8] = if subject.ends_with("/presence") {
-                &[3]
+                &[3, 10]
             } else if subject.starts_with(&format!("/f/{FLEET}/in/")) {
-                &[6, 8, 9]
+                &[6, 9]
             } else {
                 &[]
             };
@@ -2071,15 +2255,78 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     }
     drop(c);
 
-    // A quits and comes back on its roots: its journals and logs. A quit writes no carry: the
-    // carry is a seamless update's, a 0600 manifest its successor consumes, and a headless
-    // instance has no seamless lane, so no carry is read here (the record says COULD NOT RUN).
-    quit(&mut a);
+    // The crash journal is the restore store a crash leaves, and a clean quit retires it, so it
+    // is read while A runs: once a write holds the title, the person's attention and the
+    // standing hold (its positive control, which needs at least one journal file), each of its
+    // files 0600 and held to the restore store's list.
+    let state = a.root.join("astate");
+    let running = until(
+        "A's crash journal to hold the title, the person's attention and the hold",
+        || {
+            let files: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&state)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    let rel = Path::new("astate").join(e.file_name());
+                    restore_store(&rel) && !rel.ends_with("session.toml")
+                })
+                .filter_map(|e| Some((e.path(), std::fs::read(e.path()).ok()?)))
+                .collect();
+            let held: Vec<u8> = files.iter().flat_map(|(_, b)| sentinels(b)).collect();
+            [2, 5, 10].iter().all(|n| held.contains(n)).then_some(files)
+        },
+    );
+    for (path, bytes) in &running {
+        assert_eq!(mode_of(path), 0o600, "{}", path.display());
+        let rel = path.strip_prefix(&a.root).expect("under A's root");
+        sweep.read(
+            &format!("A running/{}", rel.display()),
+            bytes,
+            &kept_on_disk(rel),
+        );
+    }
+
+    // A quits with the hold standing; what it leaves at rest, before any launch takes the restore
+    // store aside: `session.toml` holds the title, the person's attention and the hold (its
+    // positive control), 0600. A quit writes no carry: the carry is a seamless update's, which
+    // `lab seamless`'s privacy leg reads (unit B23).
+    quit_by_signal(&mut a);
+    let mut store = Vec::new();
+    for e in std::fs::read_dir(&state).expect("the state root").flatten() {
+        let rel = Path::new("astate").join(e.file_name());
+        if restore_store(&rel) {
+            store.push(e.path());
+        }
+    }
+    assert!(
+        store.iter().any(|p| p.ends_with("session.toml")),
+        "the quit left no session.toml: {store:?}"
+    );
+    let mut held = Vec::new();
+    for path in &store {
+        assert_eq!(mode_of(path), 0o600, "{}", path.display());
+        held.extend(sentinels(&std::fs::read(path).expect("the restore store")));
+    }
+    for n in [2, 5, 10] {
+        assert!(
+            held.contains(&n),
+            "CONTROL: the restore store at rest {store:?} holds {n}: {held:?}"
+        );
+    }
+    // The folder is the state root, which this harness makes (macOS's default deployment hardens
+    // it to 0700 as the per-user control socket directory, `aterm_uds::control_socket_dir`; a
+    // private `--control-sock` leaves it as made): no one else may write it, and the instance
+    // root above it is 0700.
+    assert_eq!(mode_of(&state) & 0o022, 0, "{}", state.display());
+    assert_eq!(mode_of(&a.root), 0o700, "{}", a.root.display());
+    sweep.files("A at rest", &a.root, &kept_on_disk);
+
+    // A comes back on its roots. The launch takes `session.toml` aside
+    // (`.session.toml.aterm-taken-<run>`) and settles the take once it restored the windows; the
+    // sweep reads the roots it settled.
     a.launch();
     a.wait_ready(&owner);
-    // The launch takes `session.toml` aside (`.session.toml.aterm-taken-<run>`) and settles the
-    // take once it restored the windows; the sweep reads the roots it settled.
-    let state = a.root.join("astate");
     let settled = aterm_spec::wait::within(DEADLINE, Duration::from_millis(25), || {
         launch_takes(&state).is_empty().then_some(())
     });
@@ -2095,12 +2342,6 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
         x_then.as_bytes(),
         &[8, 9],
     );
-    // The journals (0600) keep the post's key and hop as `idem=` and `via=` (H); the bridge's
-    // state dir keeps the key it was handed (`link/keys/`, for its dedupe) and each session's
-    // topic names (`link/topics/`, which it subscribes by), each file 0600; the Messages store
-    // (0600) and stderr keep the config warning the person is shown, which names the font they
-    // wrote; the test's own inputs hold what it wrote. Each of these outside the session log is
-    // recorded with its reason in DESIGN-session-log §10 (Phase 6, the end to end).
     for dir in ["link/keys", "link/topics"] {
         let files: Vec<PathBuf> = std::fs::read_dir(a.root.join(dir))
             .into_iter()
@@ -2113,47 +2354,23 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
             assert_eq!(mode_of(&path), 0o600, "{}", path.display());
         }
     }
-    let journal = |rel: &Path| -> Vec<u8> {
-        if rel.starts_with("astate/logs/session-log") {
-            vec![8, 9]
-        } else if rel.starts_with("link/keys") {
-            vec![8]
-        } else if rel.starts_with("link/topics") {
-            vec![4]
-        } else if [
-            "astate/logs/messages.log",
-            "gui.log",
-            "cfg/aterm/aterm.toml",
-        ]
-        .iter()
-        .any(|p| rel == Path::new(p))
-        {
-            vec![7]
-        } else if rel == Path::new("marked.sh") {
-            vec![1]
-        } else if rel == Path::new("title.sh") {
-            vec![2]
-        } else {
-            Vec::new()
-        }
-    };
-    sweep.files("A", &a.root, &journal);
-    sweep.files("B", &b.root, &journal);
+    sweep.files("A", &a.root, &kept_on_disk);
+    sweep.files("B", &b.root, &kept_on_disk);
     sweep.files("broker", &owner.tmp.join("broker"), &|rel| {
         if rel == Path::new("b.log") {
-            vec![3, 6, 8, 9]
+            kept_on_disk(rel)
         } else {
             Vec::new()
         }
     });
     eprintln!("found:\n{}", sweep.found.join("\n"));
     let journals = journals(&a);
-    assert!(
-        journals
-            .iter()
-            .any(|(_, bytes)| holds(bytes, "detail=echo")),
-        "the command's first word is kept"
-    );
+    for detail in ["detail=echo", "detail=make"] {
+        assert!(
+            journals.iter().any(|(_, bytes)| holds(bytes, detail)),
+            "the command's program is kept: {detail}"
+        );
+    }
     assert!(
         sweep.leaks.is_empty(),
         "sentinels where the design keeps none:\n{}",

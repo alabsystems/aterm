@@ -38,6 +38,44 @@ if ($verb -eq 'launch') {
   Set-Content -Path "$d\exit" -Value $p.ExitCode
   exit 0
 }
+if ($verb -eq 'dragsource') {
+  # A window whose label starts an OLE drag of one file (CF_HDROP) when the left button goes down
+  # on it; where it is, and the drag's effect, go to the log. It is not DPI aware: the drop row
+  # runs at 100 % scaling, where its coordinates are physical pixels.
+  $file = $args[1]; $x = [int]$args[2]; $y = [int]$args[3]; $log = $args[4]
+  Set-Content -Path $file -Value 'lane drop'
+  Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+  $form = New-Object Windows.Forms.Form
+  $form.Text = 'lane-drag'; $form.StartPosition = 'Manual'; $form.TopMost = $true
+  $form.Location = New-Object Drawing.Point($x, $y); $form.Size = New-Object Drawing.Size(260, 160)
+  $label = New-Object Windows.Forms.Label
+  $label.Dock = 'Fill'; $label.Text = 'drag'; $label.TextAlign = 'MiddleCenter'
+  $form.Controls.Add($label)
+  # What the window under the cursor answered OLE's DragOver, and where the cursor was, one line
+  # each time either changes: the drop row releases the button only once aterm's window has
+  # answered Copy under it. A write the log refuses is tried again at the next answer.
+  $script:over = ''
+  $label.Add_GiveFeedback({
+    param($s, $e)
+    $p = [Windows.Forms.Cursor]::Position
+    $line = "over effect={0} at={1},{2}" -f $e.Effect, $p.X, $p.Y
+    if ($line -ne $script:over) {
+      try { Add-Content -Path $log -Value $line; $script:over = $line } catch { }
+    }
+  })
+  $label.Add_MouseDown({
+    $data = New-Object Windows.Forms.DataObject([Windows.Forms.DataFormats]::FileDrop, [string[]]@($file))
+    $effect = $label.DoDragDrop($data, [Windows.Forms.DragDropEffects]::Copy)
+    Add-Content -Path $log -Value "dropped effect=$effect"
+    $form.Close()
+  })
+  $form.Add_Shown({
+    $p = $label.PointToScreen([Drawing.Point]::Empty)
+    Add-Content -Path $log -Value ("source at={0},{1},{2},{3}" -f $p.X, $p.Y, ($p.X + $label.Width), ($p.Y + $label.Height))
+  })
+  [Windows.Forms.Application]::Run($form)
+  exit 0
+}
 $src = @'
 using System;
 using System.Runtime.InteropServices;
@@ -74,6 +112,8 @@ public static class LaneDesk {
   [DllImport("user32.dll")] static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint ms, out IntPtr result);
   [StructLayout(LayoutKind.Sequential)] public struct GUITHREADINFO { public int cbSize; public uint flags; public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret; public RECT rcCaret; }
   [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO g);
+  [DllImport("user32.dll")] static extern IntPtr GetWindowLongPtrW(IntPtr h, int i);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
   [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
   [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonProc f, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MONITORINFOEX mi);
@@ -124,10 +164,15 @@ public static class LaneDesk {
       var cls = new StringBuilder(256); GetClassNameW(h, cls, 256);
       int open = Ime(h, 5);
       long layout = GetKeyboardLayout(tid).ToInt64() & 0xFFFF;
-      sb.AppendFormat("window class={0} rect={1},{2},{3},{4} client={5}x{6} dpi={7} foreground={8} awareness={9} layout={10:x4} ime={11} machine={12} conv={13}\n",
+      // GUI_INMOVESIZE: the window's thread is in Windows' modal move or size loop for this window.
+      var gi = new GUITHREADINFO(); gi.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+      bool sizing = GetGUIThreadInfo(tid, ref gi) && (gi.flags & 0x2) != 0 && gi.hwndMoveSize == h;
+      // GWL_STYLE, GWL_EXSTYLE; DWMWA_SYSTEMBACKDROP_TYPE (38) and DWMWA_USE_IMMERSIVE_DARK_MODE (20), `-` unanswered.
+      long style = GetWindowLongPtrW(h, -16).ToInt64() & 0xFFFFFFFF, exstyle = GetWindowLongPtrW(h, -20).ToInt64() & 0xFFFFFFFF;
+      sb.AppendFormat("window class={0} rect={1},{2},{3},{4} client={5}x{6} dpi={7} foreground={8} awareness={9} layout={10:x4} ime={11} machine={12} conv={13} movesize={14} style={15:x8} exstyle={16:x8} backdrop={17} dark={18}\n",
         cls.ToString().Replace(' ', '_'), r.L, r.T, r.R, r.B, c.R, c.B, GetDpiForWindow(h), h == fg ? 1 : 0,
         GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(h)), layout, open < 0 ? -1 : open == 0 ? 0 : 1, machine,
-        Hex(Ime(h, 1)));
+        Hex(Ime(h, 1)), sizing ? 1 : 0, style, exstyle, Dwm(h, 38), Dwm(h, 20));
       return true; }, IntPtr.Zero);
     return sb.ToString();
   }
@@ -140,6 +185,8 @@ public static class LaneDesk {
   }
 
   static string Hex(int v) { return v < 0 ? "-" : v.ToString("x"); }
+
+  static string Dwm(IntPtr h, int attr) { int v; return DwmGetWindowAttribute(h, attr, out v, 4) == 0 ? v.ToString() : "-"; }
 
   // The client area of `pid`'s window of class `cls` as its DC holds it: copied
   // into a bitmap (BitBlt, SRCCOPY), read by GetDIBits as 32-bit top-down BI_RGB,
@@ -444,6 +491,15 @@ pub struct Window {
     pub machine: String,
     /// Its IME's conversion mode (`IME_CMODE_*`); `None` when the IME window did not answer.
     pub conversion: Option<u32>,
+    /// Whether its thread is in Windows' modal move or size loop for it (`GUI_INMOVESIZE`).
+    pub move_size: bool,
+    /// Its `GWL_STYLE` and `GWL_EXSTYLE` words.
+    pub style: u32,
+    pub exstyle: u32,
+    /// What DWM answers for its `DWMWA_SYSTEMBACKDROP_TYPE` and `DWMWA_USE_IMMERSIVE_DARK_MODE`;
+    /// `None` when DWM did not answer.
+    pub backdrop: Option<i32>,
+    pub dark: Option<i32>,
 }
 
 /// The `window` lines of `desk.ps1 windows` (any other line is skipped).
@@ -471,6 +527,11 @@ pub fn parse_windows(text: &str) -> Vec<Window> {
                     "-" => None,
                     hex => Some(u32::from_str_radix(hex, 16).ok()?),
                 },
+                move_size: word(l, "movesize")? == "1",
+                style: u32::from_str_radix(word(l, "style")?, 16).ok()?,
+                exstyle: u32::from_str_radix(word(l, "exstyle")?, 16).ok()?,
+                backdrop: word(l, "backdrop")?.parse().ok(),
+                dark: word(l, "dark")?.parse().ok(),
             })
         })
         .collect()
@@ -502,6 +563,28 @@ impl Place {
             b: (self.screen.b - self.at.1).min(h),
         };
         (r.l < r.r && r.t < r.b).then_some(r)
+    }
+
+    /// The parts of the client area on `monitors` (their rectangles on the virtual screen), in
+    /// client coordinates, one for each monitor the client area reaches, in `monitors`' order.
+    /// Monitors of different sizes leave parts of the virtual screen on none of them (below the
+    /// 800x600 second monitor, beside the 1920x1200 primary), and a client area there is on the
+    /// virtual screen but not on these.
+    #[must_use]
+    pub fn on_monitors(&self, monitors: &[Rect]) -> Vec<Rect> {
+        let (Ok(w), Ok(h)) = (i32::try_from(self.client.0), i32::try_from(self.client.1)) else {
+            return Vec::new();
+        };
+        monitors
+            .iter()
+            .map(|m| Rect {
+                l: (m.l - self.at.0).max(0),
+                t: (m.t - self.at.1).max(0),
+                r: (m.r - self.at.0).min(w),
+                b: (m.b - self.at.1).min(h),
+            })
+            .filter(|r| r.l < r.r && r.t < r.b)
+            .collect()
     }
 }
 
@@ -685,9 +768,10 @@ mod tests {
 
     #[test]
     fn the_helpers_windows_and_monitors_are_read_back() {
-        let out = "window class=aterm rect=208,82,1346,1134 client=1116x996 dpi=144 foreground=1 awareness=2 layout=0411 ime=1 machine=8664 conv=19\r\n\
-                   window class=Winit_Thread_Event_Target rect=0,0,16,16 client=0x0 dpi=96 foreground=0 awareness=2 layout=0409 ime=-1 machine=- conv=-\r\n\
-                   window class=broken rect=1,2,3 client=1x1 dpi=96 foreground=0 awareness=2 layout=0409 ime=0 machine=aa64 conv=0\r\n";
+        let out = "window class=aterm rect=208,82,1346,1134 client=1116x996 dpi=144 foreground=1 awareness=2 layout=0411 ime=1 machine=8664 conv=19 movesize=1 style=16cf0000 exstyle=00200100 backdrop=0 dark=1\r\n\
+                   window class=Winit_Thread_Event_Target rect=0,0,16,16 client=0x0 dpi=96 foreground=0 awareness=2 layout=0409 ime=-1 machine=- conv=- movesize=0 style=94000000 exstyle=00000080 backdrop=- dark=-\r\n\
+                   window class=broken rect=1,2,3 client=1x1 dpi=96 foreground=0 awareness=2 layout=0409 ime=0 machine=aa64 conv=0 movesize=0 style=0 exstyle=0 backdrop=0 dark=0\r\n\
+                   window class=aterm rect=0,0,9,9 client=9x9 dpi=96 foreground=0 awareness=2 layout=0407 ime=0 machine=aa64 conv=0 movesize=0\r\n";
         let w = parse_windows(out);
         assert_eq!(w.len(), 2, "{w:?}");
         assert_eq!(w[0].class, ATERM_CLASS);
@@ -713,6 +797,12 @@ mod tests {
             (w[0].machine.as_str(), w[1].machine.as_str()),
             ("8664", "-")
         );
+        assert_eq!((w[0].move_size, w[1].move_size), (true, false));
+        assert_eq!(
+            (w[0].style, w[0].exstyle, w[0].backdrop, w[0].dark),
+            (0x16cf_0000, 0x0020_0100, Some(0), Some(1))
+        );
+        assert_eq!((w[1].backdrop, w[1].dark), (None, None));
         assert_eq!(w[0].rect.centre(), (777, 608));
         assert!(w[0].rect.holds((208, 82)) && !w[0].rect.holds((1346, 500)));
 
@@ -770,6 +860,50 @@ mod tests {
             None
         );
         assert_eq!(parse_place("readback client=1116x996\r\n"), None);
+
+        // The lane's monitors, and a 150 % client area back on the primary but reaching past its
+        // right edge: on the virtual screen whole, on the monitors but for the part below the
+        // second one.
+        let monitors: Vec<Rect> = m.iter().map(|m| m.rect).collect();
+        let across = parse_place("readback client=1080x903 at=1204,45 screen=0,0,2720,1200")
+            .expect("a place");
+        assert_eq!(
+            across.on_screen(),
+            Some(Rect {
+                l: 0,
+                t: 0,
+                r: 1080,
+                b: 903
+            })
+        );
+        assert_eq!(
+            across.on_monitors(&monitors),
+            vec![
+                Rect {
+                    l: 0,
+                    t: 0,
+                    r: 716,
+                    b: 903
+                },
+                Rect {
+                    l: 716,
+                    t: 0,
+                    r: 1080,
+                    b: 555
+                }
+            ]
+        );
+        assert_eq!(
+            cut.on_monitors(&monitors),
+            vec![cut.on_screen().expect("a part")]
+        );
+        assert_eq!(
+            parse_place("place client=100x50 at=2000,700 screen=0,0,2720,1200")
+                .expect("a place")
+                .on_monitors(&monitors),
+            Vec::new(),
+            "below the second monitor, beside the primary"
+        );
     }
 
     #[test]
@@ -834,6 +968,12 @@ mod tests {
             "'lift'",
         ] {
             assert!(HELPER.contains(&format!("  {verb} {{")), "{verb}");
+        }
+        for verb in ["'launch'", "'dragsource'"] {
+            assert!(
+                HELPER.contains(&format!("if ($verb -eq {verb}) {{")),
+                "{verb}"
+            );
         }
     }
 }

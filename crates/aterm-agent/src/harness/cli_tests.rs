@@ -6937,6 +6937,9 @@ fn an_unkeyed_records_row_carries_the_key_stats_names() {
 #[path = "cli_renew_tests.rs"]
 mod renew;
 
+#[path = "cli_shared_renewal_tests.rs"]
+mod shared_renewal_tests;
+
 /// THE RESERVE BREAKS THE FULL-DISK DEADLOCK: at an emergency it is unlinked
 /// FIRST and the `released` row journalled after it (the room it made is
 /// what that row is written into); well above the target it is written and

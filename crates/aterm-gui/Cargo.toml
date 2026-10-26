@@ -471,16 +471,17 @@ aterm-wayland = { workspace = true }
 # libnotify, no `notify-send` subprocess.
 aterm-dbus = { workspace = true }
 
-[target.'cfg(not(any(target_os = "macos", target_os = "linux")))'.dependencies]
-# aterm-window's raw-window-handle traits, for the presenters that take a window
-# through them here: the GPU window surface (`aterm_gpu::WindowTarget`), the GDI CPU
-# presenter's HWND (`present/win32.rs`) and the other Win32 HWND reads. `rwh_06` is not an aterm-window default: on
-# macOS the Metal presenter and the AppKit chrome take the content view through
-# first-party `aterm_objc::HasNsView`, and on Linux the GL arm and the X11 and
-# Wayland CPU presenters take the window's handles through first-party
-# `aterm_types::native_window::HasNativeWindow`, so raw-window-handle is out of
-# both graphs (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6; mac-arm
-# and linux each -1 package, -1,984 lines).
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))'.dependencies]
+# aterm-window's raw-window-handle traits, for the GPU window surface
+# (`aterm_gpu::WindowTarget`) on the BSDs, which present on wgpu and have no cell.
+# `rwh_06` is not an aterm-window default: on macOS the Metal presenter and the
+# AppKit chrome take the content view through first-party `aterm_objc::HasNsView`;
+# on Linux the GL arm and the X11 and Wayland CPU presenters, and on Windows the
+# D3D11 arm, the GDI CPU presenter (`present/win32.rs`) and the other Win32 HWND
+# reads, take the window's handles through first-party
+# `aterm_types::native_window::HasNativeWindow`. So raw-window-handle is out of
+# every cell's graph (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6;
+# mac-arm, linux and win each -1 package, -1,984 lines).
 aterm-window = { workspace = true, features = ["rwh_06"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]

@@ -172,12 +172,27 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
-/// Writes `bytes` to `path` at `mode` only if `path` does not exist.
-///
-/// The directory's flush after the link is best-effort and never reported, unlike
-/// [`write_atomic`]'s: once the link has made `path`, an error would tell the caller nothing
-/// was placed while its next try answers "taken", a claim no caller owns.
-pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
+/// [`write_atomic`] for one of many files a pass writes: the temporary file's bytes ordered
+/// before its rename ([`aterm_durable::ordered`]) and no flush of the directory, which the
+/// pass flushes once for all its files, so `path` holds `bytes` or what it held, never a part.
+pub fn write_ordered(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
+    let (tmp, mut file) = temp_beside(path, mode)?;
+    let placed = file
+        .write_all(bytes)
+        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| aterm_durable::ordered(&file))
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&tmp, path)
+        });
+    placed.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::new(format!("{}: {e}", path.display()))
+    })
+}
+
+/// A new temporary file beside `path`, in a directory that is there.
+fn temp_beside(path: &Path, mode: u32) -> crate::Result<(std::path::PathBuf, File)> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
     {
@@ -186,12 +201,45 @@ pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
             parent.display()
         )));
     }
-    let (tmp, mut file) = aterm_uds::atomic_file::create_temp_beside(path, mode)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    aterm_uds::atomic_file::create_temp_beside(path, mode)
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
+/// Writes `bytes` to `path` at `mode` only if `path` does not exist.
+///
+/// The directory's flush after the link is best-effort and never reported, unlike
+/// [`write_atomic`]'s: once the link has made `path`, an error would tell the caller nothing
+/// was placed while its next try answers "taken", a claim no caller owns.
+pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
+    let placed = write_new_flushed(path, bytes, mode, sync)?;
+    if placed {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let _never_reported = aterm_durable::Flush::Durable.dir_best_effort(dir);
+    }
+    Ok(placed)
+}
+
+/// [`write_new`] for one of many files a pass writes, as [`write_ordered`]: the bytes ordered
+/// before the link, and no flush of the directory.
+pub fn write_new_ordered(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
+    write_new_flushed(path, bytes, mode, aterm_durable::ordered)
+}
+
+/// [`write_new`]'s link, the temporary file's bytes finished by `flush` before it.
+fn write_new_flushed(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    flush: fn(&File) -> io::Result<()>,
+) -> crate::Result<bool> {
+    let (tmp, mut file) = temp_beside(path, mode)?;
     let written = file
         .write_all(bytes)
         .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
-        .and_then(|()| sync(&file));
+        .and_then(|()| flush(&file));
     drop(file);
     let placed = match written {
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
@@ -204,12 +252,6 @@ pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
     };
     if !matches!(placed, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
-    } else {
-        let dir = match path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir,
-            _ => Path::new("."),
-        };
-        let _never_reported = aterm_durable::Flush::Durable.dir_best_effort(dir);
     }
     placed
 }

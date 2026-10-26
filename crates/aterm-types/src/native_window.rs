@@ -1,17 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Window X11 or Wayland handles ([`HasNativeWindow`]).
+//! A window's X11, Wayland or Win32 handles ([`HasNativeWindow`]).
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Borrowed X11 or Wayland window handles.
+/// Borrowed X11 or Wayland window handles; on Windows, a Win32 window's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeWindow {
     /// X11 window on an Xlib connection.
+    #[cfg(not(windows))]
     Xlib {
         /// Connection `Display *`.
         display: NonNull<c_void>,
@@ -23,19 +24,28 @@ pub enum NativeWindow {
         visual: u32,
     },
     /// Wayland window.
+    #[cfg(not(windows))]
     Wayland {
         /// Connection `wl_display *`.
         display: NonNull<c_void>,
         /// Window `wl_surface *`.
         surface: NonNull<c_void>,
     },
+    /// Win32 window.
+    #[cfg(windows)]
+    Win32 {
+        /// The window's `HWND`.
+        hwnd: NonNull<c_void>,
+        /// The `HINSTANCE` of the module whose class the window has, or `None` when unknown.
+        hinstance: Option<NonNull<c_void>>,
+    },
 }
 
-/// A value that owns or borrows an X11 or Wayland window.
+/// A value that owns or borrows an X11, Wayland or Win32 window.
 /// # Safety
 /// [`native_window`](Self::native_window) answers `None` or handles that stay live for as long as
-/// `self` does: the display connection stays open, and the X11 window or `wl_surface` is not
-/// destroyed. A caller that keeps a handle past `self` keeps `self` alive with it.
+/// `self` does: the display connection stays open, and the X11 window, `wl_surface` or `HWND` is
+/// not destroyed. A caller that keeps a handle past `self` keeps `self` alive with it.
 pub unsafe trait HasNativeWindow {
     /// The window's handles, or `None` when unavailable.
     fn native_window(&self) -> Option<NativeWindow>;

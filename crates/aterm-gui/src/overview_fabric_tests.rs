@@ -121,6 +121,124 @@ fn the_read_keeps_each_remote_need_and_drops_this_nodes() {
     assert_eq!(parse(r#"{"v":2}"#, READ_AT), Err(ReadFail::NoBrief));
 }
 
+/// [`CAPTURED`] with `s-fail`'s need and detail respelled (`detail` a JSON
+/// string body, escapes and all, or `null`).
+fn captured_with_fail_need(need: &str, detail: &str) -> String {
+    let respelled = CAPTURED.replace(
+        r#""sid":"s-fail","this":false,"ep":1,"need":"failure","detail":null"#,
+        &format!(r#""sid":"s-fail","this":false,"ep":1,"need":"{need}","detail":{detail}"#),
+    );
+    assert_ne!(respelled, CAPTURED);
+    respelled
+}
+
+/// A WALL'S RESET READS AS THE BRIEF SAYS IT (PLAN1-1): the brief's `detail`
+/// keeps its spaces from parse to the chip's words, so a usage wall's chip says
+/// when the session carries on (`limit · in 1m`), as its own tab's clause
+/// does. A detail holding a control character, or only blanks, is dropped and
+/// the chip says the bare `limit`; a long one is clipped as a word is.
+#[test]
+fn a_walls_reset_keeps_its_spaces_from_the_brief_to_the_chip() {
+    let rows = [
+        (r#""in 1m""#, "limit \u{b7} in 1m"),
+        (r#""9am tomorrow""#, "limit \u{b7} 9am tomorrow"),
+        (
+            r#""3pm (America/Los_Angeles)""#,
+            "limit \u{b7} 3pm (America/Los_Angeles)",
+        ),
+        (r#""in  1m""#, "limit \u{b7} in 1m"),
+        (r#""in\u001b[31m 1m""#, "limit"),
+        (r#""in 1m\n""#, "limit"),
+        (r#""   ""#, "limit"),
+        ("null", "limit"),
+    ];
+    let mut failed = Vec::new();
+    for (detail, want) in rows {
+        let body = captured_with_fail_need("wall:usage-weekly", detail);
+        let snap = parse(&body, READ_AT).expect("the brief's object");
+        let words = compose(&snap, READ_AT)
+            .into_iter()
+            .find(|c| c.sid == "s-fail")
+            .map(|c| c.words);
+        if words.as_deref() != Some(want) {
+            failed.push(format!("detail {detail}: {words:?}, want {want:?}"));
+        }
+    }
+    let long = format!("\"in {}\"", "1".repeat(200));
+    let snap = parse(
+        &captured_with_fail_need("wall:usage-weekly", &long),
+        READ_AT,
+    )
+    .expect("the brief's object");
+    let clipped = snap
+        .needs
+        .iter()
+        .find(|n| n.sid == "s-fail")
+        .and_then(|n| n.detail.clone());
+    if !clipped
+        .as_deref()
+        .is_some_and(|d| d.len() <= 64 && d.starts_with("in 1") && d.ends_with('\u{2026}'))
+    {
+        failed.push(format!("a long detail: {clipped:?}"));
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A SESSION THE BRIEF JUDGES GONE IS OLDER AND UNCOUNTED (PLAN1-2): for every
+/// reason the brief gives a session gone without its close
+/// ([`aterm_slog::bus::Gone`], `node-gone` and `no-close`, alone or after a
+/// seed's word), its chip is listed `older=1` and the title's count leaves it
+/// out. A partial fold for a seed's reason alone (`no-start`, `lost`) is still
+/// answerable there, so it stays fresh and counted.
+#[test]
+fn every_reason_the_brief_gives_a_session_gone_lists_it_older_and_uncounted() {
+    let appr = |partial: &str| {
+        let body = CAPTURED.replace(
+            r#""age_s":59,"partial":[]"#,
+            &format!(r#""age_s":59,"partial":{partial}"#),
+        );
+        assert!(partial == "[]" || body != CAPTURED, "{partial}");
+        body
+    };
+    let mut rows: Vec<(String, bool)> = vec![
+        (r#"["no-close"]"#.to_string(), true),
+        (r#"["no-start","no-close"]"#.to_string(), true),
+        (r#"["node-gone"]"#.to_string(), true),
+        (r#"["no-start"]"#.to_string(), false),
+        (r#"["lost"]"#.to_string(), false),
+        ("[]".to_string(), false),
+    ];
+    rows.extend(
+        aterm_slog::bus::Gone::ALL
+            .iter()
+            .map(|g| (format!(r#"["{}"]"#, g.word()), true)),
+    );
+    let mut failed = Vec::new();
+    for (partial, gone) in rows {
+        let snap = parse(&appr(&partial), READ_AT).expect("the brief's object");
+        let chips = compose(&snap, READ_AT + 30_000);
+        let older = chips.iter().find(|c| c.sid == "s-appr").map(|c| c.older);
+        let mut card = OverviewState::new(WindowId(0), Vec::new(), Vec::new());
+        card.set_fabric(group(chips));
+        let counted = if gone { 2 } else { 3 };
+        let title = card.title();
+        let line = card
+            .controls_lines()
+            .into_iter()
+            .find(|l| l.contains(" sid=s-appr "))
+            .unwrap_or_default();
+        if older != Some(gone)
+            || !title.ends_with(&format!(" \u{b7} {counted} need you"))
+            || !line.contains(&format!(" older={} ", u8::from(gone)))
+        {
+            failed.push(format!(
+                "partial {partial}: older {older:?}, {title:?}, {line:?}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 type Want<'a> = Option<(ChipMark, &'a str, Option<u64>, bool)>;
 
 type Row<'a> = (&'a str, Option<&'a str>, Option<u64>, bool, u64, Want<'a>);

@@ -502,6 +502,103 @@ impl BucketRing {
             self.bucket(k - i).and_then(Bucket::value).map(|v| m.min(v))
         })
     }
+
+    /// Compact snapshot of non-empty 10 s buckets and last-minute readings for persistence.
+    #[must_use]
+    pub fn saved(&self) -> SavedRing {
+        let buckets = self
+            .iter()
+            .filter_map(|(k, b)| {
+                (b.n > 0 && b.sum.is_finite() && b.max.is_finite())
+                    .then_some((k, b.sum, b.n, b.max, b.over_n))
+            })
+            .collect();
+        let recent = self
+            .recent
+            .readings()
+            .into_iter()
+            .filter(|r| r.v.is_finite())
+            .map(|r| (r.at_ms, r.v, r.over))
+            .collect();
+        SavedRing { buckets, recent }
+    }
+
+    /// Restore a ring persisted in an earlier run up to `now_unix_ms`, pruning stale or future
+    /// entries outside the 1-hour window.
+    #[must_use]
+    pub fn restored(saved: &SavedRing, now_unix_ms: i64) -> Self {
+        let mut ring = Self::default();
+        if now_unix_ms <= 0 {
+            return ring;
+        }
+        let now_k = now_unix_ms.div_euclid(BUCKET_MS);
+        let min_k = now_k - (RING_BUCKETS as i64 - 1);
+        let mut valid: Vec<SavedBucket> = saved
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&(k, sum, n, max, _)| {
+                n > 0 && sum.is_finite() && max.is_finite() && k >= min_k && k <= now_k
+            })
+            .collect();
+        valid.sort_by_key(|&(k, ..)| k);
+        valid.dedup_by_key(|&mut (k, ..)| k);
+        if let (Some(&(first_k, ..)), Some(&(last_k, ..))) = (valid.first(), valid.last()) {
+            let len = usize::try_from(last_k - first_k + 1)
+                .unwrap_or(0)
+                .min(RING_BUCKETS);
+            ring.first_k = last_k - len as i64 + 1;
+            ring.b.resize(len, Bucket::default());
+            for (k, sum, n, max, over_n) in valid {
+                if let Ok(idx) = usize::try_from(k - ring.first_k)
+                    && let Some(slot) = ring.b.get_mut(idx)
+                {
+                    *slot = Bucket {
+                        sum,
+                        n,
+                        max,
+                        over_n: over_n.min(n),
+                    };
+                }
+            }
+        }
+        let min_recent_ms = now_unix_ms.saturating_sub(RECENT_KEEP_MS);
+        let mut recs: Vec<SavedReading> = saved
+            .recent
+            .iter()
+            .copied()
+            .filter(|&(at_ms, v, _)| v.is_finite() && at_ms > min_recent_ms && at_ms <= now_unix_ms)
+            .collect();
+        recs.sort_by_key(|&(at_ms, ..)| at_ms);
+        for (at_ms, v, over) in recs {
+            ring.recent.push_reading(Reading { at_ms, v, over });
+        }
+        ring
+    }
+}
+
+/// One persisted non-empty 10 s bucket `(k, sum, n, max, over_n)`.
+pub type SavedBucket = (i64, f64, u16, f64, u16);
+
+/// One persisted per-sample reading `(at_ms, value, over)`.
+pub type SavedReading = (i64, f64, bool);
+
+/// Compact persisted state of one [`BucketRing`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SavedRing {
+    /// Non-empty 10 s buckets within the hour, oldest first.
+    pub buckets: Vec<SavedBucket>,
+    /// Per-sample readings within the last minute, oldest first.
+    pub recent: Vec<SavedReading>,
+}
+
+impl SavedRing {
+    /// True when neither buckets nor recent readings are held.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty() && self.recent.is_empty()
+    }
 }
 
 /// Computes [`BucketRing::columns`] over a snapshot's `cells` ending at `last_k`.
@@ -527,6 +624,519 @@ pub fn columns_of(
         .map(|j| {
             let start = last_start - (ncols - 1 - j) as i64 * per_b;
             Cell::merge((start..start + per_b).filter_map(at))
+        })
+        .collect()
+}
+
+/// Reason a wall-clock span on a time-series strip holds no continuous live reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GapKind {
+    /// Sampling paused or stalled past the continuity threshold while awake.
+    Paused,
+    /// System sleep (`mono_ms` paused while the wall clock advanced, or OS sleep/wake window).
+    Sleep,
+    /// Unrecorded span across an abnormal termination or crash before restart.
+    Crash,
+}
+
+/// Half-open wall-clock discontinuity `[start_ms, end_ms)` in Unix milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TimeGap {
+    /// Inclusive start of the discontinuity (Unix ms).
+    pub start_ms: i64,
+    /// Exclusive end of the discontinuity (Unix ms).
+    pub end_ms: i64,
+    /// Kind of discontinuity.
+    pub kind: GapKind,
+}
+
+impl TimeGap {
+    /// Overlap in milliseconds between `[self.start_ms, self.end_ms)` and `[lo_ms, hi_ms)`.
+    #[inline]
+    #[must_use]
+    pub fn overlap_ms(&self, lo_ms: i64, hi_ms: i64) -> i64 {
+        self.end_ms
+            .min(hi_ms)
+            .saturating_sub(self.start_ms.max(lo_ms))
+            .max(0)
+    }
+}
+
+/// One resolution band in a [`MultiScaleSpec`], ordered oldest (left) to newest (right).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScaleBand {
+    /// Number of consecutive boxes in this band.
+    pub slots: u16,
+    /// Wall-clock duration each box in this band covers, in milliseconds.
+    pub period_ms: i64,
+    /// Relative horizontal width weight of each box in this band.
+    pub weight: u16,
+    /// True for the far-right instantaneous live `now` box.
+    pub live_now: bool,
+}
+
+/// Normalized geometry and age window of one box in a [`MultiScaleSpec`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProgSlot {
+    /// Normalized left edge in `0.0..=1.0` across the strip.
+    pub x0: f32,
+    /// Normalized right edge in `0.0..=1.0` across the strip.
+    pub x1: f32,
+    /// Older edge of the slot's window relative to `now_unix_ms` (ms ago, `>= age_lo_ms`).
+    pub age_hi_ms: i64,
+    /// Newer edge of the slot's window relative to `now_unix_ms` (ms ago, `0` on `live_now`).
+    pub age_lo_ms: i64,
+    /// Relative width weight from its [`ScaleBand`].
+    pub weight: u16,
+    /// True when this slot is the far-right glowing real-time `now` box.
+    pub is_live_now: bool,
+}
+
+/// One X-axis tick mark and horizon label on a [`MultiScaleSpec`] strip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxisTick {
+    /// Normalized horizontal coordinate in `0.0..=1.0`.
+    pub x_frac: f32,
+    /// Age at this tick in milliseconds before `now` (`0` for `"now"`).
+    pub age_ms: i64,
+    /// Horizon label (`"–1h"`, `"–15m"`, `"–5m"`, `"–1m"`, `"–10s"`, `"now"`).
+    pub label: &'static str,
+    /// True when the label anchors to the right edge (`"now"`).
+    pub align_right: bool,
+}
+
+/// One resampled cell in a [`MultiScaleSpec`] strip, carrying its slot geometry and gap marker.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScaleCell {
+    /// Aggregated reading values in this slot (`None` mean when hollow or gap-cleared).
+    pub cell: Cell,
+    /// Discontinuity kind when this slot represents a sleep, crash, or pause gap.
+    pub gap: Option<GapKind>,
+    /// Normalized slot geometry and age bounds.
+    pub slot: ProgSlot,
+}
+
+/// Multi-scale progressive time-series specification: fine real-time boxes near `now` on the
+/// right growing into wider aggregated buckets toward the left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MultiScaleSpec {
+    /// Resolution bands ordered oldest (left) to newest (right).
+    pub bands: &'static [ScaleBand],
+    /// Horizon ticks `(age_ms, label)` ordered left to right.
+    pub ticks: &'static [(i64, &'static str)],
+}
+
+const BANDS_FULL_HOUR: [ScaleBand; 6] = [
+    ScaleBand {
+        slots: 3,
+        period_ms: 900_000,
+        weight: 16,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 2,
+        period_ms: 300_000,
+        weight: 13,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 4,
+        period_ms: 60_000,
+        weight: 10,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 7,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 4,
+        period_ms: 2_000,
+        weight: 5,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 1,
+        period_ms: 2_000,
+        weight: 11,
+        live_now: true,
+    },
+];
+
+const TICKS_FULL_HOUR: [(i64, &str); 6] = [
+    (3_600_000, "\u{2013}1h"),
+    (900_000, "\u{2013}15m"),
+    (300_000, "\u{2013}5m"),
+    (60_000, "\u{2013}1m"),
+    (10_000, "\u{2013}10s"),
+    (0, "now"),
+];
+
+const BANDS_FOLD_15M: [ScaleBand; 5] = [
+    ScaleBand {
+        slots: 2,
+        period_ms: 300_000,
+        weight: 15,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 4,
+        period_ms: 60_000,
+        weight: 11,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 7,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 4,
+        period_ms: 2_000,
+        weight: 5,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 1,
+        period_ms: 2_000,
+        weight: 11,
+        live_now: true,
+    },
+];
+
+const TICKS_FOLD_15M: [(i64, &str); 5] = [
+    (900_000, "\u{2013}15m"),
+    (300_000, "\u{2013}5m"),
+    (60_000, "\u{2013}1m"),
+    (10_000, "\u{2013}10s"),
+    (0, "now"),
+];
+
+const BANDS_COMPACT_5M: [ScaleBand; 4] = [
+    ScaleBand {
+        slots: 2,
+        period_ms: 120_000,
+        weight: 14,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 8,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 4,
+        period_ms: 2_000,
+        weight: 5,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 1,
+        period_ms: 2_000,
+        weight: 11,
+        live_now: true,
+    },
+];
+
+const TICKS_COMPACT_5M: [(i64, &str); 4] = [
+    (300_000, "\u{2013}5m"),
+    (60_000, "\u{2013}1m"),
+    (10_000, "\u{2013}10s"),
+    (0, "now"),
+];
+
+const BANDS_MINI_1M: [ScaleBand; 4] = [
+    ScaleBand {
+        slots: 2,
+        period_ms: 20_000,
+        weight: 13,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 1,
+        period_ms: 10_000,
+        weight: 8,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 4,
+        period_ms: 2_000,
+        weight: 4,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 1,
+        period_ms: 2_000,
+        weight: 9,
+        live_now: true,
+    },
+];
+
+const TICKS_MINI_1M: [(i64, &str); 3] =
+    [(60_000, "\u{2013}1m"), (10_000, "\u{2013}10s"), (0, "now")];
+
+impl MultiScaleSpec {
+    /// Full 1-hour multi-scale horizon (`15m → 5m → 1m → 10s → 2s → now`, 19 slots).
+    pub const FULL_HOUR: Self = Self {
+        bands: &BANDS_FULL_HOUR,
+        ticks: &TICKS_FULL_HOUR,
+    };
+
+    /// 15-minute multi-scale horizon (`5m → 1m → 10s → 2s → now`, 16 slots).
+    pub const FOLD_15M: Self = Self {
+        bands: &BANDS_FOLD_15M,
+        ticks: &TICKS_FOLD_15M,
+    };
+
+    /// Compact 5-minute multi-scale horizon (`2m → 10s → 2s → now`, 12 slots).
+    pub const COMPACT_5M: Self = Self {
+        bands: &BANDS_COMPACT_5M,
+        ticks: &TICKS_COMPACT_5M,
+    };
+
+    /// Narrow 1-minute multi-scale horizon (`20s → 10s → 2s → now`, 8 slots).
+    pub const MINI_1M: Self = Self {
+        bands: &BANDS_MINI_1M,
+        ticks: &TICKS_MINI_1M,
+    };
+
+    /// Pick the widest-horizon multi-scale preset whose finest (`2s`) boxes remain crisp inside
+    /// `strip_px` device pixels at `scale_x100` (`100` = 1x, `200` = 2x).
+    #[must_use]
+    pub fn for_strip_px(strip_px: u32, scale_x100: u32, prefer_hour: bool) -> Self {
+        let pt = strip_px.saturating_mul(100) / scale_x100.max(1);
+        if prefer_hour && pt >= 156 {
+            Self::FULL_HOUR
+        } else if pt >= 120 {
+            if prefer_hour && pt >= 140 {
+                Self::FULL_HOUR
+            } else {
+                Self::FOLD_15M
+            }
+        } else if pt >= 82 {
+            Self::COMPACT_5M
+        } else {
+            Self::MINI_1M
+        }
+    }
+
+    /// Total number of boxes across all bands.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.bands.iter().map(|b| usize::from(b.slots)).sum()
+    }
+
+    /// Total wall-clock horizon covered by the strip, in milliseconds.
+    #[must_use]
+    pub fn horizon_ms(&self) -> i64 {
+        self.bands
+            .iter()
+            .map(|b| i64::from(b.slots) * b.period_ms)
+            .sum()
+    }
+
+    /// Total horizontal weight across all boxes.
+    #[must_use]
+    pub fn total_weight(&self) -> u32 {
+        self.bands
+            .iter()
+            .map(|b| u32::from(b.slots) * u32::from(b.weight))
+            .sum::<u32>()
+            .max(1)
+    }
+
+    /// Compute normalized `[x0, x1]` and `[age_lo_ms, age_hi_ms]` layout for every slot, oldest first.
+    #[must_use]
+    pub fn slots(&self) -> Vec<ProgSlot> {
+        let total_w = self.total_weight() as f32;
+        let mut rem_age = self.horizon_ms();
+        let mut acc_w = 0u32;
+        let mut out = Vec::with_capacity(self.slot_count());
+        for band in self.bands {
+            for _ in 0..band.slots {
+                let next_w = acc_w + u32::from(band.weight);
+                let next_age = (rem_age - band.period_ms).max(0);
+                out.push(ProgSlot {
+                    x0: acc_w as f32 / total_w,
+                    x1: next_w as f32 / total_w,
+                    age_hi_ms: rem_age,
+                    age_lo_ms: next_age,
+                    weight: band.weight,
+                    is_live_now: band.live_now,
+                });
+                acc_w = next_w;
+                rem_age = next_age;
+            }
+        }
+        out
+    }
+
+    /// Map an event age `age_ms` (`now_unix_ms - event_unix_ms`) to its exact continuous
+    /// normalized X coordinate in `0.0..=1.0`, or `None` when older than [`Self::horizon_ms`].
+    #[must_use]
+    pub fn x_frac_of_age_ms(&self, age_ms: i64) -> Option<f32> {
+        if age_ms < -2_000 {
+            return None;
+        }
+        let age = age_ms.max(0);
+        let horizon = self.horizon_ms();
+        if age > horizon {
+            return None;
+        }
+        for slot in self.slots() {
+            if age <= slot.age_hi_ms && age >= slot.age_lo_ms {
+                let span = (slot.age_hi_ms - slot.age_lo_ms).max(1) as f32;
+                let into = (slot.age_hi_ms - age) as f32 / span;
+                return Some((slot.x0 + (slot.x1 - slot.x0) * into).clamp(0.0, 1.0));
+            }
+        }
+        Some(1.0)
+    }
+
+    /// Horizon ticks with exact normalized X positions on this strip.
+    #[must_use]
+    pub fn axis_ticks(&self) -> Vec<AxisTick> {
+        self.ticks
+            .iter()
+            .filter_map(|&(age_ms, label)| {
+                let x_frac = if age_ms == 0 {
+                    1.0
+                } else {
+                    self.x_frac_of_age_ms(age_ms)?
+                };
+                Some(AxisTick {
+                    x_frac,
+                    age_ms,
+                    label,
+                    align_right: age_ms == 0,
+                })
+            })
+            .collect()
+    }
+}
+
+fn slot_gap_kind(
+    gaps: &[TimeGap],
+    lo_ms: i64,
+    hi_ms: i64,
+    has_reading: bool,
+) -> (Option<GapKind>, bool) {
+    let dur = hi_ms.saturating_sub(lo_ms).max(1);
+    let mut best: Option<GapKind> = None;
+    let mut total_ov = 0i64;
+    for g in gaps {
+        let ov = g.overlap_ms(lo_ms, hi_ms);
+        if ov > 0 {
+            total_ov = total_ov.saturating_add(ov);
+            best = Some(best.map_or(g.kind, |b| b.max(g.kind)));
+        }
+    }
+    let Some(kind) = best else {
+        return (None, false);
+    };
+    let dominates = total_ov.saturating_mul(2) >= dur;
+    if !has_reading || dominates {
+        (Some(kind), dominates)
+    } else {
+        (None, false)
+    }
+}
+
+/// Resample a 1-hour bucket ring (`ring_cells` ending at `last_k`) and last-minute per-sample
+/// `recent` readings into progressive [`ScaleCell`]s for `spec` at `now_unix_ms`, marking
+/// discontinuous `gaps` without smearing adjacent readings across them.
+#[must_use]
+pub fn multi_scale_cells(
+    ring_cells: &[Cell],
+    last_k: i64,
+    recent: &[Reading],
+    now_unix_ms: i64,
+    spec: MultiScaleSpec,
+    cover_ms: i64,
+    gaps: &[TimeGap],
+) -> Vec<ScaleCell> {
+    let slots = spec.slots();
+    let now_k = now_unix_ms.div_euclid(BUCKET_MS);
+    let first_k = last_k + 1 - ring_cells.len() as i64;
+    let ring_at = |k: i64| -> Option<Cell> {
+        (k >= first_k && k <= last_k && k <= now_k)
+            .then(|| usize::try_from(k - first_k).ok())
+            .flatten()
+            .and_then(|i| ring_cells.get(i).copied())
+    };
+    let recent_valid = &recent[..recent.partition_point(|r| r.at_ms <= now_unix_ms)];
+    slots
+        .into_iter()
+        .map(|slot| {
+            let lo_ms = now_unix_ms.saturating_sub(slot.age_hi_ms);
+            let hi_ms = now_unix_ms.saturating_sub(slot.age_lo_ms);
+            let any_gap = gaps.iter().any(|g| g.overlap_ms(lo_ms, hi_ms) > 0);
+            let ring_cell = || {
+                let k_lo = lo_ms.div_euclid(BUCKET_MS);
+                let k_hi = hi_ms.saturating_sub(1).max(lo_ms).div_euclid(BUCKET_MS);
+                Cell::merge((k_lo..=k_hi).filter_map(ring_at))
+            };
+            let mut raw = if slot.age_hi_ms <= RECENT_KEEP_MS && !recent_valid.is_empty() {
+                let from = recent_valid.partition_point(|r| r.at_ms < lo_ms);
+                let to = if slot.is_live_now {
+                    recent_valid.partition_point(|r| r.at_ms <= hi_ms)
+                } else {
+                    recent_valid.partition_point(|r| r.at_ms < hi_ms)
+                };
+                let inside = recent_valid.get(from..to).unwrap_or_default();
+                if !inside.is_empty() {
+                    Cell::merge(inside.iter().map(|r| r.cell()))
+                } else if to == 0 && slot.age_hi_ms - slot.age_lo_ms >= BUCKET_MS {
+                    ring_cell()
+                } else if !any_gap {
+                    match (
+                        to.checked_sub(1).and_then(|i| recent_valid.get(i)),
+                        recent_valid.get(to),
+                    ) {
+                        (Some(before), Some(after))
+                            if i128::from(after.at_ms) - i128::from(before.at_ms)
+                                <= i128::from(cover_ms) =>
+                        {
+                            after.cell()
+                        }
+                        (Some(before), None)
+                            if slot.is_live_now
+                                && i128::from(now_unix_ms) - i128::from(before.at_ms)
+                                    <= i128::from(cover_ms) =>
+                        {
+                            before.cell()
+                        }
+                        _ => Cell::default(),
+                    }
+                } else {
+                    Cell::default()
+                }
+            } else {
+                ring_cell()
+            };
+            let live_resumed = slot.is_live_now
+                && raw.mean.is_some()
+                && recent_valid.last().is_some_and(|newest| {
+                    gaps.iter()
+                        .all(|g| g.overlap_ms(lo_ms, hi_ms) == 0 || newest.at_ms >= g.end_ms)
+                });
+            let (gap, clear_reading) = if live_resumed {
+                (None, false)
+            } else {
+                slot_gap_kind(gaps, lo_ms, hi_ms, raw.mean.is_some())
+            };
+            if clear_reading {
+                raw = Cell::default();
+            }
+            ScaleCell {
+                cell: raw,
+                gap,
+                slot,
+            }
         })
         .collect()
 }
@@ -880,5 +1490,89 @@ mod tests {
         // The minute it keeps, and no more.
         let _ = r.push(T0 + 2_000 + RECENT_KEEP_MS, Some(4.0), false);
         assert_eq!(r.readings().len(), 1);
+    }
+
+    #[test]
+    fn multi_scale_presets_grow_older_boxes_wider_and_place_ticks_on_exact_boundaries() {
+        for spec in [
+            MultiScaleSpec::FULL_HOUR,
+            MultiScaleSpec::FOLD_15M,
+            MultiScaleSpec::COMPACT_5M,
+            MultiScaleSpec::MINI_1M,
+        ] {
+            let slots = spec.slots();
+            assert_eq!(slots.len(), spec.slot_count());
+            assert!(slots.last().is_some_and(|s| s.is_live_now));
+            assert!(slots[..slots.len() - 1].iter().all(|s| !s.is_live_now));
+            assert!((slots[0].x0 - 0.0).abs() < 1e-6);
+            assert!((slots.last().unwrap().x1 - 1.0).abs() < 1e-6);
+            for pair in slots[..slots.len() - 1].windows(2) {
+                assert!(
+                    pair[0].weight >= pair[1].weight,
+                    "historical boxes grow wider toward older left bands: {pair:?}"
+                );
+                assert_eq!(pair[0].age_lo_ms, pair[1].age_hi_ms);
+            }
+            let ticks = spec.axis_ticks();
+            assert_eq!(ticks.len(), spec.ticks.len());
+            for pair in ticks.windows(2) {
+                assert!(
+                    pair[0].x_frac < pair[1].x_frac,
+                    "ticks increase left to right"
+                );
+            }
+        }
+        assert_eq!(MultiScaleSpec::FULL_HOUR.horizon_ms(), 3_600_000);
+        assert_eq!(MultiScaleSpec::FOLD_15M.horizon_ms(), 900_000);
+        assert_eq!(MultiScaleSpec::COMPACT_5M.horizon_ms(), 300_000);
+        assert_eq!(MultiScaleSpec::MINI_1M.horizon_ms(), 60_000);
+    }
+
+    #[test]
+    fn multi_scale_marks_sleep_and_crash_gaps_without_smearing_readings() {
+        let mut ring = BucketRing::default();
+        let now = T0 + 120_000;
+        let _ = ring.push(now - 90_000, Some(20.0), false);
+        let _ = ring.push(now - 10_000, Some(50.0), false);
+        let _ = ring.push(now - 1_000, Some(80.0), false);
+        let gaps = [
+            TimeGap {
+                start_ms: now - 50_000,
+                end_ms: now - 20_000,
+                kind: GapKind::Sleep,
+            },
+            TimeGap {
+                start_ms: now - 8_000,
+                end_ms: now - 4_000,
+                kind: GapKind::Crash,
+            },
+        ];
+        let scaled = multi_scale_cells(
+            &ring.cells(),
+            ring.open_k().unwrap_or(0),
+            &ring.readings(),
+            now,
+            MultiScaleSpec::COMPACT_5M,
+            15_000,
+            &gaps,
+        );
+        assert_eq!(scaled.last().unwrap().cell.mean, Some(80.0));
+        assert!(
+            scaled
+                .iter()
+                .any(|s| s.gap == Some(GapKind::Sleep) && s.cell.mean.is_none())
+        );
+        assert!(
+            scaled
+                .iter()
+                .any(|s| s.gap == Some(GapKind::Crash) && s.cell.mean.is_none())
+        );
+        let x_crash = MultiScaleSpec::COMPACT_5M
+            .x_frac_of_age_ms(6_000)
+            .expect("6s inside 5m horizon");
+        let x_10s = MultiScaleSpec::COMPACT_5M
+            .x_frac_of_age_ms(10_000)
+            .expect("10s boundary");
+        assert!(x_crash > x_10s && x_crash < 1.0);
     }
 }

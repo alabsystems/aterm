@@ -622,18 +622,32 @@ pub fn read_rows(path: &Path) -> Vec<Row> {
         .unwrap_or_default()
 }
 
-/// The doctor's ledger read: a missing ledger is empty history, while an unreadable file or an unrecognized complete row is missing evidence, not a clean history.
+/// What [`read_rows_checked`] read: the rows this build understands, and how many it skipped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Checked {
+    /// Every row this build parses, in ledger order.
+    pub rows: Vec<Row>,
+    /// Rows this build cannot interpret (a newer build's end, a torn line), left out.
+    pub skipped: usize,
+}
+
+/// The doctor's ledger read: a missing ledger is empty history and an unreadable file is
+/// missing evidence, not a clean history; a row this build cannot interpret (one a newer build
+/// wrote, a torn line) is skipped and counted, so the rest of the history still reads.
 /// # Errors
-/// The read error, or a row this build cannot interpret.
-pub fn read_rows_checked(path: &Path) -> std::io::Result<Vec<Row>> {
-    read_text(path)?
+/// The read error.
+pub fn read_rows_checked(path: &Path) -> std::io::Result<Checked> {
+    let mut checked = Checked::default();
+    for line in read_text(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            Row::parse(line)
-                .ok_or_else(|| std::io::Error::other("unrecognized recovery ledger row"))
-        })
-        .collect()
+    {
+        match Row::parse(line) {
+            Some(row) => checked.rows.push(row),
+            None => checked.skipped = checked.skipped.saturating_add(1),
+        }
+    }
+    Ok(checked)
 }
 
 fn read_text(path: &Path) -> std::io::Result<String> {
@@ -1281,8 +1295,9 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let dir = scratch("checked");
         let path = ledger_path(&dir);
-        assert!(
-            read_rows_checked(&path).unwrap().is_empty(),
+        assert_eq!(
+            read_rows_checked(&path).unwrap(),
+            Checked::default(),
             "absent is normal"
         );
         std::fs::create_dir(&path).unwrap();
@@ -1296,12 +1311,25 @@ mod tests {
         );
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, "").unwrap();
-        assert!(read_rows_checked(&path).unwrap().is_empty());
+        assert_eq!(read_rows_checked(&path).unwrap(), Checked::default());
         let expected = row(1, 1, PrevRun::none());
         std::fs::write(&path, format!("{}\n", expected.to_line())).unwrap();
-        assert_eq!(read_rows_checked(&path).unwrap(), vec![expected.clone()]);
+        assert_eq!(
+            read_rows_checked(&path).unwrap(),
+            Checked {
+                rows: vec![expected.clone()],
+                skipped: 0
+            }
+        );
         std::fs::write(&path, format!("{}\nunreadable row\n", expected.to_line())).unwrap();
-        assert!(read_rows_checked(&path).is_err());
+        assert_eq!(
+            read_rows_checked(&path).unwrap(),
+            Checked {
+                rows: vec![expected.clone()],
+                skipped: 1
+            },
+            "an unreadable row is skipped and counted"
+        );
         assert_eq!(
             read_rows(&path),
             vec![expected.clone()],
@@ -1323,7 +1351,7 @@ mod tests {
         assert!(opened.metadata().unwrap().len() > MAX_READ_BYTES);
         std::fs::write(&path, "unreadable row\n").unwrap();
         assert_eq!(read_opened_text(opened).unwrap(), "unreadable row\n");
-        assert!(read_rows_checked(&path).is_err());
+        assert_eq!(read_rows_checked(&path).unwrap().skipped, 1);
 
         let valid = format!("{}\n", expected.to_line());
         std::fs::write(&path, &valid).unwrap();
@@ -1331,7 +1359,48 @@ mod tests {
         std::fs::rename(&path, dir.join("retired.log")).unwrap();
         std::fs::write(&path, "unreadable row\n").unwrap();
         assert_eq!(read_opened_text(opened).unwrap(), valid);
-        assert!(read_rows_checked(&path).is_err());
+        assert_eq!(
+            read_rows_checked(&path).unwrap(),
+            Checked {
+                rows: Vec::new(),
+                skipped: 1
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A row a newer build wrote, with an end this build has no word for (`prev=watchdog`), is
+    /// skipped and counted, and the rows around it still read. NEGATIVE CONTROL: the same row
+    /// with an end this build knows reads in full.
+    #[cfg(unix)]
+    #[test]
+    fn a_newer_builds_end_is_skipped_and_counted_and_the_rest_reads() {
+        let dir = scratch("newer-end");
+        let path = ledger_path(&dir);
+        let first = row(1, 1, PrevRun::none());
+        let last = row(3, 3, PrevRun::none());
+        let known = row(2, 2, PrevRun::none()).to_line();
+        let token = format!(" prev={} ", PrevRun::none().class.token());
+        assert!(known.contains(&token), "{known}");
+        let newer = known.replacen(&token, " prev=watchdog ", 1);
+        let write = |middle: &str| {
+            std::fs::write(
+                &path,
+                format!("{}\n{middle}\n{}\n", first.to_line(), last.to_line()),
+            )
+            .unwrap();
+        };
+        write(&newer);
+        assert_eq!(
+            read_rows_checked(&path).unwrap(),
+            Checked {
+                rows: vec![first.clone(), last.clone()],
+                skipped: 1
+            }
+        );
+        write(&known);
+        let read = read_rows_checked(&path).unwrap();
+        assert_eq!((read.rows.len(), read.skipped), (3, 0), "{read:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

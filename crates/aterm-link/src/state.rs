@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod journal;
+
 /// One outstanding deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deadline {
@@ -503,16 +505,86 @@ pub(crate) struct IncSeam {
     pub span: Option<u64>,
 }
 
+/// The post journal in one open ([`journal`]): what it holds, read at the first use, and where
+/// its file stands.
+#[derive(Debug, Default)]
+struct Posts {
+    /// What the journal holds; `None` until a read of it succeeds.
+    index: Option<journal::Index>,
+    /// Whether an older build's `sent/` and `inflight/` files were taken into it
+    /// ([`StateDir::adopt_legacy_posts`]).
+    adopted: bool,
+    /// Whether the journal was judged against the dir's incarnation at its first read
+    /// ([`StateDir::judge_posts`]).
+    judged: bool,
+    /// Whether an attach the journal does not name went past it: its records in flight are retired
+    /// at the next use of a writing open ([`StateDir::posts`]).
+    stale: bool,
+    /// The index names an attach its file does not yet: the next record is written after it
+    /// ([`StateDir::name_attach_in_posts`]).
+    attach_unwritten: bool,
+    /// An older build's `sent/<sid>.<id>` that did not read, by name: kept where it is and not
+    /// taken in, so that one post's reservation is refused, naming the file, as that build
+    /// refused it, and no other post's is.
+    held_sent: std::collections::BTreeSet<String>,
+    /// An older build's `inflight/<seq>` that did not read: kept where it is, and every read of
+    /// the records in flight refused naming it, as that build refused them.
+    held_in_flight: Option<String>,
+    /// The journal, held open for appends until a rewrite replaces the file.
+    file: Option<std::fs::File>,
+    /// Whether the file exists.
+    exists: bool,
+    /// Where its whole records end: where the next one goes.
+    len: u64,
+    /// The step the next record carries.
+    next_step: u64,
+    /// The file may hold bytes past `len` (a torn tail, an append that failed): it is rewritten
+    /// from the index before the next append.
+    dirty: bool,
+    /// Its directory entry is on the media as far as this open knows.
+    entry_on_media: bool,
+    /// The size from which the next append rewrites it first ([`journal::COMPACT_AT`]).
+    compact_at: u64,
+}
+
+impl Posts {
+    fn index(&self) -> &journal::Index {
+        static EMPTY: journal::Index = journal::Index::EMPTY;
+        self.index.as_ref().unwrap_or(&EMPTY)
+    }
+}
+
+/// The reservations a moved generation resets ([`StateDir::publication_offset_resets`]).
+#[derive(Debug)]
+struct OffsetResets {
+    /// The `keys/<sid>` files to rewrite whole: path and text.
+    keys: Vec<(String, String)>,
+    /// The journal's reservations to record again: sid, post id and the pin without its offset.
+    posts: Vec<(String, u64, PublishPin)>,
+}
+
 /// The bridge's state directory.
 pub struct StateDir {
     root: PathBuf,
     disk: crate::fx::Disk,
+    /// The post journal ([`journal`]).
+    posts: std::sync::Mutex<Posts>,
+    /// Whether a read of the journal takes an older build's files into it: an open that may
+    /// write, not a peek.
+    adopts_legacy: bool,
     unflushed: std::sync::Mutex<std::collections::BTreeSet<String>>,
     logpin_fence: std::sync::Mutex<Option<std::fs::File>>,
     run_fence: std::sync::Mutex<Option<std::fs::File>>,
     undurable: std::sync::Mutex<std::collections::BTreeSet<String>>,
     floor_admitted: std::sync::atomic::AtomicBool,
     quarantine_tried: std::sync::Mutex<BTreeMap<String, QuarantineCopy>>,
+    /// The records in flight this open retired into the quarantine, by sequence, from an older
+    /// build's file or from the journal: one record, one copy
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]).
+    retired_in_flight: std::sync::Mutex<BTreeMap<u64, Vec<u8>>>,
+    /// What a stale journal's retirement moved, for the bridge to tell
+    /// ([`StateDir::take_stale_retired`]).
+    stale_retired: std::sync::Mutex<Vec<SetAside>>,
     #[cfg(any(test, debug_assertions))]
     times: crate::wait_tally::Kept,
     #[cfg(test)]
@@ -525,13 +597,16 @@ pub struct StateDir {
     dir_flush_refusal: std::sync::Mutex<Option<(PathBuf, aterm_durable::Flush, io::ErrorKind)>>,
     #[cfg(test)]
     copy_on_every_try: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    keep_refused_drops: std::sync::atomic::AtomicBool,
 }
 
 /// The filesystem operations one [`StateDir`] made, by kind (counted only in a test build,
 /// `StateDir::ops`), so a test states what a post costs as a count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileOps {
-    /// Reservation and journal reads ([`StateDir::read_reservation`]), hits and misses alike.
+    /// Reservation reads ([`StateDir::read_reservation`]) and reads of the post journal
+    /// ([`StateDir::read_regular`]), hits and misses alike.
     pub reads: u64,
     /// Atomic replaces: a fresh temp written, then renamed over the target.
     pub replaces: u64,
@@ -541,9 +616,10 @@ pub(crate) struct FileOps {
     pub fsyncs: u64,
     /// Barriers (`F_BARRIERFSYNC` on macOS, `aterm_durable::ordered`).
     pub barriers: u64,
-    /// Unlinks of a journal entry or a reservation.
+    /// Unlinks, of any file of the dir.
     pub unlinks: u64,
-    /// Appends to an append-only file.
+    /// Appends to an append-only file, by write: the one that carries an attach's name into the
+    /// post journal with its record counts once.
     pub appends: u64,
 }
 
@@ -751,7 +827,9 @@ pub(crate) struct InFlight {
 }
 
 impl InFlight {
-    fn render(&self) -> String {
+    /// The three-line form, or the four with `log=`: what `inflight/<seq>` holds, and a journal
+    /// record's body after its head.
+    pub(crate) fn render(&self) -> String {
         let mut text = format!(
             "{}\n{}\n{}",
             self.pin.render(),
@@ -832,9 +910,10 @@ impl AckedLog {
 /// A kind of file a power cut may tear and the next boot may set aside ([`StateDir::set_aside_torn`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TornKind {
-    /// `inflight/<seq>` ([`StateDir::in_flight`]).
+    /// `inflight/<seq>`: an older build's record in flight, which this build retires or set
+    /// aside as before and then takes into the journal ([`StateDir::in_flight`]).
     InFlight,
-    /// `sent/<sid>.<id>` ([`StateDir::post_pin`]).
+    /// `sent/<sid>.<id>`: an older build's post reservation, likewise ([`StateDir::post_pin`]).
     Sent,
     /// `acks/<sid>.<rid>` ([`StateDir::receipt_pin`]).
     Acks,
@@ -842,16 +921,20 @@ pub(crate) enum TornKind {
     Keys,
     /// `unhandled/<sid>` ([`StateDir::topic_floors`]).
     Unhandled,
+    /// `journal/posts`, the post journal ([`journal`]): the sweep reads it by its records
+    /// ([`StateDir::sweep_journal`]), never as text.
+    Journal,
 }
 
 impl TornKind {
     /// Every kind, in the order a sweep visits them.
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::InFlight,
         Self::Sent,
         Self::Acks,
         Self::Keys,
         Self::Unhandled,
+        Self::Journal,
     ];
 
     const fn place(self) -> &'static str {
@@ -861,6 +944,7 @@ impl TornKind {
             Self::Acks => "acks",
             Self::Keys => "keys",
             Self::Unhandled => "unhandled",
+            Self::Journal => journal::DIR,
         }
     }
 
@@ -888,6 +972,10 @@ impl TornKind {
                 .filter(|line| !line.trim().is_empty())
                 .all(|line| key_line(line).is_ok()),
             Self::Unhandled => parse_topic_floors(rel, text).is_ok(),
+            Self::Journal => matches!(
+                journal::read(text.as_bytes()).end,
+                journal::End::Clean | journal::End::Cut
+            ),
         }
     }
 
@@ -900,8 +988,20 @@ impl TornKind {
             && !name.contains('/')
             && !name.starts_with('.')
             && (self != Self::InFlight || name.bytes().all(|b| b.is_ascii_digit()))
+            && (self != Self::Journal || name == journal::NAME)
     }
 }
+
+/// Where the dir keeps files that serve one session each, by its sid (`<place>/<sid>`, and
+/// `acks/<sid>.<rid>`), with the [`TornKind`] a torn one is set aside as:
+/// [`StateDir::sweep_sessions_of_an_earlier_boot`] unlinks them.
+const SESSION_PLACES: [(&str, Option<TornKind>); 5] = [
+    ("keys", Some(TornKind::Keys)),
+    ("acks", Some(TornKind::Acks)),
+    ("unhandled", Some(TornKind::Unhandled)),
+    ("seen", None),
+    ("topics", None),
+];
 
 /// What a run record's write flushed ([`StateDir::begin_run`], [`StateDir::end_run_clean`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1114,24 +1214,27 @@ impl StateDir {
     pub(crate) fn open_on(root: impl Into<PathBuf>, disk: crate::fx::Disk) -> io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(root.join("seen"))?;
-        std::fs::create_dir_all(root.join("sent"))?;
-        Ok(Self::at_on(root, disk))
+        Ok(Self::at_on(root, disk, true))
     }
 
     fn at(root: PathBuf) -> Self {
-        Self::at_on(root, crate::fx::Disk::Os)
+        Self::at_on(root, crate::fx::Disk::Os, false)
     }
 
-    fn at_on(root: PathBuf, disk: crate::fx::Disk) -> Self {
+    fn at_on(root: PathBuf, disk: crate::fx::Disk, adopts_legacy: bool) -> Self {
         Self {
             root,
             disk,
+            posts: std::sync::Mutex::default(),
+            adopts_legacy,
             unflushed: std::sync::Mutex::default(),
             logpin_fence: std::sync::Mutex::default(),
             run_fence: std::sync::Mutex::default(),
             undurable: std::sync::Mutex::default(),
             floor_admitted: std::sync::atomic::AtomicBool::new(false),
             quarantine_tried: std::sync::Mutex::default(),
+            retired_in_flight: std::sync::Mutex::default(),
+            stale_retired: std::sync::Mutex::default(),
             #[cfg(any(test, debug_assertions))]
             times: crate::wait_tally::Kept::default(),
             #[cfg(test)]
@@ -1144,12 +1247,22 @@ impl StateDir {
             dir_flush_refusal: std::sync::Mutex::default(),
             #[cfg(test)]
             copy_on_every_try: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            keep_refused_drops: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn copy_on_every_try(&self, on: bool) {
         self.copy_on_every_try
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a drop the disk refuses: the open keeps the record
+    /// ([`crate::sim::world::Mutant::KeepARefusedDrop`]).
+    #[cfg(test)]
+    pub(crate) fn keep_refused_drops(&self, on: bool) {
+        self.keep_refused_drops
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1232,16 +1345,21 @@ impl StateDir {
         _note(&mut self.ops.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
-    fn unlink(&self, name: &str) -> io::Result<()> {
-        self.count(|ops| ops.unlinks += 1);
-        self.remove_path(&self.path(name))
-    }
-
+    /// Unlink one file of the dir. An unlinked file leaves the set the clean stop flushes in
+    /// place: the stop's flush of every [`TornKind`]'s directory puts the unlink on the media,
+    /// and a later write of the name puts it back in the set.
     fn remove_path(&self, path: &Path) -> io::Result<()> {
         let w = crate::fx::Write::Remove { path };
         let _timed = self.timed(crate::wait_tally::Row::DirUnlink);
+        self.count(|ops| ops.unlinks += 1);
         self.disk.before(w)?;
         std::fs::remove_file(path)?;
+        if let Some(rel) = path.strip_prefix(&self.root).ok().and_then(Path::to_str) {
+            self.unflushed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(rel);
+        }
         self.disk.after(w)?;
         Ok(())
     }
@@ -1522,15 +1640,527 @@ impl StateDir {
         }
     }
 
+    /// Post `id` of `sid`'s sequence reservation, as the journal holds it ([`journal`]), unless an
+    /// older build's `sent/<sid>.<id>` the journal could not take in is there: that file is read
+    /// where it is, as that build read it (it would replace the journal's at its adoption), and
+    /// refused naming it while it does not read; once it is gone the journal's answers.
     pub(crate) fn post_pin(&self, sid: &str, id: u64) -> io::Result<Option<PublishPin>> {
-        self.read_reservation(&format!("sent/{sid}.{id}"))?
-            .map(|s| PublishPin::parse(&s))
-            .transpose()
+        let mut posts = self.posts()?;
+        let name = format!("{sid}.{id}");
+        if posts.held_sent.contains(&name) {
+            let rel = format!("sent/{name}");
+            let read = self
+                .read_reservation(&rel)
+                .and_then(|text| text.map(|text| PublishPin::parse(&text)).transpose());
+            match read {
+                Ok(None) => {
+                    posts.held_sent.remove(&name);
+                }
+                Ok(pin) => return Ok(pin),
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("{}: {e}", self.path(&rel).display()),
+                    ))
+                }
+            }
+        }
+        Ok(posts.index().pin(sid, id).cloned())
     }
 
+    /// Reserve `pin` for post `id` of `sid`, before it is published: one journal record.
     pub(crate) fn set_post_pin(&self, sid: &str, id: u64, pin: &PublishPin) -> io::Result<()> {
         let _timed = self.timed(crate::wait_tally::Row::SetPostPin);
-        self.write(&format!("sent/{sid}.{id}"), &pin.render())
+        let mut posts = self.posts()?;
+        self.append_post_frame(
+            &mut posts,
+            journal::Frame::Reserve {
+                sid: sid.to_string(),
+                id,
+                pin: pin.clone(),
+            },
+        )
+    }
+
+    /// The post journal, read and judged if this open has not read it yet
+    /// ([`StateDir::judge_posts`]); where this open may write, a journal an attach it does not
+    /// name went past has its records in flight retired ([`StateDir::retire_journal_in_flight`]) and
+    /// then an older build's files are taken into it ([`StateDir::adopt_legacy_posts`]).
+    ///
+    /// # Errors
+    /// The journal unreadable, not a regular file, or damaged (`InvalidData`, naming where: it
+    /// is kept for repair, as a damaged `inflight/<seq>` was), or the retirement's or the
+    /// adoption's write. An older build's file that does not read is no error here: it is held
+    /// ([`Posts::held_sent`], [`Posts::held_in_flight`]).
+    fn posts(&self) -> io::Result<std::sync::MutexGuard<'_, Posts>> {
+        let mut posts = self.judge_posts()?;
+        if self.adopts_legacy && posts.stale {
+            let retired = self.retire_journal_in_flight(&mut posts)?;
+            posts.stale = false;
+            self.stale_retired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(retired);
+        }
+        if self.adopts_legacy && !posts.adopted {
+            self.adopt_legacy_posts(&mut posts)?;
+            posts.adopted = true;
+        }
+        Ok(posts)
+    }
+
+    /// THE JOURNAL JUDGED AGAINST THE DIR'S INCARNATION, once an open: read if it has not been,
+    /// and stale where it names an attach ([`journal::Index::attached`]) and the dir has taken
+    /// an incarnation above it since ([`StateDir::incarnation`]: the lease's, or that of a
+    /// sequence reserved). Every attach of this build names the incarnation it takes in the
+    /// journal before the lease says so ([`StateDir::take_incarnation`]); a bridge of an older
+    /// build takes one too, and names nothing. So a stale journal is one an older build's attach
+    /// went past after this build's last unclean stop (a rollback, or a dev bundle sharing the
+    /// dir): that bridge published what it found in `sent/` and `inflight/`, never the
+    /// journal's records, and may have published a post the journal holds in flight again under
+    /// a fresh sequence and retired it, so the journal's records in flight are retired, not
+    /// replayed ([`StateDir::posts`]). Its reservations stay: a post that bridge did not retire
+    /// keeps its number, and one it reserved afresh comes back in its file and replaces it at the
+    /// adoption. An older build's bridge that never attached took nothing and published
+    /// nothing. A journal no attach named is not judged stale, and nor is one after an unclean
+    /// stop in an earlier boot ([`StateDir::torn_files_possible`]): the start retires every
+    /// record in flight then anyway ([`StateDir::retire_in_flight_of_an_earlier_boot`]), and a
+    /// power cut can take a name the device had not yet put on the media.
+    fn judge_posts(&self) -> io::Result<std::sync::MutexGuard<'_, Posts>> {
+        let mut posts = self.posts.lock().unwrap_or_else(|e| e.into_inner());
+        if posts.index.is_none() {
+            self.read_posts(&mut posts)?;
+        }
+        if !posts.judged {
+            posts.stale = posts
+                .index()
+                .attached
+                .is_some_and(|named| self.incarnation() > named)
+                && !matches!(self.torn_files_possible(), Ok(true));
+            posts.judged = true;
+        }
+        Ok(posts)
+    }
+
+    /// An attach of this build takes incarnation `inc`: the journal names it
+    /// ([`journal::Frame::Attached`]) before the lease does, so the next open judges the
+    /// journal current ([`StateDir::judge_posts`]), a stop between the two included. Written at
+    /// once where the journal holds a reservation or a record in flight; otherwise held in the
+    /// open and written before the journal's next record, so an attach writes nothing to a
+    /// journal that holds nothing (a stale verdict on it retires nothing).
+    ///
+    /// # Errors
+    /// The journal unreadable or damaged, or the name's write where it is written at once: the
+    /// open holds it all the same and rewrites the journal before its next record
+    /// ([`StateDir::append_post_frame`]), and the attach does not take the incarnation.
+    fn name_attach_in_posts(&self, inc: u64) -> io::Result<()> {
+        let mut posts = self.judge_posts()?;
+        if posts.exists && !posts.index().holds_nothing() {
+            return self.append_post_frame(&mut posts, journal::Frame::Attached(inc));
+        }
+        if let Some(index) = posts.index.as_mut() {
+            index.apply(journal::Frame::Attached(inc));
+            posts.attach_unwritten = true;
+        }
+        Ok(())
+    }
+
+    /// The records in flight a stale journal held, retired at this open's first use
+    /// ([`StateDir::judge_posts`]), for the bridge to tell; each taken once.
+    pub(crate) fn take_stale_retired(&self) -> Vec<SetAside> {
+        std::mem::take(&mut *self.stale_retired.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn read_posts(&self, posts: &mut Posts) -> io::Result<()> {
+        let path = self.path(journal::FILE);
+        let Some(bytes) = self.read_regular(&path)? else {
+            *posts = Posts {
+                index: Some(journal::Index::default()),
+                compact_at: journal::COMPACT_AT,
+                ..Posts::default()
+            };
+            return Ok(());
+        };
+        let read = journal::read(&bytes);
+        let damage = match &read.end {
+            journal::End::Clean | journal::End::Cut => None,
+            journal::End::Torn => Some((read.valid_len, "a broken last record".to_string())),
+            journal::End::Fault { at, why } => Some((*at, why.clone())),
+        };
+        if let Some((at, why)) = damage {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: damaged at byte {at} of {} ({why}); kept for repair",
+                    path.display(),
+                    bytes.len()
+                ),
+            ));
+        }
+        *posts = Posts {
+            index: Some(read.index),
+            adopted: posts.adopted,
+            file: None,
+            exists: true,
+            len: read.valid_len,
+            next_step: read.next_step,
+            dirty: read.end != journal::End::Clean,
+            entry_on_media: false,
+            compact_at: journal::COMPACT_AT,
+            ..Posts::default()
+        };
+        Ok(())
+    }
+
+    /// The bytes of the regular file at `path`, never followed through a link, or `None` where
+    /// nothing is there.
+    fn read_regular(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        self.count(|ops| ops.reads += 1);
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+            .open(path)
+        {
+            Ok(file) => {
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{} is not a regular file", path.display()),
+                    ));
+                }
+                let mut bytes = Vec::new();
+                (&file).read_to_end(&mut bytes)?;
+                Ok(Some(bytes))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(other) => Err(other),
+                    Ok(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Append one record to the post journal and apply it to the index. A journal that may hold
+    /// bytes past its last whole record, or what the index no longer holds, or has grown past its
+    /// bound, is rewritten from the index first ([`StateDir::rewrite_posts`]); one this open
+    /// creates, or one whose last attach the open holds unwritten, takes the attach the index
+    /// names in the same write ([`journal::Index::attached`]). On a failure the
+    /// file is rewritten from the index before the next record, and the index is as it was,
+    /// except that a fact the open holds unwritten ([`journal::Frame::holds_unwritten`]: a
+    /// retirement, a drop, an attach named) is applied all the same, as the unlink of an older
+    /// build's file was done on a disk too full to write: a record the open dropped is never
+    /// published again by it, nor handed to the files at its stop.
+    fn append_post_frame(&self, posts: &mut Posts, frame: journal::Frame) -> io::Result<()> {
+        let written = self.write_post_frame(posts, &frame);
+        #[cfg(test)]
+        let held = frame.holds_unwritten()
+            && !(matches!(frame, journal::Frame::Dropped(_))
+                && self
+                    .keep_refused_drops
+                    .load(std::sync::atomic::Ordering::SeqCst));
+        #[cfg(not(test))]
+        let held = frame.holds_unwritten();
+        if written.is_ok() || held {
+            if written.is_err() {
+                posts.dirty = true;
+            }
+            if let Some(index) = posts.index.as_mut() {
+                index.apply(frame);
+            }
+        }
+        written
+    }
+
+    fn write_post_frame(&self, posts: &mut Posts, frame: &journal::Frame) -> io::Result<()> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if posts.dirty || posts.len >= posts.compact_at.max(journal::COMPACT_AT) {
+            self.rewrite_posts(posts, None)?;
+        }
+        #[cfg(test)]
+        {
+            self.refused_by_a_test(journal::FILE)?;
+            if let Some(file) = frame.written_file() {
+                self.refused_by_a_test(&file)?;
+            }
+        }
+        let (mut bytes, mut step) = if posts.exists && !posts.attach_unwritten {
+            (Vec::new(), posts.next_step)
+        } else {
+            journal::Index {
+                attached: posts.index().attached,
+                ..journal::Index::EMPTY
+            }
+            .encode_from(posts.next_step)?
+        };
+        bytes.extend_from_slice(&journal::encode(step, frame)?);
+        step += 1;
+        let path = self.path(journal::FILE);
+        let w = crate::fx::Write::Append {
+            path: &path,
+            bytes: &bytes,
+        };
+        let _timed = self.timed(crate::wait_tally::Row::DirAppend);
+        self.count(|ops| ops.appends += 1);
+        self.disk.before(w)?;
+        let written = (|| -> io::Result<()> {
+            if posts.file.is_none() {
+                std::fs::create_dir_all(self.path(journal::DIR))?;
+                let file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .mode(STATE_FILE_MODE)
+                    .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+                    .open(&path)?;
+                let meta = file.metadata()?;
+                if !meta.is_file() || meta.uid() != aterm_uds::peer::our_uid() || meta.nlink() != 1
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the post journal is not an owned regular single-link file",
+                    ));
+                }
+                if meta.len() != posts.len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the post journal holds {} bytes where this open wrote {}; it is \
+                             rewritten from what this open holds before the next record",
+                            meta.len(),
+                            posts.len
+                        ),
+                    ));
+                }
+                if !posts.exists {
+                    posts.entry_on_media = false;
+                }
+                posts.exists = true;
+                posts.file = Some(file);
+            }
+            posts
+                .file
+                .as_mut()
+                .map_or(Ok(()), |file| file.write_all(&bytes))
+        })();
+        if let Err(e) = written.and_then(|()| self.disk.after(w)) {
+            posts.dirty = true;
+            posts.file = None;
+            return Err(e);
+        }
+        posts.len += bytes.len() as u64;
+        posts.next_step = step;
+        posts.attach_unwritten = false;
+        let mut unflushed = self.unflushed.lock().unwrap_or_else(|e| e.into_inner());
+        if !unflushed.contains(journal::FILE) {
+            unflushed.insert(journal::FILE.to_string());
+        }
+        Ok(())
+    }
+
+    /// Replace the post journal by one that holds exactly the index ([`journal::Index::encode`]),
+    /// flushed by `flush`: an atomic replace, so a reader sees the old journal or the new.
+    fn rewrite_posts(
+        &self,
+        posts: &mut Posts,
+        flush: Option<aterm_durable::Flush>,
+    ) -> io::Result<()> {
+        let (bytes, next_step) = posts.index().encode()?;
+        posts.file = None;
+        if let Err(e) = self.replace_bytes_as(journal::FILE, &bytes, flush, STATE_FILE_MODE) {
+            posts.dirty = true;
+            return Err(e);
+        }
+        posts.exists = true;
+        posts.len = bytes.len() as u64;
+        posts.next_step = next_step;
+        posts.dirty = false;
+        posts.attach_unwritten = false;
+        posts.entry_on_media = flush == Some(aterm_durable::Flush::Durable);
+        posts.compact_at = journal::COMPACT_AT.max(2 * posts.len);
+        Ok(())
+    }
+
+    /// Put every record of the post journal on the media by `flush`, its directory entry too
+    /// where this open does not know it is there. A journal that holds what the index no longer
+    /// does, or bytes past its last whole record, is rewritten from the index under that flush
+    /// instead ([`StateDir::rewrite_posts`]).
+    fn sync_posts(&self, posts: &mut Posts, flush: aterm_durable::Flush) -> io::Result<()> {
+        if posts.dirty {
+            self.rewrite_posts(posts, Some(flush))?;
+        } else if !posts.exists {
+            return Ok(());
+        } else {
+            self.flush_in_place(journal::FILE, flush)?;
+        }
+        if !posts.entry_on_media {
+            self.flush_dir_with(&self.path(journal::DIR), flush, tolerate_dir_flush)?;
+            posts.entry_on_media = flush.is_durable();
+        }
+        if flush.is_durable() {
+            self.unflushed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(journal::FILE);
+        }
+        Ok(())
+    }
+
+    /// FOR WHICHEVER BUILD RUNS NEXT: every record the journal holds written as the file a build
+    /// before the journal reads it from (`sent/<sid>.<id>`, `inflight/<seq>`), then the journal
+    /// unlinked, so a bridge of an older build on this dir (a rollback, or a dev bundle sharing
+    /// it) finds each post's reservation and each record in flight where it looks, and publishes
+    /// none of them again under a fresh sequence. A bridge of this build takes them back at its
+    /// first read ([`StateDir::adopt_legacy_posts`]), this one too if it goes on. A cut between
+    /// the files and the unlink leaves both, which that read takes as the same records. A stop
+    /// calls it before its clean stop, which then flushes the files and the journal's directory
+    /// under its record. The attach the journal named stays named in the open, for a journal
+    /// created after. Returns how many records it wrote.
+    ///
+    /// # Errors
+    /// The journal unreadable, or a write: what is written stays, and the journal keeps every
+    /// record, rewritten from what the open holds where it held more.
+    pub(crate) fn hand_posts_to_files(&self) -> io::Result<usize> {
+        let mut posts = self.posts()?;
+        let index = posts.index().clone();
+        if index.holds_nothing() {
+            return Ok(0);
+        }
+        let written = (|| -> io::Result<()> {
+            for (sid, id, pin) in index.pins() {
+                self.write(&format!("sent/{sid}.{id}"), &pin.render())?;
+            }
+            for (seq, entry) in &index.in_flight {
+                self.write(&format!("inflight/{seq}"), &entry.render())?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            if posts.dirty {
+                let _ = self.rewrite_posts(&mut posts, None);
+            }
+            return Err(e);
+        }
+        posts.file = None;
+        match self.remove_path(&self.path(journal::FILE)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                posts.dirty = true;
+                return Err(e);
+            }
+            _ => {}
+        }
+        *posts = Posts {
+            index: Some(journal::Index {
+                attached: index.attached,
+                ..journal::Index::EMPTY
+            }),
+            judged: true,
+            compact_at: journal::COMPACT_AT,
+            ..Posts::default()
+        };
+        Ok(index.pins().count() + index.in_flight.len())
+    }
+
+    /// TAKE AN OLDER BUILD'S FILES INTO THE JOURNAL: every `sent/<sid>.<id>` and
+    /// `inflight/<seq>` an older bridge left, or a stop's hand-off wrote for whichever build ran
+    /// next ([`StateDir::hand_posts_to_files`]; a seamless update's successor continues its run),
+    /// appended as a record where the journal does not hold that very record already, the
+    /// journal flushed where anything was appended, and only then the files unlinked, so a cut at
+    /// any point leaves each reservation and entry in the files, in the journal, or in both
+    /// (taken again, the same records). The flush has only to put the records on the media
+    /// before the unlinks: a barrier where the journal shares a device with the files'
+    /// directories, a full flush otherwise. The unlinks are not flushed (a clean stop flushes
+    /// those directories): a file a power cut brings back holds a record the journal took, and
+    /// the next boot retires an earlier boot's records in flight and holds its reservations, of
+    /// sessions that boot ended, as an older build's unflushed unlink left them
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]). A file that does not read is held
+    /// where it is ([`Posts::held_sent`], [`Posts::held_in_flight`]) and the others taken in.
+    /// After an unclean stop in an earlier boot the sweep and the retirement have dealt with the
+    /// files first ([`StateDir::set_aside_torn`]).
+    ///
+    /// # Errors
+    /// A directory that does not list, or a write.
+    fn adopt_legacy_posts(&self, posts: &mut Posts) -> io::Result<()> {
+        let sent = self.kind_files(TornKind::Sent)?;
+        let in_flight = self.kind_files(TornKind::InFlight)?;
+        posts.held_sent.clear();
+        posts.held_in_flight = None;
+        let mut frames = Vec::new();
+        let mut taken: Vec<&str> = Vec::new();
+        for (name, rel) in &sent {
+            let pin = match self.read_reservation(rel) {
+                Ok(None) => continue,
+                Ok(Some(text)) => PublishPin::parse(&text).ok(),
+                Err(_) => None,
+            };
+            let post = name
+                .rsplit_once('.')
+                .and_then(|(sid, id)| Some((sid, id.parse::<u64>().ok()?)));
+            let (Some(pin), Some((sid, id))) = (pin, post) else {
+                posts.held_sent.insert(name.clone());
+                continue;
+            };
+            if posts.index().pin(sid, id) != Some(&pin) {
+                frames.push(journal::Frame::Reserve {
+                    sid: sid.to_string(),
+                    id,
+                    pin,
+                });
+            }
+            taken.push(rel);
+        }
+        for (name, rel) in &in_flight {
+            let entry = match self.read_reservation(rel) {
+                Ok(None) => continue,
+                Ok(Some(text)) => name
+                    .parse()
+                    .ok()
+                    .and_then(|seq| InFlight::parse(seq, &text)),
+                Err(_) => None,
+            };
+            let Some(entry) = entry else {
+                posts
+                    .held_in_flight
+                    .get_or_insert_with(|| self.path(rel).display().to_string());
+                continue;
+            };
+            if posts.index().in_flight.get(&entry.pin.seq) != Some(&entry) {
+                frames.push(journal::Frame::InFlight(entry));
+            }
+            taken.push(rel);
+        }
+        if !frames.is_empty() || (posts.dirty && !taken.is_empty()) {
+            for frame in frames {
+                self.append_post_frame(posts, frame)?;
+            }
+            let journal_dir = self.path(journal::DIR);
+            let shared = [(TornKind::Sent, &sent), (TornKind::InFlight, &in_flight)]
+                .into_iter()
+                .filter(|(_, files)| !files.is_empty())
+                .all(|(kind, _)| {
+                    aterm_durable::Flush::ordered_if_same_device(
+                        &journal_dir,
+                        &self.path(kind.place()),
+                    )
+                    .is_ordered()
+                });
+            let tier = if shared {
+                aterm_durable::Flush::Ordered
+            } else {
+                aterm_durable::Flush::Durable
+            };
+            self.sync_posts(posts, tier)?;
+        }
+        for rel in taken {
+            match self.remove_path(&self.path(rel)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn receipt_pin(&self, sid: &str, rid: u64) -> io::Result<Option<PublishPin>> {
@@ -1620,10 +2250,9 @@ impl StateDir {
         self.write(&format!("keys/{sid}"), &lines.join("\n"))
     }
 
-    fn publication_offset_resets(
-        &self,
-        keep_below: Option<u64>,
-    ) -> io::Result<Vec<(String, String)>> {
+    /// What a moved generation resets in the reservations: each `original-off` the new log does
+    /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out.
+    fn publication_offset_resets(&self, keep_below: Option<u64>) -> io::Result<OffsetResets> {
         let reset = |pin: &mut PublishPin| -> bool {
             let stale = pin
                 .original_off
@@ -1631,62 +2260,63 @@ impl StateDir {
             stale && pin.original_off.take().is_some()
         };
         let mut rewrites = Vec::new();
-        for directory in ["keys", "sent"] {
-            let path = self.path(directory);
-            let entries = match std::fs::read_dir(&path) {
-                Ok(entries) => entries,
-                Err(e)
-                    if e.kind() == io::ErrorKind::NotFound
-                        && std::fs::symlink_metadata(&path)
-                            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-                {
+        let path = self.path("keys");
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries.collect::<io::Result<Vec<_>>>()?,
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&path)
+                        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+            {
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid publication filename")
+            })?;
+            if name.starts_with('.') {
+                continue;
+            }
+            if !entry.file_type()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "publication reservation is not a regular file",
+                ));
+            }
+            let text = std::fs::read_to_string(entry.path())?;
+            let mut changed = false;
+            let mut lines = Vec::new();
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    lines.push(line.to_string());
                     continue;
                 }
-                Err(e) => return Err(e),
-            };
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let name = name.to_str().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid publication filename")
-                })?;
-                if name.starts_with('.') {
-                    continue;
-                }
-                if !entry.file_type()?.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "publication reservation is not a regular file",
-                    ));
-                }
-                let text = std::fs::read_to_string(entry.path())?;
-                let next = if directory == "keys" {
-                    let mut changed = false;
-                    let mut lines = Vec::new();
-                    for line in text.lines() {
-                        if line.trim().is_empty() {
-                            lines.push(line.to_string());
-                            continue;
-                        }
-                        let (key, mut pin) = key_line(line)?;
-                        if reset(&mut pin) {
-                            changed = true;
-                            lines.push(format!("{key} {}", pin.render()));
-                        } else {
-                            lines.push(line.to_string());
-                        }
-                    }
-                    changed.then(|| lines.join("\n"))
+                let (key, mut pin) = key_line(line)?;
+                if reset(&mut pin) {
+                    changed = true;
+                    lines.push(format!("{key} {}", pin.render()));
                 } else {
-                    let mut pin = PublishPin::parse(&text)?;
-                    reset(&mut pin).then(|| pin.render())
-                };
-                if let Some(next) = next {
-                    rewrites.push((format!("{directory}/{name}"), next));
+                    lines.push(line.to_string());
                 }
             }
+            if changed {
+                rewrites.push((format!("keys/{name}"), lines.join("\n")));
+            }
         }
-        Ok(rewrites)
+        let mut posts = Vec::new();
+        for (sid, id, pin) in self.posts()?.index().pins() {
+            let mut pin = pin.clone();
+            if reset(&mut pin) {
+                posts.push((sid.to_string(), id, pin));
+            }
+        }
+        Ok(OffsetResets {
+            keys: rewrites,
+            posts,
+        })
     }
 
     fn write(&self, name: &str, value: &str) -> io::Result<()> {
@@ -1974,7 +2604,8 @@ impl StateDir {
         crate::durability::this_boot()
     }
 
-    /// Take the incarnation an attach runs under, before its will is registered.
+    /// Take the incarnation an attach runs under, before its will is registered: named in the post
+    /// journal before the lease says it ([`StateDir::name_attach_in_posts`]).
     pub fn take_incarnation(&self, bus: u64) -> io::Result<u64> {
         let (top, file) = (self.incarnation_top(), self.inc_file());
         let boot = self.trusted_boot();
@@ -1996,6 +2627,7 @@ impl StateDir {
                     top.max(seq_inc).max(bus)
                 ))
             })?;
+        self.name_attach_in_posts(plan.next)?;
         let leased = |file| IncLease {
             used: plan.next,
             top: plan.top,
@@ -2136,113 +2768,126 @@ impl StateDir {
         Ok(())
     }
 
-    /// Every record in flight onto this node's own lanes, by sequence.
-    pub(crate) fn in_flight(&self) -> io::Result<Vec<(u64, InFlight)>> {
-        let dir = self.path("inflight");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e)
-                if e.kind() == io::ErrorKind::NotFound
-                    && std::fs::symlink_metadata(&dir)
-                        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-            {
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(e),
-        };
-        let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let bad = || {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{}: malformed in-flight entry", entry.path().display()),
-                )
-            };
-            let seq = name.parse().map_err(|_| bad())?;
-            let text = self
-                .read_reservation(&format!("inflight/{name}"))?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "{}: in-flight entry disappeared during recovery",
-                            entry.path().display()
-                        ),
-                    )
-                })?;
-            let record = InFlight::parse(seq, &text).ok_or_else(bad)?;
-            out.push((seq, record));
-        }
-        out.sort_by_key(|(seq, _)| *seq);
-        Ok(out)
-    }
-
-    /// WHAT THE NODE STILL OWES A PUBLICATION: the sessions with a post or a receipt
-    /// reserved (`sent/<sid>.<id>`, `acks/<sid>.<rid>`), and every subject such a
-    /// reservation or an in-flight entry names. A departed session's subjects are
-    /// given back to the subject budget only once none of this names them
-    /// (`Bridge::reclaim_subjects`). A reservation that does not parse still names its
-    /// session.
+    /// Every record in flight onto this node's own lanes, by sequence, as the journal holds them.
     ///
     /// # Errors
-    /// A directory or an entry that cannot be read, or an in-flight entry that does not parse.
+    /// The journal unreadable or damaged, or an older build's `inflight/<seq>` that does not read
+    /// and is still there (`InvalidData` naming it, as that build refused it: a record whose fate
+    /// it holds is not read as absent).
+    pub(crate) fn in_flight(&self) -> io::Result<Vec<(u64, InFlight)>> {
+        let mut posts = self.posts()?;
+        self.refuse_a_held_in_flight(&mut posts)?;
+        Ok(posts
+            .index()
+            .in_flight
+            .iter()
+            .map(|(seq, entry)| (*seq, entry.clone()))
+            .collect())
+    }
+
+    /// An older build's `inflight/<seq>` the journal could not take in, while it is still there.
+    fn refuse_a_held_in_flight(&self, posts: &mut Posts) -> io::Result<()> {
+        let Some(path) = posts.held_in_flight.clone() else {
+            return Ok(());
+        };
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                posts.held_in_flight = None;
+                posts.adopted = false;
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{path}: malformed in-flight entry"),
+            )),
+        }
+    }
+
+    /// WHAT THE NODE STILL OWES A PUBLICATION: the sessions with a post reserved in the journal
+    /// or a receipt reserved (`acks/<sid>.<rid>`), and every subject such a reservation or an
+    /// in-flight record names. A departed session's subjects are given back to the subject
+    /// budget only once none of this names them (`Bridge::reclaim_subjects`). A reservation that
+    /// does not parse (a receipt's, or an older build's `sent/<sid>.<id>` the journal held where
+    /// it is) still names its session.
+    ///
+    /// # Errors
+    /// A directory or an entry that cannot be read, the journal damaged, or an older build's
+    /// in-flight entry that does not read ([`StateDir::in_flight`]).
     pub(crate) fn owed_publications(&self) -> io::Result<Owed> {
         let mut owed = Owed::default();
-        for kind in [TornKind::Sent, TornKind::Acks] {
-            for (name, rel) in self.kind_files(kind)? {
-                if let Some((sid, _)) = name.rsplit_once('.') {
-                    owed.sids.insert(sid.to_string());
-                }
-                let pin = self
-                    .read_reservation(&rel)?
-                    .and_then(|text| PublishPin::parse(&text).ok());
-                for identity in pin.into_iter().flat_map(|p| [p.identity, p.original]) {
-                    owed.subjects.extend(identity.map(|i| i.subject));
-                }
+        let name_pin = |owed: &mut Owed, pin: Option<PublishPin>| {
+            for identity in pin.into_iter().flat_map(|p| [p.identity, p.original]) {
+                owed.subjects.extend(identity.map(|i| i.subject));
+            }
+        };
+        for (name, rel) in self.kind_files(TornKind::Acks)? {
+            if let Some((sid, _)) = name.rsplit_once('.') {
+                owed.sids.insert(sid.to_string());
+            }
+            let pin = self
+                .read_reservation(&rel)?
+                .and_then(|text| PublishPin::parse(&text).ok());
+            name_pin(&mut owed, pin);
+        }
+        let mut posts = self.posts()?;
+        self.refuse_a_held_in_flight(&mut posts)?;
+        for (sid, _, pin) in posts.index().pins() {
+            owed.sids.insert(sid.to_string());
+            name_pin(&mut owed, Some(pin.clone()));
+        }
+        for name in &posts.held_sent {
+            if let Some((sid, _)) = name.rsplit_once('.') {
+                owed.sids.insert(sid.to_string());
             }
         }
         owed.subjects.extend(
-            self.in_flight()?
-                .into_iter()
-                .map(|(_, entry)| entry.subject),
+            posts
+                .index()
+                .in_flight
+                .values()
+                .map(|entry| entry.subject.clone()),
         );
         Ok(owed)
     }
 
-    /// Record one own-lane record as in flight, before it is published.
+    /// Record one own-lane record as in flight, before it is published: one journal record.
     pub(crate) fn set_in_flight(&self, entry: &InFlight) -> io::Result<()> {
         let _timed = self.timed(crate::wait_tally::Row::SetInFlight);
-        self.replace(
-            &format!("inflight/{}", entry.pin.seq),
-            &entry.render(),
-            false,
-            0o600,
-        )
+        let mut posts = self.posts()?;
+        self.append_post_frame(&mut posts, journal::Frame::InFlight(entry.clone()))
     }
 
-    /// Forget the in-flight record at `seq`.
+    /// Forget the in-flight record at `seq`, once it landed: one journal record, none where the
+    /// journal holds no record at `seq`.
     pub(crate) fn clear_in_flight(&self, seq: u64) -> io::Result<()> {
         let _timed = self.timed(crate::wait_tally::Row::ClearInFlight);
-        match self.unlink(&format!("inflight/{seq}")) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        let mut posts = self.posts()?;
+        if !posts.index().in_flight.contains_key(&seq) {
+            return Ok(());
         }
+        self.append_post_frame(&mut posts, journal::Frame::Landed(seq))
     }
 
-    /// Drop the in-flight record at `seq` for good.
+    /// Drop the in-flight record at `seq` for good: its record, then the journal flushed in full.
+    /// The open forgets it even where its record cannot be written, as an older build's unlink of
+    /// its file did on a disk too full to write ([`StateDir::append_post_frame`]), so no later
+    /// attach of this open publishes it; the flush then rewrites the journal without it, and the
+    /// drop is on the media once either is.
+    ///
+    /// # Errors
+    /// Neither the record nor the rewrite on the media: the open has forgotten the record, and a
+    /// stop or crash before the journal's next write leaves it in the file.
     pub(crate) fn drop_in_flight(&self, seq: u64) -> io::Result<()> {
-        match self.unlink(&format!("inflight/{seq}")) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
+        let mut posts = self.posts()?;
+        let appended = if posts.index().in_flight.contains_key(&seq) {
+            self.append_post_frame(&mut posts, journal::Frame::Dropped(seq))
+        } else {
+            Ok(())
+        };
+        match self.sync_posts(&mut posts, aterm_durable::Flush::Durable) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(appended.err().unwrap_or(e)),
         }
-        self.flush_dir(&self.path("inflight"))
     }
 
     fn flush_dir(&self, dir: &Path) -> io::Result<()> {
@@ -2374,13 +3019,100 @@ impl StateDir {
         })
     }
 
+    /// Whether the last bridge of this dir ran in an earlier boot, however it stopped: the kernel
+    /// names this boot, and the run record names another, or, where there is no record, the
+    /// lease does ([`StateDir::torn_files_possible`]'s boot rule, a clean stop included). A
+    /// record that names no boot, or does not read, is no earlier boot. AN ATTACH OF THIS BOOT
+    /// WINS OVER THE RECORD: a build older than the record attaches without writing it, so where
+    /// a lease reads it must name an earlier boot too. One that names this boot is that attach's
+    /// (its sessions may still run, as [`StateDir::retire_in_flight_of_an_earlier_boot`] holds),
+    /// and one that names no boot, as every lease of a dir off the boot volume does, cannot rule
+    /// it out. Read before the start's [`StateDir::begin_run`] names this boot and before its
+    /// own attach writes the lease ([`StateDir::sweep_sessions_of_an_earlier_boot`]).
+    pub(crate) fn last_ran_in_an_earlier_boot(&self) -> bool {
+        let Some(now) = self.kernel_boot() else {
+            return false;
+        };
+        let earlier = |boot: Option<[u8; 16]>| boot.is_some_and(|then| then != now);
+        let lease = self.lease();
+        let then = match self.last_run() {
+            Ok(Some(run)) => run.boot,
+            Ok(None) => lease.and_then(|lease| lease.boot),
+            Err(_) => None,
+        };
+        earlier(then) && lease.is_none_or(|lease| earlier(lease.boot))
+    }
+
+    /// AN EARLIER BOOT'S SESSIONS' FILES GO: every `keys/<sid>`, `acks/<sid>.<rid>`,
+    /// `unhandled/<sid>`, `seen/<sid>` and `topics/<sid>` of a sid `live` does not name is
+    /// unlinked, and how many returned. aterm mints a new sid at every launch, a restore reopens
+    /// a tab under a new one, and no successor keeps a sid across a reboot, so nothing reads them
+    /// again; left, each is a file a later stop flushes and a replaced log's
+    /// ([`StateDir::forget_log_offsets`]) rewrites, and a receipt's reservation holds its
+    /// session's subjects back from the budget ([`StateDir::owed_publications`]). `live` is the
+    /// roster aterm answered at the start: a bridge of this boot whose run record could not be
+    /// written may have left files of the sessions that still run. A file of a [`TornKind`] that
+    /// does not read whole stays where it is, for the sweep of torn files or a person. Nothing of
+    /// `inflight/`, `sent/` or the post journal is touched: an earlier boot's posts follow their
+    /// own rules ([`StateDir::retire_in_flight_of_an_earlier_boot`]). The unlinks are not
+    /// flushed: a file a power cut brings back is whole and no session reads it, and the next
+    /// boot's sweep unlinks it again. The bridge sweeps once, at its start's first roster where
+    /// that reads, and where [`StateDir::last_ran_in_an_earlier_boot`] said so before the run
+    /// record named this boot; no later roster sweeps.
+    ///
+    /// # Errors
+    /// A directory that does not list, a file that does not read, or an unlink: what is left
+    /// stays until the next boot's sweep.
+    pub(crate) fn sweep_sessions_of_an_earlier_boot(
+        &self,
+        live: &BTreeSet<String>,
+    ) -> io::Result<u64> {
+        let mut removed = 0;
+        for (place, kind) in SESSION_PLACES {
+            for (name, rel) in self.files_in(place, |name| {
+                !name.is_empty() && !name.contains('/') && !name.starts_with('.')
+            })? {
+                let sid = match kind {
+                    Some(TornKind::Acks) => name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s),
+                    _ => name.as_str(),
+                };
+                if live.contains(sid) {
+                    continue;
+                }
+                let path = self.path(&rel);
+                if let Some(kind) = kind {
+                    let whole = match std::fs::read(&path) {
+                        Ok(bytes) => std::str::from_utf8(&bytes)
+                            .is_ok_and(|text| kind.whole(&path, &name, text)),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    };
+                    if !whole {
+                        continue;
+                    }
+                }
+                match self.remove_path(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     fn attached_in_this_boot(&self) -> bool {
         self.trusted_boot()
             .is_some_and(|now| self.lease().and_then(|lease| lease.boot) == Some(now))
     }
 
     fn torn_kind_dir(&self, kind: TornKind) -> io::Result<Option<PathBuf>> {
-        let path = self.path(kind.place());
+        self.dir_at(kind.place())
+    }
+
+    /// The directory `place` names in the dir, `None` where there is none.
+    fn dir_at(&self, place: &str) -> io::Result<Option<PathBuf>> {
+        let path = self.path(place);
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -2403,20 +3135,30 @@ impl StateDir {
     }
 
     fn kind_files(&self, kind: TornKind) -> io::Result<Vec<(String, String)>> {
-        let Some(dir) = self.torn_kind_dir(kind)? else {
+        self.files_in(kind.place(), |name| kind.names(name))
+    }
+
+    /// The regular files directly in `place` whose names `names` takes, by name, as
+    /// `(name, place/name)`; none where there is no `place`.
+    fn files_in(
+        &self,
+        place: &str,
+        names: impl Fn(&str) -> bool,
+    ) -> io::Result<Vec<(String, String)>> {
+        let Some(dir) = self.dir_at(place)? else {
             return Ok(Vec::new());
         };
         let entries = std::fs::read_dir(dir)?;
-        let mut names = Vec::new();
+        let mut found = Vec::new();
         for entry in entries {
-            if let Some(name) = entry?.file_name().to_str().filter(|n| kind.names(n)) {
-                names.push(name.to_string());
+            if let Some(name) = entry?.file_name().to_str().filter(|n| names(n)) {
+                found.push(name.to_string());
             }
         }
-        names.sort_unstable();
+        found.sort_unstable();
         let mut out = Vec::new();
-        for name in names {
-            let rel = format!("{}/{name}", kind.place());
+        for name in found {
+            let rel = format!("{place}/{name}");
             match std::fs::symlink_metadata(self.path(&rel)) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -2429,23 +3171,28 @@ impl StateDir {
 
     /// After an unclean stop in an earlier boot ([`StateDir::torn_files_possible`]), set every torn file aside.
     pub(crate) fn set_aside_torn(&self) -> io::Result<Vec<SetAside>> {
-        self.sweep_torn(TornKind::whole)
+        self.sweep_torn(false)
     }
 
     #[cfg(test)]
     pub(crate) fn set_aside_torn_by_the_reader_alone(&self) -> io::Result<Vec<SetAside>> {
-        self.sweep_torn(TornKind::reads)
+        self.sweep_torn(true)
     }
 
-    fn sweep_torn(
-        &self,
-        whole: fn(TornKind, &Path, &str, &str) -> bool,
-    ) -> io::Result<Vec<SetAside>> {
+    fn sweep_torn(&self, by_the_reader: bool) -> io::Result<Vec<SetAside>> {
         if !self.torn_files_possible()? {
             return Ok(Vec::new());
         }
+        let whole = if by_the_reader {
+            TornKind::reads
+        } else {
+            TornKind::whole
+        };
         let mut torn: Vec<(String, Vec<u8>)> = Vec::new();
         for (kind, name, rel) in self.torn_kind_files()? {
+            if kind == TornKind::Journal {
+                continue;
+            }
             let path = self.path(&rel);
             let bytes = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
@@ -2458,10 +3205,50 @@ impl StateDir {
                 torn.push((rel, bytes));
             }
         }
-        self.move_into_quarantine(&torn, "")
+        let mut moved = self.move_into_quarantine(&torn, "")?;
+        moved.extend(self.sweep_journal()?);
+        Ok(moved)
     }
 
-    /// After an unclean stop in an earlier boot ([`StateDir::torn_files_possible`]), every whole in-flight entry is retired.
+    /// THE SWEEP OF THE POST JOURNAL, after an unclean stop in an earlier boot: a journal whose
+    /// last record is broken, or that holds damage, has its exact bytes copied into the
+    /// quarantine (`journal.posts`) and is then replaced, in full, by one that holds what its
+    /// whole records say ([`journal::salvage`]: the records after damage too, never truncated
+    /// at it), what the damaged bytes held being unknown. A power cut tears what the device was
+    /// given after the last flush; the run whose records they were ended with that boot's
+    /// sessions, its records in flight are retired next
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]), and the bytes are kept for whoever
+    /// repairs it. A journal that ends at a whole record, or in the next record cut short (an
+    /// append cut, which its reader drops as the `acked` log's reader does), stays.
+    fn sweep_journal(&self) -> io::Result<Vec<SetAside>> {
+        let Some(bytes) = self.read_regular(&self.path(journal::FILE))? else {
+            return Ok(Vec::new());
+        };
+        if matches!(
+            journal::read(&bytes).end,
+            journal::End::Clean | journal::End::Cut
+        ) {
+            return Ok(Vec::new());
+        }
+        let moved = self.copy_into_quarantine(&[(journal::FILE.to_string(), bytes.clone())], "")?;
+        let mut posts = self.posts.lock().unwrap_or_else(|e| e.into_inner());
+        *posts = Posts {
+            index: Some(journal::salvage(&bytes)),
+            ..Posts::default()
+        };
+        self.rewrite_posts(&mut posts, Some(aterm_durable::Flush::Durable))?;
+        drop(posts);
+        self.quarantine_tried
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(journal::FILE);
+        Ok(moved)
+    }
+
+    /// After an unclean stop in an earlier boot ([`StateDir::torn_files_possible`]), every whole
+    /// in-flight entry is retired: an older build's `inflight/<seq>` moved into the quarantine as
+    /// before, and each record the journal holds in flight retired with it
+    /// ([`StateDir::retire_journal_in_flight`]).
     pub(crate) fn retire_in_flight_of_an_earlier_boot(&self) -> io::Result<Vec<SetAside>> {
         if !self.torn_files_possible()? || self.attached_in_this_boot() {
             return Ok(Vec::new());
@@ -2480,7 +3267,81 @@ impl StateDir {
                 whole.push((rel, bytes));
             }
         }
-        self.move_into_quarantine(&whole, RETIRED_PREFIX)
+        let copies = self.copy_into_quarantine(&whole, RETIRED_PREFIX)?;
+        // Noted once the copy is durable, before the unlink: a move whose unlink or directory
+        // flush fails has made its one copy all the same.
+        self.note_retired(&copies, &whole);
+        let mut retired = self.remove_moved(copies)?;
+        let mut posts = self.posts()?;
+        retired.extend(self.retire_journal_in_flight(&mut posts)?);
+        Ok(retired)
+    }
+
+    fn note_retired(&self, copies: &[SetAside], files: &[(String, Vec<u8>)]) {
+        let mut done = self
+            .retired_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (from, bytes) in files {
+            if copies.iter().any(|m| &m.from == from) {
+                if let Some(seq) = from
+                    .strip_prefix("inflight/")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    done.insert(seq, bytes.clone());
+                }
+            }
+        }
+    }
+
+    /// RETIRE WHAT THE JOURNAL HOLDS IN FLIGHT, never to be published again: each record copied
+    /// into the quarantine under the name of the file it would have been
+    /// (`retired.inflight.<seq>`, its bytes those of that file) and dropped, the journal flushed
+    /// in full after the drops. What an unclean stop in an earlier boot left
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]), and what a stale journal holds
+    /// ([`StateDir::judge_posts`]).
+    fn retire_journal_in_flight(&self, posts: &mut Posts) -> io::Result<Vec<SetAside>> {
+        let entries: Vec<(u64, String, Vec<u8>)> = posts
+            .index()
+            .in_flight
+            .iter()
+            .map(|(seq, entry)| {
+                let mut text = entry.render();
+                text.push('\n');
+                (*seq, format!("inflight/{seq}"), text.into_bytes())
+            })
+            .collect();
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ONE RECORD, ONE COPY: a stop's hand-off and a cut can leave a record both in an
+        // older build's file and in the journal ([`StateDir::hand_posts_to_files`]); the file's
+        // move, or an earlier try of this open, copied it already.
+        let files: Vec<(String, Vec<u8>)> = {
+            let done = self
+                .retired_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries
+                .iter()
+                .filter(|(seq, _, bytes)| done.get(seq) != Some(bytes))
+                .map(|(_, from, bytes)| (from.clone(), bytes.clone()))
+                .collect()
+        };
+        let copied = self.copy_into_quarantine(&files, RETIRED_PREFIX)?;
+        self.note_retired(&copied, &files);
+        for (seq, _, _) in &entries {
+            self.append_post_frame(posts, journal::Frame::Dropped(*seq))?;
+        }
+        self.sync_posts(posts, aterm_durable::Flush::Durable)?;
+        let mut tried = self
+            .quarantine_tried
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (_, from, _) in &entries {
+            tried.remove(from);
+        }
+        Ok(copied)
     }
 
     /// How many torn files the quarantine still holds.
@@ -2512,6 +3373,39 @@ impl StateDir {
     }
 
     fn move_into_quarantine(
+        &self,
+        files: &[(String, Vec<u8>)],
+        prefix: &str,
+    ) -> io::Result<Vec<SetAside>> {
+        let moved = self.copy_into_quarantine(files, prefix)?;
+        self.remove_moved(moved)
+    }
+
+    /// The sources of `moved`, whose copies are durable in the quarantine, unlinked and their
+    /// directories flushed.
+    fn remove_moved(&self, moved: Vec<SetAside>) -> io::Result<Vec<SetAside>> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for SetAside { from, .. } in &moved {
+            let path = self.path(from);
+            match self.remove_path(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            self.quarantine_tried
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(from);
+            dirs.insert(path.parent().unwrap_or(&self.root).to_path_buf());
+        }
+        for dir in dirs {
+            self.flush_dir(&dir)?;
+        }
+        Ok(moved)
+    }
+
+    /// Publish a durable copy of each `(from, bytes)` in the quarantine, as
+    /// `<prefix><from with / as .>[.N]`, reusing a copy this open made of the same bytes.
+    fn copy_into_quarantine(
         &self,
         files: &[(String, Vec<u8>)],
         prefix: &str,
@@ -2584,22 +3478,6 @@ impl StateDir {
                 from: from.clone(),
                 to,
             });
-        }
-        let mut dirs = std::collections::BTreeSet::new();
-        for SetAside { from, .. } in &moved {
-            let path = self.path(from);
-            match self.remove_path(&path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-            self.quarantine_tried
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(from);
-            dirs.insert(path.parent().unwrap_or(&self.root).to_path_buf());
-        }
-        for dir in dirs {
-            self.flush_dir(&dir)?;
         }
         Ok(moved)
     }
@@ -2722,6 +3600,10 @@ impl StateDir {
     fn begin_run_by(&self, rules: StartRules) -> io::Result<Flushed> {
         use aterm_durable::Flush;
         use std::os::unix::fs::MetadataExt as _;
+        // The post journal is judged while the record still says how the last run stopped
+        // ([`StateDir::judge_posts`]): after an unclean stop in an earlier boot never stale. One
+        // that does not read is refused where it is used.
+        drop(self.judge_posts());
         let mut known = self.run_fence.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.kernel_boot();
         let current = match self.run_file() {
@@ -3033,7 +3915,10 @@ impl StateDir {
                 .collect();
             topics.push((sid.to_string(), rebased));
         }
-        let publication_resets = self.publication_offset_resets(keep_below)?;
+        let OffsetResets {
+            keys: key_resets,
+            posts: post_resets,
+        } = self.publication_offset_resets(keep_below)?;
         let in_flight = self.in_flight()?;
         let owed = self.inbox_owed();
         let deadlines: Vec<Deadline> = self
@@ -3057,8 +3942,11 @@ impl StateDir {
         for (sid, rebased) in topics {
             self.set_topics(&sid, &rebased)?;
         }
-        for (name, text) in publication_resets {
+        for (name, text) in key_resets {
             self.write(&name, &text)?;
+        }
+        for (sid, id, pin) in post_resets {
+            self.set_post_pin(&sid, id, &pin)?;
         }
         self.set_self_acked(&head.checked_sub(1).into_iter().collect(), 1)?;
         self.clear_halt_acked()?;
@@ -3068,6 +3956,7 @@ impl StateDir {
         self.set_deadlines(&deadlines)?;
         self.set_asked(&asked)?;
         let mut dropped = Vec::new();
+        let mut posts = self.posts()?;
         let mut moved = false;
         for (seq, entry) in in_flight {
             let (Some(was), Some(now)) = (entry.log, log) else {
@@ -3081,25 +3970,19 @@ impl StateDir {
                 Some(lineage) => keep_below.and_then(|f| Some(f.min(now.continues(was, lineage)?))),
                 None => keep_below,
             };
+            moved = true;
             if re.is_some_and(|off| fork.is_some_and(|f| off < f)) {
-                self.replace(
-                    &format!("inflight/{seq}"),
-                    &InFlight { log, ..entry }.render(),
-                    true,
-                    0o600,
+                self.append_post_frame(
+                    &mut posts,
+                    journal::Frame::InFlight(InFlight { log, ..entry }),
                 )?;
                 continue;
             }
-            match self.remove_path(&self.path(&format!("inflight/{seq}"))) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                _ => {
-                    moved = true;
-                    dropped.push((seq, entry.subject));
-                }
-            }
+            self.append_post_frame(&mut posts, journal::Frame::Dropped(seq))?;
+            dropped.push((seq, entry.subject));
         }
         if moved {
-            self.flush_dir(&self.path("inflight"))?;
+            self.sync_posts(&mut posts, aterm_durable::Flush::Durable)?;
         }
         Ok(dropped)
     }
@@ -3365,18 +4248,39 @@ impl StateDir {
 
     /// Reserve a sequence for one outbound post before it is published.
     pub fn set_post_seq(&self, sid: &str, id: u64, seq: u64, via_key: bool) -> io::Result<()> {
-        let line = if via_key {
-            format!("{seq} key")
-        } else {
-            seq.to_string()
-        };
-        self.write(&format!("sent/{sid}.{id}"), &line)
+        self.set_post_pin(
+            sid,
+            id,
+            &PublishPin {
+                seq,
+                via_key,
+                identity: None,
+                original: None,
+                original_off: None,
+                owner: None,
+            },
+        )
     }
 
-    /// Forget a retired post's sequence.
+    /// Forget a retired post's sequence: one journal record, none where the journal holds no
+    /// reservation for it. The open forgets it even where the record cannot be written, as an
+    /// older build's unlink of its file did on a disk too full to write, and the journal is
+    /// rewritten without it before its next record ([`StateDir::append_post_frame`]); a stop or
+    /// crash before that leaves it in the file, for the next open.
     pub fn clear_post_seq(&self, sid: &str, id: u64) {
         let _timed = self.timed(crate::wait_tally::Row::ClearPostSeq);
-        let _ = self.unlink(&format!("sent/{sid}.{id}"));
+        let Ok(mut posts) = self.posts() else {
+            return;
+        };
+        if posts.index().pin(sid, id).is_some() {
+            let _ = self.append_post_frame(
+                &mut posts,
+                journal::Frame::Retire {
+                    sid: sid.to_string(),
+                    id,
+                },
+            );
+        }
     }
 
     /// The producer sequence this bridge reserved for one owed receipt, if any.
@@ -3937,6 +4841,360 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE JOURNAL'S BOUND (B19): past [`journal::COMPACT_AT`] the next record first rewrites
+    /// the journal from its index, so a run of retired posts never grows it past the bound and
+    /// one record, and what is live survives the rewrite and a reopen. CONTROL: below the bound
+    /// nothing is rewritten.
+    #[test]
+    fn the_journal_is_rewritten_from_its_index_past_its_bound_and_keeps_what_is_live() {
+        let dir = scratch("journal-bound");
+        let st = StateDir::open(&dir).expect("open");
+        let pin = |seq| PublishPin {
+            seq,
+            via_key: false,
+            identity: Some(PublishIdentity {
+                subject: "/f/f/in/n-a/s-b/n-a/note".into(),
+                digest: "d".repeat(64),
+            }),
+            original: None,
+            original_off: None,
+            owner: Some(1),
+        };
+        st.set_post_pin("s-live", 1, &pin(3))
+            .expect("a live reservation");
+        let entry = InFlight {
+            pin: pin(7),
+            subject: "/f/f/in/n-a/s-b/n-a/note".into(),
+            body: b"v=1 t=1 text=live".to_vec(),
+            log: None,
+        };
+        st.set_in_flight(&entry).expect("a live record in flight");
+        let journal = dir.join(journal::FILE);
+        let size = || std::fs::metadata(&journal).expect("the journal").len();
+        let (mut largest, mut rewrites, mut id) = (0, 0, 0);
+        let measured = |write: &dyn Fn()| {
+            let before = (size(), st.ops().replaces);
+            write();
+            (before, (size(), st.ops().replaces))
+        };
+        while rewrites < 2 {
+            id += 1;
+            let reserve = || {
+                st.set_post_pin("s-a", id, &pin(100 + id))
+                    .expect("a reservation");
+            };
+            let retire = || st.clear_post_seq("s-a", id);
+            for (before, after) in [measured(&reserve), measured(&retire)] {
+                largest = largest.max(after.0);
+                if after.1 > before.1 {
+                    rewrites += 1;
+                    assert!(after.0 < before.0, "a rewrite holds only what is live");
+                    assert!(
+                        before.0 >= journal::COMPACT_AT,
+                        "CONTROL: nothing is rewritten below the bound ({} bytes)",
+                        before.0
+                    );
+                }
+            }
+            assert!(id < 100_000, "the journal was never rewritten");
+        }
+        assert!(
+            largest < journal::COMPACT_AT + 1024,
+            "never past the bound and a record: {largest}"
+        );
+        let again = StateDir::open(&dir).expect("reopen");
+        assert_eq!(again.post_pin("s-live", 1).unwrap(), Some(pin(3)));
+        assert_eq!(again.in_flight().unwrap(), vec![(7, entry)]);
+        assert_eq!(again.post_pin("s-a", id).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RETIREMENT OR A DROP THE DISK REFUSES (B19 review): the open forgets the post's
+    /// reservation and the dropped record all the same, as an older build's unlink of their
+    /// files did on a disk too full to write, so nothing this open does later (an attach's
+    /// replay, a stop's hand-off) brings them back, and the journal's next record rewrites it
+    /// without them. CONTROL: a reservation or a record in flight the disk refuses is not held,
+    /// and a landing it refuses leaves its record in flight, to be cleared again (the bridge
+    /// delivers a record of its own lane only once its landing is written).
+    #[test]
+    fn a_retirement_or_a_drop_the_disk_refuses_is_forgotten_and_never_comes_back() {
+        let dir = scratch("refused-removals");
+        let st = StateDir::open(&dir).expect("open");
+        st.set_post_seq("s-a", 1, 7, false).expect("reserved");
+        st.set_in_flight(&in_flight_entry(9)).expect("in flight");
+        st.refuse_writes_of(Some(journal::FILE));
+        st.clear_post_seq("s-a", 1);
+        assert!(
+            st.drop_in_flight(9).is_err(),
+            "the drop is not on the media, and says so"
+        );
+        assert_eq!(
+            st.post_seq("s-a", 1),
+            None,
+            "the retired post's reservation"
+        );
+        assert!(
+            st.in_flight().expect("reads").is_empty(),
+            "the dropped record"
+        );
+        assert_eq!(
+            st.owed_publications().expect("reads"),
+            Owed::default(),
+            "nothing owed holds the session's subjects"
+        );
+        assert!(st.set_post_seq("s-a", 3, 11, false).is_err());
+        assert_eq!(
+            st.post_seq("s-a", 3),
+            None,
+            "CONTROL: a refused reservation"
+        );
+        assert!(st.set_in_flight(&in_flight_entry(10)).is_err());
+        assert!(
+            st.in_flight().expect("reads").is_empty(),
+            "CONTROL: a refused record in flight"
+        );
+        st.refuse_writes_of(None);
+        st.set_in_flight(&in_flight_entry(12)).expect("in flight");
+        st.refuse_writes_of(Some(journal::FILE));
+        assert!(st.clear_in_flight(12).is_err());
+        assert_eq!(
+            st.in_flight().expect("reads"),
+            vec![(12, in_flight_entry(12))],
+            "CONTROL: a refused landing leaves its record in flight"
+        );
+        st.refuse_writes_of(None);
+        st.clear_in_flight(12).expect("cleared again");
+        st.set_post_seq("s-a", 2, 8, false).expect("reserved");
+        let again = StateDir::open(&dir).expect("reopen");
+        assert_eq!(
+            again.post_seq("s-a", 1),
+            None,
+            "the journal was rewritten without it"
+        );
+        assert_eq!(again.post_seq("s-a", 2), Some((8, false)));
+        assert!(again.in_flight().expect("reads").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ONE OLDER BUILD'S FILE THAT DOES NOT READ HOLDS ONLY ITS OWN POST (B19 review): a
+    /// `sent/<sid>.<id>` an older build left damaged is kept where it is and not taken in; that
+    /// post's reservation is refused naming the file, as that build refused it, while every other
+    /// post's reads, the records in flight read, and what is owed names its session; a repair that
+    /// removes it ends the hold. A damaged `inflight/<seq>` is refused naming it wherever the
+    /// records in flight are read (that build refused them all), and the reservations still read.
+    #[test]
+    fn one_older_builds_file_that_does_not_read_holds_only_its_own_post() {
+        let dir = scratch("held");
+        std::fs::create_dir_all(dir.join("sent")).expect("an older build's directory");
+        std::fs::write(dir.join("sent/s-z.9"), "7 key identity\n").expect("a bug's damage");
+        std::fs::write(dir.join("sent/s-a.4"), "17\n").expect("a whole one");
+        let st = StateDir::open(&dir).expect("open");
+        assert_eq!(st.post_pin("s-a", 1).expect("another post reads"), None);
+        assert_eq!(
+            st.post_seq("s-a", 4),
+            Some((17, false)),
+            "a whole file is taken in"
+        );
+        let held = st.post_pin("s-z", 9).expect_err("refused");
+        assert!(
+            held.to_string().contains("sent/s-z.9"),
+            "names the file: {held}"
+        );
+        assert!(st.in_flight().expect("reads").is_empty());
+        assert!(st.owed_publications().expect("reads").sids.contains("s-z"));
+        assert!(
+            dir.join("sent/s-z.9").exists(),
+            "kept where it is for repair"
+        );
+        assert!(!dir.join("sent/s-a.4").exists());
+        std::fs::remove_file(dir.join("sent/s-z.9")).expect("repaired");
+        assert_eq!(st.post_pin("s-z", 9).expect("reads"), None, "the hold ends");
+        std::fs::create_dir_all(dir.join("inflight")).expect("an older build's directory");
+        std::fs::write(dir.join("inflight/5"), "not an entry\n").expect("a bug's damage");
+        let next = StateDir::open(&dir).expect("reopen");
+        let refused = next.in_flight().expect_err("refused");
+        assert!(refused.to_string().contains("inflight/5"), "{refused}");
+        assert!(next.owed_publications().is_err());
+        assert_eq!(
+            next.post_seq("s-a", 4),
+            Some((17, false)),
+            "the reservations read"
+        );
+        std::fs::remove_file(dir.join("inflight/5")).expect("repaired");
+        assert!(next.in_flight().expect("reads").is_empty(), "the hold ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A JOURNAL AN OLDER BUILD'S ATTACH WENT PAST (B19 review): a bridge of this build stops
+    /// uncleanly with a post reserved and its record in flight, and a bridge of an older build
+    /// then attaches on the dir: it takes an incarnation and reads none of the journal. The next
+    /// open of this build retires the journal's record in flight into the quarantine, never to
+    /// be replayed, and keeps the reservation. CONTROL: this build's own restart in that place
+    /// (its attach named in the journal) replays the record, and so does the next open after a
+    /// stop whose hand-off the disk refused (the bridge then leaves the run open:
+    /// `Bridge::end_run`).
+    #[test]
+    fn a_journal_an_older_builds_attach_went_past_has_its_records_in_flight_retired() {
+        let dir = scratch("stale-journal");
+        let crashed = StateDir::open(&dir).expect("open");
+        crashed
+            .take_incarnation(0)
+            .expect("an attach of this build");
+        crashed.set_post_seq("s-a", 5, 70, false).expect("reserved");
+        crashed
+            .set_in_flight(&in_flight_entry(70))
+            .expect("in flight");
+        drop(crashed);
+        let again = StateDir::open(&dir).expect("this build again");
+        again.take_incarnation(0).expect("its attach");
+        assert_eq!(
+            again.in_flight().expect("reads").len(),
+            1,
+            "CONTROL: replayed"
+        );
+        assert!(again.take_stale_retired().is_empty());
+        drop(again);
+        let older = StateDir::open(&dir).expect("an older build's bridge");
+        let mut lease = older.lease().expect("a lease");
+        lease.used += 1;
+        older
+            .write("inc-lease", &lease.render())
+            .expect("its attach, which names nothing in the journal");
+        drop(older);
+        let after = StateDir::open(&dir).expect("this build after it");
+        assert!(after.in_flight().expect("reads").is_empty(), "retired");
+        assert_eq!(
+            after.post_seq("s-a", 5),
+            Some((70, false)),
+            "the reservation stays"
+        );
+        let retired = after.take_stale_retired();
+        assert_eq!(
+            retired.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+            ["inflight/70"]
+        );
+        assert_eq!(
+            std::fs::read(dir.join(&retired[0].to)).expect("its copy"),
+            format!("{}\n", in_flight_entry(70).render()).into_bytes()
+        );
+        after.take_incarnation(0).expect("this build's attach");
+        after
+            .set_in_flight(&in_flight_entry(71))
+            .expect("in flight");
+        after.refuse_writes_of(Some("inflight/71"));
+        assert!(
+            after.hand_posts_to_files().is_err(),
+            "a hand-off the disk refuses"
+        );
+        drop(after);
+        let next = StateDir::open(&dir).expect("the next bridge of this build");
+        assert_eq!(
+            next.in_flight().expect("reads"),
+            vec![(71, in_flight_entry(71))],
+            "CONTROL: the attach the journal names left it"
+        );
+        assert!(next.take_stale_retired().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A STOP'S HAND-OFF TAKEN BACK (B19 review): the next open of this build takes the files a
+    /// hand-off wrote back into the journal with barriers alone where they share its device (its
+    /// records on the media before the unlinks), never a full flush, and unlinks them; a file
+    /// whose very record the journal holds already (a cut between the files and the journal's
+    /// unlink) is unlinked with no write at all. Each open reads the journal once, counted.
+    #[test]
+    fn a_hand_off_taken_back_costs_barriers_and_no_full_flush() {
+        let dir = scratch("handback");
+        let st = StateDir::open(&dir).expect("open");
+        st.set_post_seq("s-a", 1, 7, false).expect("reserved");
+        st.set_in_flight(&in_flight_entry(7)).expect("in flight");
+        assert_eq!(st.hand_posts_to_files().expect("handed"), 2);
+        assert!(!dir.join(journal::FILE).exists());
+        drop(st);
+        let next = StateDir::open(&dir).expect("the successor");
+        let before = next.ops();
+        assert_eq!(next.in_flight().expect("reads").len(), 1);
+        let spent = next.ops() - before;
+        assert_eq!(
+            (spent.fsyncs, spent.unlinks, spent.appends),
+            (0, 2, 2),
+            "{spent:?}"
+        );
+        assert!((1..=2).contains(&spent.barriers), "{spent:?}");
+        assert!(!dir.join("sent/s-a.1").exists() && !dir.join("inflight/7").exists());
+        next.write("sent/s-a.1", "7")
+            .expect("a hand-off's file again");
+        next.write("inflight/7", &in_flight_entry(7).render())
+            .expect("a hand-off's file again");
+        drop(next);
+        let third = StateDir::open(&dir).expect("after a cut");
+        let before = third.ops();
+        assert_eq!(third.post_seq("s-a", 1), Some((7, false)));
+        let spent = third.ops() - before;
+        assert_eq!(
+            (spent.fsyncs, spent.barriers, spent.appends, spent.unlinks),
+            (0, 0, 0, 2),
+            "{spent:?}"
+        );
+        let reads = third.ops().reads;
+        assert_eq!(third.in_flight().expect("reads").len(), 1);
+        assert_eq!(third.ops().reads, reads, "the journal is read once an open");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE SWEEP SALVAGES A DAMAGED JOURNAL (B19 review): after an unclean stop in an earlier
+    /// boot, a journal with damage in its first reservation keeps every whole record after it, so the
+    /// reservation after the damage still reads and the record in flight after it is retired as
+    /// its own quarantine copy, not left only inside the journal's raw bytes.
+    #[test]
+    fn the_sweep_keeps_every_whole_record_after_damage_in_the_journal() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("salvage")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(in_boot(1));
+        let inc = st.take_incarnation(0).expect("the last attach, in boot 1");
+        st.set_post_seq("s-a", 1, 7, false).expect("reserved");
+        st.set_in_flight(&in_flight_entry(7)).expect("in flight");
+        st.clear_in_flight(7).expect("landed");
+        st.set_post_seq("s-a", 2, 8, false).expect("reserved");
+        st.set_in_flight(&in_flight_entry(8)).expect("in flight");
+        drop(st);
+        let path = root.join(journal::FILE);
+        let mut damaged = std::fs::read(&path).expect("the journal");
+        let named = journal::encode(0, &journal::Frame::Attached(inc)).expect("a record");
+        damaged[named.len() + 20] ^= 0x01;
+        std::fs::write(&path, &damaged).expect("damage in its first reservation");
+        let st = StateDir::open(root).expect("boot 2's bridge");
+        st.set_inc_seam(in_boot(2));
+        let moved = st.set_aside_torn().expect("the sweep");
+        assert_eq!(
+            moved.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+            [journal::FILE]
+        );
+        assert_eq!(
+            std::fs::read(root.join("quarantine/journal.posts")).expect("kept"),
+            damaged
+        );
+        assert_eq!(st.post_seq("s-a", 2), Some((8, false)), "after the damage");
+        assert_eq!(
+            st.post_seq("s-a", 1),
+            None,
+            "the damaged record's reservation"
+        );
+        let retired = st
+            .retire_in_flight_of_an_earlier_boot()
+            .expect("the retirement");
+        assert_eq!(
+            retired.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+            ["inflight/8"]
+        );
+        assert!(root.join(&retired[0].to).exists());
+        assert!(st.in_flight().expect("reads").is_empty());
+    }
+
     #[test]
     fn a_posts_sequence_is_pinned_to_the_post_and_survives_a_reopen() {
         let dir = scratch("postseq");
@@ -3957,8 +5215,27 @@ mod tests {
             StateDir::open(&dir).expect("reopen").post_seq("s-a", 3),
             Some((0x0000_0002_0000_0009, true))
         );
+        assert!(
+            !dir.join("sent").exists(),
+            "a reservation is a record of the journal, not a file"
+        );
+        std::fs::create_dir_all(dir.join("sent")).expect("an older build's directory");
         std::fs::write(dir.join("sent/s-a.4"), "17\n").expect("write");
-        assert_eq!(st.post_seq("s-a", 4), Some((17, false)));
+        let adopting = StateDir::open(&dir).expect("reopen");
+        assert_eq!(adopting.post_seq("s-a", 4), Some((17, false)));
+        assert!(
+            !dir.join("sent/s-a.4").exists(),
+            "an older build's reservation is taken into the journal"
+        );
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").post_seq("s-a", 4),
+            Some((17, false)),
+            "and stays there"
+        );
+        assert_eq!(
+            adopting.post_seq("s-a", 3),
+            Some((0x0000_0002_0000_0009, true))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3986,6 +5263,261 @@ mod tests {
             "a pin holds the number and nothing else"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A RETIRED FILE LEAVES THE SET THE CLEAN STOP FLUSHES** (B20): N posts, each landed and
+    /// retired with its receipt, by N sessions whose refill floors went with them, leave the set
+    /// the clean stop stats and flushes as one does: the post journal alone, so the stop's
+    /// work does not grow with N. CONTROL: while a receipt's reservation and a session's floor
+    /// stand, the set names them.
+    #[test]
+    fn retired_files_leave_the_set_the_clean_stop_flushes() {
+        let after = |n: u64| {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("unflushed")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let st = StateDir::open(dir.path()).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("an open run");
+            for i in 1..=n {
+                let sid = format!("s-{i}");
+                let entry = in_flight_entry(100 + i);
+                st.set_post_pin(&sid, i, &entry.pin).expect("a reservation");
+                st.set_in_flight(&entry).expect("in flight");
+                st.set_receipt_pin(&sid, i, &entry.pin)
+                    .expect("a receipt's reservation");
+                st.set_topic_floors(&sid, &BTreeMap::from([("t".to_string(), i)]))
+                    .expect("a refill floor");
+                let held = st.unflushed.lock().unwrap().clone();
+                assert!(
+                    held.contains(&format!("acks/{sid}.{i}"))
+                        && held.contains(&format!("unhandled/{sid}")),
+                    "CONTROL: what stands is in the set: {held:?}"
+                );
+                st.clear_in_flight(entry.pin.seq).expect("landed");
+                st.clear_post_seq(&sid, i);
+                st.clear_receipt_seq(&sid, i);
+                st.forget_topics(&sid);
+            }
+            let pending = st.unflushed.lock().unwrap().clone();
+            let flushed = st.end_run_clean().expect("a clean stop");
+            (pending, flushed.files, flushed.dirs)
+        };
+        let one = after(1);
+        assert_eq!(
+            one.0,
+            BTreeSet::from([journal::FILE.to_string()]),
+            "the journal alone stands"
+        );
+        assert_eq!(
+            after(64),
+            one,
+            "64 retired posts and receipts leave the stop what one leaves"
+        );
+    }
+
+    /// **AN EARLIER BOOT'S SESSIONS' FILES GO, AND THIS BOOT'S STAY** (B20): a run writes every
+    /// per-session file for a session and a post that stays in the journal and in flight, then
+    /// stops cleanly or not. A start in the next boot, judged before its run record names that
+    /// boot, finds an earlier boot, and the sweep unlinks every such file of a sid the roster
+    /// does not name, keeping a live sid's, one that does not read whole, `inflight/`,
+    /// `sent/` and the journal; a start in the same boot finds no earlier boot. A dir with no
+    /// run record is judged by its lease's boot. AN ATTACH OF THIS BOOT WINS OVER THE RECORD: an
+    /// older build attaches without writing `run`, so a lease that names this boot says its
+    /// sessions may still run, and a dir off the boot volume, whose leases name no boot, cannot
+    /// rule one out; neither is an earlier boot, and the older build's session keeps its file.
+    #[test]
+    fn an_earlier_boots_sessions_files_are_swept_and_this_boots_kept() {
+        let session_files = |sid: &str| {
+            [
+                format!("keys/{sid}"),
+                format!("acks/{sid}.3"),
+                format!("unhandled/{sid}"),
+                format!("seen/{sid}"),
+                format!("topics/{sid}"),
+            ]
+        };
+        // How the dir stands between boot 1's run and the next start.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Then {
+            Nothing,
+            // The run record is gone.
+            NoRecord,
+            // An older build, which writes no run record, attached in the next start's boot
+            // and keyed a post of its session.
+            OlderAttach,
+        }
+        for (case, clean, then, off_volume, next_boot, want) in [
+            (
+                "a clean stop, then a reboot",
+                true,
+                Then::Nothing,
+                false,
+                2,
+                true,
+            ),
+            (
+                "an unclean stop, then a reboot",
+                false,
+                Then::Nothing,
+                false,
+                2,
+                true,
+            ),
+            (
+                "no run record, then a reboot",
+                false,
+                Then::NoRecord,
+                false,
+                2,
+                true,
+            ),
+            (
+                "a clean stop, then a start in the same boot",
+                true,
+                Then::Nothing,
+                false,
+                1,
+                false,
+            ),
+            (
+                "an open run, then a start in the same boot",
+                false,
+                Then::Nothing,
+                false,
+                1,
+                false,
+            ),
+            (
+                "a clean stop, then a reboot and an older build's attach before the start",
+                true,
+                Then::OlderAttach,
+                false,
+                2,
+                false,
+            ),
+            (
+                "a clean stop off the boot volume, then a reboot",
+                true,
+                Then::Nothing,
+                true,
+                2,
+                false,
+            ),
+        ] {
+            let seam = |boot| IncSeam {
+                off_volume,
+                ..in_boot(boot)
+            };
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("earlier-boot")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(seam(1));
+            st.begin_run().expect("boot 1's run");
+            st.take_incarnation(0).expect("boot 1's lease");
+            for sid in ["s-gone", "s-live"] {
+                st.set_key_seq(sid, "k", 9).expect("a key");
+                st.set_receipt_seq(sid, 3, 10).expect("a receipt's");
+                st.set_topic_floors(sid, &BTreeMap::from([("t".to_string(), 4)]))
+                    .expect("a floor");
+                st.set_seen_off(sid, 5).expect("seen");
+                st.set_topics(
+                    sid,
+                    &BTreeMap::from([("t".to_string(), TopicCursor { next: 6 })]),
+                )
+                .expect("a cursor");
+            }
+            st.set_receipt_seq("s-torn", 1, 11).expect("a receipt's");
+            std::fs::write(root.join("acks/s-torn.1"), b"1").expect("tear it");
+            let entry = in_flight_entry(12);
+            st.set_post_pin("s-gone", 1, &entry.pin)
+                .expect("a reservation");
+            st.set_in_flight(&entry).expect("in flight");
+            if clean {
+                st.end_run_clean().expect("its clean stop");
+            }
+            drop(st);
+            match then {
+                Then::Nothing => {}
+                Then::NoRecord => std::fs::remove_file(root.join("run")).expect("no record"),
+                Then::OlderAttach => {
+                    let older = StateDir::open(root).expect("an older build's open");
+                    older.set_inc_seam(seam(next_boot));
+                    older
+                        .take_incarnation(0)
+                        .expect("its attach, which writes no run record");
+                    older
+                        .set_key_seq("s-older", "k", 13)
+                        .expect("its session's key");
+                }
+            }
+            let next = StateDir::open(root).expect("the next start");
+            next.set_inc_seam(seam(next_boot));
+            let earlier = next.last_ran_in_an_earlier_boot();
+            assert_eq!(earlier, want, "{case}: an earlier boot");
+            next.set_aside_torn().expect("the sweep of torn files");
+            next.retire_in_flight_of_an_earlier_boot()
+                .expect("the retirement");
+            next.begin_run().expect("the next run");
+            assert!(
+                !next.last_ran_in_an_earlier_boot(),
+                "{case}: once the record names this boot, never an earlier one"
+            );
+            let torn_left = root.join("acks/s-torn.1").exists();
+            let posts = |st: &StateDir| {
+                (
+                    st.post_seq("s-gone", 1),
+                    st.in_flight().expect("the records in flight"),
+                    std::fs::read(root.join(journal::FILE)).ok(),
+                )
+            };
+            let posts_before = posts(&next);
+            assert_eq!(
+                posts_before.0,
+                Some((12, false)),
+                "{case}: the post's reservation"
+            );
+            let removed = if earlier {
+                next.sweep_sessions_of_an_earlier_boot(&BTreeSet::from(["s-live".to_string()]))
+                    .expect("the sweep")
+            } else {
+                0
+            };
+            for rel in session_files("s-gone") {
+                assert_eq!(
+                    root.join(&rel).exists(),
+                    !earlier,
+                    "{case}: {rel} of a session that boot ended"
+                );
+                assert!(
+                    !next.unflushed.lock().unwrap().contains(&rel) || !earlier,
+                    "{case}: an unlinked {rel} is not flushed in place"
+                );
+            }
+            for rel in session_files("s-live") {
+                assert!(root.join(&rel).exists(), "{case}: {rel} of a live sid");
+            }
+            assert_eq!(
+                root.join("keys/s-older").exists(),
+                then == Then::OlderAttach,
+                "{case}: the older build's session keeps its key"
+            );
+            assert_eq!(removed, if earlier { 5 } else { 0 }, "{case}");
+            assert_eq!(
+                root.join("acks/s-torn.1").exists(),
+                torn_left,
+                "{case}: a file that does not read whole is left to the sweep of torn files"
+            );
+            assert_eq!(
+                posts(&next),
+                posts_before,
+                "{case}: the post journal and what it holds are not the sweep's"
+            );
+        }
     }
 
     #[test]
@@ -4021,10 +5553,58 @@ mod tests {
         ] {
             st.write("sent/s-a.1", damaged).unwrap();
             assert_eq!(
-                st.post_pin("s-a", 1).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
+                StateDir::open(&dir)
+                    .unwrap()
+                    .post_pin("s-a", 1)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "an older build's damaged reservation {damaged:?}"
             );
+            assert!(dir.join("sent/s-a.1").exists(), "kept for repair");
         }
+        std::fs::remove_file(dir.join("sent/s-a.1")).unwrap();
+        assert_eq!(
+            StateDir::open(&dir).unwrap().post_pin("s-a", 1).unwrap(),
+            Some(pin.clone()),
+            "CONTROL: the journal's reservation"
+        );
+        let journal = dir.join(journal::FILE);
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend(
+            journal::encode(
+                1,
+                &journal::Frame::Retire {
+                    sid: "s-a".into(),
+                    id: 1,
+                },
+            )
+            .unwrap(),
+        );
+        bytes[20] ^= 0x01;
+        std::fs::write(&journal, &bytes).unwrap();
+        let err = StateDir::open(&dir)
+            .unwrap()
+            .post_pin("s-a", 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "damage: {err}");
+        assert_eq!(std::fs::read(&journal).unwrap(), bytes, "kept for repair");
+        let mut cut = bytes.clone();
+        cut[20] ^= 0x01;
+        cut.truncate(cut.len() - 3);
+        std::fs::write(&journal, &cut).unwrap();
+        let healed = StateDir::open(&dir).unwrap();
+        assert_eq!(
+            healed.post_pin("s-a", 1).unwrap(),
+            Some(pin.clone()),
+            "a torn tail is what an append that failed part-way leaves: the records before it"
+        );
+        healed.clear_post_seq("s-a", 1);
+        assert_eq!(
+            StateDir::open(&dir).unwrap().post_pin("s-a", 1).unwrap(),
+            None,
+            "the next record goes after the tail is gone"
+        );
         for damaged in [
             "key-only",
             "key-only garbage",
@@ -4078,7 +5658,7 @@ mod tests {
         st.set_in_flight(&late).unwrap();
         st.set_in_flight(&early).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(dir.join(format!("inflight/{}", late.pin.seq)))
+            &std::fs::metadata(dir.join(journal::FILE))
                 .unwrap()
                 .permissions(),
         );
@@ -4087,11 +5667,21 @@ mod tests {
             0,
             "a record's bytes are the owner's: {mode:o}"
         );
-        std::fs::write(dir.join("inflight/.9.tmp.1.abcd"), "junk").unwrap();
         assert_eq!(
             StateDir::open(&dir).unwrap().in_flight().unwrap(),
             vec![(early.pin.seq, early.clone()), (late.pin.seq, late.clone())]
         );
+        st.clear_in_flight(early.pin.seq).unwrap();
+        std::fs::create_dir_all(dir.join("inflight")).unwrap();
+        std::fs::write(dir.join("inflight/.9.tmp.1.abcd"), "junk").unwrap();
+        st.write(&format!("inflight/{}", early.pin.seq), &early.render())
+            .unwrap();
+        assert_eq!(
+            StateDir::open(&dir).unwrap().in_flight().unwrap(),
+            vec![(early.pin.seq, early.clone()), (late.pin.seq, late.clone())],
+            "an older build's entry is taken into the journal, a temp left alone"
+        );
+        assert!(!dir.join(format!("inflight/{}", early.pin.seq)).exists());
         for damaged in [
             "",
             "8589934601",
@@ -4107,7 +5697,11 @@ mod tests {
             st.write(&format!("inflight/{}", late.pin.seq), damaged)
                 .unwrap();
             assert_eq!(
-                st.in_flight().unwrap_err().kind(),
+                StateDir::open(&dir)
+                    .unwrap()
+                    .in_flight()
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidData,
                 "{damaged:?} must block recovery"
             );
@@ -4116,9 +5710,16 @@ mod tests {
                 "uncertain publication fate must not discard its journal"
             );
         }
+        std::fs::remove_file(dir.join(format!("inflight/{}", late.pin.seq))).unwrap();
+        let st = StateDir::open(&dir).unwrap();
         st.clear_in_flight(late.pin.seq).unwrap();
         st.clear_in_flight(early.pin.seq).unwrap();
         assert!(st.in_flight().unwrap().is_empty());
+        assert!(StateDir::open(&dir)
+            .unwrap()
+            .in_flight()
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4293,12 +5894,30 @@ mod tests {
         st.set_seen_off("s-b", 44).unwrap();
         st.write("inflight/5", "damaged").unwrap();
         assert_eq!(
-            st.forget_log_offsets(7, Some(b), None, None)
+            StateDir::open(&dir)
+                .unwrap()
+                .forget_log_offsets(7, Some(b), None, None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
         );
         assert!(dir.join("inflight/5").exists(), "damage is kept for repair");
+        assert_eq!(st.seen_off("s-b"), Some(44), "preflight changed nothing");
+        std::fs::remove_file(dir.join("inflight/5")).unwrap();
+        let journal = dir.join(journal::FILE);
+        let mut damaged = std::fs::read(&journal).unwrap();
+        damaged[20] ^= 0x01;
+        std::fs::write(&journal, &damaged).unwrap();
+        assert_eq!(
+            StateDir::open(&dir)
+                .unwrap()
+                .forget_log_offsets(7, Some(b), None, None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+            "a damaged journal"
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), damaged, "kept for repair");
         assert_eq!(st.seen_off("s-b"), Some(44), "preflight changed nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5601,6 +7220,22 @@ mod tests {
             };
             st.set_post_pin("s-a", 1, &pin)
                 .expect("a whole reservation");
+            let journal_path = root.join(journal::FILE);
+            let whole_journal = std::fs::read(&journal_path).expect("the journal");
+            let next_record = journal::encode(
+                journal::read(&whole_journal).next_step,
+                &journal::Frame::InFlight(in_flight_entry(10)),
+            )
+            .expect("frames");
+            let mut torn_journal = whole_journal.clone();
+            torn_journal.extend_from_slice(&next_record);
+            let last = torn_journal.len() - 1;
+            torn_journal[last] ^= 0x01;
+            std::fs::write(&journal_path, &torn_journal).expect("a record torn inside");
+            let mut cut_journal = whole_journal.clone();
+            cut_journal.extend_from_slice(&next_record[..next_record.len() / 2]);
+            std::fs::create_dir_all(root.join("inflight")).expect("an older build's");
+            std::fs::create_dir_all(root.join("sent")).expect("an older build's");
             let entry = in_flight_entry(8).render();
             let cut_entry = &entry.as_bytes()[..entry.find("/s-a/").expect("the face") + 3];
             std::fs::write(root.join("inflight/8"), cut_entry).expect("cut entry");
@@ -5638,14 +7273,16 @@ mod tests {
                         "acks/s-a.4",
                         "keys/s-a",
                         "unhandled/s-a",
+                        "journal/posts",
                     ],
                     "every torn file, kind by kind"
                 );
                 for m in &moved {
                     assert_eq!(m.to, format!("{QUARANTINE}/{}", m.from.replace('/', ".")));
-                    assert!(
-                        !root.join(&m.from).exists(),
-                        "{} is moved, not copied",
+                    assert_eq!(
+                        root.join(&m.from).exists(),
+                        m.from == journal::FILE,
+                        "{} is moved, not copied; the journal is rewritten whole",
                         m.from
                     );
                 }
@@ -5657,6 +7294,16 @@ mod tests {
                 assert_eq!(
                     std::fs::read(root.join("quarantine/sent.s-a.2")).expect("kept"),
                     cut_pin
+                );
+                assert_eq!(
+                    std::fs::read(root.join("quarantine/journal.posts")).expect("kept"),
+                    torn_journal,
+                    "the journal's exact bytes, its torn record with them"
+                );
+                assert_eq!(
+                    journal::read(&std::fs::read(&journal_path).expect("rewritten")).end,
+                    journal::End::Clean,
+                    "the journal holds what its whole records said"
                 );
                 assert_eq!(
                     st.in_flight().expect("the journal reads"),
@@ -5674,6 +7321,11 @@ mod tests {
                 st.publication_offset_resets(None)
                     .expect("a log move's reset reads");
                 assert!(st.set_aside_torn().expect("again").is_empty(), "idempotent");
+                std::fs::write(&journal_path, &cut_journal).expect("a record cut short");
+                assert!(
+                    st.set_aside_torn().expect("a cut record").is_empty(),
+                    "a record cut short stays, for its reader to drop"
+                );
                 std::fs::write(root.join("inflight/8"), b"").expect("torn again");
                 assert_eq!(
                     st.publish_quarantine_file(
@@ -5708,20 +7360,45 @@ mod tests {
                 );
                 assert!(st.set_aside_torn().expect("no sweep").is_empty());
                 assert!(!root.join(QUARANTINE).exists(), "nothing moved");
+                let next = StateDir::open(root).expect("the next bridge of the boot");
+                next.set_inc_seam(in_boot(1));
                 assert_eq!(
-                    st.in_flight().expect_err("refused").kind(),
+                    next.in_flight().expect_err("refused").kind(),
                     io::ErrorKind::InvalidData
                 );
                 assert_eq!(
-                    st.post_pin("s-a", 2).expect_err("refused").kind(),
+                    next.post_pin("s-a", 2).expect_err("refused").kind(),
                     io::ErrorKind::InvalidData
                 );
-                assert!(st.publication_offset_resets(None).is_err());
-                assert!(st.topic_floors("s-a").is_err());
-                assert!(st
+                assert!(next.publication_offset_resets(None).is_err());
+                assert!(next.topic_floors("s-a").is_err());
+                assert!(next
                     .logpin()
                     .expect("read")
                     .is_some_and(|t| crate::mirror::Pin::parse(&t).is_err()));
+                for older in ["inflight/8", "sent/s-a.2"] {
+                    std::fs::remove_file(root.join(older)).expect("repaired");
+                }
+                assert_eq!(
+                    next.in_flight().expect_err("refused").kind(),
+                    io::ErrorKind::InvalidData,
+                    "a record torn inside is damage within a boot"
+                );
+                assert_eq!(
+                    std::fs::read(&journal_path).expect("kept"),
+                    torn_journal,
+                    "kept for repair"
+                );
+                std::fs::write(&journal_path, &cut_journal).expect("a record cut short");
+                let next = StateDir::open(root).expect("the next bridge of the boot");
+                next.set_inc_seam(in_boot(1));
+                assert_eq!(
+                    next.in_flight().expect("the journal reads"),
+                    vec![(7, whole.clone())],
+                    "a record cut short within a boot is an append that failed: the records \
+                     before it"
+                );
+                assert_eq!(next.post_pin("s-a", 1).expect("reads"), Some(pin.clone()));
             }
         }
     }
@@ -5742,11 +7419,12 @@ mod tests {
         st.begin_run()
             .expect("a run in boot 1, never stopped cleanly");
         st.set_inc_seam(in_boot(2));
-        std::fs::write(root.join("sent/s-a.1"), b"").expect("torn to nothing");
+        std::fs::create_dir_all(root.join("acks")).expect("its dir");
+        std::fs::write(root.join("acks/s-a.1"), b"").expect("torn to nothing");
         std::os::unix::fs::symlink(elsewhere.path(), root.join(QUARANTINE)).expect("plant");
         let refused = st.set_aside_torn().expect_err("a link is no quarantine");
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
-        assert!(root.join("sent/s-a.1").exists(), "nothing moved");
+        assert!(root.join("acks/s-a.1").exists(), "nothing moved");
         assert_eq!(
             std::fs::read_dir(elsewhere.path()).expect("list").count(),
             0,
@@ -5976,10 +7654,10 @@ mod tests {
                 let st = StateDir::open(dir.path()).expect("open");
                 st.set_inc_seam(in_boot(1));
                 st.begin_run().expect("open run");
-                let name = if kind == TornKind::InFlight {
-                    "8"
-                } else {
-                    "s-a.1"
+                let name = match kind {
+                    TornKind::InFlight => "8",
+                    TornKind::Journal => journal::NAME,
+                    _ => "s-a.1",
                 };
                 let rel = format!("{}/{name}", kind.place());
                 st.write(&rel, "12").expect("a pending write");
@@ -6067,14 +7745,15 @@ mod tests {
                         .expect("make unreadable");
                 }
             }
-            std::fs::write(st.path("sent/s-a.1"), b"torn evidence").expect("candidate");
+            std::fs::create_dir_all(st.path("acks")).expect("its dir");
+            std::fs::write(st.path("acks/s-a.1"), b"torn evidence").expect("candidate");
             assert!(st.last_run().is_err(), "the occupant is not absence");
             assert!(st.torn_files_possible().is_err(), "no legacy verdict");
             assert!(st.set_aside_torn().is_err(), "no sweep");
             assert!(st.begin_run().is_err(), "no replacement on start");
             assert!(st.end_run_clean().is_err(), "no replacement on stop");
             assert_eq!(
-                std::fs::read(st.path("sent/s-a.1")).expect("source remains"),
+                std::fs::read(st.path("acks/s-a.1")).expect("source remains"),
                 b"torn evidence"
             );
             assert!(!st.path(QUARANTINE).exists());
@@ -6193,6 +7872,7 @@ mod tests {
         st.set_in_flight(&in_flight_entry(7))
             .expect("a whole entry");
         let entry = in_flight_entry(8).render();
+        std::fs::create_dir_all(root.join("inflight")).expect("an older build's");
         std::fs::write(
             root.join("inflight/8"),
             &entry.as_bytes()[..entry.find("/s-a/").expect("the face") + 3],
@@ -6271,12 +7951,11 @@ mod tests {
         let (st, cost) = start(in_boot(4));
         assert_eq!(cost, (0, 2), "over a record whose boot nobody named");
         st.end_run_clean().expect("a clean stop in boot 4");
-        std::fs::remove_dir_all(root.join("sent")).expect("the reservations' directory");
         let elsewhere = aterm_tempfile::Builder::new()
             .prefix("start-tier-link")
             .tempdir_in("/tmp")
             .expect("scratch");
-        std::os::unix::fs::symlink(elsewhere.path(), root.join("sent"))
+        std::os::unix::fs::symlink(elsewhere.path(), root.join(journal::DIR))
             .expect("a link where a directory goes");
         let (_, cost) = start(in_boot(5));
         assert_eq!(cost, (0, 2), "a torn kind's directory that does not read");
@@ -6368,12 +8047,12 @@ mod tests {
                 st.set_receipt_pin("s-a", 4, &entry.pin)
                     .expect("a receipt pin");
                 let pending = st.unflushed.lock().unwrap().clone();
-                assert_eq!(pending.len(), 3);
+                assert_eq!(pending.len(), 2, "the journal and the receipt's pin");
                 let open = std::fs::read(st.path("run")).expect("the open marker");
                 let (path, tier) = if final_root {
                     (st.root.clone(), Flush::Durable)
                 } else {
-                    (st.path("sent"), Flush::Ordered)
+                    (st.path(journal::DIR), Flush::Ordered)
                 };
                 *st.dir_flush_refusal.lock().unwrap() = Some((path, tier, kind));
                 assert_eq!(
@@ -6394,7 +8073,7 @@ mod tests {
                 *st.dir_flush_refusal.lock().unwrap() = None;
                 let flushed = st.end_run_clean().expect("a complete retry");
                 assert_eq!(flushed.files, pending.len() as u64);
-                assert_eq!(flushed.dirs, 3);
+                assert_eq!(flushed.dirs, 2);
                 assert_eq!(flushed.full, 1);
                 assert!(st.unflushed.lock().unwrap().is_empty());
                 assert!(st.last_run().unwrap().unwrap().clean);
@@ -6421,7 +8100,7 @@ mod tests {
             st.set_receipt_pin("s-a", 4, &entry.pin)
                 .expect("a receipt pin");
             if clean {
-                st.refuse_writes_of(Some("sent/s-a.1"));
+                st.refuse_writes_of(Some(journal::FILE));
                 assert!(
                     st.end_run_clean().is_err(),
                     "a controlled failed flush attempt"
@@ -6437,15 +8116,15 @@ mod tests {
                 assert_eq!(
                     (ops.replaces, ops.renames),
                     (1, 1),
-                    "the three files of the two runs flushed where they are: only `run` written"
+                    "the two files of the two runs flushed where they are: only `run` written"
                 );
-                assert_eq!((ops.barriers, ops.fsyncs), (3 + 3 + 1, 1));
+                assert_eq!((ops.barriers, ops.fsyncs), (2 + 2 + 1, 1));
                 assert_eq!(
                     flushed,
                     Flushed {
-                        files: 3,
-                        dirs: 3,
-                        ordered: 7,
+                        files: 2,
+                        dirs: 2,
+                        ordered: 5,
                         full: 1,
                     }
                 );
@@ -6454,16 +8133,31 @@ mod tests {
                     Some(true)
                 );
             }
+            std::fs::create_dir_all(root.join("sent")).expect("an older build's");
             std::fs::write(root.join("sent/s-a.1"), b"7 key identity\n").expect("a bug's damage");
+            let journal = root.join(journal::FILE);
+            let mut damaged = std::fs::read(&journal).expect("the journal");
+            damaged[20] ^= 0x01;
+            std::fs::write(&journal, &damaged).expect("a bug's damage");
             st.set_inc_seam(in_boot(2));
             let moved = st.set_aside_torn().expect("the sweep");
             if clean {
                 assert!(moved.is_empty(), "nothing a clean stop left can be torn");
-                assert!(st.post_pin("s-a", 1).is_err(), "refused, fail-closed");
+                let next = StateDir::open(root).expect("the next boot's bridge");
+                next.set_inc_seam(in_boot(2));
+                assert!(next.post_pin("s-a", 1).is_err(), "refused, fail-closed");
+                std::fs::remove_file(root.join("sent/s-a.1")).expect("one repaired");
+                let next = StateDir::open(root).expect("the next boot's bridge");
+                next.set_inc_seam(in_boot(2));
+                assert!(
+                    next.post_pin("s-a", 1).is_err(),
+                    "a damaged journal refused too"
+                );
+                assert_eq!(std::fs::read(&journal).expect("kept"), damaged);
             } else {
                 assert_eq!(
                     moved.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
-                    ["sent/s-a.1"],
+                    ["sent/s-a.1", journal::FILE],
                     "CONTROL: a run that never closed is judged unclean"
                 );
             }
@@ -6525,12 +8219,13 @@ mod tests {
             let (seven, nine) = (in_flight_entry(7), in_flight_entry(9));
             st.set_in_flight(&seven).expect("a whole entry");
             st.set_in_flight(&nine).expect("another");
-            let on_disk = std::fs::read(root.join("inflight/7")).expect("its bytes");
+            let on_disk = format!("{}\n", seven.render()).into_bytes();
             if clean {
                 st.end_run_clean().expect("a clean stop");
             }
             let entry = in_flight_entry(8).render();
             let cut = &entry.as_bytes()[..entry.find("/s-a/").expect("the face") + 3];
+            std::fs::create_dir_all(root.join("inflight")).expect("an older build's");
             std::fs::write(root.join("inflight/8"), cut).expect("a cut entry");
             st.set_inc_seam(in_boot(boot));
             let retired = st
@@ -6539,12 +8234,11 @@ mod tests {
             if boot == 1 || clean {
                 assert!(retired.is_empty(), "{case}: nothing is retired");
                 assert!(!root.join(QUARANTINE).exists(), "{case}: nothing moved");
-                for seq in [7, 9] {
-                    assert!(
-                        root.join(format!("inflight/{seq}")).exists(),
-                        "{case}: inflight/{seq} stays, for the attach to publish again"
-                    );
-                }
+                assert_eq!(
+                    st.in_flight().expect("the journal reads"),
+                    vec![(7, seven.clone()), (9, nine.clone())],
+                    "{case}: both stay, for the attach to publish again"
+                );
                 continue;
             }
             assert_eq!(
@@ -6560,10 +8254,20 @@ mod tests {
             assert_eq!(
                 std::fs::read(root.join("quarantine/retired.inflight.7")).expect("kept"),
                 on_disk,
-                "its exact bytes, never deleted"
+                "the bytes its file would have held, never deleted"
             );
+            assert!(
+                st.in_flight().expect("the journal reads").is_empty(),
+                "the journal's records dropped"
+            );
+            let next = || {
+                let next = StateDir::open(root).expect("the next bridge");
+                next.set_inc_seam(in_boot(boot));
+                next
+            };
             assert_eq!(
-                st.in_flight()
+                next()
+                    .in_flight()
                     .expect_err("the cut one, the torn sweep's")
                     .kind(),
                 io::ErrorKind::InvalidData
@@ -6574,7 +8278,7 @@ mod tests {
                 ["inflight/8"]
             );
             assert!(
-                st.in_flight().expect("the journal reads").is_empty(),
+                next().in_flight().expect("the journal reads").is_empty(),
                 "nothing left for the attach to publish again"
             );
             assert!(
@@ -6583,8 +8287,23 @@ mod tests {
                     .is_empty(),
                 "idempotent"
             );
-            st.set_in_flight(&seven)
-                .expect("an entry at a retired name");
+            st.set_in_flight(&seven).expect("the same record again");
+            assert!(
+                st.retire_in_flight_of_an_earlier_boot()
+                    .expect("again")
+                    .is_empty(),
+                "one record, one copy"
+            );
+            assert!(
+                st.in_flight().expect("reads").is_empty(),
+                "and it is dropped"
+            );
+            let other = InFlight {
+                body: b"v=1 t=6 text=another".to_vec(),
+                ..in_flight_entry(7)
+            };
+            st.set_in_flight(&other)
+                .expect("another record at a retired name");
             let again = st.retire_in_flight_of_an_earlier_boot().expect("again");
             assert_eq!(
                 again.iter().map(|m| m.to.as_str()).collect::<Vec<_>>(),
@@ -6594,6 +8313,53 @@ mod tests {
                 std::fs::read(root.join("quarantine/retired.inflight.7")).expect("kept"),
                 on_disk,
                 "the first one is not overwritten"
+            );
+        }
+    }
+
+    /// ONE RECORD, ONE COPY: a record a stop's hand-off left both in an older build's file and
+    /// in the journal (a cut between the file and the journal's unlink) is retired once, its
+    /// one copy in the quarantine, and dropped from the journal. CONTROL: the record alone in
+    /// the journal is retired too.
+    #[test]
+    fn a_record_in_both_a_file_and_the_journal_is_retired_once() {
+        for in_file in [true, false] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("retire-both")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("boot 1's run");
+            let seven = in_flight_entry(7);
+            st.set_in_flight(&seven).expect("in the journal");
+            if in_file {
+                st.write("inflight/7", &seven.render())
+                    .expect("and in a file");
+            }
+            st.set_inc_seam(in_boot(2));
+            let retired = st
+                .retire_in_flight_of_an_earlier_boot()
+                .expect("the retirement");
+            assert_eq!(
+                retired.iter().map(|m| m.to.as_str()).collect::<Vec<_>>(),
+                [format!("{QUARANTINE}/{RETIRED_PREFIX}inflight.7")],
+                "in_file={in_file}: one copy"
+            );
+            let copies: Vec<String> = std::fs::read_dir(root.join(QUARANTINE))
+                .expect("the quarantine")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect();
+            assert_eq!(copies, ["retired.inflight.7"], "in_file={in_file}");
+            assert!(
+                StateDir::open(root)
+                    .expect("reopen")
+                    .in_flight()
+                    .unwrap()
+                    .is_empty(),
+                "in_file={in_file}: nothing left to publish again"
             );
         }
     }
@@ -6643,7 +8409,11 @@ mod tests {
                 .expect("the retirement");
             if attached_in_boot_2 && !off_volume {
                 assert!(retired.is_empty(), "{case}: nothing is retired");
-                assert!(root.join("inflight/7").exists(), "{case}: the entry stays");
+                assert_eq!(
+                    st.in_flight().expect("reads").len(),
+                    1,
+                    "{case}: the entry stays"
+                );
             } else {
                 assert_eq!(
                     retired.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
@@ -6670,10 +8440,11 @@ mod tests {
             ..in_flight_entry(seq)
         };
         let whole = reply(7);
-        st.set_in_flight(&whole).expect("a whole entry");
+        let older_build =
+            |entry: &InFlight| st.write(&format!("inflight/{}", entry.pin.seq), &entry.render());
+        older_build(&whole).expect("a whole entry");
         for seq in [8, 9, 10] {
-            st.set_in_flight(&reply(seq))
-                .expect("an entry the cut will take");
+            older_build(&reply(seq)).expect("an entry the cut will take");
         }
         let at = |seq: u64, text: &str| match seq {
             8 => text.find("log=").expect("its witness"),
@@ -6689,6 +8460,13 @@ mod tests {
             assert_eq!(read.log.is_some(), seq == 10, "{cut:?}");
         }
         st.set_inc_seam(in_boot(2));
+        assert!(
+            st.set_aside_torn_by_the_reader_alone()
+                .expect("a sweep by the reader alone")
+                .is_empty(),
+            "NEGATIVE CONTROL: the reader takes every cut entry, so a sweep that trusts it alone \
+             keeps them, the replies among them with no witness of their log"
+        );
         let moved = st.set_aside_torn().expect("the sweep");
         assert_eq!(
             moved.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
@@ -6804,10 +8582,9 @@ mod tests {
                 let ops = st.ops() - before;
                 assert_eq!(
                     (ops.replaces, ops.barriers, ops.fsyncs),
-                    (1, 4, 1),
-                    "{world}: the pin flushed where it is, `sent/` (which every state dir has) \
-                     and the root ordered after it, then `run`'s bytes ordered and the root \
-                     flushed in full"
+                    (1, 3, 1),
+                    "{world}: the pin flushed where it is and the root ordered after it, then \
+                     `run`'s bytes ordered and the root flushed in full"
                 );
             }
             let mut text = pin.render();

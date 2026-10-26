@@ -32,6 +32,14 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   accounts-revert --operation <digest> --request <hex>\n\
   accounts-history                    signed provenance and local receipts\n\
   accounts-check                      diagnose explicit contact links; grants no login rights\n\
+  accounts-plan --key <id>             review a bound account/contact proposal; grants no rights\n\
+  accounts-activation-init             open the root account-decision history\n\
+  accounts-activation-status --account <digest>\n\
+  accounts-authorize --account <digest> --key <id> --actor <actor-hex>\n\
+        --parents <digest,...|none> --request <hex>\n\
+                                      root-sign one reviewed login-preparation decision\n\
+  accounts-stop --account <digest> --parents <digest,...|none> --request <hex>\n\
+  accounts-prepare --account <digest>  validate current permission and binding; no login\n\
   accounts-import-csv --file <path> --request <hex>\n\
                                        one atomic, inert CSV candidate document\n\
   accounts-imports                    shared candidates and signed provenance\n\
@@ -157,6 +165,16 @@ pub fn run(words: &[String]) -> Result<Value> {
     }
     if matches!(
         command,
+        "accounts-activation-init"
+            | "accounts-activation-status"
+            | "accounts-authorize"
+            | "accounts-stop"
+            | "accounts-prepare"
+    ) {
+        return crate::accounts::activations::command::run(command, options);
+    }
+    if matches!(
+        command,
         "accounts-init"
             | "accounts-get"
             | "accounts-scan"
@@ -164,6 +182,7 @@ pub fn run(words: &[String]) -> Result<Value> {
             | "accounts-revert"
             | "accounts-history"
             | "accounts-check"
+            | "accounts-plan"
     ) {
         return crate::accounts::proposals::command::run(command, options);
     }

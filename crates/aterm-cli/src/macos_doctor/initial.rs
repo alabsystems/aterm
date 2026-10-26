@@ -27,6 +27,8 @@ pub use scope::{
     InitialSetupUpgrade, SetupUpgrade, alab_mac, decline_provisional_setup_widen,
     provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
 };
+mod park_watch;
+pub use park_watch::{ParkWatch, Watches};
 mod secrets_retry;
 use secrets_retry::Pace;
 mod revision;
@@ -1307,9 +1309,23 @@ fn unanswered_join_rows(reports: Vec<aterm_machines::model::ItemReport>) -> Vec<
 
 /// What the join a probe nobody answered let through ([`unjoined_alab_row`]) heard of macOS's
 /// Local Network switch, kept for the Local Network row and later launches
-/// ([`access::lan_answered`]) as the probe would have kept it. A join made, or waiting for an admin
-/// Mac, and a server there holding no vault are a reach; macOS refusing the vault's `.local` name
-/// is the person's Don't Allow; a look nothing answered says nothing of the switch.
+/// ([`access::lan_answered`]) as the probe would have kept it. A join made, waiting for an admin
+/// Mac, or failing after the vault answered (its subscriber not installed), and a server there
+/// holding no vault are a reach; macOS refusing the vault's `.local` name is the person's Don't
+/// Allow; a look nothing answered, or a join that failed before the vault answered, says nothing
+/// of the switch.
+/// The rows of a join a probe nobody answered let through, after `keep` is handed what its look
+/// heard of Local Network ([`join_lan_answer`], [`unanswered_join_rows`]).
+fn unanswered_join(
+    reports: Vec<aterm_machines::model::ItemReport>,
+    keep: impl FnOnce(access::LanAnswer),
+) -> Vec<Row> {
+    if let Some(answer) = join_lan_answer(&reports) {
+        keep(answer);
+    }
+    unanswered_join_rows(reports)
+}
+
 fn join_lan_answer(reports: &[aterm_machines::model::ItemReport]) -> Option<access::LanAnswer> {
     use access::LanAnswer::{Reached, Refused};
     use aterm_converge::StoodAside;
@@ -1318,6 +1334,13 @@ fn join_lan_answer(reports: &[aterm_machines::model::ItemReport]) -> Option<acce
         .iter()
         .find_map(|report| match (report.outcome, &report.stood_aside) {
             (Outcome::Changed, None) | (Outcome::Blocked, Some(StoodAside::Waiting(_))) => {
+                Some(Reached)
+            }
+            (Outcome::Failed, None)
+                if report.why.as_deref().is_some_and(|why| {
+                    why.starts_with(aterm_machines::init_secrets::VAULT_ANSWERED_BUT)
+                }) =>
+            {
                 Some(Reached)
             }
             (Outcome::Blocked, Some(StoodAside::Offline(why))) => {
@@ -4275,15 +4298,16 @@ impl SetupNext {
     }
 
     /// What one stage's rows leave: done when all are in place, a park when every
-    /// row left waits on a person or an absent vault ([`WAITING`]) or on a vault
-    /// that did not answer ([`UNREACHED`]).
+    /// row left waits on a person or an absent vault ([`WAITING`]), on a vault
+    /// that did not answer ([`UNREACHED`]) or on what an engine put off ([`super::DEFERRED`]).
     fn of(rows: &[Row]) -> Self {
         if rows_ready(rows) {
             Self::Done
         } else if !rows.is_empty()
-            && rows
-                .iter()
-                .all(|row| row_ready(row) || matches!(row.status.as_str(), WAITING | UNREACHED))
+            && rows.iter().all(|row| {
+                row_ready(row)
+                    || matches!(row.status.as_str(), WAITING | UNREACHED | super::DEFERRED)
+            })
         {
             Self::Park
         } else {
@@ -4321,6 +4345,8 @@ pub struct InitialSetupParkMark {
     developer_tools: Option<bool>,
     retry_due: Option<u64>,
     mac_settings_retry_due: Option<u64>,
+    /// The earliest Secrets or Mac settings retry not due yet ([`InitialSetupParkMark::next_due`]).
+    retry_ahead: Option<u64>,
     /// An admitted, unfinished Accounts or Permissions stage
     /// ([`InitialSetupParkMark::waits_on_settings`]).
     in_settings: bool,
@@ -4404,6 +4430,25 @@ impl InitialSetupParkMark {
     /// gaining focus ends its park. No other park listens for focus (System State design §3.5).
     pub fn waits_on_settings(&self) -> bool {
         self.in_settings
+    }
+
+    /// The earliest automatic retry this run has ahead, in seconds since the epoch: the park's
+    /// one timer. `None`: no retry is ahead, so only a wake or a watched fact ends the park.
+    pub fn next_due(&self) -> Option<u64> {
+        self.retry_ahead
+    }
+
+    /// The facts [`Self::facts_changed_since`] reads that can move while the run is parked: the
+    /// secrets folder and the network for unfinished Secrets or Repositories, and the Command Line
+    /// Tools for Repositories that wait on them. A run that waits on a person alone watches none.
+    pub fn watches(&self) -> Watches {
+        Watches {
+            secrets: self.network_run.is_some(),
+            network: self.network_run.is_some(),
+            developer_tools: self.network_run.is_some()
+                && self.developer_tools_run.is_some()
+                && self.developer_tools != Some(true),
+        }
     }
 }
 
@@ -4557,6 +4602,26 @@ fn initial_setup_park_mark_reading(
                 .ok()
                 .flatten()
             }),
+        retry_ahead: unfinished_secrets
+            .and_then(|(root, progress, _, _, _, _)| {
+                secrets_retry::retry_ahead(root, progress.revision, now)
+            })
+            .into_iter()
+            .chain(
+                pending
+                    .filter(|(_, _, _, _, mac_settings, _)| *mac_settings)
+                    .and_then(|(root, progress, _, _, _, _)| {
+                        super::mac_settings_retry_ahead(
+                            root,
+                            progress.revision,
+                            &aterm_types::version::build_id(),
+                            now,
+                        )
+                        .ok()
+                        .flatten()
+                    }),
+            )
+            .min(),
         in_settings: pending.is_some_and(|(_, _, _, _, _, in_settings)| in_settings),
     }
 }
@@ -5160,7 +5225,9 @@ pub(super) fn row_status(row: &aterm_machines::model::ItemReport) -> &'static st
         {
             WAITING
         }
-        Outcome::Blocked | Outcome::Deferred => "blocked",
+        Outcome::Blocked => "blocked",
+        // Put off for the console, an idle Mac or the next launch: no pass a minute later moves it.
+        Outcome::Deferred => super::DEFERRED,
         Outcome::Unknown => "unverified",
         Outcome::Failed => "error",
     }
@@ -5263,10 +5330,7 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
             if !unanswered {
                 return secrets_rows(reports);
             }
-            if let Some(answer) = join_lan_answer(&reports) {
-                access::lan_answered(answer);
-            }
-            unanswered_join_rows(reports)
+            unanswered_join(reports, access::lan_answered)
         })
     }
 
@@ -5419,7 +5483,7 @@ fn execute_pass(
     };
     let Some(mut progress) = progress(root)? else {
         return Ok(host.legacy(root)?.map(|report| {
-            let next = if report.needs_attention() {
+            let next = if !report.complete() {
                 SetupNext::of(&report.rows)
             } else {
                 SetupNext::Done
@@ -13639,8 +13703,11 @@ mod tests {
     /// Network switch, as the probe would have: a join made or waiting for an admin Mac, or a
     /// server there with no vault, reads the switch on; macOS refusing the vault's `.local` name
     /// reads it off; a look nothing answered leaves it untold, so a laptop away from the vault's
-    /// LAN never reads on. Negative controls: keeping nothing leaves the joined Mac's row untold;
-    /// reading every stand-aside as a reach fails the unanswered case.
+    /// LAN never reads on. A join that failed after the vault answered it (its subscriber not
+    /// installed) reads on; one that failed before reaching it says nothing. What is heard is
+    /// handed to the keeper the live pass gives (`access::lan_answered`) through
+    /// [`unanswered_join`]. Negative controls: a join made whose answer is not kept leaves its row
+    /// untold; reading every stand-aside as a reach fails the unanswered case.
     #[test]
     fn a_join_an_unanswered_probe_let_through_keeps_what_its_look_heard_of_the_lan() {
         use access::{Lan, LanAnswer};
@@ -13663,6 +13730,10 @@ mod tests {
             stood_aside,
             essential: false,
             elapsed_ms: None,
+        };
+        let failed = |why: &str| ItemReport {
+            why: Some(why.to_owned()),
+            ..item(Outcome::Failed, None)
         };
         let refused = format!(
             "the vault does not answer, so nothing was changed: fetching \
@@ -13709,11 +13780,42 @@ mod tests {
                 None,
                 Lan::Untold,
             ),
+            (
+                item(
+                    Outcome::Blocked,
+                    Some(StoodAside::Offline(format!(
+                        "{}: http://alab-secrets.local:7484/v1/alab: no vault there",
+                        aterm_machines::init_secrets::NO_VAULT_NOW
+                    ))),
+                ),
+                Some(LanAnswer::Reached),
+                Lan::On,
+            ),
+            (
+                failed(&format!(
+                    "{} the subscriber could not be installed: launchctl bootstrap failed",
+                    aterm_machines::init_secrets::VAULT_ANSWERED_BUT
+                )),
+                Some(LanAnswer::Reached),
+                Lan::On,
+            ),
+            (
+                failed("joining the vault: could not write source.toml"),
+                None,
+                Lan::Untold,
+            ),
         ];
         for (report, answer, lan) in cases {
             let heard = join_lan_answer(std::slice::from_ref(&report));
             assert_eq!(heard, answer, "{report:?}");
             assert_eq!(Lan::of(heard, &[]), lan, "{report:?}");
+            let mut kept = None;
+            let rows = unanswered_join(vec![report.clone()], |answer| kept = Some(answer));
+            assert_eq!(kept, answer, "kept: {report:?}");
+            assert_eq!(
+                format!("{rows:?}"),
+                format!("{:?}", unanswered_join_rows(vec![report]))
+            );
         }
     }
 

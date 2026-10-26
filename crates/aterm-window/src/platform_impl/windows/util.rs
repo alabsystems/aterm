@@ -6,17 +6,16 @@
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
 
-use std::ffi::{c_void, OsStr, OsString};
+use std::ffi::{c_void, OsStr};
 use std::iter::once;
 use std::ops::BitAnd;
-use std::os::windows::prelude::{OsStrExt, OsStringExt};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::windows::prelude::OsStrExt;
 use std::{io, mem, ptr};
 
 use crate::utils::Lazy;
 use windows_sys::core::BOOL;
 use windows_sys::core::{HRESULT, PCWSTR};
-use windows_sys::Win32::Foundation::{HANDLE, HMODULE, HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, HMONITOR};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
@@ -26,24 +25,15 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows_sys::Win32::UI::Input::Pointer::{POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, GetClientRect, GetClipCursor, GetCursorPos, GetSystemMetrics, GetWindowPlacement,
-    GetWindowRect, IsIconic, ShowCursor, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS,
-    IDC_SIZEWE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_MAXIMIZE, WINDOWPLACEMENT,
+    ClipCursor, GetClientRect, GetClipCursor, GetSystemMetrics, GetWindowRect, IsIconic, IDC_ARROW,
+    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::window::CursorIcon;
 
 pub fn encode_wide(string: impl AsRef<OsStr>) -> Vec<u16> {
     string.as_ref().encode_wide().chain(once(0)).collect()
-}
-
-pub fn decode_wide(mut wide_c_string: &[u16]) -> OsString {
-    if let Some(null_pos) = wide_c_string.iter().position(|c| *c == 0) {
-        wide_c_string = &wide_c_string[..null_pos];
-    }
-
-    OsString::from_wide(wide_c_string)
 }
 
 pub fn has_flag<T>(bitset: T, flag: T) -> bool
@@ -87,30 +77,6 @@ impl WindowArea {
         }
 
         Ok(rect)
-    }
-}
-
-pub fn is_maximized(window: HWND) -> bool {
-    unsafe {
-        let mut placement: WINDOWPLACEMENT = mem::zeroed();
-        placement.length = mem::size_of::<WINDOWPLACEMENT>() as u32;
-        GetWindowPlacement(window, &mut placement);
-        placement.showCmd == SW_MAXIMIZE as u32
-    }
-}
-
-pub fn set_cursor_hidden(hidden: bool) {
-    static HIDDEN: AtomicBool = AtomicBool::new(false);
-    let changed = HIDDEN.swap(hidden, Ordering::SeqCst) ^ hidden;
-    if changed {
-        unsafe { ShowCursor(BOOL::from(!hidden)) };
-    }
-}
-
-pub fn get_cursor_position() -> Result<POINT, io::Error> {
-    unsafe {
-        let mut point: POINT = mem::zeroed();
-        win_to_err(GetCursorPos(&mut point)).map(|_| point)
     }
 }
 

@@ -467,6 +467,10 @@ pub struct VitalsInks {
     pub warn_text: Rgb,
     /// The Deck's critical words and marks.
     pub critical_text: Rgb,
+    /// Five-stop theme-harmonized thermal ramp (idle accent → active → amber → orange → crimson).
+    pub thermal: [Rgb; 5],
+    /// The thermal ramp under Increase Contrast.
+    pub thermal_ic: [Rgb; 5],
 }
 
 const fn over_orange(dark: bool) -> Rgb {
@@ -474,6 +478,14 @@ const fn over_orange(dark: bool) -> Rgb {
         [0xFF, 0x9A, 0x2E]
     } else {
         [0xE0, 0x7A, 0x1F]
+    }
+}
+
+const fn hot_crimson(dark: bool) -> Rgb {
+    if dark {
+        [0xFF, 0x4D, 0x3A]
+    } else {
+        [0xC9, 0x20, 0x18]
     }
 }
 
@@ -602,6 +614,23 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         over: floored(over_orange(dark), ground, NON_TEXT, dark),
         warn_text: floored(warn, ground, WORD_AA, dark),
         critical_text: floored(critical, ground, WORD_AA, dark),
+        thermal: {
+            let over_c = floored(over_orange(dark), ground, NON_TEXT, dark);
+            let hot_c = floored(hot_crimson(dark), ground, NON_TEXT, dark);
+            let warm_c = floored(mix(warn, over_c, 0.35), ground, NON_TEXT, dark);
+            let cool0 = floored(mix(aterm, heat[1], 0.55), ground, heat_floor, dark);
+            let cool1 = floored(mix(tab, heat[2], 0.35), ground, NON_TEXT, dark);
+            [cool0, cool1, warm_c, over_c, hot_c]
+        },
+        thermal_ic: {
+            let over_c = floored(over_orange(dark), ground, NON_TEXT, dark);
+            let hot_c = floored(hot_crimson(dark), ground, NON_TEXT, dark);
+            let warm_c = floored(mix(warn, over_c, 0.35), ground, NON_TEXT, dark);
+            let heat_ic = heat_ramp(ground, NON_TEXT, heat_ic_stops(dark), dark);
+            let cool0 = floored(mix(aterm_ic, heat_ic[1], 0.50), ground, NON_TEXT, dark);
+            let cool1 = floored(mix(tab_ic, heat_ic[2], 0.35), ground, NON_TEXT, dark);
+            [cool0, cool1, warm_c, over_c, hot_c]
+        },
     }
 }
 
@@ -616,6 +645,31 @@ impl VitalsInks {
         };
         let i = (t.floor() as usize).min(3);
         mix(self.load[i], self.load[i + 1], t - i as f32)
+    }
+
+    /// The theme-harmonized thermal ramp at `level` (`0..=1`), linear in OkLab between stops:
+    /// cool theme accent at idle through warm amber and hot orange to incandescent crimson.
+    #[must_use]
+    pub fn thermal_at(&self, level: f32, ic: bool) -> Rgb {
+        let ramp = if ic { &self.thermal_ic } else { &self.thermal };
+        let t = if level.is_finite() {
+            level.clamp(0.0, 1.0) * 4.0
+        } else {
+            0.0
+        };
+        let i = (t.floor() as usize).min(3);
+        mix(ramp[i], ramp[i + 1], t - i as f32)
+    }
+
+    /// Soft halo ring ink for `glow` over `self.ground` at `strength` (`0..=1`).
+    #[must_use]
+    pub fn glow_veil(&self, glow: Rgb, strength: f32) -> Rgb {
+        let s = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        mix(self.ground, glow, s)
     }
 
     /// The rising sliver's ink over a fill of colour `fill`.
@@ -1292,5 +1346,34 @@ mod tests {
         let light = vitals_inks(LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT);
         assert_eq!(dark.rise_mode, HaloMode::Add);
         assert_eq!(light.rise_mode, HaloMode::Over);
+    }
+
+    #[test]
+    fn thermal_ramp_harmonizes_with_theme_and_glows_orange_to_red_at_peak() {
+        let dark_cyan = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, [0x50, 0xDC, 0xFA]);
+        let dark_magenta = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, [0xFF, 0x79, 0xC6]);
+        let light = vitals_inks(LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT);
+
+        assert_ne!(
+            dark_cyan.thermal_at(0.0, false),
+            dark_magenta.thermal_at(0.0, false),
+            "cool end of thermal ramp inherits active theme accent"
+        );
+        for inks in [dark_cyan, dark_magenta, light] {
+            for c in inks.thermal_ic {
+                assert!(
+                    contrast(c, inks.ground) >= NON_TEXT - 0.02,
+                    "thermal_ic meets non-text contrast against ground"
+                );
+            }
+            let hot_orange = inks.thermal_at(0.75, false);
+            let hot_red = inks.thermal_at(1.0, false);
+            assert!(
+                hot_red[0] > hot_red[2] && hot_orange[0] > hot_orange[2],
+                "hot end of thermal ramp is warm orange-to-red: {hot_orange:?} -> {hot_red:?}"
+            );
+            assert_eq!(inks.glow_veil(hot_red, 0.0), inks.ground);
+            assert_eq!(inks.glow_veil(hot_red, 1.0), hot_red);
+        }
     }
 }

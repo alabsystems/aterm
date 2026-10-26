@@ -4312,6 +4312,62 @@ impl IdleHost for WorkerIdle {
     }
 
     /// The account this session moved to answered with a lost login or a usage limit ([`IdleHost::account_answered`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "CurrentAuth",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "SupersededAuth",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "RenewedDuringAuth",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "ChangedPolicyAuth",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "SupersededQuota",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "MissingRowAuth",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAnswerObservation",
+            action = "UnreadableRowAuth",
+            project = "harness_host::tests::login_observation::answer_transition"
+        )
+    )]
     fn account_answered(&self, bad: AccountBad) {
         if !self.switches.accounts_live() {
             return;
@@ -4354,9 +4410,25 @@ impl IdleHost for WorkerIdle {
                 }
             },
         };
-        let done = self.account_transact(&seat, |state, now| {
-            Ok(accounts::strike(state, label, &self.sid, &why, now))
-        });
+        let done = if matches!(bad, AccountBad::SignedOut) {
+            self.reset_flush(&seat);
+            // Authentication news belongs to this login, not to a renewal that may
+            // have replaced it since account_ctx captured the process and roster.
+            login_transact_of(
+                &self.sid,
+                &self.hooks,
+                &seat,
+                &roster,
+                &look,
+                label,
+                |state, _, now| Ok(accounts::strike(state, label, &self.sid, &why, now)),
+            )
+        } else {
+            // A provider quota belongs to the account across credential renewals.
+            self.account_transact(&seat, |state, now| {
+                Ok(accounts::strike(state, label, &self.sid, &why, now))
+            })
+        };
         if done.is_ok() {
             (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
             with_kept_of(&self.kept, |k| {

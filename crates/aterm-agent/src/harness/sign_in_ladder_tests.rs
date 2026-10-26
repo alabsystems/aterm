@@ -274,11 +274,36 @@ fn the_vault_is_refreshed_once_per_wait_and_its_wait_doubles_while_it_brings_not
 fn a_sync_says_what_it_did_in_its_first_line() {
     assert_eq!(
         Vault::of_sync(
-            "applied seq 52: 1 written, 5 unchanged, 0 removed, 0 left in place, 0 moved aside\n",
+            "applied seq 52: 1 written, 5 unchanged, 0 removed, 0 left in place, 0 moved aside, \
+             0 failed\n",
             Some(0)
         ),
         Vault::Applied(52)
     );
+    // One that left a file unwritten (or unremoved) counts it: the vault was applied, but not
+    // wholly, and the row's line says so rather than reading as a clean apply. Negative control:
+    // the line's seq alone takes it for `Applied`.
+    let partly = Vault::of_sync(
+        "applied seq 53: 1 written, 5 unchanged, 0 removed, 0 left in place, 0 moved aside, \
+         1 failed\n  mail.toml: failed: Permission denied\n",
+        Some(1),
+    );
+    assert_eq!(partly, Vault::AppliedPartly(53));
+    assert_eq!(partly.words(), "applied seq 53, some files failed");
+    // The count decides, not the exit status, which work after the files (the accounts the
+    // same process syncs next) or a signal can make non-zero.
+    let whole = "applied seq 54: 1 written, 5 unchanged, 0 removed, 0 left in place, 0 moved \
+                 aside, 0 failed\n";
+    assert_eq!(Vault::of_sync(whole, Some(101)), Vault::Applied(54));
+    assert_eq!(Vault::of_sync(whole, None), Vault::Applied(54));
+    // A line without the count (an older aterm) is read by the exit status.
+    let older = "applied seq 55: 1 written, 5 unchanged, 0 removed, 0 left in place, 0 moved \
+                 aside\n";
+    assert_eq!(Vault::of_sync(older, Some(0)), Vault::Applied(55));
+    assert_eq!(Vault::of_sync(older, Some(1)), Vault::AppliedPartly(55));
+    // Either way the files it did write are read again.
+    assert!(Vault::Applied(52).wrote_files() && partly.wrote_files());
+    assert!(!Vault::Unchanged(51).wrote_files() && !Vault::NotIn.wrote_files());
     assert_eq!(
         Vault::of_sync("up to date at seq 51\n", Some(0)),
         Vault::Unchanged(51)

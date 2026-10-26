@@ -4039,6 +4039,7 @@ fn repair_says_an_rc_it_left_alone() {
         rustup_home: None,
         login_rc: None,
         pass: crate::converge::repair::Pass::Repair,
+        reads: Default::default(),
     });
     let rows = super::repair_rows(
         &ground,

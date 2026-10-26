@@ -60,13 +60,13 @@ pub const PLANTS: &[Plant] = &[
     Plant {
         name: r###"packing"###,
         phase: r###"conformance"###,
-        file: r###"src/Win32/Graphics/Dwm.rs"###,
-        old: r###"#[repr(C, packed(1))]
+        file: r###"src/Win32/System/SystemServices.rs"###,
+        old: r###"#[repr(C, packed(2))]
 #[derive(Clone, Copy)]
-pub struct DWM_BLURBEHIND {"###,
+pub struct IMAGE_DOS_HEADER {"###,
         new: r###"#[repr(C)]
 #[derive(Clone, Copy)]
-pub struct DWM_BLURBEHIND {"###,
+pub struct IMAGE_DOS_HEADER {"###,
     },
     Plant {
         name: r###"const-value"###,

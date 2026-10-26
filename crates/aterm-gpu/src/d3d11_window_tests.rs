@@ -19,28 +19,18 @@ use crate::d3d11::surface::D3dSwapKind;
 use crate::d3d11::surface::tests::{Window, desktop_or_could_not_run};
 use aterm_win32::Win32::UI::WindowsAndMessaging as wm;
 
-/// A test window as the frontend hands one over: its raw-window-handle.
+/// A test window as the frontend hands one over: its `HWND`.
 struct Target(isize);
 
-impl raw_window_handle::HasWindowHandle for Target {
-    fn window_handle(
-        &self,
-    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let hwnd = std::num::NonZeroIsize::new(self.0)
-            .ok_or(raw_window_handle::HandleError::Unavailable)?;
-        let raw = raw_window_handle::RawWindowHandle::Win32(
-            raw_window_handle::Win32WindowHandle::new(hwnd),
-        );
-        // SAFETY: the window outlives every surface a test attaches to it.
-        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
-    }
-}
-
-impl raw_window_handle::HasDisplayHandle for Target {
-    fn display_handle(
-        &self,
-    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Ok(raw_window_handle::DisplayHandle::windows())
+// SAFETY: the window outlives every surface a test attaches to it.
+unsafe impl aterm_types::native_window::HasNativeWindow for Target {
+    fn native_window(&self) -> Option<aterm_types::native_window::NativeWindow> {
+        let hwnd =
+            std::ptr::NonNull::new(std::ptr::without_provenance_mut(self.0.cast_unsigned()))?;
+        Some(aterm_types::native_window::NativeWindow::Win32 {
+            hwnd,
+            hinstance: None,
+        })
     }
 }
 

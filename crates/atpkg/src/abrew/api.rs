@@ -280,6 +280,90 @@ impl Api {
         Ok(out)
     }
 
+    /// The search view of an index: names, aliases, description and
+    /// the status flags brew's search reads.
+    pub fn search_index(&self, casks: bool) -> Result<Vec<SearchRow>, String> {
+        let (rel, file) = if casks {
+            ("cask.json", "cask-index.json")
+        } else {
+            ("formula.json", "formula-index.json")
+        };
+        let v = self.doc_with_freshness(rel, file, 86_400, true)?;
+        let mut out = Vec::new();
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                if casks {
+                    let Some(token) = item.get("token").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if token.is_empty() {
+                        continue;
+                    }
+                    out.push(SearchRow {
+                        name: token.to_string(),
+                        aliases: Vec::new(),
+                        display_names: item
+                            .get("name")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|n| n.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        desc: item
+                            .get("desc")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        deprecated: item
+                            .get("deprecated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        disabled: item
+                            .get("disabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    });
+                } else {
+                    let Some(name) = item.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    out.push(SearchRow {
+                        name: name.to_string(),
+                        aliases: item
+                            .get("aliases")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|n| n.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        display_names: Vec::new(),
+                        desc: item
+                            .get("desc")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        deprecated: item
+                            .get("deprecated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        disabled: item
+                            .get("disabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Declared install options per formula from the raw index records.
     pub fn options_index(&self) -> Result<Vec<OptionsRow>, String> {
         let v = self.doc_with_freshness("formula.json", "formula-index.json", 86_400, true)?;
@@ -486,6 +570,17 @@ fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
         }
     }
     out
+}
+
+/// One [`Api::search_index`] record.
+pub struct SearchRow {
+    pub name: String,
+    pub aliases: Vec<String>,
+    /// Cask display names (`name` in the API); empty for formulae.
+    pub display_names: Vec<String>,
+    pub desc: String,
+    pub deprecated: bool,
+    pub disabled: bool,
 }
 
 /// One [`Api::deps_index`] record.

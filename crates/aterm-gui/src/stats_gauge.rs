@@ -168,6 +168,7 @@ pub(crate) struct GaugeInks {
     tick: Rgb,
     over: Rgb,
     heat: [Rgb; 7],
+    thermal: [Rgb; 5],
 }
 
 impl GaugeInks {
@@ -175,6 +176,11 @@ impl GaugeInks {
     /// Contrast's).
     pub(crate) fn new(inks: &VitalsInks, heat: [Rgb; 7], soak: f32) -> Self {
         let dark = inks.dark;
+        let thermal = if heat == inks.heat_ic {
+            inks.thermal_ic
+        } else {
+            inks.thermal
+        };
         Self {
             dark,
             ground: inks.ground,
@@ -189,26 +195,50 @@ impl GaugeInks {
             tick: inks.words2,
             over: inks.over,
             heat,
+            thermal,
         }
     }
 
-    /// The scale's ink at `theta`: the heat ramp through each step's centre, then the over-max
-    /// orange in the redline.
+    /// The scale's ink at `theta`: the heat ramp through each step's centre, warming into the
+    /// theme-harmonized thermal orange-to-red ramp at high load and across the redline.
     fn scale(&self, theta: f64) -> Rgb {
         if theta > RED {
-            return self.over;
+            let red_t = ((theta - RED) / (END - RED)).clamp(0.0, 1.0) as f32;
+            let hot = ink::mix(self.thermal[3], self.thermal[4], red_t);
+            return ink::mix(self.over, hot, 0.45 + 0.45 * red_t);
         }
         let v = ((theta - START) / (RED - START)).clamp(0.0, 1.0) as f32;
-        if v <= STEP_AT[0] {
-            return self.heat[0];
-        }
-        for i in 0..6 {
-            let (a, b) = (STEP_AT[i], STEP_AT[i + 1]);
-            if v <= b {
-                return ink::mix(self.heat[i], self.heat[i + 1], (v - a) / (b - a));
+        let base = if v <= STEP_AT[0] {
+            self.heat[0]
+        } else {
+            let mut c = self.heat[6];
+            for i in 0..6 {
+                let (a, b) = (STEP_AT[i], STEP_AT[i + 1]);
+                if v <= b {
+                    c = ink::mix(self.heat[i], self.heat[i + 1], (v - a) / (b - a));
+                    break;
+                }
             }
+            c
+        };
+        if v <= 0.62 {
+            base
+        } else {
+            let t = ((v - 0.62) / 0.38).clamp(0.0, 1.0);
+            let warm = ink::mix(self.thermal[2], self.thermal[3], t);
+            ink::mix(base, warm, 0.48 * t)
         }
-        self.heat[6]
+    }
+
+    /// Theme-harmonized glow color for instantaneous needle load `v` (`0..=2`).
+    fn glow_ink(&self, v: f32) -> Rgb {
+        if v <= 1.0 {
+            let t = ((v - 0.55) / 0.45).clamp(0.0, 1.0);
+            ink::mix(self.thermal[2], self.thermal[3], t)
+        } else {
+            let t = (v - 1.0).clamp(0.0, 1.0);
+            ink::mix(self.thermal[3], self.thermal[4], t)
+        }
     }
 }
 
@@ -290,6 +320,7 @@ pub(crate) fn draw(g: Gauge, at: Place, k: &GaugeInks, out: &mut Vec<DrawPrim>) 
     p.track(k);
     let tip = g.needle.map(tip_deg);
     if let Some(v) = g.needle.filter(|&v| v > LIT_FROM) {
+        p.arc_glow(v, tip_deg(v), k);
         p.lit(tip_deg(v), k);
     }
     if !g.pinned() {
@@ -463,6 +494,37 @@ impl Pen<'_> {
         self.unclip();
         for theta in [START, END] {
             self.dot(self.at(theta, R_MID), BAND_W / 2.0, track);
+        }
+    }
+
+    /// Soft theme-harmonized halo behind the lit scale arc when instantaneous load enters warm/hot
+    /// territory (`v >= 0.55`), illuminating the dial face inward without spilling past the bezel.
+    fn arc_glow(&mut self, v: f32, tip: f64, k: &GaugeInks) {
+        if v < 0.55 {
+            return;
+        }
+        let strength = ((v - 0.55) / 0.65).clamp(0.0, 1.0);
+        let glow = k.glow_ink(v);
+        let end = tip.min(END);
+        let span = (end - START).max(0.0);
+        if span <= 1.0 {
+            return;
+        }
+        let n = (span / 12.0).ceil().max(1.0);
+        let step = span / n;
+        for (r_shift, w_add, base_a) in [
+            (-0.9, 4.2, if k.dark { 0.20 } else { 0.14 }),
+            (-0.4, 2.0, if k.dark { 0.34 } else { 0.24 }),
+        ] {
+            let alpha = ((base_a * strength * 255.0).round() as u8).max(1);
+            let color = rgba(glow, alpha);
+            let r = R_MID + r_shift;
+            let w = BAND_W + w_add;
+            for i in 0..n as u32 {
+                let t0 = START + step * f64::from(i);
+                let t1 = t0 + step;
+                self.line(self.at(t0, r), self.at(t1, r), w, color);
+            }
         }
     }
 
@@ -710,5 +772,48 @@ mod tests {
             assert!((erf(x) - want).abs() < 1e-6, "erf({x})");
             assert!((erf(-x) + want).abs() < 1e-6, "erf(-{x})");
         }
+    }
+
+    #[test]
+    fn warm_and_hot_load_emit_themed_arc_glow_while_calm_does_not() {
+        let inks = aterm_vitals::ink::vitals_inks(
+            [0x16, 0x18, 0x1D],
+            [0xE6, 0xE8, 0xEE],
+            [0x58, 0xA6, 0xFF],
+        );
+        let k = GaugeInks::new(&inks, inks.heat, 0.0);
+        let place = Place {
+            centre: (80.0, 80.0),
+            slot: [10.0, 10.0, 150.0, 150.0],
+            s: 2.0,
+            r: R_FACE,
+        };
+        let translucent_lines = |needle: f32| {
+            let mut out = Vec::new();
+            draw(
+                Gauge {
+                    needle: Some(needle),
+                    soak: 0.0,
+                },
+                place,
+                &k,
+                &mut out,
+            );
+            out.into_iter()
+                .filter(|p| matches!(p, DrawPrim::Line { color, .. } if color[3] < 0xFF))
+                .count()
+        };
+        // Needle shadow uses 2 translucent lines; calm load adds zero glow lines.
+        assert_eq!(translucent_lines(0.25), 2);
+        // Warm (70%) and redline (140%) loads add the two-pass themed arc glow halo.
+        let warm = translucent_lines(0.70);
+        let redline = translucent_lines(1.40);
+        assert!(warm > 2, "70% load should emit dial arc glow: {warm}");
+        assert!(
+            redline > warm,
+            "redline sweep spans more glow segments than 70%: {redline} vs {warm}"
+        );
+        // Redline scale warms past base `over` toward `thermal[4]` crimson-red.
+        assert_ne!(k.scale(RED + 5.0), k.scale(END));
     }
 }

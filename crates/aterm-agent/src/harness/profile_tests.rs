@@ -1583,6 +1583,33 @@ fn a_login_answers_to_its_rows_address_alone() {
 }
 
 #[test]
+fn full_provider_identity_survives_email_changes_and_never_falls_back_to_another_home() {
+    let tmp = tmp_dir("full-provider-identity");
+    let first = tmp.path().join("first");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let profile = first.join(".claude.json");
+    std::fs::write(
+        &profile,
+        r#"{"oauthAccount":{"accountUuid":"stable-one","emailAddress":"first@example.test"}}"#,
+    )
+    .unwrap();
+    let observed = principal_in_home(&first).unwrap();
+    std::fs::write(
+        &profile,
+        r#"{"oauthAccount":{"accountUuid":"stable-one","emailAddress":"changed@example.test"}}"#,
+    )
+    .unwrap();
+    assert_eq!(principal_in_home(&first), Some(observed));
+    assert_eq!(principal_in_home(&other), None);
+    std::fs::write(&profile, r#"{"oauthAccount":{"accountUuid":"stable-two"}}"#).unwrap();
+    assert_ne!(principal_in_home(&first), Some(observed));
+    std::fs::write(&profile, r#"{"oauthAccount":{"accountUuid":42}}"#).unwrap();
+    assert_eq!(principal_in_home(&first), None);
+}
+
+#[test]
 fn a_muse_login_store_names_its_account_alone() {
     let tmp = tmp_dir("muse-auth");
     let home = tmp.path().join("home");

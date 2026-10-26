@@ -33,14 +33,20 @@ fn a_take_frame_reads_back_its_slots() {
     let body = "s-a 4:2:1 v=2 t=1 ep=4 seq=2 ms=1 op=open node=- k=spawn src=aterm conf=exact\n\
                 s-b 4:9:3 v=2 t=1 ep=4 seq=9 ms=3 op=gap node=- k=gap why=evicted n=2 src=aterm conf=exact\n";
     let header = format!("OK {} slots=2 more=1", body.len());
-    let (slots, more) = parse_take(&header, body.as_bytes()).expect("reads");
+    let Taken { slots, more, due } = parse_take(&header, body.as_bytes()).expect("reads");
     assert!(more);
+    assert_eq!(due, None, "no snapshot held back");
     assert_eq!(slots.len(), 2);
     assert_eq!(slots[1].sid, "s-b");
     assert_eq!(slots[1].at, BusCursor::new(4, 9, 3));
     assert!(slots[1].body.ends_with("n=2 src=aterm conf=exact"));
-    let (none, more) = parse_take("OK 0 slots=0 stale=1", b"").expect("a ghost lane's");
-    assert!(none.is_empty() && !more);
+    let ghost = parse_take("OK 0 slots=0 stale=1", b"").expect("a ghost lane's");
+    assert!(ghost.slots.is_empty() && !ghost.more && ghost.due.is_none());
+    let held = parse_take("OK 0 slots=0 due=980", b"").expect("a held-back snapshot's");
+    assert_eq!(
+        (held.slots.len(), held.more, held.due),
+        (0, false, Some(std::time::Duration::from_millis(980)))
+    );
     for (h, b) in [
         ("OK 5 slots=2", "s-a 4:2:1 x\n"),
         ("OK 5", "s-a 4:2:1 x\n"),

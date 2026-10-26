@@ -197,9 +197,10 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
         .nth(1)
         .expect("post answers OK <id>")
         .to_string();
-    let reservation = w.state.join("sent").join(format!("{a}.{id}"));
+    let post: u64 = id.parse().expect("a post id");
+    let reserved = || aterm_link::state::StateDir::peek(&w.state).post_seq(&a, post);
     until("the outbound sequence to be reserved durably", || {
-        reservation.exists().then_some(())
+        reserved().map(|_| ())
     });
 
     assert!(w.verb(&format!("@{b} close")).ok(), "close the peer");
@@ -221,10 +222,10 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
         verdict.contains("reason=unroutable"),
         "a session whose only roster row says `state=exited` is not a route: {verdict}"
     );
-    assert!(
-        !reservation.exists(),
-        "a retired post's sequence reservation is forgotten on BOTH arms: {}",
-        reservation.display()
+    assert_eq!(
+        reserved(),
+        None,
+        "a retired post's sequence reservation is forgotten on BOTH arms"
     );
     let pins = std::fs::read_to_string(w.state.join("pins")).unwrap_or_default();
     assert!(

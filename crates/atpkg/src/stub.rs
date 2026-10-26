@@ -712,6 +712,7 @@ pub fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use aterm_toolchain::lasting::{CACHEDIR_TAG_SIGNATURE, temp_roots_from};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;

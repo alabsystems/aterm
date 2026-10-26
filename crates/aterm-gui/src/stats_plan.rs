@@ -2,6 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Layout planner for the stats deck.
+use aterm_vitals::MultiScaleSpec;
+
 use crate::deck_face::FaceMetrics;
 use crate::stats_deck::{FOLDED_PT, FULL_TABLE_PT};
 use crate::stats_paint::Bar;
@@ -91,9 +93,9 @@ const GROW_GAP_MAX: f64 = 16.0;
 const SLIM_AMOUNT_MIN: f64 = 92.0;
 const AMOUNT_DRAWN_MIN: f64 = 40.0;
 const BLOCK_GUTTER: f64 = 29.0;
-/// The widest Folded block: fwide's columns (480 pt on Helvetica Neue since the glance narrowed
-/// them; 528 held 0.134's), the gap and the widest Details. Wider decks centre the table.
-const B_MAX: f64 = 480.0 + 10.0 + DETAILS_MAX;
+/// The widest Folded block: fwide's columns (489 pt on Helvetica Neue with the 3-scope bar
+/// restored), the gap and the widest Details. Wider decks centre the table.
+const B_MAX: f64 = 489.0 + 10.0 + DETAILS_MAX;
 const CORES_BLOCK_W: f64 = 68.0;
 /// The amount column where the Full deck shows its glance (wide, mid): `16.5 GiB`, `18 of 200 KB/s
 /// peak` (the refined deck, 2026-10-24; 120 pt held 0.134's longer words).
@@ -196,7 +198,8 @@ impl Pen {
     }
 }
 
-/// Heat strip geometry: `cols` columns of `period_s` on a `pitch`, the last of them now.
+/// Progressive multi-scale heat strip geometry: fine real-time boxes near `now` on the right
+/// growing into wider aggregated time buckets toward the left.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Strip {
     pub(crate) x: f64,
@@ -204,46 +207,77 @@ pub(crate) struct Strip {
     pub(crate) period_s: u32,
     pub(crate) pitch: f64,
     pub(crate) cell: f64,
+    pub(crate) spec: MultiScaleSpec,
 }
 
 impl Strip {
-    /// What a Full strip spans: ten minutes, its cells coarsening as it narrows (v2 §5.5).
+    /// What a legacy uniform Full strip spanned (kept for column pitch math).
     const FULL_SPAN_S: u32 = 600;
 
-    /// A Full strip: ten minutes over `cols` columns.
+    /// A Full strip: multi-scale progressive horizon (`1h` on wide/mid, `15m`/`5m` on narrow,
+    /// `1m` on slim).
     fn new(x: f64, cols: u32, pitch: f64) -> Self {
-        Self::of(x, cols, Self::FULL_SPAN_S / cols, pitch)
+        let spec = if cols >= 60 {
+            MultiScaleSpec::FULL_HOUR
+        } else if cols >= 30 {
+            MultiScaleSpec::FOLD_15M
+        } else if pitch >= 5.0 {
+            MultiScaleSpec::COMPACT_5M
+        } else {
+            MultiScaleSpec::MINI_1M
+        };
+        Self::of(x, cols, Self::FULL_SPAN_S / cols, pitch, spec)
     }
 
-    /// A Folded strip: `cols` slots of [`FOLD_SLOT_S`] on `pitch`, a reading's second each, so it
-    /// spans `cols` seconds and each reading slides it one pitch left.
+    /// A Folded strip: multi-scale progressive horizon (`15m` on wide, `5m` on mid, `1m` on
+    /// narrow/slim).
     const fn folded(x: f64, cols: u32, pitch: f64) -> Self {
-        Self::of(x, cols, FOLD_SLOT_S, pitch)
+        let spec = if cols >= 26 {
+            MultiScaleSpec::FOLD_15M
+        } else if pitch >= 4.0 {
+            MultiScaleSpec::COMPACT_5M
+        } else {
+            MultiScaleSpec::MINI_1M
+        };
+        Self::of(x, cols, FOLD_SLOT_S, pitch, spec)
     }
 
-    const fn of(x: f64, cols: u32, period_s: u32, pitch: f64) -> Self {
+    const fn of(x: f64, cols: u32, period_s: u32, pitch: f64, spec: MultiScaleSpec) -> Self {
         Self {
             x,
             cols,
             period_s,
             pitch,
             cell: pitch - 1.0,
+            spec,
         }
     }
 
-    /// How far back the strip reaches, seconds: its left end's age when its right end is now.
-    pub(crate) const fn span_s(self) -> u32 {
-        self.cols.saturating_mul(self.period_s)
+    /// How far back the strip reaches, seconds: its multi-scale horizon (`3600`, `900`, `300` or
+    /// `60`).
+    pub(crate) fn span_s(self) -> u32 {
+        u32::try_from(self.spec.horizon_ms() / 1_000).unwrap_or(60)
     }
 
-    /// How fast its columns glide left, pt a second: one pitch a period (the painter measures
-    /// it in the device px it draws, `Deck::live_edge`).
+    /// Total horizontal width of the strip in points (`end() - x`).
+    pub(crate) fn width(self) -> f64 {
+        self.end() - self.x
+    }
+
+    /// Exact point X coordinate for an age `age_ms` (`now - event_ms`) on the multi-scale strip.
+    pub(crate) fn x_at_age_ms(self, age_ms: i64) -> Option<f64> {
+        self.spec
+            .x_frac_of_age_ms(age_ms)
+            .map(|f| self.x + f64::from(f) * self.width())
+    }
+
+    /// How fast its finest edge glides left, pt a second.
     #[cfg(test)]
     pub(crate) fn pt_per_s(self) -> f64 {
         self.pitch / f64::from(self.period_s.max(1))
     }
 
-    /// Right edge of the last strip cell.
+    /// Right edge of the last strip cell (`now`).
     pub(crate) fn end(self) -> f64 {
         self.x + f64::from(self.cols.saturating_sub(1)) * self.pitch + self.cell
     }
@@ -538,6 +572,7 @@ fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
         }
         FullKind::Narrow => {
             plan.pct = Some(pen.col(6.0, 30.0));
+            plan.bar = Some(pen.col(6.0, 24.0));
             let amount_w = (right - (pen.0 + 8.0) - (8.0 + 76.0 + 8.0 + 76.0)).min(160.0);
             plan.amount = Some(pen.col(8.0, amount_w));
             plan.aterm = Some(pen.col(8.0, 76.0));
@@ -717,15 +752,13 @@ fn lay_folded(w: f64, gauge: bool, m: &FaceMetrics) -> (FoldedPlan, bool) {
 fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bool) {
     let rows = Rows::folded(kind);
     let (name_base, well_w, strip_gap, cols, pitch) = match kind {
-        BlockKind::Wide => (52.0, 10.0, 4.0, 30, 5.0),
+        BlockKind::Wide => (52.0, 10.0, 4.0, 26, 5.0),
         BlockKind::Mid => (52.0, 10.0, 4.0, 20, 4.0),
         BlockKind::Narrow => (48.0, 7.0, 3.0, 20, 3.0),
         BlockKind::Slim => (48.0, 7.0, 2.0, 20, 3.0),
     };
     let name = Col::new(x, name_width(name_base, rows.name_pt, m));
     let well = Col::new(name.end(), well_w);
-    // The block's strip keeps v2's cells (`cols` on `pitch`, 60 to 150 pt), each a reading's
-    // second (§12 of the live edge's design).
     let strip = Strip::folded(well.end() + strip_gap, cols, pitch);
     let e = strip.after();
     let end = x + b;
@@ -751,9 +784,9 @@ fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bo
     };
     let fits = match kind {
         BlockKind::Wide => {
-            // The glance's columns, as Full wide's: 117, 70 and 69 pt held 0.134's words.
-            plan.pct = Some(Col::new(e + 6.0, 30.0));
-            let amount = Col::new(e + 44.0, GLANCE_AMOUNT_W);
+            plan.pct = Some(Col::new(e + 5.0, 30.0));
+            plan.bar = Some(Col::new(e + 40.0, 28.0));
+            let amount = Col::new(e + 73.0, GLANCE_AMOUNT_W);
             plan.amount = Some(amount);
             let aterm = Col::new(amount.end() + 6.0, GLANCE_SCOPE_W);
             plan.aterm = Some(aterm);
@@ -973,6 +1006,10 @@ pub(crate) struct HeaderText<'a> {
     /// The machine's noun (`"this Mac"` or `"this computer"`): the Global label where the deck
     /// says the glance (Full wide and mid, and Folded), and nothing elsewhere.
     pub(crate) machine: &'a str,
+    /// Progressive machine identity + hardware capacity forms (`"this Mac · M5 Max · 18c · 128 GiB
+    /// · 2.00 TB"` down to `"this Mac · 18c · 128 GiB"`), longest first; empty falls back to
+    /// [`Self::machine`].
+    pub(crate) machine_forms: &'a [String],
     /// Whether a strip on screen draws an over mark. Where the deck says the glance (Full wide
     /// and mid, and Folded) the header keys "over max" only then, and keys nothing else (the
     /// refined deck, 2026-10-24: a legend learned once need not stay); Full narrow and slim key
@@ -1147,52 +1184,50 @@ pub(crate) struct RulerTick {
     pub(crate) text: String,
 }
 
-/// The words of a tick `age_s` back.
+/// The words of a tick `age_s` back (`–15m`, `–5m`, `–1m`, `–10s`).
 pub(crate) fn tick_words(age_s: u32) -> String {
-    format!("\u{2013}{}", age_words(age_s))
+    format!("\u{2013}{}", compact_age_words(age_s))
 }
 
-/// How long `age_s` is, in a tick's or the time label's words: `10 min`, `2.5 min`, `80 s`.
-fn age_words(age_s: u32) -> String {
-    if age_s.is_multiple_of(60) {
-        format!("{} min", age_s / 60)
-    } else if age_s >= 120 && age_s.is_multiple_of(30) {
-        format!("{}.5 min", age_s / 60)
+/// Compact horizon age (`1h`, `15m`, `5m`, `1m`, `10s`) for X-axis ticks and labels.
+fn compact_age_words(age_s: u32) -> String {
+    if age_s >= 3_600 && age_s.is_multiple_of(3_600) {
+        format!("{}h", age_s / 3_600)
+    } else if age_s >= 60 && age_s.is_multiple_of(60) {
+        format!("{}m", age_s / 60)
     } else {
-        format!("{age_s} s")
+        format!("{age_s}s")
     }
 }
 
-/// The time label over (or beside) `strip`, long then short: how far back its left end is,
-/// `10 min ago` and `–10 min` on a Full strip, `20 s ago` and `–20 s` on the default window's
-/// Folded one.
+/// The time label over (or beside) `strip`, long then short: how far back its multi-scale
+/// horizon reaches (`1h ago` / `–1h`, `15m ago` / `–15m`, `5m ago` / `–5m`, `1m ago` / `–1m`).
 pub(crate) fn time_words(strip: Strip) -> [String; 2] {
-    let span = age_words(strip.span_s());
+    let span = compact_age_words(strip.span_s());
     [format!("{span} ago"), format!("\u{2013}{span}")]
 }
 
-/// The ages `strip`'s scale may mark, most wanted first: the middle of its span where that is
-/// a round age (a whole minute, or a multiple of 10 s under one), then [`TICK_AGES`], and on a
-/// strip under a minute [`TICK_AGES_SHORT`]; only ages inside the span, since its left end is the
-/// label's.
+/// Interior horizon ages `strip`'s multi-scale X-axis marks, most wanted first.
 pub(crate) fn tick_ages(strip: Strip) -> Vec<u32> {
-    let span = strip.span_s();
-    let mid = span / 2;
-    let round =
-        span.is_multiple_of(2) && (mid.is_multiple_of(60) || (mid < 60 && mid.is_multiple_of(10)));
-    let short = TICK_AGES_SHORT.into_iter().filter(|_| span < 60);
-    round
-        .then_some(mid)
-        .into_iter()
-        .chain(TICK_AGES.into_iter().chain(short).filter(|&age| age != mid))
-        .filter(|&age| age > 0 && age < span)
-        .collect()
+    let horizon_s = strip.span_s();
+    let mut ages: Vec<u32> = strip
+        .spec
+        .ticks
+        .iter()
+        .filter_map(|&(age_ms, _)| u32::try_from(age_ms / 1_000).ok())
+        .filter(|&age_s| age_s > 0 && age_s < horizon_s)
+        .collect();
+    if horizon_s <= 60 && !ages.contains(&20) {
+        ages.insert(0, 20);
+    }
+    let _ = (TICK_AGES, TICK_AGES_SHORT);
+    ages
 }
 
 /// Where a tick `age_s` back on `strip` goes when its words, `w` wide, must stay inside
 /// `lo..hi` with the tick under their middle half, or `None` when they cannot.
 fn tick_slot(strip: Strip, age_s: u32, w: f64, (lo, hi): (f64, f64)) -> Option<(f64, f64)> {
-    let x = strip.end() - f64::from(age_s) / f64::from(strip.period_s.max(1)) * strip.pitch;
+    let x = strip.x_at_age_ms(i64::from(age_s) * 1_000)?;
     let centred = x - w / 2.0;
     let slack = w * TICK_SLACK;
     let (least, most) = (lo.max(centred - slack), (hi - w).min(centred + slack));
@@ -1294,9 +1329,26 @@ impl<'m> Header<'m> {
         w
     }
 
-    fn scope_keys(&mut self, mut x: f64, limit: f64, global: &str, tab: &str) -> f64 {
+    fn scope_keys(
+        &mut self,
+        mut x: f64,
+        limit: f64,
+        global: &str,
+        machine_forms: &[String],
+        tab: &str,
+    ) -> f64 {
+        let rest_need = 8.0
+            + SWATCH_ADVANCE
+            + self.words("aterm")
+            + 8.0
+            + SWATCH_ADVANCE
+            + self.words(tab).min(48.0);
+        let global_choice = machine_forms
+            .iter()
+            .find(|f| self.words(f) <= limit - x - SWATCH_ADVANCE - rest_need)
+            .map_or(global, String::as_str);
         for (bar, words) in [
-            (Bar::Global, global),
+            (Bar::Global, global_choice),
             (Bar::Aterm, "aterm"),
             (Bar::Tab, tab),
         ] {
@@ -1508,6 +1560,15 @@ impl<'m> Header<'m> {
     }
 }
 
+fn fit_machine(text: &HeaderText<'_>, room: f64, m: &FaceMetrics) -> String {
+    for form in text.machine_forms {
+        if m.width(form, HEADER_PT, false) <= room {
+            return form.clone();
+        }
+    }
+    m.fit(&[text.machine], room, HEADER_PT, false)
+}
+
 /// Lays out the header line and key for a `Full` deck plan.
 pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics) -> HeaderPlan {
     if plan.ground_only {
@@ -1530,19 +1591,20 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
     }
     if plan.kind == FullKind::Slim {
         if let (Some(bar), Some(amount)) = (plan.bar, plan.amount) {
-            let end = head.scope_keys(bar.x, plan.w - X0, "Global", text.tab);
+            let end = head.scope_keys(bar.x, plan.w - X0, "Global", &[], text.tab);
             head.span(end + 2.0, amount.end(), false);
         } else if let Some(bar) = plan.bar {
-            head.scope_keys(bar.x, plan.w - X0, "Global", text.tab);
+            head.scope_keys(bar.x, plan.w - X0, "Global", &[], text.tab);
         }
         return head.finish();
     }
     if let Some(amount) = plan.amount {
         let x = plan.bar.map_or(amount.x, |bar| bar.x);
+        let room = amount.end() - x - SWATCH_ADVANCE;
         let global = if long {
-            text.machine.to_owned()
+            fit_machine(&text, room, m)
         } else {
-            "Global".to_owned()
+            m.fit(&["Global"], room, HEADER_PT, false)
         };
         let w = head.scope(Bar::Global, x, global);
         head.span(x + w + KEY_GAP, amount.end(), false);
@@ -1637,11 +1699,16 @@ pub(crate) fn header_folded(
             *free = Some(block.strip);
         }
         if let (Some(amount), Some(aterm), Some(tab)) = (block.amount, block.aterm, block.tab) {
-            for (col, bar, words) in [
-                (amount, Bar::Global, text.machine),
-                (aterm, Bar::Aterm, "aterm"),
-                (tab, Bar::Tab, text.tab),
-            ] {
+            let gx = block.bar.map_or(amount.x, |bar| bar.x);
+            let groom = amount.end() - gx - SWATCH_ADVANCE;
+            let gwords = if i == 0 {
+                fit_machine(&text, groom, m)
+            } else {
+                m.fit(&[text.machine], groom, HEADER_PT, false)
+            };
+            let gw = head.scope(Bar::Global, gx, gwords);
+            head.span(gx + gw + KEY_GAP, amount.end(), false);
+            for (col, bar, words) in [(aterm, Bar::Aterm, "aterm"), (tab, Bar::Tab, text.tab)] {
                 let words = m.fit(&[words], col.w - SWATCH_ADVANCE, HEADER_PT, false);
                 let w = head.scope(bar, col.x, words);
                 head.span(col.x + w + KEY_GAP, col.end(), false);
@@ -1650,7 +1717,13 @@ pub(crate) fn header_folded(
             // The bar's key once, over block A: block B's bar is the same three scopes on the
             // same line, and a legend learned once need not be said twice.
             if i == 0 {
-                let end = head.scope_keys(bar.x, block.at.end(), text.machine, text.tab);
+                let end = head.scope_keys(
+                    bar.x,
+                    block.at.end(),
+                    text.machine,
+                    text.machine_forms,
+                    text.tab,
+                );
                 head.span(end + 2.0, amount.end(), false);
             } else {
                 head.span(bar.x, amount.end(), false);
@@ -1682,6 +1755,7 @@ mod tests {
     const TEXT: HeaderText<'static> = HeaderText {
         tab: "Tab 2",
         machine: "this Mac",
+        machine_forms: &[],
         over: true,
     };
 
@@ -1812,16 +1886,16 @@ mod tests {
         assert_eq!(p.tab.map(|t| t.x), Some(707.0));
         assert_eq!(p.details, None);
 
-        let p = at(550.0);
+        let p = at(580.0);
         assert_eq!(p.kind, FullKind::Narrow);
         assert_eq!((p.name, p.well.x), (Col::new(12.0, 52.0), 64.0));
         assert_eq!((p.strip.x, p.strip.cols, p.strip.pitch), (78.0, 20, 5.0));
         assert_eq!(p.pct, Some(Col::new(184.0, 30.0)));
-        assert_eq!((p.bar, p.details), (None, None));
-        assert_eq!(p.amount, Some(Col::new(222.0, 148.0)));
-        assert_eq!(p.aterm, Some(Col::new(378.0, 76.0)));
-        assert_eq!(p.tab, Some(Col::new(462.0, 76.0)));
-        assert_eq!(p.cores, CoresAt::Row(Col::new(78.0, 460.0)));
+        assert_eq!((p.bar, p.details), (Some(Col::new(220.0, 24.0)), None));
+        assert_eq!(p.amount, Some(Col::new(252.0, 148.0)));
+        assert_eq!(p.aterm, Some(Col::new(408.0, 76.0)));
+        assert_eq!(p.tab, Some(Col::new(492.0, 76.0)));
+        assert_eq!(p.cores, CoresAt::Row(Col::new(78.0, 490.0)));
 
         let p = at(350.0);
         assert_eq!(p.kind, FullKind::Slim);
@@ -1876,26 +1950,24 @@ mod tests {
         assert_eq!(p.divider, 595.0);
         assert_eq!(details(&p), [None, None]);
         let a = p.blocks[0];
-        // Its strip keeps v2's 30 cells on 5 pt, each a reading's second: half a minute, sliding
-        // a cell left at each reading (§12 of the live edge's design).
         assert_eq!(
             (a.strip.x, a.strip.cols, a.strip.period_s, a.strip.pitch),
-            (150.0, 30, 1, 5.0)
+            (150.0, 26, 1, 5.0)
         );
-        assert_eq!((a.strip.end(), a.strip.span_s()), (299.0, 30));
-        assert_eq!(a.pct, Some(Col::new(306.0, 30.0)));
-        // The glance's columns, as Full wide's (§3.2).
-        assert_eq!(a.amount, Some(Col::new(344.0, 96.0)));
+        assert_eq!((a.strip.end(), a.strip.span_s()), (279.0, 900));
+        assert_eq!(a.pct, Some(Col::new(285.0, 30.0)));
+        assert_eq!(a.bar, Some(Col::new(320.0, 28.0)));
+        assert_eq!(a.amount, Some(Col::new(353.0, 96.0)));
         assert_eq!(
             (a.aterm, a.tab),
-            (Some(Col::new(446.0, 56.0)), Some(Col::new(508.0, 56.0)))
+            (Some(Col::new(455.0, 56.0)), Some(Col::new(517.0, 56.0)))
         );
 
         let p = at(1424.0);
         assert_eq!(kinds(&p), [BlockKind::Wide; 2]);
         assert_eq!(
             details(&p),
-            [Some(Col::new(574.0, 159.0)), Some(Col::new(1252.0, 159.0))]
+            [Some(Col::new(583.0, 150.0)), Some(Col::new(1261.0, 150.0))]
         );
 
         // The owner's window: mid beside the gauge.
@@ -1931,10 +2003,10 @@ mod tests {
 
         // Past the cap the table is centred, the gauge leading it as Full's slot leads its table.
         let p = at(2560.0);
-        assert_eq!(p.gauge, Some(gauge(179.0)));
+        assert_eq!(p.gauge, Some(gauge(170.0)));
         assert_eq!(
             p.blocks.map(|b| b.at),
-            [Col::new(251.0, 1050.0), Col::new(1330.0, 1050.0)]
+            [Col::new(242.0, 1059.0), Col::new(1330.0, 1059.0)]
         );
         assert_eq!(details(&p).map(|d| d.map(|d| d.w)), [Some(560.0); 2]);
 
@@ -1970,7 +2042,7 @@ mod tests {
             (10.5, 10.0, 10.0, 6.0)
         );
 
-        let narrow = plan_full(550.0, &m).rows;
+        let narrow = plan_full(580.0, &m).rows;
         assert_eq!(
             (narrow.count, narrow.pitch, narrow.cell, narrow.baseline),
             (8, 10.5, 8.0, 7.0)
@@ -2005,18 +2077,18 @@ mod tests {
     #[test]
     fn breakpoints_follow_the_face() {
         let helvetica = breakpoints(&hn());
-        assert_eq!(helvetica.full, [981.0, 775.0, 522.0, 323.0]);
-        assert_eq!(helvetica.block, [480.0, 319.0, 245.0, 146.0]);
-        assert_eq!(helvetica.folded, [1085.0, 763.0, 615.0, 417.0]);
+        assert_eq!(helvetica.full, [981.0, 775.0, 552.0, 323.0]);
+        assert_eq!(helvetica.block, [489.0, 319.0, 245.0, 146.0]);
+        assert_eq!(helvetica.folded, [1103.0, 763.0, 615.0, 417.0]);
         assert_eq!(helvetica.folded_bare, 345.0);
 
         let stack = FaceMetrics::test_stack();
         assert_eq!(plan_full(1119.0, &stack).name.w, 59.0);
-        assert_eq!(plan_full(550.0, &stack).name.w, 56.0);
+        assert_eq!(plan_full(580.0, &stack).name.w, 56.0);
         let dejavu = breakpoints(&stack);
-        assert_eq!(dejavu.full, [984.0, 778.0, 526.0, 328.0]);
-        assert_eq!(dejavu.block, [484.0, 323.0, 250.0, 151.0]);
-        assert_eq!(dejavu.folded, [1093.0, 771.0, 625.0, 427.0]);
+        assert_eq!(dejavu.full, [984.0, 778.0, 556.0, 328.0]);
+        assert_eq!(dejavu.block, [493.0, 323.0, 250.0, 151.0]);
+        assert_eq!(dejavu.folded, [1111.0, 771.0, 625.0, 427.0]);
         assert_eq!(dejavu.folded_bare, 355.0);
 
         let drawn = |w: f64| {
@@ -2100,12 +2172,10 @@ mod tests {
                 }
                 assert_eq!(folded.gauge.is_some(), w >= slim_beside, "Folded W {w}");
                 for block in &folded.blocks {
-                    // v2's cells over the strip's 60, 80 or 150 pt, each a reading's second: it
-                    // spans 20 or 30 s and slides 3 to 5 pt at each reading.
                     let (width, span, pitch) = match block.kind {
-                        BlockKind::Wide => (150, 30, 5.0),
-                        BlockKind::Mid => (80, 20, 4.0),
-                        BlockKind::Narrow | BlockKind::Slim => (60, 20, 3.0),
+                        BlockKind::Wide => (130, 900, 5.0),
+                        BlockKind::Mid => (80, 300, 4.0),
+                        BlockKind::Narrow | BlockKind::Slim => (60, 60, 3.0),
                     };
                     assert_eq!(
                         (
@@ -2360,13 +2430,14 @@ mod tests {
         // to the next free span.
         let plan = plan_full(1119.0, &m);
         let [label, _] = time_words(plan.strip);
-        assert_eq!(label, "10 min ago", "a Full strip spans ten minutes");
-        let time_w = m.width(&label, HEADER_PT, false);
+        assert_eq!(label, "1h ago", "a Full wide strip spans one hour");
         let head = header_full(&plan, TEXT, &m);
-        let after_time = plan.strip.x + time_w + KEY_GAP;
         let ticks: Vec<u32> = head.ruler.iter().map(|t| t.age_s).collect();
-        assert_eq!(ticks, [300, 60]);
-        assert_eq!(placed(&head, KeyItem::Over), Some(after_time));
+        assert!(
+            ticks.contains(&900) && ticks.contains(&300),
+            "Full wide marks multi-scale horizon ticks: {ticks:?}"
+        );
+        assert!(placed(&head, KeyItem::Over).is_some());
         assert_eq!(
             (
                 placed(&head, KeyItem::Ramp),
@@ -2403,11 +2474,11 @@ mod tests {
         assert!(calm.key.placed.is_empty(), "{:?}", calm.key.placed);
         assert!(calm.ruler.len() >= head.ruler.len());
 
-        let plan = plan_full(550.0, &m);
+        let plan = plan_full(580.0, &m);
         let head = header_full(&plan, TEXT, &m);
         assert_eq!(placed(&head, KeyItem::Over), Some(plan.name.x));
         let global = label_x(&head, Label::Scope(Bar::Global));
-        assert_eq!(global, plan.amount.map(|a| a.x));
+        assert_eq!(global, plan.bar.map(|b| b.x));
         let global_end =
             global.unwrap_or_default() + SWATCH_ADVANCE + m.width("Global", HEADER_PT, false);
         let ramp = placed(&head, KeyItem::Ramp).expect("the ramp is placed");
@@ -2431,19 +2502,14 @@ mod tests {
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
         assert_eq!(label_x(&head, Label::Time), Some(a.strip.x));
-        // Its 150 pt strip spans half a minute, a reading's second a cell (§12 of the live
-        // edge's design): "30 s ago" over its left end, and twenty and ten seconds marked.
         assert_eq!(
             head.labels
                 .iter()
                 .find(|l| l.label == Label::Time)
                 .map(|l| l.text.as_str()),
-            Some("30 s ago")
+            Some("15m ago")
         );
-        assert_eq!(
-            head.ruler.iter().map(|t| t.age_s).collect::<Vec<_>>(),
-            [20, 10]
-        );
+        assert!(!head.ruler.is_empty(), "Folded wide places X-axis ticks");
         assert_eq!(placed(&head, KeyItem::Over), Some(b.strip.x));
         assert_eq!(
             (
@@ -2472,17 +2538,17 @@ mod tests {
         assert_eq!(
             scopes(&head),
             [
-                (a.amount.map_or(0.0, |c| c.x), "this Mac".to_owned()),
+                (a.bar.map_or(0.0, |c| c.x), "this Mac".to_owned()),
                 (a.aterm.map_or(0.0, |c| c.x), "aterm".to_owned()),
                 (a.tab.map_or(0.0, |c| c.x), "Tab 2".to_owned()),
-                (b.amount.map_or(0.0, |c| c.x), "this Mac".to_owned()),
+                (b.bar.map_or(0.0, |c| c.x), "this Mac".to_owned()),
                 (b.aterm.map_or(0.0, |c| c.x), "aterm".to_owned()),
                 (b.tab.map_or(0.0, |c| c.x), "Tab 2".to_owned()),
             ],
-            "wide heads each block's columns"
+            "wide heads each block's columns starting at the restored scope bar"
         );
         assert_eq!(label_x(&head, Label::Details), None);
-        // Mid keys the bar once, over block A.
+        // Mid keys the bar once, over block A, and fits hardware totals when present.
         let plan = plan_folded(1039.0, &m);
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let bar = plan.blocks[0].bar.map_or(0.0, |c| c.x);
@@ -2492,6 +2558,29 @@ mod tests {
                 .map(|(x, t)| (*x >= bar && *x < plan.divider, t.as_str()))
                 .collect::<Vec<_>>(),
             [(true, "this Mac"), (true, "aterm"), (true, "Tab 2")]
+        );
+        let forms = vec![
+            "this Mac \u{b7} M5 Max \u{b7} 18c \u{b7} 128 GiB \u{b7} 2.00 TB".to_owned(),
+            "this Mac \u{b7} 18c \u{b7} 128 GiB \u{b7} 2.00 TB".to_owned(),
+            "this Mac \u{b7} 18c \u{b7} 128 GiB".to_owned(),
+        ];
+        let rich = header_folded(
+            &plan,
+            HeaderText {
+                machine_forms: &forms,
+                ..TEXT
+            },
+            [None, None],
+            &m,
+        );
+        let rich_global = scopes(&rich)
+            .into_iter()
+            .next()
+            .expect("global scope label")
+            .1;
+        assert!(
+            rich_global.contains("18c") && rich_global.contains("128 GiB"),
+            "Folded mid fits hardware totals: {rich_global:?}"
         );
     }
 

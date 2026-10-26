@@ -113,6 +113,8 @@ mod tab_spawn_live_headless;
 mod tab_zero_master_live_headless;
 #[cfg(unix)]
 mod task_record_live_headless;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod tether_live;
 #[cfg(unix)]
 mod turn_submit_live_headless;
 #[cfg(unix)]

@@ -452,11 +452,21 @@ Outside any lab (no jail, no stub):
                                  a passing run's record goes to docs/measured/)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
-  disk-ask [tag] [--keep]        three real Claude Code tabs in a lab whose HOME is a 16 GiB sparse APFS image below its
-                                 floor once aterm's own pass is spent: verify the disk-free@v1 ask types its line to the
-                                 one tab whose checkout holds the most, naming that build as the tab's own, its cleanup
-                                 lifts the volume, the ledger and `aterm harness disk why` credit it, and, the volume
-                                 filled short again, the cooldown opens no episode and no tab gets a second line (~12 min)
+  disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted]
+                                 three real Claude Code tabs in a lab whose HOME is a sparse APFS image (10-16 GiB) below
+                                 its floor once aterm's own pass is spent: verify the disk-free@v1 ask types its line to
+                                 the one tab whose checkout holds the most, naming that build as the tab's own, and the
+                                 ledger and `aterm harness disk why` credit its cleanup. clear (the default): the cleanup
+                                 clears the volume and ends the episode, and, the volume filled short again, the cooldown
+                                 opens none, aterm's disk worker runs instead and no tab gets a second line (~15 min).
+                                 partial: the cleanup frees a GiB or more with the volume still short, and the settled
+                                 episode asks nobody else (~10 min). unanswered: the asked tab answers with words alone,
+                                 its ask is handed off once its 20-minute answer window passes, aterm's disk worker runs
+                                 first, then the next largest build's tab is asked and frees, settling the episode, so
+                                 the third tab is never asked (~38 min). exhausted: the cap on lines; the second tab
+                                 asked answers with words too, the episode runs out at its two lines, no second worker
+                                 runs and the third tab is never asked (~60 min). Each fails if aterm's disk worker runs
+                                 as a tab's session or its task reaches a tab's conversation
   slot-capture [--watch DUR [--dir DIR]]
                                  verify `build-slot` record parsing in a scratch BUILD_SLOT_DIR, or watch ~/.cache/build-slot vs the holder scan
   slot-lane [--aterm PATH] [--keep]

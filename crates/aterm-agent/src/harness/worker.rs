@@ -311,9 +311,9 @@ impl WorkerCli {
             return None;
         }
         Some(format!(
-            "{} is read here, not supervised: no reader sees its turn end yet, so its task \
-             could never be marked done and `await task` would never wake on it; no worker was \
-             started",
+            "{} is read, not supervised, by the aterm of the Mac asked to start it: no reader \
+             there sees its turn end yet, so its task could never be marked done and `await \
+             task` would never wake on it; no worker was started",
             self.agent.product()
         ))
     }

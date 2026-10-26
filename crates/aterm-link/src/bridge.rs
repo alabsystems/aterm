@@ -1139,6 +1139,12 @@ pub struct Bridge {
     quarantine_unread: bool,
     pin_unreconciled: Option<String>,
     recovery_owed: bool,
+    /// The last bridge of the state dir ran in an earlier boot, as judged when this bridge
+    /// started ([`StateDir::last_ran_in_an_earlier_boot`]): the run record named an earlier
+    /// boot, or, with no record, the incarnation lease did, and no lease named an attach of this
+    /// boot. The start's first roster, where it reads, sweeps that boot's sessions' files
+    /// ([`Bridge::sweep_sessions_of_an_earlier_boot`]); no later roster does.
+    earlier_boot: bool,
     mailbox: Arc<Mailbox>,
     fx: Fx,
     _state_lock: BridgeLock,
@@ -1426,6 +1432,7 @@ impl Bridge {
             quarantine_unread: false,
             pin_unreconciled: None,
             recovery_owed: false,
+            earlier_boot: false,
             mailbox,
             cfg,
             fx,
@@ -3629,6 +3636,9 @@ impl Bridge {
     }
 
     fn drop_in_flight(&self, seq: u64) {
+        #[cfg(test)]
+        self.state
+            .keep_refused_drops(self.fx.mutant(crate::sim::world::Mutant::KeepARefusedDrop));
         if let Err(e) = self.state.drop_in_flight(seq) {
             stderr_line!(
                 "aterm-link: the in-flight entry at sequence {seq} was not dropped durably: {e}"
@@ -3696,6 +3706,15 @@ impl Bridge {
                 return false;
             }
         };
+        for m in self.state.take_stale_retired() {
+            stderr_line!(
+                "aterm-link: {} was in flight in a post journal that a bridge of an older build \
+                 ran past after this build's last unclean stop; retired to {} in the state dir \
+                 and never published again — that bridge published what it found without it",
+                m.from,
+                m.to
+            );
+        }
         for (seq, entry) in entries {
             if Body::decode(&entry.body).0.re.is_some() {
                 let current_log = self.conn.as_ref().and_then(|conn| conn.seen_log_identity());
@@ -7123,16 +7142,6 @@ impl Bridge {
         {
             return true;
         }
-        #[cfg(test)]
-        let swept = if self
-            .fx
-            .mutant(crate::sim::world::Mutant::SweepByTheReaderAlone)
-        {
-            self.state.set_aside_torn_by_the_reader_alone()
-        } else {
-            self.state.set_aside_torn()
-        };
-        #[cfg(not(test))]
         let swept = self.state.set_aside_torn();
         match swept {
             Ok(moved) => {
@@ -7364,6 +7373,7 @@ impl Bridge {
 
     fn end_run(&self) {
         if self.bye == Some(Bye::Handoff) {
+            self.hand_posts_to_files();
             stderr_line!(
                 "aterm-link: handed off: the run goes on in the successor's bridge, so nothing \
                  is flushed and the run record stays open"
@@ -7385,6 +7395,14 @@ impl Bridge {
             );
             return;
         }
+        if !self.hand_posts_to_files() {
+            stderr_line!(
+                "aterm-link: no clean stop: the post journal holds records an older build would \
+                 not find, so the run record stays open and the next bridge of this build reads \
+                 them from the journal"
+            );
+            return;
+        }
         let began = self.fx.now();
         match self.state.end_run_clean() {
             Ok(flushed) => stderr_line!(
@@ -7401,6 +7419,29 @@ impl Bridge {
                 "aterm-link: this run's state files could not all be flushed: {e}; no marker \
                  is removed to force legacy recovery; unavailable recovery stays fail-closed"
             ),
+        }
+    }
+
+    /// At a stop, the post journal's records written as the files an older build reads
+    /// ([`StateDir::hand_posts_to_files`]), for whichever bridge runs next. Whether they were.
+    fn hand_posts_to_files(&self) -> bool {
+        match self.state.hand_posts_to_files() {
+            Ok(0) => true,
+            Ok(n) => {
+                stderr_line!(
+                    "aterm-link: {n} record(s) of the post journal written as the files a bridge \
+                     of an older build reads, for whichever bridge runs next"
+                );
+                true
+            }
+            Err(e) => {
+                stderr_line!(
+                    "aterm-link: the post journal's records could not all be written as the \
+                     files a bridge of an older build reads: {e}; a bridge of this build reads \
+                     every one from the journal"
+                );
+                false
+            }
         }
     }
 
@@ -7534,7 +7575,33 @@ impl Bridge {
                 self.link_down("endpoint-grammar");
                 false
             }
-            _ => true,
+            Err(_) => true,
+            Ok(_) => {
+                if std::mem::take(&mut self.earlier_boot) {
+                    self.sweep_sessions_of_an_earlier_boot();
+                }
+                true
+            }
+        }
+    }
+
+    /// Unlink the files an earlier boot's sessions left in the state dir, keeping those of every
+    /// session the roster just read ([`StateDir::sweep_sessions_of_an_earlier_boot`]); once, at
+    /// the start, after its recovery tried the sweep of torn files. A roster that did not read
+    /// sweeps nothing, and what is left goes at the next boot's start.
+    fn sweep_sessions_of_an_earlier_boot(&mut self) {
+        let live: BTreeSet<String> = self.locals.values().cloned().collect();
+        match self.state.sweep_sessions_of_an_earlier_boot(&live) {
+            Ok(0) => {}
+            Ok(n) => stderr_line!(
+                "aterm-link: the last bridge ran in an earlier boot: {n} files of the sessions \
+                 that boot ended (keys/, acks/, unhandled/, seen/, topics/) removed from the \
+                 state dir"
+            ),
+            Err(e) => stderr_line!(
+                "aterm-link: the files of the sessions an earlier boot ended could not all be \
+                 removed from the state dir: {e}; what is left goes at the next boot's start"
+            ),
         }
     }
 
@@ -7572,6 +7639,7 @@ impl Bridge {
                 spawn_event_reader(push, self.mailbox.clone());
             }
         }
+        self.earlier_boot = self.state.last_ran_in_an_earlier_boot();
         if self.recover() {
             self.begin_run();
         }
@@ -11069,6 +11137,74 @@ mod tests {
         }
     }
 
+    /// ONE OLDER BUILD'S DAMAGED RESERVATION LEAVES THE NODE ATTACHING (B19 review): an older
+    /// build's `sent/<sid>.<id>` that does not read holds that one post, as that build held it;
+    /// another session's reservation reads, the attach's in-flight settle goes on, and what is
+    /// owed reads.
+    #[test]
+    fn one_older_builds_damaged_reservation_leaves_the_node_attaching() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let (socket, _broker, _server) = serve_log(&lane, "broker");
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        let root = bridge.state.root().to_path_buf();
+        std::fs::create_dir_all(root.join("sent")).unwrap();
+        std::fs::write(root.join("sent/s-z.9"), b"7 key identity\n").unwrap();
+        bridge.state = StateDir::open(&root).unwrap();
+        assert_eq!(bridge.state.post_pin("s-a", 1).unwrap(), None);
+        assert!(
+            bridge.settle_in_flight(),
+            "the attach's in-flight settle goes on"
+        );
+        assert!(bridge
+            .state
+            .owed_publications()
+            .unwrap()
+            .sids
+            .contains("s-z"));
+        let held = bridge.state.post_pin("s-z", 9).unwrap_err();
+        assert!(held.to_string().contains("sent/s-z.9"), "{held}");
+    }
+
+    /// A DROP THE DISK REFUSES IS NOT PUBLISHED AT THE NEXT ATTACH (B19 review): a record the
+    /// bridge drops for good while the journal's writes are refused (a full disk) is forgotten by
+    /// the open all the same, as an older build's unlink of its file was done, so the attach
+    /// that follows in the same process publishes nothing.
+    #[test]
+    fn a_record_dropped_while_the_disk_is_full_is_not_published_at_the_next_attach() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let (socket, _broker, _server) = serve_log(&lane, "broker");
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        let face = format!(
+            "/f/{}/in/{}/s-b/{}/note",
+            bridge.cfg.fleet, bridge.node, bridge.node
+        );
+        let seq = bridge.state.reserve_next_sequence(bridge.inc).unwrap();
+        let body = b"v=1 t=1 text=refused%20for%20good";
+        bridge
+            .state
+            .set_in_flight(&InFlight {
+                pin: plain_pin(seq, &face, body),
+                subject: face.clone(),
+                body: body.to_vec(),
+                log: None,
+            })
+            .unwrap();
+        bridge
+            .state
+            .refuse_writes_of(Some(crate::state::journal::FILE));
+        bridge.drop_in_flight(seq);
+        bridge.state.refuse_writes_of(None);
+        assert!(bridge.settle_in_flight());
+        let (mut reader, _) = bridge.connect().unwrap();
+        let (rows, _) = reader.fetch(0, &face, 8).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a record the bridge dropped was published at the next attach: {rows:?}"
+        );
+    }
+
     fn assert_uncertain_in_flight_waits(kind: &str) {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let (socket, _broker, _server) = serve_log(&lane, "broker");
@@ -11095,8 +11231,9 @@ mod tests {
             .publish(bridge.producer_id, seq, &face, body)
             .unwrap();
         assert!(!deduped);
-        let dir = bridge.state.root().join("inflight");
-        let entry = dir.join(seq.to_string());
+        let root = bridge.state.root().to_path_buf();
+        let dir = root.join(crate::state::journal::DIR);
+        let entry = root.join(crate::state::journal::FILE);
         let blocked = if kind == "listing" {
             dir.clone()
         } else {
@@ -11113,6 +11250,7 @@ mod tests {
         } else {
             std::fs::write(&blocked, b"not a journal entry\n").unwrap();
         }
+        bridge.state = StateDir::open(&root).unwrap();
         assert!(
             !bridge.settle_in_flight(),
             "{kind}: uncertain publication fate was accepted as settled"
@@ -11140,7 +11278,15 @@ mod tests {
             bridge.state.self_acked().contains(&off),
             "the offset is remembered on disk"
         );
-        assert!(!entry.exists(), "the known publication is settled");
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty()
+                && StateDir::open(&root)
+                    .unwrap()
+                    .in_flight()
+                    .unwrap()
+                    .is_empty(),
+            "the known publication is settled"
+        );
         let (rows, _) = reader.fetch(0, &face, 8).unwrap();
         assert_eq!(
             rows.len(),
@@ -11249,14 +11395,14 @@ mod tests {
         assert_eq!(notes.len(), 1, "no-reference publication must recover");
         assert_eq!(Body::decode(&notes[0].2).0.text, "keep-me");
         assert!(bridge.state.in_flight().unwrap().is_empty());
-        for (seq, _) in published {
-            assert!(!bridge
-                .state
-                .root()
-                .join("inflight")
-                .join(seq.to_string())
-                .exists());
-        }
+        assert!(
+            StateDir::open(bridge.state.root())
+                .unwrap()
+                .in_flight()
+                .unwrap()
+                .is_empty(),
+            "nothing in flight on disk either: {published:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -11297,29 +11443,35 @@ mod tests {
                 b"v=1 t=1 re=0 verdict=handled text=legacy".to_vec(),
             )],
         );
-        let path = bridge
-            .state
-            .root()
-            .join("inflight")
-            .join(published[0].0.to_string());
-        let stored = std::fs::read_to_string(&path).unwrap();
-        let legacy = stored.lines().take(3).collect::<Vec<_>>().join("\n");
+        let seq = published[0].0;
+        let (_, entry) = bridge.state.in_flight().unwrap().remove(0);
+        let legacy = entry
+            .render()
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        bridge.state.clear_in_flight(seq).unwrap();
+        let root = bridge.state.root().to_path_buf();
+        std::fs::create_dir_all(root.join("inflight")).unwrap();
+        let path = root.join("inflight").join(seq.to_string());
         std::fs::write(&path, &legacy).unwrap();
+        bridge.state = StateDir::open(&root).unwrap();
         bridge.close_subscriptions();
         bridge.conn = None;
         assert!(
             !bridge.attach_broker(),
-            "a legacy reference was assigned this log without evidence"
+            "an older build's reference was assigned this log without evidence"
         );
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            legacy,
+            bridge.state.in_flight().unwrap(),
+            vec![(seq, InFlight { log: None, ..entry })],
             "uncertainty is retained"
         );
 
         std::fs::write(&path, format!("{legacy}\nlog=not-an-identity")).unwrap();
         assert!(
-            bridge.state.in_flight().is_err(),
+            StateDir::open(&root).unwrap().in_flight().is_err(),
             "malformed identity is never legacy absence"
         );
     }
@@ -11517,21 +11669,21 @@ mod tests {
             );
             let body = b"v=1 t=1 re=1 verdict=handled".to_vec();
             let pin = plain_pin(bridge.next_seq().unwrap(), &face, &body);
-            bridge
-                .state
-                .set_in_flight(&InFlight {
-                    pin: pin.clone(),
-                    subject: face.clone(),
-                    body,
-                    log: Some(broker.log_identity()),
-                })
-                .unwrap();
+            let text = InFlight {
+                pin: pin.clone(),
+                subject: face.clone(),
+                body,
+                log: Some(broker.log_identity()),
+            }
+            .render();
             bridge.close_subscriptions();
             bridge.conn = None;
-            let entry = bridge.state.root().join(format!("inflight/{}", pin.seq));
-            let text = std::fs::read_to_string(&entry).unwrap();
+            let root = bridge.state.root().to_path_buf();
+            std::fs::create_dir_all(root.join("inflight")).unwrap();
+            let entry = root.join(format!("inflight/{}", pin.seq));
             let cut = &text[..text.find("log=").expect("its witness")];
             std::fs::write(&entry, cut).unwrap();
+            bridge.state = StateDir::open(&root).unwrap();
             bridge.simulate_boot(crate::durability::test_boot(2), 0);
             if sweep {
                 bridge.set_aside_torn_state();
@@ -11657,6 +11809,35 @@ mod tests {
             "a count no longer watched is not looked at again"
         );
         bridge.close_subscriptions();
+    }
+
+    /// A QUIT WHOSE HAND-OFF THE DISK REFUSES IS NO CLEAN STOP (B19 review): the journal keeps a
+    /// record an older build would not find, so the run record stays open, and the next bridge
+    /// of this build reads the record from the journal, which names that run. CONTROL: the same
+    /// quit with its hand-off written stops cleanly, and the next bridge takes the file back.
+    #[test]
+    fn a_quit_whose_hand_off_the_disk_refuses_leaves_the_run_open() {
+        for refused in [true, false] {
+            let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.simulate_boot(crate::durability::test_boot(1), 0);
+            bridge.begin_run();
+            let pin = plain_pin(7, "/f/f/in/n-1/s-b/n-1/note", b"v=1 t=1");
+            bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+            if refused {
+                bridge.state.refuse_writes_of(Some("sent/s-a.1"));
+            }
+            bridge.bye = Some(Bye::Quit);
+            bridge.end_run();
+            bridge.state.refuse_writes_of(None);
+            let run = bridge.state.last_run().unwrap().expect("a run record");
+            assert_eq!(run.clean, !refused, "refused={refused}");
+            let next = StateDir::open(bridge.state.root()).unwrap();
+            assert_eq!(
+                next.post_pin("s-a", 1).unwrap(),
+                Some(pin),
+                "refused={refused}"
+            );
+        }
     }
 
     #[test]
@@ -11955,9 +12136,18 @@ mod tests {
                 .unwrap();
             bridge.close_subscriptions();
             bridge.conn = None;
-            let entry = bridge.state.root().join(format!("inflight/{}", pin.seq));
-            let text = std::fs::read(&entry).unwrap();
-            std::fs::write(&entry, &text[..text.len() / 2]).unwrap();
+            let root = bridge.state.root().to_path_buf();
+            let journal = root.join(crate::state::journal::FILE);
+            let mut torn = std::fs::read(&journal).unwrap();
+            let last = torn.len() - 1;
+            torn[last] ^= 0x01;
+            std::fs::write(&journal, &torn).unwrap();
+            assert_eq!(
+                crate::state::journal::read(&torn).end,
+                crate::state::journal::End::Torn,
+                "PRECONDITION: a tear inside the last record's bytes, as a power cut leaves"
+            );
+            bridge.state = StateDir::open(&root).unwrap();
             bridge.attach_past_an_earlier_boots_run = false;
             bridge.simulate_boot(crate::durability::test_boot(2), 0);
             if bridge.recover() {
@@ -11966,16 +12156,12 @@ mod tests {
             assert_eq!(
                 bridge.attach_broker(),
                 widened,
-                "{case}: boot 2's attach (the torn entry set aside, or refused)"
+                "{case}: boot 2's attach (the torn journal set aside, or refused)"
             );
             assert_eq!(
-                bridge
-                    .state
-                    .root()
-                    .join(format!("quarantine/inflight.{}", pin.seq))
-                    .exists(),
+                root.join("quarantine/journal.posts").exists(),
                 widened,
-                "{case}: the torn entry is in the quarantine"
+                "{case}: the torn journal is in the quarantine"
             );
             bridge.close_subscriptions();
         }
@@ -13825,23 +14011,26 @@ mod tests {
     #[test]
     fn unknown_post_or_key_reservation_state_cannot_retire_at_the_budget_door() {
         for (blocked, dangling) in [
-            ("sent/s-a.1", false),
+            (crate::state::journal::FILE, false),
             ("keys/s-a", false),
-            ("sent/s-a.1", true),
+            (crate::state::journal::FILE, true),
             ("keys/s-a", true),
         ] {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
             bridge.refresh_sessions().unwrap();
             let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
             let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["s-a", "s-b"], &[], max);
-            let path = bridge.state.root().join(blocked);
+            let root = bridge.state.root().to_path_buf();
+            let path = root.join(blocked);
             std::fs::create_dir_all(path.parent().expect("reservation parent")).unwrap();
+            let _ = std::fs::remove_file(&path);
             if dangling {
                 std::os::unix::fs::symlink("absent-reservation-target", &path)
                     .expect("make the existing reservation target unreadable");
             } else {
                 std::fs::create_dir(&path).expect("make the required reservation read fail");
             }
+            bridge.state = StateDir::open(&root).unwrap();
             *lane.outbox.lock().unwrap() =
                 Some("post sid=s-a id=1 to=@s-b kind=ask key=k-first len=5\nfresh".into());
             bridge.drain_outbox();
@@ -15334,13 +15523,24 @@ mod tests {
             assert!(acked.contains(&off), "@{off} is not in acked: {acked:?}");
         }
         assert!(bridge.state.in_flight().unwrap().is_empty());
-        let reservations = std::fs::read_dir(bridge.state.root().join("sent"))
-            .unwrap()
-            .count();
-        assert_eq!(reservations, 0, "a retired post left its reservation");
+        for id in 1..next {
+            assert_eq!(
+                bridge.state.post_pin(A, id).unwrap(),
+                None,
+                "a retired post left its reservation"
+            );
+        }
+        assert!(
+            !bridge.state.root().join("sent").exists()
+                && !bridge.state.root().join("inflight").exists(),
+            "no file a post"
+        );
         spent
     }
 
+    /// WHAT A LOCAL POST COSTS THE STATE DIR (B19): four records of the post journal (its
+    /// reservation, its record in flight, that record landed, the reservation retired) and the
+    /// landed offset appended to `acked`, and nothing renamed, unlinked or read.
     #[cfg(unix)]
     #[test]
     fn a_local_post_costs_the_state_dir_a_counted_set_of_operations() {
@@ -15350,13 +15550,13 @@ mod tests {
             assert_eq!(
                 spent,
                 crate::state::FileOps {
-                    reads: posts,
-                    replaces: 2 * posts,
-                    renames: 2 * posts,
+                    reads: 0,
+                    replaces: 0,
+                    renames: 0,
                     fsyncs: 0,
                     barriers: 0,
-                    unlinks: 2 * posts,
-                    appends: posts,
+                    unlinks: 0,
+                    appends: 5 * posts,
                 },
                 "{drains} drain(s) of {per_drain} post(s)"
             );
@@ -15391,10 +15591,9 @@ mod tests {
             let spent = bridge.state.ops() - before;
             assert_eq!(
                 (spent.unlinks, spent.appends),
-                (2 * posts, posts),
+                (0, 5 * posts),
                 "on={on}: what a local post costs the dir"
             );
-            assert!(spent.replaces >= 2 * posts, "on={on}");
             bridge.tally_idle();
             if !on {
                 assert!(!path.exists(), "an off tally writes nothing");
@@ -15427,10 +15626,6 @@ mod tests {
                 (n(Row::DrainPosts), t.row(Row::DrainPosts).total),
                 (drains, posts),
                 "each peek's posts"
-            );
-            assert!(
-                t.row(Row::SetPostPin).total <= t.row(Row::DirReplace).total,
-                "a call row is inside its kind's"
             );
             assert_eq!(
                 n(Row::PostPublish),
@@ -15530,10 +15725,18 @@ mod tests {
             *lane.outbox.lock().unwrap() = Some(format!(
                 "post sid=s-a id={id} to=@s-b kind=note len=4\nping"
             ));
-            let before = bridge.state.ops();
+            let records = |bridge: &Bridge| {
+                let journal = bridge.state.root().join(crate::state::journal::FILE);
+                crate::state::journal::records_and_attaches(
+                    &std::fs::read(journal).unwrap_or_default(),
+                )
+                .0
+            };
+            let (before, journaled) = (bridge.state.ops(), records(bridge));
             bridge.drain_outbox();
             let spent = bridge.state.ops() - before;
-            (retired_off(lane, id), spent.appends, spent.replaces - 2)
+            let acked_appends = spent.appends - (records(bridge) - journaled);
+            (retired_off(lane, id), acked_appends, spent.replaces)
         };
         let (first, appends, replaces) = post(&lane, &mut bridge, 1);
         assert_eq!((appends, replaces), (1, 0), "an ordinary append");
@@ -15617,6 +15820,9 @@ mod tests {
             Some("post sid=s-a id=1 to=@s-b kind=note len=4\nping".to_string());
         bridge.drain_outbox();
         assert!(lane.sent.lock().unwrap().is_empty(), "left listed");
+        let pin = bridge.state.post_pin("s-a", 1).unwrap();
+        assert!(pin.is_some(), "the journal holds the reservation");
+        bridge.end_run();
         let sent = bridge.state.root().join("sent");
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&sent).unwrap() {
@@ -15644,6 +15850,17 @@ mod tests {
                 assert!(InFlight::parse(seq, &text).is_some(), "inflight/{name}");
             }
         }
+        assert!(
+            !bridge
+                .state
+                .root()
+                .join(crate::state::journal::FILE)
+                .exists(),
+            "the stop unlinked the journal, so a later bridge of this build reads the files"
+        );
+        let next = StateDir::open(bridge.state.root()).unwrap();
+        assert_eq!(next.post_pin("s-a", 1).unwrap(), pin, "and takes it back");
+        assert!(!sent.join("s-a.1").exists());
     }
 
     #[test]

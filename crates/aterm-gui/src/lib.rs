@@ -304,13 +304,14 @@ pub use system_state::{
     InitialSetupRunPolicy, NEWER_SETUP_NOTE, RESTORE_BACKUP_UNREAD_NOTE, RESTORE_FAILED_NOTE,
     SETUP_ROW, STARTUP_RETRY_NOTE, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus,
     SetupStatusRow, VAULT_NOT_JOINED_NOTE, VAULT_UNREAD_NOTE, calm_setup_row,
-    journal_refused_entry, pass_rows, restore_rows, setup_not_started_entry, setup_set_aside_entry,
-    setup_unfinished_entry,
+    journal_refused_entry, pass_rows, restore_rows, setup_changed_since_entry,
+    setup_not_started_entry, setup_set_aside_entry, setup_unfinished_entry,
 };
 #[cfg(unix)]
 pub use system_state::{
-    clear_setup_not_started, clear_setup_set_aside, clear_setup_unfinished, note_journal_refused,
-    note_setup_not_started, note_setup_set_aside, note_setup_unfinished,
+    clear_setup_changed_since, clear_setup_not_started, clear_setup_set_aside,
+    clear_setup_unfinished, note_journal_refused, note_setup_changed_since, note_setup_not_started,
+    note_setup_set_aside, note_setup_unfinished,
 };
 /// Mend this Mac's vault subscriber off the event loop, at once and every
 /// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
@@ -16143,15 +16144,10 @@ impl App {
 
     #[cfg(windows)]
     fn window_hwnd(&self, wid: WindowId) -> isize {
-        use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         self.windows
             .get(&wid)
             .and_then(|ws| ws.os_window.as_ref())
-            .and_then(|w| w.window_handle().ok())
-            .and_then(|h| match h.as_raw() {
-                RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
-                _ => None,
-            })
+            .and_then(|w| crate::platform_win::hwnd_of(w))
             .unwrap_or(0)
     }
 
@@ -26540,9 +26536,16 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         message_inbox::queue_message(msg);
     }
     let mut keeper_evidence = (None, None);
+    let mut startup_crash_path: Option<std::path::PathBuf> = None;
+    let mut startup_had_crash = false;
     if !headless {
         let crash = logging::take_crash_evidence();
         let killed = logging::take_kill_evidence();
+        startup_crash_path = crash
+            .as_ref()
+            .map(|evidence| evidence.path.clone())
+            .or_else(|| killed.as_ref().map(|evidence| evidence.marker.clone()));
+        startup_had_crash = crash.is_some() || killed.is_some();
         let note_log = crash
             .as_ref()
             .map(|evidence| evidence.path.clone())
@@ -27195,6 +27198,45 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         event_loop_failed: false,
     };
     app.recover_developer_tools_install(0);
+    if !headless {
+        let launch_ms = aterm_time::unix_millis()
+            .and_then(|ms| i64::try_from(ms).ok())
+            .unwrap_or(0);
+        if launch_ms > 0 {
+            if startup_had_crash {
+                let crash_ms = startup_crash_path
+                    .as_deref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    .map_or(launch_ms.saturating_sub(1_000), |ms| ms.min(launch_ms));
+                if crash_ms < launch_ms {
+                    app.vitals.note_time_gap(aterm_vitals::TimeGap {
+                        start_ms: crash_ms,
+                        end_ms: launch_ms,
+                        kind: aterm_vitals::GapKind::Crash,
+                    });
+                }
+                app.vitals.note_strip_event(aterm_vitals::StripEvent {
+                    at_unix_ms: crash_ms,
+                    kind: aterm_vitals::StripEventKind::Crash,
+                    label: "aterm crash".into(),
+                });
+                app.vitals.note_strip_event(aterm_vitals::StripEvent {
+                    at_unix_ms: launch_ms,
+                    kind: aterm_vitals::StripEventKind::Restart,
+                    label: "restarted".into(),
+                });
+            } else if seamless_adopting || relaunch_of_running || just_updated {
+                app.vitals.note_strip_event(aterm_vitals::StripEvent {
+                    at_unix_ms: launch_ms,
+                    kind: aterm_vitals::StripEventKind::Restart,
+                    label: "restarted".into(),
+                });
+            }
+        }
+    }
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::AppBuilt);
     {
         let word_proxy = proxy.clone();

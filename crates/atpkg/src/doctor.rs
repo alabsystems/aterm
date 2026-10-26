@@ -266,6 +266,13 @@ pub struct Probes {
     pub trust_chain: Option<TrustChainProbe>,
     /// The rc the account's login shell reads.
     pub login_rc: Option<&'static str>,
+    /// Whether rustup answered `--version`, read beside the other probes; `None` leaves
+    /// [`report_with`] to ask it.
+    pub rustup_answers: Option<bool>,
+    /// The active Trust build and its exec root as [`crate::compat::inspect`] read it, beside
+    /// the other probes and once for a pass whose repair items read it too
+    /// ([`packages_rows_sharing`]); `None` leaves [`report_with`] to read it.
+    pub exec_root: Option<(u64, Option<Result<crate::compat::Inspection, String>>)>,
 }
 
 /// What [`probe_trust_chain`] found on the active Trust build's chain.
@@ -516,6 +523,8 @@ impl Default for Probes {
             rosetta: None,
             trust_chain: None,
             login_rc: None,
+            rustup_answers: None,
+            exec_root: None,
         }
     }
 }
@@ -981,15 +990,22 @@ pub(crate) fn probe_local_seal_at(layout: &Layout, rustup_home: &Path) -> Option
         return None;
     }
     let trustc = target.join("bin").join("trustc");
-    let commit = output_bounded(aterm_uds::spawnfd::command(&trustc).arg("-Vv"))
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .and_then(|s| {
-            s.lines().find_map(|l| {
-                l.strip_prefix("commit-hash: ")
-                    .map(|c| c.chars().take(10).collect::<String>())
-            })
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let commit = kept_answer(
+        &trustc,
+        "-Vv commit-hash",
+        crate::probe_cache::file(VERSIONS).as_deref(),
+        || {
+            output_bounded(aterm_uds::spawnfd::command(&trustc).arg("-Vv"))
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .and_then(|s| {
+                    s.lines().find_map(|l| {
+                        l.strip_prefix("commit-hash: ")
+                            .map(|c| c.chars().take(10).collect::<String>())
+                    })
+                })
+        },
+    )
+    .unwrap_or_else(|| "unknown".to_string());
     Some(LocalSealProbe {
         stale: crate::seam::stale_against_store(layout, &target),
         link,
@@ -1026,29 +1042,75 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail, json: bool) -> bool {
 /// nothing past the slowest of them.
 #[must_use]
 pub fn rows(layout: &Layout) -> Vec<ItemReport> {
-    std::thread::scope(|scope| rows_reading(layout, Some(scope.spawn(crate::devtools::facts))))
+    std::thread::scope(|scope| {
+        rows_reading(layout, Some(scope.spawn(crate::devtools::facts)), None)
+    })
 }
 
 /// [`rows`] without the Developer Tools read ([`crate::devtools::facts`]: a TCC.db read and a `log show`, which can take seconds).
 #[must_use]
 pub fn packages_rows(layout: &Layout) -> Vec<ItemReport> {
-    rows_reading(layout, None)
+    rows_reading(layout, None, None)
 }
 
-/// The rows, the `devtools` read joined last, once every other probe has read.
+/// [`packages_rows`] for a pass whose repair items read the store too: the active Trust build's
+/// exec root is inspected once, through `reads`, for both ([`crate::converge::repair::Reads`]).
+#[must_use]
+pub fn packages_rows_sharing(
+    layout: &Layout,
+    reads: &crate::converge::repair::Reads,
+) -> Vec<ItemReport> {
+    rows_reading(layout, None, Some(reads))
+}
+
+/// The rows, the `devtools` read joined last, once every other probe has read. The probes that
+/// spawn a program or walk a build (the workspace policy, a local toolchain's compiler, the C
+/// toolchain, rustup, the exec root) each run on a thread of their own.
 fn rows_reading(
     layout: &Layout,
     devtools: Option<std::thread::ScopedJoinHandle<'_, Option<crate::devtools::Facts>>>,
+    reads: Option<&crate::converge::repair::Reads>,
 ) -> Vec<ItemReport> {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
     let cfg = crate::config::cached();
+    let trust_build = crate::ops::active_builds(layout).get("trust").copied();
+    let rustup = rustup_binary(home.as_deref());
+    fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+        handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+    let (workspace, local_seal, cc, rustup_answers, exec_root) = std::thread::scope(|scope| {
+        let workspace = scope.spawn(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| probe_workspace_policy(layout, &cwd))
+        });
+        let local_seal = scope.spawn(|| probe_local_seal(layout, home.as_deref()));
+        let cc = scope.spawn(|| crate::prereq::probe(path.as_deref()));
+        let rustup_answers = scope.spawn(|| rustup.as_deref().is_some_and(rustup_present));
+        let exec_root = trust_build.map(|build| {
+            (
+                build,
+                match reads {
+                    Some(reads) => reads.inspect(layout, build),
+                    None => crate::compat::inspect(layout, build),
+                },
+            )
+        });
+        (
+            join(workspace),
+            join(local_seal),
+            join(cc),
+            join(rustup_answers),
+            exec_root,
+        )
+    });
     let mut probes = Probes {
-        workspace: std::env::current_dir()
-            .ok()
-            .and_then(|cwd| probe_workspace_policy(layout, &cwd)),
-        local_seal: probe_local_seal(layout, home.as_deref()),
+        workspace,
+        local_seal,
         automatic: crate::manager_enabled() && cfg.enabled(),
         excluded: cfg.exclude().to_vec(),
         config_notes: cfg.config_notes(),
@@ -1058,7 +1120,7 @@ fn rows_reading(
         claude_auto_prime: crate::config::load_agents_auto_prime(),
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
-        cc: Some(crate::prereq::probe(path.as_deref())),
+        cc: Some(cc),
         rosetta: crate::machine::ROSETTA_APPLIES.then(|| {
             (
                 crate::machine::rosetta_posture(&crate::machine::SystemRosetta),
@@ -1068,6 +1130,8 @@ fn rows_reading(
         trust_chain: probe_trust_chain(layout),
         login_rc: home.as_deref().and_then(crate::hooks::account_login_rc),
         devtools: None,
+        rustup_answers: Some(rustup_answers),
+        exec_root,
     };
     probes.devtools = devtools.and_then(|read| {
         read.join()
@@ -1354,6 +1418,25 @@ pub fn render(rows: &[ItemReport], p: &str, detail: Detail) -> Presented {
         verdict: format!("{}\n", verdict(rows, p)),
         faults,
         rest,
+    }
+}
+
+/// One packages row as bare `aterm doctor` shows it: its sentence and, when it has one the
+/// sentence does not already name, the one act that fixes it (`… \u{2014} fix: aterm pkg
+/// repair`).
+#[must_use]
+pub fn sentence_and_fix(row: &ItemReport) -> String {
+    let fix = row
+        .explain
+        .as_ref()
+        .and_then(|e| remedy_words(&e.remedy))
+        .filter(|words| {
+            let act = words.strip_prefix("fix: ").unwrap_or(words);
+            !sentence(row).contains(act)
+        });
+    match fix {
+        Some(words) => format!("{} \u{2014} {words}", sentence(row)),
+        None => sentence(row).to_owned(),
     }
 }
 
@@ -1886,7 +1969,11 @@ pub(crate) fn read(
                 });
             }
         }
-        match crate::compat::inspect(layout, trust_build) {
+        let inspected = match &probes.exec_root {
+            Some((build, inspected)) if *build == trust_build => inspected.clone(),
+            _ => crate::compat::inspect(layout, trust_build),
+        };
+        match inspected {
             Some(Ok(inspection)) => {
                 let (row, claim, remedy) = exec_root_line(trust_build, &inspection);
                 let class = if matches!(remedy, Remedy::Person { .. }) {
@@ -2656,7 +2743,9 @@ pub(crate) fn read(
     }
 
     let rustup = rustup_binary(home);
-    let rustup_answers = rustup.as_deref().is_some_and(rustup_present);
+    let rustup_answers = probes
+        .rustup_answers
+        .unwrap_or_else(|| rustup.as_deref().is_some_and(rustup_present));
     if rustup.is_none() {
         f.push(Finding::note(
             c::RUSTUP,
@@ -2863,17 +2952,18 @@ pub(crate) fn read(
                 ));
                 continue;
             }
+            // Outside an aterm shell an agent program's own copy first on PATH is the person's
+            // to keep: an aterm tab puts agents/ first on its own, so the row is a note.
+            let outside_agent = !probes.stub_env.in_aterm && crate::stub::is_agent_program(program);
             if let Some(row) =
                 crate::cli::agent_shell_shadow(layout, program, *build, &path, path_var)
             {
-                f.push(Finding::change(
-                    id,
-                    Class::Person,
-                    title,
-                    format!("{program}: {row}"),
-                    managed_first,
-                    Remedy::None,
-                ));
+                let why = format!("{program}: {row}");
+                f.push(if outside_agent {
+                    Finding::note(id, Class::Person, title, why)
+                } else {
+                    Finding::change(id, Class::Person, title, why, managed_first, Remedy::None)
+                });
                 continue;
             }
             let fix = crate::cli::alias_fix(layout, &tool, program, path_var)
@@ -2886,21 +2976,28 @@ pub(crate) fn read(
                 Some(s) => format!("the copy aterm updates from {}", s.vendor),
                 None => String::from("the pinned build"),
             };
-            f.push(Finding::change(
-                id,
-                Class::Person,
-                title,
-                format!(
-                    "{program}: {} (not {managed}; atpkg never edits PATH — remove or reorder \
-                     that copy if you want the managed one){fix}",
-                    crate::state::shadowed(*build, &path)
-                ),
-                managed_first,
-                Remedy::Person {
-                    pane: path.display().to_string(),
-                    how: String::from("remove or reorder that copy if you want the managed one"),
-                },
-            ));
+            let why = format!(
+                "{program}: {} (not {managed}; atpkg never edits PATH — remove or reorder that \
+                 copy if you want the managed one){fix}",
+                crate::state::shadowed(*build, &path)
+            );
+            f.push(if outside_agent {
+                Finding::note(id, Class::Person, title, why)
+            } else {
+                Finding::change(
+                    id,
+                    Class::Person,
+                    title,
+                    why,
+                    managed_first,
+                    Remedy::Person {
+                        pane: path.display().to_string(),
+                        how: String::from(
+                            "remove or reorder that copy if you want the managed one",
+                        ),
+                    },
+                )
+            });
         }
     }
     for (program, build) in &installed {
@@ -3387,22 +3484,52 @@ fn toolset_command(f: &ToolsetFacts<'_>, grouped: impl Fn(&str) -> bool) -> Opti
     }
 }
 
-fn probe_version(bin: &Path) -> String {
-    const UNKNOWN: &str = "unknown";
-    let Some(out) = output_bounded(aterm_uds::spawnfd::command(bin).arg("--version")) else {
-        return UNKNOWN.to_string();
-    };
-    if !out.status.success() {
-        return UNKNOWN.to_string();
+/// The file that keeps the programs' answers to a version question ([`kept_answer`]).
+const VERSIONS: &str = "versions";
+
+/// What `bin` answered to `question` (the words naming what is asked and read of the answer),
+/// kept in `cache` under the question and the program's identity
+/// ([`crate::probe_cache::identity`]): a store build never changes in place, so the answer is
+/// read from the cache until the file is rewritten or replaced, and `ask` (a spawn) runs only
+/// then. An unanswered question is asked again next time.
+fn kept_answer(
+    bin: &Path,
+    question: &str,
+    cache: Option<&Path>,
+    ask: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let kept = cache.zip(crate::probe_cache::key([
+        Some(question.to_owned()),
+        crate::probe_cache::identity(bin),
+    ]));
+    if let Some((file, key)) = &kept
+        && let Some(answer) = crate::probe_cache::get(file, key)
+    {
+        return Some(answer);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let Some(line) = text.lines().next() else {
-        return UNKNOWN.to_string();
-    };
-    let Some(token) = line.split_whitespace().nth(1) else {
-        return UNKNOWN.to_string();
-    };
-    token.split('+').next().unwrap_or(token).to_string()
+    let answer = ask()?;
+    if let Some((file, key)) = &kept {
+        crate::probe_cache::put(file, key, &answer);
+    }
+    Some(answer)
+}
+
+fn probe_version(bin: &Path) -> String {
+    kept_answer(
+        bin,
+        "--version",
+        crate::probe_cache::file(VERSIONS).as_deref(),
+        || {
+            let out = output_bounded(aterm_uds::spawnfd::command(bin).arg("--version"))?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            let token = text.lines().next()?.split_whitespace().nth(1)?;
+            Some(token.split('+').next().unwrap_or(token).to_string())
+        },
+    )
+    .unwrap_or_else(|| "unknown".to_string())
 }
 
 const TRUST_COMPILER_FIX: &str = "ship trustc as one signed plain file, never a symbolic link";
@@ -4109,8 +4236,6 @@ fn rustup_trust_channel_resolves(bin: &Path) -> bool {
 
 const PROBE_TIMEOUT: std::time::Duration = crate::prereq::PROBE_TIMEOUT;
 
-const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// Run a version probe with a bounded wall clock, killing it on timeout.
 pub(crate) fn output_bounded(
     cmd: &mut aterm_uds::spawnfd::Command,
@@ -4168,153 +4293,21 @@ pub(crate) fn output_bounded_capturing(
     bounded(cmd, true, within)
 }
 
-const PROBE_OUTPUT_CAP: usize = 1 << 20;
-
+/// `cmd` run with no input until it exits or `within` is up, when its process group is killed
+/// and the answer is `None`: [`aterm_uds::deadline::output_within`], which waits on the kernel's
+/// report of the exit (kqueue on macOS, a pidfd on Linux), so an answer is read the moment the
+/// probe exits, never on a poll's next tick. Each stream keeps its last
+/// [`aterm_uds::deadline::OUTPUT_KEEP`] bytes; stderr is dropped unless `keep_stderr`.
 fn bounded(
     cmd: &mut aterm_uds::spawnfd::Command,
     keep_stderr: bool,
     within: std::time::Duration,
 ) -> Option<std::process::Output> {
-    use aterm_uds::spawnfd::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(if keep_stderr {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + within;
-    let mut stdout = Capture::new(child.stdout.take());
-    let mut stderr = Capture::new(child.stderr.take());
-    let status = loop {
-        stdout.pump();
-        stderr.pump();
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return None;
-                }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                std::thread::sleep(PROBE_POLL.min(remaining));
-            }
-            Err(_) => return None,
-        }
-    };
-    Some(std::process::Output {
-        status,
-        stdout: stdout.finish(deadline),
-        stderr: stderr.finish(deadline),
-    })
-}
-
-#[cfg(unix)]
-struct Capture<R> {
-    /// `None` at end of file, after an error, or when it could not be made non-blocking.
-    pipe: Option<R>,
-    out: Vec<u8>,
-}
-
-#[cfg(unix)]
-impl<R: std::io::Read + std::os::fd::AsRawFd> Capture<R> {
-    fn new(pipe: Option<R>) -> Self {
-        let pipe = pipe.filter(|pipe| {
-            let fd = pipe.as_raw_fd();
-            // SAFETY: `fd` is the open read end of a pipe this process owns (`pipe` holds
-            // it for the whole call), and F_GETFL/F_SETFL read and set its status flags and
-            // touch no memory.
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
-            }
-        });
-        Self {
-            pipe,
-            out: Vec::new(),
-        }
+    let mut out = aterm_uds::deadline::output_within(cmd, within).ok()?;
+    if !keep_stderr {
+        out.stderr.clear();
     }
-
-    fn pump(&mut self) {
-        let mut chunk = [0u8; 8192];
-        while let Some(pipe) = self.pipe.as_mut() {
-            let room = PROBE_OUTPUT_CAP.saturating_sub(self.out.len());
-            if room == 0 {
-                return;
-            }
-            let want = room.min(chunk.len());
-            match pipe.read(&mut chunk[..want]) {
-                Ok(0) => self.pipe = None,
-                Ok(n) => self.out.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(_) => self.pipe = None,
-            }
-        }
-    }
-
-    fn finish(mut self, _deadline: std::time::Instant) -> Vec<u8> {
-        self.pump();
-        self.out
-    }
-}
-
-#[cfg(not(unix))]
-struct Capture {
-    /// What the thread has read, and whether it is done reading.
-    read: std::sync::Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
-}
-
-#[cfg(not(unix))]
-impl Capture {
-    fn new<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Self {
-        let read = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), pipe.is_none())));
-        if let Some(mut pipe) = pipe {
-            let filled = std::sync::Arc::clone(&read);
-            let spawned = std::thread::Builder::new()
-                .name("probe-pipe".into())
-                .spawn(move || {
-                    let mut chunk = [0u8; 8192];
-                    loop {
-                        let got = pipe.read(&mut chunk);
-                        let mut read = filled.lock().unwrap_or_else(|e| e.into_inner());
-                        match got {
-                            Ok(n) if n > 0 && read.0.len() < PROBE_OUTPUT_CAP => {
-                                let keep = n.min(PROBE_OUTPUT_CAP - read.0.len());
-                                read.0.extend_from_slice(&chunk[..keep]);
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                            _ => {
-                                read.1 = true;
-                                return;
-                            }
-                        }
-                    }
-                });
-            if spawned.is_err() {
-                read.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
-            }
-        }
-        Self { read }
-    }
-
-    fn pump(&mut self) {}
-
-    fn finish(self, deadline: std::time::Instant) -> Vec<u8> {
-        loop {
-            {
-                let read = self.read.lock().unwrap_or_else(|e| e.into_inner());
-                if read.1 || std::time::Instant::now() >= deadline {
-                    return read.0.clone();
-                }
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            std::thread::sleep(PROBE_POLL.min(remaining));
-        }
-    }
+    Some(out)
 }
 
 #[cfg(windows)]

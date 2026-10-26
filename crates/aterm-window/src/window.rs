@@ -9,21 +9,19 @@
 //! The [`Window`] struct and associated types.
 //!
 //! LOCAL PATCH (aterm): an item marked `#[cfg(not(macos_platform))]` is API no aterm crate calls on
-//! macOS, and one marked `#[cfg(windows_platform)]` API no aterm crate calls on Linux either; only
-//! the Windows backend still implements them.
+//! macOS, and one marked `#[cfg(windows_platform)]` API no aterm crate calls on Linux. What no aterm
+//! crate calls on any platform is gone (upstream's transparency, blur, resizability, enabled buttons,
+//! decorations, window level, content protection, maximum size, dead-key reset, pre-present notice,
+//! cursor position, grab, visibility and hit test, and exclusive full screen).
 
 use std::fmt;
 
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError};
 use crate::monitor::MonitorHandle;
-#[cfg(windows_platform)]
-use crate::monitor::VideoModeHandle;
 use crate::platform_impl::{self, PlatformSpecificWindowAttributes};
 
 pub use crate::cursor::Cursor;
-#[cfg(windows_platform)]
-pub use crate::cursor::{BadImage, CustomCursor, CustomCursorSource, MAX_CURSOR_SIZE};
 #[cfg(not(macos_platform))]
 pub use crate::icon::{BadIcon, Icon};
 
@@ -40,19 +38,6 @@ pub struct Window {
 impl fmt::Debug for Window {
     fn fmt(&self, fmtr: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmtr.pad("Window { .. }")
-    }
-}
-
-// LOCAL PATCH (aterm): Windows only; macOS, X11 and Wayland have no exclusive fullscreen to leave,
-// and their windows close in their own `Drop`.
-#[cfg(windows_platform)]
-impl Drop for Window {
-    fn drop(&mut self) {
-        self.window.maybe_wait_on_main(|w| {
-            if let Some(Fullscreen::Exclusive(_)) = w.fullscreen().map(|f| f.into()) {
-                w.set_fullscreen(None);
-            }
-        })
     }
 }
 
@@ -91,13 +76,16 @@ impl From<u64> for WindowId {
 /// Attributes used when creating a window.
 ///
 /// LOCAL PATCH (aterm): only the builders aterm calls. Upstream's other fifteen (`with_resizable`,
-/// `with_fullscreen`, `with_decorations`, `with_parent_window` and the rest) are gone, so the
-/// fields they set hold their [`Default`].
+/// `with_fullscreen`, `with_decorations`, `with_parent_window` and the rest) are gone, and every
+/// backend folds the defaults of the fields they set in: a window is created resizable, with all
+/// three buttons, decorated, at the normal level, activated, not maximized, not full screen, not
+/// transparent, following the system theme, with the default cursor and no maximum size.
 #[derive(Debug, Clone)]
 pub struct WindowAttributes {
     pub(crate) inner_size: Option<Size>,
+    #[cfg(not(windows_platform))]
     pub(crate) min_inner_size: Option<Size>,
-    #[cfg(any(macos_platform, windows_platform))]
+    #[cfg(macos_platform)]
     pub(crate) position: Option<Position>,
     pub(crate) title: String,
     pub(crate) visible: bool,
@@ -105,34 +93,6 @@ pub struct WindowAttributes {
     pub(crate) platform_specific: PlatformSpecificWindowAttributes,
     #[cfg(any(x11_platform, windows_platform))]
     pub(crate) window_icon: Option<Icon>,
-    #[cfg(windows_platform)]
-    pub(crate) max_inner_size: Option<Size>,
-    #[cfg(windows_platform)]
-    pub(crate) resizable: bool,
-    #[cfg(windows_platform)]
-    pub(crate) enabled_buttons: WindowButtons,
-    #[cfg(windows_platform)]
-    pub(crate) maximized: bool,
-    #[cfg(windows_platform)]
-    pub(crate) transparent: bool,
-    #[cfg(windows_platform)]
-    pub(crate) decorations: bool,
-    #[cfg(windows_platform)]
-    pub(crate) preferred_theme: Option<Theme>,
-    #[cfg(windows_platform)]
-    pub(crate) resize_increments: Option<Size>,
-    #[cfg(windows_platform)]
-    pub(crate) content_protected: bool,
-    #[cfg(windows_platform)]
-    pub(crate) window_level: WindowLevel,
-    #[cfg(windows_platform)]
-    pub(crate) active: bool,
-    #[cfg(windows_platform)]
-    pub(crate) cursor: Cursor,
-    #[cfg(windows_platform)]
-    pub(crate) fullscreen: Option<Fullscreen>,
-    #[cfg(all(feature = "rwh_06", windows_platform))]
-    pub(crate) parent_window: Option<SendSyncRawWindowHandle>,
 }
 
 impl Default for WindowAttributes {
@@ -140,55 +100,18 @@ impl Default for WindowAttributes {
     fn default() -> WindowAttributes {
         WindowAttributes {
             inner_size: None,
+            #[cfg(not(windows_platform))]
             min_inner_size: None,
-            #[cfg(any(macos_platform, windows_platform))]
+            #[cfg(macos_platform)]
             position: None,
             title: "winit window".to_owned(),
             visible: true,
             platform_specific: Default::default(),
             #[cfg(any(x11_platform, windows_platform))]
             window_icon: None,
-            #[cfg(windows_platform)]
-            max_inner_size: None,
-            #[cfg(windows_platform)]
-            resizable: true,
-            #[cfg(windows_platform)]
-            enabled_buttons: WindowButtons::all(),
-            #[cfg(windows_platform)]
-            maximized: false,
-            #[cfg(windows_platform)]
-            transparent: false,
-            #[cfg(windows_platform)]
-            decorations: true,
-            #[cfg(windows_platform)]
-            preferred_theme: None,
-            #[cfg(windows_platform)]
-            resize_increments: None,
-            #[cfg(windows_platform)]
-            content_protected: false,
-            #[cfg(windows_platform)]
-            window_level: Default::default(),
-            #[cfg(windows_platform)]
-            active: true,
-            #[cfg(windows_platform)]
-            cursor: Cursor::default(),
-            #[cfg(windows_platform)]
-            fullscreen: None,
-            #[cfg(all(feature = "rwh_06", windows_platform))]
-            parent_window: None,
         }
     }
 }
-
-/// Wrapper for [`rwh_06::RawWindowHandle`] for `WindowAttributes::parent_window`.
-#[derive(Debug, Clone)]
-#[cfg(all(feature = "rwh_06", windows_platform))]
-pub(crate) struct SendSyncRawWindowHandle(pub(crate) rwh_06::RawWindowHandle);
-
-#[cfg(all(feature = "rwh_06", windows_platform))]
-unsafe impl Send for SendSyncRawWindowHandle {}
-#[cfg(all(feature = "rwh_06", windows_platform))]
-unsafe impl Sync for SendSyncRawWindowHandle {}
 
 impl WindowAttributes {
     /// Requests the window to be of specific dimensions.
@@ -199,6 +122,7 @@ impl WindowAttributes {
     }
 
     /// Sets the minimum dimensions a window can have.
+    #[cfg(not(windows_platform))]
     #[inline]
     pub fn with_min_inner_size<S: Into<Size>>(mut self, min_size: S) -> Self {
         self.min_inner_size = Some(min_size.into());
@@ -206,7 +130,7 @@ impl WindowAttributes {
     }
 
     /// Sets a desired initial position for the window.
-    #[cfg(any(macos_platform, windows_platform))]
+    #[cfg(macos_platform)]
     #[inline]
     pub fn with_position<P: Into<Position>>(mut self, position: P) -> Self {
         self.position = Some(position.into());
@@ -265,32 +189,6 @@ impl Window {
         let _span = tracing::debug_span!("aterm_window::Window::request_redraw",).entered();
 
         self.window.maybe_queue_on_main(|w| w.request_redraw())
-    }
-
-    /// Notify the windowing system before presenting to the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::window::Window;
-    /// # fn swap_buffers() {}
-    /// # fn scope(window: &Window) {
-    /// window.pre_present_notify();
-    /// swap_buffers();
-    /// # }
-    /// ```
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn pre_present_notify(&self) {
-        let _span = tracing::debug_span!("aterm_window::Window::pre_present_notify",).entered();
-
-        self.window.maybe_queue_on_main(|w| w.pre_present_notify());
-    }
-
-    /// Reset the dead key state of the keyboard.
-    #[cfg(windows_platform)]
-    pub fn reset_dead_keys(&self) {
-        let _span = tracing::debug_span!("aterm_window::Window::reset_dead_keys",).entered();
-
-        self.window.maybe_queue_on_main(|w| w.reset_dead_keys())
     }
 }
 
@@ -386,6 +284,7 @@ impl Window {
     /// window.set_min_inner_size(Some(PhysicalSize::new(400, 200)));
     /// # }
     /// ```
+    #[cfg(not(windows_platform))]
     #[inline]
     pub fn set_min_inner_size<S: Into<Size>>(&self, min_size: Option<S>) {
         let min_size = min_size.map(|s| s.into());
@@ -395,38 +294,6 @@ impl Window {
         )
         .entered();
         self.window.maybe_queue_on_main(move |w| w.set_min_inner_size(min_size))
-    }
-
-    /// Sets a maximum dimension size for the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the size in logical dimensions like this:
-    /// window.set_max_inner_size(Some(LogicalSize::new(400.0, 200.0)));
-    /// // Or specify the size in physical dimensions like this:
-    /// window.set_max_inner_size(Some(PhysicalSize::new(400, 200)));
-    /// # }
-    /// ```
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_max_inner_size<S: Into<Size>>(&self, max_size: Option<S>) {
-        let max_size = max_size.map(|s| s.into());
-        let _span = tracing::debug_span!(
-            "aterm_window::Window::max_size",
-            max_size = ?max_size
-        )
-        .entered();
-        self.window.maybe_queue_on_main(move |w| w.set_max_inner_size(max_size))
-    }
-
-    /// Returns window resize increments if any were set.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn resize_increments(&self) -> Option<PhysicalSize<u32>> {
-        let _span = tracing::debug_span!("aterm_window::Window::resize_increments",).entered();
-        self.window.maybe_wait_on_main(|w| w.resize_increments())
     }
 
     /// Sets window resize increments.
@@ -450,23 +317,6 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.set_title(title))
     }
 
-    /// Change the window transparency state.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_transparent(&self, transparent: bool) {
-        let _span =
-            tracing::debug_span!("aterm_window::Window::set_transparent", transparent).entered();
-        self.window.maybe_queue_on_main(move |w| w.set_transparent(transparent))
-    }
-
-    /// Change the window blur state.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_blur(&self, blur: bool) {
-        let _span = tracing::debug_span!("aterm_window::Window::set_blur", blur).entered();
-        self.window.maybe_queue_on_main(move |w| w.set_blur(blur))
-    }
-
     /// Modifies the window's visibility.
     #[inline]
     pub fn set_visible(&self, visible: bool) {
@@ -475,46 +325,11 @@ impl Window {
     }
 
     /// Gets the window's current visibility state.
-    #[cfg(any(macos_platform, windows_platform))]
+    #[cfg(macos_platform)]
     #[inline]
     pub fn is_visible(&self) -> Option<bool> {
         let _span = tracing::debug_span!("aterm_window::Window::is_visible",).entered();
         self.window.maybe_wait_on_main(|w| w.is_visible())
-    }
-
-    /// Sets whether the window is resizable.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_resizable(&self, resizable: bool) {
-        let _span =
-            tracing::debug_span!("aterm_window::Window::set_resizable", resizable).entered();
-        self.window.maybe_queue_on_main(move |w| w.set_resizable(resizable))
-    }
-
-    /// Gets the window's current resizable state.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn is_resizable(&self) -> bool {
-        let _span = tracing::debug_span!("aterm_window::Window::is_resizable",).entered();
-        self.window.maybe_wait_on_main(|w| w.is_resizable())
-    }
-
-    /// Sets the enabled window buttons.
-    #[cfg(windows_platform)]
-    pub fn set_enabled_buttons(&self, buttons: WindowButtons) {
-        let _span = tracing::debug_span!(
-            "aterm_window::Window::set_enabled_buttons",
-            buttons = ?buttons
-        )
-        .entered();
-        self.window.maybe_queue_on_main(move |w| w.set_enabled_buttons(buttons))
-    }
-
-    /// Gets the enabled window buttons.
-    #[cfg(windows_platform)]
-    pub fn enabled_buttons(&self) -> WindowButtons {
-        let _span = tracing::debug_span!("aterm_window::Window::enabled_buttons",).entered();
-        self.window.maybe_wait_on_main(|w| w.enabled_buttons())
     }
 
     /// Sets the window to minimized or back.
@@ -604,31 +419,11 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.fullscreen().map(|f| f.into()))
     }
 
-    /// Turn window decorations on or off.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_decorations(&self, decorations: bool) {
-        let _span =
-            tracing::debug_span!("aterm_window::Window::set_decorations", decorations).entered();
-        self.window.maybe_queue_on_main(move |w| w.set_decorations(decorations))
-    }
-
     /// Gets the window's current decorations state.
     #[inline]
     pub fn is_decorated(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_decorated",).entered();
         self.window.maybe_wait_on_main(|w| w.is_decorated())
-    }
-
-    /// Change the window level.
-    #[cfg(windows_platform)]
-    pub fn set_window_level(&self, level: WindowLevel) {
-        let _span = tracing::debug_span!(
-            "aterm_window::Window::set_window_level",
-            level = ?level
-        )
-        .entered();
-        self.window.maybe_queue_on_main(move |w| w.set_window_level(level))
     }
 
     /// Sets the window icon.
@@ -726,16 +521,8 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.theme())
     }
 
-    /// Prevents the window contents from being captured by other apps.
-    #[cfg(windows_platform)]
-    pub fn set_content_protected(&self, protected: bool) {
-        let _span = tracing::debug_span!("aterm_window::Window::set_content_protected", protected)
-            .entered();
-        self.window.maybe_queue_on_main(move |w| w.set_content_protected(protected))
-    }
-
     /// Gets the current title of the window.
-    #[cfg(any(macos_platform, windows_platform))]
+    #[cfg(macos_platform)]
     #[inline]
     pub fn title(&self) -> String {
         let _span = tracing::debug_span!("aterm_window::Window::title",).entered();
@@ -752,61 +539,6 @@ impl Window {
         self.window.maybe_queue_on_main(move |w| w.set_cursor(cursor))
     }
 
-    /// Changes the position of the cursor in window coordinates.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the position in logical dimensions like this:
-    /// window.set_cursor_position(LogicalPosition::new(400.0, 200.0));
-    /// // Or specify the position in physical dimensions like this:
-    /// window.set_cursor_position(PhysicalPosition::new(400, 200));
-    /// # }
-    /// ```
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_cursor_position<P: Into<Position>>(&self, position: P) -> Result<(), ExternalError> {
-        let position = position.into();
-        let _span = tracing::debug_span!(
-            "aterm_window::Window::set_cursor_position",
-            position = ?position
-        )
-        .entered();
-        self.window.maybe_wait_on_main(|w| w.set_cursor_position(position))
-    }
-
-    /// Set grabbing [mode][CursorGrabMode] on the cursor preventing it from leaving the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::window::{CursorGrabMode, Window};
-    /// # fn scope(window: &Window) {
-    /// window
-    ///     .set_cursor_grab(CursorGrabMode::Confined)
-    ///     .or_else(|_e| window.set_cursor_grab(CursorGrabMode::Locked))
-    ///     .unwrap();
-    /// # }
-    /// ```
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), ExternalError> {
-        let _span = tracing::debug_span!(
-            "aterm_window::Window::set_cursor_grab",
-            mode = ?mode
-        )
-        .entered();
-        self.window.maybe_wait_on_main(|w| w.set_cursor_grab(mode))
-    }
-
-    /// Modifies the cursor's visibility.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_cursor_visible(&self, visible: bool) {
-        let _span =
-            tracing::debug_span!("aterm_window::Window::set_cursor_visible", visible).entered();
-        self.window.maybe_queue_on_main(move |w| w.set_cursor_visible(visible))
-    }
-
     /// Moves the window with the left mouse button until the button is released.
     #[inline]
     pub fn drag_window(&self) -> Result<(), ExternalError> {
@@ -815,7 +547,7 @@ impl Window {
     }
 
     /// Resizes the window with the left mouse button until the button is released.
-    #[cfg(not(macos_platform))]
+    #[cfg(free_unix)]
     #[inline]
     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), ExternalError> {
         let _span = tracing::debug_span!(
@@ -827,7 +559,7 @@ impl Window {
     }
 
     /// Show window menu at a specified position .
-    #[cfg(not(macos_platform))]
+    #[cfg(free_unix)]
     pub fn show_window_menu(&self, position: impl Into<Position>) {
         let position = position.into();
         let _span = tracing::debug_span!(
@@ -836,15 +568,6 @@ impl Window {
         )
         .entered();
         self.window.maybe_queue_on_main(move |w| w.show_window_menu(position))
-    }
-
-    /// Modifies whether the window catches cursor events.
-    #[cfg(windows_platform)]
-    #[inline]
-    pub fn set_cursor_hittest(&self, hittest: bool) -> Result<(), ExternalError> {
-        let _span =
-            tracing::debug_span!("aterm_window::Window::set_cursor_hittest", hittest).entered();
-        self.window.maybe_wait_on_main(|w| w.set_cursor_hittest(hittest))
     }
 }
 
@@ -873,17 +596,26 @@ impl Window {
     }
 }
 
-// LOCAL PATCH (aterm): the X11 or Wayland handles through first-party
-// `aterm_types::native_window::HasNativeWindow`, so the GL arm and aterm-gui's CPU presenters reach
-// them without `raw-window-handle` (`rwh_06` is opt-in and wraps this answer).
+// LOCAL PATCH (aterm): the X11, Wayland or Win32 handles through first-party
+// `aterm_types::native_window::HasNativeWindow`, so the GL and D3D11 arms and aterm-gui's CPU
+// presenters reach them without `raw-window-handle` (`rwh_06` is opt-in and wraps this answer).
 // SAFETY: the display is the event loop's connection, which every window holds a reference to
 // (X11's `Arc<XConnection>`, Wayland's `Arc<Connection>`), so it stays open while `self` lives;
-// the X11 window is destroyed and the `wl_surface` released only when `self` drops.
-#[cfg(free_unix)]
+// Win32 has none. The X11 window is destroyed, the `wl_surface` released and the `HWND`
+// destroyed only when `self` drops (on Windows, by the message its `Drop` posts to the window's
+// thread).
+#[cfg(any(free_unix, windows_platform))]
 unsafe impl aterm_types::native_window::HasNativeWindow for Window {
     #[inline]
     fn native_window(&self) -> Option<aterm_types::native_window::NativeWindow> {
-        Some(self.window.native_window())
+        #[cfg(free_unix)]
+        {
+            Some(self.window.native_window())
+        }
+        #[cfg(windows_platform)]
+        {
+            self.window.native_window()
+        }
     }
 }
 
@@ -909,20 +641,6 @@ impl rwh_06::HasDisplayHandle for Window {
     }
 }
 
-/// The behavior of cursor grabbing.
-#[cfg(windows_platform)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum CursorGrabMode {
-    /// No grabbing of the cursor is performed.
-    None,
-
-    /// The cursor is confined to the window area.
-    Confined,
-
-    /// The cursor is locked inside the window area to the certain position.
-    Locked,
-}
-
 /// Defines the orientation that a window resize will be performed.
 #[cfg(not(macos_platform))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -940,10 +658,6 @@ pub enum ResizeDirection {
 /// Fullscreen modes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fullscreen {
-    /// Windows only: no aterm crate asks for a video mode.
-    #[cfg(windows_platform)]
-    Exclusive(VideoModeHandle),
-
     /// Providing `None` to `Borderless` will fullscreen on the current monitor.
     Borderless(Option<MonitorHandle>),
 }
@@ -967,31 +681,6 @@ pub enum UserAttentionType {
     /// **macOS:** Bounces the dock icon.
     #[default]
     Informational,
-}
-
-#[cfg(windows_platform)]
-aterm_types::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct WindowButtons: u32 {
-        const CLOSE  = 1 << 0;
-        const MINIMIZE  = 1 << 1;
-        const MAXIMIZE  = 1 << 2;
-    }
-}
-
-/// A window level groups windows with respect to their z-position.
-#[cfg(windows_platform)]
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
-pub enum WindowLevel {
-    /// The window will always be below normal windows.
-    AlwaysOnBottom,
-
-    /// The default.
-    #[default]
-    Normal,
-
-    /// The window will always be on top of normal windows.
-    AlwaysOnTop,
 }
 
 /// Generic IME purposes for use in [`Window::set_ime_purpose`].

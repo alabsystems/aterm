@@ -338,6 +338,12 @@ fn a_grok_worker_stays_refused_whatever_flips() {
     );
     assert!(why.contains("Grok Build"), "{why}");
     assert!(why.contains("await task"), "{why}");
+    assert!(
+        why.contains("the Mac asked to start it")
+            && !why.contains(" here")
+            && !why.contains("this Mac"),
+        "a Mac that drives another over the fleet reads it too: {why}"
+    );
 }
 
 /// ONLY A ROW THE DEFAULT SET DOES NOT KEEP IS INSTALLED ON DEMAND: Grok Build's; the rows the
